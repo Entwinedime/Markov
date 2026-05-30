@@ -1,0 +1,8 @@
+.DS_Store
+
+/trace_graph
+
+.cache
+build
+
+*.json

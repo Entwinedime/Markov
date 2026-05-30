@@ -1,0 +1,6 @@
+[submodule "third_party/sglang"]
+	path = third_party/sglang
+	url = git@github.com:Entwinedime/sglang.git
+[submodule "third_party/ktransformers"]
+	path = third_party/ktransformers
+	url = git@github.com:Entwinedime/ktransformers.git

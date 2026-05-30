@@ -1,0 +1,39 @@
+x-profile-common: &profile-common
+  working_dir: /workspace/trace-sim
+  network_mode: host
+  ipc: host
+  privileged: true
+  volumes:
+    - ../..:/workspace/trace-sim
+    - /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro
+    - /usr/local/Ascend/add-ons:/usr/local/Ascend/add-ons:ro
+    - /usr/local/dcmi:/usr/local/dcmi:ro
+    - /usr/local/bin/npu-smi:/usr/local/bin/npu-smi:ro
+    - /usr/local/sbin:/usr/local/sbin:ro
+    - /models:/models:ro
+    - /root/models:/root/models
+    - /dev:/dev
+
+x-common-env: &common-env
+  ASCEND_VISIBLE_DEVICES: ${ASCEND_VISIBLE_DEVICES:-0}
+
+services:
+  sglang-profile:
+    <<: *profile-common
+    build:
+      context: ../..
+      dockerfile: docker/images/sglang/Dockerfile
+    image: markov-trace-sim-sglang:ubuntu22.04
+    environment:
+      <<: *common-env
+    command: bash
+
+  ktransformers-profile:
+    <<: *profile-common
+    build:
+      context: ../..
+      dockerfile: docker/images/ktransformers/Dockerfile
+    image: markov-trace-sim-ktransformers:ubuntu22.04
+    environment:
+      <<: *common-env
+    command: bash

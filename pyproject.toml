@@ -1,0 +1,9 @@
+[project]
+name = "ktransformers-sglang-trace-sim"
+version = "0.1.0"
+description = "Trace-driven profiling, DAG modeling, and what-if simulation for ktransformers and sglang."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

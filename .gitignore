@@ -1,0 +1,32 @@
+.cache/
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Build products
+build/
+cmake-build-*/
+compile_commands.json
+*.o
+*.so
+*.a
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Profiling and generated traces
+data/profile_runs/**
+data/traces/raw/**
+data/traces/merged/**
+data/traces/dag/**
+
+# Local runtime outputs
+kernel_meta/
+cpu_trace*.json
+raw_parsed_*.json
+output_graph.json

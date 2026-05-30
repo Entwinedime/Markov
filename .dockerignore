@@ -1,0 +1,14 @@
+.git
+build
+cmake-build-*
+.cache
+.venv
+venv
+__pycache__
+*.pyc
+kernel_meta
+data/profile_runs
+data/traces/raw
+data/traces/merged
+data/traces/dag
+build/docker

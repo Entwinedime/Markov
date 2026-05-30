@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ $# -ne 1 ]; then
+    echo "usage: $0 <trace-sim-root>" >&2
+    exit 2
+fi
+
+TRACE_SIM_ROOT="$1"
+SGLANG_SRC="${TRACE_SIM_ROOT}/third_party/sglang"
+
+log() {
+    echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*"
+}
+
+source_ascend_env() {
+    set +u
+    # shellcheck disable=SC1091
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+    set -u
+
+    export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
+}
+
+prepare_sglang_pyproject() {
+    local pyproject_dir="${SGLANG_SRC}/python"
+    local npu_pyproject="${pyproject_dir}/pyproject_npu.toml"
+
+    if [ ! -f "$npu_pyproject" ]; then
+        log "Missing SGLang NPU pyproject: ${npu_pyproject}"
+        exit 1
+    fi
+
+    rm -f "${pyproject_dir}/pyproject.toml"
+    cp "$npu_pyproject" "${pyproject_dir}/pyproject.toml"
+}
+
+install_sglang() {
+    log "Installing SGLang: ${SGLANG_SRC}"
+    prepare_sglang_pyproject
+    (
+        cd "${SGLANG_SRC}/python"
+        python3 -m pip install --no-cache-dir -v -e ".[all_npu]"
+    )
+}
+
+main() {
+    source_ascend_env
+
+    if [ ! -d "$SGLANG_SRC" ]; then
+        log "Missing SGLang source tree: ${SGLANG_SRC}"
+        exit 1
+    fi
+
+    install_sglang
+}
+
+main "$@"

@@ -1,0 +1,98 @@
+#include "trace_graph/logger.hpp"
+
+#include <chrono>
+#include <ctime>
+#include <iomanip>
+#include <iostream>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+namespace TraceGraph {
+
+Logger & Logger::instance() {
+    static Logger logger;
+    return logger;
+}
+
+namespace {
+
+bool use_color() {
+    static bool checked = false;
+    static bool color = false;
+    if (!checked) {
+        checked = true;
+        const char * env = std::getenv("TRACE_GRAPH_COLOR");
+        if (env) {
+            std::string v(env);
+            color = !(v == "0" || v == "no" || v == "off" || v == "false");
+        }
+        else {
+#ifdef _WIN32
+            color = false;
+#else
+            color = isatty(STDERR_FILENO);
+#endif
+        }
+    }
+    return color;
+}
+
+const char * ansi(Logger::Level lv) {
+    if (!use_color()) return "";
+    switch (lv) {
+    case Logger::ERROR:
+        return "\x1b[1;31m"; // bold red
+    case Logger::WARN:
+        return "\x1b[33m"; // yellow
+    case Logger::INFO:
+        return "\x1b[32m"; // green
+    case Logger::DEBUG:
+        return "\x1b[2;36m"; // dim cyan
+    default:
+        return "\x1b[0m";
+    }
+}
+
+const char * reset() { return use_color() ? "\x1b[0m" : ""; }
+
+const char * label(Logger::Level lv) {
+    switch (lv) {
+    case Logger::ERROR:
+        return "ERROR";
+    case Logger::WARN:
+        return "WARN ";
+    case Logger::INFO:
+        return "INFO ";
+    case Logger::DEBUG:
+        return "DEBUG";
+    default:
+        return "?????";
+    }
+}
+
+std::string timestamp() {
+    auto now = std::chrono::system_clock::now();
+    auto t = std::chrono::system_clock::to_time_t(now);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1'000;
+    std::ostringstream ss;
+    ss << std::put_time(std::localtime(&t), "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    return ss.str();
+}
+
+} // namespace
+
+Logger::Line::Line(Level lv, bool active, std::mutex * mtx) : lv_(lv), active_(active), mtx_(mtx) {
+    if (active_) ss_ << ansi(lv) << "[" << label(lv) << " " << timestamp() << "] " << reset();
+}
+
+Logger::Line::~Line() {
+    if (active_) {
+        ss_ << "\n";
+        std::lock_guard<std::mutex> lock(*mtx_);
+        std::cerr << ss_.str() << std::flush;
+    }
+}
+
+} // namespace TraceGraph

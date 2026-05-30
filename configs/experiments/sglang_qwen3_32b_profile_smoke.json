@@ -1,0 +1,99 @@
+{
+  "framework": "sglang",
+  "name": "qwen3-32b-profile-smoke",
+  "env": {
+    "ASCEND_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+    "SGLANG_SET_CPU_AFFINITY": "1",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    "STREAMS_PER_DEVICE": "32",
+    "HCCL_BUFFSIZE": "1536",
+    "HCCL_OP_EXPANSION_MODE": "AIV"
+  },
+  "hook": {
+    "enabled": true,
+    "library": "build/docker/sglang/lib/libhook.so",
+    "trace_output": "trace/cpu_trace"
+  },
+  "server": {
+    "ready_url": "http://127.0.0.1:30000/get_model_info",
+    "ready_timeout_sec": 2400,
+    "command": [
+      "python3",
+      "-m",
+      "sglang.launch_server",
+      "--model-path",
+      "/models/Qwen3-32B",
+      "--trust-remote-code",
+      "--attention-backend",
+      "ascend",
+      "--device",
+      "npu",
+      "--tp-size",
+      "8",
+      "--mem-fraction-static",
+      "0.7",
+      "--context-length",
+      "4096",
+      "--disable-cuda-graph",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "30000",
+      "--served-model-name",
+      "Qwen3-32B"
+    ]
+  },
+  "profile": {
+    "enabled": true,
+    "output_dir": "trace/torch",
+    "activities": [
+      "CPU",
+      "GPU"
+    ],
+    "profile_by_stage": false,
+    "with_stack": true,
+    "record_shapes": false,
+    "merge_profiles": false,
+    "profile_prefix": "qwen3_32b_smoke",
+    "stop_after_workload": true
+  },
+  "bench": {
+    "kind": "sglang.bench_serving",
+    "args": {
+      "backend": "sglang",
+      "host": "127.0.0.1",
+      "port": 30000,
+      "model": "/models/Qwen3-32B",
+      "served_model_name": "Qwen3-32B",
+      "ready_check_timeout_sec": 0,
+      "num_prompts": 1,
+      "dataset_name": "random-ids",
+      "random_input_len": 64,
+      "random_range_ratio": 0.5
+    }
+  },
+  "experiments": [
+    {
+      "name": "out16",
+      "profile": {
+        "profile_prefix": "qwen3_32b_out16"
+      },
+      "bench": {
+        "args": {
+          "random_output_len": 16
+        }
+      }
+    },
+    {
+      "name": "out32",
+      "profile": {
+        "profile_prefix": "qwen3_32b_out32"
+      },
+      "bench": {
+        "args": {
+          "random_output_len": 32
+        }
+      }
+    }
+  ]
+}
