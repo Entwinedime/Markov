@@ -19,6 +19,17 @@
 
 namespace TraceGraph {
 
+namespace {
+
+bool starts_with(const std::string & text, const std::string & prefix) { return text.rfind(prefix, 0) == 0; }
+
+bool is_cache_io_record(const ActivityRecord & record) {
+    auto domain = record.args.find("domain");
+    return record.cat == "hicache" || starts_with(record.name, "HiCache::") || (domain != record.args.end() && domain->second == "cache_io");
+}
+
+} // namespace
+
 // ======================================================================
 //  from_records  -- main pipeline
 // ======================================================================
@@ -174,7 +185,7 @@ TraceDAG TraceDAG::from_records(std::vector<std::unique_ptr<ActivityRecord>> && 
     // --- Step 4: Filter to leaf nodes only ---
     std::vector<std::unique_ptr<ActivityRecord>> filtered_records;
     for (size_t i = 0; i < in_records.size(); ++i) {
-        if (is_leaf[i] && !is_discarded[i]) { filtered_records.push_back(std::move(in_records[i])); }
+        if ((is_leaf[i] && !is_discarded[i]) || is_cache_io_record(*in_records[i])) { filtered_records.push_back(std::move(in_records[i])); }
     }
 
     g.records = std::move(filtered_records);

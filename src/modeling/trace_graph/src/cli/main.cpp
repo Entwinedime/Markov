@@ -10,6 +10,7 @@
 #include "trace_graph/trace_parser.hpp"
 
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -30,6 +31,8 @@ struct CliOptions {
     bool show_help = false;
     std::string model_config_file;
     std::string model_summary_file;
+    std::string run_summary_file;
+    std::string scenario_name;
 };
 
 void print_usage(const char * prog) {
@@ -47,7 +50,9 @@ void print_usage(const char * prog) {
               << "  --full-output               Generate full Chrome tracing with edge flows\n"
               << "  --no-raw                    Skip raw parsed trace export\n"
               << "  --model-config FILE         Apply domain model config, e.g. cache_io tiers\n"
-              << "  --model-summary FILE        Model summary JSON output\n\n"
+              << "  --model-summary FILE        Model summary JSON output\n"
+              << "  --run-summary FILE          Scenario/run summary JSON output\n"
+              << "  --scenario-name NAME        Scenario name for --run-summary\n\n"
               << "All --scale values are applied together, then a single simulation runs.\n"
               << "Multiple trace files are treated as separate GPU cards and merged.\n\n"
               << "Environment:\n"
@@ -120,6 +125,22 @@ CliOptions parse_cli(int argc, char ** argv) {
                 return opts;
             }
         }
+        else if (arg == "--run-summary") {
+            if (i + 1 < argc) opts.run_summary_file = argv[++i];
+            else {
+                std::cerr << "Error: --run-summary requires a value\n";
+                opts.show_help = true;
+                return opts;
+            }
+        }
+        else if (arg == "--scenario-name") {
+            if (i + 1 < argc) opts.scenario_name = argv[++i];
+            else {
+                std::cerr << "Error: --scenario-name requires a value\n";
+                opts.show_help = true;
+                return opts;
+            }
+        }
         else if (arg[0] == '-') {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             opts.show_help = true;
@@ -133,6 +154,54 @@ CliOptions parse_cli(int argc, char ** argv) {
         opts.show_help = true;
     }
     return opts;
+}
+
+void append_string_array(std::ostringstream & os, const std::vector<std::string> & values) {
+    os << "[";
+    bool first = true;
+    for (const auto & value : values) {
+        if (!first) os << ",";
+        first = false;
+        os << "\"" << TraceGraph::ActivityRecord::escape_json(value) << "\"";
+    }
+    os << "]";
+}
+
+void write_run_summary(const std::string & filename,
+                       const CliOptions & opts,
+                       const TraceGraph::TraceDAG & dag,
+                       bool has_cache_summary,
+                       const TraceGraph::CacheIOSummary & cache_summary) {
+    std::ofstream ofs(filename);
+    if (!ofs.is_open()) { throw std::runtime_error("Failed to write run summary: " + filename); }
+
+    std::ostringstream os;
+    os << "{";
+    auto scenario_name = opts.scenario_name.empty() ? opts.output_file : opts.scenario_name;
+    os << "\"scenario_name\":\"" << TraceGraph::ActivityRecord::escape_json(scenario_name) << "\",";
+    os << "\"input_traces\":";
+    append_string_array(os, opts.input_traces);
+    os << ",\"output_file\":\"" << TraceGraph::ActivityRecord::escape_json(opts.output_file) << "\"";
+    os << ",\"model_config\":\"" << TraceGraph::ActivityRecord::escape_json(opts.model_config_file) << "\"";
+    os << ",\"model_summary\":\"" << TraceGraph::ActivityRecord::escape_json(opts.model_summary_file) << "\"";
+    os << ",\"simulated_e2e_ns\":" << dag.e2e_time();
+    os << ",\"node_count\":" << dag.nodes.size();
+    os << ",\"edge_count\":" << dag.edges.size();
+    if (has_cache_summary) {
+        os << ",\"cache_io_estimated_latency_us\":" << cache_summary.estimated_latency_us;
+        os << ",\"cache_io_movement_events_used\":" << cache_summary.movement_events_used;
+        os << ",\"cache_io_transfer_events\":" << cache_summary.transfer_events;
+        os << ",\"warnings\":";
+        append_string_array(os, cache_summary.whatif_warnings);
+    }
+    else {
+        os << ",\"cache_io_estimated_latency_us\":0";
+        os << ",\"cache_io_movement_events_used\":0";
+        os << ",\"cache_io_transfer_events\":0";
+        os << ",\"warnings\":[]";
+    }
+    os << "}";
+    ofs << os.str() << "\n";
 }
 
 } // namespace
@@ -196,14 +265,17 @@ int main(int argc, char ** argv) {
         }
 
         bool wrote_model_summary = false;
+        bool has_cache_summary = false;
+        TraceGraph::CacheIOSummary cache_summary;
         if (!opts.model_config_file.empty()) {
             TraceGraph::ModelConfig model_config = TraceGraph::ModelConfig::from_file(opts.model_config_file);
             if (model_config.cache_io.enabled) {
-                auto summary = TraceGraph::apply_cache_io_model(merged, model_config.cache_io);
+                cache_summary = TraceGraph::apply_cache_io_model(merged, model_config.cache_io);
                 std::string summary_file = opts.model_summary_file.empty() ? opts.output_file + ".model_summary.json" : opts.model_summary_file;
-                summary.write_json(summary_file);
+                cache_summary.write_json(summary_file);
                 logger.info() << "Exported model summary to " << summary_file;
                 wrote_model_summary = true;
+                has_cache_summary = true;
             }
         }
         else if (!opts.model_summary_file.empty()) {
@@ -217,6 +289,10 @@ int main(int argc, char ** argv) {
 
         merged.to_chrome_tracing_json(opts.output_file, /*concise=*/true, opts.full_output);
         logger.info() << "Exported to " << opts.output_file;
+        if (!opts.run_summary_file.empty()) {
+            write_run_summary(opts.run_summary_file, opts, merged, has_cache_summary, cache_summary);
+            logger.info() << "Exported run summary to " << opts.run_summary_file;
+        }
         if (!wrote_model_summary && !opts.model_config_file.empty()) {
             logger.warn() << "Model config did not enable any implemented domain.";
         }

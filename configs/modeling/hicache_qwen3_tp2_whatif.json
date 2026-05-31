@@ -1,0 +1,60 @@
+{
+  "base_model_config": "configs/modeling/hicache_ascend_file.json",
+  "base_overrides": {
+    "cache_io": {
+      "model_config_path": "/models/Qwen3-32B/config.json",
+      "tp_size": 2
+    }
+  },
+  "scenarios": [
+    {
+      "name": "baseline",
+      "overrides": {}
+    },
+    {
+      "name": "l3_bandwidth_x2",
+      "overrides": {
+        "cache_io": {
+          "tiers": {
+            "L3": {
+              "bandwidth_gbps": 10
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "l3_bandwidth_half",
+      "overrides": {
+        "cache_io": {
+          "tiers": {
+            "L3": {
+              "bandwidth_gbps": 2.5
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "l2_capacity_small_lru",
+      "overrides": {
+        "cache_io": {
+          "tiers": {
+            "L2": {
+              "capacity_pages": 4,
+              "eviction": "lru"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "disable_prefetch",
+      "overrides": {
+        "cache_io": {
+          "prefetch_policy": "none"
+        }
+      }
+    }
+  ]
+}

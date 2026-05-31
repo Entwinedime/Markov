@@ -174,6 +174,16 @@ void parse_capacity(const std::string & object, CacheIOTierConfig & tier) {
     value = lower(value);
     tier.capacity_infer = value == "infer";
     tier.capacity_infinite = value == "infinite" || value == "inf";
+    if (!tier.capacity_infer && !tier.capacity_infinite) {
+        try {
+            double numeric = std::stod(value);
+            if (numeric >= 0) {
+                tier.capacity_pages = static_cast<uint64_t>(numeric);
+            }
+        }
+        catch (...) {
+        }
+    }
 }
 
 void parse_bandwidth(const std::string & object, CacheIOTierConfig & tier) {
@@ -189,6 +199,16 @@ void parse_bandwidth(const std::string & object, CacheIOTierConfig & tier) {
     value = lower(value);
     tier.bandwidth_infer = value == "infer";
     tier.bandwidth_infinite = value == "infinite" || value == "inf";
+    if (!tier.bandwidth_infer && !tier.bandwidth_infinite) {
+        try {
+            double numeric = std::stod(value);
+            if (numeric >= 0) {
+                tier.bandwidth_gbps = numeric;
+            }
+        }
+        catch (...) {
+        }
+    }
 }
 
 std::vector<CacheIOTierConfig> parse_tiers(const std::string & cache_object) {

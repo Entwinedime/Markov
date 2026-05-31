@@ -35,9 +35,11 @@ adding `src/profiling/python_probe` to `PYTHONPATH` and setting
 `TRACE_SIM_PYTHON_PROBE=1`; without that environment variable they do not patch
 imports or change framework behavior. HiCache probe output is Chrome Trace JSON
 with `cat: "hicache"` and is merged with torch/native traces before modeling.
-The current HiCache model is experimental: it verifies that semantic events can
-flow into TraceGraph, but summary values such as `bytes_by_edge` are not yet a
-correctness claim.
+Use `TRACE_SIM_PYTHON_PROBE_KEY_MODE=hash` only for base traces that need
+capacity, eviction, or prefetch-policy what-if replay. The current HiCache model
+is experimental: it can run deterministic scenario replay, but summary values
+such as `bytes_by_edge` and predicted latency are calibration signals rather
+than absolute correctness claims.
 
 The Dockerfiles and compose services intentionally do not define an entrypoint.
 They default to bash. `scripts/build.sh`, `scripts/run.sh`, and
@@ -92,6 +94,7 @@ Use the host for trace modeling and optimization:
 - build DAGs with `build/bin/trace_graph`
 - run what-if scaling through `trace_graph --scale`
 - run domain replay models through `trace_graph --model-config`
+- run explicit HiCache scenario replay through `scripts/modeling/hicache_whatif.py`
 - stage raw traces under `data/traces/raw`
 - write merged traces to `data/traces/merged`
 - write generated DAGs and what-if outputs to `data/traces/dag`
@@ -102,8 +105,10 @@ different timestamp matching or profiler output handling.
 `scripts/trace/merge_all_traces.py` writes merged Chrome Trace files plus
 `merge_report.pid*.json` diagnostics. `scripts/trace/inspect_hicache.py` reads a
 run directory or trace file and reports HiCache event coverage, including which
-events expose page counts, page size, and byte fields. These reports are host
-analysis artifacts; they do not change runtime behavior.
+events expose page counts, byte fields, and page key hashes. Its
+`whatif_readiness` section should be checked before capacity/eviction/prefetch
+scenario replay. These reports are host analysis artifacts; they do not change
+runtime behavior.
 
 This keeps the heavyweight inference runtime separate from the graph modeling
 loop, while still allowing the profiling container to emit traces into host

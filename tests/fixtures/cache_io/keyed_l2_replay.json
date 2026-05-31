@@ -1,0 +1,104 @@
+{
+  "traceEvents": [
+    {
+      "name": "HiCache::prefetch_l3_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 100,
+      "dur": 10,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L3",
+        "tier_dst": "L2",
+        "direction": "prefetch",
+        "num_pages": 1,
+        "bytes": 1000,
+        "page_keys_hash": "page-a",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::prefetch_l3_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 120,
+      "dur": 10,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L3",
+        "tier_dst": "L2",
+        "direction": "prefetch",
+        "num_pages": 1,
+        "bytes": 1000,
+        "page_keys_hash": "page-b",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::load_l2_to_l1",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 140,
+      "dur": 5,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L2",
+        "tier_dst": "L1",
+        "direction": "load",
+        "num_pages": 1,
+        "bytes": 1000,
+        "page_keys_hash": "page-a",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::prefetch_l3_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 160,
+      "dur": 10,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L3",
+        "tier_dst": "L2",
+        "direction": "prefetch",
+        "num_pages": 1,
+        "bytes": 1000,
+        "page_keys_hash": "page-c",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::load_l2_to_l1",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 180,
+      "dur": 5,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L2",
+        "tier_dst": "L1",
+        "direction": "load",
+        "num_pages": 1,
+        "bytes": 1000,
+        "page_keys_hash": "page-a",
+        "status": "ok"
+      }
+    }
+  ]
+}

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict
 
@@ -30,14 +31,16 @@ MODEL_CONFIG: Dict[str, Any] = {
 }
 
 
-def run_fixture(name: str, temp_dir: Path) -> Dict[str, Any]:
+def run_fixture(name: str, temp_dir: Path, config: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    config_path = temp_dir / f"{name}.model_config.json"
+    config_path.write_text(json.dumps(config or MODEL_CONFIG), encoding="utf-8")
     summary = temp_dir / f"{name}.summary.json"
     output = temp_dir / f"{name}.graph.json"
     subprocess.run(
         [
             str(TRACE_GRAPH_BIN),
             "--model-config",
-            str(temp_dir / "model_config.json"),
+            str(config_path),
             "--model-summary",
             str(summary),
             "--output",
@@ -56,13 +59,37 @@ def assert_equal(actual: Any, expected: Any, message: str) -> None:
         raise AssertionError(f"{message}: expected {expected!r}, got {actual!r}")
 
 
+def assert_greater(actual: Any, expected: Any, message: str) -> None:
+    if not actual > expected:
+        raise AssertionError(f"{message}: expected {actual!r} > {expected!r}")
+
+
+def assert_less(actual: Any, expected: Any, message: str) -> None:
+    if not actual < expected:
+        raise AssertionError(f"{message}: expected {actual!r} < {expected!r}")
+
+
+def config_with(**cache_io_updates: Any) -> Dict[str, Any]:
+    config = deepcopy(MODEL_CONFIG)
+    for key, value in cache_io_updates.items():
+        config["cache_io"][key] = value
+    return config
+
+
+def config_with_tier(tier_name: str, **tier_updates: Any) -> Dict[str, Any]:
+    config = deepcopy(MODEL_CONFIG)
+    for tier in config["cache_io"]["tiers"]:
+        if tier["name"] == tier_name:
+            tier.update(tier_updates)
+    return config
+
+
 def main() -> int:
     if not TRACE_GRAPH_BIN.exists():
         raise SystemExit(f"trace_graph binary not found: {TRACE_GRAPH_BIN}")
 
     with tempfile.TemporaryDirectory(prefix="trace_graph_fixtures_") as tmp:
         temp_dir = Path(tmp)
-        (temp_dir / "model_config.json").write_text(json.dumps(MODEL_CONFIG), encoding="utf-8")
 
         simple = run_fixture("simple_l3_l2_l1", temp_dir)
         assert_equal(simple["events"], 3, "simple events")
@@ -83,6 +110,44 @@ def main() -> int:
         missing = run_fixture("missing_hicache", temp_dir)
         assert_equal(missing["events"], 0, "missing events")
         assert_equal(missing["transfer_events"], 0, "missing transfer events")
+
+        movement_control = run_fixture("movement_control", temp_dir)
+        assert_equal(movement_control["events"], 2, "movement/control events")
+        assert_equal(movement_control["movement_events_used"], 1, "movement/control movement count")
+        assert_equal(movement_control["control_events_ignored"], 1, "movement/control ignored count")
+        assert_equal(movement_control["transfer_events"], 1, "movement/control transfer count")
+
+        storage_base = run_fixture("storage_bandwidth", temp_dir)
+        storage_fast = run_fixture("storage_bandwidth", temp_dir, config_with_tier("L3", bandwidth_gbps=10))
+        storage_slow = run_fixture("storage_bandwidth", temp_dir, config_with_tier("L3", bandwidth_gbps=2.5))
+        assert_less(
+            storage_fast["estimated_latency_us"],
+            storage_base["estimated_latency_us"],
+            "L3 bandwidth x2 should reduce estimated latency",
+        )
+        assert_greater(
+            storage_slow["estimated_latency_us"],
+            storage_base["estimated_latency_us"],
+            "L3 bandwidth /2 should increase estimated latency",
+        )
+
+        keyed_lru = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=2, eviction="lru"))
+        keyed_fifo = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=2, eviction="fifo"))
+        keyed_small = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=1, eviction="lru"))
+        assert_equal(keyed_lru["miss_pages_by_tier"].get("L2", 0), 0, "L2 LRU capacity 2 should keep page-a resident")
+        assert_greater(keyed_fifo["miss_pages_by_tier"].get("L2", 0), 0, "L2 FIFO should evict page-a in keyed fixture")
+        assert_greater(
+            keyed_small["evictions_by_tier"].get("L2", 0),
+            keyed_lru["evictions_by_tier"].get("L2", 0),
+            "smaller L2 capacity should increase evictions",
+        )
+
+        prefetch_none = run_fixture("keyed_l2_replay", temp_dir, config_with(prefetch_policy="none"))
+        assert_greater(
+            prefetch_none["estimated_latency_us"],
+            keyed_lru["estimated_latency_us"],
+            "disabling prefetch should move storage cost to demand load",
+        )
 
     print("trace_graph cache_io fixtures passed")
     return 0

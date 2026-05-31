@@ -1,0 +1,41 @@
+{
+  "traceEvents": [
+    {
+      "name": "HiCache::match",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 100,
+      "dur": 2,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "control",
+        "direction": "lookup",
+        "hit_tier": "L2",
+        "num_tokens": 16,
+        "status": "hit"
+      }
+    },
+    {
+      "name": "HiCache::load_l2_to_l1",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 120,
+      "dur": 5,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L2",
+        "tier_dst": "L1",
+        "direction": "load",
+        "num_pages": 1,
+        "bytes": 1024,
+        "page_keys_hash": "page-a",
+        "status": "ok"
+      }
+    }
+  ]
+}

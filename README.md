@@ -32,7 +32,8 @@ The current codebase integrates two existing pieces of progress:
 ├── scripts/profile.sh           # Run JSON-configured profiling experiments
 ├── scripts/lib/                 # Shared shell helpers for public entrypoints
 ├── scripts/internal/            # Docker/profile/build internals, not user entrypoints
-├── scripts/trace/               # Trace merge tools
+├── scripts/trace/               # Trace merge and inspection tools
+├── scripts/modeling/            # Host-side modeling scenario runners
 ├── docker/images/base/sglang/   # SGLang stable Ubuntu/CANN/PyTorch environment
 ├── docker/images/base/ktransformers/
 │                                  # ktransformers stable Ubuntu/CANN/PyTorch environment
@@ -259,6 +260,7 @@ Apply a domain model, such as SGLang HiCache multi-level KV-cache replay:
 build/bin/trace_graph \
   --model-config configs/modeling/hicache_ascend_file.json \
   --model-summary data/traces/dag/hicache_summary.json \
+  --run-summary data/traces/dag/hicache_run_summary.json \
   -o data/traces/dag/hicache_dag.json \
   data/traces/merged/merged_trace.json
 ```
@@ -268,15 +270,32 @@ means the profile, merge, and replay plumbing worked; it is not yet proof that
 the multi-level KV-cache model is quantitatively correct. For calibration runs,
 set `cache_io.model_config_path` to the model's HuggingFace `config.json` and
 `cache_io.tp_size` to the serving tensor-parallel size so TraceGraph can infer
-bytes per KV page from model metadata. Synthetic fixtures can be checked with:
+bytes per KV page from model metadata. For capacity, eviction, and prefetch
+what-if runs, capture the base trace with:
+
+```bash
+TRACE_SIM_PYTHON_PROBE_KEY_MODE=hash
+```
+
+Synthetic fixtures can be checked with:
 
 ```bash
 python3 tests/run_trace_graph_fixtures.py
 ```
 
-`bytes_by_edge` may still be partially zero when SGLang events expose control
-status but not concrete page counts. That is expected until the HiCache probe
-coverage is expanded and validated against known storage traffic.
+Run explicit HiCache what-if scenarios against the same merged base trace:
+
+```bash
+python3 scripts/modeling/hicache_whatif.py \
+  --suite configs/modeling/hicache_qwen3_tp2_whatif.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid417.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid418.json \
+  --output-dir data/profile_runs/sglang/<run-id>/whatif
+```
+
+`scripts/trace/inspect_hicache.py` reports `whatif_readiness` before modeling.
+Existing traces without `page_keys_hash` are still useful for bandwidth/latency
+replay, but not for meaningful capacity/eviction/prefetch-policy prediction.
 
 Run what-if scaling:
 

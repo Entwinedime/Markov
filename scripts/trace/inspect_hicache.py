@@ -10,17 +10,26 @@ from typing import Any, Dict, Iterable, List, Optional
 
 HICACHE_KEYS = (
     "framework",
+    "producer",
+    "domain",
+    "event_kind",
     "request_id",
+    "operation_id",
     "op_id",
+    "node_id",
     "tier_src",
     "tier_dst",
     "direction",
     "pool",
+    "pool_name",
+    "transfer_scope",
     "num_tokens",
     "num_pages",
     "page_size",
     "bytes",
     "bytes_per_page",
+    "page_keys_hash",
+    "key_truncated",
     "layout",
     "io_backend",
     "storage_backend",
@@ -29,6 +38,7 @@ HICACHE_KEYS = (
 )
 
 NUMERIC_KEYS = ("num_tokens", "num_pages", "page_size", "bytes", "bytes_per_page")
+MOVEMENT_COVERAGE_KEYS = ("num_pages", "bytes", "page_keys_hash", "request_id", "operation_id")
 
 
 def load_events(path: Path) -> List[Dict[str, Any]]:
@@ -108,6 +118,18 @@ def edge_name(args: Dict[str, Any]) -> str:
     return f"{src}->{dst}" if dst else f"{src}->"
 
 
+def event_kind(args: Dict[str, Any], edge: str) -> str:
+    kind = args.get("event_kind")
+    if kind not in (None, ""):
+        return str(kind)
+    if "->" in edge and edge != "unknown":
+        return "movement"
+    direction = args.get("direction")
+    if direction in ("evict", "release", "insert"):
+        return "movement"
+    return "control"
+
+
 def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
     files = []
     events_by_name: Counter[str] = Counter()
@@ -115,9 +137,13 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
     status_counts: Counter[str] = Counter()
     direction_counts: Counter[str] = Counter()
     edge_counts: Counter[str] = Counter()
+    edge_counts_by_kind: Counter[str] = Counter()
+    event_kind_counts: Counter[str] = Counter()
     storage_backend_counts: Counter[str] = Counter()
     key_present: Counter[str] = Counter()
+    movement_key_present: Counter[str] = Counter()
     numeric_nonzero: Counter[str] = Counter()
+    movement_numeric_nonzero: Counter[str] = Counter()
     sample_events: List[Dict[str, Any]] = []
     total_trace_events = 0
     hicache_events = 0
@@ -145,8 +171,11 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
             status_counts[str(args.get("status", "missing"))] += 1
             direction_counts[str(args.get("direction", "missing"))] += 1
             edge = edge_name(args)
+            kind = event_kind(args, edge)
+            event_kind_counts[kind] += 1
             edge_counts[edge] += 1
-            if "->" in edge and not edge.endswith("->") and edge != "unknown":
+            edge_counts_by_kind[f"{kind}:{edge}"] += 1
+            if kind == "movement" and "->" in edge and not edge.endswith("->") and edge != "unknown":
                 transfer_events += 1
             storage_backend_counts[str(args.get("storage_backend", "missing"))] += 1
 
@@ -154,9 +183,13 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
                 value = args.get(key)
                 if value not in (None, ""):
                     key_present[key] += 1
+                    if kind == "movement":
+                        movement_key_present[key] += 1
             for key in NUMERIC_KEYS:
                 if as_positive_number(args.get(key)) is not None:
                     numeric_nonzero[key] += 1
+                    if kind == "movement":
+                        movement_numeric_nonzero[key] += 1
 
             ts = as_positive_number(event.get("ts"))
             dur = as_positive_number(event.get("dur")) or 0.0
@@ -192,6 +225,43 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
         }
         for key in NUMERIC_KEYS
     }
+    movement_events = event_kind_counts.get("movement", 0)
+    movement_key_coverage = {
+        key: {
+            "present": movement_key_present.get(key, 0),
+            "missing": max(0, movement_events - movement_key_present.get(key, 0)),
+        }
+        for key in MOVEMENT_COVERAGE_KEYS
+    }
+    movement_numeric_coverage = {
+        key: {
+            "nonzero": movement_numeric_nonzero.get(key, 0),
+            "zero_or_missing": max(0, movement_events - movement_numeric_nonzero.get(key, 0)),
+        }
+        for key in NUMERIC_KEYS
+    }
+
+    has_movement = movement_events > 0
+    has_bytes_or_pages = movement_numeric_nonzero.get("bytes", 0) > 0 or movement_numeric_nonzero.get("num_pages", 0) > 0
+    has_keys = movement_key_present.get("page_keys_hash", 0) > 0
+    has_prefetch = edge_counts_by_kind.get("movement:L3->L2", 0) > 0
+    has_load = edge_counts_by_kind.get("movement:L2->L1", 0) > 0
+    whatif_readiness = {
+        "latency_bandwidth_ready": has_movement and has_bytes_or_pages,
+        "capacity_eviction_ready": has_movement and has_keys,
+        "prefetch_policy_ready": has_movement and has_keys and has_prefetch and has_load,
+        "missing": [],
+    }
+    if not has_movement:
+        whatif_readiness["missing"].append("movement_events")
+    if not has_bytes_or_pages:
+        whatif_readiness["missing"].append("movement_num_pages_or_bytes")
+    if not has_keys:
+        whatif_readiness["missing"].append("movement_page_keys_hash")
+    if not has_prefetch:
+        whatif_readiness["missing"].append("movement_L3_to_L2_prefetch")
+    if not has_load:
+        whatif_readiness["missing"].append("movement_L2_to_L1_load")
 
     return {
         "files": files,
@@ -202,12 +272,17 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
         "time_range_us": None if min_ts is None or max_ts is None else [min_ts, max_ts],
         "events_by_name": dict(events_by_name),
         "events_by_pid": dict(events_by_pid),
+        "event_kind_counts": dict(event_kind_counts),
         "status_counts": dict(status_counts),
         "direction_counts": dict(direction_counts),
         "edge_counts": dict(edge_counts),
+        "edge_counts_by_kind": dict(edge_counts_by_kind),
         "storage_backend_counts": dict(storage_backend_counts),
         "key_coverage": key_coverage,
         "numeric_coverage": numeric_coverage,
+        "movement_key_coverage": movement_key_coverage,
+        "movement_numeric_coverage": movement_numeric_coverage,
+        "whatif_readiness": whatif_readiness,
         "sample_events": sample_events,
     }
 

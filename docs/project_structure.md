@@ -35,6 +35,7 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 - `src/modeling/trace_graph/include/trace_graph/optimization/`: what-if transform boundary.
 - `src/modeling/trace_graph/`: CLI wrapper and compatibility headers for the modeling engine.
 - `configs/modeling/`: host-side model replay and what-if configs.
+- `scripts/modeling/`: host-side scenario runners such as HiCache what-if replay.
 - `data/profile_runs/`: generated container-side profile run outputs.
 - `data/traces/raw/`: host-side raw trace staging area.
 - `data/traces/merged/`: merged Chrome Trace files used as DAG input.
@@ -44,16 +45,17 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 - `docs/hicache_validation.md`: current HiCache calibration workflow, acceptance criteria, and what-if roadmap.
 
 The `cache_io` domain is an experimental replay model. It is wired into the
-normal TraceGraph workflow so HiCache events are not a plugin-shaped outlier,
-but current summaries should be treated as plumbing/sanity output until
-bytes-per-page and KV layout inference are calibrated. Merge reports and
-HiCache inspection reports live beside each run under
+normal TraceGraph workflow so HiCache events are not a plugin-shaped outlier.
+Current summaries and what-if outputs are useful for monotonic sanity checks and
+calibration, but not yet absolute performance claims. Merge reports and HiCache
+inspection reports live beside each run under
 `data/profile_runs/<framework>/<run-id>/trace/merged/` and
 `data/profile_runs/<framework>/<run-id>/model/`.
 
 ## Optimization
 
-- `src/modeling/trace_graph` exposes what-if scaling through `--scale` and domain modeling through `--model-config`.
+- `src/modeling/trace_graph` exposes generic time scaling through `--scale`, domain modeling through `--model-config`, and per-run JSON summaries through `--run-summary`.
+- `scripts/modeling/hicache_whatif.py` replays user-defined HiCache scenarios on the same base trace and writes per-scenario plus aggregate reports.
 - `data/traces/dag/` stores generated what-if outputs.
 
 Modeling and optimization are host-side stages by default. They consume trace

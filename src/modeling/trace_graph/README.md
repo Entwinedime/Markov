@@ -75,6 +75,8 @@ Options:
   --no-raw                    Skip raw parsed trace export
   --model-config FILE         Apply domain model config, e.g. cache_io tiers
   --model-summary FILE        Model summary JSON output
+  --run-summary FILE          Scenario/run summary JSON output
+  --scenario-name NAME        Scenario name for --run-summary
 ```
 
 **Multiple trace files** are treated as separate GPU cards and automatically merged with HCCL communication edges.
@@ -203,6 +205,7 @@ Example:
 build/bin/trace_graph \
   --model-config configs/modeling/hicache_ascend_file.json \
   --model-summary data/traces/dag/hicache_summary.json \
+  --run-summary data/traces/dag/hicache_run_summary.json \
   -o data/traces/dag/hicache_dag.json \
   data/traces/merged/merged_trace.json
 ```
@@ -218,9 +221,25 @@ correctness is checked in layers:
 3. Calibration configs can set `cache_io.model_config_path` and `cache_io.tp_size`
    so bytes per page are inferred from HuggingFace model metadata.
 
-`bytes_by_edge` can still be partially zero when real HiCache events represent
-control/status checks rather than concrete page movement. Treat this as a probe
+`cache_io` separates `event_kind=movement` from control/query/ack events. Only
+movement events participate in transfer replay by default; control events remain
+visible for coverage and diagnosis. `bytes_by_edge` can still be partially zero
+when real movement events lack page or byte metadata. Treat this as a probe
 coverage signal, not a correct final cache model.
+
+For scenario replay, capture the base profile with page key hashes and then run:
+
+```bash
+python3 scripts/modeling/hicache_whatif.py \
+  --suite configs/modeling/hicache_qwen3_tp2_whatif.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid417.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid418.json \
+  --output-dir data/profile_runs/sglang/<run-id>/whatif
+```
+
+The what-if runner does explicit scenario replay only. It supports user-provided
+capacity, bandwidth, latency, prefetch-policy, and eviction-policy changes; it
+does not do auto-search.
 
 Run the fixture smoke test from the repository root:
 

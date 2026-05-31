@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from typing import Any, Dict, Optional, Tuple
 
 from trace_sim_probe.patching import compact_id, safe_getattr, safe_len, wrap_method
@@ -20,39 +22,56 @@ from trace_sim_probe.writer import get_writer
 
 TARGET_MODULES = (
     "sglang.srt.mem_cache.hiradix_cache",
+    "sglang.srt.mem_cache.unified_radix_cache",
+    "sglang.srt.mem_cache.hi_mamba_radix_cache",
     "sglang.srt.managers.cache_controller",
     "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller",
 )
 
 
 METHOD_EVENTS = {
-    "match_prefix": (HICACHE_MATCH, "", "", "lookup"),
-    "prefetch_from_storage": (HICACHE_PREFETCH_QUERY, "L3", "L2", "prefetch"),
-    "prefetch": (HICACHE_PREFETCH_QUERY, "L3", "L2", "prefetch"),
-    "_storage_hit_query": (HICACHE_PREFETCH_QUERY, "L3", "L2", "query"),
-    "_page_transfer": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch"),
-    "check_prefetch_progress": ("HiCache::prefetch_progress", "", "", "control"),
-    "load": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load"),
-    "load_back": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load"),
-    "start_loading": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load"),
-    "ready_to_load_host_cache": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load"),
-    "write": (HICACHE_BACKUP_L1_TO_L2, "L1", "L2", "backup"),
-    "start_writing": (HICACHE_BACKUP_L1_TO_L2, "L1", "L2", "backup"),
-    "write_storage": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write"),
-    "_page_backup": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write"),
-    "backup_thread_func": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write"),
-    "evict_device": (HICACHE_EVICT_L1, "L1", "", "evict"),
-    "evict_host": (HICACHE_EVICT_L2, "L2", "", "evict"),
-    "evict": (HICACHE_EVICT_L1, "L1", "", "evict"),
-    "insert": ("HiCache::insert_l1", "", "L1", "insert"),
-    "init_load_back": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load"),
-    "terminate_prefetch": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch"),
-    "pop_prefetch_loaded_tokens": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch"),
-    "append_host_mem_release": (HICACHE_EVICT_L2, "L2", "", "release"),
-    "attach_storage_backend": ("HiCache::attach_storage_backend", "", "L3", "control"),
-    "detach_storage_backend": ("HiCache::detach_storage_backend", "L3", "", "control"),
-    "check_hicache_events": ("HiCache::check_events", "", "", "control"),
-    "flush_write_through_acks": ("HiCache::flush_write_acks", "", "", "control"),
+    "match_prefix": (HICACHE_MATCH, "", "", "lookup", "query"),
+    "prefetch_from_storage": (HICACHE_PREFETCH_QUERY, "L3", "L2", "prefetch", "query"),
+    "prefetch": (HICACHE_PREFETCH_QUERY, "L3", "L2", "prefetch", "queue"),
+    "_storage_hit_query": (HICACHE_PREFETCH_QUERY, "L3", "L2", "query", "query"),
+    "_page_transfer": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch", "movement"),
+    "_page_get_zero_copy": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch", "movement"),
+    "_generic_page_get": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch", "movement"),
+    "_draft_page_get": ("HiCache::draft_l3_to_l2", "L3", "L2", "prefetch", "movement"),
+    "check_prefetch_progress": ("HiCache::prefetch_progress", "", "", "control", "control"),
+    "load": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load", "queue"),
+    "load_back": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load", "movement"),
+    "start_loading": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load", "queue"),
+    "ready_to_load_host_cache": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load", "control"),
+    "write": (HICACHE_BACKUP_L1_TO_L2, "L1", "L2", "backup", "queue"),
+    "write_backup": (HICACHE_BACKUP_L1_TO_L2, "L1", "L2", "backup", "movement"),
+    "start_writing": (HICACHE_BACKUP_L1_TO_L2, "L1", "L2", "backup", "queue"),
+    "write_storage": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write", "queue"),
+    "write_backup_storage": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write", "queue"),
+    "_page_backup": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write", "movement"),
+    "_page_set_zero_copy": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write", "movement"),
+    "_generic_page_set": (HICACHE_WRITE_L2_TO_L3, "L2", "L3", "write", "movement"),
+    "_draft_page_set": ("HiCache::draft_l2_to_l3", "L2", "L3", "write", "movement"),
+    "evict_device": (HICACHE_EVICT_L1, "L1", "", "evict", "movement"),
+    "evict_host": (HICACHE_EVICT_L2, "L2", "", "evict", "movement"),
+    "evict": (HICACHE_EVICT_L1, "L1", "", "evict", "queue"),
+    "_evict_backuped": (HICACHE_EVICT_L1, "L1", "", "evict", "movement"),
+    "_evict_regular": (HICACHE_EVICT_L1, "L1", "", "evict", "movement"),
+    "insert": ("HiCache::insert_l1", "", "L1", "insert", "movement"),
+    "_insert_helper_host": (HICACHE_PREFETCH_L3_TO_L2, "L3", "L2", "prefetch", "movement"),
+    "init_load_back": (HICACHE_LOAD_L2_TO_L1, "L2", "L1", "load", "queue"),
+    "terminate_prefetch": ("HiCache::terminate_prefetch", "", "", "control", "control"),
+    "pop_prefetch_loaded_tokens": ("HiCache::prefetch_loaded_tokens", "", "", "ack", "ack"),
+    "append_host_mem_release": (HICACHE_EVICT_L2, "L2", "", "release", "movement"),
+    "_append_host_mem_release_pages": (HICACHE_EVICT_L2, "L2", "", "release", "movement"),
+    "attach_storage_backend": ("HiCache::attach_storage_backend", "", "L3", "control", "control"),
+    "detach_storage_backend": ("HiCache::detach_storage_backend", "L3", "", "control", "control"),
+    "clear_storage_backend": ("HiCache::clear_storage_backend", "L3", "", "control", "control"),
+    "check_hicache_events": ("HiCache::check_events", "", "", "control", "control"),
+    "drain_storage_control_queues": ("HiCache::drain_storage_control_queues", "", "", "control", "control"),
+    "release_aborted_request": ("HiCache::release_aborted_request", "", "", "control", "control"),
+    "flush_write_through_acks": ("HiCache::flush_write_acks", "", "", "control", "ack"),
+    "prefetch_rate_limited": ("HiCache::prefetch_rate_limited", "", "", "control", "control"),
 }
 
 
@@ -61,14 +80,56 @@ CLASS_METHODS = {
         "match_prefix",
         "prefetch_from_storage",
         "check_prefetch_progress",
+        "write_backup",
+        "write_backup_storage",
         "load_back",
         "ready_to_load_host_cache",
         "flush_write_through_acks",
         "check_hicache_events",
+        "drain_storage_control_queues",
+        "evict",
+        "evict_host",
+        "_evict_backuped",
+        "_evict_regular",
+        "insert",
+        "_insert_helper_host",
+        "init_load_back",
+        "terminate_prefetch",
+        "pop_prefetch_loaded_tokens",
+        "release_aborted_request",
+    ),
+    "UnifiedRadixCache": (
+        "match_prefix",
+        "prefetch_from_storage",
+        "check_prefetch_progress",
+        "write_backup",
+        "write_backup_storage",
+        "load_back",
+        "ready_to_load_host_cache",
+        "flush_write_through_acks",
+        "check_hicache_events",
+        "drain_storage_control_queues",
         "evict",
         "evict_host",
         "insert",
-        "init_load_back",
+        "terminate_prefetch",
+        "pop_prefetch_loaded_tokens",
+        "release_aborted_request",
+    ),
+    "HiMambaRadixCache": (
+        "match_prefix",
+        "prefetch_from_storage",
+        "check_prefetch_progress",
+        "write_backup",
+        "write_backup_storage",
+        "load_back",
+        "ready_to_load_host_cache",
+        "flush_write_through_acks",
+        "check_hicache_events",
+        "drain_storage_control_queues",
+        "evict",
+        "evict_host",
+        "insert",
         "terminate_prefetch",
         "pop_prefetch_loaded_tokens",
         "release_aborted_request",
@@ -83,11 +144,18 @@ CLASS_METHODS = {
         "prefetch",
         "terminate_prefetch",
         "append_host_mem_release",
+        "_append_host_mem_release_pages",
         "_storage_hit_query",
         "_page_transfer",
+        "_page_get_zero_copy",
+        "_generic_page_get",
         "prefetch_rate_limited",
         "write_storage",
         "_page_backup",
+        "_page_set_zero_copy",
+        "_generic_page_set",
+        "_draft_page_get",
+        "_draft_page_set",
         "attach_storage_backend",
         "detach_storage_backend",
     ),
@@ -101,10 +169,15 @@ CLASS_METHODS = {
         "prefetch",
         "terminate_prefetch",
         "append_host_mem_release",
+        "_append_host_mem_release_pages",
         "_storage_hit_query",
         "_page_transfer",
+        "_page_get_zero_copy",
+        "_generic_page_get",
         "write_storage",
         "_page_backup",
+        "_page_set_zero_copy",
+        "_generic_page_set",
         "attach_storage_backend",
         "clear_storage_backend",
     ),
@@ -127,6 +200,18 @@ def _first_count(*values: Any) -> Optional[int]:
         if count is not None:
             return count
     return None
+
+
+def _probe_key_mode() -> str:
+    mode = os.environ.get("TRACE_SIM_PYTHON_PROBE_KEY_MODE", "none").strip().lower()
+    return mode if mode in ("none", "hash", "raw") else "none"
+
+
+def _max_keys() -> int:
+    try:
+        return max(0, int(os.environ.get("TRACE_SIM_PYTHON_PROBE_MAX_KEYS_PER_EVENT", "4096")))
+    except Exception:
+        return 4096
 
 
 def _first_attr(obj: Any, *names: str) -> Any:
@@ -196,6 +281,103 @@ def _infer_bytes_per_page(self_obj: Any, page_size: Any) -> Optional[int]:
     return None
 
 
+def _safe_iter(value: Any):
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value]
+    try:
+        return list(value)
+    except Exception:
+        return [value]
+
+
+def _hash_key(value: Any) -> str:
+    return hashlib.sha1(str(value).encode("utf-8", errors="replace")).hexdigest()[:24]
+
+
+def _encode_keys(keys: Any, page_size: Any = None) -> Tuple[Optional[str], bool]:
+    mode = _probe_key_mode()
+    if mode == "none" or keys is None:
+        return None, False
+
+    values = _safe_iter(keys)
+    page = _as_int(page_size)
+    if page and values and not isinstance(values[0], str):
+        grouped = [tuple(values[i : i + page]) for i in range(0, len(values), page)]
+        values = grouped
+
+    max_keys = _max_keys()
+    truncated = max_keys > 0 and len(values) > max_keys
+    if max_keys > 0:
+        values = values[:max_keys]
+
+    if mode == "raw":
+        encoded = [str(value) for value in values]
+    else:
+        encoded = [_hash_key(value) for value in values]
+    return "|".join(encoded), truncated
+
+
+def _node_token_count(node: Any) -> Optional[int]:
+    for attr in ("value", "host_value"):
+        count = _tensor_count(safe_getattr(node, attr, None))
+        if count is not None:
+            return count
+    key = safe_getattr(node, "key", None)
+    return _tensor_count(key)
+
+
+def _node_keys(node: Any) -> Any:
+    hash_value = safe_getattr(node, "hash_value", None)
+    if hash_value is not None:
+        return hash_value
+    key = safe_getattr(node, "key", None)
+    token_ids = safe_getattr(key, "token_ids", None)
+    return token_ids if token_ids is not None else key
+
+
+def _node_id(node: Any) -> Any:
+    return safe_getattr(node, "id", None)
+
+
+def _pool_transfer_names(pool_transfers: Any) -> Tuple[Optional[str], int]:
+    names = []
+    for transfer in _safe_iter(pool_transfers):
+        name = safe_getattr(transfer, "name", None)
+        if name is not None:
+            names.append(str(name))
+    return ("|".join(names) if names else None, len(names))
+
+
+def _extra_pool_event_args(base_args: Dict[str, Any], pool_transfers: Any):
+    events = []
+    for transfer in _safe_iter(pool_transfers):
+        name = safe_getattr(transfer, "name", None)
+        host_indices = safe_getattr(transfer, "host_indices", None)
+        device_indices = safe_getattr(transfer, "device_indices", None)
+        keys = safe_getattr(transfer, "keys", None)
+        count = _first_count(host_indices, device_indices, keys)
+        if count is None:
+            continue
+        event_args = dict(base_args)
+        event_args["event_kind"] = "movement"
+        event_args["pool"] = str(name) if name is not None else "extra"
+        event_args["pool_name"] = str(name) if name is not None else "extra"
+        event_args["transfer_scope"] = "extra_pool"
+        event_args["num_tokens"] = count
+        page_size = event_args.get("page_size")
+        try:
+            event_args["num_pages"] = (int(count) + int(page_size) - 1) // int(page_size) if page_size else count
+        except Exception:
+            event_args["num_pages"] = count
+        page_keys_hash, key_truncated = _encode_keys(keys, page_size)
+        event_args["page_keys_hash"] = page_keys_hash
+        event_args["key_truncated"] = key_truncated
+        events.append(event_args)
+    return events
+
+
 def _arg(args: Tuple[Any, ...], index: int, kwargs: Dict[str, Any], name: str) -> Any:
     if name in kwargs:
         return kwargs[name]
@@ -234,6 +416,13 @@ def _prefetch_operation_for(self_obj: Any, request_id: Any) -> Any:
     return None
 
 
+def _operation_keys(operation: Any) -> Any:
+    hash_value = safe_getattr(operation, "hash_value", None)
+    if hash_value:
+        return hash_value
+    return safe_getattr(operation, "token_ids", None)
+
+
 def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
     page_size = safe_getattr(self_obj, "page_size", None)
     storage_backend = safe_getattr(self_obj, "storage_backend_type", None)
@@ -251,6 +440,11 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
     host_indices = kwargs.get("host_indices")
     device_indices = kwargs.get("device_indices")
     token_ids = kwargs.get("token_ids") or kwargs.get("new_input_tokens")
+    page_keys = None
+    node_id = None
+    operation_id = None
+    pool_transfers = kwargs.get("extra_pools")
+    transfer_scope = "kv"
     inferred_num_tokens = None
     if method_name in ("load", "append_host_mem_release"):
         host_indices = _arg(args, 0, kwargs, "host_indices")
@@ -264,6 +458,7 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
     elif method_name == "write_storage":
         host_indices = _arg(args, 0, kwargs, "host_indices")
         token_ids = _arg(args, 1, kwargs, "token_ids")
+        page_keys = _arg(args, 2, kwargs, "hash_value") or token_ids
     elif method_name == "start_loading":
         num_tokens_from_queue = _sum_operation_indices(safe_getattr(self_obj, "load_queue", None), "host_indices", "device_indices")
         if num_tokens_from_queue is not None:
@@ -274,14 +469,60 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
             inferred_num_tokens = num_tokens_from_queue
     elif method_name in ("_page_transfer", "_page_backup", "terminate_prefetch"):
         operation = _arg(args, 0, kwargs, "operation")
+        operation_id = safe_getattr(operation, "id", None)
         host_indices = safe_getattr(operation, "host_indices", None)
         token_ids = safe_getattr(operation, "token_ids", None) or safe_getattr(operation, "hash_value", None)
         request_id = request_id or safe_getattr(operation, "request_id", None)
+        page_keys = _operation_keys(operation)
+        pool_transfers = safe_getattr(operation, "pool_transfers", None)
+    elif method_name in ("_page_get_zero_copy", "_generic_page_get"):
+        operation = _arg(args, 0, kwargs, "operation")
+        hash_values = _arg(args, 1, kwargs, "hash_values")
+        host_indices = _arg(args, 2, kwargs, "host_indices")
+        operation_id = safe_getattr(operation, "id", None)
+        request_id = safe_getattr(operation, "request_id", None)
+        page_keys = hash_values
+        num_hashes = _tensor_count(hash_values)
+        inferred_num_tokens = num_hashes * int(page_size) if num_hashes is not None and page_size else None
+    elif method_name in ("_page_set_zero_copy", "_generic_page_set", "_draft_page_set", "_draft_page_get"):
+        hash_values = _arg(args, 0, kwargs, "hash_values")
+        host_indices = _arg(args, 1, kwargs, "host_indices")
+        page_keys = hash_values
+        num_hashes = _tensor_count(hash_values)
+        inferred_num_tokens = num_hashes * int(page_size) if num_hashes is not None and page_size else None
     elif method_name == "check_prefetch_progress":
         operation = _prefetch_operation_for(self_obj, request_id)
         if operation is not None:
             host_indices = safe_getattr(operation, "host_indices", None)
             token_ids = safe_getattr(operation, "hash_value", None)
+            operation_id = safe_getattr(operation, "id", None)
+            page_keys = _operation_keys(operation)
+    elif method_name in ("write_backup", "write_backup_storage", "load_back", "_evict_backuped", "_evict_regular"):
+        node = _arg(args, 0, kwargs, "node")
+        node_id = _node_id(node)
+        page_keys = _node_keys(node)
+        inferred_num_tokens = _node_token_count(node)
+        host_indices = safe_getattr(node, "host_value", None)
+        device_indices = safe_getattr(node, "value", None)
+    elif method_name == "_insert_helper_host":
+        node = _arg(args, 0, kwargs, "node")
+        key = _arg(args, 1, kwargs, "key")
+        host_indices = _arg(args, 2, kwargs, "host_value")
+        hash_value = _arg(args, 3, kwargs, "hash_value")
+        node_id = _node_id(node)
+        page_keys = hash_value or safe_getattr(key, "token_ids", None) or key
+        inferred_num_tokens = _tensor_count(host_indices) or _tensor_count(key)
+    elif method_name == "insert":
+        params = _arg(args, 0, kwargs, "params")
+        key = safe_getattr(params, "key", None)
+        value = safe_getattr(params, "value", None)
+        page_keys = safe_getattr(key, "token_ids", None) or key
+        inferred_num_tokens = _tensor_count(value) or _tensor_count(key)
+    elif method_name == "evict_host":
+        inferred_num_tokens = _as_int(_arg(args, 0, kwargs, "num_tokens"))
+    elif method_name == "_append_host_mem_release_pages":
+        host_indices = _arg(args, 1, kwargs, "host_indices")
+        page_size = _arg(args, 2, kwargs, "page_size") or page_size
 
     num_tokens = inferred_num_tokens if inferred_num_tokens is not None else _first_count(host_indices, device_indices, token_ids)
     num_pages = None
@@ -293,15 +534,22 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
     bytes_per_page = _infer_bytes_per_page(self_obj, page_size)
     bytes_moved = num_pages * bytes_per_page if num_pages and bytes_per_page else None
 
-    event_name, tier_src, tier_dst, direction = METHOD_EVENTS.get(method_name, (f"HiCache::{method_name}", "", "", "runtime"))
+    event_name, tier_src, tier_dst, direction, event_kind = METHOD_EVENTS.get(method_name, (f"HiCache::{method_name}", "", "", "runtime", "control"))
+    page_keys_hash, key_truncated = _encode_keys(page_keys, page_size)
+    pool_name, pool_transfer_count = _pool_transfer_names(pool_transfers)
+    if pool_transfer_count:
+        transfer_scope = "kv+extra_pool"
     return {
         "framework": FRAMEWORK_SGLANG,
         "producer": "python_probe",
         "domain": "cache_io",
+        "event_kind": event_kind,
         "python_module": type(self_obj).__module__,
         "python_class": type(self_obj).__name__,
         "python_method": method_name,
         "op_id": compact_id(self_obj),
+        "operation_id": operation_id,
+        "node_id": node_id,
         "request_id": request_id,
         "tier_src": tier_src,
         "tier_dst": tier_dst,
@@ -311,10 +559,16 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
         "page_size": page_size,
         "bytes_per_page": bytes_per_page,
         "bytes": bytes_moved,
+        "page_keys_hash": page_keys_hash,
+        "key_truncated": key_truncated,
         "io_backend": safe_getattr(self_obj, "io_backend", None),
         "storage_backend": storage_backend,
         "write_policy": safe_getattr(self_obj, "write_policy", None),
         "pool": type(safe_getattr(self_obj, "mem_pool_host", None)).__name__ if safe_getattr(self_obj, "mem_pool_host", None) is not None else None,
+        "pool_name": pool_name or "KV",
+        "pool_transfer_count": pool_transfer_count,
+        "transfer_scope": transfer_scope,
+        "_pool_transfers": pool_transfers,
         "_event_name": event_name,
     }
 
@@ -324,6 +578,7 @@ def _wrapper(method_name: str):
         def wrapped(self_obj, *args, **kwargs):
             event_args = _base_args(self_obj, method_name, args, kwargs)
             event_name = event_args.pop("_event_name")
+            pool_transfers = event_args.pop("_pool_transfers", None)
             writer = get_writer()
             start = writer.now_us()
             try:
@@ -348,6 +603,19 @@ def _wrapper(method_name: str):
                             event_args["num_pages"] = (loaded_tokens + int(page_size) - 1) // int(page_size)
                     except Exception:
                         pass
+                elif method_name == "_storage_hit_query":
+                    try:
+                        hash_values, hit_tokens = result
+                        event_args["storage_hit_tokens"] = int(hit_tokens)
+                        event_args["num_tokens"] = int(hit_tokens)
+                        page_size = event_args.get("page_size")
+                        if page_size:
+                            event_args["num_pages"] = (int(hit_tokens) + int(page_size) - 1) // int(page_size)
+                        page_keys_hash, key_truncated = _encode_keys(hash_values, page_size)
+                        event_args["page_keys_hash"] = page_keys_hash
+                        event_args["key_truncated"] = key_truncated
+                    except Exception:
+                        pass
                 return result
             except Exception as exc:
                 event_args["status"] = "exception"
@@ -355,6 +623,8 @@ def _wrapper(method_name: str):
                 raise
             finally:
                 writer.duration_event(event_name, start, writer.now_us(), HICACHE_CATEGORY, event_args)
+                for pool_event_args in _extra_pool_event_args(event_args, pool_transfers):
+                    writer.duration_event("HiCache::extra_pool_transfer", start, writer.now_us(), HICACHE_CATEGORY, pool_event_args)
 
         return wrapped
 

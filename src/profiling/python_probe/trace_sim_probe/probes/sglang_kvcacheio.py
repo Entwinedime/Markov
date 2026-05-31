@@ -11,7 +11,7 @@ from trace_sim_probe.schema import (
 from trace_sim_probe.writer import get_writer
 
 
-TARGET_MODULES = ("sgl_kernel.kvcacheio",)
+TARGET_MODULES = ("sgl_kernel.kvcacheio", "sgl_kernel_npu.kvcacheio")
 
 
 TRANSFER_FUNCTIONS = (
@@ -28,6 +28,7 @@ TRANSFER_FUNCTIONS = (
     "transfer_kv_per_layer_mla_pf_lf",
     "transfer_kv_all_layer_mla",
     "transfer_kv_all_layer_mla_lf_pf",
+    "transfer_kv_dim_exchange",
 )
 
 
@@ -71,8 +72,10 @@ def _wrapper(function_name: str):
                 "framework": FRAMEWORK_SGLANG,
                 "producer": "python_probe",
                 "domain": "cache_io",
-                "python_module": "sgl_kernel.kvcacheio",
+                "event_kind": "movement",
+                "python_module": getattr(original, "__module__", "sgl_kernel.kvcacheio"),
                 "python_function": function_name,
+                "transfer_scope": "kernel_kvcacheio",
                 "direction": "transfer",
                 "layout": _layout_from_name(function_name),
                 "num_tokens": count,
