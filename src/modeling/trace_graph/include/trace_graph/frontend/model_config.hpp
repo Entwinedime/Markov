@@ -22,6 +22,12 @@ struct CacheIOConfig {
     bool enabled = false;
     std::string page_size_tokens = "infer";
     std::string bytes_per_page = "infer";
+    std::string model_config_path = "";
+    uint64_t tp_size = 1;
+    uint64_t num_layers = 0;
+    uint64_t num_kv_heads = 0;
+    uint64_t head_dim = 0;
+    uint64_t dtype_bytes = 0;
     std::vector<CacheIOTierConfig> tiers;
     std::string write_policy = "trace";
     std::string prefetch_policy = "trace_replay";

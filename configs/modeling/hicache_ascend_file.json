@@ -4,6 +4,8 @@
   "cache_io": {
     "page_size_tokens": "infer",
     "bytes_per_page": "infer",
+    "model_config_path": "infer",
+    "tp_size": 1,
     "tiers": [
       {
         "name": "L1",

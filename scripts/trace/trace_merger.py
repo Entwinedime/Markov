@@ -1,14 +1,52 @@
-import json
 import argparse
-import os
+import json
 import logging
+import os
 import bisect
 from collections import defaultdict
+from dataclasses import asdict, dataclass, field
 from typing import Tuple, Dict, Any, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 DIRECT_MERGED_EVENT_NAMES = {"CPUInfer::submit", "CPUInfer::sync"}
+
+
+@dataclass
+class MergeReport:
+    profiler_path: str
+    custom_path: str
+    out_path: str
+    mode: str
+    tolerance_us: float
+    search_window: int
+    margin_us: float
+    success: bool = False
+    cann_pid: int = 0
+    custom_key_count: int = 0
+    need_match: int = 0
+    matched: int = 0
+    unmatched: int = 0
+    rejected_count: int = 0
+    count_mismatch_count: int = 0
+    occupied_collision_count: int = 0
+    fallback_count: int = 0
+    later_match_count: int = 0
+    max_match_diff_us: float = 0.0
+    standalone_custom_appended: int = 0
+    sidecar_events_appended: int = 0
+    sidecar_paths: List[str] = field(default_factory=list)
+    sidecar_details: List[Dict[str, Any]] = field(default_factory=list)
+    error: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+def write_report(report: MergeReport, report_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+    with open(report_path, "w", encoding="utf-8") as report_file:
+        json.dump(report.to_dict(), report_file, indent=2, sort_keys=True)
 
 def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dict]]:
     if not file_path or not os.path.exists(file_path):
@@ -72,9 +110,15 @@ def inject_custom_args(profiler_event: Dict, custom_args: Dict):
     profiler_args.update(custom_args)
 
 def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int, 
-                             earliest_profiler_ts: float, margin_us: float, tolerance_us: float) -> Tuple[int, int]:
+                             earliest_profiler_ts: float, margin_us: float, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
     need_to_be_matched = 0
     successfully_matched = 0
+    diagnostics: Dict[str, Any] = {
+        "rejected_count": 0,
+        "count_mismatch_count": 0,
+        "later_match_count": 0,
+        "max_match_diff_us": 0.0,
+    }
 
     logging.info("Using 'sequential' matching mode.")
     
@@ -101,6 +145,7 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
         need_to_be_matched += len(profiler_event_list)
         
         if len(profiler_event_list) != len(valid_custom_indices):
+            diagnostics["count_mismatch_count"] += 1
             logging.warning(f"Key {key}: Count mismatch. Profiler needs {len(profiler_event_list)}, "
                             f"Custom has {len(valid_custom_indices)}. Skipping sequential match.")
             continue
@@ -113,24 +158,33 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
             profiler_timestamp = float(profiler_event.get("ts", 0))
             custom_timestamp = custom_timestamps[custom_index]
             time_difference = abs(profiler_timestamp - custom_timestamp)
+            diagnostics["max_match_diff_us"] = max(diagnostics["max_match_diff_us"], time_difference)
             
             if time_difference > tolerance_us:
+                diagnostics["rejected_count"] += 1
                 logging.warning(f"Key {key}: Match rejected due to time diff {time_difference} us > tolerance {tolerance_us} us.")
                 continue
                 
             if profiler_timestamp < custom_timestamp:
+                diagnostics["later_match_count"] += 1
                 logging.warning(f"Profiler event '{profiler_event['name']}' (ts {profiler_timestamp}) happens before custom event (ts {custom_timestamp}). Potential mismatch.")
 
             inject_custom_args(profiler_event, custom_args_list[custom_index])
             successfully_matched += 1
 
-    return need_to_be_matched, successfully_matched
+    return need_to_be_matched, successfully_matched, diagnostics
 
 def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int, 
-                         search_window: int, tolerance_us: float) -> Tuple[int, int]:
+                         search_window: int, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
     need_to_be_matched = 0
     successfully_matched = 0
     used_custom_indices = {}
+    diagnostics: Dict[str, Any] = {
+        "occupied_collision_count": 0,
+        "fallback_count": 0,
+        "later_match_count": 0,
+        "max_match_diff_us": 0.0,
+    }
 
     for event in profiler_events:
         if event.get("ph") != "X" or event.get("pid") != cann_pid or not event.get("name"):
@@ -169,18 +223,22 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
             candidate_key = candidate['key']
             if candidate_key in used_custom_indices:
                 fallback_triggered = True
+                diagnostics["occupied_collision_count"] += 1
                 logging.warning(f"Custom event {candidate_key} at {candidate['ts']} is already occupied by earlier profiler event at {used_custom_indices[candidate_key]}.\n"
                                 f"Profiler event '{event['name']}' at {profiler_ts} trying next best.")
                 continue
 
             if profiler_ts < candidate['ts']:
+                diagnostics["later_match_count"] += 1
                 logging.warning(f"Profiler event '{event['name']}' (ts {profiler_ts}) matches custom event at {candidate['ts']} which occurs later.")
             
             best_candidate = candidate
             break
 
         if best_candidate:
+            diagnostics["max_match_diff_us"] = max(diagnostics["max_match_diff_us"], best_candidate["diff"])
             if fallback_triggered:
+                diagnostics["fallback_count"] += 1
                 logging.warning(f"Profiler event '{event['name']}' at {profiler_ts} used fallback custom event "
                                 f"with {best_candidate['diff']} us difference.")
 
@@ -188,9 +246,9 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
             inject_custom_args(event, best_candidate['args'])
             successfully_matched += 1
 
-    return need_to_be_matched, successfully_matched
+    return need_to_be_matched, successfully_matched, diagnostics
 
-def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: List[Dict], cutoff_ts: float):
+def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: List[Dict], cutoff_ts: float) -> int:
     appended_count = 0
     for event in custom_events:
         if event.get("name", "") in DIRECT_MERGED_EVENT_NAMES:
@@ -198,45 +256,72 @@ def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: L
                 appended_count += 1
                 profiler_events.append(event)
     logging.info(f"Appended {appended_count} standalone custom events to the merged trace.")
+    return appended_count
 
-def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List[str]):
+def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
     appended_count = 0
+    details: List[Dict[str, Any]] = []
     for sidecar_path in sidecar_paths:
         _, sidecar_events = load_trace(sidecar_path)
         if not sidecar_events:
             logging.warning("No sidecar events loaded from %s", sidecar_path)
+            details.append({"path": sidecar_path, "events": 0, "loaded": False})
             continue
         profiler_events.extend(sidecar_events)
         appended_count += len(sidecar_events)
+        details.append({"path": sidecar_path, "events": len(sidecar_events), "loaded": True})
     if sidecar_paths:
         logging.info(f"Appended {appended_count} sidecar trace events.")
+    return appended_count, details
 
 def merge_traces(profiler_path: str, custom_path: str, out_path: str, 
                  tolerance_us: float = 10000.0, search_window: int = 5, margin_us: float = 0.0, mode: str = "search",
-                 sidecar_paths: Optional[List[str]] = None):
+                 sidecar_paths: Optional[List[str]] = None, report_path: Optional[str] = None) -> Dict[str, Any]:
+    report = MergeReport(
+        profiler_path=profiler_path,
+        custom_path=custom_path,
+        out_path=out_path,
+        mode=mode,
+        tolerance_us=tolerance_us,
+        search_window=search_window,
+        margin_us=margin_us,
+        sidecar_paths=list(sidecar_paths or []),
+    )
+
     raw_data, profiler_events = load_trace(profiler_path)
     _, custom_events = load_trace(custom_path, auto_repair=True)
 
     if not profiler_events or not custom_events:
         logging.error("Failed to load events. Aborting merge.")
-        return
+        report.error = "failed_to_load_events"
+        if report_path:
+            write_report(report, report_path)
+        return report.to_dict()
 
     cann_pid = get_cann_pid(profiler_events)
+    report.cann_pid = cann_pid
     logging.info(f"Identified CANN PID: {cann_pid}")
 
     custom_map = build_custom_event_map(custom_events)
+    report.custom_key_count = len(custom_map)
     logging.info(f"Built custom map with {len(custom_map)} unique keys.")
 
     earliest_profiler_ts = get_earliest_timestamp(profiler_events)
 
     if mode == "sequential":
-        need_match, matched = execute_sequential_match(
+        need_match, matched, diagnostics = execute_sequential_match(
             profiler_events, custom_map, cann_pid, earliest_profiler_ts, margin_us, tolerance_us
         )
     else:
-        need_match, matched = execute_search_match(
+        need_match, matched, diagnostics = execute_search_match(
             profiler_events, custom_map, cann_pid, search_window, tolerance_us
         )
+    report.need_match = need_match
+    report.matched = matched
+    report.unmatched = max(0, need_match - matched)
+    for key, value in diagnostics.items():
+        if hasattr(report, key):
+            setattr(report, key, value)
 
     if need_match != matched:
         logging.warning(f"Matched {matched} out of {need_match} events. Some events missing/not properly merged.")
@@ -244,14 +329,20 @@ def merge_traces(profiler_path: str, custom_path: str, out_path: str,
         logging.info(f"Successfully matched and injected args into {matched} events.")
         
     cutoff_ts = earliest_profiler_ts - margin_us
-    append_unmatched_custom_events(profiler_events, custom_events, cutoff_ts)
-    append_sidecar_trace_events(profiler_events, sidecar_paths or [])
+    report.standalone_custom_appended = append_unmatched_custom_events(profiler_events, custom_events, cutoff_ts)
+    report.sidecar_events_appended, report.sidecar_details = append_sidecar_trace_events(profiler_events, sidecar_paths or [])
 
     logging.info(f"Saving merged trace to '{out_path}' ...")
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as output_file:
         json.dump(raw_data, output_file)
+
+    report.success = True
+    if report_path:
+        write_report(report, report_path)
         
     logging.info("Merge complete! Drag it into https://ui.perfetto.dev to view.")
+    return report.to_dict()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge Prefill, Decode, and Custom CPU Traces.")
@@ -263,7 +354,8 @@ if __name__ == "__main__":
     parser.add_argument("--margin", type=float, default=100.0, help="Margin in microseconds before earliest profiler event")
     parser.add_argument("--mode", type=str, choices=["search", "sequential"], default="search", help="Matching logic mode")
     parser.add_argument("--sidecar", action="append", default=[], help="Additional Chrome trace JSON to append")
+    parser.add_argument("--report", help="Optional JSON merge report output")
     
     args = parser.parse_args()
     
-    merge_traces(args.profiler, args.custom, args.out, args.tolerance, args.window, args.margin, args.mode, args.sidecar)
+    merge_traces(args.profiler, args.custom, args.out, args.tolerance, args.window, args.margin, args.mode, args.sidecar, args.report)

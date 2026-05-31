@@ -40,6 +40,8 @@ uint64_t arg_u64(const ActivityRecord & record, const std::string & key, uint64_
     }
 }
 
+bool has_positive_arg(const ActivityRecord & record, const std::string & key) { return arg_u64(record, key, 0) > 0; }
+
 bool is_hicache_event(const ActivityRecord & record) {
     if (record.cat == "hicache") return true;
     if (starts_with(record.name, "HiCache::")) return true;
@@ -80,13 +82,25 @@ uint64_t parse_config_u64(const std::string & value, uint64_t def) {
     }
 }
 
-uint64_t infer_bytes(const ActivityRecord & record, const CacheIOConfig & config) {
+uint64_t infer_bytes_per_page(const ActivityRecord & record, const CacheIOConfig & config) {
+    uint64_t bytes_per_page = arg_u64(record, "bytes_per_page", 0);
+    if (bytes_per_page == 0) bytes_per_page = parse_config_u64(config.bytes_per_page, 0);
+    if (bytes_per_page > 0) return bytes_per_page;
+
+    uint64_t page_size = arg_u64(record, "page_size", 0);
+    if (page_size == 0) page_size = parse_config_u64(config.page_size_tokens, 0);
+    if (page_size == 0 || config.num_layers == 0 || config.num_kv_heads == 0 || config.head_dim == 0 || config.dtype_bytes == 0) return 0;
+
+    uint64_t tp_size = std::max<uint64_t>(1, config.tp_size);
+    uint64_t kv_heads_per_rank = (config.num_kv_heads + tp_size - 1) / tp_size;
+    return page_size * config.num_layers * kv_heads_per_rank * config.head_dim * 2 * config.dtype_bytes;
+}
+
+uint64_t infer_bytes(const ActivityRecord & record, const CacheIOConfig & config, uint64_t pages) {
     uint64_t bytes = arg_u64(record, "bytes", 0);
     if (bytes > 0) return bytes;
 
-    uint64_t pages = arg_u64(record, "num_pages", 0);
-    uint64_t bytes_per_page = arg_u64(record, "bytes_per_page", 0);
-    if (bytes_per_page == 0) bytes_per_page = parse_config_u64(config.bytes_per_page, 0);
+    uint64_t bytes_per_page = infer_bytes_per_page(record, config);
     if (pages > 0 && bytes_per_page > 0) return pages * bytes_per_page;
     return 0;
 }
@@ -187,6 +201,11 @@ std::string CacheIOSummary::to_json() const {
     os << "\"transfer_events\":" << transfer_events << ",";
     os << "\"eviction_events\":" << eviction_events << ",";
     os << "\"writeback_events\":" << writeback_events << ",";
+    os << "\"events_with_tokens\":" << events_with_tokens << ",";
+    os << "\"events_with_pages\":" << events_with_pages << ",";
+    os << "\"events_with_page_size\":" << events_with_page_size << ",";
+    os << "\"events_with_bytes\":" << events_with_bytes << ",";
+    os << "\"missing_bytes_events\":" << missing_bytes_events << ",";
     os << "\"estimated_latency_us\":" << estimated_latency_us << ",";
     os << "\"hit_tokens_by_tier\":";
     append_map_json(os, hit_tokens_by_tier);
@@ -220,14 +239,22 @@ CacheIOSummary apply_cache_io_model(TraceDAG & dag, const CacheIOConfig & config
         summary.events++;
         std::string src = infer_src(record);
         std::string dst = infer_dst(record);
-        uint64_t bytes = infer_bytes(record, config);
         uint64_t pages = infer_pages(record, config);
+        uint64_t bytes = infer_bytes(record, config, pages);
         uint64_t estimated = estimate_transfer_us(config, src, dst, bytes, record.dur);
+
+        if (has_positive_arg(record, "num_tokens")) summary.events_with_tokens++;
+        if (pages > 0) summary.events_with_pages++;
+        if (has_positive_arg(record, "page_size") || parse_config_u64(config.page_size_tokens, 0) > 0) summary.events_with_page_size++;
+        if (bytes > 0) summary.events_with_bytes++;
+        else summary.missing_bytes_events++;
 
         node.args["domain"] = "cache_io";
         node.args["cache_io.src"] = src;
         node.args["cache_io.dst"] = dst;
         node.args["cache_io.estimated_time"] = std::to_string(estimated);
+        node.args["cache_io.pages"] = std::to_string(pages);
+        node.args["cache_io.bytes"] = std::to_string(bytes);
         node.args["time"] = std::to_string(estimated);
         if (node.args.find("ori_time") == node.args.end()) { node.args["ori_time"] = std::to_string(record.dur); }
 

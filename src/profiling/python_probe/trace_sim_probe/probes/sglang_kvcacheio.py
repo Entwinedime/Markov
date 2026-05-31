@@ -76,6 +76,7 @@ def _wrapper(function_name: str):
                 "direction": "transfer",
                 "layout": _layout_from_name(function_name),
                 "num_tokens": count,
+                "num_pages": count,
                 "page_size": page_size,
                 "tier_src": "",
                 "tier_dst": "",

@@ -19,7 +19,7 @@ while leaving room for ktransformers and sglang specific adapters.
 - `scripts/internal/frameworks/sglang/`: SGLang source-install internals used by the runtime image.
 - `scripts/internal/frameworks/ktransformers/`: ktransformers source-install internals used by the runtime image.
 - `scripts/internal/hooks/`: container-side hook build helper.
-- `scripts/trace/`: host-side trace merge tools.
+- `scripts/trace/`: host-side trace merge and HiCache inspection tools.
 
 Profiling is the containerized stage. SGLang and ktransformers use separate
 Docker images, profile scripts, hook build directories, and `libhook.so`
@@ -39,11 +39,17 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 - `data/traces/raw/`: host-side raw trace staging area.
 - `data/traces/merged/`: merged Chrome Trace files used as DAG input.
 - `data/traces/dag/`: generated DAG/simulation timeline JSON.
+- `tests/fixtures/cache_io/`: synthetic Chrome Trace inputs for cache IO replay checks.
+- `tests/run_trace_graph_fixtures.py`: host-side regression runner for cache IO modeling fixtures.
+- `docs/hicache_validation.md`: current HiCache calibration workflow, acceptance criteria, and what-if roadmap.
 
 The `cache_io` domain is an experimental replay model. It is wired into the
 normal TraceGraph workflow so HiCache events are not a plugin-shaped outlier,
 but current summaries should be treated as plumbing/sanity output until
-bytes-per-page and KV layout inference are calibrated.
+bytes-per-page and KV layout inference are calibrated. Merge reports and
+HiCache inspection reports live beside each run under
+`data/profile_runs/<framework>/<run-id>/trace/merged/` and
+`data/profile_runs/<framework>/<run-id>/model/`.
 
 ## Optimization
 

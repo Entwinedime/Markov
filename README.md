@@ -237,6 +237,16 @@ Merge custom hook traces with Ascend profiler traces:
 python3 scripts/trace/merge_all_traces.py --root data/profile_runs/sglang/<suite-or-run-id> --overwrite
 ```
 
+Each merged PID gets a sibling `merge_report.pid*.json` with native hook match
+counts, sidecar append counts, and matching diagnostics. Inspect merged HiCache
+events and field coverage with:
+
+```bash
+python3 scripts/trace/inspect_hicache.py \
+  data/profile_runs/sglang/<run-id> \
+  --output data/profile_runs/sglang/<run-id>/model/hicache_inspect.json
+```
+
 Build and simulate a DAG:
 
 ```bash
@@ -255,9 +265,18 @@ build/bin/trace_graph \
 
 The HiCache `cache_io` model is currently experimental. A non-empty summary only
 means the profile, merge, and replay plumbing worked; it is not yet proof that
-the multi-level KV-cache model is quantitatively correct. In particular,
-`bytes_by_edge` may remain zero until page size, bytes-per-page, and KV layout
-inference are calibrated against SGLang runtime metadata.
+the multi-level KV-cache model is quantitatively correct. For calibration runs,
+set `cache_io.model_config_path` to the model's HuggingFace `config.json` and
+`cache_io.tp_size` to the serving tensor-parallel size so TraceGraph can infer
+bytes per KV page from model metadata. Synthetic fixtures can be checked with:
+
+```bash
+python3 tests/run_trace_graph_fixtures.py
+```
+
+`bytes_by_edge` may still be partially zero when SGLang events expose control
+status but not concrete page counts. That is expected until the HiCache probe
+coverage is expanded and validated against known storage traffic.
 
 Run what-if scaling:
 

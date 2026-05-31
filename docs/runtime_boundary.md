@@ -99,6 +99,12 @@ Use the host for trace modeling and optimization:
 Trace merge scripts can stay host-side and common unless a framework needs
 different timestamp matching or profiler output handling.
 
+`scripts/trace/merge_all_traces.py` writes merged Chrome Trace files plus
+`merge_report.pid*.json` diagnostics. `scripts/trace/inspect_hicache.py` reads a
+run directory or trace file and reports HiCache event coverage, including which
+events expose page counts, page size, and byte fields. These reports are host
+analysis artifacts; they do not change runtime behavior.
+
 This keeps the heavyweight inference runtime separate from the graph modeling
 loop, while still allowing the profiling container to emit traces into host
 mounted directories.

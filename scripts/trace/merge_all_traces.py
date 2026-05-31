@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import glob
+import json
 import logging
 import os
 import re
@@ -101,6 +102,7 @@ def merge_experiment(
 
     total = 0
     merged = 0
+    reports: List[Dict[str, object]] = []
 
     for cpu_trace in cpu_traces:
         pid = extract_pid_from_cpu_trace(cpu_trace)
@@ -114,13 +116,14 @@ def merge_experiment(
             continue
 
         out_path = os.path.join(out_dir, f"merged_trace.pid{pid}.json")
+        report_path = os.path.join(out_dir, f"merge_report.pid{pid}.json")
         if os.path.exists(out_path) and not overwrite:
             logging.info("Skip existing merged trace: %s", out_path)
             continue
 
         total += 1
         logging.info("Merging pid %s -> %s", pid, out_path)
-        merge_traces(
+        report = merge_traces(
             profiler_path=profiler_trace,
             custom_path=cpu_trace,
             out_path=out_path,
@@ -129,8 +132,15 @@ def merge_experiment(
             margin_us=margin_us,
             mode=mode,
             sidecar_paths=python_probe_map.get(pid, []),
+            report_path=report_path,
         )
+        reports.append(report)
         merged += 1
+
+    if reports:
+        summary_path = os.path.join(out_dir, "merge_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as summary_file:
+            json.dump({"experiment": exp_dir, "reports": reports}, summary_file, indent=2, sort_keys=True)
 
     return total, merged
 

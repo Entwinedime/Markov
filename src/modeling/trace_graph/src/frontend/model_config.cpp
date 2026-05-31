@@ -45,6 +45,72 @@ double number_value(const std::string & text, const std::string & key, double de
     return def;
 }
 
+std::string scalar_value(const std::string & text, const std::string & key, const std::string & def) {
+    auto as_string = string_value(text, key, "");
+    if (!as_string.empty()) return as_string;
+    double numeric = number_value(text, key, -1.0);
+    if (numeric < 0) return def;
+    std::ostringstream os;
+    os << numeric;
+    return os.str();
+}
+
+uint64_t unsigned_value(const std::string & text, const std::string & key, uint64_t def) {
+    auto value = scalar_value(text, key, "");
+    if (value.empty() || value == "infer" || value == "inf" || value == "infinite") return def;
+    try {
+        double numeric = std::stod(value);
+        if (numeric < 0) return def;
+        return static_cast<uint64_t>(numeric);
+    }
+    catch (...) {
+        return def;
+    }
+}
+
+uint64_t dtype_bytes_from_text(const std::string & text) {
+    auto dtype = lower(text);
+    if (dtype.find("float64") != std::string::npos || dtype.find("double") != std::string::npos || dtype.find("int64") != std::string::npos) return 8;
+    if (dtype.find("float32") != std::string::npos || dtype.find("int32") != std::string::npos) return 4;
+    if (dtype.find("float16") != std::string::npos || dtype.find("bfloat16") != std::string::npos || dtype.find("half") != std::string::npos
+        || dtype.find("int16") != std::string::npos)
+        return 2;
+    if (dtype.find("int8") != std::string::npos || dtype.find("uint8") != std::string::npos || dtype.find("fp8") != std::string::npos) return 1;
+    return 0;
+}
+
+void fill_from_hf_model_config(CacheIOConfig & cache_config) {
+    if (cache_config.model_config_path.empty() || cache_config.model_config_path == "infer") return;
+
+    std::string model_text;
+    try {
+        model_text = read_file(cache_config.model_config_path);
+    }
+    catch (const std::exception & e) {
+        Logger::instance().warn() << "Failed to read cache_io model_config_path '" << cache_config.model_config_path << "': " << e.what();
+        return;
+    }
+
+    if (cache_config.num_layers == 0) cache_config.num_layers = unsigned_value(model_text, "num_hidden_layers", 0);
+    if (cache_config.num_kv_heads == 0) {
+        cache_config.num_kv_heads = unsigned_value(model_text, "num_key_value_heads", 0);
+        if (cache_config.num_kv_heads == 0) cache_config.num_kv_heads = unsigned_value(model_text, "num_attention_heads", 0);
+    }
+    if (cache_config.head_dim == 0) {
+        cache_config.head_dim = unsigned_value(model_text, "head_dim", 0);
+        if (cache_config.head_dim == 0) {
+            auto hidden = unsigned_value(model_text, "hidden_size", 0);
+            auto heads = unsigned_value(model_text, "num_attention_heads", 0);
+            if (hidden > 0 && heads > 0) cache_config.head_dim = hidden / heads;
+        }
+    }
+    if (cache_config.dtype_bytes == 0) {
+        cache_config.dtype_bytes = dtype_bytes_from_text(string_value(model_text, "kv_cache_dtype", ""));
+        if (cache_config.dtype_bytes == 0) cache_config.dtype_bytes = dtype_bytes_from_text(string_value(model_text, "torch_dtype", ""));
+        if (cache_config.dtype_bytes == 0) cache_config.dtype_bytes = dtype_bytes_from_text(string_value(model_text, "dtype", ""));
+    }
+}
+
 size_t find_matching(const std::string & text, size_t open_pos, char open_ch, char close_ch) {
     int depth = 0;
     bool in_string = false;
@@ -161,11 +227,18 @@ ModelConfig ModelConfig::from_file(const std::string & filename) {
     auto cache_object = object_for_key(text, "cache_io");
     if (!cache_object.empty()) {
         config.cache_io.enabled = contains_string(text, "cache_io") || config.domain_enabled("cache_io");
-        config.cache_io.page_size_tokens = string_value(cache_object, "page_size_tokens", "infer");
-        config.cache_io.bytes_per_page = string_value(cache_object, "bytes_per_page", "infer");
+        config.cache_io.page_size_tokens = scalar_value(cache_object, "page_size_tokens", "infer");
+        config.cache_io.bytes_per_page = scalar_value(cache_object, "bytes_per_page", "infer");
+        config.cache_io.model_config_path = string_value(cache_object, "model_config_path", "");
+        config.cache_io.tp_size = std::max<uint64_t>(1, unsigned_value(cache_object, "tp_size", 1));
+        config.cache_io.num_layers = unsigned_value(cache_object, "num_layers", 0);
+        config.cache_io.num_kv_heads = unsigned_value(cache_object, "num_kv_heads", 0);
+        config.cache_io.head_dim = unsigned_value(cache_object, "head_dim", 0);
+        config.cache_io.dtype_bytes = unsigned_value(cache_object, "dtype_bytes", 0);
         config.cache_io.write_policy = string_value(cache_object, "write_policy", "trace");
         config.cache_io.prefetch_policy = string_value(cache_object, "prefetch_policy", "trace_replay");
         config.cache_io.tiers = parse_tiers(cache_object);
+        fill_from_hf_model_config(config.cache_io);
     }
 
     if (config.domain_enabled("cache_io") && !config.cache_io.enabled) config.cache_io.enabled = true;

@@ -194,6 +194,8 @@ also writes a summary JSON with:
 - resident pages by tier
 - eviction/writeback counters
 - estimated cache IO latency
+- field coverage counters such as `events_with_pages`, `events_with_bytes`, and
+  `missing_bytes_events`
 
 Example:
 
@@ -207,9 +209,24 @@ build/bin/trace_graph \
 
 This domain is experimental. The first acceptance target is that HiCache events
 flow through profile, merge, DAG construction, and summary generation. Quantitative
-correctness still requires synthetic fixtures and calibration of bytes-per-page,
-page size, and KV layout metadata; `bytes_by_edge: 0` is a known possible result
-before that calibration is complete.
+correctness is checked in layers:
+
+1. Synthetic fixtures under `tests/fixtures/cache_io/` validate deterministic
+   cache replay behavior and bytes-per-page math.
+2. `scripts/trace/inspect_hicache.py` validates real-run event coverage before
+   modeling.
+3. Calibration configs can set `cache_io.model_config_path` and `cache_io.tp_size`
+   so bytes per page are inferred from HuggingFace model metadata.
+
+`bytes_by_edge` can still be partially zero when real HiCache events represent
+control/status checks rather than concrete page movement. Treat this as a probe
+coverage signal, not a correct final cache model.
+
+Run the fixture smoke test from the repository root:
+
+```bash
+python3 tests/run_trace_graph_fixtures.py
+```
 
 ## Output
 
