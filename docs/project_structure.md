@@ -7,17 +7,19 @@ while leaving room for ktransformers and sglang specific adapters.
 
 - `third_party/sglang/`: editable sglang fork submodule used by the runtime container.
 - `third_party/ktransformers/`: editable ktransformers fork submodule used by the runtime container.
-- `src/cpp/hook_framework/`: C++ LD_PRELOAD hook library.
-- `src/cpp/hook_framework/targets/`: framework/runtime-specific hook wrappers.
+- `src/profiling/common/trace_schema/`: shared Chrome Trace event contract across producers.
+- `src/profiling/native_hook/`: C++ LD_PRELOAD hook library.
+- `src/profiling/native_hook/targets/`: framework/runtime-specific hook wrappers.
+- `src/profiling/python_probe/`: env-gated Python import-hook/monkey-patch instrumentation, currently including SGLang HiCache probes.
 - `scripts/build.sh`: builds framework images and matching hook libraries.
 - `scripts/run.sh`: runs ad-hoc commands in framework runtime containers.
 - `scripts/profile.sh`: runs JSON-configured profiling experiments.
-- `scripts/libexec/profile_runner.py`: container-side profile runner for server, workload, hook, and SGLang profile API orchestration.
-- `scripts/frameworks/sglang/`: SGLang install and profiling internals.
-- `scripts/frameworks/ktransformers/`: ktransformers install and profiling internals.
-- `scripts/hooks/`: container-side hook build helper.
-- `scripts/trace/common/`: shared trace merge implementation.
-- `scripts/trace/sglang/` and `scripts/trace/ktransformers/`: framework-specific trace wrappers or future overrides.
+- `scripts/lib/common.sh`: shared shell helpers for public script entrypoints.
+- `scripts/internal/profile_runner.py`: container-side profile runner for server, workload, hook, and SGLang profile API orchestration.
+- `scripts/internal/frameworks/sglang/`: SGLang source-install internals used by the runtime image.
+- `scripts/internal/frameworks/ktransformers/`: ktransformers source-install internals used by the runtime image.
+- `scripts/internal/hooks/`: container-side hook build helper.
+- `scripts/trace/`: host-side trace merge tools.
 
 Profiling is the containerized stage. SGLang and ktransformers use separate
 Docker images, profile scripts, hook build directories, and `libhook.so`
@@ -25,15 +27,27 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 
 ## Modeling
 
-- `src/cpp/trace_graph/`: Chrome Trace parser, leaf extraction, dependency DAG, and simulator.
+- `src/modeling/trace_graph/include/trace_graph/core/`: Chrome Trace records, parser, DAG primitives, and existing Ascend DAG pipeline.
+- `src/modeling/trace_graph/include/trace_graph/frontend/`: trace normalization and model config parsing.
+- `src/modeling/trace_graph/include/trace_graph/domains/ascend_sync/`: boundary for existing Ascend event/sync/HCCL enrichment.
+- `src/modeling/trace_graph/include/trace_graph/domains/cache_io/`: HiCache/KV-cache IO replay model and summary output.
+- `src/modeling/trace_graph/include/trace_graph/simulation/`: topological replay boundary.
+- `src/modeling/trace_graph/include/trace_graph/optimization/`: what-if transform boundary.
+- `src/modeling/trace_graph/`: CLI wrapper and compatibility headers for the modeling engine.
+- `configs/modeling/`: host-side model replay and what-if configs.
 - `data/profile_runs/`: generated container-side profile run outputs.
 - `data/traces/raw/`: host-side raw trace staging area.
 - `data/traces/merged/`: merged Chrome Trace files used as DAG input.
 - `data/traces/dag/`: generated DAG/simulation timeline JSON.
 
+The `cache_io` domain is an experimental replay model. It is wired into the
+normal TraceGraph workflow so HiCache events are not a plugin-shaped outlier,
+but current summaries should be treated as plumbing/sanity output until
+bytes-per-page and KV layout inference are calibrated.
+
 ## Optimization
 
-- `src/cpp/trace_graph` currently exposes what-if scaling through the `trace_graph` CLI.
+- `src/modeling/trace_graph` exposes what-if scaling through `--scale` and domain modeling through `--model-config`.
 - `data/traces/dag/` stores generated what-if outputs.
 
 Modeling and optimization are host-side stages by default. They consume trace

@@ -1,0 +1,33 @@
+{
+  "status": "experimental",
+  "domains": ["ascend_sync", "cache_io"],
+  "cache_io": {
+    "page_size_tokens": "infer",
+    "bytes_per_page": "infer",
+    "tiers": [
+      {
+        "name": "L1",
+        "capacity_pages": "infer",
+        "latency_us": 0,
+        "bandwidth_gbps": "inf",
+        "eviction": "lru"
+      },
+      {
+        "name": "L2",
+        "capacity_pages": "infer",
+        "latency_us": 10,
+        "bandwidth_gbps": 20,
+        "eviction": "lru"
+      },
+      {
+        "name": "L3",
+        "capacity_pages": "infinite",
+        "latency_us": 100,
+        "bandwidth_gbps": 5,
+        "eviction": "infinite"
+      }
+    ],
+    "write_policy": "trace",
+    "prefetch_policy": "trace_replay"
+  }
+}

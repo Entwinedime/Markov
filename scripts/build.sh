@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/lib.sh"
+source "${SCRIPT_DIR}/lib/common.sh"
 
 ROOT_DIR="$(repo_root)"
 cd "$ROOT_DIR"
@@ -84,7 +84,7 @@ build_runtime_image() {
 }
 
 build_hook() {
-    run_in_container "$FRAMEWORK" bash -lc "set -euo pipefail; scripts/hooks/build.sh '$FRAMEWORK'"
+    run_in_container "$FRAMEWORK" bash -lc "set -euo pipefail; scripts/internal/hooks/build.sh '$FRAMEWORK'"
 }
 
 if [ "$HOOK_ONLY" != "1" ]; then

@@ -10,8 +10,10 @@ ktransformers and sglang inference workloads:
 
 The current codebase integrates two existing pieces of progress:
 
-- `src/cpp/hook_framework/`: C++ LD_PRELOAD hook framework for custom trace events.
-- `src/cpp/trace_graph/`: C++ trace parser, DAG builder, simulator, and what-if CLI.
+- `src/profiling/native_hook/`: C++ LD_PRELOAD hook framework for custom trace events.
+- `src/profiling/common/trace_schema/`: shared Chrome Trace event contract.
+- `src/profiling/python_probe/`: env-gated Python runtime probes for semantic events such as SGLang HiCache.
+- `src/modeling/trace_graph/`: C++ trace parser, DAG builder, domain models, simulator, and what-if CLI.
 - `third_party/sglang/`: Entwinedime's sglang fork, tracked as a Git submodule.
 - `third_party/ktransformers/`: Entwinedime's ktransformers fork, tracked as a Git submodule.
 
@@ -19,17 +21,18 @@ The current codebase integrates two existing pieces of progress:
 
 ```text
 .
-├── src/cpp/hook_framework/      # LD_PRELOAD hook framework and AscendCL hook targets
-├── src/cpp/trace_graph/         # Trace -> DAG -> simulation engine
+├── src/profiling/native_hook/   # LD_PRELOAD hook framework and AscendCL hook targets
+├── src/profiling/common/        # Shared Chrome Trace event schema
+├── src/profiling/python_probe/  # Non-invasive Python runtime probes
+├── src/modeling/trace_graph/    # Trace -> normalized DAG -> domain simulation engine
 ├── third_party/sglang/          # sglang fork submodule
 ├── third_party/ktransformers/   # ktransformers fork submodule
 ├── scripts/build.sh             # Build runtime image and matching hook
 ├── scripts/run.sh               # Run one-off commands in framework containers
 ├── scripts/profile.sh           # Run JSON-configured profiling experiments
-├── scripts/libexec/             # Internal script implementations
-├── scripts/frameworks/          # Framework-specific install internals
-├── scripts/hooks/               # Container-side hook build helper
-├── scripts/trace/               # Trace merge entrypoints and shared implementation
+├── scripts/lib/                 # Shared shell helpers for public entrypoints
+├── scripts/internal/            # Docker/profile/build internals, not user entrypoints
+├── scripts/trace/               # Trace merge tools
 ├── docker/images/base/sglang/   # SGLang stable Ubuntu/CANN/PyTorch environment
 ├── docker/images/base/ktransformers/
 │                                  # ktransformers stable Ubuntu/CANN/PyTorch environment
@@ -37,6 +40,7 @@ The current codebase integrates two existing pieces of progress:
 ├── docker/images/ktransformers/ # ktransformers Ubuntu runtime image
 ├── docker/compose/inference.yml # Compose services for runtime profiling
 ├── configs/experiments/         # JSON profile experiment suites
+├── configs/modeling/            # Host-side model replay / what-if configs
 ├── data/profile_runs/           # Generated profile run directories
 ├── data/traces/                 # Host-side raw, merged, and DAG trace artifacts
 └── docs/                        # Design notes by stage
@@ -83,8 +87,8 @@ The hook framework supports separate profiles:
 The framework build scripts call this inside the container:
 
 ```bash
-scripts/hooks/build.sh sglang
-scripts/hooks/build.sh ktransformers
+scripts/internal/hooks/build.sh sglang
+scripts/internal/hooks/build.sh ktransformers
 ```
 
 ## Docker / Ubuntu
@@ -138,7 +142,7 @@ prebuilt SGLang serving image:
 - dependencies: `torch==2.10.0`, Ascend `torch_npu==2.10.0`,
   `triton_ascend==3.2.1`, `memfabric-hybrid==1.0.8`, and
   `sgl-kernel-npu` release wheels installed in the environment image
-- source install: the runtime image runs `scripts/frameworks/sglang/install_from_source.sh`,
+- source install: the runtime image runs `scripts/internal/frameworks/sglang/install_from_source.sh`,
   which copies
   `third_party/sglang/python/pyproject_npu.toml` over `pyproject.toml`, then
   installs SGLang editable from the copied fork with `.[all_npu]`
@@ -155,7 +159,7 @@ Ubuntu CANN base instead of the tutorial's openeuler MindIE image:
   branch `v2.5.1` and compiled from source during the environment image build.
   The image installs only the wheel produced by that local source build and
   strips any `+git...` suffix from `torch_npu/version.py`
-- source install: the runtime image runs `scripts/frameworks/ktransformers/install_from_source.sh`
+- source install: the runtime image runs `scripts/internal/frameworks/ktransformers/install_from_source.sh`
   and installs the copied `third_party/ktransformers/archive` runtime with
   `USE_BALANCE_SERVE=1`, patches the archive config to `attn.page_size=128` and
   `attn.chunk_size=16384`, runs upstream `install.sh --dev cuda` so
@@ -211,10 +215,10 @@ The compose services bind-mount:
 - generated profile outputs under `data/profile_runs/`
 
 To add another inference framework later, add a new `docker/images/<framework>/`
-image, `scripts/frameworks/<framework>/` frontend, hook profile/target if
-needed, and a service in `docker/compose/inference.yml`. Then extend
-`scripts/build.sh`, `scripts/run.sh`, `scripts/profile.sh`, and `scripts/lib.sh`
-by framework name.
+image, `scripts/internal/frameworks/<framework>/` source-install helper, hook
+profile/target if needed, and a service in `docker/compose/inference.yml`. Then
+extend `scripts/build.sh`, `scripts/run.sh`, `scripts/profile.sh`, and
+`scripts/lib/common.sh` by framework name.
 
 Framework submodules are copied into the second Docker layer and installed into
 the runtime image. Source edits on the host require rebuilding that runtime
@@ -238,6 +242,22 @@ Build and simulate a DAG:
 ```bash
 build/bin/trace_graph -o data/traces/dag/output_graph.json data/traces/merged/merged_trace.json
 ```
+
+Apply a domain model, such as SGLang HiCache multi-level KV-cache replay:
+
+```bash
+build/bin/trace_graph \
+  --model-config configs/modeling/hicache_ascend_file.json \
+  --model-summary data/traces/dag/hicache_summary.json \
+  -o data/traces/dag/hicache_dag.json \
+  data/traces/merged/merged_trace.json
+```
+
+The HiCache `cache_io` model is currently experimental. A non-empty summary only
+means the profile, merge, and replay plumbing worked; it is not yet proof that
+the multi-level KV-cache model is quantitatively correct. In particular,
+`bytes_by_edge` may remain zero until page size, bytes-per-page, and KV layout
+inference are calibrated against SGLang runtime metadata.
 
 Run what-if scaling:
 

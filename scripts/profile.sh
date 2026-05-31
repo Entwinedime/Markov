@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/lib.sh"
+source "${SCRIPT_DIR}/lib/common.sh"
 
 ROOT_DIR="$(repo_root)"
 cd "$ROOT_DIR"
@@ -91,7 +91,7 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -u
 export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
 export HOOK_ASCENDCL_SO_PATH="$TRACE_SIM_HOOK_ASCENDCL_SO_PATH"
-python3 scripts/libexec/profile_runner.py --config "$TRACE_SIM_PROFILE_CONFIG" ${TRACE_SIM_PROFILE_DRY_RUN:+--dry-run}
+python3 scripts/internal/profile_runner.py --config "$TRACE_SIM_PROFILE_CONFIG" ${TRACE_SIM_PROFILE_DRY_RUN:+--dry-run}
 '
 
 env_args=(
