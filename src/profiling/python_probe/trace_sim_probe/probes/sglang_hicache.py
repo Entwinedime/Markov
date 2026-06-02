@@ -45,6 +45,7 @@ _OP_SEQUENCE = itertools.count(1)
 _STORAGE_CONTEXT = threading.local()
 _OPERATION_CONTEXT = threading.local()
 _LOAD_OPERATION_BY_NODE: Dict[str, str] = {}
+_CACHE_ID_BY_OBJECT: Dict[str, str] = {}
 
 
 METHOD_EVENTS = {
@@ -313,6 +314,38 @@ def _id_text(value: Any) -> Optional[str]:
         return None
     text = str(value)
     return text if text != "" else None
+
+
+def _remember_cache_links(cache_obj: Any) -> str:
+    cache_id = compact_id(cache_obj)
+    _CACHE_ID_BY_OBJECT[cache_id] = cache_id
+    for attr in ("cache_controller", "storage_backend"):
+        linked = safe_getattr(cache_obj, attr, None)
+        if linked is not None:
+            _CACHE_ID_BY_OBJECT[compact_id(linked)] = cache_id
+            nested_storage = safe_getattr(linked, "storage_backend", None)
+            if nested_storage is not None:
+                _CACHE_ID_BY_OBJECT[compact_id(nested_storage)] = cache_id
+    return cache_id
+
+
+def _cache_id_for_object(obj: Any) -> Optional[str]:
+    if obj is None:
+        return None
+    class_name = type(obj).__name__
+    if class_name == "HiRadixCache":
+        return _remember_cache_links(obj)
+    object_id = compact_id(obj)
+    mapped = _CACHE_ID_BY_OBJECT.get(object_id)
+    if mapped:
+        return mapped
+    storage = safe_getattr(obj, "storage_backend", None)
+    if storage is not None:
+        mapped = _CACHE_ID_BY_OBJECT.get(compact_id(storage))
+        if mapped:
+            _CACHE_ID_BY_OBJECT[object_id] = mapped
+            return mapped
+    return None
 
 
 def _dtype_bytes(dtype: Any) -> Optional[int]:
@@ -1094,6 +1127,7 @@ def _aligned_token_len(raw_token_len: Optional[int], page_size: Any) -> Optional
 def _radix_inputs(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any], result: Any = None) -> Dict[str, Any]:
     node = None
     raw_keys = None
+    node_local_raw_keys = None
     full_raw_keys = None
     parent_full_raw_keys = None
     raw_token_len = None
@@ -1144,6 +1178,7 @@ def _radix_inputs(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs
     if node is not None:
         node_id = _node_id(node)
         parent_node_id = _node_parent_id(node)
+        node_local_raw_keys = _node_raw_keys(node)
         full_raw_keys = _node_full_raw_keys(node)
         parent_full_raw_keys = _node_full_raw_keys(_node_parent(node))
         hit_count = _as_int(safe_getattr(node, "hit_count", None))
@@ -1154,6 +1189,7 @@ def _radix_inputs(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs
 
     return {
         "raw_keys": raw_keys,
+        "node_local_raw_keys": node_local_raw_keys,
         "full_raw_keys": full_raw_keys,
         "parent_full_raw_keys": parent_full_raw_keys,
         "raw_token_len": raw_token_len,
@@ -1183,7 +1219,9 @@ def _radix_op_args(
     page_size = base_args.get("page_size")
     aligned_len = _aligned_token_len(raw_token_len, page_size)
     dropped = (raw_token_len - aligned_len) if raw_token_len is not None and aligned_len is not None else None
-    node_local_block_keys_hash, node_local_truncated, block_size = _encode_block_keys(radix.get("raw_keys"))
+    node_local_block_keys_hash, node_local_truncated, block_size = _encode_block_keys(
+        radix.get("node_local_raw_keys")
+    )
     full_path_block_keys_hash, full_path_truncated, block_size = _encode_block_keys(radix.get("full_raw_keys"))
     parent_full_path_block_keys_hash, parent_full_truncated, block_size = _encode_block_keys(radix.get("parent_full_raw_keys"))
     trace_page_block_keys_hash, trace_page_truncated, block_size = _encode_trace_page_block_keys(radix.get("full_raw_keys"), page_size)
@@ -1315,6 +1353,7 @@ def _cache_operation_args(
 
 def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Dict[str, Any]:
     context = _current_operation_context()
+    cache_id = _cache_id_for_object(self_obj)
     page_size = safe_getattr(self_obj, "page_size", None)
     storage_backend = safe_getattr(self_obj, "storage_backend_type", None)
     storage_obj = safe_getattr(self_obj, "storage_backend", None)
@@ -1372,7 +1411,7 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
         operation_id = operation_summary.get("operation_id")
         node_id = operation_summary.get("node_id")
         pool_transfers = operation_summary.get("pool_transfers") or pool_transfers
-    elif method_name in ("_page_transfer", "_page_backup", "terminate_prefetch"):
+    elif method_name in ("_storage_hit_query", "_page_transfer", "_page_backup", "terminate_prefetch"):
         operation = _arg(args, 0, kwargs, "operation")
         operation_id = safe_getattr(operation, "id", None)
         host_indices = safe_getattr(operation, "host_indices", None)
@@ -1464,6 +1503,7 @@ def _base_args(self_obj: Any, method_name: str, args: Tuple[Any, ...], kwargs: D
         "python_class": type(self_obj).__name__,
         "python_method": method_name,
         "op_id": compact_id(self_obj),
+        "cache_id": _id_text(cache_id),
         "operation_id": _id_text(operation_id),
         "node_id": _id_text(node_id),
         "request_id": _id_text(request_id),

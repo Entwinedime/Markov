@@ -96,7 +96,7 @@ def _page_keys(pages: List[Tuple[str, ...]]) -> List[str]:
     return [_page_key(page) for page in pages if page]
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
+def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -109,7 +109,13 @@ def _load_events(paths: Iterable[Path]) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
     for path in paths:
         data = _read_json(path)
-        events.extend(data.get("traceEvents", []))
+        if isinstance(data, dict):
+            candidates = data.get("traceEvents", [])
+        elif isinstance(data, list):
+            candidates = data
+        else:
+            candidates = []
+        events.extend(event for event in candidates if isinstance(event, dict))
     events.sort(key=lambda item: (_as_int(item.get("ts")), _as_int((item.get("args") or {}).get("op_seq"))))
     return events
 
@@ -751,6 +757,22 @@ class HiRadixCacheSim:
         self._emit_pages("HiCache::prefetch_l3_to_l2", fact.ts, fact.dur, scope, "L3", "L2", "prefetch", keys, fact.method, fact.status)
         self._touch_pages(scope, "L2", keys)
 
+    def apply_cache_operation(self, fact: CacheOperationFact) -> None:
+        if (
+            fact.operation_kind != "prefetch"
+            or fact.stage != "completed"
+            or fact.method != "_insert_helper_host"
+            or self.prefetch_policy == "none"
+        ):
+            return
+        block_pages = self._block_pages_from_trace_pages(fact.block_pages)
+        keys = _page_keys(block_pages)
+        if not keys:
+            return
+        self.clock += 1
+        scope = self._scope(fact.pid, fact.cache_id)
+        self._touch_pages(scope, "L2", keys)
+
     def load_back(self, op: RadixOp) -> None:
         self.clock += 1
         scope = self._scope_for_op(op)
@@ -983,7 +1005,9 @@ def _input_report(events: List[Dict[str, Any]], ops: List[RadixOp], storage_read
     )
     load_back_ops = [op for op in ops if op.method == "load_back"]
     load_back_operation_ids = {op.operation_id for op in load_back_ops if op.operation_id}
-    load_back_link_ready = not load_back_ops or (len(load_back_operation_ids) == len(load_back_ops) and load_back_operation_ids.issubset(load_operation_ids))
+    load_back_link_ready = not load_back_ops or all(
+        op.operation_id and op.operation_id in load_operation_ids for op in load_back_ops
+    )
     operation_lifecycle_ready = storage_link_ready and load_back_link_ready
     operation_link_ready = operation_lifecycle_ready
     runtime_page_alias_ready = storage_model_events == 0 or storage_identity_events == storage_model_events
@@ -1066,6 +1090,8 @@ def run_hicache_radix_sim(
             sim.apply(op)
         elif fact := StorageReadFact.from_event(event):
             sim.apply_storage_read(fact)
+        elif cache_fact := CacheOperationFact.from_event(event):
+            sim.apply_cache_operation(cache_fact)
     warnings = list(sim.warnings)
     if sim.block_size <= 0 or sim.page_size % sim.block_size != 0:
         warnings.append("radix_sim page_size is not divisible by block_size_tokens")

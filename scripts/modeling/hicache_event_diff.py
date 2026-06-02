@@ -28,7 +28,11 @@ def as_text(args: dict[str, Any], key: str, fallback: str = "") -> str:
 def should_keep_event(event: dict[str, Any], lane: str) -> bool:
     if event.get("ph") != "X":
         return False
-    if not str(event.get("name", "")).startswith("node_"):
+    args = event.get("args") or {}
+    if args.get("domain") != "cache_io":
+        return False
+    name = str(event.get("name", ""))
+    if not (name.startswith("node_") or name.startswith("HiCache::")):
         return False
     try:
         pid = int(event.get("pid", 0))
@@ -47,12 +51,15 @@ def event_signature(
     include_page_size: bool,
 ) -> tuple[str, ...]:
     args = event.get("args") or {}
+    name = str(event.get("name", ""))
+    if name.startswith("node_"):
+        name = name[5:]
     signature = [
         as_text(args, "cache_io.event_kind") or as_text(args, "event_kind"),
         as_text(args, "cache_io.src") or as_text(args, "tier_src"),
         as_text(args, "cache_io.dst") or as_text(args, "tier_dst"),
         as_text(args, "direction"),
-        str(event.get("name", ""))[5:],
+        name,
         as_text(args, "python_class"),
         as_text(args, "python_method"),
         as_text(args, "status"),

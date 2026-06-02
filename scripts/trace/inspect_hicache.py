@@ -538,7 +538,12 @@ def summarize(paths: Iterable[Path], sample_limit: int = 5) -> Dict[str, Any]:
         and (storage_write_operation_ids.issubset(write_operation_ids) if storage_write_operation_ids else True)
     )
     load_back_link_ready = load_back_count == 0 or (
-        len(load_back_operation_ids) == load_back_count and load_back_operation_ids.issubset(load_operation_ids)
+        all(
+            as_text(args.get("operation_id"))
+            and as_text(args.get("operation_id")) in load_operation_ids
+            for args in radix_args
+            if str(args.get("method") or args.get("python_method") or "") == "load_back"
+        )
     )
     operation_lifecycle_ready = storage_link_ready and load_back_link_ready
     operation_link_ready = operation_lifecycle_ready

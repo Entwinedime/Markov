@@ -21,6 +21,7 @@ venv/
 
 # Profiling and generated traces
 data/profile_runs/**
+data/tmp/**
 data/traces/raw/**
 data/traces/merged/**
 data/traces/dag/**
