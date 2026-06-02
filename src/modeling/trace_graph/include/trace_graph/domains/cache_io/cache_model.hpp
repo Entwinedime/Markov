@@ -22,7 +22,12 @@ struct CacheIOSummary {
     uint64_t events_with_bytes = 0;
     uint64_t missing_bytes_events = 0;
     uint64_t estimated_latency_us = 0;
+    uint64_t foreground_cache_io_us = 0;
+    uint64_t background_cache_io_us = 0;
     uint64_t movement_events_used = 0;
+    uint64_t observed_movements_used = 0;
+    uint64_t inferred_movements_used = 0;
+    uint64_t model_generated_movements = 0;
     uint64_t control_events_ignored = 0;
     std::map<std::string, uint64_t> hit_tokens_by_tier;
     std::map<std::string, uint64_t> hit_pages_by_tier;

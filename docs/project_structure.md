@@ -34,6 +34,7 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 - `src/modeling/trace_graph/include/trace_graph/simulation/`: topological replay boundary.
 - `src/modeling/trace_graph/include/trace_graph/optimization/`: what-if transform boundary.
 - `src/modeling/trace_graph/`: CLI wrapper and compatibility headers for the modeling engine.
+- `src/modeling/trace_sim_model/`: Python object model for HiCache RadixCache policy simulation.
 - `configs/modeling/`: host-side model replay and what-if configs.
 - `scripts/modeling/`: host-side scenario runners such as HiCache what-if replay.
 - `data/profile_runs/`: generated container-side profile run outputs.
@@ -44,13 +45,15 @@ outputs, all wired through the single `docker/compose/inference.yml` file.
 - `tests/run_trace_graph_fixtures.py`: host-side regression runner for cache IO modeling fixtures.
 - `docs/hicache_validation.md`: current HiCache calibration workflow, acceptance criteria, and what-if roadmap.
 
-The `cache_io` domain is an experimental replay model. It is wired into the
-normal TraceGraph workflow so HiCache events are not a plugin-shaped outlier.
-Current summaries and what-if outputs are useful for monotonic sanity checks and
-calibration, but not yet absolute performance claims. Merge reports and HiCache
-inspection reports live beside each run under
+The C++ TraceGraph path remains responsible for generic DAG reconstruction and
+Ascend timing simulation. HiCache strategy prediction belongs to the Python
+`trace_sim_model` object model, which consumes `radix_op`, `storage_op`, and
+`cache_operation` inputs and regenerates cache movement events under a scenario
+config. Merge reports and HiCache inspection reports live beside each run under
 `data/profile_runs/<framework>/<run-id>/trace/merged/` and
 `data/profile_runs/<framework>/<run-id>/model/`.
+After probe changes, old run directories are stale for event-coverage claims and
+should be rerun before judging whether a physical HiCache movement was captured.
 
 ## Optimization
 

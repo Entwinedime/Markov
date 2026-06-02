@@ -35,11 +35,13 @@ adding `src/profiling/python_probe` to `PYTHONPATH` and setting
 `TRACE_SIM_PYTHON_PROBE=1`; without that environment variable they do not patch
 imports or change framework behavior. HiCache probe output is Chrome Trace JSON
 with `cat: "hicache"` and is merged with torch/native traces before modeling.
-Use `TRACE_SIM_PYTHON_PROBE_KEY_MODE=hash` only for base traces that need
-capacity, eviction, or prefetch-policy what-if replay. The current HiCache model
-is experimental: it can run deterministic scenario replay, but summary values
-such as `bytes_by_edge` and predicted latency are calibration signals rather
-than absolute correctness claims.
+Use `TRACE_SIM_PYTHON_PROBE_KEY_MODE=block_hash` for base traces that feed the
+HiCache RadixCache simulator. Profiling records observed runtime facts only:
+movement/control events for comparison plus `radix_op` events for workload and
+radix-tree reconstruction. Policy simulation happens only in the host analysis
+zone. Existing profile runs collected before a probe change must be treated as
+stale for coverage conclusions and rerun before interpreting missing physical
+movement events.
 
 The Dockerfiles and compose services intentionally do not define an entrypoint.
 They default to bash. `scripts/build.sh`, `scripts/run.sh`, and
@@ -95,6 +97,7 @@ Use the host for trace modeling and optimization:
 - run what-if scaling through `trace_graph --scale`
 - run domain replay models through `trace_graph --model-config`
 - run explicit HiCache scenario replay through `scripts/modeling/hicache_whatif.py`
+- run HiCache RadixCache policy simulation through the Python `radix_sim` engine
 - stage raw traces under `data/traces/raw`
 - write merged traces to `data/traces/merged`
 - write generated DAGs and what-if outputs to `data/traces/dag`

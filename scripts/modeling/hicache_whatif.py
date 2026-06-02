@@ -5,13 +5,16 @@ import argparse
 import csv
 import json
 import re
-import subprocess
+import sys
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "src/modeling"))
+
+from trace_sim_model.hicache_radix_sim import NoRadixOpsError, RadixInputError, run_hicache_radix_sim
 
 
 def read_json(path: Path) -> Dict[str, Any]:
@@ -67,46 +70,52 @@ def materialize_config(base_config: Dict[str, Any], *overrides: Dict[str, Any]) 
     return merged
 
 
-def run_trace_graph(
-    trace_graph_bin: Path,
+def run_radix_sim(
     traces: Iterable[Path],
     scenario_dir: Path,
     config_path: Path,
     scenario_name: str,
 ) -> Dict[str, Any]:
     summary_path = scenario_dir / "cache_io_summary.json"
-    graph_path = scenario_dir / "trace_graph.json"
+    graph_path = scenario_dir / "radix_sim_trace.json"
     run_summary_path = scenario_dir / "run_summary.json"
-
-    cmd = [
-        str(trace_graph_bin),
-        "--model-config",
-        str(config_path),
-        "--model-summary",
-        str(summary_path),
-        "--run-summary",
-        str(run_summary_path),
-        "--scenario-name",
-        scenario_name,
-        "--output",
-        str(graph_path),
-        "--no-raw",
-        *[str(trace) for trace in traces],
-    ]
-    (scenario_dir / "trace_graph_cmd.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
-    subprocess.run(cmd, cwd=REPO_ROOT, check=True)
-
-    run_summary = read_json(run_summary_path)
-    cache_summary = read_json(summary_path)
+    model_config = read_json(config_path)
+    try:
+        result = run_hicache_radix_sim(
+            traces,
+            model_config,
+            scenario_name=scenario_name,
+            output_path=graph_path,
+            summary_path=summary_path,
+            run_summary_path=run_summary_path,
+        )
+    except RadixInputError as exc:
+        write_json(scenario_dir / "input_readiness.json", exc.readiness)
+        raise
+    except NoRadixOpsError:
+        write_json(
+            scenario_dir / "input_readiness.json",
+            {
+                "radix_sim_ready": False,
+                "radix_op_events": 0,
+                "rejected_reasons": {"missing:radix_op_model_input": 1},
+            },
+        )
+        raise
+    run_summary = result["run_summary"]
+    cache_summary = result["cache_io_summary"]
+    write_json(scenario_dir / "input_readiness.json", cache_summary.get("input_readiness", {}))
     return {
         "name": scenario_name,
         "directory": str(scenario_dir),
         "scenario_config": str(config_path),
         "cache_io_summary": str(summary_path),
-        "trace_graph": str(graph_path),
+        "generated_trace": str(graph_path),
         "run_summary": str(run_summary_path),
         "simulated_e2e_ns": run_summary.get("simulated_e2e_ns", 0),
         "cache_io_estimated_latency_us": cache_summary.get("estimated_latency_us", 0),
+        "foreground_cache_io_us": cache_summary.get("foreground_cache_io_us", 0),
+        "background_cache_io_us": cache_summary.get("background_cache_io_us", 0),
         "movement_events_used": cache_summary.get("movement_events_used", 0),
         "transfer_events": cache_summary.get("transfer_events", 0),
         "eviction_events": cache_summary.get("eviction_events", 0),
@@ -123,6 +132,8 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
         "delta_e2e_ns",
         "cache_io_estimated_latency_us",
         "delta_cache_io_estimated_latency_us",
+        "foreground_cache_io_us",
+        "background_cache_io_us",
         "movement_events_used",
         "transfer_events",
         "eviction_events",
@@ -141,7 +152,6 @@ def main() -> int:
     parser.add_argument("--suite", required=True, help="What-if suite JSON.")
     parser.add_argument("--trace", action="append", required=True, help="Merged trace input. Repeat for multiple ranks/PIDs.")
     parser.add_argument("--output-dir", required=True, help="Directory for scenario outputs.")
-    parser.add_argument("--trace-graph-bin", default=str(REPO_ROOT / "build/bin/trace_graph"), help="TraceGraph binary path.")
     args = parser.parse_args()
 
     suite_path = resolve_path(args.suite, Path.cwd())
@@ -158,10 +168,6 @@ def main() -> int:
     if missing:
         raise SystemExit(f"trace input not found: {', '.join(missing)}")
 
-    trace_graph_bin = resolve_path(args.trace_graph_bin, Path.cwd())
-    if not trace_graph_bin.exists():
-        raise SystemExit(f"trace_graph binary not found: {trace_graph_bin}")
-
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "suite_config.json", suite)
@@ -174,7 +180,7 @@ def main() -> int:
         scenario_config = materialize_config(base_config, base_overrides, scenario.get("overrides", {}))
         scenario_config_path = scenario_dir / "scenario_config.json"
         write_json(scenario_config_path, scenario_config)
-        rows.append(run_trace_graph(trace_graph_bin, traces, scenario_dir, scenario_config_path, name))
+        rows.append(run_radix_sim(traces, scenario_dir, scenario_config_path, name))
 
     baseline = rows[0]
     baseline_e2e = int(baseline.get("simulated_e2e_ns", 0) or 0)
@@ -189,6 +195,7 @@ def main() -> int:
         "base_model_config": str(base_config_path),
         "input_traces": [str(trace) for trace in traces],
         "baseline": baseline["name"],
+        "engine": "radix_sim",
         "scenarios": rows,
     }
     write_json(output_dir / "whatif_summary.json", aggregate)

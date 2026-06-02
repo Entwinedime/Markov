@@ -1,0 +1,24 @@
+{
+  "traceEvents": [
+    {
+      "name": "HiCache::read_l3_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 1,
+      "dur": 1,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L3",
+        "tier_dst": "L2",
+        "direction": "read",
+        "num_tokens": 128,
+        "page_size": 64,
+        "page_keys_hash": "p0|p1",
+        "status": "ok"
+      }
+    }
+  ]
+}

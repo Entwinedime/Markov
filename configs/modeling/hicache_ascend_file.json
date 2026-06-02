@@ -29,7 +29,14 @@
         "eviction": "infinite"
       }
     ],
+    "page_size_policy": "trace",
     "write_policy": "trace",
-    "prefetch_policy": "trace_replay"
+    "writeback_on_evict": true,
+    "prefetch_policy": "trace_replay",
+    "prefetch_threshold": 0,
+    "prefetch_timeout_base": 0.0,
+    "prefetch_timeout_per_ki_token": 0.0,
+    "prefetch_timeout_max": 0.0,
+    "count_async_prefetch_latency": false
   }
 }

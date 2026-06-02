@@ -106,7 +106,7 @@ A stack-based containment check identifies parent-child relationships. Framework
 
 ### Step 4–5 — Graph Construction
 
-Six substeps executed in strict order:
+Six substeps executed in order:
 
 | Method | Edges Built |
 |--------|-------------|
@@ -210,22 +210,16 @@ build/bin/trace_graph \
   data/traces/merged/merged_trace.json
 ```
 
-This domain is experimental. The first acceptance target is that HiCache events
-flow through profile, merge, DAG construction, and summary generation. Quantitative
-correctness is checked in layers:
+This domain is retained for generic trace/DAG compatibility and low-level cache
+IO summaries. HiCache strategy prediction is handled by the Python RadixSim
+model under `src/modeling/trace_sim_model/`.
 
-1. Synthetic fixtures under `tests/fixtures/cache_io/` validate deterministic
-   cache replay behavior and bytes-per-page math.
-2. `scripts/trace/inspect_hicache.py` validates real-run event coverage before
-   modeling.
-3. Calibration configs can set `cache_io.model_config_path` and `cache_io.tp_size`
-   so bytes per page are inferred from HuggingFace model metadata.
+Quantitative HiCache checks use:
 
-`cache_io` separates `event_kind=movement` from control/query/ack events. Only
-movement events participate in transfer replay by default; control events remain
-visible for coverage and diagnosis. `bytes_by_edge` can still be partially zero
-when real movement events lack page or byte metadata. Treat this as a probe
-coverage signal, not a correct final cache model.
+- `scripts/trace/inspect_hicache.py` for probe coverage.
+- `tests/run_hicache_radix_sim_fixtures.py` for RadixSim policy semantics.
+- `scripts/modeling/hicache_whatif.py` and
+  `scripts/modeling/hicache_fit_matrix.py` for scenario replay.
 
 For scenario replay, capture the base profile with page key hashes and then run:
 
@@ -245,6 +239,7 @@ Run the fixture smoke test from the repository root:
 
 ```bash
 python3 tests/run_trace_graph_fixtures.py
+python3 tests/run_hicache_radix_sim_fixtures.py
 ```
 
 ## Output

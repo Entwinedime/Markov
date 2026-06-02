@@ -1,0 +1,64 @@
+{
+  "traceEvents": [
+    {
+      "name": "HiCache::backup_l1_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 1,
+      "dur": 1,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L1",
+        "tier_dst": "L2",
+        "direction": "backup",
+        "num_pages": 1,
+        "bytes": 1024,
+        "page_keys_hash": "page-a",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::backup_l1_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 2,
+      "dur": 1,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L1",
+        "tier_dst": "L2",
+        "direction": "backup",
+        "num_pages": 1,
+        "bytes": 1024,
+        "page_keys_hash": "page-b",
+        "status": "ok"
+      }
+    },
+    {
+      "name": "HiCache::backup_l1_to_l2",
+      "cat": "hicache",
+      "ph": "X",
+      "ts": 3,
+      "dur": 1,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "domain": "cache_io",
+        "event_kind": "movement",
+        "tier_src": "L1",
+        "tier_dst": "L2",
+        "direction": "backup",
+        "num_pages": 1,
+        "bytes": 1024,
+        "page_keys_hash": "page-c",
+        "status": "ok"
+      }
+    }
+  ]
+}

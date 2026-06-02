@@ -3,7 +3,13 @@
   "base_overrides": {
     "cache_io": {
       "model_config_path": "/models/Qwen3-32B/config.json",
-      "tp_size": 2
+      "tp_size": 2,
+      "page_size_policy": "scenario",
+      "page_size_tokens": 64,
+      "write_policy": "write_through",
+      "writeback_on_evict": true,
+      "prefetch_policy": "wait_complete",
+      "prefetch_threshold": 64
     }
   },
   "scenarios": [
@@ -53,6 +59,22 @@
       "overrides": {
         "cache_io": {
           "prefetch_policy": "none"
+        }
+      }
+    },
+    {
+      "name": "write_back",
+      "overrides": {
+        "cache_io": {
+          "write_policy": "write_back"
+        }
+      }
+    },
+    {
+      "name": "best_effort_prefetch",
+      "overrides": {
+        "cache_io": {
+          "prefetch_policy": "best_effort"
         }
       }
     }

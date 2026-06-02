@@ -13,8 +13,6 @@ from typing import Any, Dict
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRACE_GRAPH_BIN = Path(os.environ.get("TRACE_GRAPH_BIN", REPO_ROOT / "build/bin/trace_graph"))
 FIXTURE_DIR = REPO_ROOT / "tests/fixtures/cache_io"
-
-
 MODEL_CONFIG: Dict[str, Any] = {
     "domains": ["cache_io"],
     "cache_io": {
@@ -96,7 +94,7 @@ def main() -> int:
         assert_equal(simple["transfer_events"], 2, "simple transfer events")
         assert_equal(simple["bytes_by_edge"].get("L3->L2"), 2048, "simple L3->L2 bytes")
         assert_equal(simple["bytes_by_edge"].get("L2->L1"), 2048, "simple L2->L1 bytes")
-        assert_equal(simple["events_with_bytes"], 3, "simple byte coverage")
+        assert_equal(simple["events_with_bytes"], 2, "simple byte coverage")
         assert_equal(simple["missing_bytes_events"], 0, "simple missing bytes count")
 
         writeback = run_fixture("writeback_evict", temp_dir)
@@ -131,6 +129,19 @@ def main() -> int:
             "L3 bandwidth /2 should increase estimated latency",
         )
 
+        page32 = run_fixture("page_size_override", temp_dir, config_with(page_size_tokens=32, page_size_policy="scenario"))
+        page128 = run_fixture("page_size_override", temp_dir, config_with(page_size_tokens=128, page_size_policy="scenario"))
+        assert_greater(
+            page32["pages_by_edge"].get("L3->L2", 0),
+            page128["pages_by_edge"].get("L3->L2", 0),
+            "scenario page size should change replay page count",
+        )
+        assert_greater(
+            page32["bytes_by_edge"].get("L3->L2", 0),
+            page128["bytes_by_edge"].get("L3->L2", 0),
+            "scenario page size with fixed bytes_per_page should change replay bytes",
+        )
+
         keyed_lru = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=2, eviction="lru"))
         keyed_fifo = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=2, eviction="fifo"))
         keyed_small = run_fixture("keyed_l2_replay", temp_dir, config_with_tier("L2", capacity_pages=1, eviction="lru"))
@@ -147,6 +158,31 @@ def main() -> int:
             prefetch_none["estimated_latency_us"],
             keyed_lru["estimated_latency_us"],
             "disabling prefetch should move storage cost to demand load",
+        )
+
+        inferred = run_fixture("query_queue_ack_inference", temp_dir, config_with(prefetch_policy="wait_complete"))
+        assert_equal(inferred["observed_movements_used"], 0, "inference fixture should not use observed movements")
+        assert_equal(inferred["inferred_movements_used"], 0, "query/queue events should not be replayed without a physical movement point")
+        assert_equal(inferred["transfer_events"], 0, "query/queue diagnostic events are not physical transfer count")
+
+        write_through = run_fixture(
+            "capacity_lru_writeback",
+            temp_dir,
+            config_with_tier("L2", capacity_pages=2, eviction="lru"),
+        )
+        write_back_config = config_with_tier("L2", capacity_pages=2, eviction="lru")
+        write_back_config["cache_io"]["write_policy"] = "write_back"
+        write_back = run_fixture("capacity_lru_writeback", temp_dir, write_back_config)
+        assert_equal(write_through["writebacks_by_edge"].get("L2->L3", 0), 0, "write-through fixture has no model writeback")
+        assert_greater(
+            write_back["writebacks_by_edge"].get("L2->L3", 0),
+            write_through["writebacks_by_edge"].get("L2->L3", 0),
+            "write-back should write dirty victims on L2 eviction",
+        )
+        assert_greater(
+            write_back["model_generated_movements"],
+            write_through["model_generated_movements"],
+            "write-back eviction should create model-generated movements",
         )
 
     print("trace_graph cache_io fixtures passed")

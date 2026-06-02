@@ -866,7 +866,8 @@ void TraceDAG::to_chrome_tracing_json(const std::string & filename, bool concise
                 args_str += "\"" + ActivityRecord::escape_json(kv.first) + "\": ";
 
                 bool is_strict_num = false;
-                if (!kv.second.empty() && (std::isdigit(kv.second[0]) || kv.second[0] == '-' || kv.second[0] == '+')) {
+                bool looks_like_hex = kv.second.size() > 2 && kv.second[0] == '0' && (kv.second[1] == 'x' || kv.second[1] == 'X');
+                if (!looks_like_hex && !kv.second.empty() && (std::isdigit(kv.second[0]) || kv.second[0] == '-' || kv.second[0] == '+')) {
                     try {
                         size_t pos = 0;
                         std::stod(kv.second, &pos);

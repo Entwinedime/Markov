@@ -1,7 +1,7 @@
 {
   "framework": "sglang",
-  "name": "qwen3-32b-hicache-tp2-whatif-base",
-  "run_id": "manual_hicache_tp2_whatif_base",
+  "name": "qwen3-32b-hicache-l3-readback-check",
+  "run_id": "hicache_l3_readback_check",
   "env": {
     "ASCEND_VISIBLE_DEVICES": "0,1",
     "SGLANG_SET_CPU_AFFINITY": "1",
@@ -15,8 +15,8 @@
     "TRACE_SIM_PYTHON_PROBE_KEY_MODE": "block_hash",
     "TRACE_SIM_PYTHON_PROBE_BLOCK_SIZE_TOKENS": "32",
     "TRACE_SIM_PYTHON_PROBE_MAX_KEYS_PER_EVENT": "4096",
-    "TRACE_SIM_PYTHON_PROBE_OUTPUT": "/workspace/trace-sim/data/profile_runs/sglang/manual_hicache_tp2_whatif_base/trace/python_probe",
-    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/workspace/trace-sim/data/profile_runs/sglang/manual_hicache_tp2_whatif_base/hicache_file"
+    "TRACE_SIM_PYTHON_PROBE_OUTPUT": "/workspace/trace-sim/data/profile_runs/sglang/hicache_l3_readback_check/trace/python_probe",
+    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/workspace/trace-sim/data/profile_runs/sglang/hicache_calibration_matrix/01_c00_baseline/hicache_file"
   },
   "hook": {
     "enabled": true,
@@ -49,6 +49,8 @@
       "--hicache-ratio",
       "1.2",
       "--enable-cache-report",
+      "--hicache-write-policy",
+      "write_through",
       "--hicache-storage-backend",
       "file",
       "--hicache-storage-prefetch-policy",
@@ -75,10 +77,32 @@
     "with_stack": false,
     "record_shapes": false,
     "merge_profiles": false,
-    "profile_prefix": "qwen3_32b_hicache_tp2_whatif_base",
-    "stop_after_workload": true
+    "profile_prefix": "qwen3_32b_hicache_l3_readback_check",
+    "stop_after_workload": true,
+    "start_timeout_sec": 120,
+    "stop_timeout_sec": 1800,
+    "strict_stop": true
   },
   "bench": {
-    "command": "python3 - <<'PY'\nimport json\nimport time\nimport urllib.request\n\nurl = 'http://127.0.0.1:30001/generate'\nprompt = 'HiCache what-if base shared prefix. ' * 64\nbody = {\n    'text': prompt,\n    'sampling_params': {\n        'max_new_tokens': 8,\n        'temperature': 0,\n        'ignore_eos': True\n    }\n}\nfor i in range(2):\n    req = urllib.request.Request(url, data=json.dumps(body).encode('utf-8'), headers={'Content-Type': 'application/json'}, method='POST')\n    with urllib.request.urlopen(req, timeout=600) as resp:\n        payload = resp.read().decode('utf-8', errors='replace')\n    print(f'request={i} status=ok bytes={len(payload)}')\n    time.sleep(1)\nPY"
+    "command": [
+      "python3",
+      "scripts/bench/hicache_phased_workload.py",
+      "--base-url",
+      "http://127.0.0.1:30001",
+      "--output-dir",
+      "/workspace/trace-sim/data/profile_runs/sglang/hicache_l3_readback_check/workload",
+      "--warmup-requests",
+      "1",
+      "--fill-requests",
+      "8",
+      "--pressure-requests",
+      "8",
+      "--reuse-requests",
+      "4",
+      "--reuse-again-requests",
+      "4",
+      "--sleep-sec",
+      "0.05"
+    ]
   }
 }

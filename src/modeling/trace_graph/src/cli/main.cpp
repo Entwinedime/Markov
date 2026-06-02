@@ -189,6 +189,8 @@ void write_run_summary(const std::string & filename,
     os << ",\"edge_count\":" << dag.edges.size();
     if (has_cache_summary) {
         os << ",\"cache_io_estimated_latency_us\":" << cache_summary.estimated_latency_us;
+        os << ",\"cache_io_foreground_us\":" << cache_summary.foreground_cache_io_us;
+        os << ",\"cache_io_background_us\":" << cache_summary.background_cache_io_us;
         os << ",\"cache_io_movement_events_used\":" << cache_summary.movement_events_used;
         os << ",\"cache_io_transfer_events\":" << cache_summary.transfer_events;
         os << ",\"warnings\":";
@@ -196,6 +198,8 @@ void write_run_summary(const std::string & filename,
     }
     else {
         os << ",\"cache_io_estimated_latency_us\":0";
+        os << ",\"cache_io_foreground_us\":0";
+        os << ",\"cache_io_background_us\":0";
         os << ",\"cache_io_movement_events_used\":0";
         os << ",\"cache_io_transfer_events\":0";
         os << ",\"warnings\":[]";
@@ -287,7 +291,7 @@ int main(int argc, char ** argv) {
 
         logger.info() << "End-to-End time: " << merged.e2e_time() << " ns";
 
-        merged.to_chrome_tracing_json(opts.output_file, /*concise=*/true, opts.full_output);
+        merged.to_chrome_tracing_json(opts.output_file, /*concise=*/!opts.full_output, opts.full_output);
         logger.info() << "Exported to " << opts.output_file;
         if (!opts.run_summary_file.empty()) {
             write_run_summary(opts.run_summary_file, opts, merged, has_cache_summary, cache_summary);

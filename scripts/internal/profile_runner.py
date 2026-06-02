@@ -369,7 +369,11 @@ def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
             body = build_profile_body(profile, run_dir)
             dump_json(run_dir / "profile_start_body.json", body)
             log("Starting SGLang profiler via /start_profile.")
-            response = post_json(api_base.rstrip("/") + "/start_profile", body)
+            response = post_json(
+                api_base.rstrip("/") + "/start_profile",
+                body,
+                timeout=int(profile.get("start_timeout_sec", 120)),
+            )
             dump_json(run_dir / "profile_start_response.json", response)
 
         if bench_command is not None:
@@ -384,7 +388,11 @@ def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
         if profile.get("enabled", True) and profile.get("stop_after_workload", True):
             log("Stopping SGLang profiler via /stop_profile.")
             try:
-                response = post_json(api_base.rstrip("/") + "/stop_profile", None)
+                response = post_json(
+                    api_base.rstrip("/") + "/stop_profile",
+                    None,
+                    timeout=int(profile.get("stop_timeout_sec", 1800)),
+                )
             except Exception as exc:
                 if profile.get("strict_stop", False):
                     raise

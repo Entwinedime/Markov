@@ -1,112 +1,135 @@
-# HiCache Validation Flow
+# HiCache Validation Protocol
 
-This document keeps the current HiCache work honest: the goal is to prove the
-profiling and modeling loop is wired correctly before treating the model as a
-quantitative predictor.
+This document defines the current SGLang + HiCache validation loop. The only
+HiCache strategy path is:
 
-## Current Flow
-
-1. Run an SGLang profile config with native hook, torch profiler, and Python
-   probe enabled. Use `TRACE_SIM_PYTHON_PROBE_KEY_MODE=hash` for base traces
-   that will feed capacity, eviction, or prefetch-policy what-if replay.
-2. Merge traces with:
-
-   ```bash
-   python3 scripts/trace/merge_all_traces.py --root data/profile_runs/sglang/<run-id> --overwrite
-   ```
-
-   Each merged PID gets `merge_report.pid*.json` with native match counts and
-   python probe sidecar counts.
-
-3. Inspect semantic HiCache coverage:
-
-   ```bash
-   python3 scripts/trace/inspect_hicache.py \
-     data/profile_runs/sglang/<run-id> \
-     --output data/profile_runs/sglang/<run-id>/model/hicache_inspect.json
-   ```
-
-4. Run TraceGraph with a model config. For Qwen3-32B TP=2 calibration, either
-   use `configs/modeling/hicache_qwen3_tp2_whatif.json` or create a run-local
-   config that sets:
-
-   ```json
-   {
-     "cache_io": {
-       "model_config_path": "/models/Qwen3-32B/config.json",
-       "tp_size": 2
-     }
-   }
-   ```
-
-   TraceGraph then infers bytes per KV page from page size, layers,
-   key-value heads per rank, head dim, and dtype bytes.
-
-5. Run explicit what-if scenarios without changing the base trace:
-
-   ```bash
-   python3 scripts/modeling/hicache_whatif.py \
-     --suite configs/modeling/hicache_qwen3_tp2_whatif.json \
-     --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid417.json \
-     --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid418.json \
-     --output-dir data/profile_runs/sglang/<run-id>/whatif
-   ```
-
-   The runner materializes one scenario config, `cache_io_summary.json`,
-   `trace_graph.json`, and `run_summary.json` per scenario, then writes
-   `whatif_summary.json` and `whatif_summary.csv`.
-
-## Synthetic Fixtures
-
-Run:
-
-```bash
-python3 tests/run_trace_graph_fixtures.py
+```text
+Python probe facts -> RadixSim -> what-if / fit matrix
 ```
 
-These fixtures validate deterministic cache replay, movement/control separation,
-byte accounting, capacity pressure, eviction-policy differences, bandwidth
-sensitivity, and prefetch-policy replay from known Chrome Trace inputs. They are
-the first regression line for future cache_io changes.
+Old profile data is not used as evidence after probe/model changes. Rerun the
+profile matrix whenever the HiCache probe contract or RadixSim semantics change.
 
-## Current Calibration Status
+## RadixSim Contract
 
-The latest smoke run uses:
+The Python probe emits current `hicache_radix` facts:
 
-- config: `configs/experiments/sglang_qwen3_32b_hicache_tp2_smoke.json`
-- what-if base config: `configs/experiments/sglang_qwen3_32b_hicache_tp2_whatif_base.json`
-- run dir: `data/profile_runs/sglang/manual_hicache_tp2_smoke`
+- `radix_op`: radix tree operations with full block path, parent path, node id,
+  page size, and token lengths.
+- `storage_op`: storage backend query/read/write facts with runtime page aliases
+  and `trace_page_block_keys_hash`.
+- `cache_operation`: lifecycle facts linking prefetch/load/write stages through
+  `operation_id`.
+
+RadixSim consumes only `model_input=true`, `domain=cache_io` events from those
+three kinds. Runtime `page_keys_hash` is an observed alias; canonical page
+identity is `page_identity_kind=block_tuple` plus `trace_page_block_keys_hash`.
+If page identity, parent chain, operation lifecycle, or rank scope does not
+close, RadixSim fails and writes `input_readiness.json`.
+
+## Profile Matrix
+
+Use the matrix config:
+
+```bash
+configs/experiments/sglang_qwen3_32b_hicache_tp2_calibration_matrix.json
+```
+
+Fixed assumptions:
+
 - model: `/models/Qwen3-32B`
-- TP size: 2
+- TP: `2`
+- storage backend: `file`
+- key mode: `TRACE_SIM_PYTHON_PROBE_KEY_MODE=block_hash`
+- block size: `TRACE_SIM_PYTHON_PROBE_BLOCK_SIZE_TOKENS=32`
 
-Acceptance for this stage:
+Dry run:
 
-- benchmark requests complete successfully
-- torch, native hook, and python probe traces exist for both ranks
-- merge reports show all native events matched
-- HiCache inspection finds nonzero semantic events
-- TraceGraph emits a cache_io summary with nonzero transfer events
-- calibrated bytes are nonzero for events that expose page counts
-- key coverage is nonzero when the what-if base config is used
+```bash
+scripts/profile.sh \
+  configs/experiments/sglang_qwen3_32b_hicache_tp2_calibration_matrix.json \
+  --dry-run
+```
 
-Known limitation:
+Real run:
 
-- many HiCache events are control/status checks and do not carry page counts
-- `bytes_by_edge` may be partially zero when a real movement path still lacks
-  pages/bytes metadata
-- the current summary and what-if output are calibration signals, not final
-  absolute-latency correctness claims
+```bash
+scripts/profile.sh \
+  configs/experiments/sglang_qwen3_32b_hicache_tp2_calibration_matrix.json
+```
 
-## What-If Scope
+After a run, inspect each profile root:
 
-The current what-if layer is deterministic scenario replay only. It does not
-search for an optimum and does not generate sweeps by itself. Supported knobs:
+```bash
+python3 scripts/trace/inspect_hicache.py \
+  data/profile_runs/sglang/hicache_calibration_matrix/<run-id> \
+  --output data/profile_runs/sglang/hicache_calibration_matrix/<run-id>/model/hicache_inspect.json
+```
 
-- L1/L2/L3 capacity changes
-- per-tier bandwidth and latency changes
-- `prefetch_policy = trace_replay | none`
-- `eviction = lru | fifo | infinite`
+The important readiness fields are `page_identity_map_ready`,
+`runtime_page_alias_ready`, `operation_lifecycle_ready`,
+`load_back_link_ready`, `parent_prefix_ready`, `state_scope_ready`, and
+`radix_sim_ready`.
 
-Use `inspect_hicache.py` first. Its `whatif_readiness` section states whether a
-trace has enough bytes/pages, page keys, and prefetch/load linkage for each
-class of scenario.
+## What-If And Fit
+
+Run explicit scenarios on one base trace:
+
+```bash
+python3 scripts/modeling/hicache_whatif.py \
+  --suite configs/modeling/hicache_qwen3_tp2_whatif.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid417.json \
+  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid418.json \
+  --output-dir data/profile_runs/sglang/<run-id>/whatif
+```
+
+Run the calibration fit matrix:
+
+```bash
+python3 scripts/modeling/hicache_fit_matrix.py \
+  --run-root data/profile_runs/sglang/hicache_calibration_matrix \
+  --matrix-config configs/experiments/sglang_qwen3_32b_hicache_tp2_calibration_matrix.json \
+  --output-dir data/profile_runs/sglang/hicache_calibration_matrix/fit \
+  --pair-workers 4 \
+  --overwrite
+```
+
+For a quick c00 row:
+
+```bash
+python3 scripts/modeling/hicache_fit_matrix.py \
+  --run-root data/profile_runs/sglang/hicache_calibration_matrix \
+  --matrix-config configs/experiments/sglang_qwen3_32b_hicache_tp2_calibration_matrix.json \
+  --output-dir data/profile_runs/sglang/hicache_calibration_matrix/fit_c00 \
+  --base c00_baseline \
+  --pair-workers 4 \
+  --cache-only-sidecar \
+  --overwrite
+```
+
+Per-scenario `radix_sim_trace.json` is an intermediate artifact and is deleted
+unless `--keep-generated-trace-output` is set.
+
+## Acceptance
+
+- Every profile run has Python probe sidecar events.
+- Native merge reports have unmatched count `0`.
+- Inspect reports `radix_sim_ready=true`.
+- `load_back_pages_missing=0` in RadixSim summaries.
+- Event-level diff aligns observed storage reads with generated `L3->L2` pages
+  and observed load-back with generated `L2->L1` pages.
+- c00->c01, c00->c02, and c00->c09 produce explainable page-size/write-policy
+  deltas before running the full matrix.
+
+## Regression Checks
+
+```bash
+python3 -m py_compile \
+  scripts/bench/hicache_phased_workload.py \
+  scripts/modeling/hicache_fit_matrix.py \
+  scripts/modeling/hicache_whatif.py \
+  scripts/trace/*.py
+
+python3 tests/run_hicache_radix_sim_fixtures.py
+python3 tests/run_trace_graph_fixtures.py
+```

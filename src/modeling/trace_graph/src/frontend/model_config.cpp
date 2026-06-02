@@ -68,6 +68,16 @@ uint64_t unsigned_value(const std::string & text, const std::string & key, uint6
     }
 }
 
+bool bool_value(const std::string & text, const std::string & key, bool def) {
+    std::regex re("\"" + key + "\"\\s*:\\s*(true|false)", std::regex_constants::icase);
+    std::smatch m;
+    if (std::regex_search(text, m, re)) { return lower(m[1].str()) == "true"; }
+    auto as_string = lower(string_value(text, key, ""));
+    if (as_string == "true" || as_string == "1" || as_string == "yes") return true;
+    if (as_string == "false" || as_string == "0" || as_string == "no") return false;
+    return def;
+}
+
 uint64_t dtype_bytes_from_text(const std::string & text) {
     auto dtype = lower(text);
     if (dtype.find("float64") != std::string::npos || dtype.find("double") != std::string::npos || dtype.find("int64") != std::string::npos) return 8;
@@ -255,8 +265,15 @@ ModelConfig ModelConfig::from_file(const std::string & filename) {
         config.cache_io.num_kv_heads = unsigned_value(cache_object, "num_kv_heads", 0);
         config.cache_io.head_dim = unsigned_value(cache_object, "head_dim", 0);
         config.cache_io.dtype_bytes = unsigned_value(cache_object, "dtype_bytes", 0);
+        config.cache_io.page_size_policy = string_value(cache_object, "page_size_policy", "trace");
         config.cache_io.write_policy = string_value(cache_object, "write_policy", "trace");
+        config.cache_io.writeback_on_evict = bool_value(cache_object, "writeback_on_evict", true);
         config.cache_io.prefetch_policy = string_value(cache_object, "prefetch_policy", "trace_replay");
+        config.cache_io.prefetch_threshold = unsigned_value(cache_object, "prefetch_threshold", 0);
+        config.cache_io.prefetch_timeout_base = number_value(cache_object, "prefetch_timeout_base", 0.0);
+        config.cache_io.prefetch_timeout_per_ki_token = number_value(cache_object, "prefetch_timeout_per_ki_token", 0.0);
+        config.cache_io.prefetch_timeout_max = number_value(cache_object, "prefetch_timeout_max", 0.0);
+        config.cache_io.count_async_prefetch_latency = bool_value(cache_object, "count_async_prefetch_latency", false);
         config.cache_io.tiers = parse_tiers(cache_object);
         fill_from_hf_model_config(config.cache_io);
     }
