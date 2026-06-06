@@ -126,7 +126,7 @@ NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
 }
 
 HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
-    // HiCache 当前是 skeleton；这里只解析 enabled 开关，后续状态机参数从这里扩展。
+    // HiCache 当前先解析 enabled 开关；page size、capacity、policy 等参数后续从这里扩展。
     HiCacheConfig config;
     auto it = root.find("hicache");
     if (it == root.end() || !it->is_object()) {

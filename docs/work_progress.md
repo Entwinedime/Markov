@@ -2,6 +2,28 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-06 16:02:14 +0800
+
+- 已完成一次轻量基线整理提交并推送到远程：
+  - 提交 `a11eb1f chore: consolidate profiling and trace graph baseline`；
+  - 外部老版 `TraceGraph/` 仓库只作为本地参考，不进入 active 仓库提交。
+- 修复 `src/modeling/trace_graph` 中上一轮 `// !` 标出的确定问题：
+  - 缺 `Event Id` 的 record/wait 不再用默认 id 匹配，避免生成错误 sync 边；
+  - stream sync 支持 `streamId`、`stream id`、`Physic Stream Id`、`Raw Stream` 到真实 DAG lane 的 alias 映射；
+  - 补齐 `aclrtSynchronizeStreamWithTimeout`、`aclrtSynchronizeEvent`、`aclrtSynchronizeDevice` 等 sync wrapper；
+  - Chrome trace reader 能完整跳过 args 中的对象/数组，避免嵌套字段打乱后续字段扫描；
+  - 拓扑仿真按前驱节点的 `cpuinterval` 计入 CPU gap。
+- `HiCacheModule` 从 skeleton 推进到 state-only：
+  - 消费 HiCache profiling facts，维护 `L1/L2/L3 resident`、`dirty`、`backuped`、`evicted`、`prefetch planned/ready`；
+  - 输出 `final_state`、`transitions_by_kind`、缺失 page identity 和 dirty eviction 计数；
+  - 仍保持 `dag_mutations=0`，暂不做 DAG patch。
+- 已新增 fixture 覆盖：
+  - 缺 event id 不错误建 sync；
+  - stream alias sync、WithTimeout、event sync、device sync；
+  - nested args 不破坏 streamId 解析；
+  - CPU gap 计入；
+  - HiCache insert/load/write/prefetch/evict 的状态转移。
+
 ## 2026-06-06 14:36:28 +0800
 
 - 增加代码审查注释标记约定：

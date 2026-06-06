@@ -191,7 +191,7 @@ bench serving 的端到端 wall time 替代。bench serving duration 只作为 w
 
 复杂变化也是子模块：
 
-- `HiCacheModule`：当前 active 实现只保留 skeleton；后续重新实现 cache 状态和 DAG 修改；
+- `HiCacheModule`：当前 active 实现维护 page resident/dirty/backuped 状态，但暂不修改 DAG；
 - `ParallelStrategyModule`：修改 rank、sharding、collective 相关 DAG；
 - `InterconnectModule`：修改 CPU-NPU / NPU-NPU 通信相关 DAG。
 
@@ -315,11 +315,13 @@ CLI: --emit-dag-chrome-trace
 
 ## HiCache 建模
 
-HiCache 是第一个复杂子模块。当前 active C++ `HiCacheModule` 只保留 skeleton：
-它可以被 C++ module registry 加载，可以统计输入 HiCache 事件数量，但不维护 cache
-状态、不修改 DAG、不输出 replay latency。这样做是为了避免旧 observed replay 逻辑干扰后续开发。
+HiCache 是第一个复杂子模块。当前 active C++ `HiCacheModule` 已进入 state-only 阶段：
+它可以被 C++ module registry 加载，消费 HiCache profiling facts，维护
+`L1/L2/L3 resident`、`dirty`、`backuped`、`evicted`、`prefetch planned/ready`
+等 page 状态，并输出状态验证 summary。它仍然不修改 DAG、不输出 replay latency；
+这样做是为了先验证 cache 状态维护，不让未完成的 DAG patch 逻辑干扰 base DAG。
 
-后续重新实现时分两步验证：
+HiCache 后续继续分两步验证：
 
 1. cache 状态维护正确；
 2. cache 状态变化正确反映到 DAG。
@@ -329,7 +331,7 @@ HiCache 是第一个复杂子模块。当前 active C++ `HiCacheModule` 只保�
 | 层级 | 命令意图 | 验收重点 |
 | --- | --- | --- |
 | faithful replay | `mode=faithful_replay` | `dag_mutation_count=0`，不加载任何子模块，trace 内部 E2E 相对误差目标不超过 5%，真实大 trace 当前已达到约 0.89%。 |
-| cache state | `mode=cache_state` | skeleton 阶段只验证模块可加载且 `dag_mutation_count=0`；状态机重建后再验证 page identity 和状态转移。 |
+| cache state | `mode=cache_state` | `dag_mutation_count=0`；验证 page identity、tier resident、dirty/backuped、evict 和 prefetch 状态转移。 |
 | cache patch | `mode=cache_patch` | DAG mutation 非空，mutation 能映射到 fact / 状态 / policy，E2E 相对误差目标不超过 20%。 |
 
 HiCache 状态应维护：

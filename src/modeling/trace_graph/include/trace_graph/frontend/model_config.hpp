@@ -18,7 +18,7 @@ struct NodeScaleConfig {
     std::vector<NodeScaleRuleConfig> rules;
 };
 
-// HiCache 当前只保留 skeleton 开关。真实状态机和 DAG mutation 后续在该配置下扩展。
+// HiCache 当前先维护 cache state；DAG mutation 后续在该配置下继续扩展。
 struct HiCacheConfig {
     bool enabled = false;
 };
