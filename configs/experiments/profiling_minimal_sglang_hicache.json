@@ -1,0 +1,382 @@
+{
+  "name": "profiling_minimal_sglang_hicache",
+  "framework": "sglang",
+  "metadata": {
+    "purpose": "Real SGLang HiCache diagnostic profiling run for faithful replay, cache state, and cache patch validation inputs.",
+    "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+    "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
+    "hicache_ratio_note": "--hicache-ratio is fixed at 2.0 and is not a diagnostic variable. Capacity pressure should come from the workload first."
+  },
+  "profiling": {
+    "enabled": true,
+    "channels": ["torch", "python_probe", "ld_preload"],
+    "debug": false,
+    "torch": {
+      "enabled": true,
+      "output_dir": "trace/torch",
+      "with_stack": false,
+      "record_shapes": false
+    },
+    "python_probe": {
+      "probes": ["sglang.hicache"],
+      "targets": [
+        {
+          "id": "scheduler.prefetch_kvcache",
+          "module": "sglang.srt.managers.scheduler",
+          "target": "Scheduler._prefetch_kvcache",
+          "events": ["hicache_prefetch_decision_start", "hicache_prefetch_decision_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:req.rid"},
+            {"name": "host_hit_length", "source": "arg:req.host_hit_length", "required": false},
+            {"name": "storage_hit_length", "source": "arg:req.storage_hit_length", "required": false},
+            {"name": "fill_tokens", "source": "len:arg:req.fill_ids", "required": false},
+            {"name": "page_size", "source": "self.tree_cache.page_size"},
+            {"name": "event_role", "source": "const:prefetch_decision"}
+          ]
+        },
+        {
+          "id": "hiradix.match_prefix",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": ["hicache_lookup_start", "hicache_lookup_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:params.req.rid", "required": false},
+            {"name": "input_tokens", "source": "len:arg:params.key"},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
+            {"name": "device_hit_tokens", "source": "len:return.device_indices", "required": false},
+            {"name": "host_hit_length", "source": "return.host_hit_length", "required": false},
+            {"name": "last_device_node_id", "source": "return.last_device_node.id", "required": false},
+            {"name": "last_host_node_id", "source": "return.last_host_node.id", "required": false},
+            {"name": "best_match_node_id", "source": "return.best_match_node.id", "required": false},
+            {"name": "event_role", "source": "const:lookup"}
+          ]
+        },
+        {
+          "id": "hiradix.prefetch_from_storage",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.prefetch_from_storage",
+          "events": ["hicache_prefetch_schedule_start", "hicache_prefetch_schedule_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:req_id"},
+            {"name": "last_host_node_id", "source": "arg:last_host_node.id"},
+            {"name": "new_input_tokens", "source": "len:arg:new_input_tokens"},
+            {"name": "page_identity", "source": "page_hashes:arg:new_input_tokens,self.page_size,arg:last_hash"},
+            {"name": "prefix_keys", "source": "len:arg:prefix_keys", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:prefetch_schedule"}
+          ]
+        },
+        {
+          "id": "hiradix.check_prefetch_progress",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.check_prefetch_progress",
+          "events": ["hicache_prefetch_progress_start", "hicache_prefetch_progress_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:req_id"},
+            {"name": "prefetch_done", "source": "return", "required": false},
+            {"name": "ongoing_prefetch_count", "source": "len:self.ongoing_prefetch"},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:prefetch_progress"}
+          ]
+        },
+        {
+          "id": "hiradix.pop_prefetch_loaded_tokens",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.pop_prefetch_loaded_tokens",
+          "events": ["hicache_prefetch_loaded_tokens_start", "hicache_prefetch_loaded_tokens_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:req_id"},
+            {"name": "loaded_tokens", "source": "return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:prefetch_loaded_tokens"}
+          ]
+        },
+        {
+          "id": "hiradix.init_load_back",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.init_load_back",
+          "events": ["hicache_init_load_back_start", "hicache_init_load_back_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:params.req.rid", "required": false},
+            {"name": "host_hit_length", "source": "arg:params.host_hit_length"},
+            {"name": "best_match_node_id", "source": "arg:params.best_match_node.id"},
+            {"name": "page_identity", "source": "arg:params.best_match_node.hash_value", "required": false},
+            {"name": "loaded_tokens", "source": "len:return.0", "required": false},
+            {"name": "last_node_id", "source": "return.1.id", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:init_load_back"}
+          ]
+        },
+        {
+          "id": "hiradix.load_back",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.load_back",
+          "events": ["hicache_load_back_start", "hicache_load_back_end"],
+          "fields": [
+            {"name": "node_id", "source": "arg:node.id"},
+            {"name": "page_identity", "source": "arg:node.hash_value"},
+            {"name": "host_tokens", "source": "len:arg:node.host_value", "required": false},
+            {"name": "loaded_tokens", "source": "len:return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:load_back"}
+          ]
+        },
+        {
+          "id": "hiradix.insert",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.insert",
+          "events": ["hicache_insert_start", "hicache_insert_end"],
+          "fields": [
+            {"name": "insert_tokens", "source": "len:arg:params.key", "required": false},
+            {"name": "value_tokens", "source": "len:arg:params.value", "required": false},
+            {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
+            {"name": "prefix_len", "source": "return.prefix_len", "required": false},
+            {"name": "inserted_host_node_id", "source": "return.inserted_host_node.id", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:insert"}
+          ]
+        },
+        {
+          "id": "hiradix.write_backup",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.write_backup",
+          "events": ["hicache_write_backup_start", "hicache_write_backup_end"],
+          "fields": [
+            {"name": "node_id", "source": "arg:node.id"},
+            {"name": "page_identity", "source": "arg:node.hash_value"},
+            {"name": "device_tokens", "source": "len:arg:node.value", "required": false},
+            {"name": "write_back", "source": "arg:write_back", "required": false},
+            {"name": "written_tokens", "source": "return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:write_backup"}
+          ]
+        },
+        {
+          "id": "hiradix.write_backup_storage",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.write_backup_storage",
+          "events": ["hicache_write_storage_schedule_start", "hicache_write_storage_schedule_end"],
+          "fields": [
+            {"name": "node_id", "source": "arg:node.id"},
+            {"name": "host_tokens", "source": "len:arg:node.host_value", "required": false},
+            {"name": "page_identity", "source": "arg:node.hash_value"},
+            {"name": "hash_pages", "source": "len:arg:node.hash_value", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:write_storage_schedule"}
+          ]
+        },
+        {
+          "id": "hiradix.evict",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.evict",
+          "events": ["hicache_evict_start", "hicache_evict_end"],
+          "fields": [
+            {"name": "requested_tokens", "source": "arg:params.num_tokens"},
+            {"name": "evicted_tokens", "source": "return.num_tokens_evicted", "required": false},
+            {"name": "page_identity", "source": "return.best_match_node.hash_value", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:evict"}
+          ]
+        },
+        {
+          "id": "controller.load",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.load",
+          "events": ["hicache_l2_l1_enqueue_start", "hicache_l2_l1_enqueue_end"],
+          "fields": [
+            {"name": "node_id", "source": "arg:node_id"},
+            {"name": "host_tokens", "source": "len:arg:host_indices"},
+            {"name": "device_tokens", "source": "len:return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l2_to_l1_enqueue"}
+          ]
+        },
+        {
+          "id": "controller.start_loading",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.start_loading",
+          "events": ["hicache_l2_l1_start", "hicache_l2_l1_end"],
+          "fields": [
+            {"name": "producer_id", "source": "return", "required": false},
+            {"name": "load_queue_size", "source": "len:self.load_queue", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l2_to_l1_start"}
+          ]
+        },
+        {
+          "id": "controller.write",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.write",
+          "events": ["hicache_l1_l2_enqueue_start", "hicache_l1_l2_enqueue_end"],
+          "fields": [
+            {"name": "node_id", "source": "arg:node_id"},
+            {"name": "device_tokens", "source": "len:arg:device_indices"},
+            {"name": "host_tokens", "source": "len:return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l1_to_l2_enqueue"}
+          ]
+        },
+        {
+          "id": "controller.start_writing",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.start_writing",
+          "events": ["hicache_l1_l2_start", "hicache_l1_l2_end"],
+          "fields": [
+            {"name": "write_queue_size", "source": "len:self.write_queue", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l1_to_l2_start"}
+          ]
+        },
+        {
+          "id": "controller.prefetch",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.prefetch",
+          "events": ["hicache_l3_prefetch_enqueue_start", "hicache_l3_prefetch_enqueue_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:request_id"},
+            {"name": "host_tokens", "source": "len:arg:host_indices"},
+            {"name": "new_input_tokens", "source": "len:arg:new_input_tokens"},
+            {"name": "page_identity", "source": "page_hashes:arg:new_input_tokens,self.page_size,arg:last_hash"},
+            {"name": "operation_id", "source": "return.id", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l3_prefetch_enqueue"}
+          ]
+        },
+        {
+          "id": "controller.storage_hit_query",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController._storage_hit_query",
+          "events": ["hicache_l3_hit_query_start", "hicache_l3_hit_query_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:operation.request_id", "required": false},
+            {"name": "token_count", "source": "len:arg:operation.token_ids"},
+            {"name": "page_identity", "source": "return.0", "required": false},
+            {"name": "hit_pages", "source": "len:return.0", "required": false},
+            {"name": "hit_tokens", "source": "return.1", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l3_hit_query"}
+          ]
+        },
+        {
+          "id": "controller.page_transfer",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController._page_transfer",
+          "events": ["hicache_l3_l2_transfer_start", "hicache_l3_l2_transfer_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:operation.request_id", "required": false},
+            {"name": "page_identity", "source": "arg:operation.hash_value"},
+            {"name": "hash_pages", "source": "len:arg:operation.hash_value", "required": false},
+            {"name": "completed_tokens", "source": "arg:operation.completed_tokens", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l3_to_l2_transfer"}
+          ]
+        },
+        {
+          "id": "controller.write_storage",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.write_storage",
+          "events": ["hicache_l2_l3_enqueue_start", "hicache_l2_l3_enqueue_end"],
+          "fields": [
+            {"name": "host_tokens", "source": "len:arg:host_indices"},
+            {"name": "token_count", "source": "len:arg:token_ids"},
+            {"name": "page_identity", "source": "arg:hash_value"},
+            {"name": "hash_pages", "source": "len:arg:hash_value", "required": false},
+            {"name": "operation_id", "source": "return", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l2_to_l3_enqueue"}
+          ]
+        },
+        {
+          "id": "controller.page_backup",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController._page_backup",
+          "events": ["hicache_l2_l3_transfer_start", "hicache_l2_l3_transfer_end"],
+          "fields": [
+            {"name": "operation_id", "source": "arg:operation.id", "required": false},
+            {"name": "page_identity", "source": "arg:operation.hash_value"},
+            {"name": "hash_pages", "source": "len:arg:operation.hash_value", "required": false},
+            {"name": "completed_tokens", "source": "arg:operation.completed_tokens", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "event_role", "source": "const:l2_to_l3_transfer"}
+          ]
+        }
+      ]
+    },
+    "ld_preload": {
+      "enabled": true,
+      "library": "build/docker/sglang/lib/libhook.so",
+      "trace_output": "trace/ld_preload/cpu_trace.json"
+    }
+  },
+  "env": {
+    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "/tmp/trace_sim_hicache_file_backend"
+  },
+  "server": {
+    "model_path": "/models/Qwen3-32B",
+    "command": [
+      "python3",
+      "-m",
+      "sglang.launch_server",
+      "--model-path",
+      "/models/Qwen3-32B",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "30000",
+      "--tp-size",
+      "2",
+      "--trust-remote-code",
+      "--enable-hierarchical-cache",
+      "--hicache-ratio",
+      "2.0",
+      "--hicache-write-policy",
+      "write_through_selective",
+      "--hicache-io-backend",
+      "kernel_ascend",
+      "--hicache-mem-layout",
+      "layer_first",
+      "--hicache-storage-backend",
+      "file",
+      "--hicache-storage-prefetch-policy",
+      "timeout",
+      "--disable-cuda-graph"
+    ],
+    "ready_url": "http://127.0.0.1:30000/get_model_info",
+    "ready_timeout_sec": 1800
+  },
+  "bench": {
+    "command": [
+      "python3",
+      "scripts/bench/hicache_phased_workload.py",
+      "--base-url",
+      "http://127.0.0.1:30000",
+      "--output-dir",
+      "{bench_dir}/hicache_phased",
+      "--warmup-requests",
+      "1",
+      "--seed-requests",
+      "8",
+      "--reuse-requests",
+      "8",
+      "--backup-wait-requests",
+      "8",
+      "--pressure-requests",
+      "24",
+      "--reuse-after-pressure-requests",
+      "8",
+      "--prefetch-seed-requests",
+      "4",
+      "--prefetch-reuse-requests",
+      "8",
+      "--shared-prefix-repeat",
+      "128",
+      "--unique-suffix-repeat",
+      "8",
+      "--max-errors",
+      "1",
+      "--max-new-tokens",
+      "8"
+    ]
+  }
+}

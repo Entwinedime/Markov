@@ -1,0 +1,48 @@
+{
+  "traceEvents": [
+    {
+      "event_id": "launch",
+      "name": "runtime_launch",
+      "cat": "runtime",
+      "ph": "X",
+      "ts": 0,
+      "dur": 10,
+      "pid": 1,
+      "tid": 1,
+      "args": {
+        "correlation_id": "c1"
+      }
+    },
+    {
+      "event_id": "kernel",
+      "name": "device_kernel",
+      "cat": "compute",
+      "ph": "X",
+      "ts": 20,
+      "dur": 30,
+      "pid": 1,
+      "tid": 2,
+      "args": {
+        "correlation_id": "c1",
+        "device_id": 0,
+        "streamId": 0,
+        "request_id": "r1"
+      }
+    },
+    {
+      "event_id": "compute_use_kv",
+      "name": "compute_use_kv",
+      "cat": "compute",
+      "ph": "X",
+      "ts": 100,
+      "dur": 50,
+      "pid": 1,
+      "tid": 2,
+      "args": {
+        "device_id": 0,
+        "streamId": 0,
+        "request_id": "r1"
+      }
+    }
+  ]
+}

@@ -1,218 +1,180 @@
-#include "trace_graph/activity_record.hpp"
-#include "trace_graph/domains/cache_io/cache_model.hpp"
-#include "trace_graph/export_raw_trace.hpp"
+#include "trace_graph/core/dag_builder.hpp"
 #include "trace_graph/frontend/model_config.hpp"
 #include "trace_graph/frontend/trace_normalizer.hpp"
-#include "trace_graph/logger.hpp"
-#include "trace_graph/optimization/scale_transform.hpp"
+#include "trace_graph/io/chrome_trace_io.hpp"
+#include "trace_graph/core/logger.hpp"
+#include "trace_graph/modules/hicache/hicache_module.hpp"
+#include "trace_graph/modules/node_scale_module.hpp"
+#include "trace_graph/modules/simulation_module.hpp"
 #include "trace_graph/simulation/topological_simulator.hpp"
-#include "trace_graph/trace_dag.hpp"
-#include "trace_graph/trace_parser.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <sstream>
+#include <memory>
+#include <stdexcept>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace {
 
+using Json = nlohmann::json;
+
 struct CliOptions {
+    // C++ 后端输入必须是已经由 trace_merger 合并后的 Chrome trace。
+    // 多个 --input 表示多个 rank / device graph，后续由 DagGraph::merge 合并。
     std::vector<std::string> input_traces;
-    std::string output_file = "output_graph.json";
-    std::vector<std::pair<std::string, double>> scales;
-    bool debug = false;
-    bool verbose = false;
-    bool full_output = false;
-    bool no_raw = false;
-    bool explicit_help = false;
-    bool show_help = false;
+    std::string graph_output;
     std::string model_config_file;
     std::string model_summary_file;
     std::string run_summary_file;
-    std::string scenario_name;
+    std::string scenario_name = "trace_graph";
+    bool full_output = false;
+    bool debug = false;
+    bool verbose = false;
+    bool explicit_help = false;
+    bool show_help = false;
 };
 
 void print_usage(const char * prog) {
-    std::cout << "Usage: " << prog << " [OPTIONS] <trace_file> [trace_file ...]\n\n"
-              << "Build a DAG from Ascend trace JSON and run topological simulation.\n\n"
+    std::cout << "Usage: " << prog << " --input TRACE [--input TRACE ...] --run-summary FILE [OPTIONS]\n\n"
+              << "Build a C++ TraceGraph DAG from merged Chrome trace JSON and run topological simulation.\n\n"
               << "Options:\n"
               << "  -h, --help                  Show this help message\n"
-              << "  -o, --output FILE           Output file (default: output_graph.json)\n"
-              << "  -s, --scale NAME=FACTOR[,...]\n"
-              << "                              Time-scaling operations (repeatable, comma-separated)\n"
-              << "                              Example: --scale \"CPUInfer::sync=0.5\"\n"
-              << "                              Example: --scale \"CPUInfer::sync=0.5,aclrtMemcpyAsync=2.0\"\n"
-              << "  -d, --debug                 Export intermediate debug files\n"
-              << "  -v, --verbose               Show progress output\n"
-              << "  --full-output               Generate full Chrome tracing with edge flows\n"
-              << "  --no-raw                    Skip raw parsed trace export\n"
-              << "  --model-config FILE         Apply domain model config, e.g. cache_io tiers\n"
-              << "  --model-summary FILE        Model summary JSON output\n"
-              << "  --run-summary FILE          Scenario/run summary JSON output\n"
-              << "  --scenario-name NAME        Scenario name for --run-summary\n\n"
-              << "All --scale values are applied together, then a single simulation runs.\n"
-              << "Multiple trace files are treated as separate GPU cards and merged.\n\n"
-              << "Environment:\n"
-              << "  TRACE_GRAPH_COLOR=0         Disable colored log output\n";
+              << "  --input FILE                Merged Chrome trace JSON input, repeatable\n"
+              << "  --graph-output FILE         Optional Chrome trace DAG output\n"
+              << "  --full-output               Include simulated nodes and edge flow events in --graph-output\n"
+              << "  --model-config FILE         Optional C++ model config for SimulationModule execution\n"
+              << "  --model-summary FILE        Optional model summary JSON output\n"
+              << "  --run-summary FILE          Required run summary JSON output\n"
+              << "  --scenario-name NAME        Scenario name in run summary\n"
+              << "  -d, --debug                 Enable debug logging\n"
+              << "  -v, --verbose               Enable info logging\n";
 }
 
-std::vector<std::pair<std::string, double>> parse_scale_spec(const std::string & spec) {
-    std::vector<std::pair<std::string, double>> result;
-    std::istringstream iss(spec);
-    std::string token;
-    while (std::getline(iss, token, ',')) {
-        auto eq = token.find('=');
-        if (eq == std::string::npos) {
-            std::cerr << "Error: --scale expects NAME=FACTOR format, got '" << token << "'\n";
-            continue;
-        }
-        std::string name = token.substr(0, eq);
-        double factor = std::stod(token.substr(eq + 1));
-        result.emplace_back(std::move(name), factor);
+bool consume_value(int & i, int argc, char ** argv, std::string & out, const std::string & option) {
+    if (i + 1 >= argc) {
+        std::cerr << "Error: " << option << " requires a value\n";
+        return false;
     }
-    return result;
+    out = argv[++i];
+    return true;
 }
 
 CliOptions parse_cli(int argc, char ** argv) {
+    // CLI 只保留当前主线需要的参数，不再提供旧版 --scale/-s 等快捷入口。
+    // what-if 必须通过 --model-config 进入 C++ SimulationModule。
     CliOptions opts;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-
         if (arg == "-h" || arg == "--help") {
             opts.explicit_help = true;
             opts.show_help = true;
             return opts;
         }
-        else if (arg == "-o" || arg == "--output") {
-            if (i + 1 < argc) opts.output_file = argv[++i];
-            else {
-                std::cerr << "Error: --output requires a value\n";
+        if (arg == "--input") {
+            std::string value;
+            if (!consume_value(i, argc, argv, value, arg)) {
                 opts.show_help = true;
                 return opts;
             }
+            opts.input_traces.push_back(value);
         }
-        else if (arg == "-s" || arg == "--scale") {
-            if (i + 1 < argc) {
-                auto parsed = parse_scale_spec(argv[++i]);
-                for (auto & p : parsed) opts.scales.push_back(std::move(p));
-            }
-            else {
-                std::cerr << "Error: --scale requires a value\n";
-                opts.show_help = true;
-                return opts;
-            }
+        else if (arg == "--graph-output") {
+            if (!consume_value(i, argc, argv, opts.graph_output, arg)) opts.show_help = true;
         }
-        else if (arg == "-d" || arg == "--debug") { opts.debug = true; }
-        else if (arg == "-v" || arg == "--verbose") { opts.verbose = true; }
-        else if (arg == "--full-output") { opts.full_output = true; }
-        else if (arg == "--no-raw") { opts.no_raw = true; }
         else if (arg == "--model-config") {
-            if (i + 1 < argc) opts.model_config_file = argv[++i];
-            else {
-                std::cerr << "Error: --model-config requires a value\n";
-                opts.show_help = true;
-                return opts;
-            }
+            if (!consume_value(i, argc, argv, opts.model_config_file, arg)) opts.show_help = true;
         }
         else if (arg == "--model-summary") {
-            if (i + 1 < argc) opts.model_summary_file = argv[++i];
-            else {
-                std::cerr << "Error: --model-summary requires a value\n";
-                opts.show_help = true;
-                return opts;
-            }
+            if (!consume_value(i, argc, argv, opts.model_summary_file, arg)) opts.show_help = true;
         }
         else if (arg == "--run-summary") {
-            if (i + 1 < argc) opts.run_summary_file = argv[++i];
-            else {
-                std::cerr << "Error: --run-summary requires a value\n";
-                opts.show_help = true;
-                return opts;
-            }
+            if (!consume_value(i, argc, argv, opts.run_summary_file, arg)) opts.show_help = true;
         }
         else if (arg == "--scenario-name") {
-            if (i + 1 < argc) opts.scenario_name = argv[++i];
-            else {
-                std::cerr << "Error: --scenario-name requires a value\n";
-                opts.show_help = true;
-                return opts;
-            }
+            if (!consume_value(i, argc, argv, opts.scenario_name, arg)) opts.show_help = true;
         }
-        else if (arg[0] == '-') {
+        else if (arg == "--full-output") opts.full_output = true;
+        else if (arg == "-d" || arg == "--debug") opts.debug = true;
+        else if (arg == "-v" || arg == "--verbose") opts.verbose = true;
+        else {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             opts.show_help = true;
             return opts;
         }
-        else { opts.input_traces.push_back(arg); }
     }
-
     if (opts.input_traces.empty()) {
-        std::cerr << "Error: No input trace files specified.\n";
+        std::cerr << "Error: at least one --input is required\n";
+        opts.show_help = true;
+    }
+    if (opts.run_summary_file.empty()) {
+        std::cerr << "Error: --run-summary is required\n";
         opts.show_help = true;
     }
     return opts;
 }
 
-void append_string_array(std::ostringstream & os, const std::vector<std::string> & values) {
-    os << "[";
-    bool first = true;
-    for (const auto & value : values) {
-        if (!first) os << ",";
-        first = false;
-        os << "\"" << TraceGraph::ActivityRecord::escape_json(value) << "\"";
-    }
-    os << "]";
+std::vector<std::unique_ptr<TraceGraph::SimulationModule>> build_modules(const std::string & model_config_file) {
+    // 模块顺序在这里固定：简单缩放先执行，HiCache 后执行。
+    // 后续如果模块之间存在依赖，应在这里明确排序，而不是让 JSON 对象遍历顺序决定行为。
+    std::vector<std::unique_ptr<TraceGraph::SimulationModule>> modules;
+    if (model_config_file.empty()) return modules;
+
+    auto config = TraceGraph::ModelConfig::from_file(model_config_file);
+    if (config.node_scale.enabled) modules.push_back(std::make_unique<TraceGraph::NodeScaleModule>(config.node_scale));
+    if (config.hicache.enabled) modules.push_back(std::make_unique<TraceGraph::HiCacheModule>(config.hicache));
+    return modules;
 }
 
-void write_run_summary(const std::string & filename,
-                       const CliOptions & opts,
-                       const TraceGraph::TraceDAG & dag,
-                       bool has_cache_summary,
-                       const TraceGraph::CacheIOSummary & cache_summary) {
+void write_json_file(const std::string & filename, const Json & value) {
     std::ofstream ofs(filename);
-    if (!ofs.is_open()) { throw std::runtime_error("Failed to write run summary: " + filename); }
+    if (!ofs.is_open()) { throw std::runtime_error("Failed to write JSON file: " + filename); }
+    ofs << value.dump(2) << "\n";
+}
 
-    std::ostringstream os;
-    os << "{";
-    auto scenario_name = opts.scenario_name.empty() ? opts.output_file : opts.scenario_name;
-    os << "\"scenario_name\":\"" << TraceGraph::ActivityRecord::escape_json(scenario_name) << "\",";
-    os << "\"input_traces\":";
-    append_string_array(os, opts.input_traces);
-    os << ",\"output_file\":\"" << TraceGraph::ActivityRecord::escape_json(opts.output_file) << "\"";
-    os << ",\"model_config\":\"" << TraceGraph::ActivityRecord::escape_json(opts.model_config_file) << "\"";
-    os << ",\"model_summary\":\"" << TraceGraph::ActivityRecord::escape_json(opts.model_summary_file) << "\"";
-    os << ",\"simulated_e2e_ns\":" << dag.e2e_time();
-    os << ",\"node_count\":" << dag.nodes.size();
-    os << ",\"edge_count\":" << dag.edges.size();
-    if (has_cache_summary) {
-        os << ",\"cache_io_estimated_latency_us\":" << cache_summary.estimated_latency_us;
-        os << ",\"cache_io_foreground_us\":" << cache_summary.foreground_cache_io_us;
-        os << ",\"cache_io_background_us\":" << cache_summary.background_cache_io_us;
-        os << ",\"cache_io_movement_events_used\":" << cache_summary.movement_events_used;
-        os << ",\"cache_io_transfer_events\":" << cache_summary.transfer_events;
-        os << ",\"warnings\":";
-        append_string_array(os, cache_summary.whatif_warnings);
+void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<TraceGraph::SimulationModule>> & modules) {
+    // summary 只收集已经 apply 且声明 has_summary 的模块。
+    // 默认预测输出不读取 summary，避免 debug 信息参与功能路径。
+    Json root;
+    root["modules"] = Json::array();
+    for (const auto & module : modules) {
+        if (!module || !module->has_summary()) continue;
+        root["modules"].push_back(Json::parse(module->summary_json()));
     }
-    else {
-        os << ",\"cache_io_estimated_latency_us\":0";
-        os << ",\"cache_io_foreground_us\":0";
-        os << ",\"cache_io_background_us\":0";
-        os << ",\"cache_io_movement_events_used\":0";
-        os << ",\"cache_io_transfer_events\":0";
-        os << ",\"warnings\":[]";
-    }
-    os << "}";
-    ofs << os.str() << "\n";
+    write_json_file(filename, root);
+}
+
+void write_run_summary(const std::string & filename, const CliOptions & opts, const TraceGraph::DagGraph & graph, const Json & stage_timings) {
+    // run_summary 是 runner/validation 使用的辅助输出。
+    // 用户默认看到的 prediction.json 由 Python runner 从 simulated_e2e_ns 提取。
+    Json root;
+    root["scenario_name"] = opts.scenario_name;
+    root["input_traces"] = opts.input_traces;
+    root["graph_output"] = opts.graph_output;
+    root["model_config"] = opts.model_config_file;
+    root["model_summary"] = opts.model_summary_file;
+    root["parsed_record_count"] = graph.parsed_record_count();
+    root["simulated_e2e_ns"] = graph.e2e_time();
+    root["real_e2e_ns"] = graph.real_e2e_time();
+    root["node_count"] = graph.node_count();
+    root["edge_count"] = graph.edge_count();
+    root["edge_counts_by_kind"] = graph.edge_counts_by_kind();
+    root["stage_timings_ms"] = stage_timings;
+    write_json_file(filename, root);
+}
+
+uint64_t elapsed_ms(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 }
 
 } // namespace
 
 int main(int argc, char ** argv) {
-    CliOptions opts = parse_cli(argc, argv);
-
+    auto opts = parse_cli(argc, argv);
     if (opts.show_help) {
         print_usage(argv[0]);
         return opts.explicit_help ? 0 : 1;
@@ -223,88 +185,56 @@ int main(int argc, char ** argv) {
         logger.set_level(TraceGraph::Logger::DEBUG);
         setenv("DEBUG_TRACE", "1", 1);
     }
-    else if (opts.verbose) { logger.set_level(TraceGraph::Logger::INFO); }
-    else { logger.set_level(TraceGraph::Logger::WARN); }
+    else if (opts.verbose) logger.set_level(TraceGraph::Logger::INFO);
+    else logger.set_level(TraceGraph::Logger::WARN);
 
     try {
-        std::vector<TraceGraph::TraceDAG> graphs;
-        int gpu_id = 0;
-
-        for (const auto & trace_file : opts.input_traces) {
-            logger.info() << "Loading trace from: " << trace_file << " as GPU " << gpu_id;
-
-            std::vector<std::unique_ptr<TraceGraph::ActivityRecord>> records;
-            TraceGraph::parse_trace_json(trace_file, records);
-            TraceGraph::normalize_trace_records(records);
-
-            if (records.empty()) {
-                logger.warn() << "No records parsed for " << trace_file << ". Skipping.";
-                continue;
-            }
-
-            logger.info() << "  Parsed " << records.size() << " records.";
-
-            if (!opts.no_raw) {
-                std::string raw_output = "raw_parsed_" + std::to_string(gpu_id) + ".json";
-                TraceGraph::export_raw_trace(raw_output, records);
-                logger.info() << "  Exported raw trace to " << raw_output;
-            }
-
-            logger.info() << "  Building DAG...";
-            graphs.push_back(TraceGraph::TraceDAG::from_records(std::move(records), gpu_id));
-            gpu_id++;
+        std::vector<TraceGraph::DagGraph> graphs;
+        TraceGraph::DagBuilder builder;
+        Json timings;
+        uint64_t read_ms = 0;
+        uint64_t build_ms = 0;
+        for (size_t i = 0; i < opts.input_traces.size(); ++i) {
+            // 单个输入 trace 独立读入、归一化、构图；这样每个 rank 的 lane/connection 索引不会互相污染。
+            auto read_start = std::chrono::steady_clock::now();
+            auto events = TraceGraph::read_chrome_trace(opts.input_traces[i]);
+            auto read_end = std::chrono::steady_clock::now();
+            read_ms += elapsed_ms(read_start, read_end);
+            TraceGraph::normalize_trace_events(events);
+            auto build_start = std::chrono::steady_clock::now();
+            graphs.push_back(builder.build(std::move(events), static_cast<int>(i)));
+            auto build_end = std::chrono::steady_clock::now();
+            build_ms += elapsed_ms(build_start, build_end);
         }
+        timings["read_ms"] = read_ms;
+        timings["build_ms"] = build_ms;
+        // 多输入 trace 在 per-rank base DAG 构好后 merge，只追加跨 rank 约束。
+        auto merge_start = std::chrono::steady_clock::now();
+        auto graph = TraceGraph::DagGraph::merge(std::move(graphs));
+        auto merge_end = std::chrono::steady_clock::now();
+        timings["merge_ms"] = elapsed_ms(merge_start, merge_end);
 
-        if (graphs.empty()) {
-            logger.error() << "No valid graphs built. Exiting.";
-            return 1;
+        auto modules = build_modules(opts.model_config_file);
+        auto module_start = std::chrono::steady_clock::now();
+        for (const auto & module : modules) {
+            logger.info() << "Applying module: " << module->name();
+            module->apply(graph);
         }
+        auto module_end = std::chrono::steady_clock::now();
+        timings["module_ms"] = elapsed_ms(module_start, module_end);
 
-        logger.info() << "Merging " << graphs.size() << " graphs...";
-        TraceGraph::TraceDAG merged = TraceGraph::TraceDAG::merge_graphs(graphs);
-
-        for (const auto & kv : opts.scales) {
-            logger.info() << "Scaling '" << kv.first << "' by " << kv.second;
-            TraceGraph::apply_scale_transform(merged, kv.first, kv.second);
-        }
-
-        bool wrote_model_summary = false;
-        bool has_cache_summary = false;
-        TraceGraph::CacheIOSummary cache_summary;
-        if (!opts.model_config_file.empty()) {
-            TraceGraph::ModelConfig model_config = TraceGraph::ModelConfig::from_file(opts.model_config_file);
-            if (model_config.cache_io.enabled) {
-                cache_summary = TraceGraph::apply_cache_io_model(merged, model_config.cache_io);
-                std::string summary_file = opts.model_summary_file.empty() ? opts.output_file + ".model_summary.json" : opts.model_summary_file;
-                cache_summary.write_json(summary_file);
-                logger.info() << "Exported model summary to " << summary_file;
-                wrote_model_summary = true;
-                has_cache_summary = true;
-            }
-        }
-        else if (!opts.model_summary_file.empty()) {
-            logger.warn() << "--model-summary ignored because --model-config was not provided.";
-        }
-
-        logger.info() << "Running simulation...";
-        TraceGraph::run_topological_simulation(merged);
-
-        logger.info() << "End-to-End time: " << merged.e2e_time() << " ns";
-
-        merged.to_chrome_tracing_json(opts.output_file, /*concise=*/!opts.full_output, opts.full_output);
-        logger.info() << "Exported to " << opts.output_file;
-        if (!opts.run_summary_file.empty()) {
-            write_run_summary(opts.run_summary_file, opts, merged, has_cache_summary, cache_summary);
-            logger.info() << "Exported run summary to " << opts.run_summary_file;
-        }
-        if (!wrote_model_summary && !opts.model_config_file.empty()) {
-            logger.warn() << "Model config did not enable any implemented domain.";
-        }
+        // 所有模块修改完成后只跑一次拓扑仿真。
+        auto simulation_start = std::chrono::steady_clock::now();
+        TraceGraph::run_topological_simulation(graph);
+        auto simulation_end = std::chrono::steady_clock::now();
+        timings["simulation_ms"] = elapsed_ms(simulation_start, simulation_end);
+        if (!opts.graph_output.empty()) TraceGraph::write_chrome_trace_dag(opts.graph_output, graph, opts.full_output);
+        if (!opts.model_summary_file.empty()) write_module_summary(opts.model_summary_file, modules);
+        write_run_summary(opts.run_summary_file, opts, graph, timings);
     }
     catch (const std::exception & e) {
         logger.error() << e.what();
         return 1;
     }
-
     return 0;
 }

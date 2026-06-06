@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""SGLang profiling runner。
+
+本脚本只负责启动被测进程、注入采集环境、运行 workload，并写出 profile manifest。
+建模判断不放在这里，避免 profiling 阶段和 modeling 阶段互相污染。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -6,6 +12,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -13,12 +20,81 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
-INTERNAL_KEYS = {"experiments", "continue_on_error", "$unset"}
+sys.path.insert(0, str(ROOT_DIR / "src"))
+
+from profiling import build_profile_manifest, normalize_profiling_config  # noqa: E402
+from profiling.config import ProfilingRuntimeConfig  # noqa: E402
+
+
+INTERNAL_SUITE_KEYS = {"experiments", "continue_on_error", "$unset"}
+PYTHON_PROBE_ROOT = ROOT_DIR / "src/profiling/python_probe"
+BENCH_ENV_REMOVE_KEYS = (
+    "LD_PRELOAD",
+    "HOOK_TRACE_OUTPUT",
+    "TRACE_SIM_PYTHON_PROBE",
+    "TRACE_SIM_PYTHON_PROBES",
+    "TRACE_SIM_PYTHON_PROBE_TARGETS",
+    "TRACE_SIM_PYTHON_PROBE_OUTPUT",
+    "TRACE_SIM_PYTHON_PROBE_DEBUG",
+)
+
+
+@dataclass(frozen=True)
+class RunLayout:
+    """一次 profiling 运行的目录布局。
+
+    runner 所有路径先在这里规整，后续执行逻辑只使用绝对路径，避免路径相对
+    run dir 或 repo root 的语义混在一起。
+    """
+
+    run_dir: Path
+    log_dir: Path
+    trace_dir: Path
+    torch_trace_dir: Path
+    ld_preload_trace_dir: Path
+    bench_dir: Path
+
+    @classmethod
+    def from_config(cls, cfg: dict[str, Any], *, framework: str) -> "RunLayout":
+        name = sanitize(str(cfg.get("name", f"{framework}-profile")))
+        run_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / framework
+        run_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{name}"
+        run_dir = run_root / sanitize(str(run_id))
+        trace_dir = run_dir / "trace"
+        return cls(
+            run_dir=run_dir,
+            log_dir=run_dir / "logs",
+            trace_dir=trace_dir,
+            torch_trace_dir=trace_dir / "torch",
+            ld_preload_trace_dir=trace_dir / "ld_preload",
+            bench_dir=run_dir / "bench",
+        )
+
+    def prepare(self, *, clean: bool) -> None:
+        if clean and self.run_dir.exists():
+            shutil.rmtree(self.run_dir)
+        for path in (
+            self.log_dir,
+            self.trace_dir,
+            self.torch_trace_dir,
+            self.ld_preload_trace_dir,
+            self.bench_dir,
+        ):
+            path.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass(frozen=True)
+class ModelConfigBackup:
+    """被临时修改的模型 config 备份信息。"""
+
+    config_path: Path
+    backup_path: Path
 
 
 def log(message: str) -> None:
@@ -32,27 +108,43 @@ def sanitize(value: str) -> str:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    with path.open("r", encoding="utf-8") as file_obj:
+        return json.load(file_obj)
 
 
 def dump_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(value, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    with path.open("w", encoding="utf-8") as file_obj:
+        json.dump(value, file_obj, indent=2, ensure_ascii=False)
+        file_obj.write("\n")
+
+
+def resolve_repo_path(value: str | None) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return ROOT_DIR / path
+
+
+def resolve_run_path(value: str | None, run_dir: Path) -> Path | None:
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return run_dir / path
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """递归合并 suite common 配置和单个 experiment 配置。"""
+
     merged = dict(base)
     for key, value in override.items():
         if key == "$unset":
             continue
-        if (
-            key in merged
-            and isinstance(merged[key], dict)
-            and isinstance(value, dict)
-        ):
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = deep_merge(merged[key], value)
         else:
             merged[key] = value
@@ -60,6 +152,8 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def delete_path(value: dict[str, Any], path: str) -> None:
+    """按点分路径删除字段，用于 suite experiment 覆盖 common 配置。"""
+
     parts = [part for part in path.split(".") if part]
     if not parts:
         raise ValueError("$unset entries must not be empty")
@@ -82,24 +176,6 @@ def apply_unset(value: dict[str, Any], paths: Any) -> None:
         delete_path(value, path)
 
 
-def resolve_repo_path(value: str | None) -> Path | None:
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.is_absolute():
-        return path
-    return ROOT_DIR / path
-
-
-def resolve_run_path(value: str | None, run_dir: Path) -> Path | None:
-    if not value:
-        return None
-    path = Path(value).expanduser()
-    if path.is_absolute():
-        return path
-    return run_dir / path
-
-
 def command_from_config(command: Any) -> list[str] | str:
     if isinstance(command, list) and all(isinstance(item, str) for item in command):
         return command
@@ -114,6 +190,30 @@ def command_to_text(command: list[str] | str) -> str:
     return command
 
 
+def expand_command_placeholders(command: list[str] | str, layout: RunLayout) -> list[str] | str:
+    """替换显式命令中的运行目录占位符。
+
+    这只影响 runner 启动 server / bench 的命令字符串，方便实验配置把 workload
+    结果写入本次 run dir，而不是写死到全局目录。
+    """
+
+    replacements = {
+        "{run_dir}": str(layout.run_dir),
+        "{trace_dir}": str(layout.trace_dir),
+        "{bench_dir}": str(layout.bench_dir),
+        "{log_dir}": str(layout.log_dir),
+    }
+
+    def expand(value: str) -> str:
+        for placeholder, replacement in replacements.items():
+            value = value.replace(placeholder, replacement)
+        return value
+
+    if isinstance(command, list):
+        return [expand(item) for item in command]
+    return expand(command)
+
+
 def append_cli_arg(command: list[str], key: str, value: Any) -> None:
     option = "--" + key.replace("_", "-")
     if isinstance(value, bool):
@@ -126,21 +226,23 @@ def append_cli_arg(command: list[str], key: str, value: Any) -> None:
         command.extend([option, str(value)])
 
 
-def build_bench_command(bench: dict[str, Any], run_dir: Path) -> list[str] | str | None:
+def build_bench_command(bench: dict[str, Any], layout: RunLayout) -> list[str] | str | None:
+    """从配置构造 workload driver 命令。
+
+    显式 `bench.command` 优先；否则按 SGLang bench_serving 的参数对象生成命令。
+    """
+
     if not bench:
         return None
-
     if "command" in bench:
-        return command_from_config(bench["command"])
+        return expand_command_placeholders(command_from_config(bench["command"]), layout)
 
     kind = bench.get("kind", "sglang.bench_serving")
     if kind != "sglang.bench_serving":
         raise ValueError(f"unknown bench kind: {kind}")
 
-    bench_dir = run_dir / "bench"
-    output_file = bench.get("output_file") or str(bench_dir / "bench.jsonl")
     args = dict(bench.get("args", {}))
-    args.setdefault("output_file", output_file)
+    args.setdefault("output_file", bench.get("output_file") or str(layout.bench_dir / "bench.jsonl"))
 
     command = ["python3", "-m", "sglang.bench_serving"]
     for key, value in args.items():
@@ -149,6 +251,8 @@ def build_bench_command(bench: dict[str, Any], run_dir: Path) -> list[str] | str
 
 
 def parse_model_path(server_command: list[str] | str) -> str | None:
+    """从 server 命令中解析模型路径，用于临时覆盖 config.json。"""
+
     if isinstance(server_command, str):
         try:
             tokens = shlex.split(server_command)
@@ -170,11 +274,13 @@ def parse_model_path(server_command: list[str] | str) -> str | None:
 def apply_model_config_overrides(
     cfg: dict[str, Any],
     server_command: list[str] | str,
-    run_dir: Path,
-) -> tuple[Path | None, Path | None]:
+    layout: RunLayout,
+) -> ModelConfigBackup | None:
+    """临时修改模型 config.json，并保留备份以便 finally 恢复。"""
+
     overrides = cfg.get("model_config_overrides") or {}
     if not overrides:
-        return None, None
+        return None
     if not isinstance(overrides, dict):
         raise TypeError("model_config_overrides must be an object")
 
@@ -191,19 +297,39 @@ def apply_model_config_overrides(
     if not config_path.is_file():
         raise FileNotFoundError(f"missing model config: {config_path}")
 
-    backup_path = run_dir / "_config_backup" / sanitize(model_path.name) / "config.json"
+    backup_path = layout.run_dir / "_config_backup" / sanitize(model_path.name) / "config.json"
     backup_path.parent.mkdir(parents=True, exist_ok=True)
     backup_path.write_bytes(config_path.read_bytes())
 
     data = load_json(config_path)
     data.update(overrides)
     dump_json(config_path, data)
-    return config_path, backup_path
+    return ModelConfigBackup(config_path=config_path, backup_path=backup_path)
 
 
-def restore_model_config(config_path: Path | None, backup_path: Path | None) -> None:
-    if config_path and backup_path and backup_path.is_file():
-        config_path.write_bytes(backup_path.read_bytes())
+def restore_model_config(backup: ModelConfigBackup | None) -> None:
+    if backup and backup.backup_path.is_file():
+        backup.config_path.write_bytes(backup.backup_path.read_bytes())
+
+
+def prepend_pythonpath(env: dict[str, str], path: Path) -> None:
+    """把 probe 路径放到 PYTHONPATH 前面，确保 sitecustomize 可以被 Python 发现。"""
+
+    current = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = str(path) + (os.pathsep + current if current else "")
+
+
+def remove_pythonpath_entry(env: dict[str, str], path: Path) -> None:
+    """从 PYTHONPATH 移除 runner 注入项，避免 bench client 被误插桩。"""
+
+    current = env.get("PYTHONPATH")
+    if not current:
+        return
+    filtered = [item for item in current.split(os.pathsep) if item != str(path)]
+    if filtered:
+        env["PYTHONPATH"] = os.pathsep.join(filtered)
+    else:
+        env.pop("PYTHONPATH", None)
 
 
 def api_base_from_ready_url(ready_url: str) -> str:
@@ -231,6 +357,8 @@ def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
 
 
 def wait_for_ready(process: subprocess.Popen[Any], ready_url: str, timeout_sec: int) -> None:
+    """等待 server ready，同时监控进程是否提前退出。"""
+
     start = time.monotonic()
     while True:
         if process.poll() is not None:
@@ -252,18 +380,23 @@ def start_process(
     log_path: Path,
     env: dict[str, str],
 ) -> subprocess.Popen[Any]:
+    """启动子进程并把 stdout/stderr 写入日志文件。"""
+
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("wb")
-    shell = isinstance(command, str)
-    return subprocess.Popen(
-        command,
-        cwd=ROOT_DIR,
-        env=env,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        shell=shell,
-        preexec_fn=os.setsid,
-    )
+    try:
+        return subprocess.Popen(
+            command,
+            cwd=ROOT_DIR,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            shell=isinstance(command, str),
+            preexec_fn=os.setsid,
+        )
+    finally:
+        # Popen 已经复制 fd，父进程这里可以关闭，避免长时间 suite 泄漏文件句柄。
+        log_file.close()
 
 
 def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -> None:
@@ -279,8 +412,8 @@ def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -
         pass
 
 
-def build_profile_body(profile: dict[str, Any], run_dir: Path) -> dict[str, Any]:
-    output_dir = resolve_run_path(profile.get("output_dir", "trace/torch"), run_dir)
+def build_profile_body(profile: dict[str, Any], layout: RunLayout) -> dict[str, Any]:
+    output_dir = resolve_run_path(profile.get("output_dir", "trace/torch"), layout.run_dir)
     body: dict[str, Any] = {"output_dir": str(output_dir)}
     for key in (
         "start_step",
@@ -298,113 +431,249 @@ def build_profile_body(profile: dict[str, Any], run_dir: Path) -> dict[str, Any]
     return body
 
 
-def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
-    framework = cfg.get("framework", "sglang")
-    if framework != "sglang":
-        raise ValueError("scripts/internal/profile_runner.py currently supports framework=sglang")
+def channel_config(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
+    """读取采集渠道配置。
 
-    name = sanitize(cfg.get("name", "sglang-profile"))
-    run_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs/sglang"
-    run_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{name}"
-    run_dir = run_root / sanitize(run_id)
-    log_dir = run_dir / "logs"
-    trace_dir = run_dir / "trace"
-    torch_trace_dir = trace_dir / "torch"
-    bench_dir = run_dir / "bench"
-    for path in (log_dir, trace_dir, torch_trace_dir, bench_dir):
-        path.mkdir(parents=True, exist_ok=True)
+    主线 schema 只使用 `profiling.<channel>`，不读取旧顶层兼容字段。
+    """
 
-    server = cfg.get("server", {})
-    server_command = command_from_config(server["command"])
-    bench_command = build_bench_command(cfg.get("bench", {}), run_dir)
-    dump_json(run_dir / "config.json", cfg)
-    (run_dir / "server_cmd.txt").write_text(command_to_text(server_command) + "\n")
-    if bench_command is not None:
-        (run_dir / "bench_cmd.txt").write_text(command_to_text(bench_command) + "\n")
+    profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
+    current = profiling.get(profiling_key)
+    if isinstance(current, dict):
+        return current
+    return {}
 
-    log(f"Run dir: {run_dir}")
-    if dry_run:
-        return run_dir
 
-    env = os.environ.copy()
-    for key, value in cfg.get("env", {}).items():
-        env[str(key)] = str(value)
-    env.setdefault("HOOK_ASCENDCL_SO_PATH", "/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so")
-    env.setdefault("SGLANG_SET_CPU_AFFINITY", "1")
-    env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
-    env.setdefault("STREAMS_PER_DEVICE", "32")
-    env.setdefault("HCCL_BUFFSIZE", "1536")
-    env.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
-    env["SGLANG_TORCH_PROFILER_DIR"] = str(torch_trace_dir)
+class ProfileRun:
+    """单次 profiling 运行的执行器。"""
 
-    hook = cfg.get("hook", {})
-    if hook.get("enabled", True):
-        hook_lib = resolve_repo_path(
-            hook.get("library", "build/docker/sglang/lib/libhook.so")
+    def __init__(self, cfg: dict[str, Any], *, dry_run: bool) -> None:
+        self.cfg = cfg
+        self.dry_run = dry_run
+        self.framework = str(cfg.get("framework", "sglang"))
+        if self.framework != "sglang":
+            raise ValueError("scripts/internal/profile_runner.py currently supports framework=sglang")
+
+        self.runtime = normalize_profiling_config(cfg)
+        self.layout = RunLayout.from_config(cfg, framework=self.framework)
+        self.server_cfg = cfg.get("server", {})
+        self.server_command = expand_command_placeholders(command_from_config(self.server_cfg["command"]), self.layout)
+        self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout)
+
+    def run(self) -> Path:
+        self.layout.prepare(clean=bool(self.cfg.get("clean_run_dir", False)))
+        self._write_run_inputs()
+
+        log(f"Run dir: {self.layout.run_dir}")
+        started_at = time.time()
+        if self.dry_run:
+            self._write_manifest(started_at=started_at, status="dry_run", dry_run=True)
+            return self.layout.run_dir
+
+        status = "completed"
+        error: str | None = None
+        backup: ModelConfigBackup | None = None
+        server_process: subprocess.Popen[Any] | None = None
+        try:
+            server_env = self._build_server_env()
+            backup = apply_model_config_overrides(self.cfg, self.server_command, self.layout)
+
+            log("Starting SGLang server.")
+            server_process = start_process(self.server_command, self.layout.log_dir / "server.log", server_env)
+            self._wait_for_server(server_process)
+            log("Server is ready.")
+
+            torch_profile_enabled = self._torch_profile_enabled()
+            if torch_profile_enabled:
+                self._start_torch_profiler()
+
+            if self.bench_command is not None:
+                self._run_bench(server_env)
+
+            if torch_profile_enabled and self._should_stop_torch_profiler_after_workload():
+                self._stop_torch_profiler()
+
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+            raise
+        finally:
+            stop_process(server_process)
+            restore_model_config(backup)
+            self._write_manifest(
+                started_at=started_at,
+                status=status,
+                dry_run=False,
+                error=error,
+            )
+
+        log("Profile run completed.")
+        return self.layout.run_dir
+
+    def _write_run_inputs(self) -> None:
+        dump_json(self.layout.run_dir / "config.json", self.cfg)
+        (self.layout.run_dir / "server_cmd.txt").write_text(
+            command_to_text(self.server_command) + "\n",
+            encoding="utf-8",
         )
+        if self.bench_command is not None:
+            (self.layout.run_dir / "bench_cmd.txt").write_text(
+                command_to_text(self.bench_command) + "\n",
+                encoding="utf-8",
+            )
+
+    def _write_manifest(
+        self,
+        *,
+        started_at: float,
+        status: str,
+        dry_run: bool,
+        error: str | None = None,
+    ) -> None:
+        manifest = build_profile_manifest(
+            run_dir=self.layout.run_dir,
+            cfg=self.cfg,
+            runtime=self.runtime,
+            started_at=started_at,
+            ended_at=time.time(),
+            status=status,
+            dry_run=dry_run,
+            error=error,
+        )
+        dump_json(self.layout.run_dir / "profile_manifest.json", manifest)
+
+    def _build_server_env(self) -> dict[str, str]:
+        """构造 server 环境。
+
+        Python probe 和 LD_PRELOAD 是两条独立路径：前者注入 PYTHONPATH 和
+        TRACE_SIM_PYTHON_PROBE_*，后者只注入 LD_PRELOAD 与 HOOK_TRACE_OUTPUT。
+        """
+
+        env = os.environ.copy()
+        for key, value in self.cfg.get("env", {}).items():
+            env[str(key)] = str(value)
+
+        self._apply_sglang_defaults(env)
+        env["SGLANG_TORCH_PROFILER_DIR"] = str(self.layout.torch_trace_dir)
+        env["TRACE_SIM_PROFILING_CHANNELS"] = ",".join(self.runtime.channels)
+        env["TRACE_SIM_PROFILING_DEBUG"] = "1" if self.runtime.debug else "0"
+
+        if self.runtime.enabled and "python_probe" in self.runtime.channels:
+            self._apply_python_probe_env(env)
+        if self.runtime.enabled and "ld_preload" in self.runtime.channels:
+            self._apply_ld_preload_env(env)
+        return env
+
+    @staticmethod
+    def _apply_sglang_defaults(env: dict[str, str]) -> None:
+        """写入 SGLang / Ascend 常用默认值，但不覆盖用户显式 env。"""
+
+        env.setdefault("HOOK_ASCENDCL_SO_PATH", "/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so")
+        env.setdefault("SGLANG_SET_CPU_AFFINITY", "1")
+        env.setdefault("PYTORCH_NPU_ALLOC_CONF", "expandable_segments:True")
+        env.setdefault("STREAMS_PER_DEVICE", "32")
+        env.setdefault("HCCL_BUFFSIZE", "1536")
+        env.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
+
+    def _apply_python_probe_env(self, env: dict[str, str]) -> None:
+        prepend_pythonpath(env, PYTHON_PROBE_ROOT)
+        env["TRACE_SIM_PYTHON_PROBE"] = "1"
+        env["TRACE_SIM_PYTHON_PROBES"] = ",".join(self.runtime.python_probes)
+        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(
+            list(self.runtime.python_targets),
+            ensure_ascii=False,
+        )
+        env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
+        if self.runtime.debug:
+            env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
+
+    def _apply_ld_preload_env(self, env: dict[str, str]) -> None:
+        ld_preload = self._ld_preload_cfg()
+        if not ld_preload.get("enabled", True):
+            return
+        hook_lib = resolve_repo_path(ld_preload.get("library", "build/docker/sglang/lib/libhook.so"))
         if hook_lib is None or not hook_lib.is_file():
             raise FileNotFoundError(
-                f"missing hook library: {hook_lib}. Build it with scripts/build.sh sglang --hook-only."
+                f"missing LD_PRELOAD library: {hook_lib}. Build it with scripts/internal/hooks/build.sh sglang."
             )
         env["LD_PRELOAD"] = str(hook_lib)
-        env["HOOK_TRACE_OUTPUT"] = str(resolve_run_path(hook.get("trace_output", "trace/cpu_trace"), run_dir))
+        env["HOOK_TRACE_OUTPUT"] = str(
+            resolve_run_path(ld_preload.get("trace_output", "trace/ld_preload/cpu_trace.json"), self.layout.run_dir)
+        )
 
-    ready_url = server.get("ready_url", "http://127.0.0.1:30000/get_model_info")
-    ready_timeout_sec = int(server.get("ready_timeout_sec", 1800))
-    api_base = cfg.get("profile", {}).get("api_base_url") or api_base_from_ready_url(ready_url)
+    def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
+        ready_url = self.server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
+        wait_for_ready(process, ready_url, int(self.server_cfg.get("ready_timeout_sec", 1800)))
 
-    config_path = None
-    backup_path = None
-    server_process: subprocess.Popen[Any] | None = None
-    try:
-        config_path, backup_path = apply_model_config_overrides(cfg, server_command, run_dir)
+    def _api_base(self) -> str:
+        ready_url = self.server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
+        return self._torch_profile_cfg().get("api_base_url") or api_base_from_ready_url(ready_url)
 
-        log("Starting SGLang server.")
-        server_process = start_process(server_command, log_dir / "server.log", env)
-        wait_for_ready(server_process, ready_url, ready_timeout_sec)
-        log("Server is ready.")
+    def _torch_profile_enabled(self) -> bool:
+        profile = self._torch_profile_cfg()
+        return self.runtime.enabled and "torch" in self.runtime.channels and profile.get("enabled", True)
 
-        profile = cfg.get("profile", {})
-        if profile.get("enabled", True):
-            body = build_profile_body(profile, run_dir)
-            dump_json(run_dir / "profile_start_body.json", body)
-            log("Starting SGLang profiler via /start_profile.")
+    def _torch_profile_cfg(self) -> dict[str, Any]:
+        return channel_config(self.cfg, "torch")
+
+    def _ld_preload_cfg(self) -> dict[str, Any]:
+        return channel_config(self.cfg, "ld_preload")
+
+    def _should_stop_torch_profiler_after_workload(self) -> bool:
+        """判断 runner 是否需要在 workload 结束后手动停止 profiler。
+
+        默认语义是覆盖完整 workload：`/start_profile` 后运行 workload，workload 结束
+        再调用 `/stop_profile`。如果用户显式配置 `num_steps`，SGLang/torch profiler
+        会按 step 自动结束；这时 runner 不再强制 stop，避免 server 记录
+        "Profiling is not in progress" 的 500 错误。
+        """
+
+        profile = self._torch_profile_cfg()
+        if not profile.get("stop_after_workload", True):
+            return False
+        return profile.get("num_steps") is None
+
+    def _start_torch_profiler(self) -> None:
+        profile = self._torch_profile_cfg()
+        body = build_profile_body(profile, self.layout)
+        dump_json(self.layout.run_dir / "profile_start_body.json", body)
+        log("Starting SGLang profiler via /start_profile.")
+        response = post_json(
+            self._api_base().rstrip("/") + "/start_profile",
+            body,
+            timeout=int(profile.get("start_timeout_sec", 120)),
+        )
+        dump_json(self.layout.run_dir / "profile_start_response.json", response)
+
+    def _stop_torch_profiler(self) -> None:
+        profile = self._torch_profile_cfg()
+        log("Stopping SGLang profiler via /stop_profile.")
+        try:
             response = post_json(
-                api_base.rstrip("/") + "/start_profile",
-                body,
-                timeout=int(profile.get("start_timeout_sec", 120)),
+                self._api_base().rstrip("/") + "/stop_profile",
+                None,
+                timeout=int(profile.get("stop_timeout_sec", 1800)),
             )
-            dump_json(run_dir / "profile_start_response.json", response)
+        except Exception as exc:
+            if profile.get("strict_stop", False):
+                raise
+            response = {"warning": str(exc)}
+        dump_json(self.layout.run_dir / "profile_stop_response.json", response)
 
-        if bench_command is not None:
-            log("Running workload.")
-            bench_env = env.copy()
-            bench_env.pop("LD_PRELOAD", None)
-            bench_proc = start_process(bench_command, log_dir / "bench.log", bench_env)
-            bench_code = bench_proc.wait()
-            if bench_code != 0:
-                raise RuntimeError(f"bench command failed, code={bench_code}")
+    def _run_bench(self, server_env: dict[str, str]) -> None:
+        log("Running workload.")
+        bench_env = server_env.copy()
+        for key in BENCH_ENV_REMOVE_KEYS:
+            bench_env.pop(key, None)
+        remove_pythonpath_entry(bench_env, PYTHON_PROBE_ROOT)
+        bench_proc = start_process(self.bench_command, self.layout.log_dir / "bench.log", bench_env)
+        bench_code = bench_proc.wait()
+        if bench_code != 0:
+            raise RuntimeError(f"bench command failed, code={bench_code}")
 
-        if profile.get("enabled", True) and profile.get("stop_after_workload", True):
-            log("Stopping SGLang profiler via /stop_profile.")
-            try:
-                response = post_json(
-                    api_base.rstrip("/") + "/stop_profile",
-                    None,
-                    timeout=int(profile.get("stop_timeout_sec", 1800)),
-                )
-            except Exception as exc:
-                if profile.get("strict_stop", False):
-                    raise
-                response = {"warning": str(exc)}
-            dump_json(run_dir / "profile_stop_response.json", response)
 
-    finally:
-        stop_process(server_process)
-        restore_model_config(config_path, backup_path)
-
-    log("Profile run completed.")
-    return run_dir
+def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
+    return ProfileRun(cfg, dry_run=dry_run).run()
 
 
 def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
@@ -414,7 +683,7 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(experiments, list) or not experiments:
         raise ValueError("experiments must be a non-empty list")
 
-    common = {key: value for key, value in cfg.items() if key not in INTERNAL_KEYS}
+    common = {key: value for key, value in cfg.items() if key not in INTERNAL_SUITE_KEYS}
     expanded = []
     for index, experiment in enumerate(experiments, start=1):
         if not isinstance(experiment, dict):
@@ -432,19 +701,19 @@ def run_profile_suite(cfg: dict[str, Any], dry_run: bool) -> list[Path]:
         return [run_profile(experiments[0], dry_run)]
 
     framework = cfg.get("framework", "sglang")
-    suite_name = sanitize(cfg.get("name", f"{framework}-profile-suite"))
-    suite_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / framework
+    suite_name = sanitize(str(cfg.get("name", f"{framework}-profile-suite")))
+    suite_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / str(framework)
     suite_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{suite_name}"
-    suite_dir = suite_root / sanitize(suite_id)
+    suite_dir = suite_root / sanitize(str(suite_id))
     suite_dir.mkdir(parents=True, exist_ok=True)
     dump_json(suite_dir / "suite_config.json", cfg)
 
     log(f"Suite dir: {suite_dir}")
     run_dirs: list[Path] = []
-    failures = []
+    failures: list[dict[str, str]] = []
     continue_on_error = bool(cfg.get("continue_on_error", False))
     for index, experiment in enumerate(experiments, start=1):
-        exp_name = sanitize(experiment.get("name", f"experiment-{index}"))
+        exp_name = sanitize(str(experiment.get("name", f"experiment-{index}")))
         exp_cfg = dict(experiment)
         exp_cfg["run_root"] = str(suite_dir)
         exp_cfg["run_id"] = f"{index:02d}_{exp_name}"
@@ -468,17 +737,19 @@ def run_profile_suite(cfg: dict[str, Any], dry_run: bool) -> list[Path]:
     return run_dirs
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run SGLang profiling experiments.")
     parser.add_argument("--config", required=True, help="JSON profile config path")
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
+    parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
+    return parser.parse_args(argv)
 
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     config_path = resolve_repo_path(args.config)
     if config_path is None or not config_path.is_file():
         raise FileNotFoundError(f"missing config: {args.config}")
-    cfg = load_json(config_path)
-    run_dirs = run_profile_suite(cfg, args.dry_run)
+    run_dirs = run_profile_suite(load_json(config_path), args.dry_run)
     for run_dir in run_dirs:
         print(run_dir)
     return 0

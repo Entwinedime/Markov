@@ -6,20 +6,24 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(trace_graph
-    src/core/activity_record.cpp
+    src/core/trace_event.cpp
+    src/core/dag_graph.cpp
+    src/core/dag_builder.cpp
     src/core/logger.cpp
-    src/core/trace_parser.cpp
-    src/core/export_raw_trace.cpp
-    src/core/trace_dag.cpp
+    src/io/chrome_trace_io.cpp
+    src/simulation/topological_simulator.cpp
     src/frontend/model_config.cpp
     src/frontend/trace_normalizer.cpp
-    src/domains/cache_io/cache_model.cpp
+    src/modules/node_scale_module.cpp
+    src/modules/hicache/hicache_model.cpp
+    src/modules/hicache/hicache_module.cpp
     src/cli/main.cpp
 )
 
 target_include_directories(trace_graph
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/ktransformers/archive/third_party
 )
 
 set_target_properties(trace_graph PROPERTIES

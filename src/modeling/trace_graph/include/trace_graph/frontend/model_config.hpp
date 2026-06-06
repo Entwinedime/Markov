@@ -1,50 +1,37 @@
 #pragma once
 
-#include <cstdint>
 #include <string>
 #include <vector>
 
 namespace TraceGraph {
 
-struct CacheIOTierConfig {
+// 简单节点缩放子模块的单条规则。
+// name 当前是 substring match，不是正则；factor 只作用于匹配节点的 duration。
+struct NodeScaleRuleConfig {
+    std::string id;
     std::string name;
-    bool capacity_infer = true;
-    bool capacity_infinite = false;
-    uint64_t capacity_pages = 0;
-    double latency_us = 0.0;
-    bool bandwidth_infer = true;
-    bool bandwidth_infinite = false;
-    double bandwidth_gbps = 0.0;
-    std::string eviction = "lru";
+    double factor = 1.0;
 };
 
-struct CacheIOConfig {
+struct NodeScaleConfig {
     bool enabled = false;
-    std::string page_size_tokens = "infer";
-    std::string bytes_per_page = "infer";
-    std::string model_config_path = "";
-    uint64_t tp_size = 1;
-    uint64_t num_layers = 0;
-    uint64_t num_kv_heads = 0;
-    uint64_t head_dim = 0;
-    uint64_t dtype_bytes = 0;
-    std::vector<CacheIOTierConfig> tiers;
-    std::string page_size_policy = "trace";
-    std::string write_policy = "trace";
-    bool writeback_on_evict = true;
-    std::string prefetch_policy = "trace_replay";
-    uint64_t prefetch_threshold = 0;
-    double prefetch_timeout_base = 0.0;
-    double prefetch_timeout_per_ki_token = 0.0;
-    double prefetch_timeout_max = 0.0;
-    bool count_async_prefetch_latency = false;
+    std::vector<NodeScaleRuleConfig> rules;
 };
 
-struct ModelConfig {
-    std::vector<std::string> domains;
-    CacheIOConfig cache_io;
+// HiCache 当前只保留 skeleton 开关。真实状态机和 DAG mutation 后续在该配置下扩展。
+struct HiCacheConfig {
+    bool enabled = false;
+};
 
-    bool domain_enabled(const std::string & name) const;
+// C++ 后端消费的模型配置。
+// Python model_runner 会把上层 modeling config 转换成这份更窄的 C++ model config。
+struct ModelConfig {
+    std::vector<std::string> modules;
+    NodeScaleConfig node_scale;
+    HiCacheConfig hicache;
+
+    // 判断 modules 列表中是否显式启用了某个模块。
+    bool module_enabled(const std::string & name) const;
     static ModelConfig from_file(const std::string & filename);
 };
 

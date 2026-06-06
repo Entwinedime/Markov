@@ -1,21 +1,12 @@
+"""Python probe patch 工具。"""
+
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 
 PATCH_MARKER = "__trace_sim_probe_wrapped__"
-
-
-def safe_len(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        if hasattr(value, "numel"):
-            return int(value.numel())
-        return len(value)
-    except Exception:
-        return None
 
 
 def safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
@@ -25,6 +16,17 @@ def safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
         return default
 
 
+def safe_len(value: Any) -> int | None:
+    try:
+        if value is None:
+            return None
+        if hasattr(value, "numel"):
+            return int(value.numel())
+        return len(value)
+    except Exception:
+        return None
+
+
 def compact_id(value: Any) -> str:
     obj_id = safe_getattr(value, "id", None)
     if obj_id is not None:
@@ -32,7 +34,11 @@ def compact_id(value: Any) -> str:
     return hex(id(value))
 
 
-def wrap_function(module: Any, function_name: str, wrapper_factory: Callable[[Callable[..., Any]], Callable[..., Any]]) -> bool:
+def wrap_function(
+    module: Any,
+    function_name: str,
+    wrapper_factory: Callable[[Callable[..., Any]], Callable[..., Any]],
+) -> bool:
     fn = safe_getattr(module, function_name)
     if fn is None or safe_getattr(fn, PATCH_MARKER, False):
         return False
@@ -42,7 +48,11 @@ def wrap_function(module: Any, function_name: str, wrapper_factory: Callable[[Ca
     return True
 
 
-def wrap_method(cls: Any, method_name: str, wrapper_factory: Callable[[Callable[..., Any]], Callable[..., Any]]) -> bool:
+def wrap_method(
+    cls: Any,
+    method_name: str,
+    wrapper_factory: Callable[[Callable[..., Any]], Callable[..., Any]],
+) -> bool:
     method = safe_getattr(cls, method_name)
     if method is None or safe_getattr(method, PATCH_MARKER, False):
         return False

@@ -1,0 +1,27 @@
+#pragma once
+
+#include "trace_graph/core/dag_graph.hpp"
+
+#include <string>
+
+namespace TraceGraph {
+
+// 所有 what-if 都规约为 C++ SimulationModule。
+//
+// 模块可以读取 graph 中的 trace fact、维护内部状态、修改 node/edge/duration，
+// 但不应该修改原始 trace 文件，也不应该把 debug 信息混入默认 prediction.json。
+class SimulationModule {
+public:
+    virtual ~SimulationModule() = default;
+
+    // 稳定模块名，用于 registry、summary 和 debug 归属。
+    virtual std::string name() const = 0;
+    // 唯一执行入口。模块之间的顺序由 CLI 根据 model config 固定。
+    virtual void apply(DagGraph & graph) = 0;
+
+    // summary 是显式打开的辅助输出；默认预测路径不依赖它。
+    virtual bool has_summary() const { return false; }
+    virtual std::string summary_json() const { return "{}"; }
+};
+
+} // namespace TraceGraph

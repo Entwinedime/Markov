@@ -1,12 +1,13 @@
 #pragma once
 
-#include "trace_graph/activity_record.hpp"
+#include "trace_graph/core/trace_event.hpp"
 
-#include <memory>
 #include <vector>
 
 namespace TraceGraph {
 
-void normalize_trace_records(std::vector<std::unique_ptr<ActivityRecord>> & records);
+// 在 parser 之后、DagBuilder 之前补充跨采集渠道的公共 producer/domain 字段。
+// 这里不做策略推断，只做源头标记和少量类别规范化。
+void normalize_trace_events(std::vector<TraceEvent> & events);
 
 } // namespace TraceGraph

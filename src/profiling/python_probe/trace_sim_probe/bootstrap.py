@@ -1,3 +1,5 @@
+"""Python probe bootstrap。"""
+
 from __future__ import annotations
 
 import builtins
@@ -6,7 +8,7 @@ import os
 import sys
 import threading
 from types import ModuleType
-from typing import Iterable, List
+from typing import Iterable
 
 from trace_sim_probe.writer import probe_debug_enabled
 
@@ -21,14 +23,17 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _selected_probe_names() -> List[str]:
-    raw = os.environ.get("TRACE_SIM_PYTHON_PROBES", "sglang.hicache,sglang.kvcacheio")
+def _selected_probe_names() -> list[str]:
+    raw = os.environ.get("TRACE_SIM_PYTHON_PROBES", "generic_callable")
     return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _load_probe(name: str):
     module_name = {
-        "sglang.hicache": "trace_sim_probe.probes.sglang_hicache",
+        "generic_callable": "trace_sim_probe.probes.generic_callable",
+        "sglang.hicache": "trace_sim_probe.probes.sglang_hicache_callable",
+        "sglang_hicache": "trace_sim_probe.probes.sglang_hicache_callable",
+        "sglang_hicache_callable": "trace_sim_probe.probes.sglang_hicache_callable",
         "sglang.kvcacheio": "trace_sim_probe.probes.sglang_kvcacheio",
     }.get(name, name)
     return importlib.import_module(module_name)
@@ -92,6 +97,8 @@ def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
 
 
 def bootstrap() -> None:
+    """安装 import hook 并对已加载模块应用 probe。"""
+
     global _INSTALLED
     if not _truthy(os.environ.get("TRACE_SIM_PYTHON_PROBE")):
         return

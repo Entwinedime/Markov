@@ -1,8 +1,7 @@
-"""Environment-gated entry point for trace-sim Python probes.
+"""Python probe 自动入口。
 
-Put src/profiling/python_probe on PYTHONPATH and set TRACE_SIM_PYTHON_PROBE=1 to
-enable this hook. Import failures are deliberately swallowed so normal runtime
-startup is unchanged when the probe package is incomplete or disabled.
+runner 将 `src/profiling/python_probe` 加入 PYTHONPATH 后，Python 会自动导入
+本文件。只有 `TRACE_SIM_PYTHON_PROBE=1` 时才安装 probe。
 """
 
 try:
@@ -10,4 +9,5 @@ try:
 
     bootstrap()
 except Exception:
+    # probe 不能改变被测进程启动行为。
     pass

@@ -1,0 +1,37 @@
+{
+  "input": {
+    "trace_paths": ["tests/fixtures/modeling/tracegraph_basic.json"]
+  },
+  "output_dir": "data/modeling_runs/smoke_hicache",
+  "mode": "cache_patch",
+  "modules": [
+    {
+      "name": "NodeScaleModule",
+      "enabled": true,
+      "config": {
+        "rules": [
+          {
+            "id": "scale_compute_use_kv",
+            "name": "compute_use_kv",
+            "factor": 1.0
+          }
+        ]
+      }
+    },
+    {
+      "name": "HiCacheModule",
+      "enabled": true,
+      "config": {
+        "hicache": {
+          "enabled": true
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "emit_dag_chrome_trace": true,
+    "emit_module_summary": true,
+    "emit_validation": true,
+    "debug": false
+  }
+}

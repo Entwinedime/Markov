@@ -14,7 +14,8 @@ public:
     void set_level(Level lv) { level_ = lv; }
     Level level() const { return level_; }
 
-    // RAII line builder; flushes with timestamp + level prefix on destruction.
+    // RAII 日志行构造器：析构时一次性写出整行，避免多线程下半行日志交错。
+    // 用户可见日志内容保持英文；这里的注释说明实现约束。
     class Line {
     public:
         Line(Level lv, bool active, std::mutex * mtx);

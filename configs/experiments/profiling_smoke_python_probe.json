@@ -1,0 +1,39 @@
+{
+  "name": "profiling_smoke_python_probe",
+  "framework": "sglang",
+  "profiling": {
+    "enabled": true,
+    "channels": ["torch", "python_probe"],
+    "debug": true,
+    "torch": {
+      "enabled": true,
+      "output_dir": "trace/torch"
+    },
+    "python_probe": {
+      "probes": ["generic_callable"],
+      "targets": [
+        {
+          "id": "hicache.match_prefix",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": ["hicache_lookup_start", "hicache_lookup_end"],
+          "fields": [
+            {"name": "request_id", "source": "arg:req_id", "required": false},
+            {"name": "page_size", "source": "self.page_size"},
+            {"name": "status", "source": "const:observed"}
+          ]
+        }
+      ]
+    },
+    "ld_preload": {
+      "enabled": false
+    }
+  },
+  "server": {
+    "command": ["python3", "-c", "import time; time.sleep(1)"],
+    "ready_url": "http://127.0.0.1:30000/get_model_info"
+  },
+  "bench": {
+    "command": ["python3", "-c", "print('bench smoke placeholder')"]
+  }
+}

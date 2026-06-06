@@ -9,11 +9,16 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-add_subdirectory(src/profiling/native_hook)
+# C++ 侧保留 LD_PRELOAD hook，并重新启用面向对象 TraceGraph 作为 base DAG 引擎。
+add_subdirectory(src/profiling/ld_preload)
 add_subdirectory(src/modeling/trace_graph)
 
-install(TARGETS hook trace_graph
+install(TARGETS hook
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
+)
+
+install(TARGETS trace_graph
+    RUNTIME DESTINATION bin
 )

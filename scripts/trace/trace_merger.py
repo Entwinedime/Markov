@@ -3,13 +3,17 @@ import json
 import logging
 import os
 import bisect
+import re
+import shutil
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Tuple, Dict, Any, List, Optional
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 DIRECT_MERGED_EVENT_NAMES = {"CPUInfer::submit", "CPUInfer::sync"}
+DIRECT_MERGED_NAME_PREFIXES = ("HiCache::", "hicache_")
 
 
 @dataclass
@@ -167,7 +171,6 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
                 
             if profiler_timestamp < custom_timestamp:
                 diagnostics["later_match_count"] += 1
-                logging.warning(f"Profiler event '{profiler_event['name']}' (ts {profiler_timestamp}) happens before custom event (ts {custom_timestamp}). Potential mismatch.")
 
             inject_custom_args(profiler_event, custom_args_list[custom_index])
             successfully_matched += 1
@@ -230,7 +233,6 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
 
             if profiler_ts < candidate['ts']:
                 diagnostics["later_match_count"] += 1
-                logging.warning(f"Profiler event '{event['name']}' (ts {profiler_ts}) matches custom event at {candidate['ts']} which occurs later.")
             
             best_candidate = candidate
             break
@@ -251,12 +253,22 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
 def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: List[Dict], cutoff_ts: float) -> int:
     appended_count = 0
     for event in custom_events:
-        if event.get("name", "") in DIRECT_MERGED_EVENT_NAMES:
+        if should_append_standalone_event(event):
             if float(event.get("ts", 0)) >= cutoff_ts:
                 appended_count += 1
                 profiler_events.append(event)
     logging.info(f"Appended {appended_count} standalone custom events to the merged trace.")
     return appended_count
+
+def should_append_standalone_event(event: Dict[str, Any]) -> bool:
+    name = str(event.get("name", ""))
+    if name in DIRECT_MERGED_EVENT_NAMES:
+        return True
+    if any(name.startswith(prefix) for prefix in DIRECT_MERGED_NAME_PREFIXES):
+        return True
+    args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    domain = str(args.get("domain") or event.get("cat") or "").lower()
+    return domain in {"hicache", "cache_io", "python_probe"}
 
 def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
     appended_count = 0
@@ -273,6 +285,9 @@ def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List
     if sidecar_paths:
         logging.info(f"Appended {appended_count} sidecar trace events.")
     return appended_count, details
+
+def sort_events(events: List[Dict[str, Any]]) -> None:
+    events.sort(key=lambda event: (float(event.get("ts", 0) or 0), str(event.get("pid", "")), str(event.get("tid", "")), str(event.get("name", ""))))
 
 def merge_traces(profiler_path: str, custom_path: str, out_path: str, 
                  tolerance_us: float = 10000.0, search_window: int = 5, margin_us: float = 0.0, mode: str = "search",
@@ -331,6 +346,7 @@ def merge_traces(profiler_path: str, custom_path: str, out_path: str,
     cutoff_ts = earliest_profiler_ts - margin_us
     report.standalone_custom_appended = append_unmatched_custom_events(profiler_events, custom_events, cutoff_ts)
     report.sidecar_events_appended, report.sidecar_details = append_sidecar_trace_events(profiler_events, sidecar_paths or [])
+    sort_events(profiler_events)
 
     logging.info(f"Saving merged trace to '{out_path}' ...")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -344,11 +360,139 @@ def merge_traces(profiler_path: str, custom_path: str, out_path: str,
     logging.info("Merge complete! Drag it into https://ui.perfetto.dev to view.")
     return report.to_dict()
 
+def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000.0, search_window: int = 5,
+                   margin_us: float = 100.0, mode: str = "search") -> Dict[str, Any]:
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    trace = manifest.get("trace") if isinstance(manifest.get("trace"), dict) else {}
+    sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
+    torch_paths = existing_paths(trace.get("torch_trace_files", []))
+    ld_paths = existing_paths(trace.get("ld_preload_trace_files", []))
+    python_paths = existing_paths(sidecar.get("python_probe_files", []))
+
+    out_root = Path(out_dir)
+    out_root.mkdir(parents=True, exist_ok=True)
+    merged_paths: List[str] = []
+    reports: List[Dict[str, Any]] = []
+    for index, torch_path in enumerate(torch_paths):
+        pid = pid_from_path(torch_path)
+        custom_path = select_by_pid_or_index(ld_paths, pid, index)
+        sidecars = select_sidecars(python_paths, pid)
+        out_path = out_root / f"merged_trace_{index:02d}.json"
+        report_path = out_root / f"merge_report_{index:02d}.json"
+        if custom_path:
+            report = merge_traces(
+                torch_path,
+                custom_path,
+                str(out_path),
+                tolerance_us=tolerance_us,
+                search_window=search_window,
+                margin_us=margin_us,
+                mode=mode,
+                sidecar_paths=sidecars,
+                report_path=str(report_path),
+            )
+        else:
+            report = copy_profiler_with_sidecars(torch_path, str(out_path), sidecars, str(report_path))
+        merged_paths.append(str(out_path))
+        reports.append(report)
+
+    summary = {
+        "manifest_path": manifest_path,
+        "out_dir": str(out_root),
+        "torch_trace_files": torch_paths,
+        "ld_preload_trace_files": ld_paths,
+        "python_probe_files": python_paths,
+        "merged_trace_files": merged_paths,
+        "reports": reports,
+    }
+    summary_path = out_root / "merge_manifest_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return summary
+
+def existing_paths(items: Any) -> List[str]:
+    paths: List[str] = []
+    if not isinstance(items, list):
+        return paths
+    for item in items:
+        if isinstance(item, dict) and item.get("exists", True) and isinstance(item.get("path"), str):
+            path = map_repo_path(item["path"])
+            if os.path.isfile(path):
+                paths.append(path)
+        elif isinstance(item, str):
+            path = map_repo_path(item)
+            if os.path.isfile(path):
+                paths.append(path)
+    return paths
+
+def map_repo_path(path: str) -> str:
+    for prefix in ("/workspace/trace-sim", "/opt/trace-sim"):
+        if path == prefix:
+            return str(Path(__file__).resolve().parents[2])
+        if path.startswith(prefix + "/"):
+            return str(Path(__file__).resolve().parents[2] / path[len(prefix) + 1:])
+    return path
+
+def pid_from_path(path: str) -> Optional[str]:
+    match = re.search(r"pid(\d+)", path)
+    if match:
+        return match.group(1)
+    match = re.search(r"_([0-9]+)_20[0-9]{11,}", path)
+    if match:
+        return match.group(1)
+    return None
+
+def select_by_pid_or_index(paths: List[str], pid: Optional[str], index: int) -> Optional[str]:
+    if pid:
+        for path in paths:
+            if pid_from_path(path) == pid:
+                return path
+    if index < len(paths):
+        return paths[index]
+    return None
+
+def select_sidecars(paths: List[str], pid: Optional[str]) -> List[str]:
+    if not pid:
+        return paths
+    selected = [path for path in paths if pid_from_path(path) == pid]
+    return selected or paths
+
+def copy_profiler_with_sidecars(profiler_path: str, out_path: str, sidecar_paths: List[str], report_path: str) -> Dict[str, Any]:
+    raw_data, profiler_events = load_trace(profiler_path)
+    if raw_data is None:
+        shutil.copyfile(profiler_path, out_path)
+        profiler_events = []
+        raw_data = {"traceEvents": profiler_events}
+    appended, details = append_sidecar_trace_events(profiler_events, sidecar_paths)
+    sort_events(profiler_events)
+    if isinstance(raw_data, dict):
+        raw_data["traceEvents"] = profiler_events
+    else:
+        raw_data = profiler_events
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    Path(out_path).write_text(json.dumps(raw_data, ensure_ascii=False), encoding="utf-8")
+    report = MergeReport(
+        profiler_path=profiler_path,
+        custom_path="",
+        out_path=out_path,
+        mode="copy_with_sidecar",
+        tolerance_us=0.0,
+        search_window=0,
+        margin_us=0.0,
+        success=True,
+        sidecar_events_appended=appended,
+        sidecar_details=details,
+        sidecar_paths=sidecar_paths,
+    )
+    write_report(report, report_path)
+    return report.to_dict()
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge Prefill, Decode, and Custom CPU Traces.")
-    parser.add_argument("--profiler", required=True, help="Path to profiler trace json")
-    parser.add_argument("--custom", required=True, help="Path to custom cpu hook trace json")
-    parser.add_argument("--out", required=True, help="Path to output merged json")
+    parser.add_argument("--manifest", help="Path to profile_manifest.json; when set, merge all trace channels listed in manifest")
+    parser.add_argument("--out-dir", help="Output directory for manifest mode")
+    parser.add_argument("--profiler", help="Path to profiler trace json")
+    parser.add_argument("--custom", help="Path to custom cpu hook trace json")
+    parser.add_argument("--out", help="Path to output merged json")
     parser.add_argument("--tolerance", type=float, default=10000.0, help="Max time difference in microseconds")
     parser.add_argument("--window", type=int, default=5, help="Binary search neighbor window size (used in search mode)")
     parser.add_argument("--margin", type=float, default=100.0, help="Margin in microseconds before earliest profiler event")
@@ -357,5 +501,12 @@ if __name__ == "__main__":
     parser.add_argument("--report", help="Optional JSON merge report output")
     
     args = parser.parse_args()
-    
-    merge_traces(args.profiler, args.custom, args.out, args.tolerance, args.window, args.margin, args.mode, args.sidecar, args.report)
+
+    if args.manifest:
+        if not args.out_dir:
+            parser.error("--manifest requires --out-dir")
+        merge_manifest(args.manifest, args.out_dir, args.tolerance, args.window, args.margin, args.mode)
+    else:
+        if not args.profiler or not args.custom or not args.out:
+            parser.error("single-file mode requires --profiler, --custom and --out")
+        merge_traces(args.profiler, args.custom, args.out, args.tolerance, args.window, args.margin, args.mode, args.sidecar, args.report)

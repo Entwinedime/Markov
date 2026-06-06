@@ -10,7 +10,29 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 
-PHASE_ORDER = ("warmup", "fill_A", "pressure_B", "reuse_A", "reuse_A_again")
+PHASE_ORDER = (
+    "warmup",
+    "seed_A",
+    "reuse_A",
+    "backup_wait_A",
+    "pressure_B",
+    "reuse_A_after_pressure",
+    "prefetch_seed_C",
+    "prefetch_reuse_C",
+    "dirty_eviction",
+)
+
+
+PHASE_EXPECTED_MECHANISMS = {
+    "seed_A": ["lookup", "insert", "write_backup", "write_storage"],
+    "reuse_A": ["lookup"],
+    "backup_wait_A": ["lookup", "write_backup", "write_storage"],
+    "pressure_B": ["lookup", "insert", "evict"],
+    "reuse_A_after_pressure": ["lookup", "load_back"],
+    "prefetch_seed_C": ["lookup", "insert", "write_backup", "write_storage"],
+    "prefetch_reuse_C": ["lookup", "prefetch_decision", "prefetch_schedule", "prefetch_query", "prefetch_transfer"],
+    "dirty_eviction": ["lookup", "insert", "evict", "write_backup", "write_storage"],
+}
 
 
 def now_ms() -> float:
@@ -94,22 +116,42 @@ def phase_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
     prefix_a = make_shared_prefix("A", args.shared_prefix_repeat)
     prefix_b = make_shared_prefix("B", args.shared_prefix_repeat)
-    fill_prompts = [make_prompt(prefix_a, "A", index, args.unique_suffix_repeat) for index in range(args.fill_requests)]
+    prefix_c = make_shared_prefix("C", args.shared_prefix_repeat)
+    prefix_dirty = make_shared_prefix("D", args.shared_prefix_repeat)
+    seed_prompts = [make_prompt(prefix_a, "A", index, args.unique_suffix_repeat) for index in range(args.seed_requests)]
     pressure_prompts = [make_prompt(prefix_b, "B", index, args.unique_suffix_repeat) for index in range(args.pressure_requests)]
+    prefetch_prompts = [
+        make_prompt(prefix_c, "C", index, args.unique_suffix_repeat)
+        for index in range(args.prefetch_seed_requests)
+    ]
+    dirty_prompts = [
+        make_prompt(prefix_dirty, "D", index, args.unique_suffix_repeat)
+        for index in range(args.dirty_eviction_requests)
+    ]
 
     plan: List[Dict[str, Any]] = []
     for index in range(args.warmup_requests):
         plan.append({"phase": "warmup", "prompt_id": f"warmup_{index}", "prompt": make_prompt(prefix_a, "warmup", index, 1)})
-    for index, prompt in enumerate(fill_prompts):
-        plan.append({"phase": "fill_A", "prompt_id": f"A_{index}", "prompt": prompt})
+    for index, prompt in enumerate(seed_prompts):
+        plan.append({"phase": "seed_A", "prompt_id": f"A_{index}", "prompt": prompt})
+    for index in range(args.reuse_requests):
+        source_index = index % max(1, len(seed_prompts))
+        plan.append({"phase": "reuse_A", "prompt_id": f"A_{source_index}", "prompt": seed_prompts[source_index]})
+    for index in range(args.backup_wait_requests):
+        source_index = index % max(1, len(seed_prompts))
+        plan.append({"phase": "backup_wait_A", "prompt_id": f"A_{source_index}", "prompt": seed_prompts[source_index]})
     for index, prompt in enumerate(pressure_prompts):
         plan.append({"phase": "pressure_B", "prompt_id": f"B_{index}", "prompt": prompt})
-    for index in range(args.reuse_requests):
-        source_index = index % max(1, len(fill_prompts))
-        plan.append({"phase": "reuse_A", "prompt_id": f"A_{source_index}", "prompt": fill_prompts[source_index]})
-    for index in range(args.reuse_again_requests):
-        source_index = index % max(1, len(fill_prompts))
-        plan.append({"phase": "reuse_A_again", "prompt_id": f"A_{source_index}", "prompt": fill_prompts[source_index]})
+    for index in range(args.reuse_after_pressure_requests):
+        source_index = index % max(1, len(seed_prompts))
+        plan.append({"phase": "reuse_A_after_pressure", "prompt_id": f"A_{source_index}", "prompt": seed_prompts[source_index]})
+    for index, prompt in enumerate(prefetch_prompts):
+        plan.append({"phase": "prefetch_seed_C", "prompt_id": f"C_{index}", "prompt": prompt})
+    for index in range(args.prefetch_reuse_requests):
+        source_index = index % max(1, len(prefetch_prompts))
+        plan.append({"phase": "prefetch_reuse_C", "prompt_id": f"C_{source_index}", "prompt": prefetch_prompts[source_index]})
+    for index, prompt in enumerate(dirty_prompts):
+        plan.append({"phase": "dirty_eviction", "prompt_id": f"D_{index}", "prompt": prompt})
     return plan
 
 
@@ -122,12 +164,18 @@ def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.N
     phases = {phase: phase_stats(by_phase.get(phase, [])) for phase in PHASE_ORDER}
     total = phase_stats(rows)
     selected = rows_for_selected_latency(rows)
+    expected_by_phase = {
+        phase: PHASE_EXPECTED_MECHANISMS[phase]
+        for phase in PHASE_ORDER
+        if phase != "warmup" and by_phase.get(phase)
+    }
     summary = {
         "args": vars(args),
         "phases": phases,
         "total": total,
         "selected_latency": phase_stats(selected),
-        "selected_phases": ["reuse_A", "reuse_A_again"],
+        "selected_phases": ["reuse_A_after_pressure", "prefetch_reuse_C", "backup_wait_A"],
+        "expected_cache_mechanisms": expected_by_phase,
         "requests": rows,
     }
     (output_dir / "workload_report.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -137,7 +185,7 @@ def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.N
 
 
 def rows_for_selected_latency(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [row for row in rows if row.get("phase") in {"reuse_A", "reuse_A_again"}]
+    return [row for row in rows if row.get("phase") in {"reuse_A_after_pressure", "prefetch_reuse_C", "backup_wait_A"}]
 
 
 def main() -> int:
@@ -145,27 +193,39 @@ def main() -> int:
     parser.add_argument("--base-url", default="http://127.0.0.1:30001", help="SGLang server base URL.")
     parser.add_argument("--output-dir", required=True, help="Directory that will receive workload_report.json/jsonl.")
     parser.add_argument("--warmup-requests", type=int, default=1)
-    parser.add_argument("--fill-requests", type=int, default=8)
-    parser.add_argument("--pressure-requests", type=int, default=32)
+    parser.add_argument("--seed-requests", type=int, default=8)
     parser.add_argument("--reuse-requests", type=int, default=8)
-    parser.add_argument("--reuse-again-requests", type=int, default=8)
+    parser.add_argument("--backup-wait-requests", type=int, default=8)
+    parser.add_argument("--pressure-requests", type=int, default=48)
+    parser.add_argument("--reuse-after-pressure-requests", type=int, default=8)
+    parser.add_argument("--prefetch-seed-requests", type=int, default=4)
+    parser.add_argument("--prefetch-reuse-requests", type=int, default=8)
+    parser.add_argument("--dirty-eviction-requests", type=int, default=0)
     parser.add_argument("--shared-prefix-repeat", type=int, default=96)
     parser.add_argument("--unique-suffix-repeat", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--sleep-sec", type=float, default=0.0)
+    parser.add_argument(
+        "--max-errors",
+        type=int,
+        default=1,
+        help="Stop after this many request errors; 0 disables early stop.",
+    )
     args = parser.parse_args()
 
     url = args.base_url.rstrip("/") + "/generate"
     rows: List[Dict[str, Any]] = []
     for sequence_id, item in enumerate(build_plan(args)):
         result = request_generate(url, item["prompt"], args.max_new_tokens, args.timeout_sec)
+        expected_mechanisms = PHASE_EXPECTED_MECHANISMS.get(str(item["phase"]), [])
         row = {
             "sequence_id": sequence_id,
             "phase": item["phase"],
             "prompt_id": item["prompt_id"],
             "prompt_chars": len(item["prompt"]),
             "max_new_tokens": args.max_new_tokens,
+            "expected_cache_mechanisms": expected_mechanisms,
             **result,
         }
         rows.append(row)
@@ -173,6 +233,12 @@ def main() -> int:
             f"phase={row['phase']} seq={sequence_id} prompt_id={row['prompt_id']} status={row['status']} latency_ms={row['latency_ms']:.3f}",
             flush=True,
         )
+        if args.max_errors > 0 and sum(1 for item in rows if item.get("status") != "ok") >= args.max_errors:
+            print(
+                f"abort_after_error_count={args.max_errors} phase={row['phase']} seq={sequence_id}",
+                flush=True,
+            )
+            break
         if args.sleep_sec > 0:
             time.sleep(args.sleep_sec)
 
