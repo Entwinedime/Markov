@@ -1,6 +1,7 @@
 #include "trace_graph/core/dag_builder.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -26,15 +27,34 @@ uint64_t event_launch_ts(const DagGraph & graph, size_t node_id) {
 }
 
 // Ascend event 的 CPU wrapper 有时把 id 写成 "Event Id"，有时写成 event_id。
-// ! 当前 fallback 为 "0" 会把所有缺 id 事件归为同一组，可能生成错误 sync 边。
-// ! 缺 event id 时应拒绝对应 record/wait 建边，而不是用默认 id 继续匹配。
-std::string event_id_from_cpu_record(const TraceEvent & event) {
-    if (event.has_arg("Event Id")) return event.arg("Event Id");
-    if (event.has_arg("event_id")) return event.arg("event_id");
-    return "0";
+// 缺 event id 时不能建 event record/wait 边，否则多个缺 id 事件会被错误归到一组。
+std::optional<std::string> event_id_from_cpu_record(const TraceEvent & event) {
+    if (event.has_arg("Event Id")) {
+        auto value = event.arg("Event Id");
+        if (!value.empty()) return value;
+    }
+    if (event.has_arg("event_id")) {
+        auto value = event.arg("event_id");
+        if (!value.empty()) return value;
+    }
+    return std::nullopt;
 }
 
 uint64_t node_end_ts(const TraceEvent & event) { return event.ts + event.dur; }
+
+bool is_usable_lane_value(const std::string & value) { return !value.empty() && value != "-1"; }
+
+bool is_stream_sync_event(const std::string & name) {
+    return name == "AscendCL@aclrtSynchronizeStream" || name == "AscendCL@aclrtSynchronizeStreamWithTimeout";
+}
+
+bool is_event_sync_event(const std::string & name) {
+    return name == "AscendCL@aclrtSynchronizeEvent" || name == "AscendCL@aclrtSynchronizeEventWithTimeout";
+}
+
+bool is_device_sync_event(const std::string & name) {
+    return name == "AscendCL@aclrtSynchronizeDevice" || name == "AscendCL@aclrtSynchronizeDeviceWithTimeout";
+}
 
 } // namespace
 
@@ -57,6 +77,8 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     add_notify_wait_edges(graph, index);
     add_model_execute_edges(graph, index);
     add_stream_sync_edges(graph, index);
+    add_event_sync_edges(graph, index);
+    add_device_sync_edges(graph, index);
     finalize_sync_nodes(graph, index);
 
     // real_e2e_time 是 trace 自身的真实时间窗口，仅用于 validation 对照；
@@ -224,12 +246,13 @@ bool DagBuilder::is_hicache_event(const TraceEvent & event) {
 std::string DagBuilder::lane_key(const TraceEvent & event) {
     if (!is_device_event(event)) return "CPU_MERGED";
     // 对齐老版 TraceGraph：device 事件虽然用 Physic Stream Id 判断是否在 NPU 上执行，
-    // 但实际串行 lane 优先取 trace 顶层 tid，其次才取 streamId。
-    // ! reader 会把顶层 tid 也写入 args["tid"]，所以当前 fallback 通常不会触发。
-    // ! 当 streamId / Physic Stream Id 才是真实执行 lane 时，这里会错误使用 tid。
-    if (event.has_arg("tid")) return event.arg("tid");
-    if (event.has_arg("streamId")) return event.arg("streamId");
-    if (event.has_arg("Physic Stream Id")) return event.arg("Physic Stream Id");
+    // 但实际串行 lane 优先取 trace 顶层 tid，其次才取 streamId / Physic Stream Id。
+    // reader 会把顶层 tid 也写入 args["tid"]，这里必须直接读 event.tid，避免 args fallback 抢先命中。
+    if (is_usable_lane_value(event.tid)) return event.tid;
+    auto stream_id = event.arg("streamId", event.arg("stream id"));
+    if (is_usable_lane_value(stream_id)) return stream_id;
+    auto physic_stream_id = event.arg("Physic Stream Id");
+    if (is_usable_lane_value(physic_stream_id)) return physic_stream_id;
     return "NPU_UNKNOWN";
 }
 
@@ -261,6 +284,15 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
         }
         else {
             node.attrs["gpuid"] = std::to_string(graph.gpu_id());
+            // 同一个 device lane 在 trace 中可能被顶层 tid、streamId、stream id、Physic Stream Id
+            // 或 LD_PRELOAD 的 Raw Stream 描述。这里登记可确认别名，供 sync wrapper 反查真实 lane。
+            if (is_usable_lane_value(event.tid)) index.stream_alias_to_lane[event.tid] = lane;
+            auto stream_id = event.arg("streamId");
+            if (is_usable_lane_value(stream_id)) index.stream_alias_to_lane[stream_id] = lane;
+            auto stream_id_alt = event.arg("stream id");
+            if (is_usable_lane_value(stream_id_alt)) index.stream_alias_to_lane[stream_id_alt] = lane;
+            auto physic_stream_id = event.arg("Physic Stream Id");
+            if (is_usable_lane_value(physic_stream_id)) index.stream_alias_to_lane[physic_stream_id] = lane;
         }
         if (event.has_arg("parent_seq")) node.attrs["parent_seq"] = event.arg("parent_seq");
 
@@ -269,9 +301,8 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
         if (event.has_arg("correlation_id")) index.correlation_to_nodes[event.arg("correlation_id")].push_back(node_id);
         if (contains_any_hccl_name(event.name) && is_device) index.hccl_nodes.push_back(node_id);
 
-        // ! 特殊事件只在这里分类一次。LD_PRELOAD wrapper 名称必须在这里显式识别，
-        // ! 否则它只会作为普通 CPU 节点进入 DAG，不会产生 sync 语义边。
-        // ! 当前 sync wrapper 覆盖不完整，需要纳入 WithTimeout、event sync 和 device sync。
+        // 特殊事件只在这里分类一次。LD_PRELOAD wrapper 名称必须在这里显式识别，
+        // 否则它只会作为普通 CPU 节点进入 DAG，不会产生 sync 语义边。
         if (event.name == "EVENT_RECORD") index.event_record_nodes.push_back(node_id);
         else if (event.name == "EVENT_WAIT") {
             // 老版 TraceGraph 把 EVENT_WAIT 向后挪 1ns，并把正 duration 减 1ns。
@@ -280,7 +311,9 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
             if (event.dur > 0) event.dur -= 1;
             index.event_wait_nodes.push_back(node_id);
         }
-        else if (event.name == "AscendCL@aclrtSynchronizeStream") index.stream_sync_nodes.push_back(node_id);
+        else if (is_stream_sync_event(event.name)) index.stream_sync_nodes.push_back(node_id);
+        else if (is_event_sync_event(event.name)) index.event_sync_nodes.push_back(node_id);
+        else if (is_device_sync_event(event.name)) index.device_sync_nodes.push_back(node_id);
         else if (event.name == "NOTIFY_RECORD") index.notify_record_nodes.push_back(node_id);
         else if (event.name == "MODEL_EXECUTE") index.model_execute_nodes.push_back(node_id);
     }
@@ -374,8 +407,13 @@ void DagBuilder::add_event_wait_edges(DagGraph & graph, BuildIndex & index) cons
         auto cpu_node = conn_it->second.front();
         const auto & cpu_event = graph.event_for_node(cpu_node);
         // Raw Stream 是后续 aclrtSynchronizeStream 可能唯一能提供的 stream 证据。
-        if (cpu_event.has_arg("Raw Stream")) index.raw_stream_to_stream[cpu_event.arg("Raw Stream")] = graph.node(record_node).lane_key;
-        index.event_id_to_nodes[event_id_from_cpu_record(cpu_event)].push_back(record_node);
+        if (cpu_event.has_arg("Raw Stream")) {
+            auto lane = graph.node(record_node).lane_key;
+            index.raw_stream_to_stream[cpu_event.arg("Raw Stream")] = lane;
+            index.stream_alias_to_lane[cpu_event.arg("Raw Stream")] = lane;
+        }
+        auto event_id = event_id_from_cpu_record(cpu_event);
+        if (event_id) index.event_id_to_nodes[*event_id].push_back(record_node);
     }
 
     for (auto & item : index.event_id_to_nodes) {
@@ -390,7 +428,8 @@ void DagBuilder::add_event_wait_edges(DagGraph & graph, BuildIndex & index) cons
         if (conn_it == index.connection_to_nodes.end() || conn_it->second.empty()) continue;
         auto cpu_node = conn_it->second.front();
         auto eid = event_id_from_cpu_record(graph.event_for_node(cpu_node));
-        auto events_it = index.event_id_to_nodes.find(eid);
+        if (!eid) continue;
+        auto events_it = index.event_id_to_nodes.find(*eid);
         if (events_it == index.event_id_to_nodes.end()) continue;
 
         auto & records = events_it->second;
@@ -471,17 +510,31 @@ void DagBuilder::add_stream_sync_edges(DagGraph & graph, BuildIndex & index) con
     // 因此需要把目标 lane 上 sync 开始前最近的 device 节点连到这个 CPU sync 节点。
     for (size_t sync_node : index.stream_sync_nodes) {
         auto & sync_event = graph.mutable_event_for_node(sync_node);
-        auto sid = sync_event.arg("streamId", sync_event.arg("stream id", sync_event.arg("Physic Stream Id", "-1")));
-        if (sid == "-1" && sync_event.has_arg("Raw Stream")) {
-            auto it = index.raw_stream_to_stream.find(sync_event.arg("Raw Stream"));
-            if (it != index.raw_stream_to_stream.end()) sid = it->second;
-        }
-
         std::vector<std::string> target_lanes;
-        // ! sid 不一定等于 DagBuilder::lane_key 选出的 lane。当前按 sid 直接查 lane_to_nodes，
-        // ! 在 tid 与 streamId 不一致且缺 Raw Stream 映射时会漏掉 sync edge。
-        if (sid != "-1" && index.lane_to_nodes.count(sid)) target_lanes.push_back(sid);
-        else if (sid == "-1") {
+        std::unordered_set<std::string> seen_lanes;
+        auto add_lane_candidate = [&](const std::string & sid) {
+            if (!is_usable_lane_value(sid)) return;
+            std::string lane;
+            auto raw_it = index.raw_stream_to_stream.find(sid);
+            if (raw_it != index.raw_stream_to_stream.end()) lane = raw_it->second;
+            auto alias_it = index.stream_alias_to_lane.find(sid);
+            if (lane.empty() && alias_it != index.stream_alias_to_lane.end()) lane = alias_it->second;
+            if (lane.empty() && index.lane_to_nodes.count(sid)) lane = sid;
+            if (!lane.empty() && seen_lanes.insert(lane).second) target_lanes.push_back(lane);
+        };
+
+        bool has_stream_evidence = false;
+        auto consume_evidence = [&](const std::string & sid) {
+            if (!is_usable_lane_value(sid)) return;
+            has_stream_evidence = true;
+            add_lane_candidate(sid);
+        };
+        consume_evidence(sync_event.arg("Raw Stream"));
+        consume_evidence(sync_event.arg("streamId"));
+        consume_evidence(sync_event.arg("stream id"));
+        consume_evidence(sync_event.arg("Physic Stream Id"));
+
+        if (!has_stream_evidence) {
             // 缺少 stream 证据时，保守地等待所有 device lane。
             for (const auto & item : index.lane_to_nodes) {
                 if (!graph.is_cpu_lane(item.first)) target_lanes.push_back(item.first);
@@ -502,10 +555,55 @@ void DagBuilder::add_stream_sync_edges(DagGraph & graph, BuildIndex & index) con
     }
 }
 
+void DagBuilder::add_event_sync_edges(DagGraph & graph, BuildIndex & index) const {
+    // aclrtSynchronizeEvent 表示 CPU 等待某个 event 被 record。
+    // 它不一定伴随底层 EVENT_WAIT 节点，因此直接用 Event Id 连接最近的 EVENT_RECORD。
+    for (size_t sync_node : index.event_sync_nodes) {
+        const auto & sync_event = graph.event_for_node(sync_node);
+        auto event_id = event_id_from_cpu_record(sync_event);
+        if (!event_id && sync_event.has_arg("connection_id")) {
+            auto conn_it = index.connection_to_nodes.find(sync_event.arg("connection_id"));
+            if (conn_it != index.connection_to_nodes.end() && !conn_it->second.empty()) event_id = event_id_from_cpu_record(graph.event_for_node(conn_it->second.front()));
+        }
+        if (!event_id) continue;
+        auto records_it = index.event_id_to_nodes.find(*event_id);
+        if (records_it == index.event_id_to_nodes.end()) continue;
+
+        auto & records = records_it->second;
+        auto bound_value = node_end_ts(sync_event);
+        auto bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) {
+            return value < graph.event_for_node(node_id).ts;
+        });
+        if (bound == records.begin()) continue;
+        --bound;
+        graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
+    }
+}
+
+void DagBuilder::add_device_sync_edges(DagGraph & graph, BuildIndex & index) const {
+    // aclrtSynchronizeDevice 等价于 CPU 等待当前 device 上所有已提交 stream。
+    // 在单 rank graph 内保守连接每条 device lane 上 sync 开始前最近的节点。
+    for (size_t sync_node : index.device_sync_nodes) {
+        const auto & sync_event = graph.event_for_node(sync_node);
+        for (const auto & item : index.lane_to_nodes) {
+            if (graph.is_cpu_lane(item.first)) continue;
+            auto & nodes = index.lane_to_nodes[item.first];
+            auto bound = std::lower_bound(nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) {
+                return event_launch_ts(graph, node_id) < value;
+            });
+            if (bound == nodes.begin()) continue;
+            --bound;
+            graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
+        }
+    }
+}
+
 void DagBuilder::finalize_sync_nodes(DagGraph & graph, const BuildIndex & index) const {
     // 老版 TraceGraph 将同步 wait 类节点压成固定 10ns。
     // 真正的等待时间由前驱边推动 critical path 体现，避免把观测到的阻塞 dur 重复计入。
     for (size_t node_id : index.stream_sync_nodes) graph.set_node_duration(node_id, 10);
+    for (size_t node_id : index.event_sync_nodes) graph.set_node_duration(node_id, 10);
+    for (size_t node_id : index.device_sync_nodes) graph.set_node_duration(node_id, 10);
     for (size_t node_id : index.event_wait_nodes) graph.set_node_duration(node_id, 10);
     for (size_t node_id : index.notify_wait_nodes) graph.set_node_duration(node_id, 10);
 }

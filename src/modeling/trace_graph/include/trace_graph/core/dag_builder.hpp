@@ -35,11 +35,16 @@ private:
         // Raw Stream 是 LD_PRELOAD / AscendCL wrapper 看到的 stream handle；
         // 它需要通过 record event 映射到实际 DAG lane。
         std::unordered_map<std::string, std::string> raw_stream_to_stream;
+        // streamId / Physic Stream Id / 顶层 tid 都可能是同一条 device lane 的别名。
+        // stream sync 只能看到其中一种时，通过该表回到 DagBuilder::lane_key 选择出的真实 lane。
+        std::unordered_map<std::string, std::string> stream_alias_to_lane;
 
         // 特殊事件分类缓存，避免后续边构建阶段全图重复扫描。
         std::vector<size_t> event_record_nodes;
         std::vector<size_t> event_wait_nodes;
         std::vector<size_t> stream_sync_nodes;
+        std::vector<size_t> event_sync_nodes;
+        std::vector<size_t> device_sync_nodes;
         std::vector<size_t> notify_record_nodes;
         std::vector<size_t> notify_wait_nodes;
         std::vector<size_t> model_execute_nodes;
@@ -64,6 +69,8 @@ private:
     void add_notify_wait_edges(DagGraph & graph, BuildIndex & index) const;
     void add_model_execute_edges(DagGraph & graph, BuildIndex & index) const;
     void add_stream_sync_edges(DagGraph & graph, BuildIndex & index) const;
+    void add_event_sync_edges(DagGraph & graph, BuildIndex & index) const;
+    void add_device_sync_edges(DagGraph & graph, BuildIndex & index) const;
     void finalize_sync_nodes(DagGraph & graph, const BuildIndex & index) const;
 };
 

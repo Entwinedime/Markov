@@ -205,10 +205,18 @@ private:
         return parse_primitive();
     }
 
+    std::string parse_compound_value_literal() {
+        // args 中的对象/数组暂时不展开，只保留原始 JSON 片段并保证 scanner 完整越过该值。
+        // 需要参与建模的结构化字段应由 trace_merger 展平成稳定标量 key。
+        skip_ws();
+        const char * start = p_;
+        skip_value();
+        return std::string(start, p_ - start);
+    }
+
     void parse_args(std::unordered_map<std::string, std::string> & args) {
-        // 当前 args 解析只保存一层 key -> scalar string。
-        // ! 如果 value 是对象/数组，parse_scalar_value 无法完整消费结构化值，还可能打乱后续字段扫描。
-        // ! 应改为跳过/展开结构化值，或者强制所有结构化字段先由 trace_merger 展平。
+        // 当前 args 解析只保存一层 key -> string。标量直接收敛成字符串，
+        // 对象/数组保留原始 JSON 片段，避免结构化值打乱后续字段扫描。
         if (p_ >= end_ || *p_ != '{') {
             skip_value();
             return;
@@ -225,7 +233,8 @@ private:
                 skip_ws();
                 if (p_ < end_ && *p_ == ':') ++p_;
                 skip_ws();
-                args[key] = parse_scalar_value();
+                if (p_ < end_ && (*p_ == '{' || *p_ == '[')) args[key] = parse_compound_value_literal();
+                else args[key] = parse_scalar_value();
             }
             else {
                 ++p_;
@@ -278,7 +287,7 @@ private:
         if (event.pid.empty()) event.pid = "-1";
         if (event.tid.empty()) event.tid = "-1";
         // 把顶层 pid/tid 也写入 args，方便后续统一走 event.arg()。
-        // ! 这会让 DagBuilder::lane_key 的 tid fallback 永远命中，导致 streamId / Physic Stream Id fallback 失效。
+        // DagBuilder::lane_key 直接读取 event.tid，不依赖这里的 args["tid"] fallback。
         event.args["pid"] = event.pid;
         event.args["tid"] = event.tid;
         // 当前后端只支持完整 duration event。metadata 和 flow event 不是可执行节点；

@@ -110,6 +110,84 @@ def main() -> int:
         )
         raw_stream_sync_summary = run_trace(tmp, raw_stream_sync, "raw_stream_sync")
         assert raw_stream_sync_summary["edge_counts_by_kind"].get("sync", 0) == 1, raw_stream_sync_summary
+
+        missing_event_id = write_trace(
+            tmp / "missing_event_id.json",
+            [
+                event("AscendCL@aclrtRecordEvent", "runtime", 0, 1, {"connection_id": "record"}),
+                event("EVENT_RECORD", "runtime", 2, 1, {"connection_id": "record", "Physic Stream Id": "7"}, tid=7),
+                event("AscendCL@aclrtStreamWaitEvent", "runtime", 3, 1, {"connection_id": "wait"}),
+                event("EVENT_WAIT", "runtime", 4, 1, {"connection_id": "wait", "Physic Stream Id": "8"}, tid=8),
+            ],
+        )
+        missing_event_id_summary = run_trace(tmp, missing_event_id, "missing_event_id")
+        assert missing_event_id_summary["edge_counts_by_kind"].get("sync", 0) == 0, missing_event_id_summary
+
+        stream_alias_sync = write_trace(
+            tmp / "stream_alias_sync.json",
+            [
+                event("kernel", "Kernel", 0, 40, {"streamId": "s7", "device_id": 0}, tid=7),
+                event("AscendCL@aclrtSynchronizeStream", "runtime", 10, 5, {"streamId": "s7"}),
+            ],
+        )
+        stream_alias_sync_summary = run_trace(tmp, stream_alias_sync, "stream_alias_sync")
+        assert stream_alias_sync_summary["edge_counts_by_kind"].get("sync", 0) == 1, stream_alias_sync_summary
+        assert stream_alias_sync_summary["simulated_e2e_ns"] == 50, stream_alias_sync_summary
+
+        stream_timeout_sync = write_trace(
+            tmp / "stream_timeout_sync.json",
+            [
+                event("kernel", "Kernel", 0, 40, {"streamId": "s7", "device_id": 0}, tid=7),
+                event("AscendCL@aclrtSynchronizeStreamWithTimeout", "runtime", 10, 5, {"streamId": "s7"}),
+            ],
+        )
+        stream_timeout_sync_summary = run_trace(tmp, stream_timeout_sync, "stream_timeout_sync")
+        assert stream_timeout_sync_summary["edge_counts_by_kind"].get("sync", 0) == 1, stream_timeout_sync_summary
+        assert stream_timeout_sync_summary["simulated_e2e_ns"] == 50, stream_timeout_sync_summary
+
+        event_sync = write_trace(
+            tmp / "event_sync.json",
+            [
+                event("AscendCL@aclrtRecordEvent", "runtime", 0, 1, {"connection_id": "record", "Event Id": "e2"}),
+                event("EVENT_RECORD", "runtime", 5, 1, {"connection_id": "record", "Physic Stream Id": "7"}, tid=7),
+                event("AscendCL@aclrtSynchronizeEvent", "runtime", 6, 5, {"Event Id": "e2"}),
+            ],
+        )
+        event_sync_summary = run_trace(tmp, event_sync, "event_sync")
+        assert event_sync_summary["edge_counts_by_kind"].get("sync", 0) == 1, event_sync_summary
+
+        device_sync = write_trace(
+            tmp / "device_sync.json",
+            [
+                event("k1", "Kernel", 0, 40, {"streamId": "s7", "device_id": 0}, tid=7),
+                event("k2", "Kernel", 0, 60, {"streamId": "s8", "device_id": 0}, tid=8),
+                event("AscendCL@aclrtSynchronizeDevice", "runtime", 10, 5, {}),
+            ],
+        )
+        device_sync_summary = run_trace(tmp, device_sync, "device_sync")
+        assert device_sync_summary["edge_counts_by_kind"].get("sync", 0) == 2, device_sync_summary
+        assert device_sync_summary["simulated_e2e_ns"] == 70, device_sync_summary
+
+        nested_args_stream_select = write_trace(
+            tmp / "nested_args_stream_select.json",
+            [
+                event("k1", "Kernel", 0, 40, {"streamId": "s7", "device_id": 0}, tid=7),
+                event("k2", "Kernel", 0, 80, {"streamId": "s8", "device_id": 0}, tid=8),
+                event("AscendCL@aclrtSynchronizeStream", "runtime", 10, 5, {"Function-Args": {"ignored": {"value": 1}}, "streamId": "s7"}),
+            ],
+        )
+        nested_args_stream_select_summary = run_trace(tmp, nested_args_stream_select, "nested_args_stream_select")
+        assert nested_args_stream_select_summary["edge_counts_by_kind"].get("sync", 0) == 1, nested_args_stream_select_summary
+
+        cpu_gap = write_trace(
+            tmp / "cpu_gap.json",
+            [
+                event("cpu_a", "runtime", 0, 10, {}),
+                event("cpu_b", "runtime", 20, 5, {}),
+            ],
+        )
+        cpu_gap_summary = run_trace(tmp, cpu_gap, "cpu_gap")
+        assert cpu_gap_summary["simulated_e2e_ns"] == 25, cpu_gap_summary
     print("tracegraph fixtures passed")
     return 0
 

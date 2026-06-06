@@ -71,9 +71,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
         if (pred != INVALID_NODE) complete_time[node_id] += complete_time[pred];
 
         // 老版 TraceGraph 会把 CPU 顺序间隔计入关键路径上前驱节点之后。
-        // ! 当前条件先检查 node.attrs["cpuinterval"]，但 add_sequential_edges 把 interval 写在前驱节点上。
-        // ! 这会漏计最后一个 CPU gap，也可能让中间 gap 计入条件错位，应改为只检查 pred_node。
-        if (pred != INVALID_NODE && node.attrs.find("cpuinterval") != node.attrs.end()) {
+        if (pred != INVALID_NODE) {
             const auto & pred_node = graph.node(pred);
             if (pred_node.attrs.find("cpuinterval") != pred_node.attrs.end()) {
                 auto interval = read_u64_attr(pred_node, "cpuinterval", 0);
