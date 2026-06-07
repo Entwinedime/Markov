@@ -28,6 +28,7 @@ struct HiCacheFact {
     std::string direction;
     std::string prefetch_observed_policy;
     std::vector<std::string> pages;
+    std::vector<std::string> source_pages;
     std::vector<std::string> target_pages;
     uint64_t page_size = 0;
     uint64_t prefix_len = 0;
@@ -147,8 +148,10 @@ class HiCacheState {
     std::set<std::string> radix_known_pages_;
     std::unordered_map<std::string, std::vector<std::string>> pending_lookup_pages_by_request_;
     std::unordered_map<std::string, std::vector<std::string>> pending_prefetch_pages_by_request_;
+    std::unordered_map<std::string, std::vector<std::string>> latest_prefetch_schedule_pages_by_request_;
     std::unordered_map<std::string, std::vector<std::string>> latest_prefetch_progress_pages_by_request_;
     std::unordered_map<std::string, uint64_t> prefetch_schedule_ts_by_request_;
+    std::unordered_map<std::string, uint64_t> prefetch_schedule_source_page_count_by_request_;
     std::unordered_map<std::string, uint64_t> hit_count_by_scope_page_;
     std::unordered_map<std::string, uint64_t> lock_count_by_scope_page_;
     std::set<std::string> terminated_prefetch_requests_;
@@ -210,6 +213,7 @@ class HiCacheState {
     void remember_prefetch_pages(const HiCacheFact & fact, const std::vector<std::string> & pages);
     void remember_prefetch_schedule(const HiCacheFact & fact, const std::vector<std::string> & pages);
     std::vector<std::string> target_prefetch_schedule_pages(const HiCacheFact & fact) const;
+    std::vector<std::string> target_prefetch_completion_pages(const HiCacheFact & fact) const;
     std::vector<std::string> prefetch_pages_for_fact(const HiCacheFact & fact) const;
     void finalize_prefetch_policy(HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     bool should_terminate_prefetch_at_progress(const HiCacheFact & fact, const std::vector<std::string> & pages, uint64_t ready_count) const;

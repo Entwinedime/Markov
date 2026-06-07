@@ -2,6 +2,28 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-08 02:12:50 +0800
+
+- strict page64 prediction 的 final-state 已闭环：
+  - 新的 strict 输出目录：`data/profile_runs/sglang/20260607_170641_profiling_hicache_state_validation/modeling/predict_page64_state_strict_transfer_extend_v1`；
+  - `validation_ready=true`、`final_state_match=true`；
+  - final state counts 对齐：L1 `111/111`、L2 `250/250`、dirty `0/0`、backuped `250/250`、
+    evicted `139/139`、locked `0/0`、prefetch planned `364/364`、ready `17/17`、
+    suppressed `347/347`；
+  - 这次修复把 page size mismatch 下完整 base transfer 的 target planned 尾页补成 ready，
+    解决了此前 `4c64...` 被压到 suppressed 的最后一个差异。
+- 仍然保留的诊断差异：
+  - `timeline_delta_validation.match=false`，`model_extra_transition_count=704`、`oracle_extra_transition_count=212`；
+  - 现阶段这部分更像 transition granularity / observation gap 的诊断，而不是 final-state 闭环障碍；
+  - 后续如果继续收敛，应优先对照 prediction state trace 和真实 state trace 的 transition 顺序。
+- 本轮验证：
+  - `cmake --build build --target trace_graph -j 8`
+  - `git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror`
+  - `git diff --check`
+  - `python3 tests/run_hicache_state_fixtures.py`
+  - `python3 tests/run_profiling_fixtures.py`
+  - `python3 tests/run_modeling_smoke_fixtures.py`
+
 ## 2026-06-08 01:52:33 +0800
 
 - 继续收敛 base -> page64 strict HiCache state prediction：

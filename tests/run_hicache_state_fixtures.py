@@ -24,6 +24,7 @@ def main() -> int:
         run_page_size_prefetch_transfer_target_identity_fixture(tmp)
         run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp)
         run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp)
+        run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp)
         run_target_radix_prefix_fixture(tmp)
         run_write_through_selective_fixture(tmp)
         run_lock_ref_fixture(tmp)
@@ -569,6 +570,94 @@ def run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp: Path) -> None:
     final_state = summary["final_state"]
     assert final_state["prefetch_planned_pages"] == ["target_suffix"], final_state
     assert "wrong_no_parent_suffix" not in final_state["prefetch_planned_pages"], final_state
+
+
+def run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp: Path) -> None:
+    """验证跨 page size 时完整 base transfer 会补齐 target planned 尾页 ready。"""
+
+    trace_path = tmp / "hicache_page_size_prefetch_transfer_extends_schedule.json"
+    model_config = tmp / "hicache_page_size_prefetch_transfer_extends_schedule_model.json"
+    summary_out = tmp / "hicache_page_size_prefetch_transfer_extends_schedule_summary.json"
+    run_summary = tmp / "hicache_page_size_prefetch_transfer_extends_schedule_run.json"
+    base_pages = [f"base_p{i:02d}" for i in range(1, 9)]
+    target_pages = [f"target_p{i:02d}" for i in range(1, 18)]
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-page64-transfer-tail",
+                            "page_size": 128,
+                            "new_input_tokens": 1121,
+                            "page_identity": base_pages,
+                            "target_page_identity": target_pages,
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-page64-transfer-tail",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": base_pages,
+                            "target_page_identity": target_pages[:-1],
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-page64-transfer-tail",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-page64-transfer-tail",
+                                "page_size": 128,
+                                "check_return": True,
+                                "has_ongoing_prefetch": False,
+                            },
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "prefetch_policy": "timeout",
+                    "prefetch_timeout_base_sec": 10.0,
+                    "prefetch_timeout_per_ki_token_sec": 0.0,
+                    "prefetch_timeout_max_sec": 10.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert final_state["prefetch_planned_pages"] == target_pages, final_state
+    assert final_state["prefetch_ready_pages"] == target_pages, final_state
+    assert final_state["prefetch_suppressed_pages"] == [], final_state
+    assert final_state["l2_resident_pages"] == target_pages, final_state
 
 
 def run_target_radix_prefix_fixture(tmp: Path) -> None:

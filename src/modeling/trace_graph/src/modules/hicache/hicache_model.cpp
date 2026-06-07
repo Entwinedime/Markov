@@ -195,6 +195,11 @@ uint64_t ready_page_count_from_progress(const Json & progress, uint64_t fallback
 
 std::vector<std::string> sorted_vector(const std::set<std::string> & values) { return {values.begin(), values.end()}; }
 
+bool is_vector_prefix(const std::vector<std::string> & prefix, const std::vector<std::string> & values) {
+    if (prefix.size() > values.size()) return false;
+    return std::equal(prefix.begin(), prefix.end(), values.begin());
+}
+
 // page size 变化时，这些角色描述的是 base run 中已经发生的 movement。
 // 它们不能直接驱动 target state；缺少 target page identity 时应跳过并计数。
 bool is_non_invariant_observed_role(const std::string & role) {
@@ -311,6 +316,7 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.requested_tokens = event.arg_u64("requested_tokens", 0);
     fact.evicted_tokens = event.arg_u64("evicted_tokens", 0);
     fact.pages = parse_page_identity(event);
+    fact.source_pages = fact.pages;
     const bool insert_had_observed_pages = fact.role == "insert" && !fact.pages.empty();
     fact.target_pages = parse_page_arg(event, "target_page_identity");
     parse_prefetch_progress(event, fact);
@@ -786,8 +792,9 @@ void HiCacheState::apply_load_to_l1(const HiCacheFact & fact, HiCacheSummary & s
 }
 
 void HiCacheState::apply_l3_to_l2(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, bool ready) {
+    const auto pages = target_prefetch_completion_pages(fact);
     bool planned_prefetch_transfer = false;
-    for (const auto & page : fact.pages) {
+    for (const auto & page : pages) {
         if (prefetch_planned_.count(page) > 0) {
             planned_prefetch_transfer = true;
             break;
@@ -799,7 +806,7 @@ void HiCacheState::apply_l3_to_l2(const HiCacheFact & fact, HiCacheSummary & sum
         summary.skipped_non_invariant_events++;
         return;
     }
-    for (const auto & page : fact.pages) {
+    for (const auto & page : pages) {
         add_resident(fact, summary, transitions, "L3", page);
         add_resident(fact, summary, transitions, "L2", page);
         if (ready || prefetch_planned_.count(page) > 0) mark_prefetch_ready(fact, summary, transitions, page);
@@ -1086,7 +1093,14 @@ void HiCacheState::remember_prefetch_pages(const HiCacheFact & fact, const std::
 
 void HiCacheState::remember_prefetch_schedule(const HiCacheFact & fact, const std::vector<std::string> & pages) {
     remember_prefetch_pages(fact, pages);
-    if (!fact.request_id.empty()) prefetch_schedule_ts_by_request_[scoped_request_key(fact)] = fact.ts;
+    if (fact.request_id.empty()) return;
+    const auto key = scoped_request_key(fact);
+    prefetch_schedule_ts_by_request_[key] = fact.ts;
+    latest_prefetch_schedule_pages_by_request_[key] = pages;
+    if (fact.role == "prefetch_schedule" && target_page_size_mismatch(fact) && !fact.source_pages.empty()) {
+        auto & source_page_count = prefetch_schedule_source_page_count_by_request_[key];
+        source_page_count = std::max<uint64_t>(source_page_count, fact.source_pages.size());
+    }
 }
 
 std::vector<std::string> HiCacheState::target_prefetch_schedule_pages(const HiCacheFact & fact) const {
@@ -1103,6 +1117,26 @@ std::vector<std::string> HiCacheState::target_prefetch_schedule_pages(const HiCa
     const size_t suffix_pages = static_cast<size_t>(fact.new_input_tokens / config_.page_size);
     if (suffix_pages == 0 || lookup_it->second.size() < suffix_pages) return fact.pages;
     return {lookup_it->second.end() - static_cast<long>(suffix_pages), lookup_it->second.end()};
+}
+
+std::vector<std::string> HiCacheState::target_prefetch_completion_pages(const HiCacheFact & fact) const {
+    if (!target_page_size_mismatch(fact) || fact.request_id.empty()) return fact.pages;
+    if (config_.prefetch_policy != "best_effort" && config_.prefetch_policy != "timeout") return fact.pages;
+
+    const auto key = scoped_request_key(fact);
+    const auto schedule_it = latest_prefetch_schedule_pages_by_request_.find(key);
+    if (schedule_it == latest_prefetch_schedule_pages_by_request_.end() || schedule_it->second.size() <= fact.pages.size()) return fact.pages;
+
+    const auto source_count_it = prefetch_schedule_source_page_count_by_request_.find(key);
+    if (source_count_it == prefetch_schedule_source_page_count_by_request_.end() || source_count_it->second == 0) return fact.pages;
+    if (fact.source_pages.size() < source_count_it->second) return fact.pages;
+    if (!is_vector_prefix(fact.pages, schedule_it->second)) return fact.pages;
+
+    // page size what-if 下，base transfer 的 target_page_identity 只覆盖
+    // base operation token 数能整除出的 target pages；但如果该 transfer
+    // 已覆盖 schedule 中全部 base pages，目标配置应完成同 request 的
+    // planned target suffix，避免把仅因 page size 变小产生的尾页误判为 suppressed。
+    return schedule_it->second;
 }
 
 std::vector<std::string> HiCacheState::prefetch_pages_for_fact(const HiCacheFact & fact) const {
