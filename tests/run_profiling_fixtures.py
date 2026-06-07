@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PROBE_ROOT = ROOT / "src/profiling/python_probe"
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(PROBE_ROOT))
 
 from profiling import normalize_profiling_config  # noqa: E402
 
@@ -262,6 +263,7 @@ def sglang_hicache_targets() -> list[dict[str, object]]:
             "target": "HiRadixCache.insert",
             "events": ["hicache_insert_start", "hicache_insert_end"],
             "fields": [
+                {"name": "request_id", "source": "arg:params.req.rid", "required": False},
                 {"name": "insert_tokens", "source": "len:arg:params.key", "required": False},
                 {"name": "value_tokens", "source": "len:arg:params.value", "required": False},
                 {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
@@ -311,6 +313,32 @@ def sglang_hicache_targets() -> list[dict[str, object]]:
                 {"name": "page_identity", "source": "return.best_match_node.hash_value", "required": False},
                 {"name": "page_size", "source": "self.page_size"},
                 {"name": "event_role", "source": "const:evict"},
+            ],
+        },
+        {
+            "id": "hiradix.inc_lock_ref",
+            "module": "sglang.srt.mem_cache.hiradix_cache",
+            "target": "HiRadixCache.inc_lock_ref",
+            "events": ["hicache_inc_lock_ref_start", "hicache_inc_lock_ref_end"],
+            "fields": [
+                {"name": "node_id", "source": "arg:node.id", "required": False},
+                {"name": "page_identity", "source": "arg:node.hash_value"},
+                {"name": "lock_delta", "source": "return.delta", "required": False},
+                {"name": "page_size", "source": "self.page_size"},
+                {"name": "event_role", "source": "const:lock_ref_inc"},
+            ],
+        },
+        {
+            "id": "hiradix.dec_lock_ref",
+            "module": "sglang.srt.mem_cache.hiradix_cache",
+            "target": "HiRadixCache.dec_lock_ref",
+            "events": ["hicache_dec_lock_ref_start", "hicache_dec_lock_ref_end"],
+            "fields": [
+                {"name": "node_id", "source": "arg:node.id", "required": False},
+                {"name": "page_identity", "source": "arg:node.hash_value"},
+                {"name": "lock_delta", "source": "return.delta", "required": False},
+                {"name": "page_size", "source": "self.page_size"},
+                {"name": "event_role", "source": "const:lock_ref_dec"},
             ],
         },
         {
@@ -460,6 +488,135 @@ def run_config_fixture() -> None:
     assert runtime.channels == ("python_probe", "ld_preload"), runtime
     assert runtime.python_probes == ("generic_callable",), runtime
     assert runtime.python_targets[0]["id"] == "demo.target", runtime
+    assert runtime.python_state_trace_enabled is False, runtime
+
+
+def run_hicache_page_hash_literal_page_size_fixture() -> None:
+    """验证 HiCache page hash source 支持字面量 target page size。"""
+
+    from trace_sim_probe.probes import sglang_hicache_callable
+
+    bound = {"tokens": [1, 2, 3, 4, 5], "page_size": 2}
+    found_base, base_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,arg:page_size",
+        bound,
+        (),
+        {},
+        None,
+    )
+    found_literal, literal_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,2",
+        bound,
+        (),
+        {},
+        None,
+    )
+    found_const, const_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,const:2",
+        bound,
+        (),
+        {},
+        None,
+    )
+    found_larger, larger_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,4",
+        bound,
+        (),
+        {},
+        None,
+    )
+
+    assert found_base is True, base_hashes
+    assert found_literal is True, literal_hashes
+    assert found_const is True, const_hashes
+    assert found_larger is True, larger_hashes
+    assert literal_hashes == base_hashes == const_hashes, (base_hashes, literal_hashes, const_hashes)
+    assert len(literal_hashes) == 2, literal_hashes
+    assert len(larger_hashes) == 1, larger_hashes
+
+    concat_found, concat_hashes = sglang_hicache_callable._extract_page_hashes_concat(
+        "arg:prefix,arg:suffix,2",
+        {"prefix": [1, 2], "suffix": [3, 4, 5]},
+        (),
+        {},
+        None,
+    )
+    full_found, full_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,2",
+        {"tokens": [1, 2, 3, 4, 5]},
+        (),
+        {},
+        None,
+    )
+    assert concat_found is True, concat_hashes
+    assert full_found is True, full_hashes
+    assert concat_hashes == full_hashes, (concat_hashes, full_hashes)
+
+    suffix_found, suffix_hashes = sglang_hicache_callable._extract_page_hashes_after_prefix(
+        "arg:prefix,arg:suffix,2",
+        {"prefix": [1, 2], "suffix": [3, 4, 5, 6]},
+        (),
+        {},
+        None,
+    )
+    suffix_full_found, suffix_full_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:tokens,2",
+        {"tokens": [1, 2, 3, 4, 5, 6]},
+        (),
+        {},
+        None,
+    )
+    assert suffix_found is True, suffix_hashes
+    assert suffix_full_found is True, suffix_full_hashes
+    assert suffix_hashes == suffix_full_hashes[-2:], (suffix_hashes, suffix_full_hashes)
+
+
+def run_hicache_prefetch_progress_source_fixture() -> None:
+    """验证 prefetch progress source 能采到 ready/late 判定所需证据。"""
+
+    from trace_sim_probe.probes import sglang_hicache_callable
+
+    class Operation:
+        def __init__(self) -> None:
+            self.hash_value = ["h1", "h2"]
+            self.completed_tokens = 64
+
+        def is_terminated(self) -> bool:
+            return False
+
+    class Cache:
+        def __init__(self) -> None:
+            self.page_size = 64
+            self.prefetch_stop_policy = "timeout"
+            self.ongoing_prefetch = {"req-a": (None, list(range(128)), list(range(128)), Operation())}
+            self.prefetch_loaded_tokens_by_reqid = {"req-b": 64}
+
+    cache = Cache()
+    found_ongoing, ongoing = sglang_hicache_callable._extract_prefetch_progress(
+        "self,arg:req_id",
+        {"req_id": "req-a"},
+        (cache,),
+        {},
+        False,
+    )
+    found_loaded, loaded = sglang_hicache_callable._extract_prefetch_progress(
+        "self,arg:req_id",
+        {"req_id": "req-b"},
+        (cache,),
+        {},
+        True,
+    )
+
+    assert found_ongoing is True, ongoing
+    assert ongoing["has_ongoing_prefetch"] is True, ongoing
+    assert ongoing["operation_hash_pages"] == ["h1", "h2"], ongoing
+    assert ongoing["completed_tokens"] == 64, ongoing
+    assert ongoing["ready_pages_estimate"] == 1, ongoing
+    assert ongoing["late_tokens_estimate"] == 64, ongoing
+    assert found_loaded is True, loaded
+    assert loaded["has_ongoing_prefetch"] is False, loaded
+    assert loaded["loaded_tokens_evidence"] == 64, loaded
+    assert loaded["check_return"] is True, loaded
 
 
 def run_torch_profiler_lifecycle_fixture() -> None:
@@ -497,6 +654,74 @@ def run_torch_profiler_lifecycle_fixture() -> None:
     stepped_body = module.build_profile_body(stepped_cfg["profiling"]["torch"], stepped_run.layout)
     assert stepped_body["num_steps"] == 1, stepped_body
     assert stepped_run._should_stop_torch_profiler_after_workload() is False
+
+
+def run_state_trace_env_fixture() -> None:
+    """验证 state_trace 配置会补充环境变量和 validation-only source。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_state_trace",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    cfg = {
+        "name": "state_trace_env_fixture",
+        "framework": "sglang",
+        "profiling": {
+            "enabled": True,
+            "channels": ["python_probe"],
+            "python_probe": {
+                "probes": ["sglang.hicache"],
+                "state_trace": {"enabled": True},
+                "targets": [
+                    {
+                        "id": "hiradix.match_prefix",
+                        "module": "sglang.srt.mem_cache.hiradix_cache",
+                        "target": "HiRadixCache.match_prefix",
+                        "fields": [{"name": "event_role", "source": "const:lookup"}],
+                    }
+                ],
+            },
+        },
+        "server": {"command": ["python3", "-c", "import time; time.sleep(1)"]},
+        "bench": {"command": ["python3", "-c", "print('bench')"]},
+    }
+    run = module.ProfileRun(cfg, dry_run=True)
+    env = {}
+    run._apply_python_probe_env(env)
+    assert env["TRACE_SIM_HICACHE_STATE_TRACE"] == "1", env
+    targets = json.loads(env["TRACE_SIM_PYTHON_PROBE_TARGETS"])
+    fields = targets[0]["fields"]
+    assert any(field.get("source") == "hicache_state:self" for field in fields), fields
+
+
+def run_env_placeholder_fixture() -> None:
+    """验证 env 支持 run layout 占位符，避免实验间共享 HiCache storage。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_env_placeholder",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    cfg = {
+        "name": "env_placeholder_fixture",
+        "framework": "sglang",
+        "env": {"SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "{run_dir}/hicache_storage"},
+        "profiling": {"enabled": False, "channels": []},
+        "server": {"command": ["python3", "-c", "import time; time.sleep(1)"]},
+        "bench": {"command": ["python3", "-c", "print('bench')"]},
+    }
+    run = module.ProfileRun(cfg, dry_run=True)
+    env = run._build_server_env()
+    assert env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] == str(run.layout.run_dir / "hicache_storage"), env
 
 
 def run_sglang_hicache_target_fixture() -> None:
@@ -538,6 +763,8 @@ cache.load_back(node)
 cache.insert(params)
 cache.write_backup(node, write_back=True)
 cache.write_backup_storage(node)
+cache.inc_lock_ref(node)
+cache.dec_lock_ref(node)
 cache.evict(params)
 
 controller = HiCacheController()
@@ -584,6 +811,77 @@ controller._page_backup(Operation(request_id=req.rid))
         run_profile_quality_fixture(tmp, files[0])
 
 
+def run_hicache_state_snapshot_fixture() -> None:
+    """验证 HiCache state snapshot 被拆成非执行事件，不污染真实 probe 事件。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        _write_fake_sglang_package(tmp)
+        output_dir = tmp / "python_probe"
+        targets = [
+            {
+                "id": "hiradix.match_prefix",
+                "module": "sglang.srt.mem_cache.hiradix_cache",
+                "target": "HiRadixCache.match_prefix",
+                "events": ["hicache_lookup_start", "hicache_lookup_end"],
+                "fields": [
+                    {"name": "request_id", "source": "arg:params.req.rid", "required": False},
+                    {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
+                    {"name": "event_role", "source": "const:lookup"},
+                    {"name": "state_snapshot", "source": "hicache_state:self", "required": False},
+                ],
+            }
+        ]
+
+        env = os.environ.copy()
+        env["TRACE_SIM_PYTHON_PROBE"] = "1"
+        env["TRACE_SIM_PYTHON_PROBES"] = "sglang.hicache"
+        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(targets)
+        env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(output_dir)
+        env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
+        env["PYTHONPATH"] = os.pathsep.join([str(PROBE_ROOT), str(tmp), env.get("PYTHONPATH", "")])
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                """
+from sglang.srt.managers.scheduler import Req
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, Node, Params
+
+req = Req('req-state')
+cache = HiRadixCache()
+node = Node(11)
+params = Params(req=req, key=[1, 2, 3, 4], value=[5, 6, 7, 8], best_match_node=node, host_hit_length=4, num_tokens=4)
+cache.match_prefix(params)
+""",
+            ],
+            env=env,
+        )
+
+        files = sorted(output_dir.glob("python_probe_trace.*.json"))
+        assert len(files) == 1, files
+        payload = json.loads(files[0].read_text(encoding="utf-8"))
+        events = [event for event in payload["traceEvents"] if event.get("cat") == "python_probe"]
+        real_events = [event for event in events if event["args"].get("model_input") is True]
+        snapshot_events = [event for event in events if event["args"].get("event_kind") == "state_snapshot"]
+        assert len(real_events) == 2, events
+        assert len(snapshot_events) == 2, events
+        assert all(event["args"].get("model_input") is False for event in snapshot_events), snapshot_events
+        snapshot = snapshot_events[-1]["args"]["state_snapshot"]
+        assert snapshot["enabled"] is True, snapshot
+        assert snapshot["object_type"] == "HiRadixCache", snapshot
+        assert snapshot["object_id"].startswith("HiRadixCache:"), snapshot
+        assert snapshot["derived"]["l1_resident_pages"] == ["h1", "h2"], snapshot
+        assert snapshot["derived"]["l2_resident_pages"] == ["h1", "h2"], snapshot
+        assert snapshot["capacity"]["write_policy"] == "write_through", snapshot
+        assert snapshot["capacity"]["prefetch_policy"] == "best_effort", snapshot
+        assert snapshot["capacity"]["l1_capacity_pages"] == 4, snapshot
+        assert snapshot["capacity"]["l1_available_pages"] == 2, snapshot
+        assert snapshot["capacity"]["l2_capacity_pages"] == 8, snapshot
+        assert snapshot["capacity"]["l2_available_pages"] == 6, snapshot
+        assert snapshot["capacity"]["prefetch_capacity_limit_pages"] == 4, snapshot
+
+
 def run_profile_quality_fixture(tmp: Path, python_probe_file: Path) -> None:
     """验证 profile_quality 能审计 profile manifest 和 Python probe target 命中。"""
 
@@ -628,6 +926,214 @@ def run_profile_quality_fixture(tmp: Path, python_probe_file: Path) -> None:
     assert quality["configured_target_count"] == len(sglang_hicache_targets()), quality
     assert quality["observed_target_count"] == len(sglang_hicache_targets()), quality
     assert not quality["missing_targets"], quality
+    assert quality["observed_cache_mechanisms"]["lock_ref"] > 0, quality
+    assert quality["page_identity_coverage"]["stateful_required_events_missing_page_identity"] == 0, quality
+
+
+def run_profile_quality_capacity_fixture() -> None:
+    """验证 profile_quality 会汇总 validation-only capacity 快照。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        sidecar = tmp / "python_probe_trace.rank0.pid123.json"
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "hicache_lookup_end:state_snapshot",
+                            "cat": "python_probe",
+                            "ph": "X",
+                            "ts": 1,
+                            "dur": 0,
+                            "pid": 123,
+                            "tid": 1,
+                            "args": {
+                                "domain": "python_probe",
+                                "event_kind": "state_snapshot",
+                                "model_input": False,
+                                "state_snapshot": {
+                                    "enabled": True,
+                                    "object_type": "HiRadixCache",
+                                    "capacity": {
+                                        "page_size": 128,
+                                        "write_policy": "write_back",
+                                        "prefetch_policy": "timeout",
+                                        "l1_capacity_pages": 46,
+                                        "l1_available_pages": 8,
+                                        "l2_capacity_pages": 88,
+                                        "l2_available_pages": 16,
+                                        "prefetch_capacity_limit_pages": 40,
+                                        "l1_pool": {
+                                            "pool_type": "DevicePool",
+                                            "capacity_pages": 46,
+                                        },
+                                    },
+                                },
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        manifest = tmp / "profile_manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "run_dir": str(tmp),
+                    "status": "completed",
+                    "profiling_ready": True,
+                    "profiling": {"channels_enabled": ["python"], "python_state_trace_enabled": True},
+                    "trace": {"torch_trace_files": [], "ld_preload_trace_files": []},
+                    "sidecar": {"python_probe_files": [{"path": str(sidecar), "exists": True}]},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        subprocess.check_call(
+            [
+                sys.executable,
+                "scripts/internal/profile_quality.py",
+                "--manifest",
+                str(manifest),
+            ],
+            cwd=ROOT,
+        )
+        quality = json.loads((tmp / "profile_quality.json").read_text(encoding="utf-8"))
+        assert quality["quality_ready"] is True, quality
+        assert quality["hicache_state_trace_enabled"] is True, quality
+        assert quality["hicache_capacity_observed"] is True, quality
+        capacity = quality["hicache_capacity"]
+        assert capacity["ready"] is True, capacity
+        assert capacity["object_type_counts"]["HiRadixCache"] == 1, capacity
+        assert capacity["unique_values"]["l1_capacity_pages"] == [46], capacity
+        assert capacity["unique_values"]["l2_capacity_pages"] == [88], capacity
+        assert capacity["unique_values"]["write_policy"] == ["write_back"], capacity
+
+
+def run_profile_quality_capacity_missing_fixture() -> None:
+    """验证 state trace 开启时缺少 capacity snapshot 会被质量审计拦住。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        sidecar = tmp / "python_probe_trace.rank0.pid123.json"
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "hicache_lookup_end:state_snapshot",
+                            "cat": "python_probe",
+                            "ph": "X",
+                            "ts": 1,
+                            "dur": 0,
+                            "pid": 123,
+                            "tid": 1,
+                            "args": {
+                                "domain": "python_probe",
+                                "event_kind": "state_snapshot",
+                                "model_input": False,
+                                "state_snapshot": {
+                                    "enabled": True,
+                                    "object_type": "HiRadixCache",
+                                    "derived": {},
+                                },
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        manifest = tmp / "profile_manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "run_dir": str(tmp),
+                    "status": "completed",
+                    "profiling_ready": True,
+                    "profiling": {"channels_enabled": ["python"], "python_state_trace_enabled": True},
+                    "trace": {"torch_trace_files": [], "ld_preload_trace_files": []},
+                    "sidecar": {"python_probe_files": [{"path": str(sidecar), "exists": True}]},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/internal/profile_quality.py",
+                "--manifest",
+                str(manifest),
+            ],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert completed.returncode == 1, completed
+        quality = json.loads((tmp / "profile_quality.json").read_text(encoding="utf-8"))
+        assert quality["quality_ready"] is False, quality
+        assert "hicache_capacity_snapshot_missing" in quality["quality_errors"], quality
+
+
+def run_trace_merger_sidecar_only_fixture() -> None:
+    """验证没有 torch trace 时，manifest 仍能生成 state-only merged trace。"""
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        sidecar = tmp / "python_probe_trace.rank0.pid123.json"
+        sidecar.write_text(
+            json.dumps(
+                {
+                    "traceEvents": [
+                        {
+                            "name": "hicache_lookup_end",
+                            "cat": "python_probe",
+                            "ph": "X",
+                            "ts": 1,
+                            "dur": 1,
+                            "pid": 123,
+                            "tid": 1,
+                            "args": {"domain": "python_probe", "event_kind": "hicache", "model_input": True},
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest = tmp / "profile_manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "trace": {"torch_trace_files": [], "ld_preload_trace_files": []},
+                    "sidecar": {"python_probe_files": [{"path": str(sidecar), "exists": True}]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        out_dir = tmp / "merged"
+        subprocess.check_call(
+            [
+                sys.executable,
+                "scripts/trace/trace_merger.py",
+                "--manifest",
+                str(manifest),
+                "--out-dir",
+                str(out_dir),
+            ],
+            cwd=ROOT,
+        )
+        summary = json.loads((out_dir / "merge_manifest_summary.json").read_text(encoding="utf-8"))
+        assert len(summary["merged_trace_files"]) == 1, summary
+        merged = json.loads(Path(summary["merged_trace_files"][0]).read_text(encoding="utf-8"))
+        assert merged["traceEvents"][0]["name"] == "hicache_lookup_end", merged
+        assert summary["reports"][0]["mode"] == "sidecar_only", summary
 
 
 def _write_fake_sglang_package(tmp: Path) -> None:
@@ -684,6 +1190,34 @@ class Result:
         self.inserted_host_node = node
         self.num_tokens_evicted = 4
 
+class LockResult:
+    def __init__(self, delta):
+        self.delta = delta
+
+class Pool:
+    def __init__(self, size, page_size, available):
+        self.size = size
+        self.page_size = page_size
+        self.page_num = size // page_size
+        self.free_slots = list(range(available))
+
+    def available_size(self):
+        return len(self.free_slots)
+
+class ControllerSnapshot:
+    def __init__(self):
+        self.page_size = 2
+        self.mem_pool_device = Pool(8, 2, 4)
+        self.mem_pool_host = Pool(16, 2, 12)
+        self.write_policy = 'write_through'
+        self.prefetch_threshold = 4
+        self.prefetch_capacity_limit = 8
+        self.prefetch_tokens_occupied = 2
+        self.enable_storage = True
+        self.storage_batch_size = 128
+        self.load_queue = [1]
+        self.write_queue = [1]
+
 class Params:
     def __init__(self, req, key, value, best_match_node, host_hit_length, num_tokens):
         self.req = req
@@ -697,6 +1231,12 @@ class HiRadixCache:
     def __init__(self):
         self.page_size = 2
         self.ongoing_prefetch = {}
+        self.prefetch_stop_policy = 'best_effort'
+        self.write_through_threshold = 1
+        self.load_back_threshold = 10
+        self.cache_controller = ControllerSnapshot()
+        self.kv_cache = self.cache_controller.mem_pool_device
+        self.token_to_kv_pool_host = self.cache_controller.mem_pool_host
         self.node = Node(21)
 
     def match_prefix(self, params):
@@ -725,6 +1265,12 @@ class HiRadixCache:
 
     def write_backup_storage(self, node):
         return 3
+
+    def inc_lock_ref(self, node):
+        return LockResult(-len(node.hash_value) * self.page_size)
+
+    def dec_lock_ref(self, node):
+        return LockResult(len(node.hash_value) * self.page_size)
 
     def evict(self, params):
         return Result(self.node)
@@ -782,8 +1328,16 @@ class HiCacheController:
 def main() -> int:
     run_probe_fixture()
     run_sglang_hicache_target_fixture()
+    run_hicache_state_snapshot_fixture()
+    run_hicache_page_hash_literal_page_size_fixture()
+    run_hicache_prefetch_progress_source_fixture()
+    run_profile_quality_capacity_fixture()
+    run_profile_quality_capacity_missing_fixture()
     run_config_fixture()
     run_torch_profiler_lifecycle_fixture()
+    run_state_trace_env_fixture()
+    run_env_placeholder_fixture()
+    run_trace_merger_sidecar_only_fixture()
     print("profiling fixtures passed")
     return 0
 

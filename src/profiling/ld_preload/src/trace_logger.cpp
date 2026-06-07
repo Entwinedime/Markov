@@ -5,11 +5,10 @@
 #include <string>
 #include <unistd.h>
 
-
 namespace {
 
 // 未配置 HOOK_TRACE_OUTPUT 时使用的默认输出路径。
-const std::string kDefaultTraceOutputPath{ "cpu_trace.json" };
+const std::string kDefaultTraceOutputPath{"cpu_trace.json"};
 
 } // namespace
 
@@ -21,7 +20,7 @@ TraceLogger & TraceLogger::Get() {
 }
 
 TraceLogger::TraceLogger() {
-    const std::string rank_str{ GetRankString() };
+    const std::string rank_str{GetRankString()};
     trace_output_path_ = BuildTraceOutputPath(rank_str, kDefaultTraceOutputPath);
 
     pid_ = static_cast<uint32_t>(getpid());
@@ -33,7 +32,9 @@ TraceLogger::TraceLogger() {
         first_event_ = false;
         file_.flush();
     }
-    else { std::cerr << "[hook] Failed to open trace file: " << trace_output_path_ << std::endl; }
+    else {
+        std::cerr << "[hook] Failed to open trace file: " << trace_output_path_ << std::endl;
+    }
 }
 
 TraceLogger::~TraceLogger() {

@@ -18,6 +18,7 @@ class ProfilingRuntimeConfig:
     channels: tuple[str, ...]
     python_probes: tuple[str, ...]
     python_targets: tuple[dict[str, Any], ...]
+    python_state_trace_enabled: bool
     debug: bool
 
     def to_manifest_fragment(self) -> dict[str, Any]:
@@ -26,6 +27,7 @@ class ProfilingRuntimeConfig:
             "channels_enabled": list(self.channels),
             "python_probes_enabled": list(self.python_probes),
             "python_targets": list(self.python_targets),
+            "python_state_trace_enabled": self.python_state_trace_enabled,
             "debug": self.debug,
         }
 
@@ -55,14 +57,18 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
             field_name="profiling.python_probe.probes",
         )
         python_targets = _parse_python_targets(python_probe_cfg.get("targets", []))
+        state_trace = python_probe_cfg.get("state_trace") if isinstance(python_probe_cfg.get("state_trace"), dict) else {}
+        python_state_trace_enabled = _as_bool(state_trace.get("enabled"), default=False)
     else:
         python_probes = ()
         python_targets = ()
+        python_state_trace_enabled = False
     return ProfilingRuntimeConfig(
         enabled=enabled,
         channels=channels,
         python_probes=python_probes,
         python_targets=python_targets,
+        python_state_trace_enabled=python_state_trace_enabled,
         debug=_as_bool(profiling.get("debug", cfg.get("debug")), default=False),
     )
 

@@ -73,8 +73,7 @@ std::string NodeScaleModule::summary_json() const {
     for (const auto & rule : config_.rules) {
         if (!first) os << ",";
         first = false;
-        os << "{\"id\":\"" << escape_json(rule.id) << "\",\"name\":\"" << escape_json(rule.name) << "\",\"factor\":"
-           << rule.factor << "}";
+        os << "{\"id\":\"" << escape_json(rule.id) << "\",\"name\":\"" << escape_json(rule.name) << "\",\"factor\":" << rule.factor << "}";
     }
     os << "]}";
     return os.str();

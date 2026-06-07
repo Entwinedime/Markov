@@ -35,6 +35,15 @@ PHASE_EXPECTED_MECHANISMS = {
 }
 
 
+WRITE_BACK_PHASE_EXPECTED_MECHANISMS = {
+    **PHASE_EXPECTED_MECHANISMS,
+    "seed_A": ["lookup", "insert"],
+    "backup_wait_A": ["lookup"],
+    "prefetch_seed_C": ["lookup", "insert"],
+    "prefetch_reuse_C": ["lookup", "prefetch_decision", "prefetch_schedule", "prefetch_query"],
+}
+
+
 def now_ms() -> float:
     return time.perf_counter() * 1000.0
 
@@ -119,7 +128,13 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
     prefix_c = make_shared_prefix("C", args.shared_prefix_repeat)
     prefix_dirty = make_shared_prefix("D", args.shared_prefix_repeat)
     seed_prompts = [make_prompt(prefix_a, "A", index, args.unique_suffix_repeat) for index in range(args.seed_requests)]
-    pressure_prompts = [make_prompt(prefix_b, "B", index, args.unique_suffix_repeat) for index in range(args.pressure_requests)]
+    if args.pressure_unique_prefix:
+        pressure_prompts = [
+            make_prompt(make_shared_prefix(f"B{index}", args.shared_prefix_repeat), "B", index, args.unique_suffix_repeat)
+            for index in range(args.pressure_requests)
+        ]
+    else:
+        pressure_prompts = [make_prompt(prefix_b, "B", index, args.unique_suffix_repeat) for index in range(args.pressure_requests)]
     prefetch_prompts = [
         make_prompt(prefix_c, "C", index, args.unique_suffix_repeat)
         for index in range(args.prefetch_seed_requests)
@@ -155,6 +170,18 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
     return plan
 
 
+def expected_mechanisms_for_phase(phase: str, args: argparse.Namespace) -> List[str]:
+    """根据目标写策略生成质量检查期望。
+
+    write-back 不会在普通 insert 后立即写 L2/L3；只有 dirty eviction / flush
+    才应该强制期待写回事件。该函数只影响 workload report，不影响请求内容。
+    """
+
+    policy = str(args.cache_write_policy or "write_through").lower()
+    table = WRITE_BACK_PHASE_EXPECTED_MECHANISMS if policy == "write_back" else PHASE_EXPECTED_MECHANISMS
+    return list(table.get(phase, []))
+
+
 def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     by_phase: Dict[str, List[Dict[str, Any]]] = {phase: [] for phase in PHASE_ORDER}
@@ -165,7 +192,7 @@ def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.N
     total = phase_stats(rows)
     selected = rows_for_selected_latency(rows)
     expected_by_phase = {
-        phase: PHASE_EXPECTED_MECHANISMS[phase]
+        phase: expected_mechanisms_for_phase(phase, args)
         for phase in PHASE_ORDER
         if phase != "warmup" and by_phase.get(phase)
     }
@@ -201,11 +228,19 @@ def main() -> int:
     parser.add_argument("--prefetch-seed-requests", type=int, default=4)
     parser.add_argument("--prefetch-reuse-requests", type=int, default=8)
     parser.add_argument("--dirty-eviction-requests", type=int, default=0)
+    parser.add_argument(
+        "--cache-write-policy",
+        default="write_through",
+        choices=("write_through", "write_through_selective", "write_back"),
+        help="Cache write policy used only to describe expected mechanisms in workload_report.",
+    )
+    parser.add_argument("--pressure-unique-prefix", action="store_true")
     parser.add_argument("--shared-prefix-repeat", type=int, default=96)
     parser.add_argument("--unique-suffix-repeat", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=8)
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--sleep-sec", type=float, default=0.0)
+    parser.add_argument("--phase-wait-sec", type=float, default=0.0)
     parser.add_argument(
         "--max-errors",
         type=int,
@@ -216,9 +251,10 @@ def main() -> int:
 
     url = args.base_url.rstrip("/") + "/generate"
     rows: List[Dict[str, Any]] = []
-    for sequence_id, item in enumerate(build_plan(args)):
+    plan = build_plan(args)
+    for sequence_id, item in enumerate(plan):
         result = request_generate(url, item["prompt"], args.max_new_tokens, args.timeout_sec)
-        expected_mechanisms = PHASE_EXPECTED_MECHANISMS.get(str(item["phase"]), [])
+        expected_mechanisms = expected_mechanisms_for_phase(str(item["phase"]), args)
         row = {
             "sequence_id": sequence_id,
             "phase": item["phase"],
@@ -241,6 +277,9 @@ def main() -> int:
             break
         if args.sleep_sec > 0:
             time.sleep(args.sleep_sec)
+        next_item = plan[sequence_id + 1] if sequence_id + 1 < len(plan) else None
+        if next_item is not None and next_item.get("phase") != item.get("phase") and args.phase_wait_sec > 0:
+            time.sleep(args.phase_wait_sec)
 
     write_outputs(Path(args.output_dir), rows, args)
     return 0 if all(row["status"] == "ok" for row in rows) else 1

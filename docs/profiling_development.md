@@ -98,6 +98,7 @@ Profiling 配置只描述采集和运行，不嵌入 modeling 预测逻辑。
 | `profiling.torch` | torch profiler 的启动、停止和输出配置。 |
 | `profiling.python_probe.probes` | Python probe 插件列表，通用 callable 使用 `generic_callable`，SGLang HiCache 使用 `sglang.hicache`。 |
 | `profiling.python_probe.targets` | Python callable 插桩目标。 |
+| `profiling.python_probe.state_trace.enabled` | 仅 HiCache state validation 使用；开启后 runner 会设置 `TRACE_SIM_HICACHE_STATE_TRACE=1`，并给 HiCache targets 追加 validation-only `state_snapshot` 字段。 |
 | `profiling.ld_preload.enabled` | 是否启用 LD_PRELOAD。 |
 | `profiling.ld_preload.library` | LD_PRELOAD so 路径，通常是 `build/docker/sglang/lib/libhook.so`。 |
 | `profiling.ld_preload.trace_output` | hook 输出文件基名；hook 会自动追加 `.rank<RANK>.pid<PID>.json`。 |
@@ -130,8 +131,10 @@ torch-only 与 NPU graph 会在 `prefetch_reuse_C` 阶段触发
 - 需要 torch trace 时，关闭 NPU graph，或先用更小 workload / 更窄 profiler activity
   做隔离验证。
 
-Base DAG 验证优先使用 SGLang 自带 `sglang.bench_serving`，避免 HiCache workload 和
-Python probe 干扰 DAG 本身。当前配置入口：
+Base DAG 验证优先使用 SGLang 自带 `sglang.bench_serving`，是为了先降低 workload 和
+采集组合变量，不是为了定义 faithful replay 过滤规则。原则上，faithful replay 应消费完整真实执行
+trace；如果某个实验采集了 HiCache 或 CPUInfer 真实执行事件，这些事件也应进入 merged trace 并参与
+base DAG 构建。当前配置入口：
 
 ```bash
 scripts/profile.sh configs/experiments/profiling_sglang_bench_serving_base_dag.json
@@ -219,6 +222,7 @@ LD_PRELOAD 示例：
 | `TRACE_SIM_PYTHON_PROBE_TARGETS` | JSON 数组，传给 callable probe。 |
 | `TRACE_SIM_PYTHON_PROBE_OUTPUT` | Chrome trace 输出目录。 |
 | `TRACE_SIM_PYTHON_PROBE_DEBUG=1` | 打开 probe debug 日志。 |
+| `TRACE_SIM_HICACHE_STATE_TRACE=1` | 只在 HiCache state validation 中启用，允许 `sglang.hicache` 采集 `state_snapshot`。 |
 
 `generic_callable` target 字段：
 
@@ -258,13 +262,40 @@ LD_PRELOAD 示例：
 用于按 SGLang HiCache page hash 规则生成 page identity。通用 `generic_callable`
 不包含 HiCache 特化 source。
 
+`page_hashes_concat:<prefix_tokens>,<tokens>,<page_size>[,<prior_hash>]` 也只由
+`sglang.hicache` probe 支持，用于先拼接两段 token path，再按目标 page size 重新
+计算完整 path 的 page identity。
+
+`page_hashes_after_prefix:<prefix_tokens>,<tokens>,<page_size>[,<prior_hash>]` 只由
+`sglang.hicache` probe 支持，用于 page size what-if 下的 prefetch。它用
+`prefix_tokens` 在目标 page size 下重新计算 parent hash，但只输出 `<tokens>` 对应的
+suffix pages，避免把已经命中的 prefix pages 混入 prefetch planned set。base run 的
+`last_hash` 属于 base page size，不能直接作为 target page size 的 parent hash。
+
 输出格式是 Chrome trace JSON：
 
 ```text
 trace/python_probe/python_probe_trace.rank<RANK>.pid<PID>.json
 ```
 
-每个事件的事实字段写在 `traceEvents[].args` 中。默认 modeling 输入应只读取 `model_input=true` 的事件。
+每个事件的事实字段写在 `traceEvents[].args` 中。Python probe 输出需要区分两类事件：
+
+| 事件类型 | 是否进入默认性能 trace | 说明 |
+| --- | --- | --- |
+| 真实执行事件 | 是，应设置 `model_input=true` | 例如 HiCache lookup/load/prefetch/insert/write/evict、CPUInfer submit/sync；这些事件代表业务执行路径，faithful replay 必须能消费。 |
+| 验证 / debug / oracle 事件 | 否，应设置 `model_input=false` 或输出到独立 state/debug trace | 例如完整 cache state snapshot、模型预测差异、probe 内部状态、质量审计证据；这些事件只服务 validation/debug，不能污染默认性能 DAG。 |
+
+默认 modeling 输入应消费真实执行事件。`model_input=false` 的 Python probe 事件只能由显式
+validation/debug 逻辑读取。
+
+当前 HiCache state validation 配置入口：
+
+```bash
+scripts/profile.sh configs/experiments/profiling_hicache_state_validation.json
+```
+
+该配置是 state-only 快速验证路径，只启用 `python_probe` 和 `ld_preload`，关闭 torch profiler。
+它不能替代 faithful replay；需要验证 base DAG 或 cache patch 时仍应使用完整真实执行 trace。
 
 ## LD_PRELOAD
 
@@ -360,10 +391,13 @@ wrapper 实现约定：
 - Python probe target 是否命中；
 - required 字段是否缺失；
 - `workload_report.json` 声明的 HiCache 机制是否实际出现；
-- 会改变 cache resident/dirty/backuped 状态的事件是否具备 page identity。
+- 会改变 cache resident/dirty/backuped 状态的事件是否具备 page identity；
+- HiCache state trace 开启时是否采到了 validation-only `state_snapshot.capacity`。
 
 controller start/enqueue 这类队列锚点允许 count-only；真正状态转移事件缺 page
-identity 时，`quality_ready=false`。
+identity 时，`quality_ready=false`。如果 `profiling.python_probe.state_trace.enabled=true`
+但没有任何 capacity snapshot，`quality_ready=false`，因为跨配置 capacity prediction
+缺少有效 budget 证据。
 
 ## 子模块采集矩阵
 
@@ -432,6 +466,7 @@ request enters scheduler
 | cache insert / update | `python_probe` | `operation_id`, `page_identity`, `num_pages`, `dirty`, `backuped` | 维护 resident、dirty、backuped 状态。 |
 | write / backup | `python_probe`, `ld_preload` | `operation_id`, `tier_src`, `tier_dst`, `page_identity`, `bytes`, `blocking` | 区分 write-through、write-back eviction 和 background write。 |
 | eviction / release | `python_probe` | `operation_id`, `evicted_pages`, `dirty_pages`, `capacity_reason` | 验证容量模型并决定是否触发 writeback。 |
+| lock ref | `python_probe` | `operation_id`, `page_identity`, `lock_delta`, `page_size` | 验证 request/load/prefetch/write 保护的 page 是否可被 eviction 选择。 |
 | storage read/write | `python_probe`，明确 native 符号后可补 `ld_preload` | `operation_id`, `request_id`, `hash_pages`, `completed_tokens`, `ts`, `dur` | 把 L3 查询、读取和写入绑定到 request/page 事实。 |
 
 HiCache 字段采集说明：
@@ -448,9 +483,11 @@ HiCache 字段采集说明：
 | `tier_src` / `tier_dst` | cache operation 参数或常量 | 判断 L3->L2、L2->L1、L1->L2、L2->L3 等移动方向。 |
 | `blocking` | 调用点语义或同步等待事件 | 区分 critical path 与后台搬运。 |
 | `policy` | 源配置或当前对象字段 | 记录源运行使用的 policy 输入，不在 probe 中推断目标 policy。 |
+| `capacity` | 仅 `state_trace.enabled=true` 时从 `HiRadixCache.cache_controller`、device pool 和 host pool introspection 采集 | 记录 L1/L2 capacity、available pages、prefetch threshold/capacity limit 和 write/prefetch policy，用于解释跨配置 state prediction 的有效 budget。 |
 | `deadline_us` / `window_us` | prefetch scheduler 参数 | 判断 timeout / best-effort 的证据。 |
 | `dirty` / `backuped` | cache page metadata | 验证 write-back/write-through 状态。 |
 | `capacity_reason` | evict 调用上下文或容量字段 | 解释 eviction 是否由容量触发。 |
+| `lock_ref` / `lock_delta` | `HiRadixCache.inc_lock_ref` / `dec_lock_ref` 参数、返回值或 state snapshot node 字段 | 维护 `locked_pages`，判断 page 是否 evictable。 |
 
 HiCache 默认不采：
 
@@ -461,6 +498,10 @@ HiCache 默认不采：
 - 目标 scenario 的 replay 行为。
 
 这些内容属于 modeling，不属于 profiling。
+
+`HiRadixCache.inc_lock_ref` / `dec_lock_ref` 会沿父链更新到 root。root 节点没有 page
+identity，且 `lock_delta=0` 时只是 no-op 观测；质量审计不把这类事件计入缺失 page
+identity。非 root lock 事件仍必须采到 `page_identity`，否则 HiCache state replay 不能通过。
 
 当前 SGLang HiCache Python probe target set：
 
@@ -477,6 +518,8 @@ HiCache 默认不采：
 | `hiradix.write_backup` | `HiRadixCache.write_backup` | 记录 L1->L2 backup / write_back。 |
 | `hiradix.write_backup_storage` | `HiRadixCache.write_backup_storage` | 记录 L2->L3 storage write 计划。 |
 | `hiradix.evict` | `HiRadixCache.evict` | 记录 device eviction 触发和结果。 |
+| `hiradix.inc_lock_ref` | `HiRadixCache.inc_lock_ref` | 记录 page lock ref 增加，辅助验证 evictable 状态。 |
+| `hiradix.dec_lock_ref` | `HiRadixCache.dec_lock_ref` | 记录 page lock ref 减少，辅助验证 evictable 状态。 |
 | `controller.load` | `HiCacheController.load` | 记录 L2->L1 load enqueue。 |
 | `controller.start_loading` | `HiCacheController.start_loading` | 记录 L2->L1 load stream 启动。 |
 | `controller.write` | `HiCacheController.write` | 记录 L1->L2 write enqueue。 |
@@ -502,6 +545,10 @@ HiCache 默认不采：
 | `sidecar.python_probe_dir` | Python probe trace 目录。 |
 
 默认 modeling 输入只能消费干净 trace 和 sidecar。Debug 日志、probe patch 状态、质量统计和临时诊断必须由显式 debug 开关输出，并与默认输入分离。
+
+这里的“干净 trace”不是指删除 HiCache、CPUInfer 或其他领域的真实执行事件，而是指默认性能输入中
+不能混入非执行类 state snapshot、oracle、debug 和质量审计事件。真实执行事件属于 faithful replay 的
+必要输入；验证类事件属于辅助输入。
 
 ## 质量审计
 

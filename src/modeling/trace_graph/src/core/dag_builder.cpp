@@ -48,9 +48,7 @@ bool is_stream_sync_event(const std::string & name) {
     return name == "AscendCL@aclrtSynchronizeStream" || name == "AscendCL@aclrtSynchronizeStreamWithTimeout";
 }
 
-bool is_event_sync_event(const std::string & name) {
-    return name == "AscendCL@aclrtSynchronizeEvent" || name == "AscendCL@aclrtSynchronizeEventWithTimeout";
-}
+bool is_event_sync_event(const std::string & name) { return name == "AscendCL@aclrtSynchronizeEvent" || name == "AscendCL@aclrtSynchronizeEventWithTimeout"; }
 
 bool is_device_sync_event(const std::string & name) {
     return name == "AscendCL@aclrtSynchronizeDevice" || name == "AscendCL@aclrtSynchronizeDeviceWithTimeout";
@@ -239,8 +237,8 @@ bool DagBuilder::is_device_event(const TraceEvent & event) {
 
 bool DagBuilder::is_hicache_event(const TraceEvent & event) {
     auto domain = event.arg("domain");
-    return event.cat == "hicache" || starts_with(event.name, "HiCache::") || starts_with(event.name, "hicache_") || domain == "hicache"
-        || (domain == "python_probe" && event.name.find("hicache") != std::string::npos);
+    return event.cat == "hicache" || starts_with(event.name, "HiCache::") || starts_with(event.name, "hicache_") || domain == "hicache" ||
+           (domain == "python_probe" && event.name.find("hicache") != std::string::npos);
 }
 
 std::string DagBuilder::lane_key(const TraceEvent & event) {
@@ -303,7 +301,8 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
 
         // 特殊事件只在这里分类一次。LD_PRELOAD wrapper 名称必须在这里显式识别，
         // 否则它只会作为普通 CPU 节点进入 DAG，不会产生 sync 语义边。
-        if (event.name == "EVENT_RECORD") index.event_record_nodes.push_back(node_id);
+        if (event.name == "EVENT_RECORD")
+            index.event_record_nodes.push_back(node_id);
         else if (event.name == "EVENT_WAIT") {
             // 老版 TraceGraph 把 EVENT_WAIT 向后挪 1ns，并把正 duration 减 1ns。
             // 这样 record/wait 在相同 timestamp 附近时不会形成自相矛盾边界。
@@ -311,11 +310,16 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
             if (event.dur > 0) event.dur -= 1;
             index.event_wait_nodes.push_back(node_id);
         }
-        else if (is_stream_sync_event(event.name)) index.stream_sync_nodes.push_back(node_id);
-        else if (is_event_sync_event(event.name)) index.event_sync_nodes.push_back(node_id);
-        else if (is_device_sync_event(event.name)) index.device_sync_nodes.push_back(node_id);
-        else if (event.name == "NOTIFY_RECORD") index.notify_record_nodes.push_back(node_id);
-        else if (event.name == "MODEL_EXECUTE") index.model_execute_nodes.push_back(node_id);
+        else if (is_stream_sync_event(event.name))
+            index.stream_sync_nodes.push_back(node_id);
+        else if (is_event_sync_event(event.name))
+            index.event_sync_nodes.push_back(node_id);
+        else if (is_device_sync_event(event.name))
+            index.device_sync_nodes.push_back(node_id);
+        else if (event.name == "NOTIFY_RECORD")
+            index.notify_record_nodes.push_back(node_id);
+        else if (event.name == "MODEL_EXECUTE")
+            index.model_execute_nodes.push_back(node_id);
     }
     return index;
 }
@@ -438,9 +442,8 @@ void DagBuilder::add_event_wait_edges(DagGraph & graph, BuildIndex & index) cons
             // 零 duration 的 EVENT_WAIT 不能匹配同 timestamp 的 EVENT_RECORD。
             // 否则大时间戳 double 精度会把 ts - 0.1 四舍五入回 ts，多生成 sync 边。
             auto bound_value = wait_event.ts > 0 ? wait_event.ts - 1 : 0;
-            bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) {
-                return value < graph.event_for_node(node_id).ts;
-            });
+            bound = std::upper_bound(
+                records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) { return value < graph.event_for_node(node_id).ts; });
         }
         else {
             auto bound_value = static_cast<double>(wait_event.ts) + static_cast<double>(wait_event.dur) - 0.1;
@@ -545,9 +548,8 @@ void DagBuilder::add_stream_sync_edges(DagGraph & graph, BuildIndex & index) con
             auto & nodes = index.lane_to_nodes[lane];
             // lower_bound 查找 launch time 早于 sync 开始的最后一个节点。
             // 使用 launchts 而不是 event.ts，是为了把 CPU launch 与 device kernel 的提交关系考虑进去。
-            auto bound = std::lower_bound(nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) {
-                return event_launch_ts(graph, node_id) < value;
-            });
+            auto bound = std::lower_bound(
+                nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) { return event_launch_ts(graph, node_id) < value; });
             if (bound == nodes.begin()) continue;
             --bound;
             graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
@@ -563,7 +565,8 @@ void DagBuilder::add_event_sync_edges(DagGraph & graph, BuildIndex & index) cons
         auto event_id = event_id_from_cpu_record(sync_event);
         if (!event_id && sync_event.has_arg("connection_id")) {
             auto conn_it = index.connection_to_nodes.find(sync_event.arg("connection_id"));
-            if (conn_it != index.connection_to_nodes.end() && !conn_it->second.empty()) event_id = event_id_from_cpu_record(graph.event_for_node(conn_it->second.front()));
+            if (conn_it != index.connection_to_nodes.end() && !conn_it->second.empty())
+                event_id = event_id_from_cpu_record(graph.event_for_node(conn_it->second.front()));
         }
         if (!event_id) continue;
         auto records_it = index.event_id_to_nodes.find(*event_id);
@@ -571,9 +574,8 @@ void DagBuilder::add_event_sync_edges(DagGraph & graph, BuildIndex & index) cons
 
         auto & records = records_it->second;
         auto bound_value = node_end_ts(sync_event);
-        auto bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) {
-            return value < graph.event_for_node(node_id).ts;
-        });
+        auto bound = std::upper_bound(
+            records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) { return value < graph.event_for_node(node_id).ts; });
         if (bound == records.begin()) continue;
         --bound;
         graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
@@ -588,9 +590,8 @@ void DagBuilder::add_device_sync_edges(DagGraph & graph, BuildIndex & index) con
         for (const auto & item : index.lane_to_nodes) {
             if (graph.is_cpu_lane(item.first)) continue;
             auto & nodes = index.lane_to_nodes[item.first];
-            auto bound = std::lower_bound(nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) {
-                return event_launch_ts(graph, node_id) < value;
-            });
+            auto bound = std::lower_bound(
+                nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) { return event_launch_ts(graph, node_id) < value; });
             if (bound == nodes.begin()) continue;
             --bound;
             graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);

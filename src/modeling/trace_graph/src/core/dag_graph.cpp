@@ -78,7 +78,7 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, const std::string & l
 void DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind) {
     if (src >= nodes_.size() || dst >= nodes_.size()) { throw std::out_of_range("DAG edge endpoint is out of range"); }
     // 当前不做边去重。重复边不会改变 critical path，但会增加 indegree 和 summary edge_count。
-    edges_.push_back(DagEdge{ src, dst, kind });
+    edges_.push_back(DagEdge{src, dst, kind});
 }
 
 const TraceEvent & DagGraph::event(size_t event_index) const {
@@ -164,7 +164,7 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
             copy.event_index += event_offset;
             merged.nodes_.push_back(std::move(copy));
         }
-        for (const auto & edge : graph.edges_) { merged.edges_.push_back(DagEdge{ edge.src + node_offset, edge.dst + node_offset, edge.kind }); }
+        for (const auto & edge : graph.edges_) { merged.edges_.push_back(DagEdge{edge.src + node_offset, edge.dst + node_offset, edge.kind}); }
         for (const auto & lane : graph.cpu_lanes_) { merged.cpu_lanes_.insert(lane); }
         for (const auto & node : graph.nodes_) {
             auto it = node.attrs.find("name");
@@ -198,7 +198,7 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
         for (size_t comm_index = 0; comm_index < max_count; ++comm_index) {
             std::vector<std::pair<int, size_t>> current;
             for (const auto & by_gpu : group_item.second) {
-                if (comm_index < by_gpu.second.size()) current.push_back({ by_gpu.first, by_gpu.second[comm_index] });
+                if (comm_index < by_gpu.second.size()) current.push_back({by_gpu.first, by_gpu.second[comm_index]});
             }
 
             uint64_t min_time = 0;
@@ -223,7 +223,7 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
                 if (next_global >= merged.nodes_.size()) continue;
                 for (const auto & other : current) {
                     if (other.first == item.first && other.second == item.second) continue;
-                    merged.edges_.push_back(DagEdge{ other.second, next_global, DagEdgeKind::HCCL });
+                    merged.edges_.push_back(DagEdge{other.second, next_global, DagEdgeKind::HCCL});
                 }
             }
             if (min_time > 0) {

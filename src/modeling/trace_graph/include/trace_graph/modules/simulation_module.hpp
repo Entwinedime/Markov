@@ -11,7 +11,7 @@ namespace TraceGraph {
 // 模块可以读取 graph 中的 trace fact、维护内部状态、修改 node/edge/duration，
 // 但不应该修改原始 trace 文件，也不应该把 debug 信息混入默认 prediction.json。
 class SimulationModule {
-public:
+  public:
     virtual ~SimulationModule() = default;
 
     // 稳定模块名，用于 registry、summary 和 debug 归属。

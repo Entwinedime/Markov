@@ -8,21 +8,21 @@
 namespace HookFrameWork {
 
 struct FunctionScope {
-    uintptr_t begin{ 0 };
-    uintptr_t end{ 0 };
+    uintptr_t begin{0};
+    uintptr_t end{0};
 
     bool Contains(uintptr_t pc) const { return begin != 0 && end > begin && pc >= begin && pc < end; }
 };
 
 class ScopeRegistry {
-public:
+  public:
     static ScopeRegistry & Get();
 
     void RegisterScope(const std::string & scope_name, const FunctionScope & scope);
     bool Contains(uintptr_t pc) const;
     bool ContainsInScope(const std::string & scope_name, uintptr_t pc) const;
 
-private:
+  private:
     struct ScopeEntry {
         std::string scope_name;
         FunctionScope scope;

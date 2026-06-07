@@ -19,10 +19,10 @@ namespace TraceGraph {
 //
 // what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
 class DagBuilder {
-public:
+  public:
     DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
 
-private:
+  private:
     // 构图过程中反复需要按不同 key 查节点。BuildIndex 只在一次 build 内有效。
     struct BuildIndex {
         // lane -> node ids，用于同 lane 顺序边和 stream sync 查找。

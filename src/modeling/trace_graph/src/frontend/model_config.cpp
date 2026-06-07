@@ -73,6 +73,12 @@ double number_value(const Json & object, const std::string & key, double def) {
     return def;
 }
 
+uint64_t u64_value(const Json & object, const std::string & key, uint64_t def) {
+    auto number = number_value(object, key, static_cast<double>(def));
+    if (number < 0) return def;
+    return static_cast<uint64_t>(number);
+}
+
 bool bool_value(const Json & object, const std::string & key, bool def) {
     // 布尔值支持 true/false 和常见字符串写法。
     if (!object.is_object()) return def;
@@ -126,22 +132,35 @@ NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
 }
 
 HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
-    // HiCache 当前先解析 enabled 开关；page size、capacity、policy 等参数后续从这里扩展。
+    // HiCache state prediction 只读取配置事实，不在这里推导策略结果。
     HiCacheConfig config;
     auto it = root.find("hicache");
     if (it == root.end() || !it->is_object()) {
         config.enabled = module_enabled;
         return config;
     }
-    config.enabled = bool_value(*it, "enabled", true);
+    const auto & object = *it;
+    config.enabled = bool_value(object, "enabled", true);
+    config.page_size = u64_value(object, "page_size", 0);
+    config.l1_capacity_pages = u64_value(object, "l1_capacity_pages", u64_value(object, "l1_capacity", 0));
+    config.l2_capacity_pages = u64_value(object, "l2_capacity_pages", u64_value(object, "l2_capacity", 0));
+    config.write_policy = lower(string_value(object, "write_policy", "observed"));
+    config.write_through_threshold = u64_value(object, "write_through_threshold", 0);
+    config.prefetch_policy = lower(string_value(object, "prefetch_policy", string_value(object, "storage_prefetch_policy", "observed")));
+    const bool has_timeout_base = object.contains("prefetch_timeout_base_sec") || object.contains("prefetch_timeout_base");
+    const bool has_timeout_per = object.contains("prefetch_timeout_per_ki_token_sec") || object.contains("prefetch_timeout_per_ki_token");
+    const bool has_timeout_max = object.contains("prefetch_timeout_max_sec") || object.contains("prefetch_timeout_max");
+    config.prefetch_timeout_configured = has_timeout_base || has_timeout_per || has_timeout_max;
+    config.prefetch_timeout_base_sec = number_value(object, "prefetch_timeout_base_sec", number_value(object, "prefetch_timeout_base", 0.0));
+    config.prefetch_timeout_per_ki_token_sec =
+        number_value(object, "prefetch_timeout_per_ki_token_sec", number_value(object, "prefetch_timeout_per_ki_token", 0.0));
+    config.prefetch_timeout_max_sec = number_value(object, "prefetch_timeout_max_sec", number_value(object, "prefetch_timeout_max", 0.0));
     return config;
 }
 
 } // namespace
 
-bool ModelConfig::module_enabled(const std::string & name) const {
-    return std::find(modules.begin(), modules.end(), name) != modules.end();
-}
+bool ModelConfig::module_enabled(const std::string & name) const { return std::find(modules.begin(), modules.end(), name) != modules.end(); }
 
 ModelConfig ModelConfig::from_file(const std::string & filename) {
     // C++ 后端只消费窄 model config，不直接理解完整实验配置。

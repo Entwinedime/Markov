@@ -8,7 +8,7 @@ namespace TraceGraph {
 // SimulationModule 包装层，负责把 C++ module registry 接入 hicache_model。
 // 具体 cache 状态逻辑不要写在这个薄包装类里。
 class HiCacheModule final : public SimulationModule {
-public:
+  public:
     explicit HiCacheModule(HiCacheConfig config);
 
     std::string name() const override;
@@ -18,7 +18,7 @@ public:
 
     const HiCacheSummary & summary() const { return summary_; }
 
-private:
+  private:
     HiCacheConfig config_;
     HiCacheSummary summary_;
     bool applied_ = false;

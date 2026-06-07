@@ -6,7 +6,7 @@
 namespace TraceGraph {
 
 class Logger {
-public:
+  public:
     enum Level : int { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3, OFF = 4 };
 
     static Logger & instance();
@@ -17,7 +17,7 @@ public:
     // RAII 日志行构造器：析构时一次性写出整行，避免多线程下半行日志交错。
     // 用户可见日志内容保持英文；这里的注释说明实现约束。
     class Line {
-    public:
+      public:
         Line(Level lv, bool active, std::mutex * mtx);
         ~Line();
         Line(Line &&) = default;
@@ -28,7 +28,7 @@ public:
             return *this;
         }
 
-    private:
+      private:
         std::ostringstream ss_;
         Level lv_;
         bool active_;
@@ -40,7 +40,7 @@ public:
     Line warn() { return Line(WARN, level_ <= WARN, &mtx_); }
     Line error() { return Line(ERROR, level_ <= ERROR, &mtx_); }
 
-private:
+  private:
     Logger() = default;
 
     Level level_ = INFO;

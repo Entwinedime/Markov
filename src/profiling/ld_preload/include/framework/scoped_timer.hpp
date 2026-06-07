@@ -20,7 +20,7 @@
 namespace HookFrameWork {
 
 class ScopedTimer {
-public:
+  public:
     explicit ScopedTimer(const std::string & name, std::initializer_list<HookArgInfo> trace_args) : name_(name), start_us_(GetRealtimeUs()) {
 
         pmu_snapshot_ok_ = PmuRecorder::Get().ReadSnapshot(&start_pmu_);
@@ -30,28 +30,29 @@ public:
         for (const auto & arg_info : trace_args) { oss << "\"" << EscapeJsonString(arg_info.name) << "\": \"" << arg_info.value_in_string << "\", "; }
         std::string function_args_str = oss.str();
         if (function_args_str[function_args_str.length() - 1] == '{') { function_args_str_ = function_args_str + "}"; }
-        else { function_args_str_ = function_args_str.substr(0, function_args_str.length() - 2) + "}"; }
+        else {
+            function_args_str_ = function_args_str.substr(0, function_args_str.length() - 2) + "}";
+        }
     }
 
     ~ScopedTimer() {
-        const pid_t tid{ static_cast<pid_t>(syscall(SYS_gettid)) };
-        const uint64_t dur_us{ GetRealtimeUs() - start_us_ };
-        const std::string args_str{ "\"args\": {"
-                                    "\"schema_version\": 1, "
-                                    "\"model_input\": true, "
-                                    "\"domain\": \"ld_preload\", "
-                                    "\"event_kind\": \"runtime_op\", "
-                                    "\"hook_profile\": \"" +
-                                    std::string(HOOK_PROFILE_NAME) +
-                                    "\", "
-                                    "\"hook_event_name\": \"" +
-                                    EscapeJsonString(name_) +
-                                    "\", " + function_args_str_ + ", " + ProcessPMUSnapshot() + "}" };
+        const pid_t tid{static_cast<pid_t>(syscall(SYS_gettid))};
+        const uint64_t dur_us{GetRealtimeUs() - start_us_};
+        const std::string args_str{"\"args\": {"
+                                   "\"schema_version\": 1, "
+                                   "\"model_input\": true, "
+                                   "\"domain\": \"ld_preload\", "
+                                   "\"event_kind\": \"runtime_op\", "
+                                   "\"hook_profile\": \"" +
+                                   std::string(HOOK_PROFILE_NAME) +
+                                   "\", "
+                                   "\"hook_event_name\": \"" +
+                                   EscapeJsonString(name_) + "\", " + function_args_str_ + ", " + ProcessPMUSnapshot() + "}"};
 
         TraceLogger::Get().LogEvent(name_, start_us_, dur_us, tid, args_str);
     }
 
-private:
+  private:
     static uint64_t GetRealtimeUs() {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -64,7 +65,7 @@ private:
         std::ostringstream oss;
         oss << "\"Perf-Events\": {";
 
-        const bool can_emit_pmu{ pmu_snapshot_ok_ && PmuRecorder::Get().ReadSnapshot(&end_pmu) && end_pmu.IsCompatibleWith(start_pmu_) };
+        const bool can_emit_pmu{pmu_snapshot_ok_ && PmuRecorder::Get().ReadSnapshot(&end_pmu) && end_pmu.IsCompatibleWith(start_pmu_)};
         if (can_emit_pmu) {
             std::vector<long long> pmu_deltas = end_pmu.DeltaFrom(start_pmu_);
             if (pmu_deltas.size() != end_pmu.event_names.size()) { return "PMU data error"; }
@@ -75,14 +76,16 @@ private:
 
         std::string result = oss.str();
         if (result[result.length() - 1] == '{') { result += "}"; }
-        else { result = result.substr(0, result.length() - 2) + "}"; }
+        else {
+            result = result.substr(0, result.length() - 2) + "}";
+        }
         return result;
     }
 
     const std::string name_;
     const uint64_t start_us_;
     PmuSnapshot start_pmu_;
-    bool pmu_snapshot_ok_{ false };
+    bool pmu_snapshot_ok_{false};
     std::string function_args_str_;
 };
 

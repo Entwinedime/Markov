@@ -49,7 +49,7 @@ struct DagNode {
 // DagGraph 持有归一化事件、DAG 节点、DAG 边和仿真统计。
 // 它不负责解释 trace 语义；语义边由 DagBuilder 或 SimulationModule 添加。
 class DagGraph {
-public:
+  public:
     explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0);
 
     // 创建节点时只设置基础属性，不自动加任何依赖边。
@@ -96,7 +96,7 @@ public:
     // 目前只在 merge 阶段建立 HCCL 跨 rank 约束；其他跨 rank 语义需要后续子模块补充。
     static DagGraph merge(std::vector<DagGraph> graphs);
 
-private:
+  private:
     // events_ 保存所有被 parser 接受的 duration event；不包含 metadata / flow event。
     std::vector<TraceEvent> events_;
     std::vector<DagNode> nodes_;

@@ -99,6 +99,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         for channel in profiling.get("channels_enabled") or []
         if isinstance(channel, str)
     }
+    hicache_state_trace_enabled = bool(profiling.get("python_state_trace_enabled", False))
     python_channel_enabled = "python" in channels_enabled or bool(configured_targets)
     target_quality = {
         target_id: TargetQuality(
@@ -115,9 +116,13 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     page_identity = Counter()
     mechanism_counts = Counter()
     page_identity_required = Counter()
+    capacity_accumulator = _new_hicache_capacity_accumulator()
     for event in events:
         raw_args = event.get("args")
         if not isinstance(raw_args, dict):
+            continue
+        _observe_hicache_capacity(capacity_accumulator, raw_args)
+        if _false_like(raw_args.get("model_input")):
             continue
         _observe_page_identity(page_identity, raw_args)
         _observe_mechanism(mechanism_counts, raw_args)
@@ -167,6 +172,8 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         errors.append("expected_hicache_mechanisms_missing")
     if page_identity_required["required_events_missing_page_identity"] > 0:
         errors.append("stateful_hicache_page_identity_missing")
+    if hicache_state_trace_enabled and capacity_accumulator["snapshot_count"] <= 0:
+        errors.append("hicache_capacity_snapshot_missing")
 
     torch_files = _existing_paths(trace.get("torch_trace_files", []))
     if not torch_files:
@@ -206,6 +213,9 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         "expected_cache_mechanisms": expected_mechanisms,
         "observed_cache_mechanisms": dict(sorted(mechanism_counts.items())),
         "missing_cache_mechanisms": missing_mechanisms,
+        "hicache_state_trace_enabled": hicache_state_trace_enabled,
+        "hicache_capacity_observed": capacity_accumulator["snapshot_count"] > 0,
+        "hicache_capacity": _finalize_hicache_capacity(capacity_accumulator),
         "unknown_targets": sorted(unknown_targets),
         "targets": {
             target_id: quality.to_dict()
@@ -333,6 +343,7 @@ _NON_OPERATION_ROLES = {
     "prefetch_progress",
     "prefetch_loaded_tokens",
     "l3_hit_query",
+    "evict_summary",
 }
 
 
@@ -348,6 +359,9 @@ _ROLE_TO_MECHANISM = {
     "write_backup": "write_backup",
     "write_storage_schedule": "write_storage",
     "evict": "evict",
+    "remove_page": "evict",
+    "lock_ref_inc": "lock_ref",
+    "lock_ref_dec": "lock_ref",
     "l2_to_l1_enqueue": "load_back",
     "l2_to_l1_start": "load_back",
     "l1_to_l2_enqueue": "write_backup",
@@ -371,6 +385,9 @@ _PAGE_IDENTITY_REQUIRED_ROLES = {
     "l2_to_l3_enqueue",
     "l2_to_l3_transfer",
     "evict",
+    "remove_page",
+    "lock_ref_inc",
+    "lock_ref_dec",
 }
 
 
@@ -413,6 +430,12 @@ def _observe_required_page_identity(counter: Counter[str], args: dict[str, Any])
     event_role = str(args.get("event_role") or "")
     if event_role not in _PAGE_IDENTITY_REQUIRED_ROLES:
         return
+    if event_role == "insert" and _int_arg(args, "insert_tokens") == 0 and _int_arg(args, "value_tokens") == 0:
+        return
+    if event_role in {"prefetch_schedule", "l3_prefetch_enqueue"} and _int_arg(args, "new_input_tokens") < max(1, _int_arg(args, "page_size")):
+        return
+    if event_role in {"lock_ref_inc", "lock_ref_dec"} and not _has_page_identity(args) and _int_arg(args, "lock_delta") == 0:
+        return
     counter["required_events"] += 1
     if _has_page_identity(args):
         counter["required_events_with_page_identity"] += 1
@@ -427,6 +450,85 @@ def _has_page_identity(args: dict[str, Any]) -> bool:
     if isinstance(value, list):
         return len(value) > 0
     return True
+
+
+def _false_like(value: Any) -> bool:
+    return str(value).lower() in {"false", "0", "no", "off"}
+
+
+def _int_arg(args: dict[str, Any], key: str) -> int:
+    try:
+        return int(args.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _new_hicache_capacity_accumulator() -> dict[str, Any]:
+    return {
+        "snapshot_count": 0,
+        "object_type_counts": Counter(),
+        "unique_values": defaultdict(set),
+        "samples": [],
+    }
+
+
+def _observe_hicache_capacity(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """从 validation-only state snapshot 中汇总 capacity/policy 证据。"""
+
+    if str(args.get("event_kind") or "") != "state_snapshot":
+        return
+    snapshot = args.get("state_snapshot")
+    if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
+        return
+    capacity = snapshot.get("capacity")
+    if not isinstance(capacity, dict):
+        return
+    accumulator["snapshot_count"] += 1
+    object_type = str(snapshot.get("object_type") or "unknown")
+    accumulator["object_type_counts"][object_type] += 1
+    for key, value in _flatten_capacity_scalars(capacity):
+        accumulator["unique_values"][key].add(json.dumps(value, ensure_ascii=False, sort_keys=True))
+    if len(accumulator["samples"]) < 5:
+        accumulator["samples"].append(
+            {
+                "object_type": object_type,
+                "page_size": capacity.get("page_size"),
+                "write_policy": capacity.get("write_policy"),
+                "prefetch_policy": capacity.get("prefetch_policy"),
+                "l1_capacity_pages": capacity.get("l1_capacity_pages"),
+                "l1_available_pages": capacity.get("l1_available_pages"),
+                "l2_capacity_pages": capacity.get("l2_capacity_pages"),
+                "l2_available_pages": capacity.get("l2_available_pages"),
+                "prefetch_capacity_limit_pages": capacity.get("prefetch_capacity_limit_pages"),
+            }
+        )
+
+
+def _finalize_hicache_capacity(accumulator: dict[str, Any]) -> dict[str, Any]:
+    unique_values = {}
+    for key, values in sorted(accumulator["unique_values"].items()):
+        unique_values[key] = [json.loads(value) for value in sorted(values)]
+    return {
+        "ready": accumulator["snapshot_count"] > 0,
+        "snapshot_count": accumulator["snapshot_count"],
+        "object_type_counts": dict(sorted(accumulator["object_type_counts"].items())),
+        "unique_values": unique_values,
+        "samples": accumulator["samples"],
+    }
+
+
+def _flatten_capacity_scalars(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    rows: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        for key, item in sorted(value.items()):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            rows.extend(_flatten_capacity_scalars(item, child_prefix))
+        return rows
+    if value is None or isinstance(value, (list, tuple, set)):
+        return rows
+    if isinstance(value, (str, int, float, bool)):
+        rows.append((prefix, value))
+    return rows
 
 
 def _add_optional(values: set[str], value: Any) -> None:

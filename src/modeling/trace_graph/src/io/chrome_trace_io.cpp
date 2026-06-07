@@ -4,11 +4,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <cctype>
 #include <string_view>
+#include <unordered_map>
 
 namespace TraceGraph {
 
@@ -61,6 +63,26 @@ std::string json_string(const Json & object, const std::string & key, const std:
     return it == object.end() ? fallback : scalar_to_string(*it);
 }
 
+std::string lower_string(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+bool false_like_arg(const std::unordered_map<std::string, std::string> & args, const std::string & key) {
+    auto it = args.find(key);
+    if (it == args.end()) return false;
+    auto value = lower_string(it->second);
+    return value == "false" || value == "0" || value == "no" || value == "off";
+}
+
+bool validation_only_event(const TraceEvent & event) {
+    // validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
+    // 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
+    if (false_like_arg(event.args, "model_input")) return true;
+    auto kind = lower_string(event.arg("event_kind"));
+    return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff" || kind == "profiling_quality";
+}
+
 void flatten_args(const Json & value, const std::string & prefix, std::unordered_map<std::string, std::string> & args) {
     // 递归展开对象字段，形如 Function-Args.stream。
     // 当前 TraceScanner 没有调用这个函数；如果未来切回 DOM parser，应复用这里的展开规则。
@@ -85,7 +107,7 @@ Json load_json_file(const std::string & filename) {
 }
 
 class TraceScanner {
-public:
+  public:
     explicit TraceScanner(std::string buffer) : buffer_(std::move(buffer)), p_(buffer_.data()), end_(buffer_.data() + buffer_.size()) {}
 
     std::vector<TraceEvent> parse() {
@@ -114,7 +136,7 @@ public:
         return {};
     }
 
-private:
+  private:
     void skip_ws() {
         while (p_ < end_ && static_cast<unsigned char>(*p_) <= ' ') ++p_;
     }
@@ -153,7 +175,8 @@ private:
             ++p_;
             int depth = 1;
             while (p_ < end_ && depth > 0) {
-                if (*p_ == '"') parse_string();
+                if (*p_ == '"')
+                    parse_string();
                 else if (*p_ == '{') {
                     ++depth;
                     ++p_;
@@ -162,7 +185,8 @@ private:
                     --depth;
                     ++p_;
                 }
-                else ++p_;
+                else
+                    ++p_;
             }
             return;
         }
@@ -170,7 +194,8 @@ private:
             ++p_;
             int depth = 1;
             while (p_ < end_ && depth > 0) {
-                if (*p_ == '"') parse_string();
+                if (*p_ == '"')
+                    parse_string();
                 else if (*p_ == '[') {
                     ++depth;
                     ++p_;
@@ -179,7 +204,8 @@ private:
                     --depth;
                     ++p_;
                 }
-                else ++p_;
+                else
+                    ++p_;
             }
             return;
         }
@@ -189,8 +215,10 @@ private:
     uint64_t parse_u64_value() {
         // Chrome trace 的 ts/dur 可能是整数、浮点或字符串。这里统一截断到 uint64 ns/us 单位。
         std::string raw;
-        if (p_ < end_ && *p_ == '"') raw = parse_string();
-        else raw = parse_primitive();
+        if (p_ < end_ && *p_ == '"')
+            raw = parse_string();
+        else
+            raw = parse_primitive();
         try {
             double value = std::stod(raw);
             return value >= 0.0 ? static_cast<uint64_t>(value) : 0;
@@ -233,8 +261,10 @@ private:
                 skip_ws();
                 if (p_ < end_ && *p_ == ':') ++p_;
                 skip_ws();
-                if (p_ < end_ && (*p_ == '{' || *p_ == '[')) args[key] = parse_compound_value_literal();
-                else args[key] = parse_scalar_value();
+                if (p_ < end_ && (*p_ == '{' || *p_ == '['))
+                    args[key] = parse_compound_value_literal();
+                else
+                    args[key] = parse_scalar_value();
             }
             else {
                 ++p_;
@@ -263,19 +293,28 @@ private:
                 if (p_ < end_ && *p_ == ':') ++p_;
                 skip_ws();
 
-                if (key == "name") event.name = parse_scalar_value();
-                else if (key == "cat") event.cat = parse_scalar_value();
+                if (key == "name")
+                    event.name = parse_scalar_value();
+                else if (key == "cat")
+                    event.cat = parse_scalar_value();
                 else if (key == "ph") {
                     event.ph = parse_scalar_value();
                     saw_phase = true;
                 }
-                else if (key == "ts") event.ts = parse_u64_value();
-                else if (key == "dur") event.dur = parse_u64_value();
-                else if (key == "pid") event.pid = parse_scalar_value();
-                else if (key == "tid") event.tid = parse_scalar_value();
-                else if (key == "event_id") event.event_id = parse_scalar_value();
-                else if (key == "args") parse_args(event.args);
-                else skip_value();
+                else if (key == "ts")
+                    event.ts = parse_u64_value();
+                else if (key == "dur")
+                    event.dur = parse_u64_value();
+                else if (key == "pid")
+                    event.pid = parse_scalar_value();
+                else if (key == "tid")
+                    event.tid = parse_scalar_value();
+                else if (key == "event_id")
+                    event.event_id = parse_scalar_value();
+                else if (key == "args")
+                    parse_args(event.args);
+                else
+                    skip_value();
             }
             else {
                 ++p_;
@@ -292,8 +331,8 @@ private:
         event.args["tid"] = event.tid;
         // 当前后端只支持完整 duration event。metadata 和 flow event 不是可执行节点；
         // 如果未来需要使用 flow，需要单独解析为依赖边，而不是当作 0 时长节点。
-        valid = saw_phase && event.ph == "X" && !event.name.empty() && event.name != "Free" && event.name != "Computing"
-            && event.name != "Communication" && event.name != "Communication(Not Overlapped)";
+        valid = saw_phase && event.ph == "X" && !event.name.empty() && !validation_only_event(event) && event.name != "Free" && event.name != "Computing" &&
+                event.name != "Communication" && event.name != "Communication(Not Overlapped)";
         return event;
     }
 

@@ -42,6 +42,7 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_PYTHON_PROBE_TARGETS",
     "TRACE_SIM_PYTHON_PROBE_OUTPUT",
     "TRACE_SIM_PYTHON_PROBE_DEBUG",
+    "TRACE_SIM_HICACHE_STATE_TRACE",
 )
 
 
@@ -212,6 +213,25 @@ def expand_command_placeholders(command: list[str] | str, layout: RunLayout) -> 
     if isinstance(command, list):
         return [expand(item) for item in command]
     return expand(command)
+
+
+def expand_layout_placeholders(value: str, layout: RunLayout) -> str:
+    """替换配置字符串中的运行目录占位符。
+
+    server / bench 命令和 env 都使用同一套占位符，避免实验配置把
+    HiCache storage 或 trace 输出写死到全局目录，污染跨配置验证。
+    """
+
+    replacements = {
+        "{run_dir}": str(layout.run_dir),
+        "{trace_dir}": str(layout.trace_dir),
+        "{bench_dir}": str(layout.bench_dir),
+        "{log_dir}": str(layout.log_dir),
+    }
+    result = value
+    for placeholder, replacement in replacements.items():
+        result = result.replace(placeholder, replacement)
+    return result
 
 
 def append_cli_arg(command: list[str], key: str, value: Any) -> None:
@@ -551,7 +571,7 @@ class ProfileRun:
 
         env = os.environ.copy()
         for key, value in self.cfg.get("env", {}).items():
-            env[str(key)] = str(value)
+            env[str(key)] = expand_layout_placeholders(str(value), self.layout)
 
         self._apply_sglang_defaults(env)
         env["SGLANG_TORCH_PROFILER_DIR"] = str(self.layout.torch_trace_dir)
@@ -580,12 +600,53 @@ class ProfileRun:
         env["TRACE_SIM_PYTHON_PROBE"] = "1"
         env["TRACE_SIM_PYTHON_PROBES"] = ",".join(self.runtime.python_probes)
         env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(
-            list(self.runtime.python_targets),
+            self._python_probe_targets_for_env(),
             ensure_ascii=False,
         )
         env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
+        if self._hicache_state_trace_enabled():
+            env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
         if self.runtime.debug:
             env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
+
+    def _python_probe_targets_for_env(self) -> list[dict[str, Any]]:
+        """按本次 profiling 配置生成真正注入 server 的 target。
+
+        state_trace 是验证开关，不要求用户手动把 `hicache_state:self` 写进每个
+        HiCache target。开启时给相关 target 追加 validation-only 字段；probe 会把
+        它拆成 `model_input=false` 事件，真实执行事件仍进入 faithful replay。
+        """
+
+        targets = [dict(target) for target in self.runtime.python_targets]
+        if not self._hicache_state_trace_enabled():
+            return targets
+
+        for target in targets:
+            if not self._is_hicache_python_target(target):
+                continue
+            fields = [dict(field) for field in target.get("fields", []) if isinstance(field, dict)]
+            if not any(field.get("source") == "hicache_state:self" for field in fields):
+                fields.append(
+                    {
+                        "name": "state_snapshot",
+                        "source": "hicache_state:self",
+                        "required": False,
+                    }
+                )
+            target["fields"] = fields
+        return targets
+
+    def _hicache_state_trace_enabled(self) -> bool:
+        python_probe = channel_config(self.cfg, "python_probe")
+        state_trace = python_probe.get("state_trace") if isinstance(python_probe.get("state_trace"), dict) else {}
+        return bool(state_trace.get("enabled", False))
+
+    @staticmethod
+    def _is_hicache_python_target(target: dict[str, Any]) -> bool:
+        module = str(target.get("module") or "")
+        target_path = str(target.get("target") or "")
+        target_id = str(target.get("id") or "")
+        return "hicache" in target_id.lower() or "hiradix" in module.lower() or "cache_controller" in module.lower() or "HiCache" in target_path
 
     def _apply_ld_preload_env(self, env: dict[str, str]) -> None:
         ld_preload = self._ld_preload_cfg()

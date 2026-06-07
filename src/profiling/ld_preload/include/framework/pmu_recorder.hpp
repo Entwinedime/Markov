@@ -25,11 +25,11 @@ struct PmuSnapshot {
 };
 
 class PmuRecorder {
-public:
+  public:
     static PmuRecorder & Get();
     bool ReadSnapshot(PmuSnapshot * snapshot);
 
-private:
+  private:
     PmuRecorder() = default;
 };
 

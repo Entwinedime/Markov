@@ -37,6 +37,19 @@ class TargetSpec:
     enabled: bool = True
 
 
+@dataclass(frozen=True)
+class ExtractedField:
+    """source extractor 返回的字段包装。
+
+    普通字段进入真实执行事件；validation-only 字段会被拆成独立事件，避免
+    state snapshot / oracle 这类验证数据污染性能 DAG。
+    """
+
+    value: Any
+    model_input: bool = True
+    event_kind: str = ""
+
+
 _TARGETS = None
 _PATCHED: set[str] = set()
 SourceExtractor = Callable[
@@ -218,26 +231,44 @@ def _emit(
     start_us: int,
     end_us: int,
 ) -> None:
-    fields, missing = _collect_fields(target, fn, args, kwargs, result)
+    fields, validation_fields, missing = _collect_fields(target, fn, args, kwargs, result)
     event_name = _event_name(target, phase)
+    base_args = {
+        "schema_version": 1,
+        "domain": "python_probe",
+        "target_id": target.id,
+        "target": target.target,
+        "phase": phase,
+        "status": "completed" if phase == "end" else phase,
+        "missing_required_fields": missing,
+    }
     get_writer().duration_event(
         event_name,
         start_us,
         end_us,
         "python_probe",
         {
-            "schema_version": 1,
+            **base_args,
             "model_input": True,
-            "domain": "python_probe",
             "event_kind": event_name,
-            "target_id": target.id,
-            "target": target.target,
-            "phase": phase,
-            "status": "completed" if phase == "end" else phase,
-            "missing_required_fields": missing,
             **fields,
         },
     )
+    if validation_fields:
+        event_kind = str(validation_fields.pop("_event_kind", "validation"))
+        get_writer().duration_event(
+            f"{event_name}:{event_kind}",
+            start_us,
+            end_us,
+            "python_probe",
+            {
+                **base_args,
+                "model_input": False,
+                "event_kind": event_kind,
+                "source_event_name": event_name,
+                **validation_fields,
+            },
+        )
 
 
 def _event_name(target: TargetSpec, phase: str) -> str:
@@ -256,17 +287,26 @@ def _collect_fields(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-) -> tuple[dict[str, Any], list[str]]:
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     bound = _bind_arguments(fn, args, kwargs)
     fields: dict[str, Any] = {}
+    validation_fields: dict[str, Any] = {}
     missing: list[str] = []
     for field in target.fields:
         found, value = _extract_field(field, bound, args, kwargs, result)
         if found:
-            fields[field.name] = value
+            if isinstance(value, ExtractedField):
+                if value.model_input:
+                    fields[field.name] = value.value
+                else:
+                    validation_fields[field.name] = value.value
+                    if value.event_kind:
+                        validation_fields.setdefault("_event_kind", value.event_kind)
+            else:
+                fields[field.name] = value
         elif field.required:
             missing.append(field.name)
-    return fields, missing
+    return fields, validation_fields, missing
 
 
 def _bind_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -290,6 +330,8 @@ def _extract_field(
     source = field.source.strip()
     try:
         found, value = _extract_raw_value(source, field.name, bound, args, kwargs, result)
+        if found and isinstance(value, ExtractedField):
+            return (True, value)
         return (found, _jsonable(value) if found else None)
     except Exception as exc:
         return (False, {"extract_error": type(exc).__name__})

@@ -18,15 +18,15 @@ void LogPapiError(const std::string & action, int error_code) { std::cerr << "[h
 unsigned long PapiThreadId() { return static_cast<unsigned long>(syscall(SYS_gettid)); }
 
 struct PapiThreadState {
-    bool registered{ false };
-    bool initialized{ false };
-    int event_set{ PAPI_NULL };
+    bool registered{false};
+    bool initialized{false};
+    int event_set{PAPI_NULL};
     std::vector<std::string> event_names;
     std::vector<long long> counter_values;
 
     void Cleanup() {
         if (event_set != PAPI_NULL) {
-            long long * stop_values{ counter_values.empty() ? nullptr : counter_values.data() };
+            long long * stop_values{counter_values.empty() ? nullptr : counter_values.data()};
             PAPI_stop(event_set, stop_values);
             PAPI_cleanup_eventset(event_set);
             PAPI_destroy_eventset(&event_set);
@@ -47,7 +47,7 @@ struct PapiThreadState {
 };
 
 class PmuRecorderImpl {
-public:
+  public:
     PmuRecorderImpl() {
         if (!ParseEnvFlag("HOOK_ENABLE_PAPI", true)) { return; }
         if (!InitializeLibrary()) { return; }
@@ -80,9 +80,9 @@ public:
         return true;
     }
 
-private:
+  private:
     bool InitializeLibrary() {
-        int ret{ PAPI_library_init(PAPI_VER_CURRENT) };
+        int ret{PAPI_library_init(PAPI_VER_CURRENT)};
         if (ret != PAPI_VER_CURRENT) {
             std::cerr << "[hook] PAPI_library_init failed" << std::endl;
             return false;
@@ -98,19 +98,19 @@ private:
     }
 
     void LoadRequestedEvents() {
-        const std::string default_events{ "perf::CYCLES,perf::INSTRUCTIONS,perf::CACHE-"
-                                          "REFERENCES,perf::CACHE-MISSES" };
-        const std::string env_events{ safe_env("HOOK_PAPI_EVENTS") };
+        const std::string default_events{"perf::CYCLES,perf::INSTRUCTIONS,perf::CACHE-"
+                                         "REFERENCES,perf::CACHE-MISSES"};
+        const std::string env_events{safe_env("HOOK_PAPI_EVENTS")};
 
-        const std::vector<std::string> requested_events{ SplitCsv(env_events.empty() ? default_events : env_events) };
+        const std::vector<std::string> requested_events{SplitCsv(env_events.empty() ? default_events : env_events)};
         if (requested_events.empty()) {
             std::cerr << "[hook] No PAPI events configured, PMU trace disabled" << std::endl;
             return;
         }
 
         for (size_t i = 0; i < requested_events.size(); ++i) {
-            int event_code{ 0 };
-            int ret{ PAPI_event_name_to_code(const_cast<char *>(requested_events[i].c_str()), &event_code) };
+            int event_code{0};
+            int ret{PAPI_event_name_to_code(const_cast<char *>(requested_events[i].c_str()), &event_code)};
             if (ret != PAPI_OK) {
                 std::cerr << "[hook] Unsupported PAPI event: " << requested_events[i] << " (" << PAPI_strerror(ret) << ")" << std::endl;
                 continue;
@@ -124,7 +124,7 @@ private:
     bool InitializeThreadState(PapiThreadState & state) {
         if (state.initialized) { return true; }
 
-        int ret{ PAPI_register_thread() };
+        int ret{PAPI_register_thread()};
         if (ret != PAPI_OK) {
             LogPapiError("PAPI_register_thread", ret);
             return false;
@@ -174,7 +174,7 @@ private:
 #else
 
 class PmuRecorderImpl {
-public:
+  public:
     bool ReadSnapshot(PmuSnapshot *) { return false; }
 };
 

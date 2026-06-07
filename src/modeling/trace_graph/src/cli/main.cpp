@@ -1,8 +1,8 @@
 #include "trace_graph/core/dag_builder.hpp"
+#include "trace_graph/core/logger.hpp"
 #include "trace_graph/frontend/model_config.hpp"
 #include "trace_graph/frontend/trace_normalizer.hpp"
 #include "trace_graph/io/chrome_trace_io.hpp"
-#include "trace_graph/core/logger.hpp"
 #include "trace_graph/modules/hicache/hicache_module.hpp"
 #include "trace_graph/modules/node_scale_module.hpp"
 #include "trace_graph/modules/simulation_module.hpp"
@@ -98,9 +98,12 @@ CliOptions parse_cli(int argc, char ** argv) {
         else if (arg == "--scenario-name") {
             if (!consume_value(i, argc, argv, opts.scenario_name, arg)) opts.show_help = true;
         }
-        else if (arg == "--full-output") opts.full_output = true;
-        else if (arg == "-d" || arg == "--debug") opts.debug = true;
-        else if (arg == "-v" || arg == "--verbose") opts.verbose = true;
+        else if (arg == "--full-output")
+            opts.full_output = true;
+        else if (arg == "-d" || arg == "--debug")
+            opts.debug = true;
+        else if (arg == "-v" || arg == "--verbose")
+            opts.verbose = true;
         else {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             opts.show_help = true;
@@ -185,8 +188,10 @@ int main(int argc, char ** argv) {
         logger.set_level(TraceGraph::Logger::DEBUG);
         setenv("DEBUG_TRACE", "1", 1);
     }
-    else if (opts.verbose) logger.set_level(TraceGraph::Logger::INFO);
-    else logger.set_level(TraceGraph::Logger::WARN);
+    else if (opts.verbose)
+        logger.set_level(TraceGraph::Logger::INFO);
+    else
+        logger.set_level(TraceGraph::Logger::WARN);
 
     try {
         std::vector<TraceGraph::DagGraph> graphs;

@@ -55,7 +55,9 @@ std::string escape_json(const std::string & input) {
                 constexpr char digits[] = "0123456789abcdef";
                 oss << digits[(static_cast<unsigned char>(c) >> 4) & 0xf] << digits[static_cast<unsigned char>(c) & 0xf];
             }
-            else { oss << c; }
+            else {
+                oss << c;
+            }
         }
     }
     return oss.str();

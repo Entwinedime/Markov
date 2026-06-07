@@ -373,6 +373,13 @@ def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000
     out_root.mkdir(parents=True, exist_ok=True)
     merged_paths: List[str] = []
     reports: List[Dict[str, Any]] = []
+    if not torch_paths and (python_paths or ld_paths):
+        out_path = out_root / "merged_trace_00.json"
+        report_path = out_root / "merge_report_00.json"
+        report = merge_sidecar_only(ld_paths, python_paths, str(out_path), str(report_path))
+        merged_paths.append(str(out_path))
+        reports.append(report)
+
     for index, torch_path in enumerate(torch_paths):
         pid = pid_from_path(torch_path)
         custom_path = select_by_pid_or_index(ld_paths, pid, index)
@@ -455,6 +462,42 @@ def select_sidecars(paths: List[str], pid: Optional[str]) -> List[str]:
         return paths
     selected = [path for path in paths if pid_from_path(path) == pid]
     return selected or paths
+
+def merge_sidecar_only(ld_paths: List[str], sidecar_paths: List[str], out_path: str, report_path: str) -> Dict[str, Any]:
+    """没有 torch trace 时生成 state-only merged trace。
+
+    faithful replay / cache patch 仍应使用完整 torch+ld+python trace；这个 fallback
+    只服务 HiCache state-only 快速验证，让 C++ state model 可以消费 Python facts。
+    """
+
+    events: List[Dict[str, Any]] = []
+    standalone_custom = 0
+    for path in ld_paths:
+        _, custom_events = load_trace(path, auto_repair=True)
+        for event in custom_events:
+            if should_append_standalone_event(event):
+                standalone_custom += 1
+                events.append(event)
+    sidecar_appended, details = append_sidecar_trace_events(events, sidecar_paths)
+    sort_events(events)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    Path(out_path).write_text(json.dumps({"traceEvents": events}, ensure_ascii=False), encoding="utf-8")
+    report = MergeReport(
+        profiler_path="",
+        custom_path=",".join(ld_paths),
+        out_path=out_path,
+        mode="sidecar_only",
+        tolerance_us=0.0,
+        search_window=0,
+        margin_us=0.0,
+        success=True,
+        standalone_custom_appended=standalone_custom,
+        sidecar_events_appended=sidecar_appended,
+        sidecar_details=details,
+        sidecar_paths=sidecar_paths,
+    )
+    write_report(report, report_path)
+    return report.to_dict()
 
 def copy_profiler_with_sidecars(profiler_path: str, out_path: str, sidecar_paths: List[str], report_path: str) -> Dict[str, Any]:
     raw_data, profiler_events = load_trace(profiler_path)

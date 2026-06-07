@@ -4,7 +4,7 @@
 
 ## Docs 约束
 
-`docs/` 目录只维护四个文件：
+`docs/` 目录的主线文档只维护四个文件：
 
 - `profiling_development.md`
 - `modeling_development.md`
@@ -18,7 +18,14 @@
 - work progress 文档只做时间戳增量更新；
 - constraints 文档记录项目长期约束，更新时删改。
 
-不再在 `docs/` 下维护按实验、模块、历史实现拆出来的零散文档。
+不再在 `docs/` 下维护按实验、模块、历史实现拆出来的零散主线文档。
+
+`docs/tmp/` 只用于短期计划、临时方案和协作草稿：
+
+- `docs/tmp/` 不纳入 git 追踪；
+- `docs/tmp/` 中的内容不能作为长期项目文档引用；
+- 需要长期保留的结论必须合并回上述四个主线文档；
+- 合并、提交或交接前不能依赖 `docs/tmp/` 中的未提交内容。
 
 active 源码子目录也不维护独立开发文档。模块说明、设计说明、使用说明必须合并到上述四个主文档中。
 
@@ -55,12 +62,16 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - 子模块必须通过 C++ `SimulationModule` 基类和继承实现。
 - 所有 what-if 都必须规约为 C++ `SimulationModule`。
 - 不保留独立的普通图变换机制。
+- `faithful_replay` 关闭的是子模块加载和 DAG patch，不是关闭事件消费。
+- `faithful_replay` 必须消费完整真实 merged trace；HiCache、CPUInfer、Python probe 等真实执行事件不能因为对应子模块关闭而被过滤。
+- Base DAG 是所有真实执行事件的重放结果；子模块只能在 base DAG 上做 what-if 修改。
 - 子模块直接修改 C++ DAG。
 - 子模块修改 DAG 应通过统一 mutation API 记录修改。
 - 默认 E2E 预测来自 DAG 拓扑仿真，不来自子模块 latency 求和。
 - 默认 DAG 拓扑仿真不使用原始绝对时间戳兜底，faithful replay 必须能暴露缺失依赖边。
 - 子模块不能修改原始 profiling trace；三类 trace 的合并只能由 `scripts/trace/trace_merger.py` 生成新的 merged trace。
 - 子模块不能把 debug 字段混入默认预测输出。
+- 非执行类 state snapshot、oracle state、probe 内部 debug 和质量审计事件不能作为默认性能 DAG 节点；必须放在独立 debug/state trace，或显式标记为 `model_input=false` 并只由 validation/debug 路径消费。
 
 ## Debug 约束
 
@@ -120,7 +131,13 @@ runner 可以读取 profile manifest 或显式 trace 路径；默认不输出 su
 - 不回滚用户已经删除或移动的文件。
 - 不恢复旧配置和旧结果。
 - 不把 pycache、临时结果、debug 大文件重新纳入主线。
-- 文档结构变化后，`docs/` 应保持四文件约束。
+- 提交信息必须规范、具体，优先使用 Conventional Commits 形式：`type(scope): summary`。
+- 提交摘要应说明本次提交的主要行为和对象，例如 `feat(hicache): add state validation pipeline`；不得使用 `update`、`fix stuff`、`wip` 等无法追踪意图的泛化描述。
+- 如果提交涉及大范围行为变化、验证状态或已知未闭环项，应在 commit body 中补充关键上下文和验证情况。
+- 文档结构变化后，`docs/` 主线文档应保持四文件约束；短期计划只能放在未追踪的 `docs/tmp/`。
 - C/C++ 格式化配置只在仓库根目录 `.clang-format` 维护；active 源码子目录不维护局部 `.clang-format`。
+- C/C++ 改动提交前必须能运行 `git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror`。
+- 复杂 C++ 子模块必须采用面向对象结构，至少拆分 fact parser、state、policy/decision、summary 和 DAG mutation 边界。
+- 不允许把复杂状态机、fact parser、summary、policy 和 DAG mutation 全部堆在单个匿名 namespace 中。
 - active 源码子目录不维护嵌套 `.git/`、局部 `.gitignore` 或独立 `README.md`。
 - `src/profiling/ld_preload`、`src/modeling/trace_graph` 等从旧仓库迁入的目录只能保留实现文件；目录级使用说明必须收敛到 profiling / modeling 主文档。
