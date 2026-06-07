@@ -22,6 +22,8 @@ def main() -> int:
         run_target_lookup_load_fixture(tmp)
         run_page_size_invariant_fixture(tmp)
         run_page_size_prefetch_transfer_target_identity_fixture(tmp)
+        run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp)
+        run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp)
         run_target_radix_prefix_fixture(tmp)
         run_write_through_selective_fixture(tmp)
         run_lock_ref_fixture(tmp)
@@ -411,6 +413,162 @@ def run_page_size_prefetch_transfer_target_identity_fixture(tmp: Path) -> None:
     assert summary["final_state"]["prefetch_planned_pages"] == ["target_p1", "target_p2"], summary
     assert summary["final_state"]["prefetch_ready_pages"] == ["target_p1", "target_p2"], summary
     assert summary["final_state"]["l2_resident_pages"] == ["target_p1", "target_p2"], summary
+
+
+def run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp: Path) -> None:
+    """验证跨 page size 时 progress operation pages 不会污染 target state。"""
+
+    trace_path = tmp / "hicache_page_size_prefetch_progress_non_invariant.json"
+    model_config = tmp / "hicache_page_size_prefetch_progress_non_invariant_model.json"
+    summary_out = tmp / "hicache_page_size_prefetch_progress_non_invariant_summary.json"
+    run_summary = tmp / "hicache_page_size_prefetch_progress_non_invariant_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-page64-progress",
+                            "page_size": 128,
+                            "page_identity": ["base_planned"],
+                            "target_page_identity": ["target_p1", "target_p2"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_prefetch_progress_start",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-page64-progress",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-page64-progress",
+                                "page_size": 128,
+                                "operation_hash_pages": ["base_operation_page"],
+                                "completed_tokens": 128,
+                                "check_return": None,
+                                "has_ongoing_prefetch": True,
+                            },
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-page64-progress",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-page64-progress",
+                                "page_size": 128,
+                                "check_return": True,
+                                "has_ongoing_prefetch": False,
+                            },
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "prefetch_policy": "timeout",
+                    "prefetch_timeout_base_sec": 10.0,
+                    "prefetch_timeout_per_ki_token_sec": 0.0,
+                    "prefetch_timeout_max_sec": 10.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert final_state["prefetch_planned_pages"] == ["target_p1", "target_p2"], final_state
+    assert final_state["prefetch_ready_pages"] == [], final_state
+    assert final_state["prefetch_suppressed_pages"] == ["target_p1", "target_p2"], final_state
+    assert "base_operation_page" not in final_state["l2_resident_pages"], final_state
+    assert "base_operation_page" not in final_state["prefetch_ready_pages"], final_state
+    assert final_state["l2_resident_pages"] == [], final_state
+
+
+def run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp: Path) -> None:
+    """验证跨 page size 时 prefetch schedule 可从 lookup target path 取 suffix。"""
+
+    trace_path = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix.json"
+    model_config = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix_model.json"
+    summary_out = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix_summary.json"
+    run_summary = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "request_id": "req-page64-schedule",
+                            "page_size": 128,
+                            "page_identity": ["base_prefix"],
+                            "target_page_identity": ["target_prefix", "target_suffix"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-page64-schedule",
+                            "page_size": 128,
+                            "new_input_tokens": 97,
+                            "page_identity": [],
+                            "target_page_identity": ["wrong_no_parent_suffix"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "prefetch_policy": "timeout",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert final_state["prefetch_planned_pages"] == ["target_suffix"], final_state
+    assert "wrong_no_parent_suffix" not in final_state["prefetch_planned_pages"], final_state
 
 
 def run_target_radix_prefix_fixture(tmp: Path) -> None:

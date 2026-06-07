@@ -170,13 +170,14 @@ def _extract_page_hashes_after_prefix(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
-    """按完整 prefix path 计算 parent hash，只返回 suffix token 产生的 pages。
+    """按目标 page size 的 page-aligned prefix 计算 parent hash，再返回 suffix pages。
 
     表达式格式为
     `page_hashes_after_prefix:<prefix_tokens>,<tokens>,<page_size>[,<prior_hash>]`。
     该 source 专门服务 prefetch target identity：`prefix_tokens` 用于在目标
-    page size 下重新得到 parent hash，输出只保留 `<tokens>` 对应的完整 pages，
-    避免把已经命中的 prefix pages 混入 prefetch planned set。
+    page size 下重新得到 SGLang `last_host_node` 对应的 parent hash，输出只
+    保留 `<tokens>` 自身对应的完整 pages。prefix 不是 page-aligned 时，尾部
+    残余 token 不属于 parent node，也不能被拼入 prefetch suffix page。
     """
 
     parts = [part.strip() for part in spec.split(",") if part.strip()]
@@ -198,11 +199,9 @@ def _extract_page_hashes_after_prefix(
         found_prior, prior_value = _base._extract_raw_value(parts[3], "prior_hash", bound, args, kwargs, result)
         if found_prior and prior_value:
             prior_hash = str(prior_value)
-    suffix_page_count = len(_tokens_for_page_hash(tokens)) // page_size
-    if suffix_page_count <= 0:
-        return (True, [])
-    full_hashes = _compute_page_hashes(_tokens_for_page_hash(prefix_tokens) + _tokens_for_page_hash(tokens), page_size, prior_hash)
-    return (True, full_hashes[-suffix_page_count:])
+    prefix_hashes = _compute_page_hashes(prefix_tokens, page_size, prior_hash)
+    parent_hash = prefix_hashes[-1] if prefix_hashes else prior_hash
+    return (True, _compute_page_hashes(tokens, page_size, parent_hash))
 
 
 def _extract_prefetch_progress(

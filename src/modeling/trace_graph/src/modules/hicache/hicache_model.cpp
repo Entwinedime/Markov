@@ -204,8 +204,7 @@ bool is_non_invariant_observed_role(const std::string & role) {
     // l3_prefetch_enqueue 是 base run 中实际提交给 controller 的预取 enqueue。
     // page size what-if 下 target planned pages 应由 prefetch_schedule + target
     // policy 重新生成；不能消费 base enqueue 上按旧 last_hash 计算出的 target pages。
-    if (role == "l3_prefetch_enqueue")
-        return true;
+    if (role == "l3_prefetch_enqueue") return true;
     return contains(role, "to_l1") || contains(role, "to_l2") || contains(role, "to_l3");
 }
 
@@ -496,8 +495,9 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         return transitions;
     }
     if (fact.role == "prefetch_schedule" || fact.role == "l3_prefetch_enqueue") {
-        remember_prefetch_schedule(fact, fact.pages);
-        for (const auto & page : fact.pages) { mark_prefetch_planned(fact, summary, transitions, page); }
+        const auto pages = fact.role == "prefetch_schedule" ? target_prefetch_schedule_pages(fact) : fact.pages;
+        remember_prefetch_schedule(fact, pages);
+        for (const auto & page : pages) { mark_prefetch_planned(fact, summary, transitions, page); }
         return transitions;
     }
     if (fact.role == "prefetch_progress") {
@@ -1089,6 +1089,22 @@ void HiCacheState::remember_prefetch_schedule(const HiCacheFact & fact, const st
     if (!fact.request_id.empty()) prefetch_schedule_ts_by_request_[scoped_request_key(fact)] = fact.ts;
 }
 
+std::vector<std::string> HiCacheState::target_prefetch_schedule_pages(const HiCacheFact & fact) const {
+    if (!target_page_size_mismatch(fact)) return fact.pages;
+    if (fact.request_id.empty() || fact.new_input_tokens == 0 || config_.page_size == 0) return fact.pages;
+
+    const auto lookup_it = pending_lookup_pages_by_request_.find(scoped_request_key(fact));
+    if (lookup_it == pending_lookup_pages_by_request_.end() || lookup_it->second.empty()) return fact.pages;
+
+    // page size what-if 下，prefetch_from_storage 的 prefix_keys 可能为空；
+    // probe 只能生成没有 parent hash 的 target_page_identity。lookup 已经
+    // 暴露了同 request 在目标 page size 下的完整 path，这里按目标 page
+    // size 从 path 尾部截出 new_input_tokens 对应的完整 suffix pages。
+    const size_t suffix_pages = static_cast<size_t>(fact.new_input_tokens / config_.page_size);
+    if (suffix_pages == 0 || lookup_it->second.size() < suffix_pages) return fact.pages;
+    return {lookup_it->second.end() - static_cast<long>(suffix_pages), lookup_it->second.end()};
+}
+
 std::vector<std::string> HiCacheState::prefetch_pages_for_fact(const HiCacheFact & fact) const {
     if (!fact.pages.empty()) return fact.pages;
     if (fact.request_id.empty()) return {};
@@ -1306,6 +1322,14 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
                     if (suffix_pages > 0 && fact.pages.size() > suffix_pages)
                         fact.pages.erase(fact.pages.begin(), fact.pages.end() - static_cast<long>(suffix_pages));
                 }
+            }
+            else if (fact.role == "prefetch_progress") {
+                // `operation_hash_pages` 和 completed token 计数属于 base
+                // prefetch operation，不随 target page size 保持页身份不变量。
+                // 这里保留 check_return/ongoing/request_id，让 terminal progress
+                // 仍能终止 pending prefetch，但不能凭 base 页创建 target ready/L2。
+                fact.pages.clear();
+                fact.prefetch_ready_page_count = 0;
             }
             else if (fact.requires_page_identity) {
                 summary.missing_invariant_facts["target_page_identity_or_token_path"]++;

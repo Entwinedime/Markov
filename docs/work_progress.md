@@ -2,6 +2,35 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-08 01:52:33 +0800
+
+- 继续收敛 base -> page64 strict HiCache state prediction：
+  - 新 base profiling run 已完成：`data/profile_runs/sglang/20260607_170641_profiling_hicache_state_validation`；
+  - 新 base 同配置 replay 已通过：`modeling/cache_state_replay_after_prefix_fix_v1`，
+    final state L1 `56/56`、L2 `121/121`、backuped `121/121`、evicted `65/65`、
+    prefetch planned/ready/suppressed `166/166`、`8/8`、`158/158`；
+  - probe 的 `page_hashes_after_prefix` 已改为按 target page size 的 page-aligned prefix
+    计算 parent hash，避免把非页对齐 prefix 残余 token 拼入 suffix page hash；
+  - C++ state model 在 page size mismatch 下不再把 base `prefetch_progress.operation_hash_pages`
+    当作 target ready/L2 证据，只保留 terminal progress 语义；
+  - C++ state model 在 page size mismatch 下优先从同 request 的 lookup target path 尾部推导
+    `prefetch_schedule` 的 target suffix pages，解决 `prefix_keys` 为空时 no-parent hash 造成的
+    planned 集合偏差。
+- 当前 strict page64 重验输出：
+  - `modeling/predict_page64_state_strict_lookup_suffix_v1` 已把 core final state 对齐：
+    L1 `111/111`、L2 `250/250`、dirty `0/0`、backuped `250/250`、evicted `139/139`、
+    locked `0/0`；
+  - prefetch planned 已对齐为 `364/364`；
+  - 仅剩 prefetch debug 集合单页差异：ready `16/17`、suppressed `348/347`，
+    page `4c64cf964a9c8cb73db2e12c361f9d2ce4b43f107ae5dcbe52e947acb769bb94` 在模型中
+    被 suppress、在 oracle 中 ready；
+  - strict validation 仍未闭环，不能进入 state-to-DAG patch。
+- 下一步：
+  - 检查 page size mismatch 下 `l3_prefetch_enqueue` / `l3_to_l2_transfer` 的 target ready
+    evidence 是否应从已记住的 lookup/schedule target path 和目标 page 数补齐尾页；
+  - 为 1121 new-input tokens / 64 page size 产生 17 个 target suffix pages、但 base transfer
+    只暴露 16 个 target pages 的场景补 fixture，再重跑 strict page64。
+
 ## 2026-06-07 23:41:53 +0800
 
 - 对齐 HiCache state validation 文档与当前实际进展：

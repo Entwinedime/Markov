@@ -209,6 +209,7 @@ class HiCacheState {
                                   const std::string & page);
     void remember_prefetch_pages(const HiCacheFact & fact, const std::vector<std::string> & pages);
     void remember_prefetch_schedule(const HiCacheFact & fact, const std::vector<std::string> & pages);
+    std::vector<std::string> target_prefetch_schedule_pages(const HiCacheFact & fact) const;
     std::vector<std::string> prefetch_pages_for_fact(const HiCacheFact & fact) const;
     void finalize_prefetch_policy(HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     bool should_terminate_prefetch_at_progress(const HiCacheFact & fact, const std::vector<std::string> & pages, uint64_t ready_count) const;

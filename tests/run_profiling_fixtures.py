@@ -570,6 +570,32 @@ def run_hicache_page_hash_literal_page_size_fixture() -> None:
     assert suffix_full_found is True, suffix_full_hashes
     assert suffix_hashes == suffix_full_hashes[-2:], (suffix_hashes, suffix_full_hashes)
 
+    nonaligned_found, nonaligned_hashes = sglang_hicache_callable._extract_page_hashes_after_prefix(
+        "arg:prefix,arg:suffix,2",
+        {"prefix": [1, 2, 3], "suffix": [4, 5, 6]},
+        (),
+        {},
+        None,
+    )
+    prefix_found, prefix_hashes = sglang_hicache_callable._extract_page_hashes(
+        "arg:prefix,2",
+        {"prefix": [1, 2, 3]},
+        (),
+        {},
+        None,
+    )
+    expected_suffix_found, expected_suffix_hashes = sglang_hicache_callable._extract_page_hashes(
+        f"arg:suffix,2,const:{prefix_hashes[-1]}",
+        {"suffix": [4, 5, 6]},
+        (),
+        {},
+        None,
+    )
+    assert nonaligned_found is True, nonaligned_hashes
+    assert prefix_found is True, prefix_hashes
+    assert expected_suffix_found is True, expected_suffix_hashes
+    assert nonaligned_hashes == expected_suffix_hashes, (nonaligned_hashes, expected_suffix_hashes)
+
 
 def run_hicache_prefetch_progress_source_fixture() -> None:
     """验证 prefetch progress source 能采到 ready/late 判定所需证据。"""
