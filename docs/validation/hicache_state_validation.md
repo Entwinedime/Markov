@@ -412,19 +412,22 @@ remove/evict 等 observed movement 不是 target 不变量；缺少 target page 
 
 ### 主线一：两个强差异配置场景 + 两个大输入
 
-目标：先用最朴素但约束清晰的办法验证 state model 的跨配置能力。构建两个完全不同的 HiCache 配置场景，
-每个可变配置项都尽量不同，然后用两个大型输入分别做 replay 和双向 cross-config prediction。
+目标：先用最朴素但约束清晰的办法验证 state model 的跨配置能力。构建两个全新的 HiCache 配置场景：
+它们不仅彼此完全不同，也不能等同于本文已验证矩阵中跑过的任何配置组合。每个可变配置项都尽量不同，
+然后用两个大型输入分别做 replay 和双向 cross-config prediction。
 
 #### 配置场景
 
 | 场景 | 配置要求 | 覆盖目的 |
 | --- | --- | --- |
-| `S1A_baseline_large` | page size、write policy、prefetch policy、capacity、timeout、ratio 等保持一套稳定基线。 | 提供可复用 base facts，覆盖常规 write-through / timeout 行为。 |
-| `S1B_divergent_large` | 与 `S1A` 的可变项尽量全部不同，例如 page64、write-back 或 selective write、不同 prefetch policy、不同 capacity、不同 timeout。 | 强制触发 page split、dirty/writeback、capacity eviction、prefetch ready/suppressed 等 target 行为变化。 |
+| `S1A_baseline_large` | 新建一套稳定基线；page size、write policy、prefetch policy、capacity、timeout、ratio 等组合不得复用当前已验证矩阵中的 C0-C8、write-back capacity、page64、capacity、prefetch 变体等既有组合。 | 提供可复用 base facts，同时验证新的 baseline 组合是否仍能稳定 replay。 |
+| `S1B_divergent_large` | 与 `S1A` 的可变项尽量全部不同，并且同样不得复用任何已跑过的配置组合；例如 page size、write policy、prefetch policy、capacity、timeout、ratio 至少应形成一个新的联合配置。 | 强制触发 page split、dirty/writeback、capacity eviction、prefetch ready/suppressed 等 target 行为变化，同时验证未见过配置组合的 target 行为。 |
 
 约束：
 
 - `S1A` 和 `S1B` 的 request 内容必须一致，只改变 HiCache config。
+- `S1A` 和 `S1B` 必须拥有新的 config id 和完整 config snapshot；不能只把旧配置改名当作新配置。
+- 判定“新配置”时按联合配置判断：page size、write policy、prefetch policy、capacity、timeout、ratio 等核心项的组合不能和既有验证记录一致。
 - `--hicache-ratio` 可以变化，但必须 `> 1.0`，并在 config metadata 或 HCSV 记录中说明原因。
 - capacity pressure 优先来自 workload 或显式 capacity，不用 `<=1.0` ratio 构造。
 - 如果某个可变项因为 SGLang 限制不能同时改变，必须在 HCSV 记录里说明保留原因。
