@@ -2,6 +2,46 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-09 05:48:03 +0800
+
+- 闭环 HiCache state validation 主线一 `S1A_baseline_large + L1_manual_phased` 预验证：
+  - 真实 profile run label 为 `20260608_203828_profiling_hicache_state_mainline_one_manual_s1a`，workload `83/83 ok`、`errors=0`；
+  - profile quality 为 `quality_ready=true`、23/23 Python targets observed，stateful required page identity `2130/2130`；
+  - live `hicache_radix_removed_pages:self` 在真实 SGLang 中仍未稳定产出非空字段，因此 profiling runner 收尾新增 materialization：
+    只从同一次 insert start/end validation snapshot 中派生 `radix_removed_page_identity`，本 run 写入 `2` 个 insert end、合计 `26` 页；
+  - C++ HiCache state model 消费该 operation-level fact 后，observed replay 达到 `validation_ready=true`、`final_state_match=true`、
+    timeline `match=true`、`model_extra_transition_count=0`；
+  - final counts 对齐：L1 `54/54`、L2 `106/106`、backuped `106/106`、evicted `52/52`、locked `1/1`、
+    prefetch planned/ready/suppressed `356/18/338`；
+  - 明确同配置 replay 使用 observed replay config，主线一 S1A/S1B prediction target config 只用于 cross-config prediction，
+    不能直接替代 replay config。
+
+## 2026-06-09 01:20:04 +0800
+
+- 继续推进 HiCache state validation 主线一 `S1A_baseline_large + L1_manual_phased`：
+  - 真实 profile 完成，`quality_ready=true`，23/23 Python targets observed，stateful required page identity `2130/2130`；
+  - 初始 replay 仍为 `hicache_final_state_mismatch`，model 多出 13 个 L2/backuped/evicted pages；
+  - 定位原因为 insert 期间 radix leaf 消失，但第一版 `radix_removed_page_identity` 因 state snapshot 注入顺序在其后，672 个 insert start/end 字段均为空；
+  - 修改 profiler 注入顺序：含 `hicache_radix_removed_pages:self` 的 target 会先采 validation-only `hicache_state:self`，再导出 model-input `radix_removed_page_identity`；
+  - C++ state model 已消费 `radix_removed_page_identity`，同 page size 清理 L1/L2/dirty/backuped/evicted/locked 及辅助索引，page-size what-if 下跳过；
+  - 本地 fake radix extractor、C++ HiCache fixture、派生 enriched replay 均通过；派生 replay 达到 `validation_ready=true`、`final_state_match=true`、`model_extra_transition_count=0`；
+  - 仍需用修复后的注入顺序重新跑真实 S1A manual profile，确认原生 trace 中非空 `radix_removed_page_identity` 能直接让 replay 通过。
+
+## 2026-06-08 23:58:49 +0800
+
+- 复核 HiCache state validation 主线一配置新颖性要求：
+  - `S1A_baseline_large` 与 `S1B_divergent_large` 的联合配置签名彼此不同；
+  - 签名口径包含 page size、L1/L2 capacity、write policy、prefetch policy、`--hicache-ratio`、prefetch extra config；
+  - 脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，两个主线一签名均为 `old_matches=0`；
+  - 对已清理且仓库中没有实体配置的历史 run，只依据验证文档保留的历史摘要和 config metadata 继续约束，不让 HCSV 依赖 `data/` 记录。
+
+## 2026-06-08 23:39:51 +0800
+
+- 收紧 HiCache state validation 主线一配置约束：
+  - `S1A` / `S1B` 不仅必须彼此不同，还必须不同于任何此前已经跑过的 HiCache state profiling 配置组合；
+  - “历史已跑配置”覆盖当前矩阵、已清理历史 run、临时验证 run 和失败后重跑前的草案配置，不能只按 `C0-C8` 判断；
+  - 主线一候选配置开跑前需要做历史配置比对，并把比对结果写入 config metadata 或 HCSV 摘要。
+
 ## 2026-06-08 21:44:46 +0800
 
 - 完成 HiCache state validation 本轮重验矩阵和主线一可执行部分：

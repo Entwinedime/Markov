@@ -231,7 +231,7 @@ def _emit(
     start_us: int,
     end_us: int,
 ) -> None:
-    fields, validation_fields, missing = _collect_fields(target, fn, args, kwargs, result)
+    fields, validation_fields, missing = _collect_fields(target, fn, args, kwargs, result, phase)
     event_name = _event_name(target, phase)
     base_args = {
         "schema_version": 1,
@@ -287,8 +287,10 @@ def _collect_fields(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
+    phase: str,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
     bound = _bind_arguments(fn, args, kwargs)
+    bound["__trace_sim_phase"] = phase
     fields: dict[str, Any] = {}
     validation_fields: dict[str, Any] = {}
     missing: list[str] = []

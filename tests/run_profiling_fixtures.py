@@ -267,6 +267,7 @@ def sglang_hicache_targets() -> list[dict[str, object]]:
                 {"name": "insert_tokens", "source": "len:arg:params.key", "required": False},
                 {"name": "value_tokens", "source": "len:arg:params.value", "required": False},
                 {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
+                {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
                 {"name": "prefix_len", "source": "return.prefix_len", "required": False},
                 {"name": "inserted_host_node_id", "source": "return.inserted_host_node.id", "required": False},
                 {"name": "page_size", "source": "self.page_size"},
@@ -708,7 +709,10 @@ def run_state_trace_env_fixture() -> None:
                         "id": "hiradix.match_prefix",
                         "module": "sglang.srt.mem_cache.hiradix_cache",
                         "target": "HiRadixCache.match_prefix",
-                        "fields": [{"name": "event_role", "source": "const:lookup"}],
+                        "fields": [
+                            {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
+                            {"name": "event_role", "source": "const:lookup"},
+                        ],
                     }
                 ],
             },
@@ -723,6 +727,9 @@ def run_state_trace_env_fixture() -> None:
     targets = json.loads(env["TRACE_SIM_PYTHON_PROBE_TARGETS"])
     fields = targets[0]["fields"]
     assert any(field.get("source") == "hicache_state:self" for field in fields), fields
+    state_index = next(index for index, field in enumerate(fields) if field.get("source") == "hicache_state:self")
+    radix_index = next(index for index, field in enumerate(fields) if field.get("source") == "hicache_radix_removed_pages:self")
+    assert state_index < radix_index, fields
 
 
 def run_env_placeholder_fixture() -> None:
@@ -748,6 +755,92 @@ def run_env_placeholder_fixture() -> None:
     run = module.ProfileRun(cfg, dry_run=True)
     env = run._build_server_env()
     assert env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] == str(run.layout.run_dir / "hicache_storage"), env
+
+
+def run_hicache_radix_removed_materialization_fixture() -> None:
+    """验证 runner 收尾能从同次 insert start/end snapshot 派生 radix removed pages。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_radix_materialize",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        trace_dir = tmp / "trace"
+        python_probe_dir = trace_dir / "python_probe"
+        python_probe_dir.mkdir(parents=True)
+        trace_path = python_probe_dir / "python_probe_trace.rank0.pid1.json"
+
+        def snapshot_event(name: str, dur: int, pages: list[str]) -> dict[str, object]:
+            return {
+                "name": name,
+                "cat": "python_probe",
+                "pid": 1,
+                "tid": 1,
+                "ts": 100,
+                "dur": dur,
+                "args": {
+                    "target_id": "hiradix.insert",
+                    "model_input": False,
+                    "state_snapshot": {
+                        "nodes": [
+                            {
+                                "hash_value": pages,
+                            }
+                        ]
+                    },
+                },
+            }
+
+        payload = {
+            "traceEvents": [
+                {
+                    "name": "hicache_insert_start",
+                    "cat": "python_probe",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": 100,
+                    "dur": 0,
+                    "args": {
+                        "target_id": "hiradix.insert",
+                        "radix_removed_page_identity": [],
+                    },
+                },
+                snapshot_event("hicache_insert_start:state_snapshot", 0, ["old_a", "old_b", "kept"]),
+                {
+                    "name": "hicache_insert_end",
+                    "cat": "python_probe",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": 100,
+                    "dur": 7,
+                    "args": {
+                        "target_id": "hiradix.insert",
+                        "radix_removed_page_identity": [],
+                    },
+                },
+                snapshot_event("hicache_insert_end:state_snapshot", 7, ["kept", "new_a"]),
+            ]
+        }
+        trace_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        summary = module.materialize_hicache_radix_removed_pages(trace_dir)
+        assert summary["files_scanned"] == 1, summary
+        assert summary["files_updated"] == 1, summary
+        assert summary["insert_end_events"] == 1, summary
+        assert summary["materialized_events"] == 1, summary
+        assert summary["materialized_pages"] == 2, summary
+
+        updated = json.loads(trace_path.read_text(encoding="utf-8"))
+        end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
+        assert end_event["args"]["radix_removed_page_identity"] == ["old_a", "old_b"], end_event
+        snapshots = [event for event in updated["traceEvents"] if event["name"].endswith(":state_snapshot")]
+        assert all(event["args"]["model_input"] is False for event in snapshots), snapshots
 
 
 def run_sglang_hicache_target_fixture() -> None:
@@ -906,6 +999,154 @@ cache.match_prefix(params)
         assert snapshot["capacity"]["l2_capacity_pages"] == 8, snapshot
         assert snapshot["capacity"]["l2_available_pages"] == 6, snapshot
         assert snapshot["capacity"]["prefetch_capacity_limit_pages"] == 4, snapshot
+
+
+def run_hicache_radix_removed_pages_phase_fixture() -> None:
+    """验证 insert 返回 None 时仍按 phase 提取 radix removed pages。"""
+
+    from trace_sim_probe.probes import sglang_hicache_callable
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        package = tmp / "radix_pkg"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        (package / "demo.py").write_text(
+            """
+class Node:
+    def __init__(self):
+        self.id = 1
+        self.hash_value = ['old_a', 'old_b']
+        self.value = [1, 2]
+        self.host_value = [3, 4]
+
+class Params:
+    pass
+
+class Cache:
+    def __init__(self):
+        self.page_size = 2
+        self.node = Node()
+
+    def insert(self, params):
+        self.node.hash_value = []
+        return None
+""",
+            encoding="utf-8",
+        )
+        output_dir = tmp / "python_probe"
+        targets = [
+            {
+                "id": "hiradix.insert",
+                "module": "radix_pkg.demo",
+                "target": "Cache.insert",
+                "events": ["hicache_insert_start", "hicache_insert_end"],
+                "fields": [
+                    {"name": "state_snapshot", "source": "hicache_state:self", "required": False},
+                    {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
+                    {"name": "event_role", "source": "const:insert"},
+                ],
+            }
+        ]
+
+        env = os.environ.copy()
+        env["TRACE_SIM_PYTHON_PROBE"] = "1"
+        env["TRACE_SIM_PYTHON_PROBES"] = "sglang.hicache"
+        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(targets)
+        env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(output_dir)
+        env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
+        env["PYTHONPATH"] = os.pathsep.join([str(PROBE_ROOT), str(tmp), env.get("PYTHONPATH", "")])
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                "from radix_pkg.demo import Cache, Params; cache = Cache(); assert cache.insert(Params()) is None",
+            ],
+            env=env,
+        )
+
+        files = sorted(output_dir.glob("python_probe_trace.*.json"))
+        assert len(files) == 1, files
+        payload = json.loads(files[0].read_text(encoding="utf-8"))
+        events = [event for event in payload["traceEvents"] if event.get("cat") == "python_probe"]
+        real_end = [event for event in events if event["name"] == "hicache_insert_end"]
+        snapshots = [event for event in events if event["name"].endswith(":state_snapshot")]
+        assert len(real_end) == 1, events
+        assert len(snapshots) == 2, events
+        assert real_end[0]["args"]["radix_removed_page_identity"] == ["old_a", "old_b"], real_end
+        assert all(event["args"].get("model_input") is False for event in snapshots), snapshots
+
+    class DirectNode:
+        def __init__(self):
+            self.hash_value = ["direct_old"]
+
+    class DirectCache:
+        def __init__(self):
+            self.node = DirectNode()
+
+    direct_cache = DirectCache()
+    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT.clear()
+    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
+        "hicache_radix_removed_pages:self",
+        "radix_removed_page_identity",
+        {},
+        (direct_cache,),
+        {},
+        None,
+    )
+    assert handled and found and value == [], value
+    direct_cache.node.hash_value = []
+    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
+        "hicache_radix_removed_pages:self",
+        "radix_removed_page_identity",
+        {},
+        (direct_cache,),
+        {},
+        None,
+    )
+    assert handled and found and value == ["direct_old"], value
+
+    class SnapshotNode:
+        def __init__(self):
+            self.hash_value = ["snapshot_old"]
+
+    class SnapshotCache:
+        def __init__(self):
+            self.node = SnapshotNode()
+
+    snapshot_cache = SnapshotCache()
+    object_id = id(snapshot_cache)
+    snapshot_object_id = f"{type(snapshot_cache).__name__}:{object_id}"
+    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT.clear()
+    sglang_hicache_callable._RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT.clear()
+    sglang_hicache_callable._RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.clear()
+    sglang_hicache_callable._record_radix_state_snapshot_delta(
+        sglang_hicache_callable._snapshot_hicache_object(snapshot_cache)
+    )
+    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
+        "hicache_radix_removed_pages:self",
+        "radix_removed_page_identity",
+        {"__trace_sim_phase": "start"},
+        (snapshot_cache,),
+        {},
+        None,
+    )
+    assert handled and found and value == [], value
+    snapshot_cache.node.hash_value = []
+    sglang_hicache_callable._record_radix_state_snapshot_delta(
+        sglang_hicache_callable._snapshot_hicache_object(snapshot_cache)
+    )
+    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT[object_id] = [set()]
+    assert sglang_hicache_callable._RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT[snapshot_object_id] == ["snapshot_old"]
+    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
+        "hicache_radix_removed_pages:self",
+        "radix_removed_page_identity",
+        {"__trace_sim_phase": "end"},
+        (snapshot_cache,),
+        {},
+        None,
+    )
+    assert handled and found and value == ["snapshot_old"], value
 
 
 def run_profile_quality_fixture(tmp: Path, python_probe_file: Path) -> None:
@@ -1355,6 +1596,7 @@ def main() -> int:
     run_probe_fixture()
     run_sglang_hicache_target_fixture()
     run_hicache_state_snapshot_fixture()
+    run_hicache_radix_removed_pages_phase_fixture()
     run_hicache_page_hash_literal_page_size_fixture()
     run_hicache_prefetch_progress_source_fixture()
     run_profile_quality_capacity_fixture()
@@ -1363,6 +1605,7 @@ def main() -> int:
     run_torch_profiler_lifecycle_fixture()
     run_state_trace_env_fixture()
     run_env_placeholder_fixture()
+    run_hicache_radix_removed_materialization_fixture()
     run_trace_merger_sidecar_only_fixture()
     print("profiling fixtures passed")
     return 0

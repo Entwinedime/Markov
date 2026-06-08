@@ -370,6 +370,11 @@
               "required": false
             },
             {
+              "name": "radix_removed_page_identity",
+              "source": "hicache_radix_removed_pages:self",
+              "required": false
+            },
+            {
               "name": "prefix_len",
               "source": "return.prefix_len",
               "required": false

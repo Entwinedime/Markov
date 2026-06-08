@@ -13,6 +13,11 @@ from typing import Any
 from trace_sim_probe.probes import generic_callable as _base
 
 
+_RADIX_PAGES_BEFORE_CALL_BY_OBJECT: dict[int, list[set[str]]] = {}
+_RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT: dict[str, set[str]] = {}
+_RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT: dict[str, list[str]] = {}
+
+
 def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
@@ -74,7 +79,52 @@ def _hicache_state_source(
     if not args:
         return (True, False, None)
     snapshot = _snapshot_hicache_object(args[0])
+    _record_radix_state_snapshot_delta(snapshot)
     return (True, True, _base.ExtractedField(snapshot, model_input=False, event_kind="state_snapshot"))
+
+
+def _hicache_radix_removed_pages_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if source != "hicache_radix_removed_pages:self":
+        return (False, False, None)
+    if not args:
+        return (True, False, None)
+
+    obj = args[0]
+    object_id = id(obj)
+    snapshot_object_id = f"{type(obj).__name__}:{object_id}"
+    current_pages = _radix_page_set(obj)
+    phase = str(bound.get("__trace_sim_phase") or "")
+    call_stack = _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.setdefault(object_id, [])
+    if phase == "start" or (not phase and not call_stack):
+        call_stack.append(current_pages)
+        _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, None)
+        return (True, True, [])
+
+    if phase and phase != "end":
+        if call_stack:
+            call_stack.pop()
+        if not call_stack:
+            _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.pop(object_id, None)
+        _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, None)
+        return (True, True, [])
+
+    snapshot_removed_pages = _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, [])
+    previous_pages = call_stack.pop() if call_stack else None
+    if not call_stack:
+        _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.pop(object_id, None)
+    if snapshot_removed_pages:
+        return (True, True, snapshot_removed_pages)
+    if previous_pages is None:
+        return (True, True, [])
+    removed_pages = sorted(previous_pages - current_pages)
+    return (True, True, removed_pages)
 
 
 def _prefetch_progress_source(
@@ -554,6 +604,27 @@ def _derive_page_sets(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
     }
 
 
+def _radix_page_set(obj: Any) -> set[str]:
+    return _radix_page_set_from_nodes(_collect_radix_nodes(obj))
+
+
+def _radix_page_set_from_nodes(nodes: list[dict[str, Any]]) -> set[str]:
+    pages: set[str] = set()
+    for node in nodes:
+        pages.update(_page_keys_from_hash_value(node.get("hash_value")))
+    return pages
+
+
+def _record_radix_state_snapshot_delta(snapshot: dict[str, Any]) -> None:
+    object_id = snapshot.get("object_id")
+    if not isinstance(object_id, str) or not object_id:
+        return
+    current_pages = _radix_page_set_from_nodes(snapshot.get("nodes") or [])
+    previous_pages = _RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT.get(object_id)
+    _RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT[object_id] = current_pages
+    _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT[object_id] = [] if previous_pages is None else sorted(previous_pages - current_pages)
+
+
 def _page_keys_from_hash_value(value: Any) -> list[str]:
     if value is None:
         return []
@@ -585,6 +656,7 @@ _base.register_source_extractor(_page_hashes_source)
 _base.register_source_extractor(_page_hashes_concat_source)
 _base.register_source_extractor(_page_hashes_after_prefix_source)
 _base.register_source_extractor(_hicache_state_source)
+_base.register_source_extractor(_hicache_radix_removed_pages_source)
 _base.register_source_extractor(_prefetch_progress_source)
 
 install = _base.install

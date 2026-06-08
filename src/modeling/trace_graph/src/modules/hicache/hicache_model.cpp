@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -331,6 +332,7 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.source_pages = fact.pages;
     const bool insert_had_observed_pages = fact.role == "insert" && !fact.pages.empty();
     fact.target_pages = parse_page_arg(event, "target_page_identity");
+    fact.radix_removed_pages = parse_page_arg(event, "radix_removed_page_identity");
     parse_prefetch_progress(event, fact);
     if (fact.role == "insert" && fact.prefix_len > 0 && fact.page_size > 0 && !fact.pages.empty()) {
         const size_t prefix_pages = std::min(fact.pages.size(), static_cast<size_t>(fact.prefix_len / fact.page_size));
@@ -501,6 +503,12 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         return transitions;
     }
     if (fact.role == "insert") {
+        if (!fact.radix_removed_pages.empty()) {
+            if (target_page_size_mismatch(fact))
+                summary.skipped_non_invariant_events++;
+            else
+                apply_radix_removed_pages(fact, summary, transitions);
+        }
         auto insert_fact = fact;
         insert_fact.pages = target_insert_pages(fact);
         apply_insert(insert_fact, summary, transitions);
@@ -651,6 +659,47 @@ void HiCacheState::remember_leaf_group(const std::vector<std::string> & pages) {
     }
     if (group.empty()) return;
     for (const auto & page : group) leaf_group_by_page_[page] = group;
+}
+
+void HiCacheState::apply_radix_removed_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
+    std::unordered_set<std::string> seen;
+    auto erase_from_order = [](std::vector<std::string> & order, const std::string & page) {
+        order.erase(std::remove(order.begin(), order.end(), page), order.end());
+    };
+    auto erase_scoped_page = [](std::unordered_map<std::string, uint64_t> & counts, const std::string & page) {
+        const auto suffix = ":" + page;
+        for (auto it = counts.begin(); it != counts.end();) {
+            if (it->first.size() >= suffix.size() && it->first.compare(it->first.size() - suffix.size(), suffix.size(), suffix) == 0)
+                it = counts.erase(it);
+            else
+                ++it;
+        }
+    };
+
+    for (const auto & page : fact.radix_removed_pages) {
+        if (page.empty() || !seen.insert(page).second) continue;
+        remove_resident(fact, summary, transitions, "L1", page);
+        remove_resident(fact, summary, transitions, "L2", page);
+        clear_dirty(fact, summary, transitions, page);
+        clear_backuped(fact, summary, transitions, page);
+        clear_evicted(fact, summary, transitions, page);
+        clear_locked(fact, summary, transitions, page);
+
+        radix_known_pages_.erase(page);
+        leaf_group_by_page_.erase(page);
+        erase_from_order(l1_touch_order_, page);
+        erase_from_order(l2_touch_order_, page);
+        erase_scoped_page(hit_count_by_scope_page_, page);
+        erase_scoped_page(lock_count_by_scope_page_, page);
+        for (auto it = leaf_group_by_page_.begin(); it != leaf_group_by_page_.end();) {
+            auto & group = it->second;
+            group.erase(std::remove(group.begin(), group.end(), page), group.end());
+            if (group.empty())
+                it = leaf_group_by_page_.erase(it);
+            else
+                ++it;
+        }
+    }
 }
 
 void HiCacheState::apply_insert(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {

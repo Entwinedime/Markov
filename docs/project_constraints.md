@@ -56,6 +56,8 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - 普通 LD_PRELOAD 只能启用 hook so 中已实现 wrapper 的 native 符号；不能声称支持任意未知符号动态拦截。
 - HiCache diagnostic 实验中 `--hicache-ratio` 可以按实验目标调整，但必须大于 `1.0`；调整时必须在配置说明或验证记录中写明原因。容量压力优先通过 workload 或显式 capacity 配置触发，不能用小于等于 `1.0` 的 ratio 构造实验。
 - 真实 SGLang / KTransformers profiling 必须通过 `scripts/profile.sh` 外层容器入口启动。`scripts/internal/profile_runner.py` 是容器内执行器，不能在宿主机上直接用于真实 server profiling。
+- Profiling runner 可以在 state_trace 开启时，从同一次调用的 validation-only start/end snapshot materialize 最小 operation-level
+  facts，例如 insert 内消失的 radix page identity；完整 state snapshot 仍必须保持 `model_input=false`，不能整体进入 C++ state model。
 
 ## Modeling 约束
 
@@ -70,6 +72,9 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - 子模块修改 DAG 应通过统一 mutation API 记录修改。
 - 默认 E2E 预测来自 DAG 拓扑仿真，不来自子模块 latency 求和。
 - 默认 DAG 拓扑仿真不使用原始绝对时间戳兜底，faithful replay 必须能暴露缺失依赖边。
+- 同配置 replay 和跨配置 prediction 必须使用不同配置口径：replay 使用 observed replay config 验证真实 trace 能否重放；
+  prediction 才使用显式 target page size / capacity / write policy / prefetch policy 做 what-if。不得把 prediction target config
+  直接当作同配置 replay config，否则 observed remove/evict 等事实可能被错误地当成 non-invariant 跳过。
 - 子模块不能修改原始 profiling trace；三类 trace 的合并只能由 `scripts/trace/trace_merger.py` 生成新的 merged trace。
 - 子模块不能把 debug 字段混入默认预测输出。
 - 非执行类 state snapshot、oracle state、probe 内部 debug 和质量审计事件不能作为默认性能 DAG 节点；必须放在独立 debug/state trace，或显式标记为 `model_input=false` 并只由 validation/debug 路径消费。

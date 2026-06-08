@@ -30,6 +30,7 @@ struct HiCacheFact {
     std::vector<std::string> pages;
     std::vector<std::string> source_pages;
     std::vector<std::string> target_pages;
+    std::vector<std::string> radix_removed_pages;
     uint64_t page_size = 0;
     uint64_t prefix_len = 0;
     uint64_t new_input_tokens = 0;
@@ -171,6 +172,7 @@ class HiCacheState {
     std::vector<std::string> target_insert_pages(const HiCacheFact & fact) const;
     void mark_radix_known(const std::vector<std::string> & pages);
     void remember_leaf_group(const std::vector<std::string> & pages);
+    void apply_radix_removed_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_insert(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     uint64_t target_write_through_threshold() const;
     bool target_write_count_enabled() const;

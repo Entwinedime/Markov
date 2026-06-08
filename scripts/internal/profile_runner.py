@@ -464,6 +464,100 @@ def channel_config(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
     return {}
 
 
+def _page_set_from_hicache_snapshot(snapshot: Any) -> set[str]:
+    """从 HiCache state snapshot 的 radix nodes 提取 page identity 集合。"""
+
+    pages: set[str] = set()
+    if not isinstance(snapshot, dict):
+        return pages
+    nodes = snapshot.get("nodes")
+    if not isinstance(nodes, list):
+        return pages
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        value = node.get("hash_value")
+        if isinstance(value, list):
+            pages.update(str(item) for item in value if item is not None)
+        elif value is not None:
+            pages.add(str(value))
+    return pages
+
+
+def materialize_hicache_radix_removed_pages(trace_dir: Path) -> dict[str, int]:
+    """把同一 insert 调用 start/end snapshot 的 radix delta 写入模型输入事件。
+
+    `hicache_state:self` 仍作为 validation-only snapshot 输出；这里仅在 profiling
+    收尾阶段提取 operation-level `radix_removed_page_identity`。这样 C++ state
+    model 消费的是明确的 insert 事实，而不是完整 oracle state snapshot。
+    """
+
+    python_probe_dir = trace_dir / "python_probe"
+    result = {
+        "files_scanned": 0,
+        "files_updated": 0,
+        "insert_end_events": 0,
+        "materialized_events": 0,
+        "materialized_pages": 0,
+    }
+    if not python_probe_dir.is_dir():
+        return result
+
+    for trace_path in sorted(python_probe_dir.glob("*.json")):
+        result["files_scanned"] += 1
+        payload = load_json(trace_path)
+        events = payload.get("traceEvents")
+        if not isinstance(events, list):
+            continue
+
+        start_pages_by_key: dict[tuple[Any, Any, Any, Any], set[str]] = {}
+        end_pages_by_key: dict[tuple[Any, Any, Any, Any, Any], set[str]] = {}
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            name = event.get("name")
+            args = event.get("args") if isinstance(event.get("args"), dict) else {}
+            if not isinstance(args, dict) or args.get("target_id") != "hiradix.insert":
+                continue
+            target_id = args.get("target_id")
+            if name == "hicache_insert_start:state_snapshot":
+                key = (event.get("pid"), event.get("tid"), event.get("ts"), target_id)
+                start_pages_by_key[key] = _page_set_from_hicache_snapshot(args.get("state_snapshot"))
+            elif name == "hicache_insert_end:state_snapshot":
+                key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), target_id)
+                end_pages_by_key[key] = _page_set_from_hicache_snapshot(args.get("state_snapshot"))
+
+        updated = False
+        for event in events:
+            if not isinstance(event, dict) or event.get("name") != "hicache_insert_end":
+                continue
+            args = event.get("args") if isinstance(event.get("args"), dict) else None
+            if not isinstance(args, dict) or args.get("target_id") != "hiradix.insert":
+                continue
+            result["insert_end_events"] += 1
+            current = args.get("radix_removed_page_identity")
+            if isinstance(current, list) and current:
+                continue
+            start_key = (event.get("pid"), event.get("tid"), event.get("ts"), args.get("target_id"))
+            end_key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), args.get("target_id"))
+            start_pages = start_pages_by_key.get(start_key)
+            end_pages = end_pages_by_key.get(end_key)
+            if start_pages is None or end_pages is None:
+                continue
+            removed_pages = sorted(start_pages - end_pages)
+            if not removed_pages:
+                continue
+            args["radix_removed_page_identity"] = removed_pages
+            result["materialized_events"] += 1
+            result["materialized_pages"] += len(removed_pages)
+            updated = True
+
+        if updated:
+            dump_json(trace_path, payload)
+            result["files_updated"] += 1
+    return result
+
+
 class ProfileRun:
     """单次 profiling 运行的执行器。"""
 
@@ -520,6 +614,17 @@ class ProfileRun:
         finally:
             stop_process(server_process)
             restore_model_config(backup)
+            if status == "completed" and self._hicache_state_trace_enabled():
+                try:
+                    summary = materialize_hicache_radix_removed_pages(self.layout.trace_dir)
+                    if summary["materialized_events"] > 0:
+                        log(
+                            "Materialized HiCache radix removed pages: "
+                            f"events={summary['materialized_events']} pages={summary['materialized_pages']}"
+                        )
+                except Exception as exc:
+                    status = "failed"
+                    error = f"postprocess hicache radix removed pages failed: {exc}"
             self._write_manifest(
                 started_at=started_at,
                 status=status,
@@ -527,6 +632,8 @@ class ProfileRun:
                 error=error,
             )
 
+        if status == "failed" and error:
+            raise RuntimeError(error)
         log("Profile run completed.")
         return self.layout.run_dir
 
@@ -626,13 +733,19 @@ class ProfileRun:
                 continue
             fields = [dict(field) for field in target.get("fields", []) if isinstance(field, dict)]
             if not any(field.get("source") == "hicache_state:self" for field in fields):
-                fields.append(
-                    {
-                        "name": "state_snapshot",
-                        "source": "hicache_state:self",
-                        "required": False,
-                    }
+                state_field = {
+                    "name": "state_snapshot",
+                    "source": "hicache_state:self",
+                    "required": False,
+                }
+                radix_removed_index = next(
+                    (index for index, field in enumerate(fields) if field.get("source") == "hicache_radix_removed_pages:self"),
+                    None,
                 )
+                if radix_removed_index is None:
+                    fields.append(state_field)
+                else:
+                    fields.insert(radix_removed_index, state_field)
             target["fields"] = fields
         return targets
 

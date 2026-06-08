@@ -14,14 +14,17 @@
 
 ## 当前结论
 
-截至 `2026-06-08 21:06:31 +0800`，本轮验证基于 HEAD commit `43d303c`
-和当前工作树改动。当前工作树包含三类 HiCache state model 修复：
+截至 `2026-06-09 05:48:03 +0800`，本轮验证基于 HEAD commit `43d303c`
+和当前工作树改动。当前工作树包含四类 HiCache state / validation 修复：
 
 - 显式 `write_back` target 默认不消费 base write-through 的 `L3->L2` prefetch transfer credit；只有组合配置显式设置
   `write_back_prefetch_transfer_credit=true` 时才使用该 credit。
 - 显式 `best_effort` 或带 timeout 参数的 `timeout` target 不消费 base prefetch policy 下观测到的 lock/ref。
 - page size what-if 下，prefetch transfer completion 只要 source pages 覆盖同 request 的 schedule source pages，
   completion credit 就归到 target schedule pages；不再要求 transfer 的 `target_page_identity` 与 schedule target pages 前缀相同。
+- profiling runner 在 state_trace 开启时，会把同一次 insert start/end validation snapshot 中消失的 radix pages
+  materialize 成 `hicache_insert_end.radix_removed_page_identity`。C++ state model 在同 page size replay 中消费这个
+  operation-level fact，page-size what-if 下跳过它。
 
 本轮重新跑完了 `I0`、`I1`、`I2`、`I3` 四类输入，以及 `C0-C7`、`write_back + low capacity`
 共九类配置/组合的 state replay 或 cross-config prediction。结论如下：
@@ -389,6 +392,8 @@ Profiling 必须只采事实，不做 target 行为推断。
 - prefetch new input tokens、last hash、threshold、timeout、request 使用点；
 - storage query hashes、batch hit count、transfer completion、write hashes；
 - L1/L2 capacity、allocation size、locked/evictable 状态；
+- insert 调用内 radix 结构消失的 page identity，例如 `radix_removed_page_identity`。该字段只能来自同一次调用
+  start/end 的 radix state delta；完整 state snapshot 仍只作为 validation oracle，不直接喂给 target what-if。
 - DAG anchor facts，用于后续 state-to-DAG patch。
 
 只能用于 oracle 的字段包括：
@@ -413,21 +418,57 @@ remove/evict 等 observed movement 不是 target 不变量；缺少 target page 
 ### 主线一：两个强差异配置场景 + 两个大输入
 
 目标：先用最朴素但约束清晰的办法验证 state model 的跨配置能力。构建两个全新的 HiCache 配置场景：
-它们不仅彼此完全不同，也不能等同于本文已验证矩阵中跑过的任何配置组合。每个可变配置项都尽量不同，
-然后用两个大型输入分别做 replay 和双向 cross-config prediction。
+它们不仅彼此完全不同，也不能等同于任何此前已经跑过的 HiCache state profiling 配置组合。这里的“此前已经跑过”
+覆盖本文当前矩阵、已清理的历史运行、临时验证运行和失败后重跑前的草案配置；不能只按 `C0-C8` 编号集合判断。
+每个可变配置项都尽量不同，然后用两个大型输入分别做 replay 和双向 cross-config prediction。
 
 #### 配置场景
 
 | 场景 | 配置要求 | 覆盖目的 |
 | --- | --- | --- |
-| `S1A_baseline_large` | 新建一套稳定基线；page size、write policy、prefetch policy、capacity、timeout、ratio 等组合不得复用当前已验证矩阵中的 C0-C8、write-back capacity、page64、capacity、prefetch 变体等既有组合。 | 提供可复用 base facts，同时验证新的 baseline 组合是否仍能稳定 replay。 |
-| `S1B_divergent_large` | 与 `S1A` 的可变项尽量全部不同，并且同样不得复用任何已跑过的配置组合；例如 page size、write policy、prefetch policy、capacity、timeout、ratio 至少应形成一个新的联合配置。 | 强制触发 page split、dirty/writeback、capacity eviction、prefetch ready/suppressed 等 target 行为变化，同时验证未见过配置组合的 target 行为。 |
+| `S1A_baseline_large` | 新建一套稳定基线；page size、write policy、prefetch policy、capacity、timeout、ratio 等联合配置不得复用任何历史已跑配置，包括但不限于 C0-C8、write-back capacity、page64、capacity、prefetch 变体、临时验证 run 和已清理 run。 | 提供可复用 base facts，同时验证新的 baseline 组合是否仍能稳定 replay。 |
+| `S1B_divergent_large` | 与 `S1A` 的可变项尽量全部不同，并且同样不得复用任何历史已跑配置组合；例如 page size、write policy、prefetch policy、capacity、timeout、ratio 至少应形成一个新的联合配置。 | 强制触发 page split、dirty/writeback、capacity eviction、prefetch ready/suppressed 等 target 行为变化，同时验证未见过配置组合的 target 行为。 |
+
+当前候选配置签名：
+
+| 场景 | joint signature | 历史配置比对 |
+| --- | --- | --- |
+| `S1A_baseline_large` | page128、L1/L2 capacity `64/129`、`write_through_selective`、`wait_complete`、ratio `2.0`、prefetch timeout extra config `10s/0/10s`。 | 不同于 `C2_write_through_selective`，因为 prefetch policy 和显式 capacity 不同；不同于 `C5_prefetch_wait`，因为 write policy 和显式 capacity 不同；脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，`old_matches=0`。 |
+| `S1B_divergent_large` | page64、L1/L2 capacity `128/256`、`write_back`、`best_effort`、ratio `2.0`、prefetch timeout extra config `10s/0/10s`。 | 不同于 `C3_page64` / `I2_page64`，因为 write policy 和 prefetch policy 不同；不同于 `C1_write_back` / `C8_write_back_capacity`，因为 page size、capacity 和 prefetch policy 不同；脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，`old_matches=0`。 |
+
+本次签名检查按 page size、L1/L2 capacity、write policy、prefetch policy、`--hicache-ratio`、prefetch extra config
+组成联合 signature；`S1A` 和 `S1B` 的联合 signature 也互不相同。已清理且仓库中没有实体配置的历史 run，
+只能依据本文保留的历史配置摘要和 config metadata 继续约束，不把缺失的 `data/` 记录作为文档依赖。
+
+#### 当前 S1A 手工输入预验证
+
+`S1A_baseline_large + L1_manual_phased` 已完成一次真实 profile 和 replay 排查，结论如下：
+
+| 项 | 结果 |
+| --- | --- |
+| run label | `20260608_203828_profiling_hicache_state_mainline_one_manual_s1a`。run label 只标识本批次，不作为长期路径依赖。 |
+| workload | `83/83 ok`、`errors=0`；各阶段为 warmup `1`、seed `8`、reuse `8`、backup wait `8`、pressure `24`、reuse-after-pressure `8`、prefetch seed `8`、prefetch reuse `10`、dirty eviction `8`。 |
+| profile quality | `quality_ready=true`，`quality_errors=[]`，23/23 Python targets observed，stateful required page identity `2130/2130`，缺失 `0`。 |
+| 机制覆盖 | evict `122`、insert `336`、load_back `216`、lock_ref `1266`、lookup `504`、prefetch_decision `168`、prefetch_progress `424`、prefetch_query `114`、prefetch_schedule `282`、prefetch_transfer `16`、write_backup `294`、write_storage `288`。 |
+| radix removed materialization | 真实 live source 仍未稳定产出非空字段；runner 收尾从同一次 insert start/end validation snapshot materialize `2` 个 `hicache_insert_end`，每个 `13` 页，合计 `26` 页。materialization 后 insert end 统计为 `336` total、`2` nonempty、`max_len=13`。 |
+| 同配置 replay 口径 | 使用 observed replay config，不使用主线一 prediction target config。原因是 prediction config 中的显式 capacity 表示 what-if target，会跳过 observed remove/evict movement；同配置 replay 必须消费真实 observed movement。 |
+| observed replay final | `validation_ready=true`、`validation_errors=[]`、`final_state_match=true`；model/oracle 均为 L1 `54`、L2 `106`、backuped `106`、evicted `52`、locked `1`、prefetch planned/ready/suppressed `356/18/338`。 |
+| observed replay timeline | `match=true`、`model_extra_transition_count=0`、`exact_match=false`、`oracle_extra_transition_count=2946`。 |
+| event delta | `match=false`、`mismatch_count=168`，剩余差异只集中在 lock/ref transition 粒度：`mark_locked` / `clear_locked` oracle-only pages。 |
+
+本次 S1A 预验证补充了两条约束：
+
+- `radix_removed_page_identity` 是 operation-level fact，可以由 live extractor 直接产出，也可以在 profiling runner 收尾阶段从同一次
+  insert start/end validation snapshot materialize；完整 state snapshot 仍不作为 C++ state model 输入。
+- 同配置 replay 和跨配置 prediction 必须使用不同 config 口径。replay 使用 observed config 验证事实采集和状态重放；
+  prediction 才使用 `S1A` / `S1B` target config 验证 what-if 行为。
 
 约束：
 
 - `S1A` 和 `S1B` 的 request 内容必须一致，只改变 HiCache config。
 - `S1A` 和 `S1B` 必须拥有新的 config id 和完整 config snapshot；不能只把旧配置改名当作新配置。
-- 判定“新配置”时按联合配置判断：page size、write policy、prefetch policy、capacity、timeout、ratio 等核心项的组合不能和既有验证记录一致。
+- 判定“新配置”时按联合配置判断：page size、write policy、prefetch policy、capacity、timeout、ratio 等核心项的组合不能和任何已跑配置一致。
+- 主线一开跑前必须把候选 `S1A` / `S1B` 与历史已跑配置清单做一次人工或脚本化比对；比对结果写入 config metadata 或 HCSV 摘要。
 - `--hicache-ratio` 可以变化，但必须 `> 1.0`，并在 config metadata 或 HCSV 记录中说明原因。
 - capacity pressure 优先来自 workload 或显式 capacity，不用 `<=1.0` ratio 构造。
 - 如果某个可变项因为 SGLang 限制不能同时改变，必须在 HCSV 记录里说明保留原因。
@@ -449,6 +490,14 @@ input + S1B profile -> replay(S1B)
 S1A facts + S1B config + S1B oracle -> prediction(S1A -> S1B)
 S1B facts + S1A config + S1A oracle -> prediction(S1B -> S1A)
 ```
+
+配置口径：
+
+- 同配置 replay 使用 observed replay config，用来验证当前 trace 事实能否重放真实 state；它不把显式 target capacity/policy 当成
+  what-if 分支。
+- 跨配置 prediction 使用 `configs/modeling/hicache_state/mainline_one/` 下的 S1A/S1B target config；这些配置中的
+  page size、capacity、write policy、prefetch policy 是 what-if target，不能拿来替代同配置 replay config。
+- 如果同一 profiling run 同时要做 replay 和 prediction，必须分别记录两个 modeling config 和两个 validation 结论。
 
 验收：
 

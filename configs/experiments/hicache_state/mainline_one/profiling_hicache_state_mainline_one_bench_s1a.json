@@ -1,18 +1,16 @@
 {
-  "name": "profiling_hicache_state_page64_validation",
+  "name": "profiling_hicache_state_mainline_one_bench_s1a",
   "framework": "sglang",
   "metadata": {
-    "purpose": "State-only SGLang HiCache profiling run for validating C++ HiCache state derivation with page_size=64 target oracle snapshots.",
+    "purpose": "Mainline-one L2 bench_serving generated-shared-prefix run for S1A: page128 + write-through-selective + wait_complete.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
-    "hicache_ratio_note": "--hicache-ratio may be changed for validation, but it must be > 1.0. Record the reason when changing it; capacity pressure should still come from workload or explicit capacity config first."
-  },
-  "modeling": {
-    "hicache": {
-      "page_size": 64,
-      "l1_capacity_pages": 128,
-      "l2_capacity_pages": 256
-    }
+    "hicache_ratio_note": "--hicache-ratio remains 2.0 (>1.0) to keep known capacity semantics while changing the joint page/write/prefetch configuration; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
+    "mainline_one_scenario": "S1A_baseline_large",
+    "mainline_one_input": "L2_bench_serving_large",
+    "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
+    "mainline_one_config_signature": "page_size=128,l1_capacity_pages=64,l2_capacity_pages=129,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.0,prefetch_timeout_extra=10.0/0.0/10.0",
+    "mainline_one_config_comparison": "Different from C2 by prefetch policy and explicit capacity; different from C5 by write policy and explicit capacity; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records."
   },
   "profiling": {
     "enabled": true,
@@ -992,68 +990,60 @@
       "2",
       "--trust-remote-code",
       "--enable-hierarchical-cache",
-      "--max-total-tokens",
-      "8192",
-      "--hicache-ratio",
-      "2.0",
-      "--page-size",
-      "64",
-      "--hicache-write-policy",
-      "write_through",
       "--hicache-io-backend",
       "kernel_ascend",
       "--hicache-mem-layout",
       "layer_first",
       "--hicache-storage-backend",
       "file",
-      "--hicache-storage-backend-extra-config",
-      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":10.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":10.0,\"hicache_storage_pass_prefix_keys\":true}",
+      "--disable-cuda-graph",
+      "--max-total-tokens",
+      "8192",
+      "--hicache-ratio",
+      "2.0",
+      "--hicache-write-policy",
+      "write_through_selective",
       "--hicache-storage-prefetch-policy",
-      "timeout",
-      "--disable-cuda-graph"
+      "wait_complete",
+      "--hicache-storage-backend-extra-config",
+      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":10.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":10.0,\"hicache_storage_pass_prefix_keys\":true}"
     ],
     "ready_url": "http://127.0.0.1:30000/get_model_info",
     "ready_timeout_sec": 1800
   },
   "bench": {
-    "command": [
-      "python3",
-      "scripts/bench/hicache_phased_workload.py",
-      "--base-url",
-      "http://127.0.0.1:30000",
-      "--output-dir",
-      "{bench_dir}/hicache_phased",
-      "--warmup-requests",
-      "1",
-      "--seed-requests",
-      "8",
-      "--reuse-requests",
-      "8",
-      "--backup-wait-requests",
-      "8",
-      "--pressure-requests",
-      "16",
-      "--pressure-unique-prefix",
-      "--reuse-after-pressure-requests",
-      "8",
-      "--prefetch-seed-requests",
-      "8",
-      "--prefetch-reuse-requests",
-      "8",
-      "--cache-write-policy",
-      "write_through",
-      "--shared-prefix-repeat",
-      "128",
-      "--unique-suffix-repeat",
-      "12",
-      "--sleep-sec",
-      "0.02",
-      "--phase-wait-sec",
-      "2.0",
-      "--max-errors",
-      "1",
-      "--max-new-tokens",
-      "8"
-    ]
+    "kind": "sglang.bench_serving",
+    "args": {
+      "backend": "sglang",
+      "base_url": "http://127.0.0.1:30000",
+      "model": "/models/Qwen3-32B",
+      "tokenizer": "/models/Qwen3-32B",
+      "dataset_name": "generated-shared-prefix",
+      "num_prompts": 128,
+      "gsp_num_groups": 8,
+      "gsp_prompts_per_group": 16,
+      "gsp_system_prompt_len": 384,
+      "gsp_question_len": 96,
+      "gsp_output_len": 8,
+      "gsp_range_ratio": 0.0,
+      "gsp_fast_prepare": true,
+      "gsp_group_distribution": "zipf",
+      "gsp_zipf_alpha": 1.2,
+      "seed": 20260608,
+      "request_rate": 8,
+      "max_concurrency": 8,
+      "warmup_requests": 4,
+      "disable_tqdm": true,
+      "output_details": true
+    }
+  },
+  "modeling": {
+    "hicache": {
+      "page_size": 128,
+      "l1_capacity_pages": 64,
+      "l2_capacity_pages": 129,
+      "write_policy": "write_through_selective",
+      "prefetch_policy": "wait_complete"
+    }
   }
 }
