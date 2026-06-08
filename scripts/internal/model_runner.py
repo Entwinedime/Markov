@@ -325,6 +325,7 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "prefetch_timeout_base",
             "prefetch_timeout_per_ki_token",
             "prefetch_timeout_max",
+            "emit_state_digests",
         ):
             if key in hicache:
                 result[key] = hicache[key]
@@ -383,6 +384,7 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "prefetch_timeout_base",
         "prefetch_timeout_per_ki_token",
         "prefetch_timeout_max",
+        "emit_state_digests",
     ):
         if key in explicit_hicache:
             result[key] = explicit_hicache[key]
@@ -1779,6 +1781,7 @@ def build_event_delta_validation(predicted_records: list[dict[str, Any]], snapsh
         "nested_oracle_transition_count": oracle["nested_transition_count"],
         "ignored_state_keys_without_predicted_transition": oracle["ignored_state_keys"],
         "mismatch_count": len(mismatches),
+        "mismatch_totals_by_kind": summarize_delta_mismatches_by_kind(mismatches),
         "top_mismatches": mismatches[:20],
         "note": "Exact event delta comparison is intended for same-run replay; cross-config prediction should use final-state and policy oracle fields.",
     }
@@ -1835,6 +1838,7 @@ def build_timeline_delta_validation(
         "ignored_snapshot_count": oracle["ignored_snapshot_count"],
         "ignored_state_keys_without_predicted_transition": oracle["ignored_state_keys"],
         "mismatch_count": len(mismatches),
+        "mismatch_totals_by_kind": summarize_delta_mismatches_by_kind(mismatches),
         "top_mismatches": mismatches[:20],
         "note": "Timeline delta comparison requires state_snapshot.object_id and compares transition kind/page multisets. match=true means every predicted transition is covered by the raw snapshot timeline; exact_match=false can still occur when sparse multi-process snapshots expose oracle-only transient state oscillations.",
     }
@@ -2304,6 +2308,41 @@ def compare_delta_multisets(predicted_rows: list[dict[str, Any]], oracle_rows: l
             }
         )
     return mismatches
+
+
+def mismatch_value_count(value: Any) -> int:
+    if isinstance(value, list):
+        return len([item for item in value if item is not None])
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def summarize_delta_mismatches_by_kind(mismatches: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    """按 transition kind 汇总 delta mismatch，避免只看 top rows 时漏掉主因。"""
+
+    summary: dict[str, dict[str, int]] = {}
+    for row in mismatches:
+        kind = str(row.get("transition_kind") or "")
+        if not kind:
+            continue
+        item = summary.setdefault(
+            kind,
+            {
+                "mismatch_rows": 0,
+                "missing_in_predicted": 0,
+                "extra_in_predicted": 0,
+                "predicted_count": 0,
+                "oracle_count": 0,
+            },
+        )
+        item["mismatch_rows"] += 1
+        item["missing_in_predicted"] += mismatch_value_count(row.get("missing_in_predicted"))
+        item["extra_in_predicted"] += mismatch_value_count(row.get("extra_in_predicted"))
+        item["predicted_count"] += mismatch_value_count(row.get("predicted_count"))
+        item["oracle_count"] += mismatch_value_count(row.get("oracle_count"))
+    return {kind: summary[kind] for kind in sorted(summary)}
 
 
 def delta_multiset_counts(rows: list[dict[str, Any]]) -> dict[tuple[str, str], int]:

@@ -54,13 +54,13 @@ Profiling 分成三个独立采集渠道：
 真实 SGLang / KTransformers profiling 必须使用外层容器入口启动：
 
 ```bash
-scripts/profile.sh configs/experiments/profiling_minimal_sglang_hicache.json
+scripts/profile.sh configs/experiments/sglang/profiling_minimal_sglang_hicache.json
 ```
 
 dry-run 也优先使用同一个外层入口：
 
 ```bash
-scripts/profile.sh configs/experiments/profiling_minimal_sglang_hicache.json --dry-run
+scripts/profile.sh configs/experiments/sglang/profiling_minimal_sglang_hicache.json --dry-run
 ```
 
 `scripts/profile.sh` 负责选择 docker compose service、挂载仓库到
@@ -77,7 +77,7 @@ scripts/profile.sh configs/experiments/profiling_minimal_sglang_hicache.json --d
 不要在宿主机上直接运行真实 SGLang profiling：
 
 ```bash
-python3 scripts/internal/profile_runner.py --config configs/experiments/profiling_minimal_sglang_hicache.json
+python3 scripts/internal/profile_runner.py --config configs/experiments/sglang/profiling_minimal_sglang_hicache.json
 ```
 
 宿主机 Python 环境不保证安装 SGLang、torch、torch_npu 和 Ascend 运行依赖。直接调用会
@@ -137,7 +137,7 @@ trace；如果某个实验采集了 HiCache 或 CPUInfer 真实执行事件，�
 base DAG 构建。当前配置入口：
 
 ```bash
-scripts/profile.sh configs/experiments/profiling_sglang_bench_serving_base_dag.json
+scripts/profile.sh configs/experiments/sglang/profiling_sglang_bench_serving_base_dag.json
 ```
 
 该配置只启用 `torch` 和 `ld_preload`，server 关闭 graph，不启用 HiCache 参数。
@@ -291,7 +291,7 @@ validation/debug 逻辑读取。
 当前 HiCache state validation 配置入口：
 
 ```bash
-scripts/profile.sh configs/experiments/profiling_hicache_state_validation.json
+scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_validation.json
 ```
 
 该配置是 state-only 快速验证路径，只启用 `python_probe` 和 `ld_preload`，关闭 torch profiler。

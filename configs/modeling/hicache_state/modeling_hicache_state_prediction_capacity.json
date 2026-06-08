@@ -1,10 +1,10 @@
 {
   "metadata": {
     "purpose": "Predict HiCache target state from a base profiling manifest using a lower same-page-size capacity target config. l1_capacity_pages is the effective SGLang device page budget observed for this run, not max_total_tokens/page_size.",
-    "usage": "python3 scripts/internal/model_runner.py --config configs/modeling/modeling_hicache_state_prediction_capacity.json --profile-manifest <base_run_dir>/profile_manifest.json --output-dir <base_run_dir>/modeling/predict_capacity_state --mode cache_state --emit-module-summary --emit-validation --hicache-oracle-trace <target_run_dir>/modeling/cache_state_replay/merged_trace/merged_trace_00.json"
+    "usage": "python3 scripts/internal/model_runner.py --config configs/modeling/hicache_state/modeling_hicache_state_prediction_capacity.json --profile-manifest <base_run_dir>/profile_manifest.json --output-dir <base_run_dir>/modeling/predict_capacity_state --mode cache_state --emit-module-summary --emit-validation --hicache-oracle-trace <target_run_dir>/modeling/cache_state_replay/merged_trace/merged_trace_00.json"
   },
   "input": {
-    "target_experiment_config": "configs/experiments/profiling_hicache_state_capacity_validation.json"
+    "target_experiment_config": "configs/experiments/hicache_state/profiling_hicache_state_capacity_validation.json"
   },
   "output_dir": "data/modeling_runs/hicache_state_prediction_capacity",
   "mode": "cache_state",

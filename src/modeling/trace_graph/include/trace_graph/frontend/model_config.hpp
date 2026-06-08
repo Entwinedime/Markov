@@ -31,6 +31,7 @@ struct HiCacheConfig {
     double prefetch_timeout_base_sec = 0.0;
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
+    bool emit_state_digests = false;
 };
 
 // C++ 后端消费的模型配置。

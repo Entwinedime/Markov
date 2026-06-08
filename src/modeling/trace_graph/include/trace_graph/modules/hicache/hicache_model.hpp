@@ -224,6 +224,7 @@ class HiCacheState {
     void enforce_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier);
     void write_back_dirty_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & page);
     std::map<std::string, uint64_t> page_hit_count_summary() const;
+    std::string transition_state_digest() const;
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,
                            const std::string & tier, const std::string & page, const std::string & before_digest);
 };

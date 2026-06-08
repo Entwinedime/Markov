@@ -206,6 +206,9 @@ bool is_non_invariant_observed_role(const std::string & role) {
     if (role == "load_back" || role == "init_load_back" || role == "write_backup" || role == "write_storage_schedule" || role == "remove_page" ||
         role == "l3_hit_query")
         return true;
+    // lock/ref 依赖当前 radix tree 的节点拆分和父链路径。page size what-if 下
+    // base run 的 inc/dec 次数不是 target timeline 的不变量，只能用于同配置 replay。
+    if (role == "lock_ref_inc" || role == "lock_ref_dec") return true;
     // l3_prefetch_enqueue 是 base run 中实际提交给 controller 的预取 enqueue。
     // page size what-if 下 target planned pages 应由 prefetch_schedule + target
     // policy 重新生成；不能消费 base enqueue 上按旧 last_hash 计算出的 target pages。
@@ -266,8 +269,8 @@ std::string join_count_map(const std::unordered_map<std::string, uint64_t> & val
 
 std::map<std::string, uint64_t> ordered_count_map(const std::unordered_map<std::string, uint64_t> & values) { return {values.begin(), values.end()}; }
 
-Json transition_to_json(const HiCacheStateTransition & transition) {
-    return {
+Json transition_to_json(const HiCacheStateTransition & transition, bool emit_state_digests) {
+    Json row = {
         {"transition_id", transition.transition_id},
         {"kind", transition.kind},
         {"role", transition.role},
@@ -279,9 +282,12 @@ Json transition_to_json(const HiCacheStateTransition & transition) {
         {"source_event_index", transition.source_event_index},
         {"tier", transition.tier},
         {"pages", transition.pages},
-        {"before_state_digest", transition.before_state_digest},
-        {"after_state_digest", transition.after_state_digest},
     };
+    if (emit_state_digests) {
+        row["before_state_digest"] = transition.before_state_digest;
+        row["after_state_digest"] = transition.after_state_digest;
+    }
+    return row;
 }
 
 } // namespace
@@ -750,7 +756,7 @@ void HiCacheState::apply_write_policy_hit_counts(const HiCacheFact & fact, HiCac
         if (page.empty() || !counted.insert(page).second) continue;
         if (l1_.count(page) == 0 && radix_known_pages_.count(page) == 0) continue;
 
-        const auto before = digest();
+        const auto before = transition_state_digest();
         const auto scoped_key = scoped_page_key(fact, page);
         hit_count_by_scope_page_[scoped_key]++;
         record_transition(fact, summary, transitions, "increment_hit_count", "", page, before);
@@ -984,7 +990,7 @@ void HiCacheState::add_resident(const HiCacheFact & fact, HiCacheSummary & summa
                                 const std::string & page) {
     auto * pages = tier_set(tier);
     if (!pages) return;
-    auto before = digest();
+    auto before = transition_state_digest();
     touch_page(tier, page);
     if (pages->insert(page).second) {
         evicted_.erase(page);
@@ -997,7 +1003,7 @@ void HiCacheState::remove_resident(const HiCacheFact & fact, HiCacheSummary & su
                                    const std::string & tier, const std::string & page) {
     auto * pages = tier_set(tier);
     if (!pages) return;
-    auto before = digest();
+    auto before = transition_state_digest();
     if (pages->erase(page) > 0) {
         record_transition(fact, summary, transitions, "remove_" + lower(tier) + "_resident", tier, page, before);
         if (tier == "L2") clear_backuped(fact, summary, transitions, page);
@@ -1005,19 +1011,19 @@ void HiCacheState::remove_resident(const HiCacheFact & fact, HiCacheSummary & su
 }
 
 void HiCacheState::mark_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (dirty_.insert(page).second) record_transition(fact, summary, transitions, "mark_dirty", "", page, before);
 }
 
 void HiCacheState::clear_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (dirty_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_dirty", "", page, before);
 }
 
 void HiCacheState::mark_backuped(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                  const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (backuped_.insert(page).second) record_transition(fact, summary, transitions, "mark_backuped", "", page, before);
     // SGLang 的 TreeNode.backuped 表示 host_value 已存在；一旦备份成立，
     // 该页不应继续留在 dirty 集合中。
@@ -1026,43 +1032,43 @@ void HiCacheState::mark_backuped(const HiCacheFact & fact, HiCacheSummary & summ
 
 void HiCacheState::clear_backuped(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                   const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (backuped_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_backuped", "", page, before);
 }
 
 void HiCacheState::mark_evicted(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                 const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (evicted_.insert(page).second) record_transition(fact, summary, transitions, "mark_evicted", "", page, before);
 }
 
 void HiCacheState::clear_evicted(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                  const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (evicted_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_evicted", "", page, before);
 }
 
 void HiCacheState::mark_locked(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (locked_.insert(page).second) record_transition(fact, summary, transitions, "mark_locked", "", page, before);
 }
 
 void HiCacheState::clear_locked(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                 const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (locked_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_locked", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_planned(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                          const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (prefetch_planned_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_planned", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                        const std::string & page) {
-    auto before = digest();
+    auto before = transition_state_digest();
     if (prefetch_ready_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_ready", "", page, before);
     prefetch_late_.erase(page);
     prefetch_suppressed_.erase(page);
@@ -1071,14 +1077,14 @@ void HiCacheState::mark_prefetch_ready(const HiCacheFact & fact, HiCacheSummary 
 void HiCacheState::mark_prefetch_late(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                       const std::string & page) {
     if (prefetch_ready_.count(page) > 0) return;
-    auto before = digest();
+    auto before = transition_state_digest();
     if (prefetch_late_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_late", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_suppressed(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                             const std::string & page) {
     if (prefetch_ready_.count(page) > 0) return;
-    auto before = digest();
+    auto before = transition_state_digest();
     if (prefetch_suppressed_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_suppressed", "", page, before);
 }
 
@@ -1283,6 +1289,8 @@ void HiCacheState::enforce_capacity(const HiCacheFact & fact, HiCacheSummary & s
     while (pages->size() > capacity && !order->empty()) { evict_lru_pages(fact, summary, transitions, tier, pages->size() - capacity); }
 }
 
+std::string HiCacheState::transition_state_digest() const { return config_.emit_state_digests ? digest() : std::string{}; }
+
 void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                      const std::string & kind, const std::string & tier, const std::string & page, const std::string & before_digest) {
     summary.state_transition_count++;
@@ -1300,7 +1308,7 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
     transition.tier = tier;
     transition.pages = {page};
     transition.before_state_digest = before_digest;
-    transition.after_state_digest = digest();
+    transition.after_state_digest = transition_state_digest();
     transitions.push_back(std::move(transition));
 }
 
@@ -1407,7 +1415,7 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
 std::string HiCacheSummary::to_json() const {
     // summary 描述 HiCache 状态验证结果，不参与默认 E2E prediction。
     Json transition_rows = Json::array();
-    for (const auto & transition : transition_trace) transition_rows.push_back(transition_to_json(transition));
+    for (const auto & transition : transition_trace) transition_rows.push_back(transition_to_json(transition, target_config.emit_state_digests));
 
     Json root;
     root["status"] = status;
@@ -1430,6 +1438,7 @@ std::string HiCacheSummary::to_json() const {
         {"prefetch_timeout_base_sec", target_config.prefetch_timeout_base_sec},
         {"prefetch_timeout_per_ki_token_sec", target_config.prefetch_timeout_per_ki_token_sec},
         {"prefetch_timeout_max_sec", target_config.prefetch_timeout_max_sec},
+        {"emit_state_digests", target_config.emit_state_digests},
     };
     root["events_by_role"] = events_by_role;
     root["processed_events_by_role"] = processed_events_by_role;

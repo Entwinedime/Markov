@@ -1,7 +1,7 @@
 {
   "metadata": {
     "purpose": "Run C++ HiCache state-only validation from a profiling_hicache_state_validation profile manifest.",
-    "usage": "python3 scripts/internal/model_runner.py --config configs/modeling/modeling_hicache_state_validation.json --profile-manifest <run_dir>/profile_manifest.json --output-dir <run_dir>/modeling/cache_state_replay --mode cache_state --emit-module-summary --emit-validation"
+    "usage": "python3 scripts/internal/model_runner.py --config configs/modeling/hicache_state/modeling_hicache_state_validation.json --profile-manifest <run_dir>/profile_manifest.json --output-dir <run_dir>/modeling/cache_state_replay --mode cache_state --emit-module-summary --emit-validation"
   },
   "input": {},
   "output_dir": "data/modeling_runs/hicache_state_validation",

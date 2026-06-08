@@ -32,14 +32,14 @@ profile trace / sidecar
 当前主线入口：
 
 ```text
-python3 scripts/internal/model_runner.py --config configs/modeling/modeling_smoke_hicache.json
+python3 scripts/internal/model_runner.py --config configs/modeling/smoke/modeling_smoke_hicache.json
 ```
 
 从真实 profiling run 入口：
 
 ```text
 python3 scripts/internal/model_runner.py \
-  --config configs/modeling/modeling_hicache_from_manifest.json \
+  --config configs/modeling/hicache/modeling_hicache_from_manifest.json \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/faithful_replay \
   --mode faithful_replay \
@@ -373,7 +373,7 @@ HiCache state validation 的 modeling 入口：
 
 ```bash
 python3 scripts/internal/model_runner.py \
-  --config configs/modeling/modeling_hicache_state_validation.json \
+  --config configs/modeling/hicache_state/modeling_hicache_state_validation.json \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/cache_state_replay \
   --mode cache_state \

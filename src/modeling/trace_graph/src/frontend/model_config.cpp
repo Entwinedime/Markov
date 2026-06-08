@@ -155,6 +155,7 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     config.prefetch_timeout_per_ki_token_sec =
         number_value(object, "prefetch_timeout_per_ki_token_sec", number_value(object, "prefetch_timeout_per_ki_token", 0.0));
     config.prefetch_timeout_max_sec = number_value(object, "prefetch_timeout_max_sec", number_value(object, "prefetch_timeout_max", 0.0));
+    config.emit_state_digests = bool_value(object, "emit_state_digests", false);
     return config;
 }
 

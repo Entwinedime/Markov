@@ -4,7 +4,7 @@
 
 ## Docs 约束
 
-`docs/` 目录的主线文档只维护四个文件：
+`docs/` 顶级主线文档只维护四个文件：
 
 - `profiling_development.md`
 - `modeling_development.md`
@@ -18,16 +18,16 @@
 - work progress 文档只做时间戳增量更新；
 - constraints 文档记录项目长期约束，更新时删改。
 
+`docs/validation/` 用于纳入 git 追踪的专项验证记录；当前只维护
+`docs/validation/hicache_state_validation.md`，记录 HiCache state validation 的长期结论、关键 run
+索引和后续计划。新增专项验证文档前必须先确认它不是 profiling / modeling / work progress /
+constraints 四个顶级主文档能够承载的内容。
+
 不再在 `docs/` 下维护按实验、模块、历史实现拆出来的零散主线文档。
 
-`docs/tmp/` 只用于短期计划、临时方案和协作草稿：
+`docs/` 下不再使用 `tmp` 子目录。短期计划、临时方案和协作草稿如果需要保留，必须直接合并进上述四个顶级主文档或已批准的 `docs/validation/` 专项文档；不需要保留的临时材料应放在仓库外或系统临时目录，不能作为提交、交接或长期引用的依据。
 
-- `docs/tmp/` 不纳入 git 追踪；
-- `docs/tmp/` 中的内容不能作为长期项目文档引用；
-- 需要长期保留的结论必须合并回上述四个主线文档；
-- 合并、提交或交接前不能依赖 `docs/tmp/` 中的未提交内容。
-
-active 源码子目录也不维护独立开发文档。模块说明、设计说明、使用说明必须合并到上述四个主文档中。
+active 源码子目录也不维护独立开发文档。模块说明、设计说明、使用说明必须合并到上述顶级主文档或已批准的专项验证文档中。
 
 ## 语言与注释约束
 
@@ -72,6 +72,16 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - 子模块不能修改原始 profiling trace；三类 trace 的合并只能由 `scripts/trace/trace_merger.py` 生成新的 merged trace。
 - 子模块不能把 debug 字段混入默认预测输出。
 - 非执行类 state snapshot、oracle state、probe 内部 debug 和质量审计事件不能作为默认性能 DAG 节点；必须放在独立 debug/state trace，或显式标记为 `model_input=false` 并只由 validation/debug 路径消费。
+
+## 配置与数据约束
+
+- `configs/experiments/` 下按实验领域分组；HiCache state validation 配置放在 `configs/experiments/hicache_state/`，smoke 配置放在 `configs/experiments/smoke/`，普通 SGLang profiling 配置放在 `configs/experiments/sglang/`。
+- `configs/modeling/` 下按建模领域分组；HiCache state 配置放在 `configs/modeling/hicache_state/`，HiCache faithful replay 配置放在 `configs/modeling/hicache/`，smoke 配置放在 `configs/modeling/smoke/`。
+- 新增配置时必须放进已有语义分组；只有出现新的稳定领域时才新增子目录。
+- modeling 配置引用目标 experiment config 时必须使用仓库内相对路径，且路径应指向上述分组后的真实位置。
+- `data/profile_runs/**`、`data/modeling_runs/**` 和 `data/tmp/**` 都是可再生运行产物，不纳入 git 追踪，也不能作为长期唯一事实来源。
+- 需要长期保留的真实 run 结论必须写入对应主线或专项验证文档；清理 `data/` 后，文档中的 run 路径只作为历史索引和复现实验名称，不表示本地必须继续保存该目录。
+- 提交前应清理不再需要的大体积 profiling/modeling/debug 产物，避免本地状态依赖未追踪数据。
 
 ## Debug 约束
 
@@ -134,7 +144,7 @@ runner 可以读取 profile manifest 或显式 trace 路径；默认不输出 su
 - 提交信息必须规范、具体，优先使用 Conventional Commits 形式：`type(scope): summary`。
 - 提交摘要应说明本次提交的主要行为和对象，例如 `feat(hicache): add state validation pipeline`；不得使用 `update`、`fix stuff`、`wip` 等无法追踪意图的泛化描述。
 - 如果提交涉及大范围行为变化、验证状态或已知未闭环项，应在 commit body 中补充关键上下文和验证情况。
-- 文档结构变化后，`docs/` 主线文档应保持四文件约束；短期计划只能放在未追踪的 `docs/tmp/`。
+- 文档结构变化后，`docs/` 顶级主线文档应保持四文件约束；专项验证记录只能放在 `docs/validation/`，不再新增 `docs/tmp/` 或其他临时文档子目录。
 - C/C++ 格式化配置只在仓库根目录 `.clang-format` 维护；active 源码子目录不维护局部 `.clang-format`。
 - C/C++ 改动提交前必须能运行 `git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror`。
 - 复杂 C++ 子模块必须采用面向对象结构，至少拆分 fact parser、state、policy/decision、summary 和 DAG mutation 边界。

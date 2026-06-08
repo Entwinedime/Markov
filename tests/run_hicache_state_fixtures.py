@@ -28,6 +28,7 @@ def main() -> int:
         run_target_radix_prefix_fixture(tmp)
         run_write_through_selective_fixture(tmp)
         run_lock_ref_fixture(tmp)
+        run_page_size_lock_ref_non_invariant_fixture(tmp)
         run_leaf_group_l2_clear_fixture(tmp)
         run_capacity_target_skips_observed_remove_fixture(tmp)
         run_same_page_capacity_leaf_group_fixture(tmp)
@@ -120,6 +121,8 @@ def run_replay_fixture(tmp: Path) -> None:
         assert cache_summary["dag_mutations"] == 0, cache_summary
         assert cache_summary["state_transition_count"] > 0, cache_summary
         assert len(cache_summary["transition_trace"]) == cache_summary["state_transition_count"], cache_summary
+        assert "before_state_digest" not in cache_summary["transition_trace"][0], cache_summary
+        assert cache_summary["target_config"]["emit_state_digests"] is False, cache_summary
         assert cache_summary["dirty_eviction_events"] == 1, cache_summary
         assert cache_summary["missing_page_identity_events"] == 0, cache_summary
         final_state = cache_summary["final_state"]
@@ -874,6 +877,61 @@ def run_lock_ref_fixture(tmp: Path) -> None:
     assert summary["missing_page_identity_events"] == 0, summary
     assert summary["transitions_by_kind"]["mark_locked"] == 2, summary
     assert summary["transitions_by_kind"]["clear_locked"] == 1, summary
+
+
+def run_page_size_lock_ref_non_invariant_fixture(tmp: Path) -> None:
+    """验证 page size what-if 不把 base lock/ref 震荡当作 target 不变量。"""
+
+    trace_path = tmp / "hicache_page_size_lock_ref_non_invariant.json"
+    model_config = tmp / "hicache_page_size_lock_ref_non_invariant_model.json"
+    summary_out = tmp / "hicache_page_size_lock_ref_non_invariant_summary.json"
+    run_summary = tmp / "hicache_page_size_lock_ref_non_invariant_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_inc_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_inc",
+                            "page_size": 128,
+                            "page_identity": "base-p1",
+                            "target_page_identity": ["target-p1", "target-p2"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_dec_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_dec",
+                            "page_size": 128,
+                            "page_identity": "base-p1",
+                            "target_page_identity": ["target-p1", "target-p2"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["processed_events_by_role"]["lock_ref_inc"] == 1, summary
+    assert summary["processed_events_by_role"]["lock_ref_dec"] == 1, summary
+    assert summary["skipped_non_invariant_events"] == 2, summary
+    assert summary["lock_state_events"] == 0, summary
+    assert "locked_pages" not in summary["final_state"], summary
+    assert "mark_locked" not in summary["transitions_by_kind"], summary
+    assert "clear_locked" not in summary["transitions_by_kind"], summary
 
 
 def run_leaf_group_l2_clear_fixture(tmp: Path) -> None:

@@ -27,9 +27,6 @@ data/traces/raw/**
 data/traces/merged/**
 data/traces/dag/**
 
-# Short-lived planning drafts
-docs/tmp/
-
 # Local runtime outputs
 kernel_meta/
 cpu_trace*.json

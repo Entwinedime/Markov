@@ -619,6 +619,7 @@ def run_hicache_state_validation_fixture(tmp: Path) -> None:
     assert event_delta["predicted_comparable_transition_count_by_kind"]["add_l1_resident"] == 3, validation
     assert event_delta["predicted_comparable_transition_count_by_kind"]["mark_dirty"] == 3, validation
     assert event_delta["mismatch_count"] == 0, validation
+    assert event_delta["mismatch_totals_by_kind"] == {}, validation
     timeline_delta = validation["hicache_state"]["timeline_delta_validation"]
     assert timeline_delta["ready"] is True, validation
     assert timeline_delta["match"] is True, validation
@@ -628,6 +629,7 @@ def run_hicache_state_validation_fixture(tmp: Path) -> None:
     assert timeline_delta["predicted_transition_count_by_kind"]["add_l1_resident"] == 3, validation
     assert timeline_delta["predicted_transition_count_by_kind"]["mark_dirty"] == 3, validation
     assert timeline_delta["mismatch_count"] == 0, validation
+    assert timeline_delta["mismatch_totals_by_kind"] == {}, validation
     capacity_summary = validation["hicache_state"]["oracle_capacity_summary"]
     assert capacity_summary["ready"] is True, validation
     assert capacity_summary["snapshot_count"] == 1, validation
