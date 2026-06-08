@@ -5,7 +5,7 @@
     "purpose": "Real SGLang HiCache diagnostic profiling run for faithful replay, cache state, and cache patch validation inputs.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
-    "hicache_ratio_note": "--hicache-ratio is fixed at 2.0 and is not a diagnostic variable. Capacity pressure should come from the workload first."
+    "hicache_ratio_note": "--hicache-ratio may be changed for validation, but it must be > 1.0. Record the reason when changing it; capacity pressure should still come from workload or explicit capacity config first."
   },
   "profiling": {
     "enabled": true,

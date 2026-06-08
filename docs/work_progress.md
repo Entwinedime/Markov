@@ -2,6 +2,90 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-08 21:44:46 +0800
+
+- 完成 HiCache state validation 本轮重验矩阵和主线一可执行部分：
+  - `I0`、`I1`、`I2`、`I3` 四类输入下的 replay / prediction 结果已内联到
+    `docs/validation/hicache_state_validation.md`；
+  - 当前矩阵覆盖 `C0-C7`、`write_back + low capacity`、page64、capacity、prefetch wait /
+    best_effort / aggressive timeout 等配置；
+  - 所有列入矩阵的 validation 均达到 `final_state_match=true`、`timeline match=true`、
+    `model_extra_transition_count=0`。
+- 修复 `I2 C0 -> C3_page64` prediction 中 prefetch ready `26/40` 的问题：
+  - page size what-if 下，transfer completion 只要 source pages 覆盖同 request 的 schedule source pages，
+    就把 completion credit 归到 target schedule pages；
+  - 新增等长但 target identity 重新映射的 fixture，避免后续 page64 prefetch completion 回退。
+- 将后续主线拆分：
+  - `主线一`：两个强差异 HiCache 配置场景 + 两个大输入，包括手工 phased workload 和大型 bench serving；
+  - `主线二`：用户手动完成大型 profiling 矩阵，Codex 只消费 manifest 做 replay / simulation / prediction；
+  - 原 operation-level ordered transition oracle 主线顺延为 `主线三`。
+- 清理可再生生成数据：
+  - 清理前 `data` 约 `95G`；
+  - 清理后只剩空目录，约 `4.0K`；
+  - 当前长期证据以专项验证文档中的 run label、配置、指标和结论为准。
+- 本轮提交前检查已通过：
+  - `cmake --build build --target trace_graph -j 8`
+  - `python3 tests/run_hicache_state_fixtures.py`
+  - `python3 tests/run_modeling_smoke_fixtures.py`
+  - `python3 -m py_compile scripts/internal/model_runner.py tests/run_modeling_smoke_fixtures.py tests/run_hicache_state_fixtures.py`
+  - `find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`
+  - `git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror`
+  - `git diff --check`
+
+## 2026-06-08 13:15:22 +0800
+
+- 调整 HiCache profiling / validation 约束：
+  - `--hicache-ratio` 不再要求固定为 `2.0`；
+  - diagnostic / validation 实验中可以按目标调整，但必须大于 `1.0`；
+  - 调整时必须在配置说明或 `HCSV-*` 验证摘要中写明原因；
+  - 容量压力仍优先通过 workload 或显式 capacity 配置构造。
+- 已同步更新 `docs/project_constraints.md`、`docs/profiling_development.md`、
+  `docs/validation/hicache_state_validation.md` 和相关 HiCache/SGLang profiling config 的
+  `hicache_ratio_note`。
+
+## 2026-06-08 13:07:45 +0800
+
+- 在 `docs/validation/hicache_state_validation.md` 中新增“下一步工作主线”：
+  - 主线一是扩大 HiCache state model 的多配置、多输入验证矩阵；
+  - 要求不同配置使用同一输入形态做 replay 和跨配置 prediction，先做 `C0 -> Cj`，再扩展组合配置；
+  - 明确配置集合、输入集合、replay / prediction 流程、验收门槛和 `HCSV-*` 记录编号方式；
+  - 主线二是引入更强 oracle 采集，推进 operation-level ordered transition oracle；
+  - 明确 oracle transition 字段、probe-level / mutation-near / source-level guarded emitter 三阶段实现顺序，
+    以及真正 `exact_match=true` 的验收门槛。
+
+## 2026-06-08 12:55:21 +0800
+
+- 继续丰富 `docs/validation/hicache_state_validation.md`，补回已清理验证记录中仍有价值但不应依赖
+  `data/` 目录的关键信息：
+  - 目标与验收边界、验证分层、trace 输入边界；
+  - C++ HiCache state model 的输入、状态对象、状态转移和模块边界；
+  - profiling 不变量 / oracle 字段边界和 state snapshot 采集契约；
+  - 历史 cross-config 能力矩阵、event delta / timeline delta 口径、历史修正规则；
+  - phased workload 语义、配置入口、replay / prediction 验证方法、fixture 覆盖和失败处理。
+- 专项文档仍不恢复旧 run 路径：旧结论只保留为历史能力摘要，当前真实证据仍以新的
+  `HCSV-*` 记录为准。
+
+## 2026-06-08 12:44:15 +0800
+
+- 重构 `docs/validation/hicache_state_validation.md`：
+  - 删除旧版大量 `data/` run 路径索引和历史表格；
+  - 改为“记录规则 / 当前结论 / 最新真实验证摘要 / 能力边界 / 复现入口 / 新记录模板”的结构；
+  - 明确文档不依赖本地 `data/` 产物长期存在，真实 run 只保留临时 id 和抽取后的关键指标。
+- 重新跑了一轮真实 SGLang HiCache state-only validation：
+  - 临时 run id：`20260608_041916_profiling_hicache_state_validation`；
+  - workload `65/65` 请求成功，`errors=0`；
+  - profile quality `quality_ready=true`，`missing_cache_mechanisms=[]`；
+  - replay `final_state_match=true`，`missing_page_identity_events=0`；
+  - event delta `match=true`、`mismatch_count=0`；
+  - timeline coverage `match=true`、`model_extra_transition_count=0`，仅保留 oracle-only evicted transient 诊断。
+- 当前文档不再把旧 write-back / capacity / prefetch / page64 / selective run 目录当作当前凭据；
+  这些 cross-config 能力后续需要按新的 `HCSV-*` 记录规则成对重跑并内联摘要。
+- 同步收紧 `docs/project_constraints.md`：
+  - 专项验证文档以后记录稳定验证编号、内联摘要、复现入口和关键指标；
+  - 新写验证文档不能要求读者打开某个 `data/` 目录才能理解结论；
+  - 临时 run id 只用于说明实验批次，不作为长期证据载体。
+- 说明：`docs/work_progress.md` 旧时间线里保留的 `data/` 路径只是历史流水记录，不是新的验证文档引用规范。
+
 ## 2026-06-08 12:04:52 +0800
 
 - 完成项目结构整理和本地生成产物清理：
@@ -736,7 +820,8 @@
 - 增强 HiCache diagnostic workload：
   - phase 覆盖 seed/reuse/backup wait/pressure/load_back/prefetch/dirty eviction；
   - workload report 输出 `expected_cache_mechanisms`，供 profiling 质量审计使用；
-  - 官方配置继续固定 `--hicache-ratio=2.0`，容量压力优先由 workload 构造。
+  - `--hicache-ratio` 当前约束为可按实验目标调整，但必须大于 `1.0`；容量压力优先由 workload
+    或显式 capacity 配置构造。
 - 增强 profiling quality：
   - 检查 workload 声明的预期 HiCache 机制是否出现；
   - 对真正状态转移事件执行严格 page identity 检查，controller 队列锚点仍允许 count-only。

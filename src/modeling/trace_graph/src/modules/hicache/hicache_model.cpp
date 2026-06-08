@@ -231,6 +231,12 @@ bool should_skip_non_invariant_target_movement(const HiCacheConfig & config, con
     // 才能跳过 base run 中已经发生、但不再是目标配置不变量的 movement。
     const bool explicit_capacity = config.l1_capacity_pages > 0 || config.l2_capacity_pages > 0;
     if (explicit_capacity && is_capacity_observed_movement_role(fact.role)) return true;
+    if (config.write_policy == "write_back" && contains(fact.role, "l3_to_l2") && !config.write_back_prefetch_transfer_credit) return true;
+    // best_effort 和显式 timeout 变体会改变 prefetch 终止点，base policy
+    // 下观测到的 prefetch lock/ref 对数不是 target timeline 不变量。
+    if ((config.prefetch_policy == "best_effort" || (config.prefetch_policy == "timeout" && config.prefetch_timeout_configured)) &&
+        (fact.role == "lock_ref_inc" || fact.role == "lock_ref_dec"))
+        return true;
     if (config.prefetch_policy != "observed" && is_prefetch_observed_movement_role(fact.role)) {
         // best_effort 的 ready pages 来自异步完成 credit。L3->L2 transfer
         // 是可用的 completion evidence，不能像普通 observed movement 一样
@@ -847,7 +853,8 @@ void HiCacheState::apply_prefetch_progress(const HiCacheFact & fact, HiCacheSumm
     // 没有显式 progress payload 时，只保留 pending/终止语义，不把 progress
     // 观测反推出 ready page。否则纯 prefetch_done 事件会把 page64 strict
     // prediction 里的 ready 集合过度膨胀。
-    const auto ready_count = has_progress_payload ? std::min<uint64_t>(fact.prefetch_ready_page_count, pages.size()) : 0;
+    const bool progress_ready_credit_allowed = !(config_.write_policy == "write_back" && config_.prefetch_policy != "observed");
+    const auto ready_count = has_progress_payload && progress_ready_credit_allowed ? std::min<uint64_t>(fact.prefetch_ready_page_count, pages.size()) : 0;
     if (ready_count > 0) {
         for (size_t index = 0; index < static_cast<size_t>(ready_count); ++index) {
             const auto & page = pages[index];
@@ -1131,17 +1138,17 @@ std::vector<std::string> HiCacheState::target_prefetch_completion_pages(const Hi
 
     const auto key = scoped_request_key(fact);
     const auto schedule_it = latest_prefetch_schedule_pages_by_request_.find(key);
-    if (schedule_it == latest_prefetch_schedule_pages_by_request_.end() || schedule_it->second.size() <= fact.pages.size()) return fact.pages;
+    if (schedule_it == latest_prefetch_schedule_pages_by_request_.end() || schedule_it->second.empty()) return fact.pages;
 
     const auto source_count_it = prefetch_schedule_source_page_count_by_request_.find(key);
     if (source_count_it == prefetch_schedule_source_page_count_by_request_.end() || source_count_it->second == 0) return fact.pages;
     if (fact.source_pages.size() < source_count_it->second) return fact.pages;
-    if (!is_vector_prefix(fact.pages, schedule_it->second)) return fact.pages;
 
     // page size what-if 下，base transfer 的 target_page_identity 只覆盖
-    // base operation token 数能整除出的 target pages；但如果该 transfer
-    // 已覆盖 schedule 中全部 base pages，目标配置应完成同 request 的
-    // planned target suffix，避免把仅因 page size 变小产生的尾页误判为 suppressed。
+    // base operation token 数能整除出的 target pages，也可能因为 base
+    // prefetch 的 last_hash / parent context 不同而和 target schedule
+    // identity 不完全一致。只要 source pages 已覆盖该 request 的 schedule
+    // source pages，completion credit 应归到目标配置计划出的 suffix pages。
     return schedule_it->second;
 }
 
@@ -1438,6 +1445,7 @@ std::string HiCacheSummary::to_json() const {
         {"prefetch_timeout_base_sec", target_config.prefetch_timeout_base_sec},
         {"prefetch_timeout_per_ki_token_sec", target_config.prefetch_timeout_per_ki_token_sec},
         {"prefetch_timeout_max_sec", target_config.prefetch_timeout_max_sec},
+        {"write_back_prefetch_transfer_credit", target_config.write_back_prefetch_transfer_credit},
         {"emit_state_digests", target_config.emit_state_digests},
     };
     root["events_by_role"] = events_by_role;

@@ -1,11 +1,18 @@
 {
-  "name": "profiling_hicache_state_capacity_base_validation",
+  "name": "profiling_hicache_state_i2_page_split_page64_validation",
   "framework": "sglang",
   "metadata": {
-    "purpose": "State-only SGLang HiCache base profiling run with the same workload as the capacity target, but default max-total-tokens.",
+    "purpose": "State-only SGLang HiCache validation input I2 page_split page64 target run with longer prefix/suffix page-boundary pressure.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
     "hicache_ratio_note": "--hicache-ratio may be changed for validation, but it must be > 1.0. Record the reason when changing it; capacity pressure should still come from workload or explicit capacity config first."
+  },
+  "modeling": {
+    "hicache": {
+      "page_size": 64,
+      "l1_capacity_pages": 128,
+      "l2_capacity_pages": 256
+    }
   },
   "profiling": {
     "enabled": true,
@@ -984,6 +991,8 @@
       "8192",
       "--hicache-ratio",
       "2.0",
+      "--page-size",
+      "64",
       "--hicache-write-policy",
       "write_through",
       "--hicache-io-backend",
@@ -1018,7 +1027,7 @@
       "--backup-wait-requests",
       "8",
       "--pressure-requests",
-      "32",
+      "16",
       "--pressure-unique-prefix",
       "--reuse-after-pressure-requests",
       "8",
@@ -1029,9 +1038,9 @@
       "--cache-write-policy",
       "write_through",
       "--shared-prefix-repeat",
-      "128",
+      "192",
       "--unique-suffix-repeat",
-      "12",
+      "20",
       "--sleep-sec",
       "0.02",
       "--phase-wait-sec",

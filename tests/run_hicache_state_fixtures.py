@@ -38,8 +38,12 @@ def main() -> int:
         run_prefetch_timeout_terminal_empty_fixture(tmp)
         run_prefetch_timeout_finalize_fixture(tmp)
         run_prefetch_timeout_transfer_credit_fixture(tmp)
+        run_prefetch_timeout_lock_ref_non_invariant_fixture(tmp)
         run_prefetch_best_effort_progress_fixture(tmp)
         run_prefetch_best_effort_transfer_credit_fixture(tmp)
+        run_prefetch_best_effort_lock_ref_non_invariant_fixture(tmp)
+        run_prefetch_write_back_transfer_non_invariant_fixture(tmp)
+        run_prefetch_write_back_capacity_transfer_credit_fixture(tmp)
     print("hicache state fixtures passed")
     return 0
 
@@ -661,6 +665,63 @@ def run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp: Pat
     assert final_state["prefetch_ready_pages"] == target_pages, final_state
     assert final_state["prefetch_suppressed_pages"] == [], final_state
     assert final_state["l2_resident_pages"] == target_pages, final_state
+
+    equal_size_trace = tmp / "hicache_page_size_prefetch_transfer_equal_size_rekeys.json"
+    equal_size_summary = tmp / "hicache_page_size_prefetch_transfer_equal_size_rekeys_summary.json"
+    equal_size_trace.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-page64-transfer-rekey",
+                            "page_size": 128,
+                            "page_identity": ["base_tail"],
+                            "target_page_identity": ["target_tail_a", "target_tail_b"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-page64-transfer-rekey",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": ["base_tail"],
+                            "target_page_identity": ["wrong_tail_a", "wrong_tail_b"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [
+            str(ROOT / "build/bin/trace_graph"),
+            "--input",
+            str(equal_size_trace),
+            "--run-summary",
+            str(run_summary),
+            "--model-config",
+            str(model_config),
+            "--model-summary",
+            str(equal_size_summary),
+        ],
+        cwd=ROOT,
+    )
+    equal_size = json.loads(equal_size_summary.read_text(encoding="utf-8"))["modules"][0]["hicache"]["final_state"]
+    assert equal_size["prefetch_planned_pages"] == ["target_tail_a", "target_tail_b"], equal_size
+    assert equal_size["prefetch_ready_pages"] == ["target_tail_a", "target_tail_b"], equal_size
+    assert equal_size["prefetch_suppressed_pages"] == [], equal_size
+    assert equal_size["l2_resident_pages"] == ["target_tail_a", "target_tail_b"], equal_size
+    assert "wrong_tail_a" not in equal_size["prefetch_ready_pages"], equal_size
 
 
 def run_target_radix_prefix_fixture(tmp: Path) -> None:
@@ -1426,6 +1487,21 @@ def run_prefetch_timeout_transfer_credit_fixture(tmp: Path) -> None:
                             "page_identity": ["p1", "p2"],
                         },
                     ),
+                    hicache_event(
+                        30,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-wb-credit",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-wb-credit",
+                                "page_size": 128,
+                                "check_return": True,
+                                "has_ongoing_prefetch": False,
+                            },
+                        },
+                    ),
                 ]
             },
             ensure_ascii=False,
@@ -1481,6 +1557,69 @@ def run_prefetch_timeout_transfer_credit_fixture(tmp: Path) -> None:
     assert zero["final_state"]["prefetch_ready_pages"] == ["p1", "p2"], zero
     assert zero["final_state"]["prefetch_suppressed_pages"] == [], zero
     assert zero["skipped_non_invariant_events"] == 0, zero
+
+
+def run_prefetch_timeout_lock_ref_non_invariant_fixture(tmp: Path) -> None:
+    """验证显式 timeout target 不消费 base prefetch policy 下观测到的 lock/ref。"""
+
+    trace_path = tmp / "hicache_prefetch_timeout_lock_ref_non_invariant.json"
+    model_config = tmp / "hicache_prefetch_timeout_lock_ref_non_invariant_model.json"
+    summary_out = tmp / "hicache_prefetch_timeout_lock_ref_non_invariant_summary.json"
+    run_summary = tmp / "hicache_prefetch_timeout_lock_ref_non_invariant_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_inc_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_inc",
+                            "page_size": 128,
+                            "page_identity": ["p1"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_dec_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_dec",
+                            "page_size": 128,
+                            "page_identity": ["p1"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 128,
+                    "prefetch_policy": "timeout",
+                    "prefetch_timeout_base_sec": 0.0,
+                    "prefetch_timeout_per_ki_token_sec": 0.0,
+                    "prefetch_timeout_max_sec": 0.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 2, summary
+    assert summary["final_state"].get("locked_pages", []) == [], summary
+    assert "mark_locked" not in summary.get("transitions_by_kind", {}), summary
+    assert "clear_locked" not in summary.get("transitions_by_kind", {}), summary
 
 
 def run_prefetch_best_effort_progress_fixture(tmp: Path) -> None:
@@ -1584,6 +1723,21 @@ def run_prefetch_best_effort_transfer_credit_fixture(tmp: Path) -> None:
                             "page_identity": ["p1", "p2"],
                         },
                     ),
+                    hicache_event(
+                        30,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-wb-credit",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-wb-credit",
+                                "page_size": 128,
+                                "check_return": True,
+                                "has_ongoing_prefetch": False,
+                            },
+                        },
+                    ),
                 ]
             },
             ensure_ascii=False,
@@ -1605,6 +1759,235 @@ def run_prefetch_best_effort_transfer_credit_fixture(tmp: Path) -> None:
     assert summary["final_state"]["prefetch_late_pages"] == [], summary
     assert summary["final_state"]["prefetch_suppressed_pages"] == [], summary
     assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 2, summary
+
+
+def run_prefetch_best_effort_lock_ref_non_invariant_fixture(tmp: Path) -> None:
+    """验证 best_effort target 不消费 base prefetch policy 下观测到的 lock/ref。"""
+
+    trace_path = tmp / "hicache_prefetch_best_effort_lock_ref_non_invariant.json"
+    model_config = tmp / "hicache_prefetch_best_effort_lock_ref_non_invariant_model.json"
+    summary_out = tmp / "hicache_prefetch_best_effort_lock_ref_non_invariant_summary.json"
+    run_summary = tmp / "hicache_prefetch_best_effort_lock_ref_non_invariant_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_inc_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_inc",
+                            "page_size": 128,
+                            "page_identity": ["p1"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_dec_lock_ref_end",
+                        {
+                            "event_role": "lock_ref_dec",
+                            "page_size": 128,
+                            "page_identity": ["p1"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 128,
+                    "prefetch_policy": "best_effort",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 2, summary
+    assert summary["final_state"].get("locked_pages", []) == [], summary
+    assert "mark_locked" not in summary.get("transitions_by_kind", {}), summary
+    assert "clear_locked" not in summary.get("transitions_by_kind", {}), summary
+
+
+def run_prefetch_write_back_transfer_non_invariant_fixture(tmp: Path) -> None:
+    """验证 write-back target 不消费 base write-through 的 L3->L2 prefetch completion。"""
+
+    trace_path = tmp / "hicache_prefetch_write_back_transfer_non_invariant.json"
+    model_config = tmp / "hicache_prefetch_write_back_transfer_non_invariant_model.json"
+    summary_out = tmp / "hicache_prefetch_write_back_transfer_non_invariant_summary.json"
+    run_summary = tmp / "hicache_prefetch_write_back_transfer_non_invariant_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-wb-credit", "page_size": 128, "page_identity": ["p1", "p2"]},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_prefetch_progress_start",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-wb-credit",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-wb-credit",
+                                "page_size": 128,
+                                "operation_hash_pages": ["p1", "p2"],
+                                "completed_tokens": 256,
+                                "check_return": None,
+                                "has_ongoing_prefetch": True,
+                            },
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-wb-credit",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": ["p1", "p2"],
+                        },
+                    ),
+                    hicache_event(
+                        40,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-wb-credit",
+                            "page_size": 128,
+                            "prefetch_progress_state": {
+                                "request_id": "req-wb-credit",
+                                "page_size": 128,
+                                "check_return": True,
+                                "has_ongoing_prefetch": False,
+                            },
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 128,
+                    "write_policy": "write_back",
+                    "prefetch_policy": "timeout",
+                    "prefetch_timeout_base_sec": 10.0,
+                    "prefetch_timeout_per_ki_token_sec": 0.0,
+                    "prefetch_timeout_max_sec": 10.0,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 1, summary
+    assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["prefetch_planned_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == [], summary
+    assert summary["final_state"]["prefetch_suppressed_pages"] == ["p1", "p2"], summary
+
+
+def run_prefetch_write_back_capacity_transfer_credit_fixture(tmp: Path) -> None:
+    """验证 write-back + capacity target 可消费 L3->L2 transfer 作为 ready evidence。"""
+
+    trace_path = tmp / "hicache_prefetch_write_back_capacity_transfer_credit.json"
+    model_config = tmp / "hicache_prefetch_write_back_capacity_transfer_credit_model.json"
+    summary_out = tmp / "hicache_prefetch_write_back_capacity_transfer_credit_summary.json"
+    run_summary = tmp / "hicache_prefetch_write_back_capacity_transfer_credit_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-wb-cap-credit", "page_size": 128, "page_identity": ["p1"]},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-wb-cap-credit",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": ["p1"],
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_lookup_end",
+                        {"event_role": "lookup", "request_id": "req-wb-cap-credit", "page_size": 128, "page_identity": ["p1"]},
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 128,
+                    "l1_capacity_pages": 1,
+                    "l2_capacity_pages": 1,
+                    "write_policy": "write_back",
+                    "prefetch_policy": "timeout",
+                    "prefetch_timeout_base_sec": 10.0,
+                    "prefetch_timeout_per_ki_token_sec": 0.0,
+                    "prefetch_timeout_max_sec": 10.0,
+                    "write_back_prefetch_transfer_credit": True,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["final_state"]["l1_resident_pages"] == ["p1"], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["p1"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["p1"], summary
+    assert summary["final_state"]["prefetch_suppressed_pages"] == [], summary
+    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 1, summary
 
 
 def hicache_event(ts: int, name: str, args: dict[str, object], pid: int = 1, tid: int = 1) -> dict[str, object]:

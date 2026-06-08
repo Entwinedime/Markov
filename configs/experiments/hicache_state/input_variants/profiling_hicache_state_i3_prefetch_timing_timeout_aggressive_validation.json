@@ -1,11 +1,16 @@
 {
-  "name": "profiling_hicache_state_capacity_base_validation",
+  "name": "profiling_hicache_state_i3_prefetch_timing_timeout_aggressive_validation",
   "framework": "sglang",
   "metadata": {
-    "purpose": "State-only SGLang HiCache base profiling run with the same workload as the capacity target, but default max-total-tokens.",
+    "purpose": "State-only SGLang HiCache validation input I3 prefetch_timing aggressive timeout target run with denser prefetch seed/reuse coverage.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
     "hicache_ratio_note": "--hicache-ratio may be changed for validation, but it must be > 1.0. Record the reason when changing it; capacity pressure should still come from workload or explicit capacity config first."
+  },
+  "modeling": {
+    "hicache": {
+      "page_size": 128
+    }
   },
   "profiling": {
     "enabled": true,
@@ -993,7 +998,7 @@
       "--hicache-storage-backend",
       "file",
       "--hicache-storage-backend-extra-config",
-      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":10.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":10.0,\"hicache_storage_pass_prefix_keys\":true}",
+      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":0.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":0.0,\"hicache_storage_pass_prefix_keys\":true}",
       "--hicache-storage-prefetch-policy",
       "timeout",
       "--disable-cuda-graph"
@@ -1012,20 +1017,20 @@
       "--warmup-requests",
       "1",
       "--seed-requests",
-      "8",
+      "4",
       "--reuse-requests",
-      "8",
+      "4",
       "--backup-wait-requests",
-      "8",
+      "4",
       "--pressure-requests",
-      "32",
+      "8",
       "--pressure-unique-prefix",
       "--reuse-after-pressure-requests",
-      "8",
+      "4",
       "--prefetch-seed-requests",
       "8",
       "--prefetch-reuse-requests",
-      "8",
+      "10",
       "--cache-write-policy",
       "write_through",
       "--shared-prefix-repeat",
@@ -1033,13 +1038,13 @@
       "--unique-suffix-repeat",
       "12",
       "--sleep-sec",
-      "0.02",
+      "0.05",
       "--phase-wait-sec",
-      "2.0",
+      "4.0",
       "--max-errors",
       "1",
       "--max-new-tokens",
-      "8"
+      "4"
     ]
   }
 }

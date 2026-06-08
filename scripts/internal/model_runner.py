@@ -325,6 +325,7 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "prefetch_timeout_base",
             "prefetch_timeout_per_ki_token",
             "prefetch_timeout_max",
+            "write_back_prefetch_transfer_credit",
             "emit_state_digests",
         ):
             if key in hicache:
@@ -384,6 +385,7 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "prefetch_timeout_base",
         "prefetch_timeout_per_ki_token",
         "prefetch_timeout_max",
+        "write_back_prefetch_transfer_credit",
         "emit_state_digests",
     ):
         if key in explicit_hicache:

@@ -19,9 +19,10 @@
 - constraints 文档记录项目长期约束，更新时删改。
 
 `docs/validation/` 用于纳入 git 追踪的专项验证记录；当前只维护
-`docs/validation/hicache_state_validation.md`，记录 HiCache state validation 的长期结论、关键 run
-索引和后续计划。新增专项验证文档前必须先确认它不是 profiling / modeling / work progress /
-constraints 四个顶级主文档能够承载的内容。
+`docs/validation/hicache_state_validation.md`，记录 HiCache state validation 的长期结论、稳定验证编号、
+内联摘要、复现入口和后续计划。专项验证文档不能依赖本地 `data/` 目录长期存在；真实 run 只能作为
+临时实验批次，长期证据必须抽取成配置、commit、命令、关键指标和结论。新增专项验证文档前必须先确认它不是
+profiling / modeling / work progress / constraints 四个顶级主文档能够承载的内容。
 
 不再在 `docs/` 下维护按实验、模块、历史实现拆出来的零散主线文档。
 
@@ -53,7 +54,7 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - `ld_preload` 只由 `profiling.ld_preload` 配置控制是否注入和输出到哪里；不读取旧顶层 `hook` / `native` 兼容入口；具体 wrapper 由 C++ 硬编码实现决定。
 - `profiling.channels` 只接受 `torch`、`python_probe`、`ld_preload`，不接受 `python`、`hook`、`native` 等旧短名。
 - 普通 LD_PRELOAD 只能启用 hook so 中已实现 wrapper 的 native 符号；不能声称支持任意未知符号动态拦截。
-- HiCache diagnostic 实验中 `--hicache-ratio` 不能随意修改；默认固定为当前基线值 `2.0`。容量压力优先通过 workload 触发，必要时只能使用已确认安全的 `--hicache-size`。
+- HiCache diagnostic 实验中 `--hicache-ratio` 可以按实验目标调整，但必须大于 `1.0`；调整时必须在配置说明或验证记录中写明原因。容量压力优先通过 workload 或显式 capacity 配置触发，不能用小于等于 `1.0` 的 ratio 构造实验。
 - 真实 SGLang / KTransformers profiling 必须通过 `scripts/profile.sh` 外层容器入口启动。`scripts/internal/profile_runner.py` 是容器内执行器，不能在宿主机上直接用于真实 server profiling。
 
 ## Modeling 约束
@@ -79,8 +80,9 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - `configs/modeling/` 下按建模领域分组；HiCache state 配置放在 `configs/modeling/hicache_state/`，HiCache faithful replay 配置放在 `configs/modeling/hicache/`，smoke 配置放在 `configs/modeling/smoke/`。
 - 新增配置时必须放进已有语义分组；只有出现新的稳定领域时才新增子目录。
 - modeling 配置引用目标 experiment config 时必须使用仓库内相对路径，且路径应指向上述分组后的真实位置。
-- `data/profile_runs/**`、`data/modeling_runs/**` 和 `data/tmp/**` 都是可再生运行产物，不纳入 git 追踪，也不能作为长期唯一事实来源。
-- 需要长期保留的真实 run 结论必须写入对应主线或专项验证文档；清理 `data/` 后，文档中的 run 路径只作为历史索引和复现实验名称，不表示本地必须继续保存该目录。
+- `data/profile_runs/**`、`data/modeling_runs/**` 和 `data/tmp/**` 都是可再生运行产物，不纳入 git 追踪，也不能作为长期事实来源或文档阅读前提。
+- 需要长期保留的真实 run 结论必须写入对应主线或专项验证文档；文档应使用稳定验证编号和内联摘要，记录 config、commit、复现命令、workload 结果、质量门槛和 validation 结论。
+- 新写验证文档不能要求读者打开某个 `data/` 目录才能理解结论；临时 run id 只用于说明实验批次，不是长期证据载体。
 - 提交前应清理不再需要的大体积 profiling/modeling/debug 产物，避免本地状态依赖未追踪数据。
 
 ## Debug 约束

@@ -157,9 +157,9 @@ bench 使用离线 `random-ids` dataset，输出 `bench/bench.jsonl`；modeling 
 | `prefetch_reuse_C` | 复用 C，验证 prefetch 决策和 L3->L2 movement。 | prefetch decision/schedule/query/transfer |
 | `dirty_eviction` | 仅 write_back 场景启用，验证 dirty eviction writeback。 | insert、evict、writeback |
 
-`--hicache-ratio` 不作为 diagnostic 自由变量。官方配置固定使用当前基线值 `2.0`。
-如果容量压力不足，先增加 workload 的长上下文和压力请求数；只有确认 SGLang 参数
-约束后，才使用明确安全的 `--hicache-size`。
+`--hicache-ratio` 可以按实验目标调整，但必须大于 `1.0`，并且需要在配置说明或验证记录中写明原因。
+如果容量压力不足，优先增加 workload 的长上下文、压力请求数或使用显式 capacity 配置；不能用小于等于
+`1.0` 的 ratio 构造实验。
 
 Python probe 示例：
 
