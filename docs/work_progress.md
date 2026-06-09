@@ -2,6 +2,25 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-09 06:20:00 +0800
+
+- 收紧 HiCache state validation 主线一配置新颖性执行口径：
+  - 当前候选不再沿用早期主线一 2.0 草案签名；
+  - `S1A_baseline_large` 改为 page128、L1/L2 capacity `64/145`、`write_through_selective`、`wait_complete`、ratio `2.25`、prefetch timeout extra config `8s/0/8s`；
+  - `S1B_divergent_large` 改为 page64、L1/L2 capacity `128/321`、`write_back`、`best_effort`、ratio `2.5`、prefetch timeout extra config `6s/0/6s`；
+  - `tests/run_hicache_mainline_config_fixtures.py` 增加 HCSV 历史签名黑名单，覆盖当前矩阵和早期主线一草案，不只依赖仍存在的配置文件或 `data/` 目录；
+  - ratio 均保持 `>1.0`，容量压力仍由 workload 和显式 capacity snapshot 承担；旧 S1A 手工 profile 只保留为排查结论，不能作为新签名的主线一验收结果；
+  - 曾短暂尝试的低 ratio `1.5/1.75` 草案导致真实 profile 明显慢速，未完成 run 不纳入主线一证据；
+  - `2.25/2.5` 新签名配置已经固化，但本轮未完成的 20260609 profile 产物已清理，不能作为主线一 replay/prediction 证据。
+
+## 2026-06-09 05:58:00 +0800
+
+- 固化 HiCache state validation 主线一配置新颖性为长期项目约束：
+  - 两个场景不仅必须彼此不同，也必须不同于任何此前已经跑过的 HiCache state profiling 联合配置；
+  - 判定依据为 page size、L1/L2 capacity、write policy、prefetch policy、prefetch timeout、`--hicache-ratio` 等核心项组成的联合签名；
+  - 新增 `tests/run_hicache_mainline_config_fixtures.py` 固化该只读检查；
+  - 当前 S1A/S1B 配置签名检查通过，四个主线一 profiling 配置按场景收敛为两套签名，且对仓库可见非主线一配置均为 `old_matches=0`。
+
 ## 2026-06-09 05:48:03 +0800
 
 - 闭环 HiCache state validation 主线一 `S1A_baseline_large + L1_manual_phased` 预验证：

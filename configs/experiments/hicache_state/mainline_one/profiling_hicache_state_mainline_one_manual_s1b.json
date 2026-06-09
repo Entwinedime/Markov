@@ -5,12 +5,12 @@
     "purpose": "Mainline-one L1 manual phased run for S1B: page64 + write-back + best_effort.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD currently records hardcoded AscendCL runtime wrappers. HiCache state facts are collected by Python probe.",
-    "hicache_ratio_note": "--hicache-ratio remains 2.0 (>1.0) to keep known capacity semantics while changing the joint page/write/prefetch configuration; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
+    "hicache_ratio_note": "--hicache-ratio is 2.5 (>1.0) so the mainline-one joint signature is new relative to every previously profiled HiCache state config while avoiding the severe low-ratio slowdown; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
     "mainline_one_scenario": "S1B_divergent_large",
     "mainline_one_input": "L1_manual_phased",
     "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
-    "mainline_one_config_signature": "page_size=64,l1_capacity_pages=128,l2_capacity_pages=256,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.0,prefetch_timeout_extra=10.0/0.0/10.0",
-    "mainline_one_config_comparison": "Different from C3/I2 page64 by write and prefetch policy; different from C1/C8 write-back by page size, capacity, and prefetch policy; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+    "mainline_one_config_signature": "page_size=64,l1_capacity_pages=128,l2_capacity_pages=321,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
+    "mainline_one_config_comparison": "Different from C3/I2 page64 by write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
     "mainline_one_workload_scale": "L1_manual_phased uses 83 requests: larger than I2 (65) and I3 (43), with shorter prompt length than the aborted 125-request draft for repeatable profiling."
   },
   "profiling": {
@@ -1003,13 +1003,13 @@
       "--max-total-tokens",
       "8192",
       "--hicache-ratio",
-      "2.0",
+      "2.5",
       "--hicache-write-policy",
       "write_back",
       "--hicache-storage-prefetch-policy",
       "best_effort",
       "--hicache-storage-backend-extra-config",
-      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":10.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":10.0,\"hicache_storage_pass_prefix_keys\":true}"
+      "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":6.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":6.0,\"hicache_storage_pass_prefix_keys\":true}"
     ],
     "ready_url": "http://127.0.0.1:30000/get_model_info",
     "ready_timeout_sec": 1800
@@ -1061,7 +1061,7 @@
     "hicache": {
       "page_size": 64,
       "l1_capacity_pages": 128,
-      "l2_capacity_pages": 256,
+      "l2_capacity_pages": 321,
       "write_policy": "write_back",
       "prefetch_policy": "best_effort"
     }

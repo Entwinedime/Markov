@@ -433,16 +433,21 @@ remove/evict 等 observed movement 不是 target 不变量；缺少 target page 
 
 | 场景 | joint signature | 历史配置比对 |
 | --- | --- | --- |
-| `S1A_baseline_large` | page128、L1/L2 capacity `64/129`、`write_through_selective`、`wait_complete`、ratio `2.0`、prefetch timeout extra config `10s/0/10s`。 | 不同于 `C2_write_through_selective`，因为 prefetch policy 和显式 capacity 不同；不同于 `C5_prefetch_wait`，因为 write policy 和显式 capacity 不同；脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，`old_matches=0`。 |
-| `S1B_divergent_large` | page64、L1/L2 capacity `128/256`、`write_back`、`best_effort`、ratio `2.0`、prefetch timeout extra config `10s/0/10s`。 | 不同于 `C3_page64` / `I2_page64`，因为 write policy 和 prefetch policy 不同；不同于 `C1_write_back` / `C8_write_back_capacity`，因为 page size、capacity 和 prefetch policy 不同；脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，`old_matches=0`。 |
+| `S1A_baseline_large` | page128、L1/L2 capacity `64/145`、`write_through_selective`、`wait_complete`、ratio `2.25`、prefetch timeout extra config `8s/0/8s`。 | 不同于 `C2_write_through_selective`，因为 prefetch policy、显式 capacity、ratio 和 timeout extra config 不同；不同于 `C5_prefetch_wait`，因为 write policy、显式 capacity、ratio 和 timeout extra config 不同；也不同于早期主线一 S1A 2.0 草案签名。脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，并额外比对 HCSV 固化的历史签名黑名单，`old_matches=0`。 |
+| `S1B_divergent_large` | page64、L1/L2 capacity `128/321`、`write_back`、`best_effort`、ratio `2.5`、prefetch timeout extra config `6s/0/6s`。 | 不同于 `C3_page64` / `I2_page64`，因为 write policy、prefetch policy、ratio 和 timeout extra config 不同；不同于 `C1_write_back` / `C8_write_back_capacity`，因为 page size、capacity、prefetch policy、ratio 和 timeout extra config 不同；也不同于早期主线一 S1B 2.0 草案签名。脚本化扫描当前仓库可查的非主线一 HiCache state 实验配置，并额外比对 HCSV 固化的历史签名黑名单，`old_matches=0`。 |
 
 本次签名检查按 page size、L1/L2 capacity、write policy、prefetch policy、`--hicache-ratio`、prefetch extra config
-组成联合 signature；`S1A` 和 `S1B` 的联合 signature 也互不相同。已清理且仓库中没有实体配置的历史 run，
-只能依据本文保留的历史配置摘要和 config metadata 继续约束，不把缺失的 `data/` 记录作为文档依赖。
+组成联合 signature；`S1A` 和 `S1B` 的联合 signature 也互不相同。ratio 分别使用 `2.25` 和 `2.5`，均满足
+`> 1.0` 约束，目的是让主线一候选配置同时区别于当前矩阵、已清理历史运行、临时验证运行和早期主线一草案，同时避免
+ratio `1.5` 这类低 ratio 草案造成的真实 profile 严重慢速。
+`tests/run_hicache_mainline_config_fixtures.py` 同时扫描当前仓库非主线一配置，并内置 HCSV 历史签名黑名单；
+已清理且仓库中没有实体配置的历史 run 只保留签名摘要，不把缺失的 `data/` 记录作为文档依赖。
 
-#### 当前 S1A 手工输入预验证
+#### 早期 S1A 手工输入排查
 
-`S1A_baseline_large + L1_manual_phased` 已完成一次真实 profile 和 replay 排查，结论如下：
+ratio `2.0` 的 `S1A_baseline_large + L1_manual_phased` 已完成一次真实 profile 和 replay 排查。它用于定位
+radix removed materialization、observed replay config 和 prediction target config 的口径差异；由于主线一候选签名现在已经更新，
+该批次不作为新主线一完成证据。结论如下：
 
 | 项 | 结果 |
 | --- | --- |

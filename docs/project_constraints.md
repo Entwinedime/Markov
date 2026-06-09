@@ -85,6 +85,12 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - `configs/modeling/` 下按建模领域分组；HiCache state 配置放在 `configs/modeling/hicache_state/`，HiCache faithful replay 配置放在 `configs/modeling/hicache/`，smoke 配置放在 `configs/modeling/smoke/`。
 - 新增配置时必须放进已有语义分组；只有出现新的稳定领域时才新增子目录。
 - modeling 配置引用目标 experiment config 时必须使用仓库内相对路径，且路径应指向上述分组后的真实位置。
+- HiCache state validation 主线一的两个场景必须是全新的联合配置：两个场景彼此不同，并且都不能等同于任何此前已经跑过的
+  HiCache state profiling 配置组合。判定时按 page size、L1/L2 capacity、write policy、prefetch policy、prefetch timeout、
+  `--hicache-ratio` 等核心项组成联合签名；不能只按配置文件名、场景名或 `C0-C8` 编号集合判断。
+- 主线一候选配置开跑前必须做历史配置比对：仓库中仍存在的历史配置用脚本化扫描确认 `old_matches=0`，已清理的历史 run、
+  临时验证 run 和失败后重跑前的草案配置则依据专项验证文档保留的摘要、config metadata 或专用 fixture 中固化的历史签名黑名单约束。
+  比对结论必须写入 config metadata 或 `docs/validation/hicache_state_validation.md`。
 - `data/profile_runs/**`、`data/modeling_runs/**` 和 `data/tmp/**` 都是可再生运行产物，不纳入 git 追踪，也不能作为长期事实来源或文档阅读前提。
 - 需要长期保留的真实 run 结论必须写入对应主线或专项验证文档；文档应使用稳定验证编号和内联摘要，记录 config、commit、复现命令、workload 结果、质量门槛和 validation 结论。
 - 新写验证文档不能要求读者打开某个 `data/` 目录才能理解结论；临时 run id 只用于说明实验批次，不是长期证据载体。
