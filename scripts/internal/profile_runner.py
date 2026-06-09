@@ -464,7 +464,7 @@ def channel_config(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
     return {}
 
 
-def _page_set_from_hicache_snapshot(snapshot: Any) -> set[str]:
+def _page_set_from_hicache_snapshot(snapshot: Any, *, target_page_size: int | None = None) -> set[str]:
     """从 HiCache state snapshot 的 radix nodes 提取 page identity 集合。"""
 
     pages: set[str] = set()
@@ -477,6 +477,10 @@ def _page_set_from_hicache_snapshot(snapshot: Any) -> set[str]:
         if not isinstance(node, dict):
             continue
         value = node.get("hash_value")
+        if target_page_size is not None:
+            target_hashes = node.get("target_hash_value_by_page_size")
+            if isinstance(target_hashes, dict) and str(target_page_size) in target_hashes:
+                value = target_hashes.get(str(target_page_size))
         if isinstance(value, list):
             pages.update(str(item) for item in value if item is not None)
         elif value is not None:
@@ -484,21 +488,51 @@ def _page_set_from_hicache_snapshot(snapshot: Any) -> set[str]:
     return pages
 
 
-def materialize_hicache_radix_removed_pages(trace_dir: Path) -> dict[str, int]:
-    """把同一 insert 调用 start/end snapshot 的 radix delta 写入模型输入事件。
+def _is_hicache_state_target_id(target_id: Any) -> bool:
+    text = str(target_id or "").lower()
+    return "hiradix" in text or "hicache" in text or "cache_controller" in text
+
+
+def _hicache_target_page_sizes_from_targets(targets: list[dict[str, Any]]) -> list[int]:
+    sizes: list[int] = []
+    seen: set[int] = set()
+    pattern = re.compile(r"page_hashes(?:_after_prefix|_concat)?:[^,\n]+(?:,[^,\n]+)*,(\d+)(?:,|$)")
+    for target in targets:
+        fields = target.get("fields") if isinstance(target.get("fields"), list) else []
+        for field in fields:
+            if not isinstance(field, dict):
+                continue
+            source = str(field.get("source") or "")
+            for match in pattern.finditer(source):
+                try:
+                    size = int(match.group(1))
+                except ValueError:
+                    continue
+                if size <= 0 or size in seen:
+                    continue
+                seen.add(size)
+                sizes.append(size)
+    return sizes
+
+
+def materialize_hicache_radix_removed_pages(trace_dir: Path, *, target_page_size: int | None = None) -> dict[str, int]:
+    """把同一 HiCache 调用 start/end snapshot 的 radix delta 写入模型输入事件。
 
     `hicache_state:self` 仍作为 validation-only snapshot 输出；这里仅在 profiling
     收尾阶段提取 operation-level `radix_removed_page_identity`。这样 C++ state
-    model 消费的是明确的 insert 事实，而不是完整 oracle state snapshot。
+    model 消费的是明确的调用内事实，而不是完整 oracle state snapshot。
     """
 
     python_probe_dir = trace_dir / "python_probe"
     result = {
         "files_scanned": 0,
         "files_updated": 0,
+        "end_events": 0,
         "insert_end_events": 0,
         "materialized_events": 0,
         "materialized_pages": 0,
+        "target_materialized_events": 0,
+        "target_materialized_pages": 0,
     }
     if not python_probe_dir.is_dir():
         return result
@@ -512,45 +546,66 @@ def materialize_hicache_radix_removed_pages(trace_dir: Path) -> dict[str, int]:
 
         start_pages_by_key: dict[tuple[Any, Any, Any, Any], set[str]] = {}
         end_pages_by_key: dict[tuple[Any, Any, Any, Any, Any], set[str]] = {}
+        target_start_pages_by_key: dict[tuple[Any, Any, Any, Any], set[str]] = {}
+        target_end_pages_by_key: dict[tuple[Any, Any, Any, Any, Any], set[str]] = {}
         for event in events:
             if not isinstance(event, dict):
                 continue
             name = event.get("name")
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            if not isinstance(args, dict) or args.get("target_id") != "hiradix.insert":
-                continue
             target_id = args.get("target_id")
-            if name == "hicache_insert_start:state_snapshot":
+            if not isinstance(args, dict) or not _is_hicache_state_target_id(target_id):
+                continue
+            if isinstance(name, str) and name.endswith("_start:state_snapshot"):
                 key = (event.get("pid"), event.get("tid"), event.get("ts"), target_id)
-                start_pages_by_key[key] = _page_set_from_hicache_snapshot(args.get("state_snapshot"))
-            elif name == "hicache_insert_end:state_snapshot":
+                snapshot = args.get("state_snapshot")
+                start_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot)
+                if target_page_size is not None:
+                    target_start_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot, target_page_size=target_page_size)
+            elif isinstance(name, str) and name.endswith("_end:state_snapshot"):
                 key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), target_id)
-                end_pages_by_key[key] = _page_set_from_hicache_snapshot(args.get("state_snapshot"))
+                snapshot = args.get("state_snapshot")
+                end_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot)
+                if target_page_size is not None:
+                    target_end_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot, target_page_size=target_page_size)
 
         updated = False
         for event in events:
-            if not isinstance(event, dict) or event.get("name") != "hicache_insert_end":
+            if not isinstance(event, dict):
+                continue
+            name = event.get("name")
+            if not isinstance(name, str) or not name.startswith("hicache_") or not name.endswith("_end"):
                 continue
             args = event.get("args") if isinstance(event.get("args"), dict) else None
-            if not isinstance(args, dict) or args.get("target_id") != "hiradix.insert":
+            if not isinstance(args, dict) or not _is_hicache_state_target_id(args.get("target_id")):
                 continue
-            result["insert_end_events"] += 1
-            current = args.get("radix_removed_page_identity")
-            if isinstance(current, list) and current:
-                continue
+            result["end_events"] += 1
+            if args.get("target_id") == "hiradix.insert":
+                result["insert_end_events"] += 1
             start_key = (event.get("pid"), event.get("tid"), event.get("ts"), args.get("target_id"))
             end_key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), args.get("target_id"))
             start_pages = start_pages_by_key.get(start_key)
             end_pages = end_pages_by_key.get(end_key)
             if start_pages is None or end_pages is None:
                 continue
+            current = args.get("radix_removed_page_identity")
             removed_pages = sorted(start_pages - end_pages)
-            if not removed_pages:
-                continue
-            args["radix_removed_page_identity"] = removed_pages
-            result["materialized_events"] += 1
-            result["materialized_pages"] += len(removed_pages)
-            updated = True
+            if removed_pages and not (isinstance(current, list) and current):
+                args["radix_removed_page_identity"] = removed_pages
+                result["materialized_events"] += 1
+                result["materialized_pages"] += len(removed_pages)
+                updated = True
+
+            if target_page_size is not None:
+                target_start_pages = target_start_pages_by_key.get(start_key)
+                target_end_pages = target_end_pages_by_key.get(end_key)
+                if target_start_pages is not None and target_end_pages is not None:
+                    target_removed_pages = sorted(target_start_pages - target_end_pages)
+                    if target_removed_pages:
+                        args["target_radix_removed_page_identity"] = target_removed_pages
+                        result["target_materialized_events"] += 1
+                        result["target_materialized_pages"] += len(target_removed_pages)
+                        updated = True
 
         if updated:
             dump_json(trace_path, payload)
@@ -616,11 +671,14 @@ class ProfileRun:
             restore_model_config(backup)
             if status == "completed" and self._hicache_state_trace_enabled():
                 try:
-                    summary = materialize_hicache_radix_removed_pages(self.layout.trace_dir)
-                    if summary["materialized_events"] > 0:
+                    target_page_sizes = self._hicache_target_page_sizes()
+                    target_page_size = target_page_sizes[0] if len(target_page_sizes) == 1 else None
+                    summary = materialize_hicache_radix_removed_pages(self.layout.trace_dir, target_page_size=target_page_size)
+                    if summary["materialized_events"] > 0 or summary["target_materialized_events"] > 0:
                         log(
                             "Materialized HiCache radix removed pages: "
-                            f"events={summary['materialized_events']} pages={summary['materialized_pages']}"
+                            f"events={summary['materialized_events']} pages={summary['materialized_pages']} "
+                            f"target_events={summary['target_materialized_events']} target_pages={summary['target_materialized_pages']}"
                         )
                 except Exception as exc:
                     status = "failed"
@@ -713,6 +771,9 @@ class ProfileRun:
         env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
         if self._hicache_state_trace_enabled():
             env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
+            target_page_sizes = self._hicache_target_page_sizes()
+            if target_page_sizes:
+                env["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = ",".join(str(size) for size in target_page_sizes)
         if self.runtime.debug:
             env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
 
@@ -753,6 +814,9 @@ class ProfileRun:
         python_probe = channel_config(self.cfg, "python_probe")
         state_trace = python_probe.get("state_trace") if isinstance(python_probe.get("state_trace"), dict) else {}
         return bool(state_trace.get("enabled", False))
+
+    def _hicache_target_page_sizes(self) -> list[int]:
+        return _hicache_target_page_sizes_from_targets(self.runtime.python_targets)
 
     @staticmethod
     def _is_hicache_python_target(target: dict[str, Any]) -> bool:

@@ -14,8 +14,15 @@
 
 ## 当前结论
 
-截至 `2026-06-09 05:48:03 +0800`，本轮验证基于 HEAD commit `43d303c`
-和当前工作树改动。当前工作树包含四类 HiCache state / validation 修复：
+截至 `2026-06-09 17:29:17 +0800`，本文记录两类状态：
+
+- `HCSV-20260608-state-matrix` 是已经闭环的基准矩阵；该矩阵内列出的 replay / prediction 均达到
+  `final_state_match=true`、`timeline match=true`、`model_extra_transition_count=0`。
+- `HCSV-20260609-mainline-one-manual-l1` 是主线一 `L1_manual_phased` 的新增验证；两个新配置的同配置
+  replay 已通过，但双向 cross-config prediction 还没有通过，因此主线一不能宣称完成，也不能据此进入
+  `L2_bench_serving_large` 验收。
+
+当前工作树包含四类 HiCache state / validation 修复：
 
 - 显式 `write_back` target 默认不消费 base write-through 的 `L3->L2` prefetch transfer credit；只有组合配置显式设置
   `write_back_prefetch_transfer_credit=true` 时才使用该 credit。
@@ -24,9 +31,10 @@
   completion credit 就归到 target schedule pages；不再要求 transfer 的 `target_page_identity` 与 schedule target pages 前缀相同。
 - profiling runner 在 state_trace 开启时，会把同一次 insert start/end validation snapshot 中消失的 radix pages
   materialize 成 `hicache_insert_end.radix_removed_page_identity`。C++ state model 在同 page size replay 中消费这个
-  operation-level fact，page-size what-if 下跳过它。
+  operation-level fact；page-size what-if 下优先消费 `target_radix_removed_page_identity`，没有 target pages 时才跳过
+  base radix removed movement。
 
-本轮重新跑完了 `I0`、`I1`、`I2`、`I3` 四类输入，以及 `C0-C7`、`write_back + low capacity`
+`HCSV-20260608-state-matrix` 重新跑完了 `I0`、`I1`、`I2`、`I3` 四类输入，以及 `C0-C7`、`write_back + low capacity`
 共九类配置/组合的 state replay 或 cross-config prediction。结论如下：
 
 - 所有列入当前矩阵的同配置 replay 和跨配置 prediction 都达到 `final_state_match=true`。
@@ -394,6 +402,8 @@ Profiling 必须只采事实，不做 target 行为推断。
 - L1/L2 capacity、allocation size、locked/evictable 状态；
 - insert 调用内 radix 结构消失的 page identity，例如 `radix_removed_page_identity`。该字段只能来自同一次调用
   start/end 的 radix state delta；完整 state snapshot 仍只作为 validation oracle，不直接喂给 target what-if。
+- 如果 profiling config 显式要求跨 page size prediction，还应采集同一次 radix state delta 对应的
+  `target_radix_removed_page_identity`；该字段是 operation-level target page facts，不是完整 target snapshot 输入。
 - DAG anchor facts，用于后续 state-to-DAG patch。
 
 只能用于 oracle 的字段包括：
@@ -408,6 +418,11 @@ Profiling 必须只采事实，不做 target 行为推断。
 缺关键事实必须暴露为 `missing_invariant_facts`。page size 变化时，base `load_back`、write、transfer、
 remove/evict 等 observed movement 不是 target 不变量；缺少 target page identity 时必须跳过并计入
 `skipped_non_invariant_events`，不能静默更新 target state。
+
+跨 write policy 变化时，source write movement 也不能直接当作 target write-back flush 调度。尤其是
+`write_through_selective -> write_back` 这类组合，source trace 中的 `write_backup` / `write_storage` 顺序和页集合
+不等价于 target `write_back` 的异步 flush；如果未来要预测这类 target-only flush，必须采到可独立验证的
+operation-level flush oracle，或把 write-back flush policy 显式建模成不依赖 target actual trace 的稳定规则。
 
 ## 下一步工作主线
 
@@ -442,6 +457,59 @@ remove/evict 等 observed movement 不是 target 不变量；缺少 target page 
 ratio `1.5` 这类低 ratio 草案造成的真实 profile 严重慢速。
 `tests/run_hicache_mainline_config_fixtures.py` 同时扫描当前仓库非主线一配置，并内置 HCSV 历史签名黑名单；
 已清理且仓库中没有实体配置的历史 run 只保留签名摘要，不把缺失的 `data/` 记录作为文档依赖。
+
+#### HCSV-20260609-mainline-one-manual-l1
+
+本批次验证 `L1_manual_phased` 输入下的当前 `S1A` / `S1B` 候选。它的结论是：profiling 和同配置 replay
+已经可用，跨配置 prediction 暴露出 write-back flush oracle 缺口，主线一尚未闭环。
+
+| 项 | `S1A_baseline_large` | `S1B_divergent_large` |
+| --- | --- | --- |
+| run label | `20260609_053538_profiling_hicache_state_mainline_one_manual_s1a` | `20260609_073205_profiling_hicache_state_mainline_one_manual_s1b` |
+| config | page128、L1/L2 `64/145`、`write_through_selective`、`wait_complete`、ratio `2.25`、target page size `64` | page64、L1/L2 `128/321`、`write_back`、`best_effort`、ratio `2.5`、target page size `128` |
+| profile quality | `quality_ready=true`、23/23 targets observed、missing mechanisms `[]` | `quality_ready=true`、23/23 targets observed、missing mechanisms `[]` |
+| page identity coverage | stateful required `2126/2126`，missing `0` | stateful required `1804/1804`，missing `0` |
+| trace / target oracle coverage | events `15635`、snapshots `7531`、target hash nodes `87947`、target radix removed `32` events / `1072` pages | events `13840`、snapshots `6640`、target hash nodes `88944`、target radix removed `46` events / `864` pages |
+| mechanism 摘要 | evict `118`、insert `336`、load_back `216`、lock_ref `1266`、lookup `504`、prefetch transfer `16`、write `294/288` | evict `112`、insert `336`、load_back `218`、lock_ref `1072`、lookup `504`、prefetch transfer `16`、write `214/198` |
+
+同配置 replay 结果：
+
+| replay | validation | state counts | event delta | timeline |
+| --- | --- | --- | --- | --- |
+| `S1A` | pass | L1 `54/54`、L2 `106/106`、dirty `0/0`、backuped `106/106`、evicted `52/52`、locked `1/1`、prefetch `356/18/338` | match `false`、mismatch `168`，集中在 lock/ref 归因粒度 | match `true`、exact `false`、model-extra `0`、oracle-only `2924` |
+| `S1B` | pass | L1 `108/108`、L2 `144/144`、dirty `72/72`、backuped `144/144`、evicted `108/108`、locked `0/0`、prefetch `742/36/706` | match `false`、mismatch `169`，集中在 lock/ref 归因粒度 | match `true`、exact `false`、model-extra `0`、oracle-only `4860` |
+
+跨配置 prediction 结果：
+
+| prediction | validation | state counts / diff | timeline |
+| --- | --- | --- | --- |
+| `S1A -> S1B` | fail：`hicache_final_state_mismatch` | model/oracle：L1 `108/108`、L2 `125/144`、dirty `108/72`、backuped `125/144`、evicted `118/108`、prefetch `728/18/710` vs `742/36/706`；diff 为 L2 missing `36` / extra `17`、backuped missing `36` / extra `17`、dirty extra `36`、evicted extra `10`、prefetch planned missing `14`、ready missing `25` / extra `7`、suppressed missing `7` / extra `11` | match `false`、exact `false`、model-extra `72`、oracle-only `152` |
+| `S1B -> S1A` | fail：`hicache_final_state_mismatch` | 除 `locked_pages` 外 final state 全部对齐；唯一 diff 是 model `0`、oracle `1`，missing page `1` | match `true`、exact `false`、model-extra `0`、oracle-only `36` |
+
+逐 trace 对比结论：
+
+- `S1A -> S1B` 的主 mismatch 不是 page identity 缺口：`missing_page_identity_events=0`，target hash snapshot 和
+  target radix removed pages 都已采到。
+- 主 mismatch 集中在同一组 `36` 页：这 `36` 页同时满足 `extra_dirty`、`missing_l2`、`missing_backuped`。
+  也就是说，模型最终把它们留成 L1-only dirty page，而真实 `S1B` 最终把它们清 dirty，并留在 L2 / backuped。
+- 用 `S1B` 同配置 replay 的正确 transition trace 对齐同一批 page，`36/36` 页都有
+  `hicache_write_backup_end -> add_l2_resident + mark_backuped + clear_dirty`。跨配置 prediction 中没有等价的
+  target write-back flush 事实，后续 `hicache_insert_end` 又会 `remove_l2_resident + clear_backuped + mark_dirty`。
+- 直接消费 source `write_backup` / `write_storage` observed movement 不能作为修复：`S1A` 是
+  `write_through_selective + wait_complete`，source write movement 只覆盖部分页，且顺序不同于 `S1B` 的
+  `write_back + best_effort` 异步 flush。把 source write evidence 直接映射到 target 会过度增加 L2 / backuped，
+  不是可守住语义的不变量。
+- `S1B -> S1A` 的唯一缺口是 page-size what-if 下 lock/ref 被视为 non-invariant observed movement，因此模型不消费
+  base lock/ref；真实 `S1A` final oracle 还有一个 locked page。该问题应由更强 target lock/ref oracle 或验证口径处理，
+  不能用 source lock/ref 硬套 target page-size。
+
+主线一当前状态：
+
+- `L1_manual_phased` 的 profiling、quality、target identity、target radix removed materialization 和同配置 replay 已通过。
+- `L1_manual_phased` 的双向 cross-config prediction 未通过；因此主线一不得标记完成。
+- 下一步应先补齐 target write-back flush 的可验证事实边界，或调整主线一配置选择以避免无法从 source facts 推出的
+  target-only async flush。无论采用哪条路径，都需要重新跑 `L1_manual_phased` 的 prediction，再决定是否进入
+  `L2_bench_serving_large`。
 
 #### 早期 S1A 手工输入排查
 

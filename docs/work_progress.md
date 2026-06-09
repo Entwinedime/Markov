@@ -2,6 +2,20 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-09 17:29:17 +0800
+
+- 完成 HiCache state validation 主线一 `L1_manual_phased` 的 S1A/S1B 逐 trace 对比：
+  - 当前有效 run label 为 `20260609_053538_profiling_hicache_state_mainline_one_manual_s1a` 和
+    `20260609_073205_profiling_hicache_state_mainline_one_manual_s1b`；
+  - 两个 profile quality 均为 `quality_ready=true`，23/23 Python targets observed，stateful page identity 缺口为 `0`；
+  - 两个同配置 replay 均通过 final state validation，timeline 均为 `match=true`、`model_extra_transition_count=0`；
+  - `S1A -> S1B` prediction 失败，最终 diff 集中在同一组 `36` 页：模型多 dirty、少 L2、少 backuped；
+  - 逐页对齐 `S1B` 正确 replay 后确认，这 `36/36` 页真实路径都有 `hicache_write_backup_end` 产生
+    `add_l2_resident + mark_backuped + clear_dirty`，而跨配置 prediction 缺少等价 target write-back flush 事实；
+  - `S1B -> S1A` prediction 只剩一个 final locked page 缺口，属于 page-size what-if 下 lock/ref 非不变量的验证口径问题；
+  - 已更新 `docs/validation/hicache_state_validation.md`，明确主线一当前不能宣称完成，后续需补强 target write-back flush oracle
+    或调整主线一配置选择后重新验证。
+
 ## 2026-06-09 06:20:00 +0800
 
 - 收紧 HiCache state validation 主线一配置新颖性执行口径：

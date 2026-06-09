@@ -422,13 +422,15 @@ def _collect_radix_nodes(obj: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[int] = set()
     stack = [item for item in candidates if item is not None]
+    target_page_sizes = _target_page_sizes_for_snapshot()
+    full_tokens_cache: dict[int, list[Any]] = {}
     while stack and len(result) < 4096:
         node = stack.pop()
         identity = id(node)
         if identity in seen:
             continue
         seen.add(identity)
-        row = _snapshot_node(node)
+        row = _snapshot_node(node, target_page_sizes=target_page_sizes, full_tokens_cache=full_tokens_cache)
         result.append(row)
         stack.extend(_iter_children(node))
     return result
@@ -445,13 +447,18 @@ def _iter_children(node: Any) -> list[Any]:
     return [item for item in children if item is not None]
 
 
-def _snapshot_node(node: Any) -> dict[str, Any]:
+def _snapshot_node(
+    node: Any,
+    *,
+    target_page_sizes: list[int] | None = None,
+    full_tokens_cache: dict[int, list[Any]] | None = None,
+) -> dict[str, Any]:
     parent = getattr(node, "parent", None)
     hash_value = _jsonable_compact(getattr(node, "hash_value", None))
     key_value = getattr(node, "key", getattr(node, "token_ids", None))
     device_value = _first_attr(node, ("value", "device_value", "device_indices"))
     host_value = _first_attr(node, ("host_value", "host_indices"))
-    return {
+    row = {
         "node_id": _jsonable_compact(_first_attr(node, ("id", "node_id"))),
         "parent_id": _jsonable_compact(_first_attr(parent, ("id", "node_id")) if parent is not None else None),
         "hash_value": hash_value,
@@ -466,6 +473,69 @@ def _snapshot_node(node: Any) -> dict[str, Any]:
         "host_ref_counter": _safe_int(getattr(node, "host_ref_counter", 0)) or 0,
         "child_count": len(_iter_children(node)),
     }
+    target_hashes = _target_hash_values_for_node(node, target_page_sizes=target_page_sizes, full_tokens_cache=full_tokens_cache)
+    if target_hashes:
+        row["target_hash_value_by_page_size"] = target_hashes
+    return row
+
+
+def _target_page_sizes_for_snapshot() -> list[int]:
+    raw = os.environ.get("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES", "")
+    sizes: list[int] = []
+    seen: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        size = _safe_int(part.strip())
+        if size is None or size <= 0 or size in seen:
+            continue
+        seen.add(size)
+        sizes.append(size)
+    return sizes[:8]
+
+
+def _target_hash_values_for_node(
+    node: Any,
+    *,
+    target_page_sizes: list[int] | None = None,
+    full_tokens_cache: dict[int, list[Any]] | None = None,
+) -> dict[str, list[str]]:
+    sizes = target_page_sizes if target_page_sizes is not None else _target_page_sizes_for_snapshot()
+    if not sizes:
+        return {}
+    parent = getattr(node, "parent", None)
+    node_tokens = _tokens_for_page_hash(getattr(node, "key", getattr(node, "token_ids", None)))
+    if not node_tokens:
+        return {}
+    parent_tokens = _full_key_tokens(parent, full_tokens_cache) if parent is not None else []
+    full_tokens = parent_tokens + node_tokens
+    result: dict[str, list[str]] = {}
+    for page_size in sizes:
+        parent_hashes = _compute_page_hashes(parent_tokens, page_size, None)
+        full_hashes = _compute_page_hashes(full_tokens, page_size, None)
+        node_hashes = full_hashes[len(parent_hashes) :]
+        if node_hashes:
+            result[str(page_size)] = node_hashes
+    return result
+
+
+def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> list[Any]:
+    if node is None:
+        return []
+    identity = id(node)
+    if cache is not None and identity in cache:
+        return cache[identity]
+    chain = []
+    seen: set[int] = set()
+    current = node
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = getattr(current, "parent", None)
+    tokens: list[Any] = []
+    for item in reversed(chain):
+        tokens.extend(_tokens_for_page_hash(getattr(item, "key", getattr(item, "token_ids", None))))
+    if cache is not None:
+        cache[identity] = tokens
+    return tokens
 
 
 def _snapshot_controller(obj: Any) -> dict[str, Any]:

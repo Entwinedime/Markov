@@ -24,6 +24,7 @@ def main() -> int:
         run_page_size_prefetch_transfer_target_identity_fixture(tmp)
         run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp)
         run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp)
+        run_page_size_prefetch_schedule_best_effort_target_suffix_fixture(tmp)
         run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp)
         run_target_radix_prefix_fixture(tmp)
         run_write_through_selective_fixture(tmp)
@@ -31,7 +32,12 @@ def main() -> int:
         run_page_size_lock_ref_non_invariant_fixture(tmp)
         run_leaf_group_l2_clear_fixture(tmp)
         run_radix_removed_pages_fixture(tmp)
+        run_radix_removed_pages_lookup_fixture(tmp)
         run_radix_removed_pages_page_size_mismatch_fixture(tmp)
+        run_target_radix_removed_pages_page_size_mismatch_fixture(tmp)
+        run_dirty_insert_overwrites_stale_backup_fixture(tmp)
+        run_prefetch_transfer_completed_tokens_fixture(tmp)
+        run_prefetch_duplicate_transfer_ready_without_resident_fixture(tmp)
         run_capacity_target_skips_observed_remove_fixture(tmp)
         run_same_page_capacity_leaf_group_fixture(tmp)
         run_prefetch_wait_complete_fixture(tmp)
@@ -41,6 +47,8 @@ def main() -> int:
         run_prefetch_timeout_finalize_fixture(tmp)
         run_prefetch_timeout_transfer_credit_fixture(tmp)
         run_prefetch_timeout_lock_ref_non_invariant_fixture(tmp)
+        run_prefetch_wait_complete_transfer_credit_fixture(tmp)
+        run_prefetch_wait_complete_lookup_l3_credit_fixture(tmp)
         run_prefetch_best_effort_progress_fixture(tmp)
         run_prefetch_best_effort_transfer_credit_fixture(tmp)
         run_prefetch_best_effort_lock_ref_non_invariant_fixture(tmp)
@@ -518,7 +526,7 @@ def run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp: P
 
 
 def run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp: Path) -> None:
-    """验证跨 page size 时 prefetch schedule 可从 lookup target path 取 suffix。"""
+    """验证跨 page size 时 timeout prefetch schedule 可从 lookup target path 取 suffix。"""
 
     trace_path = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix.json"
     model_config = tmp / "hicache_page_size_prefetch_schedule_lookup_suffix_model.json"
@@ -579,6 +587,71 @@ def run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp: Path) -> None:
     final_state = summary["final_state"]
     assert final_state["prefetch_planned_pages"] == ["target_suffix"], final_state
     assert "wrong_no_parent_suffix" not in final_state["prefetch_planned_pages"], final_state
+
+
+def run_page_size_prefetch_schedule_best_effort_target_suffix_fixture(tmp: Path) -> None:
+    """验证 best_effort page-size what-if 优先保留 prefetch target suffix。"""
+
+    trace_path = tmp / "hicache_page_size_prefetch_schedule_best_effort_target_suffix.json"
+    model_config = tmp / "hicache_page_size_prefetch_schedule_best_effort_target_suffix_model.json"
+    summary_out = tmp / "hicache_page_size_prefetch_schedule_best_effort_target_suffix_summary.json"
+    run_summary = tmp / "hicache_page_size_prefetch_schedule_best_effort_target_suffix_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "request_id": "req-page64-best-schedule",
+                            "page_size": 128,
+                            "page_identity": ["base_prefix"],
+                            "target_page_identity": ["target_prefix", "lookup_tail"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-page64-best-schedule",
+                            "page_size": 128,
+                            "new_input_tokens": 97,
+                            "page_identity": [],
+                            "target_page_identity": ["prefetch_parent_suffix"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "prefetch_policy": "best_effort",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert final_state["prefetch_planned_pages"] == ["prefetch_parent_suffix"], final_state
+    assert final_state["prefetch_suppressed_pages"] == ["prefetch_parent_suffix"], final_state
+    assert "lookup_tail" not in final_state["prefetch_planned_pages"], final_state
 
 
 def run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp: Path) -> None:
@@ -1132,6 +1205,69 @@ def run_radix_removed_pages_fixture(tmp: Path) -> None:
     assert summary["transitions_by_kind"]["clear_evicted"] == 2, summary
 
 
+def run_radix_removed_pages_lookup_fixture(tmp: Path) -> None:
+    """验证非 insert 调用物化的 radix removed pages 也会清理状态。"""
+
+    trace_path = tmp / "hicache_radix_removed_pages_lookup.json"
+    model_config = tmp / "hicache_radix_removed_pages_lookup_model.json"
+    summary_out = tmp / "hicache_radix_removed_pages_lookup_summary.json"
+    run_summary = tmp / "hicache_radix_removed_pages_lookup_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(10, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 128, "page_identity": ["old_a"]}),
+                    hicache_event(
+                        20,
+                        "hicache_write_backup_end",
+                        {"event_role": "write_backup", "tier_src": "L1", "tier_dst": "L2", "page_size": 128, "page_identity": ["old_a"]},
+                    ),
+                    hicache_event(30, "hicache_remove_page_end", {"event_role": "remove_page", "tier_src": "GPU", "page_size": 128, "page_identity": ["old_a"]}),
+                    hicache_event(
+                        40,
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "page_size": 128,
+                            "page_identity": ["new_lookup"],
+                            "radix_removed_page_identity": ["old_a"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 128, "write_policy": "observed"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [
+            str(ROOT / "build/bin/trace_graph"),
+            "--input",
+            str(trace_path),
+            "--run-summary",
+            str(run_summary),
+            "--model-config",
+            str(model_config),
+            "--model-summary",
+            str(summary_out),
+        ],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["final_state"]["l1_resident_pages"] == [], summary
+    assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["backuped_pages"] == [], summary
+    assert summary["final_state"]["evicted_pages"] == [], summary
+    assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_evicted"] == 1, summary
+
+
 def run_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
     """验证 radix removed pages 在 page-size what-if 下不作为 target 结构事实消费。"""
 
@@ -1195,6 +1331,279 @@ def run_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
     assert summary["transitions_by_kind"].get("remove_l2_resident", 0) == 0, summary
     assert summary["transitions_by_kind"].get("clear_backuped", 0) == 0, summary
     assert summary["transitions_by_kind"].get("clear_evicted", 0) == 0, summary
+
+
+def run_target_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
+    """验证 page-size what-if 下优先消费 target radix removed pages。"""
+
+    trace_path = tmp / "hicache_target_radix_removed_pages_page_size_mismatch.json"
+    model_config = tmp / "hicache_target_radix_removed_pages_page_size_mismatch_model.json"
+    summary_out = tmp / "hicache_target_radix_removed_pages_page_size_mismatch_summary.json"
+    run_summary = tmp / "hicache_target_radix_removed_pages_page_size_mismatch_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(10, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["target_old"]}),
+                    hicache_event(
+                        20,
+                        "hicache_write_backup_end",
+                        {"event_role": "write_backup", "tier_src": "L1", "tier_dst": "L2", "page_size": 64, "page_identity": ["target_old"]},
+                    ),
+                    hicache_event(30, "hicache_remove_page_end", {"event_role": "remove_page", "tier_src": "GPU", "page_size": 64, "page_identity": ["target_old"]}),
+                    hicache_event(
+                        40,
+                        "hicache_insert_end",
+                        {
+                            "event_role": "insert",
+                            "tier_dst": "L1",
+                            "page_size": 128,
+                            "page_identity": ["base_new"],
+                            "target_page_identity": ["target_new"],
+                            "radix_removed_page_identity": ["base_old"],
+                            "target_radix_removed_page_identity": ["target_old"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "write_policy": "observed",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["final_state"]["l1_resident_pages"] == ["target_new"], summary
+    assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["backuped_pages"] == [], summary
+    assert summary["final_state"]["evicted_pages"] == [], summary
+    assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_evicted"] == 1, summary
+
+
+def run_dirty_insert_overwrites_stale_backup_fixture(tmp: Path) -> None:
+    """验证 dirty insert 会覆盖同 page 的旧 host backup。"""
+
+    trace_path = tmp / "hicache_dirty_insert_overwrites_stale_backup.json"
+    model_config = tmp / "hicache_dirty_insert_overwrites_stale_backup_model.json"
+    summary_out = tmp / "hicache_dirty_insert_overwrites_stale_backup_summary.json"
+    run_summary = tmp / "hicache_dirty_insert_overwrites_stale_backup_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(10, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["p1"]}),
+                    hicache_event(
+                        20,
+                        "hicache_write_backup_end",
+                        {"event_role": "write_backup", "tier_src": "L1", "tier_dst": "L2", "page_size": 64, "page_identity": ["p1"]},
+                    ),
+                    hicache_event(30, "hicache_remove_page_end", {"event_role": "remove_page", "tier_src": "GPU", "page_size": 64, "page_identity": ["p1"]}),
+                    hicache_event(40, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["p1"]}),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "write_policy": "observed"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["final_state"]["l1_resident_pages"] == ["p1"], summary
+    assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["backuped_pages"] == [], summary
+    assert summary["final_state"]["dirty_pages"] == ["p1"], summary
+    assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
+    assert summary["transitions_by_kind"]["mark_dirty"] == 2, summary
+
+
+def run_prefetch_transfer_completed_tokens_fixture(tmp: Path) -> None:
+    """验证 transfer completed_tokens 限制 L2/ready credit，尾页由 progress 收尾。"""
+
+    trace_path = tmp / "hicache_prefetch_transfer_completed_tokens.json"
+    model_config = tmp / "hicache_prefetch_transfer_completed_tokens_model.json"
+    summary_out = tmp / "hicache_prefetch_transfer_completed_tokens_summary.json"
+    run_summary = tmp / "hicache_prefetch_transfer_completed_tokens_run.json"
+    pages = ["p1", "p2", "p3"]
+    progress_start = {
+        "request_id": "req-a",
+        "policy": "best_effort",
+        "page_size": 64,
+        "operation_hash_pages": pages,
+        "completed_tokens": 0,
+        "ready_pages_estimate": 0,
+        "has_ongoing_prefetch": True,
+        "check_return": None,
+    }
+    progress_end = {
+        "request_id": "req-a",
+        "policy": "best_effort",
+        "page_size": 64,
+        "loaded_tokens_evidence": 128,
+        "has_ongoing_prefetch": False,
+        "check_return": True,
+    }
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-a", "page_size": 64, "new_input_tokens": 192, "page_identity": pages},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "direction": "prefetch",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "request_id": "req-a",
+                            "page_size": 64,
+                            "completed_tokens": 128,
+                            "page_identity": pages,
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_prefetch_progress_start",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-a",
+                            "page_size": 64,
+                            "prefetch_progress_state": progress_start,
+                        },
+                    ),
+                    hicache_event(
+                        40,
+                        "hicache_prefetch_progress_end",
+                        {
+                            "event_role": "prefetch_progress",
+                            "request_id": "req-a",
+                            "prefetch_done": True,
+                            "page_size": 64,
+                            "prefetch_progress_state": progress_end,
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "observed"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["final_state"]["l2_resident_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["backuped_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_late_pages"] == ["p3"], summary
+    assert summary["final_state"]["prefetch_suppressed_pages"] == ["p3"], summary
+    assert summary["transitions_by_kind"]["add_l2_resident"] == 2, summary
+    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 2, summary
+    assert summary["transitions_by_kind"]["mark_prefetch_late"] == 1, summary
+
+
+def run_prefetch_duplicate_transfer_ready_without_resident_fixture(tmp: Path) -> None:
+    """验证同 request 重复 transfer 只补 ready，不重复扩大全局 L2 resident。"""
+
+    trace_path = tmp / "hicache_prefetch_duplicate_transfer_ready_without_resident.json"
+    model_config = tmp / "hicache_prefetch_duplicate_transfer_ready_without_resident_model.json"
+    summary_out = tmp / "hicache_prefetch_duplicate_transfer_ready_without_resident_summary.json"
+    run_summary = tmp / "hicache_prefetch_duplicate_transfer_ready_without_resident_run.json"
+    pages = ["p1", "p2", "p3"]
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-a", "page_size": 64, "new_input_tokens": 192, "page_identity": pages},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "direction": "prefetch",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "request_id": "req-a",
+                            "page_size": 64,
+                            "completed_tokens": 128,
+                            "page_identity": pages,
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "direction": "prefetch",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "request_id": "req-a",
+                            "page_size": 64,
+                            "completed_tokens": 192,
+                            "page_identity": pages,
+                        },
+                        pid=2,
+                        tid=2,
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "observed"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["final_state"]["l2_resident_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["backuped_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["p1", "p2", "p3"], summary
+    assert summary["transitions_by_kind"]["add_l2_resident"] == 2, summary
+    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 3, summary
 
 
 def run_capacity_target_skips_observed_remove_fixture(tmp: Path) -> None:
@@ -1329,7 +1738,7 @@ def run_prefetch_wait_complete_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["skipped_non_invariant_events"] == 2, summary
+    assert summary["skipped_non_invariant_events"] == 1, summary
     assert summary["final_state"]["l2_resident_pages"] == ["p1", "p2"], summary
     assert summary["final_state"]["prefetch_planned_pages"] == ["p1", "p2"], summary
     assert summary["final_state"]["prefetch_ready_pages"] == ["p1", "p2"], summary
@@ -1755,6 +2164,157 @@ def run_prefetch_timeout_lock_ref_non_invariant_fixture(tmp: Path) -> None:
     assert summary["final_state"].get("locked_pages", []) == [], summary
     assert "mark_locked" not in summary.get("transitions_by_kind", {}), summary
     assert "clear_locked" not in summary.get("transitions_by_kind", {}), summary
+
+
+def run_prefetch_wait_complete_transfer_credit_fixture(tmp: Path) -> None:
+    """验证 wait_complete target 也会消费 planned page 的 transfer completion。"""
+
+    trace_path = tmp / "hicache_prefetch_wait_complete_transfer_credit.json"
+    model_config = tmp / "hicache_prefetch_wait_complete_transfer_credit_model.json"
+    summary_out = tmp / "hicache_prefetch_wait_complete_transfer_credit_summary.json"
+    run_summary = tmp / "hicache_prefetch_wait_complete_transfer_credit_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-wait-credit", "page_size": 128, "page_identity": ["p1", "p2"]},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-wait-credit",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": ["p1", "p2"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 128, "prefetch_policy": "wait_complete"}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["final_state"]["l2_resident_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_planned_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["p1", "p2"], summary
+    assert summary["final_state"]["prefetch_suppressed_pages"] == [], summary
+    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 2, summary
+
+
+def run_prefetch_wait_complete_lookup_l3_credit_fixture(tmp: Path) -> None:
+    """验证 wait_complete target lookup 从 L3 推导出的 load 也会补 ready。"""
+
+    trace_path = tmp / "hicache_prefetch_wait_complete_lookup_l3_credit.json"
+    model_config = tmp / "hicache_prefetch_wait_complete_lookup_l3_credit_model.json"
+    summary_out = tmp / "hicache_prefetch_wait_complete_lookup_l3_credit_summary.json"
+    run_summary = tmp / "hicache_prefetch_wait_complete_lookup_l3_credit_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "request_id": "req-plan",
+                            "page_size": 64,
+                            "page_identity": ["base_prefix", "base_ready"],
+                            "target_page_identity": ["target_prefix", "target_ready"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-plan",
+                            "page_size": 64,
+                            "new_input_tokens": 128,
+                            "page_identity": ["base_suffix_a", "base_suffix_b"],
+                            "target_page_identity": ["stale_direct_target"],
+                        },
+                    ),
+                    hicache_event(
+                        30,
+                        "hicache_write_storage_schedule_end",
+                        {
+                            "event_role": "write_storage_schedule",
+                            "tier_src": "L2",
+                            "tier_dst": "L3",
+                            "page_size": 128,
+                            "page_identity": ["target_ready"],
+                        },
+                    ),
+                    hicache_event(
+                        40,
+                        "hicache_remove_page_end",
+                        {
+                            "event_role": "remove_page",
+                            "tier_src": "L2",
+                            "page_size": 128,
+                            "page_identity": ["target_ready"],
+                        },
+                    ),
+                    hicache_event(
+                        50,
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "request_id": "req-load",
+                            "page_size": 64,
+                            "page_identity": ["base_prefix", "base_ready"],
+                            "target_page_identity": ["target_prefix", "target_ready"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 128,
+                    "prefetch_policy": "wait_complete",
+                    "write_policy": "observed",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["final_state"]["l1_resident_pages"] == ["target_ready"], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["target_ready"], summary
+    assert summary["final_state"]["prefetch_planned_pages"] == ["target_ready"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["target_ready"], summary
+    assert summary["final_state"]["prefetch_suppressed_pages"] == [], summary
+    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 1, summary
 
 
 def run_prefetch_best_effort_progress_fixture(tmp: Path) -> None:

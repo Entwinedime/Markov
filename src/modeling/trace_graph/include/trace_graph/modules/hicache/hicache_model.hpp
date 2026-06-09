@@ -31,6 +31,7 @@ struct HiCacheFact {
     std::vector<std::string> source_pages;
     std::vector<std::string> target_pages;
     std::vector<std::string> radix_removed_pages;
+    std::vector<std::string> target_radix_removed_pages;
     uint64_t page_size = 0;
     uint64_t prefix_len = 0;
     uint64_t new_input_tokens = 0;
@@ -46,6 +47,7 @@ struct HiCacheFact {
     bool prefetch_check_return = false;
     bool prefetch_has_ongoing = false;
     bool chunked = false;
+    bool radix_removed_pages_are_target = false;
 };
 
 struct HiCacheStateTransition {
@@ -156,6 +158,7 @@ class HiCacheState {
     std::unordered_map<std::string, uint64_t> hit_count_by_scope_page_;
     std::unordered_map<std::string, uint64_t> lock_count_by_scope_page_;
     std::set<std::string> terminated_prefetch_requests_;
+    std::set<std::string> prefetch_transfer_resident_credited_requests_;
     std::vector<std::string> last_lookup_pages_;
     std::unordered_map<std::string, std::vector<std::string>> last_lookup_pages_by_scope_;
     std::vector<std::string> l1_touch_order_;

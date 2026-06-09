@@ -758,7 +758,7 @@ def run_env_placeholder_fixture() -> None:
 
 
 def run_hicache_radix_removed_materialization_fixture() -> None:
-    """验证 runner 收尾能从同次 insert start/end snapshot 派生 radix removed pages。"""
+    """验证 runner 收尾能从同次 HiCache start/end snapshot 派生 radix removed pages。"""
 
     spec = importlib.util.spec_from_file_location(
         "trace_sim_profile_runner_radix_materialize",
@@ -776,16 +776,16 @@ def run_hicache_radix_removed_materialization_fixture() -> None:
         python_probe_dir.mkdir(parents=True)
         trace_path = python_probe_dir / "python_probe_trace.rank0.pid1.json"
 
-        def snapshot_event(name: str, dur: int, pages: list[str]) -> dict[str, object]:
+        def snapshot_event(name: str, ts: int, dur: int, target_id: str, pages: list[str]) -> dict[str, object]:
             return {
                 "name": name,
                 "cat": "python_probe",
                 "pid": 1,
                 "tid": 1,
-                "ts": 100,
+                "ts": ts,
                 "dur": dur,
                 "args": {
-                    "target_id": "hiradix.insert",
+                    "target_id": target_id,
                     "model_input": False,
                     "state_snapshot": {
                         "nodes": [
@@ -811,7 +811,7 @@ def run_hicache_radix_removed_materialization_fixture() -> None:
                         "radix_removed_page_identity": [],
                     },
                 },
-                snapshot_event("hicache_insert_start:state_snapshot", 0, ["old_a", "old_b", "kept"]),
+                snapshot_event("hicache_insert_start:state_snapshot", 100, 0, "hiradix.insert", ["old_a", "old_b", "kept"]),
                 {
                     "name": "hicache_insert_end",
                     "cat": "python_probe",
@@ -824,7 +824,31 @@ def run_hicache_radix_removed_materialization_fixture() -> None:
                         "radix_removed_page_identity": [],
                     },
                 },
-                snapshot_event("hicache_insert_end:state_snapshot", 7, ["kept", "new_a"]),
+                snapshot_event("hicache_insert_end:state_snapshot", 100, 7, "hiradix.insert", ["kept", "new_a"]),
+                {
+                    "name": "hicache_lookup_start",
+                    "cat": "python_probe",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": 200,
+                    "dur": 0,
+                    "args": {
+                        "target_id": "hiradix.match_prefix",
+                    },
+                },
+                snapshot_event("hicache_lookup_start:state_snapshot", 200, 0, "hiradix.match_prefix", ["lookup_old", "lookup_kept"]),
+                {
+                    "name": "hicache_lookup_end",
+                    "cat": "python_probe",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": 200,
+                    "dur": 5,
+                    "args": {
+                        "target_id": "hiradix.match_prefix",
+                    },
+                },
+                snapshot_event("hicache_lookup_end:state_snapshot", 200, 5, "hiradix.match_prefix", ["lookup_kept"]),
             ]
         }
         trace_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -832,15 +856,105 @@ def run_hicache_radix_removed_materialization_fixture() -> None:
         summary = module.materialize_hicache_radix_removed_pages(trace_dir)
         assert summary["files_scanned"] == 1, summary
         assert summary["files_updated"] == 1, summary
+        assert summary["end_events"] == 2, summary
         assert summary["insert_end_events"] == 1, summary
-        assert summary["materialized_events"] == 1, summary
-        assert summary["materialized_pages"] == 2, summary
+        assert summary["materialized_events"] == 2, summary
+        assert summary["materialized_pages"] == 3, summary
 
         updated = json.loads(trace_path.read_text(encoding="utf-8"))
         end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
         assert end_event["args"]["radix_removed_page_identity"] == ["old_a", "old_b"], end_event
+        lookup_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_lookup_end")
+        assert lookup_event["args"]["radix_removed_page_identity"] == ["lookup_old"], lookup_event
         snapshots = [event for event in updated["traceEvents"] if event["name"].endswith(":state_snapshot")]
         assert all(event["args"]["model_input"] is False for event in snapshots), snapshots
+
+
+def run_hicache_target_radix_removed_materialization_fixture() -> None:
+    """验证 runner 可从 target snapshot hashes 派生 target radix removed pages。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_target_radix_materialize",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    targets = [
+        {
+            "fields": [
+                {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
+                {"name": "target_page_identity", "source": "page_hashes_after_prefix:arg:prefix_keys,arg:new_input_tokens,64"},
+                {"name": "alt_target_page_identity", "source": "page_hashes_concat:arg:prefix,arg:suffix,128,arg:last_hash"},
+            ]
+        }
+    ]
+    assert module._hicache_target_page_sizes_from_targets(targets) == [64, 128]
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        trace_dir = tmp / "trace"
+        python_probe_dir = trace_dir / "python_probe"
+        python_probe_dir.mkdir(parents=True)
+        trace_path = python_probe_dir / "python_probe_trace.rank0.pid1.json"
+
+        def snapshot_event(name: str, pages: list[str], target_pages: list[str]) -> dict[str, object]:
+            return {
+                "name": name,
+                "cat": "python_probe",
+                "pid": 1,
+                "tid": 1,
+                "ts": 100,
+                "dur": 7 if "_end:" in name else 0,
+                "args": {
+                    "target_id": "hiradix.insert",
+                    "model_input": False,
+                    "state_snapshot": {
+                        "nodes": [
+                            {
+                                "hash_value": pages,
+                                "target_hash_value_by_page_size": {"64": target_pages},
+                            }
+                        ]
+                    },
+                },
+            }
+
+        payload = {
+            "traceEvents": [
+                {
+                    "name": "hicache_insert_end",
+                    "cat": "python_probe",
+                    "pid": 1,
+                    "tid": 1,
+                    "ts": 100,
+                    "dur": 7,
+                    "args": {
+                        "target_id": "hiradix.insert",
+                        "radix_removed_page_identity": ["actual_live_removed"],
+                    },
+                },
+                snapshot_event("hicache_insert_start:state_snapshot", ["actual_old", "actual_kept"], ["target_old", "target_kept"]),
+                snapshot_event("hicache_insert_end:state_snapshot", ["actual_kept", "actual_new"], ["target_kept", "target_new"]),
+            ]
+        }
+        trace_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+        summary = module.materialize_hicache_radix_removed_pages(trace_dir, target_page_size=64)
+        assert summary["files_scanned"] == 1, summary
+        assert summary["files_updated"] == 1, summary
+        assert summary["end_events"] == 1, summary
+        assert summary["insert_end_events"] == 1, summary
+        assert summary["materialized_events"] == 0, summary
+        assert summary["target_materialized_events"] == 1, summary
+        assert summary["target_materialized_pages"] == 1, summary
+
+        updated = json.loads(trace_path.read_text(encoding="utf-8"))
+        end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
+        assert end_event["args"]["radix_removed_page_identity"] == ["actual_live_removed"], end_event
+        assert end_event["args"]["target_radix_removed_page_identity"] == ["target_old"], end_event
 
 
 def run_sglang_hicache_target_fixture() -> None:
@@ -999,6 +1113,39 @@ cache.match_prefix(params)
         assert snapshot["capacity"]["l2_capacity_pages"] == 8, snapshot
         assert snapshot["capacity"]["l2_available_pages"] == 6, snapshot
         assert snapshot["capacity"]["prefetch_capacity_limit_pages"] == 4, snapshot
+
+
+def run_hicache_target_hash_snapshot_fixture() -> None:
+    """验证 state snapshot 可按目标 page size 额外输出 target page hashes。"""
+
+    from trace_sim_probe.probes import sglang_hicache_callable
+
+    class Node:
+        def __init__(self, node_id: int, key: list[int], parent=None):
+            self.id = node_id
+            self.key = key
+            self.parent = parent
+            self.hash_value = []
+            self.value = [1]
+            self.host_value = [2]
+
+    parent = Node(1, [1, 2])
+    child = Node(2, [3, 4, 5, 6], parent)
+    previous = os.environ.get("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES")
+    os.environ["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = "2,4"
+    try:
+        row = sglang_hicache_callable._snapshot_node(child)
+    finally:
+        if previous is None:
+            os.environ.pop("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES", None)
+        else:
+            os.environ["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = previous
+
+    target_hashes = row.get("target_hash_value_by_page_size")
+    assert isinstance(target_hashes, dict), row
+    assert sorted(target_hashes.keys()) == ["2", "4"], target_hashes
+    assert len(target_hashes["2"]) == 2, target_hashes
+    assert len(target_hashes["4"]) == 1, target_hashes
 
 
 def run_hicache_radix_removed_pages_phase_fixture() -> None:
@@ -1596,6 +1743,7 @@ def main() -> int:
     run_probe_fixture()
     run_sglang_hicache_target_fixture()
     run_hicache_state_snapshot_fixture()
+    run_hicache_target_hash_snapshot_fixture()
     run_hicache_radix_removed_pages_phase_fixture()
     run_hicache_page_hash_literal_page_size_fixture()
     run_hicache_prefetch_progress_source_fixture()
@@ -1606,6 +1754,7 @@ def main() -> int:
     run_state_trace_env_fixture()
     run_env_placeholder_fixture()
     run_hicache_radix_removed_materialization_fixture()
+    run_hicache_target_radix_removed_materialization_fixture()
     run_trace_merger_sidecar_only_fixture()
     print("profiling fixtures passed")
     return 0

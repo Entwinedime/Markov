@@ -239,10 +239,12 @@ bool should_skip_non_invariant_target_movement(const HiCacheConfig & config, con
         (fact.role == "lock_ref_inc" || fact.role == "lock_ref_dec"))
         return true;
     if (config.prefetch_policy != "observed" && is_prefetch_observed_movement_role(fact.role)) {
-        // best_effort 的 ready pages 来自异步完成 credit。L3->L2 transfer
-        // 是可用的 completion evidence，不能像普通 observed movement 一样
-        // 全部跳过；是否真正更新状态由 HiCacheState 根据 planned pages 再判断。
-        if ((config.prefetch_policy == "best_effort" || config.prefetch_policy == "timeout") && contains(fact.role, "l3_to_l2")) return false;
+        // 非 observed prefetch target 的 ready pages 仍需要 transfer completion
+        // evidence。L3->L2 transfer 不能像普通 observed movement 一样全部跳过；
+        // 是否真正更新状态由 HiCacheState 根据 planned pages 再判断。
+        if ((config.prefetch_policy == "best_effort" || config.prefetch_policy == "timeout" || config.prefetch_policy == "wait_complete") &&
+            contains(fact.role, "l3_to_l2"))
+            return false;
         return true;
     }
     if (config.write_policy != "observed" &&
@@ -333,7 +335,12 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     const bool insert_had_observed_pages = fact.role == "insert" && !fact.pages.empty();
     fact.target_pages = parse_page_arg(event, "target_page_identity");
     fact.radix_removed_pages = parse_page_arg(event, "radix_removed_page_identity");
+    fact.target_radix_removed_pages = parse_page_arg(event, "target_radix_removed_page_identity");
     parse_prefetch_progress(event, fact);
+    if (fact.prefetch_ready_page_count == 0) {
+        const uint64_t completed_tokens = event.arg_u64("completed_tokens", 0);
+        if (fact.page_size > 0 && completed_tokens > 0) fact.prefetch_ready_page_count = completed_tokens / fact.page_size;
+    }
     if (fact.role == "insert" && fact.prefix_len > 0 && fact.page_size > 0 && !fact.pages.empty()) {
         const size_t prefix_pages = std::min(fact.pages.size(), static_cast<size_t>(fact.prefix_len / fact.page_size));
         fact.pages.erase(fact.pages.begin(), fact.pages.begin() + static_cast<long>(prefix_pages));
@@ -498,17 +505,17 @@ HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)) {}
 
 std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
+    if (!fact.radix_removed_pages.empty()) {
+        if (target_page_size_mismatch(fact) && !fact.radix_removed_pages_are_target)
+            summary.skipped_non_invariant_events++;
+        else
+            apply_radix_removed_pages(fact, summary, transitions);
+    }
     if (fact.role == "lookup") {
         apply_lookup(fact, summary, transitions);
         return transitions;
     }
     if (fact.role == "insert") {
-        if (!fact.radix_removed_pages.empty()) {
-            if (target_page_size_mismatch(fact))
-                summary.skipped_non_invariant_events++;
-            else
-                apply_radix_removed_pages(fact, summary, transitions);
-        }
         auto insert_fact = fact;
         insert_fact.pages = target_insert_pages(fact);
         apply_insert(insert_fact, summary, transitions);
@@ -620,6 +627,7 @@ void HiCacheState::apply_lookup(const HiCacheFact & fact, HiCacheSummary & summa
         if (l3_.count(page) > 0) {
             add_resident(fact, summary, transitions, "L2", page);
             add_resident(fact, summary, transitions, "L1", page);
+            if (config_.prefetch_policy == "wait_complete" && prefetch_planned_.count(page) > 0) mark_prefetch_ready(fact, summary, transitions, page);
         }
     }
     enforce_capacity(fact, summary, transitions, "L2");
@@ -737,6 +745,12 @@ void HiCacheState::apply_insert(const HiCacheFact & fact, HiCacheSummary & summa
             clear_dirty(fact, summary, transitions, page);
         }
         else {
+            const bool dirty_insert_overwrites_backup =
+                fact.dirty && !fact.backuped && config_.write_policy != "write_through" && config_.write_policy != "write_through_selective";
+            if (dirty_insert_overwrites_backup && backuped_.count(page) > 0) {
+                remove_resident(fact, summary, transitions, "L2", page);
+                clear_backuped(fact, summary, transitions, page);
+            }
             if (fact.dirty && !backuped_.count(page)) mark_dirty(fact, summary, transitions, page);
             if (fact.backuped) mark_backuped(fact, summary, transitions, page);
         }
@@ -863,13 +877,28 @@ void HiCacheState::apply_l3_to_l2(const HiCacheFact & fact, HiCacheSummary & sum
     }
     const bool best_effort_credit = config_.prefetch_policy == "best_effort" && planned_prefetch_transfer;
     const bool timeout_credit = config_.prefetch_policy == "timeout" && planned_prefetch_transfer;
-    if (config_.prefetch_policy != "observed" && !best_effort_credit && !timeout_credit) {
+    const bool wait_complete_credit = config_.prefetch_policy == "wait_complete" && planned_prefetch_transfer;
+    if (config_.prefetch_policy != "observed" && !best_effort_credit && !timeout_credit && !wait_complete_credit) {
         summary.skipped_non_invariant_events++;
         return;
     }
-    for (const auto & page : pages) {
-        add_resident(fact, summary, transitions, "L3", page);
-        add_resident(fact, summary, transitions, "L2", page);
+    size_t credited_pages = pages.size();
+    if (fact.prefetch_ready_page_count > 0) credited_pages = std::min<size_t>(credited_pages, static_cast<size_t>(fact.prefetch_ready_page_count));
+    size_t resident_pages = credited_pages;
+    const bool prefetch_transfer = ready || planned_prefetch_transfer;
+    const auto request_key = fact.request_id;
+    if (prefetch_transfer && !request_key.empty()) {
+        if (prefetch_transfer_resident_credited_requests_.count(request_key) > 0)
+            resident_pages = 0;
+        else if (resident_pages > 0)
+            prefetch_transfer_resident_credited_requests_.insert(request_key);
+    }
+    for (size_t index = 0; index < credited_pages; ++index) {
+        const auto & page = pages[index];
+        if (index < resident_pages) {
+            add_resident(fact, summary, transitions, "L3", page);
+            add_resident(fact, summary, transitions, "L2", page);
+        }
         if (ready || prefetch_planned_.count(page) > 0) mark_prefetch_ready(fact, summary, transitions, page);
     }
     enforce_capacity(fact, summary, transitions, "L2");
@@ -988,8 +1017,8 @@ void HiCacheState::apply_remove_page(const HiCacheFact & fact, HiCacheSummary & 
         summary.skipped_non_invariant_events++;
         return;
     }
-    const auto tier = fact.tier_src.empty() ? "L1" : fact.tier_src;
     for (const auto & page : fact.pages) {
+        const auto tier = fact.tier_src.empty() ? "L1" : fact.tier_src;
         if (tier == "L1" && config_.write_policy == "write_back" && dirty_.count(page)) {
             summary.dirty_eviction_events++;
             write_back_dirty_page(fact, summary, transitions, page);
@@ -1167,6 +1196,7 @@ void HiCacheState::remember_prefetch_schedule(const HiCacheFact & fact, const st
 
 std::vector<std::string> HiCacheState::target_prefetch_schedule_pages(const HiCacheFact & fact) const {
     if (!target_page_size_mismatch(fact)) return fact.pages;
+    if (config_.prefetch_policy == "best_effort" && !fact.pages.empty()) return fact.pages;
     if (fact.request_id.empty() || fact.new_input_tokens == 0 || config_.page_size == 0) return fact.pages;
 
     const auto lookup_it = pending_lookup_pages_by_request_.find(scoped_request_key(fact));
@@ -1183,7 +1213,7 @@ std::vector<std::string> HiCacheState::target_prefetch_schedule_pages(const HiCa
 
 std::vector<std::string> HiCacheState::target_prefetch_completion_pages(const HiCacheFact & fact) const {
     if (!target_page_size_mismatch(fact) || fact.request_id.empty()) return fact.pages;
-    if (config_.prefetch_policy != "best_effort" && config_.prefetch_policy != "timeout") return fact.pages;
+    if (config_.prefetch_policy != "best_effort" && config_.prefetch_policy != "timeout" && config_.prefetch_policy != "wait_complete") return fact.pages;
 
     const auto key = scoped_request_key(fact);
     const auto schedule_it = latest_prefetch_schedule_pages_by_request_.find(key);
@@ -1404,6 +1434,10 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
         summary.processed_hicache_events++;
         summary.processed_events_by_role[fact.role]++;
         if (config_.page_size > 0 && fact.page_size > 0 && config_.page_size != fact.page_size) {
+            if (!fact.target_radix_removed_pages.empty()) {
+                fact.radix_removed_pages = fact.target_radix_removed_pages;
+                fact.radix_removed_pages_are_target = true;
+            }
             const bool target_completion_evidence = contains(fact.role, "l3_to_l2") && !fact.target_pages.empty();
             if (!target_completion_evidence && is_non_invariant_observed_role(fact.role)) {
                 summary.skipped_non_invariant_events++;
