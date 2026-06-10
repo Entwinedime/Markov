@@ -25,6 +25,7 @@ def main() -> int:
         run_hicache_dirty_derivation_fixture()
         run_hicache_capacity_config_audit_fixture()
         run_hicache_target_experiment_config_fixture(tmp)
+        run_hicache_observed_policy_rejected_fixture()
         run_hicache_l3_evidence_only_fixture(tmp)
         run_hicache_state_prediction_fixture(tmp)
         run_hicache_prefetch_oracle_fixture(tmp)
@@ -966,7 +967,13 @@ def run_hicache_lock_fact_oracle_fixture(tmp: Path) -> None:
     assert hicache_state["model_final_state_counts"]["locked_pages"] == 0, validation
     assert hicache_state["lock_fact_oracle"]["ready"] is True, validation
     assert hicache_state["lock_fact_oracle"]["lock_fact_event_count"] == 2, validation
+    assert hicache_state["skipped_non_invariant_events"] == 2, validation
+    assert hicache_state["model_transition_events"] == 0, validation
+    assert hicache_state["invariant_coverage_ready"] is True, validation
+    assert hicache_state["missing_invariant_facts"] == [], validation
+    assert hicache_state["non_invariant_fact_usage_by_role"] == {}, validation
     assert validation["validation_ready"] is True, validation
+    assert validation["validation_errors"] == [], validation
 
 
 def run_hicache_dirty_derivation_fixture() -> None:
@@ -1159,7 +1166,7 @@ def run_hicache_target_experiment_config_fixture(tmp: Path) -> None:
                 {
                     "name": "HiCacheModule",
                     "enabled": True,
-                    "config": {"hicache": {"enabled": True, "prefetch_policy": "observed"}},
+                    "config": {"hicache": {"enabled": True}},
                 }
             ],
         },
@@ -1172,7 +1179,7 @@ def run_hicache_target_experiment_config_fixture(tmp: Path) -> None:
     hicache = generated["hicache"]
     assert hicache["page_size"] == 64, generated
     assert hicache["write_policy"] == "write_back", generated
-    assert hicache["prefetch_policy"] == "observed", generated
+    assert hicache["prefetch_policy"] == "timeout", generated
     assert hicache["l1_capacity_pages"] == 46, generated
     assert hicache["l2_capacity_pages"] == 88, generated
     assert hicache["prefetch_timeout_base_sec"] == 1.5, generated
@@ -1211,8 +1218,51 @@ def run_hicache_target_experiment_config_fixture(tmp: Path) -> None:
     assert "page_size" not in no_capacity["hicache"], no_capacity
 
 
+def run_hicache_observed_policy_rejected_fixture() -> None:
+    """验证 Python runner 不再兼容旧 observed policy 配置。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_model_runner_observed_policy_rejected",
+        ROOT / "scripts/internal/model_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    invalid_module_configs = [
+        {"modules": [{"name": "HiCacheModule", "config": {"write_policy": "observed"}}]},
+        {"modules": [{"name": "hicache", "config": {"prefetch_policy": "observed"}}]},
+        {"modules": [{"name": "hicache", "config": {"storage_prefetch_policy": "observed"}}]},
+    ]
+    for config in invalid_module_configs:
+        try:
+            module.hicache_config_from_modules(config)
+            raise AssertionError(config)
+        except ValueError as exc:
+            assert "observed" in str(exc), exc
+
+    invalid_target_configs = [
+        {"input": {"target_experiment_config": {"server": {"command": ["python", "-m", "sglang", "--hicache-write-policy", "observed"]}}}},
+        {
+            "input": {
+                "target_experiment_config": {
+                    "server": {"command": ["python", "-m", "sglang"]},
+                    "modeling": {"hicache": {"prefetch_policy": "observed"}},
+                }
+            }
+        },
+    ]
+    for config in invalid_target_configs:
+        try:
+            module.hicache_config_from_target_experiment(config)
+            raise AssertionError(config)
+        except ValueError as exc:
+            assert "observed" in str(exc), exc
+
+
 def run_hicache_l3_evidence_only_fixture(tmp: Path) -> None:
-    """验证 L3 只按 evidence 记录，不要求 oracle 提供全量 L3 final set。"""
+    """验证未绑定 target schedule 的 L3->L2 movement 不直接驱动 target state。"""
 
     source = tmp / "l3_evidence/source/python_probe_trace.rank0.pid791.json"
     oracle = tmp / "l3_evidence/oracle/python_probe_trace.rank0.pid791.json"
@@ -1324,10 +1374,17 @@ def run_hicache_l3_evidence_only_fixture(tmp: Path) -> None:
     validation = json.loads((output_dir / "validation.json").read_text(encoding="utf-8"))
     module_summary = json.loads((output_dir / "model_summary.json").read_text(encoding="utf-8"))
     final_state = module_summary["modules"][0]["hicache"]["final_state"]
-    assert final_state["l3_resident_pages"] == ["p_l3"], final_state
+    assert final_state["l2_resident_pages"] == [], final_state
+    assert final_state["l3_resident_pages"] == [], final_state
+    assert final_state["backuped_pages"] == [], final_state
+    assert module_summary["modules"][0]["hicache"]["skipped_non_invariant_events"] == 1, module_summary
     assert "l3_resident_pages" not in validation["hicache_state"]["sets_diff_by_tier"], validation
-    assert validation["hicache_state"]["final_state_match"] is True, validation
-    assert validation["validation_ready"] is True, validation
+    assert validation["hicache_state"]["final_state_match"] is False, validation
+    assert validation["hicache_state"]["invariant_coverage_ready"] is True, validation
+    assert validation["hicache_state"]["missing_invariant_facts"] == [], validation
+    assert validation["hicache_state"]["non_invariant_fact_usage_by_role"] == {}, validation
+    assert validation["validation_ready"] is False, validation
+    assert validation["validation_errors"] == ["hicache_final_state_mismatch"], validation
 
 
 def run_hicache_state_prediction_fixture(tmp: Path) -> None:
@@ -1442,7 +1499,7 @@ def run_hicache_state_prediction_fixture(tmp: Path) -> None:
                 },
                 "cpp_model_config": {
                     "modules": ["hicache"],
-                    "hicache": {"enabled": True},
+                    "hicache": {"enabled": True, "write_policy": "write_through"},
                 },
             },
             ensure_ascii=False,
@@ -1463,6 +1520,7 @@ def run_hicache_state_prediction_fixture(tmp: Path) -> None:
     assert validation["hicache_state"]["oracle_trace_files"] == [str(oracle)], validation
     assert validation["hicache_state"]["final_state_match"] is True, validation
     assert validation["hicache_state"]["predicted_state_trace_ready"] is True, validation
+    assert validation["hicache_state"]["non_invariant_fact_usage"] == [], validation
     assert validation["validation_ready"] is True, validation
 
     override_output_dir = tmp / "state_prediction/modeling_override_out"
@@ -1476,7 +1534,7 @@ def run_hicache_state_prediction_fixture(tmp: Path) -> None:
                 "validation": {"hicache_state": {"enabled": True}},
                 "cpp_model_config": {
                     "modules": ["hicache"],
-                    "hicache": {"enabled": True},
+                    "hicache": {"enabled": True, "write_policy": "write_through"},
                 },
             },
             ensure_ascii=False,

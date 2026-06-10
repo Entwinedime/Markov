@@ -350,11 +350,12 @@ CLI: --emit-dag-chrome-trace
 HiCache 是第一个复杂子模块。当前 active C++ `HiCacheModule` 已进入 state-only 阶段：
 它可以被 C++ module registry 加载，消费 HiCache profiling facts，维护
 `L1/L2/L3 resident`、`dirty`、`backuped`、`evicted`、`prefetch planned/ready`
-等 page 状态，并输出状态验证 summary。它仍然不修改 DAG、不输出 replay latency；
+等 page 状态，并输出状态验证 summary。它仍然不修改 DAG、不输出 state-derived latency；
 这样做是为了先验证 cache 状态维护，不让未完成的 DAG patch 逻辑干扰 base DAG。
-截至 2026-06-07 23:41 +0800，base 和 page64 target 的同配置 replay 已通过，多数组合
-cross-config prediction 已通过；但 page size 变化下的 strict page64 prefetch / final-state
-prediction 仍未闭环。因此 HiCache DAG patch 只能作为设计目标，不能把 page64 state 作为已完成前提。
+截至 2026-06-09，`replay` 只保留给 `mode=faithful_replay` 的 trace graph baseline：不加载任何子模块，
+不执行 DAG patch。HiCache state 只能用 `self-config prediction` 或 `cross-config prediction` 表达；
+模型输入只能是 profiling 中的跨配置不变量 facts 和显式 target config，target actual trace 只作为 validation oracle。
+因此 HiCache DAG patch 仍只能作为设计目标，不能把 state-to-DAG 映射当成已完成前提。
 
 HiCache 后续继续分两步验证：
 
@@ -369,17 +370,21 @@ HiCache 后续继续分两步验证：
 | cache state | `mode=cache_state` | `dag_mutation_count=0`；验证 page identity、tier resident、dirty/backuped、evict 和 prefetch 状态转移。 |
 | cache patch | `mode=cache_patch` | DAG mutation 非空，mutation 能映射到 fact / 状态 / policy，E2E 相对误差目标不超过 20%。 |
 
-HiCache state validation 的 modeling 入口：
+HiCache state self-config prediction 的 modeling 入口：
 
 ```bash
 python3 scripts/internal/model_runner.py \
-  --config configs/modeling/hicache_state/modeling_hicache_state_validation.json \
+  --config <self_config_modeling_config> \
   --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/cache_state_replay \
+  --hicache-oracle-trace <target_oracle_trace.json> \
+  --output-dir <run_dir>/modeling/<self_config_prediction_label> \
   --mode cache_state \
   --emit-module-summary \
   --emit-validation
 ```
+
+`<self_config_modeling_config>` 必须显式给出同场景 target page size、capacity、write policy 和 prefetch policy。
+禁止省略 target config 并让 HiCacheModule 回落到 source 行为答案；显式 `observed` policy 已是非法配置。
 
 当 `validation.hicache_state.enabled=true` 时，runner 会从 `model_summary.json` 读取
 C++ HiCache state summary，并从独立 state trace 或 merged trace 中 `model_input=false`
@@ -387,6 +392,14 @@ C++ HiCache state summary，并从独立 state trace 或 merged trace 中 `model
 同时会额外生成 `predicted_target_cache_state_trace.json`，用于保存 request / operation /
 page 级 state transition。该文件是 validation/debug 输出，不属于默认主输出；不开启
 module summary 或 state validation 时不应依赖它存在。
+
+HiCache state validation 还必须检查 C++ summary 暴露的 `non_invariant_fact_usage`。
+正常 prediction 中该字段必须为空；`skipped_non_invariant_events` 只说明 source movement 被识别并跳过。
+如果未来模型又实际消费了 `load_back`、`write_backup`、`remove_page`、`lock_ref_inc/dec`、
+未绑定 target schedule 的 `l3_to_l2_transfer` 等非不变量事实，runner 会把具体 role/count 写入
+`validation.json.hicache_state.non_invariant_fact_usage`，并将 `invariant_coverage_ready` 置为 `false`。
+`final_state_match=true` 只能说明最终集合对齐；没有 `non_invariant_fact_usage=[]` 时，不能宣称
+self-config prediction 或 cross-config prediction 已满足 invariant-only 目标。
 
 跨配置 state prediction 可以通过 modeling config 的
 `input.target_experiment_config` 引用目标实验配置。runner 会从目标实验配置的
@@ -446,7 +459,7 @@ L2、backuped、evicted 和 prefetch planned/ready/suppressed 差异，需要先
 
 - inclusive oracle 保留 start/end snapshot 的包围差分，用于观察真实调用包含了哪些状态变化；
 - exclusive oracle 只比较没有嵌套 state snapshot 的调用，避免把内层 HiCache 调用的状态变化误归因给外层函数；
-- exact event key 只适合同配置 replay。跨配置 prediction 的 base run 和 target run 时间戳不同，应使用 final-state、policy oracle 和 transition coverage 验证；
+- exact event key 只适合 self-config prediction。跨配置 prediction 的 base run 和 target run 时间戳不同，应使用 final-state、policy oracle 和 transition coverage 验证；
 - 没有模型 transition 的 oracle 状态集合会进入 `ignored_state_keys_without_predicted_transition`，例如旧 trace 未采 `inc_lock_ref` / `dec_lock_ref` 时的 `locked_pages`。
 
 `validation.json.hicache_state.timeline_delta_validation` 是 object-level 状态时间线诊断输出：
@@ -493,7 +506,7 @@ oracle 的 C++ HiCache 配置建议：
 - 如果 target config 没有显式 capacity，`evidence` 只记录 raw pool、observed max 和 final count，
   并标记为 `not_auto_recommended`；
 - 这样做是因为 observed max 和 final count 描述的是运行时占用，不等价于 SGLang 的有效
-  capacity 参数；把它们自动写回 C++ config 会让 replay 误进入 capacity what-if 分支；
+  capacity 参数；把它们自动写回 C++ config 会让 state prediction 误进入 capacity what-if 分支；
 - 该推荐只用于验证后的配置修复指导，不会在同一次 run 中反向覆盖 C++ 模型输入。无 target oracle
   的纯 what-if 仍必须由用户或实验配置显式给出目标参数。
 

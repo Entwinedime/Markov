@@ -329,6 +329,13 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "emit_state_digests",
         ):
             if key in hicache:
+                if key in {"write_policy", "prefetch_policy", "storage_prefetch_policy"}:
+                    value = _normalize_policy_value(hicache.get(key))
+                    if value == "observed":
+                        raise ValueError(f"HiCache {key}=observed is not supported; use an explicit target policy")
+                    if value:
+                        result[key] = value
+                    continue
                 result[key] = hicache[key]
         return result
     return None
@@ -389,6 +396,13 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "emit_state_digests",
     ):
         if key in explicit_hicache:
+            if key in {"write_policy", "prefetch_policy", "storage_prefetch_policy"}:
+                value = _normalize_policy_value(explicit_hicache.get(key))
+                if value == "observed":
+                    raise ValueError(f"target experiment modeling.hicache {key}=observed is not supported; use an explicit target policy")
+                if value:
+                    result[key] = value
+                continue
             result[key] = explicit_hicache[key]
 
     return result if len(result) > 1 else None
@@ -418,7 +432,9 @@ def _copy_command_policy_option(result: dict[str, Any], command: list[str], opti
     if raw is None:
         return
     value = _normalize_policy_value(raw)
-    if value and value != "observed":
+    if value == "observed":
+        raise ValueError(f"{option}=observed is not supported; use an explicit target policy")
+    if value:
         result[key] = value
 
 
@@ -451,7 +467,7 @@ def write_hicache_predicted_state_trace_if_available(module_summary_path: Path, 
     """把 C++ HiCache summary 中的 transition trace 拆成验证专用输出。
 
     默认业务输出仍只有 `prediction.json`。该文件只在显式 module summary /
-    validation 场景下存在，用于 replay / prediction state diff。
+    validation 场景下存在，用于 self-config / cross-config prediction state diff。
     """
 
     if not module_summary_path.is_file():
@@ -480,7 +496,7 @@ def write_hicache_predicted_state_trace_if_available(module_summary_path: Path, 
                 "ts": row.get("ts"),
                 "event_base_name": event_base_name(str(row.get("event_name") or "")),
                 "target_page_set": pages,
-                "decision_kind": "state_replay",
+                "decision_kind": "state_prediction",
                 "decision_reason": "derived_from_hicache_fact",
                 "transition_kind": row.get("kind") or "",
                 "tier_src": tier_src_from_transition(row),
@@ -778,6 +794,9 @@ def build_hicache_state_validation_if_enabled(
     missing_invariant_counts = hicache_summary.get("missing_invariant_facts", {}) if hicache_summary else {}
     if isinstance(missing_invariant_counts, dict):
         missing_invariants.extend(sorted(str(key) for key, value in missing_invariant_counts.items() if int(value or 0) > 0))
+    non_invariant_usage = hicache_summary.get("non_invariant_fact_usage", []) if hicache_summary else []
+    if isinstance(non_invariant_usage, list) and non_invariant_usage:
+        missing_invariants.append("non_invariant_fact_usage")
 
     return {
         "state_trace_ready": bool(snapshots),
@@ -805,7 +824,8 @@ def build_hicache_state_validation_if_enabled(
         "invariant_coverage_ready": bool(hicache_summary) and not missing_invariants,
         "missing_invariant_facts": missing_invariants,
         "missing_invariant_fact_counts": missing_invariant_counts if isinstance(missing_invariant_counts, dict) else {},
-        "non_invariant_fact_usage": [],
+        "non_invariant_fact_usage": non_invariant_usage if isinstance(non_invariant_usage, list) else [],
+        "non_invariant_fact_usage_by_role": hicache_summary.get("non_invariant_fact_usage_by_role", {}) if hicache_summary else {},
         "oracle_trace_files": [str(path) for path in oracle_paths],
         "model_summary_ready": bool(hicache_summary),
         "predicted_state_trace_path": str(predicted_state_trace_path) if predicted_state_trace_path else None,
@@ -1742,7 +1762,7 @@ DELTA_KIND_BY_STATE_KEY: dict[str, tuple[str, str]] = {
 def build_event_delta_validation(predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     """把 state snapshot 的 start/end 差分变成事件级 oracle。
 
-    该校验只对同一条 trace 的 replay 有严格意义。跨配置 prediction 的 base trace 和 target
+    该校验只对同一条 trace 的 self-config prediction 有严格意义。跨配置 prediction 的 base trace 和 target
     oracle trace 时间戳不同，无法用事件 key 精确对齐；这种情况下仍输出 oracle/predicted 摘要，
     但不作为 validation_ready 的硬门槛。
 
@@ -1750,7 +1770,7 @@ def build_event_delta_validation(predicted_records: list[dict[str, Any]], snapsh
     HiCache 调用造成的状态变化。为了避免把“归因不同”误判成“状态推导错误”，这里同时输出：
 
     - inclusive oracle：保留所有包围差分，只用于观察真实调用包含了哪些状态变化；
-    - exclusive oracle：只比较没有嵌套 state snapshot 的调用，用于同配置 replay 的严格事件级
+    - exclusive oracle：只比较没有嵌套 state snapshot 的调用，用于 self-config prediction 的严格事件级
       检查候选。
     """
 
@@ -1785,7 +1805,7 @@ def build_event_delta_validation(predicted_records: list[dict[str, Any]], snapsh
         "mismatch_count": len(mismatches),
         "mismatch_totals_by_kind": summarize_delta_mismatches_by_kind(mismatches),
         "top_mismatches": mismatches[:20],
-        "note": "Exact event delta comparison is intended for same-run replay; cross-config prediction should use final-state and policy oracle fields.",
+        "note": "Exact event delta comparison is intended for self-config prediction; cross-config prediction should use final-state and policy oracle fields.",
     }
 
 
@@ -2035,7 +2055,7 @@ def active_delta_state_keys(predicted_records: list[dict[str, Any]]) -> set[str]
 
     旧 profiling run 可能能从 snapshot 看到 locked pages，但没有采集 inc/dec lock facts。此时
     C++ 模型无法为 lock 生成 transition，事件级 oracle 应把 lock 标成未比较字段，而不是把它
-    混入 replay mismatch。
+    混入 state prediction mismatch。
     """
 
     active_kinds = {str(record.get("transition_kind") or "") for record in predicted_records if isinstance(record, dict)}

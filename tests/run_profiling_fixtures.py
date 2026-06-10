@@ -757,6 +757,107 @@ def run_env_placeholder_fixture() -> None:
     assert env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] == str(run.layout.run_dir / "hicache_storage"), env
 
 
+def run_profile_suite_matrix_fixture() -> None:
+    """验证 profiling suite 支持 server/input 矩阵、子集选择和归档元数据。"""
+
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_suite_matrix",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+
+    with tempfile.TemporaryDirectory() as raw_tmp:
+        tmp = Path(raw_tmp)
+        cfg = {
+            "name": "suite_matrix_fixture",
+            "framework": "sglang",
+            "run_root": str(tmp / "runs"),
+            "run_id": "suite_matrix_fixture_run",
+            "metadata": {"purpose": "fixture"},
+            "profiling": {"enabled": False, "channels": []},
+            "matrix": {
+                "servers": [
+                    {
+                        "id": "server_a",
+                        "server": {
+                            "command": ["python3", "-c", "import time; time.sleep(1)"],
+                            "ready_url": "http://127.0.0.1:31001/get_model_info",
+                        },
+                        "env": {"SERVER_VARIANT": "a"},
+                        "metadata": {"cache_write_policy": "policy_a"},
+                    },
+                    {
+                        "id": "server_b",
+                        "server": {
+                            "command": ["python3", "-c", "import time; time.sleep(1)"],
+                            "ready_url": "http://127.0.0.1:31002/get_model_info",
+                        },
+                        "env": {"SERVER_VARIANT": "b"},
+                        "metadata": {"cache_write_policy": "policy_b"},
+                    },
+                ],
+                "inputs": [
+                    {"id": "manual", "bench": {"command": ["python3", "-c", "print('{metadata.cache_write_policy}')"]}},
+                    {"id": "bench", "bench": {"command": ["python3", "-c", "print('bench')"]}},
+                ],
+            },
+        }
+
+        expanded = module.expand_suite(cfg)
+        assert [item["id"] for item in expanded] == [
+            "server_a_manual",
+            "server_a_bench",
+            "server_b_manual",
+            "server_b_bench",
+        ], expanded
+        assert all(item["profiling"] == cfg["profiling"] for item in expanded), expanded
+        assert expanded[0]["server"]["ready_url"].endswith(":31001/get_model_info"), expanded[0]
+        assert expanded[3]["server"]["ready_url"].endswith(":31002/get_model_info"), expanded[3]
+        assert expanded[0]["bench"]["command"][-1] == "print('{metadata.cache_write_policy}')", expanded[0]
+        assert expanded[3]["bench"]["command"][-1] == "print('bench')", expanded[3]
+        assert expanded[3]["metadata"]["suite_server_id"] == "server_b", expanded[3]
+        assert expanded[3]["metadata"]["suite_input_id"] == "bench", expanded[3]
+
+        selected = module.parse_experiment_selection(["server_a_manual,server_b_bench"])
+        run_dirs = module.run_profile_suite(cfg, dry_run=True, selected_experiments=selected)
+        assert [path.name for path in run_dirs] == ["01_server_a_manual", "04_server_b_bench"], run_dirs
+
+        suite_dir = run_dirs[0].parent
+        selection = json.loads((suite_dir / "suite_selection.json").read_text(encoding="utf-8"))
+        assert selection["selected_selectors"] == ["server_a_manual", "server_b_bench"], selection
+        assert [item["index"] for item in selection["planned_experiments"]] == [1, 4], selection
+        result = json.loads((suite_dir / "suite_result.json").read_text(encoding="utf-8"))
+        assert len(result["runs"]) == 2, result
+        assert not result["failures"], result
+
+        first_config = json.loads((run_dirs[0] / "config.json").read_text(encoding="utf-8"))
+        assert first_config["metadata"]["suite_experiment_id"] == "server_a_manual", first_config
+        assert first_config["env"]["SERVER_VARIANT"] == "a", first_config
+        first_bench_cmd = (run_dirs[0] / "bench_cmd.txt").read_text(encoding="utf-8")
+        assert "policy_a" in first_bench_cmd, first_bench_cmd
+        first_manifest = json.loads((run_dirs[0] / "profile_manifest.json").read_text(encoding="utf-8"))
+        assert first_manifest["status"] == "dry_run", first_manifest
+
+        try:
+            module.filter_suite_experiments(list(enumerate(expanded, start=1)), {"missing"})
+        except ValueError as exc:
+            assert "unknown experiment selector" in str(exc), exc
+        else:
+            raise AssertionError("missing experiment selector should fail")
+
+        bad_cfg = json.loads(json.dumps(cfg))
+        bad_cfg["matrix"]["servers"][0]["profiling"] = {"enabled": True}
+        try:
+            module.expand_suite(bad_cfg)
+        except ValueError as exc:
+            assert "must not override profiling" in str(exc), exc
+        else:
+            raise AssertionError("matrix server profiling override should fail")
+
+
 def run_hicache_radix_removed_materialization_fixture() -> None:
     """验证 runner 收尾能从同次 HiCache start/end snapshot 派生 radix removed pages。"""
 
@@ -955,6 +1056,7 @@ def run_hicache_target_radix_removed_materialization_fixture() -> None:
         end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
         assert end_event["args"]["radix_removed_page_identity"] == ["actual_live_removed"], end_event
         assert end_event["args"]["target_radix_removed_page_identity"] == ["target_old"], end_event
+        assert end_event["args"]["target_radix_removed_page_identity_page64"] == ["target_old"], end_event
 
 
 def run_sglang_hicache_target_fixture() -> None:
@@ -1753,6 +1855,7 @@ def main() -> int:
     run_torch_profiler_lifecycle_fixture()
     run_state_trace_env_fixture()
     run_env_placeholder_fixture()
+    run_profile_suite_matrix_fixture()
     run_hicache_radix_removed_materialization_fixture()
     run_hicache_target_radix_removed_materialization_fixture()
     run_trace_merger_sidecar_only_fixture()

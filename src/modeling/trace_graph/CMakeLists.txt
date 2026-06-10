@@ -15,7 +15,10 @@ add_executable(trace_graph
     src/frontend/model_config.cpp
     src/frontend/trace_normalizer.cpp
     src/modules/node_scale_module.cpp
+    src/modules/hicache/hicache_fact.cpp
+    src/modules/hicache/hicache_radix_tree.cpp
     src/modules/hicache/hicache_model.cpp
+    src/modules/hicache/hicache_summary.cpp
     src/modules/hicache/hicache_module.cpp
     src/cli/main.cpp
 )

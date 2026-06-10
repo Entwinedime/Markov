@@ -1,6 +1,9 @@
 #pragma once
 
 #include "trace_graph/frontend/model_config.hpp"
+#include "trace_graph/modules/hicache/hicache_fact.hpp"
+#include "trace_graph/modules/hicache/hicache_radix_tree.hpp"
+#include "trace_graph/modules/hicache/hicache_summary.hpp"
 
 #include <cstdint>
 #include <map>
@@ -12,107 +15,6 @@
 namespace TraceGraph {
 
 class DagGraph;
-struct TraceEvent;
-
-struct HiCacheFact {
-    size_t source_node_id = 0;
-    size_t source_event_index = 0;
-    uint64_t ts = 0;
-    std::string event_name;
-    std::string role;
-    std::string request_id;
-    std::string operation_id;
-    std::string cache_scope;
-    std::string tier_src;
-    std::string tier_dst;
-    std::string direction;
-    std::string prefetch_observed_policy;
-    std::vector<std::string> pages;
-    std::vector<std::string> source_pages;
-    std::vector<std::string> target_pages;
-    std::vector<std::string> radix_removed_pages;
-    std::vector<std::string> target_radix_removed_pages;
-    uint64_t page_size = 0;
-    uint64_t prefix_len = 0;
-    uint64_t new_input_tokens = 0;
-    uint64_t requested_tokens = 0;
-    uint64_t evicted_tokens = 0;
-    uint64_t prefetch_ready_page_count = 0;
-    bool is_start = false;
-    bool requires_page_identity = false;
-    bool dirty = true;
-    bool backuped = false;
-    bool prefetch_progress_evidence = false;
-    bool prefetch_check_observed = false;
-    bool prefetch_check_return = false;
-    bool prefetch_has_ongoing = false;
-    bool chunked = false;
-    bool radix_removed_pages_are_target = false;
-};
-
-struct HiCacheStateTransition {
-    std::string transition_id;
-    std::string kind;
-    std::string role;
-    std::string request_id;
-    std::string operation_id;
-    std::string event_name;
-    std::string cache_scope;
-    uint64_t ts = 0;
-    size_t source_event_index = 0;
-    std::string tier;
-    std::vector<std::string> pages;
-    std::string before_state_digest;
-    std::string after_state_digest;
-};
-
-// HiCache 状态模型的输出摘要。
-// 当前维护 page resident/dirty/backuped 状态，但不修改 DAG。
-struct HiCacheSummary {
-    std::string status = "state_model";
-    HiCacheConfig target_config;
-    uint64_t input_hicache_events = 0;
-    uint64_t processed_hicache_events = 0;
-    uint64_t state_transition_count = 0;
-    uint64_t dag_mutations = 0;
-    uint64_t missing_page_identity_events = 0;
-    uint64_t dirty_eviction_events = 0;
-    uint64_t lock_state_events = 0;
-    uint64_t skipped_non_invariant_events = 0;
-    std::map<std::string, uint64_t> events_by_role;
-    std::map<std::string, uint64_t> processed_events_by_role;
-    std::map<std::string, uint64_t> transitions_by_kind;
-    std::map<std::string, uint64_t> missing_invariant_facts;
-    std::vector<std::string> l1_resident_pages;
-    std::vector<std::string> l2_resident_pages;
-    std::vector<std::string> l3_resident_pages;
-    std::vector<std::string> dirty_pages;
-    std::vector<std::string> backuped_pages;
-    std::vector<std::string> evicted_pages;
-    std::vector<std::string> locked_pages;
-    std::vector<std::string> prefetch_planned_pages;
-    std::vector<std::string> prefetch_ready_pages;
-    std::vector<std::string> prefetch_late_pages;
-    std::vector<std::string> prefetch_suppressed_pages;
-    std::map<std::string, uint64_t> page_hit_counts;
-    std::vector<HiCacheStateTransition> transition_trace;
-    std::vector<std::string> warnings;
-
-    std::string to_json() const;
-};
-
-class HiCacheFactParser {
-  public:
-    bool is_hicache_event(const TraceEvent & event) const;
-    HiCacheFact parse(size_t node_id, const TraceEvent & event) const;
-
-  private:
-    std::string infer_role(const TraceEvent & event) const;
-    std::vector<std::string> parse_page_identity(const TraceEvent & event) const;
-    std::vector<std::string> parse_page_arg(const TraceEvent & event, const std::string & key) const;
-    void parse_prefetch_progress(const TraceEvent & event, HiCacheFact & fact) const;
-    bool role_requires_page_identity(const std::string & role, const TraceEvent & event) const;
-};
 
 class HiCacheState {
   public:
@@ -148,7 +50,6 @@ class HiCacheState {
     std::set<std::string> prefetch_ready_;
     std::set<std::string> prefetch_late_;
     std::set<std::string> prefetch_suppressed_;
-    std::set<std::string> radix_known_pages_;
     std::unordered_map<std::string, std::vector<std::string>> pending_lookup_pages_by_request_;
     std::unordered_map<std::string, std::vector<std::string>> pending_prefetch_pages_by_request_;
     std::unordered_map<std::string, std::vector<std::string>> latest_prefetch_schedule_pages_by_request_;
@@ -163,20 +64,27 @@ class HiCacheState {
     std::unordered_map<std::string, std::vector<std::string>> last_lookup_pages_by_scope_;
     std::vector<std::string> l1_touch_order_;
     std::vector<std::string> l2_touch_order_;
-    std::unordered_map<std::string, std::vector<std::string>> leaf_group_by_page_;
+    HiCacheRadixTree radix_tree_;
     std::string last_policy_evict_key_;
     uint64_t last_policy_evict_ts_ = 0;
 
     std::set<std::string> * tier_set(const std::string & tier);
+    const std::set<std::string> * tier_set(const std::string & tier) const;
+    std::vector<std::string> * touch_order_for_tier(const std::string & tier);
+    uint64_t capacity_for_tier(const std::string & tier) const;
     bool target_page_size_mismatch(const HiCacheFact & fact) const;
     bool target_capacity_configured() const;
     bool target_load_model_enabled(const HiCacheFact & fact) const;
     void apply_lookup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    std::vector<std::string> target_radix_path_for_insert(const HiCacheFact & fact) const;
     std::vector<std::string> target_insert_pages(const HiCacheFact & fact) const;
-    void mark_radix_known(const std::vector<std::string> & pages);
-    void remember_leaf_group(const std::vector<std::string> & pages);
+    bool target_prefix_page_known(const std::string & page) const;
     void apply_radix_removed_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_insert(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    uint64_t missing_resident_page_count(const std::string & tier, const std::vector<std::string> & pages) const;
+    uint64_t pages_to_free_for_insert(const std::string & tier, const std::vector<std::string> & pages) const;
+    void enforce_insert_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                 const std::string & tier, const std::vector<std::string> & pages);
     uint64_t target_write_through_threshold() const;
     bool target_write_count_enabled() const;
     std::string scoped_request_key(const HiCacheFact & fact) const;
@@ -227,7 +135,8 @@ class HiCacheState {
     void evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier,
                          uint64_t page_count);
     void enforce_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier);
-    void write_back_dirty_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & page);
+    void flush_dirty_page_to_host(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                  const std::string & page);
     std::map<std::string, uint64_t> page_hit_count_summary() const;
     std::string transition_state_digest() const;
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,

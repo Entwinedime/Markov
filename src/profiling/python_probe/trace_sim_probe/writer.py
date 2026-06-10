@@ -15,13 +15,17 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _jsonable(value: Any) -> Any:
+_FULL_LIST_KEYS = {"token_ids"}
+
+
+def _jsonable(value: Any, *, key: str | None = None) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value[:32]]
+        items = value if key in _FULL_LIST_KEYS else value[:32]
+        return [_jsonable(item) for item in items]
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in list(value.items())[:64]}
+        return {str(child_key): _jsonable(item, key=str(child_key)) for child_key, item in list(value.items())[:64]}
     return str(value)
 
 

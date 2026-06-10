@@ -144,9 +144,14 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     config.page_size = u64_value(object, "page_size", 0);
     config.l1_capacity_pages = u64_value(object, "l1_capacity_pages", u64_value(object, "l1_capacity", 0));
     config.l2_capacity_pages = u64_value(object, "l2_capacity_pages", u64_value(object, "l2_capacity", 0));
-    config.write_policy = lower(string_value(object, "write_policy", "observed"));
+    config.write_policy = lower(string_value(object, "write_policy", "write_through"));
+    if (config.write_policy == "observed") throw std::runtime_error("hicache.write_policy=observed is not supported; use an explicit target write policy");
+    if (config.write_policy.empty()) config.write_policy = "write_through";
     config.write_through_threshold = u64_value(object, "write_through_threshold", 0);
-    config.prefetch_policy = lower(string_value(object, "prefetch_policy", string_value(object, "storage_prefetch_policy", "observed")));
+    config.prefetch_policy = lower(string_value(object, "prefetch_policy", string_value(object, "storage_prefetch_policy", "timeout")));
+    if (config.prefetch_policy == "observed")
+        throw std::runtime_error("hicache.prefetch_policy=observed is not supported; use an explicit target prefetch policy");
+    if (config.prefetch_policy.empty()) config.prefetch_policy = "timeout";
     const bool has_timeout_base = object.contains("prefetch_timeout_base_sec") || object.contains("prefetch_timeout_base");
     const bool has_timeout_per = object.contains("prefetch_timeout_per_ki_token_sec") || object.contains("prefetch_timeout_per_ki_token");
     const bool has_timeout_max = object.contains("prefetch_timeout_max_sec") || object.contains("prefetch_timeout_max");

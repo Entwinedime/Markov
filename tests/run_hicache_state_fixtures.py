@@ -16,16 +16,19 @@ ROOT = Path(__file__).resolve().parents[1]
 def main() -> int:
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
-        run_replay_fixture(tmp)
+        run_observed_policy_rejected_fixture(tmp)
+        run_non_invariant_movement_skipped_fixture(tmp)
         run_write_back_capacity_fixture(tmp)
         run_lookup_touch_capacity_fixture(tmp)
         run_target_lookup_load_fixture(tmp)
         run_page_size_invariant_fixture(tmp)
+        run_page_size_target_identity_by_size_fixture(tmp)
         run_page_size_prefetch_transfer_target_identity_fixture(tmp)
         run_page_size_prefetch_progress_operation_pages_non_invariant_fixture(tmp)
         run_page_size_prefetch_schedule_lookup_suffix_fixture(tmp)
         run_page_size_prefetch_schedule_best_effort_target_suffix_fixture(tmp)
         run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp)
+        run_page_size_prefetch_transfer_completed_tokens_target_pages_fixture(tmp)
         run_target_radix_prefix_fixture(tmp)
         run_write_through_selective_fixture(tmp)
         run_lock_ref_fixture(tmp)
@@ -35,10 +38,11 @@ def main() -> int:
         run_radix_removed_pages_lookup_fixture(tmp)
         run_radix_removed_pages_page_size_mismatch_fixture(tmp)
         run_target_radix_removed_pages_page_size_mismatch_fixture(tmp)
-        run_dirty_insert_overwrites_stale_backup_fixture(tmp)
+        run_dirty_insert_overwrites_prefetch_backup_fixture(tmp)
+        run_write_back_loaded_prefix_not_reinserted_fixture(tmp)
         run_prefetch_transfer_completed_tokens_fixture(tmp)
         run_prefetch_duplicate_transfer_ready_without_resident_fixture(tmp)
-        run_capacity_target_skips_observed_remove_fixture(tmp)
+        run_capacity_target_skips_source_remove_fixture(tmp)
         run_same_page_capacity_leaf_group_fixture(tmp)
         run_prefetch_wait_complete_fixture(tmp)
         run_prefetch_wait_complete_suppressed_fixture(tmp)
@@ -54,11 +58,48 @@ def main() -> int:
         run_prefetch_best_effort_lock_ref_non_invariant_fixture(tmp)
         run_prefetch_write_back_transfer_non_invariant_fixture(tmp)
         run_prefetch_write_back_capacity_transfer_credit_fixture(tmp)
+        run_same_page_policy_evict_leaf_group_fixture(tmp)
     print("hicache state fixtures passed")
     return 0
 
 
-def run_replay_fixture(tmp: Path) -> None:
+def run_observed_policy_rejected_fixture(tmp: Path) -> None:
+    """验证显式 observed policy 已非法，不能回落到旧兼容语义。"""
+
+    trace_path = tmp / "hicache_observed_policy_rejected_trace.json"
+    trace_path.write_text(json.dumps({"traceEvents": []}, ensure_ascii=False), encoding="utf-8")
+    for index, hicache_config in enumerate(
+        (
+            {"enabled": True, "write_policy": "observed"},
+            {"enabled": True, "prefetch_policy": "observed"},
+            {"enabled": True, "storage_prefetch_policy": "observed"},
+        )
+    ):
+        model_config = tmp / f"hicache_observed_policy_rejected_{index}.json"
+        summary_out = tmp / f"hicache_observed_policy_rejected_{index}_summary.json"
+        run_summary = tmp / f"hicache_observed_policy_rejected_{index}_run.json"
+        model_config.write_text(json.dumps({"modules": ["hicache"], "hicache": hicache_config}, ensure_ascii=False), encoding="utf-8")
+        result = subprocess.run(
+            [
+                str(ROOT / "build/bin/trace_graph"),
+                "--input",
+                str(trace_path),
+                "--run-summary",
+                str(run_summary),
+                "--model-config",
+                str(model_config),
+                "--model-summary",
+                str(summary_out),
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert "observed" in result.stderr or "observed" in result.stdout, result.stdout + result.stderr
+
+
+def run_non_invariant_movement_skipped_fixture(tmp: Path) -> None:
         trace_path = tmp / "hicache_trace.json"
         model_config = tmp / "hicache_model.json"
         graph_out = tmp / "graph.json"
@@ -137,20 +178,22 @@ def run_replay_fixture(tmp: Path) -> None:
         assert len(cache_summary["transition_trace"]) == cache_summary["state_transition_count"], cache_summary
         assert "before_state_digest" not in cache_summary["transition_trace"][0], cache_summary
         assert cache_summary["target_config"]["emit_state_digests"] is False, cache_summary
-        assert cache_summary["dirty_eviction_events"] == 1, cache_summary
+        assert cache_summary["dirty_eviction_events"] == 0, cache_summary
+        assert cache_summary["skipped_non_invariant_events"] == 6, cache_summary
+        assert cache_summary["non_invariant_fact_usage"] == [], cache_summary
         assert cache_summary["missing_page_identity_events"] == 0, cache_summary
         final_state = cache_summary["final_state"]
-        assert final_state["l1_resident_pages"] == ["p1", "p3"], final_state
-        assert final_state["l2_resident_pages"] == ["p1", "p2", "p3", "p4"], final_state
-        assert final_state["l3_resident_pages"] == ["p1", "p4"], final_state
+        assert final_state["l1_resident_pages"] == ["p1", "p2"], final_state
+        assert final_state["l2_resident_pages"] == ["p1", "p2"], final_state
+        assert final_state["l3_resident_pages"] == ["p1", "p2"], final_state
         assert final_state["dirty_pages"] == [], final_state
-        assert final_state["backuped_pages"] == ["p1", "p2", "p3", "p4"], final_state
-        assert final_state["evicted_pages"] == ["p2"], final_state
-        assert final_state["prefetch_planned_pages"] == ["p4"], final_state
-        assert final_state["prefetch_ready_pages"] == ["p4"], final_state
-        assert cache_summary["transitions_by_kind"]["mark_dirty"] == 2, cache_summary
-        assert cache_summary["transitions_by_kind"]["clear_dirty"] == 2, cache_summary
-        assert cache_summary["transitions_by_kind"]["mark_evicted"] == 1, cache_summary
+        assert final_state["backuped_pages"] == ["p1", "p2"], final_state
+        assert final_state["evicted_pages"] == [], final_state
+        assert final_state["prefetch_planned_pages"] == [], final_state
+        assert final_state["prefetch_ready_pages"] == [], final_state
+        assert cache_summary["transitions_by_kind"].get("mark_dirty", 0) == 0, cache_summary
+        assert cache_summary["transitions_by_kind"].get("clear_dirty", 0) == 0, cache_summary
+        assert cache_summary["transitions_by_kind"].get("mark_evicted", 0) == 0, cache_summary
         assert "pages_by_edge" not in cache_summary, cache_summary
         run = json.loads(run_summary.read_text(encoding="utf-8"))
         assert run["simulated_e2e_ns"] == run["real_e2e_ns"], run
@@ -362,6 +405,47 @@ def run_page_size_invariant_fixture(tmp: Path) -> None:
     target = json.loads(target_summary.read_text(encoding="utf-8"))["modules"][0]["hicache"]
     assert target["missing_invariant_facts"] == {}, target
     assert target["final_state"]["l1_resident_pages"] == ["target_p1", "target_p2"], target
+
+
+def run_page_size_target_identity_by_size_fixture(tmp: Path) -> None:
+    """验证共享 profiling 可按目标 page size 选择对应 target identity 字段。"""
+
+    trace_path = tmp / "hicache_page_size_target_identity_by_size.json"
+    model_config = tmp / "hicache_page_size_target_identity_by_size_model.json"
+    summary_out = tmp / "hicache_page_size_target_identity_by_size_summary.json"
+    run_summary = tmp / "hicache_page_size_target_identity_by_size_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_insert_end",
+                        {
+                            "event_role": "insert",
+                            "page_size": 128,
+                            "page_identity": ["base128"],
+                            "target_page_identity_page64": ["target64_a", "target64_b"],
+                            "target_page_identity_page128": ["wrong128"],
+                        },
+                    )
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64}}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["missing_invariant_facts"] == {}, summary
+    assert summary["final_state"]["l1_resident_pages"] == ["target64_a", "target64_b"], summary
 
 
 def run_page_size_prefetch_transfer_target_identity_fixture(tmp: Path) -> None:
@@ -799,6 +883,69 @@ def run_page_size_prefetch_transfer_completion_extends_schedule_fixture(tmp: Pat
     assert "wrong_tail_a" not in equal_size["prefetch_ready_pages"], equal_size
 
 
+def run_page_size_prefetch_transfer_completed_tokens_target_pages_fixture(tmp: Path) -> None:
+    """验证 page-size what-if 下 transfer completed_tokens 按 target page size 给 ready credit。"""
+
+    trace_path = tmp / "hicache_page_size_prefetch_transfer_completed_tokens_target_pages.json"
+    model_config = tmp / "hicache_page_size_prefetch_transfer_completed_tokens_target_pages_model.json"
+    summary_out = tmp / "hicache_page_size_prefetch_transfer_completed_tokens_target_pages_summary.json"
+    run_summary = tmp / "hicache_page_size_prefetch_transfer_completed_tokens_target_pages_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-target-completed",
+                            "page_size": 128,
+                            "new_input_tokens": 256,
+                            "page_identity": ["base_p1", "base_p2"],
+                            "target_page_identity": ["target_p1", "target_p2", "target_p3", "target_p4"],
+                        },
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-target-completed",
+                            "direction": "prefetch",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "completed_tokens": 128,
+                            "page_identity": ["base_p1", "base_p2"],
+                            "target_page_identity": ["target_p1", "target_p2", "target_p3", "target_p4"],
+                        },
+                    ),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "best_effort"}},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert final_state["l2_resident_pages"] == ["target_p1", "target_p2"], final_state
+    assert final_state["backuped_pages"] == ["target_p1", "target_p2"], final_state
+    assert final_state["prefetch_ready_pages"] == ["target_p1", "target_p2"], final_state
+    assert final_state["prefetch_suppressed_pages"] == ["target_p3", "target_p4"], final_state
+
+
 def run_target_radix_prefix_fixture(tmp: Path) -> None:
     """验证 page size what-if 下 insert 使用 target lookup prefix，而不是 base insert prefix。"""
 
@@ -977,7 +1124,7 @@ def run_write_through_selective_fixture(tmp: Path) -> None:
 
 
 def run_lock_ref_fixture(tmp: Path) -> None:
-    """验证 lock ref state 只在采到 lock facts 时进入 final state。"""
+    """验证 lock/ref facts 只作为非不变量计数，不直接驱动 target state。"""
 
     trace_path = tmp / "hicache_lock_ref.json"
     model_config = tmp / "hicache_lock_ref_model.json"
@@ -1008,11 +1155,12 @@ def run_lock_ref_fixture(tmp: Path) -> None:
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
     final_state = summary["final_state"]
-    assert final_state["locked_pages"] == ["p2"], final_state
-    assert summary["lock_state_events"] == 6, summary
+    assert final_state["locked_pages"] == [], final_state
+    assert summary["skipped_non_invariant_events"] == 8, summary
+    assert summary["lock_state_events"] == 0, summary
     assert summary["missing_page_identity_events"] == 0, summary
-    assert summary["transitions_by_kind"]["mark_locked"] == 2, summary
-    assert summary["transitions_by_kind"]["clear_locked"] == 1, summary
+    assert "mark_locked" not in summary["transitions_by_kind"], summary
+    assert "clear_locked" not in summary["transitions_by_kind"], summary
 
 
 def run_page_size_lock_ref_non_invariant_fixture(tmp: Path) -> None:
@@ -1065,7 +1213,7 @@ def run_page_size_lock_ref_non_invariant_fixture(tmp: Path) -> None:
     assert summary["processed_events_by_role"]["lock_ref_dec"] == 1, summary
     assert summary["skipped_non_invariant_events"] == 2, summary
     assert summary["lock_state_events"] == 0, summary
-    assert "locked_pages" not in summary["final_state"], summary
+    assert summary["final_state"]["locked_pages"] == [], summary
     assert "mark_locked" not in summary["transitions_by_kind"], summary
     assert "clear_locked" not in summary["transitions_by_kind"], summary
 
@@ -1183,7 +1331,7 @@ def run_radix_removed_pages_fixture(tmp: Path) -> None:
                 "hicache": {
                     "enabled": True,
                     "page_size": 128,
-                    "write_policy": "observed",
+                    "write_policy": "write_through",
                 },
             },
             ensure_ascii=False,
@@ -1195,14 +1343,15 @@ def run_radix_removed_pages_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["skipped_non_invariant_events"] == 2, summary
     assert summary["final_state"]["l1_resident_pages"] == ["new_a"], summary
-    assert summary["final_state"]["l2_resident_pages"] == [], summary
-    assert summary["final_state"]["backuped_pages"] == [], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["new_a"], summary
+    assert summary["final_state"]["l3_resident_pages"] == ["new_a", "old_a", "old_b"], summary
+    assert summary["final_state"]["backuped_pages"] == ["new_a"], summary
     assert summary["final_state"]["evicted_pages"] == [], summary
     assert summary["transitions_by_kind"]["remove_l2_resident"] == 2, summary
     assert summary["transitions_by_kind"]["clear_backuped"] == 2, summary
-    assert summary["transitions_by_kind"]["clear_evicted"] == 2, summary
+    assert summary["transitions_by_kind"].get("clear_evicted", 0) == 0, summary
 
 
 def run_radix_removed_pages_lookup_fixture(tmp: Path) -> None:
@@ -1240,7 +1389,7 @@ def run_radix_removed_pages_lookup_fixture(tmp: Path) -> None:
         encoding="utf-8",
     )
     model_config.write_text(
-        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 128, "write_policy": "observed"}}, ensure_ascii=False),
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 128, "write_policy": "write_through"}}, ensure_ascii=False),
         encoding="utf-8",
     )
     subprocess.check_call(
@@ -1258,14 +1407,15 @@ def run_radix_removed_pages_lookup_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["skipped_non_invariant_events"] == 0, summary
+    assert summary["skipped_non_invariant_events"] == 2, summary
     assert summary["final_state"]["l1_resident_pages"] == [], summary
     assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["l3_resident_pages"] == ["old_a"], summary
     assert summary["final_state"]["backuped_pages"] == [], summary
     assert summary["final_state"]["evicted_pages"] == [], summary
     assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
     assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
-    assert summary["transitions_by_kind"]["clear_evicted"] == 1, summary
+    assert summary["transitions_by_kind"].get("clear_evicted", 0) == 0, summary
 
 
 def run_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
@@ -1311,7 +1461,7 @@ def run_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
                 "hicache": {
                     "enabled": True,
                     "page_size": 64,
-                    "write_policy": "observed",
+                    "write_policy": "write_through",
                 },
             },
             ensure_ascii=False,
@@ -1323,11 +1473,12 @@ def run_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["skipped_non_invariant_events"] == 1, summary
-    assert summary["final_state"]["l1_resident_pages"] == ["target_new"], summary
-    assert summary["final_state"]["l2_resident_pages"] == ["old_a"], summary
-    assert summary["final_state"]["backuped_pages"] == ["old_a"], summary
-    assert summary["final_state"]["evicted_pages"] == ["old_a"], summary
+    assert summary["skipped_non_invariant_events"] == 3, summary
+    assert summary["final_state"]["l1_resident_pages"] == ["old_a", "target_new"], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["old_a", "target_new"], summary
+    assert summary["final_state"]["l3_resident_pages"] == ["old_a", "target_new"], summary
+    assert summary["final_state"]["backuped_pages"] == ["old_a", "target_new"], summary
+    assert summary["final_state"]["evicted_pages"] == [], summary
     assert summary["transitions_by_kind"].get("remove_l2_resident", 0) == 0, summary
     assert summary["transitions_by_kind"].get("clear_backuped", 0) == 0, summary
     assert summary["transitions_by_kind"].get("clear_evicted", 0) == 0, summary
@@ -1377,7 +1528,67 @@ def run_target_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None
                 "hicache": {
                     "enabled": True,
                     "page_size": 64,
-                    "write_policy": "observed",
+                    "write_policy": "write_through",
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 2, summary
+    assert summary["final_state"]["l1_resident_pages"] == ["target_new"], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["target_new"], summary
+    assert summary["final_state"]["l3_resident_pages"] == ["target_new", "target_old"], summary
+    assert summary["final_state"]["backuped_pages"] == ["target_new"], summary
+    assert summary["final_state"]["evicted_pages"] == [], summary
+    assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
+    assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
+    assert summary["transitions_by_kind"].get("clear_evicted", 0) == 0, summary
+
+
+def run_dirty_insert_overwrites_prefetch_backup_fixture(tmp: Path) -> None:
+    """验证 dirty insert 会覆盖 target prefetch 形成的同 page host backup。"""
+
+    trace_path = tmp / "hicache_dirty_insert_overwrites_prefetch_backup.json"
+    model_config = tmp / "hicache_dirty_insert_overwrites_prefetch_backup_model.json"
+    summary_out = tmp / "hicache_dirty_insert_overwrites_prefetch_backup_summary.json"
+    run_summary = tmp / "hicache_dirty_insert_overwrites_prefetch_backup_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(
+                        10,
+                        "hicache_prefetch_schedule_end",
+                        {"event_role": "prefetch_schedule", "request_id": "req-dirty", "page_size": 64, "new_input_tokens": 64, "page_identity": ["p1"]},
+                    ),
+                    hicache_event(
+                        20,
+                        "hicache_l3_l2_transfer_end",
+                        {"event_role": "l3_to_l2_transfer", "request_id": "req-dirty", "tier_src": "L3", "tier_dst": "L2", "page_size": 64, "page_identity": ["p1"]},
+                    ),
+                    hicache_event(30, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["p1"]}),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "page_size": 64,
+                    "write_policy": "write_back",
+                    "prefetch_policy": "timeout",
+                    "write_back_prefetch_transfer_credit": True,
                 },
             },
             ensure_ascii=False,
@@ -1390,34 +1601,77 @@ def run_target_radix_removed_pages_page_size_mismatch_fixture(tmp: Path) -> None
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
     assert summary["skipped_non_invariant_events"] == 0, summary
-    assert summary["final_state"]["l1_resident_pages"] == ["target_new"], summary
+    assert summary["final_state"]["l1_resident_pages"] == ["p1"], summary
     assert summary["final_state"]["l2_resident_pages"] == [], summary
+    assert summary["final_state"]["l3_resident_pages"] == ["p1"], summary
     assert summary["final_state"]["backuped_pages"] == [], summary
-    assert summary["final_state"]["evicted_pages"] == [], summary
+    assert summary["final_state"]["dirty_pages"] == ["p1"], summary
+    assert summary["final_state"]["prefetch_ready_pages"] == ["p1"], summary
     assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
     assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
-    assert summary["transitions_by_kind"]["clear_evicted"] == 1, summary
+    assert summary["transitions_by_kind"]["mark_dirty"] == 1, summary
 
 
-def run_dirty_insert_overwrites_stale_backup_fixture(tmp: Path) -> None:
-    """验证 dirty insert 会覆盖同 page 的旧 host backup。"""
+def run_write_back_loaded_prefix_not_reinserted_fixture(tmp: Path) -> None:
+    """验证 page-size what-if 下已从 host load 的 target prefix 不会被 insert 重新置脏。"""
 
-    trace_path = tmp / "hicache_dirty_insert_overwrites_stale_backup.json"
-    model_config = tmp / "hicache_dirty_insert_overwrites_stale_backup_model.json"
-    summary_out = tmp / "hicache_dirty_insert_overwrites_stale_backup_summary.json"
-    run_summary = tmp / "hicache_dirty_insert_overwrites_stale_backup_run.json"
+    trace_path = tmp / "hicache_write_back_loaded_prefix_not_reinserted.json"
+    model_config = tmp / "hicache_write_back_loaded_prefix_not_reinserted_model.json"
+    summary_out = tmp / "hicache_write_back_loaded_prefix_not_reinserted_summary.json"
+    run_summary = tmp / "hicache_write_back_loaded_prefix_not_reinserted_run.json"
     trace_path.write_text(
         json.dumps(
             {
                 "traceEvents": [
-                    hicache_event(10, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["p1"]}),
+                    hicache_event(
+                        5,
+                        "hicache_prefetch_schedule_end",
+                        {
+                            "event_role": "prefetch_schedule",
+                            "request_id": "req-a",
+                            "page_size": 128,
+                            "new_input_tokens": 64,
+                            "page_identity": ["base_p1"],
+                            "target_page_identity": ["target_p1"],
+                        },
+                    ),
+                    hicache_event(
+                        10,
+                        "hicache_l3_l2_transfer_end",
+                        {
+                            "event_role": "l3_to_l2_transfer",
+                            "request_id": "req-a",
+                            "direction": "prefetch",
+                            "tier_src": "L3",
+                            "tier_dst": "L2",
+                            "page_size": 128,
+                            "page_identity": ["base_p1"],
+                            "target_page_identity": ["target_p1"],
+                        },
+                    ),
                     hicache_event(
                         20,
-                        "hicache_write_backup_end",
-                        {"event_role": "write_backup", "tier_src": "L1", "tier_dst": "L2", "page_size": 64, "page_identity": ["p1"]},
+                        "hicache_lookup_end",
+                        {
+                            "event_role": "lookup",
+                            "request_id": "req-a",
+                            "page_size": 128,
+                            "page_identity": ["base_p1"],
+                            "target_page_identity": ["target_p1"],
+                        },
                     ),
-                    hicache_event(30, "hicache_remove_page_end", {"event_role": "remove_page", "tier_src": "GPU", "page_size": 64, "page_identity": ["p1"]}),
-                    hicache_event(40, "hicache_insert_end", {"event_role": "insert", "tier_dst": "L1", "page_size": 64, "page_identity": ["p1"]}),
+                    hicache_event(
+                        30,
+                        "hicache_insert_end",
+                        {
+                            "event_role": "insert",
+                            "request_id": "req-a",
+                            "tier_dst": "L1",
+                            "page_size": 128,
+                            "page_identity": ["base_p1"],
+                            "target_page_identity": ["target_p1"],
+                        },
+                    ),
                 ]
             },
             ensure_ascii=False,
@@ -1425,7 +1679,10 @@ def run_dirty_insert_overwrites_stale_backup_fixture(tmp: Path) -> None:
         encoding="utf-8",
     )
     model_config.write_text(
-        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "write_policy": "observed"}}, ensure_ascii=False),
+        json.dumps(
+            {"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "write_policy": "write_back", "prefetch_policy": "best_effort"}},
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     subprocess.check_call(
@@ -1433,13 +1690,14 @@ def run_dirty_insert_overwrites_stale_backup_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["final_state"]["l1_resident_pages"] == ["p1"], summary
-    assert summary["final_state"]["l2_resident_pages"] == [], summary
-    assert summary["final_state"]["backuped_pages"] == [], summary
-    assert summary["final_state"]["dirty_pages"] == ["p1"], summary
-    assert summary["transitions_by_kind"]["remove_l2_resident"] == 1, summary
-    assert summary["transitions_by_kind"]["clear_backuped"] == 1, summary
-    assert summary["transitions_by_kind"]["mark_dirty"] == 2, summary
+    final_state = summary["final_state"]
+    assert final_state["l1_resident_pages"] == ["target_p1"], final_state
+    assert final_state["l2_resident_pages"] == ["target_p1"], final_state
+    assert final_state["backuped_pages"] == ["target_p1"], final_state
+    assert final_state["dirty_pages"] == [], final_state
+    assert summary["transitions_by_kind"].get("remove_l2_resident", 0) == 0, summary
+    assert summary["transitions_by_kind"].get("clear_backuped", 0) == 0, summary
+    assert summary["transitions_by_kind"].get("mark_dirty", 0) == 0, summary
 
 
 def run_prefetch_transfer_completed_tokens_fixture(tmp: Path) -> None:
@@ -1519,7 +1777,7 @@ def run_prefetch_transfer_completed_tokens_fixture(tmp: Path) -> None:
         encoding="utf-8",
     )
     model_config.write_text(
-        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "observed"}}, ensure_ascii=False),
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "timeout"}}, ensure_ascii=False),
         encoding="utf-8",
     )
     subprocess.check_call(
@@ -1591,7 +1849,7 @@ def run_prefetch_duplicate_transfer_ready_without_resident_fixture(tmp: Path) ->
         encoding="utf-8",
     )
     model_config.write_text(
-        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "observed"}}, ensure_ascii=False),
+        json.dumps({"modules": ["hicache"], "hicache": {"enabled": True, "page_size": 64, "prefetch_policy": "timeout"}}, ensure_ascii=False),
         encoding="utf-8",
     )
     subprocess.check_call(
@@ -1606,13 +1864,13 @@ def run_prefetch_duplicate_transfer_ready_without_resident_fixture(tmp: Path) ->
     assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 3, summary
 
 
-def run_capacity_target_skips_observed_remove_fixture(tmp: Path) -> None:
+def run_capacity_target_skips_source_remove_fixture(tmp: Path) -> None:
     """验证容量 what-if 不消费 base run 中观测到的 remove_page。"""
 
-    trace_path = tmp / "hicache_capacity_skip_observed_remove.json"
-    model_config = tmp / "hicache_capacity_skip_observed_remove_model.json"
-    summary_out = tmp / "hicache_capacity_skip_observed_remove_summary.json"
-    run_summary = tmp / "hicache_capacity_skip_observed_remove_run.json"
+    trace_path = tmp / "hicache_capacity_skip_source_remove.json"
+    model_config = tmp / "hicache_capacity_skip_source_remove_model.json"
+    summary_out = tmp / "hicache_capacity_skip_source_remove_summary.json"
+    run_summary = tmp / "hicache_capacity_skip_source_remove_run.json"
     trace_path.write_text(
         json.dumps(
             {
@@ -1641,7 +1899,7 @@ def run_capacity_target_skips_observed_remove_fixture(tmp: Path) -> None:
 
 
 def run_same_page_capacity_leaf_group_fixture(tmp: Path) -> None:
-    """验证同 page size 的容量 what-if 按 page 精确裁剪容量。"""
+    """验证同 page size 的容量 what-if 按 radix leaf group 粒度释放。"""
 
     trace_path = tmp / "hicache_same_page_capacity_leaf_group.json"
     model_config = tmp / "hicache_same_page_capacity_leaf_group_model.json"
@@ -1680,12 +1938,12 @@ def run_same_page_capacity_leaf_group_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
-    assert summary["final_state"]["l1_resident_pages"] == ["p3", "p4", "p5"], summary
-    assert summary["final_state"]["l2_resident_pages"] == ["p3", "p4", "p5"], summary
+    assert summary["final_state"]["l1_resident_pages"] == ["p4", "p5"], summary
+    assert summary["final_state"]["l2_resident_pages"] == ["p4", "p5"], summary
     assert summary["final_state"]["l3_resident_pages"] == ["p1", "p2", "p3", "p4", "p5"], summary
     assert summary["final_state"]["evicted_pages"] == [], summary
-    assert summary["transitions_by_kind"]["remove_l1_resident"] == 2, summary
-    assert summary["transitions_by_kind"]["remove_l2_resident"] == 2, summary
+    assert summary["transitions_by_kind"]["remove_l1_resident"] == 3, summary
+    assert summary["transitions_by_kind"]["remove_l2_resident"] == 3, summary
 
 
 def run_prefetch_wait_complete_fixture(tmp: Path) -> None:
@@ -2253,23 +2511,22 @@ def run_prefetch_wait_complete_lookup_l3_credit_fixture(tmp: Path) -> None:
                     ),
                     hicache_event(
                         30,
-                        "hicache_write_storage_schedule_end",
+                        "hicache_insert_end",
                         {
-                            "event_role": "write_storage_schedule",
-                            "tier_src": "L2",
-                            "tier_dst": "L3",
+                            "event_role": "insert",
+                            "tier_dst": "L1",
                             "page_size": 128,
                             "page_identity": ["target_ready"],
                         },
                     ),
                     hicache_event(
                         40,
-                        "hicache_remove_page_end",
+                        "hicache_insert_end",
                         {
-                            "event_role": "remove_page",
-                            "tier_src": "L2",
+                            "event_role": "insert",
+                            "tier_dst": "L1",
                             "page_size": 128,
-                            "page_identity": ["target_ready"],
+                            "page_identity": ["target_evictor"],
                         },
                     ),
                     hicache_event(
@@ -2296,8 +2553,10 @@ def run_prefetch_wait_complete_lookup_l3_credit_fixture(tmp: Path) -> None:
                 "hicache": {
                     "enabled": True,
                     "page_size": 128,
+                    "l1_capacity_pages": 1,
+                    "l2_capacity_pages": 1,
                     "prefetch_policy": "wait_complete",
-                    "write_policy": "observed",
+                    "write_policy": "write_through",
                 },
             },
             ensure_ascii=False,
@@ -2309,6 +2568,7 @@ def run_prefetch_wait_complete_lookup_l3_credit_fixture(tmp: Path) -> None:
         cwd=ROOT,
     )
     summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    assert summary["skipped_non_invariant_events"] == 0, summary
     assert summary["final_state"]["l1_resident_pages"] == ["target_ready"], summary
     assert summary["final_state"]["l2_resident_pages"] == ["target_ready"], summary
     assert summary["final_state"]["prefetch_planned_pages"] == ["target_ready"], summary
@@ -2683,6 +2943,57 @@ def run_prefetch_write_back_capacity_transfer_credit_fixture(tmp: Path) -> None:
     assert summary["final_state"]["prefetch_ready_pages"] == ["p1"], summary
     assert summary["final_state"]["prefetch_suppressed_pages"] == [], summary
     assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 1, summary
+
+
+def run_same_page_policy_evict_leaf_group_fixture(tmp: Path) -> None:
+    """验证 same page-size policy eviction 按 radix leaf group 粒度释放。"""
+
+    trace_path = tmp / "hicache_same_page_policy_evict_leaf_group.json"
+    model_config = tmp / "hicache_same_page_policy_evict_leaf_group_model.json"
+    summary_out = tmp / "hicache_same_page_policy_evict_leaf_group_summary.json"
+    run_summary = tmp / "hicache_same_page_policy_evict_leaf_group_run.json"
+    trace_path.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    hicache_event(10, "hicache_insert_end", {"event_role": "insert", "page_size": 64, "tier_dst": "L1", "page_identity": ["p1", "p2", "p3"]}),
+                    hicache_event(20, "hicache_insert_end", {"event_role": "insert", "page_size": 64, "tier_dst": "L1", "page_identity": ["p4"]}),
+                    hicache_event(30, "hicache_evict_end", {"event_role": "evict_summary", "page_size": 64, "requested_tokens": 64}),
+                ]
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    model_config.write_text(
+        json.dumps(
+            {
+                "modules": ["hicache"],
+                "hicache": {
+                    "enabled": True,
+                    "write_policy": "write_back",
+                    "page_size": 64,
+                    "l1_capacity_pages": 4,
+                    "l2_capacity_pages": 8,
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    subprocess.check_call(
+        [str(ROOT / "build/bin/trace_graph"), "--input", str(trace_path), "--run-summary", str(run_summary), "--model-config", str(model_config), "--model-summary", str(summary_out)],
+        cwd=ROOT,
+    )
+    summary = json.loads(summary_out.read_text(encoding="utf-8"))["modules"][0]["hicache"]
+    final_state = summary["final_state"]
+    assert final_state["l1_resident_pages"] == ["p4"], final_state
+    assert final_state["l2_resident_pages"] == ["p1", "p2", "p3"], final_state
+    assert final_state["dirty_pages"] == ["p4"], final_state
+    assert final_state["backuped_pages"] == ["p1", "p2", "p3"], final_state
+    assert final_state["evicted_pages"] == ["p1", "p2", "p3"], final_state
+    assert summary["dirty_eviction_events"] == 3, summary
+    assert summary["transitions_by_kind"]["mark_evicted"] == 3, summary
 
 
 def hicache_event(ts: int, name: str, args: dict[str, object], pid: int = 1, tid: int = 1) -> dict[str, object]:

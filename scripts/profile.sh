@@ -10,11 +10,15 @@ cd "$ROOT_DIR"
 usage() {
     cat >&2 <<'EOF'
 usage:
-  scripts/profile.sh <config.json> [--dry-run]
+  scripts/profile.sh <config.json> [--dry-run] [--list-experiments] [--experiment ID]... [--experiments ID[,ID...]]
 
 Runs a JSON-configured profiling experiment inside the framework container.
 The config chooses the framework, server command, workload, hook settings, and
 SGLang /start_profile body.
+
+For suite configs, --list-experiments prints expanded experiment ids. Use
+--experiment repeatedly or --experiments with a comma-separated list to run a
+subset.
 EOF
 }
 
@@ -29,11 +33,35 @@ fi
 shift
 
 dry_run=0
+list_experiments=0
+selected_experiments=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)
             dry_run=1
             shift
+            ;;
+        --list-experiments)
+            list_experiments=1
+            shift
+            ;;
+        --experiment)
+            if [ $# -lt 2 ]; then
+                echo "--experiment requires an experiment id or name" >&2
+                usage
+                exit 2
+            fi
+            selected_experiments+=("$2")
+            shift 2
+            ;;
+        --experiments)
+            if [ $# -lt 2 ]; then
+                echo "--experiments requires a comma-separated experiment list" >&2
+                usage
+                exit 2
+            fi
+            selected_experiments+=("$2")
+            shift 2
             ;;
         *)
             echo "unknown option: $1" >&2
@@ -58,6 +86,16 @@ case "$abs_config" in
         exit 2
         ;;
 esac
+
+selected_csv=""
+if [ ${#selected_experiments[@]} -gt 0 ]; then
+    selected_csv="$(python3 - "${selected_experiments[@]}" <<'PY'
+import sys
+
+print(",".join(item for item in sys.argv[1:] if item))
+PY
+)"
+fi
 
 framework="$(python3 - "$abs_config" <<'PY'
 import json
@@ -91,7 +129,17 @@ source /usr/local/Ascend/ascend-toolkit/set_env.sh
 set -u
 export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
 export HOOK_ASCENDCL_SO_PATH="$TRACE_SIM_HOOK_ASCENDCL_SO_PATH"
-python3 scripts/internal/profile_runner.py --config "$TRACE_SIM_PROFILE_CONFIG" ${TRACE_SIM_PROFILE_DRY_RUN:+--dry-run}
+runner_args=(--config "$TRACE_SIM_PROFILE_CONFIG")
+if [ -n "${TRACE_SIM_PROFILE_DRY_RUN:-}" ]; then
+    runner_args+=(--dry-run)
+fi
+if [ -n "${TRACE_SIM_PROFILE_LIST_EXPERIMENTS:-}" ]; then
+    runner_args+=(--list-experiments)
+fi
+if [ -n "${TRACE_SIM_PROFILE_EXPERIMENTS:-}" ]; then
+    runner_args+=(--experiments "$TRACE_SIM_PROFILE_EXPERIMENTS")
+fi
+python3 scripts/internal/profile_runner.py "${runner_args[@]}"
 '
 
 env_args=(
@@ -100,6 +148,12 @@ env_args=(
 )
 if [ "$dry_run" = "1" ]; then
     env_args+=(-e "TRACE_SIM_PROFILE_DRY_RUN=1")
+fi
+if [ "$list_experiments" = "1" ]; then
+    env_args+=(-e "TRACE_SIM_PROFILE_LIST_EXPERIMENTS=1")
+fi
+if [ -n "$selected_csv" ]; then
+    env_args+=(-e "TRACE_SIM_PROFILE_EXPERIMENTS=${selected_csv}")
 fi
 
 docker compose -f "$(compose_file)" run --rm "${env_args[@]}" "$service" \

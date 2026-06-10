@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -32,7 +33,10 @@ from profiling import build_profile_manifest, normalize_profiling_config  # noqa
 from profiling.config import ProfilingRuntimeConfig  # noqa: E402
 
 
-INTERNAL_SUITE_KEYS = {"experiments", "continue_on_error", "$unset"}
+INTERNAL_SUITE_KEYS = {"experiments", "matrix", "continue_on_error", "$unset"}
+MATRIX_ENTRY_META_KEYS = {"id", "name", "description", "$unset"}
+EXPERIMENT_REF_KEYS = {"server_ref", "input_ref"}
+PROFILE_EXPERIMENTS_ENV = "TRACE_SIM_PROFILE_EXPERIMENTS"
 PYTHON_PROBE_ROOT = ROOT_DIR / "src/profiling/python_probe"
 BENCH_ENV_REMOVE_KEYS = (
     "LD_PRELOAD",
@@ -141,14 +145,14 @@ def resolve_run_path(value: str | None, run_dir: Path) -> Path | None:
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """递归合并 suite common 配置和单个 experiment 配置。"""
 
-    merged = dict(base)
+    merged = copy.deepcopy(base)
     for key, value in override.items():
         if key == "$unset":
             continue
         if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
             merged[key] = deep_merge(merged[key], value)
         else:
-            merged[key] = value
+            merged[key] = copy.deepcopy(value)
     return merged
 
 
@@ -191,7 +195,44 @@ def command_to_text(command: list[str] | str) -> str:
     return command
 
 
-def expand_command_placeholders(command: list[str] | str, layout: RunLayout) -> list[str] | str:
+CONFIG_PLACEHOLDER_ROOTS = {"metadata", "server", "bench", "env", "modeling"}
+
+
+def config_placeholder_value(cfg: dict[str, Any], path: str) -> str | None:
+    parts = [part for part in path.split(".") if part]
+    if len(parts) < 2 or parts[0] not in CONFIG_PLACEHOLDER_ROOTS:
+        return None
+    cursor: Any = cfg
+    for part in parts:
+        if not isinstance(cursor, dict) or part not in cursor:
+            return None
+        cursor = cursor[part]
+    if isinstance(cursor, (dict, list)):
+        return json.dumps(cursor, ensure_ascii=False, sort_keys=True)
+    return str(cursor)
+
+
+def expand_config_placeholders(value: str, cfg: dict[str, Any]) -> str:
+    """替换 `{metadata.foo}` 这类点分配置占位符。
+
+    suite input 可以引用 server matrix 合并后的 metadata/env 字段，避免为了
+    一个 server policy 参数复制 input 配置。普通 JSON 字符串里的 `{...}` 不含
+    点分路径，不会被这里匹配。
+    """
+
+    pattern = re.compile(r"\{([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+)\}")
+
+    def replace(match: re.Match[str]) -> str:
+        path = match.group(1)
+        replacement = config_placeholder_value(cfg, path)
+        if replacement is None:
+            raise ValueError(f"unknown config placeholder: {{{path}}}")
+        return replacement
+
+    return pattern.sub(replace, value)
+
+
+def expand_command_placeholders(command: list[str] | str, layout: RunLayout, cfg: dict[str, Any] | None = None) -> list[str] | str:
     """替换显式命令中的运行目录占位符。
 
     这只影响 runner 启动 server / bench 的命令字符串，方便实验配置把 workload
@@ -208,6 +249,8 @@ def expand_command_placeholders(command: list[str] | str, layout: RunLayout) -> 
     def expand(value: str) -> str:
         for placeholder, replacement in replacements.items():
             value = value.replace(placeholder, replacement)
+        if cfg is not None:
+            value = expand_config_placeholders(value, cfg)
         return value
 
     if isinstance(command, list):
@@ -215,7 +258,7 @@ def expand_command_placeholders(command: list[str] | str, layout: RunLayout) -> 
     return expand(command)
 
 
-def expand_layout_placeholders(value: str, layout: RunLayout) -> str:
+def expand_layout_placeholders(value: str, layout: RunLayout, cfg: dict[str, Any] | None = None) -> str:
     """替换配置字符串中的运行目录占位符。
 
     server / bench 命令和 env 都使用同一套占位符，避免实验配置把
@@ -231,7 +274,17 @@ def expand_layout_placeholders(value: str, layout: RunLayout) -> str:
     result = value
     for placeholder, replacement in replacements.items():
         result = result.replace(placeholder, replacement)
+    if cfg is not None:
+        result = expand_config_placeholders(result, cfg)
     return result
+
+
+def expand_runtime_value(value: Any, layout: RunLayout, cfg: dict[str, Any]) -> Any:
+    if isinstance(value, str):
+        return expand_layout_placeholders(value, layout, cfg)
+    if isinstance(value, list):
+        return [expand_runtime_value(item, layout, cfg) for item in value]
+    return value
 
 
 def append_cli_arg(command: list[str], key: str, value: Any) -> None:
@@ -246,7 +299,7 @@ def append_cli_arg(command: list[str], key: str, value: Any) -> None:
         command.extend([option, str(value)])
 
 
-def build_bench_command(bench: dict[str, Any], layout: RunLayout) -> list[str] | str | None:
+def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str, Any]) -> list[str] | str | None:
     """从配置构造 workload driver 命令。
 
     显式 `bench.command` 优先；否则按 SGLang bench_serving 的参数对象生成命令。
@@ -255,7 +308,7 @@ def build_bench_command(bench: dict[str, Any], layout: RunLayout) -> list[str] |
     if not bench:
         return None
     if "command" in bench:
-        return expand_command_placeholders(command_from_config(bench["command"]), layout)
+        return expand_command_placeholders(command_from_config(bench["command"]), layout, cfg)
 
     kind = bench.get("kind", "sglang.bench_serving")
     if kind != "sglang.bench_serving":
@@ -266,7 +319,7 @@ def build_bench_command(bench: dict[str, Any], layout: RunLayout) -> list[str] |
 
     command = ["python3", "-m", "sglang.bench_serving"]
     for key, value in args.items():
-        append_cli_arg(command, key, value)
+        append_cli_arg(command, key, expand_runtime_value(value, layout, cfg))
     return command
 
 
@@ -464,155 +517,6 @@ def channel_config(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
     return {}
 
 
-def _page_set_from_hicache_snapshot(snapshot: Any, *, target_page_size: int | None = None) -> set[str]:
-    """从 HiCache state snapshot 的 radix nodes 提取 page identity 集合。"""
-
-    pages: set[str] = set()
-    if not isinstance(snapshot, dict):
-        return pages
-    nodes = snapshot.get("nodes")
-    if not isinstance(nodes, list):
-        return pages
-    for node in nodes:
-        if not isinstance(node, dict):
-            continue
-        value = node.get("hash_value")
-        if target_page_size is not None:
-            target_hashes = node.get("target_hash_value_by_page_size")
-            if isinstance(target_hashes, dict) and str(target_page_size) in target_hashes:
-                value = target_hashes.get(str(target_page_size))
-        if isinstance(value, list):
-            pages.update(str(item) for item in value if item is not None)
-        elif value is not None:
-            pages.add(str(value))
-    return pages
-
-
-def _is_hicache_state_target_id(target_id: Any) -> bool:
-    text = str(target_id or "").lower()
-    return "hiradix" in text or "hicache" in text or "cache_controller" in text
-
-
-def _hicache_target_page_sizes_from_targets(targets: list[dict[str, Any]]) -> list[int]:
-    sizes: list[int] = []
-    seen: set[int] = set()
-    pattern = re.compile(r"page_hashes(?:_after_prefix|_concat)?:[^,\n]+(?:,[^,\n]+)*,(\d+)(?:,|$)")
-    for target in targets:
-        fields = target.get("fields") if isinstance(target.get("fields"), list) else []
-        for field in fields:
-            if not isinstance(field, dict):
-                continue
-            source = str(field.get("source") or "")
-            for match in pattern.finditer(source):
-                try:
-                    size = int(match.group(1))
-                except ValueError:
-                    continue
-                if size <= 0 or size in seen:
-                    continue
-                seen.add(size)
-                sizes.append(size)
-    return sizes
-
-
-def materialize_hicache_radix_removed_pages(trace_dir: Path, *, target_page_size: int | None = None) -> dict[str, int]:
-    """把同一 HiCache 调用 start/end snapshot 的 radix delta 写入模型输入事件。
-
-    `hicache_state:self` 仍作为 validation-only snapshot 输出；这里仅在 profiling
-    收尾阶段提取 operation-level `radix_removed_page_identity`。这样 C++ state
-    model 消费的是明确的调用内事实，而不是完整 oracle state snapshot。
-    """
-
-    python_probe_dir = trace_dir / "python_probe"
-    result = {
-        "files_scanned": 0,
-        "files_updated": 0,
-        "end_events": 0,
-        "insert_end_events": 0,
-        "materialized_events": 0,
-        "materialized_pages": 0,
-        "target_materialized_events": 0,
-        "target_materialized_pages": 0,
-    }
-    if not python_probe_dir.is_dir():
-        return result
-
-    for trace_path in sorted(python_probe_dir.glob("*.json")):
-        result["files_scanned"] += 1
-        payload = load_json(trace_path)
-        events = payload.get("traceEvents")
-        if not isinstance(events, list):
-            continue
-
-        start_pages_by_key: dict[tuple[Any, Any, Any, Any], set[str]] = {}
-        end_pages_by_key: dict[tuple[Any, Any, Any, Any, Any], set[str]] = {}
-        target_start_pages_by_key: dict[tuple[Any, Any, Any, Any], set[str]] = {}
-        target_end_pages_by_key: dict[tuple[Any, Any, Any, Any, Any], set[str]] = {}
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            name = event.get("name")
-            args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            target_id = args.get("target_id")
-            if not isinstance(args, dict) or not _is_hicache_state_target_id(target_id):
-                continue
-            if isinstance(name, str) and name.endswith("_start:state_snapshot"):
-                key = (event.get("pid"), event.get("tid"), event.get("ts"), target_id)
-                snapshot = args.get("state_snapshot")
-                start_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot)
-                if target_page_size is not None:
-                    target_start_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot, target_page_size=target_page_size)
-            elif isinstance(name, str) and name.endswith("_end:state_snapshot"):
-                key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), target_id)
-                snapshot = args.get("state_snapshot")
-                end_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot)
-                if target_page_size is not None:
-                    target_end_pages_by_key[key] = _page_set_from_hicache_snapshot(snapshot, target_page_size=target_page_size)
-
-        updated = False
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            name = event.get("name")
-            if not isinstance(name, str) or not name.startswith("hicache_") or not name.endswith("_end"):
-                continue
-            args = event.get("args") if isinstance(event.get("args"), dict) else None
-            if not isinstance(args, dict) or not _is_hicache_state_target_id(args.get("target_id")):
-                continue
-            result["end_events"] += 1
-            if args.get("target_id") == "hiradix.insert":
-                result["insert_end_events"] += 1
-            start_key = (event.get("pid"), event.get("tid"), event.get("ts"), args.get("target_id"))
-            end_key = (event.get("pid"), event.get("tid"), event.get("ts"), event.get("dur", 0), args.get("target_id"))
-            start_pages = start_pages_by_key.get(start_key)
-            end_pages = end_pages_by_key.get(end_key)
-            if start_pages is None or end_pages is None:
-                continue
-            current = args.get("radix_removed_page_identity")
-            removed_pages = sorted(start_pages - end_pages)
-            if removed_pages and not (isinstance(current, list) and current):
-                args["radix_removed_page_identity"] = removed_pages
-                result["materialized_events"] += 1
-                result["materialized_pages"] += len(removed_pages)
-                updated = True
-
-            if target_page_size is not None:
-                target_start_pages = target_start_pages_by_key.get(start_key)
-                target_end_pages = target_end_pages_by_key.get(end_key)
-                if target_start_pages is not None and target_end_pages is not None:
-                    target_removed_pages = sorted(target_start_pages - target_end_pages)
-                    if target_removed_pages:
-                        args["target_radix_removed_page_identity"] = target_removed_pages
-                        result["target_materialized_events"] += 1
-                        result["target_materialized_pages"] += len(target_removed_pages)
-                        updated = True
-
-        if updated:
-            dump_json(trace_path, payload)
-            result["files_updated"] += 1
-    return result
-
-
 class ProfileRun:
     """单次 profiling 运行的执行器。"""
 
@@ -626,8 +530,8 @@ class ProfileRun:
         self.runtime = normalize_profiling_config(cfg)
         self.layout = RunLayout.from_config(cfg, framework=self.framework)
         self.server_cfg = cfg.get("server", {})
-        self.server_command = expand_command_placeholders(command_from_config(self.server_cfg["command"]), self.layout)
-        self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout)
+        self.server_command = expand_command_placeholders(command_from_config(self.server_cfg["command"]), self.layout, self.cfg)
+        self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout, self.cfg)
 
     def run(self) -> Path:
         self.layout.prepare(clean=bool(self.cfg.get("clean_run_dir", False)))
@@ -669,20 +573,6 @@ class ProfileRun:
         finally:
             stop_process(server_process)
             restore_model_config(backup)
-            if status == "completed" and self._hicache_state_trace_enabled():
-                try:
-                    target_page_sizes = self._hicache_target_page_sizes()
-                    target_page_size = target_page_sizes[0] if len(target_page_sizes) == 1 else None
-                    summary = materialize_hicache_radix_removed_pages(self.layout.trace_dir, target_page_size=target_page_size)
-                    if summary["materialized_events"] > 0 or summary["target_materialized_events"] > 0:
-                        log(
-                            "Materialized HiCache radix removed pages: "
-                            f"events={summary['materialized_events']} pages={summary['materialized_pages']} "
-                            f"target_events={summary['target_materialized_events']} target_pages={summary['target_materialized_pages']}"
-                        )
-                except Exception as exc:
-                    status = "failed"
-                    error = f"postprocess hicache radix removed pages failed: {exc}"
             self._write_manifest(
                 started_at=started_at,
                 status=status,
@@ -736,7 +626,7 @@ class ProfileRun:
 
         env = os.environ.copy()
         for key, value in self.cfg.get("env", {}).items():
-            env[str(key)] = expand_layout_placeholders(str(value), self.layout)
+            env[str(key)] = expand_layout_placeholders(str(value), self.layout, self.cfg)
 
         self._apply_sglang_defaults(env)
         env["SGLANG_TORCH_PROFILER_DIR"] = str(self.layout.torch_trace_dir)
@@ -771,9 +661,6 @@ class ProfileRun:
         env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
         if self._hicache_state_trace_enabled():
             env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
-            target_page_sizes = self._hicache_target_page_sizes()
-            if target_page_sizes:
-                env["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = ",".join(str(size) for size in target_page_sizes)
         if self.runtime.debug:
             env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
 
@@ -781,8 +668,8 @@ class ProfileRun:
         """按本次 profiling 配置生成真正注入 server 的 target。
 
         state_trace 是验证开关，不要求用户手动把 `hicache_state:self` 写进每个
-        HiCache target。开启时给相关 target 追加 validation-only 字段；probe 会把
-        它拆成 `model_input=false` 事件，真实执行事件仍进入 faithful replay。
+        HiCache target。开启时给相关 target 追加 validation-only oracle 字段；probe
+        会把它拆成 `model_input=false` / `fact_class=oracle_state` 事件。
         """
 
         targets = [dict(target) for target in self.runtime.python_targets]
@@ -794,19 +681,13 @@ class ProfileRun:
                 continue
             fields = [dict(field) for field in target.get("fields", []) if isinstance(field, dict)]
             if not any(field.get("source") == "hicache_state:self" for field in fields):
-                state_field = {
-                    "name": "state_snapshot",
-                    "source": "hicache_state:self",
-                    "required": False,
-                }
-                radix_removed_index = next(
-                    (index for index, field in enumerate(fields) if field.get("source") == "hicache_radix_removed_pages:self"),
-                    None,
+                fields.append(
+                    {
+                        "name": "state_snapshot",
+                        "source": "hicache_state:self",
+                        "required": False,
+                    }
                 )
-                if radix_removed_index is None:
-                    fields.append(state_field)
-                else:
-                    fields.insert(radix_removed_index, state_field)
             target["fields"] = fields
         return targets
 
@@ -814,9 +695,6 @@ class ProfileRun:
         python_probe = channel_config(self.cfg, "python_probe")
         state_trace = python_probe.get("state_trace") if isinstance(python_probe.get("state_trace"), dict) else {}
         return bool(state_trace.get("enabled", False))
-
-    def _hicache_target_page_sizes(self) -> list[int]:
-        return _hicache_target_page_sizes_from_targets(self.runtime.python_targets)
 
     @staticmethod
     def _is_hicache_python_target(target: dict[str, Any]) -> bool:
@@ -914,10 +792,180 @@ def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
     return ProfileRun(cfg, dry_run=dry_run).run()
 
 
+def parse_experiment_selection(raw_values: list[str] | None, env_value: str | None = None) -> set[str]:
+    """解析命令行或环境变量中的实验选择器。
+
+    手动 profiling 时最常见的输入是 `--experiments a,b` 或重复
+    `--experiment a --experiment b`。这里统一拆成去重集合，供
+    `--list-experiments` 和真实运行共用同一套匹配逻辑。
+    """
+
+    selected: set[str] = set()
+    for raw in [*(raw_values or []), env_value or ""]:
+        for item in str(raw).split(","):
+            item = item.strip()
+            if item:
+                selected.add(item)
+    return selected
+
+
+def experiment_identity(cfg: dict[str, Any], index: int) -> str:
+    for key in ("id", "name"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return f"experiment-{index}"
+
+
+def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
+    """返回可用于命令行选择同一个实验的稳定选择器。"""
+
+    selectors = {str(index), f"{index:02d}"}
+    for key in ("id", "name"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            selectors.add(value.strip())
+            selectors.add(sanitize(value))
+    return selectors
+
+
+def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "index": index,
+        "id": cfg.get("id", experiment_identity(cfg, index)),
+        "name": cfg.get("name", experiment_identity(cfg, index)),
+        "selectors": sorted(experiment_selectors(cfg, index)),
+    }
+
+
+def reject_profiling_override(value: dict[str, Any], context: str) -> None:
+    if "profiling" in value:
+        raise ValueError(f"{context} must not override profiling; suite experiments share one profiling config")
+    unset_paths = value.get("$unset")
+    if isinstance(unset_paths, list):
+        for path in unset_paths:
+            if isinstance(path, str) and (path == "profiling" or path.startswith("profiling.")):
+                raise ValueError(f"{context} must not unset profiling; suite experiments share one profiling config")
+
+
+def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    raw_entries = matrix.get(key)
+    if not isinstance(raw_entries, list) or not raw_entries:
+        raise ValueError(f"matrix.{key} must be a non-empty list")
+
+    entries: dict[str, dict[str, Any]] = {}
+    for index, entry in enumerate(raw_entries):
+        if not isinstance(entry, dict):
+            raise TypeError(f"matrix.{key}[{index}] must be an object")
+        reject_profiling_override(entry, f"matrix.{key}[{index}]")
+        raw_id = entry.get("id")
+        if not isinstance(raw_id, str) or not raw_id.strip():
+            raise ValueError(f"matrix.{key}[{index}].id must be a non-empty string")
+        entry_id = raw_id.strip()
+        if entry_id in entries:
+            raise ValueError(f"duplicate matrix.{key} id: {entry_id}")
+        entries[entry_id] = entry
+    return entries
+
+
+def matrix_entry_override(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in entry.items() if key not in MATRIX_ENTRY_META_KEYS}
+
+
+def attach_suite_metadata(
+    cfg: dict[str, Any],
+    *,
+    experiment_id: str,
+    server_id: str | None,
+    input_id: str | None,
+) -> None:
+    metadata = cfg.get("metadata")
+    if metadata is None:
+        metadata = {}
+    if not isinstance(metadata, dict):
+        raise TypeError("metadata must be an object")
+    metadata = dict(metadata)
+    metadata.setdefault("suite_experiment_id", experiment_id)
+    if server_id is not None:
+        metadata.setdefault("suite_server_id", server_id)
+    if input_id is not None:
+        metadata.setdefault("suite_input_id", input_id)
+    cfg["metadata"] = metadata
+
+
+def generated_matrix_experiments(matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    servers = matrix_entries(matrix, "servers")
+    inputs = matrix_entries(matrix, "inputs")
+    experiments: list[dict[str, Any]] = []
+    for server_id in servers:
+        for input_id in inputs:
+            experiment_id = f"{server_id}_{input_id}"
+            experiments.append(
+                {
+                    "id": experiment_id,
+                    "name": experiment_id,
+                    "server_ref": server_id,
+                    "input_ref": input_id,
+                }
+            )
+    return experiments
+
+
+def expand_matrix_experiment(
+    common: dict[str, Any],
+    matrix: dict[str, Any],
+    experiment: dict[str, Any],
+    index: int,
+) -> dict[str, Any]:
+    servers = matrix_entries(matrix, "servers")
+    inputs = matrix_entries(matrix, "inputs")
+
+    server_ref = experiment.get("server_ref")
+    input_ref = experiment.get("input_ref")
+    if not isinstance(server_ref, str) or not server_ref.strip():
+        raise ValueError(f"experiments[{index - 1}].server_ref must reference matrix.servers")
+    if not isinstance(input_ref, str) or not input_ref.strip():
+        raise ValueError(f"experiments[{index - 1}].input_ref must reference matrix.inputs")
+    server_id = server_ref.strip()
+    input_id = input_ref.strip()
+    if server_id not in servers:
+        raise ValueError(f"experiments[{index - 1}].server_ref references unknown server: {server_id}")
+    if input_id not in inputs:
+        raise ValueError(f"experiments[{index - 1}].input_ref references unknown input: {input_id}")
+
+    experiment_id = str(experiment.get("id") or f"{server_id}_{input_id}").strip()
+    if not experiment_id:
+        raise ValueError(f"experiments[{index - 1}].id must not be empty")
+    merged = deep_merge(common, matrix_entry_override(servers[server_id]))
+    apply_unset(merged, servers[server_id].get("$unset"))
+    merged = deep_merge(merged, matrix_entry_override(inputs[input_id]))
+    apply_unset(merged, inputs[input_id].get("$unset"))
+
+    experiment_override = {key: value for key, value in experiment.items() if key not in EXPERIMENT_REF_KEYS}
+    reject_profiling_override(experiment_override, f"experiments[{index - 1}]")
+    merged = deep_merge(merged, experiment_override)
+    apply_unset(merged, experiment.get("$unset"))
+    merged["id"] = experiment_id
+    merged["name"] = str(experiment.get("name") or experiment_id)
+    attach_suite_metadata(
+        merged,
+        experiment_id=experiment_id,
+        server_id=server_id,
+        input_id=input_id,
+    )
+    return merged
+
+
 def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    matrix = cfg.get("matrix")
     experiments = cfg.get("experiments")
-    if experiments is None:
+    if experiments is None and matrix is None:
         return [cfg]
+
+    if matrix is not None and not isinstance(matrix, dict):
+        raise TypeError("matrix must be an object")
+    if experiments is None:
+        experiments = generated_matrix_experiments(matrix)
     if not isinstance(experiments, list) or not experiments:
         raise ValueError("experiments must be a non-empty list")
 
@@ -926,17 +974,58 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     for index, experiment in enumerate(experiments, start=1):
         if not isinstance(experiment, dict):
             raise TypeError(f"experiments[{index - 1}] must be an object")
-        merged = deep_merge(common, experiment)
-        apply_unset(merged, experiment.get("$unset"))
-        merged.setdefault("name", f"experiment-{index}")
+        if matrix is not None:
+            merged = expand_matrix_experiment(common, matrix, experiment, index)
+        else:
+            reject_profiling_override(experiment, f"experiments[{index - 1}]")
+            experiment_id = experiment_identity(experiment, index)
+            merged = deep_merge(common, experiment)
+            apply_unset(merged, experiment.get("$unset"))
+            merged["id"] = experiment_id
+            merged["name"] = str(experiment.get("name") or experiment_id)
+            attach_suite_metadata(
+                merged,
+                experiment_id=experiment_id,
+                server_id=None,
+                input_id=None,
+            )
         expanded.append(merged)
     return expanded
 
 
-def run_profile_suite(cfg: dict[str, Any], dry_run: bool) -> list[Path]:
-    experiments = expand_suite(cfg)
-    if len(experiments) == 1 and "experiments" not in cfg:
-        return [run_profile(experiments[0], dry_run)]
+def filter_suite_experiments(
+    experiments: list[tuple[int, dict[str, Any]]],
+    selected_experiments: set[str],
+) -> list[tuple[int, dict[str, Any]]]:
+    if not selected_experiments:
+        return experiments
+
+    selected: list[tuple[int, dict[str, Any]]] = []
+    matched: set[str] = set()
+    for index, experiment in experiments:
+        selectors = experiment_selectors(experiment, index)
+        overlap = selected_experiments & selectors
+        if overlap:
+            selected.append((index, experiment))
+            matched.update(overlap)
+
+    missing = sorted(selected_experiments - matched)
+    if missing:
+        available = ", ".join(str(item[1].get("id") or item[1].get("name") or item[0]) for item in experiments)
+        raise ValueError(f"unknown experiment selector(s): {', '.join(missing)}; available: {available}")
+    return selected
+
+
+def run_profile_suite(
+    cfg: dict[str, Any],
+    dry_run: bool,
+    selected_experiments: set[str] | None = None,
+) -> list[Path]:
+    is_suite = "experiments" in cfg or "matrix" in cfg
+    all_experiments = list(enumerate(expand_suite(cfg), start=1))
+    experiments = filter_suite_experiments(all_experiments, selected_experiments or set())
+    if len(experiments) == 1 and not is_suite:
+        return [run_profile(experiments[0][1], dry_run)]
 
     framework = cfg.get("framework", "sglang")
     suite_name = sanitize(str(cfg.get("name", f"{framework}-profile-suite")))
@@ -945,18 +1034,26 @@ def run_profile_suite(cfg: dict[str, Any], dry_run: bool) -> list[Path]:
     suite_dir = suite_root / sanitize(str(suite_id))
     suite_dir.mkdir(parents=True, exist_ok=True)
     dump_json(suite_dir / "suite_config.json", cfg)
+    dump_json(
+        suite_dir / "suite_selection.json",
+        {
+            "selected_selectors": sorted(selected_experiments or []),
+            "available_experiments": [describe_suite_experiment(index, experiment) for index, experiment in all_experiments],
+            "planned_experiments": [describe_suite_experiment(index, experiment) for index, experiment in experiments],
+        },
+    )
 
     log(f"Suite dir: {suite_dir}")
     run_dirs: list[Path] = []
     failures: list[dict[str, str]] = []
     continue_on_error = bool(cfg.get("continue_on_error", False))
-    for index, experiment in enumerate(experiments, start=1):
+    for ordinal, (index, experiment) in enumerate(experiments, start=1):
         exp_name = sanitize(str(experiment.get("name", f"experiment-{index}")))
         exp_cfg = dict(experiment)
         exp_cfg["run_root"] = str(suite_dir)
         exp_cfg["run_id"] = f"{index:02d}_{exp_name}"
 
-        log(f"Suite experiment {index}/{len(experiments)}: {exp_name}")
+        log(f"Suite experiment {ordinal}/{len(experiments)} (#{index}): {exp_name}")
         try:
             run_dirs.append(run_profile(exp_cfg, dry_run))
         except Exception as exc:
@@ -970,6 +1067,7 @@ def run_profile_suite(cfg: dict[str, Any], dry_run: bool) -> list[Path]:
             "suite_dir": str(suite_dir),
             "runs": [str(path) for path in run_dirs],
             "failures": failures,
+            "selected_experiments": [describe_suite_experiment(index, experiment) for index, experiment in experiments],
         },
     )
     return run_dirs
@@ -979,6 +1077,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run SGLang profiling experiments.")
     parser.add_argument("--config", required=True, help="JSON profile config path")
     parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
+    parser.add_argument("--experiment", action="append", default=[], help="run one experiment id/name; may be repeated")
+    parser.add_argument("--experiments", action="append", default=[], help="comma-separated experiment ids/names to run")
+    parser.add_argument("--list-experiments", action="store_true", help="print expanded experiment ids without running them")
     return parser.parse_args(argv)
 
 
@@ -987,7 +1088,23 @@ def main(argv: list[str] | None = None) -> int:
     config_path = resolve_repo_path(args.config)
     if config_path is None or not config_path.is_file():
         raise FileNotFoundError(f"missing config: {args.config}")
-    run_dirs = run_profile_suite(load_json(config_path), args.dry_run)
+    cfg = load_json(config_path)
+    selected_experiments = parse_experiment_selection(
+        [*args.experiment, *args.experiments],
+        os.environ.get(PROFILE_EXPERIMENTS_ENV),
+    )
+    if args.list_experiments:
+        experiments = filter_suite_experiments(
+            list(enumerate(expand_suite(cfg), start=1)),
+            selected_experiments,
+        )
+        for index, experiment in experiments:
+            exp_id = experiment.get("id") or experiment_identity(experiment, index)
+            exp_name = experiment.get("name") or exp_id
+            print(f"{index:02d}\t{exp_id}\t{exp_name}")
+        return 0
+
+    run_dirs = run_profile_suite(cfg, args.dry_run, selected_experiments)
     for run_dir in run_dirs:
         print(run_dir)
     return 0

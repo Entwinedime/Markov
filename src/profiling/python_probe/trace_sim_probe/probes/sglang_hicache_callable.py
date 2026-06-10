@@ -1,7 +1,8 @@
 """SGLang HiCache callable probe。
 
 该 probe 复用 `generic_callable` 的函数包装逻辑，只补充 HiCache 建模需要的
-`page_hashes:` 字段 source。这样通用 probe 不再包含 HiCache 特化规则。
+token/range source 和 validation-only state snapshot。这样通用 probe 不包含
+HiCache 特化规则，HiCache 新后端也不再依赖按 page size 预声明的 page identity。
 """
 
 from __future__ import annotations
@@ -13,55 +14,13 @@ from typing import Any
 from trace_sim_probe.probes import generic_callable as _base
 
 
-_RADIX_PAGES_BEFORE_CALL_BY_OBJECT: dict[int, list[set[str]]] = {}
-_RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT: dict[str, set[str]] = {}
-_RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT: dict[str, list[str]] = {}
+_TOKEN_PATHS_EMITTED_BY_SCOPE: dict[str, set[str]] = {}
+_HICACHE_SEQUENCE_BY_SCOPE: dict[str, int] = {}
+_TOKEN_HASH_ALGO = "sglang_radix_sha256_v1"
 
 
 def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
-
-
-def _page_hashes_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    if not source.startswith("page_hashes:"):
-        return (False, False, None)
-    found, value = _extract_page_hashes(source.split(":", 1)[1], bound, args, kwargs, result)
-    return (True, found, value)
-
-
-def _page_hashes_concat_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    if not source.startswith("page_hashes_concat:"):
-        return (False, False, None)
-    found, value = _extract_page_hashes_concat(source.split(":", 1)[1], bound, args, kwargs, result)
-    return (True, found, value)
-
-
-def _page_hashes_after_prefix_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    if not source.startswith("page_hashes_after_prefix:"):
-        return (False, False, None)
-    found, value = _extract_page_hashes_after_prefix(source.split(":", 1)[1], bound, args, kwargs, result)
-    return (True, found, value)
 
 
 def _hicache_state_source(
@@ -75,15 +34,40 @@ def _hicache_state_source(
     if source != "hicache_state:self":
         return (False, False, None)
     if not _truthy(os.environ.get("TRACE_SIM_HICACHE_STATE_TRACE")):
-        return (True, True, _base.ExtractedField({"enabled": False}, model_input=False, event_kind="state_snapshot"))
+        return (
+            True,
+            True,
+            _base.ExtractedField(
+                {"enabled": False},
+                model_input=False,
+                event_kind="state_snapshot",
+                extra_args={
+                    "dag_input": False,
+                    "state_model_input": False,
+                    "fact_class": "oracle_state",
+                },
+            ),
+        )
     if not args:
         return (True, False, None)
     snapshot = _snapshot_hicache_object(args[0])
-    _record_radix_state_snapshot_delta(snapshot)
-    return (True, True, _base.ExtractedField(snapshot, model_input=False, event_kind="state_snapshot"))
+    return (
+        True,
+        True,
+        _base.ExtractedField(
+            snapshot,
+            model_input=False,
+            event_kind="state_snapshot",
+            extra_args={
+                "dag_input": False,
+                "state_model_input": False,
+                "fact_class": "oracle_state",
+            },
+        ),
+    )
 
 
-def _hicache_radix_removed_pages_source(
+def _token_path_source(
     source: str,
     field_name: str,
     bound: dict[str, Any],
@@ -91,43 +75,13 @@ def _hicache_radix_removed_pages_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
-    if source != "hicache_radix_removed_pages:self":
+    if not source.startswith("token_path:"):
         return (False, False, None)
-    if not args:
-        return (True, False, None)
-
-    obj = args[0]
-    object_id = id(obj)
-    snapshot_object_id = f"{type(obj).__name__}:{object_id}"
-    current_pages = _radix_page_set(obj)
-    phase = str(bound.get("__trace_sim_phase") or "")
-    call_stack = _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.setdefault(object_id, [])
-    if phase == "start" or (not phase and not call_stack):
-        call_stack.append(current_pages)
-        _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, None)
-        return (True, True, [])
-
-    if phase and phase != "end":
-        if call_stack:
-            call_stack.pop()
-        if not call_stack:
-            _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.pop(object_id, None)
-        _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, None)
-        return (True, True, [])
-
-    snapshot_removed_pages = _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.pop(snapshot_object_id, [])
-    previous_pages = call_stack.pop() if call_stack else None
-    if not call_stack:
-        _RADIX_PAGES_BEFORE_CALL_BY_OBJECT.pop(object_id, None)
-    if snapshot_removed_pages:
-        return (True, True, snapshot_removed_pages)
-    if previous_pages is None:
-        return (True, True, [])
-    removed_pages = sorted(previous_pages - current_pages)
-    return (True, True, removed_pages)
+    found, value = _extract_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, _base.ExtractedField(value) if found else None)
 
 
-def _prefetch_progress_source(
+def _token_span_source(
     source: str,
     field_name: str,
     bound: dict[str, Any],
@@ -135,188 +89,421 @@ def _prefetch_progress_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
-    if not source.startswith("prefetch_progress:"):
+    if not source.startswith("token_span:"):
         return (False, False, None)
-    found, value = _extract_prefetch_progress(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
     return (True, found, value)
 
 
-def _extract_page_hashes(
-    spec: str,
+def _token_path_concat_source(
+    source: str,
+    field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-) -> tuple[bool, Any]:
-    """按 SGLang HiCache page hash 规则采集 page identity。
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("token_path_concat:"):
+        return (False, False, None)
+    found, value = _extract_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, _base.ExtractedField(value) if found else None)
 
-    表达式格式为 `page_hashes:<tokens>,<page_size>[,<prior_hash>]`。
-    `<tokens>` 可以是 RadixKey，也可以是 token id 序列；`<prior_hash>` 用于
-    prefetch 这类从已有前缀继续计算 page hash 的场景。
-    """
 
-    parts = [part.strip() for part in spec.split(",") if part.strip()]
+def _token_span_concat_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("token_span_concat:"):
+        return (False, False, None)
+    found, value = _extract_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, value)
+
+
+def _node_token_path_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("node_token_path:"):
+        return (False, False, None)
+    found, value = _extract_node_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, _base.ExtractedField(value) if found else None)
+
+
+def _node_token_span_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("node_token_span:"):
+        return (False, False, None)
+    found, value = _extract_node_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, value)
+
+
+def _node_token_count_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("node_token_count:"):
+        return (False, False, None)
+    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found:
+        return (True, False, None)
+    return (True, True, len(_full_key_tokens(node)))
+
+
+def _node_token_path_concat_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("node_token_path_concat:"):
+        return (False, False, None)
+    found, value = _extract_node_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, _base.ExtractedField(value) if found else None)
+
+
+def _node_token_span_concat_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("node_token_span_concat:"):
+        return (False, False, None)
+    found, value = _extract_node_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, value)
+
+
+def _hicache_cache_scope_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_cache_scope:"):
+        return (False, False, None)
+    found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found:
+        return (True, False, None)
+    return (True, True, _cache_scope_key(value))
+
+
+def _hicache_seq_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_seq:"):
+        return (False, False, None)
+    found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found:
+        return (True, False, None)
+    scope = _cache_scope_key(value)
+    next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
+    _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
+    return (True, True, next_seq)
+
+
+def _hicache_config_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_config:"):
+        return (False, False, None)
+    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
+    if not parts:
+        return (True, False, None)
+    found, value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
+    if not found:
+        return (True, False, None)
+    config = _cache_config_record(value)
+    if len(parts) == 1:
+        return (True, True, config)
+    selected = config.get(parts[1])
+    return (True, selected is not None, selected)
+
+
+def _hicache_requested_pages_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_requested_pages:"):
+        return (False, False, None)
+    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
     if len(parts) < 2:
-        return (False, None)
-    found_tokens, tokens = _base._extract_raw_value(parts[0], "page_identity", bound, args, kwargs, result)
-    found_page_size, page_size_value = _base._extract_raw_value(parts[1], "page_size", bound, args, kwargs, result)
-    if not found_page_size:
-        page_size_value = parts[1]
-        found_page_size = True
-    if not found_tokens or not found_page_size:
-        return (False, None)
-    page_size = _safe_int(page_size_value)
-    if page_size is None or page_size <= 0:
-        return (False, None)
-    prior_hash = None
-    if len(parts) >= 3:
-        found_prior, prior_value = _base._extract_raw_value(parts[2], "prior_hash", bound, args, kwargs, result)
-        if found_prior and prior_value:
-            prior_hash = str(prior_value)
-    return (True, _compute_page_hashes(tokens, page_size, prior_hash))
-
-
-def _extract_page_hashes_concat(
-    spec: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, Any]:
-    """把两段 token 序列拼接后按 HiCache page hash 规则采集 page identity。
-
-    表达式格式为 `page_hashes_concat:<prefix_tokens>,<tokens>,<page_size>[,<prior_hash>]`。
-    该 source 用于 page size what-if 下的 prefetch：此时 base run 的 `last_hash`
-    属于 base page size，不能作为 target page size 的 parent hash；必须用完整
-    prefix token path 重新计算 target page hashes。
-    """
-
-    parts = [part.strip() for part in spec.split(",") if part.strip()]
-    if len(parts) < 3:
-        return (False, None)
-    found_prefix, prefix_tokens = _base._extract_raw_value(parts[0], "prefix_tokens", bound, args, kwargs, result)
-    found_tokens, tokens = _base._extract_raw_value(parts[1], "tokens", bound, args, kwargs, result)
-    found_page_size, page_size_value = _base._extract_raw_value(parts[2], "page_size", bound, args, kwargs, result)
-    if not found_page_size:
-        page_size_value = parts[2]
-        found_page_size = True
-    if not found_prefix or not found_tokens or not found_page_size:
-        return (False, None)
-    page_size = _safe_int(page_size_value)
-    if page_size is None or page_size <= 0:
-        return (False, None)
-    prior_hash = None
-    if len(parts) >= 4:
-        found_prior, prior_value = _base._extract_raw_value(parts[3], "prior_hash", bound, args, kwargs, result)
-        if found_prior and prior_value:
-            prior_hash = str(prior_value)
-    return (True, _compute_page_hashes(_tokens_for_page_hash(prefix_tokens) + _tokens_for_page_hash(tokens), page_size, prior_hash))
-
-
-def _extract_page_hashes_after_prefix(
-    spec: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, Any]:
-    """按目标 page size 的 page-aligned prefix 计算 parent hash，再返回 suffix pages。
-
-    表达式格式为
-    `page_hashes_after_prefix:<prefix_tokens>,<tokens>,<page_size>[,<prior_hash>]`。
-    该 source 专门服务 prefetch target identity：`prefix_tokens` 用于在目标
-    page size 下重新得到 SGLang `last_host_node` 对应的 parent hash，输出只
-    保留 `<tokens>` 自身对应的完整 pages。prefix 不是 page-aligned 时，尾部
-    残余 token 不属于 parent node，也不能被拼入 prefetch suffix page。
-    """
-
-    parts = [part.strip() for part in spec.split(",") if part.strip()]
-    if len(parts) < 3:
-        return (False, None)
-    found_prefix, prefix_tokens = _base._extract_raw_value(parts[0], "prefix_tokens", bound, args, kwargs, result)
-    found_tokens, tokens = _base._extract_raw_value(parts[1], "tokens", bound, args, kwargs, result)
-    found_page_size, page_size_value = _base._extract_raw_value(parts[2], "page_size", bound, args, kwargs, result)
-    if not found_page_size:
-        page_size_value = parts[2]
-        found_page_size = True
-    if not found_prefix or not found_tokens or not found_page_size:
-        return (False, None)
-    page_size = _safe_int(page_size_value)
-    if page_size is None or page_size <= 0:
-        return (False, None)
-    prior_hash = None
-    if len(parts) >= 4:
-        found_prior, prior_value = _base._extract_raw_value(parts[3], "prior_hash", bound, args, kwargs, result)
-        if found_prior and prior_value:
-            prior_hash = str(prior_value)
-    prefix_hashes = _compute_page_hashes(prefix_tokens, page_size, prior_hash)
-    parent_hash = prefix_hashes[-1] if prefix_hashes else prior_hash
-    return (True, _compute_page_hashes(tokens, page_size, parent_hash))
-
-
-def _extract_prefetch_progress(
-    spec: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, Any]:
-    """读取一次 prefetch progress 的只读证据。
-
-    表达式格式为 `prefetch_progress:<cache_obj>,<req_id>`。该 source 不调用
-    SGLang 的 termination 方法，只读取已有 operation 状态，用于后续验证
-    planned/ready/late/suppressed page 推导。
-    """
-
-    parts = [part.strip() for part in spec.split(",") if part.strip()]
-    if len(parts) < 2:
-        return (False, None)
-    found_obj, obj = _base._extract_raw_value(parts[0], field_name="cache_obj", bound=bound, args=args, kwargs=kwargs, result=result)
-    found_req, req_id_value = _base._extract_raw_value(parts[1], field_name="request_id", bound=bound, args=args, kwargs=kwargs, result=result)
-    if not found_obj:
-        return (False, None)
-    req_id = str(req_id_value) if found_req and req_id_value is not None else ""
-    page_size = _safe_int(getattr(obj, "page_size", None)) or 0
-    ongoing = getattr(obj, "ongoing_prefetch", {}) or {}
-    loaded_by_reqid = getattr(obj, "prefetch_loaded_tokens_by_reqid", {}) or {}
-    row: dict[str, Any] = {
-        "request_id": req_id,
-        "policy": _jsonable_compact(getattr(obj, "prefetch_stop_policy", "")),
-        "page_size": page_size,
-        "ongoing_prefetch_count": _base._safe_len(ongoing) or 0,
-        "has_ongoing_prefetch": req_id in ongoing if req_id else False,
-        "loaded_tokens_evidence": _safe_int(loaded_by_reqid.get(req_id)) if isinstance(loaded_by_reqid, dict) and req_id else None,
-        "check_return": bool(result) if result is not None else None,
-    }
-    if not req_id or req_id not in ongoing:
-        return (True, row)
-
-    info = ongoing.get(req_id)
-    if not isinstance(info, tuple) or len(info) < 4:
-        return (True, row)
-    _last_host_node, prefetch_key, host_indices, operation = info[:4]
-    operation_hash_value = _jsonable_compact(getattr(operation, "hash_value", None))
-    completed_tokens = _safe_int(getattr(operation, "completed_tokens", None)) or 0
-    prefetch_tokens = _base._safe_len(prefetch_key) or 0
-    host_tokens = _base._safe_len(host_indices) or 0
-    row.update(
+        return (True, False, None)
+    found_tokens, token_value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
+    found_cache, cache_value = _extract_source_value(parts[1], "cache_scope", bound, args, kwargs, result)
+    requested_tokens = _safe_int(token_value) if found_tokens else None
+    page_size = _safe_int(getattr(cache_value, "page_size", None)) if found_cache else None
+    if requested_tokens is None:
+        return (True, False, None)
+    return (
+        True,
+        True,
         {
-            "prefetch_tokens": prefetch_tokens,
-            "host_tokens": host_tokens,
-            "operation_hash_pages": operation_hash_value,
-            "operation_hash_page_count": _base._safe_len(getattr(operation, "hash_value", None)) or 0,
-            "completed_tokens": completed_tokens,
-            "ready_pages_estimate": completed_tokens // page_size if page_size > 0 else 0,
-            "late_tokens_estimate": max(prefetch_tokens - completed_tokens, 0),
-        }
+            "requested_tokens": requested_tokens,
+            "source_page_size": page_size,
+            "requested_pages": _ceil_div(requested_tokens, page_size),
+        },
     )
-    is_terminated = getattr(operation, "is_terminated", None)
-    if callable(is_terminated):
-        try:
-            row["operation_terminated"] = bool(is_terminated())
-        except Exception:
-            row["operation_terminated"] = None
-    return (True, row)
+
+
+def _extract_token_path(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if not parts:
+        return (False, None)
+    found, value = _extract_source_value(parts[0], "token_path", bound, args, kwargs, result)
+    if not found:
+        return (False, None)
+    scope = _scope_from_optional_source(parts[1], bound, args, kwargs, result) if len(parts) > 1 else ""
+    return (True, _token_path_record(_tokens_for_path(value), scope))
+
+
+def _extract_token_span(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if not parts:
+        return (False, None)
+    found, value = _extract_source_value(parts[0], "token_span", bound, args, kwargs, result)
+    if not found:
+        return (False, None)
+    tokens = _tokens_for_path(value)
+    return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_token_path_concat(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) < 2:
+        return (False, None)
+    found_prefix, prefix = _extract_source_value(parts[0], "prefix_tokens", bound, args, kwargs, result)
+    found_suffix, suffix = _extract_source_value(parts[1], "suffix_tokens", bound, args, kwargs, result)
+    if not found_prefix or not found_suffix:
+        return (False, None)
+    scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
+    tokens = _tokens_for_path(prefix) + _tokens_for_path(suffix)
+    return (True, _token_path_record(tokens, scope))
+
+
+def _extract_token_span_concat(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) < 2:
+        return (False, None)
+    found_prefix, prefix = _extract_source_value(parts[0], "prefix_tokens", bound, args, kwargs, result)
+    found_suffix, suffix = _extract_source_value(parts[1], "suffix_tokens", bound, args, kwargs, result)
+    if not found_prefix or not found_suffix:
+        return (False, None)
+    tokens = _tokens_for_path(prefix) + _tokens_for_path(suffix)
+    return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_node_token_path(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if not parts:
+        return (False, None)
+    found, node = _extract_source_value(parts[0], "node_token_path", bound, args, kwargs, result)
+    if not found or node is None:
+        return (False, None)
+    scope = _scope_from_optional_source(parts[1], bound, args, kwargs, result) if len(parts) > 1 else ""
+    return (True, _token_path_record(_full_key_tokens(node), scope))
+
+
+def _extract_node_token_span(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if not parts:
+        return (False, None)
+    found, node = _extract_source_value(parts[0], "node_token_span", bound, args, kwargs, result)
+    if not found or node is None:
+        return (False, None)
+    tokens = _full_key_tokens(node)
+    return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_node_token_path_concat(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) < 2:
+        return (False, None)
+    found_node, node = _extract_source_value(parts[0], "prefix_node", bound, args, kwargs, result)
+    found_suffix, suffix = _extract_source_value(parts[1], "suffix_tokens", bound, args, kwargs, result)
+    if not found_node or node is None or not found_suffix:
+        return (False, None)
+    scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
+    tokens = _full_key_tokens(node) + _tokens_for_path(suffix)
+    return (True, _token_path_record(tokens, scope))
+
+
+def _extract_node_token_span_concat(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) < 2:
+        return (False, None)
+    found_node, node = _extract_source_value(parts[0], "prefix_node", bound, args, kwargs, result)
+    found_suffix, suffix = _extract_source_value(parts[1], "suffix_tokens", bound, args, kwargs, result)
+    if not found_node or node is None or not found_suffix:
+        return (False, None)
+    tokens = _full_key_tokens(node) + _tokens_for_path(suffix)
+    return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_source_value(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    return _base._extract_raw_value(source, field_name, bound, args, kwargs, result)
+
+
+def _scope_from_optional_source(
+    source: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> str:
+    found, value = _extract_source_value(source, "cache_scope", bound, args, kwargs, result)
+    return _cache_scope_key(value) if found else ""
+
+
+def _cache_scope_key(value: Any) -> str:
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown"))
+    if value is None:
+        return f"rank:{rank}:unknown"
+    if isinstance(value, (str, int, float, bool)):
+        return f"rank:{rank}:{value}"
+    return f"rank:{rank}:{type(value).__name__}:{id(value)}"
+
+
+def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any]:
+    return {
+        "path_id": _token_path_id(tokens),
+        "begin": begin,
+        "end": end,
+        "token_count": len(tokens),
+        "hash_algo": _TOKEN_HASH_ALGO,
+    }
+
+
+def _token_path_record(tokens: list[Any], scope: str = "") -> dict[str, Any]:
+    path_id = _token_path_id(tokens)
+    row: dict[str, Any] = {
+        "token_path_id": path_id,
+        "token_count": len(tokens),
+        "hash_algo": _TOKEN_HASH_ALGO,
+    }
+    scope_key = scope or "global"
+    emitted = _TOKEN_PATHS_EMITTED_BY_SCOPE.setdefault(scope_key, set())
+    if path_id not in emitted:
+        emitted.add(path_id)
+        row["token_ids"] = _jsonable_token_ids(tokens)
+    return row
+
+
+def _token_path_id(tokens: list[Any]) -> str:
+    hasher = hashlib.sha256()
+    for token in tokens:
+        _hash_one_token_id(hasher, token)
+    return "sha256_u32le:" + hasher.hexdigest()
+
+
+def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
+    result: list[Any] = []
+    for token in tokens:
+        if isinstance(token, (list, tuple)):
+            result.append([int(item) for item in token])
+        else:
+            result.append(int(token))
+    return result
+
+
+def _hash_one_token_id(hasher: "hashlib._Hash", token: Any) -> None:
+    if isinstance(token, (list, tuple)):
+        for item in token:
+            hasher.update(int(item).to_bytes(4, byteorder="little", signed=False))
+    else:
+        hasher.update(int(token).to_bytes(4, byteorder="little", signed=False))
 
 
 def _safe_int(value: Any) -> int | None:
@@ -328,36 +515,11 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
-def _compute_page_hashes(value: Any, page_size: int, prior_hash: str | None) -> list[str]:
-    """复用 RadixKey.hash_page；普通 token 序列按同样 SHA256 规则计算。"""
+def _tokens_for_path(value: Any) -> list[Any]:
+    """读取完整 token 序列。
 
-    if hasattr(value, "page_aligned") and hasattr(value, "hash_page"):
-        key = value.page_aligned(page_size)
-        hashes: list[str] = []
-        parent_hash = prior_hash
-        for start in range(0, len(key), page_size):
-            end = min(start + page_size, len(key))
-            if end <= start:
-                continue
-            parent_hash = key.hash_page(start, end, parent_hash)
-            hashes.append(parent_hash)
-        return hashes
-
-    tokens = _tokens_for_page_hash(value)
-    aligned_len = len(tokens) // page_size * page_size
-    hashes = []
-    parent_hash = prior_hash
-    for start in range(0, aligned_len, page_size):
-        parent_hash = _hash_token_page(tokens[start : start + page_size], parent_hash)
-        hashes.append(parent_hash)
-    return hashes
-
-
-def _tokens_for_page_hash(value: Any) -> list[Any]:
-    """为 page hash 读取完整 token 序列。
-
-    通用 probe 的 `_safe_list` 会截断到 64 个元素，适合作摘要，但 page hash
-    需要按 page_size 对齐计算，不能在这里截断。
+    通用 probe 的 `_safe_list` 会截断到 64 个元素，适合作摘要；token dictionary
+    需要完整 token 序列，不能在这里截断。
     """
 
     if value is None:
@@ -372,17 +534,41 @@ def _tokens_for_page_hash(value: Any) -> list[Any]:
         return []
 
 
-def _hash_token_page(tokens: list[Any], prior_hash: str | None) -> str:
-    hasher = hashlib.sha256()
-    if prior_hash:
-        hasher.update(bytes.fromhex(prior_hash))
-    for token in tokens:
-        if isinstance(token, (list, tuple)):
-            for item in token:
-                hasher.update(int(item).to_bytes(4, byteorder="little", signed=False))
-        else:
-            hasher.update(int(token).to_bytes(4, byteorder="little", signed=False))
-    return hasher.hexdigest()
+def _cache_config_record(obj: Any) -> dict[str, Any]:
+    capacity = _snapshot_capacity(obj)
+    thresholds = {
+        "write_through_threshold": capacity.get("write_through_threshold"),
+        "load_back_threshold": capacity.get("load_back_threshold"),
+        "prefetch_threshold_tokens": capacity.get("prefetch_threshold_tokens"),
+        "prefetch_threshold_pages": capacity.get("prefetch_threshold_pages"),
+        "prefetch_capacity_limit_tokens": capacity.get("prefetch_capacity_limit_tokens"),
+        "prefetch_capacity_limit_pages": capacity.get("prefetch_capacity_limit_pages"),
+        "storage_batch_size": capacity.get("storage_batch_size"),
+    }
+    capacity_summary = {
+        "l1_capacity_tokens": capacity.get("l1_capacity_tokens"),
+        "l1_capacity_pages": capacity.get("l1_capacity_pages"),
+        "l1_available_tokens": capacity.get("l1_available_tokens"),
+        "l1_available_pages": capacity.get("l1_available_pages"),
+        "l2_capacity_tokens": capacity.get("l2_capacity_tokens"),
+        "l2_capacity_pages": capacity.get("l2_capacity_pages"),
+        "l2_available_tokens": capacity.get("l2_available_tokens"),
+        "l2_available_pages": capacity.get("l2_available_pages"),
+        "enable_storage": capacity.get("enable_storage"),
+    }
+    policy_params = {
+        "write_policy": capacity.get("write_policy"),
+        "prefetch_policy": capacity.get("prefetch_policy"),
+        "thresholds": thresholds,
+    }
+    return {
+        "source_page_size": capacity.get("page_size"),
+        "write_policy": capacity.get("write_policy"),
+        "prefetch_policy": capacity.get("prefetch_policy"),
+        "thresholds": thresholds,
+        "capacity_summary": capacity_summary,
+        "policy_params": policy_params,
+    }
 
 
 def _snapshot_hicache_object(obj: Any) -> dict[str, Any]:
@@ -422,15 +608,13 @@ def _collect_radix_nodes(obj: Any) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     seen: set[int] = set()
     stack = [item for item in candidates if item is not None]
-    target_page_sizes = _target_page_sizes_for_snapshot()
-    full_tokens_cache: dict[int, list[Any]] = {}
     while stack and len(result) < 4096:
         node = stack.pop()
         identity = id(node)
         if identity in seen:
             continue
         seen.add(identity)
-        row = _snapshot_node(node, target_page_sizes=target_page_sizes, full_tokens_cache=full_tokens_cache)
+        row = _snapshot_node(node)
         result.append(row)
         stack.extend(_iter_children(node))
     return result
@@ -447,12 +631,7 @@ def _iter_children(node: Any) -> list[Any]:
     return [item for item in children if item is not None]
 
 
-def _snapshot_node(
-    node: Any,
-    *,
-    target_page_sizes: list[int] | None = None,
-    full_tokens_cache: dict[int, list[Any]] | None = None,
-) -> dict[str, Any]:
+def _snapshot_node(node: Any) -> dict[str, Any]:
     parent = getattr(node, "parent", None)
     hash_value = _jsonable_compact(getattr(node, "hash_value", None))
     key_value = getattr(node, "key", getattr(node, "token_ids", None))
@@ -473,48 +652,7 @@ def _snapshot_node(
         "host_ref_counter": _safe_int(getattr(node, "host_ref_counter", 0)) or 0,
         "child_count": len(_iter_children(node)),
     }
-    target_hashes = _target_hash_values_for_node(node, target_page_sizes=target_page_sizes, full_tokens_cache=full_tokens_cache)
-    if target_hashes:
-        row["target_hash_value_by_page_size"] = target_hashes
     return row
-
-
-def _target_page_sizes_for_snapshot() -> list[int]:
-    raw = os.environ.get("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES", "")
-    sizes: list[int] = []
-    seen: set[int] = set()
-    for part in raw.replace(";", ",").split(","):
-        size = _safe_int(part.strip())
-        if size is None or size <= 0 or size in seen:
-            continue
-        seen.add(size)
-        sizes.append(size)
-    return sizes[:8]
-
-
-def _target_hash_values_for_node(
-    node: Any,
-    *,
-    target_page_sizes: list[int] | None = None,
-    full_tokens_cache: dict[int, list[Any]] | None = None,
-) -> dict[str, list[str]]:
-    sizes = target_page_sizes if target_page_sizes is not None else _target_page_sizes_for_snapshot()
-    if not sizes:
-        return {}
-    parent = getattr(node, "parent", None)
-    node_tokens = _tokens_for_page_hash(getattr(node, "key", getattr(node, "token_ids", None)))
-    if not node_tokens:
-        return {}
-    parent_tokens = _full_key_tokens(parent, full_tokens_cache) if parent is not None else []
-    full_tokens = parent_tokens + node_tokens
-    result: dict[str, list[str]] = {}
-    for page_size in sizes:
-        parent_hashes = _compute_page_hashes(parent_tokens, page_size, None)
-        full_hashes = _compute_page_hashes(full_tokens, page_size, None)
-        node_hashes = full_hashes[len(parent_hashes) :]
-        if node_hashes:
-            result[str(page_size)] = node_hashes
-    return result
 
 
 def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> list[Any]:
@@ -532,7 +670,7 @@ def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> li
         current = getattr(current, "parent", None)
     tokens: list[Any] = []
     for item in reversed(chain):
-        tokens.extend(_tokens_for_page_hash(getattr(item, "key", getattr(item, "token_ids", None))))
+        tokens.extend(_tokens_for_path(getattr(item, "key", getattr(item, "token_ids", None))))
     if cache is not None:
         cache[identity] = tokens
     return tokens
@@ -643,6 +781,12 @@ def _page_count_from_tokens(tokens: int | None, page_size: int | None) -> int | 
     return tokens // page_size
 
 
+def _ceil_div(value: int | None, divisor: int | None) -> int | None:
+    if value is None or divisor is None or divisor <= 0:
+        return None
+    return (value + divisor - 1) // divisor
+
+
 def _derive_page_sets(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
     l1: set[str] = set()
     l2: set[str] = set()
@@ -674,27 +818,6 @@ def _derive_page_sets(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
     }
 
 
-def _radix_page_set(obj: Any) -> set[str]:
-    return _radix_page_set_from_nodes(_collect_radix_nodes(obj))
-
-
-def _radix_page_set_from_nodes(nodes: list[dict[str, Any]]) -> set[str]:
-    pages: set[str] = set()
-    for node in nodes:
-        pages.update(_page_keys_from_hash_value(node.get("hash_value")))
-    return pages
-
-
-def _record_radix_state_snapshot_delta(snapshot: dict[str, Any]) -> None:
-    object_id = snapshot.get("object_id")
-    if not isinstance(object_id, str) or not object_id:
-        return
-    current_pages = _radix_page_set_from_nodes(snapshot.get("nodes") or [])
-    previous_pages = _RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT.get(object_id)
-    _RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT[object_id] = current_pages
-    _RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT[object_id] = [] if previous_pages is None else sorted(previous_pages - current_pages)
-
-
 def _page_keys_from_hash_value(value: Any) -> list[str]:
     if value is None:
         return []
@@ -722,12 +845,20 @@ def _jsonable_compact(value: Any) -> Any:
     return str(value)
 
 
-_base.register_source_extractor(_page_hashes_source)
-_base.register_source_extractor(_page_hashes_concat_source)
-_base.register_source_extractor(_page_hashes_after_prefix_source)
 _base.register_source_extractor(_hicache_state_source)
-_base.register_source_extractor(_hicache_radix_removed_pages_source)
-_base.register_source_extractor(_prefetch_progress_source)
+_base.register_source_extractor(_token_path_source)
+_base.register_source_extractor(_token_span_source)
+_base.register_source_extractor(_token_path_concat_source)
+_base.register_source_extractor(_token_span_concat_source)
+_base.register_source_extractor(_node_token_path_source)
+_base.register_source_extractor(_node_token_span_source)
+_base.register_source_extractor(_node_token_count_source)
+_base.register_source_extractor(_node_token_path_concat_source)
+_base.register_source_extractor(_node_token_span_concat_source)
+_base.register_source_extractor(_hicache_cache_scope_source)
+_base.register_source_extractor(_hicache_seq_source)
+_base.register_source_extractor(_hicache_config_source)
+_base.register_source_extractor(_hicache_requested_pages_source)
 
 install = _base.install
 TARGET_MODULES = _base.TARGET_MODULES

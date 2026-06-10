@@ -113,9 +113,9 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     python_probe_files = _existing_paths(sidecar.get("python_probe_files", []))
     events = _load_python_probe_events(python_probe_files)
     unknown_targets: dict[str, TargetQuality] = {}
-    page_identity = Counter()
+    configured_mechanisms = _configured_mechanisms(configured_targets)
     mechanism_counts = Counter()
-    page_identity_required = Counter()
+    invariant_accumulator = _new_hicache_invariant_accumulator()
     capacity_accumulator = _new_hicache_capacity_accumulator()
     for event in events:
         raw_args = event.get("args")
@@ -124,9 +124,8 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         _observe_hicache_capacity(capacity_accumulator, raw_args)
         if _false_like(raw_args.get("model_input")):
             continue
-        _observe_page_identity(page_identity, raw_args)
         _observe_mechanism(mechanism_counts, raw_args)
-        _observe_required_page_identity(page_identity_required, raw_args)
+        _observe_hicache_invariant(invariant_accumulator, raw_args)
         target_id = str(raw_args.get("target_id") or "unknown")
         quality = target_quality.get(target_id)
         if quality is None:
@@ -163,15 +162,23 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         errors.append("python_probe_exception_events")
     workload_report = _discover_workload_report(run_dir)
     expected_mechanisms = _expected_mechanisms_from_workload(workload_report)
+    expected_configured_mechanisms = sorted(set(expected_mechanisms) & set(configured_mechanisms))
     missing_mechanisms = sorted(
         mechanism
-        for mechanism in expected_mechanisms
+        for mechanism in expected_configured_mechanisms
         if mechanism_counts.get(mechanism, 0) <= 0
     )
     if missing_mechanisms:
         errors.append("expected_hicache_mechanisms_missing")
-    if page_identity_required["required_events_missing_page_identity"] > 0:
-        errors.append("stateful_hicache_page_identity_missing")
+    invariant_coverage = _finalize_hicache_invariant(invariant_accumulator)
+    if invariant_coverage["missing_required_fact_events"] > 0:
+        errors.append("hicache_invariant_facts_missing")
+    if invariant_coverage["route_error_events"] > 0:
+        errors.append("hicache_invariant_route_invalid")
+    if invariant_coverage["missing_token_dictionary_refs"] or invariant_coverage["dictionary_ids_without_tokens"]:
+        errors.append("hicache_token_dictionary_missing")
+    if invariant_coverage["seq_order_error_count"] > 0:
+        errors.append("hicache_invariant_seq_invalid")
     if hicache_state_trace_enabled and capacity_accumulator["snapshot_count"] <= 0:
         errors.append("hicache_capacity_snapshot_missing")
 
@@ -195,22 +202,11 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         "missing_targets": missing_targets,
         "targets_with_missing_required_fields": targets_with_missing_fields,
         "exception_targets": exception_targets,
-        "page_identity_coverage": {
-            "hicache_end_events": page_identity["hicache_end_events"],
-            "hicache_end_events_with_page_identity": page_identity["hicache_end_events_with_page_identity"],
-            "operation_end_events": page_identity["operation_end_events"],
-            "operation_end_events_with_page_identity": page_identity["operation_end_events_with_page_identity"],
-            "count_only_operation_events": page_identity["operation_end_events"]
-            - page_identity["operation_end_events_with_page_identity"],
-            "stateful_required_events": page_identity_required["required_events"],
-            "stateful_required_events_with_page_identity": page_identity_required["required_events_with_page_identity"],
-            "stateful_required_events_missing_page_identity": page_identity_required[
-                "required_events_missing_page_identity"
-            ],
-            "stateful_page_identity_ready": page_identity_required["required_events_missing_page_identity"] == 0,
-        },
+        "hicache_invariant_coverage": invariant_coverage,
         "workload_report": str(workload_report) if workload_report else None,
         "expected_cache_mechanisms": expected_mechanisms,
+        "configured_cache_mechanisms": configured_mechanisms,
+        "expected_configured_cache_mechanisms": expected_configured_mechanisms,
         "observed_cache_mechanisms": dict(sorted(mechanism_counts.items())),
         "missing_cache_mechanisms": missing_mechanisms,
         "hicache_state_trace_enabled": hicache_state_trace_enabled,
@@ -336,77 +332,111 @@ def _load_python_probe_events(paths: list[Path]) -> list[dict[str, Any]]:
     return events
 
 
-_NON_OPERATION_ROLES = {
-    "",
-    "lookup",
-    "prefetch_decision",
-    "prefetch_progress",
-    "prefetch_loaded_tokens",
-    "l3_hit_query",
-    "evict_summary",
-}
-
-
 _ROLE_TO_MECHANISM = {
-    "lookup": "lookup",
-    "prefetch_decision": "prefetch_decision",
-    "prefetch_schedule": "prefetch_schedule",
-    "prefetch_progress": "prefetch_progress",
-    "prefetch_loaded_tokens": "prefetch_progress",
-    "init_load_back": "load_back",
-    "load_back": "load_back",
-    "insert": "insert",
-    "write_backup": "write_backup",
-    "write_storage_schedule": "write_storage",
-    "evict": "evict",
-    "remove_page": "evict",
-    "lock_ref_inc": "lock_ref",
-    "lock_ref_dec": "lock_ref",
-    "l2_to_l1_enqueue": "load_back",
-    "l2_to_l1_start": "load_back",
-    "l1_to_l2_enqueue": "write_backup",
-    "l1_to_l2_start": "write_backup",
-    "l3_prefetch_enqueue": "prefetch_schedule",
-    "l3_hit_query": "prefetch_query",
-    "l3_to_l2_transfer": "prefetch_transfer",
-    "l2_to_l3_enqueue": "write_storage",
-    "l2_to_l3_transfer": "write_storage",
+    "request_tokens": "lookup",
+    "lookup_path": "lookup",
+    "insert_path": "insert",
+    "prefetch_intent": "prefetch_schedule",
+    "prefetch_check_point": "prefetch_progress",
+    "capacity_request": "evict",
+    "lock_scope_delta": "lock_ref",
+    "prefetch_io_observed": "prefetch_transfer",
+    "writeback_io_observed": "write_storage",
+    "writeback_enqueue_observed": "write_storage",
 }
 
 
-_PAGE_IDENTITY_REQUIRED_ROLES = {
-    "insert",
-    "prefetch_schedule",
-    "l3_prefetch_enqueue",
-    "l3_to_l2_transfer",
-    "load_back",
-    "write_backup",
-    "write_storage_schedule",
-    "l2_to_l3_enqueue",
-    "l2_to_l3_transfer",
-    "evict",
-    "remove_page",
-    "lock_ref_inc",
-    "lock_ref_dec",
+_INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
+    "request_tokens": (
+        "request_id",
+        "cache_scope",
+        "seq_no",
+        "token_dictionary",
+        "full_path_span",
+        "token_count",
+    ),
+    "lookup_path": (
+        "request_id",
+        "cache_scope",
+        "seq_no",
+        "token_dictionary",
+        "full_path_span",
+    ),
+    "insert_path": (
+        "cache_scope",
+        "seq_no",
+        "token_dictionary",
+        "full_path_span",
+        "value_token_count",
+        "prefix_len",
+    ),
+    "prefetch_intent": (
+        "request_id",
+        "cache_scope",
+        "seq_no",
+        "prefix_token_dictionary",
+        "suffix_token_dictionary",
+        "prefix_span",
+        "suffix_span",
+        "policy_params",
+    ),
+    "prefetch_check_point": (
+        "request_id",
+        "cache_scope",
+        "seq_no",
+        "check_kind",
+    ),
+    "capacity_request": (
+        "cache_scope",
+        "seq_no",
+        "requested_tokens",
+        "requested_pages_source",
+        "reason",
+        "tier",
+        "policy_params",
+    ),
+    "lock_scope_delta": (
+        "cache_scope",
+        "seq_no",
+        "node_token_dictionary",
+        "logical_path_span",
+        "delta",
+        "lock_direction",
+    ),
+    "cache_config_observed": (
+        "cache_scope",
+        "seq_no",
+        "source_page_size",
+        "write_policy",
+        "prefetch_policy",
+        "thresholds",
+        "capacity_summary",
+    ),
 }
 
+_INVARIANT_EITHER_FIELDS_BY_ROLE = {
+    "lookup_path": (("matched_span", "matched_token_len"),),
+}
 
-def _observe_page_identity(counter: Counter[str], args: dict[str, Any]) -> None:
-    """统计 HiCache 事件中 page identity 的覆盖情况。"""
+_INVARIANT_DICTIONARY_FIELDS_BY_ROLE = {
+    "request_tokens": ("token_dictionary",),
+    "lookup_path": ("token_dictionary", "matched_token_dictionary"),
+    "insert_path": ("token_dictionary", "inserted_token_dictionary"),
+    "prefetch_intent": (
+        "prefix_token_dictionary",
+        "suffix_token_dictionary",
+        "full_token_dictionary",
+    ),
+    "lock_scope_delta": ("node_token_dictionary",),
+}
 
-    if args.get("phase") != "end":
-        return
-    event_role = str(args.get("event_role") or "")
-    target_id = str(args.get("target_id") or "")
-    if not event_role and not target_id.startswith(("hiradix.", "controller.", "scheduler.")):
-        return
-    counter["hicache_end_events"] += 1
-    if _has_page_identity(args):
-        counter["hicache_end_events_with_page_identity"] += 1
-    if event_role not in _NON_OPERATION_ROLES:
-        counter["operation_end_events"] += 1
-        if _has_page_identity(args):
-            counter["operation_end_events_with_page_identity"] += 1
+_INVARIANT_SPAN_FIELDS_BY_ROLE = {
+    "request_tokens": ("full_path_span",),
+    "lookup_path": ("full_path_span", "matched_span"),
+    "insert_path": ("full_path_span", "inserted_span"),
+    "prefetch_intent": ("prefix_span", "suffix_span", "full_path_span"),
+    "lock_scope_delta": ("logical_path_span",),
+}
 
 
 def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
@@ -418,49 +448,221 @@ def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
         counter[mechanism] += 1
 
 
-def _observe_required_page_identity(counter: Counter[str], args: dict[str, Any]) -> None:
-    """只对会改变 cache resident/dirty/backuped 的事件执行严格 page 检查。
+def _configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list[str]:
+    mechanisms: set[str] = set()
+    for target in configured_targets.values():
+        role = _configured_const_field(target, "event_role")
+        mechanism = _ROLE_TO_MECHANISM.get(role)
+        if mechanism:
+            mechanisms.add(mechanism)
+    return sorted(mechanisms)
 
-    controller start/enqueue 这类队列锚点可以是 count-only；真正状态转移必须有
-    page identity，否则 HiCache 状态验证不能通过。
-    """
 
+def _configured_const_field(target: dict[str, Any], name: str) -> str:
+    fields = target.get("fields") if isinstance(target.get("fields"), list) else []
+    for field in fields:
+        if not isinstance(field, dict) or field.get("name") != name:
+            continue
+        source = str(field.get("source") or "")
+        if source.startswith("const:"):
+            return source.split(":", 1)[1]
+    return ""
+
+
+def _new_hicache_invariant_accumulator() -> dict[str, Any]:
+    return {
+        "counts": Counter(),
+        "role_end_events": Counter(),
+        "missing_fields": Counter(),
+        "missing_fields_by_role": defaultdict(Counter),
+        "dictionary_ids": set(),
+        "dictionary_ids_with_tokens": set(),
+        "span_path_ids": set(),
+        "seq_by_scope": defaultdict(list),
+    }
+
+
+def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    if not _is_hicache_profile_event(args):
+        return
+    _observe_token_references(accumulator, args)
+    fact_class = str(args.get("fact_class") or "")
+    state_model_input = not _false_like(args.get("state_model_input"))
+    dag_input = not _false_like(args.get("dag_input"))
+    if state_model_input and fact_class != "invariant_state":
+        accumulator["counts"]["state_model_non_invariant_events"] += 1
+    if fact_class != "invariant_state":
+        return
+
+    accumulator["counts"]["invariant_events"] += 1
+    route_error = False
+    if not state_model_input:
+        accumulator["counts"]["invariant_without_state_model_input"] += 1
+        route_error = True
+    if dag_input:
+        accumulator["counts"]["invariant_with_dag_input"] += 1
+        route_error = True
+    if route_error:
+        accumulator["counts"]["route_error_events"] += 1
+
+    role = str(args.get("event_role") or "")
+    if role not in _INVARIANT_REQUIRED_FIELDS_BY_ROLE:
+        accumulator["counts"]["unknown_invariant_role_events"] += 1
+        if args.get("phase") == "end":
+            accumulator["counts"]["missing_required_fact_events"] += 1
+            accumulator["missing_fields"]["event_role"] += 1
+        return
     if args.get("phase") != "end":
         return
-    event_role = str(args.get("event_role") or "")
-    if event_role not in _PAGE_IDENTITY_REQUIRED_ROLES:
-        return
-    if event_role == "insert" and _int_arg(args, "insert_tokens") == 0 and _int_arg(args, "value_tokens") == 0:
-        return
-    if event_role in {"prefetch_schedule", "l3_prefetch_enqueue"} and _int_arg(args, "new_input_tokens") < max(1, _int_arg(args, "page_size")):
-        return
-    if event_role in {"lock_ref_inc", "lock_ref_dec"} and not _has_page_identity(args) and _int_arg(args, "lock_delta") == 0:
-        return
-    counter["required_events"] += 1
-    if _has_page_identity(args):
-        counter["required_events_with_page_identity"] += 1
-    else:
-        counter["required_events_missing_page_identity"] += 1
+
+    accumulator["counts"]["required_events"] += 1
+    accumulator["role_end_events"][role] += 1
+    missing = _missing_invariant_fields(args, role)
+    if missing:
+        accumulator["counts"]["missing_required_fact_events"] += 1
+        for field in missing:
+            accumulator["missing_fields"][field] += 1
+            accumulator["missing_fields_by_role"][role][field] += 1
+
+    scope = args.get("cache_scope")
+    seq_no = _int_or_none(args.get("seq_no"))
+    if _has_fact(scope) and seq_no is not None:
+        accumulator["seq_by_scope"][str(scope)].append(seq_no)
 
 
-def _has_page_identity(args: dict[str, Any]) -> bool:
-    value = args.get("page_identity")
+def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    for value in args.values():
+        if not isinstance(value, dict):
+            continue
+        token_path_id = value.get("token_path_id")
+        if isinstance(token_path_id, str) and token_path_id:
+            accumulator["dictionary_ids"].add(token_path_id)
+            if isinstance(value.get("token_ids"), list) and value.get("token_ids"):
+                accumulator["dictionary_ids_with_tokens"].add(token_path_id)
+        path_id = value.get("path_id")
+        if isinstance(path_id, str) and path_id:
+            accumulator["span_path_ids"].add(path_id)
+
+
+def _missing_invariant_fields(args: dict[str, Any], role: str) -> list[str]:
+    missing = [
+        field
+        for field in _INVARIANT_REQUIRED_FIELDS_BY_ROLE.get(role, ())
+        if not _has_fact(args.get(field))
+    ]
+    for choices in _INVARIANT_EITHER_FIELDS_BY_ROLE.get(role, ()):
+        if not any(_has_fact(args.get(field)) for field in choices):
+            missing.append("|".join(choices))
+
+    for field in _INVARIANT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
+        value = args.get(field)
+        if value is not None and not _has_token_dictionary(value):
+            missing.append(f"{field}.token_path_id")
+    for field in _INVARIANT_SPAN_FIELDS_BY_ROLE.get(role, ()):
+        value = args.get(field)
+        if value is not None and not _has_token_span(value):
+            missing.append(f"{field}.path_id")
+    return missing
+
+
+def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
+    counts: Counter[str] = accumulator["counts"]
+    missing_token_dictionary_refs = sorted(accumulator["span_path_ids"] - accumulator["dictionary_ids"])
+    dictionary_ids_without_tokens = sorted(accumulator["dictionary_ids"] - accumulator["dictionary_ids_with_tokens"])
+    seq_order_error_count = 0
+    for seq_values in accumulator["seq_by_scope"].values():
+        previous = None
+        for value in seq_values:
+            if previous is not None and value <= previous:
+                seq_order_error_count += 1
+            previous = value
+    return {
+        "invariant_events": counts["invariant_events"],
+        "required_events": counts["required_events"],
+        "role_end_events": dict(sorted(accumulator["role_end_events"].items())),
+        "missing_required_fact_events": counts["missing_required_fact_events"],
+        "missing_fields": dict(sorted(accumulator["missing_fields"].items())),
+        "missing_fields_by_role": {
+            role: dict(sorted(counter.items()))
+            for role, counter in sorted(accumulator["missing_fields_by_role"].items())
+        },
+        "route_error_events": counts["route_error_events"]
+        + counts["state_model_non_invariant_events"]
+        + counts["unknown_invariant_role_events"],
+        "state_model_non_invariant_events": counts["state_model_non_invariant_events"],
+        "invariant_without_state_model_input": counts["invariant_without_state_model_input"],
+        "invariant_with_dag_input": counts["invariant_with_dag_input"],
+        "unknown_invariant_role_events": counts["unknown_invariant_role_events"],
+        "token_dictionary_paths": len(accumulator["dictionary_ids"]),
+        "token_dictionary_paths_with_token_ids": len(accumulator["dictionary_ids_with_tokens"]),
+        "token_span_refs": len(accumulator["span_path_ids"]),
+        "missing_token_dictionary_refs": missing_token_dictionary_refs,
+        "dictionary_ids_without_tokens": dictionary_ids_without_tokens,
+        "seq_scope_count": len(accumulator["seq_by_scope"]),
+        "seq_order_error_count": seq_order_error_count,
+        "ready": counts["missing_required_fact_events"] == 0
+        and counts["route_error_events"] == 0
+        and counts["state_model_non_invariant_events"] == 0
+        and counts["unknown_invariant_role_events"] == 0
+        and not missing_token_dictionary_refs
+        and not dictionary_ids_without_tokens
+        and seq_order_error_count == 0,
+    }
+
+
+def _has_fact(value: Any) -> bool:
     if value is None:
         return False
-    if isinstance(value, list):
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
     return True
 
 
+def _has_token_dictionary(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        isinstance(value.get("token_path_id"), str)
+        and bool(value.get("token_path_id"))
+        and _has_fact(value.get("token_count"))
+        and _has_fact(value.get("hash_algo"))
+    )
+
+
+def _has_token_span(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    return (
+        isinstance(value.get("path_id"), str)
+        and bool(value.get("path_id"))
+        and _has_fact(value.get("begin"))
+        and _has_fact(value.get("end"))
+        and _has_fact(value.get("token_count"))
+        and _has_fact(value.get("hash_algo"))
+    )
+
+
+def _int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_hicache_profile_event(args: dict[str, Any]) -> bool:
+    target_id = str(args.get("target_id") or "").lower()
+    event_role = str(args.get("event_role") or "")
+    if target_id.startswith(("hiradix.", "hicache.", "hicache_controller.")):
+        return True
+    return event_role in _ROLE_TO_MECHANISM or event_role in _INVARIANT_REQUIRED_FIELDS_BY_ROLE
+
+
 def _false_like(value: Any) -> bool:
     return str(value).lower() in {"false", "0", "no", "off"}
-
-
-def _int_arg(args: dict[str, Any], key: str) -> int:
-    try:
-        return int(args.get(key) or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _new_hicache_capacity_accumulator() -> dict[str, Any]:

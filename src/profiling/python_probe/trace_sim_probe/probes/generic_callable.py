@@ -48,6 +48,7 @@ class ExtractedField:
     value: Any
     model_input: bool = True
     event_kind: str = ""
+    extra_args: dict[str, Any] | None = None
 
 
 _TARGETS = None
@@ -90,8 +91,15 @@ def _load_targets() -> list[TargetSpec]:
 
 
 def install(module: ModuleType) -> None:
+    targets_by_qualname: dict[str, list[TargetSpec]] = {}
     for target in _load_targets():
-        if module.__name__ != target.module_name or target.id in _PATCHED:
+        if module.__name__ == target.module_name:
+            targets_by_qualname.setdefault(target.qualname, []).append(target)
+
+    for targets in targets_by_qualname.values():
+        target = targets[0]
+        patch_key = f"{target.module_name}:{target.qualname}"
+        if patch_key in _PATCHED:
             continue
         resolved = _resolve_target(module, target)
         if resolved is None:
@@ -99,12 +107,13 @@ def install(module: ModuleType) -> None:
         owner, attr_name, original = resolved
         if original is None or getattr(original, PATCH_MARKER, False) or not callable(original):
             continue
-        wrapped = _wrap_callable(target, original)
+        wrapped = _wrap_callable(tuple(targets), original)
         setattr(wrapped, PATCH_MARKER, True)
         setattr(owner, attr_name, wrapped)
-        _PATCHED.add(target.id)
+        _PATCHED.add(patch_key)
         if probe_debug_enabled():
-            print(f"[trace_sim_probe] patched {target.target}", file=sys.stderr)
+            target_ids = ",".join(item.id for item in targets)
+            print(f"[trace_sim_probe] patched {target.target} targets={target_ids}", file=sys.stderr)
 
 
 def _parse_target(raw: dict[str, Any]) -> TargetSpec | None:
@@ -186,20 +195,20 @@ def _parse_field(raw: Any) -> FieldSpec | None:
     return None
 
 
-def _wrap_callable(target: TargetSpec, fn: Callable[..., Any]) -> Callable[..., Any]:
+def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
     if inspect.iscoroutinefunction(fn):
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             started = get_writer().now_us()
-            _emit(target, fn, args, kwargs, None, "start", started, started)
+            _emit_targets(targets, fn, args, kwargs, None, "start", started, started)
             try:
                 result = await fn(*args, **kwargs)
             except BaseException:
                 ended = get_writer().now_us()
-                _emit(target, fn, args, kwargs, None, "exception", started, ended)
+                _emit_targets(targets, fn, args, kwargs, None, "exception", started, ended)
                 raise
             ended = get_writer().now_us()
-            _emit(target, fn, args, kwargs, result, "end", started, ended)
+            _emit_targets(targets, fn, args, kwargs, result, "end", started, ended)
             return result
 
         return async_wrapped
@@ -207,18 +216,32 @@ def _wrap_callable(target: TargetSpec, fn: Callable[..., Any]) -> Callable[..., 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         started = get_writer().now_us()
-        _emit(target, fn, args, kwargs, None, "start", started, started)
+        _emit_targets(targets, fn, args, kwargs, None, "start", started, started)
         try:
             result = fn(*args, **kwargs)
         except BaseException:
             ended = get_writer().now_us()
-            _emit(target, fn, args, kwargs, None, "exception", started, ended)
+            _emit_targets(targets, fn, args, kwargs, None, "exception", started, ended)
             raise
         ended = get_writer().now_us()
-        _emit(target, fn, args, kwargs, result, "end", started, ended)
+        _emit_targets(targets, fn, args, kwargs, result, "end", started, ended)
         return result
 
     return wrapped
+
+
+def _emit_targets(
+    targets: tuple[TargetSpec, ...],
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+    phase: str,
+    start_us: int,
+    end_us: int,
+) -> None:
+    for target in targets:
+        _emit(target, fn, args, kwargs, result, phase, start_us, end_us)
 
 
 def _emit(
@@ -299,8 +322,12 @@ def _collect_fields(
         if found:
             if isinstance(value, ExtractedField):
                 if value.model_input:
+                    if value.extra_args:
+                        fields.update(value.extra_args)
                     fields[field.name] = value.value
                 else:
+                    if value.extra_args:
+                        validation_fields.update(value.extra_args)
                     validation_fields[field.name] = value.value
                     if value.event_kind:
                         validation_fields.setdefault("_event_kind", value.event_kind)

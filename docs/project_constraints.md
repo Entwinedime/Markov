@@ -18,9 +18,11 @@
 - work progress 文档只做时间戳增量更新；
 - constraints 文档记录项目长期约束，更新时删改。
 
-`docs/validation/` 用于纳入 git 追踪的专项验证记录；当前只维护
-`docs/validation/hicache_state_validation.md`，记录 HiCache state validation 的长期结论、稳定验证编号、
-内联摘要、复现入口和后续计划。专项验证文档不能依赖本地 `data/` 目录长期存在；真实 run 只能作为
+`docs/validation/` 用于纳入 git 追踪的专项验证记录；当前维护 HiCache state validation 的三个文件：
+`docs/validation/hicache_state_validation.md` 是 active 文档，只记录当前有效规则、约束、主线和后续新结果；
+`docs/validation/hicache_state_model_defects.md` 是当前 state model 缺陷清单，只记录仍需要修复或验证的机制缺口；
+`docs/validation/hicache_state_validation_legacy.md` 是历史只读结论文档，只保存旧批次和旧口径结果。
+专项验证文档不能依赖本地 `data/` 目录长期存在；真实 run 只能作为
 临时实验批次，长期证据必须抽取成配置、commit、命令、关键指标和结论。新增专项验证文档前必须先确认它不是
 profiling / modeling / work progress / constraints 四个顶级主文档能够承载的内容。
 
@@ -45,11 +47,26 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 
 - Profiling 只采事实，不做建模推断。
 - Probe 不决定 policy。
-- Probe 不做 observed replay。
+- Probe 不做 trace graph replay 或 target 行为生成。
 - Probe 不生成 target 行为。
 - Debug 字段不能成为默认模型输入。
 - 缺关键事实时应明确暴露缺口，不能用默认值掩盖。
 - 实验配置描述采集和运行，不嵌入 modeling 预测逻辑。
+- 手动连续运行并归档多组 profiling 时，应优先使用 suite config：同一个 suite 固定一套 `profiling`
+  采集配置，实验差异只能来自 `matrix.servers[]` / `matrix.inputs[]` 或显式 `experiments[]`
+  指向的 server/input 组合。
+- suite 内的 `matrix.servers[]`、`matrix.inputs[]` 和 `experiments[]` 不允许覆盖或 unset
+  `profiling`；需要改变采集渠道、probe target、torch profiler 或 LD_PRELOAD 行为时，必须新建
+  另一个 suite config。
+- suite experiment 必须有稳定 `id`，手动运行前应先用 `scripts/profile.sh <config> --list-experiments`
+  查看展开结果，再用 `--experiment` 或 `--experiments` 选择本次要跑的实验集合。归档时保留
+  `suite_config.json`、`suite_selection.json` 和 `suite_result.json` 的摘要信息。
+- HiCache state mainline-one profiling 只保留
+  `configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 作为
+  归档入口；不得恢复 S1A/S1B × manual/bench 的四个单实验配置。
+- page-size what-if 的 `target_page_identity_page<page_size>` 是有限目标 page size 矩阵的过渡字段；
+  新增任意 page size 的长期方案应优先设计 size-independent token path digest / range hash，而不是无限增加
+  预声明 target page size 字段。
 - `python_probe` 只由 `profiling.python_probe` 控制。
 - `ld_preload` 只由 `profiling.ld_preload` 配置控制是否注入和输出到哪里；不读取旧顶层 `hook` / `native` 兼容入口；具体 wrapper 由 C++ 硬编码实现决定。
 - `profiling.channels` 只接受 `torch`、`python_probe`、`ld_preload`，不接受 `python`、`hook`、`native` 等旧短名。
@@ -72,9 +89,20 @@ active 源码子目录也不维护独立开发文档。模块说明、设计说�
 - 子模块修改 DAG 应通过统一 mutation API 记录修改。
 - 默认 E2E 预测来自 DAG 拓扑仿真，不来自子模块 latency 求和。
 - 默认 DAG 拓扑仿真不使用原始绝对时间戳兜底，faithful replay 必须能暴露缺失依赖边。
-- 同配置 replay 和跨配置 prediction 必须使用不同配置口径：replay 使用 observed replay config 验证真实 trace 能否重放；
-  prediction 才使用显式 target page size / capacity / write policy / prefetch policy 做 what-if。不得把 prediction target config
-  直接当作同配置 replay config，否则 observed remove/evict 等事实可能被错误地当成 non-invariant 跳过。
+- `replay` 是保留术语，只能表示 `mode=faithful_replay`：不加载任何子模块、不执行 DAG patch，只用完整真实 merged trace
+  构建并拓扑重放 base trace graph。
+- HiCache state 不再使用带 source 行为答案的重放口径；文档、配置和输出命名都应使用
+  `self-config prediction` 或 `cross-config prediction`。
+- HiCache state model 在任何场景下都只能消费不变量事实和显式 target config。真实 target trace、state snapshot、
+  source movement、oracle-only transient、debug 字段和 policy 结果只能用于 validation / debug，不能作为模型输入。
+- HiCache state 显式 `write_policy=observed`、`prefetch_policy=observed` 或
+  `storage_prefetch_policy=observed` 都是非法配置，不能作为旧配置兼容入口。
+- HiCache state validation 必须暴露模型实际消费的非法非不变量事实；正常情况下
+  `non_invariant_fact_usage` 必须为空。只要它非空，`invariant_coverage_ready` 必须为 `false`，不能仅凭
+  `final_state_match=true` 宣称 prediction 通过。`skipped_non_invariant_events` 只是诊断计数，不表示模型消费了这些事件。
+- `self-config prediction` 指 base profiling facts 与 target config 来自同一个场景，但仍必须走显式 target page size /
+  capacity / write policy / prefetch policy；不得省略 target config，也不得回落到 source 行为答案。
+- `cross-config prediction` 指 base profiling facts 加另一个显式 target config；validation oracle 只能用于对比 predicted state。
 - 子模块不能修改原始 profiling trace；三类 trace 的合并只能由 `scripts/trace/trace_merger.py` 生成新的 merged trace。
 - 子模块不能把 debug 字段混入默认预测输出。
 - 非执行类 state snapshot、oracle state、probe 内部 debug 和质量审计事件不能作为默认性能 DAG 节点；必须放在独立 debug/state trace，或显式标记为 `model_input=false` 并只由 validation/debug 路径消费。

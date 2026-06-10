@@ -1,0 +1,1112 @@
+{
+  "name": "profiling_hicache_state_mainline_one_matrix",
+  "framework": "sglang",
+  "metadata": {
+    "purpose": "Mainline-one HiCache state profiling suite with two server scenarios and two input workloads.",
+    "manual_run_note": "Use --list-experiments first, then select one or more ids with --experiment or --experiments for manual profiling and archival.",
+    "shared_profiling_note": "HiCache collection follows the token/range invariant contract: default state inputs are classified by fact_class, use token dictionary/span facts, and keep source movement as timing/source_actual observations outside state_model_input.",
+    "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+    "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe."
+  },
+  "profiling": {
+    "enabled": true,
+    "channels": [
+      "python_probe"
+    ],
+    "debug": false,
+    "torch": {
+      "enabled": false,
+      "output_dir": "trace/torch",
+      "with_stack": false,
+      "record_shapes": false
+    },
+    "python_probe": {
+      "probes": [
+        "sglang.hicache"
+      ],
+      "state_trace": {
+        "enabled": true
+      },
+      "targets": [
+        {
+          "id": "hiradix.request_tokens",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": [
+            "hicache_request_tokens_start",
+            "hicache_request_tokens_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_tokens"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:params.key,self"
+            },
+            {
+              "name": "full_path_span",
+              "source": "token_span:arg:params.key"
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:params.key"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lookup_path",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": [
+            "hicache_lookup_path_start",
+            "hicache_lookup_path_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lookup_path"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:params.key,self"
+            },
+            {
+              "name": "full_path_span",
+              "source": "token_span:arg:params.key"
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:params.key"
+            },
+            {
+              "name": "matched_token_dictionary",
+              "source": "node_token_path:return.best_match_node,self",
+              "required": false
+            },
+            {
+              "name": "matched_span",
+              "source": "node_token_span:return.best_match_node",
+              "required": false
+            },
+            {
+              "name": "matched_token_len",
+              "source": "node_token_count:return.best_match_node",
+              "required": false
+            },
+            {
+              "name": "device_hit_tokens",
+              "source": "len:return.device_indices",
+              "required": false
+            },
+            {
+              "name": "host_hit_length",
+              "source": "return.host_hit_length",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_config_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": [
+            "hicache_cache_config_observed_start",
+            "hicache_cache_config_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:cache_config_observed"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "write_policy",
+              "source": "hicache_config:self,write_policy"
+            },
+            {
+              "name": "prefetch_policy",
+              "source": "hicache_config:self,prefetch_policy"
+            },
+            {
+              "name": "thresholds",
+              "source": "hicache_config:self,thresholds"
+            },
+            {
+              "name": "capacity_summary",
+              "source": "hicache_config:self,capacity_summary"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.insert_path",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.insert",
+          "events": [
+            "hicache_insert_path_start",
+            "hicache_insert_path_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:insert_path"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:params.key,self"
+            },
+            {
+              "name": "full_path_span",
+              "source": "token_span:arg:params.key"
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:params.key"
+            },
+            {
+              "name": "insert_tokens",
+              "source": "len:arg:params.key",
+              "required": false
+            },
+            {
+              "name": "value_token_count",
+              "source": "len:arg:params.value",
+              "required": false
+            },
+            {
+              "name": "prefix_len",
+              "source": "return.prefix_len",
+              "required": false
+            },
+            {
+              "name": "inserted_token_dictionary",
+              "source": "node_token_path:return.inserted_host_node,self",
+              "required": false
+            },
+            {
+              "name": "inserted_span",
+              "source": "node_token_span:return.inserted_host_node",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.prefetch_intent",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.prefetch_from_storage",
+          "events": [
+            "hicache_prefetch_intent_start",
+            "hicache_prefetch_intent_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_intent"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req_id"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "prefix_token_dictionary",
+              "source": "node_token_path:arg:last_host_node,self"
+            },
+            {
+              "name": "suffix_token_dictionary",
+              "source": "token_path:arg:new_input_tokens,self"
+            },
+            {
+              "name": "full_token_dictionary",
+              "source": "node_token_path_concat:arg:last_host_node,arg:new_input_tokens,self"
+            },
+            {
+              "name": "prefix_span",
+              "source": "node_token_span:arg:last_host_node"
+            },
+            {
+              "name": "suffix_span",
+              "source": "token_span:arg:new_input_tokens"
+            },
+            {
+              "name": "full_path_span",
+              "source": "node_token_span_concat:arg:last_host_node,arg:new_input_tokens"
+            },
+            {
+              "name": "new_input_tokens",
+              "source": "len:arg:new_input_tokens"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            },
+            {
+              "name": "prefetch_policy",
+              "source": "self.prefetch_stop_policy",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.prefetch_check_point",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.check_prefetch_progress",
+          "events": [
+            "hicache_prefetch_check_point_start",
+            "hicache_prefetch_check_point_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_check_point"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req_id"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "check_kind",
+              "source": "const:progress"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.capacity_request",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.evict",
+          "events": [
+            "hicache_capacity_request_start",
+            "hicache_capacity_request_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:capacity_request"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "requested_tokens",
+              "source": "arg:params.num_tokens"
+            },
+            {
+              "name": "requested_pages_source",
+              "source": "hicache_requested_pages:arg:params.num_tokens,self"
+            },
+            {
+              "name": "reason",
+              "source": "const:capacity"
+            },
+            {
+              "name": "tier",
+              "source": "const:L1"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lock_scope_inc",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.inc_lock_ref",
+          "events": [
+            "hicache_lock_scope_inc_start",
+            "hicache_lock_scope_inc_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lock_scope_delta"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "node_token_dictionary",
+              "source": "node_token_path:arg:node,self"
+            },
+            {
+              "name": "logical_path_span",
+              "source": "node_token_span:arg:node"
+            },
+            {
+              "name": "delta",
+              "source": "return.delta",
+              "required": false
+            },
+            {
+              "name": "lock_direction",
+              "source": "const:inc"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lock_scope_dec",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.dec_lock_ref",
+          "events": [
+            "hicache_lock_scope_dec_start",
+            "hicache_lock_scope_dec_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lock_scope_delta"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "node_token_dictionary",
+              "source": "node_token_path:arg:node,self"
+            },
+            {
+              "name": "logical_path_span",
+              "source": "node_token_span:arg:node"
+            },
+            {
+              "name": "delta",
+              "source": "return.delta",
+              "required": false
+            },
+            {
+              "name": "lock_direction",
+              "source": "const:dec"
+            }
+          ]
+        },
+        {
+          "id": "hicache_controller.prefetch_io_observed",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController._page_transfer",
+          "events": [
+            "hicache_prefetch_io_observed_start",
+            "hicache_prefetch_io_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:timing_observation"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_io_observed"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:operation.request_id",
+              "required": false
+            },
+            {
+              "name": "operation_id",
+              "source": "arg:operation.id",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:operation.token_ids,self",
+              "required": false
+            },
+            {
+              "name": "token_span",
+              "source": "token_span:arg:operation.token_ids",
+              "required": false
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:operation.token_ids",
+              "required": false
+            },
+            {
+              "name": "completed_tokens",
+              "source": "arg:operation.completed_tokens",
+              "required": false
+            },
+            {
+              "name": "bytes",
+              "source": "arg:operation.bytes",
+              "required": false
+            },
+            {
+              "name": "direction",
+              "source": "const:L3_to_L2"
+            }
+          ]
+        },
+        {
+          "id": "hicache_controller.writeback_io_observed",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController._page_backup",
+          "events": [
+            "hicache_writeback_io_observed_start",
+            "hicache_writeback_io_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:timing_observation"
+            },
+            {
+              "name": "event_role",
+              "source": "const:writeback_io_observed"
+            },
+            {
+              "name": "operation_id",
+              "source": "arg:operation.id",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:operation.token_ids,self",
+              "required": false
+            },
+            {
+              "name": "token_span",
+              "source": "token_span:arg:operation.token_ids",
+              "required": false
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:operation.token_ids",
+              "required": false
+            },
+            {
+              "name": "completed_tokens",
+              "source": "arg:operation.completed_tokens",
+              "required": false
+            },
+            {
+              "name": "bytes",
+              "source": "arg:operation.bytes",
+              "required": false
+            },
+            {
+              "name": "direction",
+              "source": "const:L2_to_L3"
+            }
+          ]
+        },
+        {
+          "id": "hicache_controller.writeback_enqueue_observed",
+          "module": "sglang.srt.managers.cache_controller",
+          "target": "HiCacheController.write_storage",
+          "events": [
+            "hicache_writeback_enqueue_observed_start",
+            "hicache_writeback_enqueue_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:writeback_enqueue_observed"
+            },
+            {
+              "name": "operation_id",
+              "source": "return",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "token_path:arg:token_ids,self",
+              "required": false
+            },
+            {
+              "name": "token_span",
+              "source": "token_span:arg:token_ids",
+              "required": false
+            },
+            {
+              "name": "token_count",
+              "source": "len:arg:token_ids",
+              "required": false
+            },
+            {
+              "name": "host_tokens",
+              "source": "len:arg:host_indices",
+              "required": false
+            },
+            {
+              "name": "bytes",
+              "source": "arg:bytes",
+              "required": false
+            },
+            {
+              "name": "direction",
+              "source": "const:L2_to_L3"
+            }
+          ]
+        }
+      ]
+    },
+    "ld_preload": {
+      "enabled": false,
+      "library": "build/docker/sglang/lib/libhook.so",
+      "trace_output": "trace/ld_preload/cpu_trace.json"
+    }
+  },
+  "env": {
+    "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "{run_dir}/hicache_storage"
+  },
+  "matrix": {
+    "servers": [
+      {
+        "id": "s1a",
+        "name": "S1A_baseline_large",
+        "metadata": {
+          "purpose": "Mainline-one L1 manual phased run for S1A: page128 + write-through-selective + wait_complete.",
+          "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+          "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
+          "hicache_ratio_note": "--hicache-ratio is 2.25 (>1.0) so the mainline-one joint signature is new relative to every previously profiled HiCache state config while avoiding the severe low-ratio slowdown; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
+          "mainline_one_scenario": "S1A_baseline_large",
+          "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
+          "mainline_one_config_signature": "page_size=128,l1_capacity_pages=64,l2_capacity_pages=145,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.25,prefetch_timeout_extra=8.0/0.0/8.0",
+          "mainline_one_config_comparison": "Different from C2 by prefetch policy, explicit capacity, ratio, and timeout extra config; different from C5 by write policy, explicit capacity, ratio, and timeout extra config; different from the earlier mainline-one S1A draft by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "hicache_write_policy": "write_through_selective"
+        },
+        "server": {
+          "model_path": "/models/Qwen3-32B",
+          "command": [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/models/Qwen3-32B",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--tp-size",
+            "2",
+            "--trust-remote-code",
+            "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel_ascend",
+            "--hicache-mem-layout",
+            "layer_first",
+            "--hicache-storage-backend",
+            "file",
+            "--disable-cuda-graph",
+            "--page-size",
+            "128",
+            "--max-total-tokens",
+            "8192",
+            "--hicache-ratio",
+            "2.25",
+            "--hicache-write-policy",
+            "write_through_selective",
+            "--hicache-storage-prefetch-policy",
+            "wait_complete",
+            "--hicache-storage-backend-extra-config",
+            "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":8.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":8.0,\"hicache_storage_pass_prefix_keys\":true}"
+          ],
+          "ready_url": "http://127.0.0.1:30000/get_model_info",
+          "ready_timeout_sec": 1800
+        },
+        "modeling": {
+          "hicache": {
+            "page_size": 128,
+            "l1_capacity_pages": 64,
+            "l2_capacity_pages": 145,
+            "write_policy": "write_through_selective",
+            "prefetch_policy": "wait_complete"
+          }
+        }
+      },
+      {
+        "id": "s1b",
+        "name": "S1B_divergent_large",
+        "metadata": {
+          "purpose": "Mainline-one L1 manual phased run for S1B: page64 + write-back + best_effort.",
+          "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+          "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
+          "hicache_ratio_note": "--hicache-ratio is 2.5 (>1.0) so the mainline-one joint signature is new relative to every previously profiled HiCache state config while avoiding the severe low-ratio slowdown; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
+          "mainline_one_scenario": "S1B_divergent_large",
+          "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
+          "mainline_one_config_signature": "page_size=64,l1_capacity_pages=128,l2_capacity_pages=321,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
+          "mainline_one_config_comparison": "Different from C3/I2 page64 by write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "hicache_write_policy": "write_back"
+        },
+        "server": {
+          "model_path": "/models/Qwen3-32B",
+          "command": [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/models/Qwen3-32B",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--tp-size",
+            "2",
+            "--trust-remote-code",
+            "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel_ascend",
+            "--hicache-mem-layout",
+            "layer_first",
+            "--hicache-storage-backend",
+            "file",
+            "--disable-cuda-graph",
+            "--page-size",
+            "64",
+            "--max-total-tokens",
+            "8192",
+            "--hicache-ratio",
+            "2.5",
+            "--hicache-write-policy",
+            "write_back",
+            "--hicache-storage-prefetch-policy",
+            "best_effort",
+            "--hicache-storage-backend-extra-config",
+            "{\"prefetch_threshold\":128,\"prefetch_timeout_base\":6.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":6.0,\"hicache_storage_pass_prefix_keys\":true}"
+          ],
+          "ready_url": "http://127.0.0.1:30000/get_model_info",
+          "ready_timeout_sec": 1800
+        },
+        "modeling": {
+          "hicache": {
+            "page_size": 64,
+            "l1_capacity_pages": 128,
+            "l2_capacity_pages": 321,
+            "write_policy": "write_back",
+            "prefetch_policy": "best_effort"
+          }
+        }
+      }
+    ],
+    "inputs": [
+      {
+        "id": "manual",
+        "name": "L1_manual_phased",
+        "metadata": {
+          "mainline_one_input": "L1_manual_phased",
+          "mainline_one_workload_scale": "L1_manual_phased uses 83 requests: larger than I2 (65) and I3 (43), with shorter prompt length than the aborted 125-request draft for repeatable profiling.",
+          "purpose": "Mainline-one L1 manual phased workload input shared by S1A/S1B; cache write policy is filled from server metadata."
+        },
+        "bench": {
+          "command": [
+            "python3",
+            "scripts/bench/hicache_phased_workload.py",
+            "--base-url",
+            "http://127.0.0.1:30000",
+            "--output-dir",
+            "{bench_dir}/hicache_phased",
+            "--warmup-requests",
+            "1",
+            "--seed-requests",
+            "8",
+            "--reuse-requests",
+            "8",
+            "--backup-wait-requests",
+            "8",
+            "--pressure-requests",
+            "24",
+            "--pressure-unique-prefix",
+            "--reuse-after-pressure-requests",
+            "8",
+            "--prefetch-seed-requests",
+            "8",
+            "--prefetch-reuse-requests",
+            "10",
+            "--dirty-eviction-requests",
+            "8",
+            "--shared-prefix-repeat",
+            "160",
+            "--unique-suffix-repeat",
+            "16",
+            "--sleep-sec",
+            "0.02",
+            "--phase-wait-sec",
+            "2.0",
+            "--max-errors",
+            "1",
+            "--max-new-tokens",
+            "8",
+            "--cache-write-policy",
+            "{metadata.hicache_write_policy}"
+          ]
+        }
+      },
+      {
+        "id": "bench",
+        "name": "L2_bench_serving_large",
+        "metadata": {
+          "mainline_one_input": "L2_bench_serving_large",
+          "purpose": "Mainline-one L2 bench_serving generated-shared-prefix workload input shared by S1A/S1B."
+        },
+        "bench": {
+          "kind": "sglang.bench_serving",
+          "args": {
+            "backend": "sglang",
+            "base_url": "http://127.0.0.1:30000",
+            "model": "/models/Qwen3-32B",
+            "tokenizer": "/models/Qwen3-32B",
+            "dataset_name": "generated-shared-prefix",
+            "num_prompts": 128,
+            "gsp_num_groups": 8,
+            "gsp_prompts_per_group": 16,
+            "gsp_system_prompt_len": 384,
+            "gsp_question_len": 96,
+            "gsp_output_len": 8,
+            "gsp_range_ratio": 0.0,
+            "gsp_fast_prepare": true,
+            "gsp_group_distribution": "zipf",
+            "gsp_zipf_alpha": 1.2,
+            "seed": 20260608,
+            "request_rate": 8,
+            "max_concurrency": 8,
+            "warmup_requests": 4,
+            "disable_tqdm": true,
+            "output_details": true
+          }
+        }
+      }
+    ]
+  }
+}

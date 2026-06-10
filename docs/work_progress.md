@@ -2,15 +2,77 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-09 22:25:56 +0800
+
+- 重构 HiCache state mainline-one profiling 配置归档方式：
+  - `configs/experiments/hicache_state/` 现在只保留
+    `profiling_hicache_state_mainline_one_matrix.json`；
+  - 删除 S1A/S1B × manual/bench 的四个单实验 profiling config，改由一个 suite matrix 展开
+    `s1a_manual`、`s1a_bench`、`s1b_manual`、`s1b_bench`；
+  - suite 内只有两个 server 维度 `s1a` / `s1b` 和两个 input 维度 `manual` / `bench`，manual input
+    通过 `{metadata.hicache_write_policy}` 引用 server 维度的 write policy；
+  - shared profiling 同时采集 `target_page_identity_page64` 和 `target_page_identity_page128`，C++ HiCache
+    state model 按目标 `page_size` 选择对应 target identity；
+  - profiling runner 的 radix removed materialization 同步输出
+    `target_radix_removed_page_identity_page<page_size>`；
+  - 文档已记录 page-size-specific target identity 只是有限矩阵过渡方案，长期应转向 size-independent
+    token path digest / range hash。
+
+## 2026-06-09 22:08:50 +0800
+
+- 完善 profiling suite 配置机制，方便后续手动运行 profiling 和归档配置：
+  - `scripts/internal/profile_runner.py` 支持 `matrix.servers[] × matrix.inputs[]` 自动展开实验，也支持
+    `experiments[].server_ref/input_ref` 显式选择归档组合；
+  - 同一个 suite 内强制共享 `profiling`，矩阵项和 experiment 不能覆盖或 unset 采集配置；
+  - runner 和 `scripts/profile.sh` 均支持 `--list-experiments`、重复 `--experiment` 和逗号形式
+    `--experiments`，便于先查看稳定实验 id，再选择一组手动运行；
+  - suite 输出会写入 `suite_config.json`、`suite_selection.json` 和 `suite_result.json`，并在展开后的
+    experiment metadata 中补充 suite/server/input id；
+  - `tests/run_profiling_fixtures.py` 新增 dry-run 矩阵 fixture，覆盖展开顺序、子集选择、归档 metadata
+    和 suite 内禁止覆盖 `profiling`。
+
+## 2026-06-09 21:31:35 +0800
+
+- 拆分 HiCache state validation 文档职责：
+  - `docs/validation/hicache_state_validation.md` 现在只维护 active 内容：当前有效规则、术语约束、建模边界、复现入口、主线和后续新结果模板；
+  - 新增 `docs/validation/hicache_state_validation_legacy.md`，只读保存 `HCSV-20260608-state-matrix`、
+    `HCSV-20260609-mainline-one-manual-l1` 历史口径摘要、早期 S1A 排查和历史关键修复；
+  - `docs/project_constraints.md` 已同步两个专项文档的职责，避免继续把旧结果和新规则堆在同一个入口。
+
+## 2026-06-09 21:00:30 +0800
+
+- 完成 HiCache profiling / state model invariant-only 审计：
+  - C++ HiCache summary 新增 `non_invariant_fact_usage_by_role` / `non_invariant_fact_usage`，Python validation
+    会在该字段非空时把 `invariant_coverage_ready` 置为 `false`；
+  - fixture 覆盖缺省 observed lock/ref、observed `l3_to_l2_transfer`、observed `write_backup` 三类旧兼容路径；
+  - 不重新 profiler，仅用现有 S1A/S1B manifest 做 modeling-only 重跑：`S1A` self-config 仍消费 lock/ref observed facts，
+    `S1B` self-config 无 non-invariant usage 但 final state 不对齐；
+  - `S1A -> S1B` 无 non-invariant usage 但 final state / timeline extra 仍失败，属于 state model 机制缺口；
+  - `S1B -> S1A` 无 non-invariant usage，除 final locked page 外对齐，仍需要更强 lock/ref oracle 或 target lock 模型；
+  - 因此 17:29 的 self-config 通过结论按当前 invariant-only 口径降级，旧 final/timeline 指标只能作为历史诊断，
+    不能单独证明 state model 已闭环。
+
+## 2026-06-09 20:29:08 +0800
+
+- 对齐 HiCache state validation 术语和入口：
+  - `replay` 只表示 `mode=faithful_replay` 的 trace graph baseline，不加载任何子模块；
+  - HiCache state 不再维护带 observed/default 行为答案的重放入口，启用 HiCacheModule 的建模一律称为
+    `self-config prediction` 或 `cross-config prediction`；
+  - HiCache state model 在任何场景下都只能消费不变量 facts 和显式 target config，target actual trace、state snapshot、
+    observed movement、oracle-only transient 和 debug 字段只能用于 validation / debug；
+  - 删除缺省 target config 的长期入口，避免继续运行缺省 target config；
+  - 更新 `docs/project_constraints.md`、`docs/validation/hicache_state_validation.md`、`docs/modeling_development.md`、
+    `docs/profiling_development.md` 和 prediction config usage，使 oracle trace 统一写成 `<target_oracle_trace.json>`。
+
 ## 2026-06-09 17:29:17 +0800
 
 - 完成 HiCache state validation 主线一 `L1_manual_phased` 的 S1A/S1B 逐 trace 对比：
   - 当前有效 run label 为 `20260609_053538_profiling_hicache_state_mainline_one_manual_s1a` 和
     `20260609_073205_profiling_hicache_state_mainline_one_manual_s1b`；
   - 两个 profile quality 均为 `quality_ready=true`，23/23 Python targets observed，stateful page identity 缺口为 `0`；
-  - 两个同配置 replay 均通过 final state validation，timeline 均为 `match=true`、`model_extra_transition_count=0`；
+  - 两个 self-config prediction 均通过 final state validation，timeline 均为 `match=true`、`model_extra_transition_count=0`；
   - `S1A -> S1B` prediction 失败，最终 diff 集中在同一组 `36` 页：模型多 dirty、少 L2、少 backuped；
-  - 逐页对齐 `S1B` 正确 replay 后确认，这 `36/36` 页真实路径都有 `hicache_write_backup_end` 产生
+  - 逐页对齐 `S1B` 正确 self-config prediction 后确认，这 `36/36` 页真实路径都有 `hicache_write_backup_end` 产生
     `add_l2_resident + mark_backuped + clear_dirty`，而跨配置 prediction 缺少等价 target write-back flush 事实；
   - `S1B -> S1A` prediction 只剩一个 final locked page 缺口，属于 page-size what-if 下 lock/ref 非不变量的验证口径问题；
   - 已更新 `docs/validation/hicache_state_validation.md`，明确主线一当前不能宣称完成，后续需补强 target write-back flush oracle
@@ -25,7 +87,7 @@
   - `tests/run_hicache_mainline_config_fixtures.py` 增加 HCSV 历史签名黑名单，覆盖当前矩阵和早期主线一草案，不只依赖仍存在的配置文件或 `data/` 目录；
   - ratio 均保持 `>1.0`，容量压力仍由 workload 和显式 capacity snapshot 承担；旧 S1A 手工 profile 只保留为排查结论，不能作为新签名的主线一验收结果；
   - 曾短暂尝试的低 ratio `1.5/1.75` 草案导致真实 profile 明显慢速，未完成 run 不纳入主线一证据；
-  - `2.25/2.5` 新签名配置已经固化，但本轮未完成的 20260609 profile 产物已清理，不能作为主线一 replay/prediction 证据。
+  - `2.25/2.5` 新签名配置已经固化，但本轮未完成的 20260609 profile 产物已清理，不能作为主线一 faithful replay / prediction 证据。
 
 ## 2026-06-09 05:58:00 +0800
 
@@ -42,23 +104,22 @@
   - profile quality 为 `quality_ready=true`、23/23 Python targets observed，stateful required page identity `2130/2130`；
   - live `hicache_radix_removed_pages:self` 在真实 SGLang 中仍未稳定产出非空字段，因此 profiling runner 收尾新增 materialization：
     只从同一次 insert start/end validation snapshot 中派生 `radix_removed_page_identity`，本 run 写入 `2` 个 insert end、合计 `26` 页；
-  - C++ HiCache state model 消费该 operation-level fact 后，observed replay 达到 `validation_ready=true`、`final_state_match=true`、
+  - C++ HiCache state model 消费该 operation-level fact 后，state validation 达到 `validation_ready=true`、`final_state_match=true`、
     timeline `match=true`、`model_extra_transition_count=0`；
   - final counts 对齐：L1 `54/54`、L2 `106/106`、backuped `106/106`、evicted `52/52`、locked `1/1`、
     prefetch planned/ready/suppressed `356/18/338`；
-  - 明确同配置 replay 使用 observed replay config，主线一 S1A/S1B prediction target config 只用于 cross-config prediction，
-    不能直接替代 replay config。
+  - 该批次现在只保留为 radix materialization 排查结果；当前入口必须使用显式 target config 的 self-config prediction。
 
 ## 2026-06-09 01:20:04 +0800
 
 - 继续推进 HiCache state validation 主线一 `S1A_baseline_large + L1_manual_phased`：
   - 真实 profile 完成，`quality_ready=true`，23/23 Python targets observed，stateful required page identity `2130/2130`；
-  - 初始 replay 仍为 `hicache_final_state_mismatch`，model 多出 13 个 L2/backuped/evicted pages；
+  - 初始 state validation 仍为 `hicache_final_state_mismatch`，model 多出 13 个 L2/backuped/evicted pages；
   - 定位原因为 insert 期间 radix leaf 消失，但第一版 `radix_removed_page_identity` 因 state snapshot 注入顺序在其后，672 个 insert start/end 字段均为空；
   - 修改 profiler 注入顺序：含 `hicache_radix_removed_pages:self` 的 target 会先采 validation-only `hicache_state:self`，再导出 model-input `radix_removed_page_identity`；
   - C++ state model 已消费 `radix_removed_page_identity`，同 page size 清理 L1/L2/dirty/backuped/evicted/locked 及辅助索引，page-size what-if 下跳过；
-  - 本地 fake radix extractor、C++ HiCache fixture、派生 enriched replay 均通过；派生 replay 达到 `validation_ready=true`、`final_state_match=true`、`model_extra_transition_count=0`；
-  - 仍需用修复后的注入顺序重新跑真实 S1A manual profile，确认原生 trace 中非空 `radix_removed_page_identity` 能直接让 replay 通过。
+  - 本地 fake radix extractor、C++ HiCache fixture、派生 enriched state validation 均通过；派生结果达到 `validation_ready=true`、`final_state_match=true`、`model_extra_transition_count=0`；
+  - 仍需用修复后的注入顺序重新跑真实 S1A manual profile，确认原生 trace 中非空 `radix_removed_page_identity` 能直接让 state prediction 通过。
 
 ## 2026-06-08 23:58:49 +0800
 
@@ -78,7 +139,7 @@
 ## 2026-06-08 21:44:46 +0800
 
 - 完成 HiCache state validation 本轮重验矩阵和主线一可执行部分：
-  - `I0`、`I1`、`I2`、`I3` 四类输入下的 replay / prediction 结果已内联到
+  - `I0`、`I1`、`I2`、`I3` 四类输入下的 self-config / cross-config prediction 结果已内联到
     `docs/validation/hicache_state_validation.md`；
   - 当前矩阵覆盖 `C0-C7`、`write_back + low capacity`、page64、capacity、prefetch wait /
     best_effort / aggressive timeout 等配置；
@@ -90,7 +151,7 @@
   - 新增等长但 target identity 重新映射的 fixture，避免后续 page64 prefetch completion 回退。
 - 将后续主线拆分：
   - `主线一`：两个强差异 HiCache 配置场景 + 两个大输入，包括手工 phased workload 和大型 bench serving；
-  - `主线二`：用户手动完成大型 profiling 矩阵，Codex 只消费 manifest 做 replay / simulation / prediction；
+  - `主线二`：用户手动完成大型 profiling 矩阵，Codex 只消费 manifest 做 faithful replay / self-config prediction / cross-config prediction；
   - 原 operation-level ordered transition oracle 主线顺延为 `主线三`。
 - 清理可再生生成数据：
   - 清理前 `data` 约 `95G`；
@@ -120,8 +181,8 @@
 
 - 在 `docs/validation/hicache_state_validation.md` 中新增“下一步工作主线”：
   - 主线一是扩大 HiCache state model 的多配置、多输入验证矩阵；
-  - 要求不同配置使用同一输入形态做 replay 和跨配置 prediction，先做 `C0 -> Cj`，再扩展组合配置；
-  - 明确配置集合、输入集合、replay / prediction 流程、验收门槛和 `HCSV-*` 记录编号方式；
+  - 要求不同配置使用同一输入形态做 self-config prediction 和跨配置 prediction，先做 `C0 -> Cj`，再扩展组合配置；
+  - 明确配置集合、输入集合、faithful replay / state prediction 流程、验收门槛和 `HCSV-*` 记录编号方式；
   - 主线二是引入更强 oracle 采集，推进 operation-level ordered transition oracle；
   - 明确 oracle transition 字段、probe-level / mutation-near / source-level guarded emitter 三阶段实现顺序，
     以及真正 `exact_match=true` 的验收门槛。
@@ -134,7 +195,7 @@
   - C++ HiCache state model 的输入、状态对象、状态转移和模块边界；
   - profiling 不变量 / oracle 字段边界和 state snapshot 采集契约；
   - 历史 cross-config 能力矩阵、event delta / timeline delta 口径、历史修正规则；
-  - phased workload 语义、配置入口、replay / prediction 验证方法、fixture 覆盖和失败处理。
+  - phased workload 语义、配置入口、faithful replay / state prediction 验证方法、fixture 覆盖和失败处理。
 - 专项文档仍不恢复旧 run 路径：旧结论只保留为历史能力摘要，当前真实证据仍以新的
   `HCSV-*` 记录为准。
 
@@ -148,7 +209,7 @@
   - 临时 run id：`20260608_041916_profiling_hicache_state_validation`；
   - workload `65/65` 请求成功，`errors=0`；
   - profile quality `quality_ready=true`，`missing_cache_mechanisms=[]`；
-  - replay `final_state_match=true`，`missing_page_identity_events=0`；
+  - state validation `final_state_match=true`，`missing_page_identity_events=0`；
   - event delta `match=true`、`mismatch_count=0`；
   - timeline coverage `match=true`、`model_extra_transition_count=0`，仅保留 oracle-only evicted transient 诊断。
 - 当前文档不再把旧 write-back / capacity / prefetch / page64 / selective run 目录当作当前凭据；
@@ -202,7 +263,7 @@
     radix tree 父链更新；page size what-if 下 base run 的 lock/ref 次数和节点路径不是
     target timeline 的稳定不变量；
   - C++ HiCache state model 已把 `lock_ref_inc` / `lock_ref_dec` 纳入 page-size mismatch
-    下的 non-invariant observed facts，同配置 replay 仍继续消费 lock facts；
+    下的 non-invariant observed facts；当前 state prediction 入口不再允许消费这类目标行为答案；
   - 新增 fixture 验证 page-size mismatch 下带 `target_page_identity` 的 base lock/ref 会被跳过，
     不再生成 `mark_locked` / `clear_locked` transition；
   - 用现有 `predict_page64_state_strict_transfer_extend_v1` 的 predicted trace 做只读过滤模拟后，
@@ -271,7 +332,7 @@
 
 - 继续收敛 base -> page64 strict HiCache state prediction：
   - 新 base profiling run 已完成：`data/profile_runs/sglang/20260607_170641_profiling_hicache_state_validation`；
-  - 新 base 同配置 replay 已通过：`modeling/cache_state_replay_after_prefix_fix_v1`，
+  - 新 base state validation 已通过，历史输出为 prefix-fix 版本，
     final state L1 `56/56`、L2 `121/121`、backuped `121/121`、evicted `65/65`、
     prefetch planned/ready/suppressed `166/166`、`8/8`、`158/158`；
   - probe 的 `page_hashes_after_prefix` 已改为按 target page size 的 page-aligned prefix
@@ -300,8 +361,8 @@
 
 - 对齐 HiCache state validation 文档与当前实际进展：
   - `docs/validation/hicache_state_validation.md` 明确区分已完成、未完成和下一步计划；
-  - 当前 base 同配置 replay 已通过：`20260607_144832_profiling_hicache_state_validation/modeling/cache_state_replay_after_prefix_v1`；
-  - 当前 page64 target 同配置 replay 已通过：`20260607_133143_profiling_hicache_state_page64_validation/modeling/cache_state_replay_pagehash_concat_v1`；
+  - 当前 base state validation 已通过，历史输出为 prefix 版本；
+  - 当前 page64 target state validation 已通过，历史输出为 pagehash-concat 版本；
   - strict base -> page64 prediction 仍未通过：`predict_page64_state_strict_after_prefix_v1` 中 L2 `239/250`、backuped `239/250`、evicted `120/139`、prefetch planned/ready/suppressed `366/364`、`24/17`、`350/347`，`timeline_delta_validation.match=false`；
   - 已记录一次候选 prefetch progress 修复尚未完成真实 strict 重验，临时输出 `/tmp/hicache_page64_strict_recheck` 没有 `validation.json`。
 - 下一步不进入 state-to-DAG patch；先完成 strict page64 state prediction 重验和修复。
@@ -411,15 +472,15 @@
 ## 2026-06-07 19:05:14 +0800
 
 - 修正 HiCache 推荐 C++ config 的 capacity 语义：
-  - 真实验证发现旧规则把 `oracle_observed_max_state_counts` 当作 capacity 写入推荐配置后，会让同配置 replay 误进入 capacity what-if 分支；
+  - 真实验证发现旧规则把 `oracle_observed_max_state_counts` 当作 capacity 写入推荐配置后，会让 state prediction 误进入 capacity what-if 分支；
   - 失败表现为模型保留 L1 `62` / L2 `128` 页，而真实 final state 是 L1 `56` / L2 `121` 页；
   - 新规则只自动推荐稳定的 `page_size`、`write_policy`、`prefetch_policy`；
   - `l1_capacity_pages` / `l2_capacity_pages` 只有在 target C++ config 已显式设置时才复制到推荐配置；
   - 未显式设置 capacity 时，推荐结果只在 `evidence` 中记录 raw pool、observed max、final count，并标记为 `not_auto_recommended`。
 - 已完成真实 run 回归：
-  - 重新生成 `cache_state_replay_capacity_snapshot_v2/recommended_hicache_cpp_model_config.json`；
+  - 重新生成 capacity-snapshot 版本的 `recommended_hicache_cpp_model_config.json`；
   - 推荐配置内容为 `page_size=128`、`write_policy=write_through`、`prefetch_policy=timeout`，不包含 L1/L2 capacity；
-  - 使用该推荐配置重跑 `cache_state_replay_recommended_config_v2`，`validation_ready=true`、`final_state_match=true`；
+  - 使用该推荐配置重跑 state validation，`validation_ready=true`、`final_state_match=true`；
   - final L1 `56/56`、L2 `121/121`、backuped `121/121`、evicted `65/65`、prefetch planned `166/166`、ready `8/8`、suppressed `158/158`。
 
 ## 2026-06-07 18:26:48 +0800
@@ -428,8 +489,8 @@
   - 当 `capacity_config_audit.recommended_target_config.ready=true` 时，`model_runner.py` 会写出 `recommended_hicache_cpp_model_config.json`；
   - 文件格式为 `{"modules":["hicache"],"hicache":{...}}`，可直接传给 C++ TraceGraph `--model-config`；
   - validation 会回写 `hicache_state.recommended_hicache_cpp_model_config_path`。
-- 已刷新真实 run `20260607_095024_profiling_hicache_state_validation` 的 replay validation：
-  - 推荐配置文件位于 `modeling/cache_state_replay_capacity_snapshot/recommended_hicache_cpp_model_config.json`；
+- 已刷新真实 run `20260607_095024_profiling_hicache_state_validation` 的 state validation：
+  - 推荐配置文件位于历史 state-validation 输出目录；
   - 旧版内容曾包含 `l1_capacity_pages=62`、`l2_capacity_pages=128`，该规则已在 19:05 修正为不自动推荐 capacity。
 
 ## 2026-06-07 18:21:58 +0800
@@ -439,11 +500,11 @@
   - page size、write policy、prefetch policy 使用 oracle capacity summary 中唯一观测值；
   - 旧版曾把 L1/L2 `oracle_observed_max_state_counts` 作为推荐 capacity；该规则已在 19:05 证伪并修正；
   - evidence 会记录每个字段来源，capacity 未显式配置时只保留诊断证据。
-- 刷新真实 run `20260607_095024_profiling_hicache_state_validation` 的 replay validation：
+- 刷新真实 run `20260607_095024_profiling_hicache_state_validation` 的 state validation：
   - 旧版推荐 config 为 `page_size=128`、`write_policy=write_through`、`prefetch_policy=timeout`、`l1_capacity_pages=62`、`l2_capacity_pages=128`，现已改成不自动带 capacity；
   - `validation_ready=true`、`final_state_match=true` 保持不变。
 - 当前边界：
-  - 推荐规则依赖 target oracle，适合真实 target replay / prediction 验证后修复配置；
+  - 推荐规则依赖 target oracle，适合真实 target self-config / cross-config prediction 验证后修复配置；
   - 没有 target oracle 的纯 what-if 仍需要显式给出目标 page size、policy 和 capacity。
 
 ## 2026-06-07 18:17:12 +0800
@@ -453,8 +514,8 @@
   - `profile_quality.quality_ready=true`，`hicache_capacity_observed=true`，capacity snapshot `4824` 个；
   - 真实采到 `write_policy=write_through`、`prefetch_policy=timeout`、L1 raw pool `64` pages、L2 raw pool `129` pages、prefetch capacity limit `52` pages；
   - `missing_cache_mechanisms=[]`，必须有 page identity 的 stateful events 全部覆盖。
-- 完成该 run 的同配置 state replay：
-  - replay：`modeling/cache_state_replay_capacity_snapshot`；
+- 完成该 run 的同配置 state validation：
+  - 输出为历史 capacity-snapshot state-validation 目录；
   - `validation_ready=true`、`final_state_match=true`；
   - final L1 `56/56`、L2 `121/121`、backuped `121/121`、evicted `65/65`、locked `0/0`、prefetch planned `166/166`、ready `8/8`、suppressed `158/158`；
   - event delta match，shared event key `222`；
@@ -495,18 +556,18 @@
 
 - 完成 `write_back + low capacity` 组合 state 验证闭环：
   - target run：`data/profile_runs/sglang/20260607_073450_profiling_hicache_state_write_back_capacity_validation`；
-  - target replay：`modeling/cache_state_replay_v4`；
+  - target state validation：历史 v4 输出；
   - fresh base run：`data/profile_runs/sglang/20260607_083213_profiling_hicache_state_capacity_base_validation`；
-  - base replay：`modeling/cache_state_replay_v4`；
+  - base state validation：历史 v4 输出；
   - cross prediction：`modeling/predict_write_back_capacity_state_20260607_073450_l2cap88`。
 - 本轮真实 workload 验证结果：
   - target 和 fresh base 的 `profile_quality.quality_ready=true`，`missing_cache_mechanisms=[]`；
-  - target replay `validation_ready=true`、`final_state_match=true`，L1 `46/46`、L2 `88/88`、dirty `38/38`、backuped `88/88`、evicted `80/80`、locked `0/0`；
-  - base replay `validation_ready=true`、`final_state_match=true`，L1 `56/56`、L2 `126/126`、dirty `0/0`、backuped `126/126`、evicted `70/70`、prefetch ready `8/8`；
+  - target state validation `validation_ready=true`、`final_state_match=true`，L1 `46/46`、L2 `88/88`、dirty `38/38`、backuped `88/88`、evicted `80/80`、locked `0/0`；
+  - base state validation `validation_ready=true`、`final_state_match=true`，L1 `56/56`、L2 `126/126`、dirty `0/0`、backuped `126/126`、evicted `70/70`、prefetch ready `8/8`；
   - base -> target prediction `validation_ready=true`、`final_state_match=true`，L1 `46/46`、L2 `88/88`、dirty `38/38`、backuped `88/88`、evicted `80/80`、prefetch ready `8/8`。
 - 修正 validation oracle：
   - final `locked_pages` 在有 lock facts 时按 `lock_ref_inc` / `lock_ref_dec` refcount 推导，避免尾部缺失 end snapshot 误判；
-  - timeline oracle 增加 `final_lock_timeline_correction`，本轮 target replay 补齐 8 个 `clear_locked`；
+  - timeline oracle 增加 `final_lock_timeline_correction`，本轮 target state validation 补齐 8 个 `clear_locked`；
   - prefetch ready oracle 增加 `l3_to_l2_transfer_end` 完成证据，避免把已 transfer 的 8 页误判为 late/suppressed；
   - timeline coverage 只比较 completed snapshot 可见字段，write-through 下不可见 dirty transient 进入 `ignored_unobservable_state_keys`。
 - 更新 `configs/modeling/hicache_state/modeling_hicache_state_prediction_write_back_capacity.json`：
@@ -519,9 +580,9 @@
   - `timeline_delta_validation.match=true` 现在表示模型输出的 transition 全部被 raw snapshot timeline 覆盖；
   - 新增 `exact_match`、`model_transition_covered`、`model_extra_transition_count`、`oracle_extra_transition_count`；
   - 多进程稀疏 state snapshot 造成的 oracle-only transient oscillation 保留为诊断，不再误判为模型凭空缺 transition。
-- 完成带 `object_id` 的真实 `write_through_selective` target replay：
+- 完成带 `object_id` 的真实 `write_through_selective` target state validation：
   - target run：`data/profile_runs/sglang/20260607_063721_profiling_hicache_state_write_through_selective_validation`；
-  - replay：`modeling/cache_state_replay_timeline_v4`；
+  - 输出为历史 timeline-v4 state-validation 目录；
   - `final_state_match=true`，`missing_page_identity_events=0`；
   - `event_delta_validation.match=true`，shared exclusive event key 为 `242`；
   - `timeline_delta_validation.match=true`，`exact_match=false`，`model_extra_transition_count=0`，`oracle_extra_transition_count=348`。
@@ -533,12 +594,12 @@
 
 ## 2026-06-07 14:30:56 +0800
 
-- 完成 lock-enabled `write_through_selective` target profiling / replay / prediction 闭环：
+- 完成 lock-enabled `write_through_selective` target profiling / state validation / prediction 闭环：
   - target run：`data/profile_runs/sglang/20260607_060803_profiling_hicache_state_write_through_selective_validation`；
   - target workload `65/65` 请求成功；
   - target `profile_quality.quality_ready=true`，`observed_cache_mechanisms.lock_ref=872`，`stateful_required_events_missing_page_identity=0`。
-- 完成 target 同配置 replay：
-  - replay：`modeling/cache_state_replay_lock`；
+- 完成 target 同配置 state validation：
+  - 输出为历史 lock state-validation 目录；
   - `validation_ready=true`、`final_state_match=true`；
   - L1 `56/56`、L2 `121/121`、dirty `0/0`、backuped `121/121`、evicted `65/65`、locked `0/0`；
   - `lock_state_events=708`，`mark_locked=918`、`clear_locked=918`；
@@ -558,8 +619,8 @@
   - 手动生成 `profile_quality.json`，`quality_ready=true`；
   - `observed_cache_mechanisms.lock_ref=872`；
   - `stateful_required_events_missing_page_identity=0`。
-- 完成该 run 的同配置 state replay：
-  - replay：`modeling/cache_state_replay_lock_v2`；
+- 完成该 run 的同配置 state validation：
+  - 输出为历史 lock-v2 state-validation 目录；
   - `validation_ready=true`、`final_state_match=true`；
   - L1 `56/56`、L2 `121/121`、dirty `0/0`、backuped `121/121`、evicted `65/65`、locked `0/0`；
   - `lock_state_events=708`，`mark_locked=918`、`clear_locked=918`；
@@ -575,8 +636,8 @@
   - `validation.json.hicache_state.event_delta_validation` 现在区分 inclusive 包围差分和 exclusive 可比较差分；
   - 嵌套 state snapshot 使用 snapshot `dur` 和事件顺序识别，避免把内层 HiCache 调用造成的状态变化误归因给外层函数；
   - mismatch 只在 predicted 和 oracle 共享的 exclusive event key 上比较 page delta，跨配置 prediction 仍以 final-state / policy oracle / coverage 为主。
-- 真实 selective 同配置 replay 已用新口径重跑：
-  - 目录：`data/profile_runs/sglang/20260607_043930_profiling_hicache_state_write_through_selective_validation/modeling/cache_state_replay_event_delta_v4`；
+- 真实 selective 同配置 state validation 已用新口径重跑：
+  - 输出为历史 event-delta-v4 state-validation 目录；
   - `validation_ready=true`、`final_state_match=true`；
   - `event_delta_validation.match=true`，shared exclusive event key 为 `18`；
   - 识别出 `84` 个嵌套事件和 `248` 条嵌套包围 transition，旧真实 run 中 `locked_pages` 因未采 lock facts 暂列为未比较字段。
@@ -597,7 +658,7 @@
   - `configs/modeling/hicache_state/modeling_hicache_state_prediction_write_through_selective.json`。
 - 真实 selective target run 已完成：
   - target profiling run：`data/profile_runs/sglang/20260607_043930_profiling_hicache_state_write_through_selective_validation`；
-  - target 同配置 replay：`modeling/cache_state_replay`，`validation_ready=true`、`final_state_match=true`；
+  - target 同配置 state validation：`validation_ready=true`、`final_state_match=true`；
   - base `20260607_031354` -> selective target prediction：`predict_write_through_selective_state_20260607_043930_final`，`validation_ready=true`、`final_state_match=true`；
   - 对齐计数：L1 `56/56`、L2 `121/121`、dirty `0/0`、backuped `121/121`、evicted `65/65`、prefetch planned `166/166`、ready `8/8`、suppressed `158/158`。
 - 更新 `docs/validation/hicache_state_validation.md`，将 write policy final-set model 标记为已完成；剩余重点是逐 transition oracle、evictable lock / 完整 radix node split，以及后续 DAG patch。
@@ -612,11 +673,11 @@
 - 新增并运行真实 prefetch target：
   - `profiling_hicache_state_prefetch_best_effort_validation`，run `20260607_035602`；
   - `profiling_hicache_state_prefetch_timeout_aggressive_validation`，run `20260607_041431`；
-  - 两个 target 的 `profile_quality.quality_ready=true`，同配置 replay 均 `final_state_match=true`。
+  - 两个 target 的 `profile_quality.quality_ready=true`，同配置 state validation 均 `final_state_match=true`。
 - 完成 base `20260607_031354` 到 prefetch target 的真实跨配置 prediction：
   - best_effort prediction `predict_prefetch_best_effort_state_20260607_035602_rerun3` 通过，planned `166/166`、ready `0/0`、late `8/8`、suppressed `166/166`；
   - aggressive timeout prediction `predict_prefetch_timeout_aggressive_state_20260607_041431` 通过，planned `166/166`、ready `0/0`、late `8/8`、suppressed `166/166`。
-- 更新 `docs/validation/hicache_state_validation.md`，将 prefetch wait/best_effort/timeout 的 replay 和跨配置 prediction 结果写入短期计划；下一项转向 `write_through_selective` 的 hit_count threshold 和更严格逐 transition oracle。
+- 更新 `docs/validation/hicache_state_validation.md`，将 prefetch wait/best_effort/timeout 的 self-config 和跨配置 prediction 结果写入短期计划；下一项转向 `write_through_selective` 的 hit_count threshold 和更严格逐 transition oracle。
 
 ## 2026-06-07 11:40:00 +0800
 
@@ -631,7 +692,7 @@
 - 跑完新一轮真实 HiCache state 实验：
   - base run：`data/profile_runs/sglang/20260607_031354_profiling_hicache_state_validation`；
   - wait target run：`data/profile_runs/sglang/20260607_032622_profiling_hicache_state_prefetch_wait_validation`；
-  - base replay 和 wait target replay 均 `validation_ready=true`、`final_state_match=true`；
+  - base state validation 和 wait target state validation 均 `validation_ready=true`、`final_state_match=true`；
   - base -> wait_complete prediction 通过，`prefetch_planned_pages=166/166`、
     `prefetch_ready_pages=8/8`，仅 `l3_resident_pages` 因缺 full-set oracle 保留为 unchecked。
 - 更新 `docs/validation/hicache_state_validation.md`：
@@ -642,11 +703,11 @@
 ## 2026-06-07 06:15:43 +0800
 
 - 推进 HiCache state 跨配置验证：
-  - 完成 capacity target 真实 profiling、同配置 replay 和 base -> target state prediction；
+  - 完成 capacity target 真实 profiling、同配置 state validation 和 base -> target state prediction；
   - 修复 C++ HiCache state model 中显式 `write_through` target 没有补 L3 readable set 的问题；
   - 修复同 page size capacity 下错误按 leaf group 驱逐、以及 insert pre-allocation 按全量 page 数过驱逐的问题；
   - 确认本次低容量 target 的有效 L1 page budget 是 `46`，并更新 `modeling_hicache_state_prediction_capacity.json`。
-- 完成 prefetch wait target 真实 profiling 和 replay：
+- 完成 prefetch wait target 真实 profiling 和 state validation：
   - resident/dirty/backuped/evicted final set 与 oracle 对齐；
   - 当前 workload 下 timeout 与 wait_complete 的 resident 结果相同，不能严格验证 ready/late/suppressed；
   - `model_runner.py` 增加 final state 计数和 `unchecked_model_state_keys`，显式暴露 `prefetch_ready_pages` 这类缺 oracle 字段的集合。
@@ -665,10 +726,10 @@
   - validation-only `state_snapshot` 事件标记 `model_input=false`，C++ Chrome reader 不把它们放进性能 DAG；
   - C++ `HiCacheModule` 重构为 `HiCacheFactParser`、`HiCacheState`、`HiCacheStateModel` 等面向对象骨架，当前只维护 state，保持 `dag_mutations=0`；
   - `model_runner.py` 增加 `predicted_target_cache_state_trace.json` 输出和 `validation.json.hicache_state` diff；
-  - 新增 `profiling_hicache_state_validation.json` 与 `modeling_hicache_state_validation.json` 两个 state validation 入口。
-- 真实 state replay 验证通过：
+  - 新增 HiCache state validation 的 profiling / modeling 历史入口；当前 modeling 入口已收敛为显式 target config 的 prediction config。
+- 真实 state validation 验证通过：
   - profiling run：`data/profile_runs/sglang/20260606_103159_profiling_hicache_state_validation`，manifest `status=completed`；
-  - modeling output：`modeling/cache_state_replay_final2`；
+  - modeling output：历史 final2 state-validation 输出；
   - Python probe 事件 5536 条，其中 `state_snapshot` 2628 条；
   - `validation_ready=true`，`final_state_match=true`，`invariant_coverage_ready=true`，`missing_page_identity_events=0`；
   - 对齐集合：`l1_resident_pages=24/24`、`l2_resident_pages=24/24`、`dirty_pages=0/0`、`backuped_pages=24/24`、`evicted_pages=0/0`。
@@ -785,10 +846,10 @@
 
 ## 2026-06-05 16:20:57 +0800
 
-- 清空 C++ HiCache 旧 replay 建模逻辑：
+- 清空 C++ HiCache 旧 movement/latency 建模逻辑：
   - `HiCacheModule` 保留为 skeleton，只统计输入 HiCache 事件数量；
   - skeleton 不修改 DAG node duration、metadata 或 edge；
-  - active HiCache summary 删除旧 movement/page/latency replay 指标。
+  - active HiCache summary 删除旧 movement/page/latency 指标。
 - 新增 base DAG profiling 验证入口：
   - 新配置 `configs/experiments/sglang/profiling_sglang_bench_serving_base_dag.json` 使用 SGLang `bench_serving` random dataset；
   - 该实验只启用 `torch` 和 `ld_preload`，不启用 HiCache server 参数和 Python probe；

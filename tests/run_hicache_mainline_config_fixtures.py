@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import shlex
+import importlib.util
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MAINLINE_DIR = ROOT / "configs/experiments/hicache_state/mainline_one"
 HICACHE_STATE_DIR = ROOT / "configs/experiments/hicache_state"
+MAINLINE_CONFIG = HICACHE_STATE_DIR / "profiling_hicache_state_mainline_one_matrix.json"
 
 # 这些签名来自 HCSV 已完成矩阵和主线一早期草案。它们必须保留在
 # fixture 中，而不能只依赖 data/ 或当前仍存在的配置文件；否则清理旧
@@ -40,31 +42,37 @@ def main() -> int:
 def run_mainline_one_signature_fixture() -> None:
     """验证主线一两个场景彼此不同，且不复用仓库内历史 HiCache state 配置。"""
 
-    mainline_configs = sorted(MAINLINE_DIR.glob("*.json"))
-    assert mainline_configs, MAINLINE_DIR
+    mainline_configs = [MAINLINE_CONFIG]
+    assert MAINLINE_CONFIG.exists(), MAINLINE_CONFIG
+    assert [path.name for path in mainline_configs] == ["profiling_hicache_state_mainline_one_matrix.json"], mainline_configs
+    profile_runner = load_profile_runner()
 
     old_configs = sorted(
         path
         for path in HICACHE_STATE_DIR.rglob("*.json")
-        if not path.is_relative_to(MAINLINE_DIR)
+        if path != MAINLINE_CONFIG
     )
     old_signatures: dict[tuple[str, ...], list[Path]] = {}
     for path in old_configs:
-        old_signatures.setdefault(config_signature(path), []).append(path)
+        old_signatures.setdefault(config_signature(load_json(path)), []).append(path)
 
     scenario_signatures: dict[str, set[tuple[str, ...]]] = {}
     scenario_inputs: dict[str, set[str]] = {}
     expected_inputs = {"L1_manual_phased", "L2_bench_serving_large"}
-
+    expanded_configs: list[tuple[Path, dict[str, object]]] = []
     for path in mainline_configs:
-        cfg = load_json(path)
+        for item in profile_runner.expand_suite(load_json(path)):
+            expanded_configs.append((path, item))
+    assert {str(cfg.get("id")) for _, cfg in expanded_configs} == {"s1a_manual", "s1a_bench", "s1b_manual", "s1b_bench"}
+
+    for path, cfg in expanded_configs:
         metadata = cfg.get("metadata", {})
         scenario = metadata.get("mainline_one_scenario")
         input_id = metadata.get("mainline_one_input")
         assert scenario in {"S1A_baseline_large", "S1B_divergent_large"}, (path, scenario)
         assert input_id in expected_inputs, (path, input_id)
 
-        signature = config_signature(path)
+        signature = config_signature(cfg)
         assert float(signature[5]) > 1.0, (path, signature)
         assert metadata.get("mainline_one_config_signature") == signature_text(signature), (
             path,
@@ -92,8 +100,7 @@ def run_mainline_one_signature_fixture() -> None:
     assert len(unique_signatures) == len(scenario_signatures), scenario_signatures
 
 
-def config_signature(path: Path) -> tuple[str, ...]:
-    cfg = load_json(path)
+def config_signature(cfg: dict[str, object]) -> tuple[str, ...]:
     args = command_args(cfg)
     hicache = cfg.get("modeling", {}).get("hicache", {})
     prefetch_extra = args.get("hicache-storage-backend-extra-config", "")
@@ -161,6 +168,18 @@ def command_args(cfg: dict[str, object]) -> dict[str, str]:
 
 def load_json(path: Path) -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_profile_runner():
+    spec = importlib.util.spec_from_file_location(
+        "trace_sim_profile_runner_mainline_fixture",
+        ROOT / "scripts/internal/profile_runner.py",
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[str(spec.name)] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 if __name__ == "__main__":

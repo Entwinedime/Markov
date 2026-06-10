@@ -24,9 +24,9 @@ struct HiCacheConfig {
     uint64_t page_size = 0;
     uint64_t l1_capacity_pages = 0;
     uint64_t l2_capacity_pages = 0;
-    std::string write_policy = "observed";
+    std::string write_policy = "write_through";
     uint64_t write_through_threshold = 0;
-    std::string prefetch_policy = "observed";
+    std::string prefetch_policy = "timeout";
     bool prefetch_timeout_configured = false;
     double prefetch_timeout_base_sec = 0.0;
     double prefetch_timeout_per_ki_token_sec = 0.0;
