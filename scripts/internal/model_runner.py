@@ -752,6 +752,7 @@ def build_hicache_state_validation_if_enabled(
     if not oracle_paths:
         oracle_paths = trace_paths
     oracle_required = bool(hicache_cfg.get("require_oracle_state_trace", False))
+    oracle_page_key_mode = str(hicache_cfg.get("oracle_page_key_mode") or "strip_scope")
 
     model_summary = load_json(module_summary_path) if module_summary_path.is_file() else {}
     hicache_summary = extract_hicache_summary(model_summary)
@@ -761,7 +762,12 @@ def build_hicache_state_validation_if_enabled(
     oracle_observed_max_counts = observed_max_derived_state_counts(snapshots)
     model_final = hicache_summary.get("final_state") if isinstance(hicache_summary.get("final_state"), dict) else {}
     ignored_state_keys = configured_ignore_state_keys(hicache_cfg)
-    all_sets_diff = diff_hicache_sets(model_final, oracle_final)
+    raw_sets_diff = diff_hicache_sets(model_final, oracle_final)
+    raw_active_sets_diff = {key: value for key, value in raw_sets_diff.items() if key not in ignored_state_keys}
+    raw_ignored_sets_diff = {key: value for key, value in raw_sets_diff.items() if key in ignored_state_keys}
+    normalized_model_final = normalize_hicache_state_for_oracle_compare(model_final, oracle_page_key_mode)
+    normalized_oracle_final = normalize_hicache_state_for_oracle_compare(oracle_final, oracle_page_key_mode)
+    all_sets_diff = diff_hicache_sets(normalized_model_final, normalized_oracle_final)
     sets_diff = {key: value for key, value in all_sets_diff.items() if key not in ignored_state_keys}
     ignored_sets_diff = {key: value for key, value in all_sets_diff.items() if key in ignored_state_keys}
     capacity_config_audit = build_hicache_capacity_config_audit(
@@ -772,6 +778,7 @@ def build_hicache_state_validation_if_enabled(
     )
     predicted_records = load_predicted_state_records(predicted_state_trace_path)
     first_mismatch = first_hicache_mismatch(sets_diff, predicted_records)
+    raw_first_mismatch = first_hicache_mismatch(raw_active_sets_diff, predicted_records)
     request_transition_coverage = build_request_transition_coverage(predicted_records, snapshots)
     transition_coverage = build_transition_coverage(predicted_records, snapshots)
     event_delta_validation = build_event_delta_validation(predicted_records, snapshots)
@@ -789,16 +796,23 @@ def build_hicache_state_validation_if_enabled(
         "state_trace_ready": bool(snapshots),
         "state_trace_events": len(snapshots),
         "oracle_state_validation_required": oracle_required,
+        "oracle_page_key_mode": oracle_page_key_mode,
         "model_transition_events": len(hicache_summary.get("transition_trace", []) if hicache_summary else []),
         "final_state_match": None if not oracle_final else not first_mismatch,
+        "raw_final_state_match": None if not oracle_final else not raw_first_mismatch,
         "sets_diff_by_tier": sets_diff,
+        "raw_sets_diff_by_tier": raw_active_sets_diff,
         "ignored_state_keys": sorted(ignored_state_keys),
         "ignored_sets_diff_by_tier": ignored_sets_diff,
+        "raw_ignored_sets_diff_by_tier": raw_ignored_sets_diff,
         "model_final_state_counts": final_state_counts(model_final),
         "oracle_final_state_counts": final_state_counts(oracle_final),
+        "normalized_model_final_state_counts": final_state_counts(normalized_model_final),
+        "normalized_oracle_final_state_counts": final_state_counts(normalized_oracle_final),
         "oracle_observed_max_state_counts": oracle_observed_max_counts,
-        "unchecked_model_state_keys": unchecked_model_state_keys(model_final, oracle_final),
+        "unchecked_model_state_keys": unchecked_model_state_keys(normalized_model_final, normalized_oracle_final),
         "first_mismatch": first_mismatch,
+        "raw_first_mismatch": raw_first_mismatch,
         "request_transition_coverage": request_transition_coverage,
         "transition_coverage": transition_coverage,
         "event_delta_validation": event_delta_validation,
@@ -1406,6 +1420,23 @@ def page_keys_from_snapshot_hash(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item) for item in value if item is not None]
     return [str(value)]
+
+
+def normalize_hicache_state_for_oracle_compare(state: dict[str, Any], page_key_mode: str) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in state.items():
+        if isinstance(value, list):
+            normalized[key] = sorted({normalize_hicache_page_key(item, page_key_mode) for item in value if item is not None})
+        else:
+            normalized[key] = value
+    return normalized
+
+
+def normalize_hicache_page_key(value: Any, page_key_mode: str) -> str:
+    page = str(value)
+    if page_key_mode == "strip_scope" and "|" in page:
+        return page.split("|", 1)[1]
+    return page
 
 
 def snapshot_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:

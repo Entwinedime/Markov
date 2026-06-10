@@ -12,6 +12,8 @@
   "validation": {
     "hicache_state": {
       "enabled": true,
+      "require_oracle_state_trace": true,
+      "oracle_page_key_mode": "strip_scope",
       "oracle_trace_paths": []
     }
   },
