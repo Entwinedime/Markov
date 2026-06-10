@@ -1,307 +1,191 @@
-# ktransformers / sglang Trace Simulation
+# Trace Simulation
 
-This repository is organized around a trace-driven performance simulation flow for
-ktransformers and sglang inference workloads:
+本仓库维护一条 trace-driven 建模链路：先从真实 SGLang / KTransformers 运行中采集事实，再由 C++ TraceGraph
+构建 DAG 或领域状态模型，最后用于 faithful replay、state prediction 和后续 what-if 性能预测。
 
-1. Collect runtime traces with custom LD_PRELOAD hooks and framework profilers.
-2. Merge custom CPU hook traces with profiler Chrome Trace output.
-3. Build a dependency DAG from the merged trace.
-4. Run topological simulation and graph-transform what-if analysis.
+当前 active 工作重点是 SGLang HiCache state model。旧的 page-identity/observed 行为答案口径已经停止作为主线；
+当前采集和后端都按 token/range invariant contract 推进。
 
-The current codebase integrates two existing pieces of progress:
-
-- `src/profiling/native_hook/`: C++ LD_PRELOAD hook framework for custom trace events.
-- `src/profiling/common/trace_schema/`: shared Chrome Trace event contract.
-- `src/profiling/python_probe/`: env-gated Python runtime probes for semantic events such as SGLang HiCache.
-- `src/modeling/trace_graph/`: C++ trace parser, DAG builder, domain models, simulator, and what-if CLI.
-- `third_party/sglang/`: Entwinedime's sglang fork, tracked as a Git submodule.
-- `third_party/ktransformers/`: Entwinedime's ktransformers fork, tracked as a Git submodule.
-
-## Layout
+## 当前结构
 
 ```text
 .
-├── src/profiling/native_hook/   # LD_PRELOAD hook framework and AscendCL hook targets
-├── src/profiling/common/        # Shared Chrome Trace event schema
-├── src/profiling/python_probe/  # Non-invasive Python runtime probes
-├── src/modeling/trace_graph/    # Trace -> normalized DAG -> domain simulation engine
-├── third_party/sglang/          # sglang fork submodule
-├── third_party/ktransformers/   # ktransformers fork submodule
-├── scripts/build.sh             # Build runtime image and matching hook
-├── scripts/run.sh               # Run one-off commands in framework containers
-├── scripts/profile.sh           # Run JSON-configured profiling experiments
-├── scripts/lib/                 # Shared shell helpers for public entrypoints
-├── scripts/internal/            # Docker/profile/build internals, not user entrypoints
-├── scripts/trace/               # Trace merge and inspection tools
-├── scripts/modeling/            # Host-side modeling scenario runners
-├── docker/images/base/sglang/   # SGLang stable Ubuntu/CANN/PyTorch environment
-├── docker/images/base/ktransformers/
-│                                  # ktransformers stable Ubuntu/CANN/PyTorch environment
-├── docker/images/sglang/        # SGLang Ubuntu runtime image
-├── docker/images/ktransformers/ # ktransformers Ubuntu runtime image
-├── docker/compose/inference.yml # Compose services for runtime profiling
-├── configs/experiments/         # JSON profile experiment suites
-├── configs/modeling/            # Host-side model replay / what-if configs
-├── data/profile_runs/           # Generated profile run directories
-├── data/traces/                 # Host-side raw, merged, and DAG trace artifacts
-└── docs/                        # Design notes by stage
+├── src/profiling/python_probe/          # sitecustomize + import hook + Python callable probes
+│   └── trace_sim_probe/probes/
+│       ├── generic_callable.py          # 通用 callable 插桩
+│       └── sglang_hicache_callable.py   # HiCache token/span、scope、seq、oracle snapshot source
+├── src/profiling/ld_preload/            # C++ LD_PRELOAD hook 框架和硬编码 wrapper
+├── src/modeling/trace_graph/            # C++ TraceGraph、DAG 仿真和 SimulationModule 后端
+│   ├── include/trace_graph/modules/hicache/
+│   └── src/modules/hicache/             # HiCache fact parser、radix tree、state model、summary
+├── scripts/profile.sh                   # 宿主机 profiling 入口，进入框架容器运行
+├── scripts/run.sh                       # 打开框架容器
+├── scripts/build.sh                     # 构建 runtime image 和 hook
+├── scripts/internal/profile_runner.py   # 容器内 profiling 执行器
+├── scripts/internal/profile_quality.py  # profiling 质量审计
+├── scripts/internal/model_runner.py     # modeling 编排入口
+├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
+├── scripts/bench/hicache_phased_workload.py
+├── configs/experiments/hicache_state/   # HiCache state profiling suite
+├── configs/modeling/hicache_state/      # HiCache state prediction config
+├── configs/modeling/hicache/            # faithful replay config
+├── tests/                               # smoke、profiling、HiCache fixture
+├── docs/                                # 主线文档和专项验证记录
+├── third_party/sglang/                  # SGLang fork submodule
+├── third_party/ktransformers/           # KTransformers fork submodule
+└── data/                                # 可再生 profiling/modeling 产物，不纳入长期证据
 ```
 
-## Submodules
+## 文档入口
 
-The inference frameworks are intentionally kept as editable submodules because
-profiling and runtime instrumentation may require source changes:
+| 文档 | 内容 |
+| --- | --- |
+| `docs/profiling_development.md` | profiling 架构、runner、suite、Python probe 和 HiCache 采集契约。 |
+| `docs/modeling_development.md` | C++ TraceGraph、model runner、mode、HiCache state backend 和输出格式。 |
+| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、最新 S1A token backend 结果和复现命令。 |
+| `docs/validation/hicache_state_model_defects.md` | 当前未闭环的 HiCache state model 缺陷和处理顺序。 |
+| `docs/project_constraints.md` | 项目长期约束。 |
+| `docs/work_progress.md` | 时间戳流水记录；旧条目只代表当时状态。 |
+
+## Submodules
 
 ```bash
 git submodule update --init --recursive
 ```
 
-The configured remotes are:
+框架源码作为可编辑 submodule 保留：
 
-- `https://github.com/Entwinedime/sglang.git`
-- `https://github.com/Entwinedime/ktransformers.git`
+- `third_party/sglang/`
+- `third_party/ktransformers/`
+
+容器 runtime image 会把 submodule 源码复制进镜像并安装。框架源码变更后需要重建对应 runtime layer。
 
 ## Host Build
 
+Host build 主要用于 C++ TraceGraph 和 fixture：
+
 ```bash
 cmake -S . -B build -DHOOK_ENABLE_PAPI=OFF
-cmake --build build -j
+cmake --build build --target trace_graph -j2
 ```
 
-The host build is primarily for modeling and what-if analysis:
+主要产物：
 
-- `build/bin/trace_graph`
+```text
+build/bin/trace_graph
+```
 
-Do not rely on the host-built `libhook.so` for profiling. The hook library is
-compiled inside the Docker runtime environment so it matches the framework
-container, toolchain, and mounted runtime dependencies.
+真实 profiling 不应直接使用 host build 的 hook so。LD_PRELOAD hook 需要在对应框架容器内构建，保证 ABI、工具链和运行依赖匹配。
 
-## Hook Profiles
-
-The hook framework supports separate profiles:
-
-- `sglang`: builds `build/docker/sglang/lib/libhook.so`
-- `ktransformers`: builds `build/docker/ktransformers/lib/libhook.so`
-- `ascendcl`: generic AscendCL wrapper profile
-- `template`: empty hook template
-
-The framework build scripts call this inside the container:
+## 常用检查
 
 ```bash
-scripts/internal/hooks/build.sh sglang
-scripts/internal/hooks/build.sh ktransformers
+python3 -m py_compile \
+  scripts/internal/profile_quality.py \
+  scripts/internal/model_runner.py \
+  tests/run_hicache_state_fixtures.py \
+  tests/run_modeling_smoke_fixtures.py
+
+python3 tests/run_hicache_state_fixtures.py
+python3 tests/run_modeling_smoke_fixtures.py
+python3 tests/run_profiling_fixtures.py
+python3 tests/run_hicache_mainline_config_fixtures.py
+
+find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
+git diff --check
 ```
 
-## Docker / Ubuntu
-
-The Docker setup is split into two layers per frontend:
-
-- environment images under `docker/images/base/<framework>/` hold the slower,
-  mostly stable Ubuntu/CANN/PyTorch/torch_npu dependency stack.
-- runtime images under `docker/images/<framework>/` are based on those
-  environment images and install the current framework fork source.
-
-SGLang and ktransformers may need different Python environments, launch
-commands, and hook targets.
-
-Runtime profiling runs in Docker. DAG construction, simulation, and what-if
-analysis can run on the host through `build/bin/trace_graph`.
-
-Both runtime frontends live in one compose file. Build the images with:
+C/C++ 改动还需要：
 
 ```bash
-scripts/build.sh sglang --image-only
-scripts/build.sh ktransformers --image-only
+git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror
 ```
 
-When only framework source changed and the environment image is already current,
-skip the first layer:
+## Profiling
+
+真实 SGLang / KTransformers profiling 通过宿主机入口启动：
 
 ```bash
-scripts/build.sh ktransformers --skip-env --image-only
+scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --list-experiments
+scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --experiment s1a_manual
 ```
 
-Open an interactive shell with:
+`scripts/profile.sh` 负责选择 docker compose service、挂载仓库、设置 Ascend 环境，并在容器内调用
+`scripts/internal/profile_runner.py`。宿主机上不要直接用 `profile_runner.py` 启动真实 server profiling。
+
+当前 HiCache state suite 只启用 `python_probe`。它采集：
+
+- `fact_class=invariant_state` 且 `state_model_input=true` 的 token/range 状态事实；
+- `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
+- `oracle_state` 的 validation-only state snapshot。
+
+需要 base DAG faithful replay 或 cache patch 时，应另建完整执行 trace suite，同时启用 torch / LD_PRELOAD / Python
+真实执行事件。HiCache state-only suite 不能替代性能 DAG 采集。
+
+profiling 质量审计：
 
 ```bash
-scripts/run.sh sglang -- bash
-scripts/run.sh ktransformers -- bash
+python3 scripts/internal/profile_quality.py \
+  --manifest <run_dir>/profile_manifest.json \
+  --output <run_dir>/profile_quality.json
 ```
 
-Build the runtime image and matching hook library together:
+## Modeling
+
+faithful replay：
 
 ```bash
-scripts/build.sh sglang
-scripts/build.sh ktransformers
+python3 scripts/internal/model_runner.py \
+  --config configs/modeling/hicache/modeling_hicache_from_manifest.json \
+  --profile-manifest <run_dir>/profile_manifest.json \
+  --output-dir <run_dir>/modeling/faithful_replay \
+  --mode faithful_replay \
+  --emit-validation \
+  --emit-module-summary
 ```
 
-The SGLang image follows the Ascend NPU source-install flow rather than using a
-prebuilt SGLang serving image:
-
-- base image: `quay.io/ascend/cann:8.5.0-910b-ubuntu22.04-py3.11` for Atlas 800I A2
-- Python runtime: 3.11 from the CANN image
-- dependencies: `torch==2.10.0`, Ascend `torch_npu==2.10.0`,
-  `triton_ascend==3.2.1`, `memfabric-hybrid==1.0.8`, and
-  `sgl-kernel-npu` release wheels installed in the environment image
-- source install: the runtime image runs `scripts/internal/frameworks/sglang/install_from_source.sh`,
-  which copies
-  `third_party/sglang/python/pyproject_npu.toml` over `pyproject.toml`, then
-  installs SGLang editable from the copied fork with `.[all_npu]`
-
-The ktransformers image follows the Ascend NPU tutorial flow, but keeps it on an
-Ubuntu CANN base instead of the tutorial's openeuler MindIE image:
-
-- base image: `quay.io/ascend/cann:8.3.rc1-910b-ubuntu22.04-py3.11`
-- Python runtime: 3.11 from the CANN image
-- dependencies: `torch==2.5.1`, `torchvision==0.20.1`, `torchaudio==2.5.1`,
-  `numpy==1.26.4`, `transformers==4.57.1`, and the build/runtime packages used by
-  the Ascend NPU path
-- `torch_npu` is cloned from `https://gitcode.com/Ascend/pytorch.git` at
-  branch `v2.5.1` and compiled from source during the environment image build.
-  The image installs only the wheel produced by that local source build and
-  strips any `+git...` suffix from `torch_npu/version.py`
-- source install: the runtime image runs `scripts/internal/frameworks/ktransformers/install_from_source.sh`
-  and installs the copied `third_party/ktransformers/archive` runtime with
-  `USE_BALANCE_SERVE=1`, patches the archive config to `attn.page_size=128` and
-  `attn.chunk_size=16384`, runs upstream `install.sh --dev cuda` so
-  `custom_flashinfer` follows the path that currently builds successfully, then
-  verifies the image-built `torch_npu` environment
-
-For SGLang profiling runs that need LD_PRELOAD hooks and SGLang's
-`/start_profile` / `/stop_profile` APIs, use a JSON experiment config instead:
+S1A HiCache state self-config prediction：
 
 ```bash
-scripts/profile.sh configs/experiments/sglang_qwen3_32b_profile_smoke.json
+python3 scripts/internal/model_runner.py \
+  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
+  --profile-manifest <run_dir>/profile_manifest.json \
+  --output-dir <run_dir>/modeling/token_backend_s1a \
+  --mode cache_state \
+  --emit-module-summary \
+  --emit-validation
 ```
 
-The profile config owns the server command, workload command, hook library,
-hook trace path, SGLang profiler request body, and per-run environment. Compose
-only provides the container, devices, and mounts.
+HiCacheModule 当前是 state-only backend：它维护 cache state 和 transition trace，不修改 DAG，
+`prediction.json.predicted_e2e_ns` 只来自 base DAG 拓扑仿真，不是 HiCache state 准确性的验收指标。
 
-Profile configs can describe either one run or a suite. A suite keeps common
-settings at the top level and adds an `experiments` list; each experiment
-deep-merges over the common settings and is written under one suite directory:
+## HiCache 当前进展
 
-```json
-{
-  "name": "qwen3-32b-profile-smoke",
-  "framework": "sglang",
-  "server": {"command": ["python3", "-m", "sglang.launch_server", "..."]},
-  "bench": {"args": {"random_input_len": 64}},
-  "experiments": [
-    {"name": "out16", "bench": {"args": {"random_output_len": 16}}},
-    {
-      "name": "out32",
-      "$unset": ["env.STREAMS_PER_DEVICE"],
-      "bench": {"args": {"random_output_len": 32}}
-    }
-  ]
-}
-```
+截至 2026-06-10，当前主线状态是：
 
-Inside an experiment, `$unset` removes inherited common fields before the run is
-written. It accepts dot-separated paths such as `env.STREAMS_PER_DEVICE` or
-`profile.profile_stages`.
+- profiling 已切到 token dictionary/span、`cache_scope`、`seq_no` 和 `fact_class` 分类采集；
+- C++ HiCache backend 只消费 `fact_class=invariant_state && state_model_input=true`；
+- target page 由后端按 token path 和 target `page_size` 重建，不再消费 `target_page_identity_page64/128`；
+- source movement、timing observation 和 oracle state 被跳过或只用于 validation/debug；
+- S1A `01_s1a_manual` profile quality 已通过，invariant coverage ready；
+- S1A self-config prediction 与 normalized oracle 仍不匹配，当前不是正确模型。
 
-The Dockerfiles and compose services do not set an entrypoint. They default to a
-bash shell. `scripts/build.sh` builds images and hooks, `scripts/run.sh` opens
-ad-hoc framework containers, and `scripts/profile.sh` runs profiling
-experiments.
+最新 S1A 摘要：
 
-The compose services bind-mount:
+| 项 | 结果 |
+| --- | --- |
+| profile run | `20260610_073946_profiling_hicache_state_mainline_one_matrix/01_s1a_manual` |
+| profile quality | `quality_ready=true`, `profiling_ready=true` |
+| invariant events | `6960`, required end events `3480` |
+| token dictionary | `172` paths, no missing refs, seq order ok |
+| model input audit | `non_invariant_fact_usage=[]`, `missing_invariant_facts=[]` |
+| oracle validation | `validation_ready=false`, `hicache_final_state_mismatch` |
+| normalized mismatch | L1 model `32` vs oracle `54`; L2/backuped `78` vs `106`; evicted `46` vs `52`; dirty and locked match |
 
-- the repository workspace for scripts, hook sources, trace outputs, and configs
-- Ascend driver/runtime device paths
-- model directories under `/models` and `/root/models`
-- generated profile outputs under `data/profile_runs/`
+下一步应优先做逐 page provenance debug：对 mismatch page 追踪模型 transition 和 oracle final membership，
+再修 lookup/load-back、insert/radix、capacity/evictable、prefetch/writeback 规则。
 
-To add another inference framework later, add a new `docker/images/<framework>/`
-image, `scripts/internal/frameworks/<framework>/` source-install helper, hook
-profile/target if needed, and a service in `docker/compose/inference.yml`. Then
-extend `scripts/build.sh`, `scripts/run.sh`, `scripts/profile.sh`, and
-`scripts/lib/common.sh` by framework name.
+## 数据约束
 
-Framework submodules are copied into the second Docker layer and installed into
-the runtime image. Source edits on the host require rebuilding that runtime
-layer, usually with `scripts/build.sh <framework> --skip-env`.
-
-The compose runtime does not set `PYTHONPATH` to mounted framework sources.
-Framework packages are installed into the runtime image during the second Docker
-layer build; after source edits, rebuild that runtime layer instead of shadowing
-installed packages from `/workspace`.
-
-## Trace Processing
-
-Merge custom hook traces with Ascend profiler traces:
-
-```bash
-python3 scripts/trace/merge_all_traces.py --root data/profile_runs/sglang/<suite-or-run-id> --overwrite
-```
-
-Each merged PID gets a sibling `merge_report.pid*.json` with native hook match
-counts, sidecar append counts, and matching diagnostics. Inspect merged HiCache
-events and field coverage with:
-
-```bash
-python3 scripts/trace/inspect_hicache.py \
-  data/profile_runs/sglang/<run-id> \
-  --output data/profile_runs/sglang/<run-id>/model/hicache_inspect.json
-```
-
-Build and simulate a DAG:
-
-```bash
-build/bin/trace_graph -o data/traces/dag/output_graph.json data/traces/merged/merged_trace.json
-```
-
-Apply a domain model, such as SGLang HiCache multi-level KV-cache replay:
-
-```bash
-build/bin/trace_graph \
-  --model-config configs/modeling/hicache_ascend_file.json \
-  --model-summary data/traces/dag/hicache_summary.json \
-  --run-summary data/traces/dag/hicache_run_summary.json \
-  -o data/traces/dag/hicache_dag.json \
-  data/traces/merged/merged_trace.json
-```
-
-The HiCache `cache_io` model is currently experimental. A non-empty summary only
-means the profile, merge, and replay plumbing worked; it is not yet proof that
-the multi-level KV-cache model is quantitatively correct. For calibration runs,
-set `cache_io.model_config_path` to the model's HuggingFace `config.json` and
-`cache_io.tp_size` to the serving tensor-parallel size so TraceGraph can infer
-bytes per KV page from model metadata. For capacity, eviction, and prefetch
-what-if runs, capture the base trace with:
-
-```bash
-TRACE_SIM_PYTHON_PROBE_KEY_MODE=hash
-```
-
-Synthetic fixtures can be checked with:
-
-```bash
-python3 tests/run_trace_graph_fixtures.py
-```
-
-Run explicit HiCache what-if scenarios against the same merged base trace:
-
-```bash
-python3 scripts/modeling/hicache_whatif.py \
-  --suite configs/modeling/hicache_qwen3_tp2_whatif.json \
-  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid417.json \
-  --trace data/profile_runs/sglang/<run-id>/trace/merged/merged_trace.pid418.json \
-  --output-dir data/profile_runs/sglang/<run-id>/whatif
-```
-
-`scripts/trace/inspect_hicache.py` reports `whatif_readiness` before modeling.
-Existing traces without `page_keys_hash` are still useful for bandwidth/latency
-replay, but not for meaningful capacity/eviction/prefetch-policy prediction.
-
-Run what-if scaling:
-
-```bash
-build/bin/trace_graph \
-  --scale "CPUInfer::sync=0.5,aclrtMemcpyAsync=2.0" \
-  -o data/traces/dag/what_if.json \
-  data/traces/merged/merged_trace.json
-```
+`data/profile_runs/**`、`data/modeling_runs/**`、`data/traces/**` 都是可再生运行产物，不作为长期事实来源。
+需要保留的结论必须抽取到 `docs/validation/` 或主线文档中。

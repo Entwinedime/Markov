@@ -2,6 +2,19 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-10 18:20:00 +0800
+
+- 同步 HiCache token-invariant 后端后的主线文档：
+  - `README.md` 改为当前项目结构入口，删除旧 `merge_all_traces.py`、`inspect_hicache.py`、`cache_io` what-if 等已不匹配说明；
+  - `docs/profiling_development.md` 重写为当前 profiling runner、suite、Python probe source、HiCache `fact_class` 分类和 token/span 契约；
+  - `docs/modeling_development.md` 重写为当前 C++ TraceGraph / HiCache backend 结构，明确后端只消费
+    `fact_class=invariant_state && state_model_input=true`，target page 由 token dictionary/span 和 target page size 重建；
+  - `docs/validation/hicache_state_validation.md` 更新为当前有效结果 `HCSV-20260610-token-backend-s1a`：
+    profiling quality 和 invariant coverage 通过，但 normalized oracle final state 仍 mismatch；
+  - `docs/validation/hicache_state_model_defects.md` 删掉 page-identity 依赖和旧 movement apply 分支这类过期缺陷，改为当前 S1A
+    mismatch 驱动的 resident/evicted、selective write、capacity/evictable、radix、prefetch/writeback 缺口；
+  - 删除 `docs/validation/hicache_state_validation_legacy.md`，历史只读文档不再作为 active 阅读入口；旧条目只保留在本时间线中作为历史背景。
+
 ## 2026-06-09 22:25:56 +0800
 
 - 重构 HiCache state mainline-one profiling 配置归档方式：
