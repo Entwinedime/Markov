@@ -55,6 +55,8 @@ HiCache state prediction 必须同时满足：
 - known invariant roles 是 `request_tokens`、`lookup_path`、`cache_config_observed`、`insert_path`、
   `prefetch_intent`、`prefetch_check_point`、`capacity_request`、`lock_scope_delta`；
 - target pages 由 C++ 按 token path 和 target `page_size` 生成，不再消费 `target_page_identity_page64/128`；
+- `capacity_request` 只作为容量检查点，不再把 `requested_pages` 解释为可观测 victim 数；
+- `prefetch_check_point` 在 `wait_complete` target 下不再直接把全部 planned pages 推入 L2/L3 或标记 ready；
 - oracle page key 默认用 `oracle_page_key_mode=strip_scope` 和 raw snapshot hash 对比；
 - HiCacheModule 仍是 state-only，不修改 DAG。
 
@@ -97,26 +99,29 @@ Normalized final-state diff：
 
 | prediction | L1 resident | L2 resident | backuped | dirty | evicted | locked |
 | --- | --- | --- | --- | --- | --- | --- |
-| S1A self | 32/54, missing 22 | 78/106, missing 28 | 78/106, missing 28 | 0/0 match | 46/52, missing 28, extra 22 | 11/11 match |
-| S1B self | 62/108, missing 46 | 172/144, missing 36, extra 64 | 172/144, missing 36, extra 64 | 62/72, missing 10 | 172/108, extra 64 | 0/22, missing 22 |
+| S1A self | 32/54, missing 22 | 80/106, missing 26 | 80/106, missing 26 | 0/0 match | 48/52, missing 26, extra 22 | 11/11 match |
+| S1B self | 64/108, missing 44 | 170/144, missing 36, extra 62 | 170/144, missing 36, extra 62 | 64/72, missing 8 | 170/108, extra 62 | 0/22, missing 22 |
 | S1A -> S1B | 64/108, missing 44 | 164/144, missing 40, extra 60 | 164/144, missing 40, extra 60 | 64/72, missing 8 | 164/108, missing 4, extra 60 | 22/22 match |
-| S1B -> S1A | 15/54, missing 39 | 79/106, missing 41, extra 14 | 79/106, missing 41, extra 14 | 0/0 match | 50/52, missing 41, extra 39 | 0/11, missing 11 |
+| S1B -> S1A | 32/54, missing 22 | 80/106, missing 26 | 80/106, missing 26 | 0/0 match | 48/52, missing 26, extra 22 | 0/11, missing 11 |
 
 Raw model behavior highlights：
 
 | prediction | state trace events | model transitions | skipped non-invariant | notable raw final state |
 | --- | ---: | ---: | ---: | --- |
-| S1A self | 7375 | 18935 | 416 | L1 64, L2 145, L3 712, evicted 81, locked 22, prefetch ready 712 |
-| S1B self | 6867 | 27941 | 296 | L1 124, L2 321, dirty 124, evicted 321, locked 0, prefetch suppressed 1484 |
-| S1A -> S1B | 7375 | 27465 | 416 | L1 128, L2 321, dirty 128, evicted 321, locked 44, prefetch suppressed 1452 |
-| S1B -> S1A | 6867 | 19305 | 296 | L1 30, L2 147, L3 756, evicted 89, locked 0, prefetch ready 728 |
+| S1A self | 7375 | 18253 | 416 | L1 64, L2 147, L3 712, evicted 83, locked 22, prefetch ready 36 |
+| S1B self | 6867 | 27909 | 296 | L1 128, L2 321, dirty 128, evicted 321, locked 0, prefetch suppressed 1484 |
+| S1A -> S1B | 6867 | 27465 | 416 | L1 128, L2 321, dirty 128, evicted 321, locked 44, prefetch suppressed 1452 |
+| S1B -> S1A | 7375 | 18275 | 296 | L1 64, L2 147, L3 712, evicted 83, locked 0, prefetch ready 20 |
 
 结论：
 
 - 新采集契约有效：S1A/S1B profile quality、token dictionary、seq order 和 invariant coverage 都通过。
 - 后端输入分流有效：四个方向均无 `missing_invariant_facts` 和 `non_invariant_fact_usage`。
 - 四个方向全部 final state mismatch，因此当前不能宣称 self-config 或 cross-config state prediction 通过。
-- 失败是模型缺陷而不是采集目标范围缺失的直接证据；已知缺陷记录在 `hicache_state_model_defects.md`。
+- 已收紧两个有明确证据的过度推导：`capacity_request.requested_pages` 不再强制选择 victim，
+  `wait_complete` checkpoint 不再全量构造 resident/ready。它们只小幅改善 S1A/S1B mismatch，说明剩余问题集中在
+  victim/order、write-back flush、lock/ref chain 和 radix node/ref 近似。
+- 失败是模型缺陷或当前 invariant 仍不可观测机制的证据；已知缺陷记录在 `hicache_state_model_defects.md`。
 - S1B target 的 modeling config 必须设置 `require_oracle_state_trace=true`；否则 final mismatch 可能被错误标成 ready。
 
 首个 S1A L1 normalized missing page：
@@ -180,14 +185,17 @@ jq '.hicache_state.sets_diff_by_tier
 
 ## 下一步
 
-短期不应重新采集 profiling。当前采集已经足够暴露模型错误，应先做逐 page provenance：
+短期不应重新采集 profiling。当前采集已经足够暴露模型错误，应先用逐 page provenance 区分可修复规则和不可观测机制：
 
-1. 对 S1A 的 L1 missing / evicted extra 组，列出模型 transition trace 和 oracle final membership。
-2. 对 S1B 的 raw L2/backuped/evicted 被推到 capacity 321 的路径，确认 capacity enforcement 和 write-back dirty eviction 是否过强。
-3. 对 S1B dirty missing 组，确认 flush、dirty clear、backuped 标记和 eviction 的顺序。
-4. 对 S1B self 与 S1B->S1A 中 locked 全丢的问题，追 lock/ref chain 如何从 source token path 映射到 target radix parent chain。
-5. 对 S1A/S1B 的 prefetch ready/suppressed 极端行为，确认它是否影响 resident/L2 结果，而不是只作为附加状态。
-6. 每修一类状态规则后重跑四向矩阵，不能只看单个 self-config。
+1. 已新增 `scripts/internal/hicache_state_provenance.py`，用于输出 mismatch page 的 model transition、oracle membership changes
+   和 fixability hint；四个 `four_way_*` 目录都已生成 `provenance_sample.json`。
+2. 可继续修：只要依据 invariant facts 能确定规则边界，例如不把 capacity request 当 victim oracle、不把 prefetch checkpoint
+   当 completed page list。
+3. 谨慎修：L1/L2 victim/order、selective write threshold、L2 eviction 后 backuped/evicted 生命周期，需要逐 trace 证明不是
+   rank/scope timing 差异或缺少 evictable/ref-chain 输入。
+4. 暂不强推：S1B lock/ref final set、background writeback flush exact completion、async prefetch exact ready set。当前 facts
+   没有完整 ordered completion/victim/ref-chain oracle，不能为了 final match 硬推事件。
+5. 每修一类状态规则后重跑四向矩阵，不能只看单个 self-config。
 
 只有逐 trace 证明现有 invariant facts 无法区分某类真实机制时，才进入下一轮集中重采。
 

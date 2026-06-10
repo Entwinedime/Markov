@@ -99,11 +99,6 @@ std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_
     return bytes_to_hex(digest.data(), digest.size());
 }
 
-uint64_t ceil_div(uint64_t value, uint64_t divisor) {
-    if (value == 0 || divisor == 0) return 0;
-    return (value + divisor - 1) / divisor;
-}
-
 bool is_invariant_state_fact(const HiCacheFact & fact) { return fact.fact_class == "invariant_state" && fact.state_model_input; }
 
 bool is_known_invariant_role(const std::string & role) {
@@ -124,10 +119,10 @@ bool is_known_invariant_role(const std::string & role) {
 
 std::string HiCacheState::digest() const {
     std::ostringstream os;
-    os << "l1=" << join_set(l1_) << ";l2=" << join_set(l2_) << ";l3=" << join_set(l3_) << ";dirty=" << join_set(dirty_) << ";backuped="
-       << join_set(backuped_) << ";evicted=" << join_set(evicted_) << ";prefetch_planned=" << join_set(prefetch_planned_)
-       << ";prefetch_ready=" << join_set(prefetch_ready_) << ";prefetch_late=" << join_set(prefetch_late_) << ";prefetch_suppressed="
-       << join_set(prefetch_suppressed_) << ";locked=" << join_set(locked_) << ";hit_count=" << join_count_map(hit_count_by_scope_page_);
+    os << "l1=" << join_set(l1_) << ";l2=" << join_set(l2_) << ";l3=" << join_set(l3_) << ";dirty=" << join_set(dirty_) << ";backuped=" << join_set(backuped_)
+       << ";evicted=" << join_set(evicted_) << ";prefetch_planned=" << join_set(prefetch_planned_) << ";prefetch_ready=" << join_set(prefetch_ready_)
+       << ";prefetch_late=" << join_set(prefetch_late_) << ";prefetch_suppressed=" << join_set(prefetch_suppressed_) << ";locked=" << join_set(locked_)
+       << ";hit_count=" << join_count_map(hit_count_by_scope_page_);
     return os.str();
 }
 
@@ -257,7 +252,7 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
 
 std::vector<HiCacheStateTransition> HiCacheState::finalize(HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
-    if (config_.prefetch_policy == "best_effort" || config_.prefetch_policy == "wait_complete") {
+    if (config_.prefetch_policy == "best_effort") {
         HiCacheFact fact;
         fact.role = "prefetch_finalize";
         fact.event_name = "hicache_prefetch_finalize";
@@ -358,12 +353,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     if (it == pending_prefetch_pages_.end() || it->second.empty()) return;
     const auto & pages = it->second;
     if (config_.prefetch_policy == "wait_complete") {
-        for (const auto & page : pages) {
-            add_resident(fact, summary, transitions, "L3", page);
-            add_resident(fact, summary, transitions, "L2", page);
-            mark_prefetch_ready(fact, summary, transitions, page);
-        }
-        enforce_capacity(fact, summary, transitions, "L2");
+        pending_prefetch_pages_.erase(it);
         return;
     }
     if (config_.prefetch_policy == "best_effort") {
@@ -387,10 +377,9 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
 }
 
 void HiCacheState::apply_capacity_request(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto page_size = page_size_for_fact(fact);
-    auto pages_to_free = fact.requested_pages;
-    if (pages_to_free == 0) pages_to_free = ceil_div(fact.requested_tokens, page_size);
-    evict_lru_pages(fact, summary, transitions, "L1", pages_to_free);
+    // A capacity request gives the requested allocation size, not the concrete
+    // victim set. Treat it as a capacity checkpoint and let normal capacity
+    // enforcement evict only when the modeled tier is already over capacity.
     enforce_capacity(fact, summary, transitions, "L1");
     enforce_capacity(fact, summary, transitions, "L2");
 }
@@ -442,8 +431,8 @@ void HiCacheState::apply_write_policy_hit_counts(const HiCacheFact & fact, const
     }
 }
 
-void HiCacheState::add_resident(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                const std::string & tier, const std::string & page) {
+void HiCacheState::add_resident(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier,
+                                const std::string & page) {
     auto * pages = tier_set(tier);
     if (!pages) return;
     auto before = transition_state_digest();
@@ -466,8 +455,7 @@ void HiCacheState::remove_resident(const HiCacheFact & fact, HiCacheSummary & su
     }
 }
 
-void HiCacheState::mark_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                              const std::string & page) {
+void HiCacheState::mark_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & page) {
     auto before = transition_state_digest();
     if (dirty_.insert(page).second) record_transition(fact, summary, transitions, "mark_dirty", "", page, before);
 }
@@ -722,7 +710,8 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
 
     if (!summary.missing_invariant_facts.empty()) summary.warnings.push_back("Some HiCache target-state inputs are missing token invariant facts.");
     if (summary.dirty_eviction_events > 0) summary.warnings.push_back("Dirty page eviction triggered modeled writeback state transitions.");
-    summary.warnings.push_back("HiCacheModule consumes only invariant_state facts; source_actual/timing_observation/oracle_state are ignored for target state.");
+    summary.warnings.push_back(
+        "HiCacheModule consumes only invariant_state facts; source_actual/timing_observation/oracle_state are ignored for target state.");
     summary.warnings.push_back("HiCacheModule maintains state only; no DAG mutations are applied.");
     return summary;
 }

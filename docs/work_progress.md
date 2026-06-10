@@ -2,6 +2,20 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-10 21:37:55 +0800
+
+- 基于四向 validation 和逐 page provenance 做第一轮 HiCache state model 保守修复：
+  - 新增 `scripts/internal/hicache_state_provenance.py`，从 `validation.json`、`predicted_target_cache_state_trace.json`
+    和 oracle state snapshots 输出 mismatch page 的 model transition、oracle membership changes 和 fixability hint；
+  - `capacity_request` 不再把 `requested_pages` 当作可观测 victim 数，只作为 capacity checkpoint；
+  - `wait_complete` 的 `prefetch_check_point` 不再把 pending planned pages 全量构造成 L2/L3 resident 或 ready，
+    finalize 也不再把 wait_complete 未 ready pages 全量 suppressed；
+  - 更新 HiCache fixtures，去掉旧的 precise capacity eviction / full prefetch ready 假设；
+  - 重跑四向 prediction / validation：四个方向仍 final mismatch，但 S1B self 的 L1 missing 从 46 降到 44、
+    L2/backuped/evicted extra 从 64 降到 62，S1B->S1A 的 S1A target L1/L2/backuped/evicted mismatch 明显收窄；
+  - 文档已同步：当前能修的是不变量边界内的过度推导；lock/ref chain、write-back flush exact cleanup、
+    async prefetch exact ready 和 victim/order 仍需要更强事实或更完整 radix/ref-chain 模型，不能从 oracle 强行补事件。
+
 ## 2026-06-10 19:23:32 +0800
 
 - 完成 S1A/S1B mainline-one manual profile 后的四向 HiCache state prediction / oracle validation：

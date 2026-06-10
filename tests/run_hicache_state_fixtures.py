@@ -234,11 +234,11 @@ def run_lock_scope_capacity_fixture(tmp: Path) -> None:
 
     final_state = summary["final_state"]
     assert summary["lock_state_events"] == 1, summary
-    assert final_state["l1_resident_pages"] == [page_a], final_state
+    assert final_state["l1_resident_pages"] == sorted([page_a, page_b]), final_state
     assert final_state["locked_pages"] == [page_a], final_state
-    assert final_state["evicted_pages"] == [page_b], final_state
+    assert final_state["evicted_pages"] == [], final_state
     assert summary["transitions_by_kind"]["mark_locked"] == 1, summary
-    assert summary["transitions_by_kind"]["mark_evicted"] == 1, summary
+    assert summary["transitions_by_kind"].get("mark_evicted", 0) == 0, summary
 
 
 def run_prefetch_wait_complete_fixture(tmp: Path) -> None:
@@ -276,12 +276,12 @@ def run_prefetch_wait_complete_fixture(tmp: Path) -> None:
     final_state = summary["final_state"]
     sorted_suffix_pages = sorted(suffix_pages)
     assert final_state["prefetch_planned_pages"] == sorted_suffix_pages, final_state
-    assert final_state["prefetch_ready_pages"] == sorted_suffix_pages, final_state
+    assert final_state["prefetch_ready_pages"] == [], final_state
     assert final_state["prefetch_suppressed_pages"] == [], final_state
-    assert final_state["l2_resident_pages"] == sorted([prefix_page, *suffix_pages]), final_state
-    assert final_state["l3_resident_pages"] == sorted([prefix_page, *suffix_pages]), final_state
+    assert final_state["l2_resident_pages"] == [prefix_page], final_state
+    assert final_state["l3_resident_pages"] == [prefix_page], final_state
     assert summary["transitions_by_kind"]["mark_prefetch_planned"] == 2, summary
-    assert summary["transitions_by_kind"]["mark_prefetch_ready"] == 2, summary
+    assert summary["transitions_by_kind"].get("mark_prefetch_ready", 0) == 0, summary
 
 
 def run_prefetch_best_effort_suppressed_fixture(tmp: Path) -> None:

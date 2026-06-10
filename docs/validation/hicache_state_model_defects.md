@@ -25,10 +25,10 @@ HCSV-20260610-four-way-s1a-s1b
 
 | prediction | L1 resident | L2 resident / backuped | dirty | evicted | locked |
 | --- | --- | --- | --- | --- | --- |
-| S1A self | 32/54, missing 22 | 78/106, missing 28 | 0/0 match | 46/52, missing 28, extra 22 | 11/11 match |
-| S1B self | 62/108, missing 46 | 172/144, missing 36, extra 64 | 62/72, missing 10 | 172/108, extra 64 | 0/22, missing 22 |
+| S1A self | 32/54, missing 22 | 80/106, missing 26 | 0/0 match | 48/52, missing 26, extra 22 | 11/11 match |
+| S1B self | 64/108, missing 44 | 170/144, missing 36, extra 62 | 64/72, missing 8 | 170/108, extra 62 | 0/22, missing 22 |
 | S1A -> S1B | 64/108, missing 44 | 164/144, missing 40, extra 60 | 64/72, missing 8 | 164/108, missing 4, extra 60 | 22/22 match |
-| S1B -> S1A | 15/54, missing 39 | 79/106, missing 41, extra 14 | 0/0 match | 50/52, missing 41, extra 39 | 0/11, missing 11 |
+| S1B -> S1A | 32/54, missing 22 | 80/106, missing 26 | 0/0 match | 48/52, missing 26, extra 22 | 0/11, missing 11 |
 
 这说明采集和输入分流已经不是当前阻塞点；阻塞点在状态规则。
 
@@ -46,13 +46,40 @@ HCSV-20260610-four-way-s1a-s1b
 | --- | --- | --- | --- | --- |
 | `HCSM-D1` | P0 | L1/L2 resident 与 evicted 生命周期错误 | 四向均缺 L1 resident；S1A target 同时有 evicted missing/extra | 逐 page 追 transition，优先看 lookup/load-back、clear_evicted、promotion 与 capacity eviction。 |
 | `HCSM-D2` | P0 | L2/backuped 写入与保留规则不准 | S1A target 低估 L2/backuped；S1B target 既 missing 又 extra | 分开验证 write-through-selective hit threshold、write-back flush、L2 eviction 后 backuped 语义。 |
-| `HCSM-D3` | P0 | capacity / evictable / leaf group 近似不足 | S1B target raw L2/backuped/evicted 被推到 capacity 321，normalized extra 60-64 | 对比 victim 选择、locked skip、leaf group、touch order 和 dirty victim 规则。 |
+| `HCSM-D3` | P0 | capacity / evictable / leaf group 近似不足 | S1B target raw L2/backuped/evicted 被推到 capacity 321，normalized extra 60-62 | 对比 victim 选择、locked skip、leaf group、touch order 和 dirty victim 规则。 |
 | `HCSM-D4` | P1 | radix tree 仍是 page-level 近似，不是完整 SGLang node/ref 结构 | prefix/split 复杂时可能错 resident/evicted | 补 token-level node provenance 或完善 radix split/merge 模型。 |
-| `HCSM-D5` | P1 | async prefetch scheduler 仍过强简化 | wait_complete 下 modeled ready/planned raw count 过大；oracle final 不暴露 prefetch sets | 明确 ready 对 resident 的影响，后续再做 timing/queue。 |
-| `HCSM-D6` | P0 | write-back background flush 尚未闭环 | S1B self dirty 62/72，L2/backuped 172/144 且 extra 64 | 追 flush enqueue/io、dirty clear、backuped 标记、dirty eviction 的顺序。 |
+| `HCSM-D5` | P1 | async prefetch scheduler exact 仍不可观测 | wait_complete checkpoint 全量 ready 已收紧；exact ready set 仍非 final-state oracle 目标 | 不从 checkpoint 强推 completion；后续需要 ordered prefetch completion 才做 exact。 |
+| `HCSM-D6` | P0 | write-back background flush 尚未闭环 | S1B self dirty 64/72，L2/backuped 170/144 且 extra 62 | 追 flush enqueue/io、dirty clear、backuped 标记、dirty eviction 的顺序。 |
 | `HCSM-D7` | P0 | lock/ref parent chain 仅按 logical path pages，未完整绑定 target radix parent chain | S1B self locked 0/22，S1B->S1A locked 0/11；S1A source 的 lock 能对齐 S1B target | 先查 source profile lock_scope_delta 如何绑定 target radix parent chain。 |
 | `HCSM-D8` | P2 | ordered transition oracle 不足 | 目前主要看 final normalized sets | 后续加 transition provenance / exact oracle。 |
 | `HCSM-D9` | P2 | state-to-DAG patch 未实现 | `dag_mutations=0` | state final sets 通过后再进入 DAG mutation。 |
+
+## 已收紧的规则
+
+### HCSM-F1：capacity_request 不再强制选择 victim
+
+`capacity_request.requested_pages` 是 allocation pressure，不是 victim oracle。模型现在只把该事件作为容量检查点，
+仅当 modeled tier 已超过 target capacity 时由正常 capacity enforcement 淘汰。fixture 已更新为不再要求
+`capacity_request` 精确淘汰 requested pages。
+
+四向影响有限：
+
+- S1B self L1 missing 从 46 降到 44，L2/backuped/evicted extra 从 64 降到 62；
+- S1B -> S1A L1 missing 从 39 降到 22，evicted extra 从 39 降到 22；
+- 仍不能解释主要 mismatch，说明剩余问题不是单个 capacity_request 事件能决定的。
+
+### HCSM-F2：wait_complete checkpoint 不再全量构造 resident/ready
+
+`prefetch_check_point` 当前 invariant 事实没有 loaded pages / completion pages。模型现在只保留 `prefetch_intent`
+产生的 planned pages；`wait_complete` checkpoint 不再把 pending pages 全部 add L2/L3，也不在 finalize 阶段把未 ready
+页全部 suppressed。
+
+四向影响：
+
+- target=S1A raw `prefetch_ready_pages` 从 712/728 降到 36/20；
+- S1A self L2/backuped missing 从 28 降到 26；
+- S1B -> S1A L2/backuped missing 从 41 降到 26；
+- exact prefetch ready 仍不可从当前 invariant facts 判断，不能为了对齐 oracle final state 强推 completion。
 
 ## HCSM-D1：Resident / Evicted 生命周期错误
 
@@ -60,10 +87,10 @@ HCSV-20260610-four-way-s1a-s1b
 
 四个方向都缺 L1 resident：
 
-- S1A self：L1 32/54，missing 22；evicted 46/52，missing 28，extra 22；
-- S1B self：L1 62/108，missing 46；evicted 172/108，extra 64；
+- S1A self：L1 32/54，missing 22；evicted 48/52，missing 26，extra 22；
+- S1B self：L1 64/108，missing 44；evicted 170/108，extra 62；
 - S1A -> S1B：L1 64/108，missing 44；evicted 164/108，missing 4，extra 60；
-- S1B -> S1A：L1 15/54，missing 39；evicted 50/52，missing 41，extra 39。
+- S1B -> S1A：L1 32/54，missing 22；evicted 48/52，missing 26，extra 22。
 
 S1A self 的 L1 missing sample `08c4433f...` 同时出现在 evicted extra sample。这说明模型把一部分真实最终
 resident 的 page 错误保留为 evicted，或者漏掉了后续把它们 load/promote 回 L1 的 transition。
@@ -72,7 +99,7 @@ resident 的 page 错误保留为 evicted，或者漏掉了后续把它们 load/
 
 - `lookup_path` 只根据 target radix + modeled L2/L3 做 promotion，漏了真实 source 中由 load-back 表达的可读性；
 - `insert_path` 的 prefix/longest-prefix 逻辑导致某些 page 没有被重新插入或 touch；
-- `capacity_request` 的 LRU-like victim 顺序与 SGLang 不一致；
+- capacity enforcement 的 LRU-like victim 顺序与 SGLang 不一致；
 - `leaf_group_for_page` 粒度与真实 radix leaf group 不一致；
 - prefetch/write-through 让页面进入 L2/L3 的时机不对，导致后续 lookup 无法提升。
 
@@ -99,13 +126,13 @@ resident 的 page 错误保留为 evicted，或者漏掉了后续把它们 load/
 
 S1A 是 `write_through_selective`，target threshold 默认 `2`，模型低估 L2/backuped：
 
-- S1A self：L2/backuped 78/106，missing 28；
-- S1B -> S1A：L2/backuped 79/106，missing 41，extra 14；
+- S1A self：L2/backuped 80/106，missing 26；
+- S1B -> S1A：L2/backuped 80/106，missing 26；
 - dirty 0/0 match。
 
 S1B 是 `write_back + best_effort`，模型同时 missing 和 extra：
 
-- S1B self：L2/backuped 172/144，missing 36，extra 64；
+- S1B self：L2/backuped 170/144，missing 36，extra 62；
 - S1A -> S1B：L2/backuped 164/144，missing 40，extra 60。
 
 这说明问题不只是 selective write threshold。模型既会漏掉应保留的 L2/backuped page，也会把不该保留的 page 填到 L2。
@@ -133,11 +160,12 @@ S1B 是 `write_back + best_effort`，模型同时 missing 和 extra：
 
 evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，而是 victim 集合或 evicted lifecycle 错误。S1B target
 尤其明显：raw model final state 中 L2/backuped/evicted 都达到 `321`，等于目标 L2 capacity；normalized 后仍比 oracle 多
-60-64 个 L2/backuped/evicted page。
+60-62 个 L2/backuped/evicted page。
 
 ### 当前实现
 
 - L1/L2 有显式 capacity；
+- `capacity_request` 只触发容量检查，不再强制按 requested pages 淘汰；
 - touch order 是简化 LRU；
 - dirty victim 触发 modeled writeback；
 - locked pages 会跳过；
@@ -178,8 +206,8 @@ token path 推导，再集中补 node/ref provenance。
 当前模型：
 
 - `prefetch_intent` 生成 planned pages；
-- `wait_complete` 在 checkpoint 把 pending pages 直接标为 L2/L3 resident 和 ready；
-- `best_effort` / `wait_complete` finalize 会 suppress 未 ready pages；
+- `wait_complete` checkpoint 不再把 pending pages 直接标为 L2/L3 resident 和 ready；
+- `best_effort` checkpoint / finalize 会 suppress 未 ready pages；
 - `timeout` 只按简单 elapsed timeout 标 late。
 
 缺口：
@@ -189,21 +217,20 @@ token path 推导，再集中补 node/ref provenance。
 - source timing observation 不直接驱动 target ready；
 - oracle final state 当前主要比较 resident/backuped/dirty/evicted/locked，不足以证明 prefetch exact。
 
-四向结果显示 prefetch 行为过于二值化：
+四向结果显示 prefetch exact 仍不可直接验证：
 
-- target=S1A 的 wait_complete 下，S1A self raw prefetch ready 712，S1B->S1A raw prefetch ready 728；
+- target=S1A 的 wait_complete 下，S1A self raw prefetch ready 36，S1B->S1A raw prefetch ready 20；
 - target=S1B 的 best_effort 下，S1B self raw prefetch suppressed 1484，S1A->S1B raw prefetch suppressed 1452。
 
-短期只修它对 resident/L2 可见性的影响，不把 prefetch set exact 作为当前验收门槛。
+短期只修不变量边界明确的过度推导，不把 prefetch set exact 作为当前验收门槛。
 
 ## HCSM-D6：Write-Back Flush 未闭环
 
 S1B 是 `write_back + best_effort`，已经暴露 write-back 不闭环：
 
-- S1B self dirty 62/72，missing 10；
+- S1B self dirty 64/72，missing 8；
 - S1A -> S1B dirty 64/72，missing 8；
-- S1B self raw dirty eviction events 1328，S1A->S1B raw dirty eviction events 1296；
-- S1B target 的 L2/backuped/evicted normalized extra 60-64。
+- S1B target 的 L2/backuped/evicted normalized extra 60-62。
 
 需要解释：
 
@@ -212,8 +239,8 @@ S1B 是 `write_back + best_effort`，已经暴露 write-back 不闭环：
 - flush 与 eviction、prefetch、insert 的顺序；
 - background writeback 对后续 lookup 是否可见。
 
-当前不为单点重采。先做 provenance；只有证明现有 `writeback_enqueue_observed` / `writeback_io_observed` 不能区分真实
-dirty/backuped 转换时，才把 writeback trigger/completion 扩成新的集中采集契约。
+当前不为单点重采。先做 provenance；只有证明现有 invariant facts 不能区分真实 dirty/backuped 转换时，才把 writeback
+trigger/completion 扩成新的集中采集契约。现有 `writeback_enqueue_observed` / `writeback_io_observed` 仍不是 state model input。
 
 ## HCSM-D7：Lock / Ref Parent Chain
 
@@ -266,10 +293,10 @@ HiCacheModule 当前 `dag_mutations=0`。这不是 state validation 失败原因
 
 ## 当前处理顺序
 
-1. 写 provenance debug，先覆盖 page-level transition trace、oracle membership、last mutation、request/operation 上下文。
+1. 使用 `scripts/internal/hicache_state_provenance.py` 继续扩展逐 page evidence；不要用 oracle 反向补 transition。
 2. 先解释 S1A `08c4433f...` 这类 L1 missing / evicted extra，再批量分组 S1A target 的 resident/evicted mismatch。
-3. 并行解释 S1B target raw L2/backuped/evicted 到 capacity 321 的路径，确认是否是 capacity/dirty eviction 过强。
-4. 修 lock/ref source asymmetry：S1B self 和 S1B->S1A 的 locked final set 不能继续是 0。
-5. 修 write-back dirty/backuped 规则：S1B dirty missing 与 L2/backuped extra 必须一起看。
+3. 并行解释 S1B target raw L2/backuped/evicted 到 capacity 321 的路径，确认哪些来自 dirty eviction，哪些来自不可观测 writeback cleanup。
+4. lock/ref source asymmetry 暂列难修：S1B self 和 S1B->S1A 的 locked final set 缺失不能简单通过“保留 lock”修复。
+5. write-back dirty/backuped 规则只能修有事实支撑的顺序；没有 completion/victim 事实时不强推。
 6. 每修一类状态规则后重跑四向矩阵，至少两个 self-config 都通过后再评估 cross-config 剩余缺口。
 7. state 通过后再进入 DAG patch。
