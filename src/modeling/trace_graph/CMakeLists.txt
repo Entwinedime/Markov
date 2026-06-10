@@ -29,6 +29,8 @@ target_include_directories(trace_graph
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/ktransformers/archive/third_party
 )
 
+target_link_libraries(trace_graph PRIVATE crypto)
+
 set_target_properties(trace_graph PROPERTIES
     OUTPUT_NAME trace_graph
 )

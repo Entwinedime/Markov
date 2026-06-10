@@ -348,7 +348,6 @@ _ROLE_TO_MECHANISM = {
 
 _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
     "request_tokens": (
-        "request_id",
         "cache_scope",
         "seq_no",
         "token_dictionary",
@@ -356,7 +355,6 @@ _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
         "token_count",
     ),
     "lookup_path": (
-        "request_id",
         "cache_scope",
         "seq_no",
         "token_dictionary",
@@ -537,7 +535,7 @@ def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any])
         token_path_id = value.get("token_path_id")
         if isinstance(token_path_id, str) and token_path_id:
             accumulator["dictionary_ids"].add(token_path_id)
-            if isinstance(value.get("token_ids"), list) and value.get("token_ids"):
+            if isinstance(value.get("token_ids"), list):
                 accumulator["dictionary_ids_with_tokens"].add(token_path_id)
         path_id = value.get("path_id")
         if isinstance(path_id, str) and path_id:

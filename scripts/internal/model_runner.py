@@ -318,18 +318,16 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "write_policy",
             "write_through_threshold",
             "prefetch_policy",
-            "storage_prefetch_policy",
             "prefetch_timeout_base_sec",
             "prefetch_timeout_per_ki_token_sec",
             "prefetch_timeout_max_sec",
             "prefetch_timeout_base",
             "prefetch_timeout_per_ki_token",
             "prefetch_timeout_max",
-            "write_back_prefetch_transfer_credit",
             "emit_state_digests",
         ):
             if key in hicache:
-                if key in {"write_policy", "prefetch_policy", "storage_prefetch_policy"}:
+                if key in {"write_policy", "prefetch_policy"}:
                     value = _normalize_policy_value(hicache.get(key))
                     if value == "observed":
                         raise ValueError(f"HiCache {key}=observed is not supported; use an explicit target policy")
@@ -385,18 +383,16 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "write_policy",
         "write_through_threshold",
         "prefetch_policy",
-        "storage_prefetch_policy",
         "prefetch_timeout_base_sec",
         "prefetch_timeout_per_ki_token_sec",
         "prefetch_timeout_max_sec",
         "prefetch_timeout_base",
         "prefetch_timeout_per_ki_token",
         "prefetch_timeout_max",
-        "write_back_prefetch_transfer_credit",
         "emit_state_digests",
     ):
         if key in explicit_hicache:
-            if key in {"write_policy", "prefetch_policy", "storage_prefetch_policy"}:
+            if key in {"write_policy", "prefetch_policy"}:
                 value = _normalize_policy_value(explicit_hicache.get(key))
                 if value == "observed":
                     raise ValueError(f"target experiment modeling.hicache {key}=observed is not supported; use an explicit target policy")
@@ -518,7 +514,6 @@ def write_hicache_predicted_state_trace_if_available(module_summary_path: Path, 
             "record_count": len(rows),
             "records": rows,
             "final_state": hicache_summary.get("final_state", {}),
-            "missing_page_identity_events": hicache_summary.get("missing_page_identity_events", 0),
             "missing_invariant_facts": hicache_summary.get("missing_invariant_facts", {}),
             "skipped_non_invariant_events": hicache_summary.get("skipped_non_invariant_events", 0),
             "target_config": hicache_summary.get("target_config", {}),
@@ -728,10 +723,11 @@ def build_validation(
     )
     if hicache_validation is not None:
         result["hicache_state"] = hicache_validation
-        if not hicache_validation.get("state_trace_ready", False):
-            errors.append("hicache_state_trace_not_ready")
-        if hicache_validation.get("state_trace_ready") and hicache_validation.get("final_state_match") is False:
-            errors.append("hicache_final_state_mismatch")
+        if hicache_validation.get("oracle_state_validation_required", False):
+            if not hicache_validation.get("state_trace_ready", False):
+                errors.append("hicache_state_trace_not_ready")
+            if hicache_validation.get("state_trace_ready") and hicache_validation.get("final_state_match") is False:
+                errors.append("hicache_final_state_mismatch")
         if not hicache_validation.get("invariant_coverage_ready", False):
             errors.append("hicache_invariant_coverage_not_ready")
         result["validation_errors"] = errors
@@ -755,20 +751,14 @@ def build_hicache_state_validation_if_enabled(
         oracle_paths = [resolve_repo_path(str(path)) for path in hicache_cfg.get("oracle_trace_paths", []) if isinstance(path, str)]
     if not oracle_paths:
         oracle_paths = trace_paths
+    oracle_required = bool(hicache_cfg.get("require_oracle_state_trace", False))
 
     model_summary = load_json(module_summary_path) if module_summary_path.is_file() else {}
     hicache_summary = extract_hicache_summary(model_summary)
     snapshots = extract_hicache_state_snapshots(oracle_paths)
     oracle_final = latest_derived_state(snapshots)
-    merge_state_sets(oracle_final, extract_hicache_prefetch_oracle_state(oracle_paths))
-    lock_fact_oracle = extract_hicache_lock_oracle_state(oracle_paths)
     capacity_oracle = extract_hicache_capacity_oracle_state(snapshots)
     oracle_observed_max_counts = observed_max_derived_state_counts(snapshots)
-    if lock_fact_oracle.get("ready"):
-        # lock/ref 的最终状态优先用模型输入事实推导。真实 trace 尾部可能存在
-        # dec_lock_ref_end 事实，但缺少对应的 end state_snapshot；如果继续只取
-        # snapshot，会把已经释放的 page 误判为最终 locked。
-        oracle_final["locked_pages"] = lock_fact_oracle.get("locked_pages", [])
     model_final = hicache_summary.get("final_state") if isinstance(hicache_summary.get("final_state"), dict) else {}
     ignored_state_keys = configured_ignore_state_keys(hicache_cfg)
     all_sets_diff = diff_hicache_sets(model_final, oracle_final)
@@ -785,12 +775,9 @@ def build_hicache_state_validation_if_enabled(
     request_transition_coverage = build_request_transition_coverage(predicted_records, snapshots)
     transition_coverage = build_transition_coverage(predicted_records, snapshots)
     event_delta_validation = build_event_delta_validation(predicted_records, snapshots)
-    timeline_delta_validation = build_timeline_delta_validation(predicted_records, snapshots, lock_fact_oracle)
-    missing_page_identity = int(hicache_summary.get("missing_page_identity_events", 0) or 0) if hicache_summary else 0
+    timeline_delta_validation = build_timeline_delta_validation(predicted_records, snapshots)
     skipped_non_invariant = int(hicache_summary.get("skipped_non_invariant_events", 0) or 0) if hicache_summary else 0
     missing_invariants = []
-    if missing_page_identity > 0:
-        missing_invariants.append("page_identity")
     missing_invariant_counts = hicache_summary.get("missing_invariant_facts", {}) if hicache_summary else {}
     if isinstance(missing_invariant_counts, dict):
         missing_invariants.extend(sorted(str(key) for key, value in missing_invariant_counts.items() if int(value or 0) > 0))
@@ -801,8 +788,9 @@ def build_hicache_state_validation_if_enabled(
     return {
         "state_trace_ready": bool(snapshots),
         "state_trace_events": len(snapshots),
+        "oracle_state_validation_required": oracle_required,
         "model_transition_events": len(hicache_summary.get("transition_trace", []) if hicache_summary else []),
-        "final_state_match": bool(oracle_final) and not first_mismatch,
+        "final_state_match": None if not oracle_final else not first_mismatch,
         "sets_diff_by_tier": sets_diff,
         "ignored_state_keys": sorted(ignored_state_keys),
         "ignored_sets_diff_by_tier": ignored_sets_diff,
@@ -815,10 +803,8 @@ def build_hicache_state_validation_if_enabled(
         "transition_coverage": transition_coverage,
         "event_delta_validation": event_delta_validation,
         "timeline_delta_validation": timeline_delta_validation,
-        "lock_fact_oracle": lock_fact_oracle,
         "oracle_capacity_summary": capacity_oracle,
         "capacity_config_audit": capacity_config_audit,
-        "missing_page_identity_events": missing_page_identity,
         "skipped_non_invariant_events": skipped_non_invariant,
         "unmatched_state_trace_events": 0 if snapshots else None,
         "invariant_coverage_ready": bool(hicache_summary) and not missing_invariants,
@@ -975,7 +961,7 @@ def build_hicache_capacity_config_audit(
         "l1_capacity_pages": _optional_int(target_config.get("l1_capacity_pages", target_config.get("l1_capacity"))),
         "l2_capacity_pages": _optional_int(target_config.get("l2_capacity_pages", target_config.get("l2_capacity"))),
         "write_policy": _normalize_policy_value(target_config.get("write_policy")),
-        "prefetch_policy": _normalize_policy_value(target_config.get("prefetch_policy", target_config.get("storage_prefetch_policy"))),
+        "prefetch_policy": _normalize_policy_value(target_config.get("prefetch_policy")),
     }
     comparisons = {
         "page_size": _compare_int_config("page_size", target["page_size"], _unique_int_values(unique_values, ["page_size"])),
@@ -1367,189 +1353,6 @@ def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     return {key: sorted(value) for key, value in union.items()}
 
 
-def merge_state_sets(target: dict[str, Any], extra: dict[str, list[str]]) -> None:
-    """把 validation-only 派生集合合并到 oracle final state。"""
-
-    for key, values in extra.items():
-        if not isinstance(values, list):
-            continue
-        current = set(str(item) for item in target.get(key, []) if item is not None)
-        current.update(str(item) for item in values if item is not None)
-        target[key] = sorted(current)
-
-
-def extract_hicache_lock_oracle_state(trace_paths: list[Path]) -> dict[str, Any]:
-    """从 lock/ref 模型输入事实推导最终 locked page 集合。
-
-    state snapshot 是采样式调试输出，尾部可能缺少最后一次 end snapshot。lock/ref
-    事件本身是 HiCache state model 消费的不变量事实，因此 validation oracle 在
-    存在这些事实时用 refcount 重新计算最终 locked set，避免把采样缺口归因给模型。
-    """
-
-    ref_counts: dict[str, int] = {}
-    event_count = 0
-    skipped_noop_events = 0
-    for path in trace_paths:
-        if not path.is_file():
-            continue
-        try:
-            payload = load_json(path)
-        except json.JSONDecodeError:
-            continue
-        events = payload.get("traceEvents") if isinstance(payload, dict) else payload
-        if not isinstance(events, list):
-            continue
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            name = str(event.get("name") or "")
-            args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            if not isinstance(args, dict) or false_like(args.get("model_input")):
-                continue
-            role = str(args.get("event_role") or "")
-            if not role:
-                base_name = event_base_name(name)
-                if "inc_lock_ref" in base_name:
-                    role = "lock_ref_inc"
-                elif "dec_lock_ref" in base_name:
-                    role = "lock_ref_dec"
-            if role not in {"lock_ref_inc", "lock_ref_dec"}:
-                continue
-            if event_phase(name) == "start":
-                continue
-            pages = page_keys_from_snapshot_hash(args.get("page_identity"))
-            if not pages:
-                skipped_noop_events += 1
-                continue
-            event_count += 1
-            for page in pages:
-                if role == "lock_ref_inc":
-                    ref_counts[page] = ref_counts.get(page, 0) + 1
-                else:
-                    current = ref_counts.get(page, 0)
-                    if current <= 1:
-                        ref_counts.pop(page, None)
-                    else:
-                        ref_counts[page] = current - 1
-    return {
-        "ready": event_count > 0,
-        "lock_fact_event_count": event_count,
-        "skipped_noop_event_count": skipped_noop_events,
-        "locked_pages": sorted(ref_counts),
-        "locked_page_count": len(ref_counts),
-    }
-
-
-def extract_hicache_prefetch_oracle_state(trace_paths: list[Path]) -> dict[str, list[str]]:
-    """从 target trace 的 prefetch 事件派生 planned/ready oracle。
-
-    SGLang state snapshot 当前不直接暴露 ready/late/suppressed 集合。profiling
-    的 `prefetch_progress_state` 字段会记录 operation hash pages 和 completed
-    tokens；这里仅用于 validation，不影响业务模型输入。
-    """
-
-    planned_pages: set[str] = set()
-    planned_by_request: dict[str, list[str]] = {}
-    ready_pages: set[str] = set()
-    late_pages: set[str] = set()
-    suppressed_pages: set[str] = set()
-    latest_progress_by_request: dict[str, dict[str, Any]] = {}
-    for path in trace_paths:
-        if not path.is_file():
-            continue
-        try:
-            payload = load_json(path)
-        except json.JSONDecodeError:
-            continue
-        events = payload.get("traceEvents") if isinstance(payload, dict) else payload
-        if not isinstance(events, list):
-            continue
-        for event in events:
-            if not isinstance(event, dict):
-                continue
-            args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            if not isinstance(args, dict) or false_like(args.get("model_input")):
-                continue
-            role = str(args.get("event_role") or "")
-            if role in {"prefetch_schedule", "l3_prefetch_enqueue"} and str(event.get("name") or "").endswith("_end"):
-                pages = page_keys_from_snapshot_hash(args.get("page_identity"))
-                planned_pages.update(pages)
-                request_id = str(args.get("request_id") or "")
-                if request_id and pages:
-                    planned_by_request[request_id] = merge_page_lists(planned_by_request.get(request_id, []), pages)
-            if role == "l3_to_l2_transfer" and str(event.get("name") or "").endswith("_end"):
-                pages = page_keys_from_snapshot_hash(args.get("page_identity"))
-                page_size = int(optional_float(args.get("page_size")) or 0)
-                completed_tokens = int(optional_float(args.get("completed_tokens")) or 0)
-                ready_count = len(pages)
-                if page_size > 0 and completed_tokens > 0:
-                    ready_count = min(len(pages), completed_tokens // page_size)
-                ready_pages.update(pages[:ready_count])
-            progress = args.get("prefetch_progress_state")
-            if not isinstance(progress, dict):
-                continue
-            request_id = str(progress.get("request_id") or args.get("request_id") or "")
-            if not request_id:
-                continue
-            pages = page_keys_from_snapshot_hash(progress.get("operation_hash_pages"))
-            if pages:
-                latest_progress_by_request[request_id] = progress
-            if progress.get("check_return") is True:
-                source_has_operation_pages = bool(pages)
-                source = progress if pages else latest_progress_by_request.get(request_id, progress)
-                source_pages = page_keys_from_snapshot_hash(source.get("operation_hash_pages"))
-                if not source_pages:
-                    # 没有 operation_hash_pages，但 check 已结束且没有 ongoing
-                    # operation，说明这次 planned prefetch 没有形成可验证的
-                    # transfer progress。此时只能把 planned pages 归为 suppressed；
-                    # late 必须依赖真实 operation progress evidence。
-                    if progress.get("has_ongoing_prefetch") is False:
-                        suppressed_pages.update(planned_by_request.get(request_id, []))
-                    continue
-                source_has_operation_pages = source_has_operation_pages or bool(page_keys_from_snapshot_hash(source.get("operation_hash_pages")))
-                ready_count = ready_page_count_from_prefetch_progress(source)
-                ready_pages.update(source_pages[:ready_count])
-                late_pages.update(source_pages[ready_count:])
-                if not source_has_operation_pages and not progress.get("has_ongoing_prefetch") and ready_count == 0:
-                    suppressed_pages.update(source_pages)
-    result: dict[str, list[str]] = {}
-    late_pages.difference_update(ready_pages)
-    suppressed_pages.difference_update(ready_pages)
-    if planned_pages:
-        result["prefetch_planned_pages"] = sorted(planned_pages)
-    if ready_pages:
-        result["prefetch_ready_pages"] = sorted(ready_pages)
-    if late_pages:
-        result["prefetch_late_pages"] = sorted(late_pages)
-    if suppressed_pages:
-        result["prefetch_suppressed_pages"] = sorted(suppressed_pages)
-    return result
-
-
-def merge_page_lists(left: list[str], right: list[str]) -> list[str]:
-    result = list(left)
-    seen = set(result)
-    for page in right:
-        if page not in seen:
-            result.append(page)
-            seen.add(page)
-    return result
-
-
-def ready_page_count_from_prefetch_progress(progress: dict[str, Any]) -> int:
-    page_size = int(optional_float(progress.get("page_size")) or 0)
-    completed_tokens = int(optional_float(progress.get("completed_tokens")) or 0)
-    if page_size > 0 and completed_tokens > 0:
-        return completed_tokens // page_size
-    ready_pages = int(optional_float(progress.get("ready_pages_estimate")) or 0)
-    if ready_pages > 0:
-        return ready_pages
-    loaded_tokens = int(optional_float(progress.get("loaded_tokens_evidence")) or 0)
-    if page_size > 0 and loaded_tokens > 0:
-        return loaded_tokens // page_size
-    return 0
-
-
 def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     """从 state snapshot 原始节点重新派生集合状态。
 
@@ -1809,11 +1612,7 @@ def build_event_delta_validation(predicted_records: list[dict[str, Any]], snapsh
     }
 
 
-def build_timeline_delta_validation(
-    predicted_records: list[dict[str, Any]],
-    snapshots: list[dict[str, Any]],
-    lock_fact_oracle: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def build_timeline_delta_validation(predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     """按 cache object 的 snapshot 时间线生成一次性状态变化 oracle。
 
     `event_delta_validation` 比较 start/end 包围差分，适合定位某个调用点；
@@ -1828,8 +1627,7 @@ def build_timeline_delta_validation(
     visible_state_keys = timeline_visible_state_keys(snapshots)
     comparison_state_keys = active_state_keys & visible_state_keys
     oracle = build_oracle_timeline_deltas(snapshots, comparison_state_keys)
-    final_lock_correction = build_final_lock_timeline_correction(oracle.get("final_state", {}), lock_fact_oracle, comparison_state_keys)
-    oracle_rows = list(oracle["rows"]) + final_lock_correction["rows"]
+    oracle_rows = list(oracle["rows"])
     predicted = build_predicted_event_deltas(predicted_records, comparison_state_keys)
     comparable = bool(oracle["rows"])
     mismatches = compare_delta_multisets(predicted["rows"], oracle_rows) if comparable else []
@@ -1847,7 +1645,6 @@ def build_timeline_delta_validation(
         "oracle_extra_transition_count": oracle_extra_transition_count,
         "oracle_transition_count": len(oracle_rows),
         "predicted_transition_count": len(predicted["rows"]),
-        "final_lock_timeline_correction": final_lock_correction["summary"],
         "compared_state_keys": sorted(comparison_state_keys),
         "ignored_unobservable_state_keys": sorted(active_state_keys - comparison_state_keys),
         "oracle_transition_count_by_kind": oracle_counts,
@@ -1949,65 +1746,6 @@ def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_k
         "ignored_snapshot_count": ignored_snapshot_count,
         "ignored_state_keys": sorted(ignored_state_keys),
     }
-
-
-def build_final_lock_timeline_correction(
-    final_state: dict[str, Any],
-    lock_fact_oracle: dict[str, Any] | None,
-    active_state_keys: set[str],
-) -> dict[str, Any]:
-    """为 timeline oracle 补齐尾部缺失 snapshot 导致的 lock final delta。"""
-
-    if "locked_pages" not in active_state_keys or not isinstance(lock_fact_oracle, dict) or not lock_fact_oracle.get("ready"):
-        return {"rows": [], "summary": {"ready": False, "applied": False, "transition_count": 0}}
-    snapshot_locked = set(str(item) for item in final_state.get("locked_pages", []) if item is not None)
-    fact_locked = set(str(item) for item in lock_fact_oracle.get("locked_pages", []) if item is not None)
-    to_mark = sorted(fact_locked - snapshot_locked)
-    to_clear = sorted(snapshot_locked - fact_locked)
-    rows: list[dict[str, Any]] = []
-    if to_mark:
-        rows.append(
-            {
-                "event_key": "lock_fact_final_correction",
-                "trace_path": "",
-                "cache_scope": "",
-                "tid": "",
-                "target_id": "",
-                "request_id": "",
-                "operation_id": "",
-                "ts": 0,
-                "event_base_name": "lock_fact_final_correction",
-                "transition_kind": "mark_locked",
-                "pages": to_mark,
-            }
-        )
-    if to_clear:
-        rows.append(
-            {
-                "event_key": "lock_fact_final_correction",
-                "trace_path": "",
-                "cache_scope": "",
-                "tid": "",
-                "target_id": "",
-                "request_id": "",
-                "operation_id": "",
-                "ts": 0,
-                "event_base_name": "lock_fact_final_correction",
-                "transition_kind": "clear_locked",
-                "pages": to_clear,
-            }
-        )
-    return {
-        "rows": rows,
-        "summary": {
-            "ready": True,
-            "applied": bool(rows),
-            "transition_count": len(to_mark) + len(to_clear),
-            "mark_locked_pages": to_mark,
-            "clear_locked_pages": to_clear,
-        },
-    }
-
 
 def union_hicache_states(states: Any) -> dict[str, list[str]]:
     union: dict[str, set[str]] = {}

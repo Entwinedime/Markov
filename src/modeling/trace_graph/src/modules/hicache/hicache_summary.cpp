@@ -42,7 +42,6 @@ std::string HiCacheSummary::to_json() const {
     root["processed_hicache_events"] = processed_hicache_events;
     root["state_transition_count"] = state_transition_count;
     root["dag_mutations"] = dag_mutations;
-    root["missing_page_identity_events"] = missing_page_identity_events;
     root["dirty_eviction_events"] = dirty_eviction_events;
     root["lock_state_events"] = lock_state_events;
     root["skipped_non_invariant_events"] = skipped_non_invariant_events;
@@ -57,7 +56,6 @@ std::string HiCacheSummary::to_json() const {
         {"prefetch_timeout_base_sec", target_config.prefetch_timeout_base_sec},
         {"prefetch_timeout_per_ki_token_sec", target_config.prefetch_timeout_per_ki_token_sec},
         {"prefetch_timeout_max_sec", target_config.prefetch_timeout_max_sec},
-        {"write_back_prefetch_transfer_credit", target_config.write_back_prefetch_transfer_credit},
         {"emit_state_digests", target_config.emit_state_digests},
     };
     root["events_by_role"] = events_by_role;

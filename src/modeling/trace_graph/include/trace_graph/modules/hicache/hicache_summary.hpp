@@ -35,7 +35,6 @@ struct HiCacheSummary {
     uint64_t processed_hicache_events = 0;
     uint64_t state_transition_count = 0;
     uint64_t dag_mutations = 0;
-    uint64_t missing_page_identity_events = 0;
     uint64_t dirty_eviction_events = 0;
     uint64_t lock_state_events = 0;
     uint64_t skipped_non_invariant_events = 0;
