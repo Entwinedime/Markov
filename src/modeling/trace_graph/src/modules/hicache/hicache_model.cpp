@@ -1,15 +1,10 @@
 #include "trace_graph/modules/hicache/hicache_model.hpp"
 
 #include "trace_graph/core/dag_graph.hpp"
-
-#include <openssl/sha.h>
+#include "trace_graph/modules/hicache/hicache_router.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cctype>
-#include <iomanip>
-#include <sstream>
-#include <unordered_set>
 #include <utility>
 
 namespace TraceGraph {
@@ -23,29 +18,6 @@ std::string lower(std::string value) {
 
 std::vector<std::string> sorted_vector(const std::set<std::string> & values) { return {values.begin(), values.end()}; }
 
-std::string join_set(const std::set<std::string> & values) {
-    std::ostringstream os;
-    bool first = true;
-    for (const auto & value : values) {
-        if (!first) os << ",";
-        first = false;
-        os << value;
-    }
-    return os.str();
-}
-
-std::string join_count_map(const std::unordered_map<std::string, uint64_t> & values) {
-    std::map<std::string, uint64_t> ordered(values.begin(), values.end());
-    std::ostringstream os;
-    bool first = true;
-    for (const auto & [key, count] : ordered) {
-        if (!first) os << ",";
-        first = false;
-        os << key << ":" << count;
-    }
-    return os.str();
-}
-
 std::vector<std::string> slice_pages(const std::vector<std::string> & pages, size_t begin, size_t end) {
     if (begin >= pages.size() || begin >= end) return {};
     end = std::min(end, pages.size());
@@ -54,136 +26,23 @@ std::vector<std::string> slice_pages(const std::vector<std::string> & pages, siz
 
 std::vector<std::string> suffix_pages(const std::vector<std::string> & pages, size_t begin) { return slice_pages(pages, begin, pages.size()); }
 
-std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
-    std::vector<unsigned char> bytes;
-    if (hex.size() % 2 != 0) return bytes;
-    bytes.reserve(hex.size() / 2);
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        try {
-            bytes.push_back(static_cast<unsigned char>(std::stoul(hex.substr(i, 2), nullptr, 16)));
-        }
-        catch (...) {
-            return {};
-        }
-    }
-    return bytes;
-}
-
-std::string bytes_to_hex(const unsigned char * bytes, size_t len) {
-    std::ostringstream os;
-    os << std::hex << std::setfill('0');
-    for (size_t i = 0; i < len; ++i) os << std::setw(2) << static_cast<unsigned int>(bytes[i]);
-    return os.str();
-}
-
-std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_t end, const std::string & prior_hash) {
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
-    if (!prior_hash.empty()) {
-        auto parent = hex_to_bytes(prior_hash);
-        if (!parent.empty()) SHA256_Update(&ctx, parent.data(), parent.size());
-    }
-    for (size_t index = begin; index < end && index < tokens.size(); ++index) {
-        for (const auto word : tokens[index].words) {
-            unsigned char raw[4] = {
-                static_cast<unsigned char>(word & 0xffu),
-                static_cast<unsigned char>((word >> 8u) & 0xffu),
-                static_cast<unsigned char>((word >> 16u) & 0xffu),
-                static_cast<unsigned char>((word >> 24u) & 0xffu),
-            };
-            SHA256_Update(&ctx, raw, sizeof(raw));
-        }
-    }
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
-    SHA256_Final(digest.data(), &ctx);
-    return bytes_to_hex(digest.data(), digest.size());
-}
-
-bool is_invariant_state_fact(const HiCacheFact & fact) { return fact.fact_class == "invariant_state" && fact.state_model_input; }
-
-bool is_known_invariant_role(const std::string & role) {
-    static const std::unordered_set<std::string> roles = {
-        "request_tokens",
-        "lookup_path",
-        "cache_config_observed",
-        "insert_path",
-        "prefetch_intent",
-        "prefetch_check_point",
-        "capacity_request",
-        "lock_scope_delta",
-    };
-    return roles.count(role) > 0;
-}
-
 } // namespace
 
-std::string HiCacheState::digest() const {
-    std::ostringstream os;
-    os << "l1=" << join_set(l1_) << ";l2=" << join_set(l2_) << ";l3=" << join_set(l3_) << ";dirty=" << join_set(dirty_) << ";backuped=" << join_set(backuped_)
-       << ";evicted=" << join_set(evicted_) << ";prefetch_planned=" << join_set(prefetch_planned_) << ";prefetch_ready=" << join_set(prefetch_ready_)
-       << ";prefetch_late=" << join_set(prefetch_late_) << ";prefetch_suppressed=" << join_set(prefetch_suppressed_) << ";locked=" << join_set(locked_)
-       << ";hit_count=" << join_count_map(hit_count_by_scope_page_);
-    return os.str();
-}
+std::string HiCacheState::digest() const { return state_index_.digest(); }
 
-HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)) {}
+HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)), target_pager_(config_) {}
 
-uint64_t HiCacheState::page_size_for_fact(const HiCacheFact & fact) const {
-    if (config_.page_size > 0) return config_.page_size;
-    return fact.source_page_size;
-}
-
-std::string HiCacheState::scoped_page_id(const HiCacheFact & fact, const std::string & page_hash) const {
-    const auto scope = fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope;
-    return scope + "|" + page_hash;
-}
+uint64_t HiCacheState::page_size_for_fact(const HiCacheFact & fact) const { return target_pager_.page_size_for_fact(fact); }
 
 std::vector<std::string> HiCacheState::pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
-    const auto page_size = page_size_for_fact(fact);
-    if (page_size == 0 || tokens.size() < page_size) return {};
-    const auto aligned_len = tokens.size() / page_size * page_size;
-    std::vector<std::string> pages;
-    pages.reserve(aligned_len / page_size);
-    std::string parent_hash;
-    for (size_t begin = 0; begin < aligned_len; begin += static_cast<size_t>(page_size)) {
-        const auto end = begin + static_cast<size_t>(page_size);
-        parent_hash = hash_token_page(tokens, begin, end, parent_hash);
-        pages.push_back(scoped_page_id(fact, parent_hash));
-    }
-    return pages;
+    return target_pager_.pages_for_tokens(fact, tokens);
 }
 
-std::vector<std::string> HiCacheState::suffix_pages_for_prefetch(const HiCacheFact & fact) const {
-    const auto page_size = page_size_for_fact(fact);
-    if (page_size == 0) return {};
-    if (!fact.full_path_tokens.empty()) {
-        auto full_pages = pages_for_tokens(fact, fact.full_path_tokens);
-        const auto prefix_pages = fact.prefix_tokens.size() / page_size;
-        if (prefix_pages >= full_pages.size()) return {};
-        return suffix_pages(full_pages, static_cast<size_t>(prefix_pages));
-    }
-    return pages_for_tokens(fact, fact.suffix_tokens);
-}
+std::set<std::string> * HiCacheState::tier_set(const std::string & tier) { return state_index_.tier_set(tier); }
 
-std::set<std::string> * HiCacheState::tier_set(const std::string & tier) {
-    if (tier == "L1") return &l1_;
-    if (tier == "L2") return &l2_;
-    if (tier == "L3") return &l3_;
-    return nullptr;
-}
+const std::set<std::string> * HiCacheState::tier_set(const std::string & tier) const { return state_index_.tier_set(tier); }
 
-const std::set<std::string> * HiCacheState::tier_set(const std::string & tier) const {
-    if (tier == "L1") return &l1_;
-    if (tier == "L2") return &l2_;
-    if (tier == "L3") return &l3_;
-    return nullptr;
-}
-
-std::vector<std::string> * HiCacheState::touch_order_for_tier(const std::string & tier) {
-    if (tier == "L1") return &l1_touch_order_;
-    if (tier == "L2") return &l2_touch_order_;
-    return nullptr;
-}
+std::vector<std::string> * HiCacheState::touch_order_for_tier(const std::string & tier) { return state_index_.touch_order_for_tier(tier); }
 
 uint64_t HiCacheState::capacity_for_tier(const std::string & tier) const {
     if (tier == "L1") return config_.l1_capacity_pages;
@@ -200,22 +59,7 @@ uint64_t HiCacheState::target_write_through_threshold() const {
 
 bool HiCacheState::target_write_count_enabled() const { return config_.write_policy == "write_through" || config_.write_policy == "write_through_selective"; }
 
-std::string HiCacheState::scoped_request_key(const HiCacheFact & fact) const {
-    if (fact.request_id.empty()) return "";
-    return (fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope) + ":" + fact.request_id;
-}
-
-std::string HiCacheState::scoped_page_key(const HiCacheFact & fact, const std::string & page) const {
-    return (fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope) + ":" + page;
-}
-
-bool HiCacheState::page_locked_in_any_scope(const std::string & page) const {
-    const auto suffix = ":" + page;
-    for (const auto & [key, count] : lock_count_by_scope_page_) {
-        if (count > 0 && key.size() >= suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
-    }
-    return false;
-}
+std::string HiCacheState::scoped_request_key(const HiCacheFact & fact) const { return token_store_.scoped_request_key(fact); }
 
 std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
@@ -223,6 +67,7 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         apply_request_tokens(fact);
         return transitions;
     }
+    if (fact.role == "cache_config_observed") { return transitions; }
     if (fact.role == "lookup_path") {
         apply_lookup_path(fact, summary, transitions);
         return transitions;
@@ -231,8 +76,8 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         apply_insert_path(fact, summary, transitions);
         return transitions;
     }
-    if (fact.role == "prefetch_intent") {
-        apply_prefetch_intent(fact, summary, transitions);
+    if (fact.role == "prefetch_decision") {
+        apply_prefetch_decision(fact, summary, transitions);
         return transitions;
     }
     if (fact.role == "prefetch_check_point") {
@@ -256,46 +101,40 @@ std::vector<HiCacheStateTransition> HiCacheState::finalize(HiCacheSummary & summ
         HiCacheFact fact;
         fact.role = "prefetch_finalize";
         fact.event_name = "hicache_prefetch_finalize";
-        for (const auto & page : prefetch_planned_) {
-            if (prefetch_ready_.count(page) == 0) mark_prefetch_suppressed(fact, summary, transitions, page);
+        for (const auto & page : state_index_.prefetch_planned()) {
+            if (state_index_.prefetch_ready().count(page) == 0) mark_prefetch_suppressed(fact, summary, transitions, page);
         }
     }
     return transitions;
 }
 
-void HiCacheState::apply_request_tokens(const HiCacheFact & fact) {
-    const auto key = scoped_request_key(fact);
-    if (key.empty()) return;
-    auto pages = pages_for_tokens(fact, fact.full_path_tokens);
-    if (!pages.empty()) request_pages_[key] = std::move(pages);
-}
+void HiCacheState::apply_request_tokens(const HiCacheFact & fact) { token_store_.set_request_tokens(fact, fact.full_path_tokens); }
 
 void HiCacheState::apply_lookup_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto pages = pages_for_tokens(fact, fact.full_path_tokens);
-    if (pages.empty() && !fact.request_id.empty()) {
-        auto it = request_pages_.find(scoped_request_key(fact));
-        if (it != request_pages_.end()) pages = it->second;
-    }
+    auto tokens = fact.full_path_tokens;
+    if (tokens.empty()) tokens = token_store_.request_tokens(fact);
+    auto pages = pages_for_tokens(fact, tokens);
     if (pages.empty()) return;
-    if (!fact.request_id.empty()) request_pages_[scoped_request_key(fact)] = pages;
+    token_store_.set_request_tokens(fact, tokens);
 
-    const auto matched = radix_tree_.longest_prefix_pages(pages);
+    const auto matched = radix_tree_.longest_prefix_pages(tokens, page_size_for_fact(fact));
     auto matched_pages = slice_pages(pages, 0, matched);
     for (const auto & page : matched_pages) {
-        if (l1_.count(page) > 0) {
+        if (state_index_.l1().count(page) > 0) {
             touch_page("L1", page);
-            if (l2_.count(page) > 0) touch_page("L2", page);
+            if (state_index_.l2().count(page) > 0) touch_page("L2", page);
             continue;
         }
-        if (l2_.count(page) > 0) {
+        if (state_index_.l2().count(page) > 0) {
             touch_page("L2", page);
             add_resident(fact, summary, transitions, "L1", page);
             continue;
         }
-        if (l3_.count(page) > 0) {
+        if (state_index_.l3().count(page) > 0) {
             add_resident(fact, summary, transitions, "L2", page);
             add_resident(fact, summary, transitions, "L1", page);
-            if (config_.prefetch_policy == "wait_complete" && prefetch_planned_.count(page) > 0) mark_prefetch_ready(fact, summary, transitions, page);
+            if (config_.prefetch_policy == "wait_complete" && state_index_.prefetch_planned().count(page) > 0)
+                mark_prefetch_ready(fact, summary, transitions, page);
         }
     }
     enforce_capacity(fact, summary, transitions, "L2");
@@ -303,16 +142,15 @@ void HiCacheState::apply_lookup_path(const HiCacheFact & fact, HiCacheSummary & 
 }
 
 void HiCacheState::apply_insert_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto full_pages = pages_for_tokens(fact, fact.full_path_tokens);
-    if (full_pages.empty() && !fact.request_id.empty()) {
-        auto it = request_pages_.find(scoped_request_key(fact));
-        if (it != request_pages_.end()) full_pages = it->second;
-    }
+    auto tokens = fact.full_path_tokens;
+    if (tokens.empty()) tokens = token_store_.request_tokens(fact);
+    auto full_pages = pages_for_tokens(fact, tokens);
     if (full_pages.empty()) return;
+    token_store_.set_request_tokens(fact, tokens);
 
-    const auto prefix_pages = radix_tree_.longest_prefix_pages(full_pages);
+    const auto prefix_pages = radix_tree_.longest_prefix_pages(tokens, page_size_for_fact(fact));
     auto inserted_pages = suffix_pages(full_pages, prefix_pages);
-    radix_tree_.insert_path(full_pages);
+    radix_tree_.insert_path(tokens, full_pages);
     if (inserted_pages.empty()) {
         apply_write_policy_hit_counts(fact, full_pages, summary, transitions);
         return;
@@ -335,13 +173,20 @@ void HiCacheState::apply_insert_path(const HiCacheFact & fact, HiCacheSummary & 
     enforce_capacity(fact, summary, transitions, "L2");
 }
 
-void HiCacheState::apply_prefetch_intent(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto pages = suffix_pages_for_prefetch(fact);
+void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
+    auto tokens = fact.full_path_tokens;
+    if (tokens.empty()) tokens = token_store_.request_tokens(fact);
+    auto full_pages = pages_for_tokens(fact, tokens);
+    if (full_pages.empty()) return;
+    token_store_.set_request_tokens(fact, tokens);
+
+    const auto prefix_pages = radix_tree_.longest_prefix_pages(tokens, page_size_for_fact(fact));
+    auto pages = suffix_pages(full_pages, prefix_pages);
     if (pages.empty()) return;
     if (!fact.request_id.empty()) {
         const auto key = scoped_request_key(fact);
         pending_prefetch_pages_[key] = pages;
-        prefetch_intent_ts_[key] = fact.ts;
+        prefetch_decision_ts_[key] = fact.ts;
     }
     for (const auto & page : pages) mark_prefetch_planned(fact, summary, transitions, page);
 }
@@ -358,13 +203,13 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     }
     if (config_.prefetch_policy == "best_effort") {
         for (const auto & page : pages) {
-            if (prefetch_ready_.count(page) == 0) mark_prefetch_suppressed(fact, summary, transitions, page);
+            if (state_index_.prefetch_ready().count(page) == 0) mark_prefetch_suppressed(fact, summary, transitions, page);
         }
         return;
     }
     if (config_.prefetch_policy != "timeout" || !config_.prefetch_timeout_configured) return;
-    auto ts_it = prefetch_intent_ts_.find(key);
-    if (ts_it == prefetch_intent_ts_.end() || fact.ts < ts_it->second) return;
+    auto ts_it = prefetch_decision_ts_.find(key);
+    if (ts_it == prefetch_decision_ts_.end() || fact.ts < ts_it->second) return;
     const auto page_size = page_size_for_fact(fact);
     const auto token_count = static_cast<uint64_t>(pages.size()) * page_size;
     double timeout_sec = config_.prefetch_timeout_base_sec + config_.prefetch_timeout_per_ki_token_sec * static_cast<double>(token_count) / 1024.0;
@@ -372,7 +217,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     const double elapsed_sec = static_cast<double>(fact.ts - ts_it->second) / 1000000.0;
     if (elapsed_sec < timeout_sec) return;
     for (const auto & page : pages) {
-        if (prefetch_ready_.count(page) == 0) mark_prefetch_late(fact, summary, transitions, page);
+        if (state_index_.prefetch_ready().count(page) == 0) mark_prefetch_late(fact, summary, transitions, page);
     }
 }
 
@@ -390,23 +235,12 @@ void HiCacheState::apply_lock_scope_delta(const HiCacheFact & fact, HiCacheSumma
     if (pages.empty()) return;
     const bool increment = fact.lock_direction == "inc" || fact.lock_direction == "increase" || fact.lock_direction == "+";
     for (const auto & page : pages) {
-        const auto key = scoped_page_key(fact, page);
         if (increment) {
-            lock_count_by_scope_page_[key]++;
+            state_index_.increment_lock_count(fact.cache_scope, page);
             mark_locked(fact, summary, transitions, page);
             continue;
         }
-        auto it = lock_count_by_scope_page_.find(key);
-        if (it != lock_count_by_scope_page_.end() && it->second > 0) {
-            it->second--;
-            if (it->second == 0) {
-                lock_count_by_scope_page_.erase(it);
-                if (!page_locked_in_any_scope(page)) clear_locked(fact, summary, transitions, page);
-            }
-        }
-        else if (!page_locked_in_any_scope(page)) {
-            clear_locked(fact, summary, transitions, page);
-        }
+        if (state_index_.decrement_lock_count(fact.cache_scope, page)) { clear_locked(fact, summary, transitions, page); }
     }
 }
 
@@ -418,12 +252,11 @@ void HiCacheState::apply_write_policy_hit_counts(const HiCacheFact & fact, const
     std::set<std::string> counted;
     for (const auto & page : full_pages) {
         if (page.empty() || !counted.insert(page).second) continue;
-        if (l1_.count(page) == 0 && !radix_tree_.contains_page(page)) continue;
+        if (state_index_.l1().count(page) == 0 && !radix_tree_.contains_page(page)) continue;
         auto before = transition_state_digest();
-        const auto key = scoped_page_key(fact, page);
-        hit_count_by_scope_page_[key]++;
+        const auto hit_count = state_index_.increment_hit_count(fact.cache_scope, page);
         record_transition(fact, summary, transitions, "increment_hit_count", "", page, before);
-        if (hit_count_by_scope_page_[key] < threshold) continue;
+        if (hit_count < threshold) continue;
         add_resident(fact, summary, transitions, "L2", page);
         add_resident(fact, summary, transitions, "L3", page);
         mark_backuped(fact, summary, transitions, page);
@@ -433,23 +266,15 @@ void HiCacheState::apply_write_policy_hit_counts(const HiCacheFact & fact, const
 
 void HiCacheState::add_resident(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier,
                                 const std::string & page) {
-    auto * pages = tier_set(tier);
-    if (!pages) return;
     auto before = transition_state_digest();
-    touch_page(tier, page);
-    if (pages->insert(page).second) {
-        evicted_.erase(page);
-        record_transition(fact, summary, transitions, "add_" + lower(tier) + "_resident", tier, page, before);
-    }
+    if (state_index_.add_resident(tier, page)) record_transition(fact, summary, transitions, "add_" + lower(tier) + "_resident", tier, page, before);
     if (tier == "L2") mark_backuped(fact, summary, transitions, page);
 }
 
 void HiCacheState::remove_resident(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                    const std::string & tier, const std::string & page) {
-    auto * pages = tier_set(tier);
-    if (!pages) return;
     auto before = transition_state_digest();
-    if (pages->erase(page) > 0) {
+    if (state_index_.remove_resident(tier, page)) {
         record_transition(fact, summary, transitions, "remove_" + lower(tier) + "_resident", tier, page, before);
         if (tier == "L2") clear_backuped(fact, summary, transitions, page);
     }
@@ -457,86 +282,77 @@ void HiCacheState::remove_resident(const HiCacheFact & fact, HiCacheSummary & su
 
 void HiCacheState::mark_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & page) {
     auto before = transition_state_digest();
-    if (dirty_.insert(page).second) record_transition(fact, summary, transitions, "mark_dirty", "", page, before);
+    if (state_index_.mark_dirty(page)) record_transition(fact, summary, transitions, "mark_dirty", "", page, before);
 }
 
 void HiCacheState::clear_dirty(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                const std::string & page) {
     auto before = transition_state_digest();
-    if (dirty_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_dirty", "", page, before);
+    if (state_index_.clear_dirty(page)) record_transition(fact, summary, transitions, "clear_dirty", "", page, before);
 }
 
 void HiCacheState::mark_backuped(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                  const std::string & page) {
     auto before = transition_state_digest();
-    if (backuped_.insert(page).second) record_transition(fact, summary, transitions, "mark_backuped", "", page, before);
+    if (state_index_.mark_backuped(page)) record_transition(fact, summary, transitions, "mark_backuped", "", page, before);
     clear_dirty(fact, summary, transitions, page);
 }
 
 void HiCacheState::clear_backuped(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                   const std::string & page) {
     auto before = transition_state_digest();
-    if (backuped_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_backuped", "", page, before);
+    if (state_index_.clear_backuped(page)) record_transition(fact, summary, transitions, "clear_backuped", "", page, before);
 }
 
 void HiCacheState::mark_evicted(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                 const std::string & page) {
     auto before = transition_state_digest();
-    if (evicted_.insert(page).second) record_transition(fact, summary, transitions, "mark_evicted", "", page, before);
+    if (state_index_.mark_evicted(page)) record_transition(fact, summary, transitions, "mark_evicted", "", page, before);
 }
 
 void HiCacheState::clear_evicted(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                  const std::string & page) {
     auto before = transition_state_digest();
-    if (evicted_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_evicted", "", page, before);
+    if (state_index_.clear_evicted(page)) record_transition(fact, summary, transitions, "clear_evicted", "", page, before);
 }
 
 void HiCacheState::mark_locked(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                const std::string & page) {
     auto before = transition_state_digest();
-    if (locked_.insert(page).second) record_transition(fact, summary, transitions, "mark_locked", "", page, before);
+    if (state_index_.mark_locked(page)) record_transition(fact, summary, transitions, "mark_locked", "", page, before);
 }
 
 void HiCacheState::clear_locked(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                 const std::string & page) {
     auto before = transition_state_digest();
-    if (locked_.erase(page) > 0) record_transition(fact, summary, transitions, "clear_locked", "", page, before);
+    if (state_index_.clear_locked(page)) record_transition(fact, summary, transitions, "clear_locked", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_planned(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                          const std::string & page) {
     auto before = transition_state_digest();
-    if (prefetch_planned_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_planned", "", page, before);
+    if (state_index_.mark_prefetch_planned(page)) record_transition(fact, summary, transitions, "mark_prefetch_planned", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                        const std::string & page) {
     auto before = transition_state_digest();
-    if (prefetch_ready_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_ready", "", page, before);
-    prefetch_late_.erase(page);
-    prefetch_suppressed_.erase(page);
+    if (state_index_.mark_prefetch_ready(page)) record_transition(fact, summary, transitions, "mark_prefetch_ready", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_late(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                       const std::string & page) {
-    if (prefetch_ready_.count(page) > 0) return;
     auto before = transition_state_digest();
-    if (prefetch_late_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_late", "", page, before);
+    if (state_index_.mark_prefetch_late(page)) record_transition(fact, summary, transitions, "mark_prefetch_late", "", page, before);
 }
 
 void HiCacheState::mark_prefetch_suppressed(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                             const std::string & page) {
-    if (prefetch_ready_.count(page) > 0) return;
     auto before = transition_state_digest();
-    if (prefetch_suppressed_.insert(page).second) record_transition(fact, summary, transitions, "mark_prefetch_suppressed", "", page, before);
+    if (state_index_.mark_prefetch_suppressed(page)) record_transition(fact, summary, transitions, "mark_prefetch_suppressed", "", page, before);
 }
 
-void HiCacheState::touch_page(const std::string & tier, const std::string & page) {
-    auto * order = touch_order_for_tier(tier);
-    if (!order) return;
-    order->erase(std::remove(order->begin(), order->end(), page), order->end());
-    order->push_back(page);
-}
+void HiCacheState::touch_page(const std::string & tier, const std::string & page) { state_index_.touch_page(tier, page); }
 
 void HiCacheState::flush_dirty_page_to_host(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                             const std::string & page) {
@@ -560,7 +376,7 @@ void HiCacheState::evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & su
         if (victims.empty()) victims = {victim};
         bool locked_group = false;
         for (const auto & page : victims) {
-            if (locked_.count(page) > 0) {
+            if (state_index_.locked().count(page) > 0) {
                 locked_group = true;
                 break;
             }
@@ -572,7 +388,7 @@ void HiCacheState::evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & su
         for (const auto & page : victims) {
             if (!pages->count(page)) continue;
             order->erase(std::remove(order->begin(), order->end(), page), order->end());
-            if (dirty_.count(page)) {
+            if (state_index_.dirty().count(page)) {
                 summary.dirty_eviction_events++;
                 flush_dirty_page_to_host(fact, summary, transitions, page);
             }
@@ -602,17 +418,6 @@ void HiCacheState::enforce_capacity(const HiCacheFact & fact, HiCacheSummary & s
         evict_lru_pages(fact, summary, transitions, tier, pages->size() - capacity);
         if (pages->size() == before) break;
     }
-}
-
-std::map<std::string, uint64_t> HiCacheState::page_hit_count_summary() const {
-    std::map<std::string, uint64_t> result;
-    for (const auto & [scoped_key, count] : hit_count_by_scope_page_) {
-        const auto separator = scoped_key.find(':');
-        const auto page = separator == std::string::npos ? scoped_key : scoped_key.substr(separator + 1);
-        auto & current = result[page];
-        current = std::max(current, count);
-    }
-    return result;
 }
 
 std::string HiCacheState::transition_state_digest() const { return config_.emit_state_digests ? digest() : std::string{}; }
@@ -671,24 +476,30 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
     });
 
     for (const auto & fact : facts) {
-        if (!is_invariant_state_fact(fact)) {
+        const auto route = route_hicache_fact(fact);
+        if (!route.state_model_input) {
             summary.skipped_non_invariant_events++;
             continue;
         }
-        if (!is_known_invariant_role(fact.role)) {
+        if (!route.known_role) {
             summary.missing_invariant_facts["unknown_invariant_role"]++;
             continue;
         }
         if (!fact.is_end) continue;
 
-        summary.processed_hicache_events++;
-        summary.processed_events_by_role[fact.role]++;
         const auto effective_page_size = config_.page_size > 0 ? config_.page_size : fact.source_page_size;
-        if ((fact.role == "request_tokens" || fact.role == "lookup_path" || fact.role == "insert_path") && fact.full_path_tokens.empty() &&
-            effective_page_size > 0 && fact.token_count >= effective_page_size) {
-            summary.missing_invariant_facts["token_dictionary_or_full_path_span"]++;
+        const auto missing_fields = hicache_required_fact_errors(fact, route.role, effective_page_size);
+        if (!missing_fields.empty()) {
+            for (const auto & key : missing_fields) summary.missing_invariant_facts[key]++;
             continue;
         }
+        if (!hicache_fact_role_implemented(route.role)) {
+            summary.missing_invariant_facts["unimplemented_invariant_role." + hicache_fact_role_name(route.role)]++;
+            continue;
+        }
+
+        summary.processed_hicache_events++;
+        summary.processed_events_by_role[fact.role]++;
         auto transitions = state_.apply_fact(fact, summary);
         summary.transition_trace.insert(summary.transition_trace.end(), transitions.begin(), transitions.end());
     }

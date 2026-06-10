@@ -20,6 +20,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as raw_tmp:
         tmp = Path(raw_tmp)
         run_observed_policy_rejected_fixture(tmp)
+        run_target_page_projection_fixture(tmp)
+        run_token_radix_split_projection_fixture(tmp)
         run_token_insert_write_through_fixture(tmp)
         run_lru_capacity_from_token_pages_fixture(tmp)
         run_lock_scope_capacity_fixture(tmp)
@@ -63,6 +65,55 @@ def run_observed_policy_rejected_fixture(tmp: Path) -> None:
         )
         assert result.returncode != 0, result.stdout + result.stderr
         assert "observed" in result.stderr or "observed" in result.stdout, result.stdout + result.stderr
+
+
+def run_target_page_projection_fixture(tmp: Path) -> None:
+    source_page_size = 4
+    target_page_size = 2
+    scope = "rank0"
+    tokens = [1, 2, 3, 4]
+    pages = page_ids(tokens, target_page_size, scope)
+    events = [insert_event(10, "req-target-page-size", "path-target-page-size", tokens, 1, source_page_size, scope)]
+    summary = run_hicache_trace(
+        tmp,
+        "target_page_projection",
+        events,
+        {"page_size": target_page_size, "write_policy": "write_through"},
+    )
+
+    final_state = summary["final_state"]
+    assert summary["missing_invariant_facts"] == {}, summary
+    assert final_state["l1_resident_pages"] == sorted(pages), final_state
+    assert final_state["l2_resident_pages"] == sorted(pages), final_state
+    assert final_state["l3_resident_pages"] == sorted(pages), final_state
+    assert summary["transitions_by_kind"]["add_l1_resident"] == 2, summary
+
+
+def run_token_radix_split_projection_fixture(tmp: Path) -> None:
+    page_size = 2
+    scope = "rank0"
+    path_a = [11, 12, 13, 14]
+    path_b = [11, 12, 15, 16]
+    pages_a = page_ids(path_a, page_size, scope)
+    pages_b = page_ids(path_b, page_size, scope)
+    expected_pages = sorted([pages_a[0], pages_a[1], pages_b[1]])
+    events = [
+        insert_event(10, "req-split-a", "path-split-a", path_a, 1, page_size, scope),
+        insert_event(20, "req-split-b", "path-split-b", path_b, 2, page_size, scope),
+    ]
+    summary = run_hicache_trace(
+        tmp,
+        "token_radix_split_projection",
+        events,
+        {"page_size": page_size, "write_policy": "write_through"},
+    )
+
+    final_state = summary["final_state"]
+    assert summary["missing_invariant_facts"] == {}, summary
+    assert final_state["l1_resident_pages"] == expected_pages, final_state
+    assert final_state["l2_resident_pages"] == expected_pages, final_state
+    assert final_state["l3_resident_pages"] == expected_pages, final_state
+    assert summary["transitions_by_kind"]["add_l1_resident"] == 3, summary
 
 
 def run_token_insert_write_through_fixture(tmp: Path) -> None:
@@ -251,7 +302,7 @@ def run_prefetch_wait_complete_fixture(tmp: Path) -> None:
     suffix_pages = page_ids(full, page_size, scope)[1:]
     events = [
         insert_event(10, "req-prefix", "path-prefix", prefix, 1, page_size, scope),
-        prefetch_intent_event(20, "req-prefetch", "prefetch-full", prefix, suffix, 2, page_size, scope),
+        prefetch_decision_event(20, "req-prefetch", "prefetch-full", full, 2, page_size, scope),
         invariant_event(
             30,
             "prefetch_check_point",
@@ -290,11 +341,13 @@ def run_prefetch_best_effort_suppressed_fixture(tmp: Path) -> None:
     prefix = [901, 902, 903, 904]
     suffix = [1001, 1002, 1003, 1004]
     full = prefix + suffix
+    prefix_page = page_ids(prefix, page_size, scope)[0]
     suffix_pages = page_ids(full, page_size, scope)[1:]
     events = [
-        prefetch_intent_event(10, "req-best-effort", "best-effort-full", prefix, suffix, 1, page_size, scope),
+        insert_event(10, "req-best-effort-prefix", "best-effort-prefix", prefix, 1, page_size, scope),
+        prefetch_decision_event(20, "req-best-effort", "best-effort-full", full, 2, page_size, scope),
         invariant_event(
-            20,
+            30,
             "prefetch_check_point",
             "hiradix.check_prefetch_progress",
             {
@@ -302,7 +355,7 @@ def run_prefetch_best_effort_suppressed_fixture(tmp: Path) -> None:
                 "operation_id": "best-effort-check",
                 "cache_scope": scope,
                 "source_page_size": page_size,
-                "seq_no": 2,
+                "seq_no": 3,
                 "check_kind": "poll",
             },
         ),
@@ -318,8 +371,8 @@ def run_prefetch_best_effort_suppressed_fixture(tmp: Path) -> None:
     assert final_state["prefetch_planned_pages"] == suffix_pages, final_state
     assert final_state["prefetch_ready_pages"] == [], final_state
     assert final_state["prefetch_suppressed_pages"] == suffix_pages, final_state
-    assert final_state["l2_resident_pages"] == [], final_state
-    assert final_state["l3_resident_pages"] == [], final_state
+    assert final_state["l2_resident_pages"] == [prefix_page], final_state
+    assert final_state["l3_resident_pages"] == [prefix_page], final_state
     assert summary["transitions_by_kind"]["mark_prefetch_suppressed"] == 1, summary
 
 
@@ -411,7 +464,7 @@ def run_missing_dictionary_reported_fixture(tmp: Path) -> None:
     summary = run_hicache_trace(tmp, "missing_dictionary_reported", events, {"page_size": page_size})
 
     assert summary["input_hicache_events"] == 1, summary
-    assert summary["processed_hicache_events"] == 1, summary
+    assert summary["processed_hicache_events"] == 0, summary
     assert summary["missing_invariant_facts"] == {"token_dictionary_or_full_path_span": 1}, summary
     assert summary["state_transition_count"] == 0, summary
     assert summary["final_state"]["l1_resident_pages"] == [], summary
@@ -436,38 +489,21 @@ def insert_event(ts: int, request_id: str, path_id: str, tokens: list[int], seq_
     )
 
 
-def prefetch_intent_event(
-    ts: int,
-    request_id: str,
-    path_prefix: str,
-    prefix: list[int],
-    suffix: list[int],
-    seq_no: int,
-    page_size: int,
-    scope: str,
-) -> dict[str, Any]:
-    full = prefix + suffix
-    full_id = f"{path_prefix}-full"
-    prefix_id = f"{path_prefix}-prefix"
-    suffix_id = f"{path_prefix}-suffix"
+def prefetch_decision_event(ts: int, request_id: str, path_id: str, tokens: list[int], seq_no: int, page_size: int, scope: str) -> dict[str, Any]:
     return invariant_event(
         ts,
-        "prefetch_intent",
-        "hiradix.prefetch_from_storage",
+        "prefetch_decision",
+        "scheduler.prefetch_decision",
         {
             "request_id": request_id,
-            "operation_id": f"{request_id}-intent",
+            "operation_id": f"{request_id}-decision",
             "cache_scope": scope,
             "source_page_size": page_size,
             "seq_no": seq_no,
-            "prefix_token_dictionary": token_dictionary(prefix_id, prefix),
-            "suffix_token_dictionary": token_dictionary(suffix_id, suffix),
-            "full_token_dictionary": token_dictionary(full_id, full),
-            "prefix_span": token_span(prefix_id, 0, len(prefix)),
-            "suffix_span": token_span(suffix_id, 0, len(suffix)),
-            "full_path_span": token_span(full_id, 0, len(full)),
+            "token_dictionary": token_dictionary(path_id, tokens),
+            "full_path_span": token_span(path_id, 0, len(tokens)),
+            "token_count": len(tokens),
             "policy_params": {"policy": "target"},
-            "requested_tokens": len(suffix),
         },
     )
 

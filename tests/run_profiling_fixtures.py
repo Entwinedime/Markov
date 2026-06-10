@@ -152,319 +152,11 @@ class Worker:
 
 
 def sglang_hicache_targets() -> list[dict[str, object]]:
-    """返回当前建议的 SGLang HiCache Python probe target set。"""
+    """返回当前主线 SGLang HiCache Python probe target set。"""
 
-    return [
-        {
-            "id": "scheduler.prefetch_kvcache",
-            "module": "sglang.srt.managers.scheduler",
-            "target": "Scheduler._prefetch_kvcache",
-            "events": ["hicache_prefetch_decision_start", "hicache_prefetch_decision_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:req.rid"},
-                {"name": "host_hit_length", "source": "arg:req.host_hit_length", "required": False},
-                {"name": "storage_hit_length", "source": "arg:req.storage_hit_length", "required": False},
-                {"name": "fill_tokens", "source": "len:arg:req.fill_ids", "required": False},
-                {"name": "page_size", "source": "self.tree_cache.page_size"},
-                {"name": "event_role", "source": "const:prefetch_decision"},
-            ],
-        },
-        {
-            "id": "hiradix.match_prefix",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.match_prefix",
-            "events": ["hicache_lookup_start", "hicache_lookup_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:params.req.rid", "required": False},
-                {"name": "input_tokens", "source": "len:arg:params.key"},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
-                {"name": "device_hit_tokens", "source": "len:return.device_indices", "required": False},
-                {"name": "host_hit_length", "source": "return.host_hit_length", "required": False},
-                {"name": "last_device_node_id", "source": "return.last_device_node.id", "required": False},
-                {"name": "last_host_node_id", "source": "return.last_host_node.id", "required": False},
-                {"name": "best_match_node_id", "source": "return.best_match_node.id", "required": False},
-                {"name": "event_role", "source": "const:lookup"},
-            ],
-        },
-        {
-            "id": "hiradix.prefetch_from_storage",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.prefetch_from_storage",
-            "events": ["hicache_prefetch_schedule_start", "hicache_prefetch_schedule_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:req_id"},
-                {"name": "last_host_node_id", "source": "arg:last_host_node.id"},
-                {"name": "new_input_tokens", "source": "len:arg:new_input_tokens"},
-                {"name": "page_identity", "source": "page_hashes:arg:new_input_tokens,self.page_size,arg:last_hash"},
-                {"name": "prefix_keys", "source": "len:arg:prefix_keys", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:prefetch_schedule"},
-            ],
-        },
-        {
-            "id": "hiradix.check_prefetch_progress",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.check_prefetch_progress",
-            "events": ["hicache_prefetch_progress_start", "hicache_prefetch_progress_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:req_id"},
-                {"name": "prefetch_done", "source": "return", "required": False},
-                {"name": "ongoing_prefetch_count", "source": "len:self.ongoing_prefetch"},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:prefetch_progress"},
-            ],
-        },
-        {
-            "id": "hiradix.pop_prefetch_loaded_tokens",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.pop_prefetch_loaded_tokens",
-            "events": ["hicache_prefetch_loaded_tokens_start", "hicache_prefetch_loaded_tokens_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:req_id"},
-                {"name": "loaded_tokens", "source": "return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:prefetch_loaded_tokens"},
-            ],
-        },
-        {
-            "id": "hiradix.init_load_back",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.init_load_back",
-            "events": ["hicache_init_load_back_start", "hicache_init_load_back_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:params.req.rid", "required": False},
-                {"name": "host_hit_length", "source": "arg:params.host_hit_length"},
-                {"name": "best_match_node_id", "source": "arg:params.best_match_node.id"},
-                {"name": "page_identity", "source": "arg:params.best_match_node.hash_value", "required": False},
-                {"name": "loaded_tokens", "source": "len:return.0", "required": False},
-                {"name": "last_node_id", "source": "return.1.id", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:init_load_back"},
-            ],
-        },
-        {
-            "id": "hiradix.load_back",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.load_back",
-            "events": ["hicache_load_back_start", "hicache_load_back_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node.id"},
-                {"name": "page_identity", "source": "arg:node.hash_value"},
-                {"name": "host_tokens", "source": "len:arg:node.host_value", "required": False},
-                {"name": "loaded_tokens", "source": "len:return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:load_back"},
-            ],
-        },
-        {
-            "id": "hiradix.insert",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.insert",
-            "events": ["hicache_insert_start", "hicache_insert_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:params.req.rid", "required": False},
-                {"name": "insert_tokens", "source": "len:arg:params.key", "required": False},
-                {"name": "value_tokens", "source": "len:arg:params.value", "required": False},
-                {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
-                {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
-                {"name": "prefix_len", "source": "return.prefix_len", "required": False},
-                {"name": "inserted_host_node_id", "source": "return.inserted_host_node.id", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:insert"},
-            ],
-        },
-        {
-            "id": "hiradix.write_backup",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.write_backup",
-            "events": ["hicache_write_backup_start", "hicache_write_backup_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node.id"},
-                {"name": "page_identity", "source": "arg:node.hash_value"},
-                {"name": "device_tokens", "source": "len:arg:node.value", "required": False},
-                {"name": "write_back", "source": "arg:write_back", "required": False},
-                {"name": "written_tokens", "source": "return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:write_backup"},
-            ],
-        },
-        {
-            "id": "hiradix.write_backup_storage",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.write_backup_storage",
-            "events": ["hicache_write_storage_schedule_start", "hicache_write_storage_schedule_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node.id"},
-                {"name": "host_tokens", "source": "len:arg:node.host_value", "required": False},
-                {"name": "page_identity", "source": "arg:node.hash_value"},
-                {"name": "hash_pages", "source": "len:arg:node.hash_value", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:write_storage_schedule"},
-            ],
-        },
-        {
-            "id": "hiradix.evict",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.evict",
-            "events": ["hicache_evict_start", "hicache_evict_end"],
-            "fields": [
-                {"name": "requested_tokens", "source": "arg:params.num_tokens"},
-                {"name": "evicted_tokens", "source": "return.num_tokens_evicted", "required": False},
-                {"name": "page_identity", "source": "return.best_match_node.hash_value", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:evict"},
-            ],
-        },
-        {
-            "id": "hiradix.inc_lock_ref",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.inc_lock_ref",
-            "events": ["hicache_inc_lock_ref_start", "hicache_inc_lock_ref_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node.id", "required": False},
-                {"name": "page_identity", "source": "arg:node.hash_value"},
-                {"name": "lock_delta", "source": "return.delta", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:lock_ref_inc"},
-            ],
-        },
-        {
-            "id": "hiradix.dec_lock_ref",
-            "module": "sglang.srt.mem_cache.hiradix_cache",
-            "target": "HiRadixCache.dec_lock_ref",
-            "events": ["hicache_dec_lock_ref_start", "hicache_dec_lock_ref_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node.id", "required": False},
-                {"name": "page_identity", "source": "arg:node.hash_value"},
-                {"name": "lock_delta", "source": "return.delta", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:lock_ref_dec"},
-            ],
-        },
-        {
-            "id": "controller.load",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.load",
-            "events": ["hicache_l2_l1_enqueue_start", "hicache_l2_l1_enqueue_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node_id"},
-                {"name": "host_tokens", "source": "len:arg:host_indices"},
-                {"name": "device_tokens", "source": "len:return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l2_to_l1_enqueue"},
-            ],
-        },
-        {
-            "id": "controller.start_loading",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.start_loading",
-            "events": ["hicache_l2_l1_start", "hicache_l2_l1_end"],
-            "fields": [
-                {"name": "producer_id", "source": "return", "required": False},
-                {"name": "load_queue_size", "source": "len:self.load_queue", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l2_to_l1_start"},
-            ],
-        },
-        {
-            "id": "controller.write",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.write",
-            "events": ["hicache_l1_l2_enqueue_start", "hicache_l1_l2_enqueue_end"],
-            "fields": [
-                {"name": "node_id", "source": "arg:node_id"},
-                {"name": "device_tokens", "source": "len:arg:device_indices"},
-                {"name": "host_tokens", "source": "len:return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l1_to_l2_enqueue"},
-            ],
-        },
-        {
-            "id": "controller.start_writing",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.start_writing",
-            "events": ["hicache_l1_l2_start", "hicache_l1_l2_end"],
-            "fields": [
-                {"name": "write_queue_size", "source": "len:self.write_queue", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l1_to_l2_start"},
-            ],
-        },
-        {
-            "id": "controller.prefetch",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.prefetch",
-            "events": ["hicache_l3_prefetch_enqueue_start", "hicache_l3_prefetch_enqueue_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:request_id"},
-                {"name": "host_tokens", "source": "len:arg:host_indices"},
-                {"name": "new_input_tokens", "source": "len:arg:new_input_tokens"},
-                {"name": "page_identity", "source": "page_hashes:arg:new_input_tokens,self.page_size,arg:last_hash"},
-                {"name": "operation_id", "source": "return.id", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l3_prefetch_enqueue"},
-            ],
-        },
-        {
-            "id": "controller.storage_hit_query",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController._storage_hit_query",
-            "events": ["hicache_l3_hit_query_start", "hicache_l3_hit_query_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:operation.request_id", "required": False},
-                {"name": "token_count", "source": "len:arg:operation.token_ids"},
-                {"name": "page_identity", "source": "return.0", "required": False},
-                {"name": "hit_pages", "source": "len:return.0", "required": False},
-                {"name": "hit_tokens", "source": "return.1", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l3_hit_query"},
-            ],
-        },
-        {
-            "id": "controller.page_transfer",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController._page_transfer",
-            "events": ["hicache_l3_l2_transfer_start", "hicache_l3_l2_transfer_end"],
-            "fields": [
-                {"name": "request_id", "source": "arg:operation.request_id", "required": False},
-                {"name": "page_identity", "source": "arg:operation.hash_value"},
-                {"name": "hash_pages", "source": "len:arg:operation.hash_value", "required": False},
-                {"name": "completed_tokens", "source": "arg:operation.completed_tokens", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l3_to_l2_transfer"},
-            ],
-        },
-        {
-            "id": "controller.write_storage",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController.write_storage",
-            "events": ["hicache_l2_l3_enqueue_start", "hicache_l2_l3_enqueue_end"],
-            "fields": [
-                {"name": "host_tokens", "source": "len:arg:host_indices"},
-                {"name": "token_count", "source": "len:arg:token_ids"},
-                {"name": "page_identity", "source": "arg:hash_value"},
-                {"name": "hash_pages", "source": "len:arg:hash_value", "required": False},
-                {"name": "operation_id", "source": "return", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l2_to_l3_enqueue"},
-            ],
-        },
-        {
-            "id": "controller.page_backup",
-            "module": "sglang.srt.managers.cache_controller",
-            "target": "HiCacheController._page_backup",
-            "events": ["hicache_l2_l3_transfer_start", "hicache_l2_l3_transfer_end"],
-            "fields": [
-                {"name": "operation_id", "source": "arg:operation.id", "required": False},
-                {"name": "page_identity", "source": "arg:operation.hash_value"},
-                {"name": "hash_pages", "source": "len:arg:operation.hash_value", "required": False},
-                {"name": "completed_tokens", "source": "arg:operation.completed_tokens", "required": False},
-                {"name": "page_size", "source": "self.page_size"},
-                {"name": "event_role", "source": "const:l2_to_l3_transfer"},
-            ],
-        },
-    ]
+    config_path = ROOT / "configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    return config["profiling"]["python_probe"]["targets"]
 
 
 def run_config_fixture() -> None:
@@ -492,110 +184,70 @@ def run_config_fixture() -> None:
     assert runtime.python_state_trace_enabled is False, runtime
 
 
-def run_hicache_page_hash_literal_page_size_fixture() -> None:
-    """验证 HiCache page hash source 支持字面量 target page size。"""
+def run_hicache_token_source_fixture() -> None:
+    """验证 HiCache token/range source 和 request runtime source。"""
 
     from trace_sim_probe.probes import sglang_hicache_callable
 
-    bound = {"tokens": [1, 2, 3, 4, 5], "page_size": 2}
-    found_base, base_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,arg:page_size",
-        bound,
+    class Req:
+        def __init__(self):
+            self.rid = "req-token"
+            self.fill_ids = [1, 2, 3, 4, 5, 6]
+            self.origin_input_ids = [1, 2, 3, 4]
+            self.output_ids = [5, 6]
+            self.kv_committed_len = 5
+            self.kv_committed_freed = False
+            self.cache_protected_len = 2
+            self.extend_input_len = 4
+            self.prefix_indices = [10, 11]
+            self.host_hit_length = 2
+            self.storage_hit_length = 1
+            self.priority = 7
+            self.last_node = None
+            self.last_host_node = None
+            self.best_match_node = None
+
+        def _cache_commit_len(self):
+            return 5
+
+    class Cache:
+        page_size = 2
+
+    cache = Cache()
+    req = Req()
+    found_path, path_record = sglang_hicache_callable._extract_request_token_path(
+        "arg:req,committed,arg:cache",
+        {"req": req, "cache": cache},
         (),
         {},
         None,
     )
-    found_literal, literal_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,2",
-        bound,
+    found_span, span_record = sglang_hicache_callable._extract_request_token_span(
+        "arg:req,committed",
+        {"req": req},
         (),
         {},
         None,
     )
-    found_const, const_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,const:2",
-        bound,
-        (),
-        {},
-        None,
-    )
-    found_larger, larger_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,4",
-        bound,
+    handled_runtime, found_runtime, runtime = sglang_hicache_callable._hicache_request_runtime_source(
+        "hicache_request_runtime:arg:req",
+        "request_runtime",
+        {"req": req},
         (),
         {},
         None,
     )
 
-    assert found_base is True, base_hashes
-    assert found_literal is True, literal_hashes
-    assert found_const is True, const_hashes
-    assert found_larger is True, larger_hashes
-    assert literal_hashes == base_hashes == const_hashes, (base_hashes, literal_hashes, const_hashes)
-    assert len(literal_hashes) == 2, literal_hashes
-    assert len(larger_hashes) == 1, larger_hashes
-
-    concat_found, concat_hashes = sglang_hicache_callable._extract_page_hashes_concat(
-        "arg:prefix,arg:suffix,2",
-        {"prefix": [1, 2], "suffix": [3, 4, 5]},
-        (),
-        {},
-        None,
-    )
-    full_found, full_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,2",
-        {"tokens": [1, 2, 3, 4, 5]},
-        (),
-        {},
-        None,
-    )
-    assert concat_found is True, concat_hashes
-    assert full_found is True, full_hashes
-    assert concat_hashes == full_hashes, (concat_hashes, full_hashes)
-
-    suffix_found, suffix_hashes = sglang_hicache_callable._extract_page_hashes_after_prefix(
-        "arg:prefix,arg:suffix,2",
-        {"prefix": [1, 2], "suffix": [3, 4, 5, 6]},
-        (),
-        {},
-        None,
-    )
-    suffix_full_found, suffix_full_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:tokens,2",
-        {"tokens": [1, 2, 3, 4, 5, 6]},
-        (),
-        {},
-        None,
-    )
-    assert suffix_found is True, suffix_hashes
-    assert suffix_full_found is True, suffix_full_hashes
-    assert suffix_hashes == suffix_full_hashes[-2:], (suffix_hashes, suffix_full_hashes)
-
-    nonaligned_found, nonaligned_hashes = sglang_hicache_callable._extract_page_hashes_after_prefix(
-        "arg:prefix,arg:suffix,2",
-        {"prefix": [1, 2, 3], "suffix": [4, 5, 6]},
-        (),
-        {},
-        None,
-    )
-    prefix_found, prefix_hashes = sglang_hicache_callable._extract_page_hashes(
-        "arg:prefix,2",
-        {"prefix": [1, 2, 3]},
-        (),
-        {},
-        None,
-    )
-    expected_suffix_found, expected_suffix_hashes = sglang_hicache_callable._extract_page_hashes(
-        f"arg:suffix,2,const:{prefix_hashes[-1]}",
-        {"suffix": [4, 5, 6]},
-        (),
-        {},
-        None,
-    )
-    assert nonaligned_found is True, nonaligned_hashes
-    assert prefix_found is True, prefix_hashes
-    assert expected_suffix_found is True, expected_suffix_hashes
-    assert nonaligned_hashes == expected_suffix_hashes, (nonaligned_hashes, expected_suffix_hashes)
+    assert found_path is True, path_record
+    assert path_record["token_count"] == 5, path_record
+    assert path_record["token_ids"] == [1, 2, 3, 4, 5], path_record
+    assert found_span is True, span_record
+    assert span_record["token_count"] == 5, span_record
+    assert span_record["path_id"] == path_record["token_path_id"], (span_record, path_record)
+    assert handled_runtime and found_runtime, runtime
+    assert runtime["request_id"] == "req-token", runtime
+    assert runtime["effective_commit_len"] == 5, runtime
+    assert runtime["cache_protected_len"] == 2, runtime
 
 
 def run_hicache_prefetch_progress_source_fixture() -> None:
@@ -684,7 +336,7 @@ def run_torch_profiler_lifecycle_fixture() -> None:
 
 
 def run_state_trace_env_fixture() -> None:
-    """验证 state_trace 配置会补充环境变量和 validation-only source。"""
+    """验证 state_trace 配置会补充 validation-only state snapshot。"""
 
     spec = importlib.util.spec_from_file_location(
         "trace_sim_profile_runner_state_trace",
@@ -706,12 +358,12 @@ def run_state_trace_env_fixture() -> None:
                 "state_trace": {"enabled": True},
                 "targets": [
                     {
-                        "id": "hiradix.match_prefix",
+                        "id": "hiradix.lookup_path",
                         "module": "sglang.srt.mem_cache.hiradix_cache",
                         "target": "HiRadixCache.match_prefix",
                         "fields": [
-                            {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
-                            {"name": "event_role", "source": "const:lookup"},
+                            {"name": "token_dictionary", "source": "token_path:arg:params.key,self"},
+                            {"name": "event_role", "source": "const:lookup_path"},
                         ],
                     }
                 ],
@@ -727,9 +379,7 @@ def run_state_trace_env_fixture() -> None:
     targets = json.loads(env["TRACE_SIM_PYTHON_PROBE_TARGETS"])
     fields = targets[0]["fields"]
     assert any(field.get("source") == "hicache_state:self" for field in fields), fields
-    state_index = next(index for index, field in enumerate(fields) if field.get("source") == "hicache_state:self")
-    radix_index = next(index for index, field in enumerate(fields) if field.get("source") == "hicache_radix_removed_pages:self")
-    assert state_index < radix_index, fields
+    assert fields[-1]["source"] == "hicache_state:self", fields
 
 
 def run_env_placeholder_fixture() -> None:
@@ -858,205 +508,62 @@ def run_profile_suite_matrix_fixture() -> None:
             raise AssertionError("matrix server profiling override should fail")
 
 
-def run_hicache_radix_removed_materialization_fixture() -> None:
-    """验证 runner 收尾能从同次 HiCache start/end snapshot 派生 radix removed pages。"""
+def run_no_legacy_hicache_page_identity_fixture() -> None:
+    """确认当前主配置不再声明 page-identity/radix-removed source。"""
 
-    spec = importlib.util.spec_from_file_location(
-        "trace_sim_profile_runner_radix_materialize",
-        ROOT / "scripts/internal/profile_runner.py",
+    targets = sglang_hicache_targets()
+    serialized = json.dumps(targets, ensure_ascii=False)
+    forbidden = (
+        "page_hashes:",
+        "page_hashes_after_prefix:",
+        "page_hashes_concat:",
+        "hicache_radix_removed_pages:",
+        "target_page_identity",
+        "page_identity",
     )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[str(spec.name)] = module
-    spec.loader.exec_module(module)
+    for item in forbidden:
+        assert item not in serialized, item
 
-    with tempfile.TemporaryDirectory() as raw_tmp:
-        tmp = Path(raw_tmp)
-        trace_dir = tmp / "trace"
-        python_probe_dir = trace_dir / "python_probe"
-        python_probe_dir.mkdir(parents=True)
-        trace_path = python_probe_dir / "python_probe_trace.rank0.pid1.json"
-
-        def snapshot_event(name: str, ts: int, dur: int, target_id: str, pages: list[str]) -> dict[str, object]:
-            return {
-                "name": name,
-                "cat": "python_probe",
-                "pid": 1,
-                "tid": 1,
-                "ts": ts,
-                "dur": dur,
-                "args": {
-                    "target_id": target_id,
-                    "model_input": False,
-                    "state_snapshot": {
-                        "nodes": [
-                            {
-                                "hash_value": pages,
-                            }
-                        ]
-                    },
-                },
-            }
-
-        payload = {
-            "traceEvents": [
-                {
-                    "name": "hicache_insert_start",
-                    "cat": "python_probe",
-                    "pid": 1,
-                    "tid": 1,
-                    "ts": 100,
-                    "dur": 0,
-                    "args": {
-                        "target_id": "hiradix.insert",
-                        "radix_removed_page_identity": [],
-                    },
-                },
-                snapshot_event("hicache_insert_start:state_snapshot", 100, 0, "hiradix.insert", ["old_a", "old_b", "kept"]),
-                {
-                    "name": "hicache_insert_end",
-                    "cat": "python_probe",
-                    "pid": 1,
-                    "tid": 1,
-                    "ts": 100,
-                    "dur": 7,
-                    "args": {
-                        "target_id": "hiradix.insert",
-                        "radix_removed_page_identity": [],
-                    },
-                },
-                snapshot_event("hicache_insert_end:state_snapshot", 100, 7, "hiradix.insert", ["kept", "new_a"]),
-                {
-                    "name": "hicache_lookup_start",
-                    "cat": "python_probe",
-                    "pid": 1,
-                    "tid": 1,
-                    "ts": 200,
-                    "dur": 0,
-                    "args": {
-                        "target_id": "hiradix.match_prefix",
-                    },
-                },
-                snapshot_event("hicache_lookup_start:state_snapshot", 200, 0, "hiradix.match_prefix", ["lookup_old", "lookup_kept"]),
-                {
-                    "name": "hicache_lookup_end",
-                    "cat": "python_probe",
-                    "pid": 1,
-                    "tid": 1,
-                    "ts": 200,
-                    "dur": 5,
-                    "args": {
-                        "target_id": "hiradix.match_prefix",
-                    },
-                },
-                snapshot_event("hicache_lookup_end:state_snapshot", 200, 5, "hiradix.match_prefix", ["lookup_kept"]),
-            ]
+    source_result_field_names = {
+        "matched_span",
+        "matched_token_dictionary",
+        "device_hit_tokens",
+        "host_hit_length",
+        "last_host_node",
+        "last_host_node_summary",
+        "best_match_node",
+        "best_match_node_summary",
+        "last_node_summary",
+        "last_node_chain",
+        "delta",
+        "evicted_tokens",
+        "inserted_node",
+        "inserted_span",
+        "producer_id",
+        "request_runtime",
+        "prefetch_state",
+        "progress",
+        "admission_result",
+        "result_request_id",
+        "can_run_count",
+        "new_chunked_request_id",
+        "rem_total_tokens_snapshot",
+        "cur_rem_tokens_snapshot",
+        "rem_input_tokens_snapshot",
+        "rem_chunk_tokens_snapshot",
+    }
+    for target in targets:
+        fields = target.get("fields") if isinstance(target.get("fields"), list) else []
+        const_fields = {
+            field.get("name"): str(field.get("source") or "").split(":", 1)[1]
+            for field in fields
+            if isinstance(field, dict) and str(field.get("source") or "").startswith("const:")
         }
-        trace_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-        summary = module.materialize_hicache_radix_removed_pages(trace_dir)
-        assert summary["files_scanned"] == 1, summary
-        assert summary["files_updated"] == 1, summary
-        assert summary["end_events"] == 2, summary
-        assert summary["insert_end_events"] == 1, summary
-        assert summary["materialized_events"] == 2, summary
-        assert summary["materialized_pages"] == 3, summary
-
-        updated = json.loads(trace_path.read_text(encoding="utf-8"))
-        end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
-        assert end_event["args"]["radix_removed_page_identity"] == ["old_a", "old_b"], end_event
-        lookup_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_lookup_end")
-        assert lookup_event["args"]["radix_removed_page_identity"] == ["lookup_old"], lookup_event
-        snapshots = [event for event in updated["traceEvents"] if event["name"].endswith(":state_snapshot")]
-        assert all(event["args"]["model_input"] is False for event in snapshots), snapshots
-
-
-def run_hicache_target_radix_removed_materialization_fixture() -> None:
-    """验证 runner 可从 target snapshot hashes 派生 target radix removed pages。"""
-
-    spec = importlib.util.spec_from_file_location(
-        "trace_sim_profile_runner_target_radix_materialize",
-        ROOT / "scripts/internal/profile_runner.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[str(spec.name)] = module
-    spec.loader.exec_module(module)
-
-    targets = [
-        {
-            "fields": [
-                {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
-                {"name": "target_page_identity", "source": "page_hashes_after_prefix:arg:prefix_keys,arg:new_input_tokens,64"},
-                {"name": "alt_target_page_identity", "source": "page_hashes_concat:arg:prefix,arg:suffix,128,arg:last_hash"},
-            ]
-        }
-    ]
-    assert module._hicache_target_page_sizes_from_targets(targets) == [64, 128]
-
-    with tempfile.TemporaryDirectory() as raw_tmp:
-        tmp = Path(raw_tmp)
-        trace_dir = tmp / "trace"
-        python_probe_dir = trace_dir / "python_probe"
-        python_probe_dir.mkdir(parents=True)
-        trace_path = python_probe_dir / "python_probe_trace.rank0.pid1.json"
-
-        def snapshot_event(name: str, pages: list[str], target_pages: list[str]) -> dict[str, object]:
-            return {
-                "name": name,
-                "cat": "python_probe",
-                "pid": 1,
-                "tid": 1,
-                "ts": 100,
-                "dur": 7 if "_end:" in name else 0,
-                "args": {
-                    "target_id": "hiradix.insert",
-                    "model_input": False,
-                    "state_snapshot": {
-                        "nodes": [
-                            {
-                                "hash_value": pages,
-                                "target_hash_value_by_page_size": {"64": target_pages},
-                            }
-                        ]
-                    },
-                },
-            }
-
-        payload = {
-            "traceEvents": [
-                {
-                    "name": "hicache_insert_end",
-                    "cat": "python_probe",
-                    "pid": 1,
-                    "tid": 1,
-                    "ts": 100,
-                    "dur": 7,
-                    "args": {
-                        "target_id": "hiradix.insert",
-                        "radix_removed_page_identity": ["actual_live_removed"],
-                    },
-                },
-                snapshot_event("hicache_insert_start:state_snapshot", ["actual_old", "actual_kept"], ["target_old", "target_kept"]),
-                snapshot_event("hicache_insert_end:state_snapshot", ["actual_kept", "actual_new"], ["target_kept", "target_new"]),
-            ]
-        }
-        trace_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
-        summary = module.materialize_hicache_radix_removed_pages(trace_dir, target_page_size=64)
-        assert summary["files_scanned"] == 1, summary
-        assert summary["files_updated"] == 1, summary
-        assert summary["end_events"] == 1, summary
-        assert summary["insert_end_events"] == 1, summary
-        assert summary["materialized_events"] == 0, summary
-        assert summary["target_materialized_events"] == 1, summary
-        assert summary["target_materialized_pages"] == 1, summary
-
-        updated = json.loads(trace_path.read_text(encoding="utf-8"))
-        end_event = next(event for event in updated["traceEvents"] if event["name"] == "hicache_insert_end")
-        assert end_event["args"]["radix_removed_page_identity"] == ["actual_live_removed"], end_event
-        assert end_event["args"]["target_radix_removed_page_identity"] == ["target_old"], end_event
-        assert end_event["args"]["target_radix_removed_page_identity_page64"] == ["target_old"], end_event
+        if const_fields.get("fact_class") != "invariant_state":
+            continue
+        names = {field.get("name") for field in fields if isinstance(field, dict)}
+        leaked = sorted(source_result_field_names & names)
+        assert not leaked, (target.get("id"), leaked)
 
 
 def run_sglang_hicache_target_fixture() -> None:
@@ -1079,17 +586,23 @@ def run_sglang_hicache_target_fixture() -> None:
                 "-c",
                 """
 from sglang.srt.managers.scheduler import Req, Scheduler
+from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.hiradix_cache import HiRadixCache, Node, Params
 from sglang.srt.managers.cache_controller import HiCacheController, Operation
 
 req = Req('req-1')
 scheduler = Scheduler()
 scheduler._prefetch_kvcache(req)
+adder = PrefillAdder(scheduler.tree_cache)
+adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+adder.add_chunked_req(req)
 
 cache = HiRadixCache()
 node = Node(11)
 params = Params(req=req, key=[1, 2, 3, 4], value=[5, 6, 7, 8], best_match_node=node, host_hit_length=4, num_tokens=4)
 cache.match_prefix(params)
+cache.cache_finished_req(req, is_insert=True)
+cache.cache_unfinished_req(req, chunked=True)
 cache.prefetch_from_storage(req.rid, node, [1, 2, 3, 4], '0' * 64, ['p0'])
 cache.check_prefetch_progress(req.rid)
 cache.pop_prefetch_loaded_tokens(req.rid)
@@ -1098,6 +611,9 @@ cache.load_back(node)
 cache.insert(params)
 cache.write_backup(node, write_back=True)
 cache.write_backup_storage(node)
+cache.check_hicache_events()
+cache.ready_to_load_host_cache()
+cache.flush_write_through_acks()
 cache.inc_lock_ref(node)
 cache.dec_lock_ref(node)
 cache.evict(params)
@@ -1126,23 +642,81 @@ controller._page_backup(Operation(request_id=req.rid))
         missing = expected_ids - target_ids
         assert not missing, missing
         assert any(
-            row.get("target_id") == "hiradix.match_prefix"
+            row.get("target_id") == "hiradix.lookup_path"
             and row.get("request_id") == "req-1"
-            and row.get("input_tokens") == 4
+            and row.get("event_role") == "lookup_path"
+            and row.get("fact_class") == "invariant_state"
+            and row.get("state_model_input") == "true"
+            and row.get("token_count") == 4
+            and (row.get("token_dictionary") or {}).get("token_count") == 4
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "hiradix.lookup_result_observed"
+            and row.get("fact_class") == "source_actual"
+            and row.get("state_model_input") == "false"
             and row.get("host_hit_length") == 4
             for row in rows
         )
         assert any(
-            row.get("target_id") == "controller.storage_hit_query"
-            and row.get("hit_pages") == 2
-            and row.get("hit_tokens") == 128
+            row.get("target_id") == "scheduler.prefetch_decision"
+            and row.get("event_role") == "prefetch_decision"
+            and row.get("fact_class") == "invariant_state"
+            and "host_hit_length" not in row
             for row in rows
         )
         assert any(
-            row.get("target_id") == "hiradix.match_prefix"
-            and len(row.get("page_identity") or []) == 2
+            row.get("target_id") == "scheduler.prefetch_decision_observed"
+            and row.get("event_role") == "prefetch_decision_observed"
+            and row.get("fact_class") == "source_actual"
+            and isinstance(row.get("prefetch_state"), dict)
             for row in rows
         )
+        assert any(
+            row.get("target_id") == "schedule_policy.prefill_admission"
+            and row.get("event_role") == "request_admission"
+            and row.get("fact_class") == "invariant_state"
+            and row.get("state_model_input") == "true"
+            and row.get("admission_kind") == "prefill_add_one_req"
+            and (row.get("token_dictionary") or {}).get("token_count") == 6
+            and "request_runtime" not in row
+            and "admission_result" not in row
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "schedule_policy.prefill_admission_observed"
+            and row.get("event_role") == "request_admission_observed"
+            and row.get("fact_class") == "source_actual"
+            and row.get("admission_result") == "CONTINUE"
+            and isinstance(row.get("request_runtime"), dict)
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "schedule_policy.chunked_admission"
+            and row.get("event_role") == "request_admission"
+            and row.get("fact_class") == "invariant_state"
+            and row.get("admission_kind") == "chunked_continuation"
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "hiradix.lock_scope_inc"
+            and row.get("event_role") == "lock_scope_delta"
+            and "delta" not in row
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "hiradix.lock_scope_inc_observed"
+            and row.get("event_role") == "lock_scope_result_observed"
+            and row.get("delta") == -4
+            for row in rows
+        )
+        assert any(
+            row.get("target_id") == "hicache_internal.write_enqueue"
+            and row.get("event_role") == "write_enqueue_observed"
+            and row.get("fact_class") == "source_actual"
+            for row in rows
+        )
+        assert all("page_identity" not in row for row in rows), rows
         run_profile_quality_fixture(tmp, files[0])
 
 
@@ -1161,8 +735,9 @@ def run_hicache_state_snapshot_fixture() -> None:
                 "events": ["hicache_lookup_start", "hicache_lookup_end"],
                 "fields": [
                     {"name": "request_id", "source": "arg:params.req.rid", "required": False},
-                    {"name": "page_identity", "source": "page_hashes:arg:params.key,self.page_size"},
-                    {"name": "event_role", "source": "const:lookup"},
+                    {"name": "token_dictionary", "source": "token_path:arg:params.key,self"},
+                    {"name": "full_path_span", "source": "token_span:arg:params.key"},
+                    {"name": "event_role", "source": "const:lookup_path"},
                     {"name": "state_snapshot", "source": "hicache_state:self", "required": False},
                 ],
             }
@@ -1217,187 +792,6 @@ cache.match_prefix(params)
         assert snapshot["capacity"]["prefetch_capacity_limit_pages"] == 4, snapshot
 
 
-def run_hicache_target_hash_snapshot_fixture() -> None:
-    """验证 state snapshot 可按目标 page size 额外输出 target page hashes。"""
-
-    from trace_sim_probe.probes import sglang_hicache_callable
-
-    class Node:
-        def __init__(self, node_id: int, key: list[int], parent=None):
-            self.id = node_id
-            self.key = key
-            self.parent = parent
-            self.hash_value = []
-            self.value = [1]
-            self.host_value = [2]
-
-    parent = Node(1, [1, 2])
-    child = Node(2, [3, 4, 5, 6], parent)
-    previous = os.environ.get("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES")
-    os.environ["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = "2,4"
-    try:
-        row = sglang_hicache_callable._snapshot_node(child)
-    finally:
-        if previous is None:
-            os.environ.pop("TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES", None)
-        else:
-            os.environ["TRACE_SIM_HICACHE_STATE_TARGET_PAGE_SIZES"] = previous
-
-    target_hashes = row.get("target_hash_value_by_page_size")
-    assert isinstance(target_hashes, dict), row
-    assert sorted(target_hashes.keys()) == ["2", "4"], target_hashes
-    assert len(target_hashes["2"]) == 2, target_hashes
-    assert len(target_hashes["4"]) == 1, target_hashes
-
-
-def run_hicache_radix_removed_pages_phase_fixture() -> None:
-    """验证 insert 返回 None 时仍按 phase 提取 radix removed pages。"""
-
-    from trace_sim_probe.probes import sglang_hicache_callable
-
-    with tempfile.TemporaryDirectory() as raw_tmp:
-        tmp = Path(raw_tmp)
-        package = tmp / "radix_pkg"
-        package.mkdir()
-        (package / "__init__.py").write_text("", encoding="utf-8")
-        (package / "demo.py").write_text(
-            """
-class Node:
-    def __init__(self):
-        self.id = 1
-        self.hash_value = ['old_a', 'old_b']
-        self.value = [1, 2]
-        self.host_value = [3, 4]
-
-class Params:
-    pass
-
-class Cache:
-    def __init__(self):
-        self.page_size = 2
-        self.node = Node()
-
-    def insert(self, params):
-        self.node.hash_value = []
-        return None
-""",
-            encoding="utf-8",
-        )
-        output_dir = tmp / "python_probe"
-        targets = [
-            {
-                "id": "hiradix.insert",
-                "module": "radix_pkg.demo",
-                "target": "Cache.insert",
-                "events": ["hicache_insert_start", "hicache_insert_end"],
-                "fields": [
-                    {"name": "state_snapshot", "source": "hicache_state:self", "required": False},
-                    {"name": "radix_removed_page_identity", "source": "hicache_radix_removed_pages:self", "required": False},
-                    {"name": "event_role", "source": "const:insert"},
-                ],
-            }
-        ]
-
-        env = os.environ.copy()
-        env["TRACE_SIM_PYTHON_PROBE"] = "1"
-        env["TRACE_SIM_PYTHON_PROBES"] = "sglang.hicache"
-        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(targets)
-        env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(output_dir)
-        env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
-        env["PYTHONPATH"] = os.pathsep.join([str(PROBE_ROOT), str(tmp), env.get("PYTHONPATH", "")])
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-c",
-                "from radix_pkg.demo import Cache, Params; cache = Cache(); assert cache.insert(Params()) is None",
-            ],
-            env=env,
-        )
-
-        files = sorted(output_dir.glob("python_probe_trace.*.json"))
-        assert len(files) == 1, files
-        payload = json.loads(files[0].read_text(encoding="utf-8"))
-        events = [event for event in payload["traceEvents"] if event.get("cat") == "python_probe"]
-        real_end = [event for event in events if event["name"] == "hicache_insert_end"]
-        snapshots = [event for event in events if event["name"].endswith(":state_snapshot")]
-        assert len(real_end) == 1, events
-        assert len(snapshots) == 2, events
-        assert real_end[0]["args"]["radix_removed_page_identity"] == ["old_a", "old_b"], real_end
-        assert all(event["args"].get("model_input") is False for event in snapshots), snapshots
-
-    class DirectNode:
-        def __init__(self):
-            self.hash_value = ["direct_old"]
-
-    class DirectCache:
-        def __init__(self):
-            self.node = DirectNode()
-
-    direct_cache = DirectCache()
-    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT.clear()
-    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
-        "hicache_radix_removed_pages:self",
-        "radix_removed_page_identity",
-        {},
-        (direct_cache,),
-        {},
-        None,
-    )
-    assert handled and found and value == [], value
-    direct_cache.node.hash_value = []
-    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
-        "hicache_radix_removed_pages:self",
-        "radix_removed_page_identity",
-        {},
-        (direct_cache,),
-        {},
-        None,
-    )
-    assert handled and found and value == ["direct_old"], value
-
-    class SnapshotNode:
-        def __init__(self):
-            self.hash_value = ["snapshot_old"]
-
-    class SnapshotCache:
-        def __init__(self):
-            self.node = SnapshotNode()
-
-    snapshot_cache = SnapshotCache()
-    object_id = id(snapshot_cache)
-    snapshot_object_id = f"{type(snapshot_cache).__name__}:{object_id}"
-    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT.clear()
-    sglang_hicache_callable._RADIX_PAGES_AT_STATE_SNAPSHOT_BY_OBJECT.clear()
-    sglang_hicache_callable._RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT.clear()
-    sglang_hicache_callable._record_radix_state_snapshot_delta(
-        sglang_hicache_callable._snapshot_hicache_object(snapshot_cache)
-    )
-    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
-        "hicache_radix_removed_pages:self",
-        "radix_removed_page_identity",
-        {"__trace_sim_phase": "start"},
-        (snapshot_cache,),
-        {},
-        None,
-    )
-    assert handled and found and value == [], value
-    snapshot_cache.node.hash_value = []
-    sglang_hicache_callable._record_radix_state_snapshot_delta(
-        sglang_hicache_callable._snapshot_hicache_object(snapshot_cache)
-    )
-    sglang_hicache_callable._RADIX_PAGES_BEFORE_CALL_BY_OBJECT[object_id] = [set()]
-    assert sglang_hicache_callable._RADIX_REMOVED_AT_STATE_SNAPSHOT_BY_OBJECT[snapshot_object_id] == ["snapshot_old"]
-    handled, found, value = sglang_hicache_callable._hicache_radix_removed_pages_source(
-        "hicache_radix_removed_pages:self",
-        "radix_removed_page_identity",
-        {"__trace_sim_phase": "end"},
-        (snapshot_cache,),
-        {},
-        None,
-    )
-    assert handled and found and value == ["snapshot_old"], value
-
-
 def run_profile_quality_fixture(tmp: Path, python_probe_file: Path) -> None:
     """验证 profile_quality 能审计 profile manifest 和 Python probe target 命中。"""
 
@@ -1443,7 +837,11 @@ def run_profile_quality_fixture(tmp: Path, python_probe_file: Path) -> None:
     assert quality["observed_target_count"] == len(sglang_hicache_targets()), quality
     assert not quality["missing_targets"], quality
     assert quality["observed_cache_mechanisms"]["lock_ref"] > 0, quality
-    assert quality["page_identity_coverage"]["stateful_required_events_missing_page_identity"] == 0, quality
+    invariant = quality["hicache_invariant_coverage"]
+    assert invariant["ready"] is True, quality
+    assert invariant["missing_required_fact_events"] == 0, quality
+    assert invariant["missing_token_dictionary_refs"] == [], quality
+    assert invariant["dictionary_ids_without_tokens"] == [], quality
 
 
 def run_profile_quality_capacity_fixture() -> None:
@@ -1667,33 +1065,127 @@ def _write_fake_sglang_package(tmp: Path) -> None:
 
     (tmp / "sglang/srt/managers/scheduler.py").write_text(
         """
+class SamplingParams:
+    def __init__(self):
+        self.ignore_eos = False
+        self.max_new_tokens = 16
+
 class Req:
     def __init__(self, rid):
         self.rid = rid
-        self.host_hit_length = 4
-        self.storage_hit_length = 0
+        self.sampling_params = SamplingParams()
+        self.origin_input_ids = [1, 2, 3, 4]
+        self.output_ids = [5, 6]
         self.fill_ids = [1, 2, 3, 4, 5, 6]
+        self.kv_committed_len = 5
+        self.kv_committed_freed = False
+        self.cache_protected_len = 2
+        self.extend_input_len = 4
+        self.prefix_indices = [10, 11]
+        self.host_hit_length = 2
+        self.storage_hit_length = 0
+        self.priority = 7
+        self.last_node = None
+        self.last_host_node = None
+        self.best_match_node = None
+
+    def _cache_commit_len(self):
+        return 5
 
 class TreeCache:
-    page_size = 2
+    def __init__(self):
+        self.page_size = 2
+        self.prefetch_stop_policy = 'best_effort'
+        self.hicache_storage_pass_prefix_keys = False
+        self.root_node = None
+        self.cache_controller = self
+        self.write_policy = 'write_through'
+        self.prefetch_threshold = 4
+        self.prefetch_capacity_limit = 8
+        self.prefetch_tokens_occupied = 0
+        self.enable_storage = True
+        self.storage_batch_size = 128
 
 class Scheduler:
     def __init__(self):
         self.tree_cache = TreeCache()
+        self.enable_hicache_storage = True
 
     def _prefetch_kvcache(self, req):
+        if req.last_host_node is None:
+            from sglang.srt.mem_cache.hiradix_cache import Node
+            node = Node(31)
+            req.last_host_node = node
+            req.best_match_node = node
+            req.last_node = node
+            self.tree_cache.root_node = node.parent
         return req.rid
+""",
+        encoding="utf-8",
+    )
+    (tmp / "sglang/srt/managers/schedule_policy.py").write_text(
+        """
+from enum import Enum, auto
+
+class AddReqResult(Enum):
+    CONTINUE = auto()
+    NO_TOKEN = auto()
+    OTHER = auto()
+
+class PrefillAdder:
+    def __init__(self, tree_cache, page_size=2):
+        self.page_size = page_size
+        self.tree_cache = tree_cache
+        self.can_run_list = []
+        self.new_chunked_req = None
+        self.rem_input_tokens = 64
+        self.rem_chunk_tokens = 8
+
+    @property
+    def rem_total_tokens(self):
+        return 64 - len(self.can_run_list) * self.page_size
+
+    @property
+    def cur_rem_tokens(self):
+        return 32 - len(self.can_run_list) * self.page_size
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        self.can_run_list.append(req)
+        return AddReqResult.CONTINUE
+
+    def add_chunked_req(self, req):
+        self.can_run_list.append(req)
+        return None
 """,
         encoding="utf-8",
     )
     (tmp / "sglang/srt/mem_cache/hiradix_cache.py").write_text(
         """
 class Node:
-    def __init__(self, node_id):
+    def __init__(self, node_id, key=None, parent=None):
         self.id = node_id
+        self.parent = parent
+        self.key = [1, 2] if key is None else key
         self.host_value = [1, 2, 3, 4]
         self.value = [5, 6, 7, 8]
         self.hash_value = ['h1', 'h2']
+        self.children = {}
+        self.lock_ref = 0
+        self.host_ref_counter = 0
+        self.hit_count = 0
+        self.priority = 7
+        self.evicted = False
+        self.backuped = True
+        if parent is None and node_id != 0:
+            root = Node(0, key=[], parent=None)
+            self.parent = root
+            root.children['child'] = self
+
+    def get_last_hash_value(self):
+        return self.hash_value[-1] if self.hash_value else None
+
+    def get_prefix_hash_values(self, node):
+        return ['prefix-h1']
 
 class Result:
     def __init__(self, node):
@@ -1733,6 +1225,8 @@ class ControllerSnapshot:
         self.storage_batch_size = 128
         self.load_queue = [1]
         self.write_queue = [1]
+        self.ack_write_queue = []
+        self.ack_load_queue = []
 
 class Params:
     def __init__(self, req, key, value, best_match_node, host_hit_length, num_tokens):
@@ -1742,11 +1236,22 @@ class Params:
         self.best_match_node = best_match_node
         self.host_hit_length = host_hit_length
         self.num_tokens = num_tokens
+        self.chunked = False
+        self.priority = 7
+        self.prev_prefix_len = 0
+
+class InitLoadBackParams:
+    def __init__(self, best_match_node, host_hit_length, req=None, mem_quota=None):
+        self.best_match_node = best_match_node
+        self.host_hit_length = host_hit_length
+        self.req = req
+        self.mem_quota = mem_quota
 
 class HiRadixCache:
     def __init__(self):
         self.page_size = 2
         self.ongoing_prefetch = {}
+        self.prefetch_loaded_tokens_by_reqid = {'req-1': 4}
         self.prefetch_stop_policy = 'best_effort'
         self.write_through_threshold = 1
         self.load_back_threshold = 10
@@ -1754,12 +1259,27 @@ class HiRadixCache:
         self.kv_cache = self.cache_controller.mem_pool_device
         self.token_to_kv_pool_host = self.cache_controller.mem_pool_host
         self.node = Node(21)
+        self.root_node = self.node.parent
+        self.evictable_leaves = {self.node}
+        self.evictable_host_leaves = {self.node}
+        self.evictable_size_ = 4
+        self.protected_size_ = 0
 
     def match_prefix(self, params):
+        params.req.last_node = params.best_match_node
+        params.req.last_host_node = params.best_match_node
+        params.req.best_match_node = params.best_match_node
         return Result(params.best_match_node)
 
+    def cache_finished_req(self, req, is_insert=True):
+        return None
+
+    def cache_unfinished_req(self, req, chunked=False):
+        return None
+
     def prefetch_from_storage(self, req_id, last_host_node, new_input_tokens, last_hash=None, prefix_keys=None):
-        self.ongoing_prefetch[req_id] = last_host_node
+        op = type('Operation', (), {'id': 3, 'hash_value': ['h1', 'h2'], 'completed_tokens': 2, 'is_terminated': lambda self: False})()
+        self.ongoing_prefetch[req_id] = (last_host_node, new_input_tokens, [1, 2, 3, 4], op)
 
     def check_prefetch_progress(self, req_id):
         return True
@@ -1770,7 +1290,7 @@ class HiRadixCache:
     def init_load_back(self, params):
         return [1, 2, 3, 4], params.best_match_node
 
-    def load_back(self, node):
+    def load_back(self, node, mem_quota=None):
         return [5, 6, 7, 8]
 
     def insert(self, params):
@@ -1783,13 +1303,24 @@ class HiRadixCache:
         return 3
 
     def inc_lock_ref(self, node):
+        node.lock_ref += 1
         return LockResult(-len(node.hash_value) * self.page_size)
 
     def dec_lock_ref(self, node):
+        node.lock_ref = max(0, node.lock_ref - 1)
         return LockResult(len(node.hash_value) * self.page_size)
 
     def evict(self, params):
         return Result(self.node)
+
+    def check_hicache_events(self):
+        return None
+
+    def ready_to_load_host_cache(self):
+        return 17
+
+    def flush_write_through_acks(self):
+        return None
 """,
         encoding="utf-8",
     )
@@ -1800,14 +1331,31 @@ class Operation:
         self.id = 9
         self.request_id = request_id
         self.token_ids = [1, 2, 3, 4]
+        self.host_indices = [1, 2, 3, 4]
+        self.device_indices = [5, 6, 7, 8]
         self.hash_value = ['h1', 'h2']
+        self.prefix_keys = ['p0']
         self.completed_tokens = 64
+        self.bytes = 1024
+
+    def is_terminated(self):
+        return False
+
+    def mark_terminate(self):
+        self.terminated = True
 
 class HiCacheController:
     def __init__(self):
         self.page_size = 2
         self.load_queue = [1]
         self.write_queue = [1]
+        self.prefetch_queue = []
+        self.backup_queue = []
+        self.prefetch_revoke_queue = []
+        self.ack_backup_queue = []
+        self.host_mem_release_queue = []
+        self.prefetch_tokens_occupied = 0
+        self.prefetch_capacity_limit = 8
 
     def load(self, host_indices, priority=None, node_id=-1):
         return [10, 11, 12, 13]
@@ -1823,10 +1371,22 @@ class HiCacheController:
         self.write_queue = []
 
     def prefetch(self, request_id, host_indices, new_input_tokens, last_hash=None, prefix_keys=None):
-        return Operation(request_id)
+        op = Operation(request_id)
+        self.prefetch_queue.append(op)
+        return op
+
+    def prefetch_rate_limited(self):
+        return False
 
     def _storage_hit_query(self, operation):
         return ['h1', 'h2'], 128
+
+    def terminate_prefetch(self, operation):
+        operation.mark_terminate()
+        return operation.completed_tokens, operation.hash_value
+
+    def append_host_mem_release(self, host_indices):
+        self.host_mem_release_queue.append(host_indices)
 
     def _page_transfer(self, operation):
         operation.completed_tokens += 64
@@ -1845,9 +1405,7 @@ def main() -> int:
     run_probe_fixture()
     run_sglang_hicache_target_fixture()
     run_hicache_state_snapshot_fixture()
-    run_hicache_target_hash_snapshot_fixture()
-    run_hicache_radix_removed_pages_phase_fixture()
-    run_hicache_page_hash_literal_page_size_fixture()
+    run_hicache_token_source_fixture()
     run_hicache_prefetch_progress_source_fixture()
     run_profile_quality_capacity_fixture()
     run_profile_quality_capacity_missing_fixture()
@@ -1856,8 +1414,7 @@ def main() -> int:
     run_state_trace_env_fixture()
     run_env_placeholder_fixture()
     run_profile_suite_matrix_fixture()
-    run_hicache_radix_removed_materialization_fixture()
-    run_hicache_target_radix_removed_materialization_fixture()
+    run_no_legacy_hicache_page_identity_fixture()
     run_trace_merger_sidecar_only_fixture()
     print("profiling fixtures passed")
     return 0

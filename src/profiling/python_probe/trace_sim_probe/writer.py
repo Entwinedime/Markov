@@ -15,7 +15,18 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
-_FULL_LIST_KEYS = {"token_ids"}
+_FULL_LIST_KEYS = {
+    "token_ids",
+    "node_chain",
+    "last_node_chain",
+    "last_host_node_chain",
+    "best_match_node_chain",
+    "operation_hash_pages",
+    "hash_value",
+    "hash_pages",
+    "hit_hash_pages",
+    "prefix_keys",
+}
 
 
 def _jsonable(value: Any, *, key: str | None = None) -> Any:

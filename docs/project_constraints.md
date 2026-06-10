@@ -55,11 +55,15 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - 新采集目标必须显式写入 `fact_class`、`dag_input`、`state_model_input`。
 - `fact_class=invariant_state && state_model_input=true` 才能进入 C++ HiCache state model。
 - `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不得更新 target state。
+- source matched result、admission return、actual victim、actual movement、actual async completion 等 source 已发生结果不得作为
+  `invariant_state` 事件字段混入；需要保留时必须拆成并行 `source_actual` / `timing_observation` / `oracle_state` 事件。
 - `page_identity`、`target_page_identity`、`target_page_identity_page<page_size>` 不再是 state model 主输入。
 - target page identity 必须由 token dictionary/span、`hash_algo`、`cache_scope` 和 target `page_size` 推导。
 - token dictionary 可作为默认 state input；普通事件应引用 span，避免重复携带完整 token 列表。
 - `cache_scope` 和 `seq_no` 是 HiCache invariant state fact 的必需路由字段。
 - validation-only `state_snapshot` 必须保持 `state_model_input=false`。
+- 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验、`tests/run_profiling_fixtures.py`、
+  `tests/run_hicache_mainline_config_fixtures.py`，以及 invariant target source-result 字段审计。
 
 ## Modeling
 
@@ -79,6 +83,14 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - `self-config prediction` 仍必须显式给出 target page size、capacity、write policy、prefetch policy。
 - `cross-config prediction` 只能用 target trace 做 oracle，不得偷读 target actual trace 作为模型事实源。
 - 非执行类 state snapshot、oracle state、probe debug、质量审计事件不能作为默认性能 DAG 节点。
+- 当前 HiCache mainline S1A/S1B profiling 契约固定为 31 个 target；profile quality 通过后，state mismatch 默认归类为
+  backend model/rule 问题，不能因为单次 mismatch 临时追加采集 target。
+- 只有 profile quality 明确失败、进入 DLLM/disaggregation/streaming/abort/preemption 等新 scope，或 SGLang upstream hook
+  语义边界变化时，才允许重新讨论新增 HiCache 采集 target。
+- HiCache backend 重构不保留 page-level state machine 兼容性；token-level radix tree 是 source of truth，page set 只能是
+  target page projection。
+- HiCache backend 必须拆分 router/schema、token store、target pager、token radix tree、state index、policy、async state、
+  summary/validation 边界；不能继续把复杂状态机堆在 `hicache_model.cpp` 单体里。
 
 ## 配置与数据
 

@@ -131,11 +131,20 @@ sitecustomize.py
 | --- | --- |
 | `token_path:<source>[,<scope_source>]` | 输出 token dictionary；同一 scope/path 只在首次包含完整 `token_ids` |
 | `token_span:<source>` | 输出 `{path_id, begin, end, token_count, hash_algo}` |
+| `request_token_path:<req>,<mode>[,<scope>]` | 从 SGLang `Req` 输出 request token dictionary；`mode=fill/committed/origin_output` |
+| `request_token_span:<req>,<mode>` | 从 SGLang `Req` 输出 request token span |
+| `request_token_count:<req>,<mode>` | 从 SGLang `Req` 输出 request token 数 |
 | `token_path_concat:<prefix>,<suffix>[,<scope>]` | 拼接两段 token 后输出 dictionary |
 | `token_span_concat:<prefix>,<suffix>` | 拼接两段 token 后输出 span |
 | `node_token_path:<node>[,<scope>]` | 从 radix node 的 parent chain 还原完整 token path |
 | `node_token_span:<node>` | 从 radix node 输出完整 path span |
 | `node_token_count:<node>` | 统计 radix node full key token 数 |
+| `hicache_node_summary:<node>` | 输出 node id、parent、token span、hash、device/host/ref/child 摘要 |
+| `hicache_node_chain:<node>` | 输出 root 到 node 的链式摘要 |
+| `hicache_evictable_snapshot:<cache>` | 输出 device/host evictable 候选数量和样本 |
+| `hicache_prefetch_progress:<cache>,<req_id>` | 输出 source prefetch progress 证据；只用于 observed/debug |
+| `hicache_request_runtime:<req>` | 输出 source request runtime 摘要；只用于 observed/debug |
+| `hicache_scheduler_prefetch_state:<scheduler>,<req>` | 输出 source scheduler prefetch 判定摘要；只用于 observed/debug |
 | `hicache_cache_scope:<source>` | 输出 rank + cache object 作用域 |
 | `hicache_seq:<source>` | 在 cache scope 内生成单调逻辑序号 |
 | `hicache_config:<source>[,<field>]` | 读取 source cache 配置摘要，用于质量审计和解释 |
@@ -175,23 +184,48 @@ fact_class == "invariant_state" && state_model_input == true
 
 ## 当前 HiCache State Targets
 
-`configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 当前配置 12 个
-HiCache target：
+`configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 当前配置 31 个
+HiCache target：16 个 `invariant_state`、13 个 `source_actual`、2 个 `timing_observation`。新的口径把“可重放输入”和“source 已发生结果”分开：同一个 Python callable 可以有一个
+`invariant_state` target 和一个并行 `source_actual` target。
 
 | target id | role | fact class | state input | 说明 |
 | --- | --- | --- | --- | --- |
 | `hiradix.request_tokens` | `request_tokens` | `invariant_state` | true | 记录 request full token path |
-| `hiradix.lookup_path` | `lookup_path` | `invariant_state` | true | 记录 lookup full path 与 matched path |
+| `hiradix.lookup_path` | `lookup_path` | `invariant_state` | true | 只记录 lookup full token path；matched/source hit 已拆出 |
+| `hiradix.lookup_result_observed` | `lookup_result_observed` | `source_actual` | false | 记录 source matched node、device/host hit、node chain 和 evictable snapshot |
 | `hiradix.cache_config_observed` | `cache_config_observed` | `invariant_state` | true | 记录 source cache 配置摘要；target config 仍由 modeling 显式给出 |
-| `hiradix.insert_path` | `insert_path` | `invariant_state` | true | 记录 insert full path、prefix、inserted node token facts |
-| `hiradix.prefetch_intent` | `prefetch_intent` | `invariant_state` | true | 记录 prefetch logical prefix/suffix intent |
+| `hiradix.cache_finished_req` | `request_cache_lifecycle` | `invariant_state` | true | 记录 finished request 的 committed token path、is_insert 和 priority |
+| `hiradix.cache_finished_req_observed` | `request_cache_lifecycle_observed` | `source_actual` | false | 记录 source request runtime、cache_protected_len 和 last node 证据 |
+| `hiradix.cache_unfinished_req` | `request_cache_lifecycle` | `invariant_state` | true | 记录 unfinished/chunked request 的 fill token path、chunked 和 priority |
+| `hiradix.cache_unfinished_req_observed` | `request_cache_lifecycle_observed` | `source_actual` | false | 记录 source unfinished request runtime 和 last node 证据 |
+| `scheduler.prefetch_decision` | `prefetch_decision` | `invariant_state` | true | 只记录 scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
+| `scheduler.prefetch_decision_observed` | `prefetch_decision_observed` | `source_actual` | false | 记录 source prefix/host hit/new-input/anchor 判定摘要 |
+| `schedule_policy.prefill_admission` | `request_admission` | `invariant_state` | true | 记录 `PrefillAdder.add_one_req` 的 request token path、admission kind、chunk/truncation 参数和 policy；不记录 source admission result |
+| `schedule_policy.prefill_admission_observed` | `request_admission_observed` | `source_actual` | false | 记录 source admission return、request runtime 和 phase-scoped budget snapshot |
+| `schedule_policy.chunked_admission` | `request_admission` | `invariant_state` | true | 记录 `PrefillAdder.add_chunked_req` 的 chunked continuation request token path 和 policy |
+| `schedule_policy.chunked_admission_observed` | `request_admission_observed` | `source_actual` | false | 记录 source chunked continuation return、request runtime 和 phase-scoped budget snapshot |
+| `hiradix.insert_path` | `insert_path` | `invariant_state` | true | 只记录 insert full path、value token 数、chunked 和 priority；prefix/inserted source result 已拆出 |
+| `hiradix.insert_result_observed` | `insert_result_observed` | `source_actual` | false | 记录 source prefix_len、inserted node 和 evictable snapshot |
+| `hiradix.prefetch_intent` | `prefetch_intent_observed` | `source_actual` | false | 记录 source 已发起的 prefetch prefix/suffix intent，不驱动 target prefetch |
 | `hiradix.prefetch_check_point` | `prefetch_check_point` | `invariant_state` | true | 记录请求时间线上的 prefetch check/wait 边界 |
-| `hiradix.capacity_request` | `capacity_request` | `invariant_state` | true | 记录 capacity request 的 token/page 需求 |
-| `hiradix.lock_scope_inc` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref increase |
-| `hiradix.lock_scope_dec` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref decrease |
+| `hiradix.prefetch_progress_observed` | `prefetch_progress_observed` | `source_actual` | false | 记录 source prefetch completed/revoked/progress 证据 |
+| `hiradix.maintenance_check` | `maintenance_checkpoint` | `invariant_state` | true | 记录 `check_hicache_events` 维护检查点 |
+| `hiradix.ready_to_load_host_cache` | `maintenance_checkpoint` | `invariant_state` | true | 记录 host->device load queue 启动检查点 |
+| `hiradix.flush_write_through_acks` | `maintenance_checkpoint` | `invariant_state` | true | 记录 write-through ack flush 检查点 |
+| `hiradix.capacity_request` | `capacity_request` | `invariant_state` | true | 记录 capacity request 的 token/page 需求，不记录 source victim |
+| `hiradix.capacity_result_observed` | `capacity_result_observed` | `source_actual` | false | 记录 source evicted tokens 和 evictable snapshot |
+| `hiradix.lock_scope_inc` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref increase，不记录 source delta |
+| `hiradix.lock_scope_inc_observed` | `lock_scope_result_observed` | `source_actual` | false | 记录 source inc return delta、node chain 和 evictable snapshot |
+| `hiradix.lock_scope_dec` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref decrease，不记录 source delta |
+| `hiradix.lock_scope_dec_observed` | `lock_scope_result_observed` | `source_actual` | false | 记录 source dec return delta、node chain 和 evictable snapshot |
 | `hicache_controller.prefetch_io_observed` | `prefetch_io_observed` | `timing_observation` | false | 真实 prefetch IO 样本，不驱动 target ready |
 | `hicache_controller.writeback_io_observed` | `writeback_io_observed` | `timing_observation` | false | 真实 writeback IO 样本 |
 | `hicache_controller.writeback_enqueue_observed` | `writeback_enqueue_observed` | `source_actual` | false | source writeback enqueue 事实，不驱动 target flushed pages |
+
+`sglang.hicache` probe 还会自动 patch 下列内部方法并输出 `source_actual` 事件：radix split/delete、
+device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、write hit counter delta、write/load ack checkpoint、storage control
+checkpoint、controller prefetch enqueue、rate-limit、storage hit query、prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件用于
+provenance 和 oracle 对照，默认 `state_model_input=false`。
 
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
 `fact_class=oracle_state`、`model_input=false`、`state_model_input=false`，只能给
@@ -228,13 +262,15 @@ python3 scripts/internal/profile_quality.py \
 - trace 文件是否存在；
 - Python probe target 是否命中；
 - required fields 是否缺失；
+- invariant target 是否误带 source-result 字段；
 - workload 声明的 HiCache 机制是否实际出现；
 - `invariant_state` 是否具备 token dictionary/span、cache scope、seq_no；
 - token span 是否都能找到 dictionary；
 - `seq_no` 是否在 scope 内有序；
 - state trace 开启时是否采到 capacity snapshot。
 
-`01_s1a_manual` 最新质量结果：
+旧 `01_s1a_manual` 质量结果如下。它来自 2026-06-10 已完成 profile，不是当前 31-target 契约的重跑结果；
+当前契约重跑前只能把它作为历史基线：
 
 | 指标 | 值 |
 | --- | --- |

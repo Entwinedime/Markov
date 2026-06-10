@@ -2,6 +2,104 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-11 02:09:40 +0800
+
+- 收尾审查 HiCache backend 阶段 2/3/4 最小建模：
+  - 确认当前 C++ backend 不再引用旧 `hicache_radix_tree` 源文件，`CMakeLists.txt` 已只编译 router、token store、target pager、
+    token radix tree 和 state index；
+  - 确认 `prefetch_intent` 没有作为 C++ invariant 分支残留，当前只保留 profiling 契约中的
+    `prefetch_intent_observed` source_actual；
+  - 修正 `docs/validation/hicache_state_model_defects.md` 中旧 radix 描述措辞，避免被误读为当前结构；
+  - 重新通过 `cmake --build build --target trace_graph -j 8`、`python3 tests/run_hicache_state_fixtures.py`、
+    `python3 tests/run_modeling_smoke_fixtures.py`、`python3 tests/run_hicache_mainline_config_fixtures.py`、
+    `python3 tests/run_profiling_fixtures.py`、`find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`、
+    Python compile、C++ `clang-format --dry-run --Werror` 和 `git diff --check`。
+
+## 2026-06-11 02:03:41 +0800
+
+- 在手动 31-target profiling 完成前，先完成 HiCache backend 阶段 2/3/4 的最小建模：
+  - 新增 `hicache_token_store.hpp/.cpp`，request token path 由 token store 维护，不再在 state model 中保存 request pages；
+  - 新增 `hicache_target_pager.hpp/.cpp`，target page hash 由 token path、target page size 和 cache scope 推导；
+  - 新增 `hicache_token_radix_tree.hpp/.cpp`，按 token 维护 radix prefix/split/insert，`prefetch_decision` 和 `insert_path`
+    均使用 token radix longest-prefix；
+  - 删除旧 `hicache_radix_tree.hpp/.cpp`，不再保留 page-level radix backend 入口；
+  - 新增 `hicache_state_index.hpp/.cpp`，resident、dirty、backuped、evicted、locked、prefetch 和 hit count 集合从
+    `HiCacheState` 拆到 state index；
+  - `HiCacheState` 现在主要做 orchestration：按 role 调用 token store、target pager、token radix 和 state index；
+  - 新增最小验证：target page size projection fixture、token radix split projection fixture；
+  - 已通过 `cmake --build build --target trace_graph -j 8`、`python3 tests/run_hicache_state_fixtures.py`、
+    `python3 tests/run_modeling_smoke_fixtures.py`、`python3 tests/run_hicache_mainline_config_fixtures.py`、
+    `python3 tests/run_profiling_fixtures.py`、`find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`、
+    Python compile、filesystem C++ `clang-format --dry-run --Werror` 和 `git diff --check`。
+
+## 2026-06-11 01:51:31 +0800
+
+- 开始 HiCache backend 重构阶段 1：
+  - 新增 `src/modeling/trace_graph/include/trace_graph/modules/hicache/hicache_router.hpp` 和
+    `src/modeling/trace_graph/src/modules/hicache/hicache_router.cpp`；
+  - router 现在集中维护 31-target invariant role enum、`fact_class=invariant_state && state_model_input=true` 门禁和 required field 检查；
+  - C++ backend 不再把旧 `prefetch_intent` 当 invariant role，`prefetch_decision` 由 target radix longest-prefix 计算 planned suffix；
+  - `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 已被识别但暂未实现，会显式计入
+    `missing_invariant_facts["unimplemented_invariant_role.<role>"]`，不再静默吞掉；
+  - `tests/run_hicache_state_fixtures.py` 已改为 current `prefetch_decision` fixture，并把缺 dictionary 的 invariant 断言改成 router
+    拒绝后不计入 processed；
+  - 本轮验证通过：`cmake --build build --target trace_graph -j 8`、`python3 tests/run_hicache_state_fixtures.py`、
+    `python3 tests/run_modeling_smoke_fixtures.py`、`python3 tests/run_hicache_mainline_config_fixtures.py`、
+    `python3 tests/run_profiling_fixtures.py`、`find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`、
+    Python compile、clang-format dry-run 和 `git diff --check`。
+
+## 2026-06-11 01:38:04 +0800
+
+- 暂停旧 HiCache backend 的小修小补，明确后端重构最终架构：
+  - `docs/modeling_development.md` 已把现有 `HiCacheState` / page-level `HiCacheRadixTree` 标为过渡实现，后续不保留兼容；
+  - 新后端以 token-level radix tree 为 source of truth，page set 只作为 target page size projection；
+  - 后端边界拆成 `HiCacheFactRouter`、`TokenPathStore`、`TargetPager`、`TokenRadixTree`、`NodeStateIndex`、`RequestState`、
+    `PolicyEngine`、`AsyncState`、transition summary 和 validation；
+  - 31-target mainline S1A/S1B 采集契约在当前 scope 内冻结，profile quality 通过后的 mismatch 默认归类为 backend model/rule 缺陷；
+  - 只有 profile quality 失败、新 scope 或 SGLang upstream hook 语义边界变化，才重新讨论新增采集 target；
+  - 同步 `project_constraints.md` 和 validation 缺陷文档，旧 2026-06-10 四向结果只作为 page-level backend 失败证据，
+    不再作为当前 31-target 契约的验收结果。
+
+## 2026-06-11 01:29:00 +0800
+
+- 对 27-target HiCache 采集契约做第三轮完整性审计，确认 admission/chunked continuation 是后端重放 load-back、lock/ref 和截断边界时的缺口：
+  - 主配置从 27 个 target 扩到 31 个 target；
+  - 新增 `schedule_policy.prefill_admission` / `schedule_policy.chunked_admission` 两个 `request_admission` invariant target；
+  - 新增并行 `schedule_policy.prefill_admission_observed` / `schedule_policy.chunked_admission_observed`，只记录 source admission return、request runtime 和 phase-scoped budget snapshot；
+  - invariant admission target 只携带 request token dictionary/span、`admission_kind`、chunk/truncation 参数、priority/max_new_tokens 和 policy，不携带 `request_runtime`、return result、source prefix/host hit 或 source last node；
+  - `profile_quality.py` 已新增 `request_admission` required fields 和 token/span 检查；
+  - `tests/run_profiling_fixtures.py` fake SGLang 已覆盖 `PrefillAdder.add_one_req` 和 `add_chunked_req`，并验证 31 个配置 target 全命中。
+
+## 2026-06-11 01:04:01 +0800
+
+- 针对“不要反复重跑 profile”的要求，对 HiCache 采集契约做二次审计并继续收紧：
+  - 主配置从 21 个 target 扩到 27 个 target；
+  - 从 invariant 中移除 source-result 字段：`scheduler.prefetch_decision` 不再携带 source `prefix_indices/host_hit_length/last_host_node`，
+    `lock_scope_delta` 不再携带 source return `delta`，`ready_to_load_host_cache` 不再携带 source `producer_id`；
+  - 新增并行 `source_actual` observed targets：request lifecycle observed、scheduler prefetch decision observed、
+    capacity result observed、lock/ref result observed；
+  - `insert_path` invariant 补充 `chunked`、`priority`、`prev_prefix_len`，避免后端重建 hit-count/eviction priority 时缺输入；
+  - Python probe 新增 request runtime / scheduler prefetch state source，并补内部 hook：host ref delta、load-back、write-back
+    enqueue/start、host eviction、prefetch rate-limit/terminate/abort/pop 等均以 `source_actual` 采集；
+  - `tests/run_profiling_fixtures.py` 已改为加载主配置并验证 27-target 契约，不再用旧 `page_hashes/page_identity/radix_removed` fixture。
+
+## 2026-06-11 00:39:24 +0800
+
+- 为下一轮 HiCache profile 重采收紧采集契约，目标是尽量一次补齐后端 token/node/ref/async 重构需要的事实：
+  - `configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 从 12 个 configured targets
+    第一轮扩展到 21 个 targets；当前契约已在 2026-06-11 01:04:01 继续收紧到 27 个 targets；
+  - 新增 invariant roles：`request_cache_lifecycle`、`prefetch_decision`、`maintenance_checkpoint`，用于补齐
+    request-level committed/fill token path、scheduler prefetch decision checkpoint 和 async 维护检查点；
+  - 将 `lookup` matched result、`insert` prefix/result、`prefetch_from_storage` actual intent 和 prefetch progress
+    拆为 `source_actual` observed targets，避免 source actual 混在 `invariant_state` 事件里；
+  - `sglang_hicache_callable.py` 新增 request token source、node summary/chain、evictable snapshot、prefetch progress source，
+    并自动 patch HiCache 内部 radix split/delete、evictable delta、node store/remove、write/load ack、storage control、
+    storage hit query、prefetch terminate 等 source_actual provenance；
+  - `profile_quality.py` 已同步新 invariant role 的 required fields，不再要求旧 `lookup_path.matched_span` 或
+    `insert_path.prefix_len` 这类 source result 字段；
+  - 文档已同步：这一版 21-target 契约尚未真实重跑，旧 S1A/S1B 四向 validation 仍是 2026-06-10 旧 profile 的结果；
+    当前需要以后续 27-target 契约为准。
+
 ## 2026-06-10 21:37:55 +0800
 
 - 基于四向 validation 和逐 page provenance 做第一轮 HiCache state model 保守修复：

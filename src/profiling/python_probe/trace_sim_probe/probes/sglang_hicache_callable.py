@@ -9,14 +9,25 @@ from __future__ import annotations
 
 import hashlib
 import os
+import functools
+from types import ModuleType
 from typing import Any
 
+from trace_sim_probe.patching import PATCH_MARKER
 from trace_sim_probe.probes import generic_callable as _base
+from trace_sim_probe.writer import get_writer, probe_debug_enabled
 
 
 _TOKEN_PATHS_EMITTED_BY_SCOPE: dict[str, set[str]] = {}
 _HICACHE_SEQUENCE_BY_SCOPE: dict[str, int] = {}
 _TOKEN_HASH_ALGO = "sglang_radix_sha256_v1"
+_INTERNAL_PATCHED: set[str] = set()
+_INTERNAL_TARGET_MODULES = (
+    "sglang.srt.mem_cache.events",
+    "sglang.srt.mem_cache.hiradix_cache",
+    "sglang.srt.mem_cache.radix_cache",
+    "sglang.srt.managers.cache_controller",
+)
 
 
 def _truthy(value: str | None) -> bool:
@@ -95,6 +106,48 @@ def _token_span_source(
     return (True, found, value)
 
 
+def _request_token_path_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("request_token_path:"):
+        return (False, False, None)
+    found, value = _extract_request_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, _base.ExtractedField(value) if found else None)
+
+
+def _request_token_span_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("request_token_span:"):
+        return (False, False, None)
+    found, value = _extract_request_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, value)
+
+
+def _request_token_count_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("request_token_count:"):
+        return (False, False, None)
+    found, tokens = _extract_request_tokens(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, len(tokens) if found else None)
+
+
 def _token_path_concat_source(
     source: str,
     field_name: str,
@@ -165,6 +218,104 @@ def _node_token_count_source(
     if not found:
         return (True, False, None)
     return (True, True, len(_full_key_tokens(node)))
+
+
+def _hicache_node_summary_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_node_summary:"):
+        return (False, False, None)
+    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found or node is None:
+        return (True, False, None)
+    return (True, True, _node_summary_record(node))
+
+
+def _hicache_node_chain_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_node_chain:"):
+        return (False, False, None)
+    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found or node is None:
+        return (True, False, None)
+    return (True, True, _node_chain_record(node))
+
+
+def _hicache_evictable_snapshot_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_evictable_snapshot:"):
+        return (False, False, None)
+    found, cache = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found or cache is None:
+        return (True, False, None)
+    return (True, True, _evictable_snapshot_record(cache))
+
+
+def _hicache_prefetch_progress_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_prefetch_progress:"):
+        return (False, False, None)
+    found, value = _extract_prefetch_progress(source.split(":", 1)[1], bound, args, kwargs, result)
+    return (True, found, value)
+
+
+def _hicache_request_runtime_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_request_runtime:"):
+        return (False, False, None)
+    found, req = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    if not found or req is None:
+        return (True, False, None)
+    return (True, True, _request_runtime_record(req))
+
+
+def _hicache_scheduler_prefetch_state_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    if not source.startswith("hicache_scheduler_prefetch_state:"):
+        return (False, False, None)
+    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
+    if len(parts) < 2:
+        return (True, False, None)
+    found_scheduler, scheduler = _extract_source_value(parts[0], "scheduler", bound, args, kwargs, result)
+    found_req, req = _extract_source_value(parts[1], "request", bound, args, kwargs, result)
+    if not found_scheduler or scheduler is None or not found_req or req is None:
+        return (True, False, None)
+    return (True, True, _scheduler_prefetch_state_record(scheduler, req))
 
 
 def _node_token_path_concat_source(
@@ -315,6 +466,62 @@ def _extract_token_span(
         return (False, None)
     tokens = _tokens_for_path(value)
     return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_request_token_path(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    found, tokens, scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    if not found:
+        return (False, None)
+    return (True, _token_path_record(tokens, scope))
+
+
+def _extract_request_token_span(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    if not found:
+        return (False, None)
+    return (True, _token_span_record(tokens, 0, len(tokens)))
+
+
+def _extract_request_tokens(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, list[Any]]:
+    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    return (found, tokens)
+
+
+def _extract_request_tokens_and_scope(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, list[Any], str]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if not parts:
+        return (False, [], "")
+    found_req, req = _extract_source_value(parts[0], "request", bound, args, kwargs, result)
+    if not found_req or req is None:
+        return (False, [], "")
+    mode = parts[1] if len(parts) > 1 else "active"
+    scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
+    tokens = _request_tokens(req, mode)
+    return (True, tokens, scope)
 
 
 def _extract_token_path_concat(
@@ -534,6 +741,32 @@ def _tokens_for_path(value: Any) -> list[Any]:
         return []
 
 
+def _request_tokens(req: Any, mode: str) -> list[Any]:
+    normalized = (mode or "active").lower()
+    if normalized == "fill":
+        return _tokens_for_path(getattr(req, "fill_ids", None))
+    if normalized in ("origin_output", "full"):
+        return _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
+    if normalized in ("committed", "cache_committed"):
+        tokens = _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
+        committed = _safe_int(getattr(req, "kv_committed_len", None))
+        cache_commit_len = getattr(req, "_cache_commit_len", None)
+        if callable(cache_commit_len):
+            try:
+                committed = _safe_int(cache_commit_len())
+            except Exception:
+                pass
+        if committed is not None:
+            return tokens[:committed]
+        return tokens
+    if normalized == "output":
+        return _tokens_for_path(getattr(req, "output_ids", None))
+    fill = _tokens_for_path(getattr(req, "fill_ids", None))
+    if fill:
+        return fill
+    return _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
+
+
 def _cache_config_record(obj: Any) -> dict[str, Any]:
     capacity = _snapshot_capacity(obj)
     thresholds = {
@@ -548,12 +781,8 @@ def _cache_config_record(obj: Any) -> dict[str, Any]:
     capacity_summary = {
         "l1_capacity_tokens": capacity.get("l1_capacity_tokens"),
         "l1_capacity_pages": capacity.get("l1_capacity_pages"),
-        "l1_available_tokens": capacity.get("l1_available_tokens"),
-        "l1_available_pages": capacity.get("l1_available_pages"),
         "l2_capacity_tokens": capacity.get("l2_capacity_tokens"),
         "l2_capacity_pages": capacity.get("l2_capacity_pages"),
-        "l2_available_tokens": capacity.get("l2_available_tokens"),
-        "l2_available_pages": capacity.get("l2_available_pages"),
         "enable_storage": capacity.get("enable_storage"),
     }
     policy_params = {
@@ -567,6 +796,13 @@ def _cache_config_record(obj: Any) -> dict[str, Any]:
         "prefetch_policy": capacity.get("prefetch_policy"),
         "thresholds": thresholds,
         "capacity_summary": capacity_summary,
+        "dynamic_capacity_observed": {
+            "l1_available_tokens": capacity.get("l1_available_tokens"),
+            "l1_available_pages": capacity.get("l1_available_pages"),
+            "l2_available_tokens": capacity.get("l2_available_tokens"),
+            "l2_available_pages": capacity.get("l2_available_pages"),
+            "prefetch_tokens_occupied": capacity.get("prefetch_tokens_occupied"),
+        },
         "policy_params": policy_params,
     }
 
@@ -655,6 +891,57 @@ def _snapshot_node(node: Any) -> dict[str, Any]:
     return row
 
 
+def _node_summary_record(node: Any) -> dict[str, Any]:
+    parent = getattr(node, "parent", None)
+    key_value = getattr(node, "key", getattr(node, "token_ids", None))
+    value = _first_attr(node, ("value", "device_value", "device_indices"))
+    host_value = _first_attr(node, ("host_value", "host_indices"))
+    full_tokens = _full_key_tokens(node)
+    return {
+        "node_id": _jsonable_compact(_first_attr(node, ("id", "node_id"))),
+        "parent_id": _jsonable_compact(_first_attr(parent, ("id", "node_id")) if parent is not None else None),
+        "key_token_count": _base._safe_len(key_value),
+        "full_token_count": len(full_tokens),
+        "span": _token_span_record(full_tokens, 0, len(full_tokens)) if full_tokens else None,
+        "hash_value": _jsonable_compact(getattr(node, "hash_value", None)),
+        "has_device_value": value is not None,
+        "device_token_count": _base._safe_len(value),
+        "has_host_value": host_value is not None,
+        "host_token_count": _base._safe_len(host_value),
+        "evicted": bool(getattr(node, "evicted", False)),
+        "backuped": bool(getattr(node, "backuped", getattr(node, "backed_up", False))),
+        "hit_count": _safe_int(getattr(node, "hit_count", 0)) or 0,
+        "lock_ref": _safe_int(_first_attr(node, ("lock_ref", "lock_ref_count", "lock_ref_counter"))) or 0,
+        "host_ref_counter": _safe_int(getattr(node, "host_ref_counter", 0)) or 0,
+        "child_count": len(_iter_children(node)),
+        "priority": _safe_int(getattr(node, "priority", None)),
+    }
+
+
+def _node_chain_record(node: Any) -> list[dict[str, Any]]:
+    chain = []
+    seen: set[int] = set()
+    current = node
+    while current is not None and id(current) not in seen and len(chain) < 128:
+        seen.add(id(current))
+        chain.append(current)
+        current = getattr(current, "parent", None)
+    return [_node_summary_record(item) for item in reversed(chain)]
+
+
+def _evictable_snapshot_record(cache: Any) -> dict[str, Any]:
+    device_leaves = list(getattr(cache, "evictable_leaves", []) or [])
+    host_leaves = list(getattr(cache, "evictable_host_leaves", []) or [])
+    return {
+        "evictable_size_tokens": _safe_int(getattr(cache, "evictable_size_", None)),
+        "protected_size_tokens": _safe_int(getattr(cache, "protected_size_", None)),
+        "device_leaf_count": len(device_leaves),
+        "host_leaf_count": len(host_leaves),
+        "device_leaf_sample": [_node_summary_record(node) for node in device_leaves[:32]],
+        "host_leaf_sample": [_node_summary_record(node) for node in host_leaves[:32]],
+    }
+
+
 def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> list[Any]:
     if node is None:
         return []
@@ -692,6 +979,139 @@ def _snapshot_controller(obj: Any) -> dict[str, Any]:
         "storage_backend_enabled": storage is not None,
         "storage_backend_type": type(storage).__name__ if storage is not None else "",
     }
+
+
+def _extract_prefetch_progress(
+    spec: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, dict[str, Any]]:
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) < 2:
+        return (False, {})
+    found_cache, cache = _extract_source_value(parts[0], "cache", bound, args, kwargs, result)
+    found_req, req_id = _extract_source_value(parts[1], "request_id", bound, args, kwargs, result)
+    if not found_cache or cache is None or not found_req:
+        return (False, {})
+    page_size = _safe_int(getattr(cache, "page_size", None)) or 0
+    ongoing = getattr(cache, "ongoing_prefetch", {}) or {}
+    entry = ongoing.get(req_id) if isinstance(ongoing, dict) else None
+    loaded_by_req = getattr(cache, "prefetch_loaded_tokens_by_reqid", {}) or {}
+    row: dict[str, Any] = {
+        "request_id": str(req_id),
+        "check_return": result if isinstance(result, bool) else None,
+        "has_ongoing_prefetch": entry is not None,
+        "loaded_tokens_evidence": _safe_int(loaded_by_req.get(req_id)) if isinstance(loaded_by_req, dict) else None,
+        "page_size": page_size or None,
+    }
+    if entry is None:
+        return (True, row)
+    try:
+        last_host_node, prefetch_key, host_indices, operation = entry
+    except Exception:
+        return (True, row)
+    completed_tokens = _safe_int(getattr(operation, "completed_tokens", None)) or 0
+    operation_hash_pages = _jsonable_compact(getattr(operation, "hash_value", None)) or []
+    token_count = _base._safe_len(prefetch_key) or 0
+    row.update(
+        {
+            "last_host_node": _node_summary_record(last_host_node),
+            "last_host_node_chain": _node_chain_record(last_host_node),
+            "prefetch_token_count": token_count,
+            "host_token_count": _base._safe_len(host_indices),
+            "operation_id": _jsonable_compact(getattr(operation, "id", None)),
+            "operation_hash_pages": operation_hash_pages,
+            "completed_tokens": completed_tokens,
+            "ready_pages_estimate": completed_tokens // page_size if page_size > 0 else None,
+            "late_tokens_estimate": max(0, token_count - completed_tokens),
+            "operation_terminated": _safe_call_bool(operation, "is_terminated"),
+        }
+    )
+    return (True, row)
+
+
+def _request_runtime_record(req: Any) -> dict[str, Any]:
+    commit_len = _safe_int(getattr(req, "kv_committed_len", None))
+    cache_commit_len = getattr(req, "_cache_commit_len", None)
+    effective_commit_len = commit_len
+    if callable(cache_commit_len):
+        try:
+            effective_commit_len = _safe_int(cache_commit_len())
+        except Exception:
+            pass
+    return {
+        "request_id": _jsonable_compact(getattr(req, "rid", None)),
+        "fill_tokens": _base._safe_len(getattr(req, "fill_ids", None)),
+        "origin_input_tokens": _base._safe_len(getattr(req, "origin_input_ids", None)),
+        "output_tokens": _base._safe_len(getattr(req, "output_ids", None)),
+        "kv_committed_len": commit_len,
+        "effective_commit_len": effective_commit_len,
+        "kv_committed_freed": bool(getattr(req, "kv_committed_freed", False)),
+        "cache_protected_len": _safe_int(getattr(req, "cache_protected_len", None)),
+        "extend_input_len": _safe_int(getattr(req, "extend_input_len", None)),
+        "prefix_tokens": _base._safe_len(getattr(req, "prefix_indices", None)),
+        "host_hit_length": _safe_int(getattr(req, "host_hit_length", None)),
+        "storage_hit_length": _safe_int(getattr(req, "storage_hit_length", None)),
+        "priority": _safe_int(getattr(req, "priority", None)),
+        "last_node": _summary_or_none(getattr(req, "last_node", None)),
+        "last_node_chain": _chain_or_empty(getattr(req, "last_node", None)),
+        "last_host_node": _summary_or_none(getattr(req, "last_host_node", None)),
+        "last_host_node_chain": _chain_or_empty(getattr(req, "last_host_node", None)),
+        "best_match_node": _summary_or_none(getattr(req, "best_match_node", None)),
+    }
+
+
+def _scheduler_prefetch_state_record(scheduler: Any, req: Any) -> dict[str, Any]:
+    tree_cache = getattr(scheduler, "tree_cache", None)
+    root_node = getattr(tree_cache, "root_node", None)
+    fill_tokens = _request_tokens(req, "fill")
+    prefix_tokens = _base._safe_len(getattr(req, "prefix_indices", None)) or 0
+    host_hit_length = _safe_int(getattr(req, "host_hit_length", None)) or 0
+    matched_len = max(0, prefix_tokens + host_hit_length)
+    last_host_node = getattr(req, "last_host_node", None)
+    anchor_backuped = bool(getattr(last_host_node, "backuped", False)) if last_host_node is not None else False
+    anchor_is_root = last_host_node is not None and root_node is not None and last_host_node is root_node
+    new_input_tokens = fill_tokens[matched_len:]
+    prefix_keys = None
+    if last_host_node is not None and getattr(tree_cache, "hicache_storage_pass_prefix_keys", False):
+        get_prefix_hash_values = getattr(last_host_node, "get_prefix_hash_values", None)
+        if callable(get_prefix_hash_values):
+            try:
+                prefix_keys = get_prefix_hash_values(getattr(last_host_node, "parent", None))
+            except Exception:
+                prefix_keys = None
+    last_hash = None
+    get_last_hash_value = getattr(last_host_node, "get_last_hash_value", None)
+    if callable(get_last_hash_value):
+        try:
+            last_hash = get_last_hash_value()
+        except Exception:
+            last_hash = None
+    return {
+        "request": _request_runtime_record(req),
+        "cache_scope": _cache_scope_key(tree_cache),
+        "source_page_size": _safe_int(getattr(tree_cache, "page_size", None)),
+        "enable_hicache_storage": bool(getattr(scheduler, "enable_hicache_storage", False)),
+        "matched_len": matched_len,
+        "new_input_tokens": len(new_input_tokens),
+        "prefetch_anchor_eligible": anchor_backuped or anchor_is_root,
+        "last_host_node_backuped": anchor_backuped,
+        "last_host_node_is_root": anchor_is_root,
+        "last_hash": _jsonable_compact(last_hash),
+        "prefix_keys": _jsonable_compact(prefix_keys),
+        "policy_params": _cache_config_record(tree_cache).get("policy_params") if tree_cache is not None else None,
+        "queue_snapshot": _async_queue_snapshot(tree_cache) if tree_cache is not None else None,
+    }
+
+
+def _summary_or_none(node: Any) -> dict[str, Any] | None:
+    return _node_summary_record(node) if node is not None else None
+
+
+def _chain_or_empty(node: Any) -> list[dict[str, Any]]:
+    return _node_chain_record(node) if node is not None else []
 
 
 def _snapshot_capacity(obj: Any) -> dict[str, Any]:
@@ -775,6 +1195,16 @@ def _safe_call_int(obj: Any, method_name: str) -> int | None:
         return None
 
 
+def _safe_call_bool(obj: Any, method_name: str) -> bool | None:
+    method = getattr(obj, method_name, None) if obj is not None else None
+    if not callable(method):
+        return None
+    try:
+        return bool(method())
+    except Exception:
+        return None
+
+
 def _page_count_from_tokens(tokens: int | None, page_size: int | None) -> int | None:
     if tokens is None or page_size is None or page_size <= 0:
         return None
@@ -845,14 +1275,954 @@ def _jsonable_compact(value: Any) -> Any:
     return str(value)
 
 
+def install(module: ModuleType) -> None:
+    _base.install(module)
+    _install_internal_hicache_hooks(module)
+
+
+def _install_internal_hicache_hooks(module: ModuleType) -> None:
+    module_name = getattr(module, "__name__", "")
+    if module_name == "sglang.srt.mem_cache.events":
+        mixin = getattr(module, "KVCacheEventMixin", None)
+        if mixin is not None:
+            _wrap_internal_method(mixin, "_record_store_event", _wrap_record_store_event, f"{module_name}:KVCacheEventMixin._record_store_event")
+            _wrap_internal_method(mixin, "_record_remove_event", _wrap_record_remove_event, f"{module_name}:KVCacheEventMixin._record_remove_event")
+            _wrap_internal_method(mixin, "_record_all_cleared_event", _wrap_record_all_cleared_event, f"{module_name}:KVCacheEventMixin._record_all_cleared_event")
+        return
+
+    if module_name == "sglang.srt.mem_cache.radix_cache":
+        radix = getattr(module, "RadixCache", None)
+        if radix is not None:
+            _wrap_internal_method(radix, "_delete_leaf", _wrap_delete_leaf, f"{module_name}:RadixCache._delete_leaf")
+            _wrap_internal_method(radix, "_update_leaf_status", _wrap_update_leaf_status, f"{module_name}:RadixCache._update_leaf_status")
+        tree_node = getattr(module, "TreeNode", None)
+        if tree_node is not None:
+            _wrap_internal_method(tree_node, "protect_host", _wrap_host_ref("protect"), f"{module_name}:TreeNode.protect_host")
+            _wrap_internal_method(tree_node, "release_host", _wrap_host_ref("release"), f"{module_name}:TreeNode.release_host")
+        return
+
+    if module_name == "sglang.srt.mem_cache.hiradix_cache":
+        hiradix = getattr(module, "HiRadixCache", None)
+        if hiradix is not None:
+            _wrap_internal_method(hiradix, "_split_node", _wrap_split_node, f"{module_name}:HiRadixCache._split_node")
+            _wrap_internal_method(hiradix, "_update_host_leaf_status", _wrap_update_host_leaf_status, f"{module_name}:HiRadixCache._update_host_leaf_status")
+            _wrap_internal_method(hiradix, "_inc_hit_count", _wrap_hit_count_update, f"{module_name}:HiRadixCache._inc_hit_count")
+            _wrap_internal_method(hiradix, "writing_check", _wrap_writing_check, f"{module_name}:HiRadixCache.writing_check")
+            _wrap_internal_method(hiradix, "loading_check", _wrap_loading_check, f"{module_name}:HiRadixCache.loading_check")
+            _wrap_internal_method(
+                hiradix,
+                "drain_storage_control_queues",
+                _wrap_drain_storage_control_queues,
+                f"{module_name}:HiRadixCache.drain_storage_control_queues",
+            )
+            _wrap_internal_method(hiradix, "init_load_back", _wrap_init_load_back, f"{module_name}:HiRadixCache.init_load_back")
+            _wrap_internal_method(hiradix, "load_back", _wrap_load_back, f"{module_name}:HiRadixCache.load_back")
+            _wrap_internal_method(hiradix, "write_backup", _wrap_write_backup, f"{module_name}:HiRadixCache.write_backup")
+            _wrap_internal_method(hiradix, "write_backup_storage", _wrap_write_backup_storage, f"{module_name}:HiRadixCache.write_backup_storage")
+            _wrap_internal_method(hiradix, "evict_host", _wrap_evict_host, f"{module_name}:HiRadixCache.evict_host")
+            _wrap_internal_method(hiradix, "terminate_prefetch", _wrap_hiradix_terminate_prefetch, f"{module_name}:HiRadixCache.terminate_prefetch")
+            _wrap_internal_method(hiradix, "release_aborted_request", _wrap_release_aborted_request, f"{module_name}:HiRadixCache.release_aborted_request")
+            _wrap_internal_method(hiradix, "pop_prefetch_loaded_tokens", _wrap_pop_prefetch_loaded_tokens, f"{module_name}:HiRadixCache.pop_prefetch_loaded_tokens")
+        return
+
+    if module_name == "sglang.srt.managers.cache_controller":
+        controller = getattr(module, "HiCacheController", None)
+        if controller is not None:
+            _wrap_internal_method(controller, "load", _wrap_controller_load, f"{module_name}:HiCacheController.load")
+            _wrap_internal_method(controller, "start_loading", _wrap_controller_start_loading, f"{module_name}:HiCacheController.start_loading")
+            _wrap_internal_method(controller, "write", _wrap_controller_write, f"{module_name}:HiCacheController.write")
+            _wrap_internal_method(controller, "start_writing", _wrap_controller_start_writing, f"{module_name}:HiCacheController.start_writing")
+            _wrap_internal_method(controller, "prefetch", _wrap_controller_prefetch, f"{module_name}:HiCacheController.prefetch")
+            _wrap_internal_method(controller, "prefetch_rate_limited", _wrap_prefetch_rate_limited, f"{module_name}:HiCacheController.prefetch_rate_limited")
+            _wrap_internal_method(controller, "_storage_hit_query", _wrap_storage_hit_query, f"{module_name}:HiCacheController._storage_hit_query")
+            _wrap_internal_method(controller, "terminate_prefetch", _wrap_terminate_prefetch, f"{module_name}:HiCacheController.terminate_prefetch")
+            _wrap_internal_method(
+                controller,
+                "append_host_mem_release",
+                _wrap_append_host_mem_release,
+                f"{module_name}:HiCacheController.append_host_mem_release",
+            )
+
+
+def _wrap_internal_method(cls: Any, method_name: str, wrapper_factory: Any, patch_key: str) -> None:
+    if patch_key in _INTERNAL_PATCHED:
+        return
+    method = getattr(cls, method_name, None)
+    if method is None or getattr(method, PATCH_MARKER, False):
+        return
+    wrapped = wrapper_factory(method)
+    setattr(wrapped, PATCH_MARKER, True)
+    setattr(cls, method_name, wrapped)
+    _INTERNAL_PATCHED.add(patch_key)
+    if probe_debug_enabled():
+        print(f"[trace_sim_probe] patched internal HiCache hook {patch_key}", flush=True)
+
+
+def _wrap_split_node(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, key: Any, child: Any, split_len: int, *args: Any, **kwargs: Any) -> Any:
+        before_child = _node_summary_record(child)
+        result = method(self, key, child, split_len, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.radix_node_split",
+            "radix_node_mutation_observed",
+            {
+                "mutation_kind": "split",
+                "split_len": _safe_int(split_len),
+                "before_child": before_child,
+                "after_child": _node_summary_record(child),
+                "new_parent": _node_summary_record(result),
+                "new_parent_chain": _node_chain_record(result),
+                "evictable": _evictable_snapshot_record(self),
+            },
+            target="HiRadixCache._split_node",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_delete_leaf(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before_node = _node_summary_record(node)
+        parent = getattr(node, "parent", None)
+        before_parent = _node_summary_record(parent) if parent is not None else None
+        result = method(self, node, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.radix_node_delete",
+            "radix_node_mutation_observed",
+            {
+                "mutation_kind": "delete_leaf",
+                "before_node": before_node,
+                "before_parent": before_parent,
+                "after_parent": _node_summary_record(parent) if parent is not None else None,
+                "evictable": _evictable_snapshot_record(self),
+            },
+            target="RadixCache._delete_leaf",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_update_leaf_status(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before_member = _set_contains(getattr(self, "evictable_leaves", None), node)
+        before_node = _node_summary_record(node)
+        result = method(self, node, *args, **kwargs)
+        after_member = _set_contains(getattr(self, "evictable_leaves", None), node)
+        if before_member != after_member or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.evictable_device_delta",
+                "evictable_state_observed",
+                {
+                    "tier": "L1",
+                    "before_evictable": before_member,
+                    "after_evictable": after_member,
+                    "before_node": before_node,
+                    "after_node": _node_summary_record(node),
+                    "evictable": _evictable_snapshot_record(self),
+                },
+                target="RadixCache._update_leaf_status",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_update_host_leaf_status(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before_member = _set_contains(getattr(self, "evictable_host_leaves", None), node)
+        before_node = _node_summary_record(node)
+        result = method(self, node, *args, **kwargs)
+        after_member = _set_contains(getattr(self, "evictable_host_leaves", None), node)
+        if before_member != after_member or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.evictable_host_delta",
+                "evictable_state_observed",
+                {
+                    "tier": "L2",
+                    "before_evictable": before_member,
+                    "after_evictable": after_member,
+                    "before_node": before_node,
+                    "after_node": _node_summary_record(node),
+                    "evictable": _evictable_snapshot_record(self),
+                },
+                target="HiRadixCache._update_host_leaf_status",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_record_store_event(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, medium: Any = None, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, node, medium, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.node_store",
+            "node_store_observed",
+            {
+                "medium": _medium_name(medium, default="GPU"),
+                "node": _node_summary_record(node),
+                "node_chain": _node_chain_record(node),
+            },
+            target="KVCacheEventMixin._record_store_event",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_record_remove_event(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, medium: Any = None, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, node, medium, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.node_remove",
+            "node_remove_observed",
+            {
+                "medium": _medium_name(medium, default="GPU"),
+                "node": _node_summary_record(node),
+                "node_chain": _node_chain_record(node),
+            },
+            target="KVCacheEventMixin._record_remove_event",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_record_all_cleared_event(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.all_blocks_cleared",
+            "all_blocks_cleared_observed",
+            {
+                "evictable": _evictable_snapshot_record(self),
+                "queue_snapshot": _async_queue_snapshot(self),
+            },
+            target="KVCacheEventMixin._record_all_cleared_event",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_host_ref(direction: str) -> Any:
+    def factory(method: Any) -> Any:
+        @functools.wraps(method)
+        def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+            before = _node_summary_record(self)
+            result = method(self, *args, **kwargs)
+            after = _node_summary_record(self)
+            if before.get("host_ref_counter") != after.get("host_ref_counter") or probe_debug_enabled():
+                _emit_internal_event(
+                    self,
+                    f"hicache_internal.host_ref_{direction}",
+                    "host_ref_delta_observed",
+                    {
+                        "host_ref_direction": direction,
+                        "before_node": before,
+                        "after_node": after,
+                        "node_chain": _node_chain_record(self),
+                    },
+                    target=f"TreeNode.{direction}_host",
+                    fact_class="source_actual",
+                )
+            return result
+
+        return wrapped
+
+    return factory
+
+
+def _wrap_hit_count_update(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _node_summary_record(node)
+        result = method(self, node, *args, **kwargs)
+        after = _node_summary_record(node)
+        if before.get("hit_count") != after.get("hit_count") or before.get("backuped") != after.get("backuped") or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.write_counter_delta",
+                "write_counter_delta_observed",
+                {
+                    "before_node": before,
+                    "after_node": after,
+                    "chunked": bool(args[0]) if args else bool(kwargs.get("chunked", False)),
+                    "write_policy": _jsonable_compact(_first_attr(_first_attr(self, ("cache_controller", "controller")) or self, ("write_policy",))),
+                    "write_through_threshold": _safe_int(getattr(self, "write_through_threshold", None)),
+                },
+                target="HiRadixCache._inc_hit_count",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_init_load_back(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, params: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        best_match_node = getattr(params, "best_match_node", None)
+        result = method(self, params, *args, **kwargs)
+        loaded_values, last_node = _tuple_item(result, 0), _tuple_item(result, 1)
+        _emit_internal_event(
+            self,
+            "hicache_internal.init_load_back",
+            "load_back_request_observed",
+            {
+                "request_id": _jsonable_compact(_first_attr(getattr(params, "req", None), ("rid",))),
+                "host_hit_length": _safe_int(getattr(params, "host_hit_length", None)),
+                "mem_quota": _safe_int(getattr(params, "mem_quota", None)),
+                "best_match_node": _summary_or_none(best_match_node),
+                "best_match_node_chain": _chain_or_empty(best_match_node),
+                "loaded_tokens": _base._safe_len(loaded_values),
+                "last_node": _summary_or_none(last_node),
+                "last_node_chain": _chain_or_empty(last_node),
+                "queue_before": before,
+                "queue_after": _async_queue_snapshot(self),
+            },
+            target="HiRadixCache.init_load_back",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_load_back(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        before_node = _node_summary_record(node)
+        result = method(self, node, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.load_back",
+            "load_back_result_observed",
+            {
+                "mem_quota": _safe_int(_arg_or_kw(args, kwargs, 0, "mem_quota")),
+                "before_node": before_node,
+                "after_node": _node_summary_record(node),
+                "node_chain": _node_chain_record(node),
+                "loaded_tokens": _base._safe_len(result),
+                "queue_before": before,
+                "queue_after": _async_queue_snapshot(self),
+                "evictable": _evictable_snapshot_record(self),
+            },
+            target="HiRadixCache.load_back",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_write_backup(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        result = method(self, node, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.write_backup",
+            "writeback_schedule_observed",
+            {
+                "node": _node_summary_record(node),
+                "node_chain": _node_chain_record(node),
+                "write_back": bool(_arg_or_kw(args, kwargs, 0, "write_back")),
+                "written_tokens": _safe_int(result),
+                "queue_before": before,
+                "queue_after": _async_queue_snapshot(self),
+                "evictable": _evictable_snapshot_record(self),
+            },
+            target="HiRadixCache.write_backup",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_write_backup_storage(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        result = method(self, node, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.write_backup_storage",
+            "writeback_storage_schedule_observed",
+            {
+                "node": _node_summary_record(node),
+                "node_chain": _node_chain_record(node),
+                "queue_before": before,
+                "queue_after": _async_queue_snapshot(self),
+            },
+            target="HiRadixCache.write_backup_storage",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_evict_host(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _evictable_snapshot_record(self)
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.host_eviction",
+            "host_eviction_observed",
+            {
+                "requested_tokens": _safe_int(_arg_or_kw(args, kwargs, 0, "num_tokens")),
+                "evicted_tokens": _safe_int(result),
+                "evictable_before": before,
+                "evictable_after": _evictable_snapshot_record(self),
+            },
+            target="HiRadixCache.evict_host",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_hiradix_terminate_prefetch(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, req_id: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _prefetch_progress_record_for_req(self, req_id, None)
+        result = method(self, req_id, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.hiradix_prefetch_terminate",
+            "prefetch_terminate_requested_observed",
+            {
+                "request_id": _jsonable_compact(req_id),
+                "before": before,
+                "after": _prefetch_progress_record_for_req(self, req_id, result),
+                "queue_snapshot": _async_queue_snapshot(self),
+            },
+            target="HiRadixCache.terminate_prefetch",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_release_aborted_request(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, rid: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _prefetch_progress_record_for_req(self, rid, None)
+        result = method(self, rid, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.release_aborted_request",
+            "request_abort_cleanup_observed",
+            {
+                "request_id": _jsonable_compact(rid),
+                "before": before,
+                "after": _prefetch_progress_record_for_req(self, rid, result),
+                "queue_snapshot": _async_queue_snapshot(self),
+            },
+            target="HiRadixCache.release_aborted_request",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_pop_prefetch_loaded_tokens(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, req_id: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _prefetch_progress_record_for_req(self, req_id, None)
+        result = method(self, req_id, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.pop_prefetch_loaded_tokens",
+            "prefetch_loaded_tokens_observed",
+            {
+                "request_id": _jsonable_compact(req_id),
+                "loaded_tokens": _safe_int(result),
+                "before": before,
+                "after": _prefetch_progress_record_for_req(self, req_id, result),
+            },
+            target="HiRadixCache.pop_prefetch_loaded_tokens",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_writing_check(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        after = _async_queue_snapshot(self)
+        if before != after or before.get("ongoing_write_through", 0) > 0 or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.write_ack_checkpoint",
+                "write_ack_checkpoint_observed",
+                {
+                    "write_back": bool(args[0]) if args else bool(kwargs.get("write_back", False)),
+                    "before": before,
+                    "after": after,
+                },
+                target="HiRadixCache.writing_check",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_loading_check(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        after = _async_queue_snapshot(self)
+        if before != after or before.get("ongoing_load_back", 0) > 0 or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.load_ack_checkpoint",
+                "load_ack_checkpoint_observed",
+                {"before": before, "after": after},
+                target="HiRadixCache.loading_check",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_drain_storage_control_queues(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _async_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        after = _async_queue_snapshot(self)
+        if before != after or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.storage_control_checkpoint",
+                "storage_control_checkpoint_observed",
+                {"before": before, "after": after},
+                target="HiRadixCache.drain_storage_control_queues",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _wrap_controller_load(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _controller_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        host_indices = _arg_or_kw(args, kwargs, 0, "host_indices")
+        _emit_internal_event(
+            self,
+            "hicache_internal.load_enqueue",
+            "load_enqueue_observed",
+            {
+                "node_id": _jsonable_compact(_arg_or_kw(args, kwargs, 2, "node_id")),
+                "host_tokens": _base._safe_len(host_indices),
+                "device_tokens": _base._safe_len(result),
+                "before": before,
+                "after": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.load",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_controller_start_loading(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _controller_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.load_start",
+            "load_start_observed",
+            {
+                "producer_id": _jsonable_compact(result),
+                "before": before,
+                "after": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.start_loading",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_controller_write(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _controller_queue_snapshot(self)
+        device_indices = _arg_or_kw(args, kwargs, 0, "device_indices")
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.write_enqueue",
+            "write_enqueue_observed",
+            {
+                "node_id": _jsonable_compact(_arg_or_kw(args, kwargs, 2, "node_id")),
+                "device_tokens": _base._safe_len(device_indices),
+                "host_tokens": _base._safe_len(result),
+                "before": before,
+                "after": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.write",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_controller_start_writing(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _controller_queue_snapshot(self)
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.write_start",
+            "write_start_observed",
+            {
+                "before": before,
+                "after": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.start_writing",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_controller_prefetch(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, *args, **kwargs)
+        request_id = _arg_or_kw(args, kwargs, 0, "request_id")
+        host_indices = _arg_or_kw(args, kwargs, 1, "host_indices")
+        new_input_tokens = _arg_or_kw(args, kwargs, 2, "new_input_tokens")
+        _emit_internal_event(
+            self,
+            "hicache_internal.prefetch_enqueue",
+            "prefetch_enqueue_observed",
+            {
+                "request_id": _jsonable_compact(request_id),
+                "host_tokens": _base._safe_len(host_indices),
+                "new_input_tokens": _base._safe_len(new_input_tokens),
+                "operation": _storage_operation_record(result),
+                "queue_snapshot": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.prefetch",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_prefetch_rate_limited(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, *args, **kwargs)
+        _emit_internal_event(
+            self,
+            "hicache_internal.prefetch_rate_limit",
+            "prefetch_rate_limit_observed",
+            {
+                "rate_limited": bool(result),
+                "queue_snapshot": _controller_queue_snapshot(self),
+                "prefetch_capacity_limit": _safe_int(getattr(self, "prefetch_capacity_limit", None)),
+            },
+            target="HiCacheController.prefetch_rate_limited",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_storage_hit_query(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, operation, *args, **kwargs)
+        hash_value, storage_hit_count = result if isinstance(result, tuple) and len(result) == 2 else (None, None)
+        _emit_internal_event(
+            self,
+            "hicache_internal.storage_hit_query",
+            "storage_hit_query_observed",
+            {
+                "operation": _storage_operation_record(operation),
+                "hit_hash_pages": _jsonable_compact(hash_value),
+                "hit_page_count": _base._safe_len(hash_value),
+                "hit_tokens": _safe_int(storage_hit_count),
+                "queue_snapshot": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController._storage_hit_query",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_terminate_prefetch(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
+        result = method(self, operation, *args, **kwargs)
+        completed_tokens, hash_value = result if isinstance(result, tuple) and len(result) == 2 else (None, None)
+        _emit_internal_event(
+            self,
+            "hicache_internal.prefetch_terminate",
+            "prefetch_terminate_observed",
+            {
+                "operation": _storage_operation_record(operation),
+                "completed_tokens": _safe_int(completed_tokens),
+                "hash_pages": _jsonable_compact(hash_value),
+                "queue_snapshot": _controller_queue_snapshot(self),
+            },
+            target="HiCacheController.terminate_prefetch",
+            fact_class="source_actual",
+        )
+        return result
+
+    return wrapped
+
+
+def _wrap_append_host_mem_release(method: Any) -> Any:
+    @functools.wraps(method)
+    def wrapped(self: Any, host_indices: Any, *args: Any, **kwargs: Any) -> Any:
+        before = _controller_queue_snapshot(self)
+        result = method(self, host_indices, *args, **kwargs)
+        after = _controller_queue_snapshot(self)
+        if _base._safe_len(host_indices) or before != after or probe_debug_enabled():
+            _emit_internal_event(
+                self,
+                "hicache_internal.host_mem_release_enqueue",
+                "host_mem_release_enqueue_observed",
+                {
+                    "host_tokens": _base._safe_len(host_indices),
+                    "before": before,
+                    "after": after,
+                },
+                target="HiCacheController.append_host_mem_release",
+                fact_class="source_actual",
+            )
+        return result
+
+    return wrapped
+
+
+def _emit_internal_event(
+    cache: Any,
+    target_id: str,
+    event_role: str,
+    payload: dict[str, Any],
+    *,
+    target: str,
+    fact_class: str,
+    state_model_input: bool = False,
+    dag_input: bool = False,
+    model_input: bool = True,
+) -> None:
+    try:
+        timestamp = get_writer().now_us()
+        scope, seq_no = _next_scope_seq(cache)
+        get_writer().duration_event(
+            f"hicache_{event_role}",
+            timestamp,
+            timestamp,
+            "python_probe",
+            {
+                "schema_version": 1,
+                "domain": "python_probe",
+                "target_id": target_id,
+                "target": target,
+                "phase": "instant",
+                "status": "completed",
+                "missing_required_fields": [],
+                "model_input": model_input,
+                "event_kind": f"hicache_{event_role}",
+                "dag_input": dag_input,
+                "state_model_input": state_model_input,
+                "fact_class": fact_class,
+                "event_role": event_role,
+                "cache_scope": scope,
+                "seq_no": seq_no,
+                "source_page_size": _safe_int(getattr(cache, "page_size", None)),
+                **payload,
+            },
+        )
+    except Exception as exc:
+        if probe_debug_enabled():
+            print(f"[trace_sim_probe] failed to emit HiCache internal event {target_id}: {exc}", flush=True)
+
+
+def _next_scope_seq(cache: Any) -> tuple[str, int]:
+    scope = _cache_scope_key(cache)
+    next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
+    _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
+    return scope, next_seq
+
+
+def _set_contains(values: Any, item: Any) -> bool:
+    try:
+        return item in values if values is not None else False
+    except Exception:
+        return False
+
+
+def _medium_name(value: Any, *, default: str = "") -> str:
+    if value is None:
+        return default
+    name = getattr(value, "name", None)
+    if name:
+        return str(name)
+    text = str(value)
+    return text.rsplit(".", 1)[-1] if "." in text else text
+
+
+def _queue_size(value: Any) -> int | None:
+    qsize = getattr(value, "qsize", None)
+    if callable(qsize):
+        try:
+            return _safe_int(qsize())
+        except Exception:
+            return None
+    return _base._safe_len(value)
+
+
+def _async_queue_snapshot(cache: Any) -> dict[str, Any]:
+    controller = _first_attr(cache, ("cache_controller", "controller")) or cache
+    return {
+        "ongoing_write_through": _base._safe_len(getattr(cache, "ongoing_write_through", None)) or 0,
+        "ongoing_load_back": _base._safe_len(getattr(cache, "ongoing_load_back", None)) or 0,
+        "ongoing_prefetch": _base._safe_len(getattr(cache, "ongoing_prefetch", None)) or 0,
+        "ongoing_backup": _base._safe_len(getattr(cache, "ongoing_backup", None)) or 0,
+        "ack_write_queue": _base._safe_len(getattr(controller, "ack_write_queue", None)) or 0,
+        "ack_load_queue": _base._safe_len(getattr(controller, "ack_load_queue", None)) or 0,
+        "prefetch_revoke_queue": _queue_size(getattr(controller, "prefetch_revoke_queue", None)) or 0,
+        "ack_backup_queue": _queue_size(getattr(controller, "ack_backup_queue", None)) or 0,
+        "host_mem_release_queue": _queue_size(getattr(controller, "host_mem_release_queue", None)) or 0,
+        "prefetch_tokens_occupied": _safe_int(getattr(controller, "prefetch_tokens_occupied", None)),
+    }
+
+
+def _controller_queue_snapshot(controller: Any) -> dict[str, Any]:
+    return {
+        "load_queue": _base._safe_len(getattr(controller, "load_queue", None)) or 0,
+        "write_queue": _base._safe_len(getattr(controller, "write_queue", None)) or 0,
+        "prefetch_queue": _queue_size(getattr(controller, "prefetch_queue", None)) or 0,
+        "backup_queue": _queue_size(getattr(controller, "backup_queue", None)) or 0,
+        "prefetch_revoke_queue": _queue_size(getattr(controller, "prefetch_revoke_queue", None)) or 0,
+        "ack_backup_queue": _queue_size(getattr(controller, "ack_backup_queue", None)) or 0,
+        "host_mem_release_queue": _queue_size(getattr(controller, "host_mem_release_queue", None)) or 0,
+        "prefetch_tokens_occupied": _safe_int(getattr(controller, "prefetch_tokens_occupied", None)),
+    }
+
+
+def _storage_operation_record(operation: Any) -> dict[str, Any] | None:
+    if operation is None:
+        return None
+    return {
+        "operation_id": _jsonable_compact(getattr(operation, "id", None)),
+        "request_id": _jsonable_compact(getattr(operation, "request_id", None)),
+        "token_count": _base._safe_len(getattr(operation, "token_ids", None)),
+        "host_tokens": _base._safe_len(getattr(operation, "host_indices", None)),
+        "device_tokens": _base._safe_len(getattr(operation, "device_indices", None)),
+        "completed_tokens": _safe_int(getattr(operation, "completed_tokens", None)),
+        "hash_value": _jsonable_compact(getattr(operation, "hash_value", None)),
+        "prefix_keys": _jsonable_compact(getattr(operation, "prefix_keys", None)),
+        "terminated": _safe_call_bool(operation, "is_terminated"),
+    }
+
+
+def _prefetch_progress_record_for_req(cache: Any, req_id: Any, result: Any) -> dict[str, Any]:
+    found, value = _extract_prefetch_progress(
+        "arg:cache,arg:req_id",
+        {"cache": cache, "req_id": req_id},
+        (),
+        {},
+        result,
+    )
+    return value if found else {"request_id": _jsonable_compact(req_id)}
+
+
+def _tuple_item(value: Any, index: int) -> Any:
+    if isinstance(value, (tuple, list)) and index < len(value):
+        return value[index]
+    return None
+
+
+def _arg_or_kw(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, key: str) -> Any:
+    if key in kwargs:
+        return kwargs[key]
+    if index < len(args):
+        return args[index]
+    return None
+
+
 _base.register_source_extractor(_hicache_state_source)
 _base.register_source_extractor(_token_path_source)
 _base.register_source_extractor(_token_span_source)
+_base.register_source_extractor(_request_token_path_source)
+_base.register_source_extractor(_request_token_span_source)
+_base.register_source_extractor(_request_token_count_source)
 _base.register_source_extractor(_token_path_concat_source)
 _base.register_source_extractor(_token_span_concat_source)
 _base.register_source_extractor(_node_token_path_source)
 _base.register_source_extractor(_node_token_span_source)
 _base.register_source_extractor(_node_token_count_source)
+_base.register_source_extractor(_hicache_node_summary_source)
+_base.register_source_extractor(_hicache_node_chain_source)
+_base.register_source_extractor(_hicache_evictable_snapshot_source)
+_base.register_source_extractor(_hicache_prefetch_progress_source)
+_base.register_source_extractor(_hicache_request_runtime_source)
+_base.register_source_extractor(_hicache_scheduler_prefetch_state_source)
 _base.register_source_extractor(_node_token_path_concat_source)
 _base.register_source_extractor(_node_token_span_concat_source)
 _base.register_source_extractor(_hicache_cache_scope_source)
@@ -860,5 +2230,4 @@ _base.register_source_extractor(_hicache_seq_source)
 _base.register_source_extractor(_hicache_config_source)
 _base.register_source_extractor(_hicache_requested_pages_source)
 
-install = _base.install
-TARGET_MODULES = _base.TARGET_MODULES
+TARGET_MODULES = tuple(sorted(set(_base.TARGET_MODULES) | set(_INTERNAL_TARGET_MODULES)))

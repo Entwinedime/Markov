@@ -147,10 +147,25 @@ cmake --build build --target trace_graph -j2
 | 文件 | 作用 |
 | --- | --- |
 | `hicache_fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
-| `hicache_radix_tree.hpp/.cpp` | target page-level radix tree，支持 prefix、split、leaf group、remove。 |
-| `hicache_model.hpp/.cpp` | state model 主体，按 target config 重建 page/state。 |
+| `hicache_router.hpp/.cpp` | 31-target invariant role enum、输入门禁和 required field 检查。 |
+| `hicache_token_store.hpp/.cpp` | request scoped token path store。 |
+| `hicache_target_pager.hpp/.cpp` | target page size projection 和 page hash 生成。 |
+| `hicache_token_radix_tree.hpp/.cpp` | token-level radix tree，支持 token prefix、split、insert 和 page projection leaf group。 |
+| `hicache_state_index.hpp/.cpp` | page/node projection state index，维护 resident、dirty、backuped、evicted、lock、prefetch 和 hit count 集合。 |
+| `hicache_model.hpp/.cpp` | state model orchestration：按 role 调用 store/pager/radix/state index。 |
 | `hicache_summary.hpp/.cpp` | 输出 final state、transition trace、审计计数。 |
 | `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
+
+当前代码仍是过渡实现，但已经不再保留旧 page-level radix backend。剩余主要问题：
+
+- `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 仍只被 router 识别，尚未实现 state mutation；
+- token radix tree 已按 token split/insert，但还没有完整 SGLang node parent/ref/host-ref 对等结构；
+- `state_index` 已集中 page projection sets，但 evictable、priority、host ref 和 node-level ownership 仍是后续阶段；
+- write policy、capacity victim、async prefetch/load-back/writeback 仍沿用过渡规则，后续要进入 `PolicyEngine` 和 `AsyncState`。
+
+后续 C++ 工作继续按下面的目标架构推进；旧 page-level state machine 不作为兼容对象保留。
+
+### 输入边界
 
 后端输入分流规则已经收紧成一个主判断：
 
@@ -158,24 +173,88 @@ cmake --build build --target trace_graph -j2
 consume fact iff fact_class == "invariant_state" && state_model_input == true
 ```
 
-其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。
+其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。`source_actual`、`timing_observation`、
+`oracle_state` 和 debug/provenance 字段只能进入 validation、diagnostics 或 profile quality。
 
-已知 invariant roles：
+当前 mainline S1A/S1B profiling 契约固定为 31 个 target：
 
-| role | 当前后端用途 |
+| fact class | target count | state input |
+| --- | ---: | --- |
+| `invariant_state` | 16 | true |
+| `source_actual` | 13 | false |
+| `timing_observation` | 2 | false |
+
+当前 profiling 契约提供的 invariant roles：
+
+| role | 语义 |
 | --- | --- |
-| `request_tokens` | 建立 request -> target pages 映射。 |
-| `lookup_path` | 在 target radix tree 上查 longest prefix，并按 L1/L2/L3 状态提升 resident。 |
-| `insert_path` | 在 target radix tree 上插入 path，生成 L1 resident、dirty 或 write-through backup。 |
-| `prefetch_intent` | 生成 target prefetch planned pages。 |
-| `prefetch_check_point` | 按 target prefetch policy 标记 ready / late / suppressed。 |
-| `capacity_request` | 按 target capacity 做 LRU-like eviction。 |
-| `lock_scope_delta` | 以 token logical path 重建 target lock pages。 |
-| `cache_config_observed` | 目前主要作为审计输入，不覆盖 target config。 |
+| `request_tokens` | 注册 request 的完整 token path。 |
+| `lookup_path` | 在 target token radix tree 上查 longest prefix；matched/source hit 只能由模型自己产生。 |
+| `request_cache_lifecycle` | 用 finished/unfinished request 的 committed/fill token path、chunked/is_insert/priority 驱动 request lifecycle。 |
+| `request_admission` | 在 prefill admission / chunked continuation 边界重放 target-side load-back、临时/正式 lock/ref 和截断后的 admitted path。 |
+| `insert_path` | 插入 target token path，更新 node/page resident、hit count、priority、dirty/backuped 和 write policy 状态。 |
+| `prefetch_decision` | 在 scheduler prefetch decision checkpoint 上由 target state 重新判断 anchor、suffix 和是否 enqueue prefetch。 |
+| `prefetch_check_point` | 按 target prefetch policy 推进等待、timeout、late、suppressed，不从 source completion 直接构造 ready set。 |
+| `maintenance_checkpoint` | 在 check/load/flush 边界推进 modeled async queue、write/load ack 和 storage control。 |
+| `capacity_request` | 作为 allocation pressure checkpoint，victim 由 target eviction policy 决定。 |
+| `lock_scope_delta` | 以 token logical path 和 target radix parent chain 重建 lock/ref，不消费 source return delta。 |
+| `cache_config_observed` | 只做配置审计；target page size、capacity、write/prefetch policy 仍来自 modeling config。 |
 
-unknown invariant role 会进入 `missing_invariant_facts["unknown_invariant_role"]`，不会静默消费。
+`prefetch_intent` 已从 invariant 中移除；当前配置只保留 `prefetch_intent_observed` 作为 `source_actual`。
+后端重构必须显式处理每个 invariant role；不能通过消费 `source_actual` 事件绕过 role 缺口。unknown invariant role
+应进入 `missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
 
-### Page 重建
+31-target 契约在当前 mainline S1A/S1B scope 内冻结。profile quality 通过后，如果 prediction 仍 mismatch，默认归类为
+backend model/rule 缺陷；只有下列情况才考虑新增采集 target：
+
+- profile quality 明确证明现有 target 缺 required field、token dictionary 或 seq/scope；
+- 进入 DLLM、disaggregation、streaming session、abort/timeout/preemption 等新 scope；
+- SGLang upstream path 改变，导致当前 hook 无法覆盖同一语义边界。
+
+### 目标架构
+
+重构后的 HiCache backend 以 token radix tree 为事实中心，page set 只是 projection：
+
+```text
+HiCacheFactParser
+  -> HiCacheFactRouter
+  -> TokenPathStore
+  -> TargetPager
+  -> TokenRadixTree
+  -> RequestState / NodeStateIndex / AsyncState
+  -> PolicyEngine
+  -> StateTransitionLog / Summary / Validation
+```
+
+| 组件 | 责任 |
+| --- | --- |
+| `HiCacheFactRouter` | 第一层只按 invariant 判断；第二层把 role 转成 enum；缺字段、未知 role、非法 fact class 形成硬错误或 summary error。 |
+| `TokenPathStore` | 收集 dictionary，解析 span，维护 request/operation 到 token range 的映射；不保存 source page identity 作为状态输入。 |
+| `TargetPager` | 按 target page size 从 token range 推导完整 page hash、page index、page->token range 反查。 |
+| `TokenRadixTree` | 维护 token-level node、edge token slice、parent/children、split/insert/remove/lookup；node 是 ref/lock/evictable 的归属点。 |
+| `NodeStateIndex` | 维护 node/page 的 L1/L2/L3 resident、dirty、backuped、evicted、hit count、priority、lock/ref、host ref 和 evictable membership。 |
+| `RequestState` | 维护 request full/fill/committed/admitted path、lookup result、chunked continuation、临时 lock/ref 和 lifecycle phase。 |
+| `PolicyEngine` | 根据显式 target config 实现 write policy、capacity/eviction policy、prefetch policy 和 storage policy。 |
+| `AsyncState` | 维护 prefetch/load-back/writeback queue、ready/late/suppressed/acked 状态；source timing 只作为 validation 样本。 |
+| `StateTransitionLog` | 为每个 state mutation 输出 role/request/operation/node/page/seq/ts/provenance。 |
+| `OracleValidation` | 只比较 `source_actual`/`oracle_state` 和 predicted state，不反写模型。 |
+
+建议文件边界：
+
+| 文件 | 目标 |
+| --- | --- |
+| `hicache_fact.*` | 只做 event/fact/schema 解析和 token dictionary 观察。 |
+| `hicache_router.*` | role enum、输入门禁、required field 检查和错误分类。 |
+| `hicache_token_store.*` | token path/span/request mapping。 |
+| `hicache_target_pager.*` | token range 到 target page projection。 |
+| `hicache_token_radix_tree.*` | token-level radix node 模型。 |
+| `hicache_state_index.*` | node/page resident、dirty、backuped、evicted、lock/ref、evictable 索引。 |
+| `hicache_policy.*` | write/capacity/prefetch/storage policy。 |
+| `hicache_async_state.*` | prefetch/load-back/writeback queue。 |
+| `hicache_model.*` | orchestration：按 seq 应用 role，不承载复杂策略细节。 |
+| `hicache_summary.*` | summary、transition trace 和 validation-facing 输出。 |
+
+### Target Page Projection
 
 后端不消费 `page_identity` / `target_page_identity_page<page_size>` 作为主输入。page 由 token path 重建：
 
@@ -192,24 +271,27 @@ for each full target page:
 - 只生成完整 page，不生成 tail page；
 - `cache_scope` 参与内部 page id，validation 可用 `oracle_page_key_mode=strip_scope` 与 raw oracle hash 对齐。
 
-### State
+page 级集合只能从 token/node 状态投影出来。重构后不允许再把 page-level radix tree 当作 source of truth；否则
+page size what-if 会继续在 split、lock/ref chain 和 evictable victim 上退化。
 
-当前维护的集合：
+### Target State
 
-| 集合 | 说明 |
+重构后的 summary 仍输出当前 validation 使用的集合，但集合来源改为 token node/page projection：
+
+| 集合 | 来源 |
 | --- | --- |
-| `l1_resident_pages` | device/cache L1 resident。 |
-| `l2_resident_pages` | host/cache L2 resident。 |
-| `l3_resident_pages` | storage-readable / modeled L3 resident。 |
-| `dirty_pages` | write-back dirty。 |
-| `backuped_pages` | 已备份到 L2/L3 的 page。 |
-| `evicted_pages` | L1 eviction 标记。 |
-| `locked_pages` | target logical path 上 lock/ref 非零的 page。 |
-| `prefetch_planned_pages` | target prefetch planned。 |
-| `prefetch_ready_pages` | target prefetch ready。 |
-| `prefetch_late_pages` | timeout 下 late。 |
-| `prefetch_suppressed_pages` | best_effort / wait_complete finalization 或 timeout evidence 下 suppressed。 |
-| `page_hit_counts` | write-through-selective hit count。 |
+| `l1_resident_pages` | node/page device resident projection。 |
+| `l2_resident_pages` | host resident projection。 |
+| `l3_resident_pages` | storage-readable projection。 |
+| `dirty_pages` | write-back dirty page projection。 |
+| `backuped_pages` | 已持久/host backuped projection。 |
+| `evicted_pages` | target eviction lifecycle projection。 |
+| `locked_pages` | token radix parent/ref chain 上 lock/ref 非零的 page projection。 |
+| `prefetch_planned_pages` | `AsyncState` 中 target policy 已 enqueue 的 page projection。 |
+| `prefetch_ready_pages` | modeled async queue 已完成且 target 可见的 page projection。 |
+| `prefetch_late_pages` | target policy 判定 timeout/late 的 page projection。 |
+| `prefetch_suppressed_pages` | best_effort/finalization/timeout 下被 target policy 放弃的 page projection。 |
+| `page_hit_counts` | policy-visible page hit count projection。 |
 
 summary 输出位置：
 
@@ -230,9 +312,41 @@ model_summary.json.modules[0].hicache
 | `final_state` | 模型最终 state sets 和 counts。 |
 | `transition_trace` | request / operation / page 级模型状态转移。 |
 
+### 重构阶段
+
+1. `router/schema`：实现 role enum 和 required field hard fail；删除旧 `prefetch_intent` invariant 分支；fixtures 覆盖 31-target role。
+2. `token store + pager`：把 token dictionary/span、request path、target page projection 从 `HiCacheState` 中拆出；验证 page64/page128 hash。
+3. `token radix tree`：实现 token-level insert/lookup/split/remove、node parent chain、node->page projection；page-level radix tree 退役。
+4. `state index`：实现 node/page resident、dirty、backuped、evicted、hit/priority、lock/ref、host ref、evictable 索引。
+5. `request/admission lifecycle`：用 `request_tokens`、`lookup_path`、`request_admission`、`request_cache_lifecycle` 串起 lookup、load-back、chunked admission、insert/free。
+6. `policy engine`：重建 write-through-selective、write-back、capacity victim、evictable skip、lock/ref skip 和 L2/L3 backup 规则。
+7. `async state`：用 `prefetch_decision`、`prefetch_check_point`、`maintenance_checkpoint` 重建 prefetch/load-back/writeback queue；只把 timing/source actual 用于对照。
+8. `validation/provenance`：四向 S1A/S1B prediction 必须输出逐 trace diff，能把 mismatch 分类为已建模规则 bug、当前 scope 不可观测机制或新 scope 需求。
+9. `DAG patch`：只有 state final sets 在 self-config 和 cross-config 均闭环后，才实现 cache state 到 DAG mutation。
+
+### 当前实现进度
+
+截至 2026-06-11 02:03，阶段 1/2/3/4 已完成最小建模：
+
+- 新增 `hicache_router.hpp/.cpp`，集中维护 31-target invariant role enum、第一层输入门禁和 required field 检查；
+- `HiCacheStateModel::run` 不再在本地维护 role 字符串集合，而是通过 router 分发；
+- unknown invariant role 进入 `missing_invariant_facts["unknown_invariant_role"]`；
+- 缺 token dictionary/span、`cache_scope` 或 `seq_no` 的 invariant 在进入 state mutation 前被拒绝，不计入 `processed_hicache_events`；
+- 新增 `hicache_token_store.hpp/.cpp`，request path 由 token store 维护，不再在 state model 内保存 request pages；
+- 新增 `hicache_target_pager.hpp/.cpp`，target page projection 从 token path 和 target page size 推导；
+- 新增 `hicache_token_radix_tree.hpp/.cpp`，旧 `hicache_radix_tree.hpp/.cpp` 已删除；
+- 新增 `hicache_state_index.hpp/.cpp`，resident/dirty/backuped/evicted/lock/prefetch/hit count 集合由 state index 维护；
+- `prefetch_intent` 不再是 invariant input；当前 transitional backend 用 `prefetch_decision` 在 target token radix 上计算 planned suffix；
+- `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 已被 router 识别，但还未实现 target state mutation；
+  目前会进入 `missing_invariant_facts["unimplemented_invariant_role.<role>"]`，避免静默吞事件。
+- 最小验证新增并通过：target page size projection fixture、token radix split projection fixture、原 HiCache state fixtures。
+
 ## HiCache 当前验证状态
 
-当前有效大 run 是 S1A manual：
+当前有效 modeling 证据仍是 2026-06-10 四向结果；它来自 31-target 契约之前的 profile，只能证明旧 page-level backend
+不正确，不能作为新 31-target 契约的验收结果。新 profile 完成后必须按上面的目标架构验证。
+
+历史 S1A manual run：
 
 ```text
 run label: 20260610_073946_profiling_hicache_state_mainline_one_matrix/01_s1a_manual
@@ -242,6 +356,7 @@ profile quality：
 
 | 指标 | 值 |
 | --- | --- |
+| configured target count | 12 |
 | `quality_ready` | true |
 | `profiling_ready` | true |
 | invariant events | 6960 |
@@ -265,14 +380,14 @@ normalized oracle validation：
 | set | model | oracle | 结果 |
 | --- | ---: | ---: | --- |
 | `l1_resident_pages` | 32 | 54 | missing 22 |
-| `l2_resident_pages` | 78 | 106 | missing 28 |
+| `l2_resident_pages` | 80 | 106 | missing 26 |
 | `dirty_pages` | 0 | 0 | match |
-| `backuped_pages` | 78 | 106 | missing 28 |
-| `evicted_pages` | 46 | 52 | missing 28, extra 22 |
+| `backuped_pages` | 80 | 106 | missing 26 |
+| `evicted_pages` | 48 | 52 | missing 26, extra 22 |
 | `locked_pages` | 11 | 11 | match |
 
-结论：采集契约和后端分流已经符合 invariant-only 目标，但 state model 仍不正确。当前应继续用 oracle mismatch
-做逐 page provenance debug，而不是回退到 source movement 或 page identity 字段。
+结论：旧 profile 已经证明 invariant-only 分流方向正确，但 page-level state model 不正确。新 31-target profile 完成后，
+应按目标架构重构并重跑四向验证，而不是继续在旧 page-level backend 上小修。
 
 ## 当前未实现
 

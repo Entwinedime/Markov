@@ -145,6 +145,54 @@
             {
               "name": "token_count",
               "source": "len:arg:params.key"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lookup_result_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.match_prefix",
+          "events": [
+            "hicache_lookup_result_observed_start",
+            "hicache_lookup_result_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lookup_result_observed"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
             },
             {
               "name": "matched_token_dictionary",
@@ -169,6 +217,31 @@
             {
               "name": "host_hit_length",
               "source": "return.host_hit_length",
+              "required": false
+            },
+            {
+              "name": "last_device_node",
+              "source": "hicache_node_summary:return.last_device_node",
+              "required": false
+            },
+            {
+              "name": "last_host_node",
+              "source": "hicache_node_summary:return.last_host_node",
+              "required": false
+            },
+            {
+              "name": "best_match_node",
+              "source": "hicache_node_summary:return.best_match_node",
+              "required": false
+            },
+            {
+              "name": "best_match_node_chain",
+              "source": "hicache_node_chain:return.best_match_node",
+              "required": false
+            },
+            {
+              "name": "evictable",
+              "source": "hicache_evictable_snapshot:self",
               "required": false
             }
           ]
@@ -233,6 +306,743 @@
             {
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_finished_req",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_finished_req",
+          "events": [
+            "hicache_cache_finished_req_start",
+            "hicache_cache_finished_req_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_cache_lifecycle"
+            },
+            {
+              "name": "lifecycle_kind",
+              "source": "const:finished"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "request_token_path:arg:req,committed,self"
+            },
+            {
+              "name": "full_path_span",
+              "source": "request_token_span:arg:req,committed"
+            },
+            {
+              "name": "token_count",
+              "source": "request_token_count:arg:req,committed"
+            },
+            {
+              "name": "committed_token_count",
+              "source": "arg:req.kv_committed_len",
+              "required": false
+            },
+            {
+              "name": "is_insert",
+              "source": "arg:is_insert",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_finished_req_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_finished_req",
+          "events": [
+            "hicache_cache_finished_req_observed_start",
+            "hicache_cache_finished_req_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_cache_lifecycle_observed"
+            },
+            {
+              "name": "lifecycle_kind",
+              "source": "const:finished"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "request_runtime",
+              "source": "hicache_request_runtime:arg:req",
+              "required": false
+            },
+            {
+              "name": "is_insert",
+              "source": "arg:is_insert",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_unfinished_req",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_unfinished_req",
+          "events": [
+            "hicache_cache_unfinished_req_start",
+            "hicache_cache_unfinished_req_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_cache_lifecycle"
+            },
+            {
+              "name": "lifecycle_kind",
+              "source": "const:unfinished"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "request_token_path:arg:req,fill,self"
+            },
+            {
+              "name": "full_path_span",
+              "source": "request_token_span:arg:req,fill"
+            },
+            {
+              "name": "token_count",
+              "source": "request_token_count:arg:req,fill"
+            },
+            {
+              "name": "chunked",
+              "source": "arg:chunked",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_unfinished_req_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_unfinished_req",
+          "events": [
+            "hicache_cache_unfinished_req_observed_start",
+            "hicache_cache_unfinished_req_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_cache_lifecycle_observed"
+            },
+            {
+              "name": "lifecycle_kind",
+              "source": "const:unfinished"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "request_runtime",
+              "source": "hicache_request_runtime:arg:req",
+              "required": false
+            },
+            {
+              "name": "chunked",
+              "source": "arg:chunked",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "scheduler.prefetch_decision",
+          "module": "sglang.srt.managers.scheduler",
+          "target": "Scheduler._prefetch_kvcache",
+          "events": [
+            "hicache_prefetch_decision_start",
+            "hicache_prefetch_decision_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_decision"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.tree_cache.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "request_token_path:arg:req,fill,self.tree_cache"
+            },
+            {
+              "name": "full_path_span",
+              "source": "request_token_span:arg:req,fill"
+            },
+            {
+              "name": "token_count",
+              "source": "request_token_count:arg:req,fill"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self.tree_cache,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "scheduler.prefetch_decision_observed",
+          "module": "sglang.srt.managers.scheduler",
+          "target": "Scheduler._prefetch_kvcache",
+          "events": [
+            "hicache_prefetch_decision_observed_start",
+            "hicache_prefetch_decision_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_decision_observed"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.tree_cache.page_size"
+            },
+            {
+              "name": "prefetch_state",
+              "source": "hicache_scheduler_prefetch_state:self,arg:req",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "schedule_policy.prefill_admission",
+          "module": "sglang.srt.managers.schedule_policy",
+          "target": "PrefillAdder.add_one_req",
+          "events": [
+            "hicache_prefill_admission_start",
+            "hicache_prefill_admission_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_admission"
+            },
+            {
+              "name": "admission_kind",
+              "source": "const:prefill_add_one_req"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "request_token_path:arg:req,origin_output,self.tree_cache"
+            },
+            {
+              "name": "full_path_span",
+              "source": "request_token_span:arg:req,origin_output"
+            },
+            {
+              "name": "token_count",
+              "source": "request_token_count:arg:req,origin_output"
+            },
+            {
+              "name": "has_chunked_req",
+              "source": "arg:has_chunked_req"
+            },
+            {
+              "name": "truncation_align_size",
+              "source": "arg:truncation_align_size",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            },
+            {
+              "name": "ignore_eos",
+              "source": "arg:req.sampling_params.ignore_eos",
+              "required": false
+            },
+            {
+              "name": "max_new_tokens",
+              "source": "arg:req.sampling_params.max_new_tokens",
+              "required": false
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self.tree_cache,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "schedule_policy.prefill_admission_observed",
+          "module": "sglang.srt.managers.schedule_policy",
+          "target": "PrefillAdder.add_one_req",
+          "events": [
+            "hicache_prefill_admission_observed_start",
+            "hicache_prefill_admission_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_admission_observed"
+            },
+            {
+              "name": "admission_kind",
+              "source": "const:prefill_add_one_req"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "admission_result",
+              "source": "return.name",
+              "required": false
+            },
+            {
+              "name": "request_runtime",
+              "source": "hicache_request_runtime:arg:req",
+              "required": false
+            },
+            {
+              "name": "can_run_count",
+              "source": "len:self.can_run_list",
+              "required": false
+            },
+            {
+              "name": "new_chunked_request_id",
+              "source": "self.new_chunked_req.rid",
+              "required": false
+            },
+            {
+              "name": "rem_total_tokens_snapshot",
+              "source": "self.rem_total_tokens",
+              "required": false
+            },
+            {
+              "name": "cur_rem_tokens_snapshot",
+              "source": "self.cur_rem_tokens",
+              "required": false
+            },
+            {
+              "name": "rem_input_tokens_snapshot",
+              "source": "self.rem_input_tokens",
+              "required": false
+            },
+            {
+              "name": "rem_chunk_tokens_snapshot",
+              "source": "self.rem_chunk_tokens",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "schedule_policy.chunked_admission",
+          "module": "sglang.srt.managers.schedule_policy",
+          "target": "PrefillAdder.add_chunked_req",
+          "events": [
+            "hicache_chunked_admission_start",
+            "hicache_chunked_admission_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_admission"
+            },
+            {
+              "name": "admission_kind",
+              "source": "const:chunked_continuation"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "token_dictionary",
+              "source": "request_token_path:arg:req,origin_output,self.tree_cache"
+            },
+            {
+              "name": "full_path_span",
+              "source": "request_token_span:arg:req,origin_output"
+            },
+            {
+              "name": "token_count",
+              "source": "request_token_count:arg:req,origin_output"
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            },
+            {
+              "name": "max_new_tokens",
+              "source": "arg:req.sampling_params.max_new_tokens",
+              "required": false
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self.tree_cache,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "schedule_policy.chunked_admission_observed",
+          "module": "sglang.srt.managers.schedule_policy",
+          "target": "PrefillAdder.add_chunked_req",
+          "events": [
+            "hicache_chunked_admission_observed_start",
+            "hicache_chunked_admission_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:request_admission_observed"
+            },
+            {
+              "name": "admission_kind",
+              "source": "const:chunked_continuation"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req.rid"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self.tree_cache"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self.tree_cache"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "result_request_id",
+              "source": "return.rid",
+              "required": false
+            },
+            {
+              "name": "request_runtime",
+              "source": "hicache_request_runtime:arg:req",
+              "required": false
+            },
+            {
+              "name": "can_run_count",
+              "source": "len:self.can_run_list",
+              "required": false
+            },
+            {
+              "name": "rem_total_tokens_snapshot",
+              "source": "self.rem_total_tokens",
+              "required": false
+            },
+            {
+              "name": "cur_rem_tokens_snapshot",
+              "source": "self.cur_rem_tokens",
+              "required": false
+            },
+            {
+              "name": "rem_input_tokens_snapshot",
+              "source": "self.rem_input_tokens",
+              "required": false
+            },
+            {
+              "name": "rem_chunk_tokens_snapshot",
+              "source": "self.rem_chunk_tokens",
+              "required": false
             }
           ]
         },
@@ -305,6 +1115,64 @@
               "required": false
             },
             {
+              "name": "chunked",
+              "source": "arg:params.chunked",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:params.priority",
+              "required": false
+            },
+            {
+              "name": "prev_prefix_len",
+              "source": "arg:params.prev_prefix_len",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.insert_result_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.insert",
+          "events": [
+            "hicache_insert_result_observed_start",
+            "hicache_insert_result_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:insert_result_observed"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
               "name": "prefix_len",
               "source": "return.prefix_len",
               "required": false
@@ -317,6 +1185,16 @@
             {
               "name": "inserted_span",
               "source": "node_token_span:return.inserted_host_node",
+              "required": false
+            },
+            {
+              "name": "inserted_node",
+              "source": "hicache_node_summary:return.inserted_host_node",
+              "required": false
+            },
+            {
+              "name": "evictable",
+              "source": "hicache_evictable_snapshot:self",
               "required": false
             }
           ]
@@ -340,15 +1218,15 @@
             },
             {
               "name": "state_model_input",
-              "source": "const:true"
+              "source": "const:false"
             },
             {
               "name": "fact_class",
-              "source": "const:invariant_state"
+              "source": "const:source_actual"
             },
             {
               "name": "event_role",
-              "source": "const:prefetch_intent"
+              "source": "const:prefetch_intent_observed"
             },
             {
               "name": "request_id",
@@ -457,6 +1335,211 @@
           ]
         },
         {
+          "id": "hiradix.prefetch_progress_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.check_prefetch_progress",
+          "events": [
+            "hicache_prefetch_progress_observed_start",
+            "hicache_prefetch_progress_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:prefetch_progress_observed"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:req_id"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "progress",
+              "source": "hicache_prefetch_progress:self,arg:req_id",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.maintenance_check",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.check_hicache_events",
+          "events": [
+            "hicache_maintenance_check_start",
+            "hicache_maintenance_check_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:maintenance_checkpoint"
+            },
+            {
+              "name": "checkpoint_kind",
+              "source": "const:maintenance_check"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.ready_to_load_host_cache",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.ready_to_load_host_cache",
+          "events": [
+            "hicache_ready_to_load_host_cache_start",
+            "hicache_ready_to_load_host_cache_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:maintenance_checkpoint"
+            },
+            {
+              "name": "checkpoint_kind",
+              "source": "const:ready_to_load_host_cache"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.flush_write_through_acks",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.flush_write_through_acks",
+          "events": [
+            "hicache_flush_write_through_acks_start",
+            "hicache_flush_write_through_acks_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:invariant_state"
+            },
+            {
+              "name": "event_role",
+              "source": "const:maintenance_checkpoint"
+            },
+            {
+              "name": "checkpoint_kind",
+              "source": "const:flush_write_through_acks"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "policy_params",
+              "source": "hicache_config:self,policy_params"
+            }
+          ]
+        },
+        {
           "id": "hiradix.capacity_request",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.evict",
@@ -525,6 +1608,68 @@
           ]
         },
         {
+          "id": "hiradix.capacity_result_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.evict",
+          "events": [
+            "hicache_capacity_result_observed_start",
+            "hicache_capacity_result_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:capacity_result_observed"
+            },
+            {
+              "name": "request_id",
+              "source": "arg:params.req.rid",
+              "required": false
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "requested_tokens",
+              "source": "arg:params.num_tokens"
+            },
+            {
+              "name": "evicted_tokens",
+              "source": "return.num_tokens_evicted",
+              "required": false
+            },
+            {
+              "name": "evictable",
+              "source": "hicache_evictable_snapshot:self",
+              "required": false
+            }
+          ]
+        },
+        {
           "id": "hiradix.lock_scope_inc",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.inc_lock_ref",
@@ -574,6 +1719,61 @@
               "source": "node_token_span:arg:node"
             },
             {
+              "name": "lock_direction",
+              "source": "const:inc"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lock_scope_inc_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.inc_lock_ref",
+          "events": [
+            "hicache_lock_scope_inc_observed_start",
+            "hicache_lock_scope_inc_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lock_scope_result_observed"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "node",
+              "source": "hicache_node_summary:arg:node"
+            },
+            {
+              "name": "node_chain",
+              "source": "hicache_node_chain:arg:node"
+            },
+            {
               "name": "delta",
               "source": "return.delta",
               "required": false
@@ -581,6 +1781,11 @@
             {
               "name": "lock_direction",
               "source": "const:inc"
+            },
+            {
+              "name": "evictable",
+              "source": "hicache_evictable_snapshot:self",
+              "required": false
             }
           ]
         },
@@ -634,6 +1839,61 @@
               "source": "node_token_span:arg:node"
             },
             {
+              "name": "lock_direction",
+              "source": "const:dec"
+            }
+          ]
+        },
+        {
+          "id": "hiradix.lock_scope_dec_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.dec_lock_ref",
+          "events": [
+            "hicache_lock_scope_dec_observed_start",
+            "hicache_lock_scope_dec_observed_end"
+          ],
+          "fields": [
+            {
+              "name": "model_input",
+              "source": "const:true"
+            },
+            {
+              "name": "dag_input",
+              "source": "const:false"
+            },
+            {
+              "name": "state_model_input",
+              "source": "const:false"
+            },
+            {
+              "name": "fact_class",
+              "source": "const:source_actual"
+            },
+            {
+              "name": "event_role",
+              "source": "const:lock_scope_result_observed"
+            },
+            {
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
+            },
+            {
+              "name": "seq_no",
+              "source": "hicache_seq:self"
+            },
+            {
+              "name": "source_page_size",
+              "source": "self.page_size"
+            },
+            {
+              "name": "node",
+              "source": "hicache_node_summary:arg:node"
+            },
+            {
+              "name": "node_chain",
+              "source": "hicache_node_chain:arg:node"
+            },
+            {
               "name": "delta",
               "source": "return.delta",
               "required": false
@@ -641,6 +1901,11 @@
             {
               "name": "lock_direction",
               "source": "const:dec"
+            },
+            {
+              "name": "evictable",
+              "source": "hicache_evictable_snapshot:self",
+              "required": false
             }
           ]
         },

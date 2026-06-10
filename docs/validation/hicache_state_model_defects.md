@@ -5,15 +5,16 @@
 
 ## 当前前提
 
-截至 2026-06-10：
+截至 2026-06-11：
 
 - profiling 已切到 token/range invariant contract；
-- C++ backend 只消费 `fact_class=invariant_state && state_model_input=true`；
-- target pages 由 token dictionary/span 和 target `page_size` 重建；
+- 当前 mainline S1A/S1B profiling 契约已收紧为 31 个 target，其中 16 个 `invariant_state` 是唯一状态模型输入；
+- C++ backend 必须只消费 `fact_class=invariant_state && state_model_input=true`；
+- target pages 必须由 token dictionary/span 和 target `page_size` 重建；
 - source_actual、timing_observation、oracle_state 不更新 target state；
-- `non_invariant_fact_usage=[]` 已在 S1A/S1B self-config 和 S1A<->S1B cross-config 四个方向中达成；
-- S1A/S1B profile quality 和 invariant coverage 均为 ready；
-- 四个方向的 final state 全部与 normalized oracle 不匹配。
+- 旧 2026-06-10 S1A/S1B profile 的 `non_invariant_fact_usage=[]` 已在 self-config 和 cross-config 四个方向中达成；
+- 旧 2026-06-10 profile quality 和 invariant coverage 均为 ready，但该 run 仍是 12-target 旧采集契约；
+- 四个方向的 final state 全部与 normalized oracle 不匹配，说明旧 page-level backend 不正确。
 
 最新有效验证：
 
@@ -30,7 +31,8 @@ HCSV-20260610-four-way-s1a-s1b
 | S1A -> S1B | 64/108, missing 44 | 164/144, missing 40, extra 60 | 64/72, missing 8 | 164/108, missing 4, extra 60 | 22/22 match |
 | S1B -> S1A | 32/54, missing 22 | 80/106, missing 26 | 0/0 match | 48/52, missing 26, extra 22 | 0/11, missing 11 |
 
-这说明采集和输入分流已经不是当前阻塞点；阻塞点在状态规则。
+这说明输入分流方向不是当前阻塞点；阻塞点在状态建模结构。下面的缺陷是新 token-level backend 的验收目标和
+provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set 实现上逐个小修的补丁列表。
 
 ## 分级
 
@@ -70,8 +72,9 @@ HCSV-20260610-four-way-s1a-s1b
 
 ### HCSM-F2：wait_complete checkpoint 不再全量构造 resident/ready
 
-`prefetch_check_point` 当前 invariant 事实没有 loaded pages / completion pages。模型现在只保留 `prefetch_intent`
-产生的 planned pages；`wait_complete` checkpoint 不再把 pending pages 全部 add L2/L3，也不在 finalize 阶段把未 ready
+`prefetch_check_point` 当前 invariant 事实没有 loaded pages / completion pages。旧 backend 曾只保留旧
+`prefetch_intent` 产生的 planned pages；31-target 重构后 planned pages 必须由 `prefetch_decision` 和 target state
+重新判断产生。`wait_complete` checkpoint 不能把 pending pages 全部 add L2/L3，也不能在 finalize 阶段把未 ready
 页全部 suppressed。
 
 四向影响：
@@ -169,14 +172,14 @@ evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，
 - touch order 是简化 LRU；
 - dirty victim 触发 modeled writeback；
 - locked pages 会跳过；
-- page-level radix tree 提供 leaf group。
+- token radix tree 提供当前 projection leaf group。
 
 ### 缺口
 
 - 没有 SGLang allocator / pool exact 行为；
 - 没有完整 evictable set；
-- lock/ref 与 radix parent chain 没有严格绑定；
-- leaf group 是 page-level 近似；
+- lock/ref 与完整 radix parent chain 还没有严格绑定；
+- leaf group 目前仍是 projection 近似，不等价于 SGLang node evictable set；
 - L2 eviction 后 `backuped` / `evicted` 的语义可能不等价。
 
 ### 下一步
@@ -186,16 +189,15 @@ evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，
 - 判断 extra 是否来自 L1 missing 组、L2 over-fill 组或 dirty eviction 组；
 - 如果 victim 选择无法由现有 facts 解释，再把 evictable snapshot 放入下一轮集中采集。
 
-## HCSM-D4：Radix Tree 仍是近似
+## HCSM-D4：Token Radix Tree 仍是近似
 
-当前 `HiCacheRadixTree` 是 target page-level radix tree。它支持 common prefix、split、leaf group 和 remove，
-但不是完整 SGLang HiRadixCache node/state/ref 实现。
+原 `HiCacheRadixTree` 已删除，后端使用 `HiCacheTokenRadixTree` 做 token-level prefix、split 和 insert。
+但它仍只是最小 token radix 建模，不是完整 SGLang HiRadixCache node/state/ref 实现。
 
 风险：
 
-- token-level node split 与 page-level split 不完全一致；
-- parent-child/ref chain 信息不足；
-- prefix overlap 复杂时 leaf group 可能不同；
+- node parent/ref/host-ref chain 信息不足；
+- prefix overlap 复杂时 projection leaf group 可能不同于 SGLang evictable node set；
 - insert/remove 合并生命周期不完整。
 
 当前不因该项立即重采。先用四向 mismatch 判断它是否是实际 root cause；如果锁链、leaf group 或 prefix split 无法从
@@ -203,12 +205,15 @@ token path 推导，再集中补 node/ref provenance。
 
 ## HCSM-D5：Async Prefetch Scheduler 简化
 
-当前模型：
+旧模型：
 
 - `prefetch_intent` 生成 planned pages；
 - `wait_complete` checkpoint 不再把 pending pages 直接标为 L2/L3 resident 和 ready；
 - `best_effort` checkpoint / finalize 会 suppress 未 ready pages；
 - `timeout` 只按简单 elapsed timeout 标 late。
+
+31-target 后端重构后，`prefetch_intent` 不再是 invariant input；target planned pages 必须由 `prefetch_decision`
+结合 modeled token radix state 和 prefetch policy 生成。
 
 缺口：
 

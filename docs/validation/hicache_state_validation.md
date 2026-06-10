@@ -48,12 +48,20 @@ HiCache state prediction 必须同时满足：
 
 ## 当前代码口径
 
-截至 2026-06-10：
+截至 2026-06-11：
 
 - HiCache profiling 使用 token dictionary/span、`cache_scope`、`seq_no` 和 `fact_class` 分类；
 - C++ backend 只消费 `fact_class=invariant_state && state_model_input=true`；
-- known invariant roles 是 `request_tokens`、`lookup_path`、`cache_config_observed`、`insert_path`、
-  `prefetch_intent`、`prefetch_check_point`、`capacity_request`、`lock_scope_delta`；
+- 当前 profiling 契约收紧为 31 个 target：新增 `request_cache_lifecycle`、`request_admission`、`prefetch_decision`、
+  `maintenance_checkpoint` 四类 invariant role，并把 `lookup_result_observed`、`insert_result_observed`、`request_cache_lifecycle_observed`、
+  `request_admission_observed`、
+  `prefetch_decision_observed`、`prefetch_intent_observed`、`prefetch_progress_observed`、`capacity_result_observed`、
+  `lock_scope_result_observed` 等 source 已发生结果拆成 `source_actual`；
+- `sglang.hicache` probe 会自动采集 radix split/delete、evictable delta、host ref delta、node store/remove、load-back、
+  write-back enqueue/start、write/load ack、storage control、storage hit query、prefetch rate-limit/terminate、abort cleanup
+  等 source_actual provenance；
+- 当前已完成的 HCSV-20260610 四向结果仍来自 12-target 旧 profile；新 31-target profiling 尚未形成可用于
+  backend validation 的四向结果，因此不能把下面结果解读为新契约验证结果；
 - target pages 由 C++ 按 token path 和 target `page_size` 生成，不再消费 `target_page_identity_page64/128`；
 - `capacity_request` 只作为容量检查点，不再把 `requested_pages` 解释为可观测 victim 数；
 - `prefetch_check_point` 在 `wait_complete` target 下不再直接把全部 planned pages 推入 L2/L3 或标记 ready；
@@ -78,6 +86,7 @@ HiCache state prediction 必须同时满足：
 | S1B modeling config | `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json` |
 | S1A target config | page128, L1/L2 capacity `64/145`, `write_through_selective`, `wait_complete` |
 | S1B target config | page64, L1/L2 capacity `128/321`, `write_back`, `best_effort` |
+| archived target count | 12 |
 
 Profile quality：
 
@@ -115,7 +124,8 @@ Raw model behavior highlights：
 
 结论：
 
-- 新采集契约有效：S1A/S1B profile quality、token dictionary、seq order 和 invariant coverage 都通过。
+- 旧 token-invariant profile quality、token dictionary、seq order 和 invariant coverage 都通过；这只能证明旧输入分流方向有效，
+  不能证明当前 31-target 契约已经完成 validation。
 - 后端输入分流有效：四个方向均无 `missing_invariant_facts` 和 `non_invariant_fact_usage`。
 - 四个方向全部 final state mismatch，因此当前不能宣称 self-config 或 cross-config state prediction 通过。
 - 已收紧两个有明确证据的过度推导：`capacity_request.requested_pages` 不再强制选择 victim，
@@ -185,7 +195,8 @@ jq '.hicache_state.sets_diff_by_tier
 
 ## 下一步
 
-短期不应重新采集 profiling。当前采集已经足够暴露模型错误，应先用逐 page provenance 区分可修复规则和不可观测机制：
+短期不应为了旧后端 mismatch 继续追加采集 target。当前 31-target 契约完成后，应先按新的后端目标架构做重构，再用逐
+page provenance 区分可修复规则和不可观测机制：
 
 1. 已新增 `scripts/internal/hicache_state_provenance.py`，用于输出 mismatch page 的 model transition、oracle membership changes
    和 fixability hint；四个 `four_way_*` 目录都已生成 `provenance_sample.json`。
