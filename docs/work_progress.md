@@ -2,6 +2,19 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-10 19:23:32 +0800
+
+- 完成 S1A/S1B mainline-one manual profile 后的四向 HiCache state prediction / oracle validation：
+  - S1A self、S1B self、S1A -> S1B、S1B -> S1A 均使用 token-invariant facts，`invariant_coverage_ready=true`、
+    `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+  - 四个方向的 final state 均为 mismatch，说明当前阻塞点是 C++ state model，不是采集目标分流或 token dictionary 覆盖；
+  - S1A self 仍缺 L1 resident 22、L2/backuped 28，且 L1 missing 页会落到 evicted extra；
+  - S1B self 暴露 write-back/best-effort 更明显的问题：L1 missing 46、L2/backuped extra 64、dirty missing 10、locked missing 22；
+  - S1A -> S1B 与 S1B -> S1A 分别验证出 target=S1B 的 capacity/write-back over-fill，以及 source=S1B 的 lock/ref 全丢；
+  - 修正 `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json`，目标 S1B 的 prediction
+    现在要求 `require_oracle_state_trace=true` 并使用 `oracle_page_key_mode=strip_scope`，避免 final mismatch 被误判成 ready；
+  - `docs/validation/hicache_state_validation.md` 和 `docs/validation/hicache_state_model_defects.md` 已同步为四向结果和新的缺陷优先级。
+
 ## 2026-06-10 18:20:00 +0800
 
 - 同步 HiCache token-invariant 后端后的主线文档：

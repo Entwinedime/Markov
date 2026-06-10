@@ -60,94 +60,66 @@ HiCache state prediction 必须同时满足：
 
 ## 当前有效结果
 
-### HCSV-20260610-token-backend-s1a
+### HCSV-20260610-four-way-s1a-s1b
 
-目的：验证 token-invariant profiling + C++ token backend 在 S1A self-config 上是否能与真实 oracle state 对齐。
+目的：S1A 和 S1B profiling 均完成后，用同一批 token-invariant facts 做四个方向的 HiCache state prediction，
+并用目标场景 oracle final state 验证模型正确性。
 
 输入：
 
 | 项 | 值 |
 | --- | --- |
 | profiling config | `configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` |
-| experiment | `01_s1a_manual` |
-| run label | `20260610_073946_profiling_hicache_state_mainline_one_matrix/01_s1a_manual` |
-| modeling config | `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json` |
-| output label | `modeling/token_backend_s1a` |
-| target config | page128, L1/L2 capacity `64/145`, `write_through_selective`, `wait_complete` |
+| S1A run | `20260610_073946_profiling_hicache_state_mainline_one_matrix/01_s1a_manual` |
+| S1B run | `20260610_073946_profiling_hicache_state_mainline_one_matrix/03_s1b_manual` |
+| S1A modeling config | `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json` |
+| S1B modeling config | `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json` |
+| S1A target config | page128, L1/L2 capacity `64/145`, `write_through_selective`, `wait_complete` |
+| S1B target config | page64, L1/L2 capacity `128/321`, `write_back`, `best_effort` |
 
 Profile quality：
 
-| 指标 | 值 |
-| --- | ---: |
-| `quality_ready` | true |
-| `profiling_ready` | true |
-| invariant events | 6960 |
-| required end events | 3480 |
-| token dictionary paths | 172 |
-| token dictionary paths with ids | 172 |
-| token span refs | 172 |
-| missing token dictionary refs | 0 |
-| seq order errors | 0 |
-| route errors | 0 |
+| run | `quality_ready` | `profiling_ready` | invariant events | required end events | token dictionary paths | missing token refs | seq errors | route errors |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| S1A | true | true | 6960 | 3480 | 172 | 0 | 0 | 0 |
+| S1B | true | true | 6572 | 3286 | 145 | 0 | 0 | 0 |
 
-Model summary：
+四向 prediction / validation：
 
-| 指标 | 值 |
-| --- | ---: |
-| `input_hicache_events` | 7376 |
-| `processed_hicache_events` | 3480 |
-| `skipped_non_invariant_events` | 416 |
-| `state_transition_count` | 18935 |
-| `dag_mutations` | 0 |
-| `missing_invariant_facts` | `{}` |
-| `non_invariant_fact_usage` | `[]` |
-
-Validation：
-
-| 指标 | 值 |
-| --- | --- |
-| `validation_ready` | false |
-| `validation_errors` | `["hicache_final_state_mismatch"]` |
-| `oracle_state_validation_required` | true |
-| `oracle_page_key_mode` | `strip_scope` |
-| `final_state_match` | false |
-| `raw_final_state_match` | false |
-| `invariant_coverage_ready` | true |
+| prediction | source facts | target config / oracle | output label | `predicted_e2e_ns` | `validation_ready` | `final_state_match` | invariant coverage | non-invariant usage |
+| --- | --- | --- | --- | ---: | --- | --- | --- | --- |
+| S1A self | S1A | S1A | `modeling/four_way_s1a_self` | 10644954022 | false | false | true | `[]` |
+| S1B self | S1B | S1B | `modeling/four_way_s1b_self` | 11833951018 | false | false | true | `[]` |
+| S1A -> S1B | S1A | S1B | `modeling/four_way_s1a_to_s1b` | 10644954022 | false | false | true | `[]` |
+| S1B -> S1A | S1B | S1A | `modeling/four_way_s1b_to_s1a` | 11833951018 | false | false | true | `[]` |
 
 Normalized final-state diff：
 
-| set | model | oracle | mismatch |
-| --- | ---: | ---: | --- |
-| `l1_resident_pages` | 32 | 54 | missing 22, extra 0 |
-| `l2_resident_pages` | 78 | 106 | missing 28, extra 0 |
-| `dirty_pages` | 0 | 0 | match |
-| `backuped_pages` | 78 | 106 | missing 28, extra 0 |
-| `evicted_pages` | 46 | 52 | missing 28, extra 22 |
-| `locked_pages` | 11 | 11 | match |
+| prediction | L1 resident | L2 resident | backuped | dirty | evicted | locked |
+| --- | --- | --- | --- | --- | --- | --- |
+| S1A self | 32/54, missing 22 | 78/106, missing 28 | 78/106, missing 28 | 0/0 match | 46/52, missing 28, extra 22 | 11/11 match |
+| S1B self | 62/108, missing 46 | 172/144, missing 36, extra 64 | 172/144, missing 36, extra 64 | 62/72, missing 10 | 172/108, extra 64 | 0/22, missing 22 |
+| S1A -> S1B | 64/108, missing 44 | 164/144, missing 40, extra 60 | 164/144, missing 40, extra 60 | 64/72, missing 8 | 164/108, missing 4, extra 60 | 22/22 match |
+| S1B -> S1A | 15/54, missing 39 | 79/106, missing 41, extra 14 | 79/106, missing 41, extra 14 | 0/0 match | 50/52, missing 41, extra 39 | 0/11, missing 11 |
 
-Raw model counts before `strip_scope` normalization：
+Raw model behavior highlights：
 
-| set | count |
-| --- | ---: |
-| `l1_resident_pages` | 64 |
-| `l2_resident_pages` | 145 |
-| `l3_resident_pages` | 712 |
-| `backuped_pages` | 145 |
-| `evicted_pages` | 81 |
-| `locked_pages` | 22 |
-| `dirty_pages` | 0 |
-| `prefetch_planned_pages` | 712 |
-| `prefetch_ready_pages` | 712 |
+| prediction | state trace events | model transitions | skipped non-invariant | notable raw final state |
+| --- | ---: | ---: | ---: | --- |
+| S1A self | 7375 | 18935 | 416 | L1 64, L2 145, L3 712, evicted 81, locked 22, prefetch ready 712 |
+| S1B self | 6867 | 27941 | 296 | L1 124, L2 321, dirty 124, evicted 321, locked 0, prefetch suppressed 1484 |
+| S1A -> S1B | 7375 | 27465 | 416 | L1 128, L2 321, dirty 128, evicted 321, locked 44, prefetch suppressed 1452 |
+| S1B -> S1A | 6867 | 19305 | 296 | L1 30, L2 147, L3 756, evicted 89, locked 0, prefetch ready 728 |
 
 结论：
 
-- 新采集契约有效：profile quality 和 invariant coverage 通过。
-- 后端不再需要大量分支猜 source/oracle/invariant：主入口已经用 `fact_class + state_model_input` 分流。
-- state model 仍不正确：resident/backuped under-predict，evicted 同时有 missing 和 extra。
-- dirty 和 locked final sets 已经对齐，但不能掩盖 resident/evicted mismatch。
-- 当前不能宣称 S1A self-config prediction 通过。
+- 新采集契约有效：S1A/S1B profile quality、token dictionary、seq order 和 invariant coverage 都通过。
+- 后端输入分流有效：四个方向均无 `missing_invariant_facts` 和 `non_invariant_fact_usage`。
+- 四个方向全部 final state mismatch，因此当前不能宣称 self-config 或 cross-config state prediction 通过。
+- 失败是模型缺陷而不是采集目标范围缺失的直接证据；已知缺陷记录在 `hicache_state_model_defects.md`。
+- S1B target 的 modeling config 必须设置 `require_oracle_state_trace=true`；否则 final mismatch 可能被错误标成 ready。
 
-首个 L1 normalized missing page：
+首个 S1A L1 normalized missing page：
 
 ```text
 08c4433f3c8ddb201c1d2b54e9045b63308a491a20f6b8b6b6e4686b6cfd39be
@@ -162,19 +134,32 @@ Profile quality：
 ```bash
 python3 scripts/internal/profile_quality.py \
   --manifest <run_dir>/profile_manifest.json \
-  --output /tmp/profile_quality_s1a_token_backend.json
+  --output <run_dir>/profile_quality_token_backend.json
 ```
 
-Modeling：
+Modeling self-config：
 
 ```bash
 python3 scripts/internal/model_runner.py \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
-  --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/token_backend_s1a \
+  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_<target>.json \
+  --profile-manifest <target_run_dir>/profile_manifest.json \
+  --output-dir <target_run_dir>/modeling/four_way_<target>_self \
   --mode cache_state \
   --emit-module-summary \
   --emit-validation
+```
+
+Modeling cross-config：
+
+```bash
+python3 scripts/internal/model_runner.py \
+  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_<target>.json \
+  --profile-manifest <source_run_dir>/profile_manifest.json \
+  --output-dir <source_run_dir>/modeling/four_way_<source>_to_<target> \
+  --mode cache_state \
+  --emit-module-summary \
+  --emit-validation \
+  --hicache-oracle-trace <target_run_dir>/trace/python_probe/python_probe_trace.rankunknown.pid*.json
 ```
 
 Diff 摘要：
@@ -190,19 +175,19 @@ jq '.hicache_state.sets_diff_by_tier
      extra_count: (.value.extra_in_model | length),
      missing_sample: (.value.missing_in_model[:5]),
      extra_sample: (.value.extra_in_model[:5])}' \
-  <run_dir>/modeling/token_backend_s1a/validation.json
+  <output_dir>/validation.json
 ```
 
 ## 下一步
 
 短期不应重新采集 profiling。当前采集已经足够暴露模型错误，应先做逐 page provenance：
 
-1. 对 `08c4433f...` 这类 L1 missing / evicted extra page，列出模型 transition trace 和 oracle final membership。
-2. 对 L2/backuped missing 的 28 页，确认它们来自 lookup/load-back、insert/write-through-selective、prefetch ready 还是容量回收。
-3. 对 evicted missing/extra 分组，判断是 target radix leaf group、touch order、capacity request、locked/evictable predicate 还是 write-through hit count。
-4. 修 C++ state model 后重跑 S1A。
-5. S1A self-config 通过后，再跑 S1B self-config。
-6. 两个 self-config 都通过后，再进入 S1A->S1B / S1B->S1A cross-config。
+1. 对 S1A 的 L1 missing / evicted extra 组，列出模型 transition trace 和 oracle final membership。
+2. 对 S1B 的 raw L2/backuped/evicted 被推到 capacity 321 的路径，确认 capacity enforcement 和 write-back dirty eviction 是否过强。
+3. 对 S1B dirty missing 组，确认 flush、dirty clear、backuped 标记和 eviction 的顺序。
+4. 对 S1B self 与 S1B->S1A 中 locked 全丢的问题，追 lock/ref chain 如何从 source token path 映射到 target radix parent chain。
+5. 对 S1A/S1B 的 prefetch ready/suppressed 极端行为，确认它是否影响 resident/L2 结果，而不是只作为附加状态。
+6. 每修一类状态规则后重跑四向矩阵，不能只看单个 self-config。
 
 只有逐 trace 证明现有 invariant facts 无法区分某类真实机制时，才进入下一轮集中重采。
 
