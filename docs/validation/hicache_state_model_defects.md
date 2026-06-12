@@ -17,6 +17,8 @@
 - backend radix tree 和 L1/L2 capacity enforcement 已按 `cache_scope` 隔离；当前有效 correctness 仍看 `strip_scope`
   normalized page hash union；
 - source_actual、timing_observation、oracle_state 不更新 target state；
+- C++ reader 会保留 `source_actual` / `timing_observation` 事件，供 token dictionary 水合和 provenance 使用；router
+  仍只把 atomic invariant role 分发给 state mutation；
 - 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；match-prefix concrete
   path、lifecycle path/runtime、`insert_path`、`capacity_request`、`lock_scope_delta` 和具体 `maintenance_checkpoint`
   target 当前都是 source evidence；
@@ -32,8 +34,10 @@
 - 当前 S1A self normal prediction 已 final state match；但 trace scan 仍可见 `locked_pages` 暂态差异，归类为
   snapshot/input-boundary 暂态。
 - 当前 33-target atomic profile 已完成 S1A/S1B manual run，双向 cross audit 的 `model_input_contract_ready=true`；
-  修复前 retained cross-config 仍不能做 timestamp oracle injection，因为 S1A/S1B 执行窗口不重叠，旧
-  `capacity_request`、`lock_scope_delta` 和 request token sequence 也未证明 target-independent。
+  C++ backend 已完成 atomic reader/router/state dispatch 和 normal input surface 收窄，当前四个 backend-refactor
+  prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`。
+- C++ normal backend 已删除 `maintenance_checkpoint`、`capacity_request`、`lock_scope_delta` 的状态推进入口；
+  这些 role 当前只作为 source evidence / provenance。
 - 当前 front-door workload audit 已确认 S1A/S1B 的 benchmark 入口请求形状与 prompt identity 对齐；cross 问题不是
   workload_report 层面的请求不一致。
 - 修复前 retained cross input audit 已证明旧输入契约不闭环：两向 high-risk roles 都包括 `request_tokens`、`lookup_path`、
@@ -63,9 +67,8 @@
   `input_contract_ready_for_non_async_correctness_claim=false`；`unsafe_roles_after_projection` 仍是
   `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`、`request_cache_lifecycle`。这使“当前不能把
   cross final diff 当 deterministic state-rule bug”成为机器可检查的结论，而不是只写在文档里的判断。
-- `capacity_request` 已修正为 target page-size 计数：当 fact 带 `requested_tokens` 时，按 target `page_size`
-  重算 requested pages，再触发对应次数的 modeled L1 eviction pressure；它仍不是 source victim oracle。headroom/free-space
-  假设已用真实 self-config 证伪，不能作为正常模型规则。
+- 历史 retained backend 曾尝试把 `capacity_request` 修正为 target page-size pressure；当前 atomic-refactor normal
+  backend 已删除该入口。capacity pressure 现在被归类为 target-derived mechanism/input-boundary，不是 normal fact。
 - 新增 `capacity_pressure_analysis` 后，cross capacity blocker 已确认不是 page-size-only：两向都是
   `page_size_only_explains_count=0`、`requested_tokens_differ_count=8`，并有 `4` 个 one-sided capacity event；
   首个 mismatch 是 S1A `requested_tokens=1057, requested_pages=9, page_size=128` vs S1B
@@ -79,24 +82,51 @@
   两向 `flush_write_through_acks=384`、`ready_to_load_host_cache=50` 对齐，`maintenance_check` 是 `592/596`
   或反向；pair 分类为 `check_kind_mismatch=348`、one-sided event `4`。首个 mismatch 是 index `108`，
   `maintenance_check` vs `ready_to_load_host_cache`。
-- `request_lifecycle_paths` 两向仍是 `0/150` temporal resolved、`150 unresolved`。C++ 当前对
-  `request_admission` / `request_cache_lifecycle` 只更新 request-scoped token store，不直接产生 resident/dirty/evicted
-  transition；因此 lifecycle 是 cross input-contract blocker，而不是当前 final-set 特化补丁入口。
+- `request_lifecycle_paths` 两向仍是 `0/150` temporal resolved、`150 unresolved`。C++ 当前不消费 lifecycle concrete
+  source path；正常机制改为 `request_admission` 保存 request context，`request_lifecycle_anchor` 触发
+  page-aligned insert。因此 lifecycle concrete path 仍不是 final-set 特化补丁入口。
 - 新增 lifecycle suffix 诊断后，`request_cache_lifecycle` 的分歧已从“path hash 不同”细化为：
   两向都有 `same_request_anchor_different_suffix=50`，首个真实 mismatch 是 index `4`，source/target 的同 request
   anchor hash 相同、anchor token count 都是 `5`，但 committed/generated suffix 都是 `9` tokens 且 hash 不同；
   另有 `both_missing_lifecycle_token_ids=26`、`one_side_missing_lifecycle_token_ids=24`。这说明 lifecycle path 把生成或
   fill/committed suffix 带入了 invariant 输入，不能靠 prompt/page-size projection 修正。
 
-最新真实 modeling 验证仍是修复前 retained 结果：
+最新真实 modeling 验证：
 
 ```text
-HCSV-20260612-async-elision-current-self-and-cross
+HCSV-20260612-backend-atomic-refactor
 ```
 
-当前 2026-06-12 input-contract repair 是 config/audit/fixture 层修复；真实 S1A/S1B profile 和 cross validation 需要在新契约下重跑。
+该结果基于 `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` 的同一 profile：
 
-最新 self-config 状态：
+| prediction | invariant coverage | final | 结论 |
+| --- | --- | --- | --- |
+| S1A self backend-refactor | true | fail | L2/backuped `67/67` 已对齐；L1 extra 7、evicted missing 7。 |
+| S1B self backend-refactor | true | fail | L1/dirty `28/28` 已对齐；L2/backuped/evicted `70/55`，missing 13、extra 28。 |
+| S1A -> S1B backend-refactor | true | fail | 与 S1B self 同形。 |
+| S1B -> S1A backend-refactor | true | fail | 与 S1A self 同形。 |
+
+逐 trace 结论：
+
+- first divergence 是 `lock_scope_inc_end:state_snapshot`，因为 lock/ref delta 当前仍是 source_actual，不是 normal
+  invariant；final locked `0/0`，但 transient state 不能声称对齐；
+- S1A final diff 来自 capacity/eviction pressure：oracle 中 7 个 page 经后续 `capacity_request` 从 L1 进入 evicted，
+  当前 normal invariant 没有 cross-safe capacity pressure；
+- S1B final diff 来自 host lifecycle / maintenance / prefetch visibility：oracle 中相关 pages 通过 capacity、
+  maintenance 或 prefetch visibility 后续清理，当前 normal invariant 没有这些 target-derived 边界；
+- 当前剩余问题应作为 mechanism/input-boundary 缺口处理，不能通过直接消费 source_actual 或围绕 final set 打补丁解决。
+
+Boundary-elision 诊断补充：
+
+| run | diagnostic injections | final | 分类 |
+| --- | ---: | --- | --- |
+| S1A self unlocked boundary-elided | 14 | pass | capacity pressure 8、lock-protected capacity 4、async checkpoint/source progress 2 |
+| S1B self unlocked boundary-elided | 24 | pass | capacity pressure 12、async checkpoint/source progress 8、async prefetch storage completion 2、lock-protected capacity 2 |
+
+这些 synthetic `diagnostic_state_injection` 只用于证明 residual final diff 来自 lock/capacity/prefetch/storage visibility
+边界，不是 normal prediction 的可消费输入。
+
+历史 2026-06-11 self-config 状态：
 
 | prediction | final | 结论 |
 | --- | --- | --- |
@@ -164,23 +194,24 @@ provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set �
 | `HCSM-D7` | P1 | lock/ref replay order 已修，完整 parent chain 仍需验证 | 2026-06-11 S1B self locked 已达 0/0；历史 cross-config 仍需复测 | 四向新 profile 完成后复测，不再把 S1B self locked 作为当前 P0。 |
 | `HCSM-D8` | P2 | ordered transition oracle 不足 | 目前主要看 final normalized sets | 后续加 transition provenance / exact oracle。 |
 | `HCSM-D9` | P2 | state-to-DAG patch 未实现 | `dag_mutations=0` | state final sets 通过后再进入 DAG mutation。 |
-| `HCSM-D10` | P0 | cross-config logical alignment / input contract 需要 backend validation 复核 | 修复前 audit 已证明前门请求一致，但旧正常输入混入 `request_tokens`、`lookup_path`、`insert_path`、`request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等 variant/cache-stage/control-flow facts；本轮 profile config 已改成 atomic fact，删除旧混合 role，并且 2026-06-12 15:38 的双向 atomic cross audit 已通过 `model_input_contract_ready=true` | 在新 profile 上重跑 self/cross modeling validation；若 final diff 仍存在，再归因到 async boundary、target-derived projection 缺口或 C++ state rule bug。 |
+| `HCSM-D10` | P1 | cross-config logical alignment / input contract backend validation 已完成，仍需机制闭环 | 2026-06-12 backend-refactor 四向 prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；self/cross 同 target 结果同形，说明 33-target atomic input contract 已进入 C++ 且 normal surface 已收窄 | 不再把当前失败归因到输入未消费；后续聚焦 lock/capacity/prefetch/storage visibility 的 target-derived 边界。 |
+| `HCSM-D11` | P0 | lock/capacity/prefetch/storage visibility 仍缺 normal target-derived mechanism | normal run：S1A final 剩 L1 extra 7 / evicted missing 7，S1B final 剩 L2/backuped/evicted `70/55`；boundary-elision 诊断中 S1A/S1B 分别注入 14/24 个 diagnostic boundary 后 final match | 设计新的 target-independent invariant 或 target-derived mechanism；不能直接消费 source_actual control-flow 序列，也不能围绕 final set 打补丁。 |
 
 ## 已收紧的规则
 
-### HCSM-F1：capacity_request 提供 target-size pressure，不提供 source victim
+### HCSM-F1：capacity_request 是 source evidence，不是 normal input
 
-`capacity_request` 是 capacity pressure checkpoint，不是 victim oracle。当前模型优先使用 `requested_tokens`
-和 target `page_size` 重算 requested pages；只有缺少 token count 时才回退到 source `requested_pages`。
-随后模型按这个 target page count 执行 L1 modeled eviction，victim 仍由 modeled LRU / lock / radix leaf group
-规则选择。它不能指定 source victim，也不能绕过 modeled evictable/lock 规则。
+`capacity_request` 是 source/control-flow pressure checkpoint，不是 normal atomic invariant input，也不是 victim oracle。
+当前 backend-refactor 已删除 `apply_capacity_request`，C++ normal prediction 不再解析
+`requested_pages_source/requested_tokens` 作为状态推进 fact。capacity pressure 只能通过 target-derived 机制或新的
+target-independent invariant 重新进入 normal model。
 
-已测试并拒绝的语义：把 `capacity_request` 解释成 target-side headroom/free-space 检查，也就是只有
+历史 retained backend 已测试并拒绝的语义：把 `capacity_request` 解释成 target-side headroom/free-space 检查，也就是只有
 `resident_pages + requested_pages > l1_capacity_pages` 时才淘汰。真实 self-config 验证显示该假设会让 S1A self
 从 pass 退化成 L1 extra `7` / evicted missing `7`，并扩大 S1B self 的 host/L2 diff。因此当前不把它作为正常模型规则。
 
-这个 retained fix 的边界必须保持清楚：它只说明“已经决定发生的同一个 capacity pressure event”应按 target page size
-计算需要释放多少页。它不说明 source trace 中出现的 `capacity_request` 序列可以跨 target 复用。真实 cross audit
+旧 retained fix 的边界必须保持清楚：它只说明“如果已经有合法 target-side capacity pressure event”，释放页数应按
+target page size 计算；它不说明 source trace 中出现的 `capacity_request` 序列可以跨 target 复用。真实 cross audit
 显示 S1A/S1B 的 capacity event 数量为 `8/12` 或 `12/8`，两向 `requested_tokens_differ_count=8`，
 `page_size_only_explains_count=0`，并有 `4` 个 one-sided event；首个 pair 是 S1A `1057/9@128` vs S1B
 `993/16@64`。因此 cross 中要解决的是 target capacity pressure sequence，而不是继续围绕 requested page count
@@ -309,8 +340,8 @@ missing 13、extra 14。scope 隔离后 raw model final 会保留两个 cache sc
 ### 当前实现
 
 - L1/L2 有显式 capacity；
-- `capacity_request` 按 `requested_tokens` 和 target `page_size` 重算 requested pages 后触发 L1 modeled eviction
-  pressure；victim 仍由 modeled LRU / lock skip / radix leaf group 决定；
+- normal backend 不再消费 source `capacity_request`；当前 capacity enforcement 只在 request-bound lookup、
+  lifecycle insert、prefetch 等 target-side state mutation 后按 modeled LRU / lock skip / radix leaf group 执行；
 - touch order 是简化 LRU；
 - dirty victim 触发 modeled writeback；
 - locked pages 会跳过；

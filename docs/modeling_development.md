@@ -162,15 +162,17 @@ atomic fact 契约，只把 `request_bound_match_anchor`、`request_lifecycle_an
 `prefetch_decision` 和 `prefetch_check_point` 作为正常 state 输入；其它 cache-stage concrete path、lifecycle path/runtime
 和 source control-flow role 都是 `source_actual` / `timing_observation` evidence。剩余主要问题：
 
-- `request_admission` 作为 request-scoped token context 进入 token store；当前不直接产生 resident/dirty mutation；
+- `request_bound_match_anchor` 执行 target-side lookup；`request_admission` 作为 request-scoped token context 进入 token
+  store；`request_lifecycle_anchor` 在 finished/unfinished 边界触发 page-aligned insert；
 - 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；`insert_path`、
   `capacity_request`、`lock_scope_delta` 和 `maintenance_checkpoint` 保留为 source evidence，不进入正常模型；
 - token radix tree 已按 `cache_scope` 做 token split/insert 隔离，但还没有完整 SGLang node parent/ref/host-ref 对等结构；
 - `state_index` 已集中 scoped page projection sets，L1/L2 capacity 按 `cache_scope` 统计和驱逐，但 evictable、priority、
   host ref 和 node-level ownership 仍是后续阶段；
-- write policy、capacity victim、async prefetch/load-back/writeback 仍沿用过渡规则；如果后续要重新启用
-  lifecycle/capacity/lock/maintenance 的正常输入，必须先通过 cross audit 的 `model_input_contract_ready`，不能直接复用
-  source trace 的 concrete path 或 control-flow 序列。
+- C++ normal backend 已删除 `maintenance_checkpoint`、`capacity_request`、`lock_scope_delta` 的状态推进入口，并收窄
+  `HiCacheFact`，不再解析 source observed/control-flow 字段作为模型 fact；如果后续要重新引入
+  lifecycle/capacity/lock/maintenance 语义，必须先定义 target-derived 机制或新的 target-independent atomic invariant，
+  不能直接复用 source trace 的 concrete path 或 control-flow 序列。
 
 后续 C++ 工作继续按下面的目标架构推进；旧 page-level state machine 不作为兼容对象保留。
 
@@ -186,7 +188,9 @@ consume fact iff model_input == true
 ```
 
 其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。`source_actual`、`timing_observation`、
-`oracle_state` 和 debug/provenance 字段只能进入 validation、diagnostics 或 profile quality。
+`oracle_state` 和 debug/provenance 字段不能更新 target state。C++ reader 会保留 `source_actual` / `timing_observation`
+事件，使 fact parser 能读取 token dictionary 和 provenance；router 仍只把 atomic invariant role 分发给 state
+mutation。
 
 当前 mainline S1A/S1B profiling 契约为 33 个 atomic target，正常 state model input 是其中 7 个 target / 5 个 role：
 
@@ -208,8 +212,8 @@ consume fact iff model_input == true
 
 当前 profile config 已删除 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 这类混合 role。match-prefix concrete
 path、lookup result、cache config、lifecycle path/runtime、insert/capacity/lock/maintenance 和 storage/controller 事件只作为
-`source_actual` / `timing_observation` evidence。后端仍必须显式处理每个真正进入模型的 invariant role；不能通过消费
-`source_actual` 事件绕过 role 缺口。unknown invariant role 应进入
+`source_actual` / `timing_observation` evidence。后端仍必须显式处理每个真正进入模型的 invariant role；不能通过让
+`source_actual` 事件直接更新 state 来绕过 role 缺口。unknown invariant role 应进入
 `missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
 
 cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant facts，逐 role 对比 count
@@ -252,7 +256,7 @@ HiCacheFactParser
 
 | 文件 | 目标 |
 | --- | --- |
-| `hicache_fact.*` | 只做 event/fact/schema 解析和 token dictionary 观察。 |
+| `hicache_fact.*` | 只做 event/fact/schema 解析和 token dictionary 观察；只保留 normal atomic 机制需要的 fact 字段。 |
 | `hicache_router.*` | role enum、输入门禁、required field 检查和错误分类。 |
 | `hicache_token_store.*` | token path/span/request mapping。 |
 | `hicache_target_pager.*` | token range 到 target page projection。 |
@@ -336,12 +340,16 @@ model_summary.json.modules[0].hicache
 
 ### 当前实现进度
 
-截至 2026-06-12 12:42，完成 HiCache state atomic fact 输入契约重构：
+截至 2026-06-12 18:20，完成 HiCache state atomic fact 输入契约与 C++ normal backend 收窄：
 
 - profile config 现在是 33 个 target-level atomic `fact` target，正常 state input 是 7 个 target / 5 个 role；
 - `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已删除，相关 callable 拆成 invariant anchor 与
   `source_actual` path/runtime evidence；
 - C++ router 已同步切到 atomic role gate，不再把 source/control-flow role 作为正常模型入口；
+- C++ state model 按 router enum dispatch，已删除不可达 legacy handler：
+  `apply_maintenance_checkpoint`、`apply_capacity_request`、`apply_lock_scope_delta`；
+- `HiCacheFact` 不再解析 `requested_pages_source`、`lock_direction`、
+  `matched/prefix/suffix/logical/token_span` 等 source observed/control-flow 字段；
 - cross audit 的 hard `model_input_contract` 按 atomic invariant role 比较 count 和 request-normalized canonical fact
   multiset，sequence mismatch 不再阻塞输入契约。
 
@@ -353,6 +361,19 @@ model_summary.json.modules[0].hicache
   `model_input_contract_ready=true`、blocking roles 为空；
 - S1A profile quality 的整体 `quality_ready=false` 只来自 source evidence `prefetch_transfer` 未观测到，不影响 normal
   model-input hard gate。
+
+截至 2026-06-12 18:20，基于当前 33-target atomic profile 完成 backend-refactor validation：
+
+- 四个 normal prediction 都只消费 `350` 个 atomic invariant end events：
+  `request_bound_match_anchor=100`、`request_lifecycle_anchor=100`、`request_admission=50`、
+  `prefetch_decision=50`、`prefetch_check_point=50`；
+- 四个 run 都是 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+- S1A target self/cross 同形：L2/backuped `67/67`，L1 `32/25` extra 7，evicted `35/42` missing 7；
+- S1B target self/cross 同形：L1/dirty `28/28`，L2/backuped/evicted `70/55`，missing 13、extra 28；
+- 排除 `locked_pages` 暂态后，boundary-elision 诊断可将 S1A/S1B final diff 分别通过 14/24 个
+  `diagnostic_state_injection` 对齐；分类集中在 target capacity pressure、lock-protected capacity victim eligibility
+  和 async prefetch/storage visibility；
+- 诊断注入只用于确认 residual mechanism/input-boundary，不是 normal prediction 的可消费输入。
 
 截至 2026-06-12 03:49，基于修复前 S1A/S1B 31-target fast-pressure suite 完成 async-elision 与 cross input-contract
 诊断；这些结果是本轮 demotion 的历史证据：
@@ -374,16 +395,18 @@ model_summary.json.modules[0].hicache
   `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`。因此现在还不能声称 cross 已排除 async 后无其他
   state-rule 问题；本轮已先把这些 source/control-flow 事件降级为 evidence/control-flow boundary，真实 cross run 仍需重跑。
 
-截至 2026-06-11 15:11，基于 S1B 31-target fast-pressure profile 完成一轮 backend 修正：
+截至 2026-06-11 15:11，基于 S1B 31-target fast-pressure profile 完成一轮历史 backend 修正；其中
+`request_cache_lifecycle`、`maintenance_checkpoint`、`capacity_request` 作为 normal role 的处理已在 2026-06-12
+atomic refactor 后删除或降级为 evidence-only：
 
 - router 接受 zero-token span：`begin == end` 的合法空路径不再被误报为缺 token dictionary；
 - `request_admission` / `request_cache_lifecycle` 不再被报为 unimplemented invariant role，而是更新 request scoped token store；
-- `maintenance_checkpoint` 不再被报为 unimplemented invariant role，当前作为显式 no-op 边界事件处理；
+- `maintenance_checkpoint` 不再被报为 unimplemented invariant role，历史实现中作为显式 no-op 边界事件处理；
 - fact replay 排序改为严格全局时间顺序，并在同 timestamp/scope 下使用 `seq_no` 破 ties，避免旧 comparator 的非全序导致
   lock/ref delta 乱序；
 - radix tree 和 L1/L2 capacity enforcement 改为按 `cache_scope` 隔离；raw model state 会保留两个 HiRadixCache scope，
   normalized validation 仍按 page hash union 对比 oracle；
-- `capacity_request` 接入 L1 modeled eviction pressure：当 fact 带 `requested_tokens` 时按 target `page_size`
+- 历史实现曾让 `capacity_request` 接入 L1 modeled eviction pressure：当 fact 带 `requested_tokens` 时按 target `page_size`
   重算 requested pages，再按 target eviction policy 选择 victim；不消费 source victim，也不把 cross source
   `params.num_tokens` 序列当作 target-independent 输入；
 - 最新 S1B self validation 的 `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`，`locked_pages` 已对齐
@@ -405,18 +428,22 @@ model_summary.json.modules[0].hicache
 
 ## HiCache 当前验证状态
 
-当前有效代码/配置状态是 2026-06-12 input-contract repair。最新真实 modeling 证据仍是修复前的
-`HCSV-20260612-async-elision-current-self-and-cross`，记录在 `docs/validation/hicache_state_validation.md`，只能作为
-降级变体输入的历史证据。修复前简要结论：
+当前有效代码/配置状态是 2026-06-12 backend atomic refactor。最新真实 modeling 证据是
+`HCSV-20260612-backend-atomic-refactor`，记录在
+`docs/validation/hicache_state_validation.md`。当前结论：
 
-- S1A self normal final state match；
-- S1B self normal final state mismatch 仅剩 L2/backuped/evicted，但模型侧 async-elision 后 final state match；
-- S1A->S1B 和 S1B->S1A 仍未通过，阻塞点是 cross input contract：lifecycle/control-flow facts 尚未证明
-  target-independent。
+- atomic profile config 下的 S1A/S1B profile、profile quality 和 cross audit 已完成，
+  `model_input_contract_ready=true`；
+- 四个 normal prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、
+  `non_invariant_fact_usage=[]`；
+- self/cross 对同一 target 的结果同形，说明前端 350 个 normal atomic invariant facts 已被 C++ 消费；
+- S1A target 剩余 L1 extra 7 / evicted missing 7；S1B target 剩余 L2/backuped/evicted `70/55`；
+- boundary-elision 诊断能把 S1A/S1B self final diff 对齐，分类集中在 capacity pressure、lock-protected victim
+  eligibility 和 async prefetch/storage visibility；
+- 当前不能称 normal prediction 通过，下一步是把这些 boundary 变成 target-derived 机制或新的 invariant 事件，而不是
+  恢复 source_actual 消费。
 
-atomic profile config 下的 S1A/S1B profile、profile quality 和 cross audit 已完成，当前
-`model_input_contract_ready=true`。旧 retained audit 不能再被解读为当前 atomic 正常输入契约下的失败结果；下一步是
-在新 profile 上重跑 modeling validation。
+旧 retained audit 不能再被解读为当前 atomic 正常输入契约下的失败结果；它只作为 demotion 的历史证据。
 
 下面的 2026-06-10 四向结果来自 atomic 契约之前的 profile，只能证明旧 page-level backend 不正确，不能作为当前
 33-target atomic 契约的验收结果。

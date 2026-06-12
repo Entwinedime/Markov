@@ -3,9 +3,10 @@
 
 This helper is diagnostic only. It reads predicted model transitions and
 oracle state snapshots, then compares normalized state sets at each completed
-oracle snapshot. The optional async-injection mode is still diagnostic only:
-it aligns the Python replay state to oracle at an async-looking divergence so
-the scan can continue, but it never changes the model or prediction output.
+oracle snapshot. The optional injection mode is still diagnostic only: it
+aligns the Python replay state to oracle at an async or input-boundary-looking
+divergence so the scan can continue, but it never changes the model or
+prediction output.
 """
 
 from __future__ import annotations
@@ -68,6 +69,19 @@ HOST_STORAGE_STATE_KEYS = {
     "prefetch_suppressed_pages",
 }
 
+LOCK_STATE_KEYS = {
+    "locked_pages",
+}
+
+CAPACITY_PRESSURE_STATE_KEYS = {
+    "l1_resident_pages",
+    "l2_resident_pages",
+    "dirty_pages",
+    "backuped_pages",
+    "evicted_pages",
+    "pending_writeback_pages",
+}
+
 TRANSITION_TO_STATE = {
     "add_l1_resident": ("l1_resident_pages", "add"),
     "remove_l1_resident": ("l1_resident_pages", "remove"),
@@ -108,9 +122,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--diagnostic-inject-async",
         action="store_true",
         help=(
-            "Diagnostic mode only: when a divergence is classified as async, "
+            "Diagnostic mode only: when a divergence is classified as async or an input-boundary gap, "
             "replace the replay state for the compared scope with oracle state "
-            "and continue scanning for non-async divergences."
+            "and continue scanning for non-elided divergences."
         ),
     )
     parser.add_argument(
@@ -413,6 +427,16 @@ def simplify_evidence_event(event: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def evidence_text(events: list[dict[str, Any]]) -> str:
+    pieces: list[str] = []
+    for event in events:
+        pieces.append(str(event.get("name") or ""))
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        for key in ("event_role", "target_id", "check_kind", "diagnostic_kind"):
+            pieces.append(str(args.get(key) or ""))
+    return " ".join(piece.lower() for piece in pieces if piece)
+
+
 def nearby_async_evidence(
     row: dict[str, Any],
     events_by_path: dict[str, list[dict[str, Any]]],
@@ -446,62 +470,140 @@ def nearby_async_evidence(
     return evidence
 
 
-def classify_async_divergence(diff: dict[str, Any], row: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
-    directions = diff_direction_counts(diff)
-    affected = affected_state_keys(diff)
-    text = event_text(row)
-    evidence_text = " ".join(str(event.get("name") or "").lower() for event in evidence)
-    evidence_fact_classes = {
-        str((event.get("args") if isinstance(event.get("args"), dict) else {}).get("fact_class") or "")
-        for event in evidence
-    }
-    has_source_async_evidence = bool(evidence_fact_classes.intersection(ASYNC_EVIDENCE_FACT_CLASSES)) and has_async_keyword(evidence_text)
-
-    if "prefetch" in text and directions["missing_in_model"] > 0 and directions["extra_in_model"] == 0:
-        if affected.issubset(HOST_STORAGE_STATE_KEYS):
-            return {
-                "is_async": True,
-                "classification": "async_prefetch_storage_completion",
-                "confidence": "high",
-                "reason": "prefetch checkpoint made host/storage pages visible in oracle, but completed page list is not invariant input",
-                "direction_counts": directions,
-                "affected_state_keys": sorted(affected),
-                "nearby_async_evidence_count": len(evidence),
-            }
-
-    if has_async_keyword(text) and has_source_async_evidence:
-        return {
-            "is_async": True,
-            "classification": "async_checkpoint_with_source_progress_evidence",
-            "confidence": "medium",
-            "reason": "divergence occurred at an async lifecycle/checkpoint event with nearby source_actual or timing_observation evidence",
-            "direction_counts": directions,
-            "affected_state_keys": sorted(affected),
-            "nearby_async_evidence_count": len(evidence),
-        }
-
-    if has_async_keyword(text) and affected.issubset(HOST_STORAGE_STATE_KEYS) and (
-        directions["missing_in_model"] == 0 or directions["extra_in_model"] == 0
-    ):
-        return {
-            "is_async": True,
-            "classification": "async_host_storage_lifecycle_candidate",
-            "confidence": "medium",
-            "reason": "host/storage-only one-direction diff at an async-looking lifecycle event",
-            "direction_counts": directions,
-            "affected_state_keys": sorted(affected),
-            "nearby_async_evidence_count": len(evidence),
-        }
-
+def boundary_classification(
+    *,
+    classification: str,
+    confidence: str,
+    reason: str,
+    is_async: bool,
+    diagnostic_elision_allowed: bool,
+    directions: dict[str, int],
+    affected: set[str],
+    evidence: list[dict[str, Any]],
+) -> dict[str, Any]:
     return {
-        "is_async": False,
-        "classification": "unresolved_or_non_async",
-        "confidence": "none",
-        "reason": "divergence does not match conservative async-elision patterns",
+        "is_async": is_async,
+        "is_diagnostic_boundary": diagnostic_elision_allowed,
+        "diagnostic_elision_allowed": diagnostic_elision_allowed,
+        "classification": classification,
+        "confidence": confidence,
+        "reason": reason,
         "direction_counts": directions,
         "affected_state_keys": sorted(affected),
         "nearby_async_evidence_count": len(evidence),
     }
+
+
+def classify_async_divergence(diff: dict[str, Any], row: dict[str, Any], evidence: list[dict[str, Any]]) -> dict[str, Any]:
+    directions = diff_direction_counts(diff)
+    affected = affected_state_keys(diff)
+    text = event_text(row)
+    nearby_text = evidence_text(evidence)
+    evidence_fact_classes = {
+        str((event.get("args") if isinstance(event.get("args"), dict) else {}).get("fact_class") or "")
+        for event in evidence
+    }
+    has_source_async_evidence = bool(evidence_fact_classes.intersection(ASYNC_EVIDENCE_FACT_CLASSES)) and has_async_keyword(nearby_text)
+
+    if affected.issubset(LOCK_STATE_KEYS) and ("lock" in text or "lock" in nearby_text):
+        return boundary_classification(
+            classification="lock_ref_transient_boundary",
+            confidence="high",
+            reason="lock/ref snapshots are source_actual transient boundaries; normal invariant input does not model lock deltas",
+            is_async=False,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    if affected.issubset(CAPACITY_PRESSURE_STATE_KEYS) and ("capacity" in text or "capacity" in nearby_text):
+        return boundary_classification(
+            classification="target_capacity_pressure_boundary",
+            confidence="high",
+            reason="device capacity pressure is target/control-flow derived and is not represented by a normal atomic invariant event",
+            is_async=False,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    if affected.issubset(CAPACITY_PRESSURE_STATE_KEYS) and ("lock" in text or "lock" in nearby_text):
+        return boundary_classification(
+            classification="lock_protected_capacity_boundary",
+            confidence="medium",
+            reason="lock/ref source boundaries can change capacity victim eligibility, but normal invariant input does not model lock deltas",
+            is_async=False,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    if "prefetch" in text and directions["missing_in_model"] > 0 and directions["extra_in_model"] == 0:
+        if affected.issubset(HOST_STORAGE_STATE_KEYS):
+            return boundary_classification(
+                classification="async_prefetch_storage_completion",
+                confidence="high",
+                reason="prefetch checkpoint made host/storage pages visible in oracle, but completed page list is not invariant input",
+                is_async=True,
+                diagnostic_elision_allowed=True,
+                directions=directions,
+                affected=affected,
+                evidence=evidence,
+            )
+
+    if has_async_keyword(text) and has_source_async_evidence:
+        return boundary_classification(
+            classification="async_checkpoint_with_source_progress_evidence",
+            confidence="medium",
+            reason="divergence occurred at an async lifecycle/checkpoint event with nearby source_actual or timing_observation evidence",
+            is_async=True,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    if has_async_keyword(text) and affected.issubset(HOST_STORAGE_STATE_KEYS) and (
+        directions["missing_in_model"] == 0 or directions["extra_in_model"] == 0
+    ):
+        return boundary_classification(
+            classification="async_host_storage_lifecycle_candidate",
+            confidence="medium",
+            reason="host/storage-only one-direction diff at an async-looking lifecycle event",
+            is_async=True,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    if affected.issubset(HOST_STORAGE_STATE_KEYS) and any(
+        keyword in text or keyword in nearby_text for keyword in ("maintenance", "writeback", "write_back", "storage", "release", "host")
+    ):
+        return boundary_classification(
+            classification="host_storage_visibility_boundary",
+            confidence="medium",
+            reason="host/storage visibility changed at a source lifecycle or maintenance boundary that normal invariant input does not encode",
+            is_async=False,
+            diagnostic_elision_allowed=True,
+            directions=directions,
+            affected=affected,
+            evidence=evidence,
+        )
+
+    return boundary_classification(
+        classification="unresolved_or_non_async",
+        confidence="none",
+        reason="divergence does not match conservative async/input-boundary elision patterns",
+        is_async=False,
+        diagnostic_elision_allowed=False,
+        directions=directions,
+        affected=affected,
+        evidence=evidence,
+    )
 
 
 def inject_oracle_state_for_scope(
@@ -652,7 +754,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             can_inject = (
                 args.diagnostic_inject_async
                 and args.compare_mode == "object"
-                and bool(classification.get("is_async"))
+                and bool(classification.get("diagnostic_elision_allowed", classification.get("is_async")))
                 and len(async_injections) < args.max_divergences
             )
             if can_inject:
@@ -674,13 +776,17 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
                     "oracle_snapshot": simplify_snapshot(row),
                     "model_records_applied": cursor,
                     "counts": state_counts(oracle_state),
-                    "matched_by_diagnostic_async_injection": True,
+                    "matched_by_diagnostic_boundary_injection": True,
                 }
                 continue
 
             if args.diagnostic_inject_async and args.compare_mode != "object":
-                divergence["diagnostic_injection_skipped_reason"] = "async injection currently supports object compare-mode only"
-            elif args.diagnostic_inject_async and bool(classification.get("is_async")) and len(async_injections) >= args.max_divergences:
+                divergence["diagnostic_injection_skipped_reason"] = "diagnostic injection currently supports object compare-mode only"
+            elif (
+                args.diagnostic_inject_async
+                and bool(classification.get("diagnostic_elision_allowed", classification.get("is_async")))
+                and len(async_injections) >= args.max_divergences
+            ):
                 divergence["diagnostic_injection_skipped_reason"] = "max divergence/injection limit reached"
             first_non_async_divergence = divergence
             divergences.append(divergence)
@@ -716,13 +822,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "model_transition_count": len(indexed_records),
         "diagnostic_async_injection_enabled": bool(args.diagnostic_inject_async),
         "diagnostic_async_injection_count": len(async_injections),
+        "diagnostic_boundary_injection_count": len(async_injections),
         "async_injections": async_injections,
+        "diagnostic_boundary_injections": async_injections,
         "divergence_count": len(divergences),
         "divergences": divergences,
         "first_divergence": first_divergence,
         "first_non_async_divergence": first_non_async_divergence,
         "matched_until_final_oracle_snapshot": first_divergence is None,
         "matched_after_diagnostic_async_elision_until_final_oracle_snapshot": first_non_async_divergence is None,
+        "matched_after_diagnostic_boundary_elision_until_final_oracle_snapshot": first_non_async_divergence is None,
         "final_counts": {
             "diagnostic_replay": state_counts(replay_final),
             "model_trace_final": state_counts(trace_final),

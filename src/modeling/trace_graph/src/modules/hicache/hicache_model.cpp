@@ -46,6 +46,18 @@ std::vector<std::string> slice_pages(const std::vector<std::string> & pages, siz
 
 std::vector<std::string> suffix_pages(const std::vector<std::string> & pages, size_t begin) { return slice_pages(pages, begin, pages.size()); }
 
+HiCacheTokenPath slice_token_path(const HiCacheTokenPath & tokens, size_t begin, size_t end) {
+    if (begin >= tokens.size() || begin >= end) return {};
+    end = std::min(end, tokens.size());
+    return {tokens.begin() + static_cast<long>(begin), tokens.begin() + static_cast<long>(end)};
+}
+
+size_t page_aligned_token_count(size_t token_count, uint64_t page_size) {
+    if (token_count == 0 || page_size == 0) return 0;
+    const auto page = static_cast<size_t>(page_size);
+    return token_count / page * page;
+}
+
 } // namespace
 
 std::string HiCacheState::digest() const {
@@ -69,20 +81,49 @@ std::vector<std::string> HiCacheState::pages_for_tokens(const HiCacheFact & fact
     return target_pager_.pages_for_tokens(fact, tokens);
 }
 
-HiCacheTokenPath HiCacheState::cache_stage_tokens_for_fact(const HiCacheFact & fact) const {
-    auto tokens = fact.full_path_tokens;
-    if (tokens.empty()) tokens = token_store_.request_tokens(fact);
-    if (tokens.empty()) return {};
-    if (!fact.request_id.empty()) return tokens;
-    return token_store_.target_cache_stage_tokens(fact, tokens, page_size_for_fact(fact));
+uint64_t HiCacheState::full_path_token_count(const HiCacheFact & fact) const {
+    if (fact.full_path_span.valid) {
+        if (fact.full_path_span.token_count > 0) return fact.full_path_span.token_count;
+        if (fact.full_path_span.end >= fact.full_path_span.begin) return fact.full_path_span.end - fact.full_path_span.begin;
+    }
+    if (fact.token_count > 0) return fact.token_count;
+    return static_cast<uint64_t>(fact.full_path_tokens.size());
 }
 
-uint64_t HiCacheState::target_requested_pages_for_fact(const HiCacheFact & fact) const {
-    if (fact.requested_tokens > 0) {
-        const auto page_size = page_size_for_fact(fact);
-        if (page_size > 0) return (fact.requested_tokens + page_size - 1) / page_size;
+uint64_t HiCacheState::projected_aligned_token_count(const HiCacheFact & fact) const {
+    const auto page_size = page_size_for_fact(fact);
+    if (page_size == 0) return 0;
+    const auto token_count = full_path_token_count(fact);
+    return token_count / page_size * page_size;
+}
+
+bool HiCacheState::needs_projected_pages(const HiCacheFact & fact) const { return projected_aligned_token_count(fact) > 0; }
+
+HiCacheTokenPath HiCacheState::projected_full_path_tokens_for_fact(const HiCacheFact & fact) const {
+    const auto desired = projected_aligned_token_count(fact);
+    if (desired == 0) return {};
+    const auto desired_size = static_cast<size_t>(desired);
+
+    auto slice_if_sufficient = [&](const HiCacheTokenPath & tokens) -> HiCacheTokenPath {
+        if (tokens.size() < desired_size) return {};
+        return slice_token_path(tokens, 0, desired_size);
+    };
+
+    if (!fact.full_path_tokens.empty()) {
+        auto tokens = slice_if_sufficient(fact.full_path_tokens);
+        if (!tokens.empty()) return tokens;
     }
-    return fact.requested_pages;
+
+    auto request_tokens = token_store_.request_tokens(fact);
+    if (!request_tokens.empty()) {
+        auto tokens = slice_if_sufficient(request_tokens);
+        if (!tokens.empty()) return tokens;
+    }
+    return {};
+}
+
+void HiCacheState::note_missing_projection_if_needed(const HiCacheFact & fact, HiCacheSummary & summary) const {
+    if (needs_projected_pages(fact)) summary.missing_invariant_facts["target_page_projection_tokens"]++;
 }
 
 std::set<std::string> * HiCacheState::tier_set(const std::string & tier) { return state_index_.tier_set(tier); }
@@ -124,28 +165,30 @@ uint64_t HiCacheState::tier_size_for_scope(const std::string & tier, const std::
 
 HiCacheTokenRadixTree & HiCacheState::radix_tree_for_fact(const HiCacheFact & fact) { return radix_trees_[normalized_scope(fact)]; }
 
-std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheSummary & summary) {
+std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
-    if (fact.role == "request_bound_match_anchor") {
+    switch (role) {
+    case HiCacheFactRole::RequestBoundMatchAnchor:
         apply_request_tokens(fact);
-        return transitions;
-    }
-    if (fact.role == "request_lifecycle_anchor") { return transitions; }
-    if (fact.role == "request_admission") {
-        apply_request_context(fact);
-        return transitions;
-    }
-    if (fact.role == "prefetch_decision") {
+        apply_request_bound_match_anchor(fact, summary, transitions);
+        break;
+    case HiCacheFactRole::RequestLifecycleAnchor:
+        apply_request_lifecycle_anchor(fact, summary, transitions);
+        break;
+    case HiCacheFactRole::RequestAdmission:
+        apply_request_context(fact, summary);
+        break;
+    case HiCacheFactRole::PrefetchDecision:
         apply_prefetch_decision(fact, summary, transitions);
-        return transitions;
-    }
-    if (fact.role == "prefetch_check_point") {
+        break;
+    case HiCacheFactRole::PrefetchCheckPoint:
         apply_prefetch_check_point(fact, summary, transitions);
-        return transitions;
-    }
-    if (fact.role == "diagnostic_state_injection") {
+        break;
+    case HiCacheFactRole::DiagnosticStateInjection:
         apply_diagnostic_state_injection(fact, summary, transitions);
-        return transitions;
+        break;
+    case HiCacheFactRole::Unknown:
+        break;
     }
     return transitions;
 }
@@ -168,16 +211,37 @@ void HiCacheState::apply_request_tokens(const HiCacheFact & fact) {
     token_store_.observe_request_bound_tokens(fact, fact.full_path_tokens);
 }
 
-void HiCacheState::apply_request_context(const HiCacheFact & fact) {
-    if (fact.full_path_tokens.empty()) return;
-    token_store_.set_request_tokens(fact, fact.full_path_tokens);
+void HiCacheState::apply_request_context(const HiCacheFact & fact, HiCacheSummary & summary) {
+    if (!fact.full_path_tokens.empty()) {
+        token_store_.set_request_tokens(fact, fact.full_path_tokens);
+        return;
+    }
+    auto tokens = projected_full_path_tokens_for_fact(fact);
+    if (!tokens.empty()) {
+        token_store_.set_request_tokens(fact, tokens);
+        return;
+    }
+    note_missing_projection_if_needed(fact, summary);
 }
 
-void HiCacheState::apply_lookup_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto tokens = cache_stage_tokens_for_fact(fact);
+void HiCacheState::apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                  std::vector<HiCacheStateTransition> & transitions) {
+    const auto kind = lower(fact.lifecycle_kind);
+    if (!kind.empty() && kind != "finished" && kind != "unfinished") return;
+    auto tokens = token_store_.request_tokens(fact);
+    if (tokens.empty()) return;
+    apply_request_lifecycle_insert(fact, summary, transitions);
+}
+
+void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                    std::vector<HiCacheStateTransition> & transitions) {
+    auto tokens = projected_full_path_tokens_for_fact(fact);
+    if (tokens.empty()) {
+        note_missing_projection_if_needed(fact, summary);
+        return;
+    }
     auto pages = pages_for_tokens(fact, tokens);
     if (pages.empty()) return;
-    token_store_.set_request_tokens(fact, tokens);
     token_store_.observe_request_bound_tokens(fact, tokens);
 
     auto & radix_tree = radix_tree_for_fact(fact);
@@ -205,8 +269,20 @@ void HiCacheState::apply_lookup_path(const HiCacheFact & fact, HiCacheSummary & 
     enforce_capacity(fact, summary, transitions, "L1");
 }
 
-void HiCacheState::apply_insert_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto tokens = cache_stage_tokens_for_fact(fact);
+void HiCacheState::apply_request_lifecycle_insert(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                  std::vector<HiCacheStateTransition> & transitions) {
+    auto tokens = projected_full_path_tokens_for_fact(fact);
+    if (tokens.empty()) {
+        tokens = token_store_.request_tokens(fact);
+        if (!tokens.empty()) {
+            const auto desired = page_aligned_token_count(tokens.size(), page_size_for_fact(fact));
+            tokens = slice_token_path(tokens, 0, desired);
+        }
+    }
+    if (tokens.empty()) {
+        note_missing_projection_if_needed(fact, summary);
+        return;
+    }
     auto full_pages = pages_for_tokens(fact, tokens);
     if (full_pages.empty()) return;
     token_store_.set_request_tokens(fact, tokens);
@@ -238,8 +314,11 @@ void HiCacheState::apply_insert_path(const HiCacheFact & fact, HiCacheSummary & 
 }
 
 void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    auto tokens = fact.full_path_tokens;
-    if (tokens.empty()) tokens = token_store_.request_tokens(fact);
+    auto tokens = projected_full_path_tokens_for_fact(fact);
+    if (tokens.empty()) {
+        note_missing_projection_if_needed(fact, summary);
+        return;
+    }
     auto full_pages = pages_for_tokens(fact, tokens);
     if (full_pages.empty()) return;
     token_store_.set_request_tokens(fact, tokens);
@@ -292,35 +371,6 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     }
     release_prefetch_host_buffer(fact);
     pending_prefetch_pages_.erase(it);
-}
-
-void HiCacheState::apply_maintenance_checkpoint(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto kind = lower(fact.check_kind);
-    if (!kind.empty() && kind != "maintenance_check" && kind != "flush_write_through_acks") return;
-    drain_writeback_queue(fact, summary, transitions);
-    if (kind.empty() || kind == "maintenance_check") apply_pending_prefetch_host_pressure_for_scope(fact, summary, transitions);
-}
-
-void HiCacheState::apply_capacity_request(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto requested_pages = target_requested_pages_for_fact(fact);
-    if (requested_pages > 0) evict_lru_pages(fact, summary, transitions, "L1", requested_pages);
-    enforce_capacity(fact, summary, transitions, "L1");
-    enforce_capacity(fact, summary, transitions, "L2");
-}
-
-void HiCacheState::apply_lock_scope_delta(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    summary.lock_state_events++;
-    auto pages = pages_for_tokens(fact, fact.logical_path_tokens);
-    if (pages.empty()) return;
-    const bool increment = fact.lock_direction == "inc" || fact.lock_direction == "increase" || fact.lock_direction == "+";
-    for (const auto & page : pages) {
-        if (increment) {
-            state_index_.increment_lock_count(fact.cache_scope, page);
-            mark_locked(fact, summary, transitions, page);
-            continue;
-        }
-        if (state_index_.decrement_lock_count(fact.cache_scope, page)) { clear_locked(fact, summary, transitions, page); }
-    }
 }
 
 std::string HiCacheState::page_for_scope(const HiCacheFact & fact, const std::string & page) const {
@@ -442,11 +492,6 @@ uint64_t HiCacheState::active_prefetch_host_pages_for_scope(const std::string & 
     return pages;
 }
 
-bool HiCacheState::request_key_in_scope(const std::string & request_key, const std::string & scope) const {
-    const auto prefix = scope + ":";
-    return request_key.rfind(prefix, 0) == 0;
-}
-
 void HiCacheState::apply_pending_prefetch_host_pressure_for_request(const HiCacheFact & fact, HiCacheSummary & summary,
                                                                     std::vector<HiCacheStateTransition> & transitions,
                                                                     const std::string & request_key) {
@@ -457,24 +502,6 @@ void HiCacheState::apply_pending_prefetch_host_pressure_for_request(const HiCach
         apply_prefetch_host_pressure(fact, summary, transitions, active_it->second);
     }
     pending_prefetch_host_pressure_requests_.erase(pending_it);
-}
-
-void HiCacheState::apply_pending_prefetch_host_pressure_for_scope(const HiCacheFact & fact, HiCacheSummary & summary,
-                                                                  std::vector<HiCacheStateTransition> & transitions) {
-    const auto scope = normalized_scope(fact);
-    std::vector<std::string> request_keys;
-    for (const auto & request_key : pending_prefetch_host_pressure_requests_) {
-        if (request_key_in_scope(request_key, scope)) request_keys.push_back(request_key);
-    }
-    std::sort(request_keys.begin(), request_keys.end(), [&](const auto & left, const auto & right) {
-        const auto left_it = prefetch_decision_ts_.find(left);
-        const auto right_it = prefetch_decision_ts_.find(right);
-        const auto left_ts = left_it == prefetch_decision_ts_.end() ? 0 : left_it->second;
-        const auto right_ts = right_it == prefetch_decision_ts_.end() ? 0 : right_it->second;
-        if (left_ts != right_ts) return left_ts < right_ts;
-        return left < right;
-    });
-    for (const auto & request_key : request_keys) apply_pending_prefetch_host_pressure_for_request(fact, summary, transitions, request_key);
 }
 
 void HiCacheState::release_prefetch_host_buffer(const HiCacheFact & fact) {
@@ -603,14 +630,6 @@ void HiCacheState::complete_writeback_page(const HiCacheFact & fact, HiCacheSumm
     add_resident(fact, summary, transitions, "L2", page);
     mark_backuped(fact, summary, transitions, page);
     clear_dirty(fact, summary, transitions, page);
-}
-
-void HiCacheState::drain_writeback_queue(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto scope = normalized_scope(fact);
-    auto it = pending_writeback_pages_by_scope_.find(scope);
-    if (it == pending_writeback_pages_by_scope_.end() || it->second.empty()) return;
-    std::vector<std::string> pages(it->second.begin(), it->second.end());
-    for (const auto & page : pages) complete_writeback_page(fact, summary, transitions, page);
 }
 
 void HiCacheState::apply_prefetch_host_pressure(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
@@ -850,7 +869,7 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
 
         summary.processed_hicache_events++;
         summary.processed_events_by_role[fact.role]++;
-        auto transitions = state_.apply_fact(fact, summary);
+        auto transitions = state_.apply_fact(fact, route.role, summary);
         summary.transition_trace.insert(summary.transition_trace.end(), transitions.begin(), transitions.end());
     }
     auto final_transitions = state_.finalize(summary);
@@ -873,7 +892,7 @@ HiCacheSummary HiCacheStateModel::run(DagGraph & graph) {
     if (!summary.missing_invariant_facts.empty()) summary.warnings.push_back("Some HiCache target-state inputs are missing token invariant facts.");
     if (summary.dirty_eviction_events > 0) summary.warnings.push_back("Dirty page eviction triggered modeled writeback state transitions.");
     if (summary.processed_events_by_role.count("diagnostic_state_injection") > 0)
-        summary.warnings.push_back("Diagnostic oracle state injections were applied; this run is async-elided diagnosis, not a normal prediction.");
+        summary.warnings.push_back("Diagnostic oracle state injections were applied; this run is boundary-elided diagnosis, not a normal prediction.");
     summary.warnings.push_back(
         "HiCacheModule consumes only invariant_state facts; source_actual/timing_observation/oracle_state are ignored for target state.");
     summary.warnings.push_back("HiCacheModule maintains state only; no DAG mutations are applied.");

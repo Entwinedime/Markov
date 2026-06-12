@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Build a diagnostic HiCache trace with oracle injections at async divergences.
+"""Build a diagnostic HiCache trace with oracle injections at boundary divergences.
 
 This helper is deliberately outside the normal modeling path. It consumes a
 divergence report produced with ``--diagnostic-inject-async`` and writes a new
 trace containing synthetic ``diagnostic_state_injection`` events. Those events
-let the C++ model continue from oracle-aligned state after an async boundary,
-so downstream deterministic rules are re-evaluated instead of merely replayed.
+let the C++ model continue from oracle-aligned state after an async/input
+boundary, so downstream deterministic rules are re-evaluated instead of merely
+replayed.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ def build_injection_event(
     compare_scope = str(injection.get("compare_scope") or "")
     ts = snapshot_logical_time_us(row) + index + 1
     event = {
-        "name": "hicache_diagnostic_async_state_injection_end",
+        "name": "hicache_diagnostic_boundary_state_injection_end",
         "cat": "python_probe",
         "ph": "X",
         "ts": ts,
@@ -113,12 +114,13 @@ def build_injection_event(
             "fact_granularity": "atomic",
             "cache_scope": compare_scope,
             "seq_no": 9_000_000 + index,
-            "diagnostic_kind": "async_elision_oracle_injection",
+            "diagnostic_kind": "boundary_elision_oracle_injection",
             "diagnostic_source": "oracle_state_snapshot",
             "source_snapshot_order": row.get("order"),
             "source_snapshot_event_name": row.get("event_name"),
             "source_snapshot_ts": row.get("ts"),
             "async_classification": injection.get("async_classification", {}),
+            "boundary_classification": injection.get("async_classification", {}),
             "diagnostic_state": state,
         },
     }
@@ -138,6 +140,7 @@ def build_injection_event(
             "object_id": row.get("object_id"),
         },
         "async_classification": injection.get("async_classification", {}),
+        "boundary_classification": injection.get("async_classification", {}),
         "state_counts": {key: len(value) for key, value in state.items()},
     }
     return event, manifest_row
@@ -148,7 +151,7 @@ def build_augmented_trace(args: argparse.Namespace) -> dict[str, Any]:
     report = load_json(args.divergence_report)
     injections = report.get("async_injections")
     if not isinstance(injections, list) or not injections:
-        raise ValueError("divergence report contains no async_injections")
+        raise ValueError("divergence report contains no diagnostic boundary injections")
 
     oracle_paths = args.oracle_trace or [args.base_trace]
     rows_by_order = snapshot_rows_by_order(oracle_paths)
@@ -201,7 +204,7 @@ def build_augmented_trace(args: argparse.Namespace) -> dict[str, Any]:
         "state_keys": state_keys,
         "injection_count": len(injection_events),
         "injections": manifest_rows,
-        "note": "Diagnostic only: synthetic events consume oracle_state to elide async divergences.",
+        "note": "Diagnostic only: synthetic events consume oracle_state to elide async/input-boundary divergences.",
     }
     manifest_path = args.output_dir / "async_elision_manifest.json"
     write_json(manifest_path, manifest)

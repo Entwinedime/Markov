@@ -2,6 +2,95 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-12 18:20:00 +0800
+
+- 按“后端彻底收窄正常输入、不要残留 source/control-flow 推断入口”的方向完成 C++ HiCache backend refactor：
+  - `HiCacheState::apply_fact` 改为按 router enum dispatch，不再在 state model 内重复用 role 字符串分支；
+  - 删除不可达的 legacy normal role handler：`apply_maintenance_checkpoint`、`apply_capacity_request`、
+    `apply_lock_scope_delta`；
+  - 删除旧 cache-stage projection helper `target_cache_stage_tokens`；
+  - `HiCacheFact` 只保留当前 atomic invariant 机制需要的字段，不再解析 `requested_pages_source`、
+    `lock_direction`、`matched/prefix/suffix/logical/token_span` 等 source observed/control-flow 字段进模型 fact；
+  - `lock_state_events` summary 字段删除，lock/ref delta 目前只作为诊断边界，不再暗示 normal model 会消费 lock delta。
+- 诊断脚本从“async-only”扩展为 boundary-elision：
+  - `hicache_state_trace_divergence.py` 新增 `lock_ref_transient_boundary`、
+    `target_capacity_pressure_boundary`、`lock_protected_capacity_boundary`、
+    `host_storage_visibility_boundary` 分类；
+  - `diagnostic_elision_allowed` 与 `is_async` 分离，lock/capacity 这类非 async 输入边界不再被强行标成 async；
+  - `hicache_state_async_elision.py` 生成 `boundary_elision_oracle_injection` 诊断事件，仍通过
+    `diagnostic_state_injection` role 进入 C++，不改变 normal prediction 口径。
+- 本地验证：
+  - `cmake --build build --target trace_graph -j2`
+  - `python3 -m py_compile scripts/internal/hicache_state_trace_divergence.py scripts/internal/hicache_state_async_elision.py`
+  - `git diff --check`
+- 在同一 33-target profile 上重跑四个 normal prediction，输出目录：
+  - S1A self：`01_s1a_manual/modeling/atomic_s1a_self_backend_refactor`
+  - S1B self：`03_s1b_manual/modeling/atomic_s1b_self_backend_refactor`
+  - S1A -> S1B：`01_s1a_manual/modeling/atomic_s1a_to_s1b_backend_refactor`
+  - S1B -> S1A：`03_s1b_manual/modeling/atomic_s1b_to_s1a_backend_refactor`
+- normal prediction 结果未因删除 legacy 入口而退化：
+  - 四个 run 都是 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、
+    `non_invariant_fact_usage=[]`；
+  - C++ 只处理 `350` 个 normal atomic invariant end events：
+    `request_bound_match_anchor=100`、`request_lifecycle_anchor=100`、`request_admission=50`、
+    `prefetch_decision=50`、`prefetch_check_point=50`；
+  - S1A target self/cross 同形：L2/backuped `67/67`，L1 `32/25` extra 7，evicted `35/42` missing 7；
+  - S1B target self/cross 同形：L1/dirty `28/28`，L2/backuped/evicted `70/55`，missing 13、extra 28。
+- boundary-elision 诊断结果：
+  - 排除 `locked_pages` 暂态后，S1A self 逐 trace 诊断注入 `14` 个 boundary，分类为
+    `target_capacity_pressure_boundary=8`、`lock_protected_capacity_boundary=4`、
+    `async_checkpoint_with_source_progress_evidence=2`，Python replay final 与 oracle 对齐；
+  - S1B self 逐 trace 诊断注入 `24` 个 boundary，分类为
+    `target_capacity_pressure_boundary=12`、`async_checkpoint_with_source_progress_evidence=8`、
+    `async_prefetch_storage_completion=2`、`lock_protected_capacity_boundary=2`，Python replay final 与 oracle 对齐；
+  - 生成 synthetic trace 后，C++ diagnostic run 也通过：S1A processed `diagnostic_state_injection=14`、
+    S1B processed `diagnostic_state_injection=24`，两者 `final_state_match=true`；
+  - 该结果只证明 residual diff 来自 lock/capacity/prefetch/storage visibility 边界，不是 normal model 可以直接消费
+    oracle/source state 的理由。
+
+## 2026-06-12 16:47:00 +0800
+
+- 对 33-target atomic profile 重跑 prediction 后确认 C++ backend 没有对齐前端重构：
+  - 旧结果中 S1A self `state_transition_count=0`，S1B self 也只处理了少量 path role；
+  - 根因之一是 `chrome_trace_io.cpp` 把所有 `model_input=false` 事件都过滤掉，导致 source_actual 里的 token
+    dictionary/provenance 在 C++ 第一遍扫描时不可见；
+  - router 还把“有 `full_path_span` 描述但 token ids 尚未解析”的 path role 拦成
+    `token_dictionary_or_full_path_span`；
+  - state model 仍停在旧语义：`request_bound_match_anchor` 不执行 lookup，`request_lifecycle_anchor` 不触发 insert。
+- 完成 C++ backend alignment：
+  - Chrome trace reader 只过滤 `oracle_state` / `debug_quality` / state snapshot 等 validation-only event，不再把所有
+    `model_input=false` 当成不可读事件；
+  - source_actual/timing 事件仍不进入 state mutation，只用于 token dictionary 水合和 provenance；
+  - router 接受有效 `full_path_span` descriptor，把是否能投影 target pages 留给 state model 机制判断；
+  - `request_bound_match_anchor` 建立 request token anchor 并执行 target-side lookup；
+  - `request_admission` 保存可投影 request path context；
+  - `request_lifecycle_anchor` 在 finished/unfinished 边界用 request context 触发 page-aligned insert；
+  - token store 不再用更短的 page-aligned projection 覆盖更长的 request anchor。
+- 本地检查：
+  - `git diff --check`
+  - `cmake --build build --target trace_graph -j2`
+- 在同一 profile 上重跑四个 prediction，输出目录：
+  - S1A self：`01_s1a_manual/modeling/atomic_s1a_self_backend_align`
+  - S1B self：`03_s1b_manual/modeling/atomic_s1b_self_backend_align`
+  - S1A -> S1B：`01_s1a_manual/modeling/atomic_s1a_to_s1b_backend_align`
+  - S1B -> S1A：`03_s1b_manual/modeling/atomic_s1b_to_s1a_backend_align`
+- 新结果：
+  - 四个 run 都是 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`；
+  - source profile side 的 C++ `processed_hicache_events=350`，五个 atomic invariant role 全部处理；
+  - S1A target 的 self/cross normalized final：L2/backuped `67/67` 已对齐，L1 `32/25` extra 7，
+    evicted `35/42` missing 7；
+  - S1B target 的 self/cross normalized final：L1/dirty `28/28` 已对齐，L2/backuped/evicted `70/55`，
+    missing 13、extra 28。
+- 逐 trace / provenance 结论：
+  - first divergence 仍出现在 `lock_scope_inc_end:state_snapshot`，因为 lock/ref delta 仍是 source_actual，不是 normal
+    invariant；final locked 仍为 `0/0`，但 trace-level transient 不能声称对齐；
+  - S1A final 余量是 capacity/eviction pressure 机制缺口：oracle 后续通过 `capacity_request` 让 7 个 page 离开 L1
+    并进入 evicted，当前 normal invariant 没有 cross-safe capacity pressure 输入；
+  - S1B final 余量是 host lifecycle / maintenance / prefetch visibility 机制缺口：oracle 中 extra pages 会被
+    capacity、maintenance 或 prefetch visibility 后续清掉，当前 normal invariant 不包含这些 target-derived 边界；
+  - 因此当前错误不应归因到 final-set 特化规则，而是 backend mechanism/input-boundary 仍未覆盖
+    lock/capacity/maintenance/host lifecycle。
+
 ## 2026-06-12 15:38:20 +0800
 
 - 新的 33-target atomic S1A/S1B profile 已完成：

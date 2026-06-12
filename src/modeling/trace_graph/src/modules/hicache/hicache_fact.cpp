@@ -237,40 +237,17 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.request_id = event.arg("request_id");
     fact.operation_id = event.arg("operation_id", event.arg("node_id"));
     fact.cache_scope = event.arg("cache_scope", event.pid.empty() ? "-1" : event.pid);
-    fact.lock_direction = lower(event.arg("lock_direction"));
     fact.check_kind = event.arg("check_kind", event.arg("checkpoint_kind"));
     fact.lifecycle_kind = event.arg("lifecycle_kind");
-    fact.write_policy = lower(event.arg("write_policy"));
-    fact.prefetch_policy = lower(event.arg("prefetch_policy"));
     fact.seq_no = event.arg_u64("seq_no", 0);
     fact.source_page_size = event.arg_u64("source_page_size", event.arg_u64("page_size", 0));
     fact.token_count = event.arg_u64("token_count", 0);
-    fact.matched_token_len = event.arg_u64("matched_token_len", 0);
-    fact.requested_tokens = event.arg_u64("requested_tokens", 0);
-    fact.completed_tokens = event.arg_u64("completed_tokens", 0);
-    fact.byte_count = event.arg_u64("bytes", 0);
     fact.model_input = bool_arg(event, "model_input", false);
     fact.dag_input = bool_arg(event, "dag_input", false);
 
-    auto requested_pages_source = parse_json_fragment(event.arg("requested_pages_source"));
-    if (requested_pages_source.is_object()) {
-        fact.requested_pages = json_u64_value(requested_pages_source, "requested_pages", 0);
-        if (fact.requested_tokens == 0) fact.requested_tokens = json_u64_value(requested_pages_source, "requested_tokens", 0);
-    }
-
     fact.full_path_span = parse_span(event, "full_path_span");
-    fact.matched_span = parse_span(event, "matched_span");
-    fact.prefix_span = parse_span(event, "prefix_span");
-    fact.suffix_span = parse_span(event, "suffix_span");
-    fact.logical_path_span = parse_span(event, "logical_path_span");
-    fact.token_span = parse_span(event, "token_span");
 
     fact.full_path_tokens = resolve_span(fact.full_path_span);
-    fact.matched_tokens = resolve_span(fact.matched_span);
-    fact.prefix_tokens = resolve_span(fact.prefix_span);
-    fact.suffix_tokens = resolve_span(fact.suffix_span);
-    fact.logical_path_tokens = resolve_span(fact.logical_path_span);
-    fact.io_tokens = resolve_span(fact.token_span);
 
     auto diagnostic_state = parse_json_fragment(event.arg("diagnostic_state"));
     if (diagnostic_state.is_object()) {

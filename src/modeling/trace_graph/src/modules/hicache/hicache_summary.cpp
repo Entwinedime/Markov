@@ -43,7 +43,6 @@ std::string HiCacheSummary::to_json() const {
     root["state_transition_count"] = state_transition_count;
     root["dag_mutations"] = dag_mutations;
     root["dirty_eviction_events"] = dirty_eviction_events;
-    root["lock_state_events"] = lock_state_events;
     root["skipped_non_invariant_events"] = skipped_non_invariant_events;
     root["target_config"] = {
         {"page_size", target_config.page_size},

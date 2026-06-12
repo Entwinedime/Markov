@@ -14,8 +14,6 @@ class HiCacheTokenPathStore {
     void set_request_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens);
     void observe_request_bound_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens);
     HiCacheTokenPath request_tokens(const HiCacheFact & fact) const;
-    HiCacheTokenPath target_cache_stage_tokens(const HiCacheFact & fact, const HiCacheTokenPath & observed_tokens,
-                                               uint64_t target_page_size) const;
 
   private:
     struct RequestBoundAnchor {

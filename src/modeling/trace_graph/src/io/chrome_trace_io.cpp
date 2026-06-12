@@ -68,17 +68,11 @@ std::string lower_string(std::string value) {
     return value;
 }
 
-bool false_like_arg(const std::unordered_map<std::string, std::string> & args, const std::string & key) {
-    auto it = args.find(key);
-    if (it == args.end()) return false;
-    auto value = lower_string(it->second);
-    return value == "false" || value == "0" || value == "no" || value == "off";
-}
-
 bool validation_only_event(const TraceEvent & event) {
     // validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
     // 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
-    if (false_like_arg(event.args, "model_input")) return true;
+    auto fact_class = lower_string(event.arg("fact_class"));
+    if (fact_class == "oracle_state" || fact_class == "debug_quality") return true;
     auto kind = lower_string(event.arg("event_kind"));
     return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff" || kind == "profiling_quality";
 }

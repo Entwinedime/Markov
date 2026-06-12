@@ -14,7 +14,7 @@ bool needs_full_path(HiCacheFactRole role) {
 bool has_complete_full_path(const HiCacheFact & fact, uint64_t effective_page_size) {
     if (!fact.full_path_tokens.empty()) return true;
     if (fact.full_path_span.valid && fact.full_path_span.begin == fact.full_path_span.end) return true;
-    if (fact.full_path_span.valid) return false;
+    if (fact.full_path_span.valid) return true;
     return effective_page_size == 0 || fact.token_count < effective_page_size;
 }
 

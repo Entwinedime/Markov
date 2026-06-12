@@ -39,37 +39,19 @@ struct HiCacheFact {
     std::string request_id;
     std::string operation_id;
     std::string cache_scope;
-    std::string lock_direction;
     std::string check_kind;
     std::string lifecycle_kind;
-    std::string write_policy;
-    std::string prefetch_policy;
     uint64_t seq_no = 0;
     uint64_t source_page_size = 0;
     uint64_t token_count = 0;
-    uint64_t matched_token_len = 0;
-    uint64_t requested_tokens = 0;
-    uint64_t requested_pages = 0;
-    uint64_t completed_tokens = 0;
-    uint64_t byte_count = 0;
     bool model_input = false;
     bool dag_input = false;
     bool is_start = false;
     bool is_end = false;
 
     HiCacheTokenSpan full_path_span;
-    HiCacheTokenSpan matched_span;
-    HiCacheTokenSpan prefix_span;
-    HiCacheTokenSpan suffix_span;
-    HiCacheTokenSpan logical_path_span;
-    HiCacheTokenSpan token_span;
 
     HiCacheTokenPath full_path_tokens;
-    HiCacheTokenPath matched_tokens;
-    HiCacheTokenPath prefix_tokens;
-    HiCacheTokenPath suffix_tokens;
-    HiCacheTokenPath logical_path_tokens;
-    HiCacheTokenPath io_tokens;
     std::unordered_map<std::string, std::vector<std::string>> diagnostic_state_pages;
 };
 

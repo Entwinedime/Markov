@@ -67,24 +67,22 @@ HiCache state prediction 必须同时满足：
   sequence mismatch 只作为诊断输出；
 - HCSV-20260610 四向结果仍来自 12-target 旧 profile；`HCSV-20260612-async-elision-current-self-and-cross` 是 atomic
   contract 前的 retained audit 证据；当前 33-target atomic profile/cross audit 结果记录在
-  `HCSV-20260612-atomic-input-contract`；
+  `HCSV-20260612-atomic-input-contract`，当前 C++ backend refactor 结果记录在
+  `HCSV-20260612-backend-atomic-refactor`；
 - 2026-06-11 起，当前 `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1*.json`
   已切到 fast-pressure 小容量口径；下面 HCSV-20260610 表格中的 `64/145`、`128/321` 是历史验证使用的
   archived target config，不是当前默认 modeling config；
 - target pages 由 C++ 按 token path 和 target `page_size` 生成，不再消费 `target_page_identity_page64/128`；
 - zero-token span 是合法空路径，不再被 backend 当作缺 token dictionary；
 - `request_admission` 当前更新 request scoped token store，不直接产生 resident/dirty mutation；
-- `maintenance_checkpoint`、`capacity_request` 和 `lock_scope_delta` 只作为 source evidence；若未来要用于正常模型，必须先定义
-  新的 target-independent atomic invariant 或 target-derived 机制；
-- legacy `maintenance_checkpoint` 处理仍不能消费 observed write/load ack 或 source host release page list；
+- `maintenance_checkpoint`、`capacity_request` 和 `lock_scope_delta` 只作为 source evidence；C++ normal router/model 已删除
+  这些 role 的状态推进入口。若未来要使用这些语义，必须先定义新的 target-independent atomic invariant 或
+  target-derived 机制；
 - fact replay 使用严格全局时间顺序；同 timestamp/scope 下再用 `seq_no` 破 ties，避免 lock/ref delta 乱序；
 - token radix tree 和 L1/L2 capacity enforcement 按 `cache_scope` 隔离；validation 默认仍用 `strip_scope` 的 normalized
   page hash union 与 oracle 对比；
 - host eviction pressure 当前使用 token radix 派生出的 page-level compressed radix projection 选择 host leaf group，
   避免只按 insert full path leaf group 淘汰导致 parent host leaf 漏删；
-- legacy `capacity_request` 不是 source victim oracle；如果历史 invariant trace 提供该 fact，backend 在同一
-  capacity-pressure event 已成立的前提下按 target `page_size` 重算 requested pages，再按 modeled LRU/lock/radix 规则触发
-  L1 eviction pressure；
 - current cross-config 不能把 source `capacity_request` 视为 normal invariant input：修复前 audit 显示 S1A/S1B 不只是
   `requested_pages` 因 page size 不同，连 `requested_tokens` 和事件数量也不同；当前 config 保留它为 `source_actual`
   evidence；
@@ -144,6 +142,99 @@ source/cache-stage 事件混入 invariant role。
 本条是 config/profile/audit 层结果，不是新的真实 S1A/S1B modeling 结果。下一步在该 run 上重跑 self-config /
 cross-config modeling validation。
 
+### HCSV-20260612-backend-atomic-refactor
+
+目的：在 `HCSV-20260612-atomic-input-contract` 的同一 33-target profile 上重跑 prediction，并确认 C++ backend
+正常状态推进只消费前端 atomic invariant contract，不保留 legacy source/control-flow 推断入口。
+
+代码修正：
+
+- `chrome_trace_io.cpp` 不再把所有 `model_input=false` 事件过滤掉；只过滤 `oracle_state`、`debug_quality` 和
+  state snapshot 等 validation-only 事件；
+- `source_actual` / `timing_observation` 仍不更新 target state，但会保留给 token dictionary 水合和 provenance；
+- router 接受有效 `full_path_span` descriptor，不再要求 parser 已经解析出完整 token ids 才允许 role 进入机制层；
+- state model 接入 target-derived 基础机制：
+  `request_bound_match_anchor -> lookup`、`request_admission -> request context`、
+  `request_lifecycle_anchor -> page-aligned insert`、`prefetch_decision/check_point -> prefetch state`。
+- `HiCacheState::apply_fact` 按 router enum dispatch，不再在 state model 内维护第二套 role 字符串分支；
+- 删除不可达 legacy handler：`apply_maintenance_checkpoint`、`apply_capacity_request`、`apply_lock_scope_delta`；
+- `HiCacheFact` 不再解析 `requested_pages_source`、`lock_direction`、
+  `matched/prefix/suffix/logical/token_span` 等 source observed/control-flow 字段作为模型 fact；
+- `diagnostic_state_injection` 仍保留为显式诊断入口，normal prediction 不使用。
+
+输出目录：
+
+| direction | output |
+| --- | --- |
+| S1A self | `20260612_053153/.../01_s1a_manual/modeling/atomic_s1a_self_backend_refactor` |
+| S1B self | `20260612_053153/.../03_s1b_manual/modeling/atomic_s1b_self_backend_refactor` |
+| S1A -> S1B | `20260612_053153/.../01_s1a_manual/modeling/atomic_s1a_to_s1b_backend_refactor` |
+| S1B -> S1A | `20260612_053153/.../03_s1b_manual/modeling/atomic_s1b_to_s1a_backend_refactor` |
+
+覆盖率 / 消费结果：
+
+| run | invariant coverage | missing invariant facts | non-invariant usage | processed invariant end events | model transitions |
+| --- | --- | --- | --- | ---: | ---: |
+| S1A self | true | none | `[]` | 350 | 1890 |
+| S1B self | true | none | `[]` | 350 | 3388 |
+| S1A -> S1B | true | none | `[]` | 350 | 3388 |
+| S1B -> S1A | true | none | `[]` | 350 | 1890 |
+
+C++ normal processed role set：
+
+| role | end events |
+| --- | ---: |
+| `request_bound_match_anchor` | 100 |
+| `request_lifecycle_anchor` | 100 |
+| `request_admission` | 50 |
+| `prefetch_decision` | 50 |
+| `prefetch_check_point` | 50 |
+
+normalized final 结果：
+
+| target | source profile | L1 | dirty | L2 | backuped | evicted | 结论 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| S1A | S1A | `32/25` | `0/0` | `67/67` | `67/67` | `35/42` | L2/backuped 已对齐；L1 extra 7、evicted missing 7。 |
+| S1A | S1B | `32/25` | `0/0` | `67/67` | `67/67` | `35/42` | 与 S1A self 同形。 |
+| S1B | S1B | `28/28` | `28/28` | `70/55` | `70/55` | `70/55` | L1/dirty 已对齐；L2/backuped/evicted missing 13、extra 28。 |
+| S1B | S1A | `28/28` | `28/28` | `70/55` | `70/55` | `70/55` | 与 S1B self 同形。 |
+
+逐 trace 结论：
+
+- first divergence 仍出现在 `lock_scope_inc_end:state_snapshot`：lock/ref delta 是 `source_actual`，当前 normal invariant
+  不覆盖 transient lock state；final locked 仍是 `0/0`；
+- S1A final diff 的 provenance 指向 capacity/eviction pressure：oracle 通过后续 `capacity_request` 把 7 个 page 从
+  L1 移到 evicted，当前 normal invariant 不包含 cross-safe capacity pressure；
+- S1B final diff 的 provenance 指向 host lifecycle / maintenance / prefetch visibility：oracle 中相应 pages 后续被
+  capacity、maintenance 或 prefetch visibility 清掉，当前 normal invariant 不包含这些 target-derived 边界；
+- 因此本轮 prediction 失败不是“没有消费事件”或 final-set 特化规则问题；backend 只消费 350 个 normal atomic invariant
+  end event，剩余是 lock/capacity/maintenance/host lifecycle mechanism/input-boundary 不完整。
+
+Boundary-elision 诊断：
+
+| diagnostic run | normal source | diagnostic injections | final | class summary |
+| --- | --- | ---: | --- | --- |
+| S1A self unlocked boundary-elided | S1A self backend-refactor | 14 | pass | `target_capacity_pressure_boundary=8`, `lock_protected_capacity_boundary=4`, `async_checkpoint_with_source_progress_evidence=2` |
+| S1B self unlocked boundary-elided | S1B self backend-refactor | 24 | pass | `target_capacity_pressure_boundary=12`, `async_checkpoint_with_source_progress_evidence=8`, `async_prefetch_storage_completion=2`, `lock_protected_capacity_boundary=2` |
+
+诊断输出：
+
+| run | output |
+| --- | --- |
+| S1A unlocked trace report | `01_s1a_manual/modeling/atomic_s1a_self_backend_refactor/trace_divergence_boundary_elision_unlocked.json` |
+| S1B unlocked trace report | `03_s1b_manual/modeling/atomic_s1b_self_backend_refactor/trace_divergence_boundary_elision_unlocked.json` |
+| S1A C++ diagnostic model | `01_s1a_manual/modeling/diagnostic_boundary_elided_unlocked_s1a` |
+| S1B C++ diagnostic model | `03_s1b_manual/modeling/diagnostic_boundary_elided_unlocked_s1b` |
+
+诊断解释：
+
+- full trace scan 的首个分歧仍是 `lock_ref_transient_boundary`；排除 `locked_pages` 后，resident/dirty/backuped/evicted
+  的 remaining diff 可由 capacity、lock-protected capacity victim eligibility、prefetch/storage visibility 边界解释；
+- synthetic trace 中的 `diagnostic_state_injection` 只是 oracle-state 辅助诊断：S1A C++ diagnostic run 消费 14 个该 role，
+  S1B 消费 24 个该 role，二者 final state match；
+- 这不能作为 normal prediction 通过结论，只说明当前 residual 是缺 target-derived mechanism 或缺新 invariant event，而不是
+  source profile 输入没有进 C++。
+
 ### HCSV-20260612-async-elision-current-self-and-cross
 
 目的：在 atomic contract 前的 fast-pressure S1A/S1B suite 上，区分 HiCache state model 的 deterministic bug 与
@@ -174,7 +265,7 @@ Capacity target page-size refinement：
 
 - `capacity_request.requested_pages_source.requested_pages` 是 source page-size 下的页数；cross prediction 不能直接把它当
   target page count；
-- 当前 C++ 在 fact 带 `requested_tokens` 时使用 target `page_size` 重算 requested pages，只有缺少 token count 时才回退到
+- 历史 retained backend 在 fact 带 `requested_tokens` 时使用 target `page_size` 重算 requested pages，只有缺少 token count 时才回退到
   source `requested_pages`；
 - `capacity_request` 仍只提供 eviction pressure，不提供 source victim list，victim 由 modeled LRU / lock / radix 规则决定；
 - 这只是修正“同一个 capacity request 在不同 target page size 下应释放多少页”的局部语义，不能证明 cross
@@ -393,7 +484,7 @@ Normalized final-state diff：
 - lock/ref final set 从旧 S1B 31-target self 的 `26/0 extra` 修为 `0/0 match`，root cause 是 replay ordering；
 - radix tree 和 capacity enforcement 已按 `cache_scope` 隔离；raw model final state 保留两个 cache scope，normalized
   final diff 与 scope 隔离前一致，说明当前 normalized mismatch 主因不在跨 scope 污染；
-- `capacity_request` 不消费 source victim；当前按 `requested_tokens` 和 target `page_size` 重算 requested pages，
+- `capacity_request` 不消费 source victim；历史 retained backend 按 `requested_tokens` 和 target `page_size` 重算 requested pages，
   再用 modeled LRU/lock/radix 选择 L1 victim；
 - host eviction pressure 改用 page-level compressed radix projection，修复 parent host leaf group 漏删；
 - 与前置 `s1b_self_scope_isolated` 相比，L1 从 `32/28` 收敛到 `28/28`，dirty 从 `31/28` 收敛到 `28/28`，
