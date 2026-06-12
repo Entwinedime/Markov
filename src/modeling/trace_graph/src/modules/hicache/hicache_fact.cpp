@@ -150,6 +150,18 @@ HiCacheTokenPath slice_tokens(const HiCacheTokenPath & tokens, uint64_t begin, u
     return {tokens.begin() + static_cast<long>(begin), tokens.begin() + static_cast<long>(end)};
 }
 
+std::vector<std::string> json_string_array(const Json & object, const std::string & key) {
+    std::vector<std::string> result;
+    if (!object.is_object()) return result;
+    auto it = object.find(key);
+    if (it == object.end() || !it->is_array()) return result;
+    for (const auto & item : *it) {
+        auto text = json_string_value(Json{{"value", item}}, "value");
+        if (!text.empty()) result.push_back(text);
+    }
+    return result;
+}
+
 } // namespace
 
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
@@ -210,6 +222,7 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.event_name = event.name;
     fact.target_id = event.arg("target_id");
     fact.fact_class = event.arg("fact_class");
+    fact.fact_granularity = event.arg("fact_granularity");
     fact.role = event.arg("event_role");
     if (fact.role.empty()) fact.role = "unknown";
     fact.phase = event.arg("phase");
@@ -225,7 +238,8 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.operation_id = event.arg("operation_id", event.arg("node_id"));
     fact.cache_scope = event.arg("cache_scope", event.pid.empty() ? "-1" : event.pid);
     fact.lock_direction = lower(event.arg("lock_direction"));
-    fact.check_kind = event.arg("check_kind");
+    fact.check_kind = event.arg("check_kind", event.arg("checkpoint_kind"));
+    fact.lifecycle_kind = event.arg("lifecycle_kind");
     fact.write_policy = lower(event.arg("write_policy"));
     fact.prefetch_policy = lower(event.arg("prefetch_policy"));
     fact.seq_no = event.arg_u64("seq_no", 0);
@@ -235,9 +249,8 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.requested_tokens = event.arg_u64("requested_tokens", 0);
     fact.completed_tokens = event.arg_u64("completed_tokens", 0);
     fact.byte_count = event.arg_u64("bytes", 0);
-    fact.model_input = bool_arg(event, "model_input", true);
+    fact.model_input = bool_arg(event, "model_input", false);
     fact.dag_input = bool_arg(event, "dag_input", false);
-    fact.state_model_input = bool_arg(event, "state_model_input", false);
 
     auto requested_pages_source = parse_json_fragment(event.arg("requested_pages_source"));
     if (requested_pages_source.is_object()) {
@@ -258,6 +271,15 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.suffix_tokens = resolve_span(fact.suffix_span);
     fact.logical_path_tokens = resolve_span(fact.logical_path_span);
     fact.io_tokens = resolve_span(fact.token_span);
+
+    auto diagnostic_state = parse_json_fragment(event.arg("diagnostic_state"));
+    if (diagnostic_state.is_object()) {
+        for (const auto & key :
+             {"l1_resident_pages", "l2_resident_pages", "dirty_pages", "backuped_pages", "evicted_pages", "locked_pages"}) {
+            auto pages = json_string_array(diagnostic_state, key);
+            if (!pages.empty() || diagnostic_state.contains(key)) fact.diagnostic_state_pages[key] = std::move(pages);
+        }
+    }
     return fact;
 }
 

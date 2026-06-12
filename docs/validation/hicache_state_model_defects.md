@@ -5,24 +5,132 @@
 
 ## 当前前提
 
-截至 2026-06-11：
+截至 2026-06-12：
 
-- profiling 已切到 token/range invariant contract；
-- 当前 mainline S1A/S1B profiling 契约已收紧为 31 个 target，其中 16 个 `invariant_state` 是唯一状态模型输入；
-- C++ backend 必须只消费 `fact_class=invariant_state && state_model_input=true`；
+- profiling 已切到 target-level atomic fact contract；
+- 当前 mainline S1A/S1B profiling 契约保留 33 个 target，正常状态模型输入是 7 个 target / 5 个 role：
+  `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、`prefetch_decision`、
+  `prefetch_check_point`；
+- C++ backend 必须只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic` 且 role 属于
+  已知 atomic invariant 的事件；
 - target pages 必须由 token dictionary/span 和 target `page_size` 重建；
+- backend radix tree 和 L1/L2 capacity enforcement 已按 `cache_scope` 隔离；当前有效 correctness 仍看 `strip_scope`
+  normalized page hash union；
 - source_actual、timing_observation、oracle_state 不更新 target state；
-- 旧 2026-06-10 S1A/S1B profile 的 `non_invariant_fact_usage=[]` 已在 self-config 和 cross-config 四个方向中达成；
-- 旧 2026-06-10 profile quality 和 invariant coverage 均为 ready，但该 run 仍是 12-target 旧采集契约；
-- 四个方向的 final state 全部与 normalized oracle 不匹配，说明旧 page-level backend 不正确。
+- 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；match-prefix concrete
+  path、lifecycle path/runtime、`insert_path`、`capacity_request`、`lock_scope_delta` 和具体 `maintenance_checkpoint`
+  target 当前都是 source evidence；
+- cross audit 的 hard `model_input_contract` 只比较 atomic invariant stream，逐 role 检查 count、sequence 和 canonical
+  fact value；
+- 旧 2026-06-10 S1A/S1B profile 的 `non_invariant_fact_usage=[]` 已在 self-config 和 cross-config 四个方向中达成，
+  但该 run 仍是 12-target 旧采集契约，只作为历史诊断；
+- 2026-06-11 S1B 31-target host-node-projection self prediction 已达成 `invariant_coverage_ready=true`、
+  `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+- 当前 S1B self 的 L1/dirty/locked final sets 已与 normalized oracle 对齐；normal prediction 的剩余 mismatch 集中在
+  L2/backuped/evicted，且已通过模型侧 diagnostic async-elision 证明该 self-config final diff 来自
+  async/input-boundary 分岔后的连锁状态差，而不是已知 deterministic final-set model bug。
+- 当前 S1A self normal prediction 已 final state match；但 trace scan 仍可见 `locked_pages` 暂态差异，归类为
+  snapshot/input-boundary 暂态。
+- 修复前 cross-config 仍未通过，且还不能做 timestamp oracle injection：S1A/S1B 执行窗口不重叠，`capacity_request`、
+  `lock_scope_delta` 和 request token sequence 也尚未证明 target-independent。
+- 当前 front-door workload audit 已确认 S1A/S1B 的 benchmark 入口请求形状与 prompt identity 对齐；cross 问题不是
+  workload_report 层面的请求不一致。
+- 修复前 retained cross input audit 已证明旧输入契约不闭环：两向 high-risk roles 都包括 `request_tokens`、`lookup_path`、
+  `insert_path`、`request_cache_lifecycle`。增强审计显示 `request_tokens` / `lookup_path` 两边事件数和 binding
+  shape 一致，都是 `150` 个 completed event、`100 request_bound + 50 unbound`，但第 16 个 unbound event 已是
+  S1A `768` tokens vs S1B `832` tokens；`insert_path` 两边都是 `100` 个 completed event 且全部 unbound，
+  第 8 个 event 也已是 `768` vs `832`。这里的 `request_tokens` 记录 `HiRadixCache.match_prefix(params.key)`
+  的 cache-stage key path，不保证等同于 HTTP 原始 prompt。
+- 修复前 contract layer 审计进一步显示：`request_bound_match_prefix_paths` 两向都是 `200/200` aligned；blocking
+  layers 是 `unbound_match_prefix_paths`、`insert_paths`、`request_lifecycle_paths`。因此下一步应拆分
+  request-scoped front-door token facts 与 cache-stage/control-flow path facts，而不是继续 patch L1/L2/evicted 规则。
+- request-bound anchor 审计显示 unbound/insert path 多数能解释为 exact request-bound path 或按 source page size
+  向下对齐后的 request-bound token prefix；新增 temporal anchor 后，`unbound_match_prefix_paths` / `insert_paths`
+  在两向真实 audit 中都是 `100/100` temporal resolved：S1A->S1B 为 `96 exact + 0 candidate + 4 empty`，
+  S1B->S1A 为 `36 exact + 60 candidate + 4 empty`。这说明它们更像 request-bound token facts 经 page-size /
+  cache-stage anchor 派生出的 path，不应继续作为 direct source unbound path 被 normal cross model 消费。
+- 修复前新增 projection gate 后，`projection_ready_layers` 两向都是 `insert_paths` 和 `unbound_match_prefix_paths`；
+  `contract_blocking_layers_after_projection` 两向收敛为 `request_lifecycle_paths` 和
+  `source_control_flow_checkpoints`。也就是说 unbound/insert 已经是可机制化投影目标，真正阻断 cross async-elision
+  proof 的是 lifecycle/control-flow 输入契约。
+- `after_projection_blockers` 进一步显示两向剩余 blocker 是同一组 role：
+  `request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`。其中
+  `request_admission`、`prefetch_decision`、`prefetch_check_point` 当前 role-level aligned，不是 after-projection
+  blocker。
+- 修复前新增 `normal_model_input_contract` 后，两向 retained cross audit 都明确输出
+  `contract_status=blocked_by_input_contract`、`input_contract_ready_for_cross_state_rule_diagnosis=false`、
+  `input_contract_ready_for_non_async_correctness_claim=false`；`unsafe_roles_after_projection` 仍是
+  `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`、`request_cache_lifecycle`。这使“当前不能把
+  cross final diff 当 deterministic state-rule bug”成为机器可检查的结论，而不是只写在文档里的判断。
+- `capacity_request` 已修正为 target page-size 计数：当 fact 带 `requested_tokens` 时，按 target `page_size`
+  重算 requested pages，再触发对应次数的 modeled L1 eviction pressure；它仍不是 source victim oracle。headroom/free-space
+  假设已用真实 self-config 证伪，不能作为正常模型规则。
+- 新增 `capacity_pressure_analysis` 后，cross capacity blocker 已确认不是 page-size-only：两向都是
+  `page_size_only_explains_count=0`、`requested_tokens_differ_count=8`，并有 `4` 个 one-sided capacity event；
+  首个 mismatch 是 S1A `requested_tokens=1057, requested_pages=9, page_size=128` vs S1B
+  `requested_tokens=993, requested_pages=16, page_size=64`。因此 source `capacity_request` 记录的是 target/control-flow
+  pressure sequence，不能直接作为 cross-safe normal invariant input。
+- 新增 `lock_scope_analysis` 后，cross lock/ref blocker 的性质也更清楚：两向 inc/dec 在各自 stream 内都平衡且
+  net delta 都是 `0`，但 pair 分类包含 path mismatch `228`、direction mismatch `166` 和 one-sided event `44`；
+  首个有效 mismatch 是 index `17`，S1A `inc` 768-token page-aligned prefix 对 S1B empty-path `dec`。所以 final
+  locked `0/0` 不代表 cross lock/ref delta 序列可作为 normal input 复用。
+- 新增 `maintenance_checkpoint_analysis` 后，maintenance blocker 主要是 checkpoint schedule / async polling 差异：
+  两向 `flush_write_through_acks=384`、`ready_to_load_host_cache=50` 对齐，`maintenance_check` 是 `592/596`
+  或反向；pair 分类为 `check_kind_mismatch=348`、one-sided event `4`。首个 mismatch 是 index `108`，
+  `maintenance_check` vs `ready_to_load_host_cache`。
+- `request_lifecycle_paths` 两向仍是 `0/150` temporal resolved、`150 unresolved`。C++ 当前对
+  `request_admission` / `request_cache_lifecycle` 只更新 request-scoped token store，不直接产生 resident/dirty/evicted
+  transition；因此 lifecycle 是 cross input-contract blocker，而不是当前 final-set 特化补丁入口。
+- 新增 lifecycle suffix 诊断后，`request_cache_lifecycle` 的分歧已从“path hash 不同”细化为：
+  两向都有 `same_request_anchor_different_suffix=50`，首个真实 mismatch 是 index `4`，source/target 的同 request
+  anchor hash 相同、anchor token count 都是 `5`，但 committed/generated suffix 都是 `9` tokens 且 hash 不同；
+  另有 `both_missing_lifecycle_token_ids=26`、`one_side_missing_lifecycle_token_ids=24`。这说明 lifecycle path 把生成或
+  fill/committed suffix 带入了 invariant 输入，不能靠 prompt/page-size projection 修正。
 
-最新有效验证：
+最新真实 modeling 验证仍是修复前 retained 结果：
 
 ```text
-HCSV-20260610-four-way-s1a-s1b
+HCSV-20260612-async-elision-current-self-and-cross
 ```
 
-核心 diff：
+当前 2026-06-12 input-contract repair 是 config/audit/fixture 层修复；真实 S1A/S1B profile 和 cross validation 需要在新契约下重跑。
+
+最新 self-config 状态：
+
+| prediction | final | 结论 |
+| --- | --- | --- |
+| S1A self normal | pass | final sets 全对齐；locked 暂态差异不作为 final bug。 |
+| S1B self normal | fail | L2/backuped/evicted `56/55`，missing `13`，extra `14`。 |
+| S1B self async-elided | pass | C++ 模型侧诊断注入 6 个 async checkpoint 后 L2/backuped/evicted `55/55`。 |
+
+S1B normal diff：
+
+| tier | model/oracle | missing | extra | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| L1 resident | 28/28 | 0 | 0 | 已对齐 |
+| dirty | 28/28 | 0 | 0 | 已对齐 |
+| L2 resident / backuped | 56/55 | 13 | 14 | normal prediction 受 async/input-boundary 阻塞 |
+| evicted | 56/55 | 13 | 14 | normal prediction 受 async/input-boundary 阻塞 |
+| locked | 0/0 | 0 | 0 | 已对齐 |
+
+旧 `20260611_050859` 逐 trace 首个分岔：
+
+- last matched：`hicache_maintenance_check_end:state_snapshot`，order `4200`，L1/dirty `28`，
+  L2/backuped/evicted `56`；
+- first divergence：`hicache_prefetch_check_point_end:state_snapshot`，order `4204`，ts `1781155586790332`，
+  scope `rank:unknown:HiRadixCache:281452413813520`；
+- oracle 在该 checkpoint 把 L2/backuped/evicted 从 `56` 推到 `69`，model 仍是 `56`；
+- missing 的 13 页与同 timestamp 的 source-only prefetch progress `operation_hash_pages` 对齐，但该 source evidence
+  不能作为 target state 输入。
+
+当前 `20260611_054436` 诊断补充：
+
+- 包含 locked 时，trace scan 首先碰到 capacity/maintenance 附近 `locked_pages` 暂态差异；final locked 仍是 `0/0`；
+- 排除 locked 后，S1B self trace scan 注入 6 个 async 分岔；
+- Python replay 注入后仍显示 capacity 附近 L2/backuped/evicted extra `14`，但 C++ 模型侧 async-elision final match，
+  说明该 extra 是 async 分岔后的连锁状态差，不是单独的最终模型 bug。
+
+历史 2026-06-10 四向 diff：
 
 | prediction | L1 resident | L2 resident / backuped | dirty | evicted | locked |
 | --- | --- | --- | --- | --- | --- |
@@ -46,29 +154,42 @@ provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set �
 
 | ID | 等级 | 缺陷 | 当前表现 | 下一步 |
 | --- | --- | --- | --- | --- |
-| `HCSM-D1` | P0 | L1/L2 resident 与 evicted 生命周期错误 | 四向均缺 L1 resident；S1A target 同时有 evicted missing/extra | 逐 page 追 transition，优先看 lookup/load-back、clear_evicted、promotion 与 capacity eviction。 |
-| `HCSM-D2` | P0 | L2/backuped 写入与保留规则不准 | S1A target 低估 L2/backuped；S1B target 既 missing 又 extra | 分开验证 write-through-selective hit threshold、write-back flush、L2 eviction 后 backuped 语义。 |
-| `HCSM-D3` | P0 | capacity / evictable / leaf group 近似不足 | S1B target raw L2/backuped/evicted 被推到 capacity 321，normalized extra 60-62 | 对比 victim 选择、locked skip、leaf group、touch order 和 dirty victim 规则。 |
-| `HCSM-D4` | P1 | radix tree 仍是 page-level 近似，不是完整 SGLang node/ref 结构 | prefix/split 复杂时可能错 resident/evicted | 补 token-level node provenance 或完善 radix split/merge 模型。 |
-| `HCSM-D5` | P1 | async prefetch scheduler exact 仍不可观测 | wait_complete checkpoint 全量 ready 已收紧；exact ready set 仍非 final-state oracle 目标 | 不从 checkpoint 强推 completion；后续需要 ordered prefetch completion 才做 exact。 |
-| `HCSM-D6` | P0 | write-back background flush 尚未闭环 | S1B self dirty 64/72，L2/backuped 170/144 且 extra 62 | 追 flush enqueue/io、dirty clear、backuped 标记、dirty eviction 的顺序。 |
-| `HCSM-D7` | P0 | lock/ref parent chain 仅按 logical path pages，未完整绑定 target radix parent chain | S1B self locked 0/22，S1B->S1A locked 0/11；S1A source 的 lock 能对齐 S1B target | 先查 source profile lock_scope_delta 如何绑定 target radix parent chain。 |
+| `HCSM-D1` | P1 | Resident / evicted lifecycle 历史回归仍需复测 | 当前 S1B self L1/dirty/locked 已对齐；历史 S1A 仍有 L1 missing / evicted extra 样本 | 新 S1A profile 可用后复测，不再用当前 S1B 做 L1 小修。 |
+| `HCSM-D2` | P1 | L2/backuped/evicted lifecycle 仍需在 cross 中复核 | S1B self normal 为 56/55，missing 13、extra 14；模型侧 async-elision 后 55/55 match | self-config 不继续打补丁；cross logical alignment 后再判断是否仍有 cleanup/victim 问题。 |
+| `HCSM-D3` | P1 | capacity / evictable / leaf group 仍是近似 | host projection 修复已把 maintenance 分岔消除；完整 node/ref/evictable 仍未实现 | 当前不继续局部修 leaf group，等 async prefetch 分岔解除后再逐 trace 评估 victim。 |
+| `HCSM-D4` | P1 | token radix tree 仍不是完整 SGLang node/ref 结构 | prefix/split 复杂时可能错 resident/evicted | 补 token-level node provenance 或完善 radix split/merge 模型。 |
+| `HCSM-D5` | P0 | async prefetch completion / storage insert 不可由当前 checkpoint 推导 | S1B self 的 normal mismatch 已由模型侧 async-elision 归因到该边界 | 不加“best_effort 全 pending 完成”特化规则；正常 prediction 仍需 target async model 或新增 invariant 字段。 |
+| `HCSM-D6` | P1 | write-back background flush / host release 尚未完整证明 | 当前 S1B dirty 已 28/28；write-back 不再是首个分岔，但仍可能影响后续 final extra | async prefetch 分岔解除后再追 dirty eviction、flush completion、host release 和 L2 eviction。 |
+| `HCSM-D7` | P1 | lock/ref replay order 已修，完整 parent chain 仍需验证 | 2026-06-11 S1B self locked 已达 0/0；历史 cross-config 仍需复测 | 四向新 profile 完成后复测，不再把 S1B self locked 作为当前 P0。 |
 | `HCSM-D8` | P2 | ordered transition oracle 不足 | 目前主要看 final normalized sets | 后续加 transition provenance / exact oracle。 |
 | `HCSM-D9` | P2 | state-to-DAG patch 未实现 | `dag_mutations=0` | state final sets 通过后再进入 DAG mutation。 |
+| `HCSM-D10` | P0 | cross-config logical alignment / input contract 未闭环 | 修复前 audit 已证明前门请求一致，但旧正常输入混入 `request_tokens`、`lookup_path`、`insert_path`、`request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等 variant/cache-stage/control-flow facts；本轮 profile config 已改成 atomic fact，删除旧混合 role，并用 hard `model_input_contract` 检查真实会进入模型的 5 个 atomic role | 在 atomic profile config 下重跑 S1A/S1B profile、profile quality、两向 cross audit 和 modeling validation；只有 `model_input_contract_ready=true` 后，才把 cross-only final diff 继续归因到 async boundary、target-derived projection 缺口或 C++ state rule bug。 |
 
 ## 已收紧的规则
 
-### HCSM-F1：capacity_request 不再强制选择 victim
+### HCSM-F1：capacity_request 提供 target-size pressure，不提供 source victim
 
-`capacity_request.requested_pages` 是 allocation pressure，不是 victim oracle。模型现在只把该事件作为容量检查点，
-仅当 modeled tier 已超过 target capacity 时由正常 capacity enforcement 淘汰。fixture 已更新为不再要求
-`capacity_request` 精确淘汰 requested pages。
+`capacity_request` 是 capacity pressure checkpoint，不是 victim oracle。当前模型优先使用 `requested_tokens`
+和 target `page_size` 重算 requested pages；只有缺少 token count 时才回退到 source `requested_pages`。
+随后模型按这个 target page count 执行 L1 modeled eviction，victim 仍由 modeled LRU / lock / radix leaf group
+规则选择。它不能指定 source victim，也不能绕过 modeled evictable/lock 规则。
 
-四向影响有限：
+已测试并拒绝的语义：把 `capacity_request` 解释成 target-side headroom/free-space 检查，也就是只有
+`resident_pages + requested_pages > l1_capacity_pages` 时才淘汰。真实 self-config 验证显示该假设会让 S1A self
+从 pass 退化成 L1 extra `7` / evicted missing `7`，并扩大 S1B self 的 host/L2 diff。因此当前不把它作为正常模型规则。
 
-- S1B self L1 missing 从 46 降到 44，L2/backuped/evicted extra 从 64 降到 62；
-- S1B -> S1A L1 missing 从 39 降到 22，evicted extra 从 39 降到 22；
-- 仍不能解释主要 mismatch，说明剩余问题不是单个 capacity_request 事件能决定的。
+这个 retained fix 的边界必须保持清楚：它只说明“已经决定发生的同一个 capacity pressure event”应按 target page size
+计算需要释放多少页。它不说明 source trace 中出现的 `capacity_request` 序列可以跨 target 复用。真实 cross audit
+显示 S1A/S1B 的 capacity event 数量为 `8/12` 或 `12/8`，两向 `requested_tokens_differ_count=8`，
+`page_size_only_explains_count=0`，并有 `4` 个 one-sided event；首个 pair 是 S1A `1057/9@128` vs S1B
+`993/16@64`。因此 cross 中要解决的是 target capacity pressure sequence，而不是继续围绕 requested page count
+做局部换算。
+
+2026-06-11 S1B self 的早期影响有限；host projection 修复后该项不再是当前首个分岔：
+
+- 保留 global timestamp replay 且 radix/capacity 按 scope 隔离后，早期 normalized L1 final 是 `32/28`，missing 0、extra 4；
+- 加入 host projection 后，当前 L1/dirty 已 `28/28`，L2/backuped/evicted 收敛到 `56/55`；
+- 因此主要 mismatch 不是单个 capacity_request 事件能决定的，后续重点转向 async prefetch completion / storage lifecycle。
 
 ### HCSM-F2：wait_complete checkpoint 不再全量构造 resident/ready
 
@@ -84,19 +205,37 @@ provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set �
 - S1B -> S1A L2/backuped missing 从 41 降到 26；
 - exact prefetch ready 仍不可从当前 invariant facts 判断，不能为了对齐 oracle final state 强推 completion。
 
+### HCSM-F3：host eviction 使用 page-level compressed radix projection
+
+prefetch host pressure 需要按真实 host radix 的 leaf node 粒度释放 host pages。旧模型只用 insert path 的 flat
+leaf group，遇到两个 child 合并成 parent host leaf 时会漏删 parent pages，导致 `maintenance_check_end` 后 oracle 与
+model 立即分岔。
+
+当前实现给 `HiCacheTokenRadixTree` 增加 page-level compressed radix projection，并让 `evict_host_pages()` 使用
+`host_eviction_leaf_groups(...)` 选择 host leaf group。新增 fixture
+`run_prefetch_host_pressure_promotes_parent_host_leaf_fixture` 覆盖 parent host leaf 被提升为可淘汰 leaf 的场景。
+
+效果：
+
+- 旧首个分岔 `hicache_maintenance_check_end:state_snapshot` 已消失；
+- S1B self L1/dirty 从 `32/28`、`31/28` 收敛到 `28/28`；
+- L2/backuped/evicted 从 `81/55`、`80/55` 收敛到 `56/55`；
+- 新首个分岔后移到 `prefetch_check_point`，说明继续改 host eviction 已不是当前最有效路线。
+
 ## HCSM-D1：Resident / Evicted 生命周期错误
 
 ### 现象
 
-四个方向都缺 L1 resident：
+历史 2026-06-10 四向结果里四个方向都缺 L1 resident：
 
 - S1A self：L1 32/54，missing 22；evicted 48/52，missing 26，extra 22；
 - S1B self：L1 64/108，missing 44；evicted 170/108，extra 62；
 - S1A -> S1B：L1 64/108，missing 44；evicted 164/108，missing 4，extra 60；
 - S1B -> S1A：L1 32/54，missing 22；evicted 48/52，missing 26，extra 22。
 
-S1A self 的 L1 missing sample `08c4433f...` 同时出现在 evicted extra sample。这说明模型把一部分真实最终
-resident 的 page 错误保留为 evicted，或者漏掉了后续把它们 load/promote 回 L1 的 transition。
+S1A self 的 L1 missing sample `08c4433f...` 同时出现在 evicted extra sample。当前 2026-06-11 S1B self 已经没有
+L1/dirty mismatch；resident/evicted lifecycle 的当前风险主要留在 L2/backuped/evicted final sets，以及新 S1A
+profile 可用后的交叉复测。
 
 ### 可能原因
 
@@ -162,13 +301,15 @@ S1B 是 `write_back + best_effort`，模型同时 missing 和 extra：
 ### 现象
 
 evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，而是 victim 集合或 evicted lifecycle 错误。S1B target
-尤其明显：raw model final state 中 L2/backuped/evicted 都达到 `321`，等于目标 L2 capacity；normalized 后仍比 oracle 多
-60-62 个 L2/backuped/evicted page。
+在 host projection 修复前尤其明显；当前 2026-06-11 S1B self normalized L2/backuped/evicted 是 `56/55`，
+missing 13、extra 14。scope 隔离后 raw model final 会保留两个 cache scope，raw oracle snapshot 仍不是可比口径，
+因此当前判断以 normalized diff 为准。
 
 ### 当前实现
 
 - L1/L2 有显式 capacity；
-- `capacity_request` 只触发容量检查，不再强制按 requested pages 淘汰；
+- `capacity_request` 按 `requested_tokens` 和 target `page_size` 重算 requested pages 后触发 L1 modeled eviction
+  pressure；victim 仍由 modeled LRU / lock skip / radix leaf group 决定；
 - touch order 是简化 LRU；
 - dirty victim 触发 modeled writeback；
 - locked pages 会跳过；
@@ -178,8 +319,8 @@ evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，
 
 - 没有 SGLang allocator / pool exact 行为；
 - 没有完整 evictable set；
-- lock/ref 与完整 radix parent chain 还没有严格绑定；
-- leaf group 目前仍是 projection 近似，不等价于 SGLang node evictable set；
+- lock/ref replay order 已在 S1B self 对齐，完整 radix parent chain 仍未在四向新 profile 中验证；
+- host leaf group 已有 page-level projection，但仍不等价于完整 SGLang node/ref/evictable set；
 - L2 eviction 后 `backuped` / `evicted` 的语义可能不等价。
 
 ### 下一步
@@ -189,7 +330,12 @@ evicted 同时出现 missing 和 extra，说明不是单纯容量大小错误，
 - 判断 extra 是否来自 L1 missing 组、L2 over-fill 组或 dirty eviction 组；
 - 如果 victim 选择无法由现有 facts 解释，再把 evictable snapshot 放入下一轮集中采集。
 
-## HCSM-D4：Token Radix Tree 仍是近似
+cross-config 里还要额外注意：`capacity_request` 的 `requested_tokens` 来自 SGLang
+`HiRadixCache.evict(params.num_tokens)`，这个调用已经处在 target allocator/radix/lock/memory availability 决策之后。
+所以 source capacity pressure 不是 target-independent workload fact。若后续 cross 仍有 resident/evicted 差异，先确认
+pressure sequence 是否已由 target model 或高层 invariant 重新定义，再判断是否是 D3 的 victim/evictable 规则错误。
+
+## HCSM-D4：Token Radix Tree 仍不是完整 SGLang node/ref 结构
 
 原 `HiCacheRadixTree` 已删除，后端使用 `HiCacheTokenRadixTree` 做 token-level prefix、split 和 insert。
 但它仍只是最小 token radix 建模，不是完整 SGLang HiRadixCache node/state/ref 实现。
@@ -227,43 +373,59 @@ token path 推导，再集中补 node/ref provenance。
 - target=S1A 的 wait_complete 下，S1A self raw prefetch ready 36，S1B->S1A raw prefetch ready 20；
 - target=S1B 的 best_effort 下，S1B self raw prefetch suppressed 1484，S1A->S1B raw prefetch suppressed 1452。
 
-短期只修不变量边界明确的过度推导，不把 prefetch set exact 作为当前验收门槛。
+当前 S1B 最新逐 trace 结果显示，prefetch exact 已经从“非 final-state oracle 目标”升级为当前首个 state 分岔：
+
+- invariant `hicache_prefetch_check_point_end` 只有 `check_kind=progress`，没有 completion token/page；
+- 同 timestamp 的 source-only `hicache_prefetch_progress_observed_start` 显示 `completed_tokens=832`、
+  `ready_pages_estimate=13` 和 13 个 `operation_hash_pages`；
+- oracle 在该 checkpoint 后 L2/backuped/evicted 变为 `69`，model 仍是 `56`。
+
+当前 `20260611_054436` S1B self 进一步用模型侧 diagnostic async-elision 验证：注入 6 个 async checkpoint 后，
+L2/backuped/evicted final 从 normal 的 `56/55` 收敛为 `55/55`。Python replay 中残留的 capacity extra `14`
+在 C++ synthetic trace 重跑后消失，因此它是 async 分岔后的连锁差异，不是当前 self-config 的独立 final-set 模型 bug。
+
+短期不能把 `best_effort` checkpoint 特化为“所有 pending prefetch 都完成”。正常 prediction 若要不靠 diagnostic injection
+通过，下一步要么建立 target async prefetch progress 模型，要么集中讨论新增 invariant 字段，例如 target-side prefetch
+completion token count / page hashes / storage insert boundary；在这之前 source `prefetch_progress_observed` 和
+`terminate_prefetch` 只能作为定位证据。
 
 ## HCSM-D6：Write-Back Flush 未闭环
 
-S1B 是 `write_back + best_effort`，已经暴露 write-back 不闭环：
+S1B 是 `write_back + best_effort`。当前 latest self prediction 中 write-back 不再是首个分岔，但 L2/backuped/evicted
+final sets 未闭环，后续仍需要复查 write-back / host release：
 
-- S1B self dirty 64/72，missing 8；
-- S1A -> S1B dirty 64/72，missing 8；
-- S1B target 的 L2/backuped/evicted normalized extra 60-62。
+- dirty 28/28，missing 0、extra 0；
+- L2/backuped 56/55，missing 13、extra 14；
+- evicted 56/55，missing 13、extra 14；
+- `missing_invariant_facts=[]` 且 `non_invariant_fact_usage=[]`，说明这不是输入门禁问题。
 
 需要解释：
 
 - dirty page 何时 flush；
 - flush 后是否形成 L2/backuped；
-- flush 与 eviction、prefetch、insert 的顺序；
-- background writeback 对后续 lookup 是否可见。
+- flush 与 eviction、prefetch、insert、host release 的顺序；
+- background writeback 对后续 lookup 是否可见；
+- host pool release / L2 eviction 后 `backuped`、`evicted` 的生命周期。
 
-当前不为单点重采。先做 provenance；只有证明现有 invariant facts 不能区分真实 dirty/backuped 转换时，才把 writeback
-trigger/completion 扩成新的集中采集契约。现有 `writeback_enqueue_observed` / `writeback_io_observed` 仍不是 state model input。
+当前不为 write-back 单点重采。先处理 prefetch checkpoint 的首个分岔；只有之后仍证明现有 invariant facts 不能区分真实
+dirty/backuped 转换时，才把 writeback trigger/completion 扩成新的集中采集契约。现有 `writeback_enqueue_observed` /
+`writeback_io_observed` 仍不是 state model input。
 
 ## HCSM-D7：Lock / Ref Parent Chain
 
-lock/ref 呈现明显 source asymmetry：
+2026-06-11 S1B 31-target self prediction 中，lock/ref final set 已修到 `0/0 match`。root cause 是 backend fact replay
+排序 comparator 非严格全序，导致部分 lock/ref delta 乱序；当前已改为严格全局 timestamp order，同 timestamp/scope 下再用
+`seq_no` 破 ties。
 
-- S1A self locked 11/11 match；
-- S1A -> S1B locked 22/22 match；
-- S1B self locked 0/22，missing 22；
-- S1B -> S1A locked 0/11，missing 11。
-
-这说明 S1A source facts 可以驱动 target lock final set，但 S1B source facts 会把 lock 全部丢掉。需要验证：
+仍需验证：
 
 - target radix parent chain 完整；
 - eviction eligibility 使用了正确 lock/ref；
-- page-size what-if 下 lock/ref 仍正确。
+- page-size what-if 和 cross-config 下 lock/ref 仍正确；
+- lock/ref 是否解释 D3 的 victim 差异。
 
-短期先查 S1B `lock_scope_delta` 的 token path、scope、seq 和 end-state 是否与 S1A 不同；随后验证 lock 是否影响 D3 victim
-选择。若发现 victim 被真实 lock/ref 保护但模型无法推导，再补 ordered lock/ref oracle。
+短期不再把 S1B self locked final 当 P0。新 S1A/S1B 四向 profile 完成后复测；若发现 victim 被真实 lock/ref 保护但模型无法推导，
+再补 ordered lock/ref oracle。
 
 ## HCSM-D8：Ordered Transition Oracle 不足
 
@@ -298,10 +460,15 @@ HiCacheModule 当前 `dag_mutations=0`。这不是 state validation 失败原因
 
 ## 当前处理顺序
 
-1. 使用 `scripts/internal/hicache_state_provenance.py` 继续扩展逐 page evidence；不要用 oracle 反向补 transition。
-2. 先解释 S1A `08c4433f...` 这类 L1 missing / evicted extra，再批量分组 S1A target 的 resident/evicted mismatch。
-3. 并行解释 S1B target raw L2/backuped/evicted 到 capacity 321 的路径，确认哪些来自 dirty eviction，哪些来自不可观测 writeback cleanup。
-4. lock/ref source asymmetry 暂列难修：S1B self 和 S1B->S1A 的 locked final set 缺失不能简单通过“保留 lock”修复。
-5. write-back dirty/backuped 规则只能修有事实支撑的顺序；没有 completion/victim 事实时不强推。
-6. 每修一类状态规则后重跑四向矩阵，至少两个 self-config 都通过后再评估 cross-config 剩余缺口。
-7. state 通过后再进入 DAG patch。
+1. 保留 S1A self normal pass 和 S1B self C++ async-elision pass 作为修复前 self-config 基线；换 run 或换输入契约时必须重新证明。
+2. 使用 atomic profile config 重跑 S1A/S1B profile，先确认正常 state input role 是当前 5 个 atomic invariant role。
+3. 重跑两向 cross audit，要求 `model_input_contract_ready=true`。
+4. 若 hard contract 仍失败，优先修 profile config / probe source / target-derived projection，不围绕 final L1/L2/evicted 做特化补丁。
+5. 若 hard contract 通过，再重跑 self-config 和 cross-config modeling validation，并用逐 trace 分岔对比区分 async/input-boundary、
+   deterministic model bug 和 remaining input-contract gap。
+6. 对仍需表达的 lifecycle、capacity、lock 或 maintenance 机制，只能新增 target-independent 高层 invariant 或 target-derived
+   机制；不能把 source suffix、source `params.num_tokens`、source lock/ref delta 或 source polling/check-kind 序列重新标成正常输入。
+7. 不加入“best_effort checkpoint 全 pending 完成”规则；这类修正会把 source timing / completion 结果伪装成 model rule。
+8. 每修一类状态规则后重新审视它是机制级修正还是当前 run 的特化补丁；至少两个 self-config 和两个 cross-config 的
+   async-elision proof 都闭环后，才宣称“排除 async 后没有其他 state-rule 问题”。
+9. state 通过后再进入 DAG patch。

@@ -27,6 +27,28 @@ class FieldSpec:
 
 
 @dataclass(frozen=True)
+class FactSpec:
+    """Target-level atomic fact metadata.
+
+    The explicit object keeps classification at fact granularity and avoids
+    repeating the same boilerplate in every field list.
+    """
+
+    fact_class: str
+    event_role: str
+    dag_input: bool
+    model_input: bool
+    granularity: str
+
+
+@dataclass(frozen=True)
+class EmitCondition:
+    source: str
+    op: str = "present"
+    value: Any = None
+
+
+@dataclass(frozen=True)
 class TargetSpec:
     id: str
     module_name: str
@@ -34,6 +56,8 @@ class TargetSpec:
     target: str
     events: tuple[str, ...]
     fields: tuple[FieldSpec, ...]
+    fact: FactSpec
+    emit_when: tuple[EmitCondition, ...] = ()
     enabled: bool = True
 
 
@@ -53,6 +77,7 @@ class ExtractedField:
 
 _TARGETS = None
 _PATCHED: set[str] = set()
+_KNOWN_FACT_CLASSES = {"invariant_state", "timing_observation", "source_actual", "oracle_state", "debug_quality"}
 SourceExtractor = Callable[
     [str, str, dict[str, Any], tuple[Any, ...], dict[str, Any], Any],
     tuple[bool, bool, Any],
@@ -77,15 +102,17 @@ def _load_targets() -> list[TargetSpec]:
     raw = os.environ.get("TRACE_SIM_PYTHON_PROBE_TARGETS", "[]")
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
-        data = []
+    except json.JSONDecodeError as exc:
+        raise ValueError("TRACE_SIM_PYTHON_PROBE_TARGETS must be a JSON array") from exc
     targets: list[TargetSpec] = []
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                target = _parse_target(item)
-                if target is not None and target.enabled:
-                    targets.append(target)
+    if not isinstance(data, list):
+        raise ValueError("TRACE_SIM_PYTHON_PROBE_TARGETS must be a JSON array")
+    for index, item in enumerate(data):
+        if not isinstance(item, dict):
+            raise ValueError(f"TRACE_SIM_PYTHON_PROBE_TARGETS[{index}] must be an object")
+        target = _parse_target(item)
+        if target.enabled:
+            targets.append(target)
     _TARGETS = targets
     return targets
 
@@ -116,14 +143,16 @@ def install(module: ModuleType) -> None:
             print(f"[trace_sim_probe] patched {target.target} targets={target_ids}", file=sys.stderr)
 
 
-def _parse_target(raw: dict[str, Any]) -> TargetSpec | None:
+def _parse_target(raw: dict[str, Any]) -> TargetSpec:
     target_id = raw.get("id")
     target = raw.get("target")
-    if not isinstance(target_id, str) or not isinstance(target, str):
-        return None
-    module_name, qualname = _split_target(raw, target)
-    if not module_name or not qualname:
-        return None
+    module_name = raw.get("module")
+    if not isinstance(target_id, str) or not target_id:
+        raise ValueError("python_probe target id must be a non-empty string")
+    if not isinstance(target, str) or not target:
+        raise ValueError(f"python_probe target {target_id!r} target must be a non-empty string")
+    if not isinstance(module_name, str) or not module_name:
+        raise ValueError(f"python_probe target {target_id!r} module must be a non-empty string")
     fields = []
     for item in raw.get("fields", []):
         field = _parse_field(item)
@@ -131,36 +160,19 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec | None:
             fields.append(field)
     events_raw = raw.get("events", [])
     events = tuple(item for item in events_raw if isinstance(item, str))
+    emit_when = tuple(condition for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when"))) if condition is not None)
+    fact = _parse_fact(raw.get("fact"), target_id)
     return TargetSpec(
         id=target_id,
         module_name=module_name,
-        qualname=qualname,
+        qualname=target,
         target=target,
         events=events,
         fields=tuple(fields),
+        fact=fact,
+        emit_when=emit_when,
         enabled=bool(raw.get("enabled", True)),
     )
-
-
-def _split_target(raw: dict[str, Any], target: str) -> tuple[str, str]:
-    """把配置目标拆成“导入模块”和“模块内对象路径”。
-
-    Python probe 只负责 Python 侧插桩。为了避免 runner 维护一套复杂目标解析，
-    配置可以显式写 `module`；若未写，则保留旧版使用习惯：模块级函数用完整路径，
-    形如 `pkg.mod.fn`。对常见类方法路径，若倒数第二段像类名，则按
-    `pkg.mod.Class.method` 拆成 `pkg.mod` + `Class.method`。
-    """
-
-    explicit_module = raw.get("module")
-    if isinstance(explicit_module, str) and explicit_module:
-        return explicit_module, target
-
-    parts = [part for part in target.split(".") if part]
-    if len(parts) < 2:
-        return "", ""
-    if len(parts) >= 3 and parts[-2][:1].isupper():
-        return ".".join(parts[:-2]), ".".join(parts[-2:])
-    return ".".join(parts[:-1]), parts[-1]
 
 
 def _resolve_target(module: ModuleType, target: TargetSpec) -> tuple[Any, str, Any] | None:
@@ -193,6 +205,58 @@ def _parse_field(raw: Any) -> FieldSpec | None:
             required=bool(raw.get("required", True)),
         )
     return None
+
+
+def _parse_fact(raw: Any, target_id: str) -> FactSpec:
+    if not isinstance(raw, dict):
+        raise ValueError(f"python_probe target {target_id!r} must define fact")
+    fact_class = raw.get("class")
+    event_role = raw.get("role")
+    granularity = raw.get("granularity")
+    model_input = raw.get("model_input")
+    dag_input = raw.get("dag_input")
+    if not isinstance(fact_class, str) or not fact_class:
+        raise ValueError(f"python_probe target {target_id!r} fact.class must be a non-empty string")
+    if fact_class not in _KNOWN_FACT_CLASSES:
+        raise ValueError(f"python_probe target {target_id!r} fact.class must be one of {sorted(_KNOWN_FACT_CLASSES)}")
+    if not isinstance(event_role, str) or not event_role:
+        raise ValueError(f"python_probe target {target_id!r} fact.role must be a non-empty string")
+    if not isinstance(granularity, str) or granularity != "atomic":
+        raise ValueError(f"python_probe target {target_id!r} fact.granularity must be 'atomic'")
+    if not isinstance(model_input, bool):
+        raise ValueError(f"python_probe target {target_id!r} fact.model_input must be true or false")
+    if not isinstance(dag_input, bool):
+        raise ValueError(f"python_probe target {target_id!r} fact.dag_input must be true or false")
+    return FactSpec(
+        fact_class=fact_class,
+        event_role=event_role,
+        dag_input=dag_input,
+        model_input=model_input,
+        granularity=granularity,
+    )
+
+
+def _as_list(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _parse_emit_condition(raw: Any) -> EmitCondition | None:
+    if isinstance(raw, str) and raw:
+        if raw.startswith("has:"):
+            return EmitCondition(source=raw.split(":", 1)[1], op="present")
+        if raw.startswith("missing:"):
+            return EmitCondition(source=raw.split(":", 1)[1], op="absent")
+        return EmitCondition(source=raw, op="truthy")
+    if not isinstance(raw, dict):
+        return None
+    source = raw.get("source")
+    if not isinstance(source, str) or not source:
+        return None
+    return EmitCondition(source=source, op=str(raw.get("op") or "present"), value=raw.get("value"))
 
 
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -254,7 +318,11 @@ def _emit(
     start_us: int,
     end_us: int,
 ) -> None:
-    fields, validation_fields, missing = _collect_fields(target, fn, args, kwargs, result, phase)
+    bound = _bind_arguments(fn, args, kwargs)
+    bound["__trace_sim_phase"] = phase
+    if not _should_emit_target(target, bound, args, kwargs, result):
+        return
+    fields, validation_fields, missing = _collect_fields(target, bound, args, kwargs, result)
     event_name = _event_name(target, phase)
     base_args = {
         "schema_version": 1,
@@ -272,9 +340,9 @@ def _emit(
         "python_probe",
         {
             **base_args,
-            "model_input": True,
             "event_kind": event_name,
             **fields,
+            **_fact_args(target),
         },
     )
     if validation_fields:
@@ -306,14 +374,11 @@ def _event_name(target: TargetSpec, phase: str) -> str:
 
 def _collect_fields(
     target: TargetSpec,
-    fn: Callable[..., Any],
+    bound: dict[str, Any],
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-    phase: str,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    bound = _bind_arguments(fn, args, kwargs)
-    bound["__trace_sim_phase"] = phase
     fields: dict[str, Any] = {}
     validation_fields: dict[str, Any] = {}
     missing: list[str] = []
@@ -336,6 +401,64 @@ def _collect_fields(
         elif field.required:
             missing.append(field.name)
     return fields, validation_fields, missing
+
+
+def _fact_args(target: TargetSpec) -> dict[str, Any]:
+    fact = target.fact
+    return {
+        "model_input": fact.model_input,
+        "dag_input": fact.dag_input,
+        "fact_class": fact.fact_class,
+        "event_role": fact.event_role,
+        "fact_granularity": fact.granularity,
+    }
+
+
+def _should_emit_target(
+    target: TargetSpec,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> bool:
+    for condition in target.emit_when:
+        if not _condition_matches(condition, bound, args, kwargs, result):
+            return False
+    return True
+
+
+def _condition_matches(
+    condition: EmitCondition,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> bool:
+    found, value = _extract_raw_value(condition.source, "_emit_when", bound, args, kwargs, result)
+    op = condition.op
+    if op in ("present", "exists", "has"):
+        return found and _has_value(value)
+    if op in ("absent", "missing"):
+        return not found or not _has_value(value)
+    if op == "truthy":
+        return found and bool(value)
+    if op == "falsey":
+        return (not found) or not bool(value)
+    if op in ("equals", "eq"):
+        return found and value == condition.value
+    if op in ("not_equals", "ne"):
+        return (not found) or value != condition.value
+    return False
+
+
+def _has_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
 
 
 def _bind_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:

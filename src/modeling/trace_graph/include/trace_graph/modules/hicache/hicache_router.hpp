@@ -10,26 +10,21 @@ namespace TraceGraph {
 
 enum class HiCacheFactRole {
     Unknown,
-    RequestTokens,
-    LookupPath,
-    CacheConfigObserved,
-    RequestCacheLifecycle,
+    RequestBoundMatchAnchor,
+    RequestLifecycleAnchor,
     RequestAdmission,
-    InsertPath,
     PrefetchDecision,
     PrefetchCheckPoint,
-    MaintenanceCheckpoint,
-    CapacityRequest,
-    LockScopeDelta,
+    DiagnosticStateInjection,
 };
 
 struct HiCacheFactRoute {
-    bool state_model_input = false;
+    bool model_fact = false;
     bool known_role = false;
     HiCacheFactRole role = HiCacheFactRole::Unknown;
 };
 
-bool is_hicache_state_model_input(const HiCacheFact & fact);
+bool is_hicache_state_model_fact(const HiCacheFact & fact);
 HiCacheFactRole parse_hicache_fact_role(const std::string & role);
 std::string hicache_fact_role_name(HiCacheFactRole role);
 HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact);

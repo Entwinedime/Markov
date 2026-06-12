@@ -21,6 +21,9 @@ class HiCacheTokenRadixTree {
 
     bool contains_page(const std::string & page) const;
     std::vector<std::string> leaf_group_for_page(const std::string & page) const;
+    std::vector<std::vector<std::string>> host_eviction_leaf_groups(const std::set<std::string> & host_pages,
+                                                                    const std::set<std::string> & evicted_pages,
+                                                                    const std::set<std::string> & locked_pages) const;
 
   private:
     struct Node {
@@ -30,13 +33,30 @@ class HiCacheTokenRadixTree {
         bool active = true;
     };
 
+    struct PageNode {
+        size_t parent = 0;
+        std::vector<std::string> pages;
+        std::map<std::string, size_t> children;
+        bool active = true;
+    };
+
     std::vector<Node> nodes_;
+    std::vector<PageNode> page_nodes_;
     std::set<std::string> known_pages_;
     std::map<std::string, std::vector<std::string>> leaf_group_by_page_;
 
     size_t create_child(size_t parent, const std::vector<uint32_t> & key);
     void insert_suffix(size_t node_id, const std::vector<uint32_t> & suffix);
+    size_t create_page_child(size_t parent, const std::vector<std::string> & pages);
+    void insert_page_suffix(size_t node_id, const std::vector<std::string> & suffix);
     void register_leaf_pages(const std::vector<std::string> & projected_pages);
+    bool page_node_has_host_value(size_t node_id, const std::set<std::string> & host_pages) const;
+    bool page_subtree_has_host_value(size_t node_id, const std::set<std::string> & host_pages) const;
+    bool page_node_evicted(size_t node_id, const std::set<std::string> & evicted_pages) const;
+    bool page_node_locked(size_t node_id, const std::set<std::string> & locked_pages) const;
+    void collect_host_eviction_leaf_groups(size_t node_id, const std::set<std::string> & host_pages,
+                                           const std::set<std::string> & evicted_pages, const std::set<std::string> & locked_pages,
+                                           std::vector<std::vector<std::string>> & groups) const;
 };
 
 } // namespace TraceGraph

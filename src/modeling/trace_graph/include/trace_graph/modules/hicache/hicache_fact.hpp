@@ -33,6 +33,7 @@ struct HiCacheFact {
     std::string event_name;
     std::string target_id;
     std::string fact_class;
+    std::string fact_granularity;
     std::string role;
     std::string phase;
     std::string request_id;
@@ -40,6 +41,7 @@ struct HiCacheFact {
     std::string cache_scope;
     std::string lock_direction;
     std::string check_kind;
+    std::string lifecycle_kind;
     std::string write_policy;
     std::string prefetch_policy;
     uint64_t seq_no = 0;
@@ -50,9 +52,8 @@ struct HiCacheFact {
     uint64_t requested_pages = 0;
     uint64_t completed_tokens = 0;
     uint64_t byte_count = 0;
-    bool model_input = true;
+    bool model_input = false;
     bool dag_input = false;
-    bool state_model_input = false;
     bool is_start = false;
     bool is_end = false;
 
@@ -69,6 +70,7 @@ struct HiCacheFact {
     HiCacheTokenPath suffix_tokens;
     HiCacheTokenPath logical_path_tokens;
     HiCacheTokenPath io_tokens;
+    std::unordered_map<std::string, std::vector<std::string>> diagnostic_state_pages;
 };
 
 class HiCacheFactParser {

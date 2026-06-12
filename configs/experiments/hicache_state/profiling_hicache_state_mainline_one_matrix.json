@@ -1,10 +1,11 @@
 {
   "name": "profiling_hicache_state_mainline_one_matrix",
   "framework": "sglang",
+  "continue_on_error": true,
   "metadata": {
-    "purpose": "Mainline-one HiCache state profiling suite with two server scenarios and two input workloads.",
-    "manual_run_note": "Use --list-experiments first, then select one or more ids with --experiment or --experiments for manual profiling and archival.",
-    "shared_profiling_note": "HiCache collection follows the token/range invariant contract: default state inputs are classified by fact_class, use token dictionary/span facts, and keep source movement as timing/source_actual observations outside state_model_input.",
+    "purpose": "Mainline-one HiCache state profiling suite with two server scenarios and two input workloads. The manual workload is the fast iteration profile; bench remains the larger throughput input.",
+    "manual_run_note": "Use --list-experiments first, then select one or more ids with --experiment or --experiments for manual profiling and archival. The suite uses continue_on_error so one failed experiment does not block later selected experiments.",
+    "shared_profiling_note": "HiCache collection uses target-level atomic fact metadata. Profiling config owns fact.class/fact.role/model_input/dag_input/granularity; C++ state routing consumes only model_input=true, fact_class=invariant_state, fact_granularity=atomic events with known atomic invariant roles. Concrete cache-stage paths and source-control-flow evidence remain source_actual/timing observations with model_input=false.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
     "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe."
   },
@@ -29,34 +30,14 @@
       },
       "targets": [
         {
-          "id": "hiradix.request_tokens",
+          "id": "hiradix.match_prefix.cache_stage_path_observed",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.match_prefix",
           "events": [
-            "hicache_request_tokens_start",
-            "hicache_request_tokens_end"
+            "hicache_match_prefix_cache_stage_path_observed_start",
+            "hicache_match_prefix_cache_stage_path_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_tokens"
-            },
             {
               "name": "request_id",
               "source": "arg:params.req.rid",
@@ -86,41 +67,40 @@
               "name": "token_count",
               "source": "len:arg:params.key"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "cache_stage_match_path_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
-          "id": "hiradix.lookup_path",
+          "id": "hiradix.match_prefix.request_bound_anchor",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.match_prefix",
           "events": [
-            "hicache_lookup_path_start",
-            "hicache_lookup_path_end"
+            "hicache_match_prefix_request_bound_anchor_start",
+            "hicache_match_prefix_request_bound_anchor_end"
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "request_bound_match_anchor",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          },
+          "emit_when": [
+            {
+              "source": "arg:params.req.rid",
+              "op": "present"
+            }
           ],
           "fields": [
             {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lookup_path"
-            },
-            {
               "name": "request_id",
-              "source": "arg:params.req.rid",
-              "required": false
+              "source": "arg:params.req.rid"
             },
             {
               "name": "cache_scope",
@@ -157,26 +137,6 @@
             "hicache_lookup_result_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lookup_result_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:params.req.rid",
@@ -244,7 +204,14 @@
               "source": "hicache_evictable_snapshot:self",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "lookup_result_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.cache_config_observed",
@@ -255,26 +222,6 @@
             "hicache_cache_config_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:cache_config_observed"
-            },
             {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
@@ -307,37 +254,79 @@
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "cache_config_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
-          "id": "hiradix.cache_finished_req",
+          "id": "hiradix.cache_finished_req.lifecycle_anchor",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.cache_finished_req",
           "events": [
-            "hicache_cache_finished_req_start",
-            "hicache_cache_finished_req_end"
+            "hicache_cache_finished_req_lifecycle_anchor_start",
+            "hicache_cache_finished_req_lifecycle_anchor_end"
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "request_lifecycle_anchor",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          },
+          "emit_when": [
+            {
+              "source": "arg:req.rid",
+              "op": "present"
+            }
           ],
           "fields": [
             {
-              "name": "model_input",
-              "source": "const:true"
+              "name": "lifecycle_kind",
+              "source": "const:finished"
             },
             {
-              "name": "dag_input",
-              "source": "const:false"
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": true
             },
             {
-              "name": "state_model_input",
-              "source": "const:true"
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
             },
             {
-              "name": "fact_class",
-              "source": "const:invariant_state"
+              "name": "seq_no",
+              "source": "hicache_seq:self"
             },
             {
-              "name": "event_role",
-              "source": "const:request_cache_lifecycle"
+              "name": "source_page_size",
+              "source": "self.page_size"
             },
+            {
+              "name": "is_insert",
+              "source": "arg:is_insert",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_finished_req.path_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_finished_req",
+          "events": [
+            "hicache_cache_finished_req_path_observed_start",
+            "hicache_cache_finished_req_path_observed_end"
+          ],
+          "fields": [
             {
               "name": "lifecycle_kind",
               "source": "const:finished"
@@ -386,37 +375,24 @@
               "source": "arg:req.priority",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_lifecycle_path_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
-          "id": "hiradix.cache_finished_req_observed",
+          "id": "hiradix.cache_finished_req.runtime_observed",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.cache_finished_req",
           "events": [
-            "hicache_cache_finished_req_observed_start",
-            "hicache_cache_finished_req_observed_end"
+            "hicache_cache_finished_req_runtime_observed_start",
+            "hicache_cache_finished_req_runtime_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_cache_lifecycle_observed"
-            },
             {
               "name": "lifecycle_kind",
               "source": "const:finished"
@@ -448,37 +424,79 @@
               "source": "arg:is_insert",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_lifecycle_runtime_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
-          "id": "hiradix.cache_unfinished_req",
+          "id": "hiradix.cache_unfinished_req.lifecycle_anchor",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.cache_unfinished_req",
           "events": [
-            "hicache_cache_unfinished_req_start",
-            "hicache_cache_unfinished_req_end"
+            "hicache_cache_unfinished_req_lifecycle_anchor_start",
+            "hicache_cache_unfinished_req_lifecycle_anchor_end"
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "request_lifecycle_anchor",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          },
+          "emit_when": [
+            {
+              "source": "arg:req.rid",
+              "op": "present"
+            }
           ],
           "fields": [
             {
-              "name": "model_input",
-              "source": "const:true"
+              "name": "lifecycle_kind",
+              "source": "const:unfinished"
             },
             {
-              "name": "dag_input",
-              "source": "const:false"
+              "name": "request_id",
+              "source": "arg:req.rid",
+              "required": true
             },
             {
-              "name": "state_model_input",
-              "source": "const:true"
+              "name": "cache_scope",
+              "source": "hicache_cache_scope:self"
             },
             {
-              "name": "fact_class",
-              "source": "const:invariant_state"
+              "name": "seq_no",
+              "source": "hicache_seq:self"
             },
             {
-              "name": "event_role",
-              "source": "const:request_cache_lifecycle"
+              "name": "source_page_size",
+              "source": "self.page_size"
             },
+            {
+              "name": "chunked",
+              "source": "arg:chunked",
+              "required": false
+            },
+            {
+              "name": "priority",
+              "source": "arg:req.priority",
+              "required": false
+            }
+          ]
+        },
+        {
+          "id": "hiradix.cache_unfinished_req.path_observed",
+          "module": "sglang.srt.mem_cache.hiradix_cache",
+          "target": "HiRadixCache.cache_unfinished_req",
+          "events": [
+            "hicache_cache_unfinished_req_path_observed_start",
+            "hicache_cache_unfinished_req_path_observed_end"
+          ],
+          "fields": [
             {
               "name": "lifecycle_kind",
               "source": "const:unfinished"
@@ -522,37 +540,24 @@
               "source": "arg:req.priority",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_lifecycle_path_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
-          "id": "hiradix.cache_unfinished_req_observed",
+          "id": "hiradix.cache_unfinished_req.runtime_observed",
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.cache_unfinished_req",
           "events": [
-            "hicache_cache_unfinished_req_observed_start",
-            "hicache_cache_unfinished_req_observed_end"
+            "hicache_cache_unfinished_req_runtime_observed_start",
+            "hicache_cache_unfinished_req_runtime_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_cache_lifecycle_observed"
-            },
             {
               "name": "lifecycle_kind",
               "source": "const:unfinished"
@@ -584,7 +589,14 @@
               "source": "arg:chunked",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_lifecycle_runtime_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "scheduler.prefetch_decision",
@@ -595,26 +607,6 @@
             "hicache_prefetch_decision_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_decision"
-            },
             {
               "name": "request_id",
               "source": "arg:req.rid"
@@ -647,7 +639,14 @@
               "name": "policy_params",
               "source": "hicache_config:self.tree_cache,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "prefetch_decision",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "scheduler.prefetch_decision_observed",
@@ -658,26 +657,6 @@
             "hicache_prefetch_decision_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_decision_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:req.rid"
@@ -699,7 +678,14 @@
               "source": "hicache_scheduler_prefetch_state:self,arg:req",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "prefetch_decision_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "schedule_policy.prefill_admission",
@@ -710,26 +696,6 @@
             "hicache_prefill_admission_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_admission"
-            },
             {
               "name": "admission_kind",
               "source": "const:prefill_add_one_req"
@@ -790,7 +756,14 @@
               "name": "policy_params",
               "source": "hicache_config:self.tree_cache,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "request_admission",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "schedule_policy.prefill_admission_observed",
@@ -801,26 +774,6 @@
             "hicache_prefill_admission_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_admission_observed"
-            },
             {
               "name": "admission_kind",
               "source": "const:prefill_add_one_req"
@@ -881,7 +834,14 @@
               "source": "self.rem_chunk_tokens",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_admission_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "schedule_policy.chunked_admission",
@@ -892,26 +852,6 @@
             "hicache_chunked_admission_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_admission"
-            },
             {
               "name": "admission_kind",
               "source": "const:chunked_continuation"
@@ -958,7 +898,14 @@
               "name": "policy_params",
               "source": "hicache_config:self.tree_cache,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "request_admission",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "schedule_policy.chunked_admission_observed",
@@ -969,26 +916,6 @@
             "hicache_chunked_admission_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:request_admission_observed"
-            },
             {
               "name": "admission_kind",
               "source": "const:chunked_continuation"
@@ -1044,7 +971,14 @@
               "source": "self.rem_chunk_tokens",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "request_admission_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.insert_path",
@@ -1055,26 +989,6 @@
             "hicache_insert_path_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:insert_path"
-            },
             {
               "name": "request_id",
               "source": "arg:params.req.rid",
@@ -1129,7 +1043,14 @@
               "source": "arg:params.prev_prefix_len",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "insert_path",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.insert_result_observed",
@@ -1140,26 +1061,6 @@
             "hicache_insert_result_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:insert_result_observed"
-            },
             {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
@@ -1197,7 +1098,14 @@
               "source": "hicache_evictable_snapshot:self",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "insert_result_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.prefetch_intent",
@@ -1208,26 +1116,6 @@
             "hicache_prefetch_intent_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_intent_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:req_id"
@@ -1281,7 +1169,14 @@
               "source": "self.prefetch_stop_policy",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "prefetch_intent_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.prefetch_check_point",
@@ -1292,26 +1187,6 @@
             "hicache_prefetch_check_point_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_check_point"
-            },
             {
               "name": "request_id",
               "source": "arg:req_id"
@@ -1332,7 +1207,14 @@
               "name": "check_kind",
               "source": "const:progress"
             }
-          ]
+          ],
+          "fact": {
+            "class": "invariant_state",
+            "role": "prefetch_check_point",
+            "model_input": true,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.prefetch_progress_observed",
@@ -1343,26 +1225,6 @@
             "hicache_prefetch_progress_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_progress_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:req_id"
@@ -1384,7 +1246,14 @@
               "source": "hicache_prefetch_progress:self,arg:req_id",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "prefetch_progress_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.maintenance_check",
@@ -1395,26 +1264,6 @@
             "hicache_maintenance_check_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:maintenance_checkpoint"
-            },
             {
               "name": "checkpoint_kind",
               "source": "const:maintenance_check"
@@ -1435,7 +1284,14 @@
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "maintenance_checkpoint",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.ready_to_load_host_cache",
@@ -1446,26 +1302,6 @@
             "hicache_ready_to_load_host_cache_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:maintenance_checkpoint"
-            },
             {
               "name": "checkpoint_kind",
               "source": "const:ready_to_load_host_cache"
@@ -1486,7 +1322,14 @@
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "maintenance_checkpoint",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.flush_write_through_acks",
@@ -1497,26 +1340,6 @@
             "hicache_flush_write_through_acks_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:maintenance_checkpoint"
-            },
             {
               "name": "checkpoint_kind",
               "source": "const:flush_write_through_acks"
@@ -1537,7 +1360,14 @@
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "maintenance_checkpoint",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.capacity_request",
@@ -1548,26 +1378,6 @@
             "hicache_capacity_request_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:capacity_request"
-            },
             {
               "name": "request_id",
               "source": "arg:params.req.rid",
@@ -1605,7 +1415,14 @@
               "name": "policy_params",
               "source": "hicache_config:self,policy_params"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "capacity_request",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.capacity_result_observed",
@@ -1616,26 +1433,6 @@
             "hicache_capacity_result_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:capacity_result_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:params.req.rid",
@@ -1667,7 +1464,14 @@
               "source": "hicache_evictable_snapshot:self",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "capacity_result_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.lock_scope_inc",
@@ -1679,26 +1483,6 @@
           ],
           "fields": [
             {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lock_scope_delta"
-            },
-            {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
             },
@@ -1722,7 +1506,14 @@
               "name": "lock_direction",
               "source": "const:inc"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "lock_scope_delta",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.lock_scope_inc_observed",
@@ -1734,26 +1525,6 @@
           ],
           "fields": [
             {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lock_scope_result_observed"
-            },
-            {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
             },
@@ -1787,7 +1558,14 @@
               "source": "hicache_evictable_snapshot:self",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "lock_scope_result_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.lock_scope_dec",
@@ -1798,26 +1576,6 @@
             "hicache_lock_scope_dec_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:invariant_state"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lock_scope_delta"
-            },
             {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
@@ -1842,7 +1600,14 @@
               "name": "lock_direction",
               "source": "const:dec"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "lock_scope_delta",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hiradix.lock_scope_dec_observed",
@@ -1853,26 +1618,6 @@
             "hicache_lock_scope_dec_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:lock_scope_result_observed"
-            },
             {
               "name": "cache_scope",
               "source": "hicache_cache_scope:self"
@@ -1907,7 +1652,14 @@
               "source": "hicache_evictable_snapshot:self",
               "required": false
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "lock_scope_result_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hicache_controller.prefetch_io_observed",
@@ -1918,26 +1670,6 @@
             "hicache_prefetch_io_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:timing_observation"
-            },
-            {
-              "name": "event_role",
-              "source": "const:prefetch_io_observed"
-            },
             {
               "name": "request_id",
               "source": "arg:operation.request_id",
@@ -1989,7 +1721,14 @@
               "name": "direction",
               "source": "const:L3_to_L2"
             }
-          ]
+          ],
+          "fact": {
+            "class": "timing_observation",
+            "role": "prefetch_io_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hicache_controller.writeback_io_observed",
@@ -2000,26 +1739,6 @@
             "hicache_writeback_io_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:timing_observation"
-            },
-            {
-              "name": "event_role",
-              "source": "const:writeback_io_observed"
-            },
             {
               "name": "operation_id",
               "source": "arg:operation.id",
@@ -2066,7 +1785,14 @@
               "name": "direction",
               "source": "const:L2_to_L3"
             }
-          ]
+          ],
+          "fact": {
+            "class": "timing_observation",
+            "role": "writeback_io_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         },
         {
           "id": "hicache_controller.writeback_enqueue_observed",
@@ -2077,26 +1803,6 @@
             "hicache_writeback_enqueue_observed_end"
           ],
           "fields": [
-            {
-              "name": "model_input",
-              "source": "const:true"
-            },
-            {
-              "name": "dag_input",
-              "source": "const:false"
-            },
-            {
-              "name": "state_model_input",
-              "source": "const:false"
-            },
-            {
-              "name": "fact_class",
-              "source": "const:source_actual"
-            },
-            {
-              "name": "event_role",
-              "source": "const:writeback_enqueue_observed"
-            },
             {
               "name": "operation_id",
               "source": "return",
@@ -2143,7 +1849,14 @@
               "name": "direction",
               "source": "const:L2_to_L3"
             }
-          ]
+          ],
+          "fact": {
+            "class": "source_actual",
+            "role": "writeback_enqueue_observed",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          }
         }
       ]
     },
@@ -2160,16 +1873,16 @@
     "servers": [
       {
         "id": "s1a",
-        "name": "S1A_baseline_large",
+        "name": "S1A_fast_pressure",
         "metadata": {
-          "purpose": "Mainline-one L1 manual phased run for S1A: page128 + write-through-selective + wait_complete.",
+          "purpose": "Mainline-one fast iteration run for S1A: page128 + reduced L1 + write-through-selective + wait_complete.",
           "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
           "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
-          "hicache_ratio_note": "--hicache-ratio is 2.25 (>1.0) so the mainline-one joint signature is new relative to every previously profiled HiCache state config while avoiding the severe low-ratio slowdown; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
-          "mainline_one_scenario": "S1A_baseline_large",
+          "hicache_ratio_note": "--hicache-ratio is 2.25 (>1.0). Iteration speed comes from smaller workload scale plus a reduced --max-total-tokens; S1A keeps max-total-tokens at 4096 because the NPU kernel_ascend path rewrites the host layout to page_first_direct and requires enough host pages for the 64-layer model.",
+          "mainline_one_scenario": "S1A_fast_pressure",
           "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
-          "mainline_one_config_signature": "page_size=128,l1_capacity_pages=64,l2_capacity_pages=145,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.25,prefetch_timeout_extra=8.0/0.0/8.0",
-          "mainline_one_config_comparison": "Different from C2 by prefetch policy, explicit capacity, ratio, and timeout extra config; different from C5 by write policy, explicit capacity, ratio, and timeout extra config; different from the earlier mainline-one S1A draft by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "mainline_one_config_signature": "page_size=128,l1_capacity_pages=32,l2_capacity_pages=73,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.25,prefetch_timeout_extra=8.0/0.0/8.0",
+          "mainline_one_config_comparison": "Different from C2 by capacity, prefetch policy, ratio, and timeout extra config; different from C5 by capacity, write policy, ratio, and timeout extra config; different from the earlier mainline-one S1A draft by capacity, ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
           "hicache_write_policy": "write_through_selective"
         },
         "server": {
@@ -2198,7 +1911,7 @@
             "--page-size",
             "128",
             "--max-total-tokens",
-            "8192",
+            "4096",
             "--hicache-ratio",
             "2.25",
             "--hicache-write-policy",
@@ -2214,8 +1927,8 @@
         "modeling": {
           "hicache": {
             "page_size": 128,
-            "l1_capacity_pages": 64,
-            "l2_capacity_pages": 145,
+            "l1_capacity_pages": 32,
+            "l2_capacity_pages": 73,
             "write_policy": "write_through_selective",
             "prefetch_policy": "wait_complete"
           }
@@ -2223,16 +1936,16 @@
       },
       {
         "id": "s1b",
-        "name": "S1B_divergent_large",
+        "name": "S1B_fast_pressure",
         "metadata": {
-          "purpose": "Mainline-one L1 manual phased run for S1B: page64 + write-back + best_effort.",
+          "purpose": "Mainline-one fast iteration run for S1B: page64 + small L1 + write-back + best_effort.",
           "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
           "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
-          "hicache_ratio_note": "--hicache-ratio is 2.5 (>1.0) so the mainline-one joint signature is new relative to every previously profiled HiCache state config while avoiding the severe low-ratio slowdown; capacity pressure comes from workload scale and explicit modeling.hicache capacity snapshots.",
-          "mainline_one_scenario": "S1B_divergent_large",
+          "hicache_ratio_note": "--hicache-ratio is 2.5 (>1.0). Iteration speed comes from smaller --max-total-tokens and workload scale; capacity pressure is preserved by matching modeling.hicache capacity to the smaller L1/L2 pools.",
+          "mainline_one_scenario": "S1B_fast_pressure",
           "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
-          "mainline_one_config_signature": "page_size=64,l1_capacity_pages=128,l2_capacity_pages=321,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
-          "mainline_one_config_comparison": "Different from C3/I2 page64 by write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "mainline_one_config_signature": "page_size=64,l1_capacity_pages=32,l2_capacity_pages=81,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
+          "mainline_one_config_comparison": "Different from C3/I2 page64 by capacity, write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by capacity, ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
           "hicache_write_policy": "write_back"
         },
         "server": {
@@ -2261,7 +1974,7 @@
             "--page-size",
             "64",
             "--max-total-tokens",
-            "8192",
+            "2048",
             "--hicache-ratio",
             "2.5",
             "--hicache-write-policy",
@@ -2277,8 +1990,8 @@
         "modeling": {
           "hicache": {
             "page_size": 64,
-            "l1_capacity_pages": 128,
-            "l2_capacity_pages": 321,
+            "l1_capacity_pages": 32,
+            "l2_capacity_pages": 81,
             "write_policy": "write_back",
             "prefetch_policy": "best_effort"
           }
@@ -2291,8 +2004,8 @@
         "name": "L1_manual_phased",
         "metadata": {
           "mainline_one_input": "L1_manual_phased",
-          "mainline_one_workload_scale": "L1_manual_phased uses 83 requests: larger than I2 (65) and I3 (43), with shorter prompt length than the aborted 125-request draft for repeatable profiling.",
-          "purpose": "Mainline-one L1 manual phased workload input shared by S1A/S1B; cache write policy is filled from server metadata."
+          "mainline_one_workload_scale": "L1_manual_phased uses 24 requests for fast iteration: enough to exercise seed/reuse/backup/pressure/load-back/prefetch/dirty phases without the old 83-request profile cost.",
+          "purpose": "Mainline-one L1 fast manual phased workload input shared by S1A/S1B; cache write policy is filled from server metadata. Full-scale stress should be a separate archival run, not the default iteration path."
         },
         "bench": {
           "command": [
@@ -2305,30 +2018,32 @@
             "--warmup-requests",
             "1",
             "--seed-requests",
-            "8",
+            "4",
             "--reuse-requests",
-            "8",
+            "2",
             "--backup-wait-requests",
-            "8",
+            "2",
             "--pressure-requests",
-            "24",
+            "8",
             "--pressure-unique-prefix",
             "--reuse-after-pressure-requests",
-            "8",
+            "1",
             "--prefetch-seed-requests",
-            "8",
+            "2",
             "--prefetch-reuse-requests",
-            "10",
+            "2",
             "--dirty-eviction-requests",
-            "8",
+            "2",
             "--shared-prefix-repeat",
-            "160",
+            "96",
             "--unique-suffix-repeat",
-            "16",
+            "8",
             "--sleep-sec",
-            "0.02",
+            "0.0",
             "--phase-wait-sec",
-            "2.0",
+            "0.5",
+            "--timeout-sec",
+            "300",
             "--max-errors",
             "1",
             "--max-new-tokens",

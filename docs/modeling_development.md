@@ -99,8 +99,9 @@ Trace merger 不根据 modeling mode 删除真实执行事件。`faithful_replay
 | --- | --- |
 | `model_input` | 是否进入 modeling 输入集合。 |
 | `dag_input` | 是否作为默认性能 DAG 节点。 |
-| `state_model_input` | 是否允许状态子模块消费。 |
 | `fact_class` | 子模块事实分类。 |
+| `event_role` | atomic fact role，供状态子模块二级路由。 |
+| `fact_granularity` | HiCache state 主线要求为 `atomic`。 |
 
 ## TraceGraph 结构
 
@@ -147,21 +148,29 @@ cmake --build build --target trace_graph -j2
 | 文件 | 作用 |
 | --- | --- |
 | `hicache_fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
-| `hicache_router.hpp/.cpp` | 31-target invariant role enum、输入门禁和 required field 检查。 |
+| `hicache_router.hpp/.cpp` | HiCache role enum、输入门禁和 required field 检查。 |
 | `hicache_token_store.hpp/.cpp` | request scoped token path store。 |
 | `hicache_target_pager.hpp/.cpp` | target page size projection 和 page hash 生成。 |
-| `hicache_token_radix_tree.hpp/.cpp` | token-level radix tree，支持 token prefix、split、insert 和 page projection leaf group。 |
-| `hicache_state_index.hpp/.cpp` | page/node projection state index，维护 resident、dirty、backuped、evicted、lock、prefetch 和 hit count 集合。 |
+| `hicache_token_radix_tree.hpp/.cpp` | token-level radix tree，按 `cache_scope` 隔离 token prefix、split、insert 和 page projection leaf group。 |
+| `hicache_state_index.hpp/.cpp` | scoped page/node projection state index，维护 resident、dirty、backuped、evicted、lock、prefetch 和 hit count 集合。 |
 | `hicache_model.hpp/.cpp` | state model orchestration：按 role 调用 store/pager/radix/state index。 |
 | `hicache_summary.hpp/.cpp` | 输出 final state、transition trace、审计计数。 |
 | `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
 
-当前代码仍是过渡实现，但已经不再保留旧 page-level radix backend。剩余主要问题：
+当前代码仍是过渡实现，但已经不再保留旧 page-level radix backend。当前 mainline profile config 使用 target-level
+atomic fact 契约，只把 `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、
+`prefetch_decision` 和 `prefetch_check_point` 作为正常 state 输入；其它 cache-stage concrete path、lifecycle path/runtime
+和 source control-flow role 都是 `source_actual` / `timing_observation` evidence。剩余主要问题：
 
-- `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 仍只被 router 识别，尚未实现 state mutation；
-- token radix tree 已按 token split/insert，但还没有完整 SGLang node parent/ref/host-ref 对等结构；
-- `state_index` 已集中 page projection sets，但 evictable、priority、host ref 和 node-level ownership 仍是后续阶段；
-- write policy、capacity victim、async prefetch/load-back/writeback 仍沿用过渡规则，后续要进入 `PolicyEngine` 和 `AsyncState`。
+- `request_admission` 作为 request-scoped token context 进入 token store；当前不直接产生 resident/dirty mutation；
+- 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；`insert_path`、
+  `capacity_request`、`lock_scope_delta` 和 `maintenance_checkpoint` 保留为 source evidence，不进入正常模型；
+- token radix tree 已按 `cache_scope` 做 token split/insert 隔离，但还没有完整 SGLang node parent/ref/host-ref 对等结构；
+- `state_index` 已集中 scoped page projection sets，L1/L2 capacity 按 `cache_scope` 统计和驱逐，但 evictable、priority、
+  host ref 和 node-level ownership 仍是后续阶段；
+- write policy、capacity victim、async prefetch/load-back/writeback 仍沿用过渡规则；如果后续要重新启用
+  lifecycle/capacity/lock/maintenance 的正常输入，必须先通过 cross audit 的 `model_input_contract_ready`，不能直接复用
+  source trace 的 concrete path 或 control-flow 序列。
 
 后续 C++ 工作继续按下面的目标架构推进；旧 page-level state machine 不作为兼容对象保留。
 
@@ -170,42 +179,41 @@ cmake --build build --target trace_graph -j2
 后端输入分流规则已经收紧成一个主判断：
 
 ```text
-consume fact iff fact_class == "invariant_state" && state_model_input == true
+consume fact iff model_input == true
+    && fact_class == "invariant_state"
+    && fact_granularity == "atomic"
+    && role is a known atomic invariant
 ```
 
 其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。`source_actual`、`timing_observation`、
 `oracle_state` 和 debug/provenance 字段只能进入 validation、diagnostics 或 profile quality。
 
-当前 mainline S1A/S1B profiling 契约固定为 31 个 target：
+当前 mainline S1A/S1B profiling 契约为 33 个 atomic target，正常 state model input 是其中 7 个 target / 5 个 role：
 
 | fact class | target count | state input |
 | --- | ---: | --- |
-| `invariant_state` | 16 | true |
-| `source_actual` | 13 | false |
+| `invariant_state` | 7 | true |
+| `source_actual` | 24 | false |
 | `timing_observation` | 2 | false |
 
-当前 profiling 契约提供的 invariant roles：
+当前 profiling 契约提供的正常 state input：
 
 | role | 语义 |
 | --- | --- |
-| `request_tokens` | 注册 request 的完整 token path。 |
-| `lookup_path` | 在 target token radix tree 上查 longest prefix；matched/source hit 只能由模型自己产生。 |
-| `request_cache_lifecycle` | 用 finished/unfinished request 的 committed/fill token path、chunked/is_insert/priority 驱动 request lifecycle。 |
-| `request_admission` | 在 prefill admission / chunked continuation 边界重放 target-side load-back、临时/正式 lock/ref 和截断后的 admitted path。 |
-| `insert_path` | 插入 target token path，更新 node/page resident、hit count、priority、dirty/backuped 和 write policy 状态。 |
+| `request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path。 |
+| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界的 request-level anchor，不携带 committed/fill/generated suffix path。 |
+| `request_admission` | 在 prefill admission / chunked continuation 边界记录 request token path、admission kind 和 policy。 |
 | `prefetch_decision` | 在 scheduler prefetch decision checkpoint 上由 target state 重新判断 anchor、suffix 和是否 enqueue prefetch。 |
 | `prefetch_check_point` | 按 target prefetch policy 推进等待、timeout、late、suppressed，不从 source completion 直接构造 ready set。 |
-| `maintenance_checkpoint` | 在 check/load/flush 边界推进 modeled async queue、write/load ack 和 storage control。 |
-| `capacity_request` | 作为 allocation pressure checkpoint，victim 由 target eviction policy 决定。 |
-| `lock_scope_delta` | 以 token logical path 和 target radix parent chain 重建 lock/ref，不消费 source return delta。 |
-| `cache_config_observed` | 只做配置审计；target page size、capacity、write/prefetch policy 仍来自 modeling config。 |
 
-`prefetch_intent` 已从 invariant 中移除；当前配置只保留 `prefetch_intent_observed` 作为 `source_actual`。
-后端重构必须显式处理每个 invariant role；不能通过消费 `source_actual` 事件绕过 role 缺口。unknown invariant role
-应进入 `missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
+当前 profile config 已删除 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 这类混合 role。match-prefix concrete
+path、lookup result、cache config、lifecycle path/runtime、insert/capacity/lock/maintenance 和 storage/controller 事件只作为
+`source_actual` / `timing_observation` evidence。后端仍必须显式处理每个真正进入模型的 invariant role；不能通过消费
+`source_actual` 事件绕过 role 缺口。unknown invariant role 应进入
+`missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
 
-31-target 契约在当前 mainline S1A/S1B scope 内冻结。profile quality 通过后，如果 prediction 仍 mismatch，默认归类为
-backend model/rule 缺陷；只有下列情况才考虑新增采集 target：
+cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant 事件，逐 role 对比 count、
+sequence 和 canonical fact value。只有下列情况才考虑新增采集 target：
 
 - profile quality 明确证明现有 target 缺 required field、token dictionary 或 seq/scope；
 - 进入 DLLM、disaggregation、streaming session、abort/timeout/preemption 等新 scope；
@@ -287,6 +295,7 @@ page size what-if 会继续在 split、lock/ref chain 和 evictable victim 上�
 | `backuped_pages` | 已持久/host backuped projection。 |
 | `evicted_pages` | target eviction lifecycle projection。 |
 | `locked_pages` | token radix parent/ref chain 上 lock/ref 非零的 page projection。 |
+| `pending_writeback_pages` | `AsyncState` 中 dirty eviction 已 enqueue、尚未由 maintenance checkpoint ack 的 page projection。 |
 | `prefetch_planned_pages` | `AsyncState` 中 target policy 已 enqueue 的 page projection。 |
 | `prefetch_ready_pages` | modeled async queue 已完成且 target 可见的 page projection。 |
 | `prefetch_late_pages` | target policy 判定 timeout/late 的 page projection。 |
@@ -314,21 +323,66 @@ model_summary.json.modules[0].hicache
 
 ### 重构阶段
 
-1. `router/schema`：实现 role enum 和 required field hard fail；删除旧 `prefetch_intent` invariant 分支；fixtures 覆盖 31-target role。
+1. `router/schema`：实现 atomic role enum 和 required field hard fail；router 只接受当前 5 个正常输入 role。
 2. `token store + pager`：把 token dictionary/span、request path、target page projection 从 `HiCacheState` 中拆出；验证 page64/page128 hash。
 3. `token radix tree`：实现 token-level insert/lookup/split/remove、node parent chain、node->page projection；page-level radix tree 退役。
 4. `state index`：实现 node/page resident、dirty、backuped、evicted、hit/priority、lock/ref、host ref、evictable 索引。
-5. `request/admission lifecycle`：用 `request_tokens`、`lookup_path`、`request_admission`、`request_cache_lifecycle` 串起 lookup、load-back、chunked admission、insert/free。
+5. `request/admission lifecycle`：当前直接消费 request-bound match anchor、lifecycle anchor 和 admission facts；更细的 lookup、load-back、chunked admission、insert/free 仍需要 target-derived 机制或新的 target-independent atomic invariant。
 6. `policy engine`：重建 write-through-selective、write-back、capacity victim、evictable skip、lock/ref skip 和 L2/L3 backup 规则。
-7. `async state`：用 `prefetch_decision`、`prefetch_check_point`、`maintenance_checkpoint` 重建 prefetch/load-back/writeback queue；只把 timing/source actual 用于对照。
+7. `async state`：当前只直接消费 `prefetch_decision` 和 `prefetch_check_point`；maintenance polling/check-kind 序列必须先变成 target-derived 机制或高层 invariant，才能参与 prefetch/load-back/writeback queue。
 8. `validation/provenance`：四向 S1A/S1B prediction 必须输出逐 trace diff，能把 mismatch 分类为已建模规则 bug、当前 scope 不可观测机制或新 scope 需求。
 9. `DAG patch`：只有 state final sets 在 self-config 和 cross-config 均闭环后，才实现 cache state 到 DAG mutation。
 
 ### 当前实现进度
 
+截至 2026-06-12 12:42，完成 HiCache state atomic fact 输入契约重构：
+
+- profile config 现在是 33 个 target-level atomic `fact` target，正常 state input 是 7 个 target / 5 个 role；
+- `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已删除，相关 callable 拆成 invariant anchor 与
+  `source_actual` path/runtime evidence；
+- C++ router 已同步切到 atomic role gate，不再把 source/control-flow role 作为正常模型入口；
+- cross audit 的 hard `model_input_contract` 按 atomic invariant role 比较 count、sequence 和 canonical fact value；
+- 下一步需要在 atomic profile config 下重跑真实 S1A/S1B，再用 `model_input_contract_ready=true` 作为 cross state-rule
+  diagnosis 的前置条件。
+
+截至 2026-06-12 03:49，基于修复前 S1A/S1B 31-target fast-pressure suite 完成 async-elision 与 cross input-contract
+诊断；这些结果是本轮 demotion 的历史证据：
+
+- S1A self normal prediction 已 final state match；
+- S1B self normal 仍有 L2/backuped/evicted `56/55`、missing `13`、extra `14`，但 C++ 模型侧
+  diagnostic async-elision 后 final state match，说明当前 self-config diff 来自 async/input-boundary 分岔后的连锁状态差；
+- cross-config 仍未闭环，不能用 timestamp oracle injection：S1A/S1B trace window 不重叠；
+- `unbound_match_prefix_paths` / `insert_paths` 已被 temporal anchor 诊断证明是 target-derived/page-aligned projection
+  目标，不应继续直接消费 source unbound path；
+- `request_cache_lifecycle` 的 mismatch 已定位为同 request prompt anchor 一致、committed/generated suffix 不同；
+- `capacity_request` 的 cross mismatch 已定位为 target/control-flow pressure sequence 差异，而不是 page-size-only：
+  两向 `page_size_only_explains_count=0`、`requested_tokens_differ_count=8`，另有 `4` 个 one-sided event。
+- `lock_scope_delta` 的 cross mismatch 已定位为各自 inc/dec 平衡但序列/path/direction 不可复用：net 都是 `0`，
+  但 path mismatch `228`、direction mismatch `166`、one-sided event `44`；`maintenance_checkpoint` 的 cross
+  mismatch 主要是 check_kind 调度错位，`check_kind_mismatch=348`、one-sided event `4`。
+- 修复前 `normal_model_input_contract` 已把 cross audit 的可消费结论结构化：两向都是
+  `contract_status=blocked_by_input_contract`，`unsafe_roles_after_projection` 为 `request_cache_lifecycle`、
+  `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`。因此现在还不能声称 cross 已排除 async 后无其他
+  state-rule 问题；本轮已先把这些 source/control-flow 事件降级为 evidence/control-flow boundary，真实 cross run 仍需重跑。
+
+截至 2026-06-11 15:11，基于 S1B 31-target fast-pressure profile 完成一轮 backend 修正：
+
+- router 接受 zero-token span：`begin == end` 的合法空路径不再被误报为缺 token dictionary；
+- `request_admission` / `request_cache_lifecycle` 不再被报为 unimplemented invariant role，而是更新 request scoped token store；
+- `maintenance_checkpoint` 不再被报为 unimplemented invariant role，当前作为显式 no-op 边界事件处理；
+- fact replay 排序改为严格全局时间顺序，并在同 timestamp/scope 下使用 `seq_no` 破 ties，避免旧 comparator 的非全序导致
+  lock/ref delta 乱序；
+- radix tree 和 L1/L2 capacity enforcement 改为按 `cache_scope` 隔离；raw model state 会保留两个 HiRadixCache scope，
+  normalized validation 仍按 page hash union 对比 oracle；
+- `capacity_request` 接入 L1 modeled eviction pressure：当 fact 带 `requested_tokens` 时按 target `page_size`
+  重算 requested pages，再按 target eviction policy 选择 victim；不消费 source victim，也不把 cross source
+  `params.num_tokens` 序列当作 target-independent 输入；
+- 最新 S1B self validation 的 `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`，`locked_pages` 已对齐
+  `0/0`；剩余 mismatch 集中在 L2/backuped/evicted 以及少量 L1/dirty extra。
+
 截至 2026-06-11 02:03，阶段 1/2/3/4 已完成最小建模：
 
-- 新增 `hicache_router.hpp/.cpp`，集中维护 31-target invariant role enum、第一层输入门禁和 required field 检查；
+- 新增 `hicache_router.hpp/.cpp`，集中维护 HiCache role enum、第一层输入门禁和 required field 检查；
 - `HiCacheStateModel::run` 不再在本地维护 role 字符串集合，而是通过 router 分发；
 - unknown invariant role 进入 `missing_invariant_facts["unknown_invariant_role"]`；
 - 缺 token dictionary/span、`cache_scope` 或 `seq_no` 的 invariant 在进入 state mutation 前被拒绝，不计入 `processed_hicache_events`；
@@ -337,14 +391,25 @@ model_summary.json.modules[0].hicache
 - 新增 `hicache_token_radix_tree.hpp/.cpp`，旧 `hicache_radix_tree.hpp/.cpp` 已删除；
 - 新增 `hicache_state_index.hpp/.cpp`，resident/dirty/backuped/evicted/lock/prefetch/hit count 集合由 state index 维护；
 - `prefetch_intent` 不再是 invariant input；当前 transitional backend 用 `prefetch_decision` 在 target token radix 上计算 planned suffix；
-- `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 已被 router 识别，但还未实现 target state mutation；
-  目前会进入 `missing_invariant_facts["unimplemented_invariant_role.<role>"]`，避免静默吞事件。
+- `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 已被 router 识别；
 - 最小验证新增并通过：target page size projection fixture、token radix split projection fixture、原 HiCache state fixtures。
 
 ## HiCache 当前验证状态
 
-当前有效 modeling 证据仍是 2026-06-10 四向结果；它来自 31-target 契约之前的 profile，只能证明旧 page-level backend
-不正确，不能作为新 31-target 契约的验收结果。新 profile 完成后必须按上面的目标架构验证。
+当前有效代码/配置状态是 2026-06-12 input-contract repair。最新真实 modeling 证据仍是修复前的
+`HCSV-20260612-async-elision-current-self-and-cross`，记录在 `docs/validation/hicache_state_validation.md`，只能作为
+降级变体输入的历史证据。修复前简要结论：
+
+- S1A self normal final state match；
+- S1B self normal final state mismatch 仅剩 L2/backuped/evicted，但模型侧 async-elision 后 final state match；
+- S1A->S1B 和 S1B->S1A 仍未通过，阻塞点是 cross input contract：lifecycle/control-flow facts 尚未证明
+  target-independent。
+
+atomic profile config 后，必须先重跑 S1A/S1B profile、profile quality、cross audit 和 modeling validation；旧 retained
+audit 不能再被解读为当前 atomic 正常输入契约下的失败结果。
+
+下面的 2026-06-10 四向结果来自 atomic 契约之前的 profile，只能证明旧 page-level backend 不正确，不能作为当前
+33-target atomic 契约的验收结果。
 
 历史 S1A manual run：
 
@@ -386,7 +451,7 @@ normalized oracle validation：
 | `evicted_pages` | 48 | 52 | missing 26, extra 22 |
 | `locked_pages` | 11 | 11 | match |
 
-结论：旧 profile 已经证明 invariant-only 分流方向正确，但 page-level state model 不正确。新 31-target profile 完成后，
+结论：旧 profile 已经证明 invariant-only 分流方向正确，但 page-level state model 不正确。新 atomic profile 完成后，
 应按目标架构重构并重跑四向验证，而不是继续在旧 page-level backend 上小修。
 
 ## 当前未实现

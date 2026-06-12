@@ -1,9 +1,9 @@
 {
   "metadata": {
-    "purpose": "Predict mainline-one S1B target state: page64 + write-back + best_effort.",
+    "purpose": "Predict mainline-one S1B target state: page64 + small L1 + write-back + best_effort.",
     "mainline_one_config_novelty": "S1B must be distinct from S1A and from every previously profiled HiCache state config, not only from the C0-C8 named matrix.",
-    "mainline_one_config_signature": "page_size=64,l1_capacity_pages=128,l2_capacity_pages=321,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
-    "mainline_one_config_comparison": "Different from C3/I2 page64 by write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+    "mainline_one_config_signature": "page_size=64,l1_capacity_pages=32,l2_capacity_pages=81,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
+    "mainline_one_config_comparison": "Different from C3/I2 page64 by capacity, write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by capacity, ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
     "usage": "python3 scripts/internal/model_runner.py --config <this config> --profile-manifest <base_run_dir>/profile_manifest.json --output-dir <base_run_dir>/modeling/<label> --mode cache_state --emit-module-summary --emit-validation --hicache-oracle-trace <target_oracle_trace.json>"
   },
   "input": {},
@@ -25,8 +25,8 @@
         "hicache": {
           "enabled": true,
           "page_size": 64,
-          "l1_capacity_pages": 128,
-          "l2_capacity_pages": 321,
+          "l1_capacity_pages": 32,
+          "l2_capacity_pages": 81,
           "write_policy": "write_back",
           "prefetch_policy": "best_effort"
         }

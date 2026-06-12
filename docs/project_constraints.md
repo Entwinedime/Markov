@@ -51,17 +51,27 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 
 ### HiCache Profiling
 
-- HiCache state 主线只允许 token/range invariant contract。
-- 新采集目标必须显式写入 `fact_class`、`dag_input`、`state_model_input`。
-- `fact_class=invariant_state && state_model_input=true` 才能进入 C++ HiCache state model。
+- HiCache state 主线只允许 target-level atomic fact contract。
+- 新采集目标必须显式写入 `fact.class`、`fact.role`、`fact.model_input`、`fact.dag_input` 和
+  `fact.granularity=atomic`。
+- `model_input=true && fact_class=invariant_state && fact_granularity=atomic` 才能进入 C++ HiCache state model；router
+  只接受已知 atomic invariant role。
+- 非 `invariant_state` 的 HiCache target 必须显式写 `model_input=false`。
 - `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不得更新 target state。
+- HiCache mainline 可以保留 source/evidence target，但正常 state model input 必须是显式枚举且通过 cross audit 的子集；
+  当前 33-target suite 的正常输入 role 是 `request_bound_match_anchor`、`request_lifecycle_anchor`、
+  `request_admission`、`prefetch_decision`、`prefetch_check_point`。
 - source matched result、admission return、actual victim、actual movement、actual async completion 等 source 已发生结果不得作为
   `invariant_state` 事件字段混入；需要保留时必须拆成并行 `source_actual` / `timing_observation` / `oracle_state` 事件。
+- cache-stage concrete match-prefix path、source `insert_path`、request lifecycle generated/committed suffix、
+  source `capacity_request`、source `lock_scope_delta` 和 source maintenance polling/check-kind 序列不得作为正常 cross
+  model input；需要使用时必须改成 target-derived 机制或新的 target-independent invariant。
 - `page_identity`、`target_page_identity`、`target_page_identity_page<page_size>` 不再是 state model 主输入。
 - target page identity 必须由 token dictionary/span、`hash_algo`、`cache_scope` 和 target `page_size` 推导。
-- token dictionary 可作为默认 state input；普通事件应引用 span，避免重复携带完整 token 列表。
+- 正常 state input 可以引用 token dictionary/span，但能否进入模型由 `fact_class` 和 atomic `event_role` 决定；普通事件应引用
+  span，避免重复携带完整 token 列表。
 - `cache_scope` 和 `seq_no` 是 HiCache invariant state fact 的必需路由字段。
-- validation-only `state_snapshot` 必须保持 `state_model_input=false`。
+- validation-only `state_snapshot` 必须保持 `model_input=false` 且 `fact_class=oracle_state`。
 - 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验、`tests/run_profiling_fixtures.py`、
   `tests/run_hicache_mainline_config_fixtures.py`，以及 invariant target source-result 字段审计。
 
@@ -83,8 +93,11 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - `self-config prediction` 仍必须显式给出 target page size、capacity、write policy、prefetch policy。
 - `cross-config prediction` 只能用 target trace 做 oracle，不得偷读 target actual trace 作为模型事实源。
 - 非执行类 state snapshot、oracle state、probe debug、质量审计事件不能作为默认性能 DAG 节点。
-- 当前 HiCache mainline S1A/S1B profiling 契约固定为 31 个 target；profile quality 通过后，state mismatch 默认归类为
-  backend model/rule 问题，不能因为单次 mismatch 临时追加采集 target。
+- 当前 HiCache mainline S1A/S1B profiling target count 是 33，但 profile quality 通过不代表全部 target 都是正常 state
+  input；cross-config state-rule diagnosis 必须先通过 hard `model_input_contract_ready=true`，确认 atomic invariant role
+  逐项跨配置一致。
+- 如果 `model_input_contract_ready=false`，state mismatch 先归类为输入契约、projection 或 async/control-flow boundary
+  问题，不能直接当作 backend model/rule bug 修。
 - 只有 profile quality 明确失败、进入 DLLM/disaggregation/streaming/abort/preemption 等新 scope，或 SGLang upstream hook
   语义边界变化时，才允许重新讨论新增 HiCache 采集 target。
 - HiCache backend 重构不保留 page-level state machine 兼容性；token-level radix tree 是 source of truth，page set 只能是

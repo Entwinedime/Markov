@@ -54,7 +54,6 @@ def _hicache_state_source(
                 event_kind="state_snapshot",
                 extra_args={
                     "dag_input": False,
-                    "state_model_input": False,
                     "fact_class": "oracle_state",
                 },
             ),
@@ -71,7 +70,6 @@ def _hicache_state_source(
             event_kind="state_snapshot",
             extra_args={
                 "dag_input": False,
-                "state_model_input": False,
                 "fact_class": "oracle_state",
             },
         ),
@@ -2065,9 +2063,8 @@ def _emit_internal_event(
     *,
     target: str,
     fact_class: str,
-    state_model_input: bool = False,
     dag_input: bool = False,
-    model_input: bool = True,
+    model_input: bool = False,
 ) -> None:
     try:
         timestamp = get_writer().now_us()
@@ -2088,9 +2085,9 @@ def _emit_internal_event(
                 "model_input": model_input,
                 "event_kind": f"hicache_{event_role}",
                 "dag_input": dag_input,
-                "state_model_input": state_model_input,
                 "fact_class": fact_class,
                 "event_role": event_role,
+                "fact_granularity": "atomic",
                 "cache_scope": scope,
                 "seq_no": seq_no,
                 "source_page_size": _safe_int(getattr(cache, "page_size", None)),

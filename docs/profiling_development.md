@@ -88,10 +88,19 @@ suite 的语义：
 
 | experiment | server | input |
 | --- | --- | --- |
-| `s1a_manual` | page128、write-through-selective、wait_complete | phased manual workload |
+| `s1a_manual` | page128、L1/L2 `32/73` pages、write-through-selective、wait_complete | fast phased manual workload |
 | `s1a_bench` | page128、write-through-selective、wait_complete | bench serving workload |
-| `s1b_manual` | page64、write-back、best_effort | phased manual workload |
+| `s1b_manual` | page64、L1/L2 `32/81` pages、write-back、best_effort | fast phased manual workload |
 | `s1b_bench` | page64、write-back、best_effort | bench serving workload |
+
+当前默认 manual profile 是迭代用 fast pressure profile：
+
+- HiCache target count 当前为 33，正常 state input 只由 target-level atomic `invariant_state` role 子集决定；
+- server 使用较小 L1 池保证小 workload 仍触发 pressure / eviction / load-back；S1A 为 `--max-total-tokens=4096`，
+  S1B 为 `--max-total-tokens=2048`；
+- manual workload 使用 24 个请求，覆盖 seed/reuse/backup/pressure/load-back/prefetch/dirty phases；
+- suite 顶层启用 `continue_on_error=true`，单个实验 timeout 不会阻止后续已选择实验继续运行；
+- full-scale stress 不作为默认迭代路径，应另建 archival run 或使用 bench input。
 
 suite 输出目录会保留：
 
@@ -156,80 +165,81 @@ state backend 从 token dictionary/span 和 target page size 重建 page hash。
 
 ## HiCache 事件分类
 
-HiCache Python probe 事件必须显式写入：
+HiCache Python probe target 必须显式写 `module` 和 target-level `fact`：
 
 | 字段 | 语义 |
 | --- | --- |
-| `model_input` | 是否进入 modeling 输入集合 |
-| `dag_input` | 是否允许进入默认性能 DAG |
-| `state_model_input` | 是否允许 HiCache state model 消费 |
-| `fact_class` | `invariant_state`、`timing_observation`、`source_actual`、`oracle_state`、`debug_quality` |
-| `event_role` | role 级语义，供后端二级分发 |
+| `fact.class` | `invariant_state`、`timing_observation`、`source_actual`、`oracle_state`、`debug_quality` |
+| `fact.role` | atomic role，供后端二级分发 |
+| `fact.model_input` | 是否进入 modeling 输入集合 |
+| `fact.dag_input` | 是否允许进入默认性能 DAG |
+| `fact.granularity` | HiCache state 主线要求为 `atomic` |
 
 后端第一层分流只看：
 
 ```text
-fact_class == "invariant_state" && state_model_input == true
+model_input == true
+&& fact_class == "invariant_state"
+&& fact_granularity == "atomic"
+&& event_role is a known atomic invariant
 ```
 
-其它事件即使出现在 trace 中，也只能作为 timing、source actual、oracle 或 debug 证据。
+其它事件即使出现在 trace 中，也必须写成 `model_input=false`，只能作为 timing、source actual、oracle 或 debug 证据。
 
-| `fact_class` | `state_model_input` | `dag_input` | 用途 |
-| --- | --- | --- | --- |
-| `invariant_state` | true | false | HiCache state model 唯一主输入 |
-| `timing_observation` | false | 按实验决定 | latency/bandwidth 样本，不能直接决定 target state |
-| `source_actual` | false | 按实验决定 | source run 实际 movement/policy 结果，不能作为 target answer |
-| `oracle_state` | false | false | validation-only state snapshot / transition oracle |
-| `debug_quality` | false | false | probe 内部质量审计和排查 |
+| `fact_class` | 用途 |
+| --- | --- |
+| `invariant_state` | HiCache state model 唯一主输入；必须是 atomic role |
+| `timing_observation` | latency/bandwidth 样本，不能直接决定 target state |
+| `source_actual` | source run 实际 movement/policy 结果，不能作为 target answer |
+| `oracle_state` | validation-only state snapshot / transition oracle |
+| `debug_quality` | probe 内部质量审计和排查 |
 
 ## 当前 HiCache State Targets
 
-`configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 当前配置 31 个
-HiCache target：16 个 `invariant_state`、13 个 `source_actual`、2 个 `timing_observation`。新的口径把“可重放输入”和“source 已发生结果”分开：同一个 Python callable 可以有一个
-`invariant_state` target 和一个并行 `source_actual` target。
+`configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 当前保留 33 个
+HiCache atomic target。只有下列 `invariant_state` role 会进入 C++ HiCache state model：
 
-| target id | role | fact class | state input | 说明 |
-| --- | --- | --- | --- | --- |
-| `hiradix.request_tokens` | `request_tokens` | `invariant_state` | true | 记录 request full token path |
-| `hiradix.lookup_path` | `lookup_path` | `invariant_state` | true | 只记录 lookup full token path；matched/source hit 已拆出 |
-| `hiradix.lookup_result_observed` | `lookup_result_observed` | `source_actual` | false | 记录 source matched node、device/host hit、node chain 和 evictable snapshot |
-| `hiradix.cache_config_observed` | `cache_config_observed` | `invariant_state` | true | 记录 source cache 配置摘要；target config 仍由 modeling 显式给出 |
-| `hiradix.cache_finished_req` | `request_cache_lifecycle` | `invariant_state` | true | 记录 finished request 的 committed token path、is_insert 和 priority |
-| `hiradix.cache_finished_req_observed` | `request_cache_lifecycle_observed` | `source_actual` | false | 记录 source request runtime、cache_protected_len 和 last node 证据 |
-| `hiradix.cache_unfinished_req` | `request_cache_lifecycle` | `invariant_state` | true | 记录 unfinished/chunked request 的 fill token path、chunked 和 priority |
-| `hiradix.cache_unfinished_req_observed` | `request_cache_lifecycle_observed` | `source_actual` | false | 记录 source unfinished request runtime 和 last node 证据 |
-| `scheduler.prefetch_decision` | `prefetch_decision` | `invariant_state` | true | 只记录 scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
-| `scheduler.prefetch_decision_observed` | `prefetch_decision_observed` | `source_actual` | false | 记录 source prefix/host hit/new-input/anchor 判定摘要 |
-| `schedule_policy.prefill_admission` | `request_admission` | `invariant_state` | true | 记录 `PrefillAdder.add_one_req` 的 request token path、admission kind、chunk/truncation 参数和 policy；不记录 source admission result |
-| `schedule_policy.prefill_admission_observed` | `request_admission_observed` | `source_actual` | false | 记录 source admission return、request runtime 和 phase-scoped budget snapshot |
-| `schedule_policy.chunked_admission` | `request_admission` | `invariant_state` | true | 记录 `PrefillAdder.add_chunked_req` 的 chunked continuation request token path 和 policy |
-| `schedule_policy.chunked_admission_observed` | `request_admission_observed` | `source_actual` | false | 记录 source chunked continuation return、request runtime 和 phase-scoped budget snapshot |
-| `hiradix.insert_path` | `insert_path` | `invariant_state` | true | 只记录 insert full path、value token 数、chunked 和 priority；prefix/inserted source result 已拆出 |
-| `hiradix.insert_result_observed` | `insert_result_observed` | `source_actual` | false | 记录 source prefix_len、inserted node 和 evictable snapshot |
-| `hiradix.prefetch_intent` | `prefetch_intent_observed` | `source_actual` | false | 记录 source 已发起的 prefetch prefix/suffix intent，不驱动 target prefetch |
-| `hiradix.prefetch_check_point` | `prefetch_check_point` | `invariant_state` | true | 记录请求时间线上的 prefetch check/wait 边界 |
-| `hiradix.prefetch_progress_observed` | `prefetch_progress_observed` | `source_actual` | false | 记录 source prefetch completed/revoked/progress 证据 |
-| `hiradix.maintenance_check` | `maintenance_checkpoint` | `invariant_state` | true | 记录 `check_hicache_events` 维护检查点 |
-| `hiradix.ready_to_load_host_cache` | `maintenance_checkpoint` | `invariant_state` | true | 记录 host->device load queue 启动检查点 |
-| `hiradix.flush_write_through_acks` | `maintenance_checkpoint` | `invariant_state` | true | 记录 write-through ack flush 检查点 |
-| `hiradix.capacity_request` | `capacity_request` | `invariant_state` | true | 记录 capacity request 的 token/page 需求，不记录 source victim |
-| `hiradix.capacity_result_observed` | `capacity_result_observed` | `source_actual` | false | 记录 source evicted tokens 和 evictable snapshot |
-| `hiradix.lock_scope_inc` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref increase，不记录 source delta |
-| `hiradix.lock_scope_inc_observed` | `lock_scope_result_observed` | `source_actual` | false | 记录 source inc return delta、node chain 和 evictable snapshot |
-| `hiradix.lock_scope_dec` | `lock_scope_delta` | `invariant_state` | true | 记录 logical path 上的 lock/ref decrease，不记录 source delta |
-| `hiradix.lock_scope_dec_observed` | `lock_scope_result_observed` | `source_actual` | false | 记录 source dec return delta、node chain 和 evictable snapshot |
-| `hicache_controller.prefetch_io_observed` | `prefetch_io_observed` | `timing_observation` | false | 真实 prefetch IO 样本，不驱动 target ready |
-| `hicache_controller.writeback_io_observed` | `writeback_io_observed` | `timing_observation` | false | 真实 writeback IO 样本 |
-| `hicache_controller.writeback_enqueue_observed` | `writeback_enqueue_observed` | `source_actual` | false | source writeback enqueue 事实，不驱动 target flushed pages |
+- `request_bound_match_anchor`
+- `request_lifecycle_anchor`
+- `request_admission`
+- `prefetch_decision`
+- `prefetch_check_point`
+
+它们对应 7 个 target：`hiradix.match_prefix.request_bound_anchor`、
+`hiradix.cache_finished_req.lifecycle_anchor`、`hiradix.cache_unfinished_req.lifecycle_anchor`、
+`schedule_policy.prefill_admission`、`schedule_policy.chunked_admission`、`scheduler.prefetch_decision` 和
+`hiradix.prefetch_check_point`。
+
+其余 24 个 target 是 `source_actual` evidence，2 个 target 是 `timing_observation`。这些事件可以用于 provenance、
+profile quality、oracle/debug 或后续 target-derived 机制设计，但不能直接更新 target state。当前口径把“正常模型输入”
+和“source 已发生结果 / cache-stage concrete path”拆开；同一个 Python callable 可以保留 source evidence，但每个 target
+必须代表一个 atomic fact。
+
+关键拆分如下：
+
+| target id | role | fact class | 说明 |
+| --- | --- | --- | --- |
+| `hiradix.match_prefix.request_bound_anchor` | `request_bound_match_anchor` | `invariant_state` | request-scoped match-prefix token anchor |
+| `hiradix.match_prefix.cache_stage_path_observed` | `cache_stage_match_path_observed` | `source_actual` | concrete match-prefix/cache-stage path evidence |
+| `hiradix.lookup_result_observed` | `lookup_result_observed` | `source_actual` | source matched node、device/host hit、node chain 和 evictable snapshot |
+| `hiradix.cache_finished_req.lifecycle_anchor` / `hiradix.cache_unfinished_req.lifecycle_anchor` | `request_lifecycle_anchor` | `invariant_state` | lifecycle 边界 anchor，不携带 committed/fill/generated suffix path |
+| `hiradix.cache_finished_req.path_observed` / `hiradix.cache_unfinished_req.path_observed` | `request_lifecycle_path_observed` | `source_actual` | source committed/fill token path evidence |
+| `hiradix.cache_finished_req.runtime_observed` / `hiradix.cache_unfinished_req.runtime_observed` | `request_lifecycle_runtime_observed` | `source_actual` | request runtime、chunk/insert/priority 等 source runtime evidence |
+| `schedule_policy.prefill_admission` / `schedule_policy.chunked_admission` | `request_admission` | `invariant_state` | admission boundary 的 request token path、admission kind 和 policy |
+| `scheduler.prefetch_decision` | `prefetch_decision` | `invariant_state` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
+| `hiradix.prefetch_check_point` | `prefetch_check_point` | `invariant_state` | request 时间线上的 prefetch check/wait 边界 |
 
 `sglang.hicache` probe 还会自动 patch 下列内部方法并输出 `source_actual` 事件：radix split/delete、
 device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、write hit counter delta、write/load ack checkpoint、storage control
 checkpoint、controller prefetch enqueue、rate-limit、storage hit query、prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件用于
-provenance 和 oracle 对照，默认 `state_model_input=false`。
+provenance 和 oracle 对照，默认是 `source_actual` 或 `timing_observation`，不是 normal state input。
+
+注意：match-prefix path 不再以 `request_tokens` / `lookup_path` 混合 role 出现。request-bound anchor 只在
+`params.req.rid` 存在时发出；concrete cache-stage path 另作为 `cache_stage_match_path_observed` evidence 保留。
+cross-config 诊断时需要逐项审计 atomic invariant 集合，而不能只看 workload report 的 prompt identity 是否一致。
 
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
-`fact_class=oracle_state`、`model_input=false`、`state_model_input=false`，只能给
-`profile_quality.py` 和 `model_runner.py` 的 validation 路径使用。
+`fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 `model_runner.py` 的 validation 路径使用。
 
 ## Token / Range 主事实
 
@@ -269,7 +279,7 @@ python3 scripts/internal/profile_quality.py \
 - `seq_no` 是否在 scope 内有序；
 - state trace 开启时是否采到 capacity snapshot。
 
-旧 `01_s1a_manual` 质量结果如下。它来自 2026-06-10 已完成 profile，不是当前 31-target 契约的重跑结果；
+旧 `01_s1a_manual` 质量结果如下。它来自 2026-06-10 已完成 profile，不是当前 33-target atomic 契约的重跑结果；
 当前契约重跑前只能把它作为历史基线：
 
 | 指标 | 值 |
@@ -326,3 +336,15 @@ cache patch 时，应新建/补充完整执行 trace suite，不能把 state-onl
 
 `--hicache-ratio` 必须大于 `1.0`。容量压力优先通过 workload 和显式 capacity config 构造，不用小于等于
 `1.0` 的 ratio 制造异常场景。
+
+当前 manual workload 有意采用小请求数配合小 L1：
+
+| server | page size | max total tokens | modeled L1 pages | modeled L2 pages |
+| --- | ---: | ---: | ---: | ---: |
+| S1A fast pressure | 128 | 4096 | 32 | 73 |
+| S1B fast pressure | 64 | 2048 | 32 | 81 |
+
+这样比单纯缩小 workload 更稳：pressure 仍能超过 target L1，后端 validation 也用同一组 target capacity。
+NPU `kernel_ascend` 会把 HiCache host layout 改写为 `page_first_direct`；Qwen3-32B 的 64 层模型要求
+host `page_num` 至少覆盖初始化时的 per-layer refs，因此 page128 场景不能把 `max_total_tokens` 压到 2048，
+否则 `2048 * 2.25 // 128 + 1 = 37` 会在 server 初始化时越界。

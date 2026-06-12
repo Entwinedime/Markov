@@ -122,8 +122,6 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         if not isinstance(raw_args, dict):
             continue
         _observe_hicache_capacity(capacity_accumulator, raw_args)
-        if _false_like(raw_args.get("model_input")):
-            continue
         _observe_mechanism(mechanism_counts, raw_args)
         _observe_hicache_invariant(invariant_accumulator, raw_args)
         target_id = str(raw_args.get("target_id") or "unknown")
@@ -254,7 +252,11 @@ def map_repo_path(path: Path) -> Path:
 
 def _configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
     targets: dict[str, dict[str, Any]] = {}
-    for item in profiling.get("python_targets") or []:
+    raw_targets = profiling.get("python_targets")
+    if raw_targets is None:
+        python_probe = profiling.get("python_probe") if isinstance(profiling.get("python_probe"), dict) else {}
+        raw_targets = python_probe.get("targets")
+    for item in raw_targets or []:
         if not isinstance(item, dict):
             continue
         target_id = item.get("id")
@@ -333,11 +335,12 @@ def _load_python_probe_events(paths: list[Path]) -> list[dict[str, Any]]:
 
 
 _ROLE_TO_MECHANISM = {
-    "request_tokens": "lookup",
-    "lookup_path": "lookup",
+    "request_bound_match_anchor": "lookup",
+    "cache_stage_match_path_observed": "lookup",
     "lookup_result_observed": "lookup",
-    "request_cache_lifecycle": "insert",
-    "request_cache_lifecycle_observed": "insert",
+    "request_lifecycle_anchor": "insert",
+    "request_lifecycle_path_observed": "insert",
+    "request_lifecycle_runtime_observed": "insert",
     "request_admission": "admission",
     "request_admission_observed": "admission",
     "insert_path": "insert",
@@ -387,26 +390,21 @@ _ROLE_TO_MECHANISM = {
 
 
 _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
-    "request_tokens": (
+    "request_bound_match_anchor": (
+        "request_id",
         "cache_scope",
         "seq_no",
+        "source_page_size",
         "token_dictionary",
         "full_path_span",
         "token_count",
     ),
-    "lookup_path": (
-        "cache_scope",
-        "seq_no",
-        "token_dictionary",
-        "full_path_span",
-    ),
-    "request_cache_lifecycle": (
+    "request_lifecycle_anchor": (
+        "request_id",
         "cache_scope",
         "seq_no",
         "lifecycle_kind",
-        "token_dictionary",
-        "full_path_span",
-        "token_count",
+        "source_page_size",
     ),
     "request_admission": (
         "request_id",
@@ -419,15 +417,6 @@ _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
         "token_count",
         "policy_params",
     ),
-    "insert_path": (
-        "cache_scope",
-        "seq_no",
-        "token_dictionary",
-        "full_path_span",
-        "chunked",
-        "priority",
-        "value_token_count",
-    ),
     "prefetch_decision": (
         "request_id",
         "cache_scope",
@@ -437,52 +426,11 @@ _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
         "token_count",
         "policy_params",
     ),
-    "prefetch_intent": (
-        "request_id",
-        "cache_scope",
-        "seq_no",
-        "prefix_token_dictionary",
-        "suffix_token_dictionary",
-        "prefix_span",
-        "suffix_span",
-        "policy_params",
-    ),
     "prefetch_check_point": (
         "request_id",
         "cache_scope",
         "seq_no",
         "check_kind",
-    ),
-    "capacity_request": (
-        "cache_scope",
-        "seq_no",
-        "requested_tokens",
-        "requested_pages_source",
-        "reason",
-        "tier",
-        "policy_params",
-    ),
-    "lock_scope_delta": (
-        "cache_scope",
-        "seq_no",
-        "node_token_dictionary",
-        "logical_path_span",
-        "lock_direction",
-    ),
-    "cache_config_observed": (
-        "cache_scope",
-        "seq_no",
-        "source_page_size",
-        "write_policy",
-        "prefetch_policy",
-        "thresholds",
-        "capacity_summary",
-    ),
-    "maintenance_checkpoint": (
-        "cache_scope",
-        "seq_no",
-        "checkpoint_kind",
-        "policy_params",
     ),
 }
 
@@ -490,29 +438,15 @@ _INVARIANT_EITHER_FIELDS_BY_ROLE = {
 }
 
 _INVARIANT_DICTIONARY_FIELDS_BY_ROLE = {
-    "request_tokens": ("token_dictionary",),
-    "lookup_path": ("token_dictionary",),
-    "request_cache_lifecycle": ("token_dictionary",),
+    "request_bound_match_anchor": ("token_dictionary",),
     "request_admission": ("token_dictionary",),
-    "insert_path": ("token_dictionary",),
     "prefetch_decision": ("token_dictionary",),
-    "prefetch_intent": (
-        "prefix_token_dictionary",
-        "suffix_token_dictionary",
-        "full_token_dictionary",
-    ),
-    "lock_scope_delta": ("node_token_dictionary",),
 }
 
 _INVARIANT_SPAN_FIELDS_BY_ROLE = {
-    "request_tokens": ("full_path_span",),
-    "lookup_path": ("full_path_span",),
-    "request_cache_lifecycle": ("full_path_span",),
+    "request_bound_match_anchor": ("full_path_span",),
     "request_admission": ("full_path_span",),
-    "insert_path": ("full_path_span",),
     "prefetch_decision": ("full_path_span",),
-    "prefetch_intent": ("prefix_span", "suffix_span", "full_path_span"),
-    "lock_scope_delta": ("logical_path_span",),
 }
 
 
@@ -528,21 +462,19 @@ def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
 def _configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list[str]:
     mechanisms: set[str] = set()
     for target in configured_targets.values():
-        role = _configured_const_field(target, "event_role")
+        role = _configured_fact_role(target)
         mechanism = _ROLE_TO_MECHANISM.get(role)
         if mechanism:
             mechanisms.add(mechanism)
     return sorted(mechanisms)
 
 
-def _configured_const_field(target: dict[str, Any], name: str) -> str:
-    fields = target.get("fields") if isinstance(target.get("fields"), list) else []
-    for field in fields:
-        if not isinstance(field, dict) or field.get("name") != name:
-            continue
-        source = str(field.get("source") or "")
-        if source.startswith("const:"):
-            return source.split(":", 1)[1]
+def _configured_fact_role(target: dict[str, Any]) -> str:
+    fact = target.get("fact")
+    if isinstance(fact, dict):
+        role = fact.get("role")
+        if isinstance(role, str):
+            return role
     return ""
 
 
@@ -564,23 +496,20 @@ def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]
         return
     _observe_token_references(accumulator, args)
     fact_class = str(args.get("fact_class") or "")
-    state_model_input = not _false_like(args.get("state_model_input"))
+    model_input = _true_like(args.get("model_input"))
     dag_input = not _false_like(args.get("dag_input"))
-    if state_model_input and fact_class != "invariant_state":
-        accumulator["counts"]["state_model_non_invariant_events"] += 1
     if fact_class != "invariant_state":
+        if model_input:
+            accumulator["counts"]["model_input_non_invariant_events"] += 1
         return
 
     accumulator["counts"]["invariant_events"] += 1
-    route_error = False
-    if not state_model_input:
-        accumulator["counts"]["invariant_without_state_model_input"] += 1
-        route_error = True
+    if not model_input:
+        accumulator["counts"]["invariant_without_model_input"] += 1
     if dag_input:
         accumulator["counts"]["invariant_with_dag_input"] += 1
-        route_error = True
-    if route_error:
-        accumulator["counts"]["route_error_events"] += 1
+    if str(args.get("fact_granularity") or "") != "atomic":
+        accumulator["counts"]["non_atomic_invariant_events"] += 1
 
     role = str(args.get("event_role") or "")
     if role not in _INVARIANT_REQUIRED_FIELDS_BY_ROLE:
@@ -646,6 +575,13 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
     counts: Counter[str] = accumulator["counts"]
     missing_token_dictionary_refs = sorted(accumulator["span_path_ids"] - accumulator["dictionary_ids"])
     dictionary_ids_without_tokens = sorted(accumulator["dictionary_ids"] - accumulator["dictionary_ids_with_tokens"])
+    route_error_events = (
+        counts["model_input_non_invariant_events"]
+        + counts["invariant_without_model_input"]
+        + counts["invariant_with_dag_input"]
+        + counts["non_atomic_invariant_events"]
+        + counts["unknown_invariant_role_events"]
+    )
     seq_order_error_count = 0
     for seq_values in accumulator["seq_by_scope"].values():
         previous = None
@@ -663,12 +599,11 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
             role: dict(sorted(counter.items()))
             for role, counter in sorted(accumulator["missing_fields_by_role"].items())
         },
-        "route_error_events": counts["route_error_events"]
-        + counts["state_model_non_invariant_events"]
-        + counts["unknown_invariant_role_events"],
-        "state_model_non_invariant_events": counts["state_model_non_invariant_events"],
-        "invariant_without_state_model_input": counts["invariant_without_state_model_input"],
+        "route_error_events": route_error_events,
+        "model_input_non_invariant_events": counts["model_input_non_invariant_events"],
+        "invariant_without_model_input": counts["invariant_without_model_input"],
         "invariant_with_dag_input": counts["invariant_with_dag_input"],
+        "non_atomic_invariant_events": counts["non_atomic_invariant_events"],
         "unknown_invariant_role_events": counts["unknown_invariant_role_events"],
         "token_dictionary_paths": len(accumulator["dictionary_ids"]),
         "token_dictionary_paths_with_token_ids": len(accumulator["dictionary_ids_with_tokens"]),
@@ -678,9 +613,7 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
         "seq_scope_count": len(accumulator["seq_by_scope"]),
         "seq_order_error_count": seq_order_error_count,
         "ready": counts["missing_required_fact_events"] == 0
-        and counts["route_error_events"] == 0
-        and counts["state_model_non_invariant_events"] == 0
-        and counts["unknown_invariant_role_events"] == 0
+        and route_error_events == 0
         and not missing_token_dictionary_refs
         and not dictionary_ids_without_tokens
         and seq_order_error_count == 0,
@@ -740,6 +673,10 @@ def _is_hicache_profile_event(args: dict[str, Any]) -> bool:
 
 def _false_like(value: Any) -> bool:
     return str(value).lower() in {"false", "0", "no", "off"}
+
+
+def _true_like(value: Any) -> bool:
+    return str(value).lower() in {"true", "1", "yes", "on"}
 
 
 def _new_hicache_capacity_accumulator() -> dict[str, Any]:

@@ -34,6 +34,7 @@ class HiCacheState {
     const std::set<std::string> & prefetch_ready() const { return state_index_.prefetch_ready(); }
     const std::set<std::string> & prefetch_late() const { return state_index_.prefetch_late(); }
     const std::set<std::string> & prefetch_suppressed() const { return state_index_.prefetch_suppressed(); }
+    std::set<std::string> pending_writeback() const;
     std::map<std::string, uint64_t> hit_counts() const { return state_index_.page_hit_count_summary(); }
 
     std::string digest() const;
@@ -44,14 +45,23 @@ class HiCacheState {
     HiCacheConfig config_;
     HiCacheTargetPager target_pager_;
     HiCacheTokenPathStore token_store_;
-    HiCacheTokenRadixTree radix_tree_;
+    std::unordered_map<std::string, HiCacheTokenRadixTree> radix_trees_;
     HiCacheStateIndex state_index_;
     std::unordered_map<std::string, std::vector<std::string>> pending_prefetch_pages_;
     std::unordered_map<std::string, uint64_t> prefetch_decision_ts_;
+    std::unordered_map<std::string, uint64_t> active_prefetch_host_pages_by_request_;
+    std::set<std::string> pending_prefetch_host_pressure_requests_;
+    std::unordered_map<std::string, std::set<std::string>> pending_writeback_pages_by_scope_;
 
     uint64_t page_size_for_fact(const HiCacheFact & fact) const;
     std::vector<std::string> pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
+    HiCacheTokenPath cache_stage_tokens_for_fact(const HiCacheFact & fact) const;
+    uint64_t target_requested_pages_for_fact(const HiCacheFact & fact) const;
     std::string scoped_request_key(const HiCacheFact & fact) const;
+    std::string normalized_scope(const HiCacheFact & fact) const;
+    bool page_in_scope(const std::string & page, const std::string & scope) const;
+    uint64_t tier_size_for_scope(const std::string & tier, const std::string & scope) const;
+    HiCacheTokenRadixTree & radix_tree_for_fact(const HiCacheFact & fact);
     std::set<std::string> * tier_set(const std::string & tier);
     const std::set<std::string> * tier_set(const std::string & tier) const;
     std::vector<std::string> * touch_order_for_tier(const std::string & tier);
@@ -60,14 +70,24 @@ class HiCacheState {
     bool target_write_count_enabled() const;
 
     void apply_request_tokens(const HiCacheFact & fact);
+    void apply_request_context(const HiCacheFact & fact);
     void apply_lookup_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_insert_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_prefetch_check_point(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    void apply_maintenance_checkpoint(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_capacity_request(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_lock_scope_delta(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    void apply_diagnostic_state_injection(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_write_policy_hit_counts(const HiCacheFact & fact, const std::vector<std::string> & full_pages, HiCacheSummary & summary,
                                        std::vector<HiCacheStateTransition> & transitions);
+    bool request_key_in_scope(const std::string & request_key, const std::string & scope) const;
+    uint64_t active_prefetch_host_pages_for_scope(const std::string & scope) const;
+    void apply_pending_prefetch_host_pressure_for_request(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                          std::vector<HiCacheStateTransition> & transitions, const std::string & request_key);
+    void apply_pending_prefetch_host_pressure_for_scope(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                        std::vector<HiCacheStateTransition> & transitions);
+    void release_prefetch_host_buffer(const HiCacheFact & fact);
 
     void add_resident(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier,
                       const std::string & page);
@@ -92,9 +112,23 @@ class HiCacheState {
     void enforce_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier);
     void flush_dirty_page_to_host(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                   const std::string & page);
+    void enqueue_writeback_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                const std::string & page);
+    void complete_writeback_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                 const std::string & page);
+    void drain_writeback_queue(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    void apply_prefetch_host_pressure(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                      uint64_t requested_pages);
+    void evict_host_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, uint64_t page_count);
     std::string transition_state_digest() const;
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,
                            const std::string & tier, const std::string & page, const std::string & before_digest);
+    std::string page_for_scope(const HiCacheFact & fact, const std::string & page) const;
+    std::set<std::string> diagnostic_desired_pages(const HiCacheFact & fact, const std::string & state_key) const;
+    void replace_resident_state_for_scope(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                          const std::string & state_key, const std::string & tier);
+    void replace_metadata_state_for_scope(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                          const std::string & state_key);
 };
 
 class HiCacheStateModel {

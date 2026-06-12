@@ -84,7 +84,7 @@ bool HiCacheStateIndex::add_resident(const std::string & tier, const std::string
     if (!pages) return false;
     touch_page(tier, page);
     const auto inserted = pages->insert(page).second;
-    if (inserted) evicted_.erase(page);
+    if (inserted && tier == "L1") evicted_.erase(page);
     return inserted;
 }
 

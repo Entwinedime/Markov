@@ -2,6 +2,470 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-12 12:42:07 +0800
+
+- 按“profiling 端维护精确 atomic fact contract、无 legacy/无向后兼容”的新方向完成主线重构：
+  - 主 HiCache profile config 改为 33 个 target-level `fact` target，不再把 `fact_class`、`event_role` 或 state gate
+    写在字段表里；
+  - 删除旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role；
+  - 新增/保留 normal invariant role：`request_bound_match_anchor`、`request_lifecycle_anchor`、
+    `request_admission`、`prefetch_decision`、`prefetch_check_point`；
+  - match-prefix concrete path、lifecycle committed/fill path/runtime、insert/capacity/lock/maintenance 和 controller/storage
+    事件均作为 `source_actual` / `timing_observation` evidence，且显式 `model_input=false`。
+- Python probe contract 同步收紧：
+  - `profiling.python_probe.targets[]` 必须显式写 `module` 和完整 target-level `fact`；
+  - `fact.class`、`fact.role`、`fact.model_input`、`fact.dag_input`、`fact.granularity=atomic` 缺失或非法时直接报错；
+  - `generic_callable` 不再从 `target` 猜模块名，也不再把缺失 `fact` 默认当 `model_input=true`。
+- C++ HiCache router/fact/model 同步切到 atomic gate：
+  - `state_model_input` 从 runtime fact contract 中移除；
+  - router 只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic` 且 role 属于已知
+    atomic invariant 的事件；
+  - 旧 source/control-flow role 不再是正常模型入口。
+- `profile_quality.py` 和 `hicache_state_cross_input_audit.py` 同步改为 atomic invariant 检查：
+  - profile quality 按 atomic role 校验 required fields、token dictionary/span、`dag_input=false` 和
+    `fact_granularity=atomic`，并把 HiCache 非 invariant 误标 `model_input=true` / invariant 缺 `model_input=true`
+    记为契约错误；
+  - cross audit 直接逐 role 比较 count、sequence 和 canonical fact value，不再保留旧 projection/variant pollution gate。
+- 已做本地结构检查：
+  - `python3 -m py_compile src/profiling/config.py src/profiling/python_probe/trace_sim_probe/probes/generic_callable.py src/profiling/python_probe/trace_sim_probe/probes/sglang_hicache_callable.py scripts/internal/profile_quality.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_trace_divergence.py scripts/internal/hicache_state_async_elision.py`
+  - `find configs -name '*.json' -exec jq empty {} \;`
+  - `python3 -c '... normalize_profiling_config(...) ...'` 验证 main HiCache / smoke Python probe config 都能按新契约加载；
+  - `git diff --check`
+  - `cmake --build build --target trace_graph -j2`
+  - `rg -n "state_model_input" src scripts configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json`
+
+## 2026-06-12 12:10:22 +0800
+
+- 按新的 HiCache state 输入契约完成修复：
+  - 主 profile config 仍保留 31 个 target，但正常 `state_model_input=true` target 收紧为
+    `scheduler.prefetch_decision`、`schedule_policy.prefill_admission`、`schedule_policy.chunked_admission`、
+    `hiradix.prefetch_check_point`；
+  - `request_tokens`、`lookup_path`、`cache_config_observed`、`request_cache_lifecycle`、`insert_path`、
+    `capacity_request`、`lock_scope_delta` 和具体 maintenance checkpoint target 降级为
+    `source_actual/state_model_input=false`；
+  - C++ router 不作为本轮主修复点，继续承担 schema、role 和 required-field gate。
+- 为 `scripts/internal/hicache_state_cross_input_audit.py` 新增 hard `model_input_contract`：
+  - 只比较真实会进入模型的 `fact_class=invariant_state && state_model_input=true` 事件；
+  - 输出 `model_input_contract_ready`、`model_input_blocking_roles`、`variant_events_marked_as_model_input` 和
+    `model_input_contract`；
+  - projection/temporal-anchor 诊断仍保留，但不再让 source concrete value 以“projection-ready”为理由进入正常模型输入。
+- 补充/更新 fixtures：
+  - source_actual `capacity_request` demoted case 会被 hard contract 忽略并通过；
+  - 若 `capacity_request`、`insert_path`、`request_cache_lifecycle`、`lock_scope_delta` 或 `maintenance_checkpoint`
+    被错误标成 normal model input，audit 会输出对应 blocker；
+  - `tests/run_profiling_fixtures.py` 断言当前 4 个正常 input target set。
+- 同步主文档并删除临时修复文档：
+  - 更新 `README.md`、`docs/profiling_development.md`、`docs/modeling_development.md`、
+    `docs/validation/hicache_state_validation.md`、`docs/validation/hicache_state_model_defects.md` 和
+    `docs/project_constraints.md`；
+  - 删除 `docs/validation/hicache_state_input_contract_tmp.md`；
+  - 修复前 retained cross audit 只作为 demotion 的历史证据，下一步需要在新契约下重跑真实 S1A/S1B profile 和 cross audit。
+- 本地检查通过：
+  - `find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`
+  - `python3 -m py_compile scripts/internal/hicache_state_cross_input_audit.py tests/run_hicache_state_fixtures.py tests/run_profiling_fixtures.py tests/run_hicache_mainline_config_fixtures.py`
+  - `python3 tests/run_profiling_fixtures.py`
+  - `python3 tests/run_hicache_state_fixtures.py`
+  - `python3 tests/run_hicache_mainline_config_fixtures.py`
+  - `python3 tests/run_modeling_smoke_fixtures.py`
+  - `git diff --check`
+
+## 2026-06-12 03:49:18 +0800
+
+- 为 `scripts/internal/hicache_state_cross_input_audit.py` 新增 `normal_model_input_contract`：
+  - 将 `projection_gate` 和 `after_projection_blockers` 汇总成正常模型可消费的输入契约；
+  - 输出 `contract_status`、`input_contract_ready_for_cross_state_rule_diagnosis`、
+    `input_contract_ready_for_non_async_correctness_claim`、`normal_model_safe_roles_after_projection`、
+    `roles_requiring_target_derived_projection` 和 `unsafe_roles_after_projection`；
+  - 该 contract 仍是 diagnostic-only，不改变 C++ state model，不消费 oracle，也不让 cross 自动通过。
+- 补充 fixtures：
+  - capacity / lifecycle / lock / maintenance mismatch 都会得到 `blocked_by_input_contract`；
+  - temporal anchor 可解释的 unbound/insert case 会得到 `ready_for_cross_state_rule_diagnosis`。
+- 重新生成 retained 两向真实 cross audit 后，结果一致：
+  - `projection_ready_layers=[insert_paths, unbound_match_prefix_paths]`；
+  - `contract_blocking_layers_after_projection=[request_lifecycle_paths, source_control_flow_checkpoints]`；
+  - `normal_model_input_contract.contract_status=blocked_by_input_contract`；
+  - `unsafe_roles_after_projection=[capacity_request, lock_scope_delta, maintenance_checkpoint, request_cache_lifecycle]`。
+- 当前结论：
+  - 这轮没有新增 state mutation 规则，也没有围绕 final missing/extra 打补丁；
+  - 现在 cross run 的“不能声称排除 async 后无其他问题”已经是机器可检查的输入契约结论；
+  - 下一步仍是解决 lifecycle/capacity/lock/maintenance 的 target-derived、高层 invariant 或 evidence/control-flow
+    归宿，然后再做四向逐 trace async-elision / deterministic bug 判断。
+
+## 2026-06-12 03:40:40 +0800
+
+- 继续拆 cross projection gate 中的 `lock_scope_delta` 和 `maintenance_checkpoint` blocker：
+  - 新增 `lock_scope_analysis`，按 direction、token path/hash、empty/root path、one-sided event 对 lock/ref delta
+    做 pair 分类；
+  - 新增 `maintenance_checkpoint_analysis`，按 `check_kind` 分布、序列 mismatch 和 one-sided event 对 maintenance
+    checkpoint 做 pair 分类；
+  - 新增 fixtures 覆盖 lock path mismatch / one-sided delta，以及 maintenance check_kind mismatch / one-sided checkpoint。
+- 重新生成最终 retained 两向 cross audit 后，`lock_scope_delta` 的真实结果两向对称：
+  - S1A->S1B count `352/308`，S1B->S1A count `308/352`；
+  - 各自 inc/dec 都平衡，net delta 都是 `0`；
+  - pair 分类包含 `path_mismatch_count=228`、`direction_mismatch_count=166`、`missing_event_count=44`；
+  - 跳过 benign empty/root pair 后，首个有效 mismatch 是 index `17`：S1A `inc` 768-token page-aligned prefix vs
+    S1B empty-path `dec`。
+- `maintenance_checkpoint` 的真实结果两向也对称：
+  - S1A->S1B count `1026/1030`，S1B->S1A count `1030/1026`；
+  - `flush_write_through_acks=384` 和 `ready_to_load_host_cache=50` 两边对齐；
+  - 差异集中在 `maintenance_check` count `592/596` 或反向；
+  - pair 分类是 `check_kind_mismatch=348`、`missing_event_count=4`，首个 mismatch index `108`：
+    `maintenance_check` vs `ready_to_load_host_cache`。
+- 当前结论：
+  - lock final `0/0` 对齐不代表 cross lock/ref delta 序列可复用；它仍需要 target radix/request lifecycle 推导、
+    高层 invariant，或归入 control-flow boundary；
+  - maintenance blocker 更像 schedule/polling/check_kind async 边界，不是围绕 final L1/L2/evicted 打补丁的理由；
+  - after-projection blocker 仍是同一组：`request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、
+    `maintenance_checkpoint`。
+
+## 2026-06-12 03:33:27 +0800
+
+- 继续拆 cross projection gate 中的 `capacity_request` blocker，新增 `capacity_pressure_analysis`：
+  - 区分“同一 `requested_tokens` 只是 source/target page size 导致页数不同”和“`requested_tokens` 本身已经不同”；
+  - 统计 source/target capacity event 数量、page-size-only 解释数量、requested_tokens 分歧数量和 one-sided event；
+  - 新增 fixture 覆盖 page-size-only 与 requested_tokens-different 两类 case。
+- 重新生成最终 retained 两向 cross audit 后，真实结果两向都不是 page-size-only：
+  - S1A->S1B：source/target capacity event `8/12`；
+  - S1B->S1A：source/target capacity event `12/8`；
+  - 两向 `page_size_only_explains_count=0`、`requested_tokens_differ_count=8`、`missing_event_count=4`。
+- 首个 capacity mismatch 是 S1A `requested_tokens=1057, requested_pages=9, page_size=128` vs S1B
+  `requested_tokens=993, requested_pages=16, page_size=64`。
+- 当前结论：
+  - C++ 的 target page-size capacity 修正仍保留，它只解决“同一个 capacity pressure event 在 target page size 下应释放多少页”；
+  - cross 的 capacity blocker 是 target/control-flow pressure sequence：source `HiRadixCache.evict(params.num_tokens)`
+    已经是 target allocator/radix/lock/memory availability 决策后的结果；
+  - 正常 cross model 不能消费 source `params.num_tokens` 或 source evict 调用序列，需要 target-derived pressure、
+    高层 invariant，或明确归入 async/control-flow boundary。
+
+## 2026-06-12 03:23:28 +0800
+
+- 继续拆 cross projection gate 中的 `request_cache_lifecycle` blocker，新增 `lifecycle_path_analysis`：
+  - 把 lifecycle path 分解成同 request 的 request-bound prompt anchor 和 cache finished/fill 后的 lifecycle suffix；
+  - 新增 fixture 覆盖“prompt anchor 一致，但 committed/generated suffix 不同”的场景；
+  - 该诊断仍是 diagnostic-only，不改变 normal model 输入，也不让 cross 自动通过。
+- 重新生成最终 retained 两向 cross audit 后，真实结果两向一致：
+  - `same_request_anchor_different_suffix=50`；
+  - `both_missing_lifecycle_token_ids=26`；
+  - `one_side_missing_lifecycle_token_ids=24`。
+- 首个真实 lifecycle mismatch 在 index `4`：
+  - source/target 的 request-bound anchor 都是 5 tokens，hash 都是 `ee7e16ee7db6a14b`；
+  - source/target 的 suffix 都是 9 tokens，但 hash 分别是 `0d53b4bb2e405866` 和 `9b84224a91a04844`。
+- 当前结论：
+  - `request_cache_lifecycle` 的 cross mismatch 不是 page-size projection 没做好；
+  - 它记录了输出/生命周期 suffix，因此不是 target-independent normal invariant path；
+  - 下一步不能围绕 final set 继续特化补丁，应把 lifecycle path 改成 target-derived、高层 invariant，或降级为 evidence-only。
+
+## 2026-06-12 03:12:24 +0800
+
+- 继续细化 cross projection gate，新增 `after_projection_blockers`：
+  - 输出 `blocking_roles`、`blocking_roles_by_layer`、`next_focus_roles`；
+  - 每个 role 带 `blocker_class`、`recommended_resolution`、source/target count 和首个 mismatch 摘要；
+  - 这仍是 diagnostic-only，不改变 normal model 输入，也不让 cross 自动通过。
+- 补充 fixtures：
+  - `capacity_request` mismatch 会输出 `target_capacity_pressure_sequence` blocker；
+  - temporal anchor 可解释的 unbound/insert fixture 在 after-projection 下没有 blocker。
+- 重新生成最终 retained 两向 cross audit 后，剩余 blocker 两向一致：
+  - `request_cache_lifecycle`：`100/100`，first mismatch index `4`，field `path`；
+  - `capacity_request`：S1A->S1B `8/12`、S1B->S1A `12/8`，first mismatch index `0`，requested tokens/pages；
+  - `lock_scope_delta`：S1A->S1B `352/308`、S1B->S1A `308/352`，first mismatch index `17`，direction/path；
+  - `maintenance_checkpoint`：S1A->S1B `1026/1030`、S1B->S1A `1030/1026`，first mismatch index `108`，`check_kind`。
+- 明确非 blocker：
+  - `request_admission` role-level aligned；
+  - `prefetch_decision` 和 `prefetch_check_point` role-level aligned；
+  - 当前 cross 阻断点不是“所有 prefetch 都不可信”，而是 lifecycle path、capacity/lock/maintenance control-flow
+    仍需要 target-derived、高层 invariant 或 async/input-boundary 分类。
+
+## 2026-06-12 03:08:20 +0800
+
+- 为 `scripts/internal/hicache_state_cross_input_audit.py` 新增 `projection_gate`：
+  - 保持旧的 `cross_input_contract_ready` 严格语义不变；
+  - 新增 `cross_input_contract_after_projection_ready`、`projection_ready_layers`、
+    `contract_blocking_layers_after_projection` 和逐 layer `gate_status`；
+  - 目的不是让 cross 直接通过，而是把 high-risk layer 拆成“可机制化 target-derived projection”和“仍阻断 cross proof”。
+- 补充 fixtures：
+  - `run_cross_input_audit_fixture` 现在确认 `capacity_request` 这类 source-control-flow mismatch 会继续阻断
+    after-projection proof；
+  - `run_cross_input_temporal_anchor_fixture` 现在确认 temporal anchor 可解释的 `unbound_match_prefix_paths` /
+    `insert_paths` 不再作为 after-projection blocker。
+- 用最终 retained validation 目录重新生成两向真实 cross audit：
+  - S1A->S1B：
+    `01_s1a_manual/modeling/async_elision_current_s1a_to_s1b_capacity_target_pages_final/cross_input_audit_s1a_to_s1b.json`；
+  - S1B->S1A：
+    `03_s1b_manual/modeling/async_elision_current_s1b_to_s1a_capacity_target_pages_final/cross_input_audit_s1b_to_s1a.json`。
+- 新 gate 的真实结果：
+  - 两向 `projection_ready_layers` 都是 `insert_paths`、`unbound_match_prefix_paths`；
+  - 两向 `contract_blocking_layers_after_projection` 都是 `request_lifecycle_paths`、`source_control_flow_checkpoints`；
+  - 两向 `cross_input_contract_after_projection_ready=false`。
+- 结论推进：
+  - unbound/insert 不再是围绕 final L1/L2/evicted 打补丁的理由，应作为 normal-model-safe target-derived projection 机制继续验证；
+  - cross async-elision proof 仍被 lifecycle/control-flow 输入契约阻断，下一步应优先解决这两类输入边界。
+
+## 2026-06-12 02:59:50 +0800
+
+- 收束本轮 HiCache state model 修正路线，保留两个机制级改动：
+  - unbound/insert cache-stage path 使用 request-bound token anchor + target page size 做 target-side projection；
+  - `capacity_request` 在存在 `requested_tokens` 时按 target `page_size` 重算 requested pages，再按 modeled
+    LRU/lock/radix 选择 L1 victim，不消费 source victim。
+- 明确拒绝 headroom/free-space capacity 假设：
+  - 曾测试“只有 `resident_pages + requested_pages > capacity` 才淘汰”的语义；
+  - 真实 self-config 证伪：S1A self 从 pass 退化为 L1 extra `7` / evicted missing `7`，S1B self
+    L2/backuped/evicted diff 也扩大；
+  - 因此当前 retained 规则仍是按 target requested page count 触发对应次数的 L1 modeled eviction pressure。
+- 用最终保留代码重跑当前 suite 的四向结果并同步文档：
+  - S1A self `async_elision_current_s1a_self_capacity_target_pages_final`：final match，L1 `25/25`、
+    L2/backuped `67/67`、dirty `0/0`、evicted `42/42`、locked `0/0`；
+  - S1B self `async_elision_current_s1b_self_capacity_target_pages_final`：L1/dirty/locked match，normal run
+    仍有 L2/backuped/evicted `56/55`、missing `13`、extra `14`；
+  - S1B self `async_elision_current_s1b_async_elided_no_lock`：C++ 模型侧 diagnostic async-elision 后 final match；
+  - S1A->S1B `async_elision_current_s1a_to_s1b_capacity_target_pages_final`：L1/dirty/locked 已 match，
+    L2/backuped/evicted 仍是 `56/55`、missing `13`、extra `14`，形态与 S1B self normal 一致；
+  - S1B->S1A `async_elision_current_s1b_to_s1a_capacity_target_pages_final`：L2/backuped/dirty/locked match，
+    L1 missing `13`、evicted extra `13`。
+- 当前结论不变但更精确：
+  - self-config 已基本闭环：S1A normal pass，S1B 排除 async 后 pass；
+  - cross-config 尚未证明“排除 async 后无其他问题”，因为 lifecycle/control-flow 输入契约仍未闭环，不能用
+    timestamp oracle injection 做假对齐；
+  - 下一轮 goal 应先把 lifecycle/control-flow 的 target-independent contract 定义清楚，再做四向逐 trace 分岔归因。
+
+## 2026-06-12 02:08:28 +0800
+
+- 修复并补完整 `scripts/internal/hicache_state_cross_input_audit.py` 中上轮未完成的 `AnchorContext.request_bound_token_events`：
+  - 新增 temporal anchor 诊断：对 cache-stage event 先找同一 stream 中最近的 preceding request-bound token event，再按 target page size
+    投影；
+  - 新增 `temporal_projected_match_count`、`temporal_target_candidate_match_count`、
+    `temporal_resolved_projection_count`、`temporal_unresolved_projection_count` 和
+    `nearest_request_bound_anchor_status_counts`；
+  - 保持诊断只输出 audit 字段，不改变 `cross_input_contract_ready` 判定，也不让正常 C++ 模型消费 target/oracle/source_actual。
+- 新增 `run_cross_input_temporal_anchor_fixture`，覆盖“两个 request 共享同一个 source page-aligned prefix，但 target page size
+  下投影长度不同”的歧义场景：
+  - 全局候选只能说明 target path 在候选集合里；
+  - temporal anchor 能在 source->target 方向把该歧义收敛成确定投影；
+  - reverse 方向仍可能只能是 candidate，这一点被 fixture 明确锁住，避免把诊断误说成证明。
+- 重新生成两向真实 cross audit 后，`unbound_match_prefix_paths` / `insert_paths` 的新结论更强：
+  - S1A->S1B：两层各 `100` 个 paired event，global projection `32 exact + 64 candidate + 4 empty`；temporal anchor 后变成
+    `96 exact + 0 candidate + 4 empty`，`temporal_unresolved=0`；
+  - S1B->S1A：两层各 `100` 个 paired event，temporal anchor 后为 `36 exact + 60 candidate + 4 empty`，
+    `temporal_unresolved=0`；
+  - 因此 unbound/insert 不像任意 source actual，更像 request-bound token facts 经 page-size / temporal cache-stage anchor
+    派生出的 path。
+- `request_lifecycle_paths` 仍未解决：
+  - 两向都是 `150` 个 paired event，global 与 temporal projection 均 `resolved=0, unresolved=150`；
+  - 状态分布是 `no_token_ids` 与 `no_temporal_anchor`，first mismatch 是相同 token_count 但不同 path hash；
+  - C++ 当前对 `request_admission` / `request_cache_lifecycle` 只更新 request-scoped token store，不直接产生 resident/dirty/evicted
+    transition，所以它是 cross 输入契约阻塞点，不是当前 final set 小修入口。
+- 当前路线更新：
+  - unbound/insert 的下一步应是机制级 target-derived/page-aligned path 推导，并带 cache-stage/temporal anchor；
+  - lifecycle 需要新增高层 invariant、target-side lifecycle derivation，或明确降级为 evidence；
+  - 在 lifecycle/control-flow 输入契约未闭环前，cross-only L1/L2/evicted diff 仍不能当 deterministic state rule bug 修。
+
+## 2026-06-12 01:50:00 +0800
+
+- 在 cross input audit 中新增 request-bound anchor 诊断：
+  - 每个 role/layer 现在会统计 path 是 `exact_request_bound_path`、`page_aligned_token_prefix`、`token_count_only`、
+    `unanchored` 还是 `no_path`；
+  - fixture 新增 token ids 级 page-aligned prefix 用例，覆盖 request-bound path 的向下 page-align 推导候选。
+- 重新生成两向 cross audit 后得到更细的输入契约结论：
+  - request-bound anchor 两边都是 `18` 个唯一 path，token counts 都是 `5, 777, 832, 928`；
+  - S1A 按 128 page size 向下对齐后是 `768, 896`，S1B 按 64 page size 向下对齐后是 `768, 832, 896`；
+  - S1A->S1B 的 `unbound_match_prefix_paths` / `insert_paths` source 为
+    `page_aligned_token_prefix=96, unanchored=4`，target 为
+    `exact_request_bound_path=60, page_aligned_token_prefix=36, unanchored=4`；S1B->S1A 方向对称；
+  - `request_lifecycle_paths` 两向都是 `unanchored=150`。
+- 路线更新：
+  - unbound match-prefix / insert path 大多不是任意 source actual，更像 request-bound token facts 按 page size
+    派生出的 cache-stage path，下一步可优先考虑 target-derived/page-aligned 推导；
+  - lifecycle path 不能靠 front-door prompt path + page size 推出，需要高层 invariant、target lifecycle 推导，
+    或明确降级为 evidence，不能混在 workload facts 里消费。
+
+## 2026-06-12 01:40:00 +0800
+
+- 在 `scripts/internal/hicache_state_cross_input_audit.py` 中新增 contract layer 汇总：
+  - `request_bound_match_prefix_paths`
+  - `unbound_match_prefix_paths`
+  - `insert_paths`
+  - `request_lifecycle_paths`
+  - `source_control_flow_checkpoints`
+- 重新生成当前 suite 两向 cross audit 后，blocking 范围进一步缩小：
+  - `request_bound_match_prefix_paths` 两向都是 `200/200` aligned，说明 request-scoped `request_tokens` /
+    `lookup_path` 当前可作为最接近 front-door token facts 的候选层；
+  - `unbound_match_prefix_paths` 两向都是 `100/100` 但首个分岔为 `768` vs `832`；
+  - `insert_paths` 两向都是 `100/100` 且全部 unbound，首个分岔同样是 `768` vs `832`；
+  - `request_lifecycle_paths` 两向都是 `150/150`，token count 分布一致但 path hash 分岔；
+  - `source_control_flow_checkpoints` 仍是 medium risk，数量为 S1A->S1B `1486/1450`、S1B->S1A `1450/1486`。
+- 结论更新：
+  - cross 的下一步不应再围绕 L1/L2/evicted final diff 打补丁；
+  - 应先把 request-scoped front-door token facts 与 unbound cache-stage path、insert mutation path、lifecycle
+    committed/fill path 拆开，重新定义哪些事实能作为 cross prediction 输入，哪些必须由 target model 推导或升格为新 invariant。
+
+## 2026-06-12 01:25:00 +0800
+
+- 扩展 cross-config input-contract 审计结果记录：
+  - `scripts/internal/hicache_state_cross_input_audit.py` 现在输出 `request_bound` / `unbound` 计数、event shape
+    samples 和 token count samples，用于区分“事件形态不一致”和“同形态事件的 key/path value 不一致”；
+  - fixture 覆盖 request-bound 与 unbound 的 `request_tokens`，确认增强字段不改变原有 pass/fail 语义。
+- 用当前 S1A/S1B suite 重新生成两向 cross audit 后，结论更清楚：
+  - `request_tokens` / `lookup_path` 两边都是 `150` 个 completed event，binding shape 都是
+    `100 request_bound + 50 unbound`，但第 16 个 unbound event 已经是 S1A `768` tokens vs S1B `832`
+    tokens；
+  - `insert_path` 两边都是 `100` 个 completed event 且全部 unbound，第 8 个 event 已是 `768` vs `832`；
+  - 这说明 cross 的首要问题不是 request id、timestamp 或事件 shape，而是当前 invariant input 里混入了
+    cache-stage/control-flow key path，尚未满足 cross prediction 的 target-independent 输入契约。
+- 更新 goal plan、validation 记录和 defect 清单：
+  - 最好结果被明确写成：修正 cross 输入契约后，四向 prediction 都做逐 trace 对比；如果剩余分岔都能归入
+    async/input-boundary，且 C++ 模型侧 async-elision 后 final sets 全对齐，才宣称“排除 async 后模型其他部分没有问题”；
+  - 当前状态仍只能说 self-config 已基本闭环，cross-config 还缺输入契约修正与复测。
+
+## 2026-06-12 01:22:09 +0800
+
+- 新增 front-door workload 诊断工具 `scripts/internal/hicache_state_workload_input_audit.py`：
+  - 只读取 benchmark `workload_report.json`，比较 request shape args、request sequence identity、cache write policy
+    和 response observation；
+  - 新增 `run_workload_input_audit_fixture`，验证 prompt/phase 序列一致时 `frontdoor_workload_ready=true`，同时保留
+    write policy 和 response bytes 的差异报告；
+  - 修复脚本中 response observed key 常量引用错误，并通过 `python3 tests/run_hicache_state_fixtures.py`、
+    `python3 -m py_compile ...` 和 `git diff --check`。
+- 用当前 S1A/S1B suite 生成两向 workload audit：
+  - S1A workload -> S1B workload 输出
+    `01_s1a_manual/modeling/async_elision_current_s1a_to_s1b/workload_input_audit_s1a_to_s1b.json`；
+  - S1B workload -> S1A workload 输出
+    `03_s1b_manual/modeling/async_elision_current_s1b_to_s1a/workload_input_audit_s1b_to_s1a.json`；
+  - 两向均为 request count `24/24`、request shape match、request sequence match、`frontdoor_workload_ready=true`；
+    cache write policy 和 response bytes 不同符合预期。
+- 结论更新：
+  - S1A/S1B 的入口 workload prompt/phase 对齐，因此 cross 分岔不是 workload_report 层面的请求不一致；
+  - 但 `request_tokens` / `lookup_path` 等 HiCache invariant input 仍不对齐，因为它们记录的是
+    `HiRadixCache.match_prefix(params.key)` 的 cache-stage key path，不保证等同 HTTP 原始 prompt；
+  - 下一轮 goal 的最好结果应表述为：self-config 已能在排除 async 后闭环；cross-config 要先修正输入契约，之后才能判断
+    “各种 prediction 下除 async 外没有其他问题”。
+
+## 2026-06-12 00:48:31 +0800
+
+- 新增 cross-config input-contract 诊断工具 `scripts/internal/hicache_state_cross_input_audit.py`：
+  - 只消费 normal invariant input trace，不进入 C++ state model，也不使用 oracle state；
+  - 按 completed/end 的 HiCache invariant roles 提取 token path/span 指纹，不按 request id 或 timestamp 对齐；
+  - 输出每个 role 的 source/target event count、签名 multiset/sequence 是否匹配、首个分岔和风险分类；
+  - 新增 `run_cross_input_audit_fixture`，验证同一 token path 在不同 scope/request_id/source page size 下不会误报，
+    而 `capacity_request.requested_pages_source` 不一致会被标成 source-control-flow / async-boundary 风险。
+- 用当前 suite 跑两向 cross audit：
+  - S1A source -> S1B target 输出
+    `01_s1a_manual/modeling/async_elision_current_s1a_to_s1b/cross_input_audit_s1a_to_s1b.json`，
+    source/target event count `2036/2000`，`cross_input_contract_ready=false`；
+  - S1B source -> S1A target 输出
+    `03_s1b_manual/modeling/async_elision_current_s1b_to_s1a/cross_input_audit_s1b_to_s1a.json`，
+    source/target event count `2000/2036`，`cross_input_contract_ready=false`；
+  - 两向 high-risk roles 都包括 `request_tokens`、`lookup_path`、`insert_path`、`request_cache_lifecycle`；
+    第 16 个 `request_tokens` / `lookup_path` completed event 已分岔为 S1A `768` tokens vs S1B `832` tokens。
+- 结论更新：
+  - self-config 仍保持原结论：S1A self normal pass，S1B self async-elided C++ pass；
+  - cross-config 现在有更强证据说明不能直接继续 async oracle injection，也不能把 cross-only final diff 当作 state rule bug 修；
+    下一步必须先修正或重新定义 cross 输入契约。
+
+## 2026-06-12 00:35:27 +0800
+
+- 完成 HiCache state model async-elision 诊断阶段收束：
+  - 新增/保留 `scripts/internal/hicache_state_trace_divergence.py`、`scripts/internal/hicache_state_async_elision.py`
+    和 C++ `diagnostic_state_injection` 路径，用于诊断性排除 async/input-boundary 分岔；
+  - 新增 `tests/run_hicache_state_fixtures.py` 中 diagnostic injection fixture，验证正常 trace 不出现 diagnostic role/warning，
+    synthetic trace 才能消费 oracle state，并输出明确 warning；
+  - 回归通过：`cmake --build build --target trace_graph -j 8`、`python3 tests/run_hicache_state_fixtures.py`、
+    `python3 tests/run_modeling_smoke_fixtures.py`、`python3 tests/run_hicache_mainline_config_fixtures.py`、
+    `python3 tests/run_profiling_fixtures.py`、`git diff --check`。
+- 基于 `20260611_054436_profiling_hicache_state_mainline_one_matrix` 重跑当前 S1A/S1B：
+  - S1A self normal prediction 已 `final_state_match=true`，active sets 全对齐；逐 trace 里只看到 locked 暂态可见性差异，
+    final locked 仍是 `0/0`；
+  - S1B self normal prediction 仍有 L2/backuped/evicted `56/55`，missing `13`、extra `14`；
+  - 排除 locked 暂态后，S1B trace divergence 识别 6 个 async 分岔；用 synthetic trace 跑 C++ 模型侧 async-elision 后，
+    S1B self `final_state_match=true`，L2/backuped/evicted 全部 `55/55`；
+  - 结论：S1B self 的 normal extra/missing 是 async/input-boundary 分岔后的连锁差异，不是当前已发现的 deterministic
+    final-set model bug。
+- cross-config 尚未关闭：
+  - 该条记录的是当时尚未应用 temporal anchor projection 与 target page-size capacity 修正的中间结果；当前最终
+    S1A->S1B retained diff 见 2026-06-12 02:59:50 条目；
+  - S1B->S1A 的 L2/backuped/dirty 已 match，但 L1 missing `13` 与 evicted extra `13` 配对，表示有 13 页真实 final 在 L1、
+    模型 final 留在 evicted；
+  - S1A 和 S1B 的 trace 时间窗口不重叠，不能用 target oracle 按 timestamp 注入 source trace；下一步必须先做
+    token/workload logical alignment 和 invariant role target-independence 审计，再判断 cross-only diff 是否为模型 bug。
+- 文档同步：
+  - `docs/validation/hicache_state_model_goal_plan.md` 改成下一轮可消费的 async-elision / cross-alignment goal handoff；
+  - `docs/validation/hicache_state_validation.md` 新增 `HCSV-20260612-async-elision-current-self-and-cross`；
+  - `docs/validation/hicache_state_model_defects.md` 更新缺陷优先级：S1B self async-elided 已通过，当前 P0 转向
+    async 输入边界和 cross logical alignment。
+
+## 2026-06-11 23:30:30 +0800
+
+- 基于 `s1b_self_host_node_projection` 完成 HiCache state model 本轮收束审查：
+  - `HiCacheTokenRadixTree` 增加 page-level compressed radix projection 后，host eviction pressure 已能按 host leaf group
+    淘汰 parent host leaf；
+  - 新增 fixture `run_prefetch_host_pressure_promotes_parent_host_leaf_fixture` 覆盖 parent host leaf 被提升为可淘汰 leaf；
+  - 本轮验证继续满足 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+  - normalized final 从前置 `L1 32/28, dirty 31/28, L2/backuped 81/55, evicted 80/55` 收敛到
+    `L1 28/28, dirty 28/28, L2/backuped/evicted 56/55`；
+  - final diff 仍是 L2/backuped/evicted missing 13、extra 14，不能宣称 state prediction 通过。
+- 逐 trace 对齐显示旧首个 maintenance 分岔已消失：
+  - last matched snapshot 是 `hicache_maintenance_check_end:state_snapshot`，order `4200`，counts 为 L1/dirty `28`、
+    L2/backuped/evicted `56`；
+  - 新首个分岔是 `hicache_prefetch_check_point_end:state_snapshot`，order `4204`，ts `1781155586790332`；
+  - oracle 在该 checkpoint 将 L2/backuped/evicted 从 `56` 推到 `69`，model 仍为 `56`，缺 13 个 storage prefetch
+    完成插入的 host pages。
+- 结论：host projection 是合理的机制级小修；下一步不应继续围绕 leaf group 打补丁，也不应添加
+  “best_effort checkpoint 全 pending prefetch 完成”的特化规则。剩余 blocker 应归类为 async prefetch completion /
+  storage lifecycle 的模型或 invariant 输入边界问题。
+
+## 2026-06-11 14:46:45 +0800
+
+- 基于 `20260611_050859_profiling_hicache_state_mainline_one_matrix/03_s1b_manual` 的 S1B 31-target profile 修正
+  HiCache backend：
+  - zero-token span (`begin == end`) 作为合法空路径处理，不再报 `token_dictionary_or_full_path_span` /
+    `token_dictionary_or_logical_path_span`；
+  - `request_admission` / `request_cache_lifecycle` 改为 request scoped token context 输入，更新 token store 但暂不产生
+    resident/dirty mutation；
+  - `maintenance_checkpoint` 改为显式 no-op 边界事件，不再计入 `unimplemented_invariant_role.*`；
+  - fact replay 排序改为严格全局时间顺序，同 timestamp/scope 下用 `seq_no` 破 ties，修复旧 comparator 非全序导致的
+    lock/ref delta 乱序；
+  - `capacity_request.requested_pages` 接入 L1 modeled eviction pressure，victim 仍由 modeled LRU/lock 规则选择，不消费 source victim；
+  - 新增 `tests/run_hicache_state_fixtures.py::run_context_roles_and_zero_span_fixture`，并同步 capacity fixture 语义。
+- 最新 S1B self output：
+  `data/profile_runs/sglang/20260611_050859_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/s1b_self_fast_pressure_ts_order_capacity`。
+- 最新验证结果：
+  - `validation_errors=["hicache_final_state_mismatch"]`；
+  - `invariant_coverage_ready=true`，`missing_invariant_facts=[]`，`non_invariant_fact_usage=[]`；
+  - normalized final `locked_pages=0/0` 已对齐；
+  - normalized final L1 `32/28`，missing 0、extra 4；dirty `31/28`，missing 0、extra 3；
+  - normalized final L2/backuped `81/55`，missing 15、extra 41；evicted `80/55`，missing 16、extra 41。
+- 结论：本轮修复了输入 coverage 误报、zero-token path 和 lock/ref replay order；剩余阻塞集中在 write-back async
+  flush / host release / L2 eviction 生命周期，不能通过消费 `source_actual` 强行对齐。
+
+## 2026-06-11 13:16:25 +0800
+
+- 查看 `20260611_050859_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/logs/server.log`：
+  - S1A 不再是 bench timeout，而是在 server ready 前退出，manifest 记录 `server exited before ready, code=-9`；
+  - 根因是 NPU `kernel_ascend` 路径把 HiCache host layout 改写为 `page_first_direct`，但 S1A 的
+    `--max-total-tokens=2048`、`page_size=128`、`hicache_ratio=2.25` 只生成 `37` 个 host pages；
+  - `MHATokenToKVPoolHost.__init__` 初始化 per-layer refs 时按 64 层索引 host buffer，触发
+    `IndexError: index 37 is out of bounds for dimension 0 with size 37`；
+  - `continue_on_error=true` 已生效，S1B 继续启动并运行 manual workload；
+  - 修正 S1A fast-pressure 配置为 `--max-total-tokens=4096`，建模容量同步为 page128 L1/L2 `32/73`，
+    覆盖 13:04 记录中的 S1A `2048` / `16/37` 临时方案；
+  - 保持 workload 和 31-target 采集契约不变；S1B 仍为 page64 L1/L2 `32/81`。
+
+## 2026-06-11 13:04:37 +0800
+
+- 处理 31-target HiCache profiling 迭代过慢的问题：
+  - 最新 `20260610_172720_profiling_hicache_state_mainline_one_matrix/01_s1a_manual` 的 bench 在
+    `reuse_A_after_pressure seq=49 prompt_id=A_0` 触发 `TimeoutError: timed out`，单请求等待约 `600001 ms` 后
+    `bench command failed, code=1`，因此 suite 在 S1A 后中断，未继续执行 S1B；
+  - 该 run 的 trace 质量审计仍显示 `quality_ready=true`、31 个 configured target 中 observed 29 个，缺失的是未触发的
+    `schedule_policy.chunked_admission` / `schedule_policy.chunked_admission_observed`，required invariant coverage ready；
+  - 不缩减 31-target 采集契约，改为缩小默认 manual profile 的 workload 和 L1 token budget：
+    `L1_manual_phased` 从 83 requests 降到 24 requests，`shared_prefix_repeat` 从 160 降到 96，
+    `unique_suffix_repeat` 从 16 降到 8，phase wait 从 2s 降到 0.5s，request timeout 从 600s 降到 300s；
+  - server `--max-total-tokens` 从 8192 降到 2048，以小 L1 保证小 workload 仍能触发 pressure/eviction/load-back；
+  - S1A modeling capacity 同步为 page128 L1/L2 `16/37`，S1B 同步为 page64 L1/L2 `32/81`；
+  - suite 顶层启用 `continue_on_error=true`，单个实验失败不会阻断后续已选择实验；
+  - 同步 `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1*.json`、profiling/validation 文档和
+    `tests/run_hicache_mainline_config_fixtures.py`；
+  - 已通过 JSON 校验、`python3 tests/run_hicache_mainline_config_fixtures.py` 和 `python3 tests/run_profiling_fixtures.py`。
+
 ## 2026-06-11 02:09:40 +0800
 
 - 收尾审查 HiCache backend 阶段 2/3/4 最小建模：
@@ -105,7 +569,7 @@
 - 基于四向 validation 和逐 page provenance 做第一轮 HiCache state model 保守修复：
   - 新增 `scripts/internal/hicache_state_provenance.py`，从 `validation.json`、`predicted_target_cache_state_trace.json`
     和 oracle state snapshots 输出 mismatch page 的 model transition、oracle membership changes 和 fixability hint；
-  - `capacity_request` 不再把 `requested_pages` 当作可观测 victim 数，只作为 capacity checkpoint；
+  - `capacity_request` 不再把 `requested_pages` 当作可观测 victim 数，也不指定 source victim；
   - `wait_complete` 的 `prefetch_check_point` 不再把 pending planned pages 全量构造成 L2/L3 resident 或 ready，
     finalize 也不再把 wait_complete 未 ready pages 全量 suppressed；
   - 更新 HiCache fixtures，去掉旧的 precise capacity eviction / full prefetch ready 假设；

@@ -8,6 +8,7 @@ from typing import Any
 
 DEFAULT_PYTHON_PROBES = ("generic_callable",)
 KNOWN_CHANNELS = {"torch", "python_probe", "ld_preload"}
+KNOWN_FACT_CLASSES = {"invariant_state", "timing_observation", "source_actual", "oracle_state", "debug_quality"}
 
 
 @dataclass(frozen=True)
@@ -114,12 +115,37 @@ def _parse_python_targets(raw: Any) -> tuple[dict[str, Any], ...]:
             raise TypeError(f"profiling.python_probe.targets[{index}] must be an object")
         target_id = item.get("id")
         target = item.get("target")
+        module = item.get("module")
         if not isinstance(target_id, str) or not target_id:
             raise ValueError(f"profiling.python_probe.targets[{index}].id must be a non-empty string")
         if not isinstance(target, str) or not target:
             raise ValueError(f"profiling.python_probe.targets[{index}].target must be a non-empty string")
+        if not isinstance(module, str) or not module:
+            raise ValueError(f"profiling.python_probe.targets[{index}].module must be a non-empty string")
+        _validate_python_target_fact(item, index)
         result.append(dict(item))
     return tuple(result)
+
+
+def _validate_python_target_fact(item: dict[str, Any], index: int) -> None:
+    fact = item.get("fact")
+    prefix = f"profiling.python_probe.targets[{index}].fact"
+    if not isinstance(fact, dict):
+        raise ValueError(f"{prefix} must be an object")
+    fact_class = fact.get("class")
+    if not isinstance(fact_class, str) or not fact_class:
+        raise ValueError(f"{prefix}.class must be a non-empty string")
+    if fact_class not in KNOWN_FACT_CLASSES:
+        raise ValueError(f"{prefix}.class must be one of {sorted(KNOWN_FACT_CLASSES)}")
+    role = fact.get("role")
+    if not isinstance(role, str) or not role:
+        raise ValueError(f"{prefix}.role must be a non-empty string")
+    if fact.get("granularity") != "atomic":
+        raise ValueError(f"{prefix}.granularity must be 'atomic'")
+    if not isinstance(fact.get("model_input"), bool):
+        raise ValueError(f"{prefix}.model_input must be true or false")
+    if not isinstance(fact.get("dag_input"), bool):
+        raise ValueError(f"{prefix}.dag_input must be true or false")
 
 
 def _as_str_tuple(value: Any, *, default: tuple[str, ...], field_name: str) -> tuple[str, ...]:

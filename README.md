@@ -115,7 +115,7 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mai
 
 当前 HiCache state suite 只启用 `python_probe`。它采集：
 
-- `fact_class=invariant_state` 且 `state_model_input=true` 的 token/range 状态事实；
+- target-level `fact` 描述的 atomic `invariant_state` 状态事实；
 - `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
 - `oracle_state` 的 validation-only state snapshot。
 
@@ -161,29 +161,34 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-06-10，当前主线状态是：
+截至 2026-06-12，当前主线状态是：
 
-- profiling 已切到 token dictionary/span、`cache_scope`、`seq_no` 和 `fact_class` 分类采集；
-- C++ HiCache backend 只消费 `fact_class=invariant_state && state_model_input=true`；
+- profiling config 使用 target-level atomic `fact` 契约，不再把 `fact_class` / `event_role` / state gate 写成普通字段；
+- 主 HiCache profile config 当前有 33 个 atomic target，其中 normal state model input 是 7 个 target / 5 个 role：
+  `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、`prefetch_decision`、
+  `prefetch_check_point`；
+- `request_tokens`、`lookup_path` 和 `request_cache_lifecycle` 这类混合 role 已从主配置删除；match-prefix concrete path、
+  lifecycle committed/fill path 和 runtime detail 都拆成 `source_actual` evidence；
+- C++ HiCache backend 的主门禁是 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`，
+  router 只接受已知 atomic invariant role 并做 required-field 检查；
 - target page 由后端按 token path 和 target `page_size` 重建，不再消费 `target_page_identity_page64/128`；
-- source movement、timing observation 和 oracle state 被跳过或只用于 validation/debug；
-- S1A `01_s1a_manual` profile quality 已通过，invariant coverage ready；
-- S1A self-config prediction 与 normalized oracle 仍不匹配，当前不是正确模型。
+- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant stream，逐 role 检查 count、sequence 和
+  canonical fact value。
 
-最新 S1A 摘要：
+当前契约摘要：
 
-| 项 | 结果 |
+| 项 | 当前口径 |
 | --- | --- |
-| profile run | `20260610_073946_profiling_hicache_state_mainline_one_matrix/01_s1a_manual` |
-| profile quality | `quality_ready=true`, `profiling_ready=true` |
-| invariant events | `6960`, required end events `3480` |
-| token dictionary | `172` paths, no missing refs, seq order ok |
-| model input audit | `non_invariant_fact_usage=[]`, `missing_invariant_facts=[]` |
-| oracle validation | `validation_ready=false`, `hicache_final_state_mismatch` |
-| normalized mismatch | L1 model `32` vs oracle `54`; L2/backuped `78` vs `106`; evicted `46` vs `52`; dirty and locked match |
+| configured targets | `33` |
+| normal state input targets | `7` |
+| normal state input roles | `5` |
+| source/evidence targets | `24 source_actual` + `2 timing_observation`，均为 `model_input=false` |
+| model input gate | `model_input=true && fact_class=invariant_state && fact_granularity=atomic` |
+| cross audit hard gate | `model_input_contract_ready` |
+| retained old cross audits | 只作为旧混合输入契约的历史证据，需在 atomic 契约下重跑 |
 
-下一步应优先做逐 page provenance debug：对 mismatch page 追踪模型 transition 和 oracle final membership，
-再修 lookup/load-back、insert/radix、capacity/evictable、prefetch/writeback 规则。
+下一步应先用 atomic profile config 重跑 S1A/S1B，并让 cross audit 的 `model_input_contract_ready` 对 5 个正常 role 逐项通过；
+之后再判断 remaining self/cross final diff 是 async boundary、target-derived projection 缺口，还是 C++ state rule bug。
 
 ## 数据约束
 

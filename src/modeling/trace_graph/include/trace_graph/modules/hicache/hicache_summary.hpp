@@ -50,6 +50,7 @@ struct HiCacheSummary {
     std::vector<std::string> backuped_pages;
     std::vector<std::string> evicted_pages;
     std::vector<std::string> locked_pages;
+    std::vector<std::string> pending_writeback_pages;
     std::vector<std::string> prefetch_planned_pages;
     std::vector<std::string> prefetch_ready_pages;
     std::vector<std::string> prefetch_late_pages;

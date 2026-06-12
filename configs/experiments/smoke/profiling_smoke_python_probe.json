@@ -17,6 +17,13 @@
           "module": "sglang.srt.mem_cache.hiradix_cache",
           "target": "HiRadixCache.match_prefix",
           "events": ["hicache_lookup_start", "hicache_lookup_end"],
+          "fact": {
+            "class": "debug_quality",
+            "role": "python_probe_smoke",
+            "model_input": false,
+            "dag_input": false,
+            "granularity": "atomic"
+          },
           "fields": [
             {"name": "request_id", "source": "arg:req_id", "required": false},
             {"name": "page_size", "source": "self.page_size"},
