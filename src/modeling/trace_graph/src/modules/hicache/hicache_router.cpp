@@ -93,6 +93,7 @@ std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, 
     if (role == HiCacheFactRole::RequestBoundMatchAnchor && fact.request_id.empty()) errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.request_id.empty()) errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.lifecycle_kind.empty()) errors.push_back("missing_lifecycle_kind");
+    if (role == HiCacheFactRole::RequestAdmission && fact.admission_kind.empty()) errors.push_back("missing_admission_kind");
     if ((role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision ||
          role == HiCacheFactRole::PrefetchCheckPoint) &&
         fact.request_id.empty())

@@ -414,8 +414,19 @@ def simplify_evidence_event(event: dict[str, Any]) -> dict[str, Any]:
         "check_kind",
         "request_id",
         "operation_id",
+        "admission_kind",
+        "token_count",
+        "source_page_size",
+        "max_new_tokens",
+        "has_chunked_req",
+        "ignore_eos",
+        "requested_tokens",
+        "requested_pages",
+        "evicted_tokens",
         "completed_tokens",
         "ready_pages_estimate",
+        "lock_direction",
+        "delta",
         "target_id",
     )
     return {
@@ -606,6 +617,105 @@ def classify_async_divergence(diff: dict[str, Any], row: dict[str, Any], evidenc
     )
 
 
+def mechanism_audit(
+    *,
+    classification: dict[str, Any],
+    diff: dict[str, Any],
+    row: dict[str, Any],
+    evidence: list[dict[str, Any]],
+    model_state: dict[str, list[str]],
+    oracle_state: dict[str, list[str]],
+    nearby_scope_records: list[tuple[int, dict[str, Any]]],
+) -> dict[str, Any]:
+    class_name = str(classification.get("classification") or "")
+    relevant = {
+        "lock_ref_transient_boundary",
+        "target_capacity_pressure_boundary",
+        "lock_protected_capacity_boundary",
+    }
+    if class_name not in relevant:
+        return {"classification": class_name, "mechanism_input_ready": None}
+
+    transition_counts: dict[str, int] = {}
+    request_ids: set[str] = set()
+    for _idx, record in nearby_scope_records:
+        kind = str(record.get("transition_kind") or "")
+        if kind:
+            transition_counts[kind] = transition_counts.get(kind, 0) + 1
+        request_id = str(record.get("request_id") or "")
+        if request_id:
+            request_ids.add(request_id)
+
+    source_capacity: list[dict[str, Any]] = []
+    source_lock_ref: list[dict[str, Any]] = []
+    invariant_admission: list[dict[str, Any]] = []
+    for event in evidence:
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        role = str(args.get("event_role") or "")
+        if "capacity" in role:
+            source_capacity.append(
+                {
+                    "name": event.get("name"),
+                    "ts": event.get("ts"),
+                    "requested_tokens": args.get("requested_tokens"),
+                    "requested_pages": args.get("requested_pages"),
+                    "evicted_tokens": args.get("evicted_tokens"),
+                }
+            )
+        if "lock" in role or "host_ref" in role:
+            source_lock_ref.append(
+                {
+                    "name": event.get("name"),
+                    "ts": event.get("ts"),
+                    "direction": args.get("lock_direction"),
+                    "delta": args.get("delta"),
+                }
+            )
+        if role == "request_admission":
+            invariant_admission.append(
+                {
+                    "name": event.get("name"),
+                    "ts": event.get("ts"),
+                    "token_count": args.get("token_count"),
+                    "source_page_size": args.get("source_page_size"),
+                    "max_new_tokens": args.get("max_new_tokens"),
+                    "has_chunked_req": args.get("has_chunked_req"),
+                    "ignore_eos": args.get("ignore_eos"),
+                }
+            )
+
+    affected = affected_state_keys(diff)
+    has_lock_transitions = transition_counts.get("mark_locked", 0) > 0 or transition_counts.get("clear_locked", 0) > 0
+    has_capacity_transitions = transition_counts.get("mark_evicted", 0) > 0 or transition_counts.get("remove_l1_resident", 0) > 0
+    mechanism_input_ready = bool(nearby_scope_records) and (
+        (class_name == "lock_ref_transient_boundary" and has_lock_transitions)
+        or (class_name in {"target_capacity_pressure_boundary", "lock_protected_capacity_boundary"} and has_capacity_transitions)
+    )
+
+    return {
+        "classification": class_name,
+        "mechanism_input_ready": mechanism_input_ready,
+        "oracle_snapshot": simplify_snapshot(row),
+        "affected_state_keys": sorted(affected),
+        "direction_counts": diff_direction_counts(diff),
+        "available_normal_context": {
+            "nearby_scope_transition_counts": dict(sorted(transition_counts.items())),
+            "nearby_request_ids": sorted(request_ids),
+            "model_counts": state_counts(model_state),
+            "oracle_counts": state_counts(oracle_state),
+            "model_locked_pages": len(set(model_state.get("locked_pages", []))),
+            "oracle_locked_pages": len(set(oracle_state.get("locked_pages", []))),
+            "model_l1_pages": len(set(model_state.get("l1_resident_pages", []))),
+            "oracle_l1_pages": len(set(oracle_state.get("l1_resident_pages", []))),
+        },
+        "diagnostic_source_context": {
+            "capacity_events": source_capacity[:8],
+            "lock_ref_events": source_lock_ref[:8],
+            "invariant_admission_events": invariant_admission[:8],
+        },
+    }
+
+
 def inject_oracle_state_for_scope(
     model_states_by_scope: dict[str, dict[str, set[str]]],
     compare_scope: str,
@@ -747,6 +857,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             }
             classification = classify_async_divergence(diff, row, evidence)
             divergence["async_classification"] = classification
+            divergence["mechanism_audit"] = mechanism_audit(
+                classification=classification,
+                diff=diff,
+                row=row,
+                evidence=evidence,
+                model_state=model_state,
+                oracle_state=oracle_state,
+                nearby_scope_records=nearby_scope_records,
+            )
             divergence["nearby_async_evidence"] = evidence[: args.sample_pages]
             if first_divergence is None:
                 first_divergence = divergence

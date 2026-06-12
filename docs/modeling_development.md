@@ -157,18 +157,24 @@ cmake --build build --target trace_graph -j2
 | `hicache_summary.hpp/.cpp` | 输出 final state、transition trace、审计计数。 |
 | `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
 
-当前代码仍是过渡实现，但已经不再保留旧 page-level radix backend。当前 mainline profile config 使用 target-level
-atomic fact 契约，只把 `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、
-`prefetch_decision` 和 `prefetch_check_point` 作为正常 state 输入；其它 cache-stage concrete path、lifecycle path/runtime
-和 source control-flow role 都是 `source_actual` / `timing_observation` evidence。剩余主要问题：
+当前代码仍是 state-only backend，但已经不再保留旧 page-level/source-control normal 入口。当前 mainline profile config
+使用 target-level atomic fact 契约，只把 `request_bound_match_anchor`、`request_lifecycle_anchor`、
+`request_admission`、`prefetch_decision` 和 `prefetch_check_point` 作为正常 state 输入；其它 cache-stage concrete path、
+lifecycle path/runtime 和 source control-flow role 都是 `source_actual` / `timing_observation` evidence。当前状态：
 
-- `request_bound_match_anchor` 执行 target-side lookup；`request_admission` 作为 request-scoped token context 进入 token
-  store；`request_lifecycle_anchor` 在 finished/unfinished 边界触发 page-aligned insert；
+- `request_bound_match_anchor` 执行 target-side lookup，并记录 target radix matched prefix / ancestor page chain；
+- `request_admission` 解析 admission scalar，保存 request context，从 target radix match 派生 active device
+  request lock/ref，并按 target capacity 主动触发 device pressure；
+- `request_lifecycle_anchor` 在 finished/unfinished 边界触发 page-aligned insert，并在 unfinished 上把 request lock/ref
+  转移到新 terminal ancestor chain，在 finished 上释放；
 - 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；`insert_path`、
   `capacity_request`、`lock_scope_delta` 和 `maintenance_checkpoint` 保留为 source evidence，不进入正常模型；
-- token radix tree 已按 `cache_scope` 做 token split/insert 隔离，但还没有完整 SGLang node parent/ref/host-ref 对等结构；
-- `state_index` 已集中 scoped page projection sets，L1/L2 capacity 按 `cache_scope` 统计和驱逐，但 evictable、priority、
-  host ref 和 node-level ownership 仍是后续阶段；
+- token radix tree 已按 `cache_scope` 做 token/page split/insert 隔离，暴露 terminal node、ancestor page groups 和动态
+  device eviction leaf groups；page->group 不再退回整条 projected request path；
+- `state_index` 已集中 scoped page projection sets，L1/L2 capacity 按 `cache_scope` 统计和驱逐；device-side
+  lock/ref、admission reservation 和 protected L1 victim eligibility 已由 target-derived mechanism 维护；
+- host ref、storage prefetch completion、storage hit query 和 async host memory release 仍未作为 normal invariant 机制闭合；
+  这些信息目前只来自 source_actual evidence，不能直接更新 target state；
 - C++ normal backend 已删除 `maintenance_checkpoint`、`capacity_request`、`lock_scope_delta` 的状态推进入口，并收窄
   `HiCacheFact`，不再解析 source observed/control-flow 字段作为模型 fact；如果后续要重新引入
   lifecycle/capacity/lock/maintenance 语义，必须先定义 target-derived 机制或新的 target-independent atomic invariant，
@@ -244,11 +250,11 @@ HiCacheFactParser
 | `HiCacheFactRouter` | 第一层只按 invariant 判断；第二层把 role 转成 enum；缺字段、未知 role、非法 fact class 形成硬错误或 summary error。 |
 | `TokenPathStore` | 收集 dictionary，解析 span，维护 request/operation 到 token range 的映射；不保存 source page identity 作为状态输入。 |
 | `TargetPager` | 按 target page size 从 token range 推导完整 page hash、page index、page->token range 反查。 |
-| `TokenRadixTree` | 维护 token-level node、edge token slice、parent/children、split/insert/remove/lookup；node 是 ref/lock/evictable 的归属点。 |
-| `NodeStateIndex` | 维护 node/page 的 L1/L2/L3 resident、dirty、backuped、evicted、hit count、priority、lock/ref、host ref 和 evictable membership。 |
-| `RequestState` | 维护 request full/fill/committed/admitted path、lookup result、chunked continuation、临时 lock/ref 和 lifecycle phase。 |
+| `TokenRadixTree` | 维护 token/page compressed radix tree、parent/children、split/insert/lookup、terminal ancestor chain 和 leaf-group victim 查询。 |
+| `NodeStateIndex` | 维护 page projection 的 L1/L2/L3 resident、dirty、backuped、evicted、hit count、lock/ref 和 prefetch 集合；host ref 仍待机制化。 |
+| `RequestState` | 维护 request full/admitted path、target match result、active device lock/ref、admission reservation 和 lifecycle phase。 |
 | `PolicyEngine` | 根据显式 target config 实现 write policy、capacity/eviction policy、prefetch policy 和 storage policy。 |
-| `AsyncState` | 维护 prefetch/load-back/writeback queue、ready/late/suppressed/acked 状态；source timing 只作为 validation 样本。 |
+| `AsyncState` | 维护 prefetch/load-back/writeback queue、ready/late/suppressed/acked 状态；当前仅有部分 prefetch host pressure，storage completion 仍待新 invariant 或 target async model。 |
 | `StateTransitionLog` | 为每个 state mutation 输出 role/request/operation/node/page/seq/ts/provenance。 |
 | `OracleValidation` | 只比较 `source_actual`/`oracle_state` 和 predicted state，不反写模型。 |
 

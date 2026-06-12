@@ -2,7 +2,41 @@
 
 创建时间：2026-06-12
 
-状态：临时文档。用于指导下一轮 C++ backend mechanism 重构；实现、验证并同步到主文档后删除。
+状态：临时文档。C++ device-side target resource mechanism 已按本文完成一轮实现和验证；因 host/prefetch/storage
+visibility 仍有开放输入契约问题，本文暂时保留到下一轮 host-side 方案定稿后再删除。
+
+## 2026-06-12 实施结果
+
+已完成：
+
+- C++ normal path 仍只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`；
+- `HiCacheFact` / router 已解析并要求 `request_admission.admission_kind`，并补齐 admission scalar；
+- `HiCacheTokenRadixTree` 已暴露 match/insert terminal node、ancestor page groups、动态 device eviction leaf groups；
+- page -> group 索引不再把每个 page 映射回整条 projected request path；
+- `HiCacheState` 已新增 request execution state、device request lock/ref count、admission reservation；
+- `request_admission` 已按 target radix match 派生 active device lock/ref，并主动执行 target L1 pressure；
+- `request_lifecycle_anchor` 已在 unfinished/finished 上转移或释放 request lock/ref；
+- 未恢复 `capacity_request`、`lock_scope_delta` 或其它 source_actual normal state mutation。
+
+验证结果：
+
+| prediction | result |
+| --- | --- |
+| S1A self | final match：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0` |
+| S1B -> S1A | final match，与 S1A self 同形 |
+| S1B self | L1/dirty/locked match；L2/backuped/evicted `56/55`，missing 13、extra 14 |
+| S1A -> S1B | 与 S1B self 同形 |
+
+结论：
+
+- device-side target-derived lock/ref、admission pressure、protected victim eligibility 已经修复 S1A final，并把 S1B
+  从 backend-refactor 的 `70/55` 收敛到 `56/55`；
+- S1B 剩余 diff 只在 host/L2 侧，附近 evidence 是 source_actual `host_ref_delta_observed`、storage hit query、
+  prefetch terminate/completion、host memory release；
+- 当前 profiling normal input 没有 target-independent host/prefetch completion work anchor，不能为消除 S1B residual
+  而把 source_actual host/storage result 接回 normal model；
+- 下一轮应设计 host/prefetch/storage 的 atomic invariant work intent，或在 backend 中实现完整 target async
+  storage/host-ref model。
 
 ## 背景
 

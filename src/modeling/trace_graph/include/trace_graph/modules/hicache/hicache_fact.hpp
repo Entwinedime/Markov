@@ -41,9 +41,15 @@ struct HiCacheFact {
     std::string cache_scope;
     std::string check_kind;
     std::string lifecycle_kind;
+    std::string admission_kind;
     uint64_t seq_no = 0;
     uint64_t source_page_size = 0;
     uint64_t token_count = 0;
+    uint64_t max_new_tokens = 0;
+    uint64_t truncation_align_size = 0;
+    int64_t priority = 0;
+    bool has_chunked_req = false;
+    bool ignore_eos = false;
     bool model_input = false;
     bool dag_input = false;
     bool is_start = false;

@@ -239,9 +239,15 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.cache_scope = event.arg("cache_scope", event.pid.empty() ? "-1" : event.pid);
     fact.check_kind = event.arg("check_kind", event.arg("checkpoint_kind"));
     fact.lifecycle_kind = event.arg("lifecycle_kind");
+    fact.admission_kind = event.arg("admission_kind");
     fact.seq_no = event.arg_u64("seq_no", 0);
     fact.source_page_size = event.arg_u64("source_page_size", event.arg_u64("page_size", 0));
     fact.token_count = event.arg_u64("token_count", 0);
+    fact.max_new_tokens = event.arg_u64("max_new_tokens", 0);
+    fact.truncation_align_size = event.arg_u64("truncation_align_size", 0);
+    fact.priority = static_cast<int64_t>(event.arg_u64("priority", 0));
+    fact.has_chunked_req = bool_arg(event, "has_chunked_req", false);
+    fact.ignore_eos = bool_arg(event, "ignore_eos", false);
     fact.model_input = bool_arg(event, "model_input", false);
     fact.dag_input = bool_arg(event, "dag_input", false);
 

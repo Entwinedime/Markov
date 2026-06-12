@@ -61,12 +61,52 @@ std::vector<std::string> HiCacheTokenRadixTree::leaf_group_for_page(const std::s
     return it->second;
 }
 
+std::vector<std::string> HiCacheTokenRadixTree::node_pages(size_t node_id) const {
+    if (node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return {};
+    return page_nodes_[node_id].pages;
+}
+
+std::vector<size_t> HiCacheTokenRadixTree::ancestor_node_ids(size_t terminal_node) const {
+    std::vector<size_t> ids;
+    if (terminal_node == 0 || terminal_node >= page_nodes_.size() || !page_nodes_[terminal_node].active) return ids;
+    size_t node_id = terminal_node;
+    while (node_id != 0 && node_id < page_nodes_.size() && page_nodes_[node_id].active) {
+        ids.push_back(node_id);
+        node_id = page_nodes_[node_id].parent;
+    }
+    std::reverse(ids.begin(), ids.end());
+    return ids;
+}
+
+std::vector<std::vector<std::string>> HiCacheTokenRadixTree::ancestor_page_groups(size_t terminal_node) const {
+    std::vector<std::vector<std::string>> groups;
+    for (const auto node_id : ancestor_node_ids(terminal_node)) {
+        auto pages = node_pages(node_id);
+        if (!pages.empty()) groups.push_back(std::move(pages));
+    }
+    return groups;
+}
+
+std::vector<std::string> HiCacheTokenRadixTree::flattened_ancestor_pages(size_t terminal_node) const {
+    std::vector<std::string> pages;
+    for (const auto & group : ancestor_page_groups(terminal_node)) pages.insert(pages.end(), group.begin(), group.end());
+    return pages;
+}
+
 std::vector<std::vector<std::string>> HiCacheTokenRadixTree::host_eviction_leaf_groups(const std::set<std::string> & host_pages,
                                                                                        const std::set<std::string> & evicted_pages,
                                                                                        const std::set<std::string> & locked_pages) const {
     std::vector<std::vector<std::string>> groups;
     if (host_pages.empty() || page_nodes_.empty()) return groups;
     collect_host_eviction_leaf_groups(0, host_pages, evicted_pages, locked_pages, groups);
+    return groups;
+}
+
+std::vector<std::vector<std::string>> HiCacheTokenRadixTree::device_eviction_leaf_groups(const std::set<std::string> & device_pages,
+                                                                                         const std::set<std::string> & locked_pages) const {
+    std::vector<std::vector<std::string>> groups;
+    if (device_pages.empty() || page_nodes_.empty()) return groups;
+    collect_device_eviction_leaf_groups(0, device_pages, locked_pages, groups);
     return groups;
 }
 
@@ -160,33 +200,31 @@ size_t HiCacheTokenRadixTree::create_page_child(size_t parent, const std::vector
     return node_id;
 }
 
-void HiCacheTokenRadixTree::insert_page_suffix(size_t node_id, const std::vector<std::string> & suffix) {
-    if (suffix.empty() || node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return;
+size_t HiCacheTokenRadixTree::insert_page_suffix(size_t node_id, const std::vector<std::string> & suffix) {
+    if (suffix.empty() || node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return node_id;
     auto child_it = page_nodes_[node_id].children.find(suffix.front());
     if (child_it == page_nodes_[node_id].children.end()) {
-        create_page_child(node_id, suffix);
-        return;
+        return create_page_child(node_id, suffix);
     }
 
     const auto child_id = child_it->second;
     if (child_id >= page_nodes_.size() || !page_nodes_[child_id].active) {
-        create_page_child(node_id, suffix);
-        return;
+        return create_page_child(node_id, suffix);
     }
 
     const auto child_pages = page_nodes_[child_id].pages;
     const auto shared = common_prefix_pages(child_pages, suffix);
     if (shared == child_pages.size()) {
-        insert_page_suffix(child_id, suffix_page_strings(suffix, shared));
-        return;
+        auto remaining = suffix_page_strings(suffix, shared);
+        if (remaining.empty()) return child_id;
+        return insert_page_suffix(child_id, remaining);
     }
 
     const auto prefix = slice_page_strings(child_pages, 0, shared);
     const auto old_suffix = suffix_page_strings(child_pages, shared);
     const auto new_suffix = suffix_page_strings(suffix, shared);
     if (prefix.empty()) {
-        create_page_child(node_id, suffix);
-        return;
+        return create_page_child(node_id, suffix);
     }
 
     PageNode split;
@@ -199,17 +237,57 @@ void HiCacheTokenRadixTree::insert_page_suffix(size_t node_id, const std::vector
     page_nodes_[child_id].parent = split_id;
     page_nodes_[child_id].pages = old_suffix;
     page_nodes_[split_id].children[old_suffix.front()] = child_id;
-    if (!new_suffix.empty()) create_page_child(split_id, new_suffix);
+    if (!new_suffix.empty()) return create_page_child(split_id, new_suffix);
+    return split_id;
 }
 
-void HiCacheTokenRadixTree::register_leaf_pages(const std::vector<std::string> & projected_pages) {
-    if (projected_pages.empty()) return;
-    insert_page_suffix(0, projected_pages);
-    for (const auto & page : projected_pages) {
-        if (page.empty()) continue;
-        known_pages_.insert(page);
-        leaf_group_by_page_[page] = projected_pages;
+void HiCacheTokenRadixTree::rebuild_page_group_index() {
+    leaf_group_by_page_.clear();
+    known_pages_.clear();
+    for (size_t node_id = 0; node_id < page_nodes_.size(); ++node_id) {
+        const auto & node = page_nodes_[node_id];
+        if (!node.active || node.pages.empty()) continue;
+        for (const auto & page : node.pages) {
+            if (page.empty()) continue;
+            known_pages_.insert(page);
+            if (node.children.empty()) leaf_group_by_page_[page] = node.pages;
+        }
     }
+}
+
+HiCacheTokenRadixTree::PagePathMatch HiCacheTokenRadixTree::match_page_path(const std::vector<std::string> & projected_pages) const {
+    PagePathMatch result;
+    if (projected_pages.empty() || page_nodes_.empty()) return result;
+    size_t node_id = 0;
+    size_t matched = 0;
+    while (matched < projected_pages.size()) {
+        if (node_id >= page_nodes_.size() || !page_nodes_[node_id].active) break;
+        const auto child_it = page_nodes_[node_id].children.find(projected_pages[matched]);
+        if (child_it == page_nodes_[node_id].children.end()) break;
+        const auto child_id = child_it->second;
+        if (child_id >= page_nodes_.size() || !page_nodes_[child_id].active) break;
+        const auto remaining = suffix_page_strings(projected_pages, matched);
+        const auto shared = common_prefix_pages(page_nodes_[child_id].pages, remaining);
+        result.matched_pages.insert(result.matched_pages.end(), projected_pages.begin() + static_cast<long>(matched),
+                                    projected_pages.begin() + static_cast<long>(matched + shared));
+        matched += shared;
+        if (shared < page_nodes_[child_id].pages.size()) break;
+        node_id = child_id;
+        result.terminal_node = node_id;
+    }
+    result.ancestor_page_groups = ancestor_page_groups(result.terminal_node);
+    return result;
+}
+
+HiCacheTokenRadixTree::PagePathMatch HiCacheTokenRadixTree::insert_page_path(const std::vector<std::string> & projected_pages) {
+    PagePathMatch result;
+    if (projected_pages.empty()) return result;
+    const auto terminal = insert_page_suffix(0, projected_pages);
+    rebuild_page_group_index();
+    result.terminal_node = terminal;
+    result.matched_pages = projected_pages;
+    result.ancestor_page_groups = ancestor_page_groups(terminal);
+    return result;
 }
 
 bool HiCacheTokenRadixTree::page_node_has_host_value(size_t node_id, const std::set<std::string> & host_pages) const {
@@ -220,6 +298,27 @@ bool HiCacheTokenRadixTree::page_node_has_host_value(size_t node_id, const std::
         if (host_pages.count(page) == 0) return false;
     }
     return true;
+}
+
+bool HiCacheTokenRadixTree::page_node_has_device_value(size_t node_id, const std::set<std::string> & device_pages) const {
+    if (node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return false;
+    const auto & node = page_nodes_[node_id];
+    if (node.pages.empty()) return false;
+    for (const auto & page : node.pages) {
+        if (device_pages.count(page) == 0) return false;
+    }
+    return true;
+}
+
+bool HiCacheTokenRadixTree::page_subtree_has_device_value(size_t node_id, const std::set<std::string> & device_pages) const {
+    if (node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return false;
+    if (page_node_has_device_value(node_id, device_pages)) return true;
+    const auto & node = page_nodes_[node_id];
+    for (const auto & [page, child_id] : node.children) {
+        (void)page;
+        if (page_subtree_has_device_value(child_id, device_pages)) return true;
+    }
+    return false;
 }
 
 bool HiCacheTokenRadixTree::page_subtree_has_host_value(size_t node_id, const std::set<std::string> & host_pages) const {
@@ -251,6 +350,32 @@ bool HiCacheTokenRadixTree::page_node_locked(size_t node_id, const std::set<std:
     return false;
 }
 
+void HiCacheTokenRadixTree::collect_device_eviction_leaf_groups(size_t node_id, const std::set<std::string> & device_pages,
+                                                                const std::set<std::string> & locked_pages,
+                                                                std::vector<std::vector<std::string>> & groups) const {
+    if (node_id >= page_nodes_.size() || !page_nodes_[node_id].active) return;
+    const auto & node = page_nodes_[node_id];
+    const bool node_eligible = node_id != 0 && page_node_has_device_value(node_id, device_pages) && !page_node_locked(node_id, locked_pages);
+
+    bool has_device_child = false;
+    for (const auto & [page, child_id] : node.children) {
+        (void)page;
+        if (page_subtree_has_device_value(child_id, device_pages)) {
+            has_device_child = true;
+            break;
+        }
+    }
+    if (node_eligible && !has_device_child) {
+        groups.push_back(node.pages);
+        return;
+    }
+
+    for (const auto & [page, child_id] : node.children) {
+        (void)page;
+        collect_device_eviction_leaf_groups(child_id, device_pages, locked_pages, groups);
+    }
+}
+
 void HiCacheTokenRadixTree::collect_host_eviction_leaf_groups(size_t node_id, const std::set<std::string> & host_pages,
                                                               const std::set<std::string> & evicted_pages,
                                                               const std::set<std::string> & locked_pages,
@@ -279,11 +404,10 @@ void HiCacheTokenRadixTree::collect_host_eviction_leaf_groups(size_t node_id, co
     }
 }
 
-void HiCacheTokenRadixTree::insert_path(const HiCacheTokenPath & path, const std::vector<std::string> & projected_pages) {
+HiCacheTokenRadixTree::PagePathMatch HiCacheTokenRadixTree::insert_path(const HiCacheTokenPath & path, const std::vector<std::string> & projected_pages) {
     const auto tokens = flatten_tokens(path);
-    if (tokens.empty()) return;
-    insert_suffix(0, tokens);
-    register_leaf_pages(projected_pages);
+    if (!tokens.empty()) insert_suffix(0, tokens);
+    return insert_page_path(projected_pages);
 }
 
 } // namespace TraceGraph

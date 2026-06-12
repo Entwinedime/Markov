@@ -2,6 +2,37 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-12 18:31:20 +0800
+
+- 按 `docs/tmp_hicache_target_resource_mechanism_plan.md` 完成一轮 C++ backend target resource mechanism 重构，仍保持
+  normal path 只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`：
+  - `HiCacheFact` / router 补齐 `request_admission` 的 atomic admission scalar，要求 `admission_kind`；
+  - `HiCacheTokenRadixTree` 暴露 page-path match/insert 的 terminal node、ancestor page groups，并新增动态
+    device eviction leaf group 查询；
+  - `leaf_group_by_page_` 不再把每个 page 映射到整条 projected path，静态索引只记录 page radix leaf node segment；
+  - `HiCacheState` 新增 request execution state、device request lock/ref count、admission reservation 和 target-side
+    device capacity pressure；
+  - `request_admission` 现在从 target radix match 派生 active device lock/ref，并按 target capacity 主动触发 L1 pressure；
+  - `request_lifecycle_anchor` 在 unfinished/finished 上执行 insert 后转移或释放 request lock/ref；
+  - 未恢复 `capacity_request`、`lock_scope_delta` 或任何 source_actual normal mutation。
+- 增强 `scripts/internal/hicache_state_trace_divergence.py` 的 mechanism audit，诊断报告能携带 admission/capacity/lock
+  相关 evidence，但仍只作为诊断，不进入 normal prediction。
+- 本地验证：
+  - `cmake --build build --target trace_graph -j2`
+  - 四个 normal prediction 重跑，输出目录为 `target_resource_v2_leaf_groups_*`
+  - full / unlocked trace divergence 诊断重跑，unlocked diagnostic replay final 均可对齐
+- 四个 normal prediction 结果：
+  - 四个 run 均为 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、
+    `non_invariant_fact_usage=[]`，仍只处理 350 个 normal atomic invariant end events；
+  - S1A target self/cross 已 final match：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`；
+  - S1B target self/cross 同形，L1/dirty/locked 已对齐，L2/backuped/evicted 从 backend-refactor 的 `70/55`
+    收敛为 `56/55`，剩余 13 missing / 14 extra；
+  - S1B 剩余差异集中在 host/L2/storage/prefetch completion visibility，当前只有 source_actual 的
+    `host_ref_delta_observed`、storage hit / prefetch completion evidence；不应把这些 source result 接回 normal model。
+- 结论：本轮已闭合 device target-derived lock/ref + capacity pressure + radix victim eligibility 的主缺口；
+  后续若要消除 S1B 剩余 L2/backuped/evicted diff，需要 profiling 端新增 target-independent 的 host/prefetch work
+  anchor 或 backend 建完整 host_ref/storage async model，不能直接消费 source_actual。
+
 ## 2026-06-12 18:20:00 +0800
 
 - 按“后端彻底收窄正常输入、不要残留 source/control-flow 推断入口”的方向完成 C++ HiCache backend refactor：

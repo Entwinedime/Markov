@@ -74,15 +74,17 @@ HiCache state prediction 必须同时满足：
   archived target config，不是当前默认 modeling config；
 - target pages 由 C++ 按 token path 和 target `page_size` 生成，不再消费 `target_page_identity_page64/128`；
 - zero-token span 是合法空路径，不再被 backend 当作缺 token dictionary；
-- `request_admission` 当前更新 request scoped token store，不直接产生 resident/dirty mutation；
+- `request_admission` 当前更新 request scoped token store，并派生 target-side device request lock/ref、admission reservation
+  和 L1 capacity pressure；它仍不消费 source `capacity_request` 或 source `lock_scope_delta`；
 - `maintenance_checkpoint`、`capacity_request` 和 `lock_scope_delta` 只作为 source evidence；C++ normal router/model 已删除
   这些 role 的状态推进入口。若未来要使用这些语义，必须先定义新的 target-independent atomic invariant 或
   target-derived 机制；
 - fact replay 使用严格全局时间顺序；同 timestamp/scope 下再用 `seq_no` 破 ties，避免 lock/ref delta 乱序；
 - token radix tree 和 L1/L2 capacity enforcement 按 `cache_scope` 隔离；validation 默认仍用 `strip_scope` 的 normalized
   page hash union 与 oracle 对比；
-- host eviction pressure 当前使用 token radix 派生出的 page-level compressed radix projection 选择 host leaf group，
-  避免只按 insert full path leaf group 淘汰导致 parent host leaf 漏删；
+- device eviction pressure 当前使用 token/page radix 派生出的动态 device leaf group，结合 target-derived active request
+  lock/ref 跳过 protected victim；host eviction pressure 仍使用 page-level compressed radix projection选择 host leaf group，
+  但 host ref / storage completion 还没有 normal invariant 机制；
 - current cross-config 不能把 source `capacity_request` 视为 normal invariant input：修复前 audit 显示 S1A/S1B 不只是
   `requested_pages` 因 page size 不同，连 `requested_tokens` 和事件数量也不同；当前 config 保留它为 `source_actual`
   evidence；
@@ -234,6 +236,71 @@ Boundary-elision 诊断：
   S1B 消费 24 个该 role，二者 final state match；
 - 这不能作为 normal prediction 通过结论，只说明当前 residual 是缺 target-derived mechanism 或缺新 invariant event，而不是
   source profile 输入没有进 C++。
+
+### HCSV-20260612-target-resource-mechanism
+
+目的：按 `tmp_hicache_target_resource_mechanism_plan.md` 在 C++ normal backend 中补 target-derived device resource
+mechanism，覆盖 request-derived lock/ref、admission capacity pressure 和 radix leaf victim eligibility，同时继续禁止
+source_actual capacity/lock normal mutation。
+
+代码修正：
+
+- `HiCacheFact` / router 解析并要求 `request_admission.admission_kind`，同时读取 `max_new_tokens`、
+  `truncation_align_size`、`priority`、`has_chunked_req`、`ignore_eos` 等 admission scalar；
+- `HiCacheTokenRadixTree` 增加 page-path `match/insert` 返回 terminal node、ancestor page groups，并新增动态
+  `device_eviction_leaf_groups(...)`；
+- page -> group 的静态索引只记录 page radix leaf segment，不再把每个 page 映射回整条 projected request path；
+- `HiCacheState` 增加 request execution state、device request lock/ref count、device reservation；
+- `request_admission` 根据 target radix match acquire request device lock/ref，估算 target allocation work，并主动执行
+  target L1 capacity pressure；
+- `request_lifecycle_anchor` 在 unfinished 上 insert 后转移 request lock/ref，在 finished 上 insert 后释放 request lock/ref；
+- normal path 未恢复 `capacity_request`、`lock_scope_delta`、`host_ref_delta_observed` 或 storage completion source result。
+
+输出目录：
+
+| direction | output |
+| --- | --- |
+| S1A self | `20260612_053153/.../01_s1a_manual/modeling/target_resource_v2_leaf_groups_s1a_self` |
+| S1B self | `20260612_053153/.../03_s1b_manual/modeling/target_resource_v2_leaf_groups_s1b_self` |
+| S1A -> S1B | `20260612_053153/.../01_s1a_manual/modeling/target_resource_v2_leaf_groups_s1a_to_s1b` |
+| S1B -> S1A | `20260612_053153/.../03_s1b_manual/modeling/target_resource_v2_leaf_groups_s1b_to_s1a` |
+
+覆盖率 / 消费结果：
+
+| run | invariant coverage | missing invariant facts | non-invariant usage | processed invariant end events | model transitions |
+| --- | --- | --- | --- | ---: | ---: |
+| S1A self | true | none | `[]` | 350 | 2838 |
+| S1B self | true | none | `[]` | 350 | 5304 |
+| S1A -> S1B | true | none | `[]` | 350 | 5304 |
+| S1B -> S1A | true | none | `[]` | 350 | 2838 |
+
+normalized final 结果：
+
+| target | source profile | L1 | dirty | L2 | backuped | evicted | locked | 结论 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| S1A | S1A | `25/25` | `0/0` | `67/67` | `67/67` | `42/42` | `0/0` | final match。 |
+| S1A | S1B | `25/25` | `0/0` | `67/67` | `67/67` | `42/42` | `0/0` | 与 S1A self 同形，final match。 |
+| S1B | S1B | `28/28` | `28/28` | `56/55` | `56/55` | `56/55` | `0/0` | L1/dirty/locked match；host/L2 仍差 13 missing、14 extra。 |
+| S1B | S1A | `28/28` | `28/28` | `56/55` | `56/55` | `56/55` | `0/0` | 与 S1B self 同形。 |
+
+相对 backend-refactor 的改善：
+
+- S1A 从 L1 extra 7 / evicted missing 7 变成 final match；
+- S1B 的 L2/backuped/evicted 从 `70/55` 收敛到 `56/55`；
+- self/cross 同 target 仍保持同形，说明新增 mechanism 是 target-derived，不依赖 source profile 的 variant result；
+- full trace 首个分歧仍可出现在 `lock_ref_transient_boundary`，这是 invariant lifecycle anchor 粒度与 source
+  `lock_scope_*` snapshot 粒度不同造成的 transient；final locked 已为 `0/0`。
+
+诊断结论：
+
+- unlocked trace diagnostic replay final 可对齐；S1A 的首个 unlocked 分歧归类为 `target_capacity_pressure_boundary`，
+  S1B 的首个 unlocked 分歧仍涉及 host/L2/storage/prefetch visibility；
+- S1B 剩余 final diff 只落在 L2/backuped/evicted，且附近 evidence 主要是 source_actual
+  `host_ref_delta_observed`、storage hit query、prefetch terminate/completion、host memory release；
+- 当前 profiling normal input 没有 target-independent 的 host/prefetch completion work anchor，不能把这些 source result
+  接回 normal model；
+- 后续要消除 S1B 剩余 diff，应新增 atomic invariant host/prefetch work intent，或在 backend 中实现完整 target async
+  storage/host-ref model。
 
 ### HCSV-20260612-async-elision-current-self-and-cross
 

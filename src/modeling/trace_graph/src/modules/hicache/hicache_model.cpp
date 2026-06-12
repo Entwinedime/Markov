@@ -58,6 +58,11 @@ size_t page_aligned_token_count(size_t token_count, uint64_t page_size) {
     return token_count / page * page;
 }
 
+uint64_t ceil_div(uint64_t value, uint64_t divisor) {
+    if (value == 0 || divisor == 0) return 0;
+    return (value + divisor - 1) / divisor;
+}
+
 } // namespace
 
 std::string HiCacheState::digest() const {
@@ -176,7 +181,7 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         apply_request_lifecycle_anchor(fact, summary, transitions);
         break;
     case HiCacheFactRole::RequestAdmission:
-        apply_request_context(fact, summary);
+        apply_request_admission(fact, summary, transitions);
         break;
     case HiCacheFactRole::PrefetchDecision:
         apply_prefetch_decision(fact, summary, transitions);
@@ -224,13 +229,157 @@ void HiCacheState::apply_request_context(const HiCacheFact & fact, HiCacheSummar
     note_missing_projection_if_needed(fact, summary);
 }
 
+std::vector<std::string> HiCacheState::flatten_page_groups(const std::vector<std::vector<std::string>> & groups) const {
+    std::vector<std::string> pages;
+    std::set<std::string> seen;
+    for (const auto & group : groups) {
+        for (const auto & page : group) {
+            if (!page.empty() && seen.insert(page).second) pages.push_back(page);
+        }
+    }
+    return pages;
+}
+
+void HiCacheState::update_request_path_state(const HiCacheFact & fact, const std::vector<std::string> & full_pages,
+                                             const std::vector<std::string> & matched_pages,
+                                             const std::vector<std::vector<std::string>> & chain_groups) {
+    const auto key = scoped_request_key(fact);
+    if (key.empty()) return;
+    auto & state = request_states_[key];
+    state.full_pages = full_pages;
+    state.matched_device_prefix_pages = matched_pages;
+    state.last_device_chain_groups = chain_groups;
+}
+
+uint64_t HiCacheState::active_device_reservation_pages_for_scope(const std::string & scope) const {
+    uint64_t pages = 0;
+    const auto prefix = scope + ":";
+    for (const auto & [request_key, state] : request_states_) {
+        if (request_key.rfind(prefix, 0) == 0) pages += state.device_reservation_pages;
+    }
+    return pages;
+}
+
+uint64_t HiCacheState::estimate_admission_requested_tokens(const HiCacheFact & fact, const RequestExecutionState & request_state) const {
+    const auto page_size = page_size_for_fact(fact);
+    if (page_size == 0) return 0;
+    const auto full_tokens = full_path_token_count(fact);
+    const auto matched_tokens = static_cast<uint64_t>(request_state.matched_device_prefix_pages.size()) * page_size;
+    const auto extend_tokens = full_tokens > matched_tokens ? full_tokens - matched_tokens : 0;
+    return extend_tokens + page_size;
+}
+
+uint64_t HiCacheState::estimate_admission_requested_pages(const HiCacheFact & fact, const RequestExecutionState & request_state) const {
+    const auto page_size = page_size_for_fact(fact);
+    if (page_size == 0) return 0;
+    return ceil_div(estimate_admission_requested_tokens(fact, request_state), page_size);
+}
+
+void HiCacheState::clear_device_reservation(const std::string & request_key) {
+    auto it = request_states_.find(request_key);
+    if (it != request_states_.end()) it->second.device_reservation_pages = 0;
+}
+
+void HiCacheState::acquire_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary,
+                                               std::vector<HiCacheStateTransition> & transitions, const std::string & request_key,
+                                               const std::vector<std::string> & pages) {
+    if (request_key.empty()) return;
+    std::set<std::string> desired;
+    for (const auto & page : pages) {
+        if (!page.empty()) desired.insert(page);
+    }
+    if (desired.empty()) return;
+    auto & held = request_device_lock_pages_[request_key];
+    for (const auto & page : desired) {
+        if (!held.insert(page).second) continue;
+        const auto before = device_lock_count_by_page_[page]++;
+        if (before == 0) mark_locked(fact, summary, transitions, page);
+    }
+}
+
+void HiCacheState::release_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary,
+                                               std::vector<HiCacheStateTransition> & transitions, const std::string & request_key) {
+    auto it = request_device_lock_pages_.find(request_key);
+    if (it == request_device_lock_pages_.end()) return;
+    for (const auto & page : it->second) {
+        auto count_it = device_lock_count_by_page_.find(page);
+        if (count_it == device_lock_count_by_page_.end() || count_it->second == 0) continue;
+        count_it->second--;
+        if (count_it->second == 0) {
+            device_lock_count_by_page_.erase(count_it);
+            clear_locked(fact, summary, transitions, page);
+        }
+    }
+    request_device_lock_pages_.erase(it);
+}
+
+void HiCacheState::replace_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary,
+                                               std::vector<HiCacheStateTransition> & transitions, const std::string & request_key,
+                                               const std::vector<std::string> & pages) {
+    release_device_request_lock(fact, summary, transitions, request_key);
+    acquire_device_request_lock(fact, summary, transitions, request_key, pages);
+}
+
+void HiCacheState::apply_target_device_pressure(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                std::vector<HiCacheStateTransition> & transitions, uint64_t requested_pages) {
+    if (requested_pages == 0 || config_.l1_capacity_pages == 0) return;
+    const auto scope = normalized_scope(fact);
+    const auto occupied = tier_size_for_scope("L1", scope) + active_device_reservation_pages_for_scope(scope);
+    if (occupied + requested_pages <= config_.l1_capacity_pages) return;
+    evict_lru_pages(fact, summary, transitions, "L1", requested_pages);
+}
+
+void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSummary & summary,
+                                           std::vector<HiCacheStateTransition> & transitions) {
+    apply_request_context(fact, summary);
+    auto tokens = projected_full_path_tokens_for_fact(fact);
+    if (tokens.empty()) {
+        auto stored = token_store_.request_tokens(fact);
+        if (!stored.empty()) tokens = stored;
+    }
+    if (tokens.empty()) {
+        note_missing_projection_if_needed(fact, summary);
+        return;
+    }
+    auto full_pages = pages_for_tokens(fact, tokens);
+    if (full_pages.empty()) return;
+
+    auto & radix_tree = radix_tree_for_fact(fact);
+    auto match = radix_tree.match_page_path(full_pages);
+    update_request_path_state(fact, full_pages, match.matched_pages, match.ancestor_page_groups);
+
+    const auto request_key = scoped_request_key(fact);
+    if (request_key.empty()) return;
+    auto & request_state = request_states_[request_key];
+    const auto lock_pages = flatten_page_groups(request_state.last_device_chain_groups);
+    acquire_device_request_lock(fact, summary, transitions, request_key, lock_pages);
+
+    const auto requested_pages = estimate_admission_requested_pages(fact, request_state);
+    apply_target_device_pressure(fact, summary, transitions, requested_pages);
+    request_state.device_reservation_pages = requested_pages;
+    request_state.lifecycle_state = "admitted";
+}
+
 void HiCacheState::apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCacheSummary & summary,
                                                   std::vector<HiCacheStateTransition> & transitions) {
     const auto kind = lower(fact.lifecycle_kind);
     if (!kind.empty() && kind != "finished" && kind != "unfinished") return;
     auto tokens = token_store_.request_tokens(fact);
     if (tokens.empty()) return;
+    const auto request_key = scoped_request_key(fact);
     apply_request_lifecycle_insert(fact, summary, transitions);
+    clear_device_reservation(request_key);
+    auto state_it = request_states_.find(request_key);
+    if (state_it == request_states_.end()) return;
+    const auto lock_pages = flatten_page_groups(state_it->second.last_device_chain_groups);
+    if (kind == "unfinished") {
+        replace_device_request_lock(fact, summary, transitions, request_key, lock_pages);
+        state_it->second.lifecycle_state = "unfinished";
+    }
+    else {
+        release_device_request_lock(fact, summary, transitions, request_key);
+        request_states_.erase(state_it);
+    }
 }
 
 void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, HiCacheSummary & summary,
@@ -245,8 +394,9 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
     token_store_.observe_request_bound_tokens(fact, tokens);
 
     auto & radix_tree = radix_tree_for_fact(fact);
-    const auto matched = radix_tree.longest_prefix_pages(tokens, page_size_for_fact(fact));
-    auto matched_pages = slice_pages(pages, 0, matched);
+    auto match = radix_tree.match_page_path(pages);
+    auto matched_pages = match.matched_pages;
+    update_request_path_state(fact, pages, matched_pages, match.ancestor_page_groups);
     for (const auto & page : matched_pages) {
         if (state_index_.l1().count(page) > 0) {
             touch_page("L1", page);
@@ -290,7 +440,8 @@ void HiCacheState::apply_request_lifecycle_insert(const HiCacheFact & fact, HiCa
     auto & radix_tree = radix_tree_for_fact(fact);
     const auto prefix_pages = radix_tree.longest_prefix_pages(tokens, page_size_for_fact(fact));
     auto inserted_pages = suffix_pages(full_pages, prefix_pages);
-    radix_tree.insert_path(tokens, full_pages);
+    auto inserted_match = radix_tree.insert_path(tokens, full_pages);
+    update_request_path_state(fact, full_pages, full_pages, inserted_match.ancestor_page_groups);
     if (inserted_pages.empty()) {
         apply_write_policy_hit_counts(fact, full_pages, summary, transitions);
         return;
@@ -727,13 +878,47 @@ void HiCacheState::evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & su
     uint64_t removed = 0;
     std::set<std::string> skipped_locked;
     while (removed < page_count) {
-        auto victim_it = std::find_if(order->begin(), order->end(), [&](const auto & page) { return pages->count(page) > 0 && page_in_scope(page, scope); });
-        if (victim_it == order->end()) break;
-        auto victim = *victim_it;
-        order->erase(victim_it);
-        if (!pages->count(victim)) continue;
-        auto victims = radix_tree.leaf_group_for_page(victim);
-        if (victims.empty()) victims = {victim};
+        std::vector<std::string> victims;
+        bool dynamic_device_tree_ready = false;
+        if (tier == "L1") {
+            std::set<std::string> device_pages;
+            std::set<std::string> locked_pages;
+            for (const auto & page : *pages) {
+                if (!page_in_scope(page, scope)) continue;
+                device_pages.insert(page);
+                if (radix_tree.contains_page(page)) dynamic_device_tree_ready = true;
+                if (state_index_.locked().count(page) > 0) locked_pages.insert(page);
+            }
+            if (dynamic_device_tree_ready) {
+                auto candidate_groups = radix_tree.device_eviction_leaf_groups(device_pages, locked_pages);
+                size_t best_group = candidate_groups.size();
+                size_t best_order_index = order->size();
+                for (size_t group_index = 0; group_index < candidate_groups.size(); ++group_index) {
+                    size_t group_order_index = order->size();
+                    for (const auto & page : candidate_groups[group_index]) {
+                        const auto order_it = std::find(order->begin(), order->end(), page);
+                        if (order_it == order->end()) continue;
+                        group_order_index = std::min(group_order_index, static_cast<size_t>(std::distance(order->begin(), order_it)));
+                    }
+                    if (group_order_index < best_order_index) {
+                        best_order_index = group_order_index;
+                        best_group = group_index;
+                    }
+                }
+                if (best_group == candidate_groups.size()) break;
+                victims = candidate_groups[best_group];
+            }
+        }
+        if (victims.empty()) {
+            auto victim_it =
+                std::find_if(order->begin(), order->end(), [&](const auto & page) { return pages->count(page) > 0 && page_in_scope(page, scope); });
+            if (victim_it == order->end()) break;
+            auto victim = *victim_it;
+            order->erase(victim_it);
+            if (!pages->count(victim)) continue;
+            victims = radix_tree.leaf_group_for_page(victim);
+            if (victims.empty()) victims = {victim};
+        }
         bool locked_group = false;
         for (const auto & page : victims) {
             if (state_index_.locked().count(page) > 0) {
@@ -742,7 +927,7 @@ void HiCacheState::evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & su
             }
         }
         if (locked_group) {
-            skipped_locked.insert(victim);
+            skipped_locked.insert(victims.front());
             continue;
         }
         for (const auto & page : victims) {

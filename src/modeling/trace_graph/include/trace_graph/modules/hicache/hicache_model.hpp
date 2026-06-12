@@ -43,11 +43,22 @@ class HiCacheState {
     std::vector<HiCacheStateTransition> finalize(HiCacheSummary & summary);
 
   private:
+    struct RequestExecutionState {
+        std::vector<std::string> full_pages;
+        std::vector<std::string> matched_device_prefix_pages;
+        std::vector<std::vector<std::string>> last_device_chain_groups;
+        uint64_t device_reservation_pages = 0;
+        std::string lifecycle_state;
+    };
+
     HiCacheConfig config_;
     HiCacheTargetPager target_pager_;
     HiCacheTokenPathStore token_store_;
     std::unordered_map<std::string, HiCacheTokenRadixTree> radix_trees_;
     HiCacheStateIndex state_index_;
+    std::unordered_map<std::string, RequestExecutionState> request_states_;
+    std::unordered_map<std::string, std::set<std::string>> request_device_lock_pages_;
+    std::unordered_map<std::string, uint64_t> device_lock_count_by_page_;
     std::unordered_map<std::string, std::vector<std::string>> pending_prefetch_pages_;
     std::unordered_map<std::string, uint64_t> prefetch_decision_ts_;
     std::unordered_map<std::string, uint64_t> active_prefetch_host_pages_by_request_;
@@ -75,6 +86,7 @@ class HiCacheState {
 
     void apply_request_tokens(const HiCacheFact & fact);
     void apply_request_context(const HiCacheFact & fact, HiCacheSummary & summary);
+    void apply_request_admission(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_request_bound_match_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_request_lifecycle_insert(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
@@ -83,6 +95,22 @@ class HiCacheState {
     void apply_diagnostic_state_injection(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_write_policy_hit_counts(const HiCacheFact & fact, const std::vector<std::string> & full_pages, HiCacheSummary & summary,
                                        std::vector<HiCacheStateTransition> & transitions);
+    std::vector<std::string> flatten_page_groups(const std::vector<std::vector<std::string>> & groups) const;
+    void update_request_path_state(const HiCacheFact & fact, const std::vector<std::string> & full_pages,
+                                   const std::vector<std::string> & matched_pages,
+                                   const std::vector<std::vector<std::string>> & chain_groups);
+    uint64_t active_device_reservation_pages_for_scope(const std::string & scope) const;
+    uint64_t estimate_admission_requested_tokens(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
+    uint64_t estimate_admission_requested_pages(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
+    void clear_device_reservation(const std::string & request_key);
+    void acquire_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                     const std::string & request_key, const std::vector<std::string> & pages);
+    void release_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                     const std::string & request_key);
+    void replace_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                     const std::string & request_key, const std::vector<std::string> & pages);
+    void apply_target_device_pressure(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                      uint64_t requested_pages);
     uint64_t active_prefetch_host_pages_for_scope(const std::string & scope) const;
     void apply_pending_prefetch_host_pressure_for_request(const HiCacheFact & fact, HiCacheSummary & summary,
                                                           std::vector<HiCacheStateTransition> & transitions, const std::string & request_key);

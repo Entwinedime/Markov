@@ -31,11 +31,12 @@
 - 当前 S1B self 的 L1/dirty/locked final sets 已与 normalized oracle 对齐；normal prediction 的剩余 mismatch 集中在
   L2/backuped/evicted，且已通过模型侧 diagnostic async-elision 证明该 self-config final diff 来自
   async/input-boundary 分岔后的连锁状态差，而不是已知 deterministic final-set model bug。
-- 当前 S1A self normal prediction 已 final state match；但 trace scan 仍可见 `locked_pages` 暂态差异，归类为
-  snapshot/input-boundary 暂态。
+- 当前 S1A self/cross normal prediction 已 final state match；但 full trace scan 仍可见 `locked_pages` 暂态差异，归类为
+  lifecycle anchor 粒度与 source lock/ref snapshot 粒度不同造成的 transient。
 - 当前 33-target atomic profile 已完成 S1A/S1B manual run，双向 cross audit 的 `model_input_contract_ready=true`；
-  C++ backend 已完成 atomic reader/router/state dispatch 和 normal input surface 收窄，当前四个 backend-refactor
-  prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`。
+  C++ backend 已完成 atomic reader/router/state dispatch、normal input surface 收窄，以及 target-derived device
+  request lock/ref、admission capacity pressure 和 radix leaf victim eligibility。当前四个 target-resource prediction
+  都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`。
 - C++ normal backend 已删除 `maintenance_checkpoint`、`capacity_request`、`lock_scope_delta` 的状态推进入口；
   这些 role 当前只作为 source evidence / provenance。
 - 当前 front-door workload audit 已确认 S1A/S1B 的 benchmark 入口请求形状与 prompt identity 对齐；cross 问题不是
@@ -94,37 +95,35 @@
 最新真实 modeling 验证：
 
 ```text
-HCSV-20260612-backend-atomic-refactor
+HCSV-20260612-target-resource-mechanism
 ```
 
 该结果基于 `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` 的同一 profile：
 
 | prediction | invariant coverage | final | 结论 |
 | --- | --- | --- | --- |
-| S1A self backend-refactor | true | fail | L2/backuped `67/67` 已对齐；L1 extra 7、evicted missing 7。 |
-| S1B self backend-refactor | true | fail | L1/dirty `28/28` 已对齐；L2/backuped/evicted `70/55`，missing 13、extra 28。 |
-| S1A -> S1B backend-refactor | true | fail | 与 S1B self 同形。 |
-| S1B -> S1A backend-refactor | true | fail | 与 S1A self 同形。 |
+| S1A self target-resource | true | pass | L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`。 |
+| S1B self target-resource | true | fail | L1/dirty/locked `28/28` 已对齐；L2/backuped/evicted `56/55`，missing 13、extra 14。 |
+| S1A -> S1B target-resource | true | fail | 与 S1B self 同形。 |
+| S1B -> S1A target-resource | true | pass | 与 S1A self 同形。 |
 
 逐 trace 结论：
 
-- first divergence 是 `lock_scope_inc_end:state_snapshot`，因为 lock/ref delta 当前仍是 source_actual，不是 normal
-  invariant；final locked `0/0`，但 transient state 不能声称对齐；
-- S1A final diff 来自 capacity/eviction pressure：oracle 中 7 个 page 经后续 `capacity_request` 从 L1 进入 evicted，
-  当前 normal invariant 没有 cross-safe capacity pressure；
-- S1B final diff 来自 host lifecycle / maintenance / prefetch visibility：oracle 中相关 pages 通过 capacity、
-  maintenance 或 prefetch visibility 后续清理，当前 normal invariant 没有这些 target-derived 边界；
+- full trace first divergence 仍可能是 `lock_ref_transient_boundary`，因为 normal invariant lifecycle anchor 不携带
+  source `lock_scope_*` 的 exact snapshot timing；final locked `0/0`；
+- S1A final diff 已由 target-derived device lock/ref + admission pressure + radix victim eligibility 修复；
+- S1B final diff 来自 host lifecycle / maintenance / prefetch visibility：oracle 中相关 pages 通过 host_ref、storage hit /
+  prefetch completion 或 host memory release 后续清理，当前 normal invariant 没有这些 target-derived 边界；
 - 当前剩余问题应作为 mechanism/input-boundary 缺口处理，不能通过直接消费 source_actual 或围绕 final set 打补丁解决。
 
 Boundary-elision 诊断补充：
 
-| run | diagnostic injections | final | 分类 |
-| --- | ---: | --- | --- |
-| S1A self unlocked boundary-elided | 14 | pass | capacity pressure 8、lock-protected capacity 4、async checkpoint/source progress 2 |
-| S1B self unlocked boundary-elided | 24 | pass | capacity pressure 12、async checkpoint/source progress 8、async prefetch storage completion 2、lock-protected capacity 2 |
-
-这些 synthetic `diagnostic_state_injection` 只用于证明 residual final diff 来自 lock/capacity/prefetch/storage visibility
-边界，不是 normal prediction 的可消费输入。
+- target-resource v2 的 unlocked diagnostic replay 在 S1A/S1B self 上 final 都可对齐；
+- S1A normal final 已 pass，但 unlocked trace 仍能看到 capacity boundary timing 差异；
+- S1B normal final 剩余 L2/backuped/evicted `56/55`，full trace 首个分歧仍可能先碰到
+  `lock_ref_transient_boundary`，unlocked trace 后续 evidence 指向 host_ref / storage prefetch completion / host memory
+  release visibility；
+- synthetic `diagnostic_state_injection` 只用于证明 residual final diff 的边界位置，不是 normal prediction 的可消费输入。
 
 历史 2026-06-11 self-config 状态：
 
@@ -187,15 +186,15 @@ provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set �
 | --- | --- | --- | --- | --- |
 | `HCSM-D1` | P1 | Resident / evicted lifecycle 历史回归仍需复测 | 当前 S1B self L1/dirty/locked 已对齐；历史 S1A 仍有 L1 missing / evicted extra 样本 | 新 S1A profile 可用后复测，不再用当前 S1B 做 L1 小修。 |
 | `HCSM-D2` | P1 | L2/backuped/evicted lifecycle 仍需在 cross 中复核 | S1B self normal 为 56/55，missing 13、extra 14；模型侧 async-elision 后 55/55 match | self-config 不继续打补丁；cross logical alignment 后再判断是否仍有 cleanup/victim 问题。 |
-| `HCSM-D3` | P1 | capacity / evictable / leaf group 仍是近似 | host projection 修复已把 maintenance 分岔消除；完整 node/ref/evictable 仍未实现 | 当前不继续局部修 leaf group，等 async prefetch 分岔解除后再逐 trace 评估 victim。 |
-| `HCSM-D4` | P1 | token radix tree 仍不是完整 SGLang node/ref 结构 | prefix/split 复杂时可能错 resident/evicted | 补 token-level node provenance 或完善 radix split/merge 模型。 |
+| `HCSM-D3` | P1 | capacity / evictable / leaf group 仍需更广泛复测 | device-side admission pressure、lock-protected victim eligibility 和动态 device leaf group 已实现；S1A final pass，S1B 主要残差转到 host/L2 | 用新增 host/prefetch invariant 后再逐 trace 复测 victim identity。 |
+| `HCSM-D4` | P1 | token/page radix tree 仍不是完整 SGLang node/ref/host-ref 对等结构 | 已有 terminal node、ancestor chain 和动态 device leaf group；host_ref、storage async node state 仍缺 | 补 host node/ref provenance 或新增 target-independent host/prefetch work anchor。 |
 | `HCSM-D5` | P0 | async prefetch completion / storage insert 不可由当前 checkpoint 推导 | S1B self 的 normal mismatch 已由模型侧 async-elision 归因到该边界 | 不加“best_effort 全 pending 完成”特化规则；正常 prediction 仍需 target async model 或新增 invariant 字段。 |
 | `HCSM-D6` | P1 | write-back background flush / host release 尚未完整证明 | 当前 S1B dirty 已 28/28；write-back 不再是首个分岔，但仍可能影响后续 final extra | async prefetch 分岔解除后再追 dirty eviction、flush completion、host release 和 L2 eviction。 |
 | `HCSM-D7` | P1 | lock/ref replay order 已修，完整 parent chain 仍需验证 | 2026-06-11 S1B self locked 已达 0/0；历史 cross-config 仍需复测 | 四向新 profile 完成后复测，不再把 S1B self locked 作为当前 P0。 |
 | `HCSM-D8` | P2 | ordered transition oracle 不足 | 目前主要看 final normalized sets | 后续加 transition provenance / exact oracle。 |
 | `HCSM-D9` | P2 | state-to-DAG patch 未实现 | `dag_mutations=0` | state final sets 通过后再进入 DAG mutation。 |
-| `HCSM-D10` | P1 | cross-config logical alignment / input contract backend validation 已完成，仍需机制闭环 | 2026-06-12 backend-refactor 四向 prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；self/cross 同 target 结果同形，说明 33-target atomic input contract 已进入 C++ 且 normal surface 已收窄 | 不再把当前失败归因到输入未消费；后续聚焦 lock/capacity/prefetch/storage visibility 的 target-derived 边界。 |
-| `HCSM-D11` | P0 | lock/capacity/prefetch/storage visibility 仍缺 normal target-derived mechanism | normal run：S1A final 剩 L1 extra 7 / evicted missing 7，S1B final 剩 L2/backuped/evicted `70/55`；boundary-elision 诊断中 S1A/S1B 分别注入 14/24 个 diagnostic boundary 后 final match | 设计新的 target-independent invariant 或 target-derived mechanism；不能直接消费 source_actual control-flow 序列，也不能围绕 final set 打补丁。 |
+| `HCSM-D10` | P1 | cross-config logical alignment / input contract backend validation 已完成，device resource mechanism 已闭合一层 | 2026-06-12 target-resource 四向 prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；S1A self/cross final pass，S1B self/cross 同形 | 不再把当前失败归因到输入未消费；后续聚焦 host/prefetch/storage visibility 的 target-derived 边界。 |
+| `HCSM-D11` | P0 | host/prefetch/storage visibility 仍缺 normal target-derived mechanism | S1B final 剩 L2/backuped/evicted `56/55`，missing 13、extra 14；相关 evidence 是 source_actual host_ref/storage/prefetch completion，不是当前 normal input | 新增 target-independent host/prefetch work anchor，或实现完整 target async storage/host-ref model；不能直接消费 source_actual result。 |
 
 ## 已收紧的规则
 
