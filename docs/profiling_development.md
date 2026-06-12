@@ -237,6 +237,8 @@ provenance 和 oracle 对照，默认是 `source_actual` 或 `timing_observation
 注意：match-prefix path 不再以 `request_tokens` / `lookup_path` 混合 role 出现。request-bound anchor 只在
 `params.req.rid` 存在时发出；concrete cache-stage path 另作为 `cache_stage_match_path_observed` evidence 保留。
 cross-config 诊断时需要逐项审计 atomic invariant 集合，而不能只看 workload report 的 prompt identity 是否一致。
+审计时 raw `request_id` 只用于单 run 内关联 request-scoped fact，不能作为跨配置 invariant value；跨配置签名必须归一化到
+token path / request fingerprint。
 
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
 `fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 `model_runner.py` 的 validation 路径使用。
@@ -279,8 +281,9 @@ python3 scripts/internal/profile_quality.py \
 - `seq_no` 是否在 scope 内有序；
 - state trace 开启时是否采到 capacity snapshot。
 
-旧 `01_s1a_manual` 质量结果如下。它来自 2026-06-10 已完成 profile，不是当前 33-target atomic 契约的重跑结果；
-当前契约重跑前只能把它作为历史基线：
+当前 33-target atomic 契约已在
+`data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` 完成 S1A/S1B manual profile。
+旧 `01_s1a_manual` 质量结果如下，它来自 2026-06-10 profile，只能作为历史基线：
 
 | 指标 | 值 |
 | --- | --- |

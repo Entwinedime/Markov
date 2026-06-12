@@ -212,8 +212,9 @@ path、lookup result、cache config、lifecycle path/runtime、insert/capacity/l
 `source_actual` 事件绕过 role 缺口。unknown invariant role 应进入
 `missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
 
-cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant 事件，逐 role 对比 count、
-sequence 和 canonical fact value。只有下列情况才考虑新增采集 target：
+cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant facts，逐 role 对比 count
+和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 invariant；
+sequence mismatch 只作为诊断输出。只有下列情况才考虑新增采集 target：
 
 - profile quality 明确证明现有 target 缺 required field、token dictionary 或 seq/scope；
 - 进入 DLLM、disaggregation、streaming session、abort/timeout/preemption 等新 scope；
@@ -341,9 +342,17 @@ model_summary.json.modules[0].hicache
 - `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已删除，相关 callable 拆成 invariant anchor 与
   `source_actual` path/runtime evidence；
 - C++ router 已同步切到 atomic role gate，不再把 source/control-flow role 作为正常模型入口；
-- cross audit 的 hard `model_input_contract` 按 atomic invariant role 比较 count、sequence 和 canonical fact value；
-- 下一步需要在 atomic profile config 下重跑真实 S1A/S1B，再用 `model_input_contract_ready=true` 作为 cross state-rule
-  diagnosis 的前置条件。
+- cross audit 的 hard `model_input_contract` 按 atomic invariant role 比较 count 和 request-normalized canonical fact
+  multiset，sequence mismatch 不再阻塞输入契约。
+
+截至 2026-06-12 15:38，新的 atomic profile 已完成 S1A/S1B manual run：
+
+- suite：`data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix`；
+- suite `failures=[]`，两侧 `profiling_ready=true`，Python probe trace 各 2 个；
+- 两侧 normal model input 都是 `350` 个 completed atomic invariant facts，双向 cross audit
+  `model_input_contract_ready=true`、blocking roles 为空；
+- S1A profile quality 的整体 `quality_ready=false` 只来自 source evidence `prefetch_transfer` 未观测到，不影响 normal
+  model-input hard gate。
 
 截至 2026-06-12 03:49，基于修复前 S1A/S1B 31-target fast-pressure suite 完成 async-elision 与 cross input-contract
 诊断；这些结果是本轮 demotion 的历史证据：
@@ -405,8 +414,9 @@ model_summary.json.modules[0].hicache
 - S1A->S1B 和 S1B->S1A 仍未通过，阻塞点是 cross input contract：lifecycle/control-flow facts 尚未证明
   target-independent。
 
-atomic profile config 后，必须先重跑 S1A/S1B profile、profile quality、cross audit 和 modeling validation；旧 retained
-audit 不能再被解读为当前 atomic 正常输入契约下的失败结果。
+atomic profile config 下的 S1A/S1B profile、profile quality 和 cross audit 已完成，当前
+`model_input_contract_ready=true`。旧 retained audit 不能再被解读为当前 atomic 正常输入契约下的失败结果；下一步是
+在新 profile 上重跑 modeling validation。
 
 下面的 2026-06-10 四向结果来自 atomic 契约之前的 profile，只能证明旧 page-level backend 不正确，不能作为当前
 33-target atomic 契约的验收结果。

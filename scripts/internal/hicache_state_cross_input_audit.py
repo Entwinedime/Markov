@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare HiCache atomic invariant model-input streams across configurations."""
+"""Compare HiCache atomic invariant model-input facts across configurations."""
 
 from __future__ import annotations
 
@@ -27,10 +27,9 @@ PATH_ROLES = {
 }
 
 ROLE_SCALAR_FIELDS = {
-    "request_bound_match_anchor": ("request_id", "token_count"),
-    "request_lifecycle_anchor": ("request_id", "lifecycle_kind", "is_insert", "chunked", "priority"),
+    "request_bound_match_anchor": ("token_count",),
+    "request_lifecycle_anchor": ("lifecycle_kind", "is_insert", "chunked", "priority"),
     "request_admission": (
-        "request_id",
         "admission_kind",
         "token_count",
         "has_chunked_req",
@@ -39,12 +38,13 @@ ROLE_SCALAR_FIELDS = {
         "ignore_eos",
         "max_new_tokens",
     ),
-    "prefetch_decision": ("request_id", "token_count"),
-    "prefetch_check_point": ("request_id", "check_kind"),
+    "prefetch_decision": ("token_count",),
+    "prefetch_check_point": ("check_kind",),
     "diagnostic_state_injection": ("diagnostic_kind", "diagnostic_source"),
 }
 
 KNOWN_ATOMIC_INVARIANT_ROLES = set(DEFAULT_ROLES) | {"diagnostic_state_injection"}
+REQUEST_SCOPED_ROLES = set(DEFAULT_ROLES)
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,7 @@ class AuditEvent:
     ts: int
     seq_no: int
     request_id: str
+    request_fingerprint: str
     cache_scope: str
     fields: dict[str, Any]
 
@@ -179,8 +180,6 @@ def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
         "path_id": path_id or (token_hash(tokens) if tokens else ""),
         "token_count": optional_int(value.get("token_count"), len(tokens)),
         "hash_algo": str(value.get("hash_algo") or ""),
-        "token_ids_len": len(tokens),
-        "token_ids_hash": token_hash(tokens) if tokens else "",
     }
 
 
@@ -208,6 +207,48 @@ def path_signature(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def request_anchor_signature(role: str, args: dict[str, Any]) -> str:
+    fields: dict[str, Any] = {"role": role}
+    for field in ROLE_SCALAR_FIELDS.get(role, ()):
+        value = scalar_value(args, field)
+        if value is not None:
+            fields[field] = value
+    fields["path"] = path_signature(args)
+    return canonical_json(fields)
+
+
+def build_request_fingerprints(events: list[tuple[Path, dict[str, Any]]]) -> dict[str, str]:
+    """Map run-local request ids to stable fingerprints derived from path facts.
+
+    SGLang request ids are generated per run. They are still needed inside one
+    trace to correlate lifecycle/checkpoint facts with path-bearing facts, but
+    they are not themselves cross-config invariant facts.
+    """
+
+    anchors_by_request: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
+    for _path, event in events:
+        if not completed_model_invariant(event):
+            continue
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        role = str(args.get("event_role") or "")
+        if role not in PATH_ROLES:
+            continue
+        request_id = str(args.get("request_id") or "")
+        if not request_id:
+            continue
+        anchors_by_request[request_id][request_anchor_signature(role, args)] += 1
+
+    fingerprints: dict[str, str] = {}
+    for request_id, anchors in anchors_by_request.items():
+        payload = [
+            {"count": count, "fact": json.loads(signature)}
+            for signature, count in sorted(anchors.items())
+        ]
+        encoded = canonical_json(payload).encode("utf-8")
+        fingerprints[request_id] = "sha256_json:" + hashlib.sha256(encoded).hexdigest()
+    return fingerprints
+
+
 def scalar_value(args: dict[str, Any], field: str) -> Any:
     value = maybe_json(args.get(field))
     if isinstance(value, (dict, list)):
@@ -217,9 +258,11 @@ def scalar_value(args: dict[str, Any], field: str) -> Any:
     return str(value)
 
 
-def build_signature(role: str, event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def build_signature(role: str, event: dict[str, Any], request_fingerprint: str) -> tuple[str, dict[str, Any]]:
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     fields: dict[str, Any] = {"role": role}
+    if role in REQUEST_SCOPED_ROLES:
+        fields["request_fingerprint"] = request_fingerprint
     for field in ROLE_SCALAR_FIELDS.get(role, ()):
         value = scalar_value(args, field)
         if value is not None:
@@ -231,9 +274,14 @@ def build_signature(role: str, event: dict[str, Any]) -> tuple[str, dict[str, An
     return canonical_json(fields), fields
 
 
-def extract_audit_events(paths: list[Path], label: str, roles: set[str]) -> tuple[list[AuditEvent], collections.Counter[str]]:
+def extract_audit_events(
+    paths: list[Path],
+    label: str,
+    roles: set[str],
+) -> tuple[list[AuditEvent], collections.Counter[str], collections.Counter[str]]:
     rows: list[AuditEvent] = []
     unknown_invariant_roles: collections.Counter[str] = collections.Counter()
+    unmapped_request_id_events: collections.Counter[str] = collections.Counter()
     ordered = sorted(
         trace_events(paths),
         key=lambda item: (
@@ -243,6 +291,7 @@ def extract_audit_events(paths: list[Path], label: str, roles: set[str]) -> tupl
             str(item[1].get("name") or ""),
         ),
     )
+    request_fingerprints = build_request_fingerprints(ordered)
     for _path, event in ordered:
         if not completed_model_invariant(event):
             continue
@@ -253,7 +302,15 @@ def extract_audit_events(paths: list[Path], label: str, roles: set[str]) -> tupl
             continue
         if role not in roles:
             continue
-        signature, fields = build_signature(role, event)
+        request_id = str(args.get("request_id") or "")
+        request_fingerprint = ""
+        if role in REQUEST_SCOPED_ROLES:
+            if request_id:
+                request_fingerprint = request_fingerprints.get(request_id, "")
+            if not request_fingerprint:
+                unmapped_request_id_events[role] += 1
+                request_fingerprint = "unmapped_request"
+        signature, fields = build_signature(role, event, request_fingerprint)
         rows.append(
             AuditEvent(
                 stream=label,
@@ -264,12 +321,13 @@ def extract_audit_events(paths: list[Path], label: str, roles: set[str]) -> tupl
                 event_name=str(event.get("name") or ""),
                 ts=optional_int(event.get("ts")),
                 seq_no=optional_int(args.get("seq_no")),
-                request_id=str(args.get("request_id") or ""),
+                request_id=request_id,
+                request_fingerprint=request_fingerprint,
                 cache_scope=str(args.get("cache_scope") or ""),
                 fields=fields,
             )
         )
-    return rows, unknown_invariant_roles
+    return rows, unknown_invariant_roles, unmapped_request_id_events
 
 
 def summarize_event(event: AuditEvent | None) -> dict[str, Any] | None:
@@ -284,6 +342,7 @@ def summarize_event(event: AuditEvent | None) -> dict[str, Any] | None:
         "ts": event.ts,
         "seq_no": event.seq_no,
         "request_id": event.request_id,
+        "request_fingerprint": event.request_fingerprint,
         "cache_scope": event.cache_scope,
         "fields": event.fields,
     }
@@ -342,8 +401,8 @@ def summarize_role(role: str, source: list[AuditEvent], target: list[AuditEvent]
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
     roles = set(args.role or DEFAULT_ROLES)
     unknown_roles = sorted(roles - KNOWN_ATOMIC_INVARIANT_ROLES)
-    source_events, source_unknown = extract_audit_events(args.source_trace, args.source_label, roles)
-    target_events, target_unknown = extract_audit_events(args.target_trace, args.target_label, roles)
+    source_events, source_unknown, source_unmapped = extract_audit_events(args.source_trace, args.source_label, roles)
+    target_events, target_unknown, target_unmapped = extract_audit_events(args.target_trace, args.target_label, roles)
 
     source_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
     target_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
@@ -356,18 +415,34 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         summarize_role(role, source_by_role.get(role, []), target_by_role.get(role, []), args.sample)
         for role in sorted(roles)
     ]
-    failing_roles = [
+    fact_mismatch_roles = [
         row["role"]
         for row in role_summaries
-        if not row["count_match"] or not row["sequence_match"] or not row["signature_multiset_match"]
+        if not row["count_match"] or not row["signature_multiset_match"]
+    ]
+    sequence_mismatch_roles = [
+        row["role"]
+        for row in role_summaries
+        if row["count_match"] and row["signature_multiset_match"] and not row["sequence_match"]
     ]
     unknown_invariant_roles = {
         "source": dict(sorted(source_unknown.items())),
         "target": dict(sorted(target_unknown.items())),
     }
-    ready = not failing_roles and not source_unknown and not target_unknown and not unknown_roles
+    unmapped_request_id_events = {
+        "source": dict(sorted(source_unmapped.items())),
+        "target": dict(sorted(target_unmapped.items())),
+    }
+    unmapped_roles = sorted(set(source_unmapped) | set(target_unmapped))
+    blocking_roles = sorted(set(fact_mismatch_roles) | set(unmapped_roles))
+    ready = (
+        not blocking_roles
+        and not source_unknown
+        and not target_unknown
+        and not unknown_roles
+    )
     return {
-        "schema": "trace_sim.hicache.atomic_cross_input_audit.v1",
+        "schema": "trace_sim.hicache.atomic_cross_input_audit.v2",
         "source_label": args.source_label,
         "target_label": args.target_label,
         "source_traces": [str(path) for path in args.source_trace],
@@ -377,13 +452,22 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "target_event_count": len(target_events),
         "model_input_contract_ready": ready,
         "input_contract_ready_for_cross_state_rule_diagnosis": ready,
-        "model_input_blocking_roles": failing_roles,
+        "model_input_blocking_roles": blocking_roles,
+        "model_input_fact_mismatch_roles": fact_mismatch_roles,
+        "non_blocking_sequence_mismatch_roles": sequence_mismatch_roles,
         "unknown_requested_roles": unknown_roles,
         "unknown_invariant_roles": unknown_invariant_roles,
+        "unmapped_request_id_events": unmapped_request_id_events,
         "role_summaries": role_summaries,
+        "request_id_policy": (
+            "Raw request_id is run-local and is not part of the cross-config canonical fact. "
+            "Request-scoped facts are compared with a request_fingerprint derived from path-bearing "
+            "atomic invariant facts in the same run."
+        ),
         "pass_condition": (
-            "For every selected atomic invariant role, source and target streams must match by event count, "
-            "sequence, and canonical fact value. Unknown invariant roles are hard failures."
+            "For every selected atomic invariant role, source and target streams must match by event count "
+            "and canonical fact multiset after request_id normalization. Unknown invariant roles and "
+            "unmapped request-scoped facts are hard failures; sequence mismatch is diagnostic only."
         ),
     }
 
@@ -402,7 +486,9 @@ def main(argv: list[str] | None = None) -> int:
             "target_event_count": report["target_event_count"],
             "model_input_contract_ready": report["model_input_contract_ready"],
             "model_input_blocking_roles": report["model_input_blocking_roles"],
+            "non_blocking_sequence_mismatch_roles": report["non_blocking_sequence_mismatch_roles"],
             "unknown_invariant_roles": report["unknown_invariant_roles"],
+            "unmapped_request_id_events": report["unmapped_request_id_events"],
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
     else:

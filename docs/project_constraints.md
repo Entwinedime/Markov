@@ -61,6 +61,8 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - HiCache mainline 可以保留 source/evidence target，但正常 state model input 必须是显式枚举且通过 cross audit 的子集；
   当前 33-target suite 的正常输入 role 是 `request_bound_match_anchor`、`request_lifecycle_anchor`、
   `request_admission`、`prefetch_decision`、`prefetch_check_point`。
+- raw `request_id` 只是单次运行内的 correlation id；cross audit 不得把它当成跨配置 invariant fact，必须先用
+  path-bearing atomic facts 归一化 request scope。
 - source matched result、admission return、actual victim、actual movement、actual async completion 等 source 已发生结果不得作为
   `invariant_state` 事件字段混入；需要保留时必须拆成并行 `source_actual` / `timing_observation` / `oracle_state` 事件。
 - cache-stage concrete match-prefix path、source `insert_path`、request lifecycle generated/committed suffix、
@@ -95,7 +97,8 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - 非执行类 state snapshot、oracle state、probe debug、质量审计事件不能作为默认性能 DAG 节点。
 - 当前 HiCache mainline S1A/S1B profiling target count 是 33，但 profile quality 通过不代表全部 target 都是正常 state
   input；cross-config state-rule diagnosis 必须先通过 hard `model_input_contract_ready=true`，确认 atomic invariant role
-  逐项跨配置一致。
+  在 request-normalized canonical fact multiset 上逐项跨配置一致。sequence mismatch 是诊断信号，不是输入事实 hard
+  blocker。
 - 如果 `model_input_contract_ready=false`，state mismatch 先归类为输入契约、projection 或 async/control-flow boundary
   问题，不能直接当作 backend model/rule bug 修。
 - 只有 profile quality 明确失败、进入 DLLM/disaggregation/streaming/abort/preemption 等新 scope，或 SGLang upstream hook

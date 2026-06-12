@@ -20,8 +20,8 @@
 - 旧 `request_tokens`、`lookup_path`、`request_cache_lifecycle` 混合 role 已从主配置和 router 删除；match-prefix concrete
   path、lifecycle path/runtime、`insert_path`、`capacity_request`、`lock_scope_delta` 和具体 `maintenance_checkpoint`
   target 当前都是 source evidence；
-- cross audit 的 hard `model_input_contract` 只比较 atomic invariant stream，逐 role 检查 count、sequence 和 canonical
-  fact value；
+- cross audit 的 hard `model_input_contract` 只比较 atomic invariant facts，逐 role 检查 count 和 request-normalized
+  canonical fact multiset；raw `request_id` 不作为跨配置 invariant，sequence mismatch 是诊断信号；
 - 旧 2026-06-10 S1A/S1B profile 的 `non_invariant_fact_usage=[]` 已在 self-config 和 cross-config 四个方向中达成，
   但该 run 仍是 12-target 旧采集契约，只作为历史诊断；
 - 2026-06-11 S1B 31-target host-node-projection self prediction 已达成 `invariant_coverage_ready=true`、
@@ -31,8 +31,9 @@
   async/input-boundary 分岔后的连锁状态差，而不是已知 deterministic final-set model bug。
 - 当前 S1A self normal prediction 已 final state match；但 trace scan 仍可见 `locked_pages` 暂态差异，归类为
   snapshot/input-boundary 暂态。
-- 修复前 cross-config 仍未通过，且还不能做 timestamp oracle injection：S1A/S1B 执行窗口不重叠，`capacity_request`、
-  `lock_scope_delta` 和 request token sequence 也尚未证明 target-independent。
+- 当前 33-target atomic profile 已完成 S1A/S1B manual run，双向 cross audit 的 `model_input_contract_ready=true`；
+  修复前 retained cross-config 仍不能做 timestamp oracle injection，因为 S1A/S1B 执行窗口不重叠，旧
+  `capacity_request`、`lock_scope_delta` 和 request token sequence 也未证明 target-independent。
 - 当前 front-door workload audit 已确认 S1A/S1B 的 benchmark 入口请求形状与 prompt identity 对齐；cross 问题不是
   workload_report 层面的请求不一致。
 - 修复前 retained cross input audit 已证明旧输入契约不闭环：两向 high-risk roles 都包括 `request_tokens`、`lookup_path`、
@@ -163,7 +164,7 @@ provenance 对照清单，不应继续解释为在旧 `HiCacheState` page-set �
 | `HCSM-D7` | P1 | lock/ref replay order 已修，完整 parent chain 仍需验证 | 2026-06-11 S1B self locked 已达 0/0；历史 cross-config 仍需复测 | 四向新 profile 完成后复测，不再把 S1B self locked 作为当前 P0。 |
 | `HCSM-D8` | P2 | ordered transition oracle 不足 | 目前主要看 final normalized sets | 后续加 transition provenance / exact oracle。 |
 | `HCSM-D9` | P2 | state-to-DAG patch 未实现 | `dag_mutations=0` | state final sets 通过后再进入 DAG mutation。 |
-| `HCSM-D10` | P0 | cross-config logical alignment / input contract 未闭环 | 修复前 audit 已证明前门请求一致，但旧正常输入混入 `request_tokens`、`lookup_path`、`insert_path`、`request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等 variant/cache-stage/control-flow facts；本轮 profile config 已改成 atomic fact，删除旧混合 role，并用 hard `model_input_contract` 检查真实会进入模型的 5 个 atomic role | 在 atomic profile config 下重跑 S1A/S1B profile、profile quality、两向 cross audit 和 modeling validation；只有 `model_input_contract_ready=true` 后，才把 cross-only final diff 继续归因到 async boundary、target-derived projection 缺口或 C++ state rule bug。 |
+| `HCSM-D10` | P0 | cross-config logical alignment / input contract 需要 backend validation 复核 | 修复前 audit 已证明前门请求一致，但旧正常输入混入 `request_tokens`、`lookup_path`、`insert_path`、`request_cache_lifecycle`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等 variant/cache-stage/control-flow facts；本轮 profile config 已改成 atomic fact，删除旧混合 role，并且 2026-06-12 15:38 的双向 atomic cross audit 已通过 `model_input_contract_ready=true` | 在新 profile 上重跑 self/cross modeling validation；若 final diff 仍存在，再归因到 async boundary、target-derived projection 缺口或 C++ state rule bug。 |
 
 ## 已收紧的规则
 
@@ -461,12 +462,12 @@ HiCacheModule 当前 `dag_mutations=0`。这不是 state validation 失败原因
 ## 当前处理顺序
 
 1. 保留 S1A self normal pass 和 S1B self C++ async-elision pass 作为修复前 self-config 基线；换 run 或换输入契约时必须重新证明。
-2. 使用 atomic profile config 重跑 S1A/S1B profile，先确认正常 state input role 是当前 5 个 atomic invariant role。
-3. 重跑两向 cross audit，要求 `model_input_contract_ready=true`。
-4. 若 hard contract 仍失败，优先修 profile config / probe source / target-derived projection，不围绕 final L1/L2/evicted 做特化补丁。
-5. 若 hard contract 通过，再重跑 self-config 和 cross-config modeling validation，并用逐 trace 分岔对比区分 async/input-boundary、
+2. 使用已完成的 33-target atomic S1A/S1B profile 作为当前输入基线，除非 hook 语义或新 scope 变化，不重复 profile。
+3. hard `model_input_contract_ready=true` 已由双向 cross audit 达成；若后续 contract 回退，优先修 profile config /
+   probe source / target-derived projection，不围绕 final L1/L2/evicted 做特化补丁。
+4. 重跑 self-config 和 cross-config modeling validation，并用逐 trace 分岔对比区分 async/input-boundary、
    deterministic model bug 和 remaining input-contract gap。
-6. 对仍需表达的 lifecycle、capacity、lock 或 maintenance 机制，只能新增 target-independent 高层 invariant 或 target-derived
+5. 对仍需表达的 lifecycle、capacity、lock 或 maintenance 机制，只能新增 target-independent 高层 invariant 或 target-derived
    机制；不能把 source suffix、source `params.num_tokens`、source lock/ref delta 或 source polling/check-kind 序列重新标成正常输入。
 7. 不加入“best_effort checkpoint 全 pending 完成”规则；这类修正会把 source timing / completion 结果伪装成 model rule。
 8. 每修一类状态规则后重新审视它是机制级修正还是当前 run 的特化补丁；至少两个 self-config 和两个 cross-config 的

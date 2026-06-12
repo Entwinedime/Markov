@@ -172,8 +172,9 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 - C++ HiCache backend 的主门禁是 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`，
   router 只接受已知 atomic invariant role 并做 required-field 检查；
 - target page 由后端按 token path 和 target `page_size` 重建，不再消费 `target_page_identity_page64/128`；
-- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant stream，逐 role 检查 count、sequence 和
-  canonical fact value。
+- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant facts；raw `request_id` 是 run-local
+  correlation id，不作为跨配置事实签名，hard gate 检查 count 和 request-normalized canonical fact multiset，sequence mismatch
+  只作为诊断输出。
 
 当前契约摘要：
 
@@ -185,10 +186,12 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 | source/evidence targets | `24 source_actual` + `2 timing_observation`，均为 `model_input=false` |
 | model input gate | `model_input=true && fact_class=invariant_state && fact_granularity=atomic` |
 | cross audit hard gate | `model_input_contract_ready` |
-| retained old cross audits | 只作为旧混合输入契约的历史证据，需在 atomic 契约下重跑 |
+| latest atomic S1A/S1B profile | `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` |
+| latest cross audit result | 双向 `model_input_contract_ready=true`，blocking roles 为空 |
+| retained old cross audits | 只作为旧混合输入契约的历史证据 |
 
-下一步应先用 atomic profile config 重跑 S1A/S1B，并让 cross audit 的 `model_input_contract_ready` 对 5 个正常 role 逐项通过；
-之后再判断 remaining self/cross final diff 是 async boundary、target-derived projection 缺口，还是 C++ state rule bug。
+当前 atomic profile 的 normal model input 已通过双向 cross audit。下一步应在该 run 上重跑 self/cross modeling validation，
+再判断 remaining final diff 是 async boundary、target-derived projection 缺口，还是 C++ state rule bug。
 
 ## 数据约束
 

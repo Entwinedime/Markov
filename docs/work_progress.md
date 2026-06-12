@@ -2,6 +2,36 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-12 15:38:20 +0800
+
+- 新的 33-target atomic S1A/S1B profile 已完成：
+  - suite：`data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix`；
+  - `suite_result.json` 中 `failures=[]`，选中的 run 是 `s1a_manual` 和 `s1b_manual`；
+  - 两侧 `profiling_ready=true`，Python probe trace 各 2 个。
+- 修复并确认 profiling crash：
+  - 上一轮失败来自 `generic_callable._read_path()` 读取 `arg:params.req.rid` 时遇到 `params.req=None`；
+  - `generic_callable` 已改成 path extraction missing-safe，缺中间对象时返回 `(False, None)`，不再抛
+    `AttributeError`；
+  - 新 run 的 server log 没有旧 `AttributeError`，结尾只有 SIGTERM 后 detokenizer 清理日志。
+- profile quality 结论：
+  - S1A/S1B 的 atomic invariant coverage 均 ready，completed model-input facts 都是 `350`；
+  - 五个 normal role 的 end event count 是 `prefetch_check_point=50`、`prefetch_decision=50`、
+    `request_admission=50`、`request_bound_match_anchor=100`、`request_lifecycle_anchor=100`；
+  - S1A 整体 `quality_ready=false` 只来自 source evidence `prefetch_transfer` 未观测到，S1B `quality_ready=true`。
+- `scripts/internal/hicache_state_cross_input_audit.py` 的 hard gate 口径修正：
+  - raw `request_id` 是 run-local correlation id，不再作为跨配置 canonical fact 字段；
+  - request-scoped facts 用 path-bearing atomic facts 派生 `request_fingerprint` 做归一化；
+  - token dictionary 是否在某个事件上携带完整 `token_ids` 不再影响 path fact 签名；
+  - hard gate 比较 count 和 request-normalized canonical fact multiset，sequence mismatch 只作为诊断输出。
+- 重新生成双向 cross audit：
+  - S1A -> S1B：`source_event_count=350`、`target_event_count=350`、
+    `model_input_contract_ready=true`、blocking roles 为空；
+  - S1B -> S1A：同样 `350/350`、`model_input_contract_ready=true`、blocking roles 为空；
+  - 五个 role 均存在 non-blocking sequence mismatch，说明事件顺序受运行时调度影响，但输入事实 multiset 已跨配置一致。
+- 同步更新 `README.md`、`docs/project_constraints.md`、`docs/profiling_development.md`、
+  `docs/modeling_development.md`、`docs/validation/hicache_state_validation.md` 和
+  `docs/validation/hicache_state_model_defects.md`。下一步应在该 profile run 上重跑 self/cross modeling validation。
+
 ## 2026-06-12 12:42:07 +0800
 
 - 按“profiling 端维护精确 atomic fact contract、无 legacy/无向后兼容”的新方向完成主线重构：

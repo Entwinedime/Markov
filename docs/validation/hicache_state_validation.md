@@ -62,10 +62,12 @@ HiCache state prediction 必须同时满足：
 - `sglang.hicache` probe 会自动采集 radix split/delete、evictable delta、host ref delta、node store/remove、load-back、
   write-back enqueue/start、write/load ack、storage control、storage hit query、prefetch rate-limit/terminate、abort cleanup
   等 source_actual provenance；
-- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant stream，逐 role 检查 count、sequence 和
-  canonical fact value；
+- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant facts，逐 role 检查 count 和
+  request-normalized canonical fact multiset；raw `request_id` 是 run-local correlation id，不是跨配置 invariant，
+  sequence mismatch 只作为诊断输出；
 - HCSV-20260610 四向结果仍来自 12-target 旧 profile；`HCSV-20260612-async-elision-current-self-and-cross` 是 atomic
-  contract 前的 retained audit 证据；33-target atomic 契约仍需重跑真实 S1A/S1B profile 和 cross audit；
+  contract 前的 retained audit 证据；当前 33-target atomic profile/cross audit 结果记录在
+  `HCSV-20260612-atomic-input-contract`；
 - 2026-06-11 起，当前 `configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1*.json`
   已切到 fast-pressure 小容量口径；下面 HCSV-20260610 表格中的 `64/145`、`128/321` 是历史验证使用的
   archived target config，不是当前默认 modeling config；
@@ -114,11 +116,33 @@ source/cache-stage 事件混入 invariant role。
 - `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不更新 target state；
 - cache-stage concrete match-prefix path、source `insert_path`、lifecycle generated/committed suffix、
   source `capacity_request`、source `lock_scope_delta` 和 source maintenance polling/check-kind 序列均不能作为正常 cross 输入；
-- cross audit 不再保留旧 projection gate 作为正常输入豁免；它只比较 atomic invariant stream；
+- cross audit 不再保留旧 projection gate 作为正常输入豁免；它只比较 atomic invariant fact multiset；
 - C++ router 只接受 atomic invariant role，并移除了旧 mixed/source-control role 的正常入口。
 
-本条是 config/audit 层结果，不是新的真实 S1A/S1B modeling 结果。下一步必须在 atomic profile config 下重跑
-S1A/S1B，再用 `model_input_contract_ready=true` 作为 cross-config state-rule diagnosis 的前置条件。
+真实 profile / audit 结果：
+
+| 项 | S1A | S1B |
+| --- | --- | --- |
+| run | `20260612_053153/.../01_s1a_manual` | `20260612_053153/.../03_s1b_manual` |
+| suite status | `failures=[]` | `failures=[]` |
+| profiling ready | true | true |
+| Python probe traces | 2 | 2 |
+| Python probe events | 13146 | 12924 |
+| completed model-input facts | 350 | 350 |
+| invariant coverage ready | true | true |
+| missing required fields | none | none |
+| missing source mechanisms | `prefetch_transfer` | none |
+| profile quality ready | false, only because expected source evidence `prefetch_transfer` was not observed | true |
+
+双向 cross audit 结果：
+
+| direction | source/target model-input facts | `model_input_contract_ready` | blocking roles | non-blocking sequence mismatch |
+| --- | ---: | --- | --- | --- |
+| S1A -> S1B | `350/350` | true | none | all 5 roles |
+| S1B -> S1A | `350/350` | true | none | all 5 roles |
+
+本条是 config/profile/audit 层结果，不是新的真实 S1A/S1B modeling 结果。下一步在该 run 上重跑 self-config /
+cross-config modeling validation。
 
 ### HCSV-20260612-async-elision-current-self-and-cross
 
@@ -530,11 +554,12 @@ jq '.hicache_state.sets_diff_by_tier
 
 短期不应为了旧后端 mismatch 继续追加采集 target，也不应把修复前 retained audit 的 unsafe role 当作当前正常输入。当前顺序：
 
-1. 用 33-target atomic profile config 重跑 S1A/S1B manual profile。
-2. 运行 profile quality 和本地 config checks，确认正常 state input role 是当前 5 个 atomic invariant role。
-3. 对两向 cross run 执行 `scripts/internal/hicache_state_cross_input_audit.py`，要求
-   `model_input_contract_ready=true`。
-4. 在输入契约通过后再跑 self-config / cross-config modeling validation。
+1. 当前 33-target atomic S1A/S1B profile 已完成，输入基线是
+   `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix`。
+2. profile quality 显示 normal model input coverage ready；S1A 的整体 `quality_ready=false` 只来自 source evidence
+   `prefetch_transfer` 未观测到。
+3. 两向 cross audit 已达到 `model_input_contract_ready=true`。
+4. 现在应重跑 self-config / cross-config modeling validation。
 5. 若 final state 仍 mismatch，再用逐 page provenance 区分 async boundary、target-derived projection 缺口和可修的
    C++ state rule bug。
 

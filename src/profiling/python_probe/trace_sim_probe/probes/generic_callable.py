@@ -532,13 +532,13 @@ def _extract_raw_value(
     if source.startswith("self."):
         if not args:
             return (False, None)
-        return (True, _read_path(args[0], source.split(".", 1)[1]))
+        return _read_path(args[0], source.split(".", 1)[1])
     if source == "return":
         return (result is not None, result)
     if source.startswith("return."):
         if result is None:
             return (False, None)
-        return (True, _read_path(result, source.split(".", 1)[1]))
+        return _read_path(result, source.split(".", 1)[1])
     if source.startswith("const:"):
         return (True, source.split(":", 1)[1])
     return (False, None)
@@ -557,7 +557,7 @@ def _extract_arg_source(key: str, bound: dict[str, Any], args: tuple[Any, ...]) 
         if head not in bound:
             return (False, None)
         value = bound[head]
-    return (True, _read_path(value, path) if path else value)
+    return _read_path(value, path) if path else (True, value)
 
 
 def _extract_args_source(key: str, args: tuple[Any, ...]) -> tuple[bool, Any]:
@@ -570,7 +570,7 @@ def _extract_args_source(key: str, args: tuple[Any, ...]) -> tuple[bool, Any]:
     if index >= len(args):
         return (False, None)
     value = args[index]
-    return (True, _read_path(value, path) if path else value)
+    return _read_path(value, path) if path else (True, value)
 
 
 def _extract_kwarg_source(key: str, kwargs: dict[str, Any]) -> tuple[bool, Any]:
@@ -580,7 +580,7 @@ def _extract_kwarg_source(key: str, kwargs: dict[str, Any]) -> tuple[bool, Any]:
     if head not in kwargs:
         return (False, None)
     value = kwargs[head]
-    return (True, _read_path(value, path) if path else value)
+    return _read_path(value, path) if path else (True, value)
 
 
 def _split_head_path(value: str) -> tuple[str, str]:
@@ -590,20 +590,32 @@ def _split_head_path(value: str) -> tuple[str, str]:
     return (head, path)
 
 
-def _read_path(obj: Any, path: str) -> Any:
+def _read_path(obj: Any, path: str) -> tuple[bool, Any]:
     """按点分路径读取属性、dict key 或 list/tuple 下标。"""
 
     cursor = obj
     for part in path.split("."):
         if not part:
             continue
-        if isinstance(cursor, dict):
-            cursor = cursor[part]
-        elif isinstance(cursor, (list, tuple)) and part.isdigit():
-            cursor = cursor[int(part)]
-        else:
-            cursor = getattr(cursor, part)
-    return cursor
+        if cursor is None:
+            return (False, None)
+        try:
+            if isinstance(cursor, dict):
+                if part not in cursor:
+                    return (False, None)
+                cursor = cursor[part]
+            elif isinstance(cursor, (list, tuple)) and part.isdigit():
+                index = int(part)
+                if index >= len(cursor):
+                    return (False, None)
+                cursor = cursor[index]
+            else:
+                if not hasattr(cursor, part):
+                    return (False, None)
+                cursor = getattr(cursor, part)
+        except (KeyError, IndexError, TypeError, AttributeError):
+            return (False, None)
+    return (True, cursor)
 
 
 def _safe_len(value: Any) -> int | None:
