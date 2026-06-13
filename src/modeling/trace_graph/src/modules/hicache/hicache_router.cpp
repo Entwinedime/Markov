@@ -7,8 +7,7 @@ namespace TraceGraph {
 namespace {
 
 bool needs_full_path(HiCacheFactRole role) {
-    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestAdmission ||
-           role == HiCacheFactRole::PrefetchDecision;
+    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision;
 }
 
 bool has_complete_full_path(const HiCacheFact & fact, uint64_t effective_page_size) {
@@ -31,7 +30,6 @@ HiCacheFactRole parse_hicache_fact_role(const std::string & role) {
         {"request_admission", HiCacheFactRole::RequestAdmission},
         {"prefetch_decision", HiCacheFactRole::PrefetchDecision},
         {"prefetch_check_point", HiCacheFactRole::PrefetchCheckPoint},
-        {"diagnostic_state_injection", HiCacheFactRole::DiagnosticStateInjection},
     };
     auto it = roles.find(role);
     if (it == roles.end()) return HiCacheFactRole::Unknown;
@@ -50,8 +48,6 @@ std::string hicache_fact_role_name(HiCacheFactRole role) {
         return "prefetch_decision";
     case HiCacheFactRole::PrefetchCheckPoint:
         return "prefetch_check_point";
-    case HiCacheFactRole::DiagnosticStateInjection:
-        return "diagnostic_state_injection";
     case HiCacheFactRole::Unknown:
         return "unknown";
     }
@@ -74,7 +70,6 @@ bool hicache_fact_role_implemented(HiCacheFactRole role) {
     case HiCacheFactRole::RequestAdmission:
     case HiCacheFactRole::PrefetchDecision:
     case HiCacheFactRole::PrefetchCheckPoint:
-    case HiCacheFactRole::DiagnosticStateInjection:
         return true;
     case HiCacheFactRole::Unknown:
         return false;
@@ -94,8 +89,7 @@ std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, 
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.request_id.empty()) errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.lifecycle_kind.empty()) errors.push_back("missing_lifecycle_kind");
     if (role == HiCacheFactRole::RequestAdmission && fact.admission_kind.empty()) errors.push_back("missing_admission_kind");
-    if ((role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision ||
-         role == HiCacheFactRole::PrefetchCheckPoint) &&
+    if ((role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision || role == HiCacheFactRole::PrefetchCheckPoint) &&
         fact.request_id.empty())
         errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::PrefetchCheckPoint && fact.check_kind.empty()) errors.push_back("missing_check_kind");

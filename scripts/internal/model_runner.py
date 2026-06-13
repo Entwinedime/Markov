@@ -318,6 +318,8 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "write_policy",
             "write_through_threshold",
             "prefetch_policy",
+            "prefetch_threshold_pages",
+            "prefetch_capacity_limit_pages",
             "prefetch_timeout_base_sec",
             "prefetch_timeout_per_ki_token_sec",
             "prefetch_timeout_max_sec",
@@ -383,6 +385,8 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "write_policy",
         "write_through_threshold",
         "prefetch_policy",
+        "prefetch_threshold_pages",
+        "prefetch_capacity_limit_pages",
         "prefetch_timeout_base_sec",
         "prefetch_timeout_per_ki_token_sec",
         "prefetch_timeout_max_sec",
@@ -447,6 +451,8 @@ def _copy_hicache_storage_extra_config(result: dict[str, Any], raw_extra: str) -
         "prefetch_timeout_base": "prefetch_timeout_base_sec",
         "prefetch_timeout_per_ki_token": "prefetch_timeout_per_ki_token_sec",
         "prefetch_timeout_max": "prefetch_timeout_max_sec",
+        "prefetch_threshold_pages": "prefetch_threshold_pages",
+        "prefetch_capacity_limit_pages": "prefetch_capacity_limit_pages",
     }
     for src, dst in mapping.items():
         if src in extra:
@@ -939,6 +945,7 @@ def extract_hicache_capacity_oracle_state(snapshots: list[dict[str, Any]]) -> di
                     "l1_available_pages": capacity.get("l1_available_pages"),
                     "l2_capacity_pages": capacity.get("l2_capacity_pages"),
                     "l2_available_pages": capacity.get("l2_available_pages"),
+                    "prefetch_threshold_pages": capacity.get("prefetch_threshold_pages"),
                     "prefetch_capacity_limit_pages": capacity.get("prefetch_capacity_limit_pages"),
                 }
             )
@@ -976,11 +983,23 @@ def build_hicache_capacity_config_audit(
         "l2_capacity_pages": _optional_int(target_config.get("l2_capacity_pages", target_config.get("l2_capacity"))),
         "write_policy": _normalize_policy_value(target_config.get("write_policy")),
         "prefetch_policy": _normalize_policy_value(target_config.get("prefetch_policy")),
+        "prefetch_threshold_pages": _optional_int(target_config.get("prefetch_threshold_pages")),
+        "prefetch_capacity_limit_pages": _optional_int(target_config.get("prefetch_capacity_limit_pages")),
     }
     comparisons = {
         "page_size": _compare_int_config("page_size", target["page_size"], _unique_int_values(unique_values, ["page_size"])),
         "write_policy": _compare_policy_config("write_policy", target["write_policy"], _unique_policy_values(unique_values, ["write_policy"])),
         "prefetch_policy": _compare_policy_config("prefetch_policy", target["prefetch_policy"], _unique_policy_values(unique_values, ["prefetch_policy"])),
+        "prefetch_threshold_pages": _compare_int_config(
+            "prefetch_threshold_pages",
+            target["prefetch_threshold_pages"],
+            _unique_int_values(unique_values, ["prefetch_threshold_pages", "thresholds.prefetch_threshold_pages"]),
+        ),
+        "prefetch_capacity_limit_pages": _compare_int_config(
+            "prefetch_capacity_limit_pages",
+            target["prefetch_capacity_limit_pages"],
+            _unique_int_values(unique_values, ["prefetch_capacity_limit_pages", "thresholds.prefetch_capacity_limit_pages"]),
+        ),
         "l1_capacity_pages": _compare_capacity_config(
             "l1_capacity_pages",
             target["l1_capacity_pages"],
@@ -1046,6 +1065,11 @@ def recommend_hicache_target_config(
     page_size_values = _unique_int_values(capacity_unique_values, ["page_size"])
     write_policy_values = _unique_policy_values(capacity_unique_values, ["write_policy"])
     prefetch_policy_values = _unique_policy_values(capacity_unique_values, ["prefetch_policy"])
+    prefetch_threshold_values = _unique_int_values(capacity_unique_values, ["prefetch_threshold_pages", "thresholds.prefetch_threshold_pages"])
+    prefetch_capacity_limit_values = _unique_int_values(
+        capacity_unique_values,
+        ["prefetch_capacity_limit_pages", "thresholds.prefetch_capacity_limit_pages"],
+    )
     l1_pool_values = _unique_int_values(capacity_unique_values, ["l1_capacity_pages", "l1_pool.capacity_pages"])
     l2_pool_values = _unique_int_values(capacity_unique_values, ["l2_capacity_pages", "l2_pool.capacity_pages"])
 
@@ -1056,6 +1080,8 @@ def recommend_hicache_target_config(
     _recommend_single_value(result, evidence, warnings, "page_size", page_size_values)
     _recommend_single_value(result, evidence, warnings, "write_policy", write_policy_values)
     _recommend_single_value(result, evidence, warnings, "prefetch_policy", prefetch_policy_values)
+    _recommend_single_value(result, evidence, warnings, "prefetch_threshold_pages", prefetch_threshold_values)
+    _recommend_single_value(result, evidence, warnings, "prefetch_capacity_limit_pages", prefetch_capacity_limit_values)
     _recommend_capacity_value(
         result,
         evidence,

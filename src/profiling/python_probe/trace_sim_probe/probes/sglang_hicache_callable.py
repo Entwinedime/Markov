@@ -809,7 +809,7 @@ def _snapshot_hicache_object(obj: Any) -> dict[str, Any]:
     """读取 SGLang HiCache 对象的轻量状态快照。
 
     该函数只在显式验证模式下执行。实现使用宽松 introspection，是为了同时适配
-    HiRadixCache、HiCacheController 和 fixture 中的最小假对象；缺失字段会记录为空，
+    HiRadixCache、HiCacheController 和最小替身对象；缺失字段会记录为空，
     不影响业务执行。
     """
 

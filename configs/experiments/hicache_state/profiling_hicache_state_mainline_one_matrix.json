@@ -1930,7 +1930,9 @@
             "l1_capacity_pages": 32,
             "l2_capacity_pages": 73,
             "write_policy": "write_through_selective",
-            "prefetch_policy": "wait_complete"
+            "prefetch_policy": "wait_complete",
+            "prefetch_threshold_pages": 1,
+            "prefetch_capacity_limit_pages": 32
           }
         }
       },
@@ -1993,7 +1995,9 @@
             "l1_capacity_pages": 32,
             "l2_capacity_pages": 81,
             "write_policy": "write_back",
-            "prefetch_policy": "best_effort"
+            "prefetch_policy": "best_effort",
+            "prefetch_threshold_pages": 2,
+            "prefetch_capacity_limit_pages": 39
           }
         }
       }

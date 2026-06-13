@@ -51,6 +51,8 @@ std::string HiCacheSummary::to_json() const {
         {"write_policy", target_config.write_policy},
         {"write_through_threshold", target_config.write_through_threshold},
         {"prefetch_policy", target_config.prefetch_policy},
+        {"prefetch_threshold_pages", target_config.prefetch_threshold_pages},
+        {"prefetch_capacity_limit_pages", target_config.prefetch_capacity_limit_pages},
         {"prefetch_timeout_configured", target_config.prefetch_timeout_configured},
         {"prefetch_timeout_base_sec", target_config.prefetch_timeout_base_sec},
         {"prefetch_timeout_per_ki_token_sec", target_config.prefetch_timeout_per_ki_token_sec},

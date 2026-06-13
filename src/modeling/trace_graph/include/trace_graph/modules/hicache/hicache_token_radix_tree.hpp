@@ -32,11 +32,11 @@ class HiCacheTokenRadixTree {
     std::vector<size_t> ancestor_node_ids(size_t terminal_node) const;
     std::vector<std::vector<std::string>> ancestor_page_groups(size_t terminal_node) const;
     std::vector<std::string> flattened_ancestor_pages(size_t terminal_node) const;
+    std::vector<std::string> page_path_for_page(const std::string & page) const;
     std::vector<std::string> leaf_group_for_page(const std::string & page) const;
     std::vector<std::vector<std::string>> device_eviction_leaf_groups(const std::set<std::string> & device_pages,
                                                                       const std::set<std::string> & locked_pages) const;
-    std::vector<std::vector<std::string>> host_eviction_leaf_groups(const std::set<std::string> & host_pages,
-                                                                    const std::set<std::string> & evicted_pages,
+    std::vector<std::vector<std::string>> host_eviction_leaf_groups(const std::set<std::string> & host_pages, const std::set<std::string> & evicted_pages,
                                                                     const std::set<std::string> & locked_pages) const;
 
   private:
@@ -58,6 +58,7 @@ class HiCacheTokenRadixTree {
     std::vector<PageNode> page_nodes_;
     std::set<std::string> known_pages_;
     std::map<std::string, std::vector<std::string>> leaf_group_by_page_;
+    std::map<std::string, size_t> page_node_by_page_;
 
     size_t create_child(size_t parent, const std::vector<uint32_t> & key);
     void insert_suffix(size_t node_id, const std::vector<uint32_t> & suffix);
@@ -70,12 +71,10 @@ class HiCacheTokenRadixTree {
     bool page_subtree_has_host_value(size_t node_id, const std::set<std::string> & host_pages) const;
     bool page_node_evicted(size_t node_id, const std::set<std::string> & evicted_pages) const;
     bool page_node_locked(size_t node_id, const std::set<std::string> & locked_pages) const;
-    void collect_device_eviction_leaf_groups(size_t node_id, const std::set<std::string> & device_pages,
-                                             const std::set<std::string> & locked_pages,
+    void collect_device_eviction_leaf_groups(size_t node_id, const std::set<std::string> & device_pages, const std::set<std::string> & locked_pages,
                                              std::vector<std::vector<std::string>> & groups) const;
-    void collect_host_eviction_leaf_groups(size_t node_id, const std::set<std::string> & host_pages,
-                                           const std::set<std::string> & evicted_pages, const std::set<std::string> & locked_pages,
-                                           std::vector<std::vector<std::string>> & groups) const;
+    void collect_host_eviction_leaf_groups(size_t node_id, const std::set<std::string> & host_pages, const std::set<std::string> & evicted_pages,
+                                           const std::set<std::string> & locked_pages, std::vector<std::vector<std::string>> & groups) const;
 };
 
 } // namespace TraceGraph

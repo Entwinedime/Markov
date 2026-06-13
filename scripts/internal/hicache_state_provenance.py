@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Summarize HiCache model/oracle provenance for mismatched pages.
 
-This is a diagnostic helper. It does not feed oracle data back into the model.
-It reads validation diffs, predicted transition traces, and oracle state
-snapshots, then reports the per-page evidence needed to decide whether a
-backend rule is fixable from current invariant facts or requires new profiling.
+This is a read-only diagnostic helper. It never emits model_input facts and
+does not feed oracle data back into the model. It reads validation diffs,
+predicted transition traces, and oracle state snapshots, then reports the
+per-page evidence needed to decide whether a backend rule is fixable from
+current invariant facts or requires new profiling.
 """
 
 from __future__ import annotations

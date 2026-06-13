@@ -27,6 +27,8 @@ struct HiCacheConfig {
     std::string write_policy = "write_through";
     uint64_t write_through_threshold = 0;
     std::string prefetch_policy = "timeout";
+    uint64_t prefetch_threshold_pages = 0;
+    uint64_t prefetch_capacity_limit_pages = 0;
     bool prefetch_timeout_configured = false;
     double prefetch_timeout_base_sec = 0.0;
     double prefetch_timeout_per_ki_token_sec = 0.0;

@@ -62,7 +62,7 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mai
 `scripts/internal/profile_runner.py` 是容器内执行器，只允许在下列场景直接调用：
 
 - 已经位于 `scripts/profile.sh` 启动的 framework 容器内；
-- fixture / dry-run；
+- dry-run；
 - 不启动真实 server 的配置展开检查。
 
 不要在宿主机直接启动真实 SGLang profiling；宿主机 Python 不保证安装 SGLang、torch_npu、Ascend runtime。

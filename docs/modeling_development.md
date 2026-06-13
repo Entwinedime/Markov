@@ -29,12 +29,8 @@ profile manifest / explicit trace
 
 ## 运行入口
 
-smoke：
-
-```bash
-python3 scripts/internal/model_runner.py \
-  --config configs/modeling/smoke/modeling_smoke_hicache.json
-```
+不再维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
+可复现 profile/modeling run。
 
 faithful replay：
 
@@ -173,12 +169,43 @@ lifecycle path/runtime 和 source control-flow role 都是 `source_actual` / `ti
   device eviction leaf groups；page->group 不再退回整条 projected request path；
 - `state_index` 已集中 scoped page projection sets，L1/L2 capacity 按 `cache_scope` 统计和驱逐；device-side
   lock/ref、admission reservation 和 protected L1 victim eligibility 已由 target-derived mechanism 维护；
-- host ref、storage prefetch completion、storage hit query 和 async host memory release 仍未作为 normal invariant 机制闭合；
-  这些信息目前只来自 source_actual evidence，不能直接更新 target state；
+- 2026-06-13 host/device/async 边界重构已落地：`DeviceCacheState`、`HostCacheState` 和 `AsyncState`
+  已从 `HiCacheState` 中拆出，device radix / host radix / async work queue 不再共用一条合成 visible path；
+- `add_resident()` / `remove_resident()` 不再对 `L2` 隐式写 host topology、host-visible set 或 backuped；
+  L2/backuped/host-visible 的写入和移除收敛到 `add_host_visible_page()` / `remove_host_visible_page()`；
+- 2026-06-13 SGLang-derived host release / cleanup policy 已落地：best-effort `prefetch_decision` 保留
+  `requested_host_pages` 作为 SGLang `prefetch_tokens_occupied` / release budget 语义，`reserved_host_pages` 单独记录
+  fallback 后实际 host pool reservation；
+- best-effort prefetch 的 threshold 和 capacity limit 不再有经验 fallback：显式 target config 优先；未显式配置时，
+  threshold 使用 SGLang 默认 `max(prefetch_threshold=256, page_size)` tokens 按 target page size 投影为页数，
+  capacity limit 使用 SGLang `floor(0.8 * (host_pool_pages - device_pool_pages))` 公式；
+- rate-limit 判断保持 SGLang `prefetch_tokens_occupied >= prefetch_capacity_limit` 语义；capacity limit 为 0 时不会退化成
+  无限制 prefetch；
+- host prefetch allocation 失败时按本次 page-aligned prefetch request 调用 host cleanup，对齐 SGLang
+  `evict_host(prefetch_length)`，不按 deficit、最终 L2 count 或 fallback reserved count 反推预算；
+- `prefetch_check_point` 在 best-effort path 上按 target-derived ready budget 推进 work：ready work 通过
+  `apply_host_visibility_for_ready_work()` 插入 host radix、写 L2/backuped/L3、保持 evicted、释放 reservation，并在同一事务内
+  enforce host capacity；未 ready / 终止 / finalize 的 work suppress 并释放 reservation；
+- host cleanup victim 必须来自 host radix leaf、host-visible、`evicted`、无 host ref / lock protection 的 page group；当前
+  host ref/protection 是 page-level 投影，足以驱动本轮 final3，但还不是 SGLang `TreeNode.host_ref_counter` 的完整等价；
+- storage prefetch completion、storage hit query、node remove result 和 async wall-clock completion 仍只作为 source evidence；
+  normal path 不消费 source completed/ready/loaded pages，也不消费 source host ref delta 或 storage hit result；
 - C++ normal backend 已删除 `maintenance_checkpoint`、`capacity_request`、`lock_scope_delta` 的状态推进入口，并收窄
   `HiCacheFact`，不再解析 source observed/control-flow 字段作为模型 fact；如果后续要重新引入
   lifecycle/capacity/lock/maintenance 语义，必须先定义 target-derived 机制或新的 target-independent atomic invariant，
   不能直接复用 source trace 的 concrete path 或 control-flow 序列。
+
+当前剩余工程目标：
+
+- `DeviceCacheState` 已负责 device radix view、L1 resident、device lock/ref、admission pressure 和 device leaf-group
+  victim selection；
+- `HostCacheState` 已承载 host radix view、host ref/protection、storage-known、ready-but-not-visible 和 host-visible
+  状态；
+- `AsyncState` 已维护 pending / ready / applied / suppressed / late，并区分 requested host budget 与 actual reservation；
+- `HostVisibilityApply` 现在只能由 target-derived checkpoint lifecycle 触发，并且必须和 reservation release / host cleanup
+  同事务执行，不能退化成 source completion page replay；
+- 后续重点不是继续修 final set count，而是补 transition-level provenance、async exact progress、完整 host node ref lifetime、
+  write-back batch state machine 和 state-to-DAG patch。
 
 后续 C++ 工作继续按下面的目标架构推进；旧 page-level state machine 不作为兼容对象保留。
 
@@ -254,7 +281,7 @@ HiCacheFactParser
 | `NodeStateIndex` | 维护 page projection 的 L1/L2/L3 resident、dirty、backuped、evicted、hit count、lock/ref 和 prefetch 集合；host ref 仍待机制化。 |
 | `RequestState` | 维护 request full/admitted path、target match result、active device lock/ref、admission reservation 和 lifecycle phase。 |
 | `PolicyEngine` | 根据显式 target config 实现 write policy、capacity/eviction policy、prefetch policy 和 storage policy。 |
-| `AsyncState` | 维护 prefetch/load-back/writeback queue、ready/late/suppressed/acked 状态；当前仅有部分 prefetch host pressure，storage completion 仍待新 invariant 或 target async model。 |
+| `AsyncState` | 维护 prefetch/load-back/writeback queue、ready/late/suppressed/acked 状态；当前 best-effort prefetch 的 host reservation、ready apply 和 cleanup 已闭合到 final3，exact async progress / write-back batch 仍需单独验证。 |
 | `StateTransitionLog` | 为每个 state mutation 输出 role/request/operation/node/page/seq/ts/provenance。 |
 | `OracleValidation` | 只比较 `source_actual`/`oracle_state` 和 predicted state，不反写模型。 |
 
@@ -376,10 +403,38 @@ model_summary.json.modules[0].hicache
 - 四个 run 都是 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
 - S1A target self/cross 同形：L2/backuped `67/67`，L1 `32/25` extra 7，evicted `35/42` missing 7；
 - S1B target self/cross 同形：L1/dirty `28/28`，L2/backuped/evicted `70/55`，missing 13、extra 28；
-- 排除 `locked_pages` 暂态后，boundary-elision 诊断可将 S1A/S1B final diff 分别通过 14/24 个
-  `diagnostic_state_injection` 对齐；分类集中在 target capacity pressure、lock-protected capacity victim eligibility
-  和 async prefetch/storage visibility；
-- 诊断注入只用于确认 residual mechanism/input-boundary，不是 normal prediction 的可消费输入。
+- 排除 `locked_pages` 暂态后，旧 boundary-elision 诊断曾将 S1A/S1B final diff 分别通过 14/24 个临时 oracle 对齐点定位到
+  target capacity pressure、lock-protected capacity victim eligibility 和 async prefetch/storage visibility；
+- 该临时诊断入口已从 active 脚本和 C++ router 删除，不是 normal prediction 的可消费输入。
+
+截至 2026-06-13 03:22，按 host/device/async 边界审计完成结构重构并重跑四向 normal prediction：
+
+- 四个 normal prediction 仍只消费 `350` 个 atomic invariant end events，且均为
+  `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+- S1A target self/cross final match：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`；
+- S1B target self/cross 同形：L1/dirty/locked `28/28`、`28/28`、`0/0` 保持稳定；
+  L2/backuped/evicted 为 `70/55`，missing `13`、extra `28`；
+- best-effort async 在 S1B 上产生 `prefetch_ready_pages=13`、`prefetch_suppressed_pages=143`，但 ready pages
+  被保留为 ready-but-not-visible，不直接写 L2；
+- 该结果说明本轮结构重构阻止了 device state 被 premature host mutation 污染，但没有闭合 S1B host/L2 final state。
+  剩余问题是缺 target-independent host visibility/apply checkpoint 或完整 host release/cleanup policy。
+
+截至 2026-06-13 04:42，按 SGLang 源码语义完成 target-derived host release / cleanup policy 并重跑 final3：
+
+- normal path 仍只消费 `350` 个 atomic invariant end events，四向均为
+  `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`；
+- host release budget 对齐 SGLang `prefetch_from_storage()`：host alloc 失败后按本次
+  `prefetch_length` / page-aligned prefetch request 调用 cleanup，不按超容量 deficit、最终 L2 差值或 fallback reserved count
+  拟合；
+- best-effort threshold/capacity 对齐 SGLang 源码：target config 显式值优先；未配置时 threshold 由
+  `max(256, page_size)` tokens 投影，capacity limit 由 `0.8 * (host_pool - device_pool)` 投影；
+- `requested_host_pages` 表达 request/rate-limit/release 语义，`reserved_host_pages` 表达实际 host pool reservation；二者不互相覆盖；
+- best-effort checkpoint ready work 通过 cleanup-aware `HostVisibilityApply` transaction apply，未 ready work suppress，并释放
+  reservation；
+- 四向 final state 全部通过：
+  - S1A self 与 S1B -> S1A：L1 `25/25`、dirty `0/0`、L2/backuped `67/67`、evicted `42/42`、locked `0/0`；
+  - S1B self 与 S1A -> S1B：L1/dirty `28/28`、L2/backuped/evicted `55/55`、locked `0/0`；
+- host-device-boundary 阶段的 S1B `70/55` 和 target-resource 阶段的 `56/55` 现在都是历史中间态，不是当前 active defect。
 
 截至 2026-06-12 03:49，基于修复前 S1A/S1B 31-target fast-pressure suite 完成 async-elision 与 cross input-contract
 诊断；这些结果是本轮 demotion 的历史证据：
@@ -398,8 +453,9 @@ model_summary.json.modules[0].hicache
   mismatch 主要是 check_kind 调度错位，`check_kind_mismatch=348`、one-sided event `4`。
 - 修复前 `normal_model_input_contract` 已把 cross audit 的可消费结论结构化：两向都是
   `contract_status=blocked_by_input_contract`，`unsafe_roles_after_projection` 为 `request_cache_lifecycle`、
-  `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`。因此现在还不能声称 cross 已排除 async 后无其他
-  state-rule 问题；本轮已先把这些 source/control-flow 事件降级为 evidence/control-flow boundary，真实 cross run 仍需重跑。
+  `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`。因此当时还不能声称 cross 已排除 async 后无其他
+  state-rule 问题；该阶段先把这些 source/control-flow 事件降级为 evidence/control-flow boundary，真实 cross run 留到
+  后续 atomic contract 下重跑。
 
 截至 2026-06-11 15:11，基于 S1B 31-target fast-pressure profile 完成一轮历史 backend 修正；其中
 `request_cache_lifecycle`、`maintenance_checkpoint`、`capacity_request` 作为 normal role 的处理已在 2026-06-12
@@ -415,7 +471,7 @@ atomic refactor 后删除或降级为 evidence-only：
 - 历史实现曾让 `capacity_request` 接入 L1 modeled eviction pressure：当 fact 带 `requested_tokens` 时按 target `page_size`
   重算 requested pages，再按 target eviction policy 选择 victim；不消费 source victim，也不把 cross source
   `params.num_tokens` 序列当作 target-independent 输入；
-- 最新 S1B self validation 的 `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`，`locked_pages` 已对齐
+- 该阶段 S1B self validation 的 `missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`，`locked_pages` 已对齐
   `0/0`；剩余 mismatch 集中在 L2/backuped/evicted 以及少量 L1/dirty extra。
 
 截至 2026-06-11 02:03，阶段 1/2/3/4 已完成最小建模：
@@ -430,24 +486,25 @@ atomic refactor 后删除或降级为 evidence-only：
 - 新增 `hicache_state_index.hpp/.cpp`，resident/dirty/backuped/evicted/lock/prefetch/hit count 集合由 state index 维护；
 - `prefetch_intent` 不再是 invariant input；当前 transitional backend 用 `prefetch_decision` 在 target token radix 上计算 planned suffix；
 - `request_cache_lifecycle`、`request_admission`、`maintenance_checkpoint` 已被 router 识别；
-- 最小验证新增并通过：target page size projection fixture、token radix split projection fixture、原 HiCache state fixtures。
+- 历史最小验证曾覆盖 target page size projection、token radix split projection 和原 HiCache state checks；相关本地
+  fixture suite 已删除，不再维护，也不作为当前验收依据。
 
 ## HiCache 当前验证状态
 
-当前有效代码/配置状态是 2026-06-12 backend atomic refactor。最新真实 modeling 证据是
-`HCSV-20260612-backend-atomic-refactor`，记录在
+当前有效代码/配置状态是 2026-06-13 SGLang-derived target host release / cleanup policy final3。最新真实 modeling 证据是
+`HCSV-20260613-host-release-policy-final3`，记录在
 `docs/validation/hicache_state_validation.md`。当前结论：
 
 - atomic profile config 下的 S1A/S1B profile、profile quality 和 cross audit 已完成，
   `model_input_contract_ready=true`；
 - 四个 normal prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、
-  `non_invariant_fact_usage=[]`；
+  `non_invariant_fact_usage=[]`，且 `validation_ready=true`、`validation_errors=[]`；
 - self/cross 对同一 target 的结果同形，说明前端 350 个 normal atomic invariant facts 已被 C++ 消费；
-- S1A target 剩余 L1 extra 7 / evicted missing 7；S1B target 剩余 L2/backuped/evicted `70/55`；
-- boundary-elision 诊断能把 S1A/S1B self final diff 对齐，分类集中在 capacity pressure、lock-protected victim
-  eligibility 和 async prefetch/storage visibility；
-- 当前不能称 normal prediction 通过，下一步是把这些 boundary 变成 target-derived 机制或新的 invariant 事件，而不是
-  恢复 source_actual 消费。
+- S1A target self/cross final match：L1 `25/25`、dirty `0/0`、L2/backuped `67/67`、evicted `42/42`、locked `0/0`；
+- S1B target self/cross final match：L1/dirty `28/28`、L2/backuped/evicted `55/55`、locked `0/0`；
+- 当前可以称 S1A/S1B self-config 和 cross-config 的 active final state 通过；
+- 当前不能把 final-state pass 扩大解释成完整 SGLang HiCache 仿真通过；后续重点转为 transition exactness、async exact
+  progress、完整 host node ref lifetime、write-back batch state machine 和 state-to-DAG patch。
 
 旧 retained audit 不能再被解读为当前 atomic 正常输入契约下的失败结果；它只作为 demotion 的历史证据。
 
@@ -500,13 +557,13 @@ normalized oracle validation：
 ## 当前未实现
 
 - HiCache state-to-DAG patch；
-- async prefetch scheduler 的 timing/queue 模型；
-- write-back background flush 的完整 target decision；
-- exact eviction / evictable / allocator 逻辑；
-- token-level radix node parent/ref chain 的完整 SGLang 等价实现；
-- transition exact oracle。
+- async prefetch exact progress / partial completion 的完整 target model；
+- SGLang `TreeNode.host_ref_counter`、host protection lifetime 和复杂 radix split/delete victim tie-break 的完整等价；
+- write-back background flush / `_evict_backuped()` / `writing_check(write_back=True)` 的批处理时序；
+- transition exact oracle 和逐步 provenance 验收；
+- scope-normalized comparison 之外的多 scope page identity 验证。
 
-这些缺口维护在 `docs/validation/hicache_state_model_defects.md`。
+这些风险维护在 `docs/validation/hicache_state_validation.md` 的“当前剩余风险”中，不再维护单独缺陷清单。
 
 ## Validation
 

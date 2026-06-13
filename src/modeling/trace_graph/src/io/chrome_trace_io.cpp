@@ -116,7 +116,7 @@ class TraceScanner {
             return parse_array();
         }
 
-        // 部分 fixture 使用 {"traceEvents": [...]}，真实 merged trace 通常是数组。
+        // 部分 Chrome trace 输入使用 {"traceEvents": [...]}，真实 merged trace 通常是数组。
         if (*p_ == '{') {
             auto marker = buffer_.find("\"traceEvents\"");
             if (marker != std::string::npos) {

@@ -152,6 +152,8 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     if (config.prefetch_policy == "observed")
         throw std::runtime_error("hicache.prefetch_policy=observed is not supported; use an explicit target prefetch policy");
     if (config.prefetch_policy.empty()) config.prefetch_policy = "timeout";
+    config.prefetch_threshold_pages = u64_value(object, "prefetch_threshold_pages", 0);
+    config.prefetch_capacity_limit_pages = u64_value(object, "prefetch_capacity_limit_pages", 0);
     const bool has_timeout_base = object.contains("prefetch_timeout_base_sec") || object.contains("prefetch_timeout_base");
     const bool has_timeout_per = object.contains("prefetch_timeout_per_ki_token_sec") || object.contains("prefetch_timeout_per_ki_token");
     const bool has_timeout_max = object.contains("prefetch_timeout_max_sec") || object.contains("prefetch_timeout_max");

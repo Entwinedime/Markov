@@ -58,7 +58,6 @@ struct HiCacheFact {
     HiCacheTokenSpan full_path_span;
 
     HiCacheTokenPath full_path_tokens;
-    std::unordered_map<std::string, std::vector<std::string>> diagnostic_state_pages;
 };
 
 class HiCacheFactParser {

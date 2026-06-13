@@ -15,7 +15,6 @@ enum class HiCacheFactRole {
     RequestAdmission,
     PrefetchDecision,
     PrefetchCheckPoint,
-    DiagnosticStateInjection,
 };
 
 struct HiCacheFactRoute {

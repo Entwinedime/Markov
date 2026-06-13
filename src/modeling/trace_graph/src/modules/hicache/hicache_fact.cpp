@@ -150,18 +150,6 @@ HiCacheTokenPath slice_tokens(const HiCacheTokenPath & tokens, uint64_t begin, u
     return {tokens.begin() + static_cast<long>(begin), tokens.begin() + static_cast<long>(end)};
 }
 
-std::vector<std::string> json_string_array(const Json & object, const std::string & key) {
-    std::vector<std::string> result;
-    if (!object.is_object()) return result;
-    auto it = object.find(key);
-    if (it == object.end() || !it->is_array()) return result;
-    for (const auto & item : *it) {
-        auto text = json_string_value(Json{{"value", item}}, "value");
-        if (!text.empty()) result.push_back(text);
-    }
-    return result;
-}
-
 } // namespace
 
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
@@ -254,15 +242,6 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.full_path_span = parse_span(event, "full_path_span");
 
     fact.full_path_tokens = resolve_span(fact.full_path_span);
-
-    auto diagnostic_state = parse_json_fragment(event.arg("diagnostic_state"));
-    if (diagnostic_state.is_object()) {
-        for (const auto & key :
-             {"l1_resident_pages", "l2_resident_pages", "dirty_pages", "backuped_pages", "evicted_pages", "locked_pages"}) {
-            auto pages = json_string_array(diagnostic_state, key);
-            if (!pages.empty() || diagnostic_state.contains(key)) fact.diagnostic_state_pages[key] = std::move(pages);
-        }
-    }
     return fact;
 }
 

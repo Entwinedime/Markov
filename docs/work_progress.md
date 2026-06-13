@@ -2,6 +2,209 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-13 18:04:12 +0800
+
+- 提交前复跑非 fixture 验证，未使用 `tests/`：
+  - `clang-format --dry-run --Werror` 覆盖当前 C++ 改动文件；
+  - `cmake --build build --target trace_graph -j2`；
+  - `python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_provenance.py scripts/internal/profile_quality.py`；
+  - `find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`；
+  - `git diff --check`；
+  - 四向 `precommit_hicache_audit_20260613_*` HiCache state validation 全部 `validation_ready=true`、
+    `validation_errors=[]`、`final_state_match=true`。
+- 复核结果：
+  - S1A target self/cross：L1 `25/25`、dirty `0/0`、L2/backuped `67/67`、evicted `42/42`、locked `0/0`；
+  - S1B target self/cross：L1/dirty `28/28`、L2/backuped/evicted `55/55`、locked `0/0`。
+
+## 2026-06-13 17:54:12 +0800
+
+- 复审 HiCache host release / cleanup 代码后继续收紧：
+  - 删除 diagnostic state injection 移除后遗留的未调用 `page_set_size_for_scope()` 和 `page_for_scope()` helper；
+  - best-effort prefetch threshold 未显式配置时改为 SGLang 默认 `max(prefetch_threshold=256, page_size)` tokens 的 target page projection；
+  - best-effort prefetch capacity limit 未显式配置时改为 SGLang `floor(0.8 * (host_pool_pages - device_pool_pages))` 投影；
+  - rate-limit 判断保持 SGLang `occupied >= capacity_limit`，不再把 0 capacity limit 当作无限制；
+  - 不再保留 2 pages 或 L2 一半这类经验 fallback。
+- 同步更新约束、建模和验证文档，明确 threshold / capacity / cleanup budget 必须来自显式 target config 或 SGLang 源码语义。
+
+## 2026-06-13 17:35:56 +0800
+
+- 收紧 `scripts/internal` 下 HiCache 专项脚本，只保留两个 active 只读入口：
+  - `hicache_state_cross_input_audit.py`：跨配置 normal atomic invariant input contract 审计；
+  - `hicache_state_provenance.py`：基于 validation / predicted trace / oracle snapshot 的 mismatch 页面证据汇总，不回写模型。
+- 删除过期或临时脚本：
+  - `hicache_host_residual_audit.py`：S1B host residual 临时审计，结论已经收敛进 active 文档；
+  - `hicache_state_async_elision.py`：会生成 synthetic `diagnostic_state_injection` model input；
+  - `hicache_state_trace_divergence.py`：仍包含 `--diagnostic-inject-async` oracle replay alignment；
+  - `hicache_state_workload_input_audit.py`：front-door workload 对照不再作为 active HiCache state 验收入口。
+- `hicache_state_cross_input_audit.py` 移除 `diagnostic_state_injection` 白名单，当前只接受 33-target suite 的 normal role 子集。
+- C++ HiCache router/model 同步删除 diagnostic state injection 入口、oracle replace-state handler 和相关 fact 字段，避免 active tree
+  继续保留 synthetic model-input 兼容通道。
+- 更新约束和验证文档：HiCache internal 脚本不得保留临时 spike、oracle replay alignment 或 synthetic model input 入口。
+
+## 2026-06-13 17:21:31 +0800
+
+- 按用户要求删除 `tests/` 目录；该目录下的 fixture scripts、fixture data 和 `__pycache__` 均不再保留。
+- 删除依赖 `tests/fixtures/modeling/tracegraph_basic.json` 的
+  `configs/modeling/smoke/modeling_smoke_hicache.json`，避免留下 fixture-backed modeling 入口。
+- 更新约束：之后不维护任何 fixture，不保留 `tests/` / `tests/fixtures/` / `run_*_fixtures.py`，不新增
+  fixture-backed validation gate；长期验证证据必须收敛为配置、命令、审计脚本、关键指标、结论或真实 run 的复现入口。
+- 本轮未运行测试。
+
+## 2026-06-13 17:02:18 +0800
+
+- 完成 HiCache 文档对齐和临时文档收敛：
+  - 删除 tracked 临时文档 `docs/tmp_hicache_async_visibility_model_plan.md`、
+    `docs/tmp_hicache_target_resource_mechanism_plan.md` 和旧缺陷清单
+    `docs/validation/hicache_state_model_defects.md`；
+  - `docs/validation/hicache_state_validation.md` 现在是唯一 active validation 文档，合并当前输入契约、final3 四向通过结果、
+    S1B host residual 审计结论、历史阶段摘要、剩余风险和复现命令；
+  - `docs/modeling_development.md` 已对齐当前 final3 代码状态：SGLang-derived host release / cleanup policy 已实现，S1B
+    `70/55` 与 `56/55` 只作为历史中间态保留；
+  - `docs/project_constraints.md` 已移除旧 defect 文档入口，并明确不再保留 `docs/tmp_hicache*.md` 临时方案。
+- 本轮只做文档整理和一致性检查，未触碰 `tests/`，未运行测试。
+
+## 2026-06-13 04:42:54 +0800
+
+- 按用户要求重新对照 SGLang 源码收紧 host release budget 语义：
+  - `reserve_host_pages_for_prefetch()` 的 cleanup budget 仍来自 `prefetch_from_storage()` 中本次 host alloc 请求大小，
+    即 alloc 失败后调用 `evict_host(prefetch_length)` 的源实现语义；
+  - `PrefetchWorkItem::requested_host_pages` 保留原始 page-aligned prefetch request，用于模拟
+    `prefetch_tokens_occupied` / rate limit；`reserved_host_pages` 单独记录 fallback 后实际 host pool reservation；
+  - 不再把 fallback 后的 reserved pages 回写成 requested pages，避免把实际分配占用误当成 release/rate-limit budget。
+- 复跑非 `tests/` 验证，全部通过：
+  - `cmake --build build --target trace_graph -j2`
+  - `python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_host_residual_audit.py`
+  - `find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`
+  - `git diff --check`
+  - 四向 state validation 全部 `validation_ready=true`、`validation_errors=[]`、`final_state_match=true`：
+    - S1A self：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`；
+    - S1B self：L1/dirty `28/28`、L2/backuped/evicted `55/55`、locked `0/0`；
+    - S1A -> S1B：同 S1B target final，全 tier match；
+    - S1B -> S1A：同 S1A target final，全 tier match。
+- 当前最新输出目录：
+  - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final3_s1a_self`
+  - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final3_s1b_self`
+  - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final3_s1a_to_s1b`
+  - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final3_s1b_to_s1a`
+
+## 2026-06-13 04:36:14 +0800
+
+- 完成 SGLang-derived target host release / cleanup policy 实现，未触碰 `tests/`，normal path 仍只消费
+  `model_input=true && fact_class=invariant_state && fact_granularity=atomic`：
+  - 对照 `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py`：
+    - `prefetch_from_storage()` 的 host alloc 失败按本次 `prefetch_length` 调用 `evict_host(prefetch_length)`，不是按最终 L2
+      count 或 deficit 反推；
+    - `evict_host()` 只清理 host radix leaf、`evicted`、无 `host_ref_counter` 的 host nodes；
+    - `check_prefetch_progress()` 是 best-effort prefetch reservation 生命周期边界：完成/撤销/未发出都会释放 ongoing host
+      reservation，只有 target-derived ready pages 才进入 host-visible projection；
+    - write-back 的 host alloc / `writing_check(write_back=True)` / `_evict_backuped()` 是批处理链路，本轮不再保留错误的
+      page-level `ensure_host_pages_for_write()` 前置释放路径。
+  - C++ `HiCacheState` 调整：
+    - 拆出 prefetch `requested_host_pages` 与 `reserved_host_pages`，用 active requested pages 表达
+      `prefetch_tokens_occupied`，用 reserved pages 表达 host pool occupancy；
+    - `reserve_host_pages_for_prefetch()` 在 alloc 失败时按请求页数调用 host eviction，第二次仍不足则按 available pages
+      降级，低于 threshold 则放弃；
+    - `prefetch_check_point` 下 best-effort work 在 progress checkpoint 立即 apply 或 suppress，并释放 reservation，不再积累到
+      finalize；
+    - `apply_host_visibility_for_ready_work()` 把 ready pages 插入 host radix、写 L2/backuped/L3、保持 evicted，并在同一
+      transaction 内执行 host capacity cleanup；
+    - host loadback 到 L1 时同步恢复 device radix topology，避免后续 request admission 把 host-loaded prefix 当成 device miss；
+    - best-effort admission pressure 改为完整 page suffix 数，避免 833-token / 13-page 场景为未成页 token 触发额外 radix
+      page eviction；wait-complete 路径保留原 admission reservation 语义。
+- 验证通过：
+  - `cmake --build build --target trace_graph -j2`
+  - `python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_host_residual_audit.py`
+  - `find configs -name '*.json' -print0 | xargs -0 -n1 jq empty`
+  - `git diff --check`
+  - 四向 state validation 全部 `validation_ready=true`、`validation_errors=[]`、`final_state_match=true`：
+    - S1A self：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`；
+    - S1B self：L1/dirty `28/28`、L2/backuped/evicted `55/55`、locked `0/0`；
+    - S1A -> S1B：同 S1B target final，全 tier match；
+    - S1B -> S1A：同 S1A target final，全 tier match。
+  - 最终输出目录：
+    - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final2_s1a_self`
+    - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final2_s1b_self`
+    - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final2_s1a_to_s1b`
+    - `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final2_s1b_to_s1a`
+
+## 2026-06-13 03:51:43 +0800
+
+- 按 `docs/tmp_hicache_s1b_host_residual_audit_goal.md` 完成 S1B host/L2 residual 审计产物：
+  - 新增只读脚本 `scripts/internal/hicache_host_residual_audit.py`；
+  - 生成 S1B self 审计 JSON：
+    `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_device_state_v2_s1b_self/host_residual_audit.json`；
+  - 生成 S1A -> S1B 同形参考审计 JSON：
+    `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_device_state_v2_s1a_to_s1b/host_residual_audit.json`；
+  - 新增报告 `docs/tmp_hicache_s1b_host_residual_audit_report.md`。
+- 审计结论：
+  - S1B self 的 L2/backuped/evicted diff 三组同形，都是 missing 13、extra 28；
+  - missing 13 全部分类为 `missing_ready_not_visible`，都已由 `prefetch_check_point` 标记 ready，但未 host-visible；
+  - extra 28 全部分类为 `extra_missing_host_release`，最后 model host-side transition 都停在 `mark_evicted`，
+    source evidence 指向 `hicache_node_remove_observed` / `hicache_host_eviction_observed`；
+  - 主机制边界判定为 host release / cleanup 缺失为主，`HostVisibilityApply` 不能单独 ready->L2，必须作为
+    cleanup-aware transaction 的一部分。
+
+## 2026-06-13 03:42:10 +0800
+
+- 新增 `docs/tmp_hicache_s1b_host_residual_audit_goal.md`，把下一步 S1B host/L2 residual 审计整理成可被 goal 消费的临时文档：
+  - goal objective 固定为解释 S1B target 的 L2/backuped/evicted `70/55` residual、missing 13 和 extra 28；
+  - 明确 hard constraints：不碰 `tests/`，不恢复 legacy normal role，不消费 source_actual/timing/oracle 更新 target state，
+    不写 ready->L2 特化规则；
+  - 固定 existing inputs 为 `host_device_state_v2_s1b_self` 和 `host_device_state_v2_s1a_to_s1b` 的现有 modeling 输出；
+  - 定义 `host_residual_audit.json` schema、missing 13 / extra 28 的 page-level 分类步骤、机制边界判断和 implementation gate；
+  - 下一轮必须先产出 audit report，再决定实现 `HostVisibilityApply` transaction、host release/cleanup、host ref policy，
+    或新增 target-independent atomic checkpoint metadata。
+
+## 2026-06-13 03:22:45 +0800
+
+- 按 `docs/tmp_hicache_async_visibility_model_plan.md` 和
+  `docs/tmp_hicache_host_device_state_machine_audit.md` 完成一轮 host/device/async 边界重构，不恢复 legacy normal role，
+  不消费 source_actual/timing/oracle：
+  - 删除未使用的合成 `TargetPathMatch` 路径，避免把 device radix match、host radix match 和 storage-known topology 混成
+    一个 `matched_pages`；
+  - `add_resident()` / `remove_resident()` 不再对 `L2` 隐式写 host topology、host-visible set 或 backuped；
+  - L2/backuped/host-visible 写入收敛到 `add_host_visible_page()`，host-visible 移除收敛到
+    `remove_host_visible_page()`；
+  - 删除 best-effort prefetch host reservation pressure 的 normal mutation 路径，避免在 ready 之前按 host-buffer pressure
+    提前清 L2/backuped/evicted；
+  - `prefetch_check_point` 只推进 async work 的 pending/ready/suppressed/late 状态；`HostVisibilityApply` 保留为显式
+    host visibility 边界 API，但当前 atomic input 没有可安全触发它的 normal checkpoint。
+- 本地验证：
+  - `cmake --build build --target trace_graph -j2`
+  - 四向 normal prediction 重跑，输出目录为 `host_device_state_v2_*`
+- 四向 normal prediction 结果：
+  - 四个 run 均为 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`，仍只处理
+    350 个 normal atomic invariant end events；
+  - S1A target self/cross final match：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`、dirty/locked `0/0`；
+  - S1B target self/cross 同形：L1/dirty/locked `28/28`、`28/28`、`0/0` 已保持稳定，
+    L2/backuped/evicted 为 `70/55`，missing 13、extra 28；
+  - best-effort async 在 normalized S1B 上暴露 `prefetch_ready_pages=13` 和 `prefetch_suppressed_pages=143`，
+    但 ready pages 保持 ready-but-not-visible，不修改 L2。
+- 结论：本轮完成结构边界收紧，避免继续用 host-buffer pressure 或 ready->L2 直接 mutation 污染 device state；S1B final
+  仍未通过，剩余问题明确是缺少 target-independent host visibility/apply checkpoint 或完整 host release/cleanup policy，
+  不能靠 source completion/host_ref/storage hit result 接回 normal input 解决。
+
+## 2026-06-13 02:00:48 +0800
+
+- 按 `docs/tmp_hicache_async_visibility_model_plan.md` 尝试 async visibility 建模后，修正当前方向判断：
+  - v3/v4 把 prefetch ready / host-buffer pressure 过早变成 host-visible mutation，导致后续 request admission /
+    device pressure 选错 victim，S1B 的 L1/dirty 从正确的 `28/28` 退化；
+  - v5 删除 best-effort host-buffer pressure 对 normal state 的影响，L1/dirty/locked 恢复稳定，但 L2/backuped/evicted
+    仍为 `70/55`，不是正确 final 修复；
+  - v5 的 `prefetch_ready` set 按集合看对应 oracle 中 model 缺失的 13 个 L2 pages，说明 async completion 候选有用，
+    但 ready -> host-visible L2 mutation 和 host victim selection 仍没有 target-side 机制支撑。
+- 结论：当前 async 改动只能视为 diagnostic spike / 止血，不应作为最终机制；它可能是在缺少 host-side radix/ref/storage
+  数据结构的基础上强行拟合 trace 现象。
+- 下一步计划调整为先重构数据结构：
+  - 拆清 `DeviceCacheState` 与 `HostCacheState`，不再用单棵 target radix tree + flat L2 page set 混合表达两侧语义；
+  - 为 host 侧显式维护 host radix view、host ref/protection、host leaf group、storage-known、ready-but-not-visible
+    和 host-visible 状态；
+  - `AsyncState` 只维护 pending/ready/suppressed/late，禁止 checkpoint 直接写 L2/backuped/evicted；
+  - `HostVisibilityApply` 在明确 target checkpoint 上把 ready pages 插入 host radix，并同一事务内更新 L2/backuped/evicted
+    与 host capacity eviction。
+- 仍保持 normal path 只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`；不把
+  source completed pages、storage hit result、host_ref_delta result 或 wall-clock completion 接回 normal model。
+
 ## 2026-06-12 18:31:20 +0800
 
 - 按 `docs/tmp_hicache_target_resource_mechanism_plan.md` 完成一轮 C++ backend target resource mechanism 重构，仍保持

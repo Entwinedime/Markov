@@ -13,11 +13,17 @@
 
 `docs/validation/` 只放纳入 git 追踪的专项验证记录。当前保留：
 
-- `docs/validation/hicache_state_validation.md`：当前有效验证口径、最新结果和复现入口；
-- `docs/validation/hicache_state_model_defects.md`：当前 state model 缺陷清单和处理顺序。
+- `docs/validation/hicache_state_validation.md`：当前有效验证口径、最新结果、剩余风险和复现入口。
 
-不再保留单独的 legacy validation 文档。旧结果如果还有参考价值，应压缩成 active 文档中的背景说明或
-`work_progress.md` 时间线；不得作为当前验收依据。
+不再保留单独的 legacy validation 文档、缺陷清单文档或 `docs/tmp_hicache*.md` 临时方案。旧结果如果还有参考价值，
+应压缩成 active 文档中的背景说明或 `work_progress.md` 时间线；不得作为当前验收依据。
+
+不再维护任何 fixture。具体要求：
+
+- 不保留 `tests/`、`tests/fixtures/`、`run_*_fixtures.py` 或依赖 fixture trace 的 smoke modeling config；
+- 不新增 fixture-backed validation gate；
+- 不把长期验收建立在本地 synthetic fixture 文件上；
+- 需要长期保留的验证证据必须抽取成配置、命令、审计脚本、关键指标和结论，或指向真实 profile/modeling run 的可复现入口。
 
 文档不能依赖本地 `data/` 目录长期存在。真实 run 只能作为临时实验批次，长期证据必须抽取成配置、命令、commit、
 关键指标和结论。
@@ -74,8 +80,12 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
   span，避免重复携带完整 token 列表。
 - `cache_scope` 和 `seq_no` 是 HiCache invariant state fact 的必需路由字段。
 - validation-only `state_snapshot` 必须保持 `model_input=false` 且 `fact_class=oracle_state`。
-- 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验、`tests/run_profiling_fixtures.py`、
-  `tests/run_hicache_mainline_config_fixtures.py`，以及 invariant target source-result 字段审计。
+- 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验和 invariant target source-result 字段审计；
+  不再使用 fixture 作为 profile gate。
+- `scripts/internal` 下 HiCache 专项工具只保留 active、只读、文档化的审计入口。当前允许保留：
+  `hicache_state_cross_input_audit.py` 和 `hicache_state_provenance.py`。
+- 不保留临时 residual/report spike、front-door workload 对照、async elision、timeline oracle replay alignment 或任何会生成
+  synthetic `model_input=true` 事件的 HiCache internal 脚本。
 
 ## Modeling
 
@@ -91,6 +101,11 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - HiCache state model 只能消费不变量事实和显式 target config。
 - target actual trace、state snapshot、source movement、oracle transient 和 debug 字段只能用于 validation/debug。
 - 显式 `write_policy=observed`、`prefetch_policy=observed`、`storage_prefetch_policy=observed` 都是非法配置。
+- HiCache best-effort prefetch threshold、capacity limit 和 host release budget 必须来自显式 target config 或 SGLang
+  源码语义：默认 threshold 是 `max(prefetch_threshold=256, page_size)` tokens 经 target page size 投影后的页数，capacity limit 是
+  `floor(0.8 * (host_pool_pages - device_pool_pages))`，host alloc 失败后的 cleanup budget 是本次 page-aligned
+  prefetch request，rate-limit 判断保持 `occupied >= capacity_limit`；不允许使用 L2 一半、deficit、最终 L2 差值、
+  超容量拟合预算或把 0 capacity limit 解释成无限制。
 - 正常 HiCache prediction 中 `non_invariant_fact_usage` 必须为空；只要非空，不能宣称 invariant-only prediction 通过。
 - `self-config prediction` 仍必须显式给出 target page size、capacity、write policy、prefetch policy。
 - `cross-config prediction` 只能用 target trace 做 oracle，不得偷读 target actual trace 作为模型事实源。
@@ -116,7 +131,7 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - `configs/modeling/` 按建模领域分组。
 - HiCache state prediction 配置放在 `configs/modeling/hicache_state/`。
 - faithful replay 配置放在 `configs/modeling/hicache/`。
-- smoke modeling 配置放在 `configs/modeling/smoke/`。
+- 不再维护依赖 fixture trace 的 smoke modeling 配置。
 - 新增配置必须放进已有语义分组；只有出现新的稳定领域时才新增子目录。
 - modeling 配置引用目标 experiment config 时使用仓库内相对路径。
 - `data/profile_runs/**`、`data/modeling_runs/**`、`data/traces/**` 是可再生运行产物，不纳入 git 追踪，不作为长期事实来源。
@@ -152,6 +167,7 @@ python3 scripts/internal/model_runner.py --config <config>
 ## Deprecated
 
 - active tree 中不保留可被误用的 deprecated 实现。
+- 不恢复 `tests/` 目录或任何 fixture suite。
 - 不恢复旧实验配置。
 - 不恢复旧实验结果。
 - 不恢复旧 profiling probe target。

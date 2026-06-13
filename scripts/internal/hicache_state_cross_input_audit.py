@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare HiCache atomic invariant model-input facts across configurations."""
+"""Compare current HiCache atomic invariant model-input facts across configurations."""
 
 from __future__ import annotations
 
@@ -40,10 +40,9 @@ ROLE_SCALAR_FIELDS = {
     ),
     "prefetch_decision": ("token_count",),
     "prefetch_check_point": ("check_kind",),
-    "diagnostic_state_injection": ("diagnostic_kind", "diagnostic_source"),
 }
 
-KNOWN_ATOMIC_INVARIANT_ROLES = set(DEFAULT_ROLES) | {"diagnostic_state_injection"}
+KNOWN_ATOMIC_INVARIANT_ROLES = set(DEFAULT_ROLES)
 REQUEST_SCOPED_ROLES = set(DEFAULT_ROLES)
 
 
@@ -269,8 +268,6 @@ def build_signature(role: str, event: dict[str, Any], request_fingerprint: str) 
             fields[field] = value
     if role in PATH_ROLES:
         fields["path"] = path_signature(args)
-    if role == "diagnostic_state_injection":
-        fields["diagnostic_state"] = maybe_json(args.get("diagnostic_state"))
     return canonical_json(fields), fields
 
 
@@ -442,7 +439,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         and not unknown_roles
     )
     return {
-        "schema": "trace_sim.hicache.atomic_cross_input_audit.v2",
+        "schema": "trace_sim.hicache.atomic_cross_input_audit.v3",
         "source_label": args.source_label,
         "target_label": args.target_label,
         "source_traces": [str(path) for path in args.source_trace],
