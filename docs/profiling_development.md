@@ -1,6 +1,7 @@
 # Profiling 开发文档
 
-维护方式：这是 profiling 主线文档。更新时直接删改本文件内容，不在这里写流水账。
+维护方式：这是 profiling 主线设计文档。更新时直接删改本文件内容，不在这里写流水账、实验结果或阶段分析。
+真实 run、验证结果和历史结论维护在 `docs/work_progress.md` 或 `docs/validation/`。
 
 ## 目标
 
@@ -41,7 +42,8 @@ Profiling 不回答：
 | `python_probe` | runner 注入 `src/profiling/python_probe` 到 server `PYTHONPATH` | request、scheduler、HiCache token/range facts、state oracle | `trace/python_probe/` |
 | `ld_preload` | runner 注入 C++ hook so | Python 看不到的 native runtime、AscendCL sync/event anchor | `trace/ld_preload/` |
 
-`python_probe` 和 `ld_preload` 分别由 `profiling.python_probe`、`profiling.ld_preload` 控制。
+`profiling.channels` 只声明启用哪些采集渠道。`python_probe` 和 `ld_preload` 的细节分别由
+`profiling.python_probe`、`profiling.ld_preload` 控制。
 LD_PRELOAD wrapper 是 C++ 中硬编码的符号拦截点，不支持从 JSON 动态声明任意 native symbol。
 
 ## 运行入口
@@ -49,14 +51,14 @@ LD_PRELOAD wrapper 是 C++ 中硬编码的符号拦截点，不支持从 JSON �
 真实 SGLang / KTransformers profiling 必须使用外层容器入口：
 
 ```bash
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --experiment s1a_manual
+scripts/profile.sh <config.json> --experiment <id>
 ```
 
 dry-run 和配置展开也优先使用同一入口：
 
 ```bash
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --list-experiments
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --experiment s1a_manual --dry-run
+scripts/profile.sh <config.json> --list-experiments
+scripts/profile.sh <config.json> --experiment <id> --dry-run
 ```
 
 `scripts/internal/profile_runner.py` 是容器内执行器，只允许在下列场景直接调用：
@@ -69,40 +71,23 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mai
 
 ## Experiment Suite
 
-HiCache state 主线使用 suite config：
+suite config 用于在一套采集契约下展开多个 server/input 组合：
 
 ```bash
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --list-experiments
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --experiments s1a_manual,s1b_manual
+scripts/profile.sh <suite-config.json> --list-experiments
+scripts/profile.sh <suite-config.json> --experiments <id-a>,<id-b>
 ```
 
-suite 的语义：
+suite 的设计语义：
 
 - 顶层 `profiling` 固定一套采集契约；
 - `matrix.servers[]` 定义 server 配置维度；
 - `matrix.inputs[]` 定义 workload 维度；
 - `experiments[]` 可以显式选择 server/input 组合；
-- suite 内不允许 server/input/experiment 覆盖或 unset `profiling`。
+- suite 内不允许 server/input/experiment 覆盖或 unset `profiling`；
+- suite 只能用于组合和复现采集配置，不能把实验结果写回设计文档。
 
-当前 suite 展开为：
-
-| experiment | server | input |
-| --- | --- | --- |
-| `s1a_manual` | page128、L1/L2 `32/73` pages、write-through-selective、wait_complete | fast phased manual workload |
-| `s1a_bench` | page128、write-through-selective、wait_complete | bench serving workload |
-| `s1b_manual` | page64、L1/L2 `32/81` pages、write-back、best_effort | fast phased manual workload |
-| `s1b_bench` | page64、write-back、best_effort | bench serving workload |
-
-当前默认 manual profile 是迭代用 fast pressure profile：
-
-- HiCache target count 当前为 33，正常 state input 只由 target-level atomic `invariant_state` role 子集决定；
-- server 使用较小 L1 池保证小 workload 仍触发 pressure / eviction / load-back；S1A 为 `--max-total-tokens=4096`，
-  S1B 为 `--max-total-tokens=2048`；
-- manual workload 使用 24 个请求，覆盖 seed/reuse/backup/pressure/load-back/prefetch/dirty phases；
-- suite 顶层启用 `continue_on_error=true`，单个实验 timeout 不会阻止后续已选择实验继续运行；
-- full-scale stress 不作为默认迭代路径，应另建 archival run 或使用 bench input。
-
-suite 输出目录会保留：
+suite 输出目录保留：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -194,58 +179,45 @@ model_input == true
 | `oracle_state` | validation-only state snapshot / transition oracle |
 | `debug_quality` | probe 内部质量审计和排查 |
 
-## 当前 HiCache State Targets
+## HiCache State Target Contract
 
-`configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json` 当前保留 33 个
-HiCache atomic target。只有下列 `invariant_state` role 会进入 C++ HiCache state model：
+当前正常 state model input 只允许下列 `invariant_state` role：
 
-- `request_bound_match_anchor`
-- `request_lifecycle_anchor`
-- `request_admission`
-- `prefetch_decision`
-- `prefetch_check_point`
+| role | 语义 |
+| --- | --- |
+| `request_bound_match_anchor` | request-scoped match-prefix token anchor |
+| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界 anchor |
+| `request_admission` | admission boundary 的 request token path、admission kind 和 policy |
+| `prefetch_decision` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
+| `prefetch_check_point` | request 时间线上的 prefetch check/wait 边界 |
 
-它们对应 7 个 target：`hiradix.match_prefix.request_bound_anchor`、
-`hiradix.cache_finished_req.lifecycle_anchor`、`hiradix.cache_unfinished_req.lifecycle_anchor`、
-`schedule_policy.prefill_admission`、`schedule_policy.chunked_admission`、`scheduler.prefetch_decision` 和
-`hiradix.prefetch_check_point`。
+source evidence 可以与 invariant target 采自同一个 Python callable，但必须拆成独立 target：
 
-其余 24 个 target 是 `source_actual` evidence，2 个 target 是 `timing_observation`。这些事件可以用于 provenance、
-profile quality、oracle/debug 或后续 target-derived 机制设计，但不能直接更新 target state。当前口径把“正常模型输入”
-和“source 已发生结果 / cache-stage concrete path”拆开；同一个 Python callable 可以保留 source evidence，但每个 target
-必须代表一个 atomic fact。
+| evidence role family | fact class | 设计边界 |
+| --- | --- | --- |
+| cache-stage concrete path / lookup result | `source_actual` | 只描述 source run 已发生结果，不更新 target state |
+| lifecycle path/runtime | `source_actual` | 只作为 provenance，不混入 lifecycle anchor |
+| insert / capacity / lock / maintenance / storage/controller event | `source_actual` 或 `timing_observation` | 只能用于质量审计、oracle/debug 或后续 target-derived 机制设计 |
 
-关键拆分如下：
+`sglang.hicache` probe 可以自动 patch SGLang 内部方法并输出 `source_actual` 事件，例如 radix split/delete、
+device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、
+write/load ack checkpoint、storage control checkpoint、controller prefetch enqueue、rate-limit、storage hit query、
+prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件默认不是 normal state input。
 
-| target id | role | fact class | 说明 |
-| --- | --- | --- | --- |
-| `hiradix.match_prefix.request_bound_anchor` | `request_bound_match_anchor` | `invariant_state` | request-scoped match-prefix token anchor |
-| `hiradix.match_prefix.cache_stage_path_observed` | `cache_stage_match_path_observed` | `source_actual` | concrete match-prefix/cache-stage path evidence |
-| `hiradix.lookup_result_observed` | `lookup_result_observed` | `source_actual` | source matched node、device/host hit、node chain 和 evictable snapshot |
-| `hiradix.cache_finished_req.lifecycle_anchor` / `hiradix.cache_unfinished_req.lifecycle_anchor` | `request_lifecycle_anchor` | `invariant_state` | lifecycle 边界 anchor，不携带 committed/fill/generated suffix path |
-| `hiradix.cache_finished_req.path_observed` / `hiradix.cache_unfinished_req.path_observed` | `request_lifecycle_path_observed` | `source_actual` | source committed/fill token path evidence |
-| `hiradix.cache_finished_req.runtime_observed` / `hiradix.cache_unfinished_req.runtime_observed` | `request_lifecycle_runtime_observed` | `source_actual` | request runtime、chunk/insert/priority 等 source runtime evidence |
-| `schedule_policy.prefill_admission` / `schedule_policy.chunked_admission` | `request_admission` | `invariant_state` | admission boundary 的 request token path、admission kind 和 policy |
-| `scheduler.prefetch_decision` | `prefetch_decision` | `invariant_state` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
-| `hiradix.prefetch_check_point` | `prefetch_check_point` | `invariant_state` | request 时间线上的 prefetch check/wait 边界 |
+注意：
 
-`sglang.hicache` probe 还会自动 patch 下列内部方法并输出 `source_actual` 事件：radix split/delete、
-device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、write hit counter delta、write/load ack checkpoint、storage control
-checkpoint、controller prefetch enqueue、rate-limit、storage hit query、prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件用于
-provenance 和 oracle 对照，默认是 `source_actual` 或 `timing_observation`，不是 normal state input。
-
-注意：match-prefix path 不再以 `request_tokens` / `lookup_path` 混合 role 出现。request-bound anchor 只在
-`params.req.rid` 存在时发出；concrete cache-stage path 另作为 `cache_stage_match_path_observed` evidence 保留。
-cross-config 诊断时需要逐项审计 atomic invariant 集合，而不能只看 workload report 的 prompt identity 是否一致。
-审计时 raw `request_id` 只用于单 run 内关联 request-scoped fact，不能作为跨配置 invariant value；跨配置签名必须归一化到
-token path / request fingerprint。
+- match-prefix path 不再以 `request_tokens` / `lookup_path` 混合 role 出现；
+- request-bound anchor 只在 request id 存在时发出；
+- concrete cache-stage path 另作为 evidence 保留；
+- raw `request_id` 只用于单 run 内关联 request-scoped fact，不能作为跨配置 invariant value；
+- 跨配置签名必须归一化到 token path / request fingerprint。
 
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
 `fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 `model_runner.py` 的 validation 路径使用。
 
 ## Token / Range 主事实
 
-新的 invariant profile 以 token dictionary + span 引用为核心：
+invariant profile 以 token dictionary + span 引用为核心：
 
 | 字段 | 必需性 | 说明 |
 | --- | --- | --- |
@@ -281,26 +253,12 @@ python3 scripts/internal/profile_quality.py \
 - `seq_no` 是否在 scope 内有序；
 - state trace 开启时是否采到 capacity snapshot。
 
-当前 33-target atomic 契约已在
-`data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` 完成 S1A/S1B manual profile。
-旧 `01_s1a_manual` 质量结果如下，它来自 2026-06-10 profile，只能作为历史基线：
-
-| 指标 | 值 |
-| --- | --- |
-| `quality_ready` | true |
-| `profiling_ready` | true |
-| invariant events | 6960 |
-| required end events | 3480 |
-| missing required fact events | 0 |
-| token dictionary paths | 172 |
-| missing token dictionary refs | 0 |
-| seq scope count | 2 |
-| seq order errors | 0 |
+质量审计只输出采集质量和合同缺口，不判断 state model 是否正确。
 
 ## LD_PRELOAD
 
-LD_PRELOAD 目录为 `src/profiling/ld_preload`，是独立 C++ hook 框架。当前 `sglang` profile 主要复用
-AscendCL runtime wrapper，用于补充 sync/event anchor：
+LD_PRELOAD 目录为 `src/profiling/ld_preload`，是独立 C++ hook 框架。framework profile 可以复用
+AscendCL runtime wrapper 补充 sync/event anchor：
 
 | wrapper | 用途 |
 | --- | --- |
@@ -319,12 +277,11 @@ scripts/internal/hooks/build.sh ascendcl
 scripts/internal/hooks/build.sh ld_preload
 ```
 
-真实 HiCache state suite 目前关闭 torch profiler 和 LD_PRELOAD，只采 Python probe。需要 faithful replay 或
-cache patch 时，应新建/补充完整执行 trace suite，不能把 state-only suite 当作性能 DAG 证据。
+state-only profiling suite 不能被当作性能 DAG 证据。需要 faithful replay 或 cache patch 时，应新建/补充完整执行 trace suite。
 
 ## HiCache Phased Workload
 
-`scripts/bench/hicache_phased_workload.py` 用于 deterministic HiCache 机制覆盖。当前 phase：
+`scripts/bench/hicache_phased_workload.py` 用于 deterministic HiCache 机制覆盖。phase 语义：
 
 | phase | 作用 |
 | --- | --- |
@@ -339,15 +296,3 @@ cache patch 时，应新建/补充完整执行 trace suite，不能把 state-onl
 
 `--hicache-ratio` 必须大于 `1.0`。容量压力优先通过 workload 和显式 capacity config 构造，不用小于等于
 `1.0` 的 ratio 制造异常场景。
-
-当前 manual workload 有意采用小请求数配合小 L1：
-
-| server | page size | max total tokens | modeled L1 pages | modeled L2 pages |
-| --- | ---: | ---: | ---: | ---: |
-| S1A fast pressure | 128 | 4096 | 32 | 73 |
-| S1B fast pressure | 64 | 2048 | 32 | 81 |
-
-这样比单纯缩小 workload 更稳：pressure 仍能超过 target L1，后端 validation 也用同一组 target capacity。
-NPU `kernel_ascend` 会把 HiCache host layout 改写为 `page_first_direct`；Qwen3-32B 的 64 层模型要求
-host `page_num` 至少覆盖初始化时的 per-layer refs，因此 page128 场景不能把 `max_total_tokens` 压到 2048，
-否则 `2048 * 2.25 // 128 + 1 = 37` 会在 server 初始化时越界。

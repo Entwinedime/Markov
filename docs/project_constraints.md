@@ -11,6 +11,10 @@
 - `work_progress.md`
 - `project_constraints.md`
 
+其中 `profiling_development.md` 和 `modeling_development.md` 只记录设计、接口、组件职责、输入输出契约和长期边界；
+不得携带具体实验结果、历史阶段分析、run 路径或数值 diff。实验进展写入 `work_progress.md`，当前有效验证口径和结果写入
+`docs/validation/`。
+
 `docs/validation/` 只放纳入 git 追踪的专项验证记录。当前保留：
 
 - `docs/validation/hicache_state_validation.md`：当前有效验证口径、最新结果、剩余风险和复现入口。
