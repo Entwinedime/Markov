@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Summarize HiCache model/oracle provenance for mismatched pages.
+"""汇总 HiCache mismatch page 的 model/oracle provenance。
 
-This is a read-only diagnostic helper. It never emits model_input facts and
-does not feed oracle data back into the model. It reads validation diffs,
-predicted transition traces, and oracle state snapshots, then reports the
-per-page evidence needed to decide whether a backend rule is fixable from
-current invariant facts or requires new profiling.
+该脚本是只读诊断工具。它不会输出 model_input fact，也不会把 oracle 数据回流到模型。
+它读取 validation diff、predicted transition trace 和 oracle state snapshot，按 page 汇总
+判断 backend 规则是否能基于当前 invariant fact 修复，还是需要新增 profiling 证据。
 """
 
 from __future__ import annotations
@@ -41,6 +39,8 @@ ACTIVE_STATE_KEYS = (
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析 provenance 诊断 CLI 参数。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--predicted-trace", type=Path, required=True)
@@ -54,6 +54,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def normalize_page_key(page: Any) -> str:
+    """去掉 scope 前缀，返回可跨对象比较的 page key。"""
+
     text = str(page)
     if "|" in text:
         return text.rsplit("|", 1)[-1]
@@ -61,6 +63,8 @@ def normalize_page_key(page: Any) -> str:
 
 
 def normalized_memberships(state: dict[str, Any], page: str) -> list[str]:
+    """列出 page 在一个归一化 state 中所属的状态集合。"""
+
     memberships: list[str] = []
     for key in ACTIVE_STATE_KEYS:
         values = state.get(key)
@@ -72,9 +76,13 @@ def normalized_memberships(state: dict[str, Any], page: str) -> list[str]:
 
 
 def collect_pages(validation: dict[str, Any], explicit_pages: list[str], sample_per_set: int) -> dict[str, dict[str, Any]]:
+    """从 validation diff 和显式参数中选择需要解释的 page。"""
+
     selected: dict[str, dict[str, Any]] = {}
 
     def add(page: Any, reason: str, tier: str | None = None, side: str | None = None) -> None:
+        """记录 page 被纳入诊断的原因。"""
+
         normalized = normalize_page_key(page)
         if not normalized:
             return
@@ -102,6 +110,8 @@ def collect_pages(validation: dict[str, Any], explicit_pages: list[str], sample_
 
 
 def summarize_model_trace(predicted_trace: dict[str, Any], pages: set[str], max_transitions: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """汇总模型 transition trace 中每个 page 的最终状态和样本 transition。"""
+
     records = predicted_trace.get("records")
     if not isinstance(records, list):
         records = []
@@ -153,6 +163,8 @@ def summarize_model_trace(predicted_trace: dict[str, Any], pages: set[str], max_
 
 
 def union_normalized_memberships(object_states: dict[tuple[str, str, str], dict[str, Any]], pages: set[str]) -> dict[str, list[str]]:
+    """把多个 RadixCache object snapshot 合并成 page membership 视图。"""
+
     result = {page: [] for page in pages}
     for state in object_states.values():
         normalized = normalize_hicache_state_for_oracle_compare(state, "strip_scope")
@@ -164,6 +176,8 @@ def union_normalized_memberships(object_states: dict[tuple[str, str, str], dict[
 
 
 def summarize_oracle_trace(trace_paths: list[Path], pages: set[str], max_changes: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    """从 oracle snapshot timeline 中提取 page membership 变化。"""
+
     snapshots = extract_hicache_state_snapshots(trace_paths)
     oracle_final = normalize_hicache_state_for_oracle_compare(latest_derived_state(snapshots), "strip_scope")
     final_memberships = {page: normalized_memberships(oracle_final, page) for page in pages}
@@ -215,6 +229,8 @@ def summarize_oracle_trace(trace_paths: list[Path], pages: set[str], max_changes
 
 
 def classify_fixability(model: dict[str, Any], oracle: dict[str, Any]) -> str:
+    """基于 model/oracle membership 差异给出可修复性提示。"""
+
     model_memberships = set(model.get("final_memberships") or [])
     oracle_memberships = set(oracle.get("final_memberships") or [])
     transition_counts = model.get("transition_counts") if isinstance(model.get("transition_counts"), dict) else {}
@@ -230,6 +246,8 @@ def classify_fixability(model: dict[str, Any], oracle: dict[str, Any]) -> str:
 
 
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    """构造完整 provenance 报告。"""
+
     validation = load_json(args.validation)
     predicted_trace = load_json(args.predicted_trace)
     selected = collect_pages(validation, args.page, args.sample_per_set)
@@ -262,6 +280,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口。"""
+
     args = parse_args(argv)
     report = build_report(args)
     text = json.dumps(report, ensure_ascii=False, indent=2)

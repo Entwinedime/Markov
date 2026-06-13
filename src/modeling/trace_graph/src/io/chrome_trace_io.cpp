@@ -18,8 +18,11 @@ namespace {
 
 using Json = nlohmann::json;
 
-// 保留完整 JSON parser 的辅助函数，目前主要服务于未来扩展；
-// 真实大 trace 读取路径使用下面的 TraceScanner，避免 DOM 内存开销。
+/**
+ * @brief 完整 JSON parser 路径使用的标量转换辅助函数。
+ *
+ * 当前主要服务于未来扩展；真实大 trace 读取路径使用下面的 TraceScanner，避免 DOM 内存开销。
+ */
 std::string scalar_to_string(const Json & value) {
     if (value.is_null()) return "";
     if (value.is_string()) return value.get<std::string>();
@@ -69,8 +72,12 @@ std::string lower_string(std::string value) {
 }
 
 bool validation_only_event(const TraceEvent & event) {
-    // validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
-    // 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
+    /**
+     * @brief 判断事件是否只服务 validation/debug。
+     *
+     * validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
+     * 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
+     */
     auto fact_class = lower_string(event.arg("fact_class"));
     if (fact_class == "oracle_state" || fact_class == "debug_quality") return true;
     auto kind = lower_string(event.arg("event_kind"));
@@ -78,8 +85,11 @@ bool validation_only_event(const TraceEvent & event) {
 }
 
 void flatten_args(const Json & value, const std::string & prefix, std::unordered_map<std::string, std::string> & args) {
-    // 递归展开对象字段，形如 Function-Args.stream。
-    // 当前 TraceScanner 没有调用这个函数；如果未来切回 DOM parser，应复用这里的展开规则。
+    /**
+     * @brief 递归展开对象字段，形如 Function-Args.stream。
+     *
+     * 当前 TraceScanner 没有调用这个函数；如果未来切回 DOM parser，应复用这里的展开规则。
+     */
     if (!value.is_object()) return;
     for (const auto & item : value.items()) {
         const auto key = prefix.empty() ? item.key() : prefix + "." + item.key();
@@ -89,7 +99,11 @@ void flatten_args(const Json & value, const std::string & prefix, std::unordered
 }
 
 Json load_json_file(const std::string & filename) {
-    // 当前未在 read_chrome_trace 主路径使用，保留是为了调试小 JSON 或后续 schema 检查。
+    /**
+     * @brief 加载完整 JSON DOM。
+     *
+     * 当前未在 read_chrome_trace 主路径使用，保留是为了调试小 JSON 或后续 schema 检查。
+     */
     std::ifstream ifs(filename);
     if (!ifs.is_open()) { throw std::runtime_error("Failed to open trace file: " + filename); }
     try {
@@ -105,10 +119,11 @@ class TraceScanner {
     explicit TraceScanner(std::string buffer) : buffer_(std::move(buffer)), p_(buffer_.data()), end_(buffer_.data() + buffer_.size()) {}
 
     std::vector<TraceEvent> parse() {
-        // 支持两种输入形态：
-        // 1. traceEvents 数组本身；
-        // 2. {"traceEvents": [...]} 对象。
-        // 其他顶层字段会被跳过，因为 C++ 后端只需要 duration events。
+        /**
+         * @brief 支持 traceEvents 数组本身和 {"traceEvents": [...]} 对象两种输入形态。
+         *
+         * 其他顶层字段会被跳过，因为 C++ 后端只需要 duration events。
+         */
         skip_ws();
         if (p_ >= end_) return {};
         if (*p_ == '[') {
@@ -116,7 +131,9 @@ class TraceScanner {
             return parse_array();
         }
 
-        // 部分 Chrome trace 输入使用 {"traceEvents": [...]}，真实 merged trace 通常是数组。
+        /**
+         * @brief 部分 Chrome trace 输入使用 {"traceEvents": [...]}，真实 merged trace 通常是数组。
+         */
         if (*p_ == '{') {
             auto marker = buffer_.find("\"traceEvents\"");
             if (marker != std::string::npos) {
@@ -136,8 +153,12 @@ class TraceScanner {
     }
 
     std::string parse_string() {
-        // ? 轻量 scanner 只跳过转义字符，不真正反转义。
-        // ? 这对当前构图字段可能足够；如果 name/args 中需要精确保留转义内容，需要改成完整 JSON string parser。
+        /**
+         * @warning 轻量 scanner 只跳过转义字符，不真正反转义。
+         *
+         * 这对当前构图字段可能足够；如果 name/args 中需要精确保留转义内容，需要改成完整 JSON
+         * string parser。
+         */
         if (p_ >= end_ || *p_ != '"') return "";
         ++p_;
         const char * start = p_;
@@ -157,8 +178,11 @@ class TraceScanner {
     }
 
     void skip_value() {
-        // 跳过不关心的 JSON value，支持嵌套对象/数组。
-        // 该函数用于顶层未知字段；args 解析当前只读取 scalar。
+        /**
+         * @brief 跳过不关心的 JSON value，支持嵌套对象/数组。
+         *
+         * 该函数用于顶层未知字段；args 解析当前只读取 scalar。
+         */
         skip_ws();
         if (p_ >= end_) return;
         if (*p_ == '"') {
@@ -207,7 +231,9 @@ class TraceScanner {
     }
 
     uint64_t parse_u64_value() {
-        // Chrome trace 的 ts/dur 可能是整数、浮点或字符串。这里统一截断到 uint64 ns/us 单位。
+        /**
+         * @brief Chrome trace 的 ts/dur 可能是整数、浮点或字符串；这里统一截断到 uint64。
+         */
         std::string raw;
         if (p_ < end_ && *p_ == '"')
             raw = parse_string();
@@ -228,8 +254,11 @@ class TraceScanner {
     }
 
     std::string parse_compound_value_literal() {
-        // args 中的对象/数组暂时不展开，只保留原始 JSON 片段并保证 scanner 完整越过该值。
-        // 需要参与建模的结构化字段应由 trace_merger 展平成稳定标量 key。
+        /**
+         * @brief 保留 args 中对象/数组的原始 JSON 片段。
+         *
+         * scanner 只保证完整越过该值；需要参与建模的结构化字段应由 trace_merger 展平成稳定标量 key。
+         */
         skip_ws();
         const char * start = p_;
         skip_value();
@@ -237,8 +266,11 @@ class TraceScanner {
     }
 
     void parse_args(std::unordered_map<std::string, std::string> & args) {
-        // 当前 args 解析只保存一层 key -> string。标量直接收敛成字符串，
-        // 对象/数组保留原始 JSON 片段，避免结构化值打乱后续字段扫描。
+        /**
+         * @brief 当前 args 解析只保存一层 key -> string。
+         *
+         * 标量直接收敛成字符串，对象/数组保留原始 JSON 片段，避免结构化值打乱后续字段扫描。
+         */
         if (p_ >= end_ || *p_ != '{') {
             skip_value();
             return;
@@ -269,7 +301,9 @@ class TraceScanner {
     }
 
     TraceEvent parse_event(bool & valid) {
-        // 只解析构图必须字段。未知字段会被 skip_value 跳过。
+        /**
+         * @brief 只解析构图必须字段；未知字段会被 skip_value 跳过。
+         */
         TraceEvent event;
         valid = false;
         if (p_ >= end_ || *p_ != '{') return event;
@@ -319,19 +353,28 @@ class TraceScanner {
 
         if (event.pid.empty()) event.pid = "-1";
         if (event.tid.empty()) event.tid = "-1";
-        // 把顶层 pid/tid 也写入 args，方便后续统一走 event.arg()。
-        // DagBuilder::lane_key 直接读取 event.tid，不依赖这里的 args["tid"] fallback。
+        /**
+         * @brief 把顶层 pid/tid 也写入 args，方便后续统一走 event.arg()。
+         *
+         * DagBuilder::lane_key 直接读取 event.tid，不依赖这里的 args["tid"] fallback。
+         */
         event.args["pid"] = event.pid;
         event.args["tid"] = event.tid;
-        // 当前后端只支持完整 duration event。metadata 和 flow event 不是可执行节点；
-        // 如果未来需要使用 flow，需要单独解析为依赖边，而不是当作 0 时长节点。
+        /**
+         * @brief 当前后端只支持完整 duration event。
+         *
+         * metadata 和 flow event 不是可执行节点；如果未来需要使用 flow，需要单独解析为依赖边，
+         * 而不是当作 0 时长节点。
+         */
         valid = saw_phase && event.ph == "X" && !event.name.empty() && !validation_only_event(event) && event.name != "Free" && event.name != "Computing" &&
                 event.name != "Communication" && event.name != "Communication(Not Overlapped)";
         return event;
     }
 
     std::vector<TraceEvent> parse_array() {
-        // 只把 valid 的 duration event 放入结果，event.index 使用过滤后的顺序。
+        /**
+         * @brief 只把 valid 的 duration event 放入结果，event.index 使用过滤后的顺序。
+         */
         std::vector<TraceEvent> events;
         while (p_ < end_) {
             skip_ws();
@@ -390,8 +433,11 @@ std::string json_scalar_literal(const std::string & value) {
 } // namespace
 
 std::vector<TraceEvent> read_chrome_trace(const std::string & filename) {
-    // 一次性读入文件后使用 streaming scanner 扫描。这样仍需要一份文件大小的内存，
-    // 但避免了 nlohmann::json DOM 的多倍放大。
+    /**
+     * @brief 一次性读入文件后使用 streaming scanner 扫描。
+     *
+     * 这样仍需要一份文件大小的内存，但避免了 nlohmann::json DOM 的多倍放大。
+     */
     std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
     if (!ifs.is_open()) { throw std::runtime_error("Failed to open trace file: " + filename); }
     auto size = ifs.tellg();
@@ -406,7 +452,9 @@ std::vector<TraceEvent> read_chrome_trace(const std::string & filename) {
 }
 
 void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph, bool full_output) {
-    // DAG Chrome trace 是显式 debug 输出，不参与默认 prediction。
+    /**
+     * @brief DAG Chrome trace 是显式 debug 输出，不参与默认 prediction。
+     */
     std::ofstream ofs(filename);
     if (!ofs.is_open()) { throw std::runtime_error("Failed to write Chrome trace DAG: " + filename); }
     ofs << "{\n  \"traceEvents\": [\n";
@@ -415,7 +463,11 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
         return;
     }
 
-    // 输出时把 simulation_start 平移到原 trace 的 real_min 附近，方便在 Chrome viewer 中与原 trace 对照。
+    /**
+     * @brief 输出时把 simulation_start 平移到原 trace 的 real_min 附近。
+     *
+     * 这样便于在 Chrome viewer 中与原 trace 对照。
+     */
     uint64_t real_min = 0;
     bool has_real_time = false;
     for (const auto & event : graph.events()) {
@@ -425,7 +477,9 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
 
     bool first = true;
     for (const auto & node : graph.nodes()) {
-        // 每个 DAG node 输出为一个 duration event。
+        /**
+         * @brief 每个 DAG node 输出为一个 duration event。
+         */
         const auto & event = graph.event_for_node(node.id);
         if (!first) ofs << ",\n";
         first = false;
@@ -446,7 +500,9 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
     }
 
     for (const auto & edge : graph.edges()) {
-        // 每条 DAG edge 输出为 Chrome trace flow start/end 事件，方便可视化依赖。
+        /**
+         * @brief 每条 DAG edge 输出为 Chrome trace flow start/end 事件，方便可视化依赖。
+         */
         const auto & src_event = graph.event_for_node(edge.src);
         const auto & dst_event = graph.event_for_node(edge.dst);
         const auto & src_node = graph.node(edge.src);

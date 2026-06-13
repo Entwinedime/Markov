@@ -67,6 +67,8 @@ class RunLayout:
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any], *, framework: str) -> "RunLayout":
+        """从运行配置生成稳定目录布局。"""
+
         name = sanitize(str(cfg.get("name", f"{framework}-profile")))
         run_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / framework
         run_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{name}"
@@ -82,6 +84,8 @@ class RunLayout:
         )
 
     def prepare(self, *, clean: bool) -> None:
+        """创建本次 run 需要的目录，必要时清理旧 run 目录。"""
+
         if clean and self.run_dir.exists():
             shutil.rmtree(self.run_dir)
         for path in (
@@ -103,21 +107,29 @@ class ModelConfigBackup:
 
 
 def log(message: str) -> None:
+    """输出带时间戳的 runner 日志。"""
+
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
 
 
 def sanitize(value: str) -> str:
+    """把用户可配置名称规整成可作为目录名的短字符串。"""
+
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("._-") or "profile"
 
 
 def load_json(path: Path) -> dict[str, Any]:
+    """读取 UTF-8 JSON 对象配置。"""
+
     with path.open("r", encoding="utf-8") as file_obj:
         return json.load(file_obj)
 
 
 def dump_json(path: Path, value: Any) -> None:
+    """写入格式化 JSON，并保证父目录存在。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file_obj:
         json.dump(value, file_obj, indent=2, ensure_ascii=False)
@@ -125,6 +137,8 @@ def dump_json(path: Path, value: Any) -> None:
 
 
 def resolve_repo_path(value: str | None) -> Path | None:
+    """把配置路径解析为 repo 内绝对路径。"""
+
     if not value:
         return None
     path = Path(value).expanduser()
@@ -134,6 +148,8 @@ def resolve_repo_path(value: str | None) -> Path | None:
 
 
 def resolve_run_path(value: str | None, run_dir: Path) -> Path | None:
+    """把 run-dir 相对路径解析为绝对路径。"""
+
     if not value:
         return None
     path = Path(value).expanduser()
@@ -173,6 +189,8 @@ def delete_path(value: dict[str, Any], path: str) -> None:
 
 
 def apply_unset(value: dict[str, Any], paths: Any) -> None:
+    """应用 suite `$unset` 列表，删除已合并配置中的字段。"""
+
     if paths is None:
         return
     if not isinstance(paths, list) or not all(isinstance(path, str) for path in paths):
@@ -182,6 +200,8 @@ def apply_unset(value: dict[str, Any], paths: Any) -> None:
 
 
 def command_from_config(command: Any) -> list[str] | str:
+    """校验并返回配置中的命令表达。"""
+
     if isinstance(command, list) and all(isinstance(item, str) for item in command):
         return command
     if isinstance(command, str):
@@ -190,6 +210,8 @@ def command_from_config(command: Any) -> list[str] | str:
 
 
 def command_to_text(command: list[str] | str) -> str:
+    """把命令转换成可写入审计文件的文本形式。"""
+
     if isinstance(command, list):
         return shlex.join(command)
     return command
@@ -199,6 +221,8 @@ CONFIG_PLACEHOLDER_ROOTS = {"metadata", "server", "bench", "env", "modeling"}
 
 
 def config_placeholder_value(cfg: dict[str, Any], path: str) -> str | None:
+    """解析 `{metadata.foo}` 等配置占位符的替换值。"""
+
     parts = [part for part in path.split(".") if part]
     if len(parts) < 2 or parts[0] not in CONFIG_PLACEHOLDER_ROOTS:
         return None
@@ -280,6 +304,8 @@ def expand_layout_placeholders(value: str, layout: RunLayout, cfg: dict[str, Any
 
 
 def expand_runtime_value(value: Any, layout: RunLayout, cfg: dict[str, Any]) -> Any:
+    """递归展开 runtime 配置中的 run-dir 和配置占位符。"""
+
     if isinstance(value, str):
         return expand_layout_placeholders(value, layout, cfg)
     if isinstance(value, list):
@@ -288,6 +314,8 @@ def expand_runtime_value(value: Any, layout: RunLayout, cfg: dict[str, Any]) -> 
 
 
 def append_cli_arg(command: list[str], key: str, value: Any) -> None:
+    """按 bench_serving 约定把 JSON 参数追加为 CLI 选项。"""
+
     option = "--" + key.replace("_", "-")
     if isinstance(value, bool):
         if value:
@@ -381,6 +409,8 @@ def apply_model_config_overrides(
 
 
 def restore_model_config(backup: ModelConfigBackup | None) -> None:
+    """恢复 profiling 前临时覆盖的模型 config.json。"""
+
     if backup and backup.backup_path.is_file():
         backup.config_path.write_bytes(backup.backup_path.read_bytes())
 
@@ -406,6 +436,8 @@ def remove_pythonpath_entry(env: dict[str, str], path: Path) -> None:
 
 
 def api_base_from_ready_url(ready_url: str) -> str:
+    """从 ready URL 提取 SGLang API base URL。"""
+
     parsed = urllib.parse.urlsplit(ready_url)
     if not parsed.scheme or not parsed.netloc:
         raise ValueError(f"ready_url must be absolute: {ready_url}")
@@ -413,6 +445,8 @@ def api_base_from_ready_url(ready_url: str) -> str:
 
 
 def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
+    """向 SGLang profiler API 发送 JSON POST 并宽松解析响应。"""
+
     data = None
     headers = {}
     if body is not None:
@@ -473,6 +507,8 @@ def start_process(
 
 
 def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -> None:
+    """终止 server 进程组，超时后升级为 SIGKILL。"""
+
     if process is None or process.poll() is not None:
         return
     try:
@@ -486,6 +522,8 @@ def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -
 
 
 def build_profile_body(profile: dict[str, Any], layout: RunLayout) -> dict[str, Any]:
+    """构造传给 SGLang `/start_profile` 的请求体。"""
+
     output_dir = resolve_run_path(profile.get("output_dir", "trace/torch"), layout.run_dir)
     body: dict[str, Any] = {"output_dir": str(output_dir)}
     for key in (
@@ -521,6 +559,8 @@ class ProfileRun:
     """单次 profiling 运行的执行器。"""
 
     def __init__(self, cfg: dict[str, Any], *, dry_run: bool) -> None:
+        """规整单次 run 的配置、目录和 server/workload 命令。"""
+
         self.cfg = cfg
         self.dry_run = dry_run
         self.framework = str(cfg.get("framework", "sglang"))
@@ -534,6 +574,8 @@ class ProfileRun:
         self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout, self.cfg)
 
     def run(self) -> Path:
+        """执行一次 profiling run，并在 finally 中写出 manifest。"""
+
         self.layout.prepare(clean=bool(self.cfg.get("clean_run_dir", False)))
         self._write_run_inputs()
 
@@ -586,6 +628,8 @@ class ProfileRun:
         return self.layout.run_dir
 
     def _write_run_inputs(self) -> None:
+        """保存本次运行的原始配置和展开后的命令，供复现使用。"""
+
         dump_json(self.layout.run_dir / "config.json", self.cfg)
         (self.layout.run_dir / "server_cmd.txt").write_text(
             command_to_text(self.server_command) + "\n",
@@ -605,6 +649,8 @@ class ProfileRun:
         dry_run: bool,
         error: str | None = None,
     ) -> None:
+        """写出 profile manifest，作为后续 merge/modeling 的入口。"""
+
         manifest = build_profile_manifest(
             run_dir=self.layout.run_dir,
             cfg=self.cfg,
@@ -651,6 +697,8 @@ class ProfileRun:
         env.setdefault("HCCL_OP_EXPANSION_MODE", "AIV")
 
     def _apply_python_probe_env(self, env: dict[str, str]) -> None:
+        """注入 Python probe 环境变量和 target 配置。"""
+
         prepend_pythonpath(env, PYTHON_PROBE_ROOT)
         env["TRACE_SIM_PYTHON_PROBE"] = "1"
         env["TRACE_SIM_PYTHON_PROBES"] = ",".join(self.runtime.python_probes)
@@ -692,18 +740,24 @@ class ProfileRun:
         return targets
 
     def _hicache_state_trace_enabled(self) -> bool:
+        """判断是否开启 validation-only HiCache state snapshot。"""
+
         python_probe = channel_config(self.cfg, "python_probe")
         state_trace = python_probe.get("state_trace") if isinstance(python_probe.get("state_trace"), dict) else {}
         return bool(state_trace.get("enabled", False))
 
     @staticmethod
     def _is_hicache_python_target(target: dict[str, Any]) -> bool:
+        """识别需要追加 HiCache state snapshot 字段的 target。"""
+
         module = str(target.get("module") or "")
         target_path = str(target.get("target") or "")
         target_id = str(target.get("id") or "")
         return "hicache" in target_id.lower() or "hiradix" in module.lower() or "cache_controller" in module.lower() or "HiCache" in target_path
 
     def _apply_ld_preload_env(self, env: dict[str, str]) -> None:
+        """注入 LD_PRELOAD hook，并把输出固定到本次 run 目录。"""
+
         ld_preload = self._ld_preload_cfg()
         if not ld_preload.get("enabled", True):
             return
@@ -718,21 +772,31 @@ class ProfileRun:
         )
 
     def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
+        """等待 server ready，超时时暴露进程提前退出或健康检查失败。"""
+
         ready_url = self.server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
         wait_for_ready(process, ready_url, int(self.server_cfg.get("ready_timeout_sec", 1800)))
 
     def _api_base(self) -> str:
+        """返回 profiler API base，默认从 ready_url 推导。"""
+
         ready_url = self.server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
         return self._torch_profile_cfg().get("api_base_url") or api_base_from_ready_url(ready_url)
 
     def _torch_profile_enabled(self) -> bool:
+        """判断本次 run 是否调用 SGLang torch profiler API。"""
+
         profile = self._torch_profile_cfg()
         return self.runtime.enabled and "torch" in self.runtime.channels and profile.get("enabled", True)
 
     def _torch_profile_cfg(self) -> dict[str, Any]:
+        """读取 torch profiler 渠道配置。"""
+
         return channel_config(self.cfg, "torch")
 
     def _ld_preload_cfg(self) -> dict[str, Any]:
+        """读取 LD_PRELOAD 渠道配置。"""
+
         return channel_config(self.cfg, "ld_preload")
 
     def _should_stop_torch_profiler_after_workload(self) -> bool:
@@ -750,6 +814,8 @@ class ProfileRun:
         return profile.get("num_steps") is None
 
     def _start_torch_profiler(self) -> None:
+        """调用 `/start_profile` 并保存请求体和响应。"""
+
         profile = self._torch_profile_cfg()
         body = build_profile_body(profile, self.layout)
         dump_json(self.layout.run_dir / "profile_start_body.json", body)
@@ -762,6 +828,8 @@ class ProfileRun:
         dump_json(self.layout.run_dir / "profile_start_response.json", response)
 
     def _stop_torch_profiler(self) -> None:
+        """调用 `/stop_profile`，非 strict 模式下把错误降级成响应记录。"""
+
         profile = self._torch_profile_cfg()
         log("Stopping SGLang profiler via /stop_profile.")
         try:
@@ -777,6 +845,8 @@ class ProfileRun:
         dump_json(self.layout.run_dir / "profile_stop_response.json", response)
 
     def _run_bench(self, server_env: dict[str, str]) -> None:
+        """运行 workload，并移除只应注入 server 的采集环境。"""
+
         log("Running workload.")
         bench_env = server_env.copy()
         for key in BENCH_ENV_REMOVE_KEYS:
@@ -789,6 +859,8 @@ class ProfileRun:
 
 
 def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
+    """执行单个已展开 profiling 配置。"""
+
     return ProfileRun(cfg, dry_run=dry_run).run()
 
 
@@ -810,6 +882,8 @@ def parse_experiment_selection(raw_values: list[str] | None, env_value: str | No
 
 
 def experiment_identity(cfg: dict[str, Any], index: int) -> str:
+    """返回实验的稳定 id/name，缺省时使用序号兜底。"""
+
     for key in ("id", "name"):
         value = cfg.get(key)
         if isinstance(value, str) and value.strip():
@@ -830,6 +904,8 @@ def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
 
 
 def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]:
+    """生成 `--list-experiments` 和 suite_selection 使用的实验摘要。"""
+
     return {
         "index": index,
         "id": cfg.get("id", experiment_identity(cfg, index)),
@@ -839,6 +915,8 @@ def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]
 
 
 def reject_profiling_override(value: dict[str, Any], context: str) -> None:
+    """禁止 suite 局部覆盖 profiling 配置，保证采集合同在 suite 内一致。"""
+
     if "profiling" in value:
         raise ValueError(f"{context} must not override profiling; suite experiments share one profiling config")
     unset_paths = value.get("$unset")
@@ -849,6 +927,8 @@ def reject_profiling_override(value: dict[str, Any], context: str) -> None:
 
 
 def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
+    """读取并校验 matrix.servers 或 matrix.inputs 列表。"""
+
     raw_entries = matrix.get(key)
     if not isinstance(raw_entries, list) or not raw_entries:
         raise ValueError(f"matrix.{key} must be a non-empty list")
@@ -869,6 +949,8 @@ def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]
 
 
 def matrix_entry_override(entry: dict[str, Any]) -> dict[str, Any]:
+    """去掉 matrix entry 元字段，只保留参与配置合并的覆盖项。"""
+
     return {key: value for key, value in entry.items() if key not in MATRIX_ENTRY_META_KEYS}
 
 
@@ -879,6 +961,8 @@ def attach_suite_metadata(
     server_id: str | None,
     input_id: str | None,
 ) -> None:
+    """给展开后的实验补充 suite 来源 metadata。"""
+
     metadata = cfg.get("metadata")
     if metadata is None:
         metadata = {}
@@ -894,6 +978,8 @@ def attach_suite_metadata(
 
 
 def generated_matrix_experiments(matrix: dict[str, Any]) -> list[dict[str, Any]]:
+    """在未显式列出 experiments 时生成 server/input 笛卡尔积。"""
+
     servers = matrix_entries(matrix, "servers")
     inputs = matrix_entries(matrix, "inputs")
     experiments: list[dict[str, Any]] = []
@@ -917,6 +1003,8 @@ def expand_matrix_experiment(
     experiment: dict[str, Any],
     index: int,
 ) -> dict[str, Any]:
+    """把一个 matrix experiment 展开为可直接运行的单次配置。"""
+
     servers = matrix_entries(matrix, "servers")
     inputs = matrix_entries(matrix, "inputs")
 
@@ -957,6 +1045,8 @@ def expand_matrix_experiment(
 
 
 def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """展开 suite 配置；普通单 run 配置原样返回。"""
+
     matrix = cfg.get("matrix")
     experiments = cfg.get("experiments")
     if experiments is None and matrix is None:
@@ -997,6 +1087,8 @@ def filter_suite_experiments(
     experiments: list[tuple[int, dict[str, Any]]],
     selected_experiments: set[str],
 ) -> list[tuple[int, dict[str, Any]]]:
+    """根据 CLI/env 选择器过滤 suite 实验。"""
+
     if not selected_experiments:
         return experiments
 
@@ -1021,6 +1113,8 @@ def run_profile_suite(
     dry_run: bool,
     selected_experiments: set[str] | None = None,
 ) -> list[Path]:
+    """执行普通 run 或 suite，并写出 suite 级选择/结果文件。"""
+
     is_suite = "experiments" in cfg or "matrix" in cfg
     all_experiments = list(enumerate(expand_suite(cfg), start=1))
     experiments = filter_suite_experiments(all_experiments, selected_experiments or set())
@@ -1074,6 +1168,8 @@ def run_profile_suite(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析容器内 runner CLI 参数。"""
+
     parser = argparse.ArgumentParser(description="Run SGLang profiling experiments.")
     parser.add_argument("--config", required=True, help="JSON profile config path")
     parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
@@ -1084,6 +1180,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：执行 profiling run/suite 或列出展开后的实验。"""
+
     args = parse_args(argv)
     config_path = resolve_repo_path(args.config)
     if config_path is None or not config_path.is_file():

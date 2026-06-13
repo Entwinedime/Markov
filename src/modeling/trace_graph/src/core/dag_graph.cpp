@@ -8,7 +8,11 @@ namespace TraceGraph {
 
 namespace {
 
-// summary 中使用的边类型名称。保持小写英文，属于用户可见输出字段。
+/**
+ * @brief summary 中使用的边类型名称。
+ *
+ * 名称保持小写英文，属于用户可见输出字段。
+ */
 std::string edge_kind_name(DagEdgeKind kind) {
     switch (kind) {
     case DagEdgeKind::Sequential:
@@ -33,8 +37,12 @@ bool contains_hccl_name(const std::string & name) {
     return name.find("hcom") != std::string::npos || name.find("HCCL") != std::string::npos || name.find("hccl") != std::string::npos;
 }
 
-// HCCL merge 时可能已经被子模块或前序逻辑改写 attrs["time"]。
-// 优先使用 attrs["time"]，失败时回退到 node.duration。
+/**
+ * @brief 读取 HCCL merge 使用的节点耗时。
+ *
+ * merge 前节点可能已经被子模块或前序逻辑改写 attrs["time"]；这里优先使用
+ * attrs["time"]，失败时回退到 node.duration。
+ */
 uint64_t node_time(const DagNode & node) {
     auto it = node.attrs.find("time");
     if (it == node.attrs.end()) return node.duration;
@@ -62,8 +70,11 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, const std::string & l
     node.lane_key = lane_key;
     node.duration = event.dur;
     node.original_duration = event.dur;
-    // attrs["time"] / attrs["ori_time"] 是老版 TraceGraph 与 NodeScaleModule 都会读取的字段。
-    // duration 字段和 attrs["time"] 必须保持同步。
+    /**
+     * @brief attrs["time"] / attrs["ori_time"] 是老版 TraceGraph 与 NodeScaleModule 都会读取的字段。
+     *
+     * duration 字段和 attrs["time"] 必须保持同步，否则拓扑仿真和 debug 输出会看到不同耗时。
+     */
     node.attrs["time"] = std::to_string(event.dur);
     node.attrs["ori_time"] = std::to_string(event.dur);
     node.attrs["tid"] = lane_key;
@@ -77,7 +88,12 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, const std::string & l
 
 void DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind) {
     if (src >= nodes_.size() || dst >= nodes_.size()) { throw std::out_of_range("DAG edge endpoint is out of range"); }
-    // 当前不做边去重。重复边不会改变 critical path，但会增加 indegree 和 summary edge_count。
+    /**
+     * @brief 当前不做边去重。
+     *
+     * 重复边不会改变 critical path，但会增加 indegree 和 summary edge_count；调用方负责避免
+     * 重复边污染统计。
+     */
     edges_.push_back(DagEdge{src, dst, kind});
 }
 
@@ -133,8 +149,11 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     if (graphs.empty()) return DagGraph();
     if (graphs.size() == 1) return std::move(graphs.front());
 
-    // 先合并事件数组，再按 offset 平移每个子图的 node id / event_index / edge endpoint。
-    // 这样每个 per-rank graph 内部的边保持不变，后面只追加跨 rank 边。
+    /**
+     * @brief 先合并事件数组，再按 offset 平移每个子图的 node id / event_index / edge endpoint。
+     *
+     * 这样每个 per-rank graph 内部的边保持不变，后面只追加跨 rank 边。
+     */
     std::vector<TraceEvent> merged_events;
     for (const auto & graph : graphs) {
         for (const auto & event : graph.events_) {
@@ -148,8 +167,10 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     size_t event_offset = 0;
     size_t node_offset = 0;
     std::vector<size_t> node_offsets(graphs.size() + 1, 0);
-    // ? HCCL group 的 key 当前只使用 kernel name，value 是 graph_index -> global node ids。
-    // ? 这是老版兼容策略；如果能拿到 group/correlation，应验证是否需要收窄匹配条件。
+    /**
+     * @warning HCCL group 的 key 当前只使用 kernel name，value 是 graph_index -> global node ids。
+     * 这是老版兼容策略；如果能拿到 group/correlation，应验证是否需要收窄匹配条件。
+     */
     std::unordered_map<std::string, std::unordered_map<int, std::vector<size_t>>> hccl_groups;
     uint64_t real_min = 0;
     uint64_t real_max = 0;
@@ -183,15 +204,19 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     node_offsets[graphs.size()] = node_offset;
     merged.real_e2e_time_ = has_real_time && real_max > real_min ? real_max - real_min : 0;
 
-    // 老版 TraceGraph 在多卡 merge 时按 HCCL kernel 名称和序号对齐通信节点：
-    // 其他 rank 的 HCCL 节点会约束本 rank HCCL 后继节点，并把同组通信耗时规约为最小值。
-    //
-    // 这里的关键假设：
-    // - 每个 rank 上同名 HCCL kernel 的顺序一致；
-    // - 同组通信的等待主要通过跨 rank 边表达；
-    // - duration 取最小值可以剥离各 rank 上重复计入的等待。
-    //
-    // ? 如果 trace 中 repeated collective 名称相同但顺序不一致，这里可能错配。
+    /**
+     * @brief 按 HCCL kernel 名称和序号对齐多 rank 通信节点。
+     *
+     * 老版 TraceGraph 在多卡 merge 时让其他 rank 的 HCCL 节点约束本 rank HCCL 后继节点，
+     * 并把同组通信耗时规约为最小值。
+     *
+     * 这里的关键假设：
+     * - 每个 rank 上同名 HCCL kernel 的顺序一致；
+     * - 同组通信的等待主要通过跨 rank 边表达；
+     * - duration 取最小值可以剥离各 rank 上重复计入的等待。
+     *
+     * @warning 如果 trace 中 repeated collective 名称相同但顺序不一致，这里可能错配。
+     */
     for (const auto & group_item : hccl_groups) {
         size_t max_count = 0;
         for (const auto & by_gpu : group_item.second) max_count = std::max(max_count, by_gpu.second.size());
@@ -207,8 +232,12 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
                 if (min_time == 0 || time < min_time) min_time = time;
             }
             for (const auto & item : current) {
-                // hccl_sync 是 per-rank 构图阶段记录的“本 rank HCCL 后继节点”。
-                // 跨 rank 边从其他 rank 的 HCCL 指向该后继，表达本 rank 后续工作要等其他 rank 通信完成。
+                /**
+                 * @brief hccl_sync 是 per-rank 构图阶段记录的“本 rank HCCL 后继节点”。
+                 *
+                 * 跨 rank 边从其他 rank 的 HCCL 指向该后继，表达本 rank 后续工作要等其他
+                 * rank 通信完成。
+                 */
                 auto next_it = merged.nodes_[item.second].attrs.find("hccl_sync");
                 if (next_it == merged.nodes_[item.second].attrs.end()) continue;
                 size_t next_local = 0;
@@ -227,7 +256,9 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
                 }
             }
             if (min_time > 0) {
-                // 同组通信节点统一缩为最短 duration，避免把等待时间在所有 rank 上重复计入。
+                /**
+                 * @brief 同组通信节点统一缩为最短 duration，避免把等待时间在所有 rank 上重复计入。
+                 */
                 for (const auto & item : current) merged.set_node_duration(item.second, min_time);
             }
         }

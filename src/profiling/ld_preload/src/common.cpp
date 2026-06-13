@@ -7,6 +7,11 @@
 #include <unistd.h>
 #include <vector>
 
+/**
+ * @file
+ * @brief LD_PRELOAD 框架通用字符串、环境变量和 JSON 转义工具实现。
+ */
+
 namespace HookFrameWork {
 
 std::string GetFirstNonEmptyEnv(const std::vector<std::string> & env_names) {

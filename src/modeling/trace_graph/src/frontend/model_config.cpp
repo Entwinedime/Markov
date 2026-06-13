@@ -18,7 +18,9 @@ namespace {
 using Json = nlohmann::json;
 
 Json read_json_file(const std::string & filename) {
-    // model config 一般很小，直接用 nlohmann::json DOM 解析，和大 trace 输入路径分开处理。
+    /**
+     * @brief model config 一般很小，直接用 nlohmann::json DOM 解析，和大 trace 输入路径分开处理。
+     */
     std::ifstream ifs(filename);
     if (!ifs.is_open()) { throw std::runtime_error("Failed to open model config: " + filename); }
     try {
@@ -35,7 +37,11 @@ std::string lower(std::string s) {
 }
 
 std::string json_scalar_to_string(const Json & value, const std::string & def = "") {
-    // 只把 JSON 标量转换成字符串；复杂对象不会隐式 dump，避免配置结构写错时被静默接受。
+    /**
+     * @brief 只把 JSON 标量转换成字符串。
+     *
+     * 复杂对象不会隐式 dump，避免配置结构写错时被静默接受。
+     */
     if (value.is_null()) return def;
     if (value.is_string()) return value.get<std::string>();
     if (value.is_boolean()) return value.get<bool>() ? "true" : "false";
@@ -57,7 +63,9 @@ std::string string_value(const Json & object, const std::string & key, const std
 }
 
 double number_value(const Json & object, const std::string & key, double def) {
-    // 支持数字或字符串数字，便于 Python runner 输出配置时保持宽松。
+    /**
+     * @brief 支持数字或字符串数字，便于 Python runner 输出配置时保持宽松。
+     */
     if (!object.is_object()) return def;
     auto it = object.find(key);
     if (it == object.end() || it->is_null()) return def;
@@ -80,7 +88,9 @@ uint64_t u64_value(const Json & object, const std::string & key, uint64_t def) {
 }
 
 bool bool_value(const Json & object, const std::string & key, bool def) {
-    // 布尔值支持 true/false 和常见字符串写法。
+    /**
+     * @brief 布尔值支持 true/false 和常见字符串写法。
+     */
     if (!object.is_object()) return def;
     auto it = object.find(key);
     if (it == object.end() || it->is_null()) return def;
@@ -94,7 +104,11 @@ bool bool_value(const Json & object, const std::string & key, bool def) {
 }
 
 std::vector<std::string> string_array(const Json & root, const std::string & key) {
-    // modules 当前只接受字符串数组；非字符串项直接忽略，后续可改成 strict fail。
+    /**
+     * @brief modules 当前只接受字符串数组。
+     *
+     * 非字符串项直接忽略，后续可改成 strict fail。
+     */
     std::vector<std::string> values;
     if (!root.is_object()) return values;
     auto it = root.find(key);
@@ -106,8 +120,12 @@ std::vector<std::string> string_array(const Json & root, const std::string & key
 }
 
 NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
-    // 如果 modules 中显式写了 node_scale，但没有 node_scale 对象，则启用空规则模块。
-    // 空规则不会修改 DAG，但 summary 能证明模块被调用。
+    /**
+     * @brief 解析 NodeScaleModule 配置。
+     *
+     * 如果 modules 中显式写了 node_scale，但没有 node_scale 对象，则启用空规则模块。
+     * 空规则不会修改 DAG，但 summary 能证明模块被调用。
+     */
     NodeScaleConfig config;
     auto it = root.find("node_scale");
     if (it == root.end() || !it->is_object()) {
@@ -132,7 +150,11 @@ NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
 }
 
 HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
-    // HiCache state prediction 只读取配置事实，不在这里推导策略结果。
+    /**
+     * @brief 解析 HiCache state 模块的显式 target config。
+     *
+     * HiCache state prediction 只读取配置事实，不在这里推导策略结果。
+     */
     HiCacheConfig config;
     auto it = root.find("hicache");
     if (it == root.end() || !it->is_object()) {
@@ -171,7 +193,9 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
 bool ModelConfig::module_enabled(const std::string & name) const { return std::find(modules.begin(), modules.end(), name) != modules.end(); }
 
 ModelConfig ModelConfig::from_file(const std::string & filename) {
-    // C++ 后端只消费窄 model config，不直接理解完整实验配置。
+    /**
+     * @brief C++ 后端只消费窄 model config，不直接理解完整实验配置。
+     */
     auto root = read_json_file(filename);
     if (!root.is_object()) { throw std::runtime_error("Model config root must be a JSON object: " + filename); }
 

@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief HiCache trace event parser 与 token dictionary 解析。
+ */
 #include "trace_graph/modules/hicache/hicache_fact.hpp"
 
 #include "trace_graph/core/trace_event.hpp"
@@ -106,6 +110,12 @@ Json parse_json_fragment(const std::string & raw) {
     }
 }
 
+/**
+ * @brief 将 JSON 中的 token 表示规范化为 HiCacheToken。
+ *
+ * parser 接受数字、字符串数字或数组形式；非法 item 被跳过，避免因为单个坏字段中断
+ * 整个 trace 的解析。
+ */
 HiCacheToken token_from_json(const Json & value) {
     HiCacheToken token;
     auto append_word = [&](const Json & item) {
@@ -134,6 +144,7 @@ HiCacheToken token_from_json(const Json & value) {
     return token;
 }
 
+/** @brief 从 JSON array 构造 token path，并丢弃无法解析的 token。 */
 HiCacheTokenPath token_path_from_json(const Json & value) {
     HiCacheTokenPath path;
     if (!value.is_array()) return path;
@@ -152,6 +163,12 @@ HiCacheTokenPath slice_tokens(const HiCacheTokenPath & tokens, uint64_t begin, u
 
 } // namespace
 
+/**
+ * @brief 识别 HiCache event 域。
+ *
+ * 这里兼容 target_id、domain/category 和事件名前缀三类探针输出形态；识别事件不等于
+ * 允许其进入状态模型，后续仍由 router 做 invariant 输入契约检查。
+ */
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
     const auto target_id = lower(event.arg("target_id"));
     if (starts_with(target_id, "hiradix.") || starts_with(target_id, "hicache.") || starts_with(target_id, "hicache_controller.")) return true;
@@ -161,6 +178,7 @@ bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
     return starts_with(event.name, "HiCache::") || starts_with(event.name, "hicache_");
 }
 
+/** @brief 在第一轮扫描中收集 token dictionary。 */
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     if (!is_hicache_event(event)) return;
     for (const auto & [key, raw] : event.args) {
@@ -169,6 +187,11 @@ void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     }
 }
 
+/**
+ * @brief 解析并保存一个 dictionary JSON 片段。
+ *
+ * dictionary 只提供 token_path_id 到 token_ids 的映射，不携带 page residency 语义。
+ */
 void HiCacheFactParser::observe_dictionary_value(const std::string & raw) {
     auto value = parse_json_fragment(raw);
     if (!value.is_object()) return;
@@ -180,6 +203,7 @@ void HiCacheFactParser::observe_dictionary_value(const std::string & raw) {
     token_paths_[path_id] = token_path_from_json(*ids);
 }
 
+/** @brief 从 event arg 中解析 token span 元数据。 */
 HiCacheTokenSpan HiCacheFactParser::parse_span(const TraceEvent & event, const std::string & key) const {
     HiCacheTokenSpan span;
     auto value = parse_json_fragment(event.arg(key));
@@ -194,6 +218,11 @@ HiCacheTokenSpan HiCacheFactParser::parse_span(const TraceEvent & event, const s
     return span;
 }
 
+/**
+ * @brief 使用已观察 dictionary 解析 span。
+ *
+ * dictionary 不存在或区间非法时返回空 path，让上层记录缺失 invariant。
+ */
 HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) const {
     if (!span.valid) return {};
     auto it = token_paths_.find(span.path_id);
@@ -201,6 +230,12 @@ HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) 
     return slice_tokens(it->second, span.begin, span.end);
 }
 
+/**
+ * @brief 将 TraceEvent 转换为 HiCacheFact。
+ *
+ * parse 只做字段规范化和 token span 解析，不判断 role 是否可建模，也不把 source
+ * evidence 转换成 target state。
+ */
 HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {
     HiCacheFact fact;
     fact.source_node_id = node_id;

@@ -23,6 +23,8 @@ class ProfilingRuntimeConfig:
     debug: bool
 
     def to_manifest_fragment(self) -> dict[str, Any]:
+        """生成写入 profile manifest 的采集配置摘要。"""
+
         return {
             "enabled": self.enabled,
             "channels_enabled": list(self.channels),
@@ -75,6 +77,11 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
 
 
 def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
+    """规整采集 channel 列表。
+
+    未显式配置时按各 channel 的 enabled 字段推断，仍只允许当前主线认可的三类 channel。
+    """
+
     channels = _as_str_tuple(value, default=(), field_name="profiling.channels")
     if not channels:
         inferred: list[str] = []
@@ -97,6 +104,8 @@ def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _channel_cfg(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
+    """读取 `profiling.<channel>` 对象；缺失或类型错误时返回空配置。"""
+
     profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
     current = profiling.get(profiling_key)
     if isinstance(current, dict):
@@ -105,6 +114,8 @@ def _channel_cfg(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
 
 
 def _parse_python_targets(raw: Any) -> tuple[dict[str, Any], ...]:
+    """解析 Python probe target 列表并校验 fact contract。"""
+
     if raw is None:
         return ()
     if not isinstance(raw, list):
@@ -128,6 +139,12 @@ def _parse_python_targets(raw: Any) -> tuple[dict[str, Any], ...]:
 
 
 def _validate_python_target_fact(item: dict[str, Any], index: int) -> None:
+    """校验 Python probe target 的 fact 元数据。
+
+    这里强制声明 class/role/granularity/model_input/dag_input，避免 probe 配置隐式生成
+    可进入模型的事实。
+    """
+
     fact = item.get("fact")
     prefix = f"profiling.python_probe.targets[{index}].fact"
     if not isinstance(fact, dict):
@@ -149,6 +166,8 @@ def _validate_python_target_fact(item: dict[str, Any], index: int) -> None:
 
 
 def _as_str_tuple(value: Any, *, default: tuple[str, ...], field_name: str) -> tuple[str, ...]:
+    """把字符串或字符串数组规整为 tuple。"""
+
     if value is None:
         return default
     if isinstance(value, str):
@@ -159,6 +178,8 @@ def _as_str_tuple(value: Any, *, default: tuple[str, ...], field_name: str) -> t
 
 
 def _as_bool(value: Any, *, default: bool) -> bool:
+    """只接受 JSON boolean，避免字符串布尔值在配置里被静默解释。"""
+
     if value is None:
         return default
     if isinstance(value, bool):
@@ -167,6 +188,8 @@ def _as_bool(value: Any, *, default: bool) -> bool:
 
 
 def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
+    """保持顺序去重。"""
+
     result: list[str] = []
     seen: set[str] = set()
     for value in values:

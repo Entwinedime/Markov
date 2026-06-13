@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 在 runtime 镜像中从子模块源码安装 SGLang NPU 版本。
+#
+# 该脚本由 Dockerfile 调用，假设仓库已经挂载/复制到镜像内，并且不负责
+# 初始化子模块。
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -9,10 +13,12 @@ fi
 TRACE_SIM_ROOT="$1"
 SGLANG_SRC="${TRACE_SIM_ROOT}/third_party/sglang"
 
+# 输出带时间戳的安装日志。
 log() {
     echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*"
 }
 
+# 加载 Ascend toolkit 环境并补齐 driver library path。
 source_ascend_env() {
     set +u
     # shellcheck disable=SC1091
@@ -22,6 +28,7 @@ source_ascend_env() {
     export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
 }
 
+# 把 SGLang NPU pyproject 切换为标准 pyproject.toml。
 prepare_sglang_pyproject() {
     local pyproject_dir="${SGLANG_SRC}/python"
     local npu_pyproject="${pyproject_dir}/pyproject_npu.toml"
@@ -35,6 +42,7 @@ prepare_sglang_pyproject() {
     cp "$npu_pyproject" "${pyproject_dir}/pyproject.toml"
 }
 
+# 以 editable 方式安装 SGLang Python 包和 NPU 依赖。
 install_sglang() {
     log "Installing SGLang: ${SGLANG_SRC}"
     prepare_sglang_pyproject
@@ -44,6 +52,7 @@ install_sglang() {
     )
 }
 
+# 安装入口：检查源码树、加载环境并执行安装。
 main() {
     source_ascend_env
 

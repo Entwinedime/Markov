@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""生成确定性 HiCache 分阶段 workload。
+
+该脚本只负责向目标 SGLang server 发送可复现请求，并输出 workload_report。
+report 中的 expected mechanisms 用于 profile quality 审计，不作为 C++ state model 输入。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -45,24 +51,34 @@ WRITE_BACK_PHASE_EXPECTED_MECHANISMS = {
 
 
 def now_ms() -> float:
+    """返回单调时钟毫秒值，用于请求 latency 统计。"""
+
     return time.perf_counter() * 1000.0
 
 
 def wall_ms() -> float:
+    """返回墙钟毫秒值，用于把 workload 时间窗写入报告。"""
+
     return time.time() * 1000.0
 
 
 def make_shared_prefix(label: str, repeat: int) -> str:
+    """构造共享 prefix，使多个请求命中同一 cache path 前缀。"""
+
     unit = f"HiCache calibration {label} shared prefix block. "
     return unit * repeat
 
 
 def make_prompt(prefix: str, family: str, index: int, suffix_repeat: int) -> str:
+    """在共享 prefix 后拼接可区分 suffix，形成同族请求。"""
+
     suffix = f" request family {family} item {index}. " * suffix_repeat
     return prefix + suffix
 
 
 def request_generate(url: str, prompt: str, max_new_tokens: int, timeout_sec: int) -> Dict[str, Any]:
+    """调用 SGLang `/generate`，返回请求状态和 latency 事实。"""
+
     body = {
         "text": prompt,
         "sampling_params": {
@@ -105,6 +121,8 @@ def request_generate(url: str, prompt: str, max_new_tokens: int, timeout_sec: in
 
 
 def phase_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    """汇总一个 phase 的请求数量、错误数和 latency 分布。"""
+
     rows = list(rows)
     latencies = [float(row["latency_ms"]) for row in rows]
     ok = [row for row in rows if row.get("status") == "ok"]
@@ -123,6 +141,8 @@ def phase_stats(rows: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """根据 CLI 参数生成固定顺序的 phase/request 计划。"""
+
     prefix_a = make_shared_prefix("A", args.shared_prefix_repeat)
     prefix_b = make_shared_prefix("B", args.shared_prefix_repeat)
     prefix_c = make_shared_prefix("C", args.shared_prefix_repeat)
@@ -183,6 +203,8 @@ def expected_mechanisms_for_phase(phase: str, args: argparse.Namespace) -> List[
 
 
 def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.Namespace) -> None:
+    """写出 JSON/JSONL workload report，供 profile manifest 和质量审计引用。"""
+
     output_dir.mkdir(parents=True, exist_ok=True)
     by_phase: Dict[str, List[Dict[str, Any]]] = {phase: [] for phase in PHASE_ORDER}
     for row in rows:
@@ -212,10 +234,14 @@ def write_outputs(output_dir: Path, rows: List[Dict[str, Any]], args: argparse.N
 
 
 def rows_for_selected_latency(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """筛选长期对比使用的关键 latency phase。"""
+
     return [row for row in rows if row.get("phase") in {"reuse_A_after_pressure", "prefetch_reuse_C", "backup_wait_A"}]
 
 
 def main() -> int:
+    """CLI 入口：执行请求计划并写出 workload report。"""
+
     parser = argparse.ArgumentParser(description="Run deterministic phased requests to exercise SGLang HiCache movement paths.")
     parser.add_argument("--base-url", default="http://127.0.0.1:30001", help="SGLang server base URL.")
     parser.add_argument("--output-dir", required=True, help="Directory that will receive workload_report.json/jsonl.")

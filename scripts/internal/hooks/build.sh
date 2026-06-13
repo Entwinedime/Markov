@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 构建 LD_PRELOAD hook 的内部入口。
+#
+# 该脚本既支持宿主机本地 `ld_preload` profile，也支持 Docker runtime 中的
+# 框架 profile；构建目录按 profile 隔离，避免 CMake cache 串用。
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -11,6 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SOURCE_DIR="${ROOT_DIR}/src/profiling/ld_preload"
 
+# 清理来源目录不匹配的旧 CMake cache。
 prepare_build_dir() {
     local build_dir="$1"
     local source_dir="$2"

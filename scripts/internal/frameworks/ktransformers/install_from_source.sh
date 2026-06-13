@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 在 runtime 镜像中从子模块源码安装 KTransformers archive NPU runtime。
+#
+# KTransformers 当前依赖 archive 子树和若干源码补丁；这些补丁只修正构建
+# 入口和 NPU 选择逻辑，不生成 profiling fixture。
 set -euo pipefail
 
 if [ $# -ne 1 ]; then
@@ -10,10 +14,12 @@ TRACE_SIM_ROOT="$1"
 KTRANSFORMERS_SRC="${TRACE_SIM_ROOT}/third_party/ktransformers"
 KTRANSFORMERS_RUNTIME_SRC="${KTRANSFORMERS_SRC}/archive"
 
+# 输出带时间戳的安装日志。
 log() {
     echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*"
 }
 
+# 加载 Ascend toolkit/ATB 环境并设置 runtime 必需变量。
 source_ascend_env() {
     set +u
     # shellcheck disable=SC1091
@@ -27,6 +33,7 @@ source_ascend_env() {
     export INF_NAN_MODE_FORCE_DISABLE=1
 }
 
+# 验证 torch 与 torch_npu 可导入，并输出版本信息。
 check_torch_npu() {
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 - <<'PY'
 from pathlib import Path
@@ -49,6 +56,7 @@ print(f"torch_npu={namespace.get('__version__', 'unknown')}")
 PY
 }
 
+# 在 ARM 平台禁用会冲突的 llamafile arm82 宏别名。
 patch_arm82_llamafile() {
     case "$(uname -m)" in
         aarch64|arm64) ;;
@@ -87,6 +95,7 @@ PY
     done
 }
 
+# 固定 archive 默认 attention page/chunk 配置，匹配当前运行环境。
 patch_archive_config() {
     local config="${KTRANSFORMERS_RUNTIME_SRC}/ktransformers/configs/config.yaml"
     if [ ! -f "$config" ]; then
@@ -152,6 +161,7 @@ path.write_text("\n".join(out) + "\n", encoding="utf-8")
 PY
 }
 
+# 允许通过环境变量显式选择 NPU build，避免安装期误判。
 patch_archive_setup_npu_backend() {
     local setup_py="${KTRANSFORMERS_RUNTIME_SRC}/setup.py"
     if [ ! -f "$setup_py" ]; then
@@ -211,6 +221,7 @@ path.write_text(text.replace(old, new), encoding="utf-8")
 PY
 }
 
+# 让 balance_serve 优先使用外部传入的 TORCH_NPU_PATH。
 patch_balance_serve_torch_npu_lookup() {
     local cmake_file="${KTRANSFORMERS_RUNTIME_SRC}/csrc/balance_serve/CMakeLists.txt"
     if [ ! -f "$cmake_file" ]; then
@@ -259,6 +270,7 @@ path.write_text(text.replace(old, new), encoding="utf-8")
 PY
 }
 
+# 执行 KTransformers archive runtime 安装。
 install_archive_runtime() {
     if [ ! -f "${KTRANSFORMERS_RUNTIME_SRC}/install.sh" ]; then
         log "Missing ktransformers archive install script: ${KTRANSFORMERS_RUNTIME_SRC}/install.sh"
@@ -297,6 +309,7 @@ PY
     )
 }
 
+# 安装入口：校验源码树、应用构建补丁并执行安装。
 main() {
     if [ ! -d "$KTRANSFORMERS_SRC" ]; then
         log "Missing ktransformers source tree: ${KTRANSFORMERS_SRC}"

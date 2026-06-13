@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 初始化项目当前需要的第三方源码子模块。
+#
+# 只拉取 SGLang、KTransformers 及 KTransformers archive 依赖，不维护测试
+# fixture 或临时验证数据。
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

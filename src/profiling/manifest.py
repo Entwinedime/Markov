@@ -57,6 +57,8 @@ def build_profile_manifest(
 
 
 def _path_info(path: Path) -> dict[str, Any]:
+    """生成单个 trace 文件的存在性和大小摘要。"""
+
     return {
         "path": str(path),
         "exists": path.exists(),
@@ -65,4 +67,6 @@ def _path_info(path: Path) -> dict[str, Any]:
 
 
 def _glob_files(path: Path, pattern: str) -> list[dict[str, Any]]:
+    """按 glob 收集 trace 文件，并转换成 manifest 路径条目。"""
+
     return [_path_info(item) for item in sorted(path.glob(pattern)) if item.is_file()]

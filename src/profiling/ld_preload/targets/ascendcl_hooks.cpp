@@ -3,6 +3,15 @@
 #include <memory>
 #include <string>
 
+/**
+ * @file
+ * @brief AscendCL runtime 同步与 event wrapper。
+ *
+ * 这些 wrapper 只记录 runtime 参数和调用耗时，用于补齐 torch trace 中可能缺失的 sync 边界。
+ * 采集层不推导 target policy，也不生成 HiCache target 行为。
+ */
+
+/** @brief 允许通过 HOOK_ASCENDCL_SO_PATH 指向非默认 AscendCL 安装路径。 */
 static std::string ResolveAscendClSoPath() {
     const char * env_path = std::getenv("HOOK_ASCENDCL_SO_PATH");
     if (env_path != nullptr && env_path[0] != '\0') { return env_path; }
@@ -10,6 +19,13 @@ static std::string ResolveAscendClSoPath() {
 }
 
 static const std::string TargetlibascendclSoPath{ResolveAscendClSoPath()};
+
+/**
+ * @name AscendCL 同步与 event wrapper
+ *
+ * wrapper 参数统一转换成字符串写入 Function-Args；真实函数返回值和副作用必须保持不变。
+ * @{
+ */
 
 static const std::string MangledAclrtSynchronizeStream{"aclrtSynchronizeStream"};
 using aclrt_synchronize_stream_fn_t = int (*)(void * stream);
@@ -101,3 +117,5 @@ int aclrt_stream_wait_event_hook(void * stream, void * event) {
                          stream,
                          event);
 }
+
+/** @} */

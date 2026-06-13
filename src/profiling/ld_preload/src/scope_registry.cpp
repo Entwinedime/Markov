@@ -8,6 +8,11 @@ ScopeRegistry & ScopeRegistry::Get() {
 }
 
 void ScopeRegistry::RegisterScope(const std::string & scope_name, const FunctionScope & scope) {
+    /**
+     * @brief 只注册可匹配的完整函数范围。
+     *
+     * 缺少 end 的符号不能用于 caller 过滤；直接忽略可避免 RelationRules 误判调用关系。
+     */
     if (scope_name.empty() || !scope.Contains(scope.begin)) { return; }
 
     std::lock_guard<std::mutex> lock(mtx_);

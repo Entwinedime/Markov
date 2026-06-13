@@ -31,6 +31,8 @@ _INTERNAL_TARGET_MODULES = (
 
 
 def _truthy(value: str | None) -> bool:
+    """解析 probe 环境变量中常见的 true/false 写法。"""
+
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
@@ -42,6 +44,8 @@ def _hicache_state_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 `hicache_state:self`，只生成 validation-only state snapshot。"""
+
     if source != "hicache_state:self":
         return (False, False, None)
     if not _truthy(os.environ.get("TRACE_SIM_HICACHE_STATE_TRACE")):
@@ -84,6 +88,8 @@ def _token_path_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 `token_path:` source，生成完整 token dictionary 引用。"""
+
     if not source.startswith("token_path:"):
         return (False, False, None)
     found, value = _extract_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -98,6 +104,8 @@ def _token_span_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 `token_span:` source，生成同一 token path 内的 span 引用。"""
+
     if not source.startswith("token_span:"):
         return (False, False, None)
     found, value = _extract_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -112,6 +120,8 @@ def _request_token_path_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 request 级 token path source，覆盖 active/fill/committed 等模式。"""
+
     if not source.startswith("request_token_path:"):
         return (False, False, None)
     found, value = _extract_request_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -126,6 +136,8 @@ def _request_token_span_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 request 级 token span source，避免重复携带完整 token 列表。"""
+
     if not source.startswith("request_token_span:"):
         return (False, False, None)
     found, value = _extract_request_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -140,6 +152,8 @@ def _request_token_count_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 request token 数量 source，用于 target-derived page 投影。"""
+
     if not source.startswith("request_token_count:"):
         return (False, False, None)
     found, tokens = _extract_request_tokens(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -154,6 +168,8 @@ def _token_path_concat_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 prefix/suffix 拼接后的 token path source。"""
+
     if not source.startswith("token_path_concat:"):
         return (False, False, None)
     found, value = _extract_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -168,6 +184,8 @@ def _token_span_concat_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """处理 prefix/suffix 拼接后的 token span source。"""
+
     if not source.startswith("token_span_concat:"):
         return (False, False, None)
     found, value = _extract_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -182,6 +200,8 @@ def _node_token_path_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """从 radix node 反推出根到当前节点的完整 token path。"""
+
     if not source.startswith("node_token_path:"):
         return (False, False, None)
     found, value = _extract_node_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -196,6 +216,8 @@ def _node_token_span_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """从 radix node 生成完整路径的 span 描述。"""
+
     if not source.startswith("node_token_span:"):
         return (False, False, None)
     found, value = _extract_node_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -210,6 +232,8 @@ def _node_token_count_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """读取 radix node 的完整路径 token 数量。"""
+
     if not source.startswith("node_token_count:"):
         return (False, False, None)
     found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -226,6 +250,8 @@ def _hicache_node_summary_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集单个 HiCache node 的调试摘要。"""
+
     if not source.startswith("hicache_node_summary:"):
         return (False, False, None)
     found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -242,6 +268,8 @@ def _hicache_node_chain_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集 node 到 root 的链路摘要，辅助定位 radix tree 结构变化。"""
+
     if not source.startswith("hicache_node_chain:"):
         return (False, False, None)
     found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -258,6 +286,8 @@ def _hicache_evictable_snapshot_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集 evictable device/host leaf 集合摘要。"""
+
     if not source.startswith("hicache_evictable_snapshot:"):
         return (False, False, None)
     found, cache = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -274,6 +304,8 @@ def _hicache_prefetch_progress_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集某个 request 的 prefetch 进度证据。"""
+
     if not source.startswith("hicache_prefetch_progress:"):
         return (False, False, None)
     found, value = _extract_prefetch_progress(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -288,6 +320,8 @@ def _hicache_request_runtime_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集 request 对象上的运行时长度和 anchor 字段。"""
+
     if not source.startswith("hicache_request_runtime:"):
         return (False, False, None)
     found, req = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -304,6 +338,8 @@ def _hicache_scheduler_prefetch_state_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """采集 scheduler 视角的 prefetch 判定上下文。"""
+
     if not source.startswith("hicache_scheduler_prefetch_state:"):
         return (False, False, None)
     parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
@@ -324,6 +360,8 @@ def _node_token_path_concat_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """把 node 路径和 suffix token 拼成新的 token dictionary。"""
+
     if not source.startswith("node_token_path_concat:"):
         return (False, False, None)
     found, value = _extract_node_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -338,6 +376,8 @@ def _node_token_span_concat_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """把 node 路径和 suffix token 拼成 span 描述。"""
+
     if not source.startswith("node_token_span_concat:"):
         return (False, False, None)
     found, value = _extract_node_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
@@ -352,6 +392,8 @@ def _hicache_cache_scope_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """生成 rank/object 绑定的 cache_scope 路由键。"""
+
     if not source.startswith("hicache_cache_scope:"):
         return (False, False, None)
     found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -368,6 +410,8 @@ def _hicache_seq_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """按 cache_scope 生成单调 seq_no，维持 atomic fact 顺序。"""
+
     if not source.startswith("hicache_seq:"):
         return (False, False, None)
     found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
@@ -387,6 +431,8 @@ def _hicache_config_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """从 HiCache 对象抽取 capacity/policy 配置事实。"""
+
     if not source.startswith("hicache_config:"):
         return (False, False, None)
     parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
@@ -410,6 +456,8 @@ def _hicache_requested_pages_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
+    """按 source page size 把请求 token 数投影成页数。"""
+
     if not source.startswith("hicache_requested_pages:"):
         return (False, False, None)
     parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
@@ -439,6 +487,8 @@ def _extract_token_path(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """按 source spec 读取 token path 并生成 dictionary 记录。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
@@ -456,6 +506,8 @@ def _extract_token_span(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """按 source spec 读取完整 token path，并返回覆盖全路径的 span。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
@@ -473,6 +525,8 @@ def _extract_request_token_path(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """从 request 对象提取指定模式的 token path。"""
+
     found, tokens, scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
     if not found:
         return (False, None)
@@ -486,6 +540,8 @@ def _extract_request_token_span(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """从 request 对象提取指定模式的 token span。"""
+
     found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
     if not found:
         return (False, None)
@@ -499,6 +555,8 @@ def _extract_request_tokens(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
+    """从 request source spec 返回 token 列表。"""
+
     found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
     return (found, tokens)
 
@@ -510,6 +568,8 @@ def _extract_request_tokens_and_scope(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any], str]:
+    """解析 request source spec，返回 token 列表和可选 cache scope。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, [], "")
@@ -529,6 +589,8 @@ def _extract_token_path_concat(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """拼接两个 token source 并生成 token dictionary。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (False, None)
@@ -548,6 +610,8 @@ def _extract_token_span_concat(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """拼接两个 token source 并生成覆盖全路径的 span。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (False, None)
@@ -566,6 +630,8 @@ def _extract_node_token_path(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """从 radix node 提取根到节点的 token path dictionary。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
@@ -583,6 +649,8 @@ def _extract_node_token_span(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """从 radix node 提取根到节点的 token span。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
@@ -600,6 +668,8 @@ def _extract_node_token_path_concat(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """把 radix node 全路径和 suffix token 合成为 dictionary。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (False, None)
@@ -619,6 +689,8 @@ def _extract_node_token_span_concat(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """把 radix node 全路径和 suffix token 合成为 span。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (False, None)
@@ -638,6 +710,8 @@ def _extract_source_value(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """委托通用 probe source 语法读取原始值。"""
+
     return _base._extract_raw_value(source, field_name, bound, args, kwargs, result)
 
 
@@ -648,11 +722,15 @@ def _scope_from_optional_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> str:
+    """从可选 source 读取 cache_scope，缺失时返回空字符串。"""
+
     found, value = _extract_source_value(source, "cache_scope", bound, args, kwargs, result)
     return _cache_scope_key(value) if found else ""
 
 
 def _cache_scope_key(value: Any) -> str:
+    """生成包含 rank 和对象身份的 cache scope 路由键。"""
+
     rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown"))
     if value is None:
         return f"rank:{rank}:unknown"
@@ -662,6 +740,8 @@ def _cache_scope_key(value: Any) -> str:
 
 
 def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any]:
+    """生成 token span 记录，引用同一 hash 算法下的 path id。"""
+
     return {
         "path_id": _token_path_id(tokens),
         "begin": begin,
@@ -672,6 +752,8 @@ def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any
 
 
 def _token_path_record(tokens: list[Any], scope: str = "") -> dict[str, Any]:
+    """生成 token dictionary 记录，并在同一 scope 内只携带一次 token_ids。"""
+
     path_id = _token_path_id(tokens)
     row: dict[str, Any] = {
         "token_path_id": path_id,
@@ -687,6 +769,8 @@ def _token_path_record(tokens: list[Any], scope: str = "") -> dict[str, Any]:
 
 
 def _token_path_id(tokens: list[Any]) -> str:
+    """按 SGLang token 序列生成稳定 path hash。"""
+
     hasher = hashlib.sha256()
     for token in tokens:
         _hash_one_token_id(hasher, token)
@@ -694,6 +778,8 @@ def _token_path_id(tokens: list[Any]) -> str:
 
 
 def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
+    """把 token id 转成 JSON 可写整数列表。"""
+
     result: list[Any] = []
     for token in tokens:
         if isinstance(token, (list, tuple)):
@@ -704,6 +790,8 @@ def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
 
 
 def _hash_one_token_id(hasher: "hashlib._Hash", token: Any) -> None:
+    """把单个 token 或复合 token 按 u32le 写入 hash。"""
+
     if isinstance(token, (list, tuple)):
         for item in token:
             hasher.update(int(item).to_bytes(4, byteorder="little", signed=False))
@@ -712,6 +800,8 @@ def _hash_one_token_id(hasher: "hashlib._Hash", token: Any) -> None:
 
 
 def _safe_int(value: Any) -> int | None:
+    """宽松解析整数，避免 None/bool 污染容量和长度字段。"""
+
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -740,6 +830,8 @@ def _tokens_for_path(value: Any) -> list[Any]:
 
 
 def _request_tokens(req: Any, mode: str) -> list[Any]:
+    """按 SGLang request 阶段选择可建模 token 序列。"""
+
     normalized = (mode or "active").lower()
     if normalized == "fill":
         return _tokens_for_path(getattr(req, "fill_ids", None))
@@ -766,6 +858,8 @@ def _request_tokens(req: Any, mode: str) -> list[Any]:
 
 
 def _cache_config_record(obj: Any) -> dict[str, Any]:
+    """生成 HiCache 配置事实摘要，供 target config 与质量审计使用。"""
+
     capacity = _snapshot_capacity(obj)
     thresholds = {
         "write_through_threshold": capacity.get("write_through_threshold"),
@@ -828,6 +922,8 @@ def _snapshot_hicache_object(obj: Any) -> dict[str, Any]:
 
 
 def _collect_radix_nodes(obj: Any) -> list[dict[str, Any]]:
+    """遍历可能的 radix tree 入口，采集去重后的 node 快照。"""
+
     candidates = []
     for attr in ("root_node", "root", "tree_root", "node"):
         if hasattr(obj, attr):
@@ -855,6 +951,8 @@ def _collect_radix_nodes(obj: Any) -> list[dict[str, Any]]:
 
 
 def _iter_children(node: Any) -> list[Any]:
+    """读取 radix node 的 children 集合，兼容不同字段名。"""
+
     children = []
     for attr in ("children", "childs", "child_nodes"):
         value = getattr(node, attr, None)
@@ -866,6 +964,8 @@ def _iter_children(node: Any) -> list[Any]:
 
 
 def _snapshot_node(node: Any) -> dict[str, Any]:
+    """采集单个 radix node 的状态字段。"""
+
     parent = getattr(node, "parent", None)
     hash_value = _jsonable_compact(getattr(node, "hash_value", None))
     key_value = getattr(node, "key", getattr(node, "token_ids", None))
@@ -890,6 +990,8 @@ def _snapshot_node(node: Any) -> dict[str, Any]:
 
 
 def _node_summary_record(node: Any) -> dict[str, Any]:
+    """生成更适合事件 payload 的 node 摘要。"""
+
     parent = getattr(node, "parent", None)
     key_value = getattr(node, "key", getattr(node, "token_ids", None))
     value = _first_attr(node, ("value", "device_value", "device_indices"))
@@ -917,6 +1019,8 @@ def _node_summary_record(node: Any) -> dict[str, Any]:
 
 
 def _node_chain_record(node: Any) -> list[dict[str, Any]]:
+    """采集 root 到当前 node 的摘要链，限制长度避免 trace 膨胀。"""
+
     chain = []
     seen: set[int] = set()
     current = node
@@ -928,6 +1032,8 @@ def _node_chain_record(node: Any) -> list[dict[str, Any]]:
 
 
 def _evictable_snapshot_record(cache: Any) -> dict[str, Any]:
+    """采集 device/host evictable leaf 的数量和样本。"""
+
     device_leaves = list(getattr(cache, "evictable_leaves", []) or [])
     host_leaves = list(getattr(cache, "evictable_host_leaves", []) or [])
     return {
@@ -941,6 +1047,8 @@ def _evictable_snapshot_record(cache: Any) -> dict[str, Any]:
 
 
 def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> list[Any]:
+    """沿 parent 链拼出 radix node 的完整 token key。"""
+
     if node is None:
         return []
     identity = id(node)
@@ -962,6 +1070,8 @@ def _full_key_tokens(node: Any, cache: dict[int, list[Any]] | None = None) -> li
 
 
 def _snapshot_controller(obj: Any) -> dict[str, Any]:
+    """采集 HiCache controller 队列和当前 storage operation 摘要。"""
+
     controller = _first_attr(obj, ("cache_controller", "controller")) or obj
     queues = {}
     for attr in ("load_queue", "write_queue", "prefetch_queue", "backup_queue", "ack_queue"):
@@ -986,6 +1096,8 @@ def _extract_prefetch_progress(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, dict[str, Any]]:
+    """读取 request 当前 prefetch 进度和 operation 完成证据。"""
+
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (False, {})
@@ -1031,6 +1143,8 @@ def _extract_prefetch_progress(
 
 
 def _request_runtime_record(req: Any) -> dict[str, Any]:
+    """采集 request 生命周期中与 cache state 相关的运行时字段。"""
+
     commit_len = _safe_int(getattr(req, "kv_committed_len", None))
     cache_commit_len = getattr(req, "_cache_commit_len", None)
     effective_commit_len = commit_len
@@ -1062,6 +1176,8 @@ def _request_runtime_record(req: Any) -> dict[str, Any]:
 
 
 def _scheduler_prefetch_state_record(scheduler: Any, req: Any) -> dict[str, Any]:
+    """采集 scheduler 做 prefetch 判定时可见的上下文。"""
+
     tree_cache = getattr(scheduler, "tree_cache", None)
     root_node = getattr(tree_cache, "root_node", None)
     fill_tokens = _request_tokens(req, "fill")
@@ -1105,10 +1221,14 @@ def _scheduler_prefetch_state_record(scheduler: Any, req: Any) -> dict[str, Any]
 
 
 def _summary_or_none(node: Any) -> dict[str, Any] | None:
+    """可空 node 摘要辅助函数。"""
+
     return _node_summary_record(node) if node is not None else None
 
 
 def _chain_or_empty(node: Any) -> list[dict[str, Any]]:
+    """可空 node chain 辅助函数。"""
+
     return _node_chain_record(node) if node is not None else []
 
 
@@ -1184,6 +1304,8 @@ def _snapshot_pool_capacity(pool: Any, page_size: int | None) -> dict[str, Any]:
 
 
 def _safe_call_int(obj: Any, method_name: str) -> int | None:
+    """安全调用无参方法并解析整数结果。"""
+
     method = getattr(obj, method_name, None) if obj is not None else None
     if not callable(method):
         return None
@@ -1194,6 +1316,8 @@ def _safe_call_int(obj: Any, method_name: str) -> int | None:
 
 
 def _safe_call_bool(obj: Any, method_name: str) -> bool | None:
+    """安全调用无参方法并解析布尔结果。"""
+
     method = getattr(obj, method_name, None) if obj is not None else None
     if not callable(method):
         return None
@@ -1204,18 +1328,24 @@ def _safe_call_bool(obj: Any, method_name: str) -> bool | None:
 
 
 def _page_count_from_tokens(tokens: int | None, page_size: int | None) -> int | None:
+    """把 token 容量向下投影为完整 page 数。"""
+
     if tokens is None or page_size is None or page_size <= 0:
         return None
     return tokens // page_size
 
 
 def _ceil_div(value: int | None, divisor: int | None) -> int | None:
+    """按 page size 计算请求页数，保留非整页请求。"""
+
     if value is None or divisor is None or divisor <= 0:
         return None
     return (value + divisor - 1) // divisor
 
 
 def _derive_page_sets(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """从 node snapshot 派生 validation-only page state 集合。"""
+
     l1: set[str] = set()
     l2: set[str] = set()
     dirty: set[str] = set()
@@ -1247,6 +1377,8 @@ def _derive_page_sets(nodes: list[dict[str, Any]]) -> dict[str, list[str]]:
 
 
 def _page_keys_from_hash_value(value: Any) -> list[str]:
+    """把 SGLang hash_value 规整成 page key 字符串列表。"""
+
     if value is None:
         return []
     if isinstance(value, list):
@@ -1255,6 +1387,8 @@ def _page_keys_from_hash_value(value: Any) -> list[str]:
 
 
 def _first_attr(obj: Any, names: tuple[str, ...]) -> Any:
+    """按候选字段名顺序读取第一个存在的属性。"""
+
     if obj is None:
         return None
     for name in names:
@@ -1264,6 +1398,8 @@ def _first_attr(obj: Any, names: tuple[str, ...]) -> Any:
 
 
 def _jsonable_compact(value: Any) -> Any:
+    """把对象收敛为短 JSON 值，控制 trace payload 大小。"""
+
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
@@ -1274,11 +1410,15 @@ def _jsonable_compact(value: Any) -> Any:
 
 
 def install(module: ModuleType) -> None:
+    """安装通用 callable probe，并补充 HiCache 内部 hook。"""
+
     _base.install(module)
     _install_internal_hicache_hooks(module)
 
 
 def _install_internal_hicache_hooks(module: ModuleType) -> None:
+    """按 SGLang 模块名安装 HiCache source_actual 内部 hook。"""
+
     module_name = getattr(module, "__name__", "")
     if module_name == "sglang.srt.mem_cache.events":
         mixin = getattr(module, "KVCacheEventMixin", None)
@@ -1343,6 +1483,8 @@ def _install_internal_hicache_hooks(module: ModuleType) -> None:
 
 
 def _wrap_internal_method(cls: Any, method_name: str, wrapper_factory: Any, patch_key: str) -> None:
+    """给指定类方法安装一次性 wrapper，避免重复插桩。"""
+
     if patch_key in _INTERNAL_PATCHED:
         return
     method = getattr(cls, method_name, None)
@@ -1357,6 +1499,8 @@ def _wrap_internal_method(cls: Any, method_name: str, wrapper_factory: Any, patc
 
 
 def _wrap_split_node(method: Any) -> Any:
+    """包装 radix split，记录 split 前后 node 结构变化。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, key: Any, child: Any, split_len: int, *args: Any, **kwargs: Any) -> Any:
         before_child = _node_summary_record(child)
@@ -1383,6 +1527,8 @@ def _wrap_split_node(method: Any) -> Any:
 
 
 def _wrap_delete_leaf(method: Any) -> Any:
+    """包装 radix leaf 删除，记录删除节点及父节点变化。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before_node = _node_summary_record(node)
@@ -1409,6 +1555,8 @@ def _wrap_delete_leaf(method: Any) -> Any:
 
 
 def _wrap_update_leaf_status(method: Any) -> Any:
+    """包装 device evictable leaf 状态更新。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before_member = _set_contains(getattr(self, "evictable_leaves", None), node)
@@ -1437,6 +1585,8 @@ def _wrap_update_leaf_status(method: Any) -> Any:
 
 
 def _wrap_update_host_leaf_status(method: Any) -> Any:
+    """包装 host evictable leaf 状态更新。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before_member = _set_contains(getattr(self, "evictable_host_leaves", None), node)
@@ -1465,6 +1615,8 @@ def _wrap_update_host_leaf_status(method: Any) -> Any:
 
 
 def _wrap_record_store_event(method: Any) -> Any:
+    """包装 KVCacheEventMixin store 事件，记录 node 存储介质。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, medium: Any = None, *args: Any, **kwargs: Any) -> Any:
         result = method(self, node, medium, *args, **kwargs)
@@ -1486,6 +1638,8 @@ def _wrap_record_store_event(method: Any) -> Any:
 
 
 def _wrap_record_remove_event(method: Any) -> Any:
+    """包装 KVCacheEventMixin remove 事件，记录 node 从介质移除。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, medium: Any = None, *args: Any, **kwargs: Any) -> Any:
         result = method(self, node, medium, *args, **kwargs)
@@ -1507,6 +1661,8 @@ def _wrap_record_remove_event(method: Any) -> Any:
 
 
 def _wrap_record_all_cleared_event(method: Any) -> Any:
+    """包装全量清理事件，记录清理后的 evictable 和队列状态。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = method(self, *args, **kwargs)
@@ -1527,6 +1683,8 @@ def _wrap_record_all_cleared_event(method: Any) -> Any:
 
 
 def _wrap_host_ref(direction: str) -> Any:
+    """生成 host ref 计数增减 wrapper factory。"""
+
     def factory(method: Any) -> Any:
         @functools.wraps(method)
         def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1555,6 +1713,8 @@ def _wrap_host_ref(direction: str) -> Any:
 
 
 def _wrap_hit_count_update(method: Any) -> Any:
+    """包装 hit/write 计数更新，记录 write-back 相关 node 标记。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before = _node_summary_record(node)
@@ -1581,6 +1741,8 @@ def _wrap_hit_count_update(method: Any) -> Any:
 
 
 def _wrap_init_load_back(method: Any) -> Any:
+    """包装 load-back 初始化，记录请求 quota、anchor 和队列变化。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, params: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1612,6 +1774,8 @@ def _wrap_init_load_back(method: Any) -> Any:
 
 
 def _wrap_load_back(method: Any) -> Any:
+    """包装 load-back 结果，记录 node 从 host 回载到 device 的证据。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1640,6 +1804,8 @@ def _wrap_load_back(method: Any) -> Any:
 
 
 def _wrap_write_backup(method: Any) -> Any:
+    """包装 write_backup 调度，记录待写回 node 和队列变化。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1666,6 +1832,8 @@ def _wrap_write_backup(method: Any) -> Any:
 
 
 def _wrap_write_backup_storage(method: Any) -> Any:
+    """包装 storage write-back 调度，记录异步队列快照。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, node: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1689,6 +1857,8 @@ def _wrap_write_backup_storage(method: Any) -> Any:
 
 
 def _wrap_evict_host(method: Any) -> Any:
+    """包装 host eviction，记录请求和实际释放 token 数。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _evictable_snapshot_record(self)
@@ -1712,6 +1882,8 @@ def _wrap_evict_host(method: Any) -> Any:
 
 
 def _wrap_hiradix_terminate_prefetch(method: Any) -> Any:
+    """包装 HiRadixCache prefetch 终止请求。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, req_id: Any, *args: Any, **kwargs: Any) -> Any:
         before = _prefetch_progress_record_for_req(self, req_id, None)
@@ -1735,6 +1907,8 @@ def _wrap_hiradix_terminate_prefetch(method: Any) -> Any:
 
 
 def _wrap_release_aborted_request(method: Any) -> Any:
+    """包装 abort cleanup，记录 request 相关 prefetch 状态收敛。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, rid: Any, *args: Any, **kwargs: Any) -> Any:
         before = _prefetch_progress_record_for_req(self, rid, None)
@@ -1758,6 +1932,8 @@ def _wrap_release_aborted_request(method: Any) -> Any:
 
 
 def _wrap_pop_prefetch_loaded_tokens(method: Any) -> Any:
+    """包装已加载 prefetch token 消费点。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, req_id: Any, *args: Any, **kwargs: Any) -> Any:
         before = _prefetch_progress_record_for_req(self, req_id, None)
@@ -1781,6 +1957,8 @@ def _wrap_pop_prefetch_loaded_tokens(method: Any) -> Any:
 
 
 def _wrap_writing_check(method: Any) -> Any:
+    """包装 write ack 轮询点，记录写回队列前后状态。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1805,6 +1983,8 @@ def _wrap_writing_check(method: Any) -> Any:
 
 
 def _wrap_loading_check(method: Any) -> Any:
+    """包装 load ack 轮询点，记录回载队列前后状态。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1825,6 +2005,8 @@ def _wrap_loading_check(method: Any) -> Any:
 
 
 def _wrap_drain_storage_control_queues(method: Any) -> Any:
+    """包装 storage control queue drain，记录维护性队列变化。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _async_queue_snapshot(self)
@@ -1845,6 +2027,8 @@ def _wrap_drain_storage_control_queues(method: Any) -> Any:
 
 
 def _wrap_controller_load(method: Any) -> Any:
+    """包装 controller load 入队，记录 host/device token 数。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _controller_queue_snapshot(self)
@@ -1870,6 +2054,8 @@ def _wrap_controller_load(method: Any) -> Any:
 
 
 def _wrap_controller_start_loading(method: Any) -> Any:
+    """包装 controller load 启动，记录 producer 和队列状态。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _controller_queue_snapshot(self)
@@ -1892,6 +2078,8 @@ def _wrap_controller_start_loading(method: Any) -> Any:
 
 
 def _wrap_controller_write(method: Any) -> Any:
+    """包装 controller write 入队，记录 device 到 host 的 token 迁移。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _controller_queue_snapshot(self)
@@ -1917,6 +2105,8 @@ def _wrap_controller_write(method: Any) -> Any:
 
 
 def _wrap_controller_start_writing(method: Any) -> Any:
+    """包装 controller write 启动，记录写队列推进。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         before = _controller_queue_snapshot(self)
@@ -1938,6 +2128,8 @@ def _wrap_controller_start_writing(method: Any) -> Any:
 
 
 def _wrap_controller_prefetch(method: Any) -> Any:
+    """包装 controller prefetch 入队，记录 operation 和队列快照。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = method(self, *args, **kwargs)
@@ -1964,6 +2156,8 @@ def _wrap_controller_prefetch(method: Any) -> Any:
 
 
 def _wrap_prefetch_rate_limited(method: Any) -> Any:
+    """包装 prefetch rate-limit 判断，记录 capacity limit 证据。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = method(self, *args, **kwargs)
@@ -1985,6 +2179,8 @@ def _wrap_prefetch_rate_limited(method: Any) -> Any:
 
 
 def _wrap_storage_hit_query(method: Any) -> Any:
+    """包装 storage hit 查询，记录命中的 hash pages 和 token 数。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
         result = method(self, operation, *args, **kwargs)
@@ -2009,6 +2205,8 @@ def _wrap_storage_hit_query(method: Any) -> Any:
 
 
 def _wrap_terminate_prefetch(method: Any) -> Any:
+    """包装 controller prefetch 终止，记录完成 token 和 hash pages。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, operation: Any, *args: Any, **kwargs: Any) -> Any:
         result = method(self, operation, *args, **kwargs)
@@ -2032,6 +2230,8 @@ def _wrap_terminate_prefetch(method: Any) -> Any:
 
 
 def _wrap_append_host_mem_release(method: Any) -> Any:
+    """包装 host memory release 入队，记录 cleanup request 的目标规模。"""
+
     @functools.wraps(method)
     def wrapped(self: Any, host_indices: Any, *args: Any, **kwargs: Any) -> Any:
         before = _controller_queue_snapshot(self)
@@ -2066,6 +2266,12 @@ def _emit_internal_event(
     dag_input: bool = False,
     model_input: bool = False,
 ) -> None:
+    """发出 HiCache 内部 source_actual/debug 事件。
+
+    默认 `model_input=false`、`dag_input=false`，确保 source actual 只用于质量
+    审计和 oracle 对齐，不会被正常 C++ state model 当作输入事实消费。
+    """
+
     try:
         timestamp = get_writer().now_us()
         scope, seq_no = _next_scope_seq(cache)
@@ -2100,6 +2306,8 @@ def _emit_internal_event(
 
 
 def _next_scope_seq(cache: Any) -> tuple[str, int]:
+    """为同一 cache_scope 分配单调递增 seq_no。"""
+
     scope = _cache_scope_key(cache)
     next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
     _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
@@ -2107,6 +2315,8 @@ def _next_scope_seq(cache: Any) -> tuple[str, int]:
 
 
 def _set_contains(values: Any, item: Any) -> bool:
+    """安全判断集合是否包含对象，兼容自定义容器异常。"""
+
     try:
         return item in values if values is not None else False
     except Exception:
@@ -2114,6 +2324,8 @@ def _set_contains(values: Any, item: Any) -> bool:
 
 
 def _medium_name(value: Any, *, default: str = "") -> str:
+    """把 SGLang medium enum/对象规整成短字符串。"""
+
     if value is None:
         return default
     name = getattr(value, "name", None)
@@ -2124,6 +2336,8 @@ def _medium_name(value: Any, *, default: str = "") -> str:
 
 
 def _queue_size(value: Any) -> int | None:
+    """读取 queue-like 对象长度，优先使用 qsize。"""
+
     qsize = getattr(value, "qsize", None)
     if callable(qsize):
         try:
@@ -2134,6 +2348,8 @@ def _queue_size(value: Any) -> int | None:
 
 
 def _async_queue_snapshot(cache: Any) -> dict[str, Any]:
+    """采集 HiRadixCache 异步写回/回载/prefetch 队列状态。"""
+
     controller = _first_attr(cache, ("cache_controller", "controller")) or cache
     return {
         "ongoing_write_through": _base._safe_len(getattr(cache, "ongoing_write_through", None)) or 0,
@@ -2150,6 +2366,8 @@ def _async_queue_snapshot(cache: Any) -> dict[str, Any]:
 
 
 def _controller_queue_snapshot(controller: Any) -> dict[str, Any]:
+    """采集 HiCacheController 队列状态。"""
+
     return {
         "load_queue": _base._safe_len(getattr(controller, "load_queue", None)) or 0,
         "write_queue": _base._safe_len(getattr(controller, "write_queue", None)) or 0,
@@ -2163,6 +2381,8 @@ def _controller_queue_snapshot(controller: Any) -> dict[str, Any]:
 
 
 def _storage_operation_record(operation: Any) -> dict[str, Any] | None:
+    """把 storage operation 对象收敛为 JSON 摘要。"""
+
     if operation is None:
         return None
     return {
@@ -2179,6 +2399,8 @@ def _storage_operation_record(operation: Any) -> dict[str, Any] | None:
 
 
 def _prefetch_progress_record_for_req(cache: Any, req_id: Any, result: Any) -> dict[str, Any]:
+    """复用 prefetch progress extractor 生成某个 request 的进度记录。"""
+
     found, value = _extract_prefetch_progress(
         "arg:cache,arg:req_id",
         {"cache": cache, "req_id": req_id},
@@ -2190,12 +2412,16 @@ def _prefetch_progress_record_for_req(cache: Any, req_id: Any, result: Any) -> d
 
 
 def _tuple_item(value: Any, index: int) -> Any:
+    """安全读取 tuple/list 中的指定元素。"""
+
     if isinstance(value, (tuple, list)) and index < len(value):
         return value[index]
     return None
 
 
 def _arg_or_kw(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, key: str) -> Any:
+    """按位置或关键字读取 wrapper 参数。"""
+
     if key in kwargs:
         return kwargs[key]
     if index < len(args):

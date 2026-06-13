@@ -12,18 +12,27 @@
 
 namespace HookFrameWork {
 
+/**
+ * @brief 单个 LD_PRELOAD 目标函数的惰性解析器。
+ *
+ * HookTarget 保存 trace 名称、目标符号和目标 so 路径；第一次调用时解析原函数并注册函数范围，
+ * 后续 wrapper 通过 Original() 调用真实实现。
+ */
 template <typename FnType> class HookTarget {
   public:
     HookTarget(const std::string & trace_name, const std::string & mangled_name, const std::string & so_path)
         : trace_name_(trace_name), mangled_name_(mangled_name), so_path_(so_path) {}
 
+    /** @brief 返回真实函数指针；首次调用会解析目标符号。 */
     FnType Original() {
         EnsureInitialized();
         return original_;
     }
 
+    /** @brief Chrome trace 中使用的稳定事件名。 */
     const std::string & TraceName() const { return trace_name_; }
 
+    /** @brief 返回真实函数范围；首次调用会触发符号解析。 */
     const FunctionScope & Scope() {
         EnsureInitialized();
         return scope_;
@@ -35,6 +44,12 @@ template <typename FnType> class HookTarget {
     }
 
     void Initialize() {
+        /**
+         * @brief 初始化阶段必须同时解析真实符号和注册 scope。
+         *
+         * RelationRules 依赖 scope 判断调用关系；如果只解析 original_ 而不注册 scope，
+         * caller 过滤会退化为无法匹配。
+         */
         void * symbol_addr{ResolveSymbol(mangled_name_, so_path_)};
         original_ = reinterpret_cast<FnType>(symbol_addr);
 
@@ -44,6 +59,11 @@ template <typename FnType> class HookTarget {
     }
 
     static FunctionScope BuildScope(void * symbol_addr) {
+        /**
+         * @brief 从动态链接器提供的符号元数据推导函数范围。
+         *
+         * 部分平台或符号缺少 st_size，这时 end 保持 0，RelationRules 不会把该 scope 当作可匹配范围。
+         */
         FunctionScope scope{reinterpret_cast<uintptr_t>(symbol_addr), 0};
 
 #if defined(__GLIBC__) && defined(_GNU_SOURCE)

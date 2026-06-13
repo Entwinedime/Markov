@@ -19,9 +19,18 @@
 
 namespace HookFrameWork {
 
+/**
+ * @brief wrapper 调用范围计时器。
+ *
+ * ScopedTimer 在构造时记录开始时间和 PMU 起始快照，在析构时输出一条 Chrome trace duration event。
+ * 输出字段描述采集事实和 hook profile，不推导建模策略。
+ */
 class ScopedTimer {
   public:
     explicit ScopedTimer(const std::string & name, std::initializer_list<HookArgInfo> trace_args) : name_(name), start_us_(GetRealtimeUs()) {
+        /**
+         * @brief PMU 是可选增强事实；读取失败不影响基础 runtime_op 事件输出。
+         */
 
         pmu_snapshot_ok_ = PmuRecorder::Get().ReadSnapshot(&start_pmu_);
 
@@ -36,6 +45,9 @@ class ScopedTimer {
     }
 
     ~ScopedTimer() {
+        /**
+         * @brief 析构时输出事件，确保 wrapper 中真实函数抛出或提前返回时仍能记录已完成范围。
+         */
         const pid_t tid{static_cast<pid_t>(syscall(SYS_gettid))};
         const uint64_t dur_us{GetRealtimeUs() - start_us_};
         const std::string args_str{"\"args\": {"
@@ -53,6 +65,7 @@ class ScopedTimer {
     }
 
   private:
+    /** @brief 读取墙钟时间，单位为微秒，对齐 Chrome trace 的 ts/dur 字段。 */
     static uint64_t GetRealtimeUs() {
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
@@ -60,6 +73,9 @@ class ScopedTimer {
     }
 
     std::string ProcessPMUSnapshot() {
+        /**
+         * @brief 输出 PMU delta JSON 字段；快照不可用时输出空 Perf-Events 对象。
+         */
         PmuSnapshot end_pmu;
 
         std::ostringstream oss;

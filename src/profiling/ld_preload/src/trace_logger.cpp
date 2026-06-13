@@ -7,7 +7,7 @@
 
 namespace {
 
-// 未配置 HOOK_TRACE_OUTPUT 时使用的默认输出路径。
+/** @brief 未配置 HOOK_TRACE_OUTPUT 时使用的默认输出路径。 */
 const std::string kDefaultTraceOutputPath{"cpu_trace.json"};
 
 } // namespace

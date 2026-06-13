@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief HiCache 状态模型 summary JSON 序列化。
+ */
 #include "trace_graph/modules/hicache/hicache_summary.hpp"
 
 #include <nlohmann/json.hpp>
@@ -8,6 +12,7 @@ namespace {
 
 using Json = nlohmann::json;
 
+/** @brief 将 transition row 序列化为 JSON，并按配置决定是否包含 digest。 */
 Json transition_to_json(const HiCacheStateTransition & transition, bool emit_state_digests) {
     Json row = {
         {"transition_id", transition.transition_id},
@@ -31,8 +36,13 @@ Json transition_to_json(const HiCacheStateTransition & transition, bool emit_sta
 
 } // namespace
 
+/**
+ * @brief 序列化 HiCache summary。
+ *
+ * summary 描述 HiCache 状态验证结果，不参与默认 E2E prediction；final_state 和
+ * transition_trace 是消费者审查 target-state 状态模型的主要入口。
+ */
 std::string HiCacheSummary::to_json() const {
-    // summary 描述 HiCache 状态验证结果，不参与默认 E2E prediction。
     Json transition_rows = Json::array();
     for (const auto & transition : transition_trace) transition_rows.push_back(transition_to_json(transition, target_config.emit_state_digests));
 

@@ -1,3 +1,10 @@
+"""合并 torch profiler、LD_PRELOAD 和 Python probe 生成的 Chrome trace。
+
+trace_merger 是 profiling 到 C++ modeling 之间的 trace 合流层。它只把 runtime
+wrapper 参数注入对应 profiler event，并把 Python sidecar 事实附加到 merged trace；
+它不推导 HiCache policy，也不生成 synthetic model_input 事件。
+"""
+
 import argparse
 import json
 import logging
@@ -18,6 +25,12 @@ DIRECT_MERGED_NAME_PREFIXES = ("HiCache::", "hicache_")
 
 @dataclass
 class MergeReport:
+    """单次 trace merge 的质量摘要。
+
+    report 字段既供 runner 判断合并是否成功，也供后续人工审查匹配质量；字段名
+    保持稳定，避免 downstream validation 需要解析日志文本。
+    """
+
     profiler_path: str
     custom_path: str
     out_path: str
@@ -44,15 +57,25 @@ class MergeReport:
     error: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
+        """转换为 JSON 可序列化字典，保持 report 字段名稳定。"""
+
         return asdict(self)
 
 
 def write_report(report: MergeReport, report_path: str) -> None:
+    """写入 merge report，保证父目录存在。"""
+
     os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
     with open(report_path, "w", encoding="utf-8") as report_file:
         json.dump(report.to_dict(), report_file, indent=2, sort_keys=True)
 
 def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dict]]:
+    """读取 Chrome trace JSON。
+
+    LD_PRELOAD trace 在异常退出时可能缺少最后的 `]`；auto_repair 只修复这一种
+    明确可恢复的尾部缺口，不尝试修复任意损坏 JSON。
+    """
+
     if not file_path or not os.path.exists(file_path):
         logging.error(f"File '{file_path}' does not exist.")
         return None, []
@@ -74,12 +97,16 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
         return None, []
 
 def get_cann_pid(events: List[Dict]) -> int:
+    """从 metadata event 中查找 CANN 进程 pid。"""
+
     return next((
         event.get("pid", 0) for event in events 
         if event.get("name") == "process_name" and event.get("args", {}).get("name") == "CANN"
     ), 0)
 
 def get_earliest_timestamp(events: List[Dict]) -> float:
+    """读取 trace 中最早 timestamp，用于过滤 profiler 开始前的 sidecar 事件。"""
+
     earliest = float('inf')
     for event in events:
         if 'ts' in event:
@@ -87,6 +114,8 @@ def get_earliest_timestamp(events: List[Dict]) -> float:
     return earliest
 
 def build_custom_event_map(custom_events: List[Dict]) -> Dict[Tuple[int, str], Tuple[List[float], List[Dict]]]:
+    """按 `(tid, name)` 建立 LD_PRELOAD event 查找表。"""
+
     temp_map = defaultdict(list)
     for event in custom_events:
         if event.get("ph") == "X" and "args" in event:
@@ -97,12 +126,14 @@ def build_custom_event_map(custom_events: List[Dict]) -> Dict[Tuple[int, str], T
     custom_map = {}
     for key, values in temp_map.items():
         values.sort(key=lambda item: item[0])
-        # Separating timestamps and args for fast bisect array search
+        # 将 timestamp 与 args 分离，search 模式可以直接对 timestamp 数组做 bisect。
         custom_map[key] = ([item[0] for item in values], [item[1] for item in values])
         
     return custom_map
 
 def inject_custom_args(profiler_event: Dict, custom_args: Dict):
+    """把 LD_PRELOAD 采集到的 wrapper 参数注入 profiler event。"""
+
     profiler_args = profiler_event.setdefault("args", {})
     function_args = custom_args.get("Function-Args", {})
 
@@ -113,8 +144,14 @@ def inject_custom_args(profiler_event: Dict, custom_args: Dict):
 
     profiler_args.update(custom_args)
 
-def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int, 
+def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int,
                              earliest_profiler_ts: float, margin_us: float, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
+    """按同 key 顺序一一匹配 profiler event 和 LD_PRELOAD event。
+
+    sequential 模式要求每个 `(tid, name)` 下 profiler/custom 数量完全一致，适合
+    稳定 trace 的严格审计；数量不一致时直接跳过该 key，避免错位注入。
+    """
+
     need_to_be_matched = 0
     successfully_matched = 0
     diagnostics: Dict[str, Any] = {
@@ -126,7 +163,7 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
 
     logging.info("Using 'sequential' matching mode.")
     
-    # * 1. Group active profiler events by their unique identifier (tid, name)
+    # 第一步：按 `(tid, name)` 分组，只处理 CANN pid 下能和 custom_map 对齐的 event。
     profiler_groups = defaultdict(list)
     for event in profiler_events:
         if event.get("ph") != "X" or event.get("pid") != cann_pid or not event.get("name"):
@@ -135,7 +172,7 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
         if key in custom_map:
             profiler_groups[key].append(event)
 
-    # * 2. Iterate each group and try sequential inject
+    # 第二步：分组内按 timestamp 顺序注入，超过 tolerance 的样本保留为未匹配。
     for key, profiler_event_list in profiler_groups.items():
         profiler_event_list.sort(key=lambda e: float(e.get("ts", 0)))
         
@@ -177,8 +214,14 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
 
     return need_to_be_matched, successfully_matched, diagnostics
 
-def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int, 
+def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int,
                          search_window: int, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
+    """用 timestamp 附近窗口搜索匹配 LD_PRELOAD event。
+
+    search 模式允许 profiler/custom 数量不完全一致，但每个 custom event 只能被占用一次；
+    collision 会记录到 diagnostics，避免静默把同一 wrapper 参数注入多个 profiler event。
+    """
+
     need_to_be_matched = 0
     successfully_matched = 0
     used_custom_indices = {}
@@ -251,6 +294,8 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
     return need_to_be_matched, successfully_matched, diagnostics
 
 def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: List[Dict], cutoff_ts: float) -> int:
+    """把不需要匹配 profiler event 的事实事件直接附加到 merged trace。"""
+
     appended_count = 0
     for event in custom_events:
         if should_append_standalone_event(event):
@@ -261,6 +306,8 @@ def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: L
     return appended_count
 
 def should_append_standalone_event(event: Dict[str, Any]) -> bool:
+    """判断 custom event 是否应作为独立事实保留。"""
+
     name = str(event.get("name", ""))
     if name in DIRECT_MERGED_EVENT_NAMES:
         return True
@@ -271,6 +318,8 @@ def should_append_standalone_event(event: Dict[str, Any]) -> bool:
     return domain in {"hicache", "cache_io", "python_probe"}
 
 def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
+    """附加 Python probe sidecar trace，并返回可审计的路径明细。"""
+
     appended_count = 0
     details: List[Dict[str, Any]] = []
     for sidecar_path in sidecar_paths:
@@ -287,11 +336,15 @@ def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List
     return appended_count, details
 
 def sort_events(events: List[Dict[str, Any]]) -> None:
+    """按 Chrome trace 可读性稳定排序 merged event。"""
+
     events.sort(key=lambda event: (float(event.get("ts", 0) or 0), str(event.get("pid", "")), str(event.get("tid", "")), str(event.get("name", ""))))
 
-def merge_traces(profiler_path: str, custom_path: str, out_path: str, 
+def merge_traces(profiler_path: str, custom_path: str, out_path: str,
                  tolerance_us: float = 10000.0, search_window: int = 5, margin_us: float = 0.0, mode: str = "search",
                  sidecar_paths: Optional[List[str]] = None, report_path: Optional[str] = None) -> Dict[str, Any]:
+    """合并单组 torch profiler、LD_PRELOAD 和可选 Python sidecar trace。"""
+
     report = MergeReport(
         profiler_path=profiler_path,
         custom_path=custom_path,
@@ -362,6 +415,8 @@ def merge_traces(profiler_path: str, custom_path: str, out_path: str,
 
 def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000.0, search_window: int = 5,
                    margin_us: float = 100.0, mode: str = "search") -> Dict[str, Any]:
+    """按 profile_manifest.json 批量合并一次 profiling run 的所有 trace channel。"""
+
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     trace = manifest.get("trace") if isinstance(manifest.get("trace"), dict) else {}
     sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
@@ -417,6 +472,8 @@ def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000
     return summary
 
 def existing_paths(items: Any) -> List[str]:
+    """从 manifest 路径条目中筛出真实存在的文件。"""
+
     paths: List[str] = []
     if not isinstance(items, list):
         return paths
@@ -432,6 +489,8 @@ def existing_paths(items: Any) -> List[str]:
     return paths
 
 def map_repo_path(path: str) -> str:
+    """把容器内 trace-sim 路径映射回当前仓库路径。"""
+
     for prefix in ("/workspace/trace-sim", "/opt/trace-sim"):
         if path == prefix:
             return str(Path(__file__).resolve().parents[2])
@@ -440,6 +499,8 @@ def map_repo_path(path: str) -> str:
     return path
 
 def pid_from_path(path: str) -> Optional[str]:
+    """从 trace 文件名中提取 pid，用于多进程 trace 对齐。"""
+
     match = re.search(r"pid(\d+)", path)
     if match:
         return match.group(1)
@@ -449,6 +510,8 @@ def pid_from_path(path: str) -> Optional[str]:
     return None
 
 def select_by_pid_or_index(paths: List[str], pid: Optional[str], index: int) -> Optional[str]:
+    """优先按 pid 选择 trace；缺 pid 时回退到输入顺序。"""
+
     if pid:
         for path in paths:
             if pid_from_path(path) == pid:
@@ -458,6 +521,8 @@ def select_by_pid_or_index(paths: List[str], pid: Optional[str], index: int) -> 
     return None
 
 def select_sidecars(paths: List[str], pid: Optional[str]) -> List[str]:
+    """选择同 pid 的 Python sidecar；无法判定 pid 时保守返回全部 sidecar。"""
+
     if not pid:
         return paths
     selected = [path for path in paths if pid_from_path(path) == pid]
@@ -500,6 +565,8 @@ def merge_sidecar_only(ld_paths: List[str], sidecar_paths: List[str], out_path: 
     return report.to_dict()
 
 def copy_profiler_with_sidecars(profiler_path: str, out_path: str, sidecar_paths: List[str], report_path: str) -> Dict[str, Any]:
+    """缺 LD_PRELOAD trace 时复制 profiler trace 并附加 Python sidecar。"""
+
     raw_data, profiler_events = load_trace(profiler_path)
     if raw_data is None:
         shutil.copyfile(profiler_path, out_path)

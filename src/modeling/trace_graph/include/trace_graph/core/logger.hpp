@@ -5,8 +5,10 @@
 
 namespace TraceGraph {
 
+/** @brief C++ TraceGraph CLI 进程内使用的轻量日志器。 */
 class Logger {
   public:
+    /** @brief 日志级别；数值越小输出越详细。 */
     enum Level : int { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3, OFF = 4 };
 
     static Logger & instance();
@@ -14,8 +16,12 @@ class Logger {
     void set_level(Level lv) { level_ = lv; }
     Level level() const { return level_; }
 
-    // RAII 日志行构造器：析构时一次性写出整行，避免多线程下半行日志交错。
-    // 用户可见日志内容保持英文；这里的注释说明实现约束。
+    /**
+     * @brief RAII 日志行构造器。
+     *
+     * 析构时一次性写出整行，避免多线程下半行日志交错。用户可见日志内容保持英文；
+     * 这里的注释说明实现约束。
+     */
     class Line {
       public:
         Line(Level lv, bool active, std::mutex * mtx);

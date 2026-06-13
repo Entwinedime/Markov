@@ -30,6 +30,11 @@ void RelationRules::UpsertRule(const std::string & callee, std::initializer_list
 }
 
 bool RelationRules::ShouldTrace(const std::string & callee_name, uintptr_t caller_pc) const {
+    /**
+     * @brief 未配置规则的 callee 默认采集。
+     *
+     * 规则存在但 caller 列表为空时同样不限制 caller；只有显式 caller 列表才需要 scope 匹配。
+     */
     std::vector<std::string> callers;
     {
         std::lock_guard<std::mutex> lock(mtx_);

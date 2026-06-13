@@ -8,38 +8,54 @@
 
 namespace TraceGraph {
 
-// DagBuilder 把一组 TraceEvent 转换成可仿真的 base DAG。
-//
-// 它只负责 faithful replay 的基础因果边：
-// - 同 CPU lane 的顺序边；
-// - 同 device stream/lane 的顺序边；
-// - runtime launch 到 kernel 的 correlation 边；
-// - event/stream sync 边；
-// - 少量老版 TraceGraph 兼容的 notify/model_execute 边。
-//
-// what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
+/**
+ * @brief 把一组 TraceEvent 转换成可仿真的 base DAG。
+ *
+ * DagBuilder 只负责 faithful replay 的基础因果边：
+ * - 同 CPU lane 的顺序边；
+ * - 同 device stream/lane 的顺序边；
+ * - runtime launch 到 kernel 的 correlation 边；
+ * - event/stream sync 边；
+ * - 少量老版 TraceGraph 兼容的 notify/model_execute 边。
+ *
+ * what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
+ */
 class DagBuilder {
   public:
+    /** @brief 构建单 rank / 单输入 trace 的 base DAG。 */
     DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
 
   private:
-    // 构图过程中反复需要按不同 key 查节点。BuildIndex 只在一次 build 内有效。
+    /**
+     * @brief 单次构图中的临时索引。
+     *
+     * 构图过程中反复需要按不同 key 查节点；BuildIndex 只在一次 build 内有效，
+     * 不能跨 graph 或跨输入 trace 复用。
+     */
     struct BuildIndex {
-        // lane -> node ids，用于同 lane 顺序边和 stream sync 查找。
+        /** @brief lane -> node ids，用于同 lane 顺序边和 stream sync 查找。 */
         std::unordered_map<std::string, std::vector<size_t>> lane_to_nodes;
-        // correlation_id / connection_id 是 runtime 与 device event 的主要关联证据。
+        /** @brief correlation_id / connection_id 是 runtime 与 device event 的主要关联证据。 */
         std::unordered_map<std::string, std::vector<size_t>> correlation_to_nodes;
         std::unordered_map<std::string, std::vector<size_t>> connection_to_nodes;
-        // event_id_to_nodes 只应该收集可确认 event id 的 record node。
+        /** @brief 只收集可确认 event id 的 record node，避免缺 id 事件被错误归组。 */
         std::unordered_map<std::string, std::vector<size_t>> event_id_to_nodes;
-        // Raw Stream 是 LD_PRELOAD / AscendCL wrapper 看到的 stream handle；
-        // 它需要通过 record event 映射到实际 DAG lane。
+        /**
+         * @brief Raw Stream 到实际 DAG lane 的映射。
+         *
+         * Raw Stream 是 LD_PRELOAD / AscendCL wrapper 看到的 stream handle，需要通过 record event
+         * 映射到实际 DAG lane。
+         */
         std::unordered_map<std::string, std::string> raw_stream_to_stream;
-        // streamId / Physic Stream Id / 顶层 tid 都可能是同一条 device lane 的别名。
-        // stream sync 只能看到其中一种时，通过该表回到 DagBuilder::lane_key 选择出的真实 lane。
+        /**
+         * @brief device lane 别名到真实 lane_key 的映射。
+         *
+         * streamId / Physic Stream Id / 顶层 tid 都可能是同一条 device lane 的别名；
+         * stream sync 只能看到其中一种时，通过该表回到 DagBuilder::lane_key 选择出的真实 lane。
+         */
         std::unordered_map<std::string, std::string> stream_alias_to_lane;
 
-        // 特殊事件分类缓存，避免后续边构建阶段全图重复扫描。
+        /** @brief 特殊事件分类缓存，避免后续边构建阶段全图重复扫描。 */
         std::vector<size_t> event_record_nodes;
         std::vector<size_t> event_wait_nodes;
         std::vector<size_t> stream_sync_nodes;
@@ -51,17 +67,26 @@ class DagBuilder {
         std::vector<size_t> hccl_nodes;
     };
 
-    // 归一化阶段会合并重复事件、过滤 CPU 嵌套父节点，并保留 HiCache 事实事件。
+    /** @brief 归一化阶段合并重复事件、过滤 CPU 嵌套父节点，并保留 HiCache 事实事件。 */
     static std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
-    // 判断一个事件是否应该被视作 device 执行节点。这个判断会影响 lane 和边类型。
+
+    /** @brief 判断一个事件是否应被视作 device 执行节点；该判断会影响 lane 和边类型。 */
     static bool is_device_event(const TraceEvent & event);
+
+    /** @brief 判断事件是否属于 HiCache 事实事件，确保事实事件不会被 CPU leaf 过滤误删。 */
     static bool is_hicache_event(const TraceEvent & event);
-    // lane_key 是顺序边的资源身份。这个函数是 faithful replay 精度的关键点。
+
+    /** @brief 计算顺序边使用的资源身份；该函数是 faithful replay 精度的关键点。 */
     static std::string lane_key(const TraceEvent & event);
     static std::string event_arg(const TraceEvent & event, const std::string & key, const std::string & fallback = "");
 
-    // 以下函数按固定顺序执行。顺序本身有语义：create_nodes 先收集 index，
-    // correlation/sequence/sync 再根据这些 index 补边，最后统一收敛 sync 节点耗时。
+    /**
+     * @name 构图阶段
+     *
+     * 以下函数按固定顺序执行。顺序本身有语义：create_nodes 先收集 index，
+     * correlation/sequence/sync 再根据这些 index 补边，最后统一收敛 sync 节点耗时。
+     * @{
+     */
     BuildIndex create_nodes(DagGraph & graph) const;
     void add_correlation_edges(DagGraph & graph, BuildIndex & index) const;
     void add_sequential_edges(DagGraph & graph, BuildIndex & index) const;
@@ -72,6 +97,7 @@ class DagBuilder {
     void add_event_sync_edges(DagGraph & graph, BuildIndex & index) const;
     void add_device_sync_edges(DagGraph & graph, BuildIndex & index) const;
     void finalize_sync_nodes(DagGraph & graph, const BuildIndex & index) const;
+    /** @} */
 };
 
 } // namespace TraceGraph

@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief HiCache target page id 投影。
+ */
 #include "trace_graph/modules/hicache/hicache_target_pager.hpp"
 
 #include <openssl/sha.h>
@@ -10,6 +14,7 @@ namespace TraceGraph {
 
 namespace {
 
+/** @brief 将十六进制 parent hash 还原为字节，用于 chained page hash。 */
 std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
     std::vector<unsigned char> bytes;
     if (hex.size() % 2 != 0) return bytes;
@@ -25,6 +30,7 @@ std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
     return bytes;
 }
 
+/** @brief 将 digest bytes 编码为稳定小写十六进制字符串。 */
 std::string bytes_to_hex(const unsigned char * bytes, size_t len) {
     std::ostringstream os;
     os << std::hex << std::setfill('0');
@@ -32,6 +38,12 @@ std::string bytes_to_hex(const unsigned char * bytes, size_t len) {
     return os.str();
 }
 
+/**
+ * @brief 计算单个 target page 的 chained hash。
+ *
+ * parent hash 参与下一页 hash，保持 page id 对 prefix path 敏感；同一 page token 在
+ * 不同前缀下不会意外复用 page id。
+ */
 std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_t end, const std::string & prior_hash) {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
@@ -59,16 +71,23 @@ std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_
 
 HiCacheTargetPager::HiCacheTargetPager(HiCacheConfig config) : config_(std::move(config)) {}
 
+/** @brief target 配置优先；缺省时使用 fact 声明的 source_page_size 作为 invariant。 */
 uint64_t HiCacheTargetPager::page_size_for_fact(const HiCacheFact & fact) const {
     if (config_.page_size > 0) return config_.page_size;
     return fact.source_page_size;
 }
 
+/** @brief page id 总是包含 cache_scope，避免跨 scope page hash 冲突。 */
 std::string HiCacheTargetPager::scoped_page_id(const HiCacheFact & fact, const std::string & page_hash) const {
     const auto scope = fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope;
     return scope + "|" + page_hash;
 }
 
+/**
+ * @brief 从 token path 生成 target page id 序列。
+ *
+ * 只对完整 page 生成 id；尾部不足一个 page 的 token 不形成 cache state。
+ */
 std::vector<std::string> HiCacheTargetPager::pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
     const auto page_size = page_size_for_fact(fact);
     if (page_size == 0 || tokens.size() < page_size) return {};

@@ -21,6 +21,8 @@ from trace_sim_probe.writer import get_writer, probe_debug_enabled
 
 @dataclass(frozen=True)
 class FieldSpec:
+    """单个 probe 字段的配置描述。"""
+
     name: str
     source: str = ""
     required: bool = True
@@ -28,10 +30,10 @@ class FieldSpec:
 
 @dataclass(frozen=True)
 class FactSpec:
-    """Target-level atomic fact metadata.
+    """target 级 atomic fact 元数据。
 
-    The explicit object keeps classification at fact granularity and avoids
-    repeating the same boilerplate in every field list.
+    fact 分类必须显式落在 target 上，避免字段列表隐式决定 `model_input`、
+    `dag_input` 或 HiCache invariant role。
     """
 
     fact_class: str
@@ -43,6 +45,8 @@ class FactSpec:
 
 @dataclass(frozen=True)
 class EmitCondition:
+    """控制某个 target 是否在当前调用阶段发事件的条件。"""
+
     source: str
     op: str = "present"
     value: Any = None
@@ -50,6 +54,8 @@ class EmitCondition:
 
 @dataclass(frozen=True)
 class TargetSpec:
+    """一个可被通用 callable probe 包装的目标函数配置。"""
+
     id: str
     module_name: str
     qualname: str
@@ -96,6 +102,8 @@ def register_source_extractor(extractor: SourceExtractor) -> None:
 
 
 def _load_targets() -> list[TargetSpec]:
+    """从环境变量加载并缓存 Python probe target 配置。"""
+
     global _TARGETS
     if _TARGETS is not None:
         return _TARGETS
@@ -118,6 +126,8 @@ def _load_targets() -> list[TargetSpec]:
 
 
 def install(module: ModuleType) -> None:
+    """在模块加载后安装该模块匹配的 callable wrapper。"""
+
     targets_by_qualname: dict[str, list[TargetSpec]] = {}
     for target in _load_targets():
         if module.__name__ == target.module_name:
@@ -144,6 +154,8 @@ def install(module: ModuleType) -> None:
 
 
 def _parse_target(raw: dict[str, Any]) -> TargetSpec:
+    """校验并解析单个 target 配置。"""
+
     target_id = raw.get("id")
     target = raw.get("target")
     module_name = raw.get("module")
@@ -196,6 +208,8 @@ def _resolve_target(module: ModuleType, target: TargetSpec) -> tuple[Any, str, A
 
 
 def _parse_field(raw: Any) -> FieldSpec | None:
+    """解析字段配置；无效字段返回 None 由调用方忽略。"""
+
     if isinstance(raw, str) and raw:
         return FieldSpec(name=raw)
     if isinstance(raw, dict) and isinstance(raw.get("name"), str):
@@ -208,6 +222,8 @@ def _parse_field(raw: Any) -> FieldSpec | None:
 
 
 def _parse_fact(raw: Any, target_id: str) -> FactSpec:
+    """解析 fact 合同，强制 target 显式声明分类和输入边界。"""
+
     if not isinstance(raw, dict):
         raise ValueError(f"python_probe target {target_id!r} must define fact")
     fact_class = raw.get("class")
@@ -237,6 +253,8 @@ def _parse_fact(raw: Any, target_id: str) -> FactSpec:
 
 
 def _as_list(value: Any) -> list[Any]:
+    """把单值配置规整成列表，便于统一处理 emit_when。"""
+
     if value is None:
         return []
     if isinstance(value, list):
@@ -245,6 +263,8 @@ def _as_list(value: Any) -> list[Any]:
 
 
 def _parse_emit_condition(raw: Any) -> EmitCondition | None:
+    """解析 target 的条件发射规则。"""
+
     if isinstance(raw, str) and raw:
         if raw.startswith("has:"):
             return EmitCondition(source=raw.split(":", 1)[1], op="present")
@@ -260,6 +280,8 @@ def _parse_emit_condition(raw: Any) -> EmitCondition | None:
 
 
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
+    """包装同步或异步 callable，并在 start/end/exception 发事件。"""
+
     if inspect.iscoroutinefunction(fn):
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
@@ -304,6 +326,8 @@ def _emit_targets(
     start_us: int,
     end_us: int,
 ) -> None:
+    """对同一个 callable 上绑定的多个 target 逐一发事件。"""
+
     for target in targets:
         _emit(target, fn, args, kwargs, result, phase, start_us, end_us)
 
@@ -318,6 +342,8 @@ def _emit(
     start_us: int,
     end_us: int,
 ) -> None:
+    """构造 Chrome trace event，并把 validation-only 字段拆成旁路事件。"""
+
     bound = _bind_arguments(fn, args, kwargs)
     bound["__trace_sim_phase"] = phase
     if not _should_emit_target(target, bound, args, kwargs, result):
@@ -363,6 +389,8 @@ def _emit(
 
 
 def _event_name(target: TargetSpec, phase: str) -> str:
+    """按 target 配置和 phase 生成事件名。"""
+
     if not target.events:
         return f"{target.id}:{phase}"
     if phase == "start":
@@ -379,6 +407,8 @@ def _collect_fields(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """采集 target 字段，并区分模型输入字段与 validation-only 字段。"""
+
     fields: dict[str, Any] = {}
     validation_fields: dict[str, Any] = {}
     missing: list[str] = []
@@ -404,6 +434,8 @@ def _collect_fields(
 
 
 def _fact_args(target: TargetSpec) -> dict[str, Any]:
+    """生成写入事件 args 的 fact 元数据。"""
+
     fact = target.fact
     return {
         "model_input": fact.model_input,
@@ -421,6 +453,8 @@ def _should_emit_target(
     kwargs: dict[str, Any],
     result: Any,
 ) -> bool:
+    """判断 target 的所有 emit_when 条件是否满足。"""
+
     for condition in target.emit_when:
         if not _condition_matches(condition, bound, args, kwargs, result):
             return False
@@ -434,6 +468,8 @@ def _condition_matches(
     kwargs: dict[str, Any],
     result: Any,
 ) -> bool:
+    """执行单个 emit_when 条件判断。"""
+
     found, value = _extract_raw_value(condition.source, "_emit_when", bound, args, kwargs, result)
     op = condition.op
     if op in ("present", "exists", "has"):
@@ -452,6 +488,8 @@ def _condition_matches(
 
 
 def _has_value(value: Any) -> bool:
+    """判断条件表达式中的值是否算作存在。"""
+
     if value is None:
         return False
     if isinstance(value, str):
@@ -462,6 +500,8 @@ def _has_value(value: Any) -> bool:
 
 
 def _bind_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """把位置参数、关键字参数和函数签名绑定结果合并成取值上下文。"""
+
     values = {f"arg{index}": value for index, value in enumerate(args)}
     values.update(kwargs)
     try:
@@ -479,6 +519,8 @@ def _extract_field(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
+    """提取单个字段，并把普通对象收敛成 JSON 可写形态。"""
+
     source = field.source.strip()
     try:
         found, value = _extract_raw_value(source, field.name, bound, args, kwargs, result)
@@ -584,6 +626,8 @@ def _extract_kwarg_source(key: str, kwargs: dict[str, Any]) -> tuple[bool, Any]:
 
 
 def _split_head_path(value: str) -> tuple[str, str]:
+    """把 `head.tail.path` 拆成首段和剩余路径。"""
+
     head, separator, path = value.partition(".")
     if not separator:
         return (head, "")
@@ -645,6 +689,8 @@ def _safe_list(value: Any) -> list[Any] | None:
 
 
 def _jsonable(value: Any) -> Any:
+    """把任意 Python 对象收敛成短 JSON 值，避免 trace 过大。"""
+
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):

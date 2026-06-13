@@ -12,7 +12,9 @@
 namespace TraceGraph {
 
 Logger & Logger::instance() {
-    // 全局 logger 只用于 C++ CLI 进程内日志；不跨动态库边界暴露。
+    /**
+     * @brief 全局 logger 只用于 C++ CLI 进程内日志；不跨动态库边界暴露。
+     */
     static Logger logger;
     return logger;
 }
@@ -20,7 +22,9 @@ Logger & Logger::instance() {
 namespace {
 
 bool use_color() {
-    // 默认只有 stderr 是 tty 时才输出颜色；也可以用 TRACE_GRAPH_COLOR 强制开关。
+    /**
+     * @brief 默认只有 stderr 是 tty 时才输出颜色；也可以用 TRACE_GRAPH_COLOR 强制开关。
+     */
     static bool checked = false;
     static bool color = false;
     if (!checked) {
@@ -42,17 +46,19 @@ bool use_color() {
 }
 
 const char * ansi(Logger::Level lv) {
-    // 用户可见日志保持英文 label，颜色只影响终端显示，不写入 JSON 输出。
+    /**
+     * @brief 用户可见日志保持英文 label，颜色只影响终端显示，不写入 JSON 输出。
+     */
     if (!use_color()) return "";
     switch (lv) {
     case Logger::ERROR:
-        return "\x1b[1;31m"; // 粗体红色
+        return "\x1b[1;31m";
     case Logger::WARN:
-        return "\x1b[33m"; // 黄色
+        return "\x1b[33m";
     case Logger::INFO:
-        return "\x1b[32m"; // 绿色
+        return "\x1b[32m";
     case Logger::DEBUG:
-        return "\x1b[2;36m"; // 暗青色
+        return "\x1b[2;36m";
     default:
         return "\x1b[0m";
     }
@@ -76,7 +82,9 @@ const char * label(Logger::Level lv) {
 }
 
 std::string timestamp() {
-    // 日志时间只用于人工调试，不参与性能预测或 validation。
+    /**
+     * @brief 日志时间只用于人工调试，不参与性能预测或 validation。
+     */
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1'000;
@@ -88,12 +96,16 @@ std::string timestamp() {
 } // namespace
 
 Logger::Line::Line(Level lv, bool active, std::mutex * mtx) : lv_(lv), active_(active), mtx_(mtx) {
-    // active=false 时仍允许调用方继续 << 拼接，但不会产生实际输出。
+    /**
+     * @brief active=false 时仍允许调用方继续 << 拼接，但不会产生实际输出。
+     */
     if (active_) ss_ << ansi(lv) << "[" << label(lv) << " " << timestamp() << "] " << reset();
 }
 
 Logger::Line::~Line() {
-    // 析构时一次性加锁输出整行，避免多个日志调用在 stderr 上交错。
+    /**
+     * @brief 析构时一次性加锁输出整行，避免多个日志调用在 stderr 上交错。
+     */
     if (active_) {
         ss_ << "\n";
         std::lock_guard<std::mutex> lock(*mtx_);

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# 从宿主机进入框架容器，执行 JSON 配置驱动的 profiling run 或 suite。
+#
+# 真实 profiling 必须经过该入口，确保 repo 路径、Ascend 环境和容器内
+# `profile_runner.py` 的执行边界一致。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -7,6 +11,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 ROOT_DIR="$(repo_root)"
 cd "$ROOT_DIR"
 
+# 打印 profiling 外层入口的命令行用法。
 usage() {
     cat >&2 <<'EOF'
 usage:

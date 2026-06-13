@@ -38,6 +38,8 @@ class TargetQuality:
     node_ids: set[str] = field(default_factory=set)
 
     def observe(self, args: dict[str, Any]) -> None:
+        """吸收一个 Python probe 事件参数，累计 target 质量指标。"""
+
         self.events_total += 1
         self.phases[str(args.get("phase") or "unknown")] += 1
         self.statuses[str(args.get("status") or "unknown")] += 1
@@ -54,6 +56,8 @@ class TargetQuality:
         _add_optional(self.node_ids, args.get("best_match_node_id"))
 
     def to_dict(self) -> dict[str, Any]:
+        """输出稳定 JSON 摘要，避免把 set/Counter 原样泄露到报告。"""
+
         return {
             "configured": self.configured,
             "target": self.target,
@@ -69,6 +73,8 @@ class TargetQuality:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：生成 profile_quality.json，并用退出码表达是否 ready。"""
+
     args = parse_args(argv)
     manifest_path = resolve_path(args.manifest)
     result = audit_profile(manifest_path)
@@ -80,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析 profiling quality 审计参数。"""
+
     parser = argparse.ArgumentParser(description="Audit profiling trace quality.")
     parser.add_argument("--manifest", required=True, help="profile_manifest.json path")
     parser.add_argument("--output", help="output JSON path; defaults to run_dir/profile_quality.json")
@@ -87,6 +95,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def audit_profile(manifest_path: Path) -> dict[str, Any]:
+    """审计一次 profiling run 的采集质量。
+
+    本函数只检查 trace/channel/target/fact 是否齐备，返回阻塞后续 modeling 的
+    缺口列表；它不尝试从实际 trace 反推 HiCache 策略或 state transition。
+    """
+
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     run_dir = map_repo_path(Path(str(manifest.get("run_dir") or manifest_path.parent)))
     profiling = manifest.get("profiling") if isinstance(manifest.get("profiling"), dict) else {}
@@ -225,6 +239,8 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
 
 
 def resolve_path(value: str) -> Path:
+    """把 CLI 路径解析到当前 repo 视角。"""
+
     path = Path(value).expanduser()
     if path.is_absolute():
         return path
@@ -232,6 +248,8 @@ def resolve_path(value: str) -> Path:
 
 
 def resolve_output_path(value: str | None, manifest_path: Path, result: dict[str, Any]) -> Path:
+    """确定质量报告输出路径，默认写到 run_dir。"""
+
     if value:
         return resolve_path(value)
     run_dir = Path(str(result.get("run_dir") or manifest_path.parent))
@@ -251,6 +269,8 @@ def map_repo_path(path: Path) -> Path:
 
 
 def _configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """从 manifest profiling fragment 读取已配置 Python probe target。"""
+
     targets: dict[str, dict[str, Any]] = {}
     raw_targets = profiling.get("python_targets")
     if raw_targets is None:
@@ -266,6 +286,8 @@ def _configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _existing_paths(entries: Any) -> list[Path]:
+    """把 manifest sidecar path 条目过滤成当前宿主机可读文件。"""
+
     paths: list[Path] = []
     if not isinstance(entries, list):
         return paths
@@ -301,6 +323,8 @@ def _discover_workload_report(run_dir: Path) -> Path | None:
 
 
 def _expected_mechanisms_from_workload(path: Path | None) -> list[str]:
+    """从 workload report 读取期望命中的 HiCache 机制集合。"""
+
     if path is None or not path.is_file():
         return []
     try:
@@ -319,6 +343,8 @@ def _expected_mechanisms_from_workload(path: Path | None) -> list[str]:
 
 
 def _load_python_probe_events(paths: list[Path]) -> list[dict[str, Any]]:
+    """加载所有 Python probe Chrome trace event。"""
+
     events: list[dict[str, Any]] = []
     for path in paths:
         try:
@@ -451,6 +477,8 @@ _INVARIANT_SPAN_FIELDS_BY_ROLE = {
 
 
 def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
+    """把 end-phase 事件角色映射为 workload 机制命中。"""
+
     if args.get("phase") != "end":
         return
     event_role = str(args.get("event_role") or "")
@@ -460,6 +488,8 @@ def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
 
 
 def _configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list[str]:
+    """根据配置 target 的 fact.role 推导理论可观测机制。"""
+
     mechanisms: set[str] = set()
     for target in configured_targets.values():
         role = _configured_fact_role(target)
@@ -470,6 +500,8 @@ def _configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> lis
 
 
 def _configured_fact_role(target: dict[str, Any]) -> str:
+    """读取 target 配置中的 fact.role。"""
+
     fact = target.get("fact")
     if isinstance(fact, dict):
         role = fact.get("role")
@@ -479,6 +511,8 @@ def _configured_fact_role(target: dict[str, Any]) -> str:
 
 
 def _new_hicache_invariant_accumulator() -> dict[str, Any]:
+    """创建 HiCache invariant fact 覆盖率累加器。"""
+
     return {
         "counts": Counter(),
         "role_end_events": Counter(),
@@ -492,6 +526,8 @@ def _new_hicache_invariant_accumulator() -> dict[str, Any]:
 
 
 def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """检查单个事件是否满足 HiCache invariant fact 合同。"""
+
     if not _is_hicache_profile_event(args):
         return
     _observe_token_references(accumulator, args)
@@ -537,6 +573,8 @@ def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]
 
 
 def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """记录 token dictionary/span 引用，检查 span 是否有字典支撑。"""
+
     for value in args.values():
         if not isinstance(value, dict):
             continue
@@ -551,6 +589,8 @@ def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any])
 
 
 def _missing_invariant_fields(args: dict[str, Any], role: str) -> list[str]:
+    """返回某个 invariant role 缺失的必需字段列表。"""
+
     missing = [
         field
         for field in _INVARIANT_REQUIRED_FIELDS_BY_ROLE.get(role, ())
@@ -572,6 +612,8 @@ def _missing_invariant_fields(args: dict[str, Any], role: str) -> list[str]:
 
 
 def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """汇总 HiCache invariant fact 合同检查结果。"""
+
     counts: Counter[str] = accumulator["counts"]
     missing_token_dictionary_refs = sorted(accumulator["span_path_ids"] - accumulator["dictionary_ids"])
     dictionary_ids_without_tokens = sorted(accumulator["dictionary_ids"] - accumulator["dictionary_ids_with_tokens"])
@@ -621,6 +663,8 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
 
 
 def _has_fact(value: Any) -> bool:
+    """判断字段值是否能作为有效事实参与合同检查。"""
+
     if value is None:
         return False
     if isinstance(value, str):
@@ -631,6 +675,8 @@ def _has_fact(value: Any) -> bool:
 
 
 def _has_token_dictionary(value: Any) -> bool:
+    """判断 token dictionary 是否包含模型所需的身份字段。"""
+
     if not isinstance(value, dict):
         return False
     return (
@@ -642,6 +688,8 @@ def _has_token_dictionary(value: Any) -> bool:
 
 
 def _has_token_span(value: Any) -> bool:
+    """判断 token span 是否能引用已记录 token dictionary。"""
+
     if not isinstance(value, dict):
         return False
     return (
@@ -655,6 +703,8 @@ def _has_token_span(value: Any) -> bool:
 
 
 def _int_or_none(value: Any) -> int | None:
+    """宽松解析整数，避免 bool 被误当成 0/1。"""
+
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -664,6 +714,8 @@ def _int_or_none(value: Any) -> int | None:
 
 
 def _is_hicache_profile_event(args: dict[str, Any]) -> bool:
+    """识别需要参与 HiCache 专项质量审计的事件。"""
+
     target_id = str(args.get("target_id") or "").lower()
     event_role = str(args.get("event_role") or "")
     if target_id.startswith(("hiradix.", "hicache.", "hicache_controller.")):
@@ -672,14 +724,20 @@ def _is_hicache_profile_event(args: dict[str, Any]) -> bool:
 
 
 def _false_like(value: Any) -> bool:
+    """解析常见 false 字符串。"""
+
     return str(value).lower() in {"false", "0", "no", "off"}
 
 
 def _true_like(value: Any) -> bool:
+    """解析常见 true 字符串。"""
+
     return str(value).lower() in {"true", "1", "yes", "on"}
 
 
 def _new_hicache_capacity_accumulator() -> dict[str, Any]:
+    """创建 validation-only capacity snapshot 累加器。"""
+
     return {
         "snapshot_count": 0,
         "object_type_counts": Counter(),
@@ -721,6 +779,8 @@ def _observe_hicache_capacity(accumulator: dict[str, Any], args: dict[str, Any])
 
 
 def _finalize_hicache_capacity(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """汇总 capacity/policy snapshot 中出现过的标量值。"""
+
     unique_values = {}
     for key, values in sorted(accumulator["unique_values"].items()):
         unique_values[key] = [json.loads(value) for value in sorted(values)]
@@ -734,6 +794,8 @@ def _finalize_hicache_capacity(accumulator: dict[str, Any]) -> dict[str, Any]:
 
 
 def _flatten_capacity_scalars(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """把嵌套 capacity 对象展开成可比较的标量路径。"""
+
     rows: list[tuple[str, Any]] = []
     if isinstance(value, dict):
         for key, item in sorted(value.items()):
@@ -748,6 +810,8 @@ def _flatten_capacity_scalars(value: Any, prefix: str = "") -> list[tuple[str, A
 
 
 def _add_optional(values: set[str], value: Any) -> None:
+    """把非空观测值加入去重集合。"""
+
     if value is not None:
         values.add(str(value))
 

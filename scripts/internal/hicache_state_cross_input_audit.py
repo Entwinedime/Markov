@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Compare current HiCache atomic invariant model-input facts across configurations."""
+"""跨配置审计 HiCache atomic invariant model-input facts。
+
+该脚本只读真实 trace，比较 source/target 中已声明为 model_input 的 atomic invariant
+事实集合是否在 request 归一化后匹配。它不生成 synthetic fact，也不把 target actual
+或 oracle 信息写回模型输入。
+"""
 
 from __future__ import annotations
 
@@ -48,6 +53,12 @@ REQUEST_SCOPED_ROLES = set(DEFAULT_ROLES)
 
 @dataclass(frozen=True)
 class AuditEvent:
+    """可比较的 atomic invariant fact 摘要。
+
+    signature 是跨配置比较的 canonical key；原始 request_id 只保留为诊断字段，
+    不直接参与 source/target 匹配。
+    """
+
     stream: str
     ordinal: int
     role: str
@@ -63,6 +74,8 @@ class AuditEvent:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析 cross-input audit CLI 参数。"""
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-trace", type=Path, action="append", required=True)
     parser.add_argument("--target-trace", type=Path, action="append", required=True)
@@ -75,15 +88,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def load_json(path: Path) -> Any:
+    """读取 JSON 文件。"""
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_json(path: Path, value: Any) -> None:
+    """写入 JSON 文件并创建父目录。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def trace_events(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
+    """从一个或多个 Chrome trace 文件中提取 event 行。"""
+
     rows: list[tuple[Path, dict[str, Any]]] = []
     for path in paths:
         payload = load_json(path)
@@ -94,6 +113,8 @@ def trace_events(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
 
 
 def optional_int(value: Any, default: int = 0) -> int:
+    """宽松解析整数，失败时返回 default。"""
+
     try:
         return int(float(value))
     except (TypeError, ValueError):
@@ -101,6 +122,8 @@ def optional_int(value: Any, default: int = 0) -> int:
 
 
 def true_like(value: Any) -> bool:
+    """解析 trace args 中可能出现的宽松布尔值。"""
+
     if isinstance(value, bool):
         return value
     if value is None:
@@ -113,6 +136,8 @@ def true_like(value: Any) -> bool:
 
 
 def maybe_json(value: Any) -> Any:
+    """解析可能被双重 JSON 编码的 trace arg。"""
+
     if not isinstance(value, str):
         return value
     text = value.strip()
@@ -130,10 +155,14 @@ def maybe_json(value: Any) -> Any:
 
 
 def canonical_json(value: Any) -> str:
+    """生成稳定 canonical JSON 字符串，用作 fact signature。"""
+
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
 def completed_model_invariant(event: dict[str, Any]) -> bool:
+    """判断 event 是否是已完成的 atomic invariant model-input fact。"""
+
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     if not true_like(args.get("model_input")):
         return False
@@ -147,6 +176,8 @@ def completed_model_invariant(event: dict[str, Any]) -> bool:
 
 
 def token_ids(value: Any) -> tuple[int, ...]:
+    """从 token dictionary JSON 中提取 token id 序列。"""
+
     value = maybe_json(value)
     if not isinstance(value, dict):
         return ()
@@ -163,6 +194,8 @@ def token_ids(value: Any) -> tuple[int, ...]:
 
 
 def token_hash(tokens: tuple[int, ...]) -> str:
+    """按 u32 little-endian token 序列生成稳定 path hash。"""
+
     hasher = hashlib.sha256()
     for token in tokens:
         hasher.update(int(token).to_bytes(4, byteorder="little", signed=False))
@@ -170,6 +203,8 @@ def token_hash(tokens: tuple[int, ...]) -> str:
 
 
 def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
+    """提取 token dictionary 的跨配置比较描述。"""
+
     value = maybe_json(args.get(key))
     if not isinstance(value, dict):
         return {}
@@ -183,6 +218,8 @@ def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def span_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
+    """提取 token span 的跨配置比较描述。"""
+
     value = maybe_json(args.get(key))
     if not isinstance(value, dict):
         return {}
@@ -198,6 +235,8 @@ def span_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def path_signature(args: dict[str, Any]) -> dict[str, Any]:
+    """组合 dictionary/span，形成 path-bearing fact 的稳定描述。"""
+
     dictionary = dictionary_descriptor(args, "token_dictionary")
     span = span_descriptor(args, "full_path_span")
     return {
@@ -207,6 +246,8 @@ def path_signature(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def request_anchor_signature(role: str, args: dict[str, Any]) -> str:
+    """生成 request fingerprint 使用的 path-bearing anchor signature。"""
+
     fields: dict[str, Any] = {"role": role}
     for field in ROLE_SCALAR_FIELDS.get(role, ()):
         value = scalar_value(args, field)
@@ -217,11 +258,10 @@ def request_anchor_signature(role: str, args: dict[str, Any]) -> str:
 
 
 def build_request_fingerprints(events: list[tuple[Path, dict[str, Any]]]) -> dict[str, str]:
-    """Map run-local request ids to stable fingerprints derived from path facts.
+    """把 run-local request id 映射成 path fact 派生的稳定 fingerprint。
 
-    SGLang request ids are generated per run. They are still needed inside one
-    trace to correlate lifecycle/checkpoint facts with path-bearing facts, but
-    they are not themselves cross-config invariant facts.
+    SGLang request id 每次运行都会重新生成；它在单次 trace 内仍用于关联
+    lifecycle/checkpoint fact 和 path-bearing fact，但自身不是跨配置 invariant fact。
     """
 
     anchors_by_request: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
@@ -249,6 +289,8 @@ def build_request_fingerprints(events: list[tuple[Path, dict[str, Any]]]) -> dic
 
 
 def scalar_value(args: dict[str, Any], field: str) -> Any:
+    """读取 signature 中允许参与比较的标量或结构化字段。"""
+
     value = maybe_json(args.get(field))
     if isinstance(value, (dict, list)):
         return value
@@ -258,6 +300,8 @@ def scalar_value(args: dict[str, Any], field: str) -> Any:
 
 
 def build_signature(role: str, event: dict[str, Any], request_fingerprint: str) -> tuple[str, dict[str, Any]]:
+    """为单个 atomic invariant fact 构造 canonical signature。"""
+
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     fields: dict[str, Any] = {"role": role}
     if role in REQUEST_SCOPED_ROLES:
@@ -276,6 +320,8 @@ def extract_audit_events(
     label: str,
     roles: set[str],
 ) -> tuple[list[AuditEvent], collections.Counter[str], collections.Counter[str]]:
+    """从 trace 中抽取可比较的 AuditEvent 列表。"""
+
     rows: list[AuditEvent] = []
     unknown_invariant_roles: collections.Counter[str] = collections.Counter()
     unmapped_request_id_events: collections.Counter[str] = collections.Counter()
@@ -328,6 +374,8 @@ def extract_audit_events(
 
 
 def summarize_event(event: AuditEvent | None) -> dict[str, Any] | None:
+    """把 AuditEvent 转成报告中可读的诊断结构。"""
+
     if event is None:
         return None
     return {
@@ -346,6 +394,8 @@ def summarize_event(event: AuditEvent | None) -> dict[str, Any] | None:
 
 
 def first_sequence_mismatch(source: list[AuditEvent], target: list[AuditEvent]) -> dict[str, Any] | None:
+    """定位 source/target 序列中第一个 signature 不一致位置。"""
+
     limit = min(len(source), len(target))
     for index in range(limit):
         if source[index].signature != target[index].signature:
@@ -364,6 +414,8 @@ def first_sequence_mismatch(source: list[AuditEvent], target: list[AuditEvent]) 
 
 
 def counter_samples(counter: collections.Counter[str], sample: int) -> list[dict[str, Any]]:
+    """从 signature counter 中提取报告样本。"""
+
     rows = []
     for signature, count in counter.most_common(sample):
         try:
@@ -375,6 +427,8 @@ def counter_samples(counter: collections.Counter[str], sample: int) -> list[dict
 
 
 def summarize_role(role: str, source: list[AuditEvent], target: list[AuditEvent], sample: int) -> dict[str, Any]:
+    """汇总单个 role 的 count、sequence 和 canonical multiset 匹配结果。"""
+
     source_counter = collections.Counter(event.signature for event in source)
     target_counter = collections.Counter(event.signature for event in target)
     source_only = source_counter - target_counter
@@ -396,6 +450,8 @@ def summarize_role(role: str, source: list[AuditEvent], target: list[AuditEvent]
 
 
 def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    """构造 cross-input audit 完整报告。"""
+
     roles = set(args.role or DEFAULT_ROLES)
     unknown_roles = sorted(roles - KNOWN_ATOMIC_INVARIANT_ROLES)
     source_events, source_unknown, source_unmapped = extract_audit_events(args.source_trace, args.source_label, roles)
@@ -470,6 +526,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口。"""
+
     args = parse_args(argv)
     report = build_report(args)
     if args.output:

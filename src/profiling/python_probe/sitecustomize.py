@@ -9,5 +9,5 @@ try:
 
     bootstrap()
 except Exception:
-    # probe 不能改变被测进程启动行为。
+    # probe 加载失败时必须保持被测进程继续启动，不能改变 server 原始启动行为。
     pass

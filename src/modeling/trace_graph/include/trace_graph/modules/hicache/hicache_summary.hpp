@@ -10,6 +10,12 @@
 
 namespace TraceGraph {
 
+/**
+ * @brief 单个 target-state mutation 的审计记录。
+ *
+ * transition trace 只描述模型内部 state mutation，不代表 DAG 已经被修改。
+ * digest 字段由配置控制，便于在需要时定位状态分叉。
+ */
 struct HiCacheStateTransition {
     std::string transition_id;
     std::string kind;
@@ -26,8 +32,13 @@ struct HiCacheStateTransition {
     std::string after_state_digest;
 };
 
-// HiCache 状态模型的输出摘要。
-// 当前维护 page resident/dirty/backuped 状态，但不修改 DAG。
+/**
+ * @brief HiCache 状态模型的输出摘要。
+ *
+ * summary 汇总输入事件、被处理的 invariant fact、缺失字段、transition trace 和最终
+ * page state。当前模块只维护 state，不修改 DAG；dag_mutations 保持为显式输出字段，
+ * 用于防止后续误把状态建模与 DAG rewrite 混在一起。
+ */
 struct HiCacheSummary {
     std::string status = "state_model";
     HiCacheConfig target_config;
@@ -58,6 +69,7 @@ struct HiCacheSummary {
     std::vector<HiCacheStateTransition> transition_trace;
     std::vector<std::string> warnings;
 
+    /** @brief 序列化为模块 summary JSON。 */
     std::string to_json() const;
 };
 

@@ -15,8 +15,12 @@ namespace {
 
 constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
 
-// 子模块可能只更新 attrs["time"]，也可能通过 DagGraph::set_node_duration 更新。
-// 仿真阶段优先读取 attrs["time"]，保证兼容老版字段。
+/**
+ * @brief 读取仿真阶段使用的节点耗时字段。
+ *
+ * 子模块可能只更新 attrs["time"]，也可能通过 DagGraph::set_node_duration 更新。
+ * 仿真阶段优先读取 attrs["time"]，保证兼容老版字段。
+ */
 uint64_t read_u64_attr(const DagNode & node, const std::string & key, uint64_t fallback = 0) {
     auto it = node.attrs.find(key);
     if (it == node.attrs.end()) return fallback;
@@ -34,8 +38,12 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
     SimulationResult result;
     const size_t node_count = graph.node_count();
 
-    // 为 Kahn 拓扑排序构建邻接表和入度。这里不预先压缩重复边；
-    // 如果上游重复添加同一条边，indegree 会重复增加，直到对应重复边都被处理完。
+    /**
+     * @brief 为 Kahn 拓扑排序构建邻接表和入度。
+     *
+     * 这里不预先压缩重复边；如果上游重复添加同一条边，indegree 会重复增加，
+     * 直到对应重复边都被处理完。
+     */
     std::vector<std::vector<size_t>> outgoing(node_count);
     std::vector<int> indegree(node_count, 0);
     std::vector<uint64_t> complete_time(node_count, 0);
@@ -58,19 +66,28 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
         result.processed_nodes++;
 
         auto & node = graph.mutable_node(node_id);
-        // 当前节点自身耗时。node.duration 与 attrs["time"] 理论上应一致；
-        // 这里保留 attrs 优先级，是为了兼容历史子模块直接写 attrs 的行为。
+        /**
+         * @brief 当前节点自身耗时优先从 attrs["time"] 读取。
+         *
+         * node.duration 与 attrs["time"] 理论上应一致；这里保留 attrs 优先级，是为了兼容历史
+         * 子模块直接写 attrs 的行为。
+         */
         uint64_t node_time = node.duration;
         auto attr_time = read_u64_attr(node, "time", node.duration);
         if (attr_time != node.duration) node_time = attr_time;
         complete_time[node_id] = node_time;
 
-        // critical_pred 保存当前已知完成时间最大的前驱。DAG edge 都是 hard dependency，
-        // 所以节点开始时间由最大完成前驱决定。
+        /**
+         * @brief critical_pred 保存当前已知完成时间最大的前驱。
+         *
+         * DAG edge 都是 hard dependency，所以节点开始时间由最大完成前驱决定。
+         */
         auto pred = critical_pred[node_id];
         if (pred != INVALID_NODE) complete_time[node_id] += complete_time[pred];
 
-        // 老版 TraceGraph 会把 CPU 顺序间隔计入关键路径上前驱节点之后。
+        /**
+         * @brief 老版 TraceGraph 会把 CPU 顺序间隔计入关键路径上前驱节点之后。
+         */
         if (pred != INVALID_NODE) {
             const auto & pred_node = graph.node(pred);
             if (pred_node.attrs.find("cpuinterval") != pred_node.attrs.end()) {
@@ -85,7 +102,9 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
         if (complete_time[node_id] > e2e) e2e = complete_time[node_id];
 
         for (size_t dst : outgoing[node_id]) {
-            // 如果多个前驱都指向同一 dst，只保留完成时间最大的那个作为 critical predecessor。
+            /**
+             * @brief 如果多个前驱都指向同一 dst，只保留完成时间最大的那个作为 critical predecessor。
+             */
             if (critical_pred[dst] == INVALID_NODE || complete_time[node_id] > complete_time[critical_pred[dst]]) critical_pred[dst] = node_id;
             indegree[dst]--;
             if (indegree[dst] == 0) ready.push(dst);
@@ -96,7 +115,9 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
         result.cycle_detected = true;
         result.error = "Cycle detected in DAG. Simulation aborted.";
 
-        // 拓扑排序失败时再做一次 DFS，尽量输出一段具体 cycle node id，方便定位错误边。
+        /**
+         * @brief 拓扑排序失败时再做一次 DFS，尽量输出一段具体 cycle node id，方便定位错误边。
+         */
         std::vector<int> visit_state(node_count, 0);
         std::vector<size_t> path_stack;
         std::function<bool(size_t)> dfs = [&](size_t node_id) {

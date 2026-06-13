@@ -48,15 +48,21 @@ class ModelingOptions:
 
 
 def load_json(path: Path) -> dict[str, Any]:
+    """读取 JSON 对象配置或运行摘要。"""
+
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_json(path: Path, value: Any) -> None:
+    """以稳定缩进写出 JSON，并创建父目录。"""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
 def resolve_repo_path(value: str) -> Path:
+    """把用户输入路径解析为仓库内真实路径。"""
+
     path = Path(value).expanduser()
     if path.is_absolute():
         return map_repo_path(path)
@@ -64,6 +70,8 @@ def resolve_repo_path(value: str) -> Path:
 
 
 def map_repo_path(path: Path) -> Path:
+    """把容器内仓库前缀映射成本机仓库路径。"""
+
     raw = str(path)
     for prefix in CONTAINER_REPO_PREFIXES:
         if raw == prefix:
@@ -74,6 +82,8 @@ def map_repo_path(path: Path) -> Path:
 
 
 def parse_args(argv: list[str] | None = None) -> ModelingOptions:
+    """解析 modeling runner CLI 参数。"""
+
     parser = argparse.ArgumentParser(description="Run C++ trace-based modeling.")
     parser.add_argument("--config", required=True, help="modeling config path")
     parser.add_argument("--output-dir", help="override config.output_dir")
@@ -110,6 +120,12 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
 
 
 def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
+    """执行一次 modeling run。
+
+    Python 侧只准备输入 trace、C++ model config 和输出路径；实际 DAG 构建、模块执行和拓扑仿真
+    均由 C++ TraceGraph 完成。
+    """
+
     config = load_json(options.config_path)
     mode = options.mode or str(config.get("mode") or "faithful_replay")
     output_dir = options.output_dir or resolve_repo_path(str(config.get("output_dir") or "data/modeling_runs/cpp_trace_graph"))
@@ -183,6 +199,8 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
 
 
 def prepare_trace_inputs(config: dict[str, Any], input_cfg: dict[str, Any], manifest_path: Path | None, output_dir: Path) -> list[Path]:
+    """根据 config 或 profile manifest 准备 C++ 后端输入 trace。"""
+
     if manifest_path is not None:
         merged_dir = output_dir / "merged_trace"
         reusable = load_reusable_merge_summary(merged_dir, manifest_path)
@@ -242,6 +260,8 @@ def load_reusable_merge_summary(merged_dir: Path, manifest_path: Path) -> list[P
 
 
 def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) -> Path | None:
+    """把上层 modeling config 收敛为 C++ TraceGraph 消费的窄 model config。"""
+
     if mode == "faithful_replay":
         return None
 
@@ -277,6 +297,8 @@ def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) 
 
 
 def node_scale_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None:
+    """从 modules 配置中提取 NodeScaleModule 的窄配置。"""
+
     for module in config.get("modules") or []:
         if not isinstance(module, dict) or not module.get("enabled", True):
             continue
@@ -300,6 +322,8 @@ def node_scale_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | N
 
 
 def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None:
+    """从 modules 配置中提取 HiCacheModule 的显式 target config。"""
+
     for module in config.get("modules") or []:
         if not isinstance(module, dict) or not module.get("enabled", True):
             continue
@@ -421,6 +445,8 @@ def _command_option_value(command: list[str], option: str) -> str | None:
 
 
 def _copy_command_int_option(result: dict[str, Any], command: list[str], option: str, key: str) -> None:
+    """从 target experiment command 中复制整数型 HiCache 选项。"""
+
     raw = _command_option_value(command, option)
     value = _optional_int(raw)
     if value is not None and value > 0:
@@ -428,6 +454,8 @@ def _copy_command_int_option(result: dict[str, Any], command: list[str], option:
 
 
 def _copy_command_policy_option(result: dict[str, Any], command: list[str], option: str, key: str) -> None:
+    """从 target experiment command 中复制 policy 字符串选项。"""
+
     raw = _command_option_value(command, option)
     if raw is None:
         return
@@ -460,6 +488,8 @@ def _copy_hicache_storage_extra_config(result: dict[str, Any], raw_extra: str) -
 
 
 def hicache_state_validation_enabled(config: dict[str, Any]) -> bool:
+    """判断当前 modeling config 是否启用 HiCache state validation。"""
+
     validation_cfg = config.get("validation") if isinstance(config.get("validation"), dict) else {}
     hicache_cfg = validation_cfg.get("hicache_state") if isinstance(validation_cfg.get("hicache_state"), dict) else {}
     return bool(hicache_cfg.get("enabled", False))
@@ -530,6 +560,8 @@ def write_hicache_predicted_state_trace_if_available(module_summary_path: Path, 
 
 
 def tier_src_from_transition(row: dict[str, Any]) -> str:
+    """把 C++ transition 行映射为 validation 使用的源 tier。"""
+
     kind = str(row.get("kind") or "")
     tier = str(row.get("tier") or "")
     if kind.startswith("remove_"):
@@ -538,6 +570,8 @@ def tier_src_from_transition(row: dict[str, Any]) -> str:
 
 
 def tier_dst_from_transition(row: dict[str, Any]) -> str:
+    """把 C++ transition 行映射为 validation 使用的目标 tier。"""
+
     kind = str(row.get("kind") or "")
     tier = str(row.get("tier") or "")
     if kind.startswith("add_"):
@@ -546,6 +580,8 @@ def tier_dst_from_transition(row: dict[str, Any]) -> str:
 
 
 def predicted_operation_kind_from_transition(row: dict[str, Any]) -> str:
+    """把 C++ transition kind 归类为 oracle delta 对比使用的 operation kind。"""
+
     kind = str(row.get("kind") or "")
     if kind.startswith("add_") or kind.startswith("remove_"):
         return "resident_state_update"
@@ -583,6 +619,8 @@ def write_hicache_recommended_cpp_config_if_available(validation: dict[str, Any]
 
 
 def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | None) -> WorkloadWindow | None:
+    """从显式配置或 profile manifest 中发现 workload 真实时间窗。"""
+
     explicit = input_cfg.get("workload_report")
     if isinstance(explicit, str):
         return load_workload_window(resolve_repo_path(explicit))
@@ -603,6 +641,8 @@ def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | No
 
 
 def load_workload_window(path: Path) -> WorkloadWindow | None:
+    """从 workload_report.json 读取请求开始/结束时间窗。"""
+
     if not path.is_file():
         return None
     report = load_json(path)
@@ -626,6 +666,8 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
 
 
 def load_bench_serving_window(path: Path) -> WorkloadWindow | None:
+    """从 SGLang bench serving JSONL 读取整体 duration。"""
+
     if not path.is_file():
         return None
     last: dict[str, Any] | None = None
@@ -651,6 +693,8 @@ def load_bench_serving_window(path: Path) -> WorkloadWindow | None:
 
 
 def optional_float(value: Any) -> float | None:
+    """宽松解析 float，失败时返回 None。"""
+
     try:
         return float(value)
     except (TypeError, ValueError):
@@ -658,6 +702,8 @@ def optional_float(value: Any) -> float | None:
 
 
 def trace_graph_executable(config: dict[str, Any]) -> Path:
+    """解析 C++ trace_graph 可执行文件路径。"""
+
     cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
     if isinstance(cpp.get("executable"), str):
         executable = resolve_repo_path(cpp["executable"])
@@ -680,6 +726,8 @@ def build_validation(
     predicted_state_trace_path: Path | None,
     hicache_oracle_trace_paths: list[Path] | None = None,
 ) -> dict[str, Any]:
+    """构造 modeling validation 输出。"""
+
     validation_cfg = config.get("validation") if isinstance(config.get("validation"), dict) else {}
     threshold = float(validation_cfg.get("faithful_replay_full_e2e_rel_error_max", 0.05))
     summary_real = optional_float(run_summary.get("real_e2e_ns"))
@@ -748,6 +796,12 @@ def build_hicache_state_validation_if_enabled(
     predicted_state_trace_path: Path | None,
     oracle_trace_paths_override: list[Path] | None = None,
 ) -> dict[str, Any] | None:
+    """构造 HiCache state validation。
+
+    oracle snapshot 只用于 validation/debug；该函数不会修改 C++ model config，也不会把 oracle
+    状态回流到预测路径。
+    """
+
     hicache_cfg = validation_cfg.get("hicache_state") if isinstance(validation_cfg.get("hicache_state"), dict) else {}
     if not bool(hicache_cfg.get("enabled", False)):
         return None
@@ -854,6 +908,8 @@ def configured_ignore_state_keys(hicache_cfg: dict[str, Any]) -> set[str]:
 
 
 def extract_hicache_summary(model_summary: dict[str, Any]) -> dict[str, Any]:
+    """从 C++ module summary 中提取 HiCache summary。"""
+
     modules = model_summary.get("modules")
     if not isinstance(modules, list):
         return {}
@@ -864,6 +920,8 @@ def extract_hicache_summary(model_summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, Any]]:
+    """从 oracle trace 中提取 validation-only HiCache state snapshot。"""
+
     snapshots: list[dict[str, Any]] = []
     for path in trace_paths:
         if not path.is_file():
@@ -889,8 +947,7 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
             if isinstance(snapshot, dict):
                 snapshots.append(
                     {
-                        # C++ state model 当前在一个 DagGraph 内聚合所有进程事件。
-                        # oracle 也必须先按进程取最终快照，再做集合 union。
+                        # C++ state model 当前在一个 DagGraph 内聚合所有进程事件；oracle 也必须先按进程取最终快照，再做集合 union。
                         "order": len(snapshots),
                         "trace_path": str(path),
                         "pid": event.get("pid"),
@@ -1120,6 +1177,8 @@ def _recommend_single_value(
     field: str,
     values: list[Any],
 ) -> None:
+    """从唯一观测值生成推荐配置字段；多值或缺失时只写 warning。"""
+
     if len(values) == 1:
         result[field] = values[0]
         evidence[field] = {"source": "unique_observed_value", "observed_values": values}
@@ -1141,6 +1200,11 @@ def _recommend_capacity_value(
     final_count: int | None,
     explicit_target_value: int | None = None,
 ) -> None:
+    """推荐容量字段。
+
+    容量只从显式 target config 复制；runtime occupancy 和 pool snapshot 仅作为诊断证据。
+    """
+
     raw_pool = pool_values[0] if len(pool_values) == 1 else None
     if len(pool_values) > 1:
         warnings.append(f"{field}:multiple_observed_pool_values")
@@ -1171,6 +1235,8 @@ def _recommend_capacity_value(
 
 
 def _compare_int_config(field: str, target_value: int | None, observed_values: list[int]) -> dict[str, Any]:
+    """比较整数型 target config 和 oracle 观测值。"""
+
     if target_value is None or target_value <= 0:
         status = "not_configured"
     elif not observed_values:
@@ -1188,6 +1254,8 @@ def _compare_int_config(field: str, target_value: int | None, observed_values: l
 
 
 def _compare_policy_config(field: str, target_value: str, observed_values: list[str]) -> dict[str, Any]:
+    """比较 policy 型 target config 和 oracle 观测值。"""
+
     if target_value in {"", "observed"}:
         status = "not_configured"
     elif not observed_values:
@@ -1211,6 +1279,8 @@ def _compare_capacity_config(
     oracle_final_count: int | None,
     oracle_observed_max_count: int | None,
 ) -> dict[str, Any]:
+    """比较容量 config、oracle final count 和 oracle observed max count。"""
+
     if target_value is None or target_value <= 0:
         status = "not_configured"
     elif not observed_values:
@@ -1257,6 +1327,8 @@ def _compare_capacity_config(
 
 
 def _unique_int_values(unique_values: dict[str, Any], keys: list[str]) -> list[int]:
+    """从 capacity oracle unique_values 中收集整数值。"""
+
     values: set[int] = set()
     for key in keys:
         raw_values = unique_values.get(key)
@@ -1270,6 +1342,8 @@ def _unique_int_values(unique_values: dict[str, Any], keys: list[str]) -> list[i
 
 
 def _unique_policy_values(unique_values: dict[str, Any], keys: list[str]) -> list[str]:
+    """从 capacity oracle unique_values 中收集规整后的 policy 值。"""
+
     values: set[str] = set()
     for key in keys:
         raw_values = unique_values.get(key)
@@ -1283,6 +1357,8 @@ def _unique_policy_values(unique_values: dict[str, Any], keys: list[str]) -> lis
 
 
 def _optional_int(value: Any) -> int | None:
+    """严格解析正整数候选；bool 和非法值返回 None。"""
+
     if value is None or isinstance(value, bool):
         return None
     try:
@@ -1292,12 +1368,16 @@ def _optional_int(value: Any) -> int | None:
 
 
 def _normalize_policy_value(value: Any) -> str:
+    """规整 policy 字符串，使用下划线形式。"""
+
     if value is None:
         return ""
     return str(value).strip().lower().replace("-", "_")
 
 
 def flatten_hicache_capacity_scalars(value: Any, prefix: str = "") -> list[tuple[str, Any]]:
+    """把 capacity snapshot 中的嵌套标量展开成点分路径。"""
+
     rows: list[tuple[str, Any]] = []
     if isinstance(value, dict):
         for key, item in sorted(value.items()):
@@ -1350,6 +1430,8 @@ def observed_max_derived_state_counts(snapshots: list[dict[str, Any]]) -> dict[s
 
 
 def _update_max_state_counts(max_counts: dict[str, int], state: dict[str, Any]) -> None:
+    """用一个 state 更新每个集合字段达到过的最大规模。"""
+
     for key, value in state.items():
         if not isinstance(value, list):
             continue
@@ -1358,6 +1440,8 @@ def _update_max_state_counts(max_counts: dict[str, int], state: dict[str, Any]) 
 
 
 def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
+    """按进程取最后一个 completed snapshot，并合并成 oracle final state。"""
+
     latest_by_process: dict[tuple[str, str], dict[str, Any]] = {}
     completed_snapshots = [row for row in snapshots if snapshot_is_completed_state(row)]
     source_snapshots = completed_snapshots if completed_snapshots else snapshots
@@ -1426,9 +1510,7 @@ def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, A
             result["l1_resident_pages"].update(pages)
         if has_host_value:
             result["l2_resident_pages"].update(pages)
-        # SGLang HiRadixCache 目前没有可靠暴露 dirty 字段；write-back
-        # 下 device-resident 且未备份到 host 的页就是 state model 需要维护
-        # 的 dirty 页。显式 dirty=true 仍优先保留。
+        # SGLang HiRadixCache 目前没有可靠暴露 dirty 字段；write-back 下 device-resident 且未备份到 host 的页就是 state model 需要维护的 dirty 页。
         if node.get("dirty") or (has_device_value and not backuped and not evicted):
             result["dirty_pages"].update(pages)
         if backuped:
@@ -1441,6 +1523,8 @@ def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, A
 
 
 def page_keys_from_snapshot_hash(value: Any) -> list[str]:
+    """从 snapshot hash_value 字段提取 page key 列表。"""
+
     if value is None:
         return []
     if isinstance(value, list):
@@ -1449,6 +1533,8 @@ def page_keys_from_snapshot_hash(value: Any) -> list[str]:
 
 
 def normalize_hicache_state_for_oracle_compare(state: dict[str, Any], page_key_mode: str) -> dict[str, Any]:
+    """按 page_key_mode 归一化 state 中的集合字段。"""
+
     normalized: dict[str, Any] = {}
     for key, value in state.items():
         if isinstance(value, list):
@@ -1459,6 +1545,8 @@ def normalize_hicache_state_for_oracle_compare(state: dict[str, Any], page_key_m
 
 
 def normalize_hicache_page_key(value: Any, page_key_mode: str) -> str:
+    """归一化单个 page key；strip_scope 模式会去掉 scope 前缀。"""
+
     page = str(value)
     if page_key_mode == "strip_scope" and "|" in page:
         return page.split("|", 1)[1]
@@ -1480,6 +1568,8 @@ def snapshot_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def diff_hicache_sets(model_final: dict[str, Any], oracle_final: dict[str, Any]) -> dict[str, Any]:
+    """比较 model final state 和 oracle final state 的集合字段。"""
+
     keys = [
         "l1_resident_pages",
         "l2_resident_pages",
@@ -1535,6 +1625,12 @@ def unchecked_model_state_keys(model_final: dict[str, Any], oracle_final: dict[s
 
 
 def load_predicted_state_records(path: Path | None) -> list[dict[str, Any]]:
+    """读取 C++ HiCache state model 输出的 transition 明细。
+
+    缺失或损坏的文件只代表该次验证没有 transition 明细，不应让上层
+    profiling/modeling 编排因为诊断附件不可用而失败。
+    """
+
     if path is None or not path.is_file():
         return []
     try:
@@ -1739,6 +1835,13 @@ def timeline_visible_state_keys(snapshots: list[dict[str, Any]]) -> set[str]:
 
 
 def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_keys: set[str]) -> dict[str, Any]:
+    """沿 raw state snapshot 时间线构造 oracle transition multiset。
+
+    timeline oracle 先按 cache object 汇总，再对所有对象状态取 union 后求相邻差分。
+    这与 C++ state model 的最终可见页集合语义一致，避免多对象/多进程 snapshot
+    让同一页被错误地来回清空。
+    """
+
     timeline: list[tuple[tuple[int, int, int], tuple[str, str, str], dict[str, Any]]] = []
     snapshot_count_with_object_id = 0
     snapshot_count_without_object_id = 0
@@ -1805,6 +1908,8 @@ def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_k
     }
 
 def union_hicache_states(states: Any) -> dict[str, list[str]]:
+    """把多个 cache object 的集合状态合并成一次全局可见状态。"""
+
     union: dict[str, set[str]] = {}
     for state in states:
         if not isinstance(state, dict):
@@ -1832,6 +1937,11 @@ def snapshot_is_completed_state(row: dict[str, Any]) -> bool:
 
 
 def snapshot_logical_time_us(row: dict[str, Any]) -> int:
+    """返回 snapshot 参与 timeline 排序的逻辑时间。
+
+    end snapshot 的真实状态变化点在 duration 末尾，因此使用 `ts + dur`。
+    """
+
     ts = int(optional_float(row.get("ts")) or 0)
     source_name = str(row.get("source_event_name") or row.get("event_name") or "")
     if event_phase(source_name) == "end":
@@ -1840,6 +1950,8 @@ def snapshot_logical_time_us(row: dict[str, Any]) -> int:
 
 
 def snapshot_timeline_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
+    """生成稳定 timeline 排序键，确保同时间戳下 start 先于 end。"""
+
     source_name = str(row.get("source_event_name") or row.get("event_name") or "")
     phase_score = 0 if event_phase(source_name) == "start" else 1
     return (snapshot_logical_time_us(row), phase_score, int(row.get("order") or 0))
@@ -1862,6 +1974,13 @@ def active_delta_state_keys(predicted_records: list[dict[str, Any]]) -> set[str]
 
 
 def build_oracle_event_deltas(snapshots: list[dict[str, Any]], active_state_keys: set[str]) -> dict[str, Any]:
+    """把 start/end 成对 snapshot 转成事件包围区间差分。
+
+    该函数同时输出 inclusive 和 exclusive 两套结果：inclusive 保留嵌套调用造成
+    的全部净变化；exclusive 排除包含其他 snapshot 的外层调用，用于更严格的
+    self-config prediction 对齐。
+    """
+
     groups: dict[tuple[str, str, str, str, str, str, int, str], dict[str, dict[str, Any]]] = {}
     for row in snapshots:
         source_name = str(row.get("source_event_name") or row.get("event_name") or "")
@@ -1966,6 +2085,8 @@ def event_has_nested_snapshots(
 
 
 def snapshot_event_key(row: dict[str, Any], source_name: str) -> tuple[str, str, str, str, str, str, int, str]:
+    """生成 start/end snapshot 配对使用的事件身份。"""
+
     return (
         str(row.get("trace_path") or ""),
         str(row.get("pid") or ""),
@@ -1979,6 +2100,8 @@ def snapshot_event_key(row: dict[str, Any], source_name: str) -> tuple[str, str,
 
 
 def event_phase(name: str) -> str:
+    """从 probe event name 后缀解析 start/end phase。"""
+
     clean = name.split(":", 1)[0]
     if clean.endswith("_start"):
         return "start"
@@ -1988,6 +2111,8 @@ def event_phase(name: str) -> str:
 
 
 def event_base_name(name: str) -> str:
+    """去掉 start/end 后缀，得到 prediction 和 oracle 共享的事件基名。"""
+
     clean = name.split(":", 1)[0]
     if clean.endswith("_start"):
         return clean[: -len("_start")]
@@ -2002,6 +2127,12 @@ def delta_rows_for_event_key(
     end_state: dict[str, Any],
     active_state_keys: set[str],
 ) -> dict[str, Any]:
+    """把两个集合状态之间的差分展开成 transition rows。
+
+    只有 C++ 模型实际输出过的 state key 会参与比较；其他 snapshot 中可见但
+    没有输入事实支撑的变化会被记录到 ignored_state_keys。
+    """
+
     trace_path, pid, tid, target_id, request_id, operation_id, ts, base_name = key
     rows: list[dict[str, Any]] = []
     ignored_state_keys: set[str] = set()
@@ -2034,6 +2165,8 @@ def delta_rows_for_event_key(
 
 
 def build_predicted_event_deltas(predicted_records: list[dict[str, Any]], active_state_keys: set[str] | None = None) -> dict[str, Any]:
+    """把 C++ transition 明细规整成事件级可比较 delta rows。"""
+
     state_keys = active_state_keys if active_state_keys is not None else set(DELTA_KIND_BY_STATE_KEY)
     comparable_kinds = {kind for state_key, kinds in DELTA_KIND_BY_STATE_KEY.items() if state_key in state_keys for kind in kinds}
     grouped: dict[tuple[str, str], set[str]] = {}
@@ -2069,6 +2202,8 @@ def build_predicted_event_deltas(predicted_records: list[dict[str, Any]], active
 
 
 def event_delta_key(cache_scope: str, ts: int, base_name: str) -> str:
+    """生成 prediction/oracle 事件级 delta 的紧凑匹配键。"""
+
     return f"{cache_scope}:{ts}:{base_name}"
 
 
@@ -2077,6 +2212,8 @@ def compare_event_delta_rows(
     oracle_rows: list[dict[str, Any]],
     allowed_event_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """按事件键和 transition kind 比较 predicted/oracle 页集合。"""
+
     predicted_by_key = {(str(row.get("event_key") or ""), str(row.get("transition_kind") or "")): row for row in predicted_rows}
     oracle_by_key = {(str(row.get("event_key") or ""), str(row.get("transition_kind") or "")): row for row in oracle_rows}
     mismatches: list[dict[str, Any]] = []
@@ -2105,6 +2242,8 @@ def compare_event_delta_rows(
 
 
 def compare_delta_multisets(predicted_rows: list[dict[str, Any]], oracle_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按 `(transition_kind, page)` multiset 比较 timeline delta。"""
+
     predicted_counts = delta_multiset_counts(predicted_rows)
     oracle_counts = delta_multiset_counts(oracle_rows)
     mismatches: list[dict[str, Any]] = []
@@ -2128,6 +2267,8 @@ def compare_delta_multisets(predicted_rows: list[dict[str, Any]], oracle_rows: l
 
 
 def mismatch_value_count(value: Any) -> int:
+    """把 mismatch 字段里的 list/count 统一折算成数量。"""
+
     if isinstance(value, list):
         return len([item for item in value if item is not None])
     try:
@@ -2163,6 +2304,8 @@ def summarize_delta_mismatches_by_kind(mismatches: list[dict[str, Any]]) -> dict
 
 
 def delta_multiset_counts(rows: list[dict[str, Any]]) -> dict[tuple[str, str], int]:
+    """统计 delta rows 中每个 transition/page 出现次数。"""
+
     counts: dict[tuple[str, str], int] = {}
     for row in rows:
         kind = str(row.get("transition_kind") or "")
@@ -2177,6 +2320,8 @@ def delta_multiset_counts(rows: list[dict[str, Any]]) -> dict[tuple[str, str], i
 
 
 def count_rows_by_transition_kind(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """按 transition kind 汇总触达页数。"""
+
     counts: dict[str, int] = {}
     for row in rows:
         kind = str(row.get("transition_kind") or "")
@@ -2187,11 +2332,15 @@ def count_rows_by_transition_kind(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def page_set_from_predicted_record(record: dict[str, Any]) -> list[Any]:
+    """读取 C++ transition 明细中的目标页集合。"""
+
     pages = record.get("target_page_set")
     return pages if isinstance(pages, list) else []
 
 
 def count_records_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    """按指定字段统计记录数量，忽略空字段值。"""
+
     counts: dict[str, int] = {}
     for row in rows:
         value = str(row.get(key) or "")
@@ -2202,6 +2351,8 @@ def count_records_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]
 
 
 def first_hicache_mismatch(sets_diff: dict[str, Any], predicted_records: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
+    """返回第一个 final-state mismatch 及其候选 transition 证据。"""
+
     predicted_records = predicted_records or []
     for key, value in sets_diff.items():
         if isinstance(value, dict) and not value.get("match", False):
@@ -2219,6 +2370,8 @@ def first_hicache_mismatch(sets_diff: dict[str, Any], predicted_records: list[di
 
 
 def first_transition_touching_page(records: list[dict[str, Any]], page: str) -> dict[str, Any] | None:
+    """查找第一条触达指定 page 的 predicted transition。"""
+
     if not page:
         return None
     for record in records:
@@ -2239,11 +2392,15 @@ def first_transition_touching_page(records: list[dict[str, Any]], page: str) -> 
 
 
 def false_like(value: Any) -> bool:
+    """解析配置/JSON 中常见的 false 字符串表示。"""
+
     text = str(value).lower()
     return text in {"false", "0", "no", "off"}
 
 
 def main(argv: list[str] | None = None) -> int:
+    """CLI 入口：输出单次 modeling prediction JSON。"""
+
     prediction = run_from_cli(parse_args(argv))
     print(json.dumps(prediction, ensure_ascii=False))
     return 0

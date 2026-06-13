@@ -24,8 +24,11 @@ namespace {
 using Json = nlohmann::json;
 
 struct CliOptions {
-    // C++ 后端输入必须是已经由 trace_merger 合并后的 Chrome trace。
-    // 多个 --input 表示多个 rank / device graph，后续由 DagGraph::merge 合并。
+    /**
+     * @brief C++ 后端输入必须是已经由 trace_merger 合并后的 Chrome trace。
+     *
+     * 多个 --input 表示多个 rank / device graph，后续由 DagGraph::merge 合并。
+     */
     std::vector<std::string> input_traces;
     std::string graph_output;
     std::string model_config_file;
@@ -65,8 +68,11 @@ bool consume_value(int & i, int argc, char ** argv, std::string & out, const std
 }
 
 CliOptions parse_cli(int argc, char ** argv) {
-    // CLI 只保留当前主线需要的参数，不再提供旧版 --scale/-s 等快捷入口。
-    // what-if 必须通过 --model-config 进入 C++ SimulationModule。
+    /**
+     * @brief CLI 只保留当前主线需要的参数，不再提供旧版 --scale/-s 等快捷入口。
+     *
+     * what-if 必须通过 --model-config 进入 C++ SimulationModule。
+     */
     CliOptions opts;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -122,8 +128,12 @@ CliOptions parse_cli(int argc, char ** argv) {
 }
 
 std::vector<std::unique_ptr<TraceGraph::SimulationModule>> build_modules(const std::string & model_config_file) {
-    // 模块顺序在这里固定：简单缩放先执行，HiCache 后执行。
-    // 后续如果模块之间存在依赖，应在这里明确排序，而不是让 JSON 对象遍历顺序决定行为。
+    /**
+     * @brief 按固定顺序构造 SimulationModule。
+     *
+     * 简单缩放先执行，HiCache 后执行。后续如果模块之间存在依赖，应在这里明确排序，
+     * 而不是让 JSON 对象遍历顺序决定行为。
+     */
     std::vector<std::unique_ptr<TraceGraph::SimulationModule>> modules;
     if (model_config_file.empty()) return modules;
 
@@ -140,8 +150,11 @@ void write_json_file(const std::string & filename, const Json & value) {
 }
 
 void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<TraceGraph::SimulationModule>> & modules) {
-    // summary 只收集已经 apply 且声明 has_summary 的模块。
-    // 默认预测输出不读取 summary，避免 debug 信息参与功能路径。
+    /**
+     * @brief summary 只收集已经 apply 且声明 has_summary 的模块。
+     *
+     * 默认预测输出不读取 summary，避免 debug 信息参与功能路径。
+     */
     Json root;
     root["modules"] = Json::array();
     for (const auto & module : modules) {
@@ -152,8 +165,11 @@ void write_module_summary(const std::string & filename, const std::vector<std::u
 }
 
 void write_run_summary(const std::string & filename, const CliOptions & opts, const TraceGraph::DagGraph & graph, const Json & stage_timings) {
-    // run_summary 是 runner/validation 使用的辅助输出。
-    // 用户默认看到的 prediction.json 由 Python runner 从 simulated_e2e_ns 提取。
+    /**
+     * @brief run_summary 是 runner/validation 使用的辅助输出。
+     *
+     * 用户默认看到的 prediction.json 由 Python runner 从 simulated_e2e_ns 提取。
+     */
     Json root;
     root["scenario_name"] = opts.scenario_name;
     root["input_traces"] = opts.input_traces;
@@ -200,7 +216,11 @@ int main(int argc, char ** argv) {
         uint64_t read_ms = 0;
         uint64_t build_ms = 0;
         for (size_t i = 0; i < opts.input_traces.size(); ++i) {
-            // 单个输入 trace 独立读入、归一化、构图；这样每个 rank 的 lane/connection 索引不会互相污染。
+            /**
+             * @brief 单个输入 trace 独立读入、归一化、构图。
+             *
+             * 这样每个 rank 的 lane/connection 索引不会互相污染。
+             */
             auto read_start = std::chrono::steady_clock::now();
             auto events = TraceGraph::read_chrome_trace(opts.input_traces[i]);
             auto read_end = std::chrono::steady_clock::now();
@@ -213,7 +233,9 @@ int main(int argc, char ** argv) {
         }
         timings["read_ms"] = read_ms;
         timings["build_ms"] = build_ms;
-        // 多输入 trace 在 per-rank base DAG 构好后 merge，只追加跨 rank 约束。
+        /**
+         * @brief 多输入 trace 在 per-rank base DAG 构好后 merge，只追加跨 rank 约束。
+         */
         auto merge_start = std::chrono::steady_clock::now();
         auto graph = TraceGraph::DagGraph::merge(std::move(graphs));
         auto merge_end = std::chrono::steady_clock::now();
@@ -228,7 +250,9 @@ int main(int argc, char ** argv) {
         auto module_end = std::chrono::steady_clock::now();
         timings["module_ms"] = elapsed_ms(module_start, module_end);
 
-        // 所有模块修改完成后只跑一次拓扑仿真。
+        /**
+         * @brief 所有模块修改完成后只跑一次拓扑仿真。
+         */
         auto simulation_start = std::chrono::steady_clock::now();
         TraceGraph::run_topological_simulation(graph);
         auto simulation_end = std::chrono::steady_clock::now();
