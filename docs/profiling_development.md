@@ -16,7 +16,7 @@ experiment config
   -> container-side profile_runner.py
   -> torch / python_probe / ld_preload 分渠道采集
   -> profile_manifest.json
-  -> profile_quality.py / model_runner.py
+  -> profile_quality.py / scripts/model.sh -> container-side model_runner.py
 ```
 
 Profiling 应回答：
@@ -53,6 +53,20 @@ LD_PRELOAD wrapper 是 C++ 中硬编码的符号拦截点，不支持从 JSON �
 ```bash
 scripts/profile.sh <config.json> --experiment <id>
 ```
+
+Profiling 运行在 framework runtime Docker 容器中：`sglang-profile` 对应 SGLang，`ktransformers-profile` 对应
+KTransformers。这两个容器包含 Ascend/CANN、torch_npu、对应框架源码安装层和 LD_PRELOAD hook 的 ABI 上下文。
+宿主机不作为真实 profiling 或 C++ hook 编译验收环境。
+
+构建 framework runtime 镜像和 hook：
+
+```bash
+scripts/build.sh sglang
+scripts/build.sh ktransformers
+```
+
+独立的 `modeling` Docker service 只用于 C++ TraceGraph / modeling 编译和运行检查，不用于真实 server profiling，
+也不要求安装 Ascend/CANN。
 
 dry-run 和配置展开也优先使用同一入口：
 
@@ -213,7 +227,8 @@ prefetch terminate、abort cleanup 和 host memory release enqueue。这些事�
 - 跨配置签名必须归一化到 token path / request fingerprint。
 
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
-`fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 `model_runner.py` 的 validation 路径使用。
+`fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 modeling 容器内 `model_runner.py` 的
+validation 路径使用。
 
 ## Token / Range 主事实
 

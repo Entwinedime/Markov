@@ -10,11 +10,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <ranges>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -104,12 +106,9 @@ CliOptions parse_cli(int argc, char ** argv) {
         else if (arg == "--scenario-name") {
             if (!consume_value(i, argc, argv, opts.scenario_name, arg)) opts.show_help = true;
         }
-        else if (arg == "--full-output")
-            opts.full_output = true;
-        else if (arg == "-d" || arg == "--debug")
-            opts.debug = true;
-        else if (arg == "-v" || arg == "--verbose")
-            opts.verbose = true;
+        else if (arg == "--full-output") opts.full_output = true;
+        else if (arg == "-d" || arg == "--debug") opts.debug = true;
+        else if (arg == "-v" || arg == "--verbose") opts.verbose = true;
         else {
             std::cerr << "Error: Unknown option: " << arg << "\n";
             opts.show_help = true;
@@ -136,6 +135,7 @@ std::vector<std::unique_ptr<TraceGraph::SimulationModule>> build_modules(const s
      */
     std::vector<std::unique_ptr<TraceGraph::SimulationModule>> modules;
     if (model_config_file.empty()) return modules;
+    modules.reserve(2);
 
     auto config = TraceGraph::ModelConfig::from_file(model_config_file);
     if (config.node_scale.enabled) modules.push_back(std::make_unique<TraceGraph::NodeScaleModule>(config.node_scale));
@@ -157,10 +157,10 @@ void write_module_summary(const std::string & filename, const std::vector<std::u
      */
     Json root;
     root["modules"] = Json::array();
-    for (const auto & module : modules) {
-        if (!module || !module->has_summary()) continue;
+    std::ranges::for_each(modules, [&](const auto & module) {
+        if (!module || !module->has_summary()) return;
         root["modules"].push_back(Json::parse(module->summary_json()));
-    }
+    });
     write_json_file(filename, root);
 }
 
@@ -204,10 +204,8 @@ int main(int argc, char ** argv) {
         logger.set_level(TraceGraph::Logger::DEBUG);
         setenv("DEBUG_TRACE", "1", 1);
     }
-    else if (opts.verbose)
-        logger.set_level(TraceGraph::Logger::INFO);
-    else
-        logger.set_level(TraceGraph::Logger::WARN);
+    else if (opts.verbose) logger.set_level(TraceGraph::Logger::INFO);
+    else logger.set_level(TraceGraph::Logger::WARN);
 
     try {
         std::vector<TraceGraph::DagGraph> graphs;
@@ -215,7 +213,7 @@ int main(int argc, char ** argv) {
         Json timings;
         uint64_t read_ms = 0;
         uint64_t build_ms = 0;
-        for (size_t i = 0; i < opts.input_traces.size(); ++i) {
+        for (const auto i : std::views::iota(size_t{ 0 }, opts.input_traces.size())) {
             /**
              * @brief 单个输入 trace 独立读入、归一化、构图。
              *
@@ -243,10 +241,10 @@ int main(int argc, char ** argv) {
 
         auto modules = build_modules(opts.model_config_file);
         auto module_start = std::chrono::steady_clock::now();
-        for (const auto & module : modules) {
+        std::ranges::for_each(modules, [&](const auto & module) {
             logger.info() << "Applying module: " << module->name();
             module->apply(graph);
-        }
+        });
         auto module_end = std::chrono::steady_clock::now();
         timings["module_ms"] = elapsed_ms(module_start, module_end);
 
@@ -254,7 +252,7 @@ int main(int argc, char ** argv) {
          * @brief 所有模块修改完成后只跑一次拓扑仿真。
          */
         auto simulation_start = std::chrono::steady_clock::now();
-        TraceGraph::run_topological_simulation(graph);
+        (void)TraceGraph::run_topological_simulation(graph);
         auto simulation_end = std::chrono::steady_clock::now();
         timings["simulation_ms"] = elapsed_ms(simulation_start, simulation_end);
         if (!opts.graph_output.empty()) TraceGraph::write_chrome_trace_dag(opts.graph_output, graph, opts.full_output);

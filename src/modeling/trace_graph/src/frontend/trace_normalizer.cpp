@@ -1,14 +1,10 @@
 #include "trace_graph/frontend/trace_normalizer.hpp"
 
+#include <algorithm>
+#include <ranges>
 #include <string>
 
 namespace TraceGraph {
-
-namespace {
-
-bool starts_with(const std::string & text, const std::string & prefix) { return text.rfind(prefix, 0) == 0; }
-
-} // namespace
 
 void normalize_trace_events(std::vector<TraceEvent> & events) {
     /**
@@ -16,21 +12,21 @@ void normalize_trace_events(std::vector<TraceEvent> & events) {
      *
      * 例如 hicache 事件只标记 domain/producer，是否命中、是否写回由后续 HiCacheModule 决定。
      */
-    for (auto & event : events) {
-        if (event.cat == "hicache" || starts_with(event.name, "HiCache::") || starts_with(event.name, "hicache_")) {
+    std::ranges::for_each(events, [](TraceEvent & event) {
+        if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) {
             event.cat = "hicache";
             event.args.emplace("domain", "hicache");
             event.args.emplace("producer", "python_probe");
             event.args.emplace("framework", "sglang");
-            continue;
+            return;
         }
 
-        if (event.cat == "hook" || event.cat == "ld_preload" || starts_with(event.name, "AscendCL@")) {
+        if (event.cat == "hook" || event.cat == "ld_preload" || event.name.starts_with("AscendCL@")) {
             /**
              * @brief LD_PRELOAD 事件常用于补充 torch trace 缺失的 runtime 参数或 sync 边界。
              */
             event.args.emplace("producer", "ld_preload");
-            continue;
+            return;
         }
 
         if (event.cat == "Kernel" || event.cat == "cpu_op" || event.cat == "runtime" || event.cat == "compute") {
@@ -39,7 +35,7 @@ void normalize_trace_events(std::vector<TraceEvent> & events) {
              */
             event.args.emplace("producer", "torch_profiler");
         }
-    }
+    });
 }
 
 } // namespace TraceGraph

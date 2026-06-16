@@ -4,14 +4,22 @@
  */
 #include "trace_graph/modules/hicache/hicache_module.hpp"
 
+#include <string_view>
 #include <utility>
 
 namespace TraceGraph {
 
+namespace {
+
+/** @brief module registry 和 summary JSON 共用的稳定名称。 */
+constexpr std::string_view kHiCacheModuleName = "HiCacheModule";
+
+} // namespace
+
 HiCacheModule::HiCacheModule(HiCacheConfig config) : config_(std::move(config)) {}
 
 /** @brief 返回 module registry 中使用的稳定名称。 */
-std::string HiCacheModule::name() const { return "HiCacheModule"; }
+std::string HiCacheModule::name() const { return std::string{ kHiCacheModuleName }; }
 
 /**
  * @brief 运行 HiCache 状态模型并保存 summary。
@@ -28,6 +36,6 @@ void HiCacheModule::apply(DagGraph & graph) {
 bool HiCacheModule::has_summary() const { return applied_; }
 
 /** @brief 返回 SimulationModule summary JSON 外壳。 */
-std::string HiCacheModule::summary_json() const { return "{\"name\":\"HiCacheModule\",\"hicache\":" + summary_.to_json() + "}"; }
+std::string HiCacheModule::summary_json() const { return "{\"name\":\"" + std::string{ kHiCacheModuleName } + "\",\"hicache\":" + summary_.to_json() + "}"; }
 
 } // namespace TraceGraph

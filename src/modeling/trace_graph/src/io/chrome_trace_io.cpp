@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -38,7 +39,7 @@ std::string scalar_to_string(const Json & value) {
 }
 
 uint64_t json_u64(const Json & object, const std::string & key, uint64_t fallback = 0) {
-    auto it = object.find(key);
+    const auto it = object.find(key);
     if (it == object.end() || it->is_null()) return fallback;
     if (it->is_number_unsigned()) return it->get<uint64_t>();
     if (it->is_number_integer()) {
@@ -62,13 +63,18 @@ uint64_t json_u64(const Json & object, const std::string & key, uint64_t fallbac
 }
 
 std::string json_string(const Json & object, const std::string & key, const std::string & fallback = "") {
-    auto it = object.find(key);
-    return it == object.end() ? fallback : scalar_to_string(*it);
+    if (const auto it = object.find(key); it != object.end()) return scalar_to_string(*it);
+    return fallback;
 }
 
 std::string lower_string(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(value, value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
+}
+
+bool ignored_duration_event_name(const std::string & name) {
+    constexpr std::string_view ignored_names[] = { "Free", "Computing", "Communication", "Communication(Not Overlapped)" };
+    return std::ranges::find(ignored_names, name) != std::end(ignored_names);
 }
 
 bool validation_only_event(const TraceEvent & event) {
@@ -115,7 +121,7 @@ Json load_json_file(const std::string & filename) {
 }
 
 class TraceScanner {
-  public:
+public:
     explicit TraceScanner(std::string buffer) : buffer_(std::move(buffer)), p_(buffer_.data()), end_(buffer_.data() + buffer_.size()) {}
 
     std::vector<TraceEvent> parse() {
@@ -147,7 +153,7 @@ class TraceScanner {
         return {};
     }
 
-  private:
+private:
     void skip_ws() {
         while (p_ < end_ && static_cast<unsigned char>(*p_) <= ' ') ++p_;
     }
@@ -193,8 +199,7 @@ class TraceScanner {
             ++p_;
             int depth = 1;
             while (p_ < end_ && depth > 0) {
-                if (*p_ == '"')
-                    parse_string();
+                if (*p_ == '"') parse_string();
                 else if (*p_ == '{') {
                     ++depth;
                     ++p_;
@@ -203,8 +208,7 @@ class TraceScanner {
                     --depth;
                     ++p_;
                 }
-                else
-                    ++p_;
+                else ++p_;
             }
             return;
         }
@@ -212,8 +216,7 @@ class TraceScanner {
             ++p_;
             int depth = 1;
             while (p_ < end_ && depth > 0) {
-                if (*p_ == '"')
-                    parse_string();
+                if (*p_ == '"') parse_string();
                 else if (*p_ == '[') {
                     ++depth;
                     ++p_;
@@ -222,8 +225,7 @@ class TraceScanner {
                     --depth;
                     ++p_;
                 }
-                else
-                    ++p_;
+                else ++p_;
             }
             return;
         }
@@ -235,10 +237,8 @@ class TraceScanner {
          * @brief Chrome trace 的 ts/dur 可能是整数、浮点或字符串；这里统一截断到 uint64。
          */
         std::string raw;
-        if (p_ < end_ && *p_ == '"')
-            raw = parse_string();
-        else
-            raw = parse_primitive();
+        if (p_ < end_ && *p_ == '"') raw = parse_string();
+        else raw = parse_primitive();
         try {
             double value = std::stod(raw);
             return value >= 0.0 ? static_cast<uint64_t>(value) : 0;
@@ -287,14 +287,10 @@ class TraceScanner {
                 skip_ws();
                 if (p_ < end_ && *p_ == ':') ++p_;
                 skip_ws();
-                if (p_ < end_ && (*p_ == '{' || *p_ == '['))
-                    args[key] = parse_compound_value_literal();
-                else
-                    args[key] = parse_scalar_value();
+                if (p_ < end_ && (*p_ == '{' || *p_ == '[')) args[key] = parse_compound_value_literal();
+                else args[key] = parse_scalar_value();
             }
-            else {
-                ++p_;
-            }
+            else { ++p_; }
             skip_ws();
             if (p_ < end_ && *p_ == ',') ++p_;
         }
@@ -321,32 +317,21 @@ class TraceScanner {
                 if (p_ < end_ && *p_ == ':') ++p_;
                 skip_ws();
 
-                if (key == "name")
-                    event.name = parse_scalar_value();
-                else if (key == "cat")
-                    event.cat = parse_scalar_value();
+                if (key == "name") event.name = parse_scalar_value();
+                else if (key == "cat") event.cat = parse_scalar_value();
                 else if (key == "ph") {
                     event.ph = parse_scalar_value();
                     saw_phase = true;
                 }
-                else if (key == "ts")
-                    event.ts = parse_u64_value();
-                else if (key == "dur")
-                    event.dur = parse_u64_value();
-                else if (key == "pid")
-                    event.pid = parse_scalar_value();
-                else if (key == "tid")
-                    event.tid = parse_scalar_value();
-                else if (key == "event_id")
-                    event.event_id = parse_scalar_value();
-                else if (key == "args")
-                    parse_args(event.args);
-                else
-                    skip_value();
+                else if (key == "ts") event.ts = parse_u64_value();
+                else if (key == "dur") event.dur = parse_u64_value();
+                else if (key == "pid") event.pid = parse_scalar_value();
+                else if (key == "tid") event.tid = parse_scalar_value();
+                else if (key == "event_id") event.event_id = parse_scalar_value();
+                else if (key == "args") parse_args(event.args);
+                else skip_value();
             }
-            else {
-                ++p_;
-            }
+            else { ++p_; }
             skip_ws();
             if (p_ < end_ && *p_ == ',') ++p_;
         }
@@ -366,8 +351,7 @@ class TraceScanner {
          * metadata 和 flow event 不是可执行节点；如果未来需要使用 flow，需要单独解析为依赖边，
          * 而不是当作 0 时长节点。
          */
-        valid = saw_phase && event.ph == "X" && !event.name.empty() && !validation_only_event(event) && event.name != "Free" && event.name != "Computing" &&
-                event.name != "Communication" && event.name != "Communication(Not Overlapped)";
+        valid = saw_phase && event.ph == "X" && !event.name.empty() && !validation_only_event(event) && !ignored_duration_event_name(event.name);
         return event;
     }
 
@@ -387,9 +371,7 @@ class TraceScanner {
                     events.push_back(std::move(event));
                 }
             }
-            else {
-                ++p_;
-            }
+            else { ++p_; }
             skip_ws();
             if (p_ < end_ && *p_ == ',') ++p_;
         }
@@ -402,15 +384,15 @@ class TraceScanner {
 };
 
 std::string output_pid(const TraceEvent & event, const DagNode & node) {
-    if (node.attrs.count("sim_pid")) return node.attrs.at("sim_pid");
-    if (node.attrs.count("gpuid")) return node.attrs.at("gpuid");
+    if (const auto it = node.attrs.find("sim_pid"); it != node.attrs.end()) return it->second;
+    if (const auto it = node.attrs.find("gpuid"); it != node.attrs.end()) return it->second;
     if (!event.pid.empty()) return event.pid;
     return "-1";
 }
 
 std::string output_tid(const TraceEvent & event, const DagNode & node) {
-    if (node.attrs.count("sim_tid")) return node.attrs.at("sim_tid");
-    if (node.attrs.count("tid")) return node.attrs.at("tid");
+    if (const auto it = node.attrs.find("sim_tid"); it != node.attrs.end()) return it->second;
+    if (const auto it = node.attrs.find("tid"); it != node.attrs.end()) return it->second;
     if (!event.tid.empty()) return event.tid;
     return "-1";
 }
@@ -419,10 +401,8 @@ bool is_integer_literal(const std::string & value) {
     if (value.empty()) return false;
     size_t start = value[0] == '-' ? 1 : 0;
     if (start == value.size()) return false;
-    for (size_t i = start; i < value.size(); ++i) {
-        if (!std::isdigit(static_cast<unsigned char>(value[i]))) return false;
-    }
-    return true;
+    auto digits = value | std::views::drop(static_cast<std::ranges::range_difference_t<std::string>>(start));
+    return std::ranges::all_of(digits, [](unsigned char c) { return std::isdigit(c); });
 }
 
 std::string json_scalar_literal(const std::string & value) {
@@ -470,10 +450,10 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
      */
     uint64_t real_min = 0;
     bool has_real_time = false;
-    for (const auto & event : graph.events()) {
+    std::ranges::for_each(graph.events(), [&](const auto & event) {
         if (!has_real_time || event.ts < real_min) real_min = event.ts;
         has_real_time = true;
-    }
+    });
 
     bool first = true;
     for (const auto & node : graph.nodes()) {

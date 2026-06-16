@@ -59,7 +59,7 @@ struct DagNode {
  * DagGraph 不负责解释 trace 语义；语义边由 DagBuilder 或 SimulationModule 添加。
  */
 class DagGraph {
-  public:
+public:
     explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0);
 
     /** @brief 创建节点时只设置基础属性，不自动加任何依赖边。 */
@@ -68,41 +68,41 @@ class DagGraph {
     /** @brief 添加一条硬依赖边；当前不做去重，调用方需要避免重复边导致 indegree 膨胀。 */
     void add_edge(size_t src, size_t dst, DagEdgeKind kind);
 
-    const std::vector<TraceEvent> & events() const { return events_; }
+    [[nodiscard]] const std::vector<TraceEvent> & events() const { return events_; }
     std::vector<TraceEvent> & mutable_events() { return events_; }
-    const std::vector<DagNode> & nodes() const { return nodes_; }
-    const std::vector<DagEdge> & edges() const { return edges_; }
+    [[nodiscard]] const std::vector<DagNode> & nodes() const { return nodes_; }
+    [[nodiscard]] const std::vector<DagEdge> & edges() const { return edges_; }
 
-    const TraceEvent & event(size_t event_index) const;
+    [[nodiscard]] const TraceEvent & event(size_t event_index) const;
     TraceEvent & mutable_event(size_t event_index);
-    const TraceEvent & event_for_node(size_t node_id) const;
+    [[nodiscard]] const TraceEvent & event_for_node(size_t node_id) const;
     TraceEvent & mutable_event_for_node(size_t node_id);
 
-    const DagNode & node(size_t node_id) const;
+    [[nodiscard]] const DagNode & node(size_t node_id) const;
     DagNode & mutable_node(size_t node_id);
 
     void set_node_attr(size_t node_id, const std::string & key, const std::string & value);
 
     /** @brief 修改节点耗时时同时更新 attrs["time"]，保证拓扑仿真和 debug 输出读到一致值。 */
     void set_node_duration(size_t node_id, uint64_t duration);
-    std::string node_attr(size_t node_id, const std::string & key, const std::string & fallback = "") const;
+    [[nodiscard]] std::string node_attr(size_t node_id, const std::string & key, const std::string & fallback = "") const;
 
     /** @brief CPU lane 集合用于决定 lane 顺序边类型，以及输出时是否合并 pid/tid。 */
     void set_cpu_lane(const std::string & lane_key);
-    bool is_cpu_lane(const std::string & lane_key) const;
-    const std::unordered_set<std::string> & cpu_lanes() const { return cpu_lanes_; }
+    [[nodiscard]] bool is_cpu_lane(const std::string & lane_key) const;
+    [[nodiscard]] const std::unordered_set<std::string> & cpu_lanes() const { return cpu_lanes_; }
 
-    size_t node_count() const { return nodes_.size(); }
-    size_t edge_count() const { return edges_.size(); }
-    size_t parsed_record_count() const { return parsed_record_count_; }
+    [[nodiscard]] size_t node_count() const { return nodes_.size(); }
+    [[nodiscard]] size_t edge_count() const { return edges_.size(); }
+    [[nodiscard]] size_t parsed_record_count() const { return parsed_record_count_; }
     void set_parsed_record_count(size_t value) { parsed_record_count_ = value; }
-    uint64_t real_e2e_time() const { return real_e2e_time_; }
+    [[nodiscard]] uint64_t real_e2e_time() const { return real_e2e_time_; }
     void set_real_e2e_time(uint64_t value) { real_e2e_time_ = value; }
-    std::unordered_map<std::string, size_t> edge_counts_by_kind() const;
-    int gpu_id() const { return gpu_id_; }
+    [[nodiscard]] std::unordered_map<std::string, size_t> edge_counts_by_kind() const;
+    [[nodiscard]] int gpu_id() const { return gpu_id_; }
 
     void set_e2e_time(uint64_t value) { e2e_time_ = value; }
-    uint64_t e2e_time() const { return e2e_time_; }
+    [[nodiscard]] uint64_t e2e_time() const { return e2e_time_; }
 
     /**
      * @brief 合并多输入 trace 构出的 per-rank graph。
@@ -111,7 +111,7 @@ class DagGraph {
      */
     static DagGraph merge(std::vector<DagGraph> graphs);
 
-  private:
+private:
     /** @brief 保存所有被 parser 接受的 duration event；不包含 metadata / flow event。 */
     std::vector<TraceEvent> events_;
     std::vector<DagNode> nodes_;

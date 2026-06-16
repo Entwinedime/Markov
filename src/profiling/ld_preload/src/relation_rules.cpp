@@ -38,7 +38,7 @@ bool RelationRules::ShouldTrace(const std::string & callee_name, uintptr_t calle
     std::vector<std::string> callers;
     {
         std::lock_guard<std::mutex> lock(mtx_);
-        std::map<std::string, std::vector<std::string>>::const_iterator it{rules_.find(callee_name)};
+        std::map<std::string, std::vector<std::string>>::const_iterator it{ rules_.find(callee_name) };
         if (it == rules_.end()) { return true; }
         callers = it->second;
     }

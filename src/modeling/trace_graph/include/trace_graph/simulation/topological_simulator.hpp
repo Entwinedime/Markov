@@ -2,6 +2,7 @@
 
 #include "trace_graph/core/dag_graph.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,6 +27,6 @@ struct SimulationResult {
  *
  * 所有边都被解释为 hard dependency：dst 的开始时间不早于 src 的完成时间。
  */
-SimulationResult run_topological_simulation(DagGraph & graph);
+[[nodiscard]] SimulationResult run_topological_simulation(DagGraph & graph);
 
 } // namespace TraceGraph

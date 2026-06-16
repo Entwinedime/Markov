@@ -13,7 +13,7 @@ compose_file() {
     printf 'docker/compose/inference.yml\n'
 }
 
-# 把 framework 名称映射为 compose service 名称。
+# 把 profiling framework 名称映射为带 Ascend/CANN runtime 的 compose service 名称。
 profile_service() {
     local framework=${1:-}
     case "$framework" in
@@ -28,12 +28,30 @@ profile_service() {
     esac
 }
 
-# 在指定 framework 的 runtime 容器中执行命令。
+# 把可交互运行的环境名称映射为 compose service 名称。
+container_service() {
+    local environment=${1:-}
+    case "$environment" in
+        sglang|ktransformers)
+            profile_service "$environment"
+            ;;
+        modeling)
+            printf 'modeling\n'
+            ;;
+        *)
+            echo "unknown environment: ${environment}" >&2
+            echo "known environments: sglang, ktransformers, modeling" >&2
+            return 2
+            ;;
+    esac
+}
+
+# 在指定 Docker 环境中执行命令。
 run_in_container() {
-    local framework=$1
+    local environment=$1
     shift
 
     local service
-    service="$(profile_service "$framework")"
+    service="$(container_service "$environment")"
     docker compose -f "$(compose_file)" run --rm "$service" "$@"
 }

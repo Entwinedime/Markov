@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -56,10 +57,10 @@ struct ModelConfig {
     HiCacheConfig hicache;
 
     /** @brief 判断 modules 列表中是否显式启用了某个模块。 */
-    bool module_enabled(const std::string & name) const;
+    [[nodiscard]] bool module_enabled(const std::string & name) const;
 
     /** @brief 从窄 C++ model config JSON 文件加载配置。 */
-    static ModelConfig from_file(const std::string & filename);
+    [[nodiscard]] static ModelConfig from_file(const std::string & filename);
 };
 
 } // namespace TraceGraph

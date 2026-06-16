@@ -1,9 +1,12 @@
 #include "trace_graph/core/logger.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <ranges>
+#include <string_view>
 
 #ifndef _WIN32
 #include <unistd.h>
@@ -25,14 +28,14 @@ bool use_color() {
     /**
      * @brief 默认只有 stderr 是 tty 时才输出颜色；也可以用 TRACE_GRAPH_COLOR 强制开关。
      */
-    static bool checked = false;
     static bool color = false;
-    if (!checked) {
-        checked = true;
+    static std::once_flag init;
+    std::call_once(init, [] {
         const char * env = std::getenv("TRACE_GRAPH_COLOR");
         if (env) {
-            std::string v(env);
-            color = !(v == "0" || v == "no" || v == "off" || v == "false");
+            constexpr std::string_view false_values[] = { "0", "no", "off", "false" };
+            const std::string_view value(env);
+            color = std::ranges::find(false_values, value) == std::end(false_values);
         }
         else {
 #ifdef _WIN32
@@ -41,7 +44,7 @@ bool use_color() {
             color = isatty(STDERR_FILENO);
 #endif
         }
-    }
+    });
     return color;
 }
 

@@ -16,9 +16,9 @@ namespace TraceGraph {
  * 观测结果误当作 target state。
  */
 class HiCacheTokenPathStore {
-  public:
+public:
     /** @brief 返回 scope/request 复合 key；缺少 request_id 时返回空字符串。 */
-    std::string scoped_request_key(const HiCacheFact & fact) const;
+    [[nodiscard]] std::string scoped_request_key(const HiCacheFact & fact) const;
 
     /** @brief 保存 request token path，只允许更完整的 path 覆盖较短 path。 */
     void set_request_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens);
@@ -27,9 +27,9 @@ class HiCacheTokenPathStore {
     void observe_request_bound_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens);
 
     /** @brief 查询 request 当前已知的 token path。 */
-    HiCacheTokenPath request_tokens(const HiCacheFact & fact) const;
+    [[nodiscard]] HiCacheTokenPath request_tokens(const HiCacheFact & fact) const;
 
-  private:
+private:
     /**
      * @brief request-bound token anchor。
      *

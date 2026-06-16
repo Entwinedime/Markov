@@ -1,7 +1,7 @@
 {
   "metadata": {
     "purpose": "Consume merged profiling traces from a real profile_manifest.json and run C++ TraceGraph modeling.",
-    "usage": "python3 scripts/internal/model_runner.py --config configs/modeling/hicache/modeling_hicache_from_manifest.json --profile-manifest <run_dir>/profile_manifest.json --output-dir <run_dir>/modeling/faithful_replay --mode faithful_replay --emit-validation --emit-module-summary"
+    "usage": "scripts/model.sh --config configs/modeling/hicache/modeling_hicache_from_manifest.json --profile-manifest <run_dir>/profile_manifest.json --output-dir <run_dir>/modeling/faithful_replay --mode faithful_replay --emit-validation --emit-module-summary"
   },
   "input": {},
   "output_dir": "data/modeling_runs/hicache_from_manifest",

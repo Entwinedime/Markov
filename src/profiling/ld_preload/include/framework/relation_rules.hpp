@@ -16,7 +16,7 @@ namespace HookFrameWork {
  * 不推导 target policy 或建模行为。
  */
 class RelationRules {
-  public:
+public:
     static RelationRules & Get();
 
     /** @brief 覆盖某个 callee 的允许 caller 列表；空列表表示不限制 caller。 */
@@ -26,7 +26,7 @@ class RelationRules {
     /** @brief 根据 callee 名称和调用方 PC 判断本次调用是否应该写 trace。 */
     bool ShouldTrace(const std::string & callee_name, uintptr_t caller_pc) const;
 
-  private:
+private:
     RelationRules();
 
     mutable std::mutex mtx_;

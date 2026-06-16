@@ -89,9 +89,9 @@ struct HiCacheFact {
  * parser 本身不决定 fact 是否进入模型。
  */
 class HiCacheFactParser {
-  public:
+public:
     /** @brief 判断一个 trace event 是否属于 HiCache 事件域。 */
-    bool is_hicache_event(const TraceEvent & event) const;
+    [[nodiscard]] bool is_hicache_event(const TraceEvent & event) const;
 
     /**
      * @brief 从 HiCache event 中提取 token dictionary。
@@ -101,16 +101,16 @@ class HiCacheFactParser {
     void observe_token_dictionaries(const TraceEvent & event);
 
     /** @brief 解析单个 HiCache event，保留其 source node 与 event 顺序信息。 */
-    HiCacheFact parse(size_t node_id, const TraceEvent & event) const;
+    [[nodiscard]] HiCacheFact parse(size_t node_id, const TraceEvent & event) const;
 
-  private:
+private:
     std::unordered_map<std::string, HiCacheTokenPath> token_paths_;
 
     /** @brief 解析 JSON span 描述，但不在这里合成 page state。 */
-    HiCacheTokenSpan parse_span(const TraceEvent & event, const std::string & key) const;
+    [[nodiscard]] HiCacheTokenSpan parse_span(const TraceEvent & event, const std::string & key) const;
 
     /** @brief 使用已观察到的 dictionary 将 span 解析为 token path。 */
-    HiCacheTokenPath resolve_span(const HiCacheTokenSpan & span) const;
+    [[nodiscard]] HiCacheTokenPath resolve_span(const HiCacheTokenSpan & span) const;
 
     /** @brief 接纳一个 dictionary JSON 片段，无法解析时保持静默跳过。 */
     void observe_dictionary_value(const std::string & raw);

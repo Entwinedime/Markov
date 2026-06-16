@@ -16,7 +16,7 @@ namespace HookFrameWork {
 
 std::string GetFirstNonEmptyEnv(const std::vector<std::string> & env_names) {
     for (size_t i = 0; i < env_names.size(); ++i) {
-        const std::string value{safe_env(env_names[i].c_str())};
+        const std::string value{ safe_env(env_names[i].c_str()) };
         if (!value.empty()) { return value; }
     }
     return "";
@@ -33,13 +33,13 @@ std::string GetRankString() {
 }
 
 std::string BuildTraceOutputPath(const std::string & rank_str, const std::string & default_path) {
-    const std::string trace_base_env{safe_env("HOOK_TRACE_OUTPUT")};
-    std::string trace_base{trace_base_env.empty() ? default_path : trace_base_env};
+    const std::string trace_base_env{ safe_env("HOOK_TRACE_OUTPUT") };
+    std::string trace_base{ trace_base_env.empty() ? default_path : trace_base_env };
     return trace_base + ".rank" + rank_str + ".pid" + std::to_string(getpid()) + ".json";
 }
 
 bool ParseEnvFlag(const std::string & env_name, bool default_value) {
-    const std::string value{safe_env(env_name.c_str())};
+    const std::string value{ safe_env(env_name.c_str()) };
     if (value.empty()) { return default_value; }
 
     std::string normalized(value);
@@ -115,9 +115,7 @@ std::string EscapeJsonString(const std::string & input) {
                 std::snprintf(hex_buffer, sizeof(hex_buffer), "\\u%04x", static_cast<unsigned int>(ch));
                 output += hex_buffer;
             }
-            else {
-                output += static_cast<char>(ch);
-            }
+            else { output += static_cast<char>(ch); }
         }
     }
 

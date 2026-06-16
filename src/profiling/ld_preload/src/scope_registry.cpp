@@ -23,7 +23,7 @@ void ScopeRegistry::RegisterScope(const std::string & scope_name, const Function
         }
     }
 
-    ScopeEntry entry{scope_name, scope};
+    ScopeEntry entry{ scope_name, scope };
     entries_.push_back(entry);
 }
 

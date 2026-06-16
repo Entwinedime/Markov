@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONTAINER_REPO_PREFIXES = ("/workspace/trace-sim", "/opt/trace-sim")
+MODELING_CONTAINER_ENV = "TRACE_SIM_MODELING_CONTAINER"
 
 
 @dataclass(frozen=True)
@@ -79,6 +81,26 @@ def map_repo_path(path: Path) -> Path:
         if raw.startswith(prefix + "/"):
             return ROOT_DIR / raw[len(prefix) + 1 :]
     return path
+
+
+def running_in_modeling_container() -> bool:
+    """判断当前 runner 是否位于受支持的 modeling Docker 环境。"""
+
+    root = str(ROOT_DIR)
+    under_container_repo = any(root == prefix or root.startswith(prefix + "/") for prefix in CONTAINER_REPO_PREFIXES)
+    has_container_marker = os.environ.get(MODELING_CONTAINER_ENV) == "1" or Path("/.dockerenv").exists()
+    return under_container_repo and has_container_marker
+
+
+def require_modeling_container() -> None:
+    """阻止宿主机直接执行 modeling runner。"""
+
+    if running_in_modeling_container():
+        return
+    raise SystemExit(
+        "scripts/internal/model_runner.py is container-internal. "
+        "Use scripts/model.sh ... or scripts/run.sh modeling -- ... instead."
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> ModelingOptions:
@@ -709,10 +731,17 @@ def trace_graph_executable(config: dict[str, Any]) -> Path:
         executable = resolve_repo_path(cpp["executable"])
         if executable.is_file():
             return executable
-    for path in (ROOT_DIR / "build/bin/trace_graph", ROOT_DIR / "build/src/modeling/trace_graph/trace_graph"):
+    candidate_paths = (
+        ROOT_DIR / "build/modeling/bin/trace_graph",
+    )
+    for path in candidate_paths:
         if path.is_file():
             return path
-    raise FileNotFoundError("missing trace_graph executable; run cmake --build build --target trace_graph")
+    raise FileNotFoundError(
+        "missing trace_graph executable at build/modeling/bin/trace_graph; "
+        "run scripts/run.sh modeling -- bash -lc 'cmake -S . -B build/modeling -G Ninja "
+        "&& cmake --build build/modeling --target trace_graph -j2'"
+    )
 
 
 def build_validation(
@@ -2401,6 +2430,7 @@ def false_like(value: Any) -> bool:
 def main(argv: list[str] | None = None) -> int:
     """CLI 入口：输出单次 modeling prediction JSON。"""
 
+    require_modeling_container()
     prediction = run_from_cli(parse_args(argv))
     print(json.dumps(prediction, ensure_ascii=False))
     return 0

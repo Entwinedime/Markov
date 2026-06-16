@@ -3,6 +3,7 @@
 #include "trace_graph/frontend/model_config.hpp"
 #include "trace_graph/modules/simulation_module.hpp"
 
+#include <cstdint>
 #include <string>
 
 namespace TraceGraph {
@@ -14,15 +15,15 @@ namespace TraceGraph {
  * 它不新增/删除节点和边，主要用于验证 SimulationModule 管线和简单 latency 变换。
  */
 class NodeScaleModule final : public SimulationModule {
-  public:
+public:
     explicit NodeScaleModule(NodeScaleConfig config);
 
-    std::string name() const override;
+    [[nodiscard]] std::string name() const override;
     void apply(DagGraph & graph) override;
-    bool has_summary() const override;
-    std::string summary_json() const override;
+    [[nodiscard]] bool has_summary() const override;
+    [[nodiscard]] std::string summary_json() const override;
 
-  private:
+private:
     NodeScaleConfig config_;
     /** @brief apply 后写入 summary，便于验证规则是否实际命中。 */
     uint64_t scaled_nodes_ = 0;

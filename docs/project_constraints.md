@@ -36,6 +36,19 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 
 ## 语言与注释
 
+- C/C++ 主线统一使用 C++23，CMake 最低版本为 3.20。
+- 项目维护三个 Docker 环境，职责不能混用：
+  - `sglang-profile`：SGLang 真实 profiling / runtime 环境，包含 Ascend/CANN、torch_npu、SGLang 和对应 hook build
+    上下文；
+  - `ktransformers-profile`：KTransformers 真实 profiling / runtime 环境，包含 Ascend/CANN、torch_npu、KTransformers
+    和对应 hook build 上下文；
+  - `modeling`：干净 Ubuntu 24.04 C++23 环境，只用于 C++ TraceGraph 构建、clang-format/clang-tidy、modeling
+    runner 和 modeling-only 检查，不依赖 Ascend/CANN。
+- C++ TraceGraph 构建、clang-format dry-run 和 modeling 后端验证以 `modeling` Docker 容器为准；宿主机 toolchain
+  只允许用于无编译依赖的文本检查，不作为 C++ 构建验收环境。
+- `scripts/model.sh` 是宿主机侧唯一支持的 modeling run 入口；`scripts/internal/model_runner.py` 是容器内执行器，
+  必须拒绝宿主机直接执行，不维护旧 host build、`build/bin/trace_graph` 或 fixture-backed smoke 兼容路径。
+- LD_PRELOAD hook 的构建验收跟随对应 framework runtime 容器；需要 AscendCL wrapper 时不得在 `modeling` 容器中构建。
 - 项目文档统一使用中文。
 - 新增代码注释统一使用中文，保留必要的项目内英文术语、类型名、字段名和配置名。
 - 解释性 C/C++ 注释统一使用 Doxygen 风格，优先使用 `/** ... */` 与 `@brief`；文件、类型、函数、状态机边界、字段契约、错误处理和不变量说明都应按这个风格书写。
@@ -57,6 +70,7 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - 缺关键事实时必须暴露缺口，不能用默认值掩盖。
 - 实验配置描述采集和运行，不嵌入 modeling prediction 逻辑。
 - 真实 SGLang / KTransformers profiling 必须通过 `scripts/profile.sh` 外层容器入口启动。
+- `scripts/run.sh modeling` 只用于进入干净 C++23 modeling 环境，不能作为真实 framework profiling 入口。
 - `scripts/internal/profile_runner.py` 是容器内执行器，不能在宿主机上直接用于真实 server profiling。
 - `profiling.channels` 只接受 `torch`、`python_probe`、`ld_preload`。
 - `python_probe` 只由 `profiling.python_probe` 控制。
@@ -111,10 +125,11 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - HiCache state model 只能消费不变量事实和显式 target config。
 - target actual trace、state snapshot、source movement、oracle transient 和 debug 字段只能用于 validation/debug。
 - 显式 `write_policy=observed`、`prefetch_policy=observed`、`storage_prefetch_policy=observed` 都是非法配置。
-- HiCache best-effort prefetch threshold、capacity limit 和 host release budget 必须来自显式 target config 或 SGLang
-  源码语义：默认 threshold 是 `max(prefetch_threshold=256, page_size)` tokens 经 target page size 投影后的页数，capacity limit 是
-  `floor(0.8 * (host_pool_pages - device_pool_pages))`，host alloc 失败后的 cleanup budget 是本次 page-aligned
-  prefetch request，rate-limit 判断保持 `occupied >= capacity_limit`；不允许使用 L2 一半、deficit、最终 L2 差值、
+- HiCache 三种 storage prefetch policy 的 threshold、capacity limit、host release budget、storage hit 截断和 anchor protection
+  必须来自显式 target config 或 SGLang 源码语义：默认 threshold 是 `max(prefetch_threshold=256, page_size)` tokens 经
+  target page size 投影后的页数，capacity limit 是 `floor(0.8 * (host_pool_pages - device_pool_pages))`，host alloc 失败后的
+  cleanup budget 是本次 page-aligned prefetch request，storage hit query 只能保留连续命中前缀，prefetch 期间必须保护
+  anchor host pages，rate-limit 判断保持 `occupied >= capacity_limit`；不允许使用 L2 一半、deficit、最终 L2 差值、
   超容量拟合预算或把 0 capacity limit 解释成无限制。
 - 正常 HiCache prediction 中 `non_invariant_fact_usage` 必须为空；只要非空，不能宣称 invariant-only prediction 通过。
 - `self-config prediction` 仍必须显式给出 target page size、capacity、write policy、prefetch policy。
@@ -171,7 +186,7 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 建模 CLI 主入口：
 
 ```bash
-python3 scripts/internal/model_runner.py --config <config>
+scripts/model.sh --config <config>
 ```
 
 ## Deprecated

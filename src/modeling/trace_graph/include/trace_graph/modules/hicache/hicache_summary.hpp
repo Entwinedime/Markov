@@ -70,7 +70,7 @@ struct HiCacheSummary {
     std::vector<std::string> warnings;
 
     /** @brief 序列化为模块 summary JSON。 */
-    std::string to_json() const;
+    [[nodiscard]] std::string to_json() const;
 };
 
 } // namespace TraceGraph

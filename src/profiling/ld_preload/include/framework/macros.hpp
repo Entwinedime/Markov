@@ -27,6 +27,6 @@
 /** @brief 在静态初始化阶段注册或覆盖 callee 的 caller 过滤规则。 */
 #define HOOKFW_SET_RULE(CALLEE, ...)                                                                                                                           \
     static const bool HOOKFW_PP_CAT(hookfw_rule_, __LINE__) = []() {                                                                                           \
-        ::HookFrameWork::RelationRules::Get().UpsertRule((CALLEE), {__VA_ARGS__});                                                                             \
+        ::HookFrameWork::RelationRules::Get().UpsertRule((CALLEE), { __VA_ARGS__ });                                                                           \
         return true;                                                                                                                                           \
     }();

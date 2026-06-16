@@ -33,12 +33,12 @@ struct PmuSnapshot {
  * 未启用 PAPI 或当前线程初始化失败时返回 false；调用方应继续输出基础 runtime trace。
  */
 class PmuRecorder {
-  public:
+public:
     static PmuRecorder & Get();
     /** @brief 读取当前线程 PMU 快照，失败时不修改建模语义。 */
     bool ReadSnapshot(PmuSnapshot * snapshot);
 
-  private:
+private:
     PmuRecorder() = default;
 };
 

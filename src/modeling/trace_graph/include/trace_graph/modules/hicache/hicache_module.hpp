@@ -13,18 +13,18 @@ namespace TraceGraph {
  * 状态机入口。
  */
 class HiCacheModule final : public SimulationModule {
-  public:
+public:
     explicit HiCacheModule(HiCacheConfig config);
 
-    std::string name() const override;
+    [[nodiscard]] std::string name() const override;
     void apply(DagGraph & graph) override;
-    bool has_summary() const override;
-    std::string summary_json() const override;
+    [[nodiscard]] bool has_summary() const override;
+    [[nodiscard]] std::string summary_json() const override;
 
     /** @brief 返回最近一次 apply 产生的 HiCache summary。 */
-    const HiCacheSummary & summary() const { return summary_; }
+    [[nodiscard]] const HiCacheSummary & summary() const { return summary_; }
 
-  private:
+private:
     HiCacheConfig config_;
     HiCacheSummary summary_;
     bool applied_ = false;

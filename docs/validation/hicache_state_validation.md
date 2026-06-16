@@ -68,15 +68,19 @@ C++ state model 当前已经拆成三条状态线：
 - SGLang-derived host release / cleanup：
   - host prefetch allocation 失败时按本次 page-aligned prefetch request 调用 host eviction，对齐 SGLang `evict_host(prefetch_length)`；
   - cleanup budget 不按最终 L2 count、deficit 或 fallback reserved count 反推；
-  - best-effort threshold / capacity limit 来自显式 target config；未配置时分别按 SGLang
+  - storage prefetch threshold / capacity limit 来自显式 target config；未配置时分别按 SGLang
     `max(prefetch_threshold=256, page_size)` tokens 和 `floor(0.8 * (host_pool_pages - device_pool_pages))` 源码公式投影；
   - rate-limit 判断保持 SGLang `prefetch_tokens_occupied >= prefetch_capacity_limit` 语义，capacity limit 为 0 时不被当作无限制；
+  - `prefetch_decision` 中 `planned_pages` 表示 page-aligned prefetch key，`pages` 表示 storage hit query 后保留的连续命中前缀；
+  - prefetch anchor 在 work 生命周期内纳入 modeled host ref/protection，terminate、revoke、late 或 finalize 时释放；
   - host victim 必须是 host radix leaf、host-visible、`evicted`、无 host ref / lock protection，且不能有 backuped child；
   - alloc 第二次仍不足时按 host pool available pages 降级，低于 prefetch threshold 则放弃；
-  - best-effort `prefetch_check_point` 对齐 SGLang `check_prefetch_progress()` 生命周期边界：ready work apply，未 ready / revoked / 未发出 work suppress，并释放 reservation。
+  - `prefetch_check_point` 对齐 SGLang `check_prefetch_progress()` 生命周期边界：wait_complete 完成后 apply ready pages，
+    best_effort 在 checkpoint terminate，timeout 在 completed/timeout 后 terminate 或 late；未 ready / revoked work suppress，
+    未发出 work 不产生 prefetch state，并释放 reservation 与 anchor protection。
 - Write-back：
   - 不再保留错误的 page-level `ensure_host_pages_for_write()` 前置释放路径；
-  - write-back 当前只建模 enqueue/complete、dirty clear 和 host-visible 结果，不把 source writeback ack 当 normal state input。
+  - write-back 当前把 ACK 时序折叠为同步 enqueue/complete，只建模 dirty clear、host-visible 和 storage-readable 结果，不把 source writeback ack 当 normal state input。
 
 ## 当前有效结果
 
@@ -129,7 +133,7 @@ normalized final active sets：
 
 补充状态：
 
-- target=S1A model final 还包含 `l3_resident_pages=74`、`prefetch_planned_pages=74`、`prefetch_ready_pages=0`、`prefetch_suppressed_pages=0`。
+- target=S1A model final 还包含 `l3_resident_pages=74`、`prefetch_planned_pages=74`、`prefetch_ready_pages=0`、`prefetch_suppressed_pages=74`。
 - target=S1B model final 还包含 `l3_resident_pages=13`、`prefetch_planned_pages=150`、`prefetch_ready_pages=13`、`prefetch_suppressed_pages=137`。
 - 当前 validation 的 unchecked model state keys 仍包括 `l3_resident_pages`、`prefetch_planned_pages`、`prefetch_ready_pages`、`prefetch_suppressed_pages`；这些不是本轮 active final-state oracle 的通过条件。
 
@@ -163,10 +167,10 @@ normalized final active sets：
 
 | 风险 | 当前状态 | 影响 |
 | --- | --- | --- |
-| Async prefetch exact progress | `best_effort_ready_budget_available()` 是 target-derived lifecycle 近似，不消费 source `completed_tokens` / completion pages | 多个 overlapping prefetch、partial completion 或复杂 terminate 条件下，`prefetch_ready/suppressed` 与中间 L2 时序可能不精确。 |
-| Host ref / protection node lifetime | 当前是 page-level host ref/protection 投影，不是 SGLang `TreeNode.host_ref_counter` 完整等价 | ongoing prefetch / backup / loadback 交错时，host eviction eligibility 可能偏。 |
+| Async prefetch exact progress | storage hit / revoke / anchor protection 已按 target-derived state 建模，但 transfer completion 仍不消费 source `completed_tokens` / completion pages | 多个 overlapping prefetch、partial completion 或复杂 terminate 条件下，`prefetch_ready/suppressed` 与中间 L2 时序可能不精确。 |
+| Host ref / protection node lifetime | prefetch anchor 已纳入 page-level host ref/protection，但仍不是 SGLang `TreeNode.host_ref_counter` 的节点级完整等价 | ongoing prefetch / backup / loadback 交错时，host eviction eligibility 可能偏。 |
 | Host victim ordering | host cleanup candidate 已对齐，但 priority heap、node last access、parent promotion tie-break 仍是投影 | 更复杂 radix split/delete 或同优先级 victim 下，victim identity 仍需逐 trace 证明。 |
-| Write-back batch state machine | 已移除错误前置 release；仍未完整实现 `write_backup(..., write_back=True)` / `writing_check(write_back=True)` / `_evict_backuped()` 批处理时序 | write-back 与 prefetch、host release、device eviction 交错时可能影响 transition exactness。 |
+| Write-back batch state machine | 已折叠为同步 completion 语义，并与 `write_through` / `write_through_selective` 共享同一组 host backup / eviction helper | 仍不追踪真实 ack 异步时序；write-back 与 prefetch、host release、device eviction 交错时的 transition exactness 仍需后续 targeted validation。 |
 | Transition exact oracle | 当前主要证明 final normalized active sets，不证明每一步 transition 与 oracle 同序同因 | 后续做 DAG patch 或性能归因前，需要 transition provenance / exact oracle。 |
 | Scope-normalized comparison | validation 默认看 `strip_scope` page hash union，C++ 内部按 `cache_scope` 隔离 | 多 scope 同 hash 或 scope-local victim 问题可能被 normalized final 掩盖。 |
 | State-to-DAG patch | `HiCacheModule` 仍是 state-only，`dag_mutations=0` 是预期 | state 通过后仍需要单独设计 cache state -> DAG mutation。 |
@@ -214,8 +218,10 @@ normalized final active sets：
 基础检查：
 
 ```bash
-cmake --build build --target trace_graph -j2
-python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_provenance.py
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
+scripts/run.sh modeling -- bash -lc \
+  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_provenance.py'
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
@@ -223,7 +229,7 @@ git diff --check
 S1A self：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
   --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/profile_manifest.json \
   --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final3_s1a_self \
@@ -235,7 +241,7 @@ python3 scripts/internal/model_runner.py \
 S1B self：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json \
   --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/profile_manifest.json \
   --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final3_s1b_self \
@@ -247,7 +253,7 @@ python3 scripts/internal/model_runner.py \
 S1A -> S1B：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json \
   --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/profile_manifest.json \
   --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/trace/python_probe/python_probe_trace.rankunknown.pid2488.json \
@@ -261,7 +267,7 @@ python3 scripts/internal/model_runner.py \
 S1B -> S1A：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
   --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/profile_manifest.json \
   --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/trace/python_probe/python_probe_trace.rankunknown.pid417.json \

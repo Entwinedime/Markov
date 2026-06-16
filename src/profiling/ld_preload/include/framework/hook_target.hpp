@@ -19,9 +19,11 @@ namespace HookFrameWork {
  * 后续 wrapper 通过 Original() 调用真实实现。
  */
 template <typename FnType> class HookTarget {
-  public:
+public:
     HookTarget(const std::string & trace_name, const std::string & mangled_name, const std::string & so_path)
-        : trace_name_(trace_name), mangled_name_(mangled_name), so_path_(so_path) {}
+        : trace_name_(trace_name),
+          mangled_name_(mangled_name),
+          so_path_(so_path) {}
 
     /** @brief 返回真实函数指针；首次调用会解析目标符号。 */
     FnType Original() {
@@ -38,7 +40,7 @@ template <typename FnType> class HookTarget {
         return scope_;
     }
 
-  private:
+private:
     void EnsureInitialized() {
         std::call_once(init_once_, [this]() { Initialize(); });
     }
@@ -50,7 +52,7 @@ template <typename FnType> class HookTarget {
          * RelationRules 依赖 scope 判断调用关系；如果只解析 original_ 而不注册 scope，
          * caller 过滤会退化为无法匹配。
          */
-        void * symbol_addr{ResolveSymbol(mangled_name_, so_path_)};
+        void * symbol_addr{ ResolveSymbol(mangled_name_, so_path_) };
         original_ = reinterpret_cast<FnType>(symbol_addr);
 
         scope_ = BuildScope(symbol_addr);
@@ -64,14 +66,14 @@ template <typename FnType> class HookTarget {
          *
          * 部分平台或符号缺少 st_size，这时 end 保持 0，RelationRules 不会把该 scope 当作可匹配范围。
          */
-        FunctionScope scope{reinterpret_cast<uintptr_t>(symbol_addr), 0};
+        FunctionScope scope{ reinterpret_cast<uintptr_t>(symbol_addr), 0 };
 
 #if defined(__GLIBC__) && defined(_GNU_SOURCE)
         Dl_info info;
         std::memset(&info, 0, sizeof(info));
-        void * sym_extra{nullptr};
+        void * sym_extra{ nullptr };
         if (symbol_addr != nullptr && dladdr1(symbol_addr, &info, &sym_extra, RTLD_DL_SYMENT) != 0 && sym_extra != nullptr) {
-            const ElfW(Sym) * sym{reinterpret_cast<const ElfW(Sym) *>(sym_extra)};
+            const ElfW(Sym) * sym{ reinterpret_cast<const ElfW(Sym) *>(sym_extra) };
             if (sym->st_size > 0) { scope.end = scope.begin + static_cast<uintptr_t>(sym->st_size); }
         }
 #endif
@@ -83,7 +85,7 @@ template <typename FnType> class HookTarget {
     const std::string mangled_name_;
     const std::string so_path_;
     std::once_flag init_once_;
-    FnType original_{nullptr};
+    FnType original_{ nullptr };
     FunctionScope scope_;
 };
 

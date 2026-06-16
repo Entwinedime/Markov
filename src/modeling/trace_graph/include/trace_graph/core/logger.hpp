@@ -7,14 +7,14 @@ namespace TraceGraph {
 
 /** @brief C++ TraceGraph CLI 进程内使用的轻量日志器。 */
 class Logger {
-  public:
+public:
     /** @brief 日志级别；数值越小输出越详细。 */
     enum Level : int { DEBUG = 0, INFO = 1, WARN = 2, ERROR = 3, OFF = 4 };
 
     static Logger & instance();
 
     void set_level(Level lv) { level_ = lv; }
-    Level level() const { return level_; }
+    [[nodiscard]] Level level() const { return level_; }
 
     /**
      * @brief RAII 日志行构造器。
@@ -23,7 +23,7 @@ class Logger {
      * 这里的注释说明实现约束。
      */
     class Line {
-      public:
+    public:
         Line(Level lv, bool active, std::mutex * mtx);
         ~Line();
         Line(Line &&) = default;
@@ -34,19 +34,19 @@ class Logger {
             return *this;
         }
 
-      private:
+    private:
         std::ostringstream ss_;
         Level lv_;
         bool active_;
         std::mutex * mtx_;
     };
 
-    Line debug() { return Line(DEBUG, level_ <= DEBUG, &mtx_); }
-    Line info() { return Line(INFO, level_ <= INFO, &mtx_); }
-    Line warn() { return Line(WARN, level_ <= WARN, &mtx_); }
-    Line error() { return Line(ERROR, level_ <= ERROR, &mtx_); }
+    [[nodiscard]] Line debug() { return Line(DEBUG, level_ <= DEBUG, &mtx_); }
+    [[nodiscard]] Line info() { return Line(INFO, level_ <= INFO, &mtx_); }
+    [[nodiscard]] Line warn() { return Line(WARN, level_ <= WARN, &mtx_); }
+    [[nodiscard]] Line error() { return Line(ERROR, level_ <= ERROR, &mtx_); }
 
-  private:
+private:
     Logger() = default;
 
     Level level_ = INFO;

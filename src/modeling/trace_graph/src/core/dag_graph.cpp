@@ -1,6 +1,8 @@
 #include "trace_graph/core/dag_graph.hpp"
 
 #include <algorithm>
+#include <numeric>
+#include <ranges>
 #include <stdexcept>
 #include <utility>
 
@@ -33,9 +35,7 @@ std::string edge_kind_name(DagEdgeKind kind) {
     return "unknown";
 }
 
-bool contains_hccl_name(const std::string & name) {
-    return name.find("hcom") != std::string::npos || name.find("HCCL") != std::string::npos || name.find("hccl") != std::string::npos;
-}
+bool contains_hccl_name(const std::string & name) { return name.contains("hcom") || name.contains("HCCL") || name.contains("hccl"); }
 
 /**
  * @brief 读取 HCCL merge 使用的节点耗时。
@@ -44,7 +44,7 @@ bool contains_hccl_name(const std::string & name) {
  * attrs["time"]，失败时回退到 node.duration。
  */
 uint64_t node_time(const DagNode & node) {
-    auto it = node.attrs.find("time");
+    const auto it = node.attrs.find("time");
     if (it == node.attrs.end()) return node.duration;
     try {
         return std::stoull(it->second);
@@ -94,7 +94,7 @@ void DagGraph::add_edge(size_t src, size_t dst, DagEdgeKind kind) {
      * 重复边不会改变 critical path，但会增加 indegree 和 summary edge_count；调用方负责避免
      * 重复边污染统计。
      */
-    edges_.push_back(DagEdge{src, dst, kind});
+    edges_.push_back(DagEdge{ src, dst, kind });
 }
 
 const TraceEvent & DagGraph::event(size_t event_index) const {
@@ -137,11 +137,11 @@ std::string DagGraph::node_attr(size_t node_id, const std::string & key, const s
 
 void DagGraph::set_cpu_lane(const std::string & lane_key) { cpu_lanes_.insert(lane_key); }
 
-bool DagGraph::is_cpu_lane(const std::string & lane_key) const { return cpu_lanes_.find(lane_key) != cpu_lanes_.end(); }
+bool DagGraph::is_cpu_lane(const std::string & lane_key) const { return cpu_lanes_.contains(lane_key); }
 
 std::unordered_map<std::string, size_t> DagGraph::edge_counts_by_kind() const {
     std::unordered_map<std::string, size_t> counts;
-    for (const auto & edge : edges_) counts[edge_kind_name(edge.kind)]++;
+    std::ranges::for_each(edges_, [&](const auto & edge) { counts[edge_kind_name(edge.kind)]++; });
     return counts;
 }
 
@@ -155,13 +155,16 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
      * 这样每个 per-rank graph 内部的边保持不变，后面只追加跨 rank 边。
      */
     std::vector<TraceEvent> merged_events;
-    for (const auto & graph : graphs) {
+    const auto total_events =
+        std::accumulate(graphs.begin(), graphs.end(), size_t{ 0 }, [](size_t total, const auto & graph) { return total + graph.events_.size(); });
+    merged_events.reserve(total_events);
+    std::ranges::for_each(graphs, [&](const auto & graph) {
         for (const auto & event : graph.events_) {
             TraceEvent copy = event;
             copy.index = merged_events.size();
             merged_events.push_back(std::move(copy));
         }
-    }
+    });
 
     DagGraph merged(std::move(merged_events), 0);
     size_t event_offset = 0;
@@ -185,8 +188,9 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
             copy.event_index += event_offset;
             merged.nodes_.push_back(std::move(copy));
         }
-        for (const auto & edge : graph.edges_) { merged.edges_.push_back(DagEdge{edge.src + node_offset, edge.dst + node_offset, edge.kind}); }
-        for (const auto & lane : graph.cpu_lanes_) { merged.cpu_lanes_.insert(lane); }
+        std::ranges::for_each(graph.edges_,
+                              [&](const auto & edge) { merged.edges_.push_back(DagEdge{ edge.src + node_offset, edge.dst + node_offset, edge.kind }); });
+        merged.cpu_lanes_.insert(graph.cpu_lanes_.begin(), graph.cpu_lanes_.end());
         for (const auto & node : graph.nodes_) {
             auto it = node.attrs.find("name");
             if (it != node.attrs.end() && !node.is_cpu && contains_hccl_name(it->second)) {
@@ -219,11 +223,11 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
      */
     for (const auto & group_item : hccl_groups) {
         size_t max_count = 0;
-        for (const auto & by_gpu : group_item.second) max_count = std::max(max_count, by_gpu.second.size());
-        for (size_t comm_index = 0; comm_index < max_count; ++comm_index) {
+        std::ranges::for_each(group_item.second, [&](const auto & by_gpu) { max_count = std::max(max_count, by_gpu.second.size()); });
+        for (const auto comm_index : std::views::iota(size_t{ 0 }, max_count)) {
             std::vector<std::pair<int, size_t>> current;
             for (const auto & by_gpu : group_item.second) {
-                if (comm_index < by_gpu.second.size()) current.push_back({by_gpu.first, by_gpu.second[comm_index]});
+                if (comm_index < by_gpu.second.size()) current.push_back({ by_gpu.first, by_gpu.second[comm_index] });
             }
 
             uint64_t min_time = 0;
@@ -252,7 +256,7 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
                 if (next_global >= merged.nodes_.size()) continue;
                 for (const auto & other : current) {
                     if (other.first == item.first && other.second == item.second) continue;
-                    merged.edges_.push_back(DagEdge{other.second, next_global, DagEdgeKind::HCCL});
+                    merged.edges_.push_back(DagEdge{ other.second, next_global, DagEdgeKind::HCCL });
                 }
             }
             if (min_time > 0) {

@@ -30,13 +30,45 @@ profile manifest / explicit trace
 
 ## 运行入口
 
+Modeling 后端是 C++23 TraceGraph，构建和运行基线是独立的 `modeling` Docker service。该 service 基于干净
+Ubuntu 24.04，只提供 C++23、CMake、Ninja、clang-format/clang-tidy、Python 标准运行环境和 modeling 脚本依赖；
+不挂载 Ascend 设备，不依赖 CANN，不安装 SGLang / KTransformers runtime。宿主机只负责启动外层 wrapper 或执行无
+modeling runtime 依赖的文本检查；不再支持直接在宿主机运行 `scripts/internal/model_runner.py`、host build
+`trace_graph` 或旧 `build/bin` 产物。
+
+构建 modeling 环境：
+
+```bash
+scripts/build.sh modeling
+```
+
+进入 modeling 环境：
+
+```bash
+scripts/run.sh modeling
+```
+
+在 modeling 容器内构建 TraceGraph：
+
+```bash
+cmake -S . -B build/modeling -G Ninja
+cmake --build build/modeling --target trace_graph -j2
+```
+
+宿主机也可以通过一次性命令执行同一检查：
+
+```bash
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
+```
+
 不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
 可复现 profile/modeling run。
 
 faithful replay：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config <modeling-config.json> \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/faithful_replay \
@@ -48,7 +80,7 @@ python3 scripts/internal/model_runner.py \
 HiCache state prediction：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config <hicache-state-modeling-config.json> \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/cache_state \
@@ -116,7 +148,7 @@ C++ 后端位于 `src/modeling/trace_graph`：
 构建目标：
 
 ```bash
-cmake --build build --target trace_graph -j2
+scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace_graph -j2'
 ```
 
 ## SimulationModule
@@ -176,7 +208,7 @@ consume fact iff model_input == true
 | `request_lifecycle_anchor` | finished/unfinished lifecycle 边界的 request-level anchor，不携带 committed/fill/generated suffix path。 |
 | `request_admission` | 在 admission 边界记录 request token path、admission kind 和 policy。 |
 | `prefetch_decision` | 在 scheduler prefetch decision checkpoint 上由 target state 重新判断 anchor、suffix 和是否 enqueue prefetch。 |
-| `prefetch_check_point` | 按 target prefetch policy 推进等待、timeout、late、suppressed，不从 source completion 直接构造 ready set。 |
+| `prefetch_check_point` | 按 target prefetch policy 推进 wait/best-effort/timeout 的 terminate、late、suppressed 和 host visibility，不从 source completion 直接构造 ready set。 |
 
 match-prefix concrete path、lookup result、cache config、lifecycle path/runtime、insert/capacity/lock/maintenance 和
 storage/controller 事件只作为 `source_actual` / `timing_observation` evidence。unknown invariant role 应进入
@@ -254,7 +286,7 @@ summary 输出当前 validation 使用的集合，但集合来源必须是 token
 | `prefetch_planned_pages` | `AsyncState` 中 target policy 已 enqueue 的 page projection。 |
 | `prefetch_ready_pages` | modeled async queue 已完成且 target 可见的 page projection。 |
 | `prefetch_late_pages` | target policy 判定 timeout/late 的 page projection。 |
-| `prefetch_suppressed_pages` | best_effort/finalization/timeout 下被 target policy 放弃的 page projection。 |
+| `prefetch_suppressed_pages` | storage miss / revoke / finalization / timeout 下被 target policy 放弃的 page projection。 |
 | `page_hit_counts` | policy-visible page hit count projection。 |
 
 request/admission 设计边界：
@@ -271,17 +303,23 @@ host/device/async 设计边界：
   host-visible、storage-known 混成一个 `matched_pages`；
 - host prefetch allocation 失败时 cleanup budget 来自本次 page-aligned prefetch request，不按最终 L2 count、deficit
   或 fallback reserved count 反推；
-- best-effort threshold / capacity limit 来自显式 target config；未配置时按 SGLang 源码语义投影；
+- storage prefetch threshold / capacity limit 来自显式 target config；未配置时按 SGLang 源码语义投影；
 - rate-limit 判断保持 `prefetch_tokens_occupied >= prefetch_capacity_limit`，capacity limit 为 0 时不被当作无限制；
-- `prefetch_check_point` 推进 modeled async work lifecycle：ready work apply，未 ready / revoked / 未发出 work suppress，
-  并释放 reservation。
+- `prefetch_decision` 先创建统一 work：`planned_pages` 是 page-aligned prefetch key，`pages` 是 target-derived storage hit
+  query 后保留的连续命中前缀；低于 threshold 的 storage hit 在 checkpoint 处按 revoked/suppressed 处理；
+- prefetch 开始时把 anchor pages 纳入 page-level host ref/protection，terminate / revoke / late / finalize 时必须释放；
+- `prefetch_check_point` 推进 modeled async work lifecycle：wait_complete 在完成边界 apply ready pages，best_effort 在 checkpoint
+  立即 terminate，timeout 在 terminal checkpoint 或目标 timeout 后 terminate/late，并统一释放 reservation 和 anchor ref。
 
 write-back 设计边界：
 
 - 不使用 page-level 前置 release 代替 write-back batch state machine；
 - source writeback ack、storage hit result、node remove result 和 async wall-clock completion 不能作为 normal state input；
+- write-back 的 ACK 时序在当前模型里折叠为同步 completion，结果语义统一走 `commit_host_backup_page()`；
 - write-back enqueue、dirty clear、backuped/host-visible 结果必须来自 target-derived policy 或新的 target-independent
-  invariant。
+  invariant；
+- `write_through` / `write_through_selective` / `write_back` 共享同一组 device insert、host backup 与 eviction helper，
+  仅在 threshold 和是否要求同步写回上分支。
 
 ### Summary
 
@@ -328,7 +366,7 @@ HiCache state validation 必须同时看：
 - HiCache state-to-DAG patch；
 - async prefetch exact progress / partial completion 的完整 target model；
 - SGLang `TreeNode.host_ref_counter`、host protection lifetime 和复杂 radix split/delete victim tie-break 的完整等价；
-- write-back background flush / `_evict_backuped()` / `writing_check(write_back=True)` 的批处理时序；
+- write-back ack、background flush 和 `_evict_backuped()` / `writing_check(write_back=True)` 的真实异步批处理时序；
 - transition exact oracle 和逐步 provenance 验收；
 - scope-normalized comparison 之外的多 scope page identity 验证。
 

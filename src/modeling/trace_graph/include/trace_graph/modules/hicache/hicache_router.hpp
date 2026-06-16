@@ -42,19 +42,19 @@ struct HiCacheFactRoute {
  * fact_granularity=atomic`。其他 fact 只能作为证据或输出统计，不能驱动 target
  * state。
  */
-bool is_hicache_state_model_fact(const HiCacheFact & fact);
+[[nodiscard]] bool is_hicache_state_model_fact(const HiCacheFact & fact);
 
 /** @brief 将 event_role 字符串解析为白名单 role。 */
-HiCacheFactRole parse_hicache_fact_role(const std::string & role);
+[[nodiscard]] HiCacheFactRole parse_hicache_fact_role(const std::string & role);
 
 /** @brief 返回 role 的稳定字符串名，用于 summary 与缺失项统计。 */
-std::string hicache_fact_role_name(HiCacheFactRole role);
+[[nodiscard]] std::string hicache_fact_role_name(HiCacheFactRole role);
 
 /** @brief 对 fact 执行模型输入契约检查和 role 白名单路由。 */
-HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact);
+[[nodiscard]] HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact);
 
 /** @brief 判断 role 是否已经有状态机 handler。 */
-bool hicache_fact_role_implemented(HiCacheFactRole role);
+[[nodiscard]] bool hicache_fact_role_implemented(HiCacheFactRole role);
 
 /**
  * @brief 返回 role 对应的必需字段缺失列表。
@@ -62,6 +62,6 @@ bool hicache_fact_role_implemented(HiCacheFactRole role);
  * 这里检查的是 target projection 和状态机所需的不变量字段；缺失字段会进入
  * summary.missing_invariant_facts，而不是触发 source-state 兜底路径。
  */
-std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role, uint64_t effective_page_size);
+[[nodiscard]] std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role, uint64_t effective_page_size);
 
 } // namespace TraceGraph

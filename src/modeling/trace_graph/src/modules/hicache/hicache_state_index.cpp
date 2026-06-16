@@ -5,6 +5,7 @@
 #include "trace_graph/modules/hicache/hicache_state_index.hpp"
 
 #include <algorithm>
+#include <ranges>
 #include <sstream>
 
 namespace TraceGraph {
@@ -15,11 +16,11 @@ namespace {
 std::string join_set(const std::set<std::string> & values) {
     std::ostringstream os;
     bool first = true;
-    for (const auto & value : values) {
+    std::ranges::for_each(values, [&](const auto & value) {
         if (!first) os << ",";
         first = false;
         os << value;
-    }
+    });
     return os.str();
 }
 
@@ -28,11 +29,12 @@ std::string join_count_map(const std::unordered_map<std::string, uint64_t> & val
     std::map<std::string, uint64_t> ordered(values.begin(), values.end());
     std::ostringstream os;
     bool first = true;
-    for (const auto & [key, count] : ordered) {
+    std::ranges::for_each(ordered, [&](const auto & item) {
+        const auto & [key, count] = item;
         if (!first) os << ",";
         first = false;
         os << key << ":" << count;
-    }
+    });
     return os.str();
 }
 
@@ -91,7 +93,7 @@ std::vector<std::string> * HiCacheStateIndex::touch_order_for_tier(const std::st
 void HiCacheStateIndex::touch_page(const std::string & tier, const std::string & page) {
     auto * order = touch_order_for_tier(tier);
     if (!order) return;
-    order->erase(std::remove(order->begin(), order->end(), page), order->end());
+    std::erase(*order, page);
     order->push_back(page);
 }
 
@@ -149,13 +151,13 @@ bool HiCacheStateIndex::mark_prefetch_ready(const std::string & page) {
 
 /** @brief 标记 prefetch late；ready page 不会被降级为 late。 */
 bool HiCacheStateIndex::mark_prefetch_late(const std::string & page) {
-    if (prefetch_ready_.count(page) > 0) return false;
+    if (prefetch_ready_.contains(page)) return false;
     return prefetch_late_.insert(page).second;
 }
 
 /** @brief 标记 prefetch suppressed；ready page 不会被降级为 suppressed。 */
 bool HiCacheStateIndex::mark_prefetch_suppressed(const std::string & page) {
-    if (prefetch_ready_.count(page) > 0) return false;
+    if (prefetch_ready_.contains(page)) return false;
     return prefetch_suppressed_.insert(page).second;
 }
 
@@ -190,10 +192,10 @@ bool HiCacheStateIndex::decrement_lock_count(const std::string & cache_scope, co
 /** @brief 检查 page 在任意 scope 下是否仍有 lock count。 */
 bool HiCacheStateIndex::page_locked_in_any_scope(const std::string & page) const {
     const auto suffix = ":" + page;
-    for (const auto & [key, count] : lock_count_by_scope_page_) {
-        if (count > 0 && key.size() >= suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
-    }
-    return false;
+    return std::ranges::any_of(lock_count_by_scope_page_, [&](const auto & item) {
+        const auto & [key, count] = item;
+        return count > 0 && key.ends_with(suffix);
+    });
 }
 
 } // namespace TraceGraph

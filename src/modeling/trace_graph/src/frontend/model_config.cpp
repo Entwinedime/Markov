@@ -7,6 +7,9 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <initializer_list>
+#include <iterator>
+#include <ranges>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -32,9 +35,11 @@ Json read_json_file(const std::string & filename) {
 }
 
 std::string lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return s;
 }
+
+bool is_allowed_policy(const std::string & value, std::initializer_list<const char *> allowed) { return std::ranges::find(allowed, value) != allowed.end(); }
 
 std::string json_scalar_to_string(const Json & value, const std::string & def = "") {
     /**
@@ -113,9 +118,9 @@ std::vector<std::string> string_array(const Json & root, const std::string & key
     if (!root.is_object()) return values;
     auto it = root.find(key);
     if (it == root.end() || !it->is_array()) return values;
-    for (const auto & item : *it) {
-        if (item.is_string()) values.push_back(item.get<std::string>());
-    }
+    auto strings = *it | std::views::filter([](const Json & item) { return item.is_string(); })
+                   | std::views::transform([](const Json & item) { return item.get<std::string>(); });
+    std::ranges::copy(strings, std::back_inserter(values));
     return values;
 }
 
@@ -137,14 +142,14 @@ NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
     config.enabled = bool_value(object, "enabled", true);
     auto rules_it = object.find("rules");
     if (rules_it != object.end() && rules_it->is_array()) {
-        for (const auto & item : *rules_it) {
-            if (!item.is_object()) continue;
+        auto rules = *rules_it | std::views::filter([](const Json & item) { return item.is_object(); }) | std::views::transform([](const Json & item) {
             NodeScaleRuleConfig rule;
             rule.id = string_value(item, "id", "");
             rule.name = string_value(item, "name", "");
             rule.factor = number_value(item, "factor", number_value(item, "scale", 1.0));
-            if (!rule.name.empty()) config.rules.push_back(rule);
-        }
+            return rule;
+        }) | std::views::filter([](const NodeScaleRuleConfig & rule) { return !rule.name.empty(); });
+        std::ranges::copy(rules, std::back_inserter(config.rules));
     }
     return config;
 }
@@ -155,7 +160,7 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
      *
      * HiCache state prediction 只读取配置事实，不在这里推导策略结果。
      */
-    HiCacheConfig config;
+    HiCacheConfig config{};
     auto it = root.find("hicache");
     if (it == root.end() || !it->is_object()) {
         config.enabled = module_enabled;
@@ -169,6 +174,8 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     config.write_policy = lower(string_value(object, "write_policy", "write_through"));
     if (config.write_policy == "observed") throw std::runtime_error("hicache.write_policy=observed is not supported; use an explicit target write policy");
     if (config.write_policy.empty()) config.write_policy = "write_through";
+    if (!is_allowed_policy(config.write_policy, { "write_through", "write_through_selective", "write_back" }))
+        throw std::runtime_error("Invalid hicache.write_policy: " + config.write_policy);
     config.write_through_threshold = u64_value(object, "write_through_threshold", 0);
     config.prefetch_policy = lower(string_value(object, "prefetch_policy", "timeout"));
     if (config.prefetch_policy == "observed")
@@ -190,7 +197,7 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
 
 } // namespace
 
-bool ModelConfig::module_enabled(const std::string & name) const { return std::find(modules.begin(), modules.end(), name) != modules.end(); }
+bool ModelConfig::module_enabled(const std::string & name) const { return std::ranges::find(modules, name) != modules.end(); }
 
 ModelConfig ModelConfig::from_file(const std::string & filename) {
     /**

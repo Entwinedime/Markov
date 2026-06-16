@@ -6,8 +6,11 @@
 
 #include <openssl/sha.h>
 
+#include <algorithm>
 #include <array>
 #include <iomanip>
+#include <ranges>
+#include <span>
 #include <sstream>
 
 namespace TraceGraph {
@@ -19,9 +22,9 @@ std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
     std::vector<unsigned char> bytes;
     if (hex.size() % 2 != 0) return bytes;
     bytes.reserve(hex.size() / 2);
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+    for (const auto byte_index : std::views::iota(size_t{ 0 }, hex.size() / 2)) {
         try {
-            bytes.push_back(static_cast<unsigned char>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+            bytes.push_back(static_cast<unsigned char>(std::stoul(hex.substr(byte_index * 2, 2), nullptr, 16)));
         }
         catch (...) {
             return {};
@@ -34,7 +37,7 @@ std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
 std::string bytes_to_hex(const unsigned char * bytes, size_t len) {
     std::ostringstream os;
     os << std::hex << std::setfill('0');
-    for (size_t i = 0; i < len; ++i) os << std::setw(2) << static_cast<unsigned int>(bytes[i]);
+    std::ranges::for_each(std::span(bytes, len), [&](const auto byte) { os << std::setw(2) << static_cast<unsigned int>(byte); });
     return os.str();
 }
 
@@ -51,8 +54,9 @@ std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_
         auto parent = hex_to_bytes(prior_hash);
         if (!parent.empty()) SHA256_Update(&ctx, parent.data(), parent.size());
     }
-    for (size_t index = begin; index < end && index < tokens.size(); ++index) {
-        for (const auto word : tokens[index].words) {
+    const auto bounded_end = std::min(end, tokens.size());
+    for (const auto index : std::views::iota(begin, bounded_end)) {
+        std::ranges::for_each(tokens[index].words, [&](const auto word) {
             unsigned char raw[4] = {
                 static_cast<unsigned char>(word & 0xffu),
                 static_cast<unsigned char>((word >> 8u) & 0xffu),
@@ -60,7 +64,7 @@ std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_
                 static_cast<unsigned char>((word >> 24u) & 0xffu),
             };
             SHA256_Update(&ctx, raw, sizeof(raw));
-        }
+        });
     }
     std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
     SHA256_Final(digest.data(), &ctx);
@@ -95,7 +99,9 @@ std::vector<std::string> HiCacheTargetPager::pages_for_tokens(const HiCacheFact 
     std::vector<std::string> pages;
     pages.reserve(aligned_len / page_size);
     std::string parent_hash;
-    for (size_t begin = 0; begin < aligned_len; begin += static_cast<size_t>(page_size)) {
+    const auto page_count = aligned_len / static_cast<size_t>(page_size);
+    for (const auto page_index : std::views::iota(size_t{ 0 }, page_count)) {
+        const auto begin = page_index * static_cast<size_t>(page_size);
         const auto end = begin + static_cast<size_t>(page_size);
         parent_hash = hash_token_page(tokens, begin, end, parent_hash);
         pages.push_back(scoped_page_id(fact, parent_hash));

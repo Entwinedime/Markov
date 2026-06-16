@@ -6,6 +6,7 @@
 #include <functional>
 #include <limits>
 #include <queue>
+#include <ranges>
 #include <stdexcept>
 #include <vector>
 
@@ -22,7 +23,7 @@ constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
  * 仿真阶段优先读取 attrs["time"]，保证兼容老版字段。
  */
 uint64_t read_u64_attr(const DagNode & node, const std::string & key, uint64_t fallback = 0) {
-    auto it = node.attrs.find(key);
+    const auto it = node.attrs.find(key);
     if (it == node.attrs.end()) return fallback;
     try {
         return std::stoull(it->second);
@@ -50,14 +51,14 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
     std::vector<size_t> critical_pred(node_count, INVALID_NODE);
     std::queue<size_t> ready;
 
-    for (const auto & edge : graph.edges()) {
-        if (edge.src >= node_count || edge.dst >= node_count) continue;
+    std::ranges::for_each(graph.edges(), [&](const auto & edge) {
+        if (edge.src >= node_count || edge.dst >= node_count) return;
         outgoing[edge.src].push_back(edge.dst);
         indegree[edge.dst]++;
-    }
-    for (const auto & node : graph.nodes()) {
+    });
+    std::ranges::for_each(graph.nodes(), [&](const auto & node) {
         if (indegree[node.id] == 0) ready.push(node.id);
-    }
+    });
 
     uint64_t e2e = 0;
     while (!ready.empty()) {
@@ -90,7 +91,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
          */
         if (pred != INVALID_NODE) {
             const auto & pred_node = graph.node(pred);
-            if (pred_node.attrs.find("cpuinterval") != pred_node.attrs.end()) {
+            if (pred_node.attrs.contains("cpuinterval")) {
                 auto interval = read_u64_attr(pred_node, "cpuinterval", 0);
                 if (interval <= 1'000'000'000'000ull) complete_time[node_id] += interval;
             }
@@ -129,7 +130,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
                     if (dfs(dst)) return true;
                 }
                 else if (visit_state[dst] == 1) {
-                    auto it = std::find(path_stack.begin(), path_stack.end(), dst);
+                    auto it = std::ranges::find(path_stack, dst);
                     if (it != path_stack.end()) result.cycle_nodes.assign(it, path_stack.end());
                     return true;
                 }
@@ -139,7 +140,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
             return false;
         };
 
-        for (size_t node_id = 0; node_id < node_count; ++node_id) {
+        for (const auto node_id : std::views::iota(size_t{ 0 }, node_count)) {
             if (indegree[node_id] > 0 && visit_state[node_id] == 0 && dfs(node_id)) break;
         }
 
@@ -147,7 +148,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
         log << result.error << " Processed " << result.processed_nodes << " out of " << node_count << " nodes.";
         if (!result.cycle_nodes.empty()) {
             log << " Cycle nodes:";
-            for (auto node_id : result.cycle_nodes) log << " " << node_id;
+            std::ranges::for_each(result.cycle_nodes, [&](auto node_id) { log << " " << node_id; });
         }
         throw std::runtime_error(result.error);
     }

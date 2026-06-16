@@ -9,6 +9,7 @@
 #include "trace_graph/modules/hicache/hicache_token_radix_tree.hpp"
 #include "trace_graph/modules/hicache/hicache_token_store.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <set>
@@ -46,36 +47,36 @@ class DagGraph;
  * fact 引入。
  */
 class HiCacheState {
-  public:
+public:
     /** @brief 基于固定 target 配置构造一个空的 target-state 状态模型。 */
     explicit HiCacheState(HiCacheConfig config = HiCacheConfig{});
 
     /** @name 最终 tier 与生命周期视图 */
     /** @{ */
-    const std::set<std::string> & l1() const { return state_index_.l1(); }
-    const std::set<std::string> & l2() const { return state_index_.l2(); }
-    const std::set<std::string> & l3() const { return state_index_.l3(); }
-    const std::set<std::string> & dirty() const { return state_index_.dirty(); }
-    const std::set<std::string> & backuped() const { return state_index_.backuped(); }
-    const std::set<std::string> & evicted() const { return state_index_.evicted(); }
-    const std::set<std::string> & locked() const { return state_index_.locked(); }
-    const std::set<std::string> & prefetch_planned() const { return state_index_.prefetch_planned(); }
-    const std::set<std::string> & prefetch_ready() const { return state_index_.prefetch_ready(); }
-    const std::set<std::string> & prefetch_late() const { return state_index_.prefetch_late(); }
-    const std::set<std::string> & prefetch_suppressed() const { return state_index_.prefetch_suppressed(); }
-    std::set<std::string> pending_writeback() const;
-    std::map<std::string, uint64_t> hit_counts() const { return state_index_.page_hit_count_summary(); }
+    [[nodiscard]] const std::set<std::string> & l1() const { return state_index_.l1(); }
+    [[nodiscard]] const std::set<std::string> & l2() const { return state_index_.l2(); }
+    [[nodiscard]] const std::set<std::string> & l3() const { return state_index_.l3(); }
+    [[nodiscard]] const std::set<std::string> & dirty() const { return state_index_.dirty(); }
+    [[nodiscard]] const std::set<std::string> & backuped() const { return state_index_.backuped(); }
+    [[nodiscard]] const std::set<std::string> & evicted() const { return state_index_.evicted(); }
+    [[nodiscard]] const std::set<std::string> & locked() const { return state_index_.locked(); }
+    [[nodiscard]] const std::set<std::string> & prefetch_planned() const { return state_index_.prefetch_planned(); }
+    [[nodiscard]] const std::set<std::string> & prefetch_ready() const { return state_index_.prefetch_ready(); }
+    [[nodiscard]] const std::set<std::string> & prefetch_late() const { return state_index_.prefetch_late(); }
+    [[nodiscard]] const std::set<std::string> & prefetch_suppressed() const { return state_index_.prefetch_suppressed(); }
+    [[nodiscard]] std::set<std::string> pending_writeback() const;
+    [[nodiscard]] std::map<std::string, uint64_t> hit_counts() const { return state_index_.page_hit_count_summary(); }
     /** @} */
 
     /** @brief 返回 modeled state 的确定性摘要。 */
-    std::string digest() const;
+    [[nodiscard]] std::string digest() const;
 
     /**
      * @brief 将一个已经路由完成的 atomic invariant fact 应用到 target state。
      *
      * 调用方负责 role 路由和必需字段校验；这里不重新接纳 evidence-only fact。
      */
-    std::vector<HiCacheStateTransition> apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary);
+    [[nodiscard]] std::vector<HiCacheStateTransition> apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary);
 
     /**
      * @brief 在 trace 结束时收束仍然打开的 modeled work。
@@ -84,9 +85,9 @@ class HiCacheState {
      * 尚未完成的 best-effort prefetch work，绝不导入 source final-state
      * observation。
      */
-    std::vector<HiCacheStateTransition> finalize(HiCacheSummary & summary);
+    [[nodiscard]] std::vector<HiCacheStateTransition> finalize(HiCacheSummary & summary);
 
-  private:
+private:
     /**
      * @brief request-local 的 target execution 视图。
      *
@@ -154,16 +155,18 @@ class HiCacheState {
     enum class PrefetchWorkState { Pending, Ready, Applied, Suppressed, Late };
 
     /**
-     * @brief best-effort / timeout prefetch work 的建模状态。
+     * @brief storage prefetch work 的建模状态。
      *
-     * requested_host_pages 对应 SGLang page-aligned prefetch request 用于
-     * request/rate-limit/release 的 budget；reserved_host_pages 是经过
-     * SGLang-style fallback 后实际能放进 modeled host memory 的数量。不要合并
-     * 两个字段，否则 cleanup 和 rate limiting 会变成依赖 observed final L2
-     * counts，而不是 SGLang-derived target policy。
+     * planned_pages 对应 SGLang page-aligned prefetch_key；pages 对应 controller
+     * storage hit query 后仍保留的连续命中前缀。requested_host_pages 用于
+     * prefetch_tokens_occupied / rate-limit，reserved_host_pages 是经过
+     * SGLang-style host allocation fallback 后实际能放进 modeled host memory 的数量。
+     * 两个 budget 不可合并，否则 cleanup 和 rate limiting 会退化成依赖 observed
+     * final L2 counts，而不是 target policy。
      */
     struct PrefetchWorkItem {
         std::string request_key;
+        std::string anchor_ref_key;
         std::string cache_scope;
         std::vector<std::string> anchor_pages;
         std::vector<std::string> planned_pages;
@@ -212,12 +215,12 @@ class HiCacheState {
      * source_page_size 当作 fact 声明的 invariant page size。
      */
     /** @{ */
-    uint64_t page_size_for_fact(const HiCacheFact & fact) const;
-    std::vector<std::string> pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
-    uint64_t full_path_token_count(const HiCacheFact & fact) const;
-    uint64_t projected_aligned_token_count(const HiCacheFact & fact) const;
-    bool needs_projected_pages(const HiCacheFact & fact) const;
-    HiCacheTokenPath projected_full_path_tokens_for_fact(const HiCacheFact & fact) const;
+    [[nodiscard]] uint64_t page_size_for_fact(const HiCacheFact & fact) const;
+    [[nodiscard]] std::vector<std::string> pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
+    [[nodiscard]] uint64_t full_path_token_count(const HiCacheFact & fact) const;
+    [[nodiscard]] uint64_t projected_aligned_token_count(const HiCacheFact & fact) const;
+    [[nodiscard]] bool needs_projected_pages(const HiCacheFact & fact) const;
+    [[nodiscard]] HiCacheTokenPath projected_full_path_tokens_for_fact(const HiCacheFact & fact) const;
     void note_missing_projection_if_needed(const HiCacheFact & fact, HiCacheSummary & summary) const;
     /** @} */
 
@@ -229,15 +232,15 @@ class HiCacheState {
      * storage-known page 不是等价概念。
      */
     /** @{ */
-    std::string scoped_request_key(const HiCacheFact & fact) const;
-    std::string normalized_scope(const HiCacheFact & fact) const;
-    bool page_in_scope(const std::string & page, const std::string & scope) const;
-    uint64_t tier_size_for_scope(const std::string & tier, const std::string & scope) const;
+    [[nodiscard]] std::string scoped_request_key(const HiCacheFact & fact) const;
+    [[nodiscard]] std::string normalized_scope(const HiCacheFact & fact) const;
+    [[nodiscard]] bool page_in_scope(const std::string & page, const std::string & scope) const;
+    [[nodiscard]] uint64_t tier_size_for_scope(const std::string & tier, const std::string & scope) const;
     HiCacheTokenRadixTree & device_radix_tree_for_fact(const HiCacheFact & fact);
     HiCacheTokenRadixTree & host_radix_tree_for_fact(const HiCacheFact & fact);
-    RequestLookupMatch match_request_lookup_path(const HiCacheFact & fact, const std::vector<std::string> & full_pages);
-    std::vector<std::string> contiguous_resident_prefix(const std::vector<std::string> & full_pages, size_t max_pages, bool include_device, bool include_host,
-                                                        bool include_storage) const;
+    [[nodiscard]] RequestLookupMatch match_request_lookup_path(const HiCacheFact & fact, const std::vector<std::string> & full_pages);
+    [[nodiscard]] std::vector<std::string> contiguous_resident_prefix(const std::vector<std::string> & full_pages, size_t max_pages, bool include_device,
+                                                                      bool include_host, bool include_storage) const;
     void insert_host_path_topology(const HiCacheFact & fact, const std::vector<std::string> & pages);
     void insert_host_page_topology_from_device(const HiCacheFact & fact, const std::string & page);
     /** @} */
@@ -249,18 +252,19 @@ class HiCacheState {
      * policy default，不是为了贴合 source observation 的兼容 shim。
      */
     /** @{ */
-    std::set<std::string> * tier_set(const std::string & tier);
-    const std::set<std::string> * tier_set(const std::string & tier) const;
-    std::vector<std::string> * touch_order_for_tier(const std::string & tier);
-    uint64_t capacity_for_tier(const std::string & tier) const;
-    uint64_t target_write_through_threshold() const;
-    bool target_write_count_enabled() const;
-    uint64_t target_prefetch_threshold_pages() const;
-    uint64_t target_prefetch_capacity_limit_pages() const;
-    uint64_t active_prefetch_requested_pages_for_scope(const std::string & scope) const;
-    uint64_t reserved_prefetch_pages_for_scope(const std::string & scope) const;
-    uint64_t host_pool_occupied_pages_for_scope(const std::string & scope) const;
-    uint64_t host_pool_available_pages_for_scope(const std::string & scope) const;
+    [[nodiscard]] std::set<std::string> * tier_set(const std::string & tier);
+    [[nodiscard]] const std::set<std::string> * tier_set(const std::string & tier) const;
+    [[nodiscard]] std::vector<std::string> * touch_order_for_tier(const std::string & tier);
+    [[nodiscard]] uint64_t capacity_for_tier(const std::string & tier) const;
+    [[nodiscard]] uint64_t target_write_through_threshold() const;
+    [[nodiscard]] bool target_write_count_enabled() const;
+    [[nodiscard]] bool target_write_back_enabled() const;
+    [[nodiscard]] uint64_t target_prefetch_threshold_pages() const;
+    [[nodiscard]] uint64_t target_prefetch_capacity_limit_pages() const;
+    [[nodiscard]] uint64_t active_prefetch_requested_pages_for_scope(const std::string & scope) const;
+    [[nodiscard]] uint64_t reserved_prefetch_pages_for_scope(const std::string & scope) const;
+    [[nodiscard]] uint64_t host_pool_occupied_pages_for_scope(const std::string & scope) const;
+    [[nodiscard]] uint64_t host_pool_available_pages_for_scope(const std::string & scope) const;
     /** @} */
 
     /**
@@ -279,8 +283,23 @@ class HiCacheState {
     void apply_request_lifecycle_insert(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_prefetch_check_point(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @} */
+
+    /**
+     * @name write policy semantics
+     *
+     * 三种 write policy 共享 device insert、hit-count backup、device eviction 前处理
+     * 和同步 host backup commit。这里不建模 ack 异步时序，只建模策略语义结果。
+     */
+    /** @{ */
     void apply_write_policy_hit_counts(const HiCacheFact & fact, const std::vector<std::string> & full_pages, HiCacheSummary & summary,
                                        std::vector<HiCacheStateTransition> & transitions);
+    void apply_new_device_page_write_policy(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                            const std::string & page);
+    void apply_device_eviction_write_policy(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                            const std::string & page);
+    void commit_host_backup_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                 const std::string & page, bool storage_resident);
     /** @} */
 
     /**
@@ -290,13 +309,13 @@ class HiCacheState {
      * 保护 target eviction 决策，但不会 replay 旧的锁增量事件。
      */
     /** @{ */
-    std::vector<std::string> flatten_page_groups(const std::vector<std::vector<std::string>> & groups) const;
+    [[nodiscard]] std::vector<std::string> flatten_page_groups(const std::vector<std::vector<std::string>> & groups) const;
     void update_request_path_state(const HiCacheFact & fact, const std::vector<std::string> & full_pages, const std::vector<std::string> & matched_pages,
                                    const std::vector<std::vector<std::string>> & device_chain_groups,
                                    const std::vector<std::vector<std::string>> & host_chain_groups);
-    uint64_t active_device_reservation_pages_for_scope(const std::string & scope) const;
-    uint64_t estimate_admission_requested_tokens(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
-    uint64_t estimate_admission_requested_pages(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
+    [[nodiscard]] uint64_t active_device_reservation_pages_for_scope(const std::string & scope) const;
+    [[nodiscard]] uint64_t estimate_admission_requested_tokens(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
+    [[nodiscard]] uint64_t estimate_admission_requested_pages(const HiCacheFact & fact, const RequestExecutionState & request_state) const;
     void clear_device_reservation(const std::string & request_key);
     void acquire_device_request_lock(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                      const std::string & request_key, const std::vector<std::string> & pages);
@@ -322,12 +341,17 @@ class HiCacheState {
      * cleanup，与 cleanup 后实际 fit 的 reservation 不是同一个量。
      */
     /** @{ */
-    uint64_t reserve_host_pages_for_prefetch(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                             const std::string & scope, uint64_t requested_pages);
+    [[nodiscard]] uint64_t reserve_host_pages_for_prefetch(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                           std::vector<HiCacheStateTransition> & transitions, const std::string & scope,
+                                                           uint64_t requested_pages);
     void release_prefetch_reservation(PrefetchWorkItem & work);
-    bool best_effort_ready_budget_available(const PrefetchWorkItem & work) const;
-    std::vector<std::string> target_prefetch_storage_pages(const std::vector<std::string> & matched_pages) const;
-    bool terminal_prefetch_checkpoint(const HiCacheFact & fact) const;
+    void release_prefetch_work_resources(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                         PrefetchWorkItem & work);
+    [[nodiscard]] bool prefetch_work_open(const PrefetchWorkItem & work) const;
+    [[nodiscard]] bool best_effort_ready_budget_available(const PrefetchWorkItem & work) const;
+    [[nodiscard]] bool prefetch_timeout_elapsed(const HiCacheFact & fact, const PrefetchWorkItem & work) const;
+    [[nodiscard]] std::vector<std::string> target_prefetch_storage_pages(const std::vector<std::string> & matched_pages, size_t first_page_index) const;
+    [[nodiscard]] bool terminal_prefetch_checkpoint(const HiCacheFact & fact) const;
     void complete_prefetch_ready_checkpoint(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                             PrefetchWorkItem & work);
     void apply_host_visibility_for_ready_work(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
@@ -377,8 +401,6 @@ class HiCacheState {
     void evict_lru_pages(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier,
                          uint64_t page_count);
     void enforce_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & tier);
-    void flush_dirty_page_to_host(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                  const std::string & page);
     void enqueue_writeback_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                 const std::string & page);
     void complete_writeback_page(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
@@ -387,7 +409,7 @@ class HiCacheState {
     uint64_t evict_host_pages_for_scope(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                         const std::string & scope, uint64_t page_count);
     void enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
-    std::string transition_state_digest() const;
+    [[nodiscard]] std::string transition_state_digest() const;
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,
                            const std::string & tier, const std::string & page, const std::string & before_digest);
     /** @} */
@@ -400,17 +422,17 @@ class HiCacheState {
  * 委托给 HiCacheState。
  */
 class HiCacheStateModel {
-  public:
+public:
     explicit HiCacheStateModel(HiCacheConfig config);
-    HiCacheSummary run(DagGraph & graph);
+    [[nodiscard]] HiCacheSummary run(DagGraph & graph);
 
-  private:
+private:
     HiCacheConfig config_;
     HiCacheFactParser fact_parser_;
     HiCacheState state_;
 };
 
 /** @brief module 包装层使用的便捷入口。 */
-HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & config);
+[[nodiscard]] HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & config);
 
 } // namespace TraceGraph

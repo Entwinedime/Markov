@@ -5,6 +5,7 @@
 #include "trace_graph/modules/hicache/hicache_token_store.hpp"
 
 #include <algorithm>
+#include <ranges>
 
 namespace TraceGraph {
 
@@ -12,11 +13,7 @@ namespace {
 
 /** @brief 比较两个 token path 是否逐 token 完全一致。 */
 bool tokens_equal(const HiCacheTokenPath & left, const HiCacheTokenPath & right) {
-    if (left.size() != right.size()) return false;
-    for (size_t index = 0; index < left.size(); ++index) {
-        if (left[index].words != right[index].words) return false;
-    }
-    return true;
+    return std::ranges::equal(left, right, {}, &HiCacheToken::words, &HiCacheToken::words);
 }
 
 /** @brief 空 cache_scope 归一到 -1，保持与 fact parser / pager 一致。 */
@@ -47,8 +44,8 @@ void HiCacheTokenPathStore::set_request_tokens(const HiCacheFact & fact, const H
 /** @brief 记录 request-bound token anchor，并按 scope/path 去重。 */
 void HiCacheTokenPathStore::observe_request_bound_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) {
     if (fact.request_id.empty() || tokens.empty()) return;
-    const RequestBoundAnchor anchor{normalized_scope(fact), tokens};
-    auto duplicate = std::find_if(request_bound_anchors_.begin(), request_bound_anchors_.end(), [&](const auto & existing) {
+    const RequestBoundAnchor anchor{ normalized_scope(fact), tokens };
+    auto duplicate = std::ranges::find_if(request_bound_anchors_, [&](const auto & existing) {
         return existing.scope == anchor.scope && tokens_equal(existing.tokens, anchor.tokens);
     });
     if (duplicate != request_bound_anchors_.end()) return;

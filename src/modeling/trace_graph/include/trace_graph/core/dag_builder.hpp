@@ -2,6 +2,7 @@
 
 #include "trace_graph/core/dag_graph.hpp"
 
+#include <cstddef>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,11 +22,11 @@ namespace TraceGraph {
  * what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
  */
 class DagBuilder {
-  public:
+public:
     /** @brief 构建单 rank / 单输入 trace 的 base DAG。 */
-    DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
+    [[nodiscard]] DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
 
-  private:
+private:
     /**
      * @brief 单次构图中的临时索引。
      *
@@ -68,17 +69,17 @@ class DagBuilder {
     };
 
     /** @brief 归一化阶段合并重复事件、过滤 CPU 嵌套父节点，并保留 HiCache 事实事件。 */
-    static std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
+    [[nodiscard]] static std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
 
     /** @brief 判断一个事件是否应被视作 device 执行节点；该判断会影响 lane 和边类型。 */
-    static bool is_device_event(const TraceEvent & event);
+    [[nodiscard]] static bool is_device_event(const TraceEvent & event);
 
     /** @brief 判断事件是否属于 HiCache 事实事件，确保事实事件不会被 CPU leaf 过滤误删。 */
-    static bool is_hicache_event(const TraceEvent & event);
+    [[nodiscard]] static bool is_hicache_event(const TraceEvent & event);
 
     /** @brief 计算顺序边使用的资源身份；该函数是 faithful replay 精度的关键点。 */
-    static std::string lane_key(const TraceEvent & event);
-    static std::string event_arg(const TraceEvent & event, const std::string & key, const std::string & fallback = "");
+    [[nodiscard]] static std::string lane_key(const TraceEvent & event);
+    [[nodiscard]] static std::string event_arg(const TraceEvent & event, const std::string & key, const std::string & fallback = "");
 
     /**
      * @name 构图阶段

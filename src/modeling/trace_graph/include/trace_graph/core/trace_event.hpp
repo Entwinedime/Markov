@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -38,11 +39,11 @@ struct TraceEvent {
     std::unordered_map<std::string, std::string> args;
 
     /** @brief 判断统一参数表中是否存在指定 key。 */
-    bool has_arg(const std::string & key) const;
+    [[nodiscard]] bool has_arg(const std::string & key) const;
     /** @brief 读取字符串参数，缺失时返回调用方提供的 fallback。 */
-    std::string arg(const std::string & key, const std::string & fallback = "") const;
+    [[nodiscard]] std::string arg(const std::string & key, const std::string & fallback = "") const;
     /** @brief 以 uint64_t 形式读取参数；非法或负值输入按缺失处理。 */
-    uint64_t arg_u64(const std::string & key, uint64_t fallback = 0) const;
+    [[nodiscard]] uint64_t arg_u64(const std::string & key, uint64_t fallback = 0) const;
 };
 
 /**

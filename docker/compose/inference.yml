@@ -37,3 +37,13 @@ services:
     environment:
       <<: *common-env
     command: bash
+
+  modeling:
+    working_dir: /workspace/trace-sim
+    build:
+      context: ../..
+      dockerfile: docker/images/modeling/Dockerfile
+    image: markov-trace-sim-modeling:ubuntu24.04
+    volumes:
+      - ../..:/workspace/trace-sim
+    command: bash

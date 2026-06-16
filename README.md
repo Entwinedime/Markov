@@ -19,17 +19,17 @@
 │   ├── include/trace_graph/modules/hicache/
 │   └── src/modules/hicache/             # HiCache fact parser、radix tree、state model、summary
 ├── scripts/profile.sh                   # 宿主机 profiling 入口，进入框架容器运行
-├── scripts/run.sh                       # 打开框架容器
-├── scripts/build.sh                     # 构建 runtime image 和 hook
+├── scripts/model.sh                     # 宿主机 modeling 入口，进入干净 modeling 容器运行
+├── scripts/run.sh                       # 打开 framework runtime 或 modeling 容器
+├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
 ├── scripts/internal/profile_runner.py   # 容器内 profiling 执行器
 ├── scripts/internal/profile_quality.py  # profiling 质量审计
-├── scripts/internal/model_runner.py     # modeling 编排入口
+├── scripts/internal/model_runner.py     # 容器内 modeling 执行器
 ├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
 ├── scripts/bench/hicache_phased_workload.py
 ├── configs/experiments/hicache_state/   # HiCache state profiling suite
 ├── configs/modeling/hicache_state/      # HiCache state prediction config
 ├── configs/modeling/hicache/            # faithful replay config
-├── tests/                               # smoke、profiling、HiCache fixture
 ├── docs/                                # 主线文档和专项验证记录
 ├── third_party/sglang/                  # SGLang fork submodule
 ├── third_party/ktransformers/           # KTransformers fork submodule
@@ -43,7 +43,6 @@
 | `docs/profiling_development.md` | profiling 架构、runner、suite、Python probe 和 HiCache 采集契约。 |
 | `docs/modeling_development.md` | C++ TraceGraph、model runner、mode、HiCache state backend 和输出格式。 |
 | `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、最新 S1A token backend 结果和复现命令。 |
-| `docs/validation/hicache_state_model_defects.md` | 当前未闭环的 HiCache state model 缺陷和处理顺序。 |
 | `docs/project_constraints.md` | 项目长期约束。 |
 | `docs/work_progress.md` | 时间戳流水记录；旧条目只代表当时状态。 |
 
@@ -60,19 +59,27 @@ git submodule update --init --recursive
 
 容器 runtime image 会把 submodule 源码复制进镜像并安装。框架源码变更后需要重建对应 runtime layer。
 
-## Host Build
+## Docker 环境
 
-Host build 主要用于 C++ TraceGraph 和 fixture：
+项目维护三个 Docker 环境：
+
+- `sglang-profile`：SGLang 真实 profiling / runtime 环境，包含 Ascend/CANN 和 hook build 上下文；
+- `ktransformers-profile`：KTransformers 真实 profiling / runtime 环境，包含 Ascend/CANN 和 hook build 上下文；
+- `modeling`：干净 Ubuntu 24.04 C++23 环境，只用于 C++ TraceGraph 构建、clang-format/clang-tidy 和 modeling run/check。
+
+构建 modeling 环境并检查 TraceGraph：
 
 ```bash
-cmake -S . -B build -DHOOK_ENABLE_PAPI=OFF
-cmake --build build --target trace_graph -j2
+scripts/build.sh modeling
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
 ```
 
-主要产物：
+构建 framework runtime 和对应 hook：
 
-```text
-build/bin/trace_graph
+```bash
+scripts/build.sh sglang
+scripts/build.sh ktransformers
 ```
 
 真实 profiling 不应直接使用 host build 的 hook so。LD_PRELOAD hook 需要在对应框架容器内构建，保证 ABI、工具链和运行依赖匹配。
@@ -80,25 +87,17 @@ build/bin/trace_graph
 ## 常用检查
 
 ```bash
-python3 -m py_compile \
-  scripts/internal/profile_quality.py \
-  scripts/internal/model_runner.py \
-  tests/run_hicache_state_fixtures.py \
-  tests/run_modeling_smoke_fixtures.py
-
-python3 tests/run_hicache_state_fixtures.py
-python3 tests/run_modeling_smoke_fixtures.py
-python3 tests/run_profiling_fixtures.py
-python3 tests/run_hicache_mainline_config_fixtures.py
-
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
 
-C/C++ 改动还需要：
+C/C++ 或 modeling runner 改动还需要：
 
 ```bash
-git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror
+scripts/run.sh modeling -- bash -lc \
+  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/profile_quality.py'
+scripts/run.sh modeling -- bash -lc \
+  "git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror"
 ```
 
 ## Profiling
@@ -135,7 +134,7 @@ python3 scripts/internal/profile_quality.py \
 faithful replay：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache/modeling_hicache_from_manifest.json \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/faithful_replay \
@@ -147,7 +146,7 @@ python3 scripts/internal/model_runner.py \
 S1A HiCache state self-config prediction：
 
 ```bash
-python3 scripts/internal/model_runner.py \
+scripts/model.sh \
   --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/token_backend_s1a \

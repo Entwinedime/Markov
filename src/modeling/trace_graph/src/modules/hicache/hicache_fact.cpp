@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ranges>
 #include <string>
 
 namespace TraceGraph {
@@ -18,16 +19,8 @@ namespace {
 
 using Json = nlohmann::json;
 
-bool starts_with(const std::string & text, const std::string & prefix) { return text.rfind(prefix, 0) == 0; }
-
-bool contains(const std::string & text, const std::string & needle) { return text.find(needle) != std::string::npos; }
-
-bool ends_with(const std::string & text, const std::string & suffix) {
-    return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 std::string lower(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    std::ranges::transform(value, value.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
 }
 
@@ -120,8 +113,7 @@ HiCacheToken token_from_json(const Json & value) {
     HiCacheToken token;
     auto append_word = [&](const Json & item) {
         try {
-            if (item.is_number_unsigned())
-                token.words.push_back(static_cast<uint32_t>(item.get<uint64_t>()));
+            if (item.is_number_unsigned()) token.words.push_back(static_cast<uint32_t>(item.get<uint64_t>()));
             else if (item.is_number_integer()) {
                 auto number = item.get<int64_t>();
                 if (number >= 0) token.words.push_back(static_cast<uint32_t>(number));
@@ -138,9 +130,7 @@ HiCacheToken token_from_json(const Json & value) {
     if (value.is_array()) {
         for (const auto & item : value) append_word(item);
     }
-    else {
-        append_word(value);
-    }
+    else { append_word(value); }
     return token;
 }
 
@@ -148,17 +138,22 @@ HiCacheToken token_from_json(const Json & value) {
 HiCacheTokenPath token_path_from_json(const Json & value) {
     HiCacheTokenPath path;
     if (!value.is_array()) return path;
-    for (const auto & item : value) {
+    std::ranges::for_each(value, [&](const auto & item) {
         auto token = token_from_json(item);
         if (!token.words.empty()) path.push_back(std::move(token));
-    }
+    });
     return path;
 }
 
 HiCacheTokenPath slice_tokens(const HiCacheTokenPath & tokens, uint64_t begin, uint64_t end) {
     if (begin >= tokens.size() || begin >= end) return {};
     end = std::min<uint64_t>(end, tokens.size());
-    return {tokens.begin() + static_cast<long>(begin), tokens.begin() + static_cast<long>(end)};
+    HiCacheTokenPath result;
+    result.reserve(static_cast<size_t>(end - begin));
+    auto slice = tokens | std::views::drop(static_cast<std::ranges::range_difference_t<HiCacheTokenPath>>(begin))
+                 | std::views::take(static_cast<std::ranges::range_difference_t<HiCacheTokenPath>>(end - begin));
+    std::ranges::copy(slice, std::back_inserter(result));
+    return result;
 }
 
 } // namespace
@@ -171,20 +166,21 @@ HiCacheTokenPath slice_tokens(const HiCacheTokenPath & tokens, uint64_t begin, u
  */
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
     const auto target_id = lower(event.arg("target_id"));
-    if (starts_with(target_id, "hiradix.") || starts_with(target_id, "hicache.") || starts_with(target_id, "hicache_controller.")) return true;
+    if (target_id.starts_with("hiradix.") || target_id.starts_with("hicache.") || target_id.starts_with("hicache_controller.")) return true;
     const auto domain = lower(event.arg("domain"));
-    if (domain == "python_probe" && contains(lower(event.name), "hicache")) return true;
+    if (domain == "python_probe" && lower(event.name).contains("hicache")) return true;
     if (event.cat == "hicache") return true;
-    return starts_with(event.name, "HiCache::") || starts_with(event.name, "hicache_");
+    return event.name.starts_with("HiCache::") || event.name.starts_with("hicache_");
 }
 
 /** @brief 在第一轮扫描中收集 token dictionary。 */
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     if (!is_hicache_event(event)) return;
-    for (const auto & [key, raw] : event.args) {
-        if (!contains(key, "dictionary")) continue;
+    std::ranges::for_each(event.args, [&](const auto & item) {
+        const auto & [key, raw] = item;
+        if (!key.contains("dictionary")) return;
         observe_dictionary_value(raw);
-    }
+    });
 }
 
 /**
@@ -250,13 +246,11 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     if (fact.role.empty()) fact.role = "unknown";
     fact.phase = event.arg("phase");
     if (fact.phase.empty()) {
-        if (ends_with(event.name, "_start"))
-            fact.phase = "start";
-        else if (ends_with(event.name, "_end"))
-            fact.phase = "end";
+        if (event.name.ends_with("_start")) fact.phase = "start";
+        else if (event.name.ends_with("_end")) fact.phase = "end";
     }
-    fact.is_start = fact.phase == "start" || ends_with(event.name, "_start");
-    fact.is_end = fact.phase == "end" || ends_with(event.name, "_end");
+    fact.is_start = fact.phase == "start" || event.name.ends_with("_start");
+    fact.is_end = fact.phase == "end" || event.name.ends_with("_end");
     fact.request_id = event.arg("request_id");
     fact.operation_id = event.arg("operation_id", event.arg("node_id"));
     fact.cache_scope = event.arg("cache_scope", event.pid.empty() ? "-1" : event.pid);

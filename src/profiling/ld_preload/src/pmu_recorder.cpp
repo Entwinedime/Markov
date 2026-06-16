@@ -21,9 +21,9 @@ unsigned long PapiThreadId() { return static_cast<unsigned long>(syscall(SYS_get
 
 /** @brief 每个线程独立持有 PAPI event set，避免跨线程复用计数器状态。 */
 struct PapiThreadState {
-    bool registered{false};
-    bool initialized{false};
-    int event_set{PAPI_NULL};
+    bool registered{ false };
+    bool initialized{ false };
+    int event_set{ PAPI_NULL };
     std::vector<std::string> event_names;
     std::vector<long long> counter_values;
 
@@ -32,7 +32,7 @@ struct PapiThreadState {
          * @brief 清理顺序保持 stop -> cleanup -> destroy -> unregister，避免 PAPI 资源泄漏到目标进程。
          */
         if (event_set != PAPI_NULL) {
-            long long * stop_values{counter_values.empty() ? nullptr : counter_values.data()};
+            long long * stop_values{ counter_values.empty() ? nullptr : counter_values.data() };
             PAPI_stop(event_set, stop_values);
             PAPI_cleanup_eventset(event_set);
             PAPI_destroy_eventset(&event_set);
@@ -54,7 +54,7 @@ struct PapiThreadState {
 
 /** @brief PAPI-backed PMU recorder 实现；未启用或初始化失败时保持静默降级。 */
 class PmuRecorderImpl {
-  public:
+public:
     PmuRecorderImpl() {
         /**
          * @brief PMU 由编译开关和环境变量共同控制，默认事件只作为采集事实附加到 trace。
@@ -90,12 +90,12 @@ class PmuRecorderImpl {
         return true;
     }
 
-  private:
+private:
     bool InitializeLibrary() {
         /**
          * @brief PAPI library 和 thread support 必须同时初始化成功，后续线程快照才可用。
          */
-        int ret{PAPI_library_init(PAPI_VER_CURRENT)};
+        int ret{ PAPI_library_init(PAPI_VER_CURRENT) };
         if (ret != PAPI_VER_CURRENT) {
             std::cerr << "[hook] PAPI_library_init failed" << std::endl;
             return false;
@@ -114,19 +114,19 @@ class PmuRecorderImpl {
         /**
          * @brief 从 HOOK_PAPI_EVENTS 读取事件列表；非法事件被跳过而不是中断基础 hook。
          */
-        const std::string default_events{"perf::CYCLES,perf::INSTRUCTIONS,perf::CACHE-"
-                                         "REFERENCES,perf::CACHE-MISSES"};
-        const std::string env_events{safe_env("HOOK_PAPI_EVENTS")};
+        const std::string default_events{ "perf::CYCLES,perf::INSTRUCTIONS,perf::CACHE-"
+                                          "REFERENCES,perf::CACHE-MISSES" };
+        const std::string env_events{ safe_env("HOOK_PAPI_EVENTS") };
 
-        const std::vector<std::string> requested_events{SplitCsv(env_events.empty() ? default_events : env_events)};
+        const std::vector<std::string> requested_events{ SplitCsv(env_events.empty() ? default_events : env_events) };
         if (requested_events.empty()) {
             std::cerr << "[hook] No PAPI events configured, PMU trace disabled" << std::endl;
             return;
         }
 
         for (size_t i = 0; i < requested_events.size(); ++i) {
-            int event_code{0};
-            int ret{PAPI_event_name_to_code(const_cast<char *>(requested_events[i].c_str()), &event_code)};
+            int event_code{ 0 };
+            int ret{ PAPI_event_name_to_code(const_cast<char *>(requested_events[i].c_str()), &event_code) };
             if (ret != PAPI_OK) {
                 std::cerr << "[hook] Unsupported PAPI event: " << requested_events[i] << " (" << PAPI_strerror(ret) << ")" << std::endl;
                 continue;
@@ -145,7 +145,7 @@ class PmuRecorderImpl {
          */
         if (state.initialized) { return true; }
 
-        int ret{PAPI_register_thread()};
+        int ret{ PAPI_register_thread() };
         if (ret != PAPI_OK) {
             LogPapiError("PAPI_register_thread", ret);
             return false;
@@ -196,7 +196,7 @@ class PmuRecorderImpl {
 
 /** @brief 未启用 PAPI 编译开关时的空实现，保证基础 trace 采集不依赖 PMU。 */
 class PmuRecorderImpl {
-  public:
+public:
     bool ReadSnapshot(PmuSnapshot *) { return false; }
 };
 

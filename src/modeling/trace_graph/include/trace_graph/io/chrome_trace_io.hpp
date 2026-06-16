@@ -14,7 +14,7 @@ namespace TraceGraph {
  * 当前 reader 为了处理千万级 trace 使用轻量 scanner，只抽取构图需要的字段，
  * 不保留完整 JSON DOM。
  */
-std::vector<TraceEvent> read_chrome_trace(const std::string & filename);
+[[nodiscard]] std::vector<TraceEvent> read_chrome_trace(const std::string & filename);
 
 /**
  * @brief 以 Chrome trace 格式导出仿真后的 DAG。

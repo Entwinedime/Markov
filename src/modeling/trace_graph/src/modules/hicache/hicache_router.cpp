@@ -4,7 +4,10 @@
  */
 #include "trace_graph/modules/hicache/hicache_router.hpp"
 
-#include <unordered_map>
+#include <algorithm>
+#include <array>
+#include <ranges>
+#include <string_view>
 
 namespace TraceGraph {
 
@@ -42,16 +45,19 @@ bool is_hicache_state_model_fact(const HiCacheFact & fact) {
 
 /** @brief 将稳定 event_role 字符串映射到 handler 枚举。 */
 HiCacheFactRole parse_hicache_fact_role(const std::string & role) {
-    static const std::unordered_map<std::string, HiCacheFactRole> roles = {
-        {"request_bound_match_anchor", HiCacheFactRole::RequestBoundMatchAnchor},
-        {"request_lifecycle_anchor", HiCacheFactRole::RequestLifecycleAnchor},
-        {"request_admission", HiCacheFactRole::RequestAdmission},
-        {"prefetch_decision", HiCacheFactRole::PrefetchDecision},
-        {"prefetch_check_point", HiCacheFactRole::PrefetchCheckPoint},
+    struct RoleMapping {
+        std::string_view name;
+        HiCacheFactRole role = HiCacheFactRole::Unknown;
     };
-    auto it = roles.find(role);
-    if (it == roles.end()) return HiCacheFactRole::Unknown;
-    return it->second;
+    static constexpr std::array roles = {
+        RoleMapping{ "request_bound_match_anchor", HiCacheFactRole::RequestBoundMatchAnchor },
+        RoleMapping{   "request_lifecycle_anchor",  HiCacheFactRole::RequestLifecycleAnchor },
+        RoleMapping{          "request_admission",        HiCacheFactRole::RequestAdmission },
+        RoleMapping{          "prefetch_decision",        HiCacheFactRole::PrefetchDecision },
+        RoleMapping{       "prefetch_check_point",      HiCacheFactRole::PrefetchCheckPoint },
+    };
+    const auto match = std::ranges::find(roles, role, &RoleMapping::name);
+    return match == roles.end() ? HiCacheFactRole::Unknown : match->role;
 }
 
 /** @brief 返回 summary 中使用的稳定 role 名。 */
@@ -115,8 +121,8 @@ std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, 
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.request_id.empty()) errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.lifecycle_kind.empty()) errors.push_back("missing_lifecycle_kind");
     if (role == HiCacheFactRole::RequestAdmission && fact.admission_kind.empty()) errors.push_back("missing_admission_kind");
-    if ((role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision || role == HiCacheFactRole::PrefetchCheckPoint) &&
-        fact.request_id.empty())
+    if ((role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision || role == HiCacheFactRole::PrefetchCheckPoint)
+        && fact.request_id.empty())
         errors.push_back("missing_request_id");
     if (role == HiCacheFactRole::PrefetchCheckPoint && fact.check_kind.empty()) errors.push_back("missing_check_kind");
     if (needs_full_path(role) && !has_complete_full_path(fact, effective_page_size)) { errors.push_back("token_dictionary_or_full_path_span"); }
