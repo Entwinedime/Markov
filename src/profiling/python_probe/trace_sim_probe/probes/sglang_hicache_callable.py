@@ -36,6 +36,23 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _internal_hooks_enabled() -> bool:
+    """判断是否安装 HiCache source/timing 归因用 internal hooks。"""
+
+    override = os.environ.get("TRACE_SIM_HICACHE_INTERNAL_HOOKS")
+    if override is not None:
+        return _truthy(override)
+
+    mode = os.environ.get("TRACE_SIM_HICACHE_PROBE_MODE", "auto").strip().lower()
+    if mode in {"off", "state", "state_only", "invariant", "invariant_only"}:
+        return False
+    if mode in {"on", "full", "debug", "attribution", "physical"}:
+        return True
+
+    fact_classes = _base.configured_fact_classes()
+    return any(fact_class != "invariant_state" for fact_class in fact_classes)
+
+
 def _hicache_state_source(
     source: str,
     field_name: str,
@@ -1413,7 +1430,8 @@ def install(module: ModuleType) -> None:
     """安装通用 callable probe，并补充 HiCache 内部 hook。"""
 
     _base.install(module)
-    _install_internal_hicache_hooks(module)
+    if _internal_hooks_enabled():
+        _install_internal_hicache_hooks(module)
 
 
 def _install_internal_hicache_hooks(module: ModuleType) -> None:
@@ -2453,4 +2471,4 @@ _base.register_source_extractor(_hicache_seq_source)
 _base.register_source_extractor(_hicache_config_source)
 _base.register_source_extractor(_hicache_requested_pages_source)
 
-TARGET_MODULES = tuple(sorted(set(_base.TARGET_MODULES) | set(_INTERNAL_TARGET_MODULES)))
+TARGET_MODULES = tuple(sorted(set(_base.TARGET_MODULES) | (set(_INTERNAL_TARGET_MODULES) if _internal_hooks_enabled() else set())))

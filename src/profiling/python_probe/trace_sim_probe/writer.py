@@ -8,7 +8,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 
 def _truthy(value: str | None) -> bool:
@@ -58,7 +58,12 @@ class ChromeTraceWriter:
         root = Path(output_dir or os.environ.get("TRACE_SIM_PYTHON_PROBE_OUTPUT", "."))
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / f"python_probe_trace.rank{self.rank}.pid{self.pid}.json"
-        self._events: list[dict[str, Any]] = []
+        self._flush_every = max(1, _env_u64("TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY", 256))
+        self._file: TextIO = self.path.open("w", encoding="utf-8")
+        self._file.write('{"traceEvents":[')
+        self._first_event = True
+        self._event_count = 0
+        self._closed = False
         self._lock = threading.Lock()
         atexit.register(self.close)
 
@@ -76,7 +81,7 @@ class ChromeTraceWriter:
         cat: str,
         args: dict[str, Any] | None = None,
     ) -> None:
-        """追加一条 duration event，并立即落盘到临时文件再原子替换。"""
+        """追加一条 duration event；文件按事件流写入，并按批次 flush。"""
 
         tid = threading.get_native_id() if hasattr(threading, "get_native_id") else threading.get_ident()
         event = {
@@ -90,24 +95,32 @@ class ChromeTraceWriter:
             "args": _jsonable(args or {}),
         }
         with self._lock:
-            self._events.append(event)
-            self._write_locked()
+            self._write_event_locked(event)
 
     def close(self) -> None:
-        """进程退出时刷新当前内存中的事件列表。"""
+        """进程退出时补齐 Chrome trace JSON 结尾并关闭文件。"""
 
         with self._lock:
-            self._write_locked()
+            if self._closed:
+                return
+            self._file.write("]}\n")
+            self._file.flush()
+            self._file.close()
+            self._closed = True
 
-    def _write_locked(self) -> None:
-        """在持锁状态下写 trace 文件，避免多线程交错写 JSON。"""
+    def _write_event_locked(self, event: dict[str, Any]) -> None:
+        """在持锁状态下追加单个 event，避免多线程交错写 JSON。"""
 
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(
-            json.dumps({"traceEvents": list(self._events)}, ensure_ascii=True, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        tmp_path.replace(self.path)
+        if self._closed:
+            return
+        if not self._first_event:
+            self._file.write(",")
+        else:
+            self._first_event = False
+        self._file.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")))
+        self._event_count += 1
+        if self._event_count % self._flush_every == 0:
+            self._file.flush()
 
 
 _writer: ChromeTraceWriter | None = None
@@ -128,3 +141,16 @@ def probe_debug_enabled() -> bool:
     """判断是否允许 probe 将调试信息写到 stderr。"""
 
     return _truthy(os.environ.get("TRACE_SIM_PYTHON_PROBE_DEBUG"))
+
+
+def _env_u64(name: str, fallback: int) -> int:
+    """读取非负整数环境变量，非法值按 fallback 处理。"""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return fallback
+    try:
+        value = int(raw)
+    except ValueError:
+        return fallback
+    return value if value >= 0 else fallback

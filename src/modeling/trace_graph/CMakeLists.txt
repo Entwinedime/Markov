@@ -21,6 +21,13 @@ add_executable(trace_graph
     src/modules/hicache/hicache_token_store.cpp
     src/modules/hicache/hicache_target_pager.cpp
     src/modules/hicache/hicache_token_radix_tree.cpp
+    src/modules/hicache/hicache_node_split_policy.cpp
+    src/modules/hicache/hicache_storage_directory.cpp
+    src/modules/hicache/hicache_capacity_index.cpp
+    src/modules/hicache/hicache_ref_ledger.cpp
+    src/modules/hicache/hicache_target_control_clock.cpp
+    src/modules/hicache/hicache_async_state.cpp
+    src/modules/hicache/hicache_policy.cpp
     src/modules/hicache/hicache_state_index.cpp
     src/modules/hicache/hicache_model.cpp
     src/modules/hicache/hicache_summary.cpp

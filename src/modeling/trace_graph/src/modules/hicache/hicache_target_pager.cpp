@@ -1,30 +1,31 @@
 /**
  * @file
- * @brief HiCache target page id 投影。
+ * @brief HiCache target page projection。
  */
 #include "trace_graph/modules/hicache/hicache_target_pager.hpp"
 
-#include <openssl/sha.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <array>
 #include <iomanip>
+#include <iterator>
 #include <ranges>
 #include <span>
 #include <sstream>
+#include <utility>
 
 namespace TraceGraph {
 
 namespace {
 
-/** @brief 将十六进制 parent hash 还原为字节，用于 chained page hash。 */
 std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
+    if (hex.size() % 2 != 0) return {};
     std::vector<unsigned char> bytes;
-    if (hex.size() % 2 != 0) return bytes;
     bytes.reserve(hex.size() / 2);
-    for (const auto byte_index : std::views::iota(size_t{ 0 }, hex.size() / 2)) {
+    for (const auto index : std::views::iota(size_t{ 0 }, hex.size() / 2)) {
         try {
-            bytes.push_back(static_cast<unsigned char>(std::stoul(hex.substr(byte_index * 2, 2), nullptr, 16)));
+            bytes.push_back(static_cast<unsigned char>(std::stoul(hex.substr(index * 2, 2), nullptr, 16)));
         }
         catch (...) {
             return {};
@@ -33,80 +34,88 @@ std::vector<unsigned char> hex_to_bytes(const std::string & hex) {
     return bytes;
 }
 
-/** @brief 将 digest bytes 编码为稳定小写十六进制字符串。 */
-std::string bytes_to_hex(const unsigned char * bytes, size_t len) {
+std::string to_hex(std::span<const unsigned char> bytes) {
     std::ostringstream os;
     os << std::hex << std::setfill('0');
-    std::ranges::for_each(std::span(bytes, len), [&](const auto byte) { os << std::setw(2) << static_cast<unsigned int>(byte); });
+    std::ranges::for_each(bytes, [&](unsigned char byte) { os << std::setw(2) << static_cast<unsigned int>(byte); });
     return os.str();
 }
 
-/**
- * @brief 计算单个 target page 的 chained hash。
- *
- * parent hash 参与下一页 hash，保持 page id 对 prefix path 敏感；同一 page token 在
- * 不同前缀下不会意外复用 page id。
- */
-std::string hash_token_page(const HiCacheTokenPath & tokens, size_t begin, size_t end, const std::string & prior_hash) {
-    SHA256_CTX ctx;
-    SHA256_Init(&ctx);
+std::string hash_page(const HiCacheTokenPath & tokens, size_t begin, size_t end, const std::string & prior_hash) {
+    auto * ctx = EVP_MD_CTX_new();
+    if (ctx == nullptr) return "";
+    EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
     if (!prior_hash.empty()) {
-        auto parent = hex_to_bytes(prior_hash);
-        if (!parent.empty()) SHA256_Update(&ctx, parent.data(), parent.size());
+        const auto parent = hex_to_bytes(prior_hash);
+        if (!parent.empty()) EVP_DigestUpdate(ctx, parent.data(), parent.size());
     }
-    const auto bounded_end = std::min(end, tokens.size());
-    for (const auto index : std::views::iota(begin, bounded_end)) {
-        std::ranges::for_each(tokens[index].words, [&](const auto word) {
-            unsigned char raw[4] = {
+    for (const auto index : std::views::iota(begin, std::min(end, tokens.size()))) {
+        std::ranges::for_each(tokens[index].words, [&](uint32_t word) {
+            const std::array<unsigned char, 4> raw{
                 static_cast<unsigned char>(word & 0xffu),
                 static_cast<unsigned char>((word >> 8u) & 0xffu),
                 static_cast<unsigned char>((word >> 16u) & 0xffu),
                 static_cast<unsigned char>((word >> 24u) & 0xffu),
             };
-            SHA256_Update(&ctx, raw, sizeof(raw));
+            EVP_DigestUpdate(ctx, raw.data(), raw.size());
         });
     }
-    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
-    SHA256_Final(digest.data(), &ctx);
-    return bytes_to_hex(digest.data(), digest.size());
+    std::array<unsigned char, EVP_MAX_MD_SIZE> digest{};
+    unsigned int digest_size = 0;
+    EVP_DigestFinal_ex(ctx, digest.data(), &digest_size);
+    EVP_MD_CTX_free(ctx);
+    return to_hex(std::span<const unsigned char>(digest.data(), digest_size));
 }
 
 } // namespace
 
+std::vector<std::string> HiCachePagePath::page_ids() const {
+    std::vector<std::string> ids;
+    ids.reserve(pages.size());
+    std::ranges::transform(pages, std::back_inserter(ids), &HiCacheProjectedPage::id);
+    return ids;
+}
+
 HiCacheTargetPager::HiCacheTargetPager(HiCacheConfig config) : config_(std::move(config)) {}
 
-/** @brief target 配置优先；缺省时使用 fact 声明的 source_page_size 作为 invariant。 */
 uint64_t HiCacheTargetPager::page_size_for_fact(const HiCacheFact & fact) const {
     if (config_.page_size > 0) return config_.page_size;
     return fact.source_page_size;
 }
 
-/** @brief page id 总是包含 cache_scope，避免跨 scope page hash 冲突。 */
-std::string HiCacheTargetPager::scoped_page_id(const HiCacheFact & fact, const std::string & page_hash) const {
-    const auto scope = fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope;
-    return scope + "|" + page_hash;
+std::string HiCacheTargetPager::scoped_page_id(const std::string & cache_scope, const std::string & page_hash) const {
+    return (cache_scope.empty() ? std::string("-1") : cache_scope) + "|" + page_hash;
 }
 
-/**
- * @brief 从 token path 生成 target page id 序列。
- *
- * 只对完整 page 生成 id；尾部不足一个 page 的 token 不形成 cache state。
- */
-std::vector<std::string> HiCacheTargetPager::pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
-    const auto page_size = page_size_for_fact(fact);
-    if (page_size == 0 || tokens.size() < page_size) return {};
-    const auto aligned_len = tokens.size() / page_size * page_size;
-    std::vector<std::string> pages;
-    pages.reserve(aligned_len / page_size);
-    std::string parent_hash;
-    const auto page_count = aligned_len / static_cast<size_t>(page_size);
+HiCachePagePath HiCacheTargetPager::project(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
+    HiCachePagePath path;
+    path.cache_scope = fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope;
+    path.page_size = page_size_for_fact(fact);
+    if (path.page_size == 0 || tokens.size() < path.page_size) return path;
+
+    const auto aligned_tokens = tokens.size() / static_cast<size_t>(path.page_size) * static_cast<size_t>(path.page_size);
+    const auto page_count = aligned_tokens / static_cast<size_t>(path.page_size);
+    path.pages.reserve(page_count);
+
+    std::string prior_hash;
     for (const auto page_index : std::views::iota(size_t{ 0 }, page_count)) {
-        const auto begin = page_index * static_cast<size_t>(page_size);
-        const auto end = begin + static_cast<size_t>(page_size);
-        parent_hash = hash_token_page(tokens, begin, end, parent_hash);
-        pages.push_back(scoped_page_id(fact, parent_hash));
+        const auto begin = page_index * static_cast<size_t>(path.page_size);
+        const auto end = begin + static_cast<size_t>(path.page_size);
+        prior_hash = hash_page(tokens, begin, end, prior_hash);
+        path.pages.push_back(HiCacheProjectedPage{
+            .id = scoped_page_id(path.cache_scope, prior_hash),
+            .cache_scope = path.cache_scope,
+            .hash = prior_hash,
+            .page_index = static_cast<uint64_t>(page_index),
+            .token_begin = static_cast<uint64_t>(begin),
+            .token_end = static_cast<uint64_t>(end),
+        });
     }
-    return pages;
+    return path;
+}
+
+std::vector<std::string> HiCacheTargetPager::pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
+    return project(fact, tokens).page_ids();
 }
 
 } // namespace TraceGraph

@@ -8,9 +8,8 @@ namespace TraceGraph {
 /**
  * @brief HiCache 状态模型的 SimulationModule 包装层。
  *
- * 这个类只负责接入 C++ module registry、调用 hicache_model 并保存 summary。
- * 具体 cache 状态逻辑必须留在 hicache_model.cpp，避免 module 包装层变成第二套
- * 状态机入口。
+ * 包装层只负责接入 module registry 和暴露 summary，具体状态逻辑集中在
+ * HiCacheState。
  */
 class HiCacheModule final : public SimulationModule {
 public:
@@ -20,8 +19,6 @@ public:
     void apply(DagGraph & graph) override;
     [[nodiscard]] bool has_summary() const override;
     [[nodiscard]] std::string summary_json() const override;
-
-    /** @brief 返回最近一次 apply 产生的 HiCache summary。 */
     [[nodiscard]] const HiCacheSummary & summary() const { return summary_; }
 
 private:

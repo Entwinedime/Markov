@@ -61,6 +61,7 @@ class TargetSpec:
     qualname: str
     target: str
     events: tuple[str, ...]
+    phases: tuple[str, ...]
     fields: tuple[FieldSpec, ...]
     fact: FactSpec
     emit_when: tuple[EmitCondition, ...] = ()
@@ -125,6 +126,12 @@ def _load_targets() -> list[TargetSpec]:
     return targets
 
 
+def configured_fact_classes() -> set[str]:
+    """返回当前 target 配置声明的 fact class 集合，供专用 probe 判断工作模式。"""
+
+    return {target.fact.fact_class for target in _load_targets()}
+
+
 def install(module: ModuleType) -> None:
     """在模块加载后安装该模块匹配的 callable wrapper。"""
 
@@ -172,6 +179,7 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
             fields.append(field)
     events_raw = raw.get("events", [])
     events = tuple(item for item in events_raw if isinstance(item, str))
+    phases = _parse_phases(raw)
     emit_when = tuple(condition for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when"))) if condition is not None)
     fact = _parse_fact(raw.get("fact"), target_id)
     return TargetSpec(
@@ -180,6 +188,7 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         qualname=target,
         target=target,
         events=events,
+        phases=phases,
         fields=tuple(fields),
         fact=fact,
         emit_when=emit_when,
@@ -262,6 +271,18 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def _parse_phases(raw: dict[str, Any]) -> tuple[str, ...]:
+    """解析 target 需要发射的调用阶段；默认只保留 end 事件。"""
+
+    value = raw.get("phases", raw.get("emit_phases"))
+    phases = tuple(str(item).strip() for item in _as_list(value) if str(item).strip())
+    if not phases:
+        phases = ("end",)
+    allowed = {"start", "end", "exception"}
+    normalized = tuple(phase for phase in phases if phase in allowed)
+    return normalized or ("end",)
+
+
 def _parse_emit_condition(raw: Any) -> EmitCondition | None:
     """解析 target 的条件发射规则。"""
 
@@ -280,7 +301,7 @@ def _parse_emit_condition(raw: Any) -> EmitCondition | None:
 
 
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
-    """包装同步或异步 callable，并在 start/end/exception 发事件。"""
+    """包装同步或异步 callable，并按 target phase 配置发事件。"""
 
     if inspect.iscoroutinefunction(fn):
         @functools.wraps(fn)
@@ -329,6 +350,8 @@ def _emit_targets(
     """对同一个 callable 上绑定的多个 target 逐一发事件。"""
 
     for target in targets:
+        if phase not in target.phases:
+            continue
         _emit(target, fn, args, kwargs, result, phase, start_us, end_us)
 
 
