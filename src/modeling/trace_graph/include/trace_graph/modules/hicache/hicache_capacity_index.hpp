@@ -187,7 +187,7 @@ private:
     [[nodiscard]] HiCacheCapacityNodeRecord make_record(const HiCacheTokenRadixTree & tree, HiCacheNodeId node_id) const;
     [[nodiscard]] std::set<HiCacheNodeId> observation_closure(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes) const;
     [[nodiscard]] bool has_device_descendant(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const;
-    [[nodiscard]] bool has_backup_descendant(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const;
+    [[nodiscard]] bool has_backup_child(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const;
     void remove_record_contribution(const HiCacheCapacityNodeRecord & record);
     void add_record_contribution(const HiCacheCapacityNodeRecord & record);
     void record_mutation(HiCacheCapacityMutation mutation);

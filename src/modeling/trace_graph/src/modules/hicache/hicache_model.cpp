@@ -32,7 +32,7 @@ std::vector<std::string> flatten_node_pages(const HiCacheTokenRadixTree & tree, 
     return pages;
 }
 
-bool has_backup(const HiCacheCacheNode & node) { return node.residency.host_present || node.residency.storage_readable; }
+bool has_host_backup(const HiCacheCacheNode & node) { return node.residency.host_present; }
 
 template <typename T> std::vector<T> suffix_from(const std::vector<T> & values, size_t begin) {
     if (begin >= values.size()) return {};
@@ -59,6 +59,99 @@ std::vector<std::string> storage_hit_prefix(const HiCacheStorageDirectory & stor
 bool prefetch_active(const HiCachePrefetchOperation & op) {
     return op.prefetch_state == HiCachePrefetchState::Pending || op.prefetch_state == HiCachePrefetchState::Ready;
 }
+
+uint64_t ceil_div(uint64_t value, uint64_t divisor) {
+    if (divisor == 0) return 0;
+    return value / divisor + (value % divisor == 0 ? 0 : 1);
+}
+
+/**
+ * @brief 一次 SGLang extend allocator batch 的语义化输入。
+ *
+ * 当前 trace 还没有 `ScheduleBatch` 粒度 invariant，因此调用方显式传入
+ * resolved policy 中的 `batch_size=1`。结构体保留 batch 语义字段，后续接入
+ * `extend_allocation_intent` 后只需要替换构造来源，不需要重写 capacity 链路。
+ */
+struct ExtendAllocationIntent {
+    uint64_t batch_size = 1;
+    uint64_t page_size = 0;
+    uint64_t seq_tokens = 0;
+    uint64_t prefix_tokens = 0;
+    uint64_t extend_tokens = 0;
+    uint64_t requested_tokens = 0;
+    uint64_t requested_pages = 0;
+    uint64_t allocated_pages = 0;
+
+    /** @brief 本轮是否会形成 allocator pressure。 */
+    [[nodiscard]] bool needs_pressure() const { return requested_pages > 0; }
+};
+
+/**
+ * @brief 计算 SGLang paged extend 的 eviction pressure token 数。
+ *
+ * `alloc_paged_token_slots_extend()` 对 paged allocator 使用
+ * `extend_num_tokens + len(seq_lens_cpu) * page_size`。当 `page_size == 1` 时，
+ * SGLang 走 non-paged `alloc_token_slots()`，没有每 request 一页的保守预算。
+ */
+uint64_t extend_requested_tokens(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size) {
+    if (extend_tokens == 0 || page_size == 0) return 0;
+    if (page_size == 1) return extend_tokens;
+    return extend_tokens + batch_size * page_size;
+}
+
+/**
+ * @brief 计算本次 extend 真正占用的新 page 数。
+ *
+ * 该值对应 SGLang `get_num_new_pages(seq_lens, prefix_lens)`，不包含 allocator
+ * 为 eviction gate 额外加入的 conservative batch overhead。
+ */
+uint64_t extend_allocated_pages(uint64_t seq_tokens, uint64_t prefix_tokens, uint64_t page_size) {
+    if (seq_tokens == 0 || page_size == 0) return 0;
+    const auto bounded_prefix_tokens = std::min(prefix_tokens, seq_tokens);
+    const auto pages_after = ceil_div(seq_tokens, page_size);
+    const auto pages_before = ceil_div(bounded_prefix_tokens, page_size);
+    return pages_after > pages_before ? pages_after - pages_before : 0;
+}
+
+/**
+ * @brief 用当前显式 single-request batch 合同构造 extend allocation intent。
+ */
+ExtendAllocationIntent make_extend_allocation_intent(uint64_t token_count, uint64_t prefix_tokens, uint64_t page_size, uint64_t batch_size) {
+    auto intent = ExtendAllocationIntent{
+        .batch_size = batch_size == 0 ? uint64_t{ 1 } : batch_size,
+        .page_size = page_size,
+        .seq_tokens = token_count,
+    };
+    if (token_count == 0 || page_size == 0) return intent;
+
+    intent.prefix_tokens = std::min(token_count, prefix_tokens);
+    intent.extend_tokens = token_count - intent.prefix_tokens;
+    intent.requested_tokens = extend_requested_tokens(intent.extend_tokens, intent.batch_size, page_size);
+    intent.requested_pages = ceil_div(intent.requested_tokens, page_size);
+    intent.allocated_pages = extend_allocated_pages(intent.seq_tokens, intent.prefix_tokens, page_size);
+    return intent;
+}
+
+/**
+ * @brief 计算 SGLang allocator 语义下本轮需要真实清理的 page 数。
+ *
+ * SGLang 在 device/host allocator 当前可用空间不足时才调用 radix eviction；
+ * 一旦触发，预算使用本次 allocation request 大小，而不是仅清理 free-space deficit。
+ * 如果没有 allocation request，则只清理当前已经超过 target capacity 的部分。
+ */
+uint64_t allocation_cleanup_target(uint64_t occupied_pages, uint64_t reserved_pages, uint64_t capacity_pages, uint64_t requested_pages) {
+    if (capacity_pages == 0) return 0;
+
+    const auto committed_pages = occupied_pages + reserved_pages;
+    const auto excess_pages = committed_pages > capacity_pages ? committed_pages - capacity_pages : 0;
+    if (requested_pages == 0) return excess_pages;
+
+    const auto free_pages = committed_pages < capacity_pages ? capacity_pages - committed_pages : 0;
+    if (free_pages >= requested_pages) return excess_pages;
+    return std::max(excess_pages, requested_pages);
+}
+
+uint64_t bounded_subtract(uint64_t value, uint64_t decrement) { return decrement >= value ? 0 : value - decrement; }
 
 HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, const std::string & operation_id, const std::string & cache_scope,
                                              const std::string & request_key, const std::string & owner, HiCacheNodeId anchor_node,
@@ -95,6 +188,54 @@ HiCacheTokenCompleteness completeness_for_fact(const HiCacheFact & fact, uint64_
 
 } // namespace
 
+void HiCacheState::DeviceAllocatorLedger::configure(uint64_t pages, bool sort_required) {
+    if (initialized && capacity_pages == pages && need_sort == sort_required) return;
+    initialized = true;
+    need_sort = sort_required;
+    capacity_pages = pages;
+    free_pages = pages;
+    release_pages = 0;
+}
+
+uint64_t HiCacheState::DeviceAllocatorLedger::available_pages() const { return free_pages + release_pages; }
+
+bool HiCacheState::DeviceAllocatorLedger::should_evict(uint64_t requested_pages) const {
+    return initialized && capacity_pages > 0 && requested_pages > 0 && available_pages() < requested_pages;
+}
+
+void HiCacheState::DeviceAllocatorLedger::merge_release_pages() {
+    free_pages += release_pages;
+    release_pages = 0;
+}
+
+void HiCacheState::DeviceAllocatorLedger::merge_before_extend(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size) {
+    if (!need_sort || page_size == 0) return;
+    const auto needed_pages = page_size == 1 ? extend_tokens : extend_tokens / page_size + batch_size + 1;
+    if (needed_pages > free_pages) merge_release_pages();
+}
+
+void HiCacheState::DeviceAllocatorLedger::merge_before_page_allocation(uint64_t requested_pages) {
+    if (need_sort && requested_pages > free_pages) merge_release_pages();
+}
+
+bool HiCacheState::DeviceAllocatorLedger::can_allocate(uint64_t pages) const { return capacity_pages == 0 || pages <= free_pages; }
+
+uint64_t HiCacheState::DeviceAllocatorLedger::allocate(uint64_t pages) {
+    if (capacity_pages == 0) return pages;
+    const auto consumed = std::min(pages, free_pages);
+    free_pages -= consumed;
+    return consumed;
+}
+
+uint64_t HiCacheState::DeviceAllocatorLedger::release(uint64_t pages) {
+    if (pages == 0 || capacity_pages == 0) return 0;
+    const auto room = capacity_pages > available_pages() ? capacity_pages - available_pages() : 0;
+    const auto released = std::min(pages, room);
+    if (need_sort) release_pages += released;
+    else free_pages += released;
+    return released;
+}
+
 HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)), pager_(config_), policy_(config_) {}
 
 std::string HiCacheState::normalized_scope(const HiCacheFact & fact) const { return fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope; }
@@ -105,6 +246,23 @@ std::string HiCacheState::scoped_request_key(const HiCacheFact & fact) const {
 }
 
 HiCacheState::ScopedState & HiCacheState::scope_state(const HiCacheFact & fact) { return scopes_[normalized_scope(fact)]; }
+
+void HiCacheState::ensure_device_allocator(ScopedState & scope) {
+    scope.device_allocator.configure(policy_.l1_capacity_pages(), policy_.resolved().device_allocator_need_sort);
+}
+
+void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                   ScopedState & scope, const std::string & reason) {
+    if (scope.pending_write_through_backups.empty()) return;
+
+    auto pending = std::exchange(scope.pending_write_through_backups, {});
+    for (const auto & backup : pending) {
+        const auto before = digest();
+        const auto ref = scope.refs.release_owner(scope.tree, backup.owner);
+        sync_capacity_for_ref(scope, normalized_scope(fact), ref, reason);
+        record_transition(fact, summary, transitions, "complete_write_through_backup", "writeback", backup.pages, before);
+    }
+}
 
 HiCacheTokenPath HiCacheState::tokens_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const {
     if (!fact.full_path_tokens.empty()) return fact.full_path_tokens;
@@ -399,6 +557,10 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
     if (!fact.full_path_tokens.empty()) {
         token_store_.set_request_tokens(fact, fact.full_path_tokens, completeness_for_fact(fact, pager_.page_size_for_fact(fact)));
     }
+    if (role != HiCacheFactRole::Unknown) {
+        auto & scope = scope_state(fact);
+        drain_write_through_backup_refs(fact, summary, transitions, scope, "write_through_backup_ack_boundary");
+    }
 
     switch (role) {
     case HiCacheFactRole::RequestBoundMatchAnchor:
@@ -428,8 +590,7 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
 void HiCacheState::update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages) {
     const auto key = scoped_request_key(fact);
     if (key.empty()) return;
-    auto lookup = scope.tree.lookup(pages);
-    sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "request_lookup_touch");
+    auto lookup = scope.tree.lookup_peek(pages);
     auto & request = scope.requests[key];
     request.request_key = key;
     request.cache_scope = normalized_scope(fact);
@@ -448,40 +609,93 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
     if (pages.empty()) return;
 
     auto & scope = scope_state(fact);
+    ensure_device_allocator(scope);
     scope.storage.observe_path(page_path);
     scope.tree.observe_page_path(page_path);
+    resolve_prefetch_before_request_use(fact, summary, transitions, scope);
     auto lookup = scope.tree.lookup(pages);
-    scope.tree.touch_chain(lookup.device_chain);
-    scope.tree.touch_chain(lookup.host_chain);
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "match_anchor_touch");
 
+    const auto request_key = scoped_request_key(fact);
     /**
-     * @brief modeled load-back：已经在 host/storage 可见但 device 缺失的连续前缀，
-     * 在 request lookup 边界可以重新 materialize 到 L1。
+     * @brief modeled loadback：只把 host-visible prefix 同步 materialize 到 L1。
+     *
+     * SGLang 的 request match 命中 host cache 时会在 admission 前把 host KV
+     * load 回 device，并把这段 prefix 放入 request 的 `prefix_indices`。storage
+     * readable 只说明 L3 可读，不等价于本轮已经完成 H2D loadback，因此这里不能
+     * 使用 `visible_pages`；必须要求 radix 上已经有 host-visible residency。
+     *
+     * 当前 normal invariant 还没有 scheduler `host_hit_length`、`mem_quota` 或 loadback
+     * intent。由于 write-back ACK 被折叠为同步，model 可能比真实 SGLang 更早看到
+     * host-visible prefix；因此 loadback 只能 opportunistic 消费当前 free pages，不能
+     * 由这个推导结果主动触发 device eviction。
      */
-    if (lookup.visible_pages.size() > lookup.device_pages.size()) {
+    const auto promotable_pages = lookup.host_pages;
+    if (promotable_pages.size() > lookup.device_pages.size()) {
+        const auto loadback_pages = static_cast<uint64_t>(promotable_pages.size() - lookup.device_pages.size());
+        scope.device_allocator.merge_before_page_allocation(loadback_pages);
+        if (!scope.device_allocator.can_allocate(loadback_pages)) {
+            record_policy_decision(
+                fact,
+                HiCachePolicyDecisionRecord{
+                    .policy_area = "device_allocator",
+                    .policy_name = "loadback_allocation",
+                    .decision = "skip_loadback_eviction_without_intent",
+                    .reason = "loadback requires scheduler host_hit/loadback intent; modeled host visibility must not invent device eviction",
+                    .accepted = false,
+                    .requested_pages = loadback_pages,
+                    .capacity_pages = scope.device_allocator.capacity_pages,
+                    .allocator_free_pages = scope.device_allocator.free_pages,
+                    .allocator_release_pages = scope.device_allocator.release_pages,
+                    .allocator_available_pages = scope.device_allocator.available_pages(),
+                    .pages = promotable_pages,
+                });
+            update_request_state(fact, scope, pages);
+            return;
+        }
+        const auto consumed_pages = scope.device_allocator.allocate(loadback_pages);
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "device_allocator",
+                                   .policy_name = "loadback_allocation",
+                                   .decision = consumed_pages == loadback_pages ? "consume_device_pages_for_loadback" : "skip_loadback_allocation_oom",
+                                   .reason = "sglang load_back allocates device pages before host prefix becomes L1 resident",
+                                   .accepted = consumed_pages == loadback_pages,
+                                   .requested_pages = loadback_pages,
+                                   .allocated_pages = consumed_pages,
+                                   .capacity_pages = scope.device_allocator.capacity_pages,
+                                   .allocator_free_pages = scope.device_allocator.free_pages,
+                                   .allocator_release_pages = scope.device_allocator.release_pages,
+                                   .allocator_available_pages = scope.device_allocator.available_pages(),
+                                   .allocator_consumed_pages = consumed_pages,
+                                   .pages = promotable_pages,
+                               });
+        if (consumed_pages != loadback_pages) {
+            update_request_state(fact, scope, pages);
+            return;
+        }
+
         const auto loadback_id = scope.clock.next_operation_id("loadback");
-        const auto loadback_owner = scoped_request_key(fact) + ":loadback:" + loadback_id;
+        const auto loadback_owner = request_key + ":loadback:" + loadback_id;
         const auto before_enqueue = digest();
         scope.async_ops.upsert_loadback(HiCacheLoadbackOperation{
             .header = make_operation_header(HiCacheOperationKind::Loadback,
                                             loadback_id,
                                             normalized_scope(fact),
-                                            scoped_request_key(fact),
+                                            request_key,
                                             loadback_owner,
                                             lookup.terminal_node,
                                             lookup.topology_chain,
-                                            lookup.visible_pages,
+                                            promotable_pages,
                                             fact.ts,
                                             0),
             .target_node = lookup.terminal_node,
         });
-        auto ref = scope.refs.acquire_lock(scope.tree, loadback_owner, "loadback", scoped_request_key(fact), loadback_id, lookup.topology_chain);
+        auto ref = scope.refs.acquire_lock(scope.tree, loadback_owner, "loadback", request_key, loadback_id, lookup.topology_chain);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "loadback_ref_acquire");
-        record_transition(fact, summary, transitions, "enqueue_loadback", "loadback", lookup.visible_pages, before_enqueue);
+        record_transition(fact, summary, transitions, "enqueue_loadback", "loadback", promotable_pages, before_enqueue);
         const auto before = digest();
-        auto promoted = prefix_to(lookup.visible_pages, lookup.visible_pages.size());
-        auto insert = scope.tree.insert_device_path(promoted, fact.priority, false);
+        auto insert = scope.tree.insert_device_path(promotable_pages, fact.priority, false);
         sync_capacity_for_insert(scope, normalized_scope(fact), insert, "loadback_insert_device");
         record_transition(fact,
                           summary,
@@ -494,21 +708,23 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
         scope.async_ops.set_loadback_state(loadback_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
         ref = scope.refs.release_owner(scope.tree, loadback_owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "loadback_ref_release");
-        record_transition(fact, summary, transitions, "complete_loadback", "loadback", lookup.visible_pages, before_complete);
+        record_transition(fact, summary, transitions, "complete_loadback", "loadback", promotable_pages, before_complete);
     }
 
     update_request_state(fact, scope, pages);
-    enforce_device_capacity(fact, summary, transitions, scope, 0);
-    enforce_host_capacity(fact, summary, transitions, scope, 0);
 }
 
 void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto page_path = page_path_for_fact(fact, summary);
+    const auto tokens = tokens_for_fact(fact, summary);
+    const auto admission_token_count = static_cast<uint64_t>(tokens.empty() ? fact.token_count : tokens.size());
+    const auto page_path = pager_.project(fact, tokens);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
+    ensure_device_allocator(scope);
     scope.storage.observe_path(page_path);
     scope.tree.observe_page_path(page_path);
+    resolve_prefetch_before_request_use(fact, summary, transitions, scope);
     update_request_state(fact, scope, pages);
 
     const auto key = scoped_request_key(fact);
@@ -521,17 +737,65 @@ void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSumm
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "request_lock_ref_acquire");
     ref = scope.refs.acquire_host(scope.tree, owner, "request", key, "", request.host_chain);
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "request_host_ref_acquire");
-    request.device_reservation_pages =
+    const auto full_missing_pages =
         request.full_pages.size() > request.device_pages.size() ? static_cast<uint64_t>(request.full_pages.size() - request.device_pages.size()) : 0;
+    const auto device_prefix_pages = static_cast<uint64_t>(request.device_pages.size());
+    const auto device_prefix_tokens = device_prefix_pages * page_path.page_size;
+    const auto prior_committed_prefix_tokens =
+        request.lifecycle_state == "unfinished" ? std::min(request.committed_tokens, admission_token_count) : uint64_t{ 0 };
+    const auto allocation_prefix_tokens = std::max(device_prefix_tokens, prior_committed_prefix_tokens);
+    const auto allocation_intent =
+        make_extend_allocation_intent(admission_token_count, allocation_prefix_tokens, page_path.page_size, policy_.extend_allocation_batch_size());
+    const auto allocation_pressure_needed = allocation_intent.needs_pressure();
+    const auto allocation_decision = !allocation_pressure_needed ? "skip_full_hit_allocation_pressure"
+                                     : full_missing_pages > 0    ? "reserve_target_extend_budget"
+                                                                 : "reserve_partial_tail_budget";
+    const auto allocation_reason = !allocation_pressure_needed ? "target radix covers complete pages and request has no partial tail"
+                                   : full_missing_pages > 0
+                                       ? "explicit batch_size=1 allocation intent uses target device prefix to derive SGLang extend_num_tokens"
+                                       : "complete target pages hit but partial tail still requires explicit batch_size=1 allocator pressure";
+    const auto allocator_available_before = scope.device_allocator.available_pages();
+    enforce_device_capacity(fact, summary, transitions, scope, allocation_intent.requested_pages);
+    scope.device_allocator.merge_before_extend(allocation_intent.extend_tokens, allocation_intent.batch_size, page_path.page_size);
+    const auto consumed_pages = scope.device_allocator.allocate(allocation_intent.allocated_pages);
+    request.kv_allocated_pages += consumed_pages;
+    request.cache_protected_pages = std::max(request.cache_protected_pages, device_prefix_pages);
+    request.page_aligned_key_pages = static_cast<uint64_t>(pages.size());
+    request.active_request_pages = request.kv_allocated_pages;
     request.lifecycle_state = "admitted";
+    const auto capacity_snapshot = scope.capacity.snapshot();
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .policy_area = "device_allocation",
+                               .policy_name = "extend_allocation_intent",
+                               .decision = allocation_decision,
+                               .reason = allocation_reason,
+                               .accepted = allocation_pressure_needed,
+                               .requested_pages = allocation_intent.requested_pages,
+                               .requested_tokens = allocation_intent.requested_tokens,
+                               .candidate_pages = full_missing_pages,
+                               .hit_pages = device_prefix_pages,
+                               .batch_size = allocation_intent.batch_size,
+                               .extend_tokens = allocation_intent.extend_tokens,
+                               .allocated_pages = consumed_pages,
+                               .capacity_pages = policy_.l1_capacity_pages(),
+                               .occupied_pages = capacity_snapshot.occupied_device_pages,
+                               .reserved_pages = request.active_request_pages,
+                               .allocator_free_pages = scope.device_allocator.free_pages,
+                               .allocator_release_pages = scope.device_allocator.release_pages,
+                               .allocator_available_pages = scope.device_allocator.available_pages(),
+                               .allocator_available_before_pages = allocator_available_before,
+                               .allocator_consumed_pages = consumed_pages,
+                               .pages = request.full_pages,
+                           });
     record_transition(fact, summary, transitions, "acquire_request_ref", "node_ref", request.device_pages, digest());
-    enforce_device_capacity(fact, summary, transitions, scope, request.device_reservation_pages);
+    drain_deferred_host_releases(fact, scope);
 }
 
-void HiCacheState::insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                       ScopedState & scope, const std::vector<std::string> & pages) {
+HiCacheInsertResult HiCacheState::insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                      ScopedState & scope, const std::vector<std::string> & pages) {
     const auto before = digest();
-    const auto insert = scope.tree.insert_device_path(pages, fact.priority, policy_.write_back_enabled());
+    auto insert = scope.tree.insert_device_path(pages, fact.priority, policy_.write_back_enabled());
     sync_capacity_for_insert(scope, normalized_scope(fact), insert, "request_insert_device");
     auto new_pages = flatten_node_pages(scope.tree, insert.new_device_nodes);
     auto restored_pages = flatten_node_pages(scope.tree, insert.restored_device_nodes);
@@ -549,28 +813,68 @@ void HiCacheState::insert_request_path(const HiCacheFact & fact, HiCacheSummary 
                                .pages = new_pages,
                            });
     if (policy_.write_back_enabled()) record_transition(fact, summary, transitions, "mark_dirty", "dirty", new_pages, before);
+    return insert;
 }
 
 void HiCacheState::apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
     const auto kind = lower_copy(fact.lifecycle_kind);
     if (!kind.empty() && kind != "finished" && kind != "unfinished") return;
 
-    const auto page_path = page_path_for_fact(fact, summary);
+    const auto tokens = tokens_for_fact(fact, summary);
+    const auto lifecycle_token_count = static_cast<uint64_t>(tokens.size());
+    const auto page_path = pager_.project(fact, tokens);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
+    ensure_device_allocator(scope);
     scope.storage.observe_path(page_path);
     scope.tree.observe_page_path(page_path);
-    insert_request_path(fact, summary, transitions, scope, pages);
+    const auto key = scoped_request_key(fact);
+    if (key.empty()) return;
+    auto & request = scope.requests[key];
+    const auto protected_pages_before_insert = request.cache_protected_pages;
+    const auto request_owned_pages_before_insert = request.kv_allocated_pages;
+    const auto insert = insert_request_path(fact, summary, transitions, scope, pages);
     apply_write_count_policy(fact, summary, transitions, scope, pages);
     update_request_state(fact, scope, pages);
 
-    const auto key = scoped_request_key(fact);
     auto it = scope.requests.find(key);
     if (it == scope.requests.end()) return;
-    it->second.device_reservation_pages = 0;
+    const auto duplicate_pages = std::min(bounded_subtract(insert.existing_device_prefix_pages, protected_pages_before_insert), it->second.kv_allocated_pages);
+    const auto owned_after_duplicate = bounded_subtract(it->second.kv_allocated_pages, duplicate_pages);
+    const auto total_committed_pages = ceil_div(lifecycle_token_count, page_path.page_size);
+    const auto page_aligned_pages = static_cast<uint64_t>(pages.size());
+    const auto tail_pages = bounded_subtract(total_committed_pages, page_aligned_pages);
+    const auto unfinished_tail_pages = std::min(tail_pages, owned_after_duplicate);
+    const auto tail_release_pages = kind == "finished" || kind.empty() ? unfinished_tail_pages : uint64_t{ 0 };
+    const auto released_pages = scope.device_allocator.release(duplicate_pages + tail_release_pages);
+    it->second.kv_allocated_pages = kind == "unfinished" ? unfinished_tail_pages : uint64_t{ 0 };
+    it->second.committed_tokens = lifecycle_token_count;
+    it->second.page_aligned_key_pages = page_aligned_pages;
+    it->second.active_request_pages = it->second.kv_allocated_pages;
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .policy_area = "request_lifecycle",
+                               .policy_name = "device_allocator_release",
+                               .decision = kind == "unfinished" ? "release_duplicate_keep_tail" : "release_duplicate_and_tail",
+                               .reason = "sglang request cache lifecycle frees duplicate radix-covered KV and finished-request tail KV",
+                               .accepted = released_pages > 0,
+                               .candidate_pages = request_owned_pages_before_insert,
+                               .hit_pages = protected_pages_before_insert,
+                               .allocated_pages = it->second.kv_allocated_pages,
+                               .capacity_pages = scope.device_allocator.capacity_pages,
+                               .allocator_free_pages = scope.device_allocator.free_pages,
+                               .allocator_release_pages = scope.device_allocator.release_pages,
+                               .allocator_available_pages = scope.device_allocator.available_pages(),
+                               .allocator_released_pages = released_pages,
+                               .lifecycle_duplicate_pages = duplicate_pages,
+                               .lifecycle_tail_pages = tail_release_pages,
+                               .pages = pages,
+                           });
     if (kind == "unfinished") {
         it->second.lifecycle_state = "unfinished";
+        it->second.cache_protected_pages = page_aligned_pages;
+        it->second.active_request_pages = it->second.kv_allocated_pages;
         const auto owner = request_ref_owner(key);
         auto ref = scope.refs.release_owner(scope.tree, owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "request_ref_release_before_unfinished");
@@ -586,13 +890,34 @@ void HiCacheState::apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCa
         record_transition(fact, summary, transitions, "release_request_ref", "node_ref", it->second.full_pages, before);
         scope.requests.erase(it);
     }
-    enforce_device_capacity(fact, summary, transitions, scope, 0);
-    enforce_host_capacity(fact, summary, transitions, scope, 0);
 }
 
-void HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+bool HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                       ScopedState & scope, HiCacheNodeId node_id, bool storage_readable) {
     const auto pages = scope.tree.node_pages(node_id);
+    const auto * node = scope.tree.node(node_id);
+    if (node == nullptr || pages.empty()) return false;
+    const auto host_allocation_pages = !(node->residency.host_present && node->residency.host_visible) ? static_cast<uint64_t>(pages.size()) : uint64_t{ 0 };
+    if (host_allocation_pages > 0) {
+        const auto allocation = request_host_allocation(fact, summary, transitions, scope, host_allocation_pages, host_allocation_pages, false, "write_backup");
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "host_allocation",
+                                   .policy_name = "write_backup",
+                                   .decision = allocation.accepted ? "accept_host_backup_pages" : "skip_host_backup_capacity",
+                                   .reason = allocation.accepted ? "target host pool can fit write_backup allocation after SGLang-style cleanup"
+                                                                 : "target host pool still lacks space after SGLang-style cleanup",
+                                   .accepted = allocation.accepted,
+                                   .requested_pages = host_allocation_pages,
+                                   .candidate_pages = allocation.accepted_pages,
+                                   .capacity_pages = allocation.capacity_pages,
+                                   .occupied_pages = allocation.occupied_pages,
+                                   .reserved_pages = allocation.reserved_pages,
+                                   .pages = pages,
+                               });
+        if (!allocation.accepted) return false;
+    }
+
     std::string storage_id;
     if (storage_readable) {
         storage_id = scope.clock.next_operation_id("storage");
@@ -625,6 +950,7 @@ void HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary &
         scope.storage.mark_materialized_pages(pages, node_id);
     }
     record_transition(fact, summary, transitions, storage_readable ? "commit_host_storage_backup" : "commit_host_backup", "L2", pages, before);
+    if (storage_readable && policy_.write_count_enabled()) { hold_write_through_backup_ref(fact, summary, transitions, scope, node_id, pages); }
     if (!storage_id.empty()) {
         const auto before_complete = digest();
         scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
@@ -632,6 +958,35 @@ void HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary &
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_release");
         record_transition(fact, summary, transitions, "complete_storage_backup", "storage", pages, before_complete);
     }
+    return true;
+}
+
+void HiCacheState::hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                 ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages) {
+    const auto chain = scope.tree.ancestor_node_ids(node_id);
+    if (chain.empty()) return;
+
+    const auto operation_id = scope.clock.next_operation_id("write_through_backup");
+    const auto owner = scoped_request_key(fact) + ":write_through_backup:" + operation_id;
+    const auto before = digest();
+    const auto ref = scope.refs.acquire_lock(scope.tree, owner, "write_through_backup", scoped_request_key(fact), operation_id, chain);
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "write_through_backup_ref_acquire");
+    scope.pending_write_through_backups.push_back(PendingWriteThroughBackup{
+        .owner = owner,
+        .pages = pages,
+    });
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .operation_id = operation_id,
+                               .policy_area = "write_policy",
+                               .policy_name = policy_.write_policy(),
+                               .decision = "hold_write_through_backup_ref",
+                               .reason = "SGLang write_backup() protects non-write-back nodes until writing_check() observes the async CPU write ack",
+                               .accepted = true,
+                               .candidate_pages = static_cast<uint64_t>(pages.size()),
+                               .pages = pages,
+                           });
+    record_transition(fact, summary, transitions, "enqueue_write_through_backup", "writeback", pages, before);
 }
 
 void HiCacheState::apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
@@ -664,48 +1019,48 @@ void HiCacheState::apply_write_count_policy(const HiCacheFact & fact, HiCacheSum
         return;
     }
 
-    auto lookup = scope.tree.lookup(pages);
-    sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "write_count_lookup_touch");
+    auto lookup = scope.tree.lookup_peek(pages);
     for (const auto node_id : lookup.topology_chain) {
         auto * node = scope.tree.mutable_node(node_id);
         if (node == nullptr || !node->residency.device_present) continue;
         const auto before = digest();
         node->hit_count++;
         record_transition(fact, summary, transitions, "increment_hit_count", "hit_count", node->pages, before);
-        const auto should_backup = !has_backup(*node) && node->hit_count >= threshold;
+        const auto should_backup = !has_host_backup(*node) && node->hit_count >= threshold;
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .policy_area = "write_policy",
                                    .policy_name = policy_.write_policy(),
                                    .decision = should_backup ? "commit_hit_count_backup" : "wait_for_hit_count_backup",
-                                   .reason = has_backup(*node) ? "node already has host/storage backup"
-                                             : should_backup   ? "node hit count reached write-through threshold"
-                                                               : "node hit count is below write-through threshold",
+                                   .reason = has_host_backup(*node) ? "node already has host backup"
+                                             : should_backup        ? "node hit count reached write-through threshold"
+                                                                    : "node hit count is below write-through threshold",
                                    .accepted = should_backup,
                                    .candidate_pages = static_cast<uint64_t>(node->pages.size()),
                                    .hit_count = node->hit_count,
                                    .threshold_pages = threshold,
                                    .pages = node->pages,
                                });
-        if (should_backup) commit_host_backup(fact, summary, transitions, scope, node_id, true);
+        if (should_backup) (void)commit_host_backup(fact, summary, transitions, scope, node_id, true);
     }
 }
 
-void HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                                     HiCacheNodeId node_id) {
+uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                         ScopedState & scope, HiCacheNodeId node_id) {
     auto * node = scope.tree.mutable_node(node_id);
-    if (node == nullptr || !node->residency.device_present) return;
+    if (node == nullptr || !node->residency.device_present) return 0;
 
     const auto pages = node->pages;
-    const bool needs_writeback = policy_.write_back_enabled() && !has_backup(*node);
+    const auto released_pages = static_cast<uint64_t>(pages.size());
+    const bool needs_writeback = policy_.write_back_enabled() && !has_host_backup(*node);
     record_policy_decision(fact,
                            HiCachePolicyDecisionRecord{
                                .policy_area = "write_policy",
                                .policy_name = policy_.write_policy(),
                                .decision = needs_writeback ? "enqueue_dirty_eviction_writeback" : "evict_without_writeback",
-                               .reason = needs_writeback     ? "write_back dirty node has no host/storage backup"
-                                         : has_backup(*node) ? "node already has host/storage backup"
-                                                             : "target write policy does not require dirty eviction writeback",
+                               .reason = needs_writeback          ? "write_back dirty node has no host backup"
+                                         : has_host_backup(*node) ? "node already has host backup"
+                                                                  : "target write policy does not require dirty eviction writeback",
                                .accepted = needs_writeback,
                                .candidate_pages = static_cast<uint64_t>(pages.size()),
                                .pages = pages,
@@ -732,44 +1087,125 @@ void HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummary & 
             scope.refs.acquire_lock(scope.tree, writeback_owner, "writeback", scoped_request_key(fact), writeback_id, std::vector<HiCacheNodeId>{ node_id });
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "writeback_ref_acquire");
         record_transition(fact, summary, transitions, "enqueue_writeback", "writeback", pages, before_enqueue);
-        commit_host_backup(fact, summary, transitions, scope, node_id, true);
+        const auto committed = commit_host_backup(fact, summary, transitions, scope, node_id, true);
         const auto before_complete = digest();
-        scope.async_ops.set_writeback_state(writeback_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
+        scope.async_ops.set_writeback_state(writeback_id,
+                                            committed ? HiCacheOperationState::Committed : HiCacheOperationState::Cancelled,
+                                            committed ? "sync_commit" : "host_backup_capacity_rejected",
+                                            fact.ts);
         ref = scope.refs.release_owner(scope.tree, writeback_owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "writeback_ref_release");
-        record_transition(fact, summary, transitions, "complete_writeback", "writeback", pages, before_complete);
+        record_transition(fact, summary, transitions, committed ? "complete_writeback" : "cancel_writeback", "writeback", pages, before_complete);
+        if (!committed) return 0;
     }
 
     const auto before = digest();
-    if (has_backup(*node)) scope.tree.demote_device_to_host(node_id, false);
+    if (has_host_backup(*node)) scope.tree.demote_device_to_host(node_id, false);
     else scope.tree.remove_device_regular(node_id);
+    const auto allocator_released_pages = scope.device_allocator.release(released_pages);
     sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "evict_device_node");
     record_transition(fact, summary, transitions, "evict_l1_node", "L1", pages, before);
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .policy_area = "device_allocator",
+                               .policy_name = "device_eviction_free",
+                               .decision = "release_device_pages_to_allocator",
+                               .reason = "sglang device eviction frees the victim node value back to token_to_kv_pool_allocator",
+                               .accepted = allocator_released_pages > 0,
+                               .candidate_pages = released_pages,
+                               .capacity_pages = scope.device_allocator.capacity_pages,
+                               .allocator_free_pages = scope.device_allocator.free_pages,
+                               .allocator_release_pages = scope.device_allocator.release_pages,
+                               .allocator_available_pages = scope.device_allocator.available_pages(),
+                               .allocator_released_pages = allocator_released_pages,
+                               .pages = pages,
+                           });
+    return released_pages;
 }
 
-void HiCacheState::evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                                   HiCacheNodeId node_id) {
-    const auto pages = scope.tree.node_pages(node_id);
+uint64_t HiCacheState::evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                       ScopedState & scope, HiCacheNodeId node_id) {
+    const auto * node = scope.tree.node(node_id);
+    const auto pages = node == nullptr ? std::vector<std::string>{} : node->pages;
+    if (node != nullptr && node->refs.host_ref_total > 0) {
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "host_cleanup",
+                                   .policy_name = "evict_host",
+                                   .decision = "skip_host_ref_protected_leaf",
+                                   .reason = "SGLang evict_host skips a popped host leaf while host_ref_counter is positive",
+                                   .accepted = false,
+                                   .candidate_pages = static_cast<uint64_t>(pages.size()),
+                                   .pages = pages,
+                               });
+        sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "evict_host_ref_protected");
+        return 0;
+    }
+
     const auto before = digest();
-    scope.tree.remove_host(node_id);
-    sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "evict_host_node");
+    const auto result = scope.tree.evict_host_leaf(node_id);
+    sync_capacity(scope,
+                  normalized_scope(fact),
+                  result.affected_nodes.empty() ? std::vector<HiCacheNodeId>{ node_id } : result.affected_nodes,
+                  result.evicted ? "evict_host_leaf" : "evict_host_leaf_skipped");
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .policy_area = "host_cleanup",
+                               .policy_name = "evict_host",
+                               .decision = result.evicted ? "evict_host_leaf" : "skip_host_leaf",
+                               .reason = result.reason,
+                               .accepted = result.evicted,
+                               .candidate_pages = static_cast<uint64_t>(result.pages.size()),
+                               .pages = result.pages,
+                           });
+    if (!result.evicted) return 0;
     record_transition(fact, summary, transitions, "evict_host_node", "L2", pages, before);
+    return static_cast<uint64_t>(pages.size());
 }
 
 void HiCacheState::enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                            ScopedState & scope, uint64_t requested_pages) {
-    const auto capacity = policy_.l1_capacity_pages();
-    if (capacity == 0) return;
-    sync_capacity(scope, normalized_scope(fact), {}, "device_capacity_budget");
-    auto target = std::max(requested_pages, scope.capacity.device_excess_pages(capacity));
+    ensure_device_allocator(scope);
+    const auto capacity = scope.device_allocator.capacity_pages;
+    if (capacity == 0 || requested_pages == 0) return;
+    sync_capacity(scope, normalized_scope(fact), {}, "device_allocator_budget");
+    if (!scope.device_allocator.should_evict(requested_pages)) {
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "device_allocator",
+                                   .policy_name = "available_size_gate",
+                                   .decision = "skip_device_eviction",
+                                   .reason = "sglang standard allocator evicts only when available_size is below request budget",
+                                   .accepted = false,
+                                   .requested_pages = requested_pages,
+                                   .capacity_pages = capacity,
+                                   .allocator_free_pages = scope.device_allocator.free_pages,
+                                   .allocator_release_pages = scope.device_allocator.release_pages,
+                                   .allocator_available_pages = scope.device_allocator.available_pages(),
+                               });
+        return;
+    }
+    auto target = requested_pages;
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .policy_area = "device_allocator",
+                               .policy_name = "available_size_gate",
+                               .decision = "evict_for_device_allocation",
+                               .reason = "sglang standard allocator passes the full request budget to tree_cache.evict once available_size is insufficient",
+                               .accepted = true,
+                               .requested_pages = requested_pages,
+                               .capacity_pages = capacity,
+                               .allocator_free_pages = scope.device_allocator.free_pages,
+                               .allocator_release_pages = scope.device_allocator.release_pages,
+                               .allocator_available_pages = scope.device_allocator.available_pages(),
+                           });
     while (target > 0) {
-        sync_capacity(scope, normalized_scope(fact), {}, "device_capacity_loop");
-        const auto victim = scope.capacity.select_device_victim(capacity, requested_pages, "device_capacity_loop");
+        sync_capacity(scope, normalized_scope(fact), {}, "device_allocator_loop");
+        const auto victim = scope.capacity.select_device_victim(capacity, requested_pages, "device_allocator_loop");
         if (!victim) break;
-        const auto victim_pages = scope.tree.node_pages(*victim).size();
-        evict_device_node(fact, summary, transitions, scope, *victim);
-        if (victim_pages >= target) break;
-        target -= victim_pages;
+        const auto released_pages = evict_device_node(fact, summary, transitions, scope, *victim);
+        if (released_pages == 0 || released_pages >= target) break;
+        target -= released_pages;
     }
 }
 
@@ -777,17 +1213,76 @@ void HiCacheState::enforce_host_capacity(const HiCacheFact & fact, HiCacheSummar
                                          ScopedState & scope, uint64_t requested_pages) {
     const auto capacity = policy_.l2_capacity_pages();
     if (capacity == 0) return;
-    sync_capacity(scope, normalized_scope(fact), {}, "host_capacity_budget");
-    auto target = std::max(requested_pages, scope.capacity.host_excess_pages(capacity));
+    const auto budget_reason = requested_pages > 0 ? "host_allocation_request_budget" : "host_capacity_budget";
+    const auto loop_reason = requested_pages > 0 ? "host_allocation_request_loop" : "host_capacity_loop";
+    sync_capacity(scope, normalized_scope(fact), {}, budget_reason);
+    const auto snapshot = scope.capacity.snapshot();
+    auto target = allocation_cleanup_target(snapshot.occupied_host_pages, snapshot.reserved_host_pages, capacity, requested_pages);
     while (target > 0) {
-        sync_capacity(scope, normalized_scope(fact), {}, "host_capacity_loop");
-        const auto victim = scope.capacity.select_host_victim(capacity, requested_pages, "host_capacity_loop");
+        sync_capacity(scope, normalized_scope(fact), {}, loop_reason);
+        const auto victim = scope.capacity.select_host_victim(capacity, requested_pages, loop_reason);
         if (!victim) break;
-        const auto victim_pages = scope.tree.node_pages(*victim).size();
-        evict_host_node(fact, summary, transitions, scope, *victim);
+        const auto victim_pages = evict_host_node(fact, summary, transitions, scope, *victim);
+        if (victim_pages == 0) break;
         if (victim_pages >= target) break;
         target -= victim_pages;
     }
+}
+
+void HiCacheState::drain_deferred_host_releases(const HiCacheFact & fact, ScopedState & scope) {
+    const auto cache_scope = normalized_scope(fact);
+    const auto released_pages = scope.async_ops.release_deferred_host_pages(cache_scope);
+    if (released_pages == 0) return;
+
+    sync_capacity(scope, cache_scope, {}, "prefetch_deferred_host_release_drain");
+    record_policy_decision(
+        fact,
+        HiCachePolicyDecisionRecord{
+            .policy_area = "host_allocation",
+            .policy_name = "prefetch_host_release_queue",
+            .decision = "drain_deferred_host_release_pages",
+            .reason = "sglang frees revoked or unused prefetch host pages through the storage control release queue after allocation pressure",
+            .accepted = true,
+            .allocator_released_pages = released_pages,
+        });
+}
+
+HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                                         std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+                                                                         uint64_t requested_pages, uint64_t minimum_pages, bool allow_truncate,
+                                                                         const std::string & reason) {
+    auto result = HostAllocationResult{
+        .requested_pages = requested_pages,
+        .capacity_pages = policy_.l2_capacity_pages(),
+    };
+    if (requested_pages == 0) {
+        result.accepted = true;
+        return result;
+    }
+    if (result.capacity_pages == 0) {
+        result.accepted = true;
+        result.accepted_pages = requested_pages;
+        return result;
+    }
+
+    enforce_host_capacity(fact, summary, transitions, scope, requested_pages);
+    sync_capacity(scope, normalized_scope(fact), {}, reason + "_host_allocation_post_cleanup");
+    const auto snapshot = scope.capacity.snapshot();
+    result.occupied_pages = snapshot.occupied_host_pages;
+    result.reserved_pages = snapshot.reserved_host_pages;
+    const auto committed_pages = snapshot.occupied_host_pages + snapshot.reserved_host_pages;
+    const auto available_pages = committed_pages < result.capacity_pages ? result.capacity_pages - committed_pages : uint64_t{ 0 };
+    if (available_pages >= requested_pages) {
+        result.accepted = true;
+        result.accepted_pages = requested_pages;
+        return result;
+    }
+    if (allow_truncate && available_pages >= minimum_pages) {
+        result.accepted = true;
+        result.truncated = true;
+        result.accepted_pages = available_pages;
+    }
+    return result;
 }
 
 void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
@@ -797,6 +1292,7 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
     auto & scope = scope_state(fact);
     scope.storage.observe_path(page_path);
     scope.tree.observe_page_path(page_path);
+    drain_deferred_host_releases(fact, scope);
     auto lookup = scope.tree.lookup(pages);
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "prefetch_lookup_touch");
     const auto memory_prefix = scope.tree.contiguous_prefix(pages, true, true, false);
@@ -852,66 +1348,56 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
         return;
     }
 
-    enforce_host_capacity(fact, summary, transitions, scope, requested_pages);
-    sync_capacity(scope, normalized_scope(fact), {}, "prefetch_capacity_budget");
-    const auto capacity_snapshot = scope.capacity.snapshot();
-    const auto capacity = policy_.l2_capacity_pages();
-    const auto committed_host_pages = capacity_snapshot.occupied_host_pages + capacity_snapshot.reserved_host_pages;
-    if (capacity > 0 && committed_host_pages >= capacity) {
+    const auto request_key = scoped_request_key(fact);
+    if (request_key.empty()) return;
+    const auto prefetch_id = scope.clock.next_operation_id("prefetch");
+    const auto enqueue_epoch = scope.clock.next_enqueue_epoch();
+    auto owner = request_key + ":" + prefetch_id;
+    const auto anchor_nodes = lookup.deepest_host_node == 0 ? std::vector<HiCacheNodeId>{} : std::vector<HiCacheNodeId>{ lookup.deepest_host_node };
+    if (!anchor_nodes.empty()) {
+        const auto ref = scope.refs.acquire_host(scope.tree, owner, "prefetch", request_key, prefetch_id, anchor_nodes);
+        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_anchor_ref_acquire");
+    }
+
+    const auto allocation = request_host_allocation(fact, summary, transitions, scope, requested_pages, policy_.prefetch_threshold_pages(), true, "prefetch");
+    const auto capacity = allocation.capacity_pages;
+    if (!allocation.accepted) {
+        const auto ref = scope.refs.release_owner(scope.tree, owner);
+        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_anchor_ref_release_no_capacity");
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .policy_area = "prefetch_enqueue",
                                    .policy_name = policy_.prefetch_policy(),
                                    .decision = "skip_prefetch",
-                                   .reason = "target host capacity has no reservable space after cleanup",
+                                   .reason = "target host capacity cannot fit a threshold-sized prefetch allocation after cleanup",
                                    .accepted = false,
                                    .requested_pages = requested_pages,
                                    .candidate_pages = requested_pages,
                                    .active_requested_pages = active_requested_pages,
                                    .capacity_pages = capacity,
-                                   .occupied_pages = capacity_snapshot.occupied_host_pages,
-                                   .reserved_pages = capacity_snapshot.reserved_host_pages,
+                                   .occupied_pages = allocation.occupied_pages,
+                                   .reserved_pages = allocation.reserved_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .limit_pages = policy_.prefetch_capacity_limit_pages(),
                                    .pages = planned_pages,
                                });
         return;
     }
-    auto reservable = capacity == 0 ? requested_pages : std::min<uint64_t>(requested_pages, capacity - committed_host_pages);
-    if (reservable < policy_.prefetch_threshold_pages()) {
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .policy_area = "prefetch_enqueue",
-                                   .policy_name = policy_.prefetch_policy(),
-                                   .decision = "skip_prefetch",
-                                   .reason = "reservable host pages are below prefetch threshold",
-                                   .accepted = false,
-                                   .requested_pages = requested_pages,
-                                   .candidate_pages = reservable,
-                                   .active_requested_pages = active_requested_pages,
-                                   .capacity_pages = capacity,
-                                   .occupied_pages = capacity_snapshot.occupied_host_pages,
-                                   .reserved_pages = capacity_snapshot.reserved_host_pages,
-                                   .threshold_pages = policy_.prefetch_threshold_pages(),
-                                   .limit_pages = policy_.prefetch_capacity_limit_pages(),
-                                   .pages = planned_pages,
-                               });
-        return;
-    }
-    if (planned_pages.size() > reservable) {
+    auto reservable = allocation.accepted_pages;
+    if (allocation.truncated) {
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .policy_area = "prefetch_enqueue",
                                    .policy_name = policy_.prefetch_policy(),
                                    .decision = "truncate_prefetch_reservation",
-                                   .reason = "host capacity allows only a prefix of planned prefetch pages",
+                                   .reason = "host allocator retry allows only a threshold-sized prefix of planned prefetch pages",
                                    .accepted = true,
                                    .requested_pages = requested_pages,
                                    .candidate_pages = reservable,
                                    .active_requested_pages = active_requested_pages,
                                    .capacity_pages = capacity,
-                                   .occupied_pages = capacity_snapshot.occupied_host_pages,
-                                   .reserved_pages = capacity_snapshot.reserved_host_pages,
+                                   .occupied_pages = allocation.occupied_pages,
+                                   .reserved_pages = allocation.reserved_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .limit_pages = policy_.prefetch_capacity_limit_pages(),
                                    .pages = planned_pages,
@@ -921,8 +1407,6 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
     }
 
     const auto hit_pages = storage_hit_prefix(scope.storage, planned_projected_pages);
-    const auto request_key = scoped_request_key(fact);
-    if (request_key.empty()) return;
     if (auto * prior = scope.async_ops.prefetch_for_request(request_key); prior != nullptr) {
         if (prefetch_active(*prior)) {
             record_policy_decision(fact,
@@ -951,13 +1435,6 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
         }
     }
 
-    const auto prefetch_id = scope.clock.next_operation_id("prefetch");
-    const auto enqueue_epoch = scope.clock.next_enqueue_epoch();
-    auto owner = request_key + ":" + prefetch_id;
-    if (!lookup.host_chain.empty()) {
-        const auto ref = scope.refs.acquire_host(scope.tree, owner, "prefetch", request_key, prefetch_id, lookup.host_chain);
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_anchor_ref_acquire");
-    }
     HiCachePrefetchOperation op{
         .header = make_operation_header(HiCacheOperationKind::Prefetch,
                                         prefetch_id,
@@ -965,11 +1442,11 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
                                         request_key,
                                         owner,
                                         lookup.deepest_host_node,
-                                        lookup.host_chain,
+                                        anchor_nodes,
                                         planned_pages,
                                         fact.ts,
                                         enqueue_epoch),
-        .anchor_chain = lookup.host_chain,
+        .anchor_chain = anchor_nodes,
         .host_insert_pages = prefix_to(pages, memory_prefix.size() + hit_pages.size()),
         .host_visible_offset_pages = static_cast<uint64_t>(memory_prefix.size()),
         .planned_pages = planned_pages,
@@ -993,7 +1470,7 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
                                .hit_pages = static_cast<uint64_t>(hit_pages.size()),
                                .active_requested_pages = active_requested_pages,
                                .capacity_pages = capacity,
-                               .occupied_pages = capacity_snapshot.occupied_host_pages,
+                               .occupied_pages = allocation.occupied_pages,
                                .reserved_pages = reservable,
                                .threshold_pages = policy_.prefetch_threshold_pages(),
                                .limit_pages = policy_.prefetch_capacity_limit_pages(),
@@ -1001,6 +1478,99 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
                            });
     sync_capacity(scope, normalized_scope(fact), {}, "prefetch_reservation");
     record_transition(fact, summary, transitions, "prefetch_planned", "prefetch", planned_pages, digest());
+}
+
+void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                        ScopedState & scope, HiCachePrefetchOperation & op) {
+    const auto before_ready = digest();
+    scope.async_ops.set_prefetch_state_by_id(op.header.operation_id, HiCachePrefetchState::Ready, HiCacheOperationState::Ready, "storage_hit_ready", fact.ts);
+    record_transition(fact, summary, transitions, "prefetch_ready", "prefetch", op.hit_pages, before_ready);
+
+    const auto before_apply = digest();
+    const auto visible_pages = std::set<std::string>(op.hit_pages.begin(), op.hit_pages.end());
+    (void)scope.tree.lookup(prefix_to(op.host_insert_pages, static_cast<size_t>(op.host_visible_offset_pages)));
+    auto insert = scope.tree.insert_host_path(op.host_insert_pages, visible_pages, true);
+    sync_capacity_for_insert(scope, normalized_scope(fact), insert, "prefetch_insert_host");
+    scope.storage.mark_readable_pages(normalized_scope(fact), op.hit_pages);
+    for (const auto node_id : insert.touched_nodes) { scope.storage.mark_materialized_pages(scope.tree.node_pages(node_id), node_id); }
+    scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
+                                             HiCachePrefetchState::Applied,
+                                             HiCacheOperationState::Committed,
+                                             "apply_host_visibility",
+                                             fact.ts);
+    op.reserved_host_pages = bounded_subtract(op.reserved_host_pages, static_cast<uint64_t>(op.hit_pages.size()));
+    const auto ref = scope.refs.release_owner(scope.tree, op.header.owner);
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_ref_release");
+    sync_capacity(scope, normalized_scope(fact), {}, "prefetch_apply_pending_host_release");
+    record_transition(fact, summary, transitions, "apply_prefetch_host_visibility", "L2", flatten_node_pages(scope.tree, insert.new_host_nodes), before_apply);
+}
+
+void HiCacheState::cancel_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                   ScopedState & scope, HiCachePrefetchOperation & op, const std::string & transition_kind,
+                                                   HiCachePrefetchState prefetch_state) {
+    const auto before = digest();
+    scope.async_ops.set_prefetch_state_by_id(op.header.operation_id, prefetch_state, HiCacheOperationState::Cancelled, transition_kind, fact.ts);
+    const auto ref = scope.refs.release_owner(scope.tree, op.header.owner);
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_ref_release");
+    sync_capacity(scope, normalized_scope(fact), {}, "prefetch_cancel_pending_host_release");
+    record_transition(fact, summary, transitions, transition_kind, "prefetch", op.planned_pages, before);
+}
+
+void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                       ScopedState & scope) {
+    auto * op = scope.async_ops.prefetch_for_request(scoped_request_key(fact));
+    if (op == nullptr || !prefetch_active(*op) || op->hit_pages.size() < policy_.prefetch_threshold_pages()) return;
+
+    const auto policy = policy_.prefetch_policy();
+    if (policy == "wait_complete") {
+        record_policy_decision(
+            fact,
+            HiCachePolicyDecisionRecord{
+                .operation_id = op->header.operation_id,
+                .policy_area = "prefetch_request_boundary",
+                .policy_name = policy,
+                .decision = "apply_prefetch",
+                .reason = "request boundary implies check_prefetch_progress returned true; wait_complete can only continue after completed IO",
+                .accepted = true,
+                .requested_pages = op->requested_host_pages,
+                .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                .reserved_pages = op->reserved_host_pages,
+                .threshold_pages = policy_.prefetch_threshold_pages(),
+                .pages = op->planned_pages,
+            });
+        apply_prefetch_ready(fact, summary, transitions, scope, *op);
+        drain_deferred_host_releases(fact, scope);
+        return;
+    }
+
+    if (policy == "timeout") {
+        const auto timeout_elapsed =
+            policy_.prefetch_timeout_elapsed(op->header.enqueue_ts, fact.ts, static_cast<uint64_t>(op->planned_pages.size() * config_.page_size));
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .operation_id = op->header.operation_id,
+                                   .policy_area = "prefetch_request_boundary",
+                                   .policy_name = policy,
+                                   .decision = timeout_elapsed ? "cancel_prefetch_without_completed_io" : "apply_prefetch",
+                                   .reason = timeout_elapsed ? "timeout request boundary can be explained by elapsed timeout before modeled completion"
+                                                             : "request boundary before target timeout implies completed prefetch IO",
+                                   .accepted = !timeout_elapsed,
+                                   .requested_pages = op->requested_host_pages,
+                                   .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                                   .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .reserved_pages = op->reserved_host_pages,
+                                   .threshold_pages = policy_.prefetch_threshold_pages(),
+                                   .pages = op->planned_pages,
+                               });
+        if (timeout_elapsed) {
+            cancel_prefetch_pending_release(fact, summary, transitions, scope, *op, "prefetch_timeout_incomplete", HiCachePrefetchState::Late);
+        }
+        else {
+            apply_prefetch_ready(fact, summary, transitions, scope, *op);
+            drain_deferred_host_releases(fact, scope);
+        }
+    }
 }
 
 void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
@@ -1027,49 +1597,8 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     op->header.checkpoint_epoch = checkpoint.checkpoint_epoch;
     op->header.checkpoint_ts = fact.ts;
 
-    auto release_op_refs = [&] {
-        const auto ref = scope.refs.release_owner(scope.tree, op->header.owner);
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_ref_release");
-    };
     auto suppress = [&](const std::string & kind, HiCachePrefetchState state) {
-        const auto before = digest();
-        scope.async_ops.set_prefetch_state_by_id(op->header.operation_id, state, HiCacheOperationState::Cancelled, kind, fact.ts);
-        op->reserved_host_pages = 0;
-        release_op_refs();
-        sync_capacity(scope, normalized_scope(fact), {}, "prefetch_cancel_reservation");
-        record_transition(fact, summary, transitions, kind, "prefetch", op->planned_pages, before);
-    };
-    auto apply_ready = [&] {
-        const auto before_ready = digest();
-        scope.async_ops.set_prefetch_state_by_id(op->header.operation_id,
-                                                 HiCachePrefetchState::Ready,
-                                                 HiCacheOperationState::Ready,
-                                                 "storage_hit_ready",
-                                                 fact.ts);
-        record_transition(fact, summary, transitions, "prefetch_ready", "prefetch", op->hit_pages, before_ready);
-        const auto before_apply = digest();
-        const auto visible_pages = std::set<std::string>(op->hit_pages.begin(), op->hit_pages.end());
-        (void)scope.tree.lookup(prefix_to(op->host_insert_pages, static_cast<size_t>(op->host_visible_offset_pages)));
-        auto insert = scope.tree.insert_host_path(op->host_insert_pages, visible_pages, true);
-        sync_capacity_for_insert(scope, normalized_scope(fact), insert, "prefetch_insert_host");
-        scope.storage.mark_readable_pages(normalized_scope(fact), op->hit_pages);
-        for (const auto node_id : insert.touched_nodes) { scope.storage.mark_materialized_pages(scope.tree.node_pages(node_id), node_id); }
-        scope.async_ops.set_prefetch_state_by_id(op->header.operation_id,
-                                                 HiCachePrefetchState::Applied,
-                                                 HiCacheOperationState::Committed,
-                                                 "apply_host_visibility",
-                                                 fact.ts);
-        op->reserved_host_pages = 0;
-        release_op_refs();
-        sync_capacity(scope, normalized_scope(fact), {}, "prefetch_apply_reservation");
-        record_transition(fact,
-                          summary,
-                          transitions,
-                          "apply_prefetch_host_visibility",
-                          "L2",
-                          flatten_node_pages(scope.tree, insert.new_host_nodes),
-                          before_apply);
-        enforce_host_capacity(fact, summary, transitions, scope, 0);
+        cancel_prefetch_pending_release(fact, summary, transitions, scope, *op, kind, state);
     };
 
     if (op->hit_pages.size() < policy_.prefetch_threshold_pages()) {
@@ -1110,7 +1639,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
-        if (terminal) apply_ready();
+        if (terminal) apply_prefetch_ready(fact, summary, transitions, scope, *op);
         return;
     }
     if (policy == "best_effort") {
@@ -1129,13 +1658,33 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
-        apply_ready();
+        apply_prefetch_ready(fact, summary, transitions, scope, *op);
         return;
     }
     if (policy == "timeout") {
         const auto terminal = policy_.terminal_prefetch_checkpoint(fact.check_kind);
         const auto timeout_elapsed =
             policy_.prefetch_timeout_elapsed(op->header.enqueue_ts, fact.ts, static_cast<uint64_t>(op->planned_pages.size() * config_.page_size));
+        if (timeout_elapsed && !terminal) {
+            record_policy_decision(fact,
+                                   HiCachePolicyDecisionRecord{
+                                       .operation_id = op->header.operation_id,
+                                       .policy_area = "prefetch_checkpoint",
+                                       .policy_name = policy,
+                                       .decision = "cancel_prefetch_without_completed_io",
+                                       .reason = "timeout can terminate before the storage IO thread publishes completed tokens; invariant checkpoints do not "
+                                                 "carry completed-token progress",
+                                       .accepted = false,
+                                       .requested_pages = op->requested_host_pages,
+                                       .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                                       .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                       .reserved_pages = op->reserved_host_pages,
+                                       .threshold_pages = policy_.prefetch_threshold_pages(),
+                                       .pages = op->planned_pages,
+                                   });
+            suppress("prefetch_timeout_incomplete", HiCachePrefetchState::Late);
+            return;
+        }
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .operation_id = op->header.operation_id,
@@ -1153,7 +1702,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
-        if (terminal || timeout_elapsed) { apply_ready(); }
+        if (terminal || timeout_elapsed) { apply_prefetch_ready(fact, summary, transitions, scope, *op); }
         return;
     }
     record_policy_decision(fact,
@@ -1171,7 +1720,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                .threshold_pages = policy_.prefetch_threshold_pages(),
                                .pages = op->planned_pages,
                            });
-    apply_ready();
+    apply_prefetch_ready(fact, summary, transitions, scope, *op);
 }
 
 void HiCacheState::apply_storage_backend_readable(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {

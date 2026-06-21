@@ -52,13 +52,12 @@ HiCacheDerivedStateView::HiCacheDerivedStateView(HiCacheDerivedStateMode mode) {
 void HiCacheDerivedStateView::include_tree(const HiCacheTokenRadixTree & tree) {
     for (const auto & node : tree.nodes()) {
         if (!node.active || node.id == 0 || node.pages.empty()) continue;
-        const auto backuped = node.residency.host_present || node.residency.storage_readable;
         if (node.residency.device_present) insert_all(snapshot_.l1, node.pages);
         if (node.residency.host_present && node.residency.host_visible) insert_all(snapshot_.l2, node.pages);
         if (node.residency.storage_readable) insert_all(snapshot_.l3, node.pages);
         if (node.residency.device_present && node.residency.device_dirty) insert_all(snapshot_.dirty, node.pages);
-        if (backuped) insert_all(snapshot_.backuped, node.pages);
-        if (!node.residency.device_present && backuped) insert_all(snapshot_.evicted, node.pages);
+        if (node.residency.host_present) insert_all(snapshot_.backuped, node.pages);
+        if (!node.residency.device_present && node.residency.host_present) insert_all(snapshot_.evicted, node.pages);
         if (node.refs.lock_ref_total > 0 || node.refs.host_ref_total > 0) insert_all(snapshot_.locked, node.pages);
         if (node.hit_count > 0)
             std::ranges::for_each(node.pages,

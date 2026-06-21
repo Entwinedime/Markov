@@ -18,6 +18,7 @@ namespace {
 constexpr uint64_t kSglangDefaultPrefetchThresholdTokens = 256;
 constexpr uint64_t kSglangWriteThroughThreshold = 1;
 constexpr uint64_t kSglangWriteThroughSelectiveThreshold = 2;
+constexpr uint64_t kExplicitSingleRequestExtendBatchSize = 1;
 constexpr double kSglangPrefetchCapacityRatio = 0.8;
 
 uint64_t ceil_div(uint64_t value, uint64_t divisor) {
@@ -112,6 +113,11 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
         .prefetch_capacity_limit_source = prefetch_capacity_limit_source,
         .host_cleanup_budget_rule = "current_target_request_pages",
         .host_cleanup_budget_source = "sglang: cleanup budget follows current page-aligned target request",
+        .extend_allocation_batch_size = kExplicitSingleRequestExtendBatchSize,
+        .extend_allocation_batch_source = "temporary model contract: explicit single-request ScheduleBatch until batch-level invariant is collected",
+        .extend_allocation_rule = "sglang paged extend pressure: extend_num_tokens + batch_size * page_size; page_size=1 uses extend_num_tokens",
+        .device_allocator_need_sort = config.device_allocator_need_sort,
+        .device_allocator_need_sort_source = "target_config.device_allocator_need_sort or derived from target_config.disaggregation_mode",
         .storage_hit_policy = "continuous_prefix",
         .storage_hit_policy_source = "sglang: storage hit query keeps only contiguous hit prefix",
         .prefetch_timeout_configured = config.prefetch_timeout_configured,

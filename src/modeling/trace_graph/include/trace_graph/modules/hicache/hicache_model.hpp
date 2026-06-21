@@ -65,13 +65,47 @@ private:
     struct RequestState {
         std::string request_key;
         std::string cache_scope;
+        uint64_t committed_tokens = 0;
+        uint64_t kv_allocated_pages = 0;
+        uint64_t cache_protected_pages = 0;
+        uint64_t page_aligned_key_pages = 0;
+        uint64_t active_request_pages = 0;
         std::vector<std::string> full_pages;
         std::vector<std::string> device_pages;
         std::vector<std::string> host_pages;
         std::vector<HiCacheNodeId> device_chain;
         std::vector<HiCacheNodeId> host_chain;
-        uint64_t device_reservation_pages = 0;
         std::string lifecycle_state;
+    };
+
+    /** @brief 等待下一轮 target control 边界 drain 的 write-through backup lock。 */
+    struct PendingWriteThroughBackup {
+        std::string owner;
+        std::vector<std::string> pages;
+    };
+
+    /**
+     * @brief SGLang device KV allocator 的 count-level 投影。
+     *
+     * 该账本只维护 `free_pages` / `release_pages` 计数，用于还原
+     * `allocator.available_size()` gate；逻辑 residency 仍由 radix tree 维护。
+     */
+    struct DeviceAllocatorLedger {
+        bool initialized = false;
+        bool need_sort = false;
+        uint64_t capacity_pages = 0;
+        uint64_t free_pages = 0;
+        uint64_t release_pages = 0;
+
+        void configure(uint64_t pages, bool sort_required);
+        [[nodiscard]] uint64_t available_pages() const;
+        [[nodiscard]] bool should_evict(uint64_t requested_pages) const;
+        void merge_release_pages();
+        void merge_before_extend(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size);
+        void merge_before_page_allocation(uint64_t requested_pages);
+        [[nodiscard]] bool can_allocate(uint64_t pages) const;
+        uint64_t allocate(uint64_t pages);
+        uint64_t release(uint64_t pages);
     };
 
     struct ScopedState {
@@ -81,7 +115,25 @@ private:
         HiCacheCapacityIndex capacity;
         HiCacheRefLedger refs;
         HiCacheTargetControlClock clock;
+        DeviceAllocatorLedger device_allocator;
         std::unordered_map<std::string, RequestState> requests;
+        std::vector<PendingWriteThroughBackup> pending_write_through_backups;
+    };
+
+    /**
+     * @brief 一次 host allocator 申请在 target capacity 下的结果。
+     *
+     * 当前仍使用 capacity/reservation 投影，不引入独立 host allocator 对象；所有
+     * write backup 和 prefetch 入口都必须经由该结构收敛申请、清理、截断语义。
+     */
+    struct HostAllocationResult {
+        uint64_t requested_pages = 0;
+        uint64_t accepted_pages = 0;
+        uint64_t capacity_pages = 0;
+        uint64_t occupied_pages = 0;
+        uint64_t reserved_pages = 0;
+        bool accepted = false;
+        bool truncated = false;
     };
 
     HiCacheConfig config_;
@@ -97,6 +149,9 @@ private:
     [[nodiscard]] ScopedState & scope_state(const HiCacheFact & fact);
     [[nodiscard]] HiCacheTokenPath tokens_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const;
     [[nodiscard]] HiCachePagePath page_path_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const;
+    void ensure_device_allocator(ScopedState & scope);
+    void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                         ScopedState & scope, const std::string & reason);
 
     void sync_capacity(ScopedState & scope, const std::string & cache_scope, const std::vector<HiCacheNodeId> & node_ids, const std::string & reason);
     void sync_capacity_for_insert(ScopedState & scope, const std::string & cache_scope, const HiCacheInsertResult & insert, const std::string & reason);
@@ -109,22 +164,38 @@ private:
     void apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_prefetch_check_point(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
     void apply_storage_backend_readable(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief 将已完成的 target prefetch prefix 统一落到 host radix / storage directory。 */
+    void apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+                              HiCachePrefetchOperation & op);
+    /** @brief 取消 prefetch operation，并保留尚未 drain 的 host reservation。 */
+    void cancel_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                         ScopedState & scope, HiCachePrefetchOperation & op, const std::string & transition_kind,
+                                         HiCachePrefetchState prefetch_state);
+    /** @brief 在 request 重新进入调度主链路前，补齐 SGLang check_prefetch_progress 的完成边界。 */
+    void resolve_prefetch_before_request_use(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                             ScopedState & scope);
 
     void update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);
-    void insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                             const std::vector<std::string> & pages);
+    [[nodiscard]] HiCacheInsertResult insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                                          ScopedState & scope, const std::vector<std::string> & pages);
     void apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
                                   const std::vector<std::string> & pages);
     void enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
                                  uint64_t requested_pages);
     void enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
                                uint64_t requested_pages);
-    void evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                           HiCacheNodeId node_id);
-    void evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                         HiCacheNodeId node_id);
-    void commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
-                            HiCacheNodeId node_id, bool storage_readable);
+    void drain_deferred_host_releases(const HiCacheFact & fact, ScopedState & scope);
+    [[nodiscard]] HostAllocationResult request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                               std::vector<HiCacheStateTransition> & transitions, ScopedState & scope, uint64_t requested_pages,
+                                                               uint64_t minimum_pages, bool allow_truncate, const std::string & reason);
+    [[nodiscard]] uint64_t evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                             ScopedState & scope, HiCacheNodeId node_id);
+    [[nodiscard]] uint64_t evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                           ScopedState & scope, HiCacheNodeId node_id);
+    [[nodiscard]] bool commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                          ScopedState & scope, HiCacheNodeId node_id, bool storage_readable);
+    void hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+                                       ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages);
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,
                            const std::string & tier, const std::vector<std::string> & pages, const std::string & before_digest);
 };

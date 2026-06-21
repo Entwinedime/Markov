@@ -20,6 +20,11 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONTAINER_REPO_PREFIXES = ("/workspace/trace-sim", "/opt/trace-sim")
 MODELING_CONTAINER_ENV = "TRACE_SIM_MODELING_CONTAINER"
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from trace_json import load_chrome_trace_events  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -195,7 +200,11 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
 
     completed = subprocess.run(command, cwd=ROOT_DIR, text=True, capture_output=True, check=False)
     if completed.returncode != 0:
-        raise RuntimeError(f"C++ TraceGraph failed: {completed.stderr.strip() or completed.stdout.strip()}")
+        detail = completed.stderr.strip() or completed.stdout.strip() or "<no stdout/stderr>"
+        raise RuntimeError(
+            "C++ TraceGraph failed "
+            f"(returncode={completed.returncode}, command={json.dumps(command, ensure_ascii=False)}): {detail}"
+        )
 
     summary = load_json(run_summary)
     prediction = {"predicted_e2e_ns": int(summary.get("simulated_e2e_ns", 0))}
@@ -372,6 +381,8 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
             "prefetch_timeout_base",
             "prefetch_timeout_per_ki_token",
             "prefetch_timeout_max",
+            "device_allocator_need_sort",
+            "disaggregation_mode",
             "emit_state_digests",
         ):
             if key in hicache:
@@ -439,6 +450,8 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
         "prefetch_timeout_base",
         "prefetch_timeout_per_ki_token",
         "prefetch_timeout_max",
+        "device_allocator_need_sort",
+        "disaggregation_mode",
         "emit_state_digests",
     ):
         if key in explicit_hicache:
@@ -955,16 +968,8 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
     for path in trace_paths:
         if not path.is_file():
             continue
-        try:
-            payload = load_json(path)
-        except json.JSONDecodeError:
-            continue
-        events = payload.get("traceEvents") if isinstance(payload, dict) else payload
-        if not isinstance(events, list):
-            continue
+        events, _status = load_chrome_trace_events(path, auto_repair=True)
         for event in events:
-            if not isinstance(event, dict):
-                continue
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
             if not isinstance(args, dict):
                 continue

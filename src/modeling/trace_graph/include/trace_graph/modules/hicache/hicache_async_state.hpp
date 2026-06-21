@@ -137,6 +137,7 @@ public:
     [[nodiscard]] const std::unordered_map<std::string, HiCachePrefetchOperation> & prefetch_ops() const { return prefetch_by_id_; }
     [[nodiscard]] uint64_t active_requested_pages(const std::string & cache_scope) const;
     [[nodiscard]] uint64_t reserved_pages(const std::string & cache_scope) const;
+    uint64_t release_deferred_host_pages(const std::string & cache_scope);
 
     void upsert_writeback(HiCacheWritebackOperation op);
     void set_writeback_state(const std::string & operation_id, HiCacheOperationState state, const std::string & reason, uint64_t transition_ts = 0);

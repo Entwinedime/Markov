@@ -19,6 +19,11 @@ from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 CONTAINER_REPO_PREFIXES = ("/workspace/trace-sim", "/opt/trace-sim")
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from trace_json import load_chrome_trace_events  # noqa: E402
 
 
 @dataclass
@@ -347,17 +352,22 @@ def _load_python_probe_events(paths: list[Path]) -> list[dict[str, Any]]:
 
     events: list[dict[str, Any]] = []
     for path in paths:
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-        raw_events = data.get("traceEvents") if isinstance(data, dict) else None
-        if not isinstance(raw_events, list):
-            continue
+        raw_events, _status = load_chrome_trace_events(path, auto_repair=True)
         for event in raw_events:
-            if isinstance(event, dict) and event.get("cat") == "python_probe":
+            if _is_python_probe_trace_event(event):
                 events.append(event)
     return events
+
+
+def _is_python_probe_trace_event(event: dict[str, Any]) -> bool:
+    """判断 event 是否来自 Python probe。"""
+
+    args = event.get("args") if isinstance(event.get("args"), dict) else {}
+    return (
+        event.get("cat") == "python_probe"
+        or str(args.get("domain") or "") == "python_probe"
+        or str(event.get("name") or "").startswith("hicache_")
+    )
 
 
 _ROLE_TO_MECHANISM = {

@@ -82,10 +82,29 @@ struct HiCachePathLookup {
  */
 struct HiCacheInsertResult {
     HiCacheNodeId terminal_node = 0;
+    uint64_t existing_device_prefix_pages = 0;
+    uint64_t existing_topology_prefix_pages = 0;
+    uint64_t inserted_key_pages = 0;
+    uint64_t page_aligned_key_pages = 0;
     std::vector<HiCacheNodeId> touched_nodes;
     std::vector<HiCacheNodeId> new_device_nodes;
     std::vector<HiCacheNodeId> restored_device_nodes;
     std::vector<HiCacheNodeId> new_host_nodes;
+};
+
+/**
+ * @brief SGLang `evict_host()` 删除 host leaf 后的结构化结果。
+ *
+ * SGLang 释放 host leaf 时会从 parent.children 中移除整棵子树，而不是只清
+ * host_value。模型必须显式返回被移除的 node，供 capacity/ref 审计同步旧 record。
+ */
+struct HiCacheHostEvictionResult {
+    bool evicted = false;
+    HiCacheNodeId node_id = 0;
+    HiCacheNodeId parent_node = 0;
+    std::vector<std::string> pages;
+    std::vector<HiCacheNodeId> affected_nodes;
+    std::string reason;
 };
 
 /**
@@ -153,6 +172,7 @@ public:
     void observe_page_path(const HiCachePagePath & path);
 
     [[nodiscard]] HiCachePathLookup lookup(const std::vector<std::string> & pages);
+    [[nodiscard]] HiCachePathLookup lookup_peek(const std::vector<std::string> & pages);
     [[nodiscard]] std::vector<std::string> contiguous_prefix(const std::vector<std::string> & pages, bool include_device, bool include_host,
                                                              bool include_storage);
 
@@ -169,7 +189,7 @@ public:
     void clear_dirty(HiCacheNodeId node_id);
     void demote_device_to_host(HiCacheNodeId node_id, bool ensure_host);
     void remove_device_regular(HiCacheNodeId node_id);
-    void remove_host(HiCacheNodeId node_id);
+    [[nodiscard]] HiCacheHostEvictionResult evict_host_leaf(HiCacheNodeId node_id);
 
 private:
     std::vector<HiCacheCacheNode> nodes_;
@@ -182,6 +202,9 @@ private:
     [[nodiscard]] HiCacheNodeId insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & suffix);
     [[nodiscard]] HiCacheNodeId split_child(HiCacheNodeId parent, HiCacheNodeId child, size_t split_pages);
     [[nodiscard]] HiCacheNodeSplitProjection split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const;
+    [[nodiscard]] HiCachePathLookup lookup_impl(const std::vector<std::string> & pages, bool refresh_access);
+    [[nodiscard]] bool has_backup_child(HiCacheNodeId node_id) const;
+    void deactivate_subtree(HiCacheNodeId node_id, std::vector<HiCacheNodeId> & affected_nodes);
     void rebuild_page_index();
     void touch_node(HiCacheNodeId node_id);
 };

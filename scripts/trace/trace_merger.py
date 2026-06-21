@@ -73,7 +73,8 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
     """读取 Chrome trace JSON。
 
     LD_PRELOAD trace 在异常退出时可能缺少最后的 `]`；auto_repair 只修复这一种
-    明确可恢复的尾部缺口，不尝试修复任意损坏 JSON。
+    明确可恢复的尾部缺口，不尝试修复任意损坏 JSON。Python probe 流式 trace
+    也可能缺少最后的 `]}`，按同一原则补齐。
     """
 
     if not file_path or not os.path.exists(file_path):
@@ -84,9 +85,11 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
     with open(file_path, 'r', encoding='utf-8') as file_object:
         content = file_object.read().strip()
 
-    if auto_repair and content.startswith('[') and not content.endswith(']'):
-        logging.info(f"Fixing missing closing bracket in '{file_path}'...")
-        content = content[:content.rfind('}') + 1] + '\n]'
+    if auto_repair:
+        repaired = repair_trace_tail(content)
+        if repaired != content:
+            logging.info(f"Fixing missing Chrome trace tail in '{file_path}'...")
+            content = repaired
 
     try:
         data = json.loads(content)
@@ -95,6 +98,20 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
     except json.JSONDecodeError as error:
         logging.error(f"Failed to parse JSON: {error}")
         return None, []
+
+def repair_trace_tail(content: str) -> str:
+    """补齐流式 Chrome trace 常见的尾部未闭合。"""
+
+    stripped = content.strip()
+    if stripped.startswith('{"traceEvents":[') and not stripped.endswith("]}"):
+        end = stripped.rfind("}")
+        if end >= 0:
+            return stripped[: end + 1].rstrip(",") + "]}"
+    if stripped.startswith("[") and not stripped.endswith("]"):
+        end = stripped.rfind("}")
+        if end >= 0:
+            return stripped[: end + 1].rstrip(",") + "\n]"
+    return content
 
 def get_cann_pid(events: List[Dict]) -> int:
     """从 metadata event 中查找 CANN 进程 pid。"""
@@ -323,7 +340,7 @@ def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List
     appended_count = 0
     details: List[Dict[str, Any]] = []
     for sidecar_path in sidecar_paths:
-        _, sidecar_events = load_trace(sidecar_path)
+        _, sidecar_events = load_trace(sidecar_path, auto_repair=True)
         if not sidecar_events:
             logging.warning("No sidecar events loaded from %s", sidecar_path)
             details.append({"path": sidecar_path, "events": 0, "loaded": False})

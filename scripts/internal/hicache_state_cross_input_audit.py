@@ -12,9 +12,16 @@ import argparse
 import collections
 import hashlib
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from trace_json import load_chrome_trace_events  # noqa: E402
 
 
 DEFAULT_ROLES = (
@@ -105,10 +112,8 @@ def trace_events(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
 
     rows: list[tuple[Path, dict[str, Any]]] = []
     for path in paths:
-        payload = load_json(path)
-        events = payload.get("traceEvents") if isinstance(payload, dict) else payload
-        if isinstance(events, list):
-            rows.extend((path, event) for event in events if isinstance(event, dict))
+        events, _status = load_chrome_trace_events(path, auto_repair=True)
+        rows.extend((path, event) for event in events)
     return rows
 
 

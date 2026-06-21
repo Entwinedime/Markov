@@ -43,6 +43,7 @@ struct HiCacheConfig {
     double prefetch_timeout_base_sec = 0.0;
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
+    bool device_allocator_need_sort = false;
     bool emit_state_digests = false;
 };
 

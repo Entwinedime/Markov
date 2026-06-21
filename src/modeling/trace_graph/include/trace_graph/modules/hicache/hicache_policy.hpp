@@ -36,6 +36,11 @@ struct HiCacheResolvedPolicyState {
     std::string prefetch_capacity_limit_source;
     std::string host_cleanup_budget_rule;
     std::string host_cleanup_budget_source;
+    uint64_t extend_allocation_batch_size = 1;
+    std::string extend_allocation_batch_source;
+    std::string extend_allocation_rule;
+    bool device_allocator_need_sort = false;
+    std::string device_allocator_need_sort_source;
     std::string storage_hit_policy;
     std::string storage_hit_policy_source;
     bool prefetch_timeout_configured = false;
@@ -68,13 +73,25 @@ struct HiCachePolicyDecisionRecord {
     std::string reason;
     bool accepted = false;
     uint64_t requested_pages = 0;
+    uint64_t requested_tokens = 0;
     uint64_t candidate_pages = 0;
     uint64_t hit_pages = 0;
     uint64_t hit_count = 0;
+    uint64_t batch_size = 0;
+    uint64_t extend_tokens = 0;
+    uint64_t allocated_pages = 0;
     uint64_t active_requested_pages = 0;
     uint64_t capacity_pages = 0;
     uint64_t occupied_pages = 0;
     uint64_t reserved_pages = 0;
+    uint64_t allocator_free_pages = 0;
+    uint64_t allocator_release_pages = 0;
+    uint64_t allocator_available_pages = 0;
+    uint64_t allocator_available_before_pages = 0;
+    uint64_t allocator_consumed_pages = 0;
+    uint64_t allocator_released_pages = 0;
+    uint64_t lifecycle_duplicate_pages = 0;
+    uint64_t lifecycle_tail_pages = 0;
     uint64_t threshold_pages = 0;
     uint64_t limit_pages = 0;
     std::vector<std::string> pages;
@@ -99,6 +116,7 @@ public:
     [[nodiscard]] bool prefetch_rate_limited(uint64_t active_requested_pages) const;
     [[nodiscard]] bool terminal_prefetch_checkpoint(const std::string & check_kind) const;
     [[nodiscard]] bool prefetch_timeout_elapsed(uint64_t enqueue_ts, uint64_t checkpoint_ts, uint64_t token_count) const;
+    [[nodiscard]] uint64_t extend_allocation_batch_size() const { return resolved_.extend_allocation_batch_size; }
 
     [[nodiscard]] uint64_t l1_capacity_pages() const { return resolved_.l1_capacity_pages; }
     [[nodiscard]] uint64_t l2_capacity_pages() const { return resolved_.l2_capacity_pages; }

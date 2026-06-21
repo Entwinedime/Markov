@@ -12,8 +12,15 @@ namespace TraceGraph {
 
 namespace {
 
-bool prefetch_occupies_host_budget(const HiCachePrefetchOperation & op) {
+bool prefetch_has_active_request_budget(const HiCachePrefetchOperation & op) {
     return op.prefetch_state == HiCachePrefetchState::Pending || op.prefetch_state == HiCachePrefetchState::Ready;
+}
+
+bool prefetch_occupies_host_budget(const HiCachePrefetchOperation & op) {
+    if (op.reserved_host_pages == 0) return false;
+    return op.prefetch_state == HiCachePrefetchState::Pending || op.prefetch_state == HiCachePrefetchState::Ready
+           || op.prefetch_state == HiCachePrefetchState::Applied || op.prefetch_state == HiCachePrefetchState::Suppressed
+           || op.prefetch_state == HiCachePrefetchState::Late || op.prefetch_state == HiCachePrefetchState::Revoked;
 }
 
 } // namespace
@@ -88,7 +95,7 @@ const HiCachePrefetchOperation * HiCacheAsyncOperationTable::prefetch_for_reques
 uint64_t HiCacheAsyncOperationTable::active_requested_pages(const std::string & cache_scope) const {
     uint64_t pages = 0;
     for (const auto & op : prefetch_by_id_ | std::views::values) {
-        if (op.header.cache_scope != cache_scope || !prefetch_occupies_host_budget(op)) continue;
+        if (op.header.cache_scope != cache_scope || !prefetch_has_active_request_budget(op)) continue;
         pages += op.requested_host_pages;
     }
     return pages;
@@ -99,6 +106,16 @@ uint64_t HiCacheAsyncOperationTable::reserved_pages(const std::string & cache_sc
     for (const auto & op : prefetch_by_id_ | std::views::values) {
         if (op.header.cache_scope != cache_scope || !prefetch_occupies_host_budget(op)) continue;
         pages += op.reserved_host_pages;
+    }
+    return pages;
+}
+
+uint64_t HiCacheAsyncOperationTable::release_deferred_host_pages(const std::string & cache_scope) {
+    uint64_t pages = 0;
+    for (auto & op : prefetch_by_id_ | std::views::values) {
+        if (op.header.cache_scope != cache_scope || prefetch_has_active_request_budget(op)) continue;
+        pages += op.reserved_host_pages;
+        op.reserved_host_pages = 0;
     }
     return pages;
 }

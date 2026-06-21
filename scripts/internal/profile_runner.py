@@ -46,7 +46,10 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_PYTHON_PROBE_TARGETS",
     "TRACE_SIM_PYTHON_PROBE_OUTPUT",
     "TRACE_SIM_PYTHON_PROBE_DEBUG",
+    "TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY",
     "TRACE_SIM_HICACHE_STATE_TRACE",
+    "TRACE_SIM_HICACHE_PROBE_MODE",
+    "TRACE_SIM_HICACHE_INTERNAL_HOOKS",
 )
 
 
@@ -699,6 +702,7 @@ class ProfileRun:
     def _apply_python_probe_env(self, env: dict[str, str]) -> None:
         """注入 Python probe 环境变量和 target 配置。"""
 
+        python_probe = channel_config(self.cfg, "python_probe")
         prepend_pythonpath(env, PYTHON_PROBE_ROOT)
         env["TRACE_SIM_PYTHON_PROBE"] = "1"
         env["TRACE_SIM_PYTHON_PROBES"] = ",".join(self.runtime.python_probes)
@@ -707,6 +711,12 @@ class ProfileRun:
             ensure_ascii=False,
         )
         env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
+        env["TRACE_SIM_HICACHE_PROBE_MODE"] = str(python_probe.get("hicache_mode", python_probe.get("mode", "auto")))
+        flush_every = python_probe.get("flush_every", python_probe.get("flush_interval_events"))
+        if flush_every is not None:
+            env["TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY"] = str(flush_every)
+        if "internal_hooks" in python_probe:
+            env["TRACE_SIM_HICACHE_INTERNAL_HOOKS"] = "1" if bool(python_probe.get("internal_hooks")) else "0"
         if self._hicache_state_trace_enabled():
             env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
         if self.runtime.debug:
@@ -720,7 +730,11 @@ class ProfileRun:
         会把它拆成 `model_input=false` / `fact_class=oracle_state` 事件。
         """
 
+        python_probe = channel_config(self.cfg, "python_probe")
         targets = [dict(target) for target in self.runtime.python_targets]
+        fact_classes = self._python_probe_fact_class_filter(python_probe)
+        if fact_classes is not None:
+            targets = [target for target in targets if self._python_target_fact_class(target) in fact_classes]
         if not self._hicache_state_trace_enabled():
             return targets
 
@@ -738,6 +752,27 @@ class ProfileRun:
                 )
             target["fields"] = fields
         return targets
+
+    @staticmethod
+    def _python_target_fact_class(target: dict[str, Any]) -> str:
+        """读取 target 声明的 fact class。"""
+
+        fact = target.get("fact") if isinstance(target.get("fact"), dict) else {}
+        return str(fact.get("class") or "")
+
+    @staticmethod
+    def _python_probe_fact_class_filter(python_probe: dict[str, Any]) -> set[str] | None:
+        """根据 python_probe mode / fact_classes 过滤注入 target。"""
+
+        explicit = python_probe.get("fact_classes", python_probe.get("classes"))
+        if isinstance(explicit, str):
+            return {explicit}
+        if isinstance(explicit, list):
+            return {str(item) for item in explicit if isinstance(item, str)}
+        mode = str(python_probe.get("mode", "")).strip().lower()
+        if mode in {"state", "state_only", "invariant", "invariant_only"}:
+            return {"invariant_state"}
+        return None
 
     def _hicache_state_trace_enabled(self) -> bool:
         """判断是否开启 validation-only HiCache state snapshot。"""

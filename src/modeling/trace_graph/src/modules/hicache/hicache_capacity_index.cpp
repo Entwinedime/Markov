@@ -19,7 +19,7 @@ uint64_t excess(uint64_t occupied, uint64_t capacity) {
     return occupied - capacity;
 }
 
-bool has_backup(const HiCacheCacheNode & node) { return node.residency.host_present || node.residency.storage_readable; }
+bool has_host_backup(const HiCacheCacheNode & node) { return node.residency.host_present; }
 
 bool same_residency(const HiCacheNodeResidency & left, const HiCacheNodeResidency & right) {
     return left.device_present == right.device_present && left.device_dirty == right.device_dirty && left.host_present == right.host_present
@@ -56,22 +56,21 @@ bool HiCacheCapacityIndex::has_device_descendant(const HiCacheTokenRadixTree & t
     });
 }
 
-bool HiCacheCapacityIndex::has_backup_descendant(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const {
+bool HiCacheCapacityIndex::has_backup_child(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const {
     return std::ranges::any_of(node.children | std::views::values, [&](auto child_id) {
         const auto * child = tree.node(child_id);
         if (child == nullptr) return false;
-        if (has_backup(*child)) return true;
-        return has_backup_descendant(tree, *child);
+        return has_host_backup(*child);
     });
 }
 
 HiCacheCapacityNodeRecord HiCacheCapacityIndex::make_record(const HiCacheTokenRadixTree & tree, HiCacheNodeId node_id) const {
     const auto * node = tree.node(node_id);
-    if (node == nullptr) return HiCacheCapacityNodeRecord{ .node_id = node_id };
+    if (node == nullptr || node_id == 0) return HiCacheCapacityNodeRecord{ .node_id = node_id };
 
     const auto device_leaf = node_id != 0 && node->residency.device_present && node->refs.lock_ref_total == 0 && !has_device_descendant(tree, *node);
     const auto host_leaf = node_id != 0 && !node->residency.device_present && node->residency.host_present && node->residency.host_visible
-                           && node->refs.lock_ref_total == 0 && node->refs.host_ref_total == 0 && !has_backup_descendant(tree, *node);
+                           && node->refs.lock_ref_total == 0 && !has_backup_child(tree, *node);
     return HiCacheCapacityNodeRecord{
         .node_id = node_id,
         .parent = node->parent,
@@ -91,6 +90,7 @@ HiCacheCapacityNodeRecord HiCacheCapacityIndex::make_record(const HiCacheTokenRa
 std::set<HiCacheNodeId> HiCacheCapacityIndex::observation_closure(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes) const {
     std::set<HiCacheNodeId> nodes;
     auto add_with_ancestors = [&](HiCacheNodeId node_id) {
+        nodes.insert(node_id);
         auto current = tree.node(node_id);
         while (current != nullptr) {
             nodes.insert(current->id);
@@ -253,8 +253,13 @@ std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_device_victim() const {
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_host_victim() const {
-    if (snapshot_.evictable_host_leaves.empty()) return std::nullopt;
-    return snapshot_.evictable_host_leaves.front();
+    for (const auto & candidate : evictable_host_leaves_) {
+        const auto record_it = records_.find(candidate.node_id);
+        if (record_it == records_.end()) continue;
+        if (record_it->second.refs.host_ref_total > 0) continue;
+        return candidate.node_id;
+    }
+    return std::nullopt;
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_device_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason) {
