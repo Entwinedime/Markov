@@ -18,9 +18,10 @@
 `docs/validation/` 只放纳入 git 追踪的专项验证记录。当前保留：
 
 - `docs/validation/hicache_state_validation.md`：当前有效验证口径、最新结果、剩余风险和复现入口。
+- `docs/validation/hicache_state_model_limitations.md`：当前仍存在的中长期建模缺口、临时妥协方案、风险和正确收敛方向。
 
-不再保留单独的 legacy validation 文档、缺陷清单文档或 `docs/tmp_hicache*.md` 临时方案。旧结果如果还有参考价值，
-应压缩成 active 文档中的背景说明或 `work_progress.md` 时间线；不得作为当前验收依据。
+不再保留单独的 legacy validation 文档、短期计划文档、顶级 `*_draft.md` 或 `docs/tmp_hicache*.md` 临时方案。旧结果如果还有参考价值，
+应压缩成 active 文档中的背景说明、长期限制项或 `work_progress.md` 时间线；不得作为当前验收依据。
 
 不再维护任何 fixture。具体要求：
 
@@ -74,6 +75,10 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - `scripts/internal/profile_runner.py` 是容器内执行器，不能在宿主机上直接用于真实 server profiling。
 - `profiling.channels` 只接受 `torch`、`python_probe`、`ld_preload`。
 - `python_probe` 只由 `profiling.python_probe` 控制。
+- HiCache 最终 normal state / intent 主线 profiling 应使用 `profiling.python_probe.mode=invariant` 或显式等价的
+  `fact_classes=["invariant_state"]`，用于低扰动 state/intent 输入。当前尚未对齐的 alignment/debug suite 可以显式使用
+  `mode=full` 保留 source/timing evidence，但不得把这些 evidence 写入 target state，也不得把 full-probe wall time 当作低扰动
+  E2E 标签。
 - `ld_preload` 只由 `profiling.ld_preload` 控制注入和输出；具体 wrapper 由 C++ 硬编码。
 - suite config 中 `profiling` 必须共享；`matrix.servers[]`、`matrix.inputs[]`、`experiments[]` 不得覆盖或 unset `profiling`。
 - 改采集类别、probe target、torch profiler 或 LD_PRELOAD 行为时，新建 suite。
@@ -106,8 +111,9 @@ active 源码子目录不维护独立 README。模块说明、设计说明和使
 - validation-only `state_snapshot` 必须保持 `model_input=false` 且 `fact_class=oracle_state`。
 - 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验和 invariant target source-result 字段审计；
   不再使用 fixture 作为 profile gate。
-- `scripts/internal` 下 HiCache 专项工具只保留 active、只读、文档化的审计入口。当前允许保留：
-  `hicache_state_cross_input_audit.py` 和 `hicache_state_provenance.py`。
+- `scripts/internal` 下 HiCache 专项工具只保留 active、只读、文档化的审计/验证入口。当前允许保留：
+  `hicache_state_cross_input_audit.py`、`hicache_state_matrix.py`、`hicache_state_matrix_validation.py`、
+  `hicache_state_provenance.py` 和 `hicache_transition_exactness.py`。
 - 不保留临时 residual/report spike、front-door workload 对照、async elision、timeline oracle replay alignment 或任何会生成
   synthetic `model_input=true` 事件的 HiCache internal 脚本。
 

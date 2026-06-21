@@ -2,6 +2,27 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-22 02:21:06 +0800
+
+- 完成 HiCache 文档收敛：
+  - `docs/modeling_development.md` 合并 active state model 数据结构、canonical radix / storage directory / ref ledger /
+    capacity index / async operation table / target control clock 等当前 C++ 结构，并补齐 state -> intent -> DAG patch -> E2E
+    的长期路线；
+  - `docs/profiling_development.md` 合并 HiCache profiling 输入层级 P0-P5，明确 state 输入、物理执行证据和 target
+    E2E oracle label 的边界；
+  - `docs/validation/hicache_state_validation.md` 提升到当前 5 config x 3 manual input 矩阵口径：final state self
+    `15/15`、cross `75/75`，transition exactness T1/T2 `25/75`；
+  - `docs/validation/hicache_state_model_limitations.md` 继续作为长期限制文档，补入 host/storage 异步控制边界近似；
+  - `docs/project_constraints.md` 对齐新的长期文档集合和 active HiCache internal validation scripts。
+- 删除已迁移的临时/短期文档：
+  - `docs/hicache_5x4_state_transition_alignment_plan_draft.md`
+  - `docs/hicache_e2e_prediction_iteration_plan_draft.md`
+  - `docs/hicache_state_data_structure_design_draft.md`
+  - `docs/hicache_transition_exactness_iteration_plan_draft.md`
+  - `docs/tmp_hicache_l2_host_storage_final_state_diagnosis.md`
+  - `docs/validation/hicache_allocator_lifecycle_short_term_plan.md`
+- 本轮只整理文档，未运行 modeling/profile 实验。
+
 ## 2026-06-13 18:04:12 +0800
 
 - 提交前复跑非 fixture 验证，未使用 `tests/`：

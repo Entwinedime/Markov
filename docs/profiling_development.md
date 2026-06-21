@@ -129,8 +129,25 @@ sitecustomize.py
 | `TRACE_SIM_PYTHON_PROBES` | probe 插件列表；HiCache state 使用 `sglang.hicache` |
 | `TRACE_SIM_PYTHON_PROBE_TARGETS` | target JSON 数组 |
 | `TRACE_SIM_PYTHON_PROBE_OUTPUT` | Chrome trace 输出目录 |
+| `TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY` | streaming writer 每多少条 event flush 一次，默认 256 |
+| `TRACE_SIM_HICACHE_PROBE_MODE` | HiCache probe 模式：`auto`、`invariant`、`attribution`、`debug` |
+| `TRACE_SIM_HICACHE_INTERNAL_HOOKS` | 显式开关 HiCache internal source/timing hooks |
 | `TRACE_SIM_PYTHON_PROBE_DEBUG=1` | probe debug 日志 |
 | `TRACE_SIM_HICACHE_STATE_TRACE=1` | 允许 `sglang.hicache` 采集 validation-only state snapshot |
+
+`profiling.python_probe.mode` 会由 runner 写入 `TRACE_SIM_HICACHE_PROBE_MODE`：
+
+| mode | 行为 |
+| --- | --- |
+| `invariant` / `state_only` | 只注入 `invariant_state` targets，不安装 HiCache internal source/timing hooks；这是最终 normal state / intent 主线的低扰动选择。 |
+| `attribution` / `physical` | 保留 source/timing evidence，并安装 HiCache internal hooks，用于 source physical op 归因。 |
+| `debug` / `full` | 打开完整 evidence/debug hooks，用于当前未对齐阶段的 alignment、排查和专项审计。 |
+| `auto` | 根据 target fact class 自动判断；存在非 `invariant_state` target 时安装 internal hooks。 |
+
+Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐 JSON 结尾。当前尚未对齐的 HiCache alignment suite 可以使用 full/debug mode 保留证据；进入低扰动 normal state 或 E2E oracle 采集时应切回 invariant/attribution 的最小必要输入，避免 probe 自身开销污染时延标签。
+
+单个 target 默认只发 `end` phase；需要 start/exception envelope 时必须在 target 上显式写
+`"phases": ["start", "end", "exception"]` 或等价的 `emit_phases`。HiCache state 主线不需要 start phase。
 
 通用 callable source 由 `generic_callable` 提供；HiCache 特化 source 只存在于
 `sglang_hicache_callable.py`：
@@ -213,7 +230,7 @@ source evidence 可以与 invariant target 采自同一个 Python callable，但
 | lifecycle path/runtime | `source_actual` | 只作为 provenance，不混入 lifecycle anchor |
 | insert / capacity / lock / maintenance / storage/controller event | `source_actual` 或 `timing_observation` | 只能用于质量审计、oracle/debug 或后续 target-derived 机制设计 |
 
-`sglang.hicache` probe 可以自动 patch SGLang 内部方法并输出 `source_actual` 事件，例如 radix split/delete、
+`sglang.hicache` probe 在 `attribution` / `debug` / `full` 模式下可以 patch SGLang 内部方法并输出 `source_actual` 事件，例如 radix split/delete、
 device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、
 write/load ack checkpoint、storage control checkpoint、controller prefetch enqueue、rate-limit、storage hit query、
 prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件默认不是 normal state input。
@@ -229,6 +246,25 @@ prefetch terminate、abort cleanup 和 host memory release enqueue。这些事�
 validation-only state snapshot 由 `profiling.python_probe.state_trace.enabled=true` 打开。它写成
 `fact_class=oracle_state`、`model_input=false`，只能给 `profile_quality.py` 和 modeling 容器内 `model_runner.py` 的
 validation 路径使用。
+
+## HiCache Profiling 输入层级
+
+HiCache 从 state alignment 推进到 DAG patch / E2E prediction 时，不同阶段需要的 profiling 强度不同。配置和文档必须显式区分
+state 输入、物理执行证据和验证标签。
+
+| 层级 | Profiling 种类 | 高层含义 | 主要用途 |
+| --- | --- | --- | --- |
+| P0 | 不新增 profiling，只使用 schema / 文档 / 已有样本 | 统一概念和输出结构 | 设计边界、summary 结构、字段契约。 |
+| P1 | Python probe invariant-only | target-independent semantic anchors 和 token dictionary/span | target state、transition、target intent。 |
+| P2 | Python probe invariant + oracle snapshot | P1 加 validation label，不进入模型输入 | final state validation。 |
+| P3 | source physical profiling | torch / LD_PRELOAD / physical timing evidence，加 invariant anchors 做对齐 | source DAG 中 cache-owned node / edge 归因。 |
+| P4 | full faithful profiling | P1 + P3；必要时保留显式标记的 timing/source evidence | cache-neutral DAG、DAG patch、duration calibration、self reconstruction。 |
+| P5 | target E2E oracle profiling | 对真实 target config 跑 P4 级 profiling | cross-config E2E prediction 验收标签。 |
+
+当前 HiCache state / transition alignment 仍可使用 full Python probe，因为还需要 `source_actual`、`timing_observation` 和
+`oracle_state` 做排查、transition oracle 抽取和验证标签。进入 normal state / target intent 主线时，应优先退回 P1/P2，
+避免 full probe 自身开销污染 E2E 标签。进入 DAG patch / faithful replay 时，必须补 P3/P4；只有 Python probe 的 state-only
+trace 不能作为完整性能 DAG 证据。
 
 ## Token / Range 主事实
 

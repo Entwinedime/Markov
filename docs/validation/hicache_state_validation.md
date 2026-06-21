@@ -1,17 +1,24 @@
 # HiCache State Validation
 
-维护方式：本文是 HiCache state validation 的唯一 active 文档，直接维护当前有效口径、最新结果、仍未证明的风险和复现入口。历史实验只保留能解释当前边界的压缩结论；不再维护单独的缺陷清单文件。
+维护方式：本文是 HiCache state validation 的 active 文档，直接维护当前有效口径、最新结果、仍未证明的风险和复现入口。历史实验只保留能解释当前边界的压缩结论；不再维护单独的短期计划或临时诊断文档。
 
 ## 目标
 
-本阶段只验证一个问题：
+本阶段验证的问题是：
 
 ```text
 base profiling invariant facts + explicit target cache config
   -> C++ HiCache state model
-  -> predicted target cache state
-  -> compare with oracle state snapshot
+  -> predicted target cache state / transition trace
+  -> compare with target oracle evidence
 ```
+
+它分成两个层级：
+
+| 层级 | 目标 | 当前地位 |
+| --- | --- | --- |
+| final state alignment | L1/L2/L3/dirty/backuped/evicted/locked 等最终集合对齐 | hard gate。 |
+| transition exactness | 中间状态变化、operation lifecycle、policy/ref/capacity 账本可与 target run 证据分层比较 | diagnostic / next gate。 |
 
 它不是 DAG patch 验收，也不是 E2E 性能预测验收。`prediction.json.predicted_e2e_ns` 只能作为 runner / DAG sanity check，不能证明 HiCache state 正确。
 
@@ -32,12 +39,12 @@ HiCache state prediction 必须同时满足：
 
 ## 当前输入契约
 
-截至 2026-06-13，HiCache state 主线使用 target-level atomic fact contract。
+HiCache state 主线使用 target-level atomic fact contract。
 
 - C++ backend 只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`，且 role 属于已知 atomic invariant。
-- 当前 33-target suite 的正常 state model input 是 7 个 target / 5 个 role：
+- 当前正常 state model input 是 5 个 role：
   `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、`prefetch_decision`、`prefetch_check_point`。
-- `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不更新 target state；它们只用于 token dictionary 水合、provenance、质量检查和审计。
+- `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不更新 target state；它们只用于 token dictionary 水合、provenance、质量检查、target oracle 抽取和审计。
 - 旧 mixed/source-control role 不再是 normal input：`request_tokens`、`lookup_path`、`request_cache_lifecycle`、`insert_path`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 都不能进入 normal mutation path。
 - source matched result、source admission return、actual victim、actual movement、actual async completion、node remove result、storage hit result、host ref delta 等 source 已发生结果不得作为 `invariant_state` 字段混入。
 - raw `request_id` 只是单次运行内 correlation id；cross audit 必须使用 request-normalized canonical fact，不把 raw id 当跨配置 invariant。
@@ -45,173 +52,149 @@ HiCache state prediction 必须同时满足：
 
 ## 当前模型边界
 
-C++ state model 当前已经拆成三条状态线：
+当前 active C++ state model 已完成的 target-derived 机制：
 
-- `DeviceCacheState`：device radix、L1、request device lock/ref、active admission reservation。
-- `HostCacheState`：host radix、host ref/protection、storage-known、ready-but-not-visible、host-visible。
-- `AsyncState`：prefetch work 的 pending / ready / applied / suppressed / late lifecycle，并区分 `requested_host_pages` 和 `reserved_host_pages`。
+| 机制 | 当前语义 |
+| --- | --- |
+| token/path | `HiCacheTokenPathStore` 收集 dictionary/span，`HiCacheTargetPager` 按 target page size 生成完整 page hash。 |
+| canonical radix | 每个 `cache_scope` 一棵 canonical token/page radix tree；device/host/storage/ref 是 node state，不再维护 device tree 与 host tree 两套事实源。 |
+| device allocator | `request_admission` 构造 `ExtendAllocationIntent`；eviction gate 使用 `DeviceAllocatorLedger.available_pages()`，不从 radix occupancy 反推。 |
+| request lifecycle | finished / unfinished 在 handler 内恢复 committed token path，插入 radix，并释放 duplicate / tail / overallocated KV 到 allocator ledger。 |
+| capacity index | `HiCacheCapacityIndex` mutation-driven 维护 device/host leaf、occupied pages、reserved host pages、victim choice 和 audit trace。 |
+| ref ledger | request / writeback / loadback / storage / prefetch owner 级 acquire/release，输出 ref mutation 和 tree ref audit。 |
+| storage directory | 区分 materialized page record 与 backend-readable hash record；prefetch storage hit query 只保留连续 readable prefix。 |
+| prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离。 |
+| host cleanup | host allocation 失败按 SGLang request budget cleanup；victim 是 host-visible、evicted、无 ref 保护且无 backuped child 的 host radix leaf。 |
+| write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK 时序当前按同步或 target control boundary 近似。 |
 
-当前已实现的 target-derived 机制：
-
-- Request/admission：
-  - `request_bound_match_anchor` 做 target lookup / touch / loadback；
-  - `request_admission` 根据 target radix match 派生 active device lock/ref 和 admission pressure；
-  - `request_lifecycle_anchor` 在 unfinished / finished 上 insert、迁移或释放 active request lock/ref。
-- Device capacity：
-  - capacity pressure 来自 target config、target page size、request state 和 active reservation；
-  - victim 由 modeled radix leaf group、LRU/touch order 和 active lock/ref eligibility 推导；
-  - 不消费 source `capacity_request`、source victim 或 source evicted token count。
-- Host/device/async：
-  - L2/backuped/host-visible mutation 只能通过 `add_host_visible_page()` / `remove_host_visible_page()`；
-  - `add_resident()` / `remove_resident()` 不再对 L2 隐式写 host topology、backuped 或 host-visible；
-  - request lookup 分别维护 device radix match、host radix match 和 target-visible prefix，避免把 device resident、host-visible、storage-known 混成一个 `matched_pages`。
-- SGLang-derived host release / cleanup：
-  - host prefetch allocation 失败时按本次 page-aligned prefetch request 调用 host eviction，对齐 SGLang `evict_host(prefetch_length)`；
-  - cleanup budget 不按最终 L2 count、deficit 或 fallback reserved count 反推；
-  - storage prefetch threshold / capacity limit 来自显式 target config；未配置时分别按 SGLang
-    `max(prefetch_threshold=256, page_size)` tokens 和 `floor(0.8 * (host_pool_pages - device_pool_pages))` 源码公式投影；
-  - rate-limit 判断保持 SGLang `prefetch_tokens_occupied >= prefetch_capacity_limit` 语义，capacity limit 为 0 时不被当作无限制；
-  - `prefetch_decision` 中 `planned_pages` 表示 page-aligned prefetch key，`pages` 表示 storage hit query 后保留的连续命中前缀；
-  - prefetch anchor 在 work 生命周期内纳入 modeled host ref/protection，terminate、revoke、late 或 finalize 时释放；
-  - host victim 必须是 host radix leaf、host-visible、`evicted`、无 host ref / lock protection，且不能有 backuped child；
-  - alloc 第二次仍不足时按 host pool available pages 降级，低于 prefetch threshold 则放弃；
-  - `prefetch_check_point` 对齐 SGLang `check_prefetch_progress()` 生命周期边界：wait_complete 完成后 apply ready pages，
-    best_effort 在 checkpoint terminate，timeout 在 completed/timeout 后 terminate 或 late；未 ready / revoked work suppress，
-    未发出 work 不产生 prefetch state，并释放 reservation 与 anchor protection。
-- Write-back：
-  - 不再保留错误的 page-level `ensure_host_pages_for_write()` 前置释放路径；
-  - write-back 当前把 ACK 时序折叠为同步 enqueue/complete，只建模 dirty clear、host-visible 和 storage-readable 结果，不把 source writeback ack 当 normal state input。
+当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、transition exactness 和异步 ACK / host release 的近似边界。
 
 ## 当前有效结果
 
-### HCSV-20260613-host-release-policy-final3
+### HCSV-20260618-5x3-matrix-after-reconstruction
 
-这是当前 active 结论。它基于同一组 33-target atomic S1A/S1B profile：
+这是当前 active final-state 结论。验证基于 5 个 HiCache config、3 个 manual input 的 full Python probe matrix；bench-generated input 已清理，不作为当前结果口径。
+
+当前结果目录：
 
 ```text
-data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix
+data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe/modeling/hicache_state_matrix_validation_after_reconstruction
 ```
 
-输入与质量：
+参与的 target configs：
 
-| 项 | S1A | S1B |
-| --- | --- | --- |
-| run | `01_s1a_manual` | `03_s1b_manual` |
-| suite status | `failures=[]` | `failures=[]` |
-| profiling ready | true | true |
-| Python probe traces | 2 | 2 |
-| Python probe events | 13146 | 12924 |
-| completed normal model-input facts | 350 | 350 |
-| cross audit `model_input_contract_ready` | true | true |
-
-四向 prediction 输出：
-
-| prediction | output |
+| config | 主要覆盖 |
 | --- | --- |
-| S1A self | `01_s1a_manual/modeling/host_release_policy_final3_s1a_self` |
-| S1B self | `03_s1b_manual/modeling/host_release_policy_final3_s1b_self` |
-| S1A -> S1B | `01_s1a_manual/modeling/host_release_policy_final3_s1a_to_s1b` |
-| S1B -> S1A | `03_s1b_manual/modeling/host_release_policy_final3_s1b_to_s1a` |
+| `c0_wt_timeout_p128_balanced` | write-through + timeout prefetch + page size 128 + balanced capacity。 |
+| `c1_wts_wait_p128_low_l1` | write-through-selective + wait-complete prefetch + low L1。 |
+| `c2_wb_best_effort_p64_low_l1` | write-back + best-effort prefetch + page size 64 + low L1。 |
+| `c3_wt_best_effort_p32_low_host` | write-through + best-effort prefetch + page size 32 + low host。 |
+| `c4_wb_timeout_p64_low_capacity` | write-back + timeout prefetch + page size 64 + low overall capacity。 |
 
-硬门槛结果：
+参与的 manual inputs：
 
-| prediction | validation | invariant coverage | missing invariant facts | non-invariant usage | final |
-| --- | --- | --- | --- | --- | --- |
-| S1A self | ready, errors `[]` | true | none | `[]` | pass |
-| S1B self | ready, errors `[]` | true | none | `[]` | pass |
-| S1A -> S1B | ready, errors `[]` | true | none | `[]` | pass |
-| S1B -> S1A | ready, errors `[]` | true | none | `[]` | pass |
+| input | 主要覆盖 |
+| --- | --- |
+| `manual_phased_fast` | 基础 seed/reuse/pressure/prefetch phase。 |
+| `manual_pressure_prefetch` | 更强 capacity pressure 与 prefetch 交错。 |
+| `manual_deeper_pressure_prefetch` | 更深 host/storage/prefetch pressure。 |
 
-normalized final active sets：
+final-state matrix：
 
-| target | source profile | L1 | dirty | L2 | backuped | evicted | locked | 结论 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| S1A | S1A | `25/25` | `0/0` | `67/67` | `67/67` | `42/42` | `0/0` | final match |
-| S1A | S1B | `25/25` | `0/0` | `67/67` | `67/67` | `42/42` | `0/0` | final match |
-| S1B | S1B | `28/28` | `28/28` | `55/55` | `55/55` | `55/55` | `0/0` | final match |
-| S1B | S1A | `28/28` | `28/28` | `55/55` | `55/55` | `55/55` | `0/0` | final match |
+| 项 | 结果 |
+| --- | ---: |
+| self prediction | `15 / 15` pass |
+| cross prediction，含 self 对角线 | `75 / 75` pass |
+| validation ready | `75 / 75` ready |
+| final-state pass rate | `1.0` |
 
-补充状态：
+按 input：
 
-- target=S1A model final 还包含 `l3_resident_pages=74`、`prefetch_planned_pages=74`、`prefetch_ready_pages=0`、`prefetch_suppressed_pages=74`。
-- target=S1B model final 还包含 `l3_resident_pages=13`、`prefetch_planned_pages=150`、`prefetch_ready_pages=13`、`prefetch_suppressed_pages=137`。
-- 当前 validation 的 unchecked model state keys 仍包括 `l3_resident_pages`、`prefetch_planned_pages`、`prefetch_ready_pages`、`prefetch_suppressed_pages`；这些不是本轮 active final-state oracle 的通过条件。
+| input | self | cross |
+| --- | ---: | ---: |
+| `manual_phased_fast` | `5 / 5` | `25 / 25` |
+| `manual_pressure_prefetch` | `5 / 5` | `25 / 25` |
+| `manual_deeper_pressure_prefetch` | `5 / 5` | `25 / 25` |
+
+按 input × target config 的 cross final-state 结果全部为 `5 / 5`：
+
+| input | c0 | c1 | c2 | c3 | c4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `manual_phased_fast` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
+| `manual_pressure_prefetch` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
+| `manual_deeper_pressure_prefetch` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
 
 结论：
 
-- 当前 S1A/S1B self-config 和 cross-config 的 active final state 已闭环。
-- S1B 之前的 L2/backuped/evicted `70/55` residual 已关闭；最终收敛为 `55/55`。
-- 该闭环不依赖 source_actual、timing_observation、oracle result 或 node remove/source completion shortcut。
-- 不再把 `HCSM-D11`、`70/55` 或 `56/55` 作为当前 active defect；这些仅保留为历史阶段结果。
+- 当前 5x3 manual matrix 的 active final state 已闭环。
+- 该闭环不依赖 `source_actual`、`timing_observation`、`oracle_state` 或 target run result 回写。
+- bench-generated input 不在当前结果口径中；恢复 bench 前必须先证明 workload 输入跨配置稳定。
+- final-state pass 不表示 transition exactness、operation intent 或 DAG patch 已通过。
 
-## S1B Host Residual 审计结论
+### Transition Exactness 当前结果
 
-修复前的 S1B host residual 审计回答了两个问题：
+transition exactness 使用同一 matrix 目录生成：
 
-- missing 13：全部是 best-effort prefetch ready-but-not-visible 候选，不能单独用 ready->L2 特化规则处理。
-- extra 28：主要是缺 host release / cleanup；若只把 ready pages apply 到 L2，会在已有 `70/55` 基础上继续增加 host-visible pages。
+```text
+transition_exactness_cross_matrix.json
+```
 
-当前实现将两者放到同一个 target-derived transaction：
+当前结果：
 
-1. best-effort `prefetch_check_point` 判断 ready work；
-2. ready work 通过 `HostVisibilityApply` 插入 host radix、写 L2/backuped/L3，并保持 `evicted`；
-3. checkpoint 释放 prefetch reservation；
-4. host capacity / alloc-fail cleanup 按 SGLang `evict_host(prefetch_length)` 预算清理 host-visible evicted leaf；
-5. write-back cleanup 不在 page-level 前置路径中提前释放。
+| 层级 | 结果 |
+| --- | ---: |
+| prediction count | `75` |
+| oracle / model self-check ready | `75 / 75` |
+| T0 final-state exact | `75 / 75` |
+| T1 transition-count exact | `25 / 75` |
+| T2 page-lifecycle multiset exact | `25 / 75` |
 
-这就是 S1B 从 host-device-boundary 阶段 `70/55` 收敛到 final3 `55/55` 的机制边界。
+失败分类：
 
-## 当前剩余风险
+| classification | count |
+| --- | ---: |
+| `matched` | `25` |
+| `transition_semantic_or_snapshot_observability_mismatch` | `50` |
 
-当前 final-state pass 不等于完整 SGLang HiCache 仿真。仍未证明或仍为近似的部分如下：
+按 target config：
 
-| 风险 | 当前状态 | 影响 |
-| --- | --- | --- |
-| Async prefetch exact progress | storage hit / revoke / anchor protection 已按 target-derived state 建模，但 transfer completion 仍不消费 source `completed_tokens` / completion pages | 多个 overlapping prefetch、partial completion 或复杂 terminate 条件下，`prefetch_ready/suppressed` 与中间 L2 时序可能不精确。 |
-| Host ref / protection node lifetime | prefetch anchor 已纳入 page-level host ref/protection，但仍不是 SGLang `TreeNode.host_ref_counter` 的节点级完整等价 | ongoing prefetch / backup / loadback 交错时，host eviction eligibility 可能偏。 |
-| Host victim ordering | host cleanup candidate 已对齐，但 priority heap、node last access、parent promotion tie-break 仍是投影 | 更复杂 radix split/delete 或同优先级 victim 下，victim identity 仍需逐 trace 证明。 |
-| Write-back batch state machine | 已折叠为同步 completion 语义，并与 `write_through` / `write_through_selective` 共享同一组 host backup / eviction helper | 仍不追踪真实 ack 异步时序；write-back 与 prefetch、host release、device eviction 交错时的 transition exactness 仍需后续 targeted validation。 |
-| Transition exact oracle | 当前主要证明 final normalized active sets，不证明每一步 transition 与 oracle 同序同因 | 后续做 DAG patch 或性能归因前，需要 transition provenance / exact oracle。 |
-| Scope-normalized comparison | validation 默认看 `strip_scope` page hash union，C++ 内部按 `cache_scope` 隔离 | 多 scope 同 hash 或 scope-local victim 问题可能被 normalized final 掩盖。 |
-| State-to-DAG patch | `HiCacheModule` 仍是 state-only，`dag_mutations=0` 是预期 | state 通过后仍需要单独设计 cache state -> DAG mutation。 |
+| target config | exact | T0 | T1 | T2 |
+| --- | ---: | ---: | ---: | ---: |
+| `c0_wt_timeout_p128_balanced` | `10 / 15` | `15 / 15` | `10 / 15` | `10 / 15` |
+| `c1_wts_wait_p128_low_l1` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
+| `c2_wb_best_effort_p64_low_l1` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
+| `c3_wt_best_effort_p32_low_host` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
+| `c4_wb_timeout_p64_low_capacity` | `15 / 15` | `15 / 15` | `15 / 15` | `15 / 15` |
 
-## 历史阶段摘要
+按 input：
 
-这些结果只用于解释当前设计，不作为 active 失败结论。
+| input | exact | T0 | T1 | T2 |
+| --- | ---: | ---: | ---: | ---: |
+| `manual_phased_fast` | `10 / 25` | `25 / 25` | `10 / 25` | `10 / 25` |
+| `manual_pressure_prefetch` | `10 / 25` | `25 / 25` | `10 / 25` | `10 / 25` |
+| `manual_deeper_pressure_prefetch` | `5 / 25` | `25 / 25` | `5 / 25` | `5 / 25` |
 
-### HCSV-20260612-atomic-input-contract
+解释：
 
-- 33-target atomic profile 完成，S1A/S1B normal model input 都是 350 个 completed atomic invariant facts。
-- 双向 cross audit `model_input_contract_ready=true`，blocking roles 为空。
-- 旧 mixed roles 被拆掉：`request_tokens`、`lookup_path`、`request_cache_lifecycle` 不再是 normal role。
-- source/control-flow 事实降级为 evidence：`insert_path`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等不更新 target state。
+- T0 已经是 final-state hard pass。
+- T1/T2 的 50 个 mismatch 不是 final-state failure，而是 transition 语义或 snapshot 可观测性层面的差异。
+- `locked_pages` 仍参与 T0 final-state 检查，但暂不参与 T1/T2 transient exactness；真实 lock/ref inc/dec 来自 `source_actual` evidence，按约束不能作为 state model input。
+- `operation-intent` 当前只是 DAG patch 前的 scaffold，不能直接作为 patch 输入。
 
-### HCSV-20260612-backend-atomic-refactor
+## 验证脚本职责
 
-- C++ backend 改为 router enum dispatch，删除 legacy handlers：`apply_maintenance_checkpoint`、`apply_capacity_request`、`apply_lock_scope_delta`。
-- 四向 prediction 都达到 `invariant_coverage_ready=true`、`missing_invariant_facts=[]`、`non_invariant_fact_usage=[]`。
-- 当时 final 尚未通过：S1A target 主要是 L1 extra / evicted missing；S1B target 是 L2/backuped/evicted `70/55`。
-- 该阶段证明问题不在输入没有进入 C++，而在 target-derived resource / host lifecycle mechanism 尚未实现。
+当前 active HiCache validation scripts：
 
-### HCSV-20260612-target-resource-mechanism
+| 脚本 | 职责 |
+| --- | --- |
+| `scripts/internal/hicache_state_cross_input_audit.py` | 跨配置 normal atomic invariant input contract 审计。 |
+| `scripts/internal/hicache_state_matrix.py` | matrix profile discovery、target config 推导、quality/self/cross 共用编排逻辑。 |
+| `scripts/internal/hicache_state_matrix_validation.py` | 执行 final-state quality / self / cross matrix validation；S1A/B 一对一是矩阵特例。 |
+| `scripts/internal/hicache_state_provenance.py` | 基于 validation / predicted trace / oracle snapshot 的 mismatch 页面证据汇总，不回写模型。 |
+| `scripts/internal/hicache_transition_exactness.py` | 只读 transition exactness 链路：model self-check、target oracle extraction、self/cross compare、operation intent scaffold。 |
 
-- 实现 request-derived device lock/ref、admission reservation、target L1 capacity pressure 和 dynamic device radix leaf victim。
-- S1A self/cross 收敛到 final match：L1 `25/25`、L2/backuped `67/67`、evicted `42/42`。
-- S1B target 从 `70/55` 收敛到 `56/55`，剩余集中在 host/L2。
-- 该阶段关闭了 device-side resource mechanism 的主要缺口，但没有闭合 host/prefetch/storage visibility。
-
-### HCSV-20260613-host-device-boundary-refactor
-
-- 拆出 `DeviceCacheState`、`HostCacheState`、`AsyncState`；
-- 删除 L2 mutation 的隐式 side effect；
-- best-effort ready 保留为 ready-but-not-visible，避免 premature ready->L2 污染 device pressure。
-- 当时 S1B target 仍为 `70/55`，这是故意暴露 host release / cleanup 缺口的中间态，不是当前最终结果。
-
-### HCSV-20260611 / HCSV-20260610 retained audits
-
-- 31-target / 12-target 旧结果只作为历史诊断，不代表当前 33-target atomic 输入契约。
-- 这些 audit 证明过 source `capacity_request`、`lock_scope_delta`、`maintenance_checkpoint`、`request_cache_lifecycle` 不是 cross-safe normal input。
-- 旧 async-elision injection 只用于定位 async/input-boundary，不是 normal prediction 的可消费输入。
+这些脚本都不能生成 synthetic `model_input=true` 事件，不能修改 profiling trace，也不能把 `source_actual` / `timing_observation` /
+`oracle_state` 写回 target state。
 
 ## 复现命令
 
@@ -221,80 +204,136 @@ normalized final active sets：
 scripts/run.sh modeling -- bash -lc \
   'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
 scripts/run.sh modeling -- bash -lc \
-  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_provenance.py'
+  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_matrix.py scripts/internal/hicache_state_matrix_validation.py scripts/internal/hicache_state_provenance.py scripts/internal/hicache_transition_exactness.py'
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
 
-S1A self：
+跑 3 个 manual input 下的 5x5 final-state matrix：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
-  --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/profile_manifest.json \
-  --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final3_s1a_self \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+python3 scripts/internal/hicache_state_matrix_validation.py \
+  --profile-run-dir data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe \
+  --output-dir data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe/modeling/hicache_state_matrix_validation_after_reconstruction \
+  --stages quality,self,cross \
+  --input manual_phased_fast \
+  --input manual_pressure_prefetch \
+  --input manual_deeper_pressure_prefetch
 ```
 
-S1B self：
+只跑某个 targeted 格子：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json \
-  --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/profile_manifest.json \
-  --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final3_s1b_self \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+python3 scripts/internal/hicache_state_matrix_validation.py \
+  --profile-run-dir <profile_run_dir> \
+  --output-dir <profile_run_dir>/modeling/<targeted_output_dir> \
+  --stages self \
+  --input <input_id> \
+  --source-config <config_id> \
+  --target-config <config_id> \
+  --force \
+  --max-predictions 1
 ```
 
-S1A -> S1B：
+Transition exactness：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1b.json \
-  --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/profile_manifest.json \
-  --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/trace/python_probe/python_probe_trace.rankunknown.pid2488.json \
-  --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/trace/python_probe/python_probe_trace.rankunknown.pid2489.json \
-  --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/modeling/host_release_policy_final3_s1a_to_s1b \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+python3 scripts/internal/hicache_transition_exactness.py \
+  --mode model-self-check \
+  --prediction-dir <prediction_dir>
+
+python3 scripts/internal/hicache_transition_exactness.py \
+  --mode extract-target-oracle \
+  --target-manifest <target_profile_manifest.json> \
+  --output <matrix_dir>/observed_target_transitions/<input_id>/<config_id>.observed_target_transition_trace.json
+
+python3 scripts/internal/hicache_transition_exactness.py \
+  --mode compare-self \
+  --prediction-dir <prediction_dir> \
+  --observed-target-trace <observed_target_transition_trace.json>
+
+python3 scripts/internal/hicache_transition_exactness.py \
+  --mode compare-cross-matrix \
+  --matrix-dir <hicache_state_matrix_validation_dir>
 ```
 
-S1B -> S1A：
+矩阵模式默认复用已生成的 target oracle；`--force` 会重建 full Python probe oracle，耗时明显更高，仅在脚本或 oracle 抽取逻辑变化后使用。
+
+结果摘要读取：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
-  --profile-manifest data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/profile_manifest.json \
-  --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/trace/python_probe/python_probe_trace.rankunknown.pid417.json \
-  --hicache-oracle-trace data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/01_s1a_manual/trace/python_probe/python_probe_trace.rankunknown.pid418.json \
-  --output-dir data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix/03_s1b_manual/modeling/host_release_policy_final3_s1b_to_s1a \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+jq '{prediction_count,
+     validation_ready_count,
+     final_state_match_count,
+     final_state_pass_rate,
+     by_input}' \
+  <matrix_dir>/final_state_cross_5x4.json
+
+jq '{prediction_count,
+     ready_count,
+     exact_count,
+     t0_final_state_exact_count,
+     t1_transition_count_exact_count,
+     t2_page_lifecycle_multiset_exact_count,
+     failure_classification_counts,
+     by_input,
+     by_target_config}' \
+  <matrix_dir>/transition_exactness_cross_matrix.json
 ```
 
-结果摘要：
+`final_state_self_5x4.json` 和 `final_state_cross_5x4.json` 是脚本沿用的历史文件名；当前 active 结果口径以文件内
+`prediction_count`、`by_input` 和本文记录为准。
 
-```bash
-jq '{validation_ready,
-     validation_errors,
-     final_state_match: .hicache_state.final_state_match,
-     counts: .hicache_state.normalized_model_final_state_counts,
-     oracle: .hicache_state.normalized_oracle_final_state_counts,
-     diff: .hicache_state.sets_diff_by_tier}' \
-  <output_dir>/validation.json
-```
+## 已关闭机制缺口
+
+这些结论来自已迁移的临时诊断文档，不再作为单独文档维护。
+
+### Allocator / Lifecycle
+
+- device eviction gate 不再使用 `occupied_device_pages + reservation_pages > capacity` 这类 radix occupancy 反推；
+- gate 对齐 SGLang `allocator.available_size() < requested_tokens`，其中 available 来自 allocator ledger；
+- eviction budget 使用完整 allocation request，而不是只清理 deficit；
+- request lifecycle 在 finished / unfinished 时释放 duplicate、tail 和 overallocated KV；
+- `request_bound_match_anchor` 的 loadback allocation 当前只做 opportunistic promotion；需要 eviction 的 loadback 等待新的 loadback intent。
+
+该机制关闭了早期 c2 self prediction 的 L1 mismatch。batch-level allocator 仍以 `batch_size=1` 为短期合同，详见限制文档。
+
+### L2 / Host / Storage
+
+- `backuped` 只表示 host copy，不把 storage-readable 直接当成 backuped；
+- host cleanup 删除 host leaf subtree，并更新 parent/child topology 与 capacity index；
+- timeout prefetch 不再因为 storage directory hit 就直接落 host，必须等 target policy 的 completed/apply 边界；
+- target host/device capacity 从 SGLang server command 推导，包括 host pool page 对齐和 prefetch capacity limit；
+- prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 deferred release 近似；
+- write-through backup ACK 前持有普通 lock ref，并在下一条 target control fact 近似 drain。
+
+这些机制共同关闭了 15 个 manual self prediction 中的 L2/backuped/evicted/locked final-state mismatch，并在当前 75 个 prediction 中保持 final-state pass。
+
+## 历史阶段摘要
+
+### HCSV-20260613-host-release-policy-final3
+
+- S1A/S1B 33-target atomic profile 四向 prediction 全部 final-state pass；
+- S1B 早期 L2/backuped/evicted `70/55` residual 已通过 target-derived host release / cleanup policy 关闭；
+- 该阶段证明 host release budget 必须来自 SGLang allocation request，而不是超容量拟合预算。
+
+### HCSV-20260612-atomic-input-contract
+
+- 旧 mixed roles 被拆掉：`request_tokens`、`lookup_path`、`request_cache_lifecycle` 不再是 normal role；
+- source/control-flow 事实降级为 evidence：`insert_path`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等不更新 target state；
+- 双向 cross audit 证明 atomic invariant contract 可以作为 state model 输入边界。
+
+### HCSV-20260612-target-resource-mechanism
+
+- request-derived device lock/ref、admission reservation、target L1 capacity pressure 和 dynamic device radix leaf victim 初步闭合；
+- S1A target self/cross 已 final-state pass；
+- S1B 剩余差异集中在 host/L2/storage/prefetch visibility，推动后续 host/device/async 边界重构。
 
 ## 下一步
 
-当前不需要继续围绕 S1B final count 打补丁。后续优先级：
+当前不再围绕 final-state count 做局部补丁。后续优先级：
 
-1. 做 transition-level / provenance audit，确认 final-state pass 下的中间时序误差范围。
-2. 若要进入 DAG patch，先定义 cache state -> DAG mutation 的可验证接口和最小验收场景。
-3. 对 async prefetch exactness、host node ref lifetime、write-back batch 时序分别设计 targeted validation；只有现有 target-derived 机制无法表达时，才讨论新增 target-independent atomic metadata。
-4. 保持 source_actual / timing_observation / oracle 只做 evidence，不回到 normal state mutation。
+1. 针对 50 个 T1/T2 transition mismatch 做 family-level 逐 trace 诊断，优先 `c1` dirty oscillation、`c2` write-back/eviction 交错、`c3` low-host cleanup 和 deeper prefetch evicted marker。
+2. 把 raw transition 聚合成 stable `CacheIntentLog`，作为 DAG patch 的输入层，而不是直接把 page-level transition 转成 graph mutation。
+3. 为 loadback intent、batch-level allocation intent、maintenance/ACK boundary 设计 target-independent invariant；只有现有 target-derived 机制无法表达时才新增 profiling target。
+4. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。

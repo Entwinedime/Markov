@@ -172,17 +172,20 @@ scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace
 
 ## HiCache State Backend
 
-HiCache backend 以 token radix tree 为事实中心，page set 只是 target page projection：
+HiCache backend 当前是 state-only `SimulationModule`：它消费 invariant facts 和显式 target config，维护 target cache state，
+输出 final state、transition trace、policy decision trace 和 validation summary；它暂不修改 DAG。
+
+主链路：
 
 ```text
-HiCacheFactParser
+HiCacheFact
   -> HiCacheFactRouter
-  -> TokenPathStore
-  -> TargetPager
-  -> TokenRadixTree
-  -> RequestState / DeviceCacheState / HostCacheState / AsyncState
-  -> PolicyEngine
-  -> StateTransitionLog / Summary / Validation
+  -> HiCacheTokenPathStore
+  -> HiCacheTargetPager
+  -> scoped canonical HiCacheTokenRadixTree
+  -> StorageDirectory / RefLedger / CapacityIndex / AsyncOperationTable / TargetControlClock
+  -> HiCachePolicy
+  -> DerivedStateView / transition summary / validation
 ```
 
 ### 输入边界
@@ -197,26 +200,24 @@ consume fact iff model_input == true
 ```
 
 其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。`source_actual`、`timing_observation`、
-`oracle_state` 和 debug/provenance 字段不能更新 target state。C++ reader 会保留 `source_actual` / `timing_observation`
-事件，使 fact parser 能读取 token dictionary 和 provenance；router 仍只把 atomic invariant role 分发给 state mutation。
+`oracle_state` 和 debug/provenance 字段只能用于 token dictionary 水合、质量审计、validation label 或 transition
+归因；不能回写为 target state mutation。
 
-当前 profiling 契约提供的正常 state input role：
+当前正常 state input role：
 
 | role | 语义 |
 | --- | --- |
-| `request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path。 |
-| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界的 request-level anchor，不携带 committed/fill/generated suffix path。 |
-| `request_admission` | 在 admission 边界记录 request token path、admission kind 和 policy。 |
-| `prefetch_decision` | 在 scheduler prefetch decision checkpoint 上由 target state 重新判断 anchor、suffix 和是否 enqueue prefetch。 |
-| `prefetch_check_point` | 按 target prefetch policy 推进 wait/best-effort/timeout 的 terminate、late、suppressed 和 host visibility，不从 source completion 直接构造 ready set。 |
+| `request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path，并做 target lookup / touch。 |
+| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界；模型基于 token store 恢复 committed/fill path，插入 radix 并释放 request KV lifecycle。 |
+| `request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
+| `prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
+| `prefetch_check_point` | prefetch progress/wait 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
 
-match-prefix concrete path、lookup result、cache config、lifecycle path/runtime、insert/capacity/lock/maintenance 和
-storage/controller 事件只作为 `source_actual` / `timing_observation` evidence。unknown invariant role 应进入
-`missing_invariant_facts["unknown_invariant_role"]` 或等价质量错误，不能静默消费。
+match-prefix concrete path、lookup result、source insert/capacity/lock/maintenance、storage/controller result 和 async completion
+只作为 `source_actual` / `timing_observation` evidence。unknown invariant role 必须进入 quality / summary error，不能静默消费。
 
 cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant facts，逐 role 对比 count
-和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 invariant；
-sequence mismatch 只作为诊断输出。
+和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 invariant。
 
 ### 组件边界
 
@@ -226,28 +227,20 @@ sequence mismatch 只作为诊断输出。
 | --- | --- |
 | `hicache_fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
 | `hicache_router.hpp/.cpp` | role enum、输入门禁和 required field 检查。 |
-| `hicache_token_store.hpp/.cpp` | request scoped token path store。 |
-| `hicache_target_pager.hpp/.cpp` | target page size projection 和 page hash 生成。 |
-| `hicache_token_radix_tree.hpp/.cpp` | token-level radix tree，按 `cache_scope` 隔离 token prefix、split、insert 和 page projection leaf group。 |
-| `hicache_state_index.hpp/.cpp` | scoped page/node projection state index，维护 resident、dirty、backuped、evicted、lock、prefetch 和 hit count 集合。 |
-| `hicache_model.hpp/.cpp` | state model orchestration：按 role 调用 store/pager/radix/state index。 |
-| `hicache_summary.hpp/.cpp` | 输出 final state、transition trace、审计计数。 |
+| `hicache_token_store.hpp/.cpp` | request / operation scoped token path store；不保存 source page identity 作为状态输入。 |
+| `hicache_target_pager.hpp/.cpp` | 按 target page size 投影完整 page hash、page id 和 page path。 |
+| `hicache_token_radix_tree.hpp/.cpp` | 每个 `cache_scope` 一棵 canonical compressed radix tree；device/host/storage/ref 都是 node residency/ref 字段，不再维护 device tree 与 host tree 两套事实源。 |
+| `hicache_storage_directory.hpp/.cpp` | target storage namespace；区分 materialized page record 与 backend-readable hash record，支持连续 storage hit prefix 查询。 |
+| `hicache_ref_ledger.hpp/.cpp` | request / writeback / loadback / storage / prefetch owner 级 ref 账本，负责同步 tree 上的 lock ref 和 host ref。 |
+| `hicache_capacity_index.hpp/.cpp` | mutation-driven device/host leaf index、capacity snapshot、victim choice 和 audit trace。 |
+| `hicache_async_state.hpp/.cpp` | prefetch、writeback、loadback、storage operation table 和 lifecycle transition。 |
+| `hicache_target_control_clock.hpp/.cpp` | target-side control checkpoint 与内部 operation id，避免把 source timestamp 当作 target 调度事实。 |
+| `hicache_node_split_policy.hpp/.cpp` | radix split 时 residency/ref/hit count/page projection 的结构化迁移策略。 |
+| `hicache_policy.hpp/.cpp` | 显式 target config 解析、SGLang-derived default 和 policy decision trace。 |
+| `hicache_state_index.hpp/.cpp` | `DerivedStateView`，从 tree / storage / async 派生 validation-facing state sets。 |
+| `hicache_model.hpp/.cpp` | role dispatch 和 state orchestration；不承担 fact schema、summary 或 DAG patch 职责。 |
+| `hicache_summary.hpp/.cpp` | final state、transition trace、policy/capacity/ref/async 审计输出。 |
 | `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
-
-目标职责：
-
-| 组件 | 责任 |
-| --- | --- |
-| `HiCacheFactRouter` | 第一层只按 invariant 判断；第二层把 role 转成 enum；缺字段、未知 role、非法 fact class 形成硬错误或 summary error。 |
-| `TokenPathStore` | 收集 dictionary，解析 span，维护 request/operation 到 token range 的映射；不保存 source page identity 作为状态输入。 |
-| `TargetPager` | 按 target page size 从 token range 推导完整 page hash、page index、page->token range 反查。 |
-| `TokenRadixTree` | 维护 token/page compressed radix tree、parent/children、split/insert/lookup、terminal ancestor chain 和 leaf-group victim 查询。 |
-| `DeviceCacheState` | 维护 device radix view、L1 resident、device lock/ref、admission pressure 和 device leaf-group victim selection。 |
-| `HostCacheState` | 维护 host radix view、host ref/protection、storage-known、ready-but-not-visible 和 host-visible 状态。 |
-| `AsyncState` | 维护 pending / ready / applied / suppressed / late，并区分 requested host budget 与 actual reservation。 |
-| `PolicyEngine` | 根据显式 target config 实现 write policy、capacity/eviction policy、prefetch policy 和 storage policy。 |
-| `StateTransitionLog` | 为每个 state mutation 输出 role/request/operation/node/page/seq/ts/provenance。 |
-| `OracleValidation` | 只比较 `source_actual`/`oracle_state` 和 predicted state，不反写模型。 |
 
 ### Target Page Projection
 
@@ -264,62 +257,56 @@ for each full target page:
 - target `page_size` 优先来自 modeling config；
 - 没有 target page size 时才回落 source page size；
 - 只生成完整 page，不生成 tail page；
-- `cache_scope` 参与内部 page id，validation 可用 `oracle_page_key_mode=strip_scope` 与 raw oracle hash 对齐。
-
-page 级集合只能从 token/node 状态投影出来。不允许再把 page-level radix tree 当作 source of truth；否则 page size
-what-if 会继续在 split、lock/ref chain 和 evictable victim 上退化。
+- `cache_scope` 参与内部 page id，validation 可用 `oracle_page_key_mode=strip_scope` 与 raw oracle hash 对齐；
+- page 级集合只能从 canonical node、operation lifecycle 和 storage directory 派生，不能作为独立事实源。
 
 ### Target State
 
-summary 输出当前 validation 使用的集合，但集合来源必须是 token node/page projection：
+summary 输出当前 validation 使用的集合，但集合来源必须是 canonical tree / storage / async projection：
 
 | 集合 | 来源 |
 | --- | --- |
-| `l1_resident_pages` | node/page device resident projection。 |
-| `l2_resident_pages` | host resident projection。 |
-| `l3_resident_pages` | storage-readable projection。 |
-| `dirty_pages` | write-back dirty page projection。 |
-| `backuped_pages` | 已持久/host backuped projection。 |
+| `l1_resident_pages` | node device residency projection。 |
+| `l2_resident_pages` | `host.present && host.visible` projection。 |
+| `l3_resident_pages` | storage-readable projection；是否包含 backend-only readable hash 由 derived view mode 明确选择。 |
+| `dirty_pages` | node dirty projection。 |
+| `backuped_pages` | host copy projection；不把 storage readable 直接当成 backuped。 |
 | `evicted_pages` | target eviction lifecycle projection。 |
-| `locked_pages` | token radix parent/ref chain 上 lock/ref 非零的 page projection。 |
-| `pending_writeback_pages` | `AsyncState` 中 dirty eviction 已 enqueue、尚未由 maintenance checkpoint ack 的 page projection。 |
-| `prefetch_planned_pages` | `AsyncState` 中 target policy 已 enqueue 的 page projection。 |
-| `prefetch_ready_pages` | modeled async queue 已完成且 target 可见的 page projection。 |
+| `locked_pages` | lock ref 非零的 node/page projection。 |
+| `pending_writeback_pages` | async operation table 中尚未完成的 writeback projection。 |
+| `prefetch_planned_pages` | prefetch operation planned path projection。 |
+| `prefetch_ready_pages` | modeled async queue 已 ready 但可能尚未全部 host-visible 的 page projection。 |
 | `prefetch_late_pages` | target policy 判定 timeout/late 的 page projection。 |
 | `prefetch_suppressed_pages` | storage miss / revoke / finalization / timeout 下被 target policy 放弃的 page projection。 |
-| `page_hit_counts` | policy-visible page hit count projection。 |
+| `page_hit_counts` | policy-visible page hit count projection，仅作诊断 metadata。 |
 
-request/admission 设计边界：
+### Policy 与资源语义
 
-- `request_bound_match_anchor` 做 target lookup / touch / loadback；
-- `request_admission` 根据 target radix match 派生 active device lock/ref 和 admission pressure；
-- `request_lifecycle_anchor` 在 unfinished / finished 上 insert、迁移或释放 active request lock/ref。
+request / allocator：
 
-host/device/async 设计边界：
+- `request_admission` 先用 target radix lookup 得到 prefix，再构造 `ExtendAllocationIntent`；
+- eviction gate 对齐 SGLang allocator：用 `DeviceAllocatorLedger.available_pages()` 判断是否需要 eviction，不从 radix occupancy 反推；
+- eviction budget 使用完整 allocation request；实际 active request reservation 使用本次真正分配/占用的 page；
+- 当前 batch-level allocation intent 尚未由 profiling 提供，模型以 `extend_allocation_batch_size=1` 作为显式短期合同；
+- `request_lifecycle_anchor` 在 finished / unfinished 上插入 committed path，并释放 duplicate / tail / overallocated KV 到 allocator ledger。
 
-- L2/backuped/host-visible mutation 只能通过 `add_host_visible_page()` / `remove_host_visible_page()`；
-- `add_resident()` / `remove_resident()` 不应对 L2 隐式写 host topology、backuped 或 host-visible；
-- request lookup 分别维护 device radix match、host radix match 和 target-visible prefix，避免把 device resident、
-  host-visible、storage-known 混成一个 `matched_pages`；
-- host prefetch allocation 失败时 cleanup budget 来自本次 page-aligned prefetch request，不按最终 L2 count、deficit
-  或 fallback reserved count 反推；
-- storage prefetch threshold / capacity limit 来自显式 target config；未配置时按 SGLang 源码语义投影；
-- rate-limit 判断保持 `prefetch_tokens_occupied >= prefetch_capacity_limit`，capacity limit 为 0 时不被当作无限制；
-- `prefetch_decision` 先创建统一 work：`planned_pages` 是 page-aligned prefetch key，`pages` 是 target-derived storage hit
-  query 后保留的连续命中前缀；低于 threshold 的 storage hit 在 checkpoint 处按 revoked/suppressed 处理；
-- prefetch 开始时把 anchor pages 纳入 page-level host ref/protection，terminate / revoke / late / finalize 时必须释放；
-- `prefetch_check_point` 推进 modeled async work lifecycle：wait_complete 在完成边界 apply ready pages，best_effort 在 checkpoint
-  立即 terminate，timeout 在 terminal checkpoint 或目标 timeout 后 terminate/late，并统一释放 reservation 和 anchor ref。
+host / storage / prefetch：
 
-write-back 设计边界：
+- host cleanup victim 是 host radix leaf，必须 host-visible、evicted、无 lock/host ref protection，且没有 host-present backup child；
+- host cleanup budget 来自本次 allocation request：prefetch 对齐 `evict_host(prefetch_length)`，write backup 对齐
+  `evict_host(len(node.value))`；
+- storage hit query 只保留连续命中前缀；storage-readable 不等于 host-visible；
+- prefetch operation 保存 planned path、hit prefix、requested host pages、reserved host pages 和 anchor ref；
+- wait-complete 完成后 apply ready pages，best-effort 在 checkpoint terminate，timeout 在 completed 或 timeout 边界 terminate/late；
+- revoke / timeout incomplete 的 host reservation 进入 deferred release 近似，不立即从 host budget 中消失。
 
-- 不使用 page-level 前置 release 代替 write-back batch state machine；
-- source writeback ack、storage hit result、node remove result 和 async wall-clock completion 不能作为 normal state input；
-- write-back 的 ACK 时序在当前模型里折叠为同步 completion，结果语义统一走 `commit_host_backup_page()`；
-- write-back enqueue、dirty clear、backuped/host-visible 结果必须来自 target-derived policy 或新的 target-independent
-  invariant；
-- `write_through` / `write_through_selective` / `write_back` 共享同一组 device insert、host backup 与 eviction helper，
-  仅在 threshold 和是否要求同步写回上分支。
+write policy：
+
+- `write_through`、`write_through_selective` 和 `write_back` 共享 device insert、host backup、storage readable、capacity cleanup helper；
+- `write_through_selective` 的 hit-count threshold 由 target policy 决定；
+- write-through backup ACK 前会持有普通 lock ref；当前按下一条 target control fact drain，最后一条 fact 后的 pending ACK 可以保留到 final；
+- write-back ACK 时序当前折叠为同步 completion，结果语义统一落到 host backup / storage readable / dirty clear；
+- source writeback ACK、storage hit result、node remove result 和 async wall-clock completion 不能作为 normal state input。
 
 ### Summary
 
@@ -339,8 +326,54 @@ model_summary.json.modules[0].hicache
 | `processed_events_by_role` | 各 role 消费计数。 |
 | `missing_invariant_facts` | 缺失或未知 invariant 输入。 |
 | `non_invariant_fact_usage` | 非不变量实际消费审计；正常必须为空。 |
-| `final_state` | 模型最终 state sets 和 counts。 |
+| `final_state` | `DerivedStateView` 派生的模型最终 state sets 和 counts。 |
+| `storage_directory_inclusive_state` | 包含 backend-readable hash 的 storage-inclusive projection。 |
 | `transition_trace` | request / operation / page 级模型状态转移。 |
+| `async_lifecycle_trace` | prefetch / writeback / loadback / storage operation lifecycle。 |
+| `policy_decision_trace` | policy、allocator、capacity、loadback 和 cleanup 决策账本。 |
+| `capacity_mutation_trace` / `capacity_victim_choices` | capacity index 增量更新和 victim 选择证据。 |
+| `ref_mutation_trace` / `ref_audit` | owner 级 ref acquire/release 和 tree ref 一致性审计。 |
+
+### State 到 DAG / E2E 路线
+
+HiCache 的最终目标不是只让 final state 对齐，而是预测 target config 下的 E2E、关键路径和主要 cache 开销变化。
+后续链路按以下边界推进：
+
+```text
+target semantic chain:
+  invariant probe events
+    -> target state
+    -> state transitions
+    -> target cache operation intents
+
+source physical chain:
+  torch / LD_PRELOAD / timing evidence
+    -> source cache physical op groups
+    -> source DAG node / edge attribution
+
+DAG rewrite chain:
+  source full DAG
+    - source-only cache physical ops
+    + target-only cache intents
+    +/- resize ops that exist in both source and target
+    -> predicted target DAG
+    -> predicted E2E
+```
+
+长期阶段：
+
+| 阶段 | 输入 | 输出 | 通过口径 |
+| --- | --- | --- | --- |
+| target state | invariant facts + target config + oracle label | final state / transition trace | final state 对齐，`non_invariant_fact_usage=[]`。 |
+| target intent | invariant facts + transition / policy / async / ref traces | cache operation intent stream | intent 可追溯到 state transition，source outcome 不混入。 |
+| source physical attribution | torch / LD_PRELOAD / timing evidence + invariant anchors | source cache-owned node / edge groups | physical op group 归因稳定且不重复占用 DAG node。 |
+| cache-neutral baseline | source full DAG + source physical groups | cache-neutral DAG | source cache cost 能拆出去并装回去。 |
+| source/target cache diff | source physical groups + target intents | delete / insert / replace / resize decisions | self-config diff 基本 identity，cross diff 可解释。 |
+| DAG patch | cache-neutral DAG + target intents | predicted target DAG | 无 dangling edge、无 cycle，blocking intent 位于正确依赖边界。 |
+| duration / E2E | source calibration + target intents + target oracle label | predicted E2E / critical path audit | E2E 误差、phase 误差和 cache op contribution 可解释。 |
+
+`transition` 解释 state 怎么变；`intent` 解释 target 下应该有哪些物理 cache 操作。DAG patch 应消费 intent，
+不能直接消费 raw page-level transition 或 final page set。
 
 ## Validation
 
@@ -370,4 +403,5 @@ HiCache state validation 必须同时看：
 - transition exact oracle 和逐步 provenance 验收；
 - scope-normalized comparison 之外的多 scope page identity 验证。
 
-这些风险的当前验证状态维护在 `docs/validation/hicache_state_validation.md`，不在本文件重复实验分析。
+这些风险的当前验证状态维护在 `docs/validation/hicache_state_validation.md`；中长期缺口和阶段性妥协维护在
+`docs/validation/hicache_state_model_limitations.md`。本文件不重复实验分析。

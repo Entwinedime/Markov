@@ -1,25 +1,30 @@
 {
-  "name": "profiling_hicache_state_mainline_one_matrix",
+  "name": "profiling_hicache_state_config_space_faithful_replay",
   "framework": "sglang",
   "continue_on_error": true,
   "metadata": {
-    "purpose": "Mainline-one HiCache state profiling suite with two server scenarios and two input workloads. The manual workload is the fast iteration profile; bench remains the larger throughput input.",
-    "manual_run_note": "Use --list-experiments first, then select one or more ids with --experiment or --experiments for manual profiling and archival. The suite uses continue_on_error so one failed experiment does not block later selected experiments.",
-    "shared_profiling_note": "HiCache collection uses target-level atomic fact metadata. Profiling config owns fact.class/fact.role/model_input/dag_input/granularity; C++ state routing consumes only model_input=true, fact_class=invariant_state, fact_granularity=atomic events with known atomic invariant roles. Concrete cache-stage paths and source-control-flow evidence remain source_actual/timing observations with model_input=false.",
+    "purpose": "Faithful replay profiling copy of profiling_hicache_state_config_space_python_probe. It keeps the same 5x4 HiCache matrix and enables torch profiler plus LD_PRELOAD in addition to Python probe.",
+    "server_matrix_note": "Five server configs cover all active HiCache write policies and prefetch policies, Ascend-runnable page32/page64/page128 regimes, low/balanced capacity, different thresholds, and different timeout regimes.",
+    "input_matrix_note": "Inputs are three manual phased workloads plus one bench_serving generated-shared-prefix workload. Runner expands the matrix to 20 experiments.",
+    "faithful_replay_pair": "Use profiling_hicache_state_config_space_faithful_replay.json for the same matrix with torch profiler and LD_PRELOAD enabled.",
     "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
-    "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe."
+    "state_validation_pair": "profiling_hicache_state_config_space_python_probe.json is the python-probe-only state validation pair."
   },
   "profiling": {
     "enabled": true,
     "channels": [
-      "python_probe"
+      "torch",
+      "python_probe",
+      "ld_preload"
     ],
     "debug": false,
     "torch": {
-      "enabled": false,
+      "enabled": true,
       "output_dir": "trace/torch",
       "with_stack": false,
-      "record_shapes": false
+      "record_shapes": false,
+      "stop_after_workload": true,
+      "strict_stop": false
     },
     "python_probe": {
       "mode": "full",
@@ -1863,7 +1868,7 @@
       ]
     },
     "ld_preload": {
-      "enabled": false,
+      "enabled": true,
       "library": "build/docker/sglang/lib/libhook.so",
       "trace_output": "trace/ld_preload/cpu_trace.json"
     }
@@ -1874,17 +1879,79 @@
   "matrix": {
     "servers": [
       {
-        "id": "s1a",
-        "name": "S1A_fast_pressure",
+        "id": "c0_wt_timeout_p128_balanced",
+        "name": "C0_write_through_timeout_page128_balanced",
         "metadata": {
-          "purpose": "Mainline-one fast iteration run for S1A: page128 + reduced L1 + write-through-selective + wait_complete.",
+          "purpose": "Baseline explicit write-through + timeout target with moderate L1/L2 capacity and page128 projection.",
           "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
-          "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
-          "hicache_ratio_note": "--hicache-ratio is 2.25 (>1.0). Iteration speed comes from smaller workload scale plus a reduced --max-total-tokens; S1A keeps max-total-tokens at 4096 because the NPU kernel_ascend path rewrites the host layout to page_first_direct and requires enough host pages for the 64-layer model.",
-          "mainline_one_scenario": "S1A_fast_pressure",
-          "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
-          "mainline_one_config_signature": "page_size=128,l1_capacity_pages=32,l2_capacity_pages=73,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.25,prefetch_timeout_extra=8.0/0.0/8.0",
-          "mainline_one_config_comparison": "Different from C2 by capacity, prefetch policy, ratio, and timeout extra config; different from C5 by capacity, write policy, ratio, and timeout extra config; different from the earlier mainline-one S1A draft by capacity, ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "collection_note": "This config-space suite is intended for HiCache state validation; the faithful-replay copy enables torch profiler and LD_PRELOAD on the same matrix.",
+          "hicache_config_signature": "page_size=128,l1_capacity_pages=64,l2_capacity_pages=129,write_policy=write_through,prefetch_policy=timeout,hicache_ratio=2.0,prefetch_threshold_tokens=256,prefetch_timeout=2.0/0.25/4.0",
+          "hicache_coverage": "The five-server matrix jointly covers write_through, write_through_selective, write_back, wait_complete, best_effort, timeout, multiple page sizes, and multiple capacity/threshold regimes.",
+          "hicache_write_policy": "write_through"
+        },
+        "server": {
+          "model_path": "/models/Qwen3-32B",
+          "command": [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/models/Qwen3-32B",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--tp-size",
+            "2",
+            "--trust-remote-code",
+            "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel_ascend",
+            "--hicache-mem-layout",
+            "page_first_direct",
+            "--hicache-storage-backend",
+            "file",
+            "--disable-cuda-graph",
+            "--page-size",
+            "128",
+            "--max-total-tokens",
+            "8192",
+            "--hicache-ratio",
+            "2.0",
+            "--hicache-write-policy",
+            "write_through",
+            "--hicache-storage-prefetch-policy",
+            "timeout",
+            "--hicache-storage-backend-extra-config",
+            "{\"prefetch_threshold\":256,\"prefetch_timeout_base\":2.0,\"prefetch_timeout_per_ki_token\":0.25,\"prefetch_timeout_max\":4.0,\"hicache_storage_pass_prefix_keys\":true}"
+          ],
+          "ready_url": "http://127.0.0.1:30000/get_model_info",
+          "ready_timeout_sec": 1800
+        },
+        "modeling": {
+          "hicache": {
+            "page_size": 128,
+            "l1_capacity_pages": 64,
+            "l2_capacity_pages": 129,
+            "write_policy": "write_through",
+            "prefetch_policy": "timeout",
+            "prefetch_threshold_pages": 2,
+            "prefetch_capacity_limit_pages": 52,
+            "prefetch_timeout_base_sec": 2.0,
+            "prefetch_timeout_per_ki_token_sec": 0.25,
+            "prefetch_timeout_max_sec": 4.0
+          }
+        }
+      },
+      {
+        "id": "c1_wts_wait_p128_low_l1",
+        "name": "C1_write_through_selective_wait_page128_low_l1",
+        "metadata": {
+          "purpose": "Selective write-through + wait_complete target with reduced L1 pressure; keeps the proven S1A-style page128 regime.",
+          "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+          "collection_note": "This config-space suite is intended for HiCache state validation; the faithful-replay copy enables torch profiler and LD_PRELOAD on the same matrix.",
+          "hicache_config_signature": "page_size=128,l1_capacity_pages=32,l2_capacity_pages=73,write_policy=write_through_selective,prefetch_policy=wait_complete,hicache_ratio=2.25,prefetch_threshold_tokens=128,prefetch_timeout=8.0/0.0/8.0",
+          "hicache_coverage": "The five-server matrix jointly covers write_through, write_through_selective, write_back, wait_complete, best_effort, timeout, multiple page sizes, and multiple capacity/threshold regimes.",
           "hicache_write_policy": "write_through_selective"
         },
         "server": {
@@ -1906,7 +1973,7 @@
             "--hicache-io-backend",
             "kernel_ascend",
             "--hicache-mem-layout",
-            "layer_first",
+            "page_first_direct",
             "--hicache-storage-backend",
             "file",
             "--disable-cuda-graph",
@@ -1934,22 +2001,22 @@
             "write_policy": "write_through_selective",
             "prefetch_policy": "wait_complete",
             "prefetch_threshold_pages": 1,
-            "prefetch_capacity_limit_pages": 32
+            "prefetch_capacity_limit_pages": 32,
+            "prefetch_timeout_base_sec": 8.0,
+            "prefetch_timeout_per_ki_token_sec": 0.0,
+            "prefetch_timeout_max_sec": 8.0
           }
         }
       },
       {
-        "id": "s1b",
-        "name": "S1B_fast_pressure",
+        "id": "c2_wb_best_effort_p64_low_l1",
+        "name": "C2_write_back_best_effort_page64_low_l1",
         "metadata": {
-          "purpose": "Mainline-one fast iteration run for S1B: page64 + small L1 + write-back + best_effort.",
+          "purpose": "Write-back + best_effort target with page64 projection and dirty/host cleanup pressure; keeps the proven S1B-style regime.",
           "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
-          "ld_preload_note": "LD_PRELOAD is disabled for this HiCache state suite; HiCache state facts are collected by Python probe.",
-          "hicache_ratio_note": "--hicache-ratio is 2.5 (>1.0). Iteration speed comes from smaller --max-total-tokens and workload scale; capacity pressure is preserved by matching modeling.hicache capacity to the smaller L1/L2 pools.",
-          "mainline_one_scenario": "S1B_fast_pressure",
-          "mainline_one_config_novelty": "This joint HiCache config is new relative to all previously profiled HiCache state configs, including C0-C8, cleaned historical runs, temporary validation runs, and aborted draft runs; it is also distinct from the paired mainline-one scenario.",
-          "mainline_one_config_signature": "page_size=64,l1_capacity_pages=32,l2_capacity_pages=81,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_timeout_extra=6.0/0.0/6.0",
-          "mainline_one_config_comparison": "Different from C3/I2 page64 by capacity, write policy, prefetch policy, ratio, and timeout extra config; different from C1/C8 write-back by page size, capacity, prefetch policy, ratio, and timeout extra config; different from earlier mainline-one S1B drafts by capacity, ratio, L2 capacity, and timeout extra config; no matching joint signature was found in the current matrix or cleaned historical HiCache state validation records.",
+          "collection_note": "This config-space suite is intended for HiCache state validation; the faithful-replay copy enables torch profiler and LD_PRELOAD on the same matrix.",
+          "hicache_config_signature": "page_size=64,l1_capacity_pages=32,l2_capacity_pages=81,write_policy=write_back,prefetch_policy=best_effort,hicache_ratio=2.5,prefetch_threshold_tokens=128,prefetch_timeout=6.0/0.0/6.0",
+          "hicache_coverage": "The five-server matrix jointly covers write_through, write_through_selective, write_back, wait_complete, best_effort, timeout, multiple page sizes, and multiple capacity/threshold regimes.",
           "hicache_write_policy": "write_back"
         },
         "server": {
@@ -1971,7 +2038,7 @@
             "--hicache-io-backend",
             "kernel_ascend",
             "--hicache-mem-layout",
-            "layer_first",
+            "page_first_direct",
             "--hicache-storage-backend",
             "file",
             "--disable-cuda-graph",
@@ -1999,19 +2066,151 @@
             "write_policy": "write_back",
             "prefetch_policy": "best_effort",
             "prefetch_threshold_pages": 2,
-            "prefetch_capacity_limit_pages": 39
+            "prefetch_capacity_limit_pages": 39,
+            "prefetch_timeout_base_sec": 6.0,
+            "prefetch_timeout_per_ki_token_sec": 0.0,
+            "prefetch_timeout_max_sec": 6.0
+          }
+        }
+      },
+      {
+        "id": "c3_wt_best_effort_p32_low_host",
+        "name": "C3_write_through_best_effort_page32_low_host",
+        "metadata": {
+          "purpose": "Page32 target that pairs write-through with best_effort prefetch and a tight host-token budget. The current torch_npu page-attention operator documents FP16/BF16 block_size as 16-aligned and no larger than 512, while page256 is excluded because this Qwen3-32B Ascend path accepts it at startup but fails during inference.",
+          "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+          "collection_note": "This config-space suite is intended for HiCache state validation; the faithful-replay copy enables torch profiler and LD_PRELOAD on the same matrix.",
+          "hicache_config_signature": "page_size=32,l1_capacity_pages=128,l2_capacity_pages=161,write_policy=write_through,prefetch_policy=best_effort,hicache_ratio=1.25,prefetch_threshold_tokens=256,prefetch_timeout=5.0/0.0/5.0",
+          "hicache_coverage": "The five-server matrix jointly covers write_through, write_through_selective, write_back, wait_complete, best_effort, timeout, multiple page sizes, and multiple capacity/threshold regimes.",
+          "hicache_write_policy": "write_through"
+        },
+        "server": {
+          "model_path": "/models/Qwen3-32B",
+          "command": [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/models/Qwen3-32B",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--tp-size",
+            "2",
+            "--trust-remote-code",
+            "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel_ascend",
+            "--hicache-mem-layout",
+            "page_first_direct",
+            "--hicache-storage-backend",
+            "file",
+            "--disable-cuda-graph",
+            "--page-size",
+            "32",
+            "--max-total-tokens",
+            "4096",
+            "--hicache-ratio",
+            "1.25",
+            "--hicache-write-policy",
+            "write_through",
+            "--hicache-storage-prefetch-policy",
+            "best_effort",
+            "--hicache-storage-backend-extra-config",
+            "{\"prefetch_threshold\":256,\"prefetch_timeout_base\":5.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":5.0,\"hicache_storage_pass_prefix_keys\":true}"
+          ],
+          "ready_url": "http://127.0.0.1:30000/get_model_info",
+          "ready_timeout_sec": 1800
+        },
+        "modeling": {
+          "hicache": {
+            "page_size": 32,
+            "l1_capacity_pages": 128,
+            "l2_capacity_pages": 161,
+            "write_policy": "write_through",
+            "prefetch_policy": "best_effort",
+            "prefetch_threshold_pages": 8,
+            "prefetch_capacity_limit_pages": 96,
+            "prefetch_timeout_base_sec": 5.0,
+            "prefetch_timeout_per_ki_token_sec": 0.0,
+            "prefetch_timeout_max_sec": 5.0
+          }
+        }
+      },
+      {
+        "id": "c4_wb_timeout_p64_low_capacity",
+        "name": "C4_write_back_timeout_page64_low_capacity",
+        "metadata": {
+          "purpose": "Write-back + timeout target with page64 and tighter effective L2 budget to exercise dirty eviction, timeout late/suppressed, and host cleanup together.",
+          "model_path_note": "The current model path is /models/Qwen3-32B. Update server.model_path and server.command if the container mount changes.",
+          "collection_note": "This config-space suite is intended for HiCache state validation; the faithful-replay copy enables torch profiler and LD_PRELOAD on the same matrix.",
+          "hicache_config_signature": "page_size=64,l1_capacity_pages=46,l2_capacity_pages=88,write_policy=write_back,prefetch_policy=timeout,hicache_ratio=2.0,prefetch_threshold_tokens=256,prefetch_timeout=0.0/0.0/0.0",
+          "hicache_coverage": "The five-server matrix jointly covers write_through, write_through_selective, write_back, wait_complete, best_effort, timeout, multiple page sizes, and multiple capacity/threshold regimes.",
+          "hicache_write_policy": "write_back"
+        },
+        "server": {
+          "model_path": "/models/Qwen3-32B",
+          "command": [
+            "python3",
+            "-m",
+            "sglang.launch_server",
+            "--model-path",
+            "/models/Qwen3-32B",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "30000",
+            "--tp-size",
+            "2",
+            "--trust-remote-code",
+            "--enable-hierarchical-cache",
+            "--hicache-io-backend",
+            "kernel_ascend",
+            "--hicache-mem-layout",
+            "page_first_direct",
+            "--hicache-storage-backend",
+            "file",
+            "--disable-cuda-graph",
+            "--page-size",
+            "64",
+            "--max-total-tokens",
+            "3072",
+            "--hicache-ratio",
+            "2.0",
+            "--hicache-write-policy",
+            "write_back",
+            "--hicache-storage-prefetch-policy",
+            "timeout",
+            "--hicache-storage-backend-extra-config",
+            "{\"prefetch_threshold\":256,\"prefetch_timeout_base\":0.0,\"prefetch_timeout_per_ki_token\":0.0,\"prefetch_timeout_max\":0.0,\"hicache_storage_pass_prefix_keys\":true}"
+          ],
+          "ready_url": "http://127.0.0.1:30000/get_model_info",
+          "ready_timeout_sec": 1800
+        },
+        "modeling": {
+          "hicache": {
+            "page_size": 64,
+            "l1_capacity_pages": 46,
+            "l2_capacity_pages": 88,
+            "write_policy": "write_back",
+            "prefetch_policy": "timeout",
+            "prefetch_threshold_pages": 4,
+            "prefetch_capacity_limit_pages": 33,
+            "prefetch_timeout_base_sec": 0.0,
+            "prefetch_timeout_per_ki_token_sec": 0.0,
+            "prefetch_timeout_max_sec": 0.0
           }
         }
       }
     ],
     "inputs": [
       {
-        "id": "manual",
-        "name": "L1_manual_phased",
+        "id": "manual_phased_fast",
+        "name": "M1_manual_phased_fast",
         "metadata": {
-          "mainline_one_input": "L1_manual_phased",
-          "mainline_one_workload_scale": "L1_manual_phased uses 24 requests for fast iteration: enough to exercise seed/reuse/backup/pressure/load-back/prefetch/dirty phases without the old 83-request profile cost.",
-          "purpose": "Mainline-one L1 fast manual phased workload input shared by S1A/S1B; cache write policy is filled from server metadata. Full-scale stress should be a separate archival run, not the default iteration path."
+          "input_class": "manual",
+          "purpose": "Fast phased manual workload for seed/reuse/backup/pressure/load-back/prefetch/dirty coverage."
         },
         "bench": {
           "command": [
@@ -2020,7 +2219,7 @@
             "--base-url",
             "http://127.0.0.1:30000",
             "--output-dir",
-            "{bench_dir}/hicache_phased",
+            "{bench_dir}/hicache_phased_fast",
             "--warmup-requests",
             "1",
             "--seed-requests",
@@ -2060,37 +2259,143 @@
         }
       },
       {
-        "id": "bench",
-        "name": "L2_bench_serving_large",
+        "id": "manual_pressure_prefetch",
+        "name": "M2_manual_pressure_prefetch",
         "metadata": {
-          "mainline_one_input": "L2_bench_serving_large",
-          "purpose": "Mainline-one L2 bench_serving generated-shared-prefix workload input shared by S1A/S1B."
+          "input_class": "manual",
+          "purpose": "Higher-pressure manual workload emphasizing host cleanup, prefetch reservation, and post-pressure reuse."
         },
         "bench": {
-          "kind": "sglang.bench_serving",
-          "args": {
+          "command": [
+            "python3",
+            "scripts/bench/hicache_phased_workload.py",
+            "--base-url",
+            "http://127.0.0.1:30000",
+            "--output-dir",
+            "{bench_dir}/hicache_pressure_prefetch",
+            "--warmup-requests",
+            "1",
+            "--seed-requests",
+            "6",
+            "--reuse-requests",
+            "3",
+            "--backup-wait-requests",
+            "3",
+            "--pressure-requests",
+            "12",
+            "--pressure-unique-prefix",
+            "--reuse-after-pressure-requests",
+            "2",
+            "--prefetch-seed-requests",
+            "3",
+            "--prefetch-reuse-requests",
+            "3",
+            "--dirty-eviction-requests",
+            "3",
+            "--shared-prefix-repeat",
+            "128",
+            "--unique-suffix-repeat",
+            "12",
+            "--sleep-sec",
+            "0.0",
+            "--phase-wait-sec",
+            "1.0",
+            "--timeout-sec",
+            "480",
+            "--max-errors",
+            "1",
+            "--max-new-tokens",
+            "12",
+            "--cache-write-policy",
+            "{metadata.hicache_write_policy}"
+          ]
+        }
+      },
+      {
+        "id": "manual_deeper_pressure_prefetch",
+        "name": "M3_manual_deeper_pressure_prefetch",
+        "metadata": {
+          "input_class": "manual",
+          "purpose": "Larger manual phased workload for deeper host pressure, longer shared prefixes, stronger prefetch reuse, and more dirty eviction coverage."
+        },
+        "bench": {
+          "command": [
+            "python3",
+            "scripts/bench/hicache_phased_workload.py",
+            "--base-url",
+            "http://127.0.0.1:30000",
+            "--output-dir",
+            "{bench_dir}/hicache_deeper_pressure_prefetch",
+            "--warmup-requests",
+            "1",
+            "--seed-requests",
+            "8",
+            "--reuse-requests",
+            "4",
+            "--backup-wait-requests",
+            "4",
+            "--pressure-requests",
+            "18",
+            "--pressure-unique-prefix",
+            "--reuse-after-pressure-requests",
+            "3",
+            "--prefetch-seed-requests",
+            "4",
+            "--prefetch-reuse-requests",
+            "5",
+            "--dirty-eviction-requests",
+            "4",
+            "--shared-prefix-repeat",
+            "160",
+            "--unique-suffix-repeat",
+            "16",
+            "--sleep-sec",
+            "0.0",
+            "--phase-wait-sec",
+            "1.0",
+            "--timeout-sec",
+            "720",
+            "--max-errors",
+            "1",
+            "--max-new-tokens",
+            "16",
+            "--cache-write-policy",
+            "{metadata.hicache_write_policy}"
+          ]
+        }
+      },
+      {
+        "id": "bench_generated_shared_prefix",
+        "name": "B1_bench_serving_generated_shared_prefix",
+      "metadata": {
+        "input_class": "bench",
+        "purpose": "Lightweight SGLang bench_serving generated-shared-prefix workload for faithful replay and throughput-oriented cache reuse without tripping the SGLang scheduler watchdog under Python probe overhead."
+      },
+      "bench": {
+        "kind": "sglang.bench_serving",
+        "args": {
             "backend": "sglang",
             "base_url": "http://127.0.0.1:30000",
-            "model": "/models/Qwen3-32B",
-            "tokenizer": "/models/Qwen3-32B",
-            "dataset_name": "generated-shared-prefix",
-            "num_prompts": 128,
-            "gsp_num_groups": 8,
-            "gsp_prompts_per_group": 16,
-            "gsp_system_prompt_len": 384,
-            "gsp_question_len": 96,
-            "gsp_output_len": 8,
-            "gsp_range_ratio": 0.0,
-            "gsp_fast_prepare": true,
-            "gsp_group_distribution": "zipf",
-            "gsp_zipf_alpha": 1.2,
-            "seed": 20260608,
-            "request_rate": 8,
-            "max_concurrency": 8,
-            "warmup_requests": 4,
-            "disable_tqdm": true,
-            "output_details": true
-          }
+          "model": "/models/Qwen3-32B",
+          "tokenizer": "/models/Qwen3-32B",
+          "dataset_name": "generated-shared-prefix",
+          "num_prompts": 32,
+          "gsp_num_groups": 4,
+          "gsp_prompts_per_group": 8,
+          "gsp_system_prompt_len": 192,
+          "gsp_question_len": 64,
+          "gsp_output_len": 8,
+          "gsp_range_ratio": 0,
+          "gsp_fast_prepare": true,
+          "gsp_group_distribution": "zipf",
+          "gsp_zipf_alpha": 1.2,
+          "seed": 20260617,
+          "request_rate": 2,
+          "max_concurrency": 2,
+          "warmup_requests": 2,
+          "disable_tqdm": true,
+          "output_details": true
+        }
         }
       }
     ]
