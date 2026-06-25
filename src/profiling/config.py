@@ -80,8 +80,12 @@ def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
     """规整采集 channel 列表。
 
     未显式配置时按各 channel 的 enabled 字段推断，仍只允许当前主线认可的三类 channel。
+    显式 `channels: []` 表示本次 run 不启用任何采集通道，用于 forced-token
+    capture 这类只需要 workload 产物、不需要 trace 的执行。
     """
 
+    if isinstance(value, list) and not value:
+        return ()
     channels = _as_str_tuple(value, default=(), field_name="profiling.channels")
     if not channels:
         inferred: list[str] = []

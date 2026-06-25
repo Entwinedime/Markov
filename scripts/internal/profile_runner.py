@@ -37,7 +37,11 @@ INTERNAL_SUITE_KEYS = {"experiments", "matrix", "continue_on_error", "$unset"}
 MATRIX_ENTRY_META_KEYS = {"id", "name", "description", "$unset"}
 EXPERIMENT_REF_KEYS = {"server_ref", "input_ref"}
 PROFILE_EXPERIMENTS_ENV = "TRACE_SIM_PROFILE_EXPERIMENTS"
+PROFILE_INPUTS_ENV = "TRACE_SIM_PROFILE_INPUTS"
+PROFILE_SERVERS_ENV = "TRACE_SIM_PROFILE_SERVERS"
+PROFILE_FORCED_TOKEN_BUNDLE_ENV = "TRACE_SIM_FORCED_TOKEN_BUNDLE"
 PYTHON_PROBE_ROOT = ROOT_DIR / "src/profiling/python_probe"
+BENCH_SCRIPT_ROOT = ROOT_DIR / "scripts/bench"
 BENCH_ENV_REMOVE_KEYS = (
     "LD_PRELOAD",
     "HOOK_TRACE_OUTPUT",
@@ -50,6 +54,33 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_HICACHE_STATE_TRACE",
     "TRACE_SIM_HICACHE_PROBE_MODE",
     "TRACE_SIM_HICACHE_INTERNAL_HOOKS",
+)
+
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+if str(BENCH_SCRIPT_ROOT) not in sys.path:
+    sys.path.insert(0, str(BENCH_SCRIPT_ROOT))
+
+from hicache_forced_token_contract import (  # noqa: E402
+    FORCED_TOKEN_BUNDLE_SCHEMA,
+    FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE,
+    FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE,
+    FORCED_TOKEN_ERROR_PLAN_MISSING,
+    forced_token_bundle_summary,
+    forced_token_plan_summary,
+    forced_token_quality_from_workload_report,
+    load_forced_token_plan,
+    resolve_forced_token_bundle_plan,
+    sha256_file,
+    sha256_json,
+    validate_plan_contract,
+)
+from hicache_phased_workload import (  # noqa: E402
+    build_arg_parser as build_hicache_workload_arg_parser,
+    build_plan as build_hicache_workload_plan,
+    logical_request_id as hicache_logical_request_id,
+    workload_args_digest as hicache_workload_args_digest,
+    workload_id as hicache_workload_id,
 )
 
 
@@ -352,6 +383,175 @@ def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str,
     for key, value in args.items():
         append_cli_arg(command, key, expand_runtime_value(value, layout, cfg))
     return command
+
+
+def command_tokens(command: list[str] | str | None) -> list[str]:
+    """把命令规整为 token list，解析失败时返回空列表。"""
+
+    if command is None:
+        return []
+    if isinstance(command, list):
+        return list(command)
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return []
+
+
+def hicache_workload_argv(tokens: list[str]) -> list[str] | None:
+    """从命令中提取 hicache_phased_workload.py 的参数段。"""
+
+    for index, token in enumerate(tokens):
+        if token.endswith("hicache_phased_workload.py"):
+            return tokens[index + 1 :]
+    return None
+
+
+def parse_hicache_workload_args(command: list[str] | str | None) -> argparse.Namespace | None:
+    """解析 HiCache phased workload 参数；其他 workload 返回 None。"""
+
+    argv = hicache_workload_argv(command_tokens(command))
+    if argv is None:
+        return None
+    try:
+        return build_hicache_workload_arg_parser().parse_args(argv)
+    except SystemExit as exc:
+        raise ValueError(f"invalid hicache phased workload command, argparse_exit={exc.code}") from None
+
+
+def forced_token_plan_path_from_args(args: argparse.Namespace) -> Path | None:
+    """按 workload CLI 语义解析 forced-token plan 路径。"""
+
+    if args.forced_token_plan:
+        return resolve_repo_path(str(args.forced_token_plan))
+    if args.forced_token_mode == "capture":
+        return Path(str(args.output_dir)) / "forced_token_plan.json"
+    return None
+
+
+def forced_token_contract_report(
+    bench_command: list[str] | str | None,
+    bundle_provenance: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """解析并校验一次 workload 命令中的 forced-token contract。"""
+
+    workload_args = parse_hicache_workload_args(bench_command)
+    if workload_args is None:
+        return {
+            "enabled": False,
+            "mode": "none",
+            "errors": [],
+        }
+
+    mode = str(workload_args.forced_token_mode)
+    workload_plan = build_hicache_workload_plan(workload_args)
+    plan_path = forced_token_plan_path_from_args(workload_args)
+    report: dict[str, Any] = {
+        "enabled": mode != "none",
+        "mode": mode,
+        "errors": [],
+        "workload_id": hicache_workload_id(workload_args),
+        "workload_fingerprint": hicache_workload_args_digest(workload_args),
+        "workload_request_count": len(workload_plan),
+        "plan_path": str(plan_path) if plan_path is not None else None,
+        "plan": None,
+        "bundle": bundle_provenance,
+    }
+    if mode == "none":
+        return report
+    if plan_path is None:
+        report["errors"] = [FORCED_TOKEN_ERROR_PLAN_MISSING]
+        return report
+
+    if mode == "capture":
+        report["plan"] = forced_token_plan_summary(plan_path).to_dict()
+        if plan_path.exists():
+            report["errors"] = [FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE]
+            return report
+        return report
+
+    if mode != "replay":
+        report["errors"] = [f"unsupported_forced_token_mode:{mode}"]
+        return report
+
+    summary = forced_token_plan_summary(plan_path)
+    report["plan"] = summary.to_dict()
+    if not summary.exists:
+        report["errors"] = [FORCED_TOKEN_ERROR_PLAN_MISSING]
+        return report
+    try:
+        plan = load_forced_token_plan(plan_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        report["errors"] = [f"forced_token_plan_invalid:{exc}"]
+        return report
+
+    expected_request_ids = [
+        hicache_logical_request_id(workload_args, item, sequence_id)
+        for sequence_id, item in enumerate(workload_plan)
+    ]
+    report["errors"] = validate_plan_contract(
+        plan,
+        workload_id=hicache_workload_id(workload_args),
+        workload_fingerprint=hicache_workload_args_digest(workload_args),
+        expected_request_ids=expected_request_ids,
+    )
+    if bundle_provenance:
+        if bundle_provenance.get("plan_sha256") != summary.sha256:
+            report["errors"].append(FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE)
+        report["errors"] = sorted(set(report["errors"]))
+    return report
+
+
+def forced_token_mode_from_config(cfg: dict[str, Any]) -> str:
+    """读取已展开 experiment 的 forced-token workload mode。"""
+
+    bench = cfg.get("bench") if isinstance(cfg.get("bench"), dict) else {}
+    command = command_from_config(bench.get("command")) if "command" in bench else None
+    tokens = command_tokens(command)
+    if "--forced-token-mode" not in tokens:
+        return "none"
+    index = tokens.index("--forced-token-mode")
+    if index + 1 >= len(tokens):
+        raise ValueError("--forced-token-mode is missing its value")
+    return str(tokens[index + 1])
+
+
+def inject_forced_token_bundle_plan(
+    cfg: dict[str, Any],
+    bundle_path: Path | None,
+) -> dict[str, Any]:
+    """按 suite input 从显式 bundle 注入 replay plan 和 provenance。"""
+
+    result = copy.deepcopy(cfg)
+    mode = forced_token_mode_from_config(result)
+    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+    bench = result.get("bench") if isinstance(result.get("bench"), dict) else {}
+    raw_command = command_from_config(bench.get("command")) if "command" in bench else None
+
+    if mode != "replay":
+        if bundle_path is not None:
+            raise ValueError("--forced-token-bundle can only be used with forced-token replay experiments")
+        return result
+    if bundle_path is None:
+        raise ValueError("forced-token replay requires --forced-token-bundle")
+
+    input_id = str(metadata.get("suite_input_id") or "")
+    if not input_id:
+        raise ValueError("forced-token replay experiment is missing metadata.suite_input_id")
+    resolved = resolve_forced_token_bundle_plan(bundle_path, input_id)
+    plan_path = resolved.plan_path
+    tokens = command_tokens(raw_command)
+    if not tokens:
+        raise ValueError("forced-token replay requires an explicit bench.command")
+    if "--forced-token-plan" not in tokens:
+        raise ValueError("forced-token replay config must contain --forced-token-plan {forced_token_plan}")
+    index = tokens.index("--forced-token-plan")
+    if index + 1 >= len(tokens) or tokens[index + 1] != "{forced_token_plan}":
+        raise ValueError("forced-token replay config must use --forced-token-plan {forced_token_plan}")
+    tokens[index + 1] = plan_path
+    result.setdefault("bench", {})["command"] = tokens
+    result.setdefault("metadata", {})["forced_token_bundle"] = resolved.to_dict()
+    return result
 
 
 def parse_model_path(server_command: list[str] | str) -> str | None:
@@ -887,6 +1087,29 @@ class ProfileRun:
         for key in BENCH_ENV_REMOVE_KEYS:
             bench_env.pop(key, None)
         remove_pythonpath_entry(bench_env, PYTHON_PROBE_ROOT)
+        metadata = self.cfg.get("metadata") if isinstance(self.cfg.get("metadata"), dict) else {}
+        bench_env["TRACE_SIM_PROFILE_RUN_DIR"] = str(self.layout.run_dir)
+        bench_env["TRACE_SIM_PROFILE_RUN_ID"] = str(self.cfg.get("run_id") or self.cfg.get("id") or self.cfg.get("name") or "")
+        bench_env["TRACE_SIM_PROFILE_MANIFEST_PATH"] = str(self.layout.run_dir / "profile_manifest.json")
+        if metadata.get("suite_server_id"):
+            bench_env["TRACE_SIM_PROFILE_CONFIG_ID"] = str(metadata["suite_server_id"])
+        if metadata.get("suite_input_id"):
+            bench_env["TRACE_SIM_PROFILE_INPUT_ID"] = str(metadata["suite_input_id"])
+        forced_token_bundle = metadata.get("forced_token_bundle")
+        if isinstance(forced_token_bundle, dict):
+            bundle_env = {
+                "TRACE_SIM_FORCED_TOKEN_BUNDLE_PATH": forced_token_bundle.get("path"),
+                "TRACE_SIM_FORCED_TOKEN_BUNDLE_SCHEMA": forced_token_bundle.get("schema"),
+                "TRACE_SIM_FORCED_TOKEN_BUNDLE_SHA256": forced_token_bundle.get("sha256"),
+                "TRACE_SIM_FORCED_TOKEN_BUNDLE_ID": forced_token_bundle.get("bundle_id"),
+                "TRACE_SIM_FORCED_TOKEN_BUNDLE_PLAN_SHA256": forced_token_bundle.get("plan_sha256"),
+            }
+            for key, value in bundle_env.items():
+                if value:
+                    bench_env[key] = str(value)
+        model_path = self.cfg.get("model_path") or self.server_cfg.get("model_path") or parse_model_path(self.server_command)
+        if model_path:
+            bench_env["TRACE_SIM_PROFILE_MODEL_PATH"] = str(model_path)
         bench_proc = start_process(self.bench_command, self.layout.log_dir / "bench.log", bench_env)
         bench_code = bench_proc.wait()
         if bench_code != 0:
@@ -897,6 +1120,23 @@ def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
     """执行单个已展开 profiling 配置。"""
 
     return ProfileRun(cfg, dry_run=dry_run).run()
+
+
+def preflight_profile_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """对单个已展开配置做只读/轻量 preflight。"""
+
+    probe = ProfileRun(cfg, dry_run=True)
+    metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
+    bundle = metadata.get("forced_token_bundle")
+    bundle_provenance = bundle if isinstance(bundle, dict) else None
+    report = forced_token_contract_report(probe.bench_command, bundle_provenance)
+    forced_errors = [str(error) for error in report.get("errors", [])]
+    if forced_errors:
+        exp_id = cfg.get("id") or cfg.get("name") or "profile"
+        raise ValueError(
+            f"forced token preflight failed for {exp_id}: {', '.join(forced_errors)}"
+        )
+    return report
 
 
 def parse_experiment_selection(raw_values: list[str] | None, env_value: str | None = None) -> set[str]:
@@ -941,10 +1181,14 @@ def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
 def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]:
     """生成 `--list-experiments` 和 suite_selection 使用的实验摘要。"""
 
+    metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
     return {
         "index": index,
         "id": cfg.get("id", experiment_identity(cfg, index)),
         "name": cfg.get("name", experiment_identity(cfg, index)),
+        "server_id": metadata.get("suite_server_id"),
+        "input_id": metadata.get("suite_input_id"),
+        "profile_mode": metadata.get("profile_mode"),
         "selectors": sorted(experiment_selectors(cfg, index)),
     }
 
@@ -1121,85 +1365,397 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 def filter_suite_experiments(
     experiments: list[tuple[int, dict[str, Any]]],
     selected_experiments: set[str],
+    *,
+    selected_inputs: set[str] | None = None,
+    selected_servers: set[str] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
     """根据 CLI/env 选择器过滤 suite 实验。"""
 
+    selected_inputs = selected_inputs or set()
+    selected_servers = selected_servers or set()
+    available_inputs = sorted(
+        {
+            str((experiment.get("metadata") or {}).get("suite_input_id"))
+            for _index, experiment in experiments
+            if isinstance(experiment.get("metadata"), dict)
+            and (experiment.get("metadata") or {}).get("suite_input_id")
+        }
+    )
+    available_servers = sorted(
+        {
+            str((experiment.get("metadata") or {}).get("suite_server_id"))
+            for _index, experiment in experiments
+            if isinstance(experiment.get("metadata"), dict)
+            and (experiment.get("metadata") or {}).get("suite_server_id")
+        }
+    )
+
     if not selected_experiments:
-        return experiments
+        selected = list(experiments)
+    else:
+        selected = []
+        matched: set[str] = set()
+        for index, experiment in experiments:
+            selectors = experiment_selectors(experiment, index)
+            overlap = selected_experiments & selectors
+            if overlap:
+                selected.append((index, experiment))
+                matched.update(overlap)
 
-    selected: list[tuple[int, dict[str, Any]]] = []
-    matched: set[str] = set()
-    for index, experiment in experiments:
-        selectors = experiment_selectors(experiment, index)
-        overlap = selected_experiments & selectors
-        if overlap:
-            selected.append((index, experiment))
-            matched.update(overlap)
+        missing = sorted(selected_experiments - matched)
+        if missing:
+            available = ", ".join(str(item[1].get("id") or item[1].get("name") or item[0]) for item in experiments)
+            raise ValueError(f"unknown experiment selector(s): {', '.join(missing)}; available: {available}")
 
-    missing = sorted(selected_experiments - matched)
-    if missing:
-        available = ", ".join(str(item[1].get("id") or item[1].get("name") or item[0]) for item in experiments)
-        raise ValueError(f"unknown experiment selector(s): {', '.join(missing)}; available: {available}")
-    return selected
+    missing_inputs = selected_inputs - set(available_inputs)
+    if missing_inputs:
+        raise ValueError(
+            f"unknown input selector(s): {', '.join(sorted(missing_inputs))}; "
+            f"available inputs: {', '.join(available_inputs)}"
+        )
+    missing_servers = selected_servers - set(available_servers)
+    if missing_servers:
+        raise ValueError(
+            f"unknown server selector(s): {', '.join(sorted(missing_servers))}; "
+            f"available servers: {', '.join(available_servers)}"
+        )
+
+    def metadata_value(experiment: dict[str, Any], key: str) -> str:
+        metadata = experiment.get("metadata") if isinstance(experiment.get("metadata"), dict) else {}
+        value = metadata.get(key)
+        return str(value) if isinstance(value, str) else ""
+
+    filtered = [
+        (index, experiment)
+        for index, experiment in selected
+        if (not selected_inputs or metadata_value(experiment, "suite_input_id") in selected_inputs)
+        and (not selected_servers or metadata_value(experiment, "suite_server_id") in selected_servers)
+    ]
+    if not filtered:
+        raise ValueError("no experiments matched the selected experiment/input/server combination")
+    return filtered
+
+
+def repo_relative_text(path: Path) -> str:
+    """优先把 artifact 路径写成仓库相对形式。"""
+
+    resolved = path.resolve()
+    try:
+        return str(resolved.relative_to(ROOT_DIR.resolve()))
+    except ValueError:
+        return str(resolved)
+
+
+def single_run_artifact(run_dir: Path, pattern: str) -> Path:
+    """查找 run 中唯一 artifact，避免 bundle 聚合静默选错文件。"""
+
+    candidates = sorted(run_dir.glob(pattern))
+    if len(candidates) != 1:
+        raise ValueError(
+            f"expected exactly one {pattern} under {run_dir}, found {len(candidates)}"
+        )
+    return candidates[0]
+
+
+def build_forced_token_bundle(
+    suite_dir: Path,
+    run_dirs: list[Path],
+    *,
+    capture_config_path: Path,
+) -> dict[str, Any]:
+    """把 capture experiment 的 run-local plan 聚合成 suite-level bundle。"""
+
+    plans_dir = suite_dir / "forced_token_plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+    plans: dict[str, dict[str, Any]] = {}
+    model_paths: set[str] = set()
+    server_config_ids: set[str] = set()
+    for run_dir in run_dirs:
+        config = load_json(run_dir / "config.json")
+        metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+        input_id = str(metadata.get("suite_input_id") or "")
+        server_config_id = str(metadata.get("suite_server_id") or "")
+        if not input_id or not server_config_id:
+            raise ValueError(f"capture run is missing suite input/server metadata: {run_dir}")
+        if input_id in plans:
+            raise ValueError(f"duplicate capture plan for input: {input_id}")
+
+        source_plan = single_run_artifact(run_dir, "bench/**/forced_token_plan.json")
+        workload_report = single_run_artifact(run_dir, "bench/**/workload_report.json")
+        quality = forced_token_quality_from_workload_report(workload_report)
+        if quality.get("mode") != "capture" or not quality.get("ready"):
+            raise ValueError(
+                f"capture forced-token contract is not ready for {input_id}: "
+                f"{quality.get('errors', [])}"
+            )
+        plan = load_forced_token_plan(source_plan)
+        if (
+            quality.get("plan_workload_id") != input_id
+            or quality.get("plan_workload_fingerprint") != plan.get("workload_fingerprint")
+            or int(quality.get("request_count") or 0) != len(plan.get("requests") or [])
+        ):
+            raise ValueError(f"capture plan/report metadata mismatch for input: {input_id}")
+        target_plan = plans_dir / f"{sanitize(input_id)}.json"
+        shutil.copy2(source_plan, target_plan)
+        target_sha256 = sha256_file(target_plan)
+        if quality.get("plan_sha256") != target_sha256:
+            raise ValueError(
+                f"capture plan hash changed while aggregating {input_id}: "
+                f"report={quality.get('plan_sha256')} copied={target_sha256}"
+            )
+        capture = plan.get("capture") if isinstance(plan.get("capture"), dict) else {}
+        if capture.get("model_path"):
+            model_paths.add(str(capture["model_path"]))
+        server_config_ids.add(server_config_id)
+        plans[input_id] = {
+            "path": str(target_plan.relative_to(suite_dir)),
+            "sha256": target_sha256,
+            "workload_id": str(quality.get("plan_workload_id") or input_id),
+            "workload_fingerprint": quality.get("plan_workload_fingerprint"),
+            "request_count": int(quality.get("request_count") or 0),
+            "workload_report": str(workload_report.relative_to(suite_dir)),
+            "capture_run_dir": str(run_dir.relative_to(suite_dir)),
+            "capture_run_id": capture.get("run_id") or run_dir.name,
+            "capture_config_id": capture.get("config_id") or server_config_id,
+        }
+
+    if len(model_paths) != 1:
+        raise ValueError(f"capture bundle requires exactly one model path, found: {sorted(model_paths)}")
+    if len(server_config_ids) != 1:
+        raise ValueError(
+            f"capture bundle requires exactly one server config, found: {sorted(server_config_ids)}"
+        )
+    model_path = next(iter(model_paths))
+    server_config_id = next(iter(server_config_ids))
+    stable_identity = {
+        "schema": FORCED_TOKEN_BUNDLE_SCHEMA,
+        "capture_config": repo_relative_text(capture_config_path),
+        "model_path": model_path,
+        "server_config_id": server_config_id,
+        "plans": plans,
+    }
+    payload = {
+        "schema": FORCED_TOKEN_BUNDLE_SCHEMA,
+        "bundle_id": sha256_json(stable_identity),
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "capture_suite_dir": repo_relative_text(suite_dir),
+        "capture_config": repo_relative_text(capture_config_path),
+        "model_path": model_path,
+        "server_config_id": server_config_id,
+        "plans": plans,
+    }
+    bundle_path = suite_dir / "forced_token_bundle.json"
+    dump_json(bundle_path, payload)
+    return forced_token_bundle_summary(bundle_path)
 
 
 def run_profile_suite(
     cfg: dict[str, Any],
     dry_run: bool,
     selected_experiments: set[str] | None = None,
+    selected_inputs: set[str] | None = None,
+    selected_servers: set[str] | None = None,
+    *,
+    forced_token_bundle: Path | None = None,
+    config_path: Path | None = None,
 ) -> list[Path]:
     """执行普通 run 或 suite，并写出 suite 级选择/结果文件。"""
 
     is_suite = "experiments" in cfg or "matrix" in cfg
     all_experiments = list(enumerate(expand_suite(cfg), start=1))
-    experiments = filter_suite_experiments(all_experiments, selected_experiments or set())
+    experiments = filter_suite_experiments(
+        all_experiments,
+        selected_experiments or set(),
+        selected_inputs=selected_inputs,
+        selected_servers=selected_servers,
+    )
     if len(experiments) == 1 and not is_suite:
-        return [run_profile(experiments[0][1], dry_run)]
+        experiment = inject_forced_token_bundle_plan(experiments[0][1], forced_token_bundle)
+        preflight_profile_config(experiment)
+        return [run_profile(experiment, dry_run)]
 
     framework = cfg.get("framework", "sglang")
     suite_name = sanitize(str(cfg.get("name", f"{framework}-profile-suite")))
     suite_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / str(framework)
     suite_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{suite_name}"
     suite_dir = suite_root / sanitize(str(suite_id))
+    run_dirs: list[Path] = []
+    failures: list[dict[str, Any]] = []
+    continue_on_error = bool(cfg.get("continue_on_error", False))
+    prepared_experiments: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
+    for ordinal, (index, experiment) in enumerate(experiments, start=1):
+        exp_name = sanitize(str(experiment.get("name", f"experiment-{index}")))
+        exp_cfg = inject_forced_token_bundle_plan(experiment, forced_token_bundle)
+        exp_cfg["run_root"] = str(suite_dir)
+        exp_cfg["run_id"] = f"{index:02d}_{exp_name}"
+        forced_token_contract = preflight_profile_config(exp_cfg)
+        prepared_experiments.append((ordinal, index, exp_name, exp_cfg, forced_token_contract))
+
     suite_dir.mkdir(parents=True, exist_ok=True)
     dump_json(suite_dir / "suite_config.json", cfg)
+    log(f"Suite dir: {suite_dir}")
     dump_json(
         suite_dir / "suite_selection.json",
         {
+            "schema": "trace_sim.profile.suite_selection.v1",
+            "suite_name": suite_name,
+            "framework": framework,
+            "profile_mode": suite_profile_mode(cfg),
+            "metadata": cfg.get("metadata", {}) if isinstance(cfg.get("metadata"), dict) else {},
             "selected_selectors": sorted(selected_experiments or []),
+            "selected_inputs": sorted(selected_inputs or []),
+            "selected_servers": sorted(selected_servers or []),
+            "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
+            if forced_token_bundle is not None
+            else None,
             "available_experiments": [describe_suite_experiment(index, experiment) for index, experiment in all_experiments],
-            "planned_experiments": [describe_suite_experiment(index, experiment) for index, experiment in experiments],
+            "planned_experiments": [
+                {
+                    **describe_suite_experiment(index, exp_cfg),
+                    "forced_token_contract": forced_token_contract,
+                }
+                for _ordinal, index, _exp_name, exp_cfg, forced_token_contract in prepared_experiments
+            ],
         },
     )
 
-    log(f"Suite dir: {suite_dir}")
-    run_dirs: list[Path] = []
-    failures: list[dict[str, str]] = []
-    continue_on_error = bool(cfg.get("continue_on_error", False))
-    for ordinal, (index, experiment) in enumerate(experiments, start=1):
-        exp_name = sanitize(str(experiment.get("name", f"experiment-{index}")))
-        exp_cfg = dict(experiment)
-        exp_cfg["run_root"] = str(suite_dir)
-        exp_cfg["run_id"] = f"{index:02d}_{exp_name}"
-
+    fatal_error: Exception | None = None
+    attempted_count = 0
+    for ordinal, index, exp_name, exp_cfg, forced_token_contract in prepared_experiments:
+        attempted_count += 1
         log(f"Suite experiment {ordinal}/{len(experiments)} (#{index}): {exp_name}")
         try:
             run_dirs.append(run_profile(exp_cfg, dry_run))
         except Exception as exc:
-            failures.append({"name": exp_name, "error": str(exc)})
+            failures.append({"name": exp_name, "error": str(exc), "forced_token_contract": forced_token_contract})
             if not continue_on_error:
-                raise
+                fatal_error = exc
+                break
+
+    generated_bundle: dict[str, Any] | None = None
+    bundle_error: str | None = None
+    if suite_profile_mode(cfg) == "forced_token_capture" and not dry_run and not failures:
+        try:
+            if config_path is None:
+                raise ValueError("capture suite requires its source config path")
+            generated_bundle = build_forced_token_bundle(
+                suite_dir,
+                run_dirs,
+                capture_config_path=config_path,
+            )
+            log(f"Forced token bundle: {generated_bundle.get('path')}")
+        except Exception as exc:
+            bundle_error = str(exc)
+            failures.append({"name": "forced_token_bundle", "error": bundle_error})
 
     dump_json(
         suite_dir / "suite_result.json",
         {
+            "schema": "trace_sim.profile.suite_result.v1",
             "suite_dir": str(suite_dir),
+            "suite_name": suite_name,
+            "framework": framework,
+            "profile_mode": suite_profile_mode(cfg),
+            "metadata": cfg.get("metadata", {}) if isinstance(cfg.get("metadata"), dict) else {},
+            "dry_run": bool(dry_run),
+            "selected_selectors": sorted(selected_experiments or []),
+            "selected_inputs": sorted(selected_inputs or []),
+            "selected_servers": sorted(selected_servers or []),
+            "planned_count": len(prepared_experiments),
+            "attempted_count": attempted_count,
+            "completed_count": len(run_dirs),
+            "failure_count": len(failures),
+            "aborted_count": len(prepared_experiments) - attempted_count,
+            "status": "failed" if failures else "completed",
             "runs": [str(path) for path in run_dirs],
             "failures": failures,
-            "selected_experiments": [describe_suite_experiment(index, experiment) for index, experiment in experiments],
+            "forced_token_contracts": summarize_suite_forced_token_contracts(
+                [
+                    forced_token_contract
+                    for _ordinal, _index, _exp_name, _exp_cfg, forced_token_contract in prepared_experiments
+                ]
+            ),
+            "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
+            if forced_token_bundle is not None
+            else None,
+            "generated_forced_token_bundle": generated_bundle,
+            "selected_experiments": [
+                {
+                    **describe_suite_experiment(index, exp_cfg),
+                    "forced_token_contract": forced_token_contract,
+                }
+                for _ordinal, index, _exp_name, exp_cfg, forced_token_contract in prepared_experiments
+            ],
         },
     )
+    if bundle_error:
+        raise ValueError(f"forced token bundle aggregation failed: {bundle_error}")
+    if fatal_error is not None:
+        raise RuntimeError(f"profile suite failed: {failures[-1]['name']}: {fatal_error}") from fatal_error
     return run_dirs
+
+
+def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
+    """读取 suite metadata 中的 profile mode。"""
+
+    metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
+    value = metadata.get("profile_mode")
+    return str(value) if isinstance(value, str) and value else None
+
+
+def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总 suite 中 forced-token preflight 合同，便于顶层审计。"""
+
+    modes = sorted({str(contract.get("mode") or "none") for contract in contracts})
+    errors = sorted(
+        {
+            str(error)
+            for contract in contracts
+            for error in contract.get("errors", [])
+        }
+    )
+    plan_hashes = sorted(
+        {
+            str(plan.get("sha256"))
+            for contract in contracts
+            for plan in [contract.get("plan")]
+            if isinstance(plan, dict) and plan.get("sha256")
+        }
+    )
+    bundle_hashes = sorted(
+        {
+            str(bundle.get("sha256"))
+            for contract in contracts
+            for bundle in [contract.get("bundle")]
+            if isinstance(bundle, dict) and bundle.get("sha256")
+        }
+    )
+    bundle_ids = sorted(
+        {
+            str(bundle.get("bundle_id"))
+            for contract in contracts
+            for bundle in [contract.get("bundle")]
+            if isinstance(bundle, dict) and bundle.get("bundle_id")
+        }
+    )
+    workloads = sorted(
+        {
+            str(contract.get("workload_id"))
+            for contract in contracts
+            if contract.get("workload_id")
+        }
+    )
+    return {
+        "mode_count": {mode: sum(1 for contract in contracts if str(contract.get("mode") or "none") == mode) for mode in modes},
+        "errors": errors,
+        "ready": not errors,
+        "workload_ids": workloads,
+        "plan_sha256_count": len(plan_hashes),
+        "plan_sha256_values": plan_hashes,
+        "bundle_sha256_count": len(bundle_hashes),
+        "bundle_sha256_values": bundle_hashes,
+        "bundle_ids": bundle_ids,
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1210,6 +1766,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
     parser.add_argument("--experiment", action="append", default=[], help="run one experiment id/name; may be repeated")
     parser.add_argument("--experiments", action="append", default=[], help="comma-separated experiment ids/names to run")
+    parser.add_argument("--input", action="append", default=[], help="run one suite input id; may be repeated")
+    parser.add_argument("--inputs", action="append", default=[], help="comma-separated suite input ids to run")
+    parser.add_argument("--server", action="append", default=[], help="run one suite server id; may be repeated")
+    parser.add_argument("--servers", action="append", default=[], help="comma-separated suite server ids to run")
+    parser.add_argument(
+        "--forced-token-bundle",
+        help="Explicit forced_token_bundle.json required by forced-token replay suites.",
+    )
     parser.add_argument("--list-experiments", action="store_true", help="print expanded experiment ids without running them")
     return parser.parse_args(argv)
 
@@ -1226,18 +1790,43 @@ def main(argv: list[str] | None = None) -> int:
         [*args.experiment, *args.experiments],
         os.environ.get(PROFILE_EXPERIMENTS_ENV),
     )
+    selected_inputs = parse_experiment_selection(
+        [*args.input, *args.inputs],
+        os.environ.get(PROFILE_INPUTS_ENV),
+    )
+    selected_servers = parse_experiment_selection(
+        [*args.server, *args.servers],
+        os.environ.get(PROFILE_SERVERS_ENV),
+    )
+    forced_token_bundle = resolve_repo_path(
+        args.forced_token_bundle or os.environ.get(PROFILE_FORCED_TOKEN_BUNDLE_ENV)
+    )
     if args.list_experiments:
         experiments = filter_suite_experiments(
             list(enumerate(expand_suite(cfg), start=1)),
             selected_experiments,
+            selected_inputs=selected_inputs,
+            selected_servers=selected_servers,
         )
         for index, experiment in experiments:
             exp_id = experiment.get("id") or experiment_identity(experiment, index)
             exp_name = experiment.get("name") or exp_id
-            print(f"{index:02d}\t{exp_id}\t{exp_name}")
+            metadata = experiment.get("metadata") if isinstance(experiment.get("metadata"), dict) else {}
+            print(
+                f"{index:02d}\t{exp_id}\t{exp_name}\t"
+                f"server={metadata.get('suite_server_id')}\tinput={metadata.get('suite_input_id')}"
+            )
         return 0
 
-    run_dirs = run_profile_suite(cfg, args.dry_run, selected_experiments)
+    run_dirs = run_profile_suite(
+        cfg,
+        args.dry_run,
+        selected_experiments,
+        selected_inputs,
+        selected_servers,
+        forced_token_bundle=forced_token_bundle,
+        config_path=config_path,
+    )
     for run_dir in run_dirs:
         print(run_dir)
     return 0
@@ -1246,5 +1835,8 @@ def main(argv: list[str] | None = None) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except (FileNotFoundError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(2)
     except KeyboardInterrupt:
         raise SystemExit(130)
