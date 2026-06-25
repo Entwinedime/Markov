@@ -34,13 +34,14 @@ DEFAULT_ROLES = (
 
 PATH_ROLES = {
     "request_bound_match_anchor",
+    "request_lifecycle_anchor",
     "request_admission",
     "prefetch_decision",
 }
 
 ROLE_SCALAR_FIELDS = {
     "request_bound_match_anchor": ("token_count",),
-    "request_lifecycle_anchor": ("lifecycle_kind", "is_insert", "chunked", "priority"),
+    "request_lifecycle_anchor": ("lifecycle_kind", "token_count", "is_insert", "chunked", "priority"),
     "request_admission": (
         "admission_kind",
         "token_count",
@@ -83,14 +84,28 @@ class AuditEvent:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析 cross-input audit CLI 参数。"""
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-trace", type=Path, action="append", required=True)
-    parser.add_argument("--target-trace", type=Path, action="append", required=True)
-    parser.add_argument("--source-label", default="source")
-    parser.add_argument("--target-label", default="target")
-    parser.add_argument("--role", action="append", default=[])
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--sample", type=int, default=8)
+    parser = argparse.ArgumentParser(
+        description="Audit cross-config HiCache atomic invariant model-input facts."
+    )
+    parser.add_argument(
+        "--source-trace",
+        type=Path,
+        action="append",
+        required=True,
+        help="Source Python probe trace path. Can be repeated.",
+    )
+    parser.add_argument(
+        "--target-trace",
+        type=Path,
+        action="append",
+        required=True,
+        help="Target Python probe trace path. Can be repeated.",
+    )
+    parser.add_argument("--source-label", default="source", help="Source label used in the report.")
+    parser.add_argument("--target-label", default="target", help="Target label used in the report.")
+    parser.add_argument("--role", action="append", default=[], help="Invariant role to audit. Can be repeated.")
+    parser.add_argument("--output", type=Path, help="Output JSON path. Prints full report when omitted.")
+    parser.add_argument("--sample", type=int, default=8, help="Maximum mismatch / issue sample size.")
     return parser.parse_args(argv)
 
 
@@ -124,6 +139,15 @@ def optional_int(value: Any, default: int = 0) -> int:
         return int(float(value))
     except (TypeError, ValueError):
         return default
+
+
+def maybe_int(value: Any) -> int | None:
+    """宽松解析整数，失败时返回 None。"""
+
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def true_like(value: Any) -> bool:
@@ -183,18 +207,25 @@ def completed_model_invariant(event: dict[str, Any]) -> bool:
 def token_ids(value: Any) -> tuple[int, ...]:
     """从 token dictionary JSON 中提取 token id 序列。"""
 
+    tokens = token_id_list(value)
+    return () if tokens is None else tokens
+
+
+def token_id_list(value: Any) -> tuple[int, ...] | None:
+    """从 token dictionary JSON 中提取 token id 序列，缺失时返回 None。"""
+
     value = maybe_json(value)
     if not isinstance(value, dict):
-        return ()
+        return None
     raw_tokens = value.get("token_ids")
     if not isinstance(raw_tokens, list):
-        return ()
+        return None
     parsed: list[int] = []
     for token in raw_tokens:
         try:
             parsed.append(int(token[0] if isinstance(token, list) else token))
         except (TypeError, ValueError, IndexError):
-            return ()
+            return None
     return tuple(parsed)
 
 
@@ -247,6 +278,177 @@ def path_signature(args: dict[str, Any]) -> dict[str, Any]:
     return {
         "dictionary": dictionary,
         "span": span,
+    }
+
+
+def model_input_path_contract(paths: list[Path], roles: set[str], sample: int) -> dict[str, Any]:
+    """检查 path-bearing invariant event 是否能被 C++ token parser 直接消费。"""
+
+    issue_counts: collections.Counter[str] = collections.Counter()
+    issue_counts_by_role: collections.Counter[str] = collections.Counter()
+    samples: list[dict[str, Any]] = []
+    path_refs_by_id: dict[str, set[str]] = collections.defaultdict(set)
+    path_ids_with_tokens: set[str] = set()
+    path_event_count = 0
+
+    def record_issue(role: str, issue: str, event: dict[str, Any], detail: dict[str, Any] | None = None) -> None:
+        issue_counts[issue] += 1
+        issue_counts_by_role[role] += 1
+        if len(samples) >= sample:
+            return
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        samples.append(
+            {
+                "role": role,
+                "issue": issue,
+                "event_name": str(event.get("name") or ""),
+                "target_id": str(args.get("target_id") or ""),
+                "request_id": str(args.get("request_id") or ""),
+                "seq_no": optional_int(args.get("seq_no")),
+                "detail": detail or {},
+            }
+        )
+
+    events = trace_events(paths)
+    for _path, event in events:
+        if not completed_model_invariant(event):
+            continue
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        for key, value in args.items():
+            if "dictionary" not in str(key):
+                continue
+            dictionary = maybe_json(value)
+            if not isinstance(dictionary, dict):
+                continue
+            path_id = str(dictionary.get("token_path_id") or dictionary.get("path_id") or "")
+            tokens = token_id_list(dictionary)
+            if path_id and tokens is not None:
+                path_ids_with_tokens.add(path_id)
+
+    for _path, event in events:
+        if not completed_model_invariant(event):
+            continue
+        args = event.get("args") if isinstance(event.get("args"), dict) else {}
+        role = str(args.get("event_role") or "")
+        if role not in roles or role not in PATH_ROLES:
+            continue
+
+        path_event_count += 1
+        dictionary = maybe_json(args.get("token_dictionary"))
+        span = maybe_json(args.get("full_path_span"))
+        if maybe_int(args.get("token_count")) is None:
+            record_issue(role, "missing_role_token_count", event)
+
+        dictionary_path_id = ""
+        dictionary_token_count: int | None = None
+        if not isinstance(dictionary, dict):
+            record_issue(role, "missing_token_dictionary", event)
+        else:
+            dictionary_path_id = str(dictionary.get("token_path_id") or dictionary.get("path_id") or "")
+            dictionary_token_count = maybe_int(dictionary.get("token_count"))
+            if not dictionary_path_id:
+                record_issue(role, "missing_token_dictionary_path_id", event)
+            if dictionary_token_count is None:
+                record_issue(role, "missing_token_dictionary_token_count", event, {"path_id": dictionary_path_id})
+            if not str(dictionary.get("hash_algo") or ""):
+                record_issue(role, "missing_token_dictionary_hash_algo", event, {"path_id": dictionary_path_id})
+
+            tokens = token_id_list(dictionary)
+            if tokens is not None and dictionary_path_id:
+                path_ids_with_tokens.add(dictionary_path_id)
+                computed_path_id = token_hash(tokens)
+                if computed_path_id != dictionary_path_id:
+                    record_issue(
+                        role,
+                        "token_dictionary_hash_mismatch",
+                        event,
+                        {"path_id": dictionary_path_id, "computed_path_id": computed_path_id},
+                    )
+                if dictionary_token_count is not None and dictionary_token_count != len(tokens):
+                    record_issue(
+                        role,
+                        "token_dictionary_token_count_mismatch",
+                        event,
+                        {
+                            "path_id": dictionary_path_id,
+                            "token_count": dictionary_token_count,
+                            "token_ids": len(tokens),
+                        },
+                    )
+
+        span_path_id = ""
+        span_begin: int | None = None
+        span_end: int | None = None
+        if not isinstance(span, dict):
+            record_issue(role, "missing_full_path_span", event, {"path_id": dictionary_path_id})
+        else:
+            span_path_id = str(span.get("path_id") or span.get("token_path_id") or "")
+            span_begin = maybe_int(span.get("begin"))
+            span_end = maybe_int(span.get("end"))
+            if not span_path_id:
+                record_issue(role, "missing_full_path_span_path_id", event, {"path_id": dictionary_path_id})
+            if span_begin is None:
+                record_issue(role, "missing_full_path_span_begin", event, {"path_id": span_path_id})
+            if span_end is None:
+                record_issue(role, "missing_full_path_span_end", event, {"path_id": span_path_id})
+            if not str(span.get("hash_algo") or ""):
+                record_issue(role, "missing_full_path_span_hash_algo", event, {"path_id": span_path_id})
+            if span_begin is not None and span_end is not None and span_end < span_begin:
+                record_issue(
+                    role,
+                    "invalid_full_path_span_range",
+                    event,
+                    {"path_id": span_path_id, "begin": span_begin, "end": span_end},
+                )
+            if dictionary_path_id and span_path_id and dictionary_path_id != span_path_id:
+                record_issue(
+                    role,
+                    "dictionary_span_path_mismatch",
+                    event,
+                    {"dictionary_path_id": dictionary_path_id, "span_path_id": span_path_id},
+                )
+            if dictionary_token_count is not None and span_end is not None and span_end > dictionary_token_count:
+                record_issue(
+                    role,
+                    "full_path_span_exceeds_dictionary",
+                    event,
+                    {"path_id": span_path_id, "span_end": span_end, "dictionary_token_count": dictionary_token_count},
+                )
+
+        for path_id in {dictionary_path_id, span_path_id} - {""}:
+            path_refs_by_id[path_id].add(role)
+
+    missing_token_ids = sorted(path_id for path_id in path_refs_by_id if path_id not in path_ids_with_tokens)
+    for path_id in missing_token_ids:
+        roles_for_path = sorted(path_refs_by_id[path_id])
+        issue_counts["token_dictionary_missing_token_ids"] += 1
+        for role in roles_for_path:
+            issue_counts_by_role[role] += 1
+        if len(samples) < sample:
+            samples.append(
+                {
+                    "role": ",".join(roles_for_path),
+                    "issue": "token_dictionary_missing_token_ids",
+                    "event_name": "",
+                    "target_id": "",
+                    "request_id": "",
+                    "seq_no": 0,
+                    "detail": {"path_id": path_id, "referenced_by_roles": roles_for_path},
+                }
+            )
+
+    issue_count = sum(issue_counts.values())
+    return {
+        "ready": issue_count == 0,
+        "path_event_count": path_event_count,
+        "referenced_path_count": len(path_refs_by_id),
+        "path_ids_with_token_ids": len(path_ids_with_tokens),
+        "missing_token_ids_path_count": len(missing_token_ids),
+        "issue_count": issue_count,
+        "issue_counts": dict(sorted(issue_counts.items())),
+        "issue_counts_by_role": dict(sorted(issue_counts_by_role.items())),
+        "blocking_roles": sorted(issue_counts_by_role),
+        "samples": samples,
     }
 
 
@@ -461,6 +663,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     unknown_roles = sorted(roles - KNOWN_ATOMIC_INVARIANT_ROLES)
     source_events, source_unknown, source_unmapped = extract_audit_events(args.source_trace, args.source_label, roles)
     target_events, target_unknown, target_unmapped = extract_audit_events(args.target_trace, args.target_label, roles)
+    source_path_contract = model_input_path_contract(args.source_trace, roles, args.sample)
+    target_path_contract = model_input_path_contract(args.target_trace, roles, args.sample)
 
     source_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
     target_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
@@ -492,12 +696,17 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "target": dict(sorted(target_unmapped.items())),
     }
     unmapped_roles = sorted(set(source_unmapped) | set(target_unmapped))
-    blocking_roles = sorted(set(fact_mismatch_roles) | set(unmapped_roles))
+    path_contract_roles = sorted(
+        set(source_path_contract["blocking_roles"]) | set(target_path_contract["blocking_roles"])
+    )
+    blocking_roles = sorted(set(fact_mismatch_roles) | set(unmapped_roles) | set(path_contract_roles))
     ready = (
         not blocking_roles
         and not source_unknown
         and not target_unknown
         and not unknown_roles
+        and source_path_contract["ready"]
+        and target_path_contract["ready"]
     )
     return {
         "schema": "trace_sim.hicache.atomic_cross_input_audit.v3",
@@ -512,6 +721,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "input_contract_ready_for_cross_state_rule_diagnosis": ready,
         "model_input_blocking_roles": blocking_roles,
         "model_input_fact_mismatch_roles": fact_mismatch_roles,
+        "model_input_path_contract_blocking_roles": path_contract_roles,
+        "source_model_input_path_contract": source_path_contract,
+        "target_model_input_path_contract": target_path_contract,
         "non_blocking_sequence_mismatch_roles": sequence_mismatch_roles,
         "unknown_requested_roles": unknown_roles,
         "unknown_invariant_roles": unknown_invariant_roles,
@@ -525,7 +737,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "pass_condition": (
             "For every selected atomic invariant role, source and target streams must match by event count "
             "and canonical fact multiset after request_id normalization. Unknown invariant roles and "
-            "unmapped request-scoped facts are hard failures; sequence mismatch is diagnostic only."
+            "unmapped request-scoped facts are hard failures. Path-bearing invariant facts must be directly "
+            "consumable by the C++ token parser, including at least one model-input token_ids dictionary for "
+            "every referenced path_id. Sequence mismatch is diagnostic only."
         ),
     }
 
@@ -546,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             "target_event_count": report["target_event_count"],
             "model_input_contract_ready": report["model_input_contract_ready"],
             "model_input_blocking_roles": report["model_input_blocking_roles"],
+            "model_input_path_contract_blocking_roles": report["model_input_path_contract_blocking_roles"],
             "non_blocking_sequence_mismatch_roles": report["non_blocking_sequence_mismatch_roles"],
             "unknown_invariant_roles": report["unknown_invariant_roles"],
             "unmapped_request_id_events": report["unmapped_request_id_events"],

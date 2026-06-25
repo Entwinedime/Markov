@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""HiCache transition exactness 分阶段验证工具。
+"""HiCache transition exactness 验证入口。
 
-该脚本是只读诊断入口：它读取 C++ state model 已输出的 predicted transition
-trace，以及 full Python probe 中的 validation-only evidence，生成 transition
-exactness 所需的阶段化 JSON 产物。它不生成 synthetic model_input 事件，也不把
-target actual / oracle 信息回写到建模输入。
+本脚本是只读诊断入口。它读取 C++ state model 输出的 predicted transition
+trace，以及 full Python probe 中的 validation-only evidence，完成 self、cross
+或 matrix 方向的 transition 比较。每个 compare 结果都会带上 family 分类和
+DAG patch gate 字段；matrix 级 catalog 与 gate scoreboard 是显式开关控制的
+派生产物。本脚本不生成 synthetic model_input，也不把 target actual / oracle
+信息回写到建模输入。
 """
 
 from __future__ import annotations
@@ -22,6 +24,19 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from hicache_state_matrix import profile_run_from_manifest, safe_slug  # noqa: E402
+from hicache_transition_catalog import (  # noqa: E402
+    build_transition_mismatch_catalog_from_entries,
+    write_transition_catalog_outputs,
+)
+from hicache_transition_gate import (  # noqa: E402
+    build_transition_patch_gate_scoreboard_from_entries,
+    write_prediction_gate_outputs,
+)
+from hicache_transition_taxonomy import (  # noqa: E402
+    build_transition_classification_entry,
+    compare_result_classification_fields,
+    load_hicache_summary,
+)
 from model_runner import (  # noqa: E402
     DELTA_KIND_BY_STATE_KEY,
     build_oracle_timeline_deltas,
@@ -39,6 +54,10 @@ from trace_json import load_chrome_trace_events  # noqa: E402
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_PAGE_KEY_MODE = "strip_scope"
+CLI_DESCRIPTION = (
+    "Validate HiCache transition exactness from predicted model transitions "
+    "and target-side Python-probe oracle traces."
+)
 
 ACTIVE_STATE_KEYS = (
     "l1_resident_pages",
@@ -97,6 +116,7 @@ KNOWN_TRANSITION_KINDS = {
     "prefetch_ready",
     "prefetch_revoked",
     "prefetch_suppressed",
+    "prefetch_terminated",
     "prefetch_timeout_incomplete",
     "promote_visible_prefix_to_l1",
     "release_request_ref",
@@ -135,7 +155,7 @@ LOCK_RELEASE_BY_KIND = {
     "cancel_writeback": "writeback",
 }
 
-OPERATION_ROLE_TO_INTENT = {
+OBSERVED_ROLE_TO_OPERATION_KIND = {
     "all_blocks_cleared_observed": "host_cleanup",
     "capacity_request": "capacity_request",
     "capacity_result_observed": "capacity_result",
@@ -184,7 +204,7 @@ class PathsForPrediction:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析 CLI 参数。"""
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=CLI_DESCRIPTION)
     parser.add_argument(
         "--mode",
         required=True,
@@ -193,20 +213,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "extract-target-oracle",
             "compare-self",
             "compare-cross",
-            "compare-cross-matrix",
-            "operation-intent",
+            "compare-matrix",
         ),
     )
-    parser.add_argument("--prediction-dir", type=Path, help="单个 prediction 输出目录。")
-    parser.add_argument("--predicted-trace", type=Path, help="显式指定 predicted_target_cache_state_trace.json。")
-    parser.add_argument("--target-manifest", type=Path, help="target profile_manifest.json。")
-    parser.add_argument("--oracle-trace", type=Path, action="append", default=[], help="显式指定 target Python probe trace，可重复。")
-    parser.add_argument("--observed-target-trace", type=Path, help="observed_target_transition_trace.json。")
-    parser.add_argument("--matrix-dir", type=Path, help="hicache_state_matrix_validation 输出目录。")
-    parser.add_argument("--output", type=Path, help="输出 JSON 路径；缺省按 mode 写到标准位置。")
+    parser.add_argument("--prediction-dir", type=Path, help="Single prediction output directory.")
+    parser.add_argument("--predicted-trace", type=Path, help="Explicit predicted_target_cache_state_trace.json path.")
+    parser.add_argument("--target-manifest", type=Path, help="Target profile_manifest.json path.")
+    parser.add_argument(
+        "--oracle-trace",
+        type=Path,
+        action="append",
+        default=[],
+        help="Explicit target Python probe trace path. Can be repeated.",
+    )
+    parser.add_argument("--observed-target-trace", type=Path, help="observed_target_transition_trace.json path.")
+    parser.add_argument("--matrix-dir", type=Path, help="hicache_state_workflow output directory.")
+    parser.add_argument("--output", type=Path, help="Primary JSON output path. Defaults depend on --mode.")
+    parser.add_argument(
+        "--catalog-output",
+        type=Path,
+        help="Output path used by --emit-catalog. Default: transition_mismatch_catalog.json.",
+    )
+    parser.add_argument(
+        "--gate-output",
+        type=Path,
+        help="Matrix scoreboard output path used by --emit-gates. Default: transition_patch_gate_scoreboard.json.",
+    )
     parser.add_argument("--page-key-mode", default=DEFAULT_PAGE_KEY_MODE, choices=("strip_scope", "raw"))
-    parser.add_argument("--force", action="store_true", help="矩阵模式下强制重建已存在的阶段产物。")
-    parser.add_argument("--sample", type=int, default=20, help="mismatch / issue 样本最大数量。")
+    parser.add_argument("--force", action="store_true", help="Rebuild existing oracle / compare artifacts.")
+    parser.add_argument(
+        "--emit-catalog",
+        action="store_true",
+        help="Emit transition mismatch catalog artifacts from compare results.",
+    )
+    parser.add_argument("--emit-gates", action="store_true", help="Emit operation gate artifacts from compare results.")
+    parser.add_argument("--sample", type=int, default=20, help="Maximum mismatch / issue sample size.")
     return parser.parse_args(argv)
 
 
@@ -230,32 +271,83 @@ def main(argv: list[str] | None = None) -> int:
         observed_path = resolve_required_path(args.observed_target_trace, "--observed-target-trace")
         default_name = "transition_exactness_self.json" if mode == "compare-self" else "transition_exactness_cross.json"
         output = resolve_output(args.output, prediction_paths.prediction_dir / default_name)
+        comparison = compare_prediction_to_observed(
+            prediction_paths,
+            observed_path,
+            comparison_mode="self" if mode == "compare-self" else "cross",
+            page_key_mode=args.page_key_mode,
+            sample_limit=args.sample,
+            include_classification_evidence=bool(args.emit_catalog),
+        )
+        write_json(output, comparison)
+        emit_single_compare_derivatives(
+            args,
+            prediction_paths,
+            observed_path,
+            classification_entry_from_comparison(comparison),
+        )
+        return 0
+    if mode == "compare-matrix":
+        matrix_dir = resolve_required_path(args.matrix_dir, "--matrix-dir")
+        output = resolve_output(args.output, matrix_dir / "transition_exactness_matrix.json")
         write_json(
             output,
-            compare_prediction_to_observed(
-                prediction_paths,
-                observed_path,
-                comparison_mode="self" if mode == "compare-self" else "cross",
+            compare_transition_matrix(
+                matrix_dir,
                 page_key_mode=args.page_key_mode,
+                force=args.force,
                 sample_limit=args.sample,
+                emit_catalog=args.emit_catalog,
+                emit_gates=args.emit_gates,
+                catalog_output=args.catalog_output,
+                gate_output=args.gate_output,
+                matrix_output_path=output,
             ),
         )
         return 0
-    if mode == "operation-intent":
-        prediction_paths = prediction_paths_from_args(args)
-        observed_path = resolve_required_path(args.observed_target_trace, "--observed-target-trace")
-        output = resolve_output(args.output, prediction_paths.prediction_dir / "operation_intent_exactness.json")
-        write_json(
-            output,
-            compare_operation_intents(prediction_paths.predicted_trace, observed_path, page_key_mode=args.page_key_mode, sample_limit=args.sample),
-        )
-        return 0
-    if mode == "compare-cross-matrix":
-        matrix_dir = resolve_required_path(args.matrix_dir, "--matrix-dir")
-        output = resolve_output(args.output, matrix_dir / "transition_exactness_cross_matrix.json")
-        write_json(output, compare_cross_matrix(matrix_dir, page_key_mode=args.page_key_mode, force=args.force, sample_limit=args.sample))
-        return 0
     raise SystemExit(f"unsupported mode: {mode}")
+
+
+def classification_entry_from_comparison(comparison: dict[str, Any]) -> dict[str, Any]:
+    """从 compare 输出中读取分类 entry。"""
+
+    entry = comparison.get("transition_classification")
+    return entry if isinstance(entry, dict) else {}
+
+
+def emit_single_compare_derivatives(
+    args: argparse.Namespace,
+    prediction_paths: PathsForPrediction,
+    observed_path: Path,
+    classification_entry: dict[str, Any],
+) -> None:
+    """按显式开关写出单格 catalog/gate 派生产物。"""
+
+    if args.emit_catalog:
+        catalog_output = resolve_output(
+            args.catalog_output,
+            prediction_paths.prediction_dir / "transition_mismatch_catalog.json",
+        )
+        catalog = build_transition_mismatch_catalog_from_entries(
+            prediction_paths.prediction_dir,
+            [classification_entry],
+            source_matrix_path="",
+            sample_limit=args.sample,
+        )
+        write_transition_catalog_outputs(
+            prediction_paths.prediction_dir,
+            catalog_output,
+            catalog,
+            sample_limit=args.sample,
+        )
+    if args.emit_gates:
+        write_prediction_gate_outputs(
+            prediction_paths.prediction_dir,
+            observed_path,
+            classification_entry,
+            page_key_mode=args.page_key_mode,
+            sample_limit=args.sample,
+        )
 
 
 def resolve_repo_path(path: Path) -> Path:
@@ -311,8 +403,16 @@ def prediction_paths_from_args(args: argparse.Namespace) -> PathsForPrediction:
 
     if args.prediction_dir is None and args.predicted_trace is None:
         raise SystemExit("missing --prediction-dir or --predicted-trace")
-    prediction_dir = resolve_repo_path(args.prediction_dir) if args.prediction_dir else resolve_repo_path(args.predicted_trace).parent
-    predicted_trace = resolve_repo_path(args.predicted_trace) if args.predicted_trace else prediction_dir / "predicted_target_cache_state_trace.json"
+    prediction_dir = (
+        resolve_repo_path(args.prediction_dir)
+        if args.prediction_dir
+        else resolve_repo_path(args.predicted_trace).parent
+    )
+    predicted_trace = (
+        resolve_repo_path(args.predicted_trace)
+        if args.predicted_trace
+        else prediction_dir / "predicted_target_cache_state_trace.json"
+    )
     return PathsForPrediction(
         prediction_dir=prediction_dir,
         predicted_trace=predicted_trace,
@@ -534,6 +634,8 @@ def replay_predicted_records(records: list[dict[str, Any]], *, sample_limit: int
             add_pages(state, delta_rows, "prefetch_suppressed_pages", pages, record, ordinal)
         elif kind == "prefetch_timeout_incomplete":
             add_pages(state, delta_rows, "prefetch_late_pages", pages, record, ordinal)
+        elif kind == "prefetch_terminated":
+            pass
         elif kind == "increment_hit_count":
             for page in pages:
                 page_hit_counts[page] += 1
@@ -557,7 +659,14 @@ def replay_predicted_records(records: list[dict[str, Any]], *, sample_limit: int
                     "source_event_index": record.get("source_event_index"),
                 }
             )
-        if len(delta_rows) == before_delta_count and pages and kind not in {"increment_hit_count", "complete_storage_backup", "complete_loadback", "complete_writeback", "cancel_writeback"}:
+        if len(delta_rows) == before_delta_count and pages and kind not in {
+            "increment_hit_count",
+            "complete_storage_backup",
+            "complete_loadback",
+            "complete_writeback",
+            "cancel_writeback",
+            "prefetch_terminated",
+        }:
             noop_rows.append(
                 {
                     "ordinal": ordinal,
@@ -874,6 +983,7 @@ def build_lifecycle_check(records: list[dict[str, Any]], *, sample_limit: int) -
             counts.get("prefetch_ready", 0)
             + counts.get("prefetch_revoked", 0)
             + counts.get("prefetch_suppressed", 0)
+            + counts.get("prefetch_terminated", 0)
             + counts.get("prefetch_timeout_incomplete", 0)
         )
         if terminal < planned:
@@ -1030,10 +1140,10 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
 
 
 def observed_operation_kind(role: str, event_kind: str) -> str:
-    """把 probe role 归一化为 operation intent kind。"""
+    """把 probe role 归一化为 transition patch gate 使用的 operation kind。"""
 
-    if role in OPERATION_ROLE_TO_INTENT:
-        return OPERATION_ROLE_TO_INTENT[role]
+    if role in OBSERVED_ROLE_TO_OPERATION_KIND:
+        return OBSERVED_ROLE_TO_OPERATION_KIND[role]
     if "prefetch" in role or "prefetch" in event_kind:
         return "prefetch"
     if "writeback" in role or "writeback" in event_kind:
@@ -1129,8 +1239,10 @@ def compare_prediction_to_observed(
     page_key_mode: str,
     sample_limit: int,
     force_self_check: bool = False,
+    context: dict[str, Any] | None = None,
+    include_classification_evidence: bool = False,
 ) -> dict[str, Any]:
-    """构建第 3/4 阶段单格 transition exactness 对比。"""
+    """构建单格 transition exactness 对比，并同步生成分类与 patch gate 字段。"""
 
     self_check_path = prediction_paths.model_self_check
     if self_check_path.is_file() and not force_self_check:
@@ -1155,7 +1267,7 @@ def compare_prediction_to_observed(
         and bool(model_rows or observed_rows)
     )
     exact = ready and count_match["match"] and lifecycle_match["match"]
-    return {
+    result = {
         "schema": f"trace_sim.hicache.transition_exactness_{comparison_mode}.v1",
         "comparison_mode": comparison_mode,
         "ready": ready,
@@ -1170,9 +1282,9 @@ def compare_prediction_to_observed(
         "target_config_id": observed.get("target_config_id", ""),
         "input_id": observed.get("input_id", ""),
         "validation_final_state_match": validation_summary.get("final_state_match"),
-        "t0_final_state_exact": final_state["match"],
-        "t1_transition_count_exact": count_match["match"],
-        "t2_page_lifecycle_multiset_exact": lifecycle_match["match"],
+        "final_state_exact": final_state["match"],
+        "transition_count_exact": count_match["match"],
+        "page_lifecycle_multiset_exact": lifecycle_match["match"],
         "final_state_comparison": final_state,
         "transition_count_comparison": count_match,
         "page_lifecycle_multiset_comparison": lifecycle_match,
@@ -1180,15 +1292,27 @@ def compare_prediction_to_observed(
         "observed_delta_count_by_kind": count_rows_by_transition_kind(observed_rows),
         "unsupported_or_unobservable_state_keys": observed.get("unsupported_or_unobservable_state_keys", []),
         "ignored_transition_state_keys": {
-            "locked_pages": "lock/ref transient is observed through source_actual evidence, but it is not invariant_state model input; final locked state remains checked in T0.",
+            "locked_pages": "lock/ref transient is observed through source_actual evidence, but it is not invariant_state model input; final locked state remains checked through final-state exactness.",
         },
         "failure_classification": classify_transition_comparison_failure(self_check, observed, final_state, count_match, lifecycle_match),
         "notes": [
-            "T1/T2 compare normalized state-delta rows, not raw C++ transition names.",
+            "Transition count and page lifecycle checks compare normalized state-delta rows, not raw C++ transition names.",
             "Snapshot timeline is validation evidence only; source_actual is not consumed as model input.",
             "Cross mode uses page-key normalization and transition/page multiset; raw timestamp alignment is intentionally not required.",
         ],
     }
+    classification_entry = build_transition_classification_entry(
+        context or comparison_context_from_prediction(prediction_paths, observed_target_trace_path, result),
+        result,
+        load_hicache_summary(prediction_paths.prediction_dir / "model_summary.json"),
+        observed_target_trace_path,
+        page_key_mode=page_key_mode,
+        sample_limit=sample_limit,
+        include_evidence=include_classification_evidence,
+    )
+    result.update(compare_result_classification_fields(classification_entry))
+    result["transition_classification"] = classification_entry
+    return result
 
 
 def load_validation_summary(path: Path) -> dict[str, Any]:
@@ -1394,9 +1518,17 @@ def count_rows_by_transition_kind(rows: list[dict[str, Any]]) -> dict[str, int]:
         kind = str(row.get("transition_kind") or "")
         if not kind:
             continue
-        pages = row.get("pages")
-        counts[kind] = counts.get(kind, 0) + len([page for page in pages if page is not None]) if isinstance(pages, list) else counts.get(kind, 0)
+        counts[kind] = counts.get(kind, 0) + row_page_count(row)
     return dict(sorted(counts.items()))
+
+
+def row_page_count(row: dict[str, Any]) -> int:
+    """统计一条 delta row 中有效 page 数。"""
+
+    pages = row.get("pages")
+    if not isinstance(pages, list):
+        return 0
+    return sum(1 for page in pages if page is not None)
 
 
 def summarize_delta_mismatches_by_kind(mismatches: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
@@ -1432,178 +1564,42 @@ def classify_transition_comparison_failure(
     return "matched"
 
 
-def compare_operation_intents(predicted_trace_path: Path, observed_target_trace_path: Path, *, page_key_mode: str, sample_limit: int) -> dict[str, Any]:
-    """构建第 5 阶段 operation intent exactness 初版对比。"""
+def comparison_context_from_prediction(prediction_paths: PathsForPrediction, observed_path: Path, comparison: dict[str, Any]) -> dict[str, Any]:
+    """从单格 prediction 路径构造比较上下文。"""
 
-    predicted = load_predicted_trace(predicted_trace_path)
-    observed = load_json(observed_target_trace_path)
-    model_intents = model_operation_intents(predicted_records(predicted), page_key_mode)
-    observed_intents = observed_operation_intents(observed.get("observed_operations", []), page_key_mode)
-    count_match = compare_intent_counts(model_intents, observed_intents)
-    page_match = compare_intent_page_multisets(model_intents, observed_intents, sample_limit=sample_limit)
-    ready = bool(model_intents) and bool(observed.get("oracle_ready"))
     return {
-        "schema": "trace_sim.hicache.operation_intent_exactness.v1",
-        "ready": ready,
-        "exact": ready and count_match["match"] and page_match["match"],
-        "predicted_trace_path": str(predicted_trace_path),
-        "observed_target_trace_path": str(observed_target_trace_path),
-        "model_intent_count": len(model_intents),
-        "observed_intent_count": len(observed_intents),
-        "intent_count_comparison": count_match,
-        "intent_page_multiset_comparison": page_match,
-        "model_intent_count_by_kind": count_intents_by_kind(model_intents),
-        "observed_intent_count_by_kind": count_intents_by_kind(observed_intents),
-        "notes": [
-            "This stage is an intent-layer scaffold for DAG patch design.",
-            "Observed source_actual events are validation evidence only; they are not model inputs.",
-            "Intent exactness is intentionally separate from raw transition exactness.",
-        ],
+        "label": prediction_paths.prediction_dir.name,
+        "input_id": comparison.get("input_id", ""),
+        "source_config_id": "",
+        "target_config_id": comparison.get("target_config_id", ""),
+        "source_run_id": "",
+        "target_run_id": comparison.get("target_run_id", ""),
+        "is_self": comparison.get("comparison_mode") == "self",
+        "prediction_dir": str(prediction_paths.prediction_dir),
+        "observed_target_trace_path": str(observed_path),
+        "transition_exactness_path": "",
     }
 
 
-def model_operation_intents(records: list[dict[str, Any]], page_key_mode: str) -> list[dict[str, Any]]:
-    """把模型 transition 聚合成 operation intent rows。"""
+def comparison_context_from_matrix_row(matrix_row: dict[str, Any], prediction_dir: Path, observed_path: Path, comparison_path: Path) -> dict[str, Any]:
+    """从矩阵行构造比较上下文。"""
 
-    intents: list[dict[str, Any]] = []
-    for ordinal, record in enumerate(records):
-        pages = [normalize_hicache_page_key(page, page_key_mode) for page in record_pages(record)]
-        kind = model_intent_kind(str(record.get("transition_kind") or ""))
-        intents.append(
-            {
-                "intent_id": f"model:{ordinal}",
-                "intent_kind": kind,
-                "transition_kind": record.get("transition_kind") or "",
-                "canonical_request_key": canonical_request_key_from_row(record),
-                "operation_id": record.get("operation_id") or "",
-                "cache_scope": record.get("cache_scope") or "",
-                "pages": sorted(set(pages)),
-                "source_transition_ids": [record.get("transition_id") or ordinal],
-                "state_effect_summary": record.get("transition_kind") or "",
-                "physical_effect_hint": kind,
-            }
-        )
-    return intents
+    return {
+        "label": matrix_row.get("label"),
+        "input_id": matrix_row.get("input_id"),
+        "source_config_id": matrix_row.get("source_config_id"),
+        "target_config_id": matrix_row.get("target_config_id"),
+        "source_run_id": matrix_row.get("source_run_id"),
+        "target_run_id": matrix_row.get("target_run_id"),
+        "is_self": matrix_row.get("is_self"),
+        "prediction_dir": str(prediction_dir),
+        "observed_target_trace_path": str(observed_path),
+        "transition_exactness_path": str(comparison_path),
+    }
 
 
-def observed_operation_intents(operations: Any, page_key_mode: str) -> list[dict[str, Any]]:
-    """把 target observed operations 规整成 operation intent rows。"""
-
-    if not isinstance(operations, list):
-        return []
-    intents: list[dict[str, Any]] = []
-    for ordinal, row in enumerate(operations):
-        if not isinstance(row, dict):
-            continue
-        pages = row.get("pages") if isinstance(row.get("pages"), list) else []
-        intents.append(
-            {
-                "intent_id": f"observed:{ordinal}",
-                "intent_kind": row.get("operation_kind") or "unknown",
-                "canonical_request_key": row.get("canonical_request_key") or "",
-                "operation_id": row.get("operation_id") or "",
-                "cache_scope": row.get("cache_scope") or "",
-                "pages": sorted({normalize_hicache_page_key(page, page_key_mode) for page in pages if page is not None}),
-                "observed_evidence_ids": [row.get("observed_operation_id") or ordinal],
-                "state_effect_summary": row.get("event_role") or "",
-                "physical_effect_hint": row.get("event_kind") or "",
-            }
-        )
-    return intents
-
-
-def model_intent_kind(transition_kind: str) -> str:
-    """把模型 transition kind 归为 DAG patch 前的 intent kind。"""
-
-    if transition_kind in {"add_l1_residency", "restore_l1_residency"}:
-        return "request_insert"
-    if transition_kind in {"promote_visible_prefix_to_l1", "enqueue_loadback", "complete_loadback"}:
-        return "device_loadback"
-    if transition_kind == "evict_l1_node":
-        return "device_eviction"
-    if transition_kind == "evict_host_node":
-        return "host_cleanup"
-    if transition_kind in {"enqueue_write_through_backup", "complete_write_through_backup"}:
-        return "write_through_backup"
-    if transition_kind in {"enqueue_writeback", "complete_writeback", "cancel_writeback"}:
-        return "write_back_flush"
-    if transition_kind in {"enqueue_storage_backup", "commit_host_storage_backup", "commit_host_backup", "complete_storage_backup"}:
-        return "storage_backup"
-    if transition_kind in {"prefetch_planned"}:
-        return "prefetch_plan"
-    if transition_kind in {"prefetch_ready", "apply_prefetch_host_visibility"}:
-        return "prefetch_ready"
-    if transition_kind in {"prefetch_revoked", "prefetch_suppressed", "prefetch_timeout_incomplete"}:
-        return "prefetch_revoke"
-    if transition_kind in {"acquire_request_ref", "release_request_ref"}:
-        return "lock_ref"
-    if transition_kind == "increment_hit_count":
-        return "hit_count_update"
-    if transition_kind == "mark_dirty":
-        return "dirty_mark"
-    return transition_kind or "unknown"
-
-
-def compare_intent_counts(model_intents: list[dict[str, Any]], observed_intents: list[dict[str, Any]]) -> dict[str, Any]:
-    """比较 intent kind 计数。"""
-
-    model_counts = count_intents_by_kind(model_intents)
-    observed_counts = count_intents_by_kind(observed_intents)
-    by_kind: dict[str, Any] = {}
-    match = True
-    for kind in sorted(set(model_counts) | set(observed_counts)):
-        model_count = model_counts.get(kind, 0)
-        observed_count = observed_counts.get(kind, 0)
-        if model_count != observed_count:
-            match = False
-        by_kind[kind] = {"match": model_count == observed_count, "model_count": model_count, "observed_count": observed_count}
-    return {"match": match, "by_kind": by_kind}
-
-
-def compare_intent_page_multisets(model_intents: list[dict[str, Any]], observed_intents: list[dict[str, Any]], *, sample_limit: int) -> dict[str, Any]:
-    """比较 intent kind/page multiset。"""
-
-    model_counts = intent_page_counts(model_intents)
-    observed_counts = intent_page_counts(observed_intents)
-    mismatches: list[dict[str, Any]] = []
-    for key in sorted(set(model_counts) | set(observed_counts)):
-        model_count = model_counts.get(key, 0)
-        observed_count = observed_counts.get(key, 0)
-        if model_count == observed_count:
-            continue
-        kind, page = key
-        mismatches.append(
-            {
-                "intent_kind": kind,
-                "page": page,
-                "model_count": model_count,
-                "observed_count": observed_count,
-                "missing_in_model": max(observed_count - model_count, 0),
-                "extra_in_model": max(model_count - observed_count, 0),
-            }
-        )
-    return {"match": not mismatches, "mismatch_count": len(mismatches), "top_mismatches": mismatches[:sample_limit]}
-
-
-def count_intents_by_kind(intents: list[dict[str, Any]]) -> dict[str, int]:
-    """按 intent kind 计数。"""
-
-    counts: collections.Counter[str] = collections.Counter(str(row.get("intent_kind") or "") for row in intents)
-    return dict(sorted(counts.items()))
-
-
-def intent_page_counts(intents: list[dict[str, Any]]) -> dict[tuple[str, str], int]:
-    """统计 intent/page multiset。"""
-
-    counts: dict[tuple[str, str], int] = {}
-    for row in intents:
-        kind = str(row.get("intent_kind") or "")
-        for page in row.get("pages", []):
-            if page is None:
-                continue
-            counts[(kind, str(page))] = counts.get((kind, str(page)), 0) + 1
-    return counts
-
+# transition taxonomy / catalog / gate 的派生产物生成逻辑放在独立模块中。
+# 本文件只保留 CLI、oracle 抽取、compare 和 matrix 编排。
 
 def canonical_request_key_from_row(row: dict[str, Any]) -> str:
     """生成保守的 run-local canonical request key。"""
@@ -1618,8 +1614,19 @@ def canonical_request_key_from_row(row: dict[str, Any]) -> str:
     return cache_scope
 
 
-def compare_cross_matrix(matrix_dir: Path, *, page_key_mode: str, force: bool, sample_limit: int) -> dict[str, Any]:
-    """构建第 4 阶段矩阵级 transition exactness 汇总。"""
+def compare_transition_matrix(
+    matrix_dir: Path,
+    *,
+    page_key_mode: str,
+    force: bool,
+    sample_limit: int,
+    emit_catalog: bool,
+    emit_gates: bool,
+    catalog_output: Path | None,
+    gate_output: Path | None,
+    matrix_output_path: Path | None,
+) -> dict[str, Any]:
+    """构建矩阵级 transition exactness 汇总。"""
 
     plan_path = matrix_dir / "matrix_plan.json"
     if not plan_path.is_file():
@@ -1628,6 +1635,7 @@ def compare_cross_matrix(matrix_dir: Path, *, page_key_mode: str, force: bool, s
     target_runs = target_runs_from_matrix_plan(plan)
     rebuilt_oracle_keys: set[tuple[str, str]] = set()
     rows = []
+    classification_entries: list[dict[str, Any]] = []
     for matrix_row_path in sorted((matrix_dir / "predictions").glob("*/*/matrix_row.json")):
         matrix_row = load_json(matrix_row_path)
         prediction_dir = resolve_repo_path(Path(str(matrix_row.get("output_dir") or matrix_row_path.parent)))
@@ -1639,8 +1647,10 @@ def compare_cross_matrix(matrix_dir: Path, *, page_key_mode: str, force: bool, s
         )
         target_key = (str(matrix_row.get("input_id") or ""), str(matrix_row.get("target_config_id") or ""))
         target_run = target_runs.get(target_key)
-        observed_path = matrix_dir / "observed_target_transitions" / safe_slug(target_key[0]) / f"{safe_slug(target_key[1])}.observed_target_transition_trace.json"
-        should_rebuild_oracle = target_run is not None and ((force and target_key not in rebuilt_oracle_keys) or not observed_path.is_file())
+        observed_path = observed_transition_path(matrix_dir, target_key)
+        should_rebuild_oracle = target_run is not None and (
+            (force and target_key not in rebuilt_oracle_keys) or not observed_path.is_file()
+        )
         if should_rebuild_oracle:
             oracle = extract_target_oracle(
                 [Path(path) for path in target_run["python_probe_files"]],
@@ -1649,8 +1659,18 @@ def compare_cross_matrix(matrix_dir: Path, *, page_key_mode: str, force: bool, s
             )
             write_json(observed_path, oracle)
             rebuilt_oracle_keys.add(target_key)
-        comparison_path = prediction_dir / ("transition_exactness_self.json" if matrix_row.get("is_self") else "transition_exactness_cross.json")
-        if observed_path.is_file() and prediction_paths.predicted_trace.is_file() and (force or not comparison_path.is_file()):
+        comparison_path = prediction_dir / (
+            "transition_exactness_self.json"
+            if matrix_row.get("is_self")
+            else "transition_exactness_cross.json"
+        )
+        should_rebuild_comparison = (
+            force
+            or not comparison_path.is_file()
+            or transition_comparison_needs_rebuild(comparison_path)
+            or (emit_catalog and transition_comparison_lacks_catalog_evidence(comparison_path))
+        )
+        if observed_path.is_file() and prediction_paths.predicted_trace.is_file() and should_rebuild_comparison:
             comparison = compare_prediction_to_observed(
                 prediction_paths,
                 observed_path,
@@ -1658,30 +1678,130 @@ def compare_cross_matrix(matrix_dir: Path, *, page_key_mode: str, force: bool, s
                 page_key_mode=page_key_mode,
                 sample_limit=sample_limit,
                 force_self_check=force,
+                context=comparison_context_from_matrix_row(matrix_row, prediction_dir, observed_path, comparison_path),
+                include_classification_evidence=emit_catalog,
             )
             write_json(comparison_path, comparison)
         row = summarize_matrix_transition_row(matrix_row, comparison_path, observed_path)
+        if isinstance(row.get("transition_classification"), dict):
+            classification_entries.append(row["transition_classification"])
         rows.append(row)
 
-    return {
-        "schema": "trace_sim.hicache.transition_exactness_cross_matrix.v1",
+    summary = {
+        "schema": "trace_sim.hicache.transition_exactness_matrix.v1",
         "matrix_dir": str(matrix_dir),
         "prediction_count": len(rows),
         "ready_count": sum(1 for row in rows if row.get("ready")),
         "exact_count": sum(1 for row in rows if row.get("exact")),
-        "t0_final_state_exact_count": sum(1 for row in rows if row.get("t0_final_state_exact")),
-        "t1_transition_count_exact_count": sum(1 for row in rows if row.get("t1_transition_count_exact")),
-        "t2_page_lifecycle_multiset_exact_count": sum(1 for row in rows if row.get("t2_page_lifecycle_multiset_exact")),
+        "final_state_exact_count": sum(1 for row in rows if row.get("final_state_exact")),
+        "transition_count_exact_count": sum(1 for row in rows if row.get("transition_count_exact")),
+        "page_lifecycle_multiset_exact_count": sum(1 for row in rows if row.get("page_lifecycle_multiset_exact")),
         "by_input": summarize_rows_by_key(rows, "input_id"),
         "by_target_config": summarize_rows_by_key(rows, "target_config_id"),
-        "failure_classification_counts": dict(sorted(collections.Counter(str(row.get("failure_classification") or "") for row in rows).items())),
+        "failure_classification_counts": count_rows_by_value(rows, "failure_classification"),
+        "family_counts": count_rows_by_value(rows, "transition_family"),
+        "classification_counts": count_rows_by_value(rows, "classification"),
+        "patch_risk_counts": count_patch_risks(rows),
         "predictions": rows,
         "notes": [
             "Only predictions with final-state exactness should be treated as transition-comparable.",
             "The matrix summary reuses target-side observed oracle per input/config.",
-            "Transition exactness mismatches are diagnostics; they are not automatically C++ state model bugs.",
+            "Each prediction row includes transition family classification and patch gate fields.",
         ],
     }
+    if emit_catalog:
+        catalog_path = resolve_output(catalog_output, matrix_dir / "transition_mismatch_catalog.json")
+        catalog = build_transition_mismatch_catalog_from_entries(
+            matrix_dir,
+            classification_entries,
+            source_matrix_path=str(matrix_output_path or matrix_dir / "transition_exactness_matrix.json"),
+            sample_limit=sample_limit,
+        )
+        write_transition_catalog_outputs(matrix_dir, catalog_path, catalog, sample_limit=sample_limit)
+        summary["catalog_path"] = str(catalog_path)
+    if emit_gates:
+        gate_path = resolve_output(gate_output, matrix_dir / "transition_patch_gate_scoreboard.json")
+        scoreboard = build_transition_patch_gate_scoreboard_from_entries(
+            matrix_dir,
+            classification_entries,
+            page_key_mode=page_key_mode,
+            sample_limit=sample_limit,
+        )
+        write_json(gate_path, scoreboard)
+        summary["gate_scoreboard_path"] = str(gate_path)
+    return summary
+
+
+def observed_transition_path(matrix_dir: Path, target_key: tuple[str, str]) -> Path:
+    """返回某个 input/config 的 target-side transition oracle 路径。"""
+
+    input_id, target_config_id = target_key
+    return (
+        matrix_dir
+        / "observed_target_transitions"
+        / safe_slug(input_id)
+        / f"{safe_slug(target_config_id)}.observed_target_transition_trace.json"
+    )
+
+
+def count_rows_by_value(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
+    """按矩阵行字段值计数。"""
+
+    return dict(
+        sorted(
+            collections.Counter(str(row.get(field) or "") for row in rows).items()
+        )
+    )
+
+
+def count_patch_risks(rows: list[dict[str, Any]]) -> dict[str, int]:
+    """按 patch gate 风险字段计数。"""
+
+    return dict(
+        sorted(
+            collections.Counter(
+                str(row.get("patch_gate", {}).get("patch_risk") or "")
+                for row in rows
+                if isinstance(row.get("patch_gate"), dict)
+            ).items()
+        )
+    )
+
+
+def transition_comparison_needs_rebuild(path: Path) -> bool:
+    """判断 per-prediction transition exactness 是否仍是旧字段 schema。"""
+
+    if not path.is_file():
+        return True
+    try:
+        payload = load_json(path)
+    except (OSError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict):
+        return True
+    required = (
+        "final_state_exact",
+        "transition_count_exact",
+        "page_lifecycle_multiset_exact",
+        "transition_classification",
+        "patch_gate",
+    )
+    return any(key not in payload for key in required)
+
+
+def transition_comparison_lacks_catalog_evidence(path: Path) -> bool:
+    """判断 compare 输出是否缺少 catalog 需要的证据摘要。"""
+
+    if not path.is_file():
+        return True
+    try:
+        payload = load_json(path)
+    except (OSError, json.JSONDecodeError):
+        return True
+    classification = payload.get("transition_classification") if isinstance(payload, dict) else None
+    if not isinstance(classification, dict):
+        return True
+    return "hicache_evidence" not in classification or "observed_evidence" not in classification
 
 
 def target_runs_from_matrix_plan(plan: dict[str, Any]) -> dict[tuple[str, str], dict[str, Any]]:
@@ -1730,21 +1850,38 @@ def summarize_matrix_transition_row(matrix_row: dict[str, Any], comparison_path:
             "ready": False,
             "exact": False,
             "failure_classification": "missing_transition_exactness_output",
-            "t0_final_state_exact": False,
-            "t1_transition_count_exact": False,
-            "t2_page_lifecycle_multiset_exact": False,
+            "final_state_exact": False,
+            "transition_count_exact": False,
+            "page_lifecycle_multiset_exact": False,
+            "transition_family": "model_or_oracle_not_ready",
+            "classification": "observed_unobservable",
+            "patch_gate": {
+                "patch_allowed": False,
+                "patch_filter_action": "blocked",
+                "patch_risk": "blocked",
+                "source_attribution_required": False,
+                "duration_required": False,
+                "evidence_required": ["transition exactness output"],
+            },
         }
     comparison = load_json(comparison_path)
+    classification_entry = comparison.get("transition_classification") if isinstance(comparison.get("transition_classification"), dict) else {}
     return {
         **base,
         "ready": comparison.get("ready"),
         "exact": comparison.get("exact"),
         "model_transition_self_check_ready": comparison.get("model_transition_self_check_ready"),
         "oracle_ready": comparison.get("oracle_ready"),
-        "t0_final_state_exact": comparison.get("t0_final_state_exact"),
-        "t1_transition_count_exact": comparison.get("t1_transition_count_exact"),
-        "t2_page_lifecycle_multiset_exact": comparison.get("t2_page_lifecycle_multiset_exact"),
+        "final_state_exact": comparison.get("final_state_exact"),
+        "transition_count_exact": comparison.get("transition_count_exact"),
+        "page_lifecycle_multiset_exact": comparison.get("page_lifecycle_multiset_exact"),
         "failure_classification": comparison.get("failure_classification"),
+        "transition_family": comparison.get("transition_family"),
+        "classification": comparison.get("classification"),
+        "classification_reason": comparison.get("classification_reason"),
+        "mismatch_kinds": comparison.get("mismatch_kinds", []),
+        "patch_gate": comparison.get("patch_gate", {}),
+        "transition_classification": classification_entry,
         "model_delta_count_by_kind": comparison.get("model_delta_count_by_kind", {}),
         "observed_delta_count_by_kind": comparison.get("observed_delta_count_by_kind", {}),
         "mismatch_totals_by_kind": comparison.get("page_lifecycle_multiset_comparison", {}).get("mismatch_totals_by_kind", {}),
@@ -1761,9 +1898,9 @@ def summarize_rows_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, Any
             "prediction_count": len(selected),
             "ready_count": sum(1 for row in selected if row.get("ready")),
             "exact_count": sum(1 for row in selected if row.get("exact")),
-            "t0_final_state_exact_count": sum(1 for row in selected if row.get("t0_final_state_exact")),
-            "t1_transition_count_exact_count": sum(1 for row in selected if row.get("t1_transition_count_exact")),
-            "t2_page_lifecycle_multiset_exact_count": sum(1 for row in selected if row.get("t2_page_lifecycle_multiset_exact")),
+            "final_state_exact_count": sum(1 for row in selected if row.get("final_state_exact")),
+            "transition_count_exact_count": sum(1 for row in selected if row.get("transition_count_exact")),
+            "page_lifecycle_multiset_exact_count": sum(1 for row in selected if row.get("page_lifecycle_multiset_exact")),
         }
     return result
 

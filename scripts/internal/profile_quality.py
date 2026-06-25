@@ -23,6 +23,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from hicache_forced_token_contract import forced_token_quality_from_workload_report  # noqa: E402
 from trace_json import load_chrome_trace_events  # noqa: E402
 
 
@@ -108,6 +109,8 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     run_dir = map_repo_path(Path(str(manifest.get("run_dir") or manifest_path.parent)))
+    run_config = _load_run_config(manifest, run_dir)
+    expected_forced_token_mode = _expected_forced_token_mode(run_config)
     profiling = manifest.get("profiling") if isinstance(manifest.get("profiling"), dict) else {}
     trace = manifest.get("trace") if isinstance(manifest.get("trace"), dict) else {}
     sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
@@ -133,6 +136,10 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     events = _load_python_probe_events(python_probe_files)
     unknown_targets: dict[str, TargetQuality] = {}
     configured_mechanisms = _configured_mechanisms(configured_targets)
+    lifecycle_observed_configured = any(
+        _configured_fact_role(target) == "request_lifecycle_path_observed"
+        for target in configured_targets.values()
+    )
     mechanism_counts = Counter()
     invariant_accumulator = _new_hicache_invariant_accumulator()
     capacity_accumulator = _new_hicache_capacity_accumulator()
@@ -178,6 +185,17 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     if exception_targets:
         errors.append("python_probe_exception_events")
     workload_report = _discover_workload_report(run_dir)
+    forced_token_quality = forced_token_quality_from_workload_report(workload_report)
+    if expected_forced_token_mode:
+        if workload_report is None:
+            errors.append("forced_token_workload_report_missing")
+        if (
+            not forced_token_quality.get("enabled")
+            or forced_token_quality.get("mode") != expected_forced_token_mode
+        ):
+            errors.append("forced_token_mode_mismatch")
+    if forced_token_quality["errors"]:
+        errors.extend(forced_token_quality["errors"])
     expected_mechanisms = _expected_mechanisms_from_workload(workload_report)
     expected_configured_mechanisms = sorted(set(expected_mechanisms) & set(configured_mechanisms))
     missing_mechanisms = sorted(
@@ -196,6 +214,10 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         errors.append("hicache_token_dictionary_missing")
     if invariant_coverage["seq_order_error_count"] > 0:
         errors.append("hicache_invariant_seq_invalid")
+    if invariant_coverage.get("prefetch_path_contract_error_count", 0) > 0:
+        errors.append("hicache_prefetch_decision_path_contract_invalid")
+    if lifecycle_observed_configured and invariant_coverage["lifecycle_path_contract_error_count"] > 0:
+        errors.append("hicache_lifecycle_path_contract_invalid")
     if hicache_state_trace_enabled and capacity_accumulator["snapshot_count"] <= 0:
         errors.append("hicache_capacity_snapshot_missing")
 
@@ -221,11 +243,14 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         "exception_targets": exception_targets,
         "hicache_invariant_coverage": invariant_coverage,
         "workload_report": str(workload_report) if workload_report else None,
+        "expected_forced_token_mode": expected_forced_token_mode,
+        "forced_token_quality": forced_token_quality,
         "expected_cache_mechanisms": expected_mechanisms,
         "configured_cache_mechanisms": configured_mechanisms,
         "expected_configured_cache_mechanisms": expected_configured_mechanisms,
         "observed_cache_mechanisms": dict(sorted(mechanism_counts.items())),
         "missing_cache_mechanisms": missing_mechanisms,
+        "lifecycle_observed_configured": lifecycle_observed_configured,
         "hicache_state_trace_enabled": hicache_state_trace_enabled,
         "hicache_capacity_observed": capacity_accumulator["snapshot_count"] > 0,
         "hicache_capacity": _finalize_hicache_capacity(capacity_accumulator),
@@ -325,6 +350,32 @@ def _discover_workload_report(run_dir: Path) -> Path | None:
         return None
     candidates = sorted(run_dir.glob("bench/**/workload_report.json"))
     return candidates[-1] if candidates else None
+
+
+def _load_run_config(manifest: dict[str, Any], run_dir: Path) -> dict[str, Any]:
+    """读取 run-local config，用于判断 workload 必须满足的输入合同。"""
+
+    raw_path = manifest.get("config_path")
+    config_path = map_repo_path(Path(str(raw_path))) if raw_path else run_dir / "config.json"
+    if not config_path.is_file():
+        return {}
+    try:
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _expected_forced_token_mode(config: dict[str, Any]) -> str | None:
+    """从当前 run config 读取不可降级的 forced-token 模式。"""
+
+    metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+    profile_mode = metadata.get("profile_mode")
+    if profile_mode == "forced_token_capture":
+        return "capture"
+    if profile_mode == "forced_token_replay":
+        return "replay"
+    return None
 
 
 def _expected_mechanisms_from_workload(path: Path | None) -> list[str]:
@@ -441,6 +492,9 @@ _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
         "seq_no",
         "lifecycle_kind",
         "source_page_size",
+        "token_dictionary",
+        "full_path_span",
+        "token_count",
     ),
     "request_admission": (
         "request_id",
@@ -475,12 +529,14 @@ _INVARIANT_EITHER_FIELDS_BY_ROLE = {
 
 _INVARIANT_DICTIONARY_FIELDS_BY_ROLE = {
     "request_bound_match_anchor": ("token_dictionary",),
+    "request_lifecycle_anchor": ("token_dictionary",),
     "request_admission": ("token_dictionary",),
     "prefetch_decision": ("token_dictionary",),
 }
 
 _INVARIANT_SPAN_FIELDS_BY_ROLE = {
     "request_bound_match_anchor": ("full_path_span",),
+    "request_lifecycle_anchor": ("full_path_span",),
     "request_admission": ("full_path_span",),
     "prefetch_decision": ("full_path_span",),
 }
@@ -532,6 +588,15 @@ def _new_hicache_invariant_accumulator() -> dict[str, Any]:
         "dictionary_ids_with_tokens": set(),
         "span_path_ids": set(),
         "seq_by_scope": defaultdict(list),
+        "lifecycle_anchor_paths": defaultdict(list),
+        "lifecycle_observed_paths": defaultdict(list),
+        "prefetch_actual_enqueue_events": 0,
+        "prefetch_actual_path_events": 0,
+        "prefetch_actual_positive_path_events": 0,
+        "prefetch_intent_positive_path_events": 0,
+        "prefetch_enqueue_positive_path_events": 0,
+        "prefetch_decision_empty_path_events": 0,
+        "prefetch_decision_nonempty_path_events": 0,
     }
 
 
@@ -540,7 +605,10 @@ def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]
 
     if not _is_hicache_profile_event(args):
         return
-    _observe_token_references(accumulator, args)
+    _observe_prefetch_path_contract(accumulator, args)
+    if _is_completed_model_input_invariant(args):
+        _observe_token_references(accumulator, args)
+    _observe_lifecycle_path_contract(accumulator, args)
     fact_class = str(args.get("fact_class") or "")
     model_input = _true_like(args.get("model_input"))
     dag_input = not _false_like(args.get("dag_input"))
@@ -582,10 +650,130 @@ def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]
         accumulator["seq_by_scope"][str(scope)].append(seq_no)
 
 
-def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
-    """记录 token dictionary/span 引用，检查 span 是否有字典支撑。"""
+def _observe_prefetch_path_contract(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """记录 prefetch invariant path 与实际 enqueue 证据是否一致。"""
 
-    for value in args.values():
+    role = str(args.get("event_role") or "")
+    if role == "prefetch_intent_observed":
+        if args.get("phase") == "end":
+            _observe_prefetch_actual_path(accumulator, args, "intent")
+        return
+    if role == "prefetch_enqueue_observed":
+        _observe_prefetch_actual_path(accumulator, args, "enqueue")
+        return
+    if args.get("phase") != "end":
+        return
+    if role != "prefetch_decision" or not _is_completed_model_input_invariant(args):
+        return
+    token_count = _model_input_token_count(args)
+    if token_count is None or token_count <= 0:
+        accumulator["prefetch_decision_empty_path_events"] += 1
+    else:
+        accumulator["prefetch_decision_nonempty_path_events"] += 1
+
+
+def _observe_prefetch_actual_path(accumulator: dict[str, Any], args: dict[str, Any], source_kind: str) -> None:
+    """记录 source_actual prefetch 是否确实携带非空候选路径。"""
+
+    token_count = _prefetch_actual_token_count(args, source_kind)
+    if source_kind == "enqueue":
+        accumulator["prefetch_actual_enqueue_events"] += 1
+    accumulator["prefetch_actual_path_events"] += 1
+    if token_count is None or token_count <= 0:
+        return
+    accumulator["prefetch_actual_positive_path_events"] += 1
+    if source_kind == "intent":
+        accumulator["prefetch_intent_positive_path_events"] += 1
+    if source_kind == "enqueue":
+        accumulator["prefetch_enqueue_positive_path_events"] += 1
+
+
+def _prefetch_actual_token_count(args: dict[str, Any], source_kind: str) -> int | None:
+    """从 source_actual prefetch 事件读取实际候选 token 数。"""
+
+    candidates: list[int] = []
+    fields = ("new_input_tokens", "token_count") if source_kind == "intent" else ("new_input_tokens", "host_tokens", "token_count")
+    for field in fields:
+        value = _int_or_none(args.get(field))
+        if value is not None:
+            candidates.append(value)
+    span_name = "suffix_span" if source_kind == "intent" else ""
+    span = args.get(span_name) if span_name else None
+    if isinstance(span, dict):
+        value = _int_or_none(span.get("token_count"))
+        if value is not None:
+            candidates.append(value)
+    operation = args.get("operation")
+    if isinstance(operation, dict):
+        for field in ("token_count", "host_tokens"):
+            value = _int_or_none(operation.get(field))
+            if value is not None:
+                candidates.append(value)
+    return max(candidates) if candidates else None
+
+
+def _model_input_token_count(args: dict[str, Any]) -> int | None:
+    """从 invariant fact 中读取可投影 path 的 token 数。"""
+
+    span = args.get("full_path_span")
+    if isinstance(span, dict):
+        value = _int_or_none(span.get("token_count"))
+        if value is not None:
+            return value
+    return _int_or_none(args.get("token_count"))
+
+
+def _observe_lifecycle_path_contract(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """记录 lifecycle invariant anchor 与 source_actual path 证据。"""
+
+    if args.get("phase") != "end":
+        return
+    role = str(args.get("event_role") or "")
+    if role not in {"request_lifecycle_anchor", "request_lifecycle_path_observed"}:
+        return
+    key = _lifecycle_path_key(args)
+    if key is None:
+        return
+    signature = _lifecycle_path_signature(args)
+    if role == "request_lifecycle_anchor":
+        accumulator["lifecycle_anchor_paths"][key].append(signature)
+    else:
+        accumulator["lifecycle_observed_paths"][key].append(signature)
+
+
+def _lifecycle_path_key(args: dict[str, Any]) -> tuple[str, str, str] | None:
+    """生成同一次 run 内 lifecycle path 对照使用的 request key。"""
+
+    cache_scope = args.get("cache_scope")
+    request_id = args.get("request_id")
+    lifecycle_kind = args.get("lifecycle_kind")
+    if not (_has_fact(cache_scope) and _has_fact(request_id) and _has_fact(lifecycle_kind)):
+        return None
+    return (str(cache_scope), str(request_id), str(lifecycle_kind))
+
+
+def _lifecycle_path_signature(args: dict[str, Any]) -> dict[str, Any]:
+    """提取 lifecycle path 的可比较签名。"""
+
+    dictionary = args.get("token_dictionary")
+    span = args.get("full_path_span")
+    return {
+        "token_path_id": dictionary.get("token_path_id") if isinstance(dictionary, dict) else None,
+        "token_count": _int_or_none(args.get("token_count")),
+        "span_path_id": span.get("path_id") if isinstance(span, dict) else None,
+        "span_begin": _int_or_none(span.get("begin")) if isinstance(span, dict) else None,
+        "span_end": _int_or_none(span.get("end")) if isinstance(span, dict) else None,
+        "span_token_count": _int_or_none(span.get("token_count")) if isinstance(span, dict) else None,
+        "hash_algo": span.get("hash_algo") if isinstance(span, dict) else None,
+    }
+
+
+def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """记录 normal model 可消费的 token dictionary/span 引用。"""
+
+    role = str(args.get("event_role") or "")
+    for field in _INVARIANT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
+        value = args.get(field)
         if not isinstance(value, dict):
             continue
         token_path_id = value.get("token_path_id")
@@ -593,6 +781,10 @@ def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any])
             accumulator["dictionary_ids"].add(token_path_id)
             if isinstance(value.get("token_ids"), list):
                 accumulator["dictionary_ids_with_tokens"].add(token_path_id)
+    for field in _INVARIANT_SPAN_FIELDS_BY_ROLE.get(role, ()):
+        value = args.get(field)
+        if not isinstance(value, dict):
+            continue
         path_id = value.get("path_id")
         if isinstance(path_id, str) and path_id:
             accumulator["span_path_ids"].add(path_id)
@@ -641,6 +833,8 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
             if previous is not None and value <= previous:
                 seq_order_error_count += 1
             previous = value
+    lifecycle_path_contract = _finalize_lifecycle_path_contract(accumulator)
+    prefetch_path_contract = _finalize_prefetch_path_contract(accumulator)
     return {
         "invariant_events": counts["invariant_events"],
         "required_events": counts["required_events"],
@@ -664,12 +858,100 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
         "dictionary_ids_without_tokens": dictionary_ids_without_tokens,
         "seq_scope_count": len(accumulator["seq_by_scope"]),
         "seq_order_error_count": seq_order_error_count,
+        **lifecycle_path_contract,
+        **prefetch_path_contract,
         "ready": counts["missing_required_fact_events"] == 0
         and route_error_events == 0
         and not missing_token_dictionary_refs
         and not dictionary_ids_without_tokens
-        and seq_order_error_count == 0,
+        and seq_order_error_count == 0
+        and prefetch_path_contract["prefetch_path_contract_error_count"] == 0,
     }
+
+
+def _finalize_prefetch_path_contract(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """汇总 prefetch enqueue 与 invariant candidate path 的合同检查。"""
+
+    enqueue_events = int(accumulator["prefetch_actual_enqueue_events"])
+    actual_path_events = int(accumulator["prefetch_actual_path_events"])
+    positive_actual_path_events = int(accumulator["prefetch_actual_positive_path_events"])
+    intent_positive_path_events = int(accumulator["prefetch_intent_positive_path_events"])
+    enqueue_positive_path_events = int(accumulator["prefetch_enqueue_positive_path_events"])
+    nonempty_path_events = int(accumulator["prefetch_decision_nonempty_path_events"])
+    empty_path_events = int(accumulator["prefetch_decision_empty_path_events"])
+    error_count = 1 if positive_actual_path_events > 0 and nonempty_path_events == 0 else 0
+    return {
+        "prefetch_actual_enqueue_events": enqueue_events,
+        "prefetch_actual_path_events": actual_path_events,
+        "prefetch_actual_positive_path_events": positive_actual_path_events,
+        "prefetch_intent_positive_path_events": intent_positive_path_events,
+        "prefetch_enqueue_positive_path_events": enqueue_positive_path_events,
+        "prefetch_decision_empty_path_events": empty_path_events,
+        "prefetch_decision_nonempty_path_events": nonempty_path_events,
+        "prefetch_path_contract_error_count": error_count,
+    }
+
+
+def _finalize_lifecycle_path_contract(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """对照 lifecycle invariant path 与 source_actual observed path。"""
+
+    anchors: dict[tuple[str, str, str], list[dict[str, Any]]] = accumulator["lifecycle_anchor_paths"]
+    observed: dict[tuple[str, str, str], list[dict[str, Any]]] = accumulator["lifecycle_observed_paths"]
+    missing_observed = 0
+    missing_anchor = 0
+    path_disagree = 0
+    token_count_disagree = 0
+    for key in sorted(set(anchors) | set(observed)):
+        anchor_rows = anchors.get(key, [])
+        observed_rows = observed.get(key, [])
+        missing_observed += max(0, len(anchor_rows) - len(observed_rows))
+        missing_anchor += max(0, len(observed_rows) - len(anchor_rows))
+        for anchor, row in zip(anchor_rows, observed_rows):
+            if _lifecycle_token_count_signature(anchor) != _lifecycle_token_count_signature(row):
+                token_count_disagree += 1
+            if _lifecycle_path_identity(anchor) != _lifecycle_path_identity(row):
+                path_disagree += 1
+    return {
+        "lifecycle_anchor_path_events": sum(len(rows) for rows in anchors.values()),
+        "lifecycle_observed_path_events": sum(len(rows) for rows in observed.values()),
+        "lifecycle_anchor_observed_missing": missing_observed,
+        "lifecycle_observed_anchor_missing": missing_anchor,
+        "lifecycle_anchor_observed_path_disagree": path_disagree,
+        "lifecycle_anchor_observed_token_count_disagree": token_count_disagree,
+        "lifecycle_path_contract_error_count": missing_observed + missing_anchor + path_disagree + token_count_disagree,
+    }
+
+
+def _lifecycle_path_identity(signature: dict[str, Any]) -> tuple[Any, ...]:
+    """返回 lifecycle path identity 相关字段。"""
+
+    return (
+        signature.get("token_path_id"),
+        signature.get("span_path_id"),
+        signature.get("span_begin"),
+        signature.get("span_end"),
+        signature.get("hash_algo"),
+    )
+
+
+def _lifecycle_token_count_signature(signature: dict[str, Any]) -> tuple[Any, ...]:
+    """返回 lifecycle token 数相关字段。"""
+
+    return (
+        signature.get("token_count"),
+        signature.get("span_token_count"),
+    )
+
+
+def _is_completed_model_input_invariant(args: dict[str, Any]) -> bool:
+    """判断事件是否是 normal model 可消费的 completed invariant fact。"""
+
+    return (
+        args.get("phase") == "end"
+        and _true_like(args.get("model_input"))
+        and str(args.get("fact_class") or "") == "invariant_state"
+        and str(args.get("fact_granularity") or "") == "atomic"
+    )
 
 
 def _has_fact(value: Any) -> bool:

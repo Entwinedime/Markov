@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HiCache state matrix validation 的共享编排逻辑。"""
+"""HiCache state workflow 的共享 profile、quality 和 prediction 逻辑。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hicache_state_cross_input_audit import canonical_json, extract_audit_events
+from hicache_state_cross_input_audit import canonical_json, extract_audit_events, model_input_path_contract
 from profile_quality import audit_profile, map_repo_path
 from trace_json import TraceLoadStatus, load_chrome_trace_events
 
@@ -121,15 +121,19 @@ def profile_run_from_manifest(manifest_path: Path) -> ProfileRun:
     config_path = map_repo_path(Path(str(manifest.get("config_path") or run_dir / "config.json")))
     config = load_json(config_path)
     metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
-    run_id = str(manifest.get("run_id") or manifest.get("experiment_id") or config.get("run_id") or config.get("name") or manifest_path.parent.name)
+    run_id = str(
+        manifest.get("run_id")
+        or manifest.get("experiment_id")
+        or config.get("run_id")
+        or config.get("name")
+        or manifest_path.parent.name
+    )
     config_id = first_non_empty(
         metadata.get("suite_server_id"),
-        metadata.get("mainline_one_scenario"),
         infer_config_id(run_id),
     )
     input_id = first_non_empty(
         metadata.get("suite_input_id"),
-        metadata.get("mainline_one_input"),
         infer_input_id(run_id),
     )
     input_class = first_non_empty(metadata.get("input_class"), "unknown")
@@ -360,13 +364,11 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
     quality_dir = output_dir / "quality"
     for run in runs:
         profile_quality_path = quality_dir / f"{safe_slug(run.run_id)}.profile_quality.json"
-        if profile_quality_path.is_file():
-            profile_quality = load_json(profile_quality_path)
-        else:
-            profile_quality = audit_profile(run.manifest_path)
-            write_json(profile_quality_path, profile_quality)
+        profile_quality = audit_profile(run.manifest_path)
+        write_json(profile_quality_path, profile_quality)
         trace_summary = summarize_profile_trace(run)
         workload_signature = build_workload_signature(run)
+        forced_token_quality = normalize_forced_token_quality(profile_quality)
         rows.append(
             {
                 "run_id": run.run_id,
@@ -383,13 +385,26 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
                 "source_actual_count": trace_summary["fact_class_counts"].get("source_actual", 0),
                 "timing_count": trace_summary["fact_class_counts"].get("timing_observation", 0),
                 "fact_class_counts": trace_summary["fact_class_counts"],
-                "missing_required_fields": profile_quality.get("hicache_invariant_coverage", {}).get("missing_fields", {}),
+                "missing_required_fields": profile_quality.get("hicache_invariant_coverage", {}).get(
+                    "missing_fields",
+                    {},
+                ),
                 "canonical_request_count": workload_signature["request_event_count"],
                 "canonical_workload_signature": workload_signature["signature"],
                 "canonical_workload_ready": workload_signature["ready"],
                 "profile_quality_ready": bool(profile_quality.get("quality_ready")),
                 "profile_quality_errors": profile_quality.get("quality_errors", []),
                 "state_quality_ready": state_quality_ready(profile_quality, trace_summary, workload_signature),
+                "forced_token_enabled": bool(forced_token_quality.get("enabled")),
+                "forced_token_ready": bool(forced_token_quality.get("ready")),
+                "forced_token_plan_ready": bool(forced_token_quality.get("plan_ready")),
+                "forced_token_bundle_ready": bool(forced_token_quality.get("bundle_ready")),
+                "forced_token_mode": forced_token_quality.get("mode"),
+                "forced_token_plan_sha256": forced_token_quality.get("plan_sha256"),
+                "forced_token_bundle_sha256": forced_token_quality.get("bundle_sha256"),
+                "forced_token_bundle_id": forced_token_quality.get("bundle_id"),
+                "forced_token_bundle_path": forced_token_quality.get("bundle_path"),
+                "forced_token_quality": forced_token_quality,
                 "hicache_invariant_coverage": profile_quality.get("hicache_invariant_coverage", {}),
                 "hicache_capacity": profile_quality.get("hicache_capacity", {}),
                 "workload_signature_detail": workload_signature,
@@ -400,7 +415,13 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
     for row in rows:
         by_input[str(row["input_id"])].append(row)
     for input_id, input_rows in sorted(by_input.items()):
-        signatures = sorted({str(row["canonical_workload_signature"]) for row in input_rows if row["canonical_workload_signature"]})
+        signatures = sorted(
+            {
+                str(row["canonical_workload_signature"])
+                for row in input_rows
+                if row["canonical_workload_signature"]
+            }
+        )
         signature_by_input[input_id] = {
             "input_id": input_id,
             "run_count": len(input_rows),
@@ -408,9 +429,21 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
             "signature_count": len(signatures),
             "signature_match": len(signatures) == 1,
             "signatures": signatures,
+            **summarize_forced_token_input_group(input_rows),
         }
+        signature_by_input[input_id]["input_contract_ready"] = (
+            signature_by_input[input_id]["signature_match"]
+            and signature_by_input[input_id]["forced_token_enabled_count"] == signature_by_input[input_id]["run_count"]
+            and signature_by_input[input_id]["forced_token_plan_signature_match"]
+            and signature_by_input[input_id]["forced_token_bundle_signature_match"]
+        )
 
-    quality_ready = all(row["state_quality_ready"] for row in rows) and all(row["signature_match"] for row in signature_by_input.values())
+    quality_ready = (
+        all(row["state_quality_ready"] for row in rows)
+        and all(row["signature_match"] for row in signature_by_input.values())
+        and all(row["forced_token_plan_signature_match"] for row in signature_by_input.values())
+        and all(row["forced_token_bundle_signature_match"] for row in signature_by_input.values())
+    )
     report = {
         "schema": "trace_sim.hicache.state_matrix.profile_quality.v1",
         "stage": "quality",
@@ -424,12 +457,82 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
         "runs": rows,
         "note": (
             "quality_ready uses state modeling requirements: invariant facts, token dictionary/span, oracle snapshots, "
-            "and same-input canonical workload signatures. profile_quality_ready keeps the stricter collection audit for "
-            "source_actual/timing diagnostics."
+            "same-input canonical workload signatures, and forced-token plan/bundle consistency when forced replay "
+            "is enabled. "
+            "profile_quality_ready keeps the stricter collection audit for source_actual/timing diagnostics."
         ),
     }
-    write_json(output_dir / "profile_quality_5x4.json", report)
+    write_json(output_dir / "profile_quality.json", report)
     return report
+
+
+def normalize_forced_token_quality(profile_quality: dict[str, Any]) -> dict[str, Any]:
+    """从 profile_quality 中提取稳定的 forced-token gate 摘要。"""
+
+    quality = profile_quality.get("forced_token_quality")
+    if not isinstance(quality, dict):
+        return {"enabled": False, "ready": True, "mode": "none", "plan_sha256": None}
+    return {
+        **quality,
+        "enabled": bool(quality.get("enabled")),
+        "ready": bool(quality.get("ready")),
+        "mode": quality.get("mode") or "none",
+        "plan_sha256": quality.get("plan_sha256"),
+    }
+
+
+def summarize_forced_token_input_group(input_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """汇总同一个 input 下的 forced-token plan/bundle 一致性。"""
+
+    forced_rows = [row for row in input_rows if row.get("forced_token_enabled")]
+    plan_signatures = sorted(
+        {
+            str(row.get("forced_token_plan_sha256"))
+            for row in forced_rows
+            if row.get("forced_token_plan_sha256")
+        }
+    )
+    signature_match = (
+        not forced_rows
+        or (
+            len(forced_rows) == len(input_rows)
+            and len(plan_signatures) == 1
+            and all(row.get("forced_token_plan_ready") for row in forced_rows)
+        )
+    )
+    bundle_signatures = sorted(
+        {
+            str(row.get("forced_token_bundle_sha256"))
+            for row in forced_rows
+            if row.get("forced_token_bundle_sha256")
+        }
+    )
+    bundle_ids = sorted(
+        {
+            str(row.get("forced_token_bundle_id"))
+            for row in forced_rows
+            if row.get("forced_token_bundle_id")
+        }
+    )
+    bundle_signature_match = (
+        not forced_rows
+        or (
+            len(forced_rows) == len(input_rows)
+            and len(bundle_signatures) == 1
+            and len(bundle_ids) == 1
+            and all(row.get("forced_token_bundle_ready") for row in forced_rows)
+        )
+    )
+    return {
+        "forced_token_enabled_count": len(forced_rows),
+        "forced_token_plan_signature_count": len(plan_signatures),
+        "forced_token_plan_signature_match": signature_match,
+        "forced_token_plan_signatures": plan_signatures,
+        "forced_token_bundle_signature_count": len(bundle_signatures),
+        "forced_token_bundle_signature_match": bundle_signature_match,
+        "forced_token_bundle_signatures": bundle_signatures,
+        "forced_token_bundle_ids": bundle_ids,
+    }
 
 
 def summarize_profile_trace(run: ProfileRun) -> dict[str, Any]:
@@ -465,6 +568,7 @@ def build_workload_signature(run: ProfileRun) -> dict[str, Any]:
 
     roles = set(WORKLOAD_SIGNATURE_ROLES)
     events, unknown_roles, unmapped_requests = extract_audit_events(list(run.python_probe_files), run.run_id, roles)
+    path_contract = model_input_path_contract(list(run.python_probe_files), roles, sample=0)
     by_role: dict[str, collections.Counter[str]] = {role: collections.Counter() for role in roles}
     for event in events:
         by_role.setdefault(event.role, collections.Counter())[event.signature] += 1
@@ -483,16 +587,21 @@ def build_workload_signature(run: ProfileRun) -> dict[str, Any]:
     unmapped = dict(sorted(unmapped_requests.items()))
     return {
         "signature": signature,
-        "ready": bool(events) and not unknown and not unmapped,
+        "ready": bool(events) and not unknown and not unmapped and bool(path_contract.get("ready")),
         "request_event_count": len(events),
         "roles": sorted(roles),
         "role_counts": {role: sum(counter.values()) for role, counter in sorted(by_role.items())},
         "unknown_invariant_roles": unknown,
         "unmapped_request_id_events": unmapped,
+        "model_input_path_contract": path_contract,
     }
 
 
-def state_quality_ready(profile_quality: dict[str, Any], trace_summary: dict[str, Any], workload_signature: dict[str, Any]) -> bool:
+def state_quality_ready(
+    profile_quality: dict[str, Any],
+    trace_summary: dict[str, Any],
+    workload_signature: dict[str, Any],
+) -> bool:
     """判断 profile 是否满足 final-state 建模输入要求。"""
 
     invariant = profile_quality.get("hicache_invariant_coverage")
@@ -502,6 +611,10 @@ def state_quality_ready(profile_quality: dict[str, Any], trace_summary: dict[str
         return False
     if trace_summary.get("fact_class_counts", {}).get("invariant_state", 0) <= 0:
         return False
+    forced_token_quality = profile_quality.get("forced_token_quality")
+    if isinstance(forced_token_quality, dict) and forced_token_quality.get("enabled"):
+        if not forced_token_quality.get("ready"):
+            return False
     return bool(workload_signature.get("ready"))
 
 
@@ -511,7 +624,7 @@ def write_target_model_config(target: ProfileRun, config_dir: Path) -> Path:
     path = config_dir / f"target_{safe_slug(target.config_id)}.json"
     payload = {
         "metadata": {
-            "purpose": "Generated by hicache_state_matrix_validation.py for matrix final-state prediction.",
+            "purpose": "Generated by hicache_state_workflow.py for matrix final-state prediction.",
             "target_config_id": target.config_id,
             "target_run_id": target.run_id,
             "target_config_path": str(target.config_path),
@@ -611,7 +724,11 @@ def matrix_summary(rows: list[dict[str, Any]], *, schema: str, stage: str) -> di
         input_rows = [row for row in rows if row.get("input_id") == input_id]
         by_input[input_id] = {
             "prediction_count": len(input_rows),
-            "final_state_match_count": sum(1 for row in input_rows if row.get("hicache_state", {}).get("final_state_match") is True),
+            "final_state_match_count": sum(
+                1
+                for row in input_rows
+                if row.get("hicache_state", {}).get("final_state_match") is True
+            ),
             "validation_ready_count": sum(1 for row in input_rows if row.get("validation_ready")),
         }
     return {
@@ -631,8 +748,10 @@ def tier_count_delta(row: dict[str, Any], tier: str) -> int | None:
     """计算某个 tier 的 model/oracle count delta。"""
 
     hicache = row.get("hicache_state") if isinstance(row.get("hicache_state"), dict) else {}
-    model = hicache.get("normalized_model_final_state_counts") if isinstance(hicache.get("normalized_model_final_state_counts"), dict) else {}
-    oracle = hicache.get("normalized_oracle_final_state_counts") if isinstance(hicache.get("normalized_oracle_final_state_counts"), dict) else {}
+    model_counts = hicache.get("normalized_model_final_state_counts")
+    oracle_counts = hicache.get("normalized_oracle_final_state_counts")
+    model = model_counts if isinstance(model_counts, dict) else {}
+    oracle = oracle_counts if isinstance(oracle_counts, dict) else {}
     if tier not in model and tier not in oracle:
         return None
     return int(model.get(tier, 0) or 0) - int(oracle.get(tier, 0) or 0)
