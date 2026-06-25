@@ -179,13 +179,6 @@ std::string storage_hash_from_fact_value(const std::string & value) {
     return value.substr(delimiter + 1);
 }
 
-HiCacheTokenCompleteness completeness_for_fact(const HiCacheFact & fact, uint64_t page_size) {
-    if (fact.full_path_tokens.empty()) return HiCacheTokenCompleteness::Unknown;
-    if (fact.full_path_span.valid && fact.full_path_span.token_count == fact.full_path_tokens.size()) return HiCacheTokenCompleteness::Full;
-    if (page_size > 0 && fact.full_path_tokens.size() / page_size * page_size == fact.full_path_tokens.size()) return HiCacheTokenCompleteness::PageAligned;
-    return HiCacheTokenCompleteness::Partial;
-}
-
 } // namespace
 
 void HiCacheState::DeviceAllocatorLedger::configure(uint64_t pages, bool sort_required) {
@@ -251,6 +244,63 @@ void HiCacheState::ensure_device_allocator(ScopedState & scope) {
     scope.device_allocator.configure(policy_.l1_capacity_pages(), policy_.resolved().device_allocator_need_sort);
 }
 
+bool HiCacheState::inserted_device_dirty_visible_at_insert_boundary() const {
+    if (policy_.write_back_enabled()) return true;
+    return policy_.write_count_enabled() && policy_.write_through_threshold() > 1;
+}
+
+HiCacheState::PrefetchIoProgressEstimate HiCacheState::estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact) const {
+    (void)op;
+    (void)fact;
+    return PrefetchIoProgressEstimate{
+        .completed_pages = {},
+        .model_name = "zero_progress",
+        .reason = "zero-progress IO model: invariant input has no calibrated storage transfer progress",
+    };
+}
+
+HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
+                                                                                bool require_full_completion) const {
+    auto estimate = PrefetchProgressEstimate{
+        .storage_hit_pages = static_cast<uint64_t>(op.hit_pages.size()),
+        .storage_hit_sufficient = op.hit_pages.size() >= policy_.prefetch_threshold_pages(),
+        .terminal_checkpoint = policy_.terminal_prefetch_checkpoint(fact.check_kind),
+        .timeout_elapsed = policy_.prefetch_timeout_elapsed(op.header.enqueue_ts, fact.ts, static_cast<uint64_t>(op.planned_pages.size() * config_.page_size)),
+    };
+    if (!estimate.storage_hit_sufficient) {
+        estimate.reason = "storage hit prefix is below target prefetch threshold";
+        return estimate;
+    }
+
+    const auto policy = policy_.prefetch_policy();
+    if (require_full_completion) {
+        estimate.completed_pages = op.hit_pages;
+        estimate.fully_completed = estimate.completed_pages.size() == op.hit_pages.size();
+        estimate.reason = "stop boundary requires completed IO; modeled completed prefix equals storage hit prefix";
+        return estimate;
+    }
+    if (policy == "best_effort") {
+        const auto io_progress = estimate_prefetch_io_progress(op, fact);
+        estimate.completed_pages = io_progress.completed_pages;
+        estimate.reason = "best_effort can terminate immediately; " + io_progress.reason;
+        return estimate;
+    }
+    if (policy == "timeout" && estimate.terminal_checkpoint && !estimate.timeout_elapsed) {
+        estimate.completed_pages = op.hit_pages;
+        estimate.fully_completed = estimate.completed_pages.size() == op.hit_pages.size();
+        estimate.reason = "terminal timeout checkpoint is modeled as completed IO until calibrated progress is available";
+        return estimate;
+    }
+    if (estimate.timeout_elapsed) {
+        const auto io_progress = estimate_prefetch_io_progress(op, fact);
+        estimate.completed_pages = io_progress.completed_pages;
+        estimate.reason = "timeout stop boundary exposes only calibrated completed IO; " + io_progress.reason;
+        return estimate;
+    }
+    estimate.reason = "prefetch has not reached a modeled completion or timeout boundary";
+    return estimate;
+}
+
 void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                                    ScopedState & scope, const std::string & reason) {
     if (scope.pending_write_through_backups.empty()) return;
@@ -264,18 +314,29 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiC
     }
 }
 
-HiCacheTokenPath HiCacheState::tokens_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const {
-    if (!fact.full_path_tokens.empty()) return fact.full_path_tokens;
-    const auto stored = token_store_.request_tokens(fact);
-    if (!stored.empty()) return stored;
-    if (fact.token_count >= pager_.page_size_for_fact(fact)) summary.missing_invariant_facts["token_dictionary_or_full_path_span"]++;
-    return {};
+void HiCacheState::record_token_resolution(const HiCacheFact & fact, HiCacheSummary & summary, const HiCacheTokenResolution & resolution) const {
+    const auto status = hicache_token_resolution_status_name(resolution.status);
+    summary.token_resolution_by_status[status]++;
+    summary.token_path_diagnostics[fact.role + "." + status]++;
+
+    if (!resolution.ok()) {
+        summary.missing_invariant_facts["token_resolution_" + status]++;
+        if (fact.role == "request_lifecycle_anchor" && resolution.status == HiCacheTokenResolutionStatus::Missing)
+            summary.token_path_diagnostics["lifecycle_anchor_missing_committed_path_count"]++;
+        return;
+    }
+
+    if (fact.role == "prefetch_decision") summary.token_path_diagnostics["prefetch_path_not_committed_count"]++;
+    if (fact.role == "request_lifecycle_anchor") {
+        const auto * previous = token_directory_.previous_committed_snapshot(fact);
+        if (previous != nullptr && resolution.page_aligned_token_count > previous->page_aligned_token_count)
+            summary.token_path_diagnostics["lifecycle_path_growth_cross_page_boundary_count"]++;
+    }
 }
 
-HiCachePagePath HiCacheState::page_path_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const {
-    const auto tokens = tokens_for_fact(fact, summary);
-    if (tokens.empty()) return {};
-    return pager_.project(fact, tokens);
+HiCachePagePath HiCacheState::page_path_from_resolution(const HiCacheFact & fact, const HiCacheTokenResolution & resolution) const {
+    if (!resolution.ok() || resolution.tokens.empty()) return {};
+    return pager_.project(fact, resolution.tokens);
 }
 
 std::string HiCacheState::digest() const { return derived_state().digest(); }
@@ -507,6 +568,7 @@ void HiCacheState::sync_capacity_for_insert(ScopedState & scope, const std::stri
     nodes.insert(insert.touched_nodes.begin(), insert.touched_nodes.end());
     nodes.insert(insert.new_device_nodes.begin(), insert.new_device_nodes.end());
     nodes.insert(insert.restored_device_nodes.begin(), insert.restored_device_nodes.end());
+    nodes.insert(insert.dirtied_device_nodes.begin(), insert.dirtied_device_nodes.end());
     nodes.insert(insert.new_host_nodes.begin(), insert.new_host_nodes.end());
     sync_capacity(scope, cache_scope, { nodes.begin(), nodes.end() }, reason);
 }
@@ -554,9 +616,7 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
 
 std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
-    if (!fact.full_path_tokens.empty()) {
-        token_store_.set_request_tokens(fact, fact.full_path_tokens, completeness_for_fact(fact, pager_.page_size_for_fact(fact)));
-    }
+    token_directory_.observe_fact_path(fact, pager_.page_size_for_fact(fact));
     if (role != HiCacheFactRole::Unknown) {
         auto & scope = scope_state(fact);
         drain_write_through_backup_refs(fact, summary, transitions, scope, "write_through_backup_ack_boundary");
@@ -602,9 +662,9 @@ void HiCacheState::update_request_state(const HiCacheFact & fact, ScopedState & 
 }
 
 void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto tokens = tokens_for_fact(fact, summary);
-    if (!tokens.empty()) token_store_.observe_request_bound_tokens(fact, tokens);
-    const auto page_path = pager_.project(fact, tokens);
+    const auto resolution = token_directory_.resolve_match_path(fact, pager_.page_size_for_fact(fact));
+    record_token_resolution(fact, summary, resolution);
+    const auto page_path = page_path_from_resolution(fact, resolution);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
 
@@ -715,9 +775,10 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
 }
 
 void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto tokens = tokens_for_fact(fact, summary);
-    const auto admission_token_count = static_cast<uint64_t>(tokens.empty() ? fact.token_count : tokens.size());
-    const auto page_path = pager_.project(fact, tokens);
+    const auto resolution = token_directory_.resolve_admission_path(fact, pager_.page_size_for_fact(fact));
+    record_token_resolution(fact, summary, resolution);
+    const auto admission_token_count = resolution.ok() ? resolution.token_count : fact.token_count;
+    const auto page_path = page_path_from_resolution(fact, resolution);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
@@ -795,24 +856,27 @@ void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSumm
 HiCacheInsertResult HiCacheState::insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                                       ScopedState & scope, const std::vector<std::string> & pages) {
     const auto before = digest();
-    auto insert = scope.tree.insert_device_path(pages, fact.priority, policy_.write_back_enabled());
+    const auto dirty_visible_at_insert = inserted_device_dirty_visible_at_insert_boundary();
+    auto insert = scope.tree.insert_device_path(pages, fact.priority, dirty_visible_at_insert);
     sync_capacity_for_insert(scope, normalized_scope(fact), insert, "request_insert_device");
     auto new_pages = flatten_node_pages(scope.tree, insert.new_device_nodes);
     auto restored_pages = flatten_node_pages(scope.tree, insert.restored_device_nodes);
+    auto dirtied_pages = flatten_node_pages(scope.tree, insert.dirtied_device_nodes);
     record_transition(fact, summary, transitions, "add_l1_residency", "L1", new_pages, before);
     record_transition(fact, summary, transitions, "restore_l1_residency", "L1", restored_pages, before);
     record_policy_decision(fact,
                            HiCachePolicyDecisionRecord{
                                .policy_area = "write_policy",
                                .policy_name = policy_.write_policy(),
-                               .decision = policy_.write_back_enabled() ? "mark_new_device_pages_dirty" : "defer_to_hit_count_backup",
-                               .reason = policy_.write_back_enabled() ? "write_back stores fresh pages as dirty" : "write-through policy uses hit-count backup",
-                               .accepted = policy_.write_back_enabled(),
-                               .candidate_pages = static_cast<uint64_t>(new_pages.size()),
+                               .decision = dirty_visible_at_insert ? "mark_inserted_device_pages_dirty" : "defer_to_immediate_hit_count_backup",
+                               .reason = dirty_visible_at_insert ? "inserted or recomputed unbacked device pages remain dirty beyond the insert boundary"
+                                                                 : "hit-count backup reaches the threshold inside the same insert boundary",
+                               .accepted = dirty_visible_at_insert,
+                               .candidate_pages = static_cast<uint64_t>(dirtied_pages.size()),
                                .threshold_pages = policy_.write_through_threshold(),
-                               .pages = new_pages,
+                               .pages = dirtied_pages,
                            });
-    if (policy_.write_back_enabled()) record_transition(fact, summary, transitions, "mark_dirty", "dirty", new_pages, before);
+    if (dirty_visible_at_insert) record_transition(fact, summary, transitions, "mark_dirty", "dirty", dirtied_pages, before);
     return insert;
 }
 
@@ -820,9 +884,10 @@ void HiCacheState::apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCa
     const auto kind = lower_copy(fact.lifecycle_kind);
     if (!kind.empty() && kind != "finished" && kind != "unfinished") return;
 
-    const auto tokens = tokens_for_fact(fact, summary);
-    const auto lifecycle_token_count = static_cast<uint64_t>(tokens.size());
-    const auto page_path = pager_.project(fact, tokens);
+    const auto resolution = token_directory_.resolve_lifecycle_path(fact, pager_.page_size_for_fact(fact));
+    record_token_resolution(fact, summary, resolution);
+    const auto lifecycle_token_count = resolution.token_count;
+    const auto page_path = page_path_from_resolution(fact, resolution);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
@@ -1052,15 +1117,15 @@ uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummar
 
     const auto pages = node->pages;
     const auto released_pages = static_cast<uint64_t>(pages.size());
-    const bool needs_writeback = policy_.write_back_enabled() && !has_host_backup(*node);
+    const bool needs_writeback = policy_.write_back_enabled() && node->residency.device_dirty;
     record_policy_decision(fact,
                            HiCachePolicyDecisionRecord{
                                .policy_area = "write_policy",
                                .policy_name = policy_.write_policy(),
                                .decision = needs_writeback ? "enqueue_dirty_eviction_writeback" : "evict_without_writeback",
-                               .reason = needs_writeback          ? "write_back dirty node has no host backup"
-                                         : has_host_backup(*node) ? "node already has host backup"
-                                                                  : "target write policy does not require dirty eviction writeback",
+                               .reason = needs_writeback                ? "write_back dirty device node must refresh host backup before eviction"
+                                         : node->residency.device_dirty ? "target write policy does not require dirty eviction writeback"
+                                                                        : "device node is clean at eviction boundary",
                                .accepted = needs_writeback,
                                .candidate_pages = static_cast<uint64_t>(pages.size()),
                                .pages = pages,
@@ -1286,7 +1351,9 @@ HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const H
 }
 
 void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions) {
-    const auto page_path = page_path_for_fact(fact, summary);
+    const auto resolution = token_directory_.resolve_prefetch_path(fact, pager_.page_size_for_fact(fact));
+    record_token_resolution(fact, summary, resolution);
+    const auto page_path = page_path_from_resolution(fact, resolution);
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
@@ -1483,22 +1550,28 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
 void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                         ScopedState & scope, HiCachePrefetchOperation & op) {
     const auto before_ready = digest();
-    scope.async_ops.set_prefetch_state_by_id(op.header.operation_id, HiCachePrefetchState::Ready, HiCacheOperationState::Ready, "storage_hit_ready", fact.ts);
-    record_transition(fact, summary, transitions, "prefetch_ready", "prefetch", op.hit_pages, before_ready);
+    scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
+                                             HiCachePrefetchState::Ready,
+                                             HiCacheOperationState::Ready,
+                                             "completed_prefetch_ready",
+                                             fact.ts);
+    record_transition(fact, summary, transitions, "prefetch_ready", "prefetch", op.completed_pages, before_ready);
+    if (op.completed_pages.empty()) record_transition(fact, summary, transitions, "prefetch_terminated", "prefetch", op.planned_pages, before_ready);
 
     const auto before_apply = digest();
-    const auto visible_pages = std::set<std::string>(op.hit_pages.begin(), op.hit_pages.end());
+    const auto visible_pages = std::set<std::string>(op.completed_pages.begin(), op.completed_pages.end());
     (void)scope.tree.lookup(prefix_to(op.host_insert_pages, static_cast<size_t>(op.host_visible_offset_pages)));
-    auto insert = scope.tree.insert_host_path(op.host_insert_pages, visible_pages, true);
+    const auto host_insert_pages = prefix_to(op.host_insert_pages, static_cast<size_t>(op.host_visible_offset_pages + op.completed_pages.size()));
+    auto insert = scope.tree.insert_host_path(host_insert_pages, visible_pages, true);
     sync_capacity_for_insert(scope, normalized_scope(fact), insert, "prefetch_insert_host");
-    scope.storage.mark_readable_pages(normalized_scope(fact), op.hit_pages);
+    scope.storage.mark_readable_pages(normalized_scope(fact), op.completed_pages);
     for (const auto node_id : insert.touched_nodes) { scope.storage.mark_materialized_pages(scope.tree.node_pages(node_id), node_id); }
     scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
                                              HiCachePrefetchState::Applied,
                                              HiCacheOperationState::Committed,
                                              "apply_host_visibility",
                                              fact.ts);
-    op.reserved_host_pages = bounded_subtract(op.reserved_host_pages, static_cast<uint64_t>(op.hit_pages.size()));
+    op.reserved_host_pages = bounded_subtract(op.reserved_host_pages, static_cast<uint64_t>(op.completed_pages.size()));
     const auto ref = scope.refs.release_owner(scope.tree, op.header.owner);
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "prefetch_ref_release");
     sync_capacity(scope, normalized_scope(fact), {}, "prefetch_apply_pending_host_release");
@@ -1523,22 +1596,24 @@ void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact,
 
     const auto policy = policy_.prefetch_policy();
     if (policy == "wait_complete") {
-        record_policy_decision(
-            fact,
-            HiCachePolicyDecisionRecord{
-                .operation_id = op->header.operation_id,
-                .policy_area = "prefetch_request_boundary",
-                .policy_name = policy,
-                .decision = "apply_prefetch",
-                .reason = "request boundary implies check_prefetch_progress returned true; wait_complete can only continue after completed IO",
-                .accepted = true,
-                .requested_pages = op->requested_host_pages,
-                .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
-                .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
-                .reserved_pages = op->reserved_host_pages,
-                .threshold_pages = policy_.prefetch_threshold_pages(),
-                .pages = op->planned_pages,
-            });
+        auto progress = estimate_prefetch_progress(*op, fact, true);
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .operation_id = op->header.operation_id,
+                                   .policy_area = "prefetch_request_boundary",
+                                   .policy_name = policy,
+                                   .decision = "apply_prefetch",
+                                   .reason = progress.reason,
+                                   .accepted = true,
+                                   .requested_pages = op->requested_host_pages,
+                                   .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                                   .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
+                                   .reserved_pages = op->reserved_host_pages,
+                                   .threshold_pages = policy_.prefetch_threshold_pages(),
+                                   .pages = op->planned_pages,
+                               });
+        op->completed_pages = std::move(progress.completed_pages);
         apply_prefetch_ready(fact, summary, transitions, scope, *op);
         drain_deferred_host_releases(fact, scope);
         return;
@@ -1547,18 +1622,19 @@ void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact,
     if (policy == "timeout") {
         const auto timeout_elapsed =
             policy_.prefetch_timeout_elapsed(op->header.enqueue_ts, fact.ts, static_cast<uint64_t>(op->planned_pages.size() * config_.page_size));
+        auto progress = estimate_prefetch_progress(*op, fact, !timeout_elapsed);
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .operation_id = op->header.operation_id,
                                    .policy_area = "prefetch_request_boundary",
                                    .policy_name = policy,
                                    .decision = timeout_elapsed ? "cancel_prefetch_without_completed_io" : "apply_prefetch",
-                                   .reason = timeout_elapsed ? "timeout request boundary can be explained by elapsed timeout before modeled completion"
-                                                             : "request boundary before target timeout implies completed prefetch IO",
+                                   .reason = progress.reason,
                                    .accepted = !timeout_elapsed,
                                    .requested_pages = op->requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                    .reserved_pages = op->reserved_host_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
@@ -1567,6 +1643,7 @@ void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact,
             cancel_prefetch_pending_release(fact, summary, transitions, scope, *op, "prefetch_timeout_incomplete", HiCachePrefetchState::Late);
         }
         else {
+            op->completed_pages = std::move(progress.completed_pages);
             apply_prefetch_ready(fact, summary, transitions, scope, *op);
             drain_deferred_host_releases(fact, scope);
         }
@@ -1624,40 +1701,48 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
     const auto policy = policy_.prefetch_policy();
     if (policy == "wait_complete") {
         const auto terminal = policy_.terminal_prefetch_checkpoint(fact.check_kind);
+        auto progress = estimate_prefetch_progress(*op, fact, terminal);
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .operation_id = op->header.operation_id,
                                    .policy_area = "prefetch_checkpoint",
                                    .policy_name = policy,
                                    .decision = terminal ? "apply_prefetch" : "wait_for_completion",
-                                   .reason = terminal ? "wait_complete checkpoint is terminal" : "wait_complete requires terminal checkpoint",
+                                   .reason = terminal ? progress.reason : "wait_complete requires a checkpoint where completed IO is known",
                                    .accepted = terminal,
                                    .requested_pages = op->requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                    .reserved_pages = op->reserved_host_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
-        if (terminal) apply_prefetch_ready(fact, summary, transitions, scope, *op);
+        if (terminal) {
+            op->completed_pages = std::move(progress.completed_pages);
+            apply_prefetch_ready(fact, summary, transitions, scope, *op);
+        }
         return;
     }
     if (policy == "best_effort") {
+        auto progress = estimate_prefetch_progress(*op, fact, false);
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .operation_id = op->header.operation_id,
                                    .policy_area = "prefetch_checkpoint",
                                    .policy_name = policy,
-                                   .decision = "apply_prefetch",
-                                   .reason = "best_effort applies once storage hit prefix passes threshold",
+                                   .decision = "terminate_prefetch",
+                                   .reason = progress.reason,
                                    .accepted = true,
                                    .requested_pages = op->requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                    .reserved_pages = op->reserved_host_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
+        op->completed_pages = std::move(progress.completed_pages);
         apply_prefetch_ready(fact, summary, transitions, scope, *op);
         return;
     }
@@ -1665,6 +1750,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
         const auto terminal = policy_.terminal_prefetch_checkpoint(fact.check_kind);
         const auto timeout_elapsed =
             policy_.prefetch_timeout_elapsed(op->header.enqueue_ts, fact.ts, static_cast<uint64_t>(op->planned_pages.size() * config_.page_size));
+        auto progress = estimate_prefetch_progress(*op, fact, terminal);
         if (timeout_elapsed && !terminal) {
             record_policy_decision(fact,
                                    HiCachePolicyDecisionRecord{
@@ -1672,12 +1758,12 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                        .policy_area = "prefetch_checkpoint",
                                        .policy_name = policy,
                                        .decision = "cancel_prefetch_without_completed_io",
-                                       .reason = "timeout can terminate before the storage IO thread publishes completed tokens; invariant checkpoints do not "
-                                                 "carry completed-token progress",
+                                       .reason = progress.reason,
                                        .accepted = false,
                                        .requested_pages = op->requested_host_pages,
                                        .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                        .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                       .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                        .reserved_pages = op->reserved_host_pages,
                                        .threshold_pages = policy_.prefetch_threshold_pages(),
                                        .pages = op->planned_pages,
@@ -1691,20 +1777,23 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                    .policy_area = "prefetch_checkpoint",
                                    .policy_name = policy,
                                    .decision = terminal || timeout_elapsed ? "apply_prefetch" : "wait_for_timeout_or_completion",
-                                   .reason = terminal          ? "timeout policy checkpoint is terminal"
-                                             : timeout_elapsed ? "target timeout elapsed"
-                                                               : "timeout policy waits for terminal checkpoint or elapsed timeout",
+                                   .reason = terminal || timeout_elapsed ? progress.reason : "timeout policy waits for terminal checkpoint or elapsed timeout",
                                    .accepted = terminal || timeout_elapsed,
                                    .requested_pages = op->requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                    .reserved_pages = op->reserved_host_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
                                    .pages = op->planned_pages,
                                });
-        if (terminal || timeout_elapsed) { apply_prefetch_ready(fact, summary, transitions, scope, *op); }
+        if (terminal || timeout_elapsed) {
+            op->completed_pages = std::move(progress.completed_pages);
+            apply_prefetch_ready(fact, summary, transitions, scope, *op);
+        }
         return;
     }
+    op->completed_pages = op->hit_pages;
     record_policy_decision(fact,
                            HiCachePolicyDecisionRecord{
                                .operation_id = op->header.operation_id,
@@ -1716,6 +1805,7 @@ void HiCacheState::apply_prefetch_check_point(const HiCacheFact & fact, HiCacheS
                                .requested_pages = op->requested_host_pages,
                                .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                               .allocated_pages = static_cast<uint64_t>(op->completed_pages.size()),
                                .reserved_pages = op->reserved_host_pages,
                                .threshold_pages = policy_.prefetch_threshold_pages(),
                                .pages = op->planned_pages,

@@ -78,7 +78,7 @@ void HiCacheDerivedStateView::include_async(const HiCacheAsyncOperationTable & a
     for (const auto & op : async_ops.prefetch_ops() | std::views::values) {
         insert_all(snapshot_.prefetch_planned, op.planned_pages);
         if (op.prefetch_state == HiCachePrefetchState::Ready || op.prefetch_state == HiCachePrefetchState::Applied)
-            insert_all(snapshot_.prefetch_ready, op.hit_pages);
+            insert_all(snapshot_.prefetch_ready, op.completed_pages);
         if (op.prefetch_state == HiCachePrefetchState::Late) insert_all(snapshot_.prefetch_late, op.planned_pages);
         if (op.prefetch_state == HiCachePrefetchState::Suppressed || op.prefetch_state == HiCachePrefetchState::Revoked)
             insert_all(snapshot_.prefetch_suppressed, op.planned_pages);

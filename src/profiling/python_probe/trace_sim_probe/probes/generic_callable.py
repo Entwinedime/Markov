@@ -180,7 +180,11 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
     events_raw = raw.get("events", [])
     events = tuple(item for item in events_raw if isinstance(item, str))
     phases = _parse_phases(raw)
-    emit_when = tuple(condition for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when"))) if condition is not None)
+    emit_when = tuple(
+        condition
+        for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when")))
+        if condition is not None
+    )
     fact = _parse_fact(raw.get("fact"), target_id)
     return TargetSpec(
         id=target_id,
@@ -307,15 +311,15 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             started = get_writer().now_us()
-            _emit_targets(targets, fn, args, kwargs, None, "start", started, started)
+            _emit_call_phase(targets, fn, args, kwargs, None, "start", started, started)
             try:
                 result = await fn(*args, **kwargs)
             except BaseException:
                 ended = get_writer().now_us()
-                _emit_targets(targets, fn, args, kwargs, None, "exception", started, ended)
+                _emit_call_phase(targets, fn, args, kwargs, None, "exception", started, ended)
                 raise
             ended = get_writer().now_us()
-            _emit_targets(targets, fn, args, kwargs, result, "end", started, ended)
+            _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
             return result
 
         return async_wrapped
@@ -323,18 +327,33 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         started = get_writer().now_us()
-        _emit_targets(targets, fn, args, kwargs, None, "start", started, started)
+        _emit_call_phase(targets, fn, args, kwargs, None, "start", started, started)
         try:
             result = fn(*args, **kwargs)
         except BaseException:
             ended = get_writer().now_us()
-            _emit_targets(targets, fn, args, kwargs, None, "exception", started, ended)
+            _emit_call_phase(targets, fn, args, kwargs, None, "exception", started, ended)
             raise
         ended = get_writer().now_us()
-        _emit_targets(targets, fn, args, kwargs, result, "end", started, ended)
+        _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
         return result
 
     return wrapped
+
+
+def _emit_call_phase(
+    targets: tuple[TargetSpec, ...],
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+    phase: str,
+    start_us: int,
+    end_us: int,
+) -> None:
+    """发射某次 callable 调用的一个阶段事件。"""
+
+    _emit_targets(targets, fn, args, kwargs, result, phase, start_us, end_us)
 
 
 def _emit_targets(
@@ -368,7 +387,7 @@ def _emit(
     """构造 Chrome trace event，并把 validation-only 字段拆成旁路事件。"""
 
     bound = _bind_arguments(fn, args, kwargs)
-    bound["__trace_sim_phase"] = phase
+    _bind_trace_context(bound, target, phase)
     if not _should_emit_target(target, bound, args, kwargs, result):
         return
     fields, validation_fields, missing = _collect_fields(target, bound, args, kwargs, result)
@@ -411,6 +430,17 @@ def _emit(
         )
 
 
+def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -> None:
+    """把 fact 元数据注入 source extractor 可见的取值上下文。"""
+
+    bound["__trace_sim_phase"] = phase
+    bound["__trace_sim_fact_class"] = target.fact.fact_class
+    bound["__trace_sim_fact_granularity"] = target.fact.granularity
+    bound["__trace_sim_model_input"] = target.fact.model_input
+    bound["__trace_sim_dag_input"] = target.fact.dag_input
+    bound["__trace_sim_event_role"] = target.fact.event_role
+
+
 def _event_name(target: TargetSpec, phase: str) -> str:
     """按 target 配置和 phase 生成事件名。"""
 
@@ -438,22 +468,30 @@ def _collect_fields(
     for field in target.fields:
         found, value = _extract_field(field, bound, args, kwargs, result)
         if found:
-            if isinstance(value, ExtractedField):
-                if value.model_input:
-                    if value.extra_args:
-                        fields.update(value.extra_args)
-                    fields[field.name] = value.value
-                else:
-                    if value.extra_args:
-                        validation_fields.update(value.extra_args)
-                    validation_fields[field.name] = value.value
-                    if value.event_kind:
-                        validation_fields.setdefault("_event_kind", value.event_kind)
-            else:
-                fields[field.name] = value
+            _store_extracted_field(field.name, value, fields, validation_fields)
         elif field.required:
             missing.append(field.name)
     return fields, validation_fields, missing
+
+
+def _store_extracted_field(
+    field_name: str,
+    value: Any,
+    fields: dict[str, Any],
+    validation_fields: dict[str, Any],
+) -> None:
+    """按 ExtractedField 的 model_input 标记分流字段。"""
+
+    if not isinstance(value, ExtractedField):
+        fields[field_name] = value
+        return
+
+    target_fields = fields if value.model_input else validation_fields
+    if value.extra_args:
+        target_fields.update(value.extra_args)
+    target_fields[field_name] = value.value
+    if not value.model_input and value.event_kind:
+        validation_fields.setdefault("_event_kind", value.event_kind)
 
 
 def _fact_args(target: TargetSpec) -> dict[str, Any]:
@@ -569,20 +607,66 @@ def _extract_raw_value(
     tensor/list/tuple 等对象，再记录长度，避免把大对象字符串化后才取长度。
     """
 
+    handled, found, value = _extract_transform_source(source, field_name, bound, args, kwargs, result)
+    if handled:
+        return (found, value)
+
+    handled, found, value = _extract_custom_source(source, field_name, bound, args, kwargs, result)
+    if handled:
+        return (found, value)
+
+    return _extract_builtin_source(source, field_name, bound, args, kwargs, result)
+
+
+def _extract_transform_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    """处理 `len:` / `list:` 这类包装型 source。"""
+
     if source.startswith("len:"):
         found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
         if not found:
-            return (False, None)
-        return (True, _safe_len(value))
+            return (True, False, None)
+        return (True, True, _safe_len(value))
     if source.startswith("list:"):
         found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
         if not found:
-            return (False, None)
-        return (True, _safe_list(value))
+            return (True, False, None)
+        return (True, True, _safe_list(value))
+    return (False, False, None)
+
+
+def _extract_custom_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    """把专用 source 交给已注册的插件解析器。"""
+
     for extractor in _SOURCE_EXTRACTORS:
         handled, found, value = extractor(source, field_name, bound, args, kwargs, result)
         if handled:
-            return (found, value)
+            return (True, found, value)
+    return (False, False, None)
+
+
+def _extract_builtin_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, Any]:
+    """解析 generic callable probe 内置的 source 语法。"""
 
     if not source:
         return (field_name in bound, bound.get(field_name))

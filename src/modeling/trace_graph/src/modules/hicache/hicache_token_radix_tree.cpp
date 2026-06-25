@@ -339,8 +339,10 @@ HiCacheInsertResult HiCacheTokenRadixTree::insert_device_path(const std::vector<
         if (current.residency.device_present) continue;
         const bool existed = existing_nodes.contains(node_id);
         const bool had_backup = has_host_backup(current);
+        const bool was_dirty = current.residency.device_dirty;
         current.residency.device_present = true;
         current.residency.device_dirty = dirty && !had_backup;
+        if (!was_dirty && current.residency.device_dirty) result.dirtied_device_nodes.push_back(node_id);
         if (existed && had_backup) result.restored_device_nodes.push_back(node_id);
         else result.new_device_nodes.push_back(node_id);
     }

@@ -85,6 +85,7 @@ struct HiCacheOperationLifecycleTransition {
  * @brief 单个 storage prefetch operation。
  *
  * planned_pages 是 page-aligned prefetch request；hit_pages 是 storage 连续命中前缀；
+ * completed_pages 是 target I/O progress 在 terminate 边界已经传完的 prefix；
  * reserved_host_pages 是 host allocation/cleanup 后实际 reservation。
  */
 struct HiCachePrefetchOperation {
@@ -94,6 +95,7 @@ struct HiCachePrefetchOperation {
     uint64_t host_visible_offset_pages = 0;
     std::vector<std::string> planned_pages;
     std::vector<std::string> hit_pages;
+    std::vector<std::string> completed_pages;
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
     int64_t priority = 0;

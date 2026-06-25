@@ -43,6 +43,18 @@ bool bool_value(const TraceEvent & event, const std::string & key, bool fallback
     return fallback;
 }
 
+bool completed_event(const TraceEvent & event) {
+    const auto phase = lower_copy(trim_copy(event.arg("phase")));
+    return phase == "end" || event.name.ends_with("_end");
+}
+
+bool model_input_invariant_event(const TraceEvent & event) {
+    return bool_value(event, "model_input", false) && lower_copy(trim_copy(event.arg("fact_class"))) == "invariant_state"
+           && lower_copy(trim_copy(event.arg("fact_granularity"))) == "atomic";
+}
+
+bool model_input_dictionary_source(const TraceEvent & event) { return completed_event(event) && model_input_invariant_event(event); }
+
 Json parse_json_arg(const std::string & raw) {
     const auto text = trim_copy(raw);
     if (text.empty()) return Json{};
@@ -184,6 +196,7 @@ bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
 
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     if (!is_hicache_event(event)) return;
+    if (!model_input_dictionary_source(event)) return;
     std::ranges::for_each(event.args, [&](const auto & item) {
         const auto & [key, value] = item;
         if (key.contains("dictionary")) observe_dictionary_value(value);
@@ -221,6 +234,12 @@ HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) 
     const auto it = token_paths_.find(span.path_id);
     if (it == token_paths_.end()) return {};
     return slice_path(it->second, span.begin, span.end);
+}
+
+bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact) {
+    if (!fact.full_path_span.valid) return false;
+    if (fact.full_path_span.token_count == 0) return fact.full_path_span.begin == fact.full_path_span.end;
+    return static_cast<uint64_t>(fact.full_path_tokens.size()) == fact.full_path_span.token_count;
 }
 
 HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {

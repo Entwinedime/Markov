@@ -89,6 +89,8 @@ struct HiCacheInsertResult {
     std::vector<HiCacheNodeId> touched_nodes;
     std::vector<HiCacheNodeId> new_device_nodes;
     std::vector<HiCacheNodeId> restored_device_nodes;
+    /** @brief 本次 device insert 中从 clean 变为 dirty 的 node。 */
+    std::vector<HiCacheNodeId> dirtied_device_nodes;
     std::vector<HiCacheNodeId> new_host_nodes;
 };
 

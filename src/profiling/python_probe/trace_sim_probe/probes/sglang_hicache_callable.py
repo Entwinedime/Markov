@@ -7,9 +7,9 @@ HiCache 特化规则，HiCache 新后端也不再依赖按 page size 预声明�
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
-import functools
 from types import ModuleType
 from typing import Any
 
@@ -51,6 +51,14 @@ def _internal_hooks_enabled() -> bool:
 
     fact_classes = _base.configured_fact_classes()
     return any(fact_class != "invariant_state" for fact_class in fact_classes)
+
+
+def _source_spec(source: str, prefix: str) -> str | None:
+    """如果 source 命中特定前缀，返回冒号后的参数段。"""
+
+    if not source.startswith(prefix):
+        return None
+    return source.split(":", 1)[1]
 
 
 def _hicache_state_source(
@@ -107,9 +115,10 @@ def _token_path_source(
 ) -> tuple[bool, bool, Any]:
     """处理 `token_path:` source，生成完整 token dictionary 引用。"""
 
-    if not source.startswith("token_path:"):
+    spec = _source_spec(source, "token_path:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_token_path(spec, bound, args, kwargs, result)
     return (True, found, _base.ExtractedField(value) if found else None)
 
 
@@ -123,9 +132,10 @@ def _token_span_source(
 ) -> tuple[bool, bool, Any]:
     """处理 `token_span:` source，生成同一 token path 内的 span 引用。"""
 
-    if not source.startswith("token_span:"):
+    spec = _source_spec(source, "token_span:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_token_span(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -139,9 +149,10 @@ def _request_token_path_source(
 ) -> tuple[bool, bool, Any]:
     """处理 request 级 token path source，覆盖 active/fill/committed 等模式。"""
 
-    if not source.startswith("request_token_path:"):
+    spec = _source_spec(source, "request_token_path:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_request_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_request_token_path(spec, bound, args, kwargs, result)
     return (True, found, _base.ExtractedField(value) if found else None)
 
 
@@ -155,9 +166,10 @@ def _request_token_span_source(
 ) -> tuple[bool, bool, Any]:
     """处理 request 级 token span source，避免重复携带完整 token 列表。"""
 
-    if not source.startswith("request_token_span:"):
+    spec = _source_spec(source, "request_token_span:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_request_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_request_token_span(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -171,9 +183,10 @@ def _request_token_count_source(
 ) -> tuple[bool, bool, Any]:
     """处理 request token 数量 source，用于 target-derived page 投影。"""
 
-    if not source.startswith("request_token_count:"):
+    spec = _source_spec(source, "request_token_count:")
+    if spec is None:
         return (False, False, None)
-    found, tokens = _extract_request_tokens(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, tokens = _extract_request_tokens(spec, bound, args, kwargs, result)
     return (True, found, len(tokens) if found else None)
 
 
@@ -187,9 +200,10 @@ def _token_path_concat_source(
 ) -> tuple[bool, bool, Any]:
     """处理 prefix/suffix 拼接后的 token path source。"""
 
-    if not source.startswith("token_path_concat:"):
+    spec = _source_spec(source, "token_path_concat:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_token_path_concat(spec, bound, args, kwargs, result)
     return (True, found, _base.ExtractedField(value) if found else None)
 
 
@@ -203,9 +217,10 @@ def _token_span_concat_source(
 ) -> tuple[bool, bool, Any]:
     """处理 prefix/suffix 拼接后的 token span source。"""
 
-    if not source.startswith("token_span_concat:"):
+    spec = _source_spec(source, "token_span_concat:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_token_span_concat(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -219,9 +234,10 @@ def _node_token_path_source(
 ) -> tuple[bool, bool, Any]:
     """从 radix node 反推出根到当前节点的完整 token path。"""
 
-    if not source.startswith("node_token_path:"):
+    spec = _source_spec(source, "node_token_path:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_node_token_path(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_node_token_path(spec, bound, args, kwargs, result)
     return (True, found, _base.ExtractedField(value) if found else None)
 
 
@@ -235,9 +251,10 @@ def _node_token_span_source(
 ) -> tuple[bool, bool, Any]:
     """从 radix node 生成完整路径的 span 描述。"""
 
-    if not source.startswith("node_token_span:"):
+    spec = _source_spec(source, "node_token_span:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_node_token_span(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_node_token_span(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -251,9 +268,10 @@ def _node_token_count_source(
 ) -> tuple[bool, bool, Any]:
     """读取 radix node 的完整路径 token 数量。"""
 
-    if not source.startswith("node_token_count:"):
+    spec = _source_spec(source, "node_token_count:")
+    if spec is None:
         return (False, False, None)
-    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, node = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found:
         return (True, False, None)
     return (True, True, len(_full_key_tokens(node)))
@@ -269,9 +287,10 @@ def _hicache_node_summary_source(
 ) -> tuple[bool, bool, Any]:
     """采集单个 HiCache node 的调试摘要。"""
 
-    if not source.startswith("hicache_node_summary:"):
+    spec = _source_spec(source, "hicache_node_summary:")
+    if spec is None:
         return (False, False, None)
-    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, node = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found or node is None:
         return (True, False, None)
     return (True, True, _node_summary_record(node))
@@ -287,9 +306,10 @@ def _hicache_node_chain_source(
 ) -> tuple[bool, bool, Any]:
     """采集 node 到 root 的链路摘要，辅助定位 radix tree 结构变化。"""
 
-    if not source.startswith("hicache_node_chain:"):
+    spec = _source_spec(source, "hicache_node_chain:")
+    if spec is None:
         return (False, False, None)
-    found, node = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, node = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found or node is None:
         return (True, False, None)
     return (True, True, _node_chain_record(node))
@@ -305,9 +325,10 @@ def _hicache_evictable_snapshot_source(
 ) -> tuple[bool, bool, Any]:
     """采集 evictable device/host leaf 集合摘要。"""
 
-    if not source.startswith("hicache_evictable_snapshot:"):
+    spec = _source_spec(source, "hicache_evictable_snapshot:")
+    if spec is None:
         return (False, False, None)
-    found, cache = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, cache = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found or cache is None:
         return (True, False, None)
     return (True, True, _evictable_snapshot_record(cache))
@@ -323,9 +344,10 @@ def _hicache_prefetch_progress_source(
 ) -> tuple[bool, bool, Any]:
     """采集某个 request 的 prefetch 进度证据。"""
 
-    if not source.startswith("hicache_prefetch_progress:"):
+    spec = _source_spec(source, "hicache_prefetch_progress:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_prefetch_progress(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_prefetch_progress(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -339,9 +361,10 @@ def _hicache_request_runtime_source(
 ) -> tuple[bool, bool, Any]:
     """采集 request 对象上的运行时长度和 anchor 字段。"""
 
-    if not source.startswith("hicache_request_runtime:"):
+    spec = _source_spec(source, "hicache_request_runtime:")
+    if spec is None:
         return (False, False, None)
-    found, req = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, req = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found or req is None:
         return (True, False, None)
     return (True, True, _request_runtime_record(req))
@@ -357,9 +380,10 @@ def _hicache_scheduler_prefetch_state_source(
 ) -> tuple[bool, bool, Any]:
     """采集 scheduler 视角的 prefetch 判定上下文。"""
 
-    if not source.startswith("hicache_scheduler_prefetch_state:"):
+    spec = _source_spec(source, "hicache_scheduler_prefetch_state:")
+    if spec is None:
         return (False, False, None)
-    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (True, False, None)
     found_scheduler, scheduler = _extract_source_value(parts[0], "scheduler", bound, args, kwargs, result)
@@ -379,9 +403,10 @@ def _node_token_path_concat_source(
 ) -> tuple[bool, bool, Any]:
     """把 node 路径和 suffix token 拼成新的 token dictionary。"""
 
-    if not source.startswith("node_token_path_concat:"):
+    spec = _source_spec(source, "node_token_path_concat:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_node_token_path_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_node_token_path_concat(spec, bound, args, kwargs, result)
     return (True, found, _base.ExtractedField(value) if found else None)
 
 
@@ -395,9 +420,10 @@ def _node_token_span_concat_source(
 ) -> tuple[bool, bool, Any]:
     """把 node 路径和 suffix token 拼成 span 描述。"""
 
-    if not source.startswith("node_token_span_concat:"):
+    spec = _source_spec(source, "node_token_span_concat:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_node_token_span_concat(source.split(":", 1)[1], bound, args, kwargs, result)
+    found, value = _extract_node_token_span_concat(spec, bound, args, kwargs, result)
     return (True, found, value)
 
 
@@ -411,9 +437,10 @@ def _hicache_cache_scope_source(
 ) -> tuple[bool, bool, Any]:
     """生成 rank/object 绑定的 cache_scope 路由键。"""
 
-    if not source.startswith("hicache_cache_scope:"):
+    spec = _source_spec(source, "hicache_cache_scope:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found:
         return (True, False, None)
     return (True, True, _cache_scope_key(value))
@@ -429,9 +456,10 @@ def _hicache_seq_source(
 ) -> tuple[bool, bool, Any]:
     """按 cache_scope 生成单调 seq_no，维持 atomic fact 顺序。"""
 
-    if not source.startswith("hicache_seq:"):
+    spec = _source_spec(source, "hicache_seq:")
+    if spec is None:
         return (False, False, None)
-    found, value = _extract_source_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
     if not found:
         return (True, False, None)
     scope = _cache_scope_key(value)
@@ -450,9 +478,10 @@ def _hicache_config_source(
 ) -> tuple[bool, bool, Any]:
     """从 HiCache 对象抽取 capacity/policy 配置事实。"""
 
-    if not source.startswith("hicache_config:"):
+    spec = _source_spec(source, "hicache_config:")
+    if spec is None:
         return (False, False, None)
-    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (True, False, None)
     found, value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
@@ -475,9 +504,10 @@ def _hicache_requested_pages_source(
 ) -> tuple[bool, bool, Any]:
     """按 source page size 把请求 token 数投影成页数。"""
 
-    if not source.startswith("hicache_requested_pages:"):
+    spec = _source_spec(source, "hicache_requested_pages:")
+    if spec is None:
         return (False, False, None)
-    parts = [part.strip() for part in source.split(":", 1)[1].split(",") if part.strip()]
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) < 2:
         return (True, False, None)
     found_tokens, token_value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
@@ -513,7 +543,7 @@ def _extract_token_path(
     if not found:
         return (False, None)
     scope = _scope_from_optional_source(parts[1], bound, args, kwargs, result) if len(parts) > 1 else ""
-    return (True, _token_path_record(_tokens_for_path(value), scope))
+    return (True, _token_path_record(_tokens_for_path(value), scope, _token_dictionary_bucket(bound)))
 
 
 def _extract_token_span(
@@ -547,7 +577,7 @@ def _extract_request_token_path(
     found, tokens, scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
     if not found:
         return (False, None)
-    return (True, _token_path_record(tokens, scope))
+    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound)))
 
 
 def _extract_request_token_span(
@@ -617,7 +647,7 @@ def _extract_token_path_concat(
         return (False, None)
     scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
     tokens = _tokens_for_path(prefix) + _tokens_for_path(suffix)
-    return (True, _token_path_record(tokens, scope))
+    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound)))
 
 
 def _extract_token_span_concat(
@@ -656,7 +686,7 @@ def _extract_node_token_path(
     if not found or node is None:
         return (False, None)
     scope = _scope_from_optional_source(parts[1], bound, args, kwargs, result) if len(parts) > 1 else ""
-    return (True, _token_path_record(_full_key_tokens(node), scope))
+    return (True, _token_path_record(_full_key_tokens(node), scope, _token_dictionary_bucket(bound)))
 
 
 def _extract_node_token_span(
@@ -696,7 +726,7 @@ def _extract_node_token_path_concat(
         return (False, None)
     scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
     tokens = _full_key_tokens(node) + _tokens_for_path(suffix)
-    return (True, _token_path_record(tokens, scope))
+    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound)))
 
 
 def _extract_node_token_span_concat(
@@ -768,7 +798,7 @@ def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any
     }
 
 
-def _token_path_record(tokens: list[Any], scope: str = "") -> dict[str, Any]:
+def _token_path_record(tokens: list[Any], scope: str = "", bucket: str = "unknown") -> dict[str, Any]:
     """生成 token dictionary 记录，并在同一 scope 内只携带一次 token_ids。"""
 
     path_id = _token_path_id(tokens)
@@ -777,12 +807,26 @@ def _token_path_record(tokens: list[Any], scope: str = "") -> dict[str, Any]:
         "token_count": len(tokens),
         "hash_algo": _TOKEN_HASH_ALGO,
     }
-    scope_key = scope or "global"
+    scope_key = f"{bucket}:{scope or 'global'}"
     emitted = _TOKEN_PATHS_EMITTED_BY_SCOPE.setdefault(scope_key, set())
     if path_id not in emitted:
         emitted.add(path_id)
         row["token_ids"] = _jsonable_token_ids(tokens)
     return row
+
+
+def _token_dictionary_bucket(bound: dict[str, Any]) -> str:
+    """区分 normal model input 与诊断证据的 token dictionary 去重域。"""
+
+    phase = str(bound.get("__trace_sim_phase") or "")
+    model_input = bool(bound.get("__trace_sim_model_input"))
+    fact_class = str(bound.get("__trace_sim_fact_class") or "")
+    granularity = str(bound.get("__trace_sim_fact_granularity") or "")
+    if model_input and fact_class == "invariant_state" and granularity == "atomic" and phase == "end":
+        return "model_input_end"
+    if model_input and fact_class == "invariant_state" and granularity == "atomic":
+        return f"model_input_{phase or 'unknown'}"
+    return "diagnostic"
 
 
 def _token_path_id(tokens: list[Any]) -> str:
@@ -838,6 +882,11 @@ def _tokens_for_path(value: Any) -> list[Any]:
         return []
     if hasattr(value, "tolist") and callable(value.tolist):
         value = value.tolist()
+    elif hasattr(value, "raw_token_ids") and callable(value.raw_token_ids):
+        try:
+            return list(value)
+        except Exception:
+            return _tokens_for_path(value.raw_token_ids())
     elif hasattr(value, "token_ids"):
         value = getattr(value, "token_ids")
     try:
@@ -851,11 +900,15 @@ def _request_tokens(req: Any, mode: str) -> list[Any]:
 
     normalized = (mode or "active").lower()
     if normalized == "fill":
-        return _tokens_for_path(getattr(req, "fill_ids", None))
+        return _request_fill_tokens(req)
+    if normalized in ("admission", "current_fill"):
+        return _request_admission_tokens(req)
+    if normalized in ("prefetch", "prefetch_candidate"):
+        return _request_prefetch_tokens(req)
     if normalized in ("origin_output", "full"):
-        return _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
+        return _request_origin_output_tokens(req)
     if normalized in ("committed", "cache_committed"):
-        tokens = _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
+        tokens = _request_origin_output_tokens(req)
         committed = _safe_int(getattr(req, "kv_committed_len", None))
         cache_commit_len = getattr(req, "_cache_commit_len", None)
         if callable(cache_commit_len):
@@ -868,9 +921,70 @@ def _request_tokens(req: Any, mode: str) -> list[Any]:
         return tokens
     if normalized == "output":
         return _tokens_for_path(getattr(req, "output_ids", None))
-    fill = _tokens_for_path(getattr(req, "fill_ids", None))
+    fill = _request_fill_tokens(req)
     if fill:
         return fill
+    return _request_origin_output_tokens(req)
+
+
+def _request_fill_tokens(req: Any) -> list[Any]:
+    """读取 `cache_unfinished_req()` 所用的当前 fill token 序列。"""
+
+    get_fill_ids = getattr(req, "get_fill_ids", None)
+    if callable(get_fill_ids):
+        try:
+            tokens = _tokens_for_path(get_fill_ids())
+        except Exception:
+            tokens = []
+        if tokens:
+            return tokens
+    tokens = _tokens_for_path(getattr(req, "fill_ids", None))
+    if tokens:
+        return tokens
+    return []
+
+
+def _request_admission_tokens(req: Any) -> list[Any]:
+    """读取 PrefillAdder admission 后本轮实际接受的 fill path。"""
+
+    tokens = _request_fill_tokens(req)
+    if tokens:
+        return tokens
+    tokens = _tokens_for_path(getattr(req, "full_untruncated_fill_ids", None))
+    if tokens:
+        return tokens
+    return _request_origin_output_tokens(req)
+
+
+def _request_prefetch_tokens(req: Any) -> list[Any]:
+    """读取 `_prefetch_kvcache()` 做 storage prefetch 判定时使用的 token path。
+
+    SGLang 当前实现会先 `init_next_round_input()`，再用
+    `full_untruncated_fill_ids[:_compute_max_prefix_len(...)]` 作为 prefetch
+    候选全集。这里不能复用 `get_fill_ids()`：forced-token replay 下 `fill_len`
+    可能尚未初始化，而 full path 已经在 `full_untruncated_fill_ids` 中。
+    """
+
+    tokens = _tokens_for_path(getattr(req, "full_untruncated_fill_ids", None))
+    if not tokens:
+        tokens = _request_fill_tokens(req)
+    if not tokens:
+        tokens = _request_origin_output_tokens(req)
+
+    compute_limit = getattr(req, "_compute_max_prefix_len", None)
+    if callable(compute_limit):
+        try:
+            limit = _safe_int(compute_limit(len(tokens)))
+        except Exception:
+            limit = None
+        if limit is not None:
+            tokens = tokens[:limit]
+    return tokens
+
+
+def _request_origin_output_tokens(req: Any) -> list[Any]:
+    """读取请求原始输入和已生成输出拼接后的完整 path。"""
+
     return _tokens_for_path(getattr(req, "origin_input_ids", None)) + _tokens_for_path(getattr(req, "output_ids", None))
 
 
@@ -1095,10 +1209,12 @@ def _snapshot_controller(obj: Any) -> dict[str, Any]:
         queues[attr] = _base._safe_len(getattr(controller, attr, None)) or 0
     ongoing = _first_attr(controller, ("ongoing_operation", "current_operation", "operation"))
     storage = _first_attr(controller, ("storage", "storage_backend", "file_backend"))
+    ongoing_id = _first_attr(ongoing, ("id", "operation_id")) if ongoing is not None else None
+    ongoing_hash_pages = _first_attr(ongoing, ("hash_value", "hash_pages")) if ongoing is not None else None
     return {
         "queues": queues,
-        "ongoing_operation_id": _jsonable_compact(_first_attr(ongoing, ("id", "operation_id")) if ongoing is not None else None),
-        "ongoing_hash_pages": _jsonable_compact(_first_attr(ongoing, ("hash_value", "hash_pages")) if ongoing is not None else None),
+        "ongoing_operation_id": _jsonable_compact(ongoing_id),
+        "ongoing_hash_pages": _jsonable_compact(ongoing_hash_pages),
         "completed_tokens": _safe_int(_first_attr(ongoing, ("completed_tokens",))) if ongoing is not None else None,
         "prefetch_occupied_tokens": _safe_int(getattr(controller, "prefetch_occupied_tokens", None)),
         "storage_backend_enabled": storage is not None,
@@ -1197,14 +1313,14 @@ def _scheduler_prefetch_state_record(scheduler: Any, req: Any) -> dict[str, Any]
 
     tree_cache = getattr(scheduler, "tree_cache", None)
     root_node = getattr(tree_cache, "root_node", None)
-    fill_tokens = _request_tokens(req, "fill")
+    prefetch_tokens = _request_prefetch_tokens(req)
     prefix_tokens = _base._safe_len(getattr(req, "prefix_indices", None)) or 0
     host_hit_length = _safe_int(getattr(req, "host_hit_length", None)) or 0
     matched_len = max(0, prefix_tokens + host_hit_length)
     last_host_node = getattr(req, "last_host_node", None)
     anchor_backuped = bool(getattr(last_host_node, "backuped", False)) if last_host_node is not None else False
     anchor_is_root = last_host_node is not None and root_node is not None and last_host_node is root_node
-    new_input_tokens = fill_tokens[matched_len:]
+    new_input_tokens = prefetch_tokens[matched_len:]
     prefix_keys = None
     if last_host_node is not None and getattr(tree_cache, "hicache_storage_pass_prefix_keys", False):
         get_prefix_hash_values = getattr(last_host_node, "get_prefix_hash_values", None)
@@ -1226,6 +1342,7 @@ def _scheduler_prefetch_state_record(scheduler: Any, req: Any) -> dict[str, Any]
         "source_page_size": _safe_int(getattr(tree_cache, "page_size", None)),
         "enable_hicache_storage": bool(getattr(scheduler, "enable_hicache_storage", False)),
         "matched_len": matched_len,
+        "prefetch_candidate_tokens": len(prefetch_tokens),
         "new_input_tokens": len(new_input_tokens),
         "prefetch_anchor_eligible": anchor_backuped or anchor_is_root,
         "last_host_node_backuped": anchor_backuped,
@@ -1438,66 +1555,108 @@ def _install_internal_hicache_hooks(module: ModuleType) -> None:
     """按 SGLang 模块名安装 HiCache source_actual 内部 hook。"""
 
     module_name = getattr(module, "__name__", "")
-    if module_name == "sglang.srt.mem_cache.events":
-        mixin = getattr(module, "KVCacheEventMixin", None)
-        if mixin is not None:
-            _wrap_internal_method(mixin, "_record_store_event", _wrap_record_store_event, f"{module_name}:KVCacheEventMixin._record_store_event")
-            _wrap_internal_method(mixin, "_record_remove_event", _wrap_record_remove_event, f"{module_name}:KVCacheEventMixin._record_remove_event")
-            _wrap_internal_method(mixin, "_record_all_cleared_event", _wrap_record_all_cleared_event, f"{module_name}:KVCacheEventMixin._record_all_cleared_event")
-        return
+    installer = _INTERNAL_HOOK_INSTALLERS.get(module_name)
+    if installer is not None:
+        installer(module)
 
-    if module_name == "sglang.srt.mem_cache.radix_cache":
-        radix = getattr(module, "RadixCache", None)
-        if radix is not None:
-            _wrap_internal_method(radix, "_delete_leaf", _wrap_delete_leaf, f"{module_name}:RadixCache._delete_leaf")
-            _wrap_internal_method(radix, "_update_leaf_status", _wrap_update_leaf_status, f"{module_name}:RadixCache._update_leaf_status")
-        tree_node = getattr(module, "TreeNode", None)
-        if tree_node is not None:
-            _wrap_internal_method(tree_node, "protect_host", _wrap_host_ref("protect"), f"{module_name}:TreeNode.protect_host")
-            _wrap_internal_method(tree_node, "release_host", _wrap_host_ref("release"), f"{module_name}:TreeNode.release_host")
-        return
 
-    if module_name == "sglang.srt.mem_cache.hiradix_cache":
-        hiradix = getattr(module, "HiRadixCache", None)
-        if hiradix is not None:
-            _wrap_internal_method(hiradix, "_split_node", _wrap_split_node, f"{module_name}:HiRadixCache._split_node")
-            _wrap_internal_method(hiradix, "_update_host_leaf_status", _wrap_update_host_leaf_status, f"{module_name}:HiRadixCache._update_host_leaf_status")
-            _wrap_internal_method(hiradix, "_inc_hit_count", _wrap_hit_count_update, f"{module_name}:HiRadixCache._inc_hit_count")
-            _wrap_internal_method(hiradix, "writing_check", _wrap_writing_check, f"{module_name}:HiRadixCache.writing_check")
-            _wrap_internal_method(hiradix, "loading_check", _wrap_loading_check, f"{module_name}:HiRadixCache.loading_check")
-            _wrap_internal_method(
-                hiradix,
-                "drain_storage_control_queues",
-                _wrap_drain_storage_control_queues,
-                f"{module_name}:HiRadixCache.drain_storage_control_queues",
-            )
-            _wrap_internal_method(hiradix, "init_load_back", _wrap_init_load_back, f"{module_name}:HiRadixCache.init_load_back")
-            _wrap_internal_method(hiradix, "load_back", _wrap_load_back, f"{module_name}:HiRadixCache.load_back")
-            _wrap_internal_method(hiradix, "write_backup", _wrap_write_backup, f"{module_name}:HiRadixCache.write_backup")
-            _wrap_internal_method(hiradix, "write_backup_storage", _wrap_write_backup_storage, f"{module_name}:HiRadixCache.write_backup_storage")
-            _wrap_internal_method(hiradix, "evict_host", _wrap_evict_host, f"{module_name}:HiRadixCache.evict_host")
-            _wrap_internal_method(hiradix, "terminate_prefetch", _wrap_hiradix_terminate_prefetch, f"{module_name}:HiRadixCache.terminate_prefetch")
-            _wrap_internal_method(hiradix, "release_aborted_request", _wrap_release_aborted_request, f"{module_name}:HiRadixCache.release_aborted_request")
-            _wrap_internal_method(hiradix, "pop_prefetch_loaded_tokens", _wrap_pop_prefetch_loaded_tokens, f"{module_name}:HiRadixCache.pop_prefetch_loaded_tokens")
-        return
+def _patch_class_methods(module: ModuleType, class_name: str, methods: tuple[tuple[str, Any], ...]) -> None:
+    """按类名批量安装方法 wrapper。"""
 
-    if module_name == "sglang.srt.managers.cache_controller":
-        controller = getattr(module, "HiCacheController", None)
-        if controller is not None:
-            _wrap_internal_method(controller, "load", _wrap_controller_load, f"{module_name}:HiCacheController.load")
-            _wrap_internal_method(controller, "start_loading", _wrap_controller_start_loading, f"{module_name}:HiCacheController.start_loading")
-            _wrap_internal_method(controller, "write", _wrap_controller_write, f"{module_name}:HiCacheController.write")
-            _wrap_internal_method(controller, "start_writing", _wrap_controller_start_writing, f"{module_name}:HiCacheController.start_writing")
-            _wrap_internal_method(controller, "prefetch", _wrap_controller_prefetch, f"{module_name}:HiCacheController.prefetch")
-            _wrap_internal_method(controller, "prefetch_rate_limited", _wrap_prefetch_rate_limited, f"{module_name}:HiCacheController.prefetch_rate_limited")
-            _wrap_internal_method(controller, "_storage_hit_query", _wrap_storage_hit_query, f"{module_name}:HiCacheController._storage_hit_query")
-            _wrap_internal_method(controller, "terminate_prefetch", _wrap_terminate_prefetch, f"{module_name}:HiCacheController.terminate_prefetch")
-            _wrap_internal_method(
-                controller,
-                "append_host_mem_release",
-                _wrap_append_host_mem_release,
-                f"{module_name}:HiCacheController.append_host_mem_release",
-            )
+    cls = getattr(module, class_name, None)
+    if cls is None:
+        return
+    module_name = getattr(module, "__name__", "")
+    for method_name, wrapper_factory in methods:
+        _wrap_internal_method(cls, method_name, wrapper_factory, f"{module_name}:{class_name}.{method_name}")
+
+
+def _install_event_hooks(module: ModuleType) -> None:
+    """安装 mem_cache.events 中的 KVCache event hooks。"""
+
+    _patch_class_methods(
+        module,
+        "KVCacheEventMixin",
+        (
+            ("_record_store_event", _wrap_record_store_event),
+            ("_record_remove_event", _wrap_record_remove_event),
+            ("_record_all_cleared_event", _wrap_record_all_cleared_event),
+        ),
+    )
+
+
+def _install_radix_hooks(module: ModuleType) -> None:
+    """安装基础 radix tree 上的 device leaf 与 host ref hooks。"""
+
+    _patch_class_methods(
+        module,
+        "RadixCache",
+        (
+            ("_delete_leaf", _wrap_delete_leaf),
+            ("_update_leaf_status", _wrap_update_leaf_status),
+        ),
+    )
+    _patch_class_methods(
+        module,
+        "TreeNode",
+        (
+            ("protect_host", _wrap_host_ref("protect")),
+            ("release_host", _wrap_host_ref("release")),
+        ),
+    )
+
+
+def _install_hiradix_hooks(module: ModuleType) -> None:
+    """安装 HiRadixCache 内部状态迁移 hooks。"""
+
+    _patch_class_methods(
+        module,
+        "HiRadixCache",
+        (
+            ("_split_node", _wrap_split_node),
+            ("_update_host_leaf_status", _wrap_update_host_leaf_status),
+            ("_inc_hit_count", _wrap_hit_count_update),
+            ("writing_check", _wrap_writing_check),
+            ("loading_check", _wrap_loading_check),
+            ("drain_storage_control_queues", _wrap_drain_storage_control_queues),
+            ("init_load_back", _wrap_init_load_back),
+            ("load_back", _wrap_load_back),
+            ("write_backup", _wrap_write_backup),
+            ("write_backup_storage", _wrap_write_backup_storage),
+            ("evict_host", _wrap_evict_host),
+            ("terminate_prefetch", _wrap_hiradix_terminate_prefetch),
+            ("release_aborted_request", _wrap_release_aborted_request),
+            ("pop_prefetch_loaded_tokens", _wrap_pop_prefetch_loaded_tokens),
+        ),
+    )
+
+
+def _install_controller_hooks(module: ModuleType) -> None:
+    """安装 HiCacheController 队列与 I/O 边界 hooks。"""
+
+    _patch_class_methods(
+        module,
+        "HiCacheController",
+        (
+            ("load", _wrap_controller_load),
+            ("start_loading", _wrap_controller_start_loading),
+            ("write", _wrap_controller_write),
+            ("start_writing", _wrap_controller_start_writing),
+            ("prefetch", _wrap_controller_prefetch),
+            ("prefetch_rate_limited", _wrap_prefetch_rate_limited),
+            ("_storage_hit_query", _wrap_storage_hit_query),
+            ("terminate_prefetch", _wrap_terminate_prefetch),
+            ("append_host_mem_release", _wrap_append_host_mem_release),
+        ),
+    )
+
+
+_INTERNAL_HOOK_INSTALLERS = {
+    "sglang.srt.mem_cache.events": _install_event_hooks,
+    "sglang.srt.mem_cache.radix_cache": _install_radix_hooks,
+    "sglang.srt.mem_cache.hiradix_cache": _install_hiradix_hooks,
+    "sglang.srt.managers.cache_controller": _install_controller_hooks,
+}
 
 
 def _wrap_internal_method(cls: Any, method_name: str, wrapper_factory: Any, patch_key: str) -> None:
@@ -1738,7 +1897,10 @@ def _wrap_hit_count_update(method: Any) -> Any:
         before = _node_summary_record(node)
         result = method(self, node, *args, **kwargs)
         after = _node_summary_record(node)
-        if before.get("hit_count") != after.get("hit_count") or before.get("backuped") != after.get("backuped") or probe_debug_enabled():
+        hit_count_changed = before.get("hit_count") != after.get("hit_count")
+        backuped_changed = before.get("backuped") != after.get("backuped")
+        if hit_count_changed or backuped_changed or probe_debug_enabled():
+            controller = _first_attr(self, ("cache_controller", "controller")) or self
             _emit_internal_event(
                 self,
                 "hicache_internal.write_counter_delta",
@@ -1747,7 +1909,7 @@ def _wrap_hit_count_update(method: Any) -> Any:
                     "before_node": before,
                     "after_node": after,
                     "chunked": bool(args[0]) if args else bool(kwargs.get("chunked", False)),
-                    "write_policy": _jsonable_compact(_first_attr(_first_attr(self, ("cache_controller", "controller")) or self, ("write_policy",))),
+                    "write_policy": _jsonable_compact(_first_attr(controller, ("write_policy",))),
                     "write_through_threshold": _safe_int(getattr(self, "write_through_threshold", None)),
                 },
                 target="HiRadixCache._inc_hit_count",
@@ -2447,28 +2609,34 @@ def _arg_or_kw(args: tuple[Any, ...], kwargs: dict[str, Any], index: int, key: s
     return None
 
 
-_base.register_source_extractor(_hicache_state_source)
-_base.register_source_extractor(_token_path_source)
-_base.register_source_extractor(_token_span_source)
-_base.register_source_extractor(_request_token_path_source)
-_base.register_source_extractor(_request_token_span_source)
-_base.register_source_extractor(_request_token_count_source)
-_base.register_source_extractor(_token_path_concat_source)
-_base.register_source_extractor(_token_span_concat_source)
-_base.register_source_extractor(_node_token_path_source)
-_base.register_source_extractor(_node_token_span_source)
-_base.register_source_extractor(_node_token_count_source)
-_base.register_source_extractor(_hicache_node_summary_source)
-_base.register_source_extractor(_hicache_node_chain_source)
-_base.register_source_extractor(_hicache_evictable_snapshot_source)
-_base.register_source_extractor(_hicache_prefetch_progress_source)
-_base.register_source_extractor(_hicache_request_runtime_source)
-_base.register_source_extractor(_hicache_scheduler_prefetch_state_source)
-_base.register_source_extractor(_node_token_path_concat_source)
-_base.register_source_extractor(_node_token_span_concat_source)
-_base.register_source_extractor(_hicache_cache_scope_source)
-_base.register_source_extractor(_hicache_seq_source)
-_base.register_source_extractor(_hicache_config_source)
-_base.register_source_extractor(_hicache_requested_pages_source)
+_HICACHE_SOURCE_EXTRACTORS = (
+    _hicache_state_source,
+    _token_path_source,
+    _token_span_source,
+    _request_token_path_source,
+    _request_token_span_source,
+    _request_token_count_source,
+    _token_path_concat_source,
+    _token_span_concat_source,
+    _node_token_path_source,
+    _node_token_span_source,
+    _node_token_count_source,
+    _hicache_node_summary_source,
+    _hicache_node_chain_source,
+    _hicache_evictable_snapshot_source,
+    _hicache_prefetch_progress_source,
+    _hicache_request_runtime_source,
+    _hicache_scheduler_prefetch_state_source,
+    _node_token_path_concat_source,
+    _node_token_span_concat_source,
+    _hicache_cache_scope_source,
+    _hicache_seq_source,
+    _hicache_config_source,
+    _hicache_requested_pages_source,
+)
 
-TARGET_MODULES = tuple(sorted(set(_base.TARGET_MODULES) | (set(_INTERNAL_TARGET_MODULES) if _internal_hooks_enabled() else set())))
+for _extractor in _HICACHE_SOURCE_EXTRACTORS:
+    _base.register_source_extractor(_extractor)
+
+_ENABLED_INTERNAL_TARGET_MODULES = set(_INTERNAL_TARGET_MODULES) if _internal_hooks_enabled() else set()
+TARGET_MODULES = tuple(sorted(set(_base.TARGET_MODULES) | _ENABLED_INTERNAL_TARGET_MODULES))

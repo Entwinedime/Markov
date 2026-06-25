@@ -136,9 +136,37 @@ private:
         bool truncated = false;
     };
 
+    /**
+     * @brief storage prefetch I/O progress 的独立估计结果。
+     *
+     * 该层只回答“已经传到 host 的 prefix 是多少”，不决定 policy 是否可以
+     * terminate。当前实现是 zero-progress placeholder，后续可替换成校准模型。
+     */
+    struct PrefetchIoProgressEstimate {
+        std::vector<std::string> completed_pages;
+        std::string model_name;
+        std::string reason;
+    };
+
+    /**
+     * @brief 单次 prefetch checkpoint/request 边界的 target progress 估计。
+     *
+     * storage hit 只说明 L3 中存在连续 prefix；completed pages 才表示 terminate
+     * 时已经传输到 host，可安全插入 host radix。
+     */
+    struct PrefetchProgressEstimate {
+        std::vector<std::string> completed_pages;
+        uint64_t storage_hit_pages = 0;
+        bool storage_hit_sufficient = false;
+        bool fully_completed = false;
+        bool terminal_checkpoint = false;
+        bool timeout_elapsed = false;
+        std::string reason;
+    };
+
     HiCacheConfig config_;
     HiCacheTargetPager pager_;
-    HiCacheTokenPathStore token_store_;
+    HiCacheTokenDirectory token_directory_;
     HiCachePolicy policy_;
     std::unordered_map<std::string, ScopedState> scopes_;
     uint64_t policy_decision_epoch_ = 0;
@@ -147,9 +175,16 @@ private:
     [[nodiscard]] std::string normalized_scope(const HiCacheFact & fact) const;
     [[nodiscard]] std::string scoped_request_key(const HiCacheFact & fact) const;
     [[nodiscard]] ScopedState & scope_state(const HiCacheFact & fact);
-    [[nodiscard]] HiCacheTokenPath tokens_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const;
-    [[nodiscard]] HiCachePagePath page_path_for_fact(const HiCacheFact & fact, HiCacheSummary & summary) const;
+    void record_token_resolution(const HiCacheFact & fact, HiCacheSummary & summary, const HiCacheTokenResolution & resolution) const;
+    [[nodiscard]] HiCachePagePath page_path_from_resolution(const HiCacheFact & fact, const HiCacheTokenResolution & resolution) const;
     void ensure_device_allocator(ScopedState & scope);
+    /** @brief 判断新 materialize 的 device page 是否会在当前 insert 边界留下可观测 dirty 生命周期。 */
+    [[nodiscard]] bool inserted_device_dirty_visible_at_insert_boundary() const;
+    /** @brief 估计 storage prefetch I/O 在当前 target 边界已经完成的 page prefix。 */
+    [[nodiscard]] PrefetchIoProgressEstimate estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact) const;
+    /** @brief 估计 SGLang terminate_prefetch 边界可见的 completed prefix。 */
+    [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
+                                                                      bool require_full_completion) const;
     void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
                                          ScopedState & scope, const std::string & reason);
 

@@ -35,7 +35,7 @@ Json target_config_json(const HiCacheConfig & config) {
         {         "prefetch_timeout_base_sec",         config.prefetch_timeout_base_sec },
         { "prefetch_timeout_per_ki_token_sec", config.prefetch_timeout_per_ki_token_sec },
         {          "prefetch_timeout_max_sec",          config.prefetch_timeout_max_sec },
-        {       "device_allocator_need_sort",       config.device_allocator_need_sort },
+        {        "device_allocator_need_sort",        config.device_allocator_need_sort },
         {                "emit_state_digests",                config.emit_state_digests },
     };
 }
@@ -66,8 +66,8 @@ Json resolved_policy_json(const HiCacheResolvedPolicyState & policy) {
         {       "extend_allocation_batch_size",       policy.extend_allocation_batch_size },
         {     "extend_allocation_batch_source",     policy.extend_allocation_batch_source },
         {             "extend_allocation_rule",             policy.extend_allocation_rule },
-        {     "device_allocator_need_sort",     policy.device_allocator_need_sort },
-        { "device_allocator_need_sort_source", policy.device_allocator_need_sort_source },
+        {         "device_allocator_need_sort",         policy.device_allocator_need_sort },
+        {  "device_allocator_need_sort_source",  policy.device_allocator_need_sort_source },
         {                 "storage_hit_policy",                 policy.storage_hit_policy },
         {          "storage_hit_policy_source",          policy.storage_hit_policy_source },
         {        "prefetch_timeout_configured",        policy.prefetch_timeout_configured },
@@ -165,40 +165,40 @@ Json control_checkpoint_json(const HiCacheControlCheckpoint & checkpoint) {
 
 Json policy_decision_json(const HiCachePolicyDecisionRecord & decision) {
     return Json{
-        {         "decision_epoch",         decision.decision_epoch },
-        {            "cache_scope",            decision.cache_scope },
-        {            "request_key",            decision.request_key },
-        {           "operation_id",           decision.operation_id },
-        {                   "role",                   decision.role },
-        {             "event_name",             decision.event_name },
-        {            "policy_area",            decision.policy_area },
-        {            "policy_name",            decision.policy_name },
-        {               "decision",               decision.decision },
-        {                 "reason",                 decision.reason },
-        {               "accepted",               decision.accepted },
-        {        "requested_pages",        decision.requested_pages },
-        {       "requested_tokens",       decision.requested_tokens },
-        {        "candidate_pages",        decision.candidate_pages },
-        {              "hit_pages",              decision.hit_pages },
-        {              "hit_count",              decision.hit_count },
-        {             "batch_size",             decision.batch_size },
-        {          "extend_tokens",          decision.extend_tokens },
-        {        "allocated_pages",        decision.allocated_pages },
-        { "active_requested_pages", decision.active_requested_pages },
-        {         "capacity_pages",         decision.capacity_pages },
-        {         "occupied_pages",         decision.occupied_pages },
-        {         "reserved_pages",         decision.reserved_pages },
-        {   "allocator_free_pages",   decision.allocator_free_pages },
-        { "allocator_release_pages", decision.allocator_release_pages },
-        { "allocator_available_pages", decision.allocator_available_pages },
+        {                   "decision_epoch",                   decision.decision_epoch },
+        {                      "cache_scope",                      decision.cache_scope },
+        {                      "request_key",                      decision.request_key },
+        {                     "operation_id",                     decision.operation_id },
+        {                             "role",                             decision.role },
+        {                       "event_name",                       decision.event_name },
+        {                      "policy_area",                      decision.policy_area },
+        {                      "policy_name",                      decision.policy_name },
+        {                         "decision",                         decision.decision },
+        {                           "reason",                           decision.reason },
+        {                         "accepted",                         decision.accepted },
+        {                  "requested_pages",                  decision.requested_pages },
+        {                 "requested_tokens",                 decision.requested_tokens },
+        {                  "candidate_pages",                  decision.candidate_pages },
+        {                        "hit_pages",                        decision.hit_pages },
+        {                        "hit_count",                        decision.hit_count },
+        {                       "batch_size",                       decision.batch_size },
+        {                    "extend_tokens",                    decision.extend_tokens },
+        {                  "allocated_pages",                  decision.allocated_pages },
+        {           "active_requested_pages",           decision.active_requested_pages },
+        {                   "capacity_pages",                   decision.capacity_pages },
+        {                   "occupied_pages",                   decision.occupied_pages },
+        {                   "reserved_pages",                   decision.reserved_pages },
+        {             "allocator_free_pages",             decision.allocator_free_pages },
+        {          "allocator_release_pages",          decision.allocator_release_pages },
+        {        "allocator_available_pages",        decision.allocator_available_pages },
         { "allocator_available_before_pages", decision.allocator_available_before_pages },
-        { "allocator_consumed_pages", decision.allocator_consumed_pages },
-        { "allocator_released_pages", decision.allocator_released_pages },
-        { "lifecycle_duplicate_pages", decision.lifecycle_duplicate_pages },
-        {      "lifecycle_tail_pages",      decision.lifecycle_tail_pages },
-        {        "threshold_pages",        decision.threshold_pages },
-        {            "limit_pages",            decision.limit_pages },
-        {                  "pages",                  decision.pages },
+        {         "allocator_consumed_pages",         decision.allocator_consumed_pages },
+        {         "allocator_released_pages",         decision.allocator_released_pages },
+        {        "lifecycle_duplicate_pages",        decision.lifecycle_duplicate_pages },
+        {             "lifecycle_tail_pages",             decision.lifecycle_tail_pages },
+        {                  "threshold_pages",                  decision.threshold_pages },
+        {                      "limit_pages",                      decision.limit_pages },
+        {                            "pages",                            decision.pages },
     };
 }
 
@@ -429,6 +429,8 @@ std::string HiCacheSummary::to_json() const {
     root["processed_events_by_role"] = processed_events_by_role;
     root["transitions_by_kind"] = transitions_by_kind;
     root["missing_invariant_facts"] = missing_invariant_facts;
+    root["token_resolution_by_status"] = token_resolution_by_status;
+    root["token_path_diagnostics"] = token_path_diagnostics;
     root["non_invariant_fact_usage_by_role"] = non_invariant_fact_usage_by_role;
     root["non_invariant_fact_usage"] = array_from(non_invariant_fact_usage_by_role, [](const auto & item) {
         const auto & [role, count] = item;

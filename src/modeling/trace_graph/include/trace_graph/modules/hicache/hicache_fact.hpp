@@ -84,10 +84,20 @@ struct HiCacheFact {
 };
 
 /**
+ * @brief 判断 fact-local full path 是否已经可被模型消费。
+ *
+ * 空 path 是合法输入：当 span 明确指向长度为 0 的 token 区间时，它表示本轮没有
+ * 可投影 page，而不是 token dictionary 缺失。非空 path 则必须已经通过
+ * token dictionary 水合出完整 token 序列。
+ */
+[[nodiscard]] bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact);
+
+/**
  * @brief HiCache event parser 和 token dictionary 索引。
  *
- * parser 先观察 dictionary，再解析 span-only fact。它不做 target policy 推断，
- * 也不接纳 source actual / oracle 字段作为状态事实。
+ * parser 先从 completed atomic invariant model-input event 中观察 dictionary，
+ * 再解析 span-only fact。source actual / oracle 中的 dictionary 只可用于诊断，
+ * 不能水合 normal model 的 token path。
  */
 class HiCacheFactParser {
 public:

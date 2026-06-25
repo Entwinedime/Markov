@@ -73,6 +73,8 @@ struct HiCacheSummary {
     std::map<std::string, uint64_t> processed_events_by_role;
     std::map<std::string, uint64_t> transitions_by_kind;
     std::map<std::string, uint64_t> missing_invariant_facts;
+    std::map<std::string, uint64_t> token_resolution_by_status;
+    std::map<std::string, uint64_t> token_path_diagnostics;
     std::map<std::string, uint64_t> non_invariant_fact_usage_by_role;
     std::vector<HiCacheNodeSplitRecord> radix_split_trace;
     std::vector<HiCacheControlCheckpoint> control_checkpoint_trace;

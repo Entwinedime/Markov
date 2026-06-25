@@ -3,6 +3,7 @@
 #include "trace_graph/modules/hicache/hicache_fact.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,40 +19,114 @@ namespace TraceGraph {
 enum class HiCacheTokenCompleteness { Unknown, Partial, PageAligned, Full };
 
 /**
- * @brief request key 到 token path 的当前最完整映射。
+ * @brief token path snapshot 的语义阶段。
+ *
+ * 同一个 request_id 在 SGLang 中是一条增长的 token timeline；stage 用来明确
+ * 当前 path 是 lookup key、admission path、lifecycle committed path，还是
+ * prefetch candidate，避免跨阶段互相覆盖。
  */
-struct HiCacheRequestTokenPath {
-    std::string cache_scope;
-    std::string request_id;
-    HiCacheTokenPath tokens;
-    HiCacheTokenCompleteness completeness = HiCacheTokenCompleteness::Unknown;
-    std::vector<size_t> source_event_indices;
+enum class HiCacheTokenSnapshotStage {
+    Unknown,
+    Match,
+    Admission,
+    LifecycleUnfinished,
+    LifecycleFinished,
+    PrefetchCandidate,
+    StorageReadable,
 };
 
 /**
- * @brief request 维度的 token path 表。
- *
- * 表只保存 token path，不保存 page residency、lookup result 或 source movement。
+ * @brief role-specific resolver 的解析结果状态。
  */
-class HiCacheTokenPathStore {
+enum class HiCacheTokenResolutionStatus {
+    Direct,
+    TimelineFallback,
+    Missing,
+    StaleRejected,
+    WrongStageRejected,
+    SourceClassRejected,
+};
+
+/** @brief 返回 snapshot stage 的稳定诊断名。 */
+[[nodiscard]] std::string hicache_token_snapshot_stage_name(HiCacheTokenSnapshotStage stage);
+
+/** @brief 返回 token resolution status 的稳定诊断名。 */
+[[nodiscard]] std::string hicache_token_resolution_status_name(HiCacheTokenResolutionStatus status);
+
+/**
+ * @brief 单个 fact 显式携带的 token path snapshot。
+ *
+ * snapshot 是不可变事实记录；directory 只保存它，不判断 state policy，也不推断
+ * insert/prefetch/backup 是否应该发生。
+ */
+struct HiCacheTokenPathSnapshot {
+    std::string snapshot_id;
+    std::string cache_scope;
+    std::string request_id;
+    size_t source_event_index = 0;
+    uint64_t seq_no = 0;
+    uint64_t ts = 0;
+    std::string role;
+    HiCacheTokenSnapshotStage stage = HiCacheTokenSnapshotStage::Unknown;
+    std::string lifecycle_kind;
+    std::string admission_kind;
+    HiCacheTokenSpan span;
+    HiCacheTokenPath tokens;
+    uint64_t token_count = 0;
+    uint64_t page_aligned_token_count = 0;
+    HiCacheTokenCompleteness completeness = HiCacheTokenCompleteness::Unknown;
+    std::string source_class;
+    bool model_input = false;
+};
+
+/**
+ * @brief role-specific token path 解析结果。
+ */
+struct HiCacheTokenResolution {
+    HiCacheTokenResolutionStatus status = HiCacheTokenResolutionStatus::Missing;
+    HiCacheTokenPath tokens;
+    std::string snapshot_id;
+    HiCacheTokenSnapshotStage stage = HiCacheTokenSnapshotStage::Unknown;
+    uint64_t token_count = 0;
+    uint64_t page_aligned_token_count = 0;
+    std::string reason;
+
+    /** @brief 当前解析结果是否可供 state model 消费。 */
+    [[nodiscard]] bool ok() const { return status == HiCacheTokenResolutionStatus::Direct; }
+};
+
+/**
+ * @brief request 维度的 token path snapshot directory。
+ *
+ * directory 显式保存 request timeline，不维护“当前最好 path”，也不允许 prefetch
+ * candidate 覆盖 lifecycle/admission committed path。
+ */
+class HiCacheTokenDirectory {
 public:
     /** @brief 返回 scope/request 复合 key；缺少 request_id 时返回空字符串。 */
     [[nodiscard]] std::string scoped_request_key(const HiCacheFact & fact) const;
 
-    /** @brief 保存 request token path；更完整或更长的 path 可以覆盖旧值。 */
-    void set_request_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens, HiCacheTokenCompleteness completeness);
+    /** @brief 记录当前 fact 显式携带的 token path snapshot；缺 path 时不产生记录。 */
+    void observe_fact_path(const HiCacheFact & fact, uint64_t page_size);
 
-    /** @brief 记录 request-bound token anchor。 */
-    void observe_request_bound_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens);
+    /** @brief 解析 request-bound match path，必须来自当前 fact。 */
+    [[nodiscard]] HiCacheTokenResolution resolve_match_path(const HiCacheFact & fact, uint64_t page_size) const;
 
-    /** @brief 查询 request 当前已知 token path。 */
-    [[nodiscard]] HiCacheTokenPath request_tokens(const HiCacheFact & fact) const;
+    /** @brief 解析 request admission path，必须来自当前 fact。 */
+    [[nodiscard]] HiCacheTokenResolution resolve_admission_path(const HiCacheFact & fact, uint64_t page_size) const;
 
-    /** @brief 查询 request 当前完整 token path 记录。 */
-    [[nodiscard]] const HiCacheRequestTokenPath * request_path(const HiCacheFact & fact) const;
+    /** @brief 解析 finished/unfinished lifecycle committed path，必须来自当前 fact。 */
+    [[nodiscard]] HiCacheTokenResolution resolve_lifecycle_path(const HiCacheFact & fact, uint64_t page_size) const;
+
+    /** @brief 解析 prefetch candidate path；该 path 不会更新 request committed timeline。 */
+    [[nodiscard]] HiCacheTokenResolution resolve_prefetch_path(const HiCacheFact & fact, uint64_t page_size) const;
+
+    /** @brief 查询当前 fact 之前最近一次 committed/admission snapshot。 */
+    [[nodiscard]] const HiCacheTokenPathSnapshot * previous_committed_snapshot(const HiCacheFact & fact) const;
 
 private:
-    std::unordered_map<std::string, HiCacheRequestTokenPath> paths_by_request_;
+    std::vector<HiCacheTokenPathSnapshot> snapshots_;
+    std::unordered_map<std::string, std::vector<size_t>> snapshots_by_request_;
 };
 
 } // namespace TraceGraph

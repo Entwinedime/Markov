@@ -28,19 +28,19 @@ constexpr std::array kRoles = {
 };
 
 bool needs_full_path(HiCacheFactRole role) {
-    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestAdmission || role == HiCacheFactRole::PrefetchDecision;
+    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestLifecycleAnchor || role == HiCacheFactRole::RequestAdmission
+           || role == HiCacheFactRole::PrefetchDecision;
 }
 
 bool has_projectable_path(const HiCacheFact & fact, uint64_t effective_page_size) {
-    if (!fact.full_path_tokens.empty()) return true;
-    if (fact.full_path_span.valid) return true;
-    return effective_page_size == 0 || fact.token_count < effective_page_size;
+    (void)effective_page_size;
+    return hicache_fact_has_resolved_full_path(fact);
 }
 
 } // namespace
 
 bool is_hicache_state_model_fact(const HiCacheFact & fact) {
-    return fact.model_input && fact.fact_class == "invariant_state" && fact.fact_granularity == "atomic";
+    return fact.is_end && fact.model_input && fact.fact_class == "invariant_state" && fact.fact_granularity == "atomic";
 }
 
 HiCacheFactRole parse_hicache_fact_role(const std::string & role) {
