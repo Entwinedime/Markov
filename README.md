@@ -24,12 +24,12 @@
 ├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
 ├── scripts/internal/profile_runner.py   # 容器内 profiling 执行器
 ├── scripts/internal/profile_quality.py  # profiling 质量审计
+├── scripts/internal/hicache_state_workflow.py
+│                                         # HiCache profiling 后 validation 主入口
 ├── scripts/internal/model_runner.py     # 容器内 modeling 执行器
 ├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
 ├── scripts/bench/hicache_phased_workload.py
-├── configs/experiments/hicache_state/   # HiCache state profiling suite
-├── configs/modeling/hicache_state/      # HiCache state prediction config
-├── configs/modeling/hicache/            # faithful replay config
+├── configs/experiments/hicache_state/   # common / forced capture / forced replay
 ├── docs/                                # 主线文档和专项验证记录
 ├── third_party/sglang/                  # SGLang fork submodule
 ├── third_party/ktransformers/           # KTransformers fork submodule
@@ -42,7 +42,8 @@
 | --- | --- |
 | `docs/profiling_development.md` | profiling 架构、runner、suite、Python probe 和 HiCache 采集契约。 |
 | `docs/modeling_development.md` | C++ TraceGraph、model runner、mode、HiCache state backend 和输出格式。 |
-| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、最新 S1A token backend 结果和复现命令。 |
+| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、pre-bundle 5x3 基线、新 bundle gate 和复现命令。 |
+| `docs/validation/hicache_state_model_limitations.md` | 当前仍存在的中长期模型限制和收敛方向。 |
 | `docs/project_constraints.md` | 项目长期约束。 |
 | `docs/work_progress.md` | 时间戳流水记录；旧条目只代表当时状态。 |
 
@@ -105,14 +106,15 @@ scripts/run.sh modeling -- bash -lc \
 真实 SGLang / KTransformers profiling 通过宿主机入口启动：
 
 ```bash
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --list-experiments
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_mainline_one_matrix.json --experiment s1a_manual
+scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_common.json --list-experiments
+scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_common.json \
+  --inputs manual_phased_fast
 ```
 
 `scripts/profile.sh` 负责选择 docker compose service、挂载仓库、设置 Ascend 环境，并在容器内调用
 `scripts/internal/profile_runner.py`。宿主机上不要直接用 `profile_runner.py` 启动真实 server profiling。
 
-当前 HiCache state suite 只启用 `python_probe`。它采集：
+当前 HiCache state validation suite 只启用 `python_probe`。它采集：
 
 - target-level `fact` 描述的 atomic `invariant_state` 状态事实；
 - `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
@@ -129,30 +131,35 @@ python3 scripts/internal/profile_quality.py \
   --output <run_dir>/profile_quality.json
 ```
 
-## Modeling
-
-faithful replay：
+跨配置验证使用 forced-token capture/replay suite，保证同一 input 的 generated token timeline 一致：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache/modeling_hicache_from_manifest.json \
-  --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/faithful_replay \
-  --mode faithful_replay \
-  --emit-validation \
-  --emit-module-summary
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_capture.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch
+
+CAPTURE_BUNDLE=data/profile_runs/sglang/<capture_suite>/forced_token_bundle.json
+
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_replay.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --forced-token-bundle "$CAPTURE_BUNDLE"
 ```
 
-S1A HiCache state self-config prediction：
+capture suite 在自身目录生成 `forced_token_bundle.json` 和 `forced_token_plans/`。forced replay 必须显式传 bundle；
+runner 不读取仓库固定 plan，也不自动选择最近一次 capture。
+
+## Modeling
+
+当前不维护静态 modeling config。`hicache_state_workflow.py` 根据 replay suite 中的 target server config 动态生成
+`<workflow_output>/configs/target_<config_id>.json` 并调用 `scripts/model.sh`：
 
 ```bash
-scripts/model.sh \
-  --config configs/modeling/hicache_state/modeling_hicache_state_mainline_one_prediction_s1a.json \
-  --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/token_backend_s1a \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+python3 scripts/internal/hicache_state_workflow.py \
+  --profile-run-dir <profile_suite_dir> \
+  --output-dir <profile_suite_dir>/modeling/hicache_state_workflow \
+  --stages quality,final-state \
+  --prediction-scope self
 ```
 
 HiCacheModule 当前是 state-only backend：它维护 cache state 和 transition trace，不修改 DAG，
@@ -160,37 +167,23 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-06-12，当前主线状态是：
+截至 2026-06-25，当前主线状态是：
 
-- profiling config 使用 target-level atomic `fact` 契约，不再把 `fact_class` / `event_role` / state gate 写成普通字段；
-- 主 HiCache profile config 当前有 33 个 atomic target，其中 normal state model input 是 7 个 target / 5 个 role：
-  `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、`prefetch_decision`、
-  `prefetch_check_point`；
-- `request_tokens`、`lookup_path` 和 `request_cache_lifecycle` 这类混合 role 已从主配置删除；match-prefix concrete path、
-  lifecycle committed/fill path 和 runtime detail 都拆成 `source_actual` evidence；
-- C++ HiCache backend 的主门禁是 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`，
-  router 只接受已知 atomic invariant role 并做 required-field 检查；
-- target page 由后端按 token path 和 target `page_size` 重建，不再消费 `target_page_identity_page64/128`；
-- `scripts/internal/hicache_state_cross_input_audit.py` 现在只比较 atomic invariant facts；raw `request_id` 是 run-local
-  correlation id，不作为跨配置事实签名，hard gate 检查 count 和 request-normalized canonical fact multiset，sequence mismatch
-  只作为诊断输出。
+- profiling 仍使用 33 个 atomic target，其中 7 个 target / 5 个 role 是 normal state model input；
+- `request_lifecycle_anchor` 已携带当前 committed/fill path；C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，
+  不再用 `request_id -> longest path` 或 admission path 回退；
+- Python probe 的 committed/fill/admission/prefetch path 已按当前 SGLang API 分开解析，normal model input 与
+  diagnostic evidence 使用独立 token dictionary 去重域；
+- forced-token capture bundle、显式 replay bundle 依赖、preflight、quality gate 和 `hicache_state_workflow.py` 已落地；
+- 2026-06-24 的旧固定-plan 5 config x 3 input 结果为 final state `70/75`、transition exact `65/75`，只作为
+  pre-bundle 模型回归基线；
+- 新 bundle gate 会拒绝该旧 run，因为它没有 bundle provenance；需要重新 capture/replay 后才能形成当前 active validation；
+- 该 pre-bundle 基线的 final-state failure 只出现在
+  `manual_deeper_pressure_prefetch -> c1_wts_wait_p128_low_l1` 的 5 个 source/target 组合；
+- 基线中另有 5 个 `c0/manual_deeper_pressure_prefetch` prediction 只差 evicted marker oscillation，final state exact。
 
-当前契约摘要：
-
-| 项 | 当前口径 |
-| --- | --- |
-| configured targets | `33` |
-| normal state input targets | `7` |
-| normal state input roles | `5` |
-| source/evidence targets | `24 source_actual` + `2 timing_observation`，均为 `model_input=false` |
-| model input gate | `model_input=true && fact_class=invariant_state && fact_granularity=atomic` |
-| cross audit hard gate | `model_input_contract_ready` |
-| latest atomic S1A/S1B profile | `data/profile_runs/sglang/20260612_053153_profiling_hicache_state_mainline_one_matrix` |
-| latest cross audit result | 双向 `model_input_contract_ready=true`，blocking roles 为空 |
-| retained old cross audits | 只作为旧混合输入契约的历史证据 |
-
-当前 atomic profile 的 normal model input 已通过双向 cross audit。下一步应在该 run 上重跑 self/cross modeling validation，
-再判断 remaining final diff 是 async boundary、target-derived projection 缺口，还是 C++ state rule bug。
+当前详细结果、失败语义和复现命令以 `docs/validation/hicache_state_validation.md` 为准。当前 transition 根因分析仍保留在
+`docs/tmp/`；bundle workflow 已迁入主线文档。
 
 ## 数据约束
 

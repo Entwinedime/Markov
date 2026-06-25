@@ -87,9 +87,23 @@ scripts/profile.sh <config.json> --experiment <id> --dry-run
 
 suite config 用于在一套采集契约下展开多个 server/input 组合：
 
+当前 `configs/` 只维护 cache-state 开发主链的三套配置：
+
+| 配置 | 用途 |
+| --- | --- |
+| `profiling_hicache_state_common.json` | 普通生成的 common suite；用于采集诊断和 self prediction。 |
+| `profiling_hicache_state_forced_capture.json` | 三个 manual input 的 immutable plan/bundle capture。 |
+| `profiling_hicache_state_forced_replay.json` | 显式 bundle 驱动的 5×3 cross-config replay。 |
+
+不维护 S1A/S1B、smoke 或 faithful profiling suite。
+common suite 只用于 quality、采集诊断和 self prediction；`--prediction-scope cross` 必须使用 forced replay suite。
+
 ```bash
 scripts/profile.sh <suite-config.json> --list-experiments
 scripts/profile.sh <suite-config.json> --experiments <id-a>,<id-b>
+scripts/profile.sh <suite-config.json> --inputs <input-a>,<input-b>
+scripts/profile.sh <suite-config.json> --servers <server-a>,<server-b>
+scripts/profile.sh <forced-replay-suite.json> --forced-token-bundle <bundle.json>
 ```
 
 suite 的设计语义：
@@ -106,9 +120,11 @@ suite 输出目录保留：
 | 文件 | 作用 |
 | --- | --- |
 | `suite_config.json` | 本次使用的 suite config 归档 |
-| `suite_selection.json` | 全部可选实验与本次选择 |
-| `suite_result.json` | 已完成/失败 run 摘要 |
+| `suite_selection.json` | suite schema、profile mode、metadata、全部可选实验、本次 selector 和 forced-token preflight 摘要 |
+| `suite_result.json` | planned/attempted/completed/failure/aborted count、status、run 列表和 forced-token contract 聚合摘要 |
 | `<experiment>/profile_manifest.json` | 单个实验的 manifest |
+| `forced_token_bundle.json` | forced capture suite 的稳定输出合同；replay 通过 CLI 显式消费 |
+| `forced_token_plans/<input_id>.json` | bundle 内按 input 聚合的 plan；路径相对 bundle 保存 |
 
 ## Python Probe
 
@@ -154,9 +170,9 @@ Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐
 
 | source | 作用 |
 | --- | --- |
-| `token_path:<source>[,<scope_source>]` | 输出 token dictionary；同一 scope/path 只在首次包含完整 `token_ids` |
+| `token_path:<source>[,<scope_source>]` | 输出 token dictionary；同一 scope/path 在 normal model input 与 diagnostic evidence 各自去重域内首次包含完整 `token_ids` |
 | `token_span:<source>` | 输出 `{path_id, begin, end, token_count, hash_algo}` |
-| `request_token_path:<req>,<mode>[,<scope>]` | 从 SGLang `Req` 输出 request token dictionary；`mode=fill/committed/origin_output` |
+| `request_token_path:<req>,<mode>[,<scope>]` | 从 SGLang `Req` 输出 request token dictionary；`mode=fill/committed/admission/prefetch/origin_output` |
 | `request_token_span:<req>,<mode>` | 从 SGLang `Req` 输出 request token span |
 | `request_token_count:<req>,<mode>` | 从 SGLang `Req` 输出 request token 数 |
 | `token_path_concat:<prefix>,<suffix>[,<scope>]` | 拼接两段 token 后输出 dictionary |
@@ -179,6 +195,20 @@ Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐
 旧的 `page_hashes:*` / `target_page_identity_page<page_size>` 不再是当前 HiCache state 主契约。
 state backend 从 token dictionary/span 和 target page size 重建 page hash。
 
+request path mode 必须对应当前 SGLang 调用边界：
+
+| mode | 当前读取语义 |
+| --- | --- |
+| `fill` | `cache_unfinished_req()` 使用的 `Req.get_fill_ids()`；仅在 API 不可用时回退旧字段。 |
+| `committed` | `origin_input_ids + output_ids` 按 `kv_committed_len` / `_cache_commit_len()` 截断。 |
+| `admission` | `PrefillAdder` 接受本轮请求后可见的 fill path，优先使用 `get_fill_ids()`。 |
+| `prefetch` | `_prefetch_kvcache()` 的 `full_untruncated_fill_ids[:_compute_max_prefix_len(...)]` 候选 path；不能用 fill path 代替。 |
+| `origin_output` | 完整 `origin_input_ids + output_ids`，只在明确需要完整 request path 时使用。 |
+
+`RadixKey` 必须按其迭代和长度语义读取，不能直接绕过 `limit` / bigram view 读取底层 `.token_ids`。
+配置 target 与 full/debug internal hook 需要跟随当前 SGLang callable 签名；缺少 request 归属的 `InsertParams` /
+`EvictParams` 只能输出 optional `request_id`，不能伪造归属。
+
 ## HiCache 事件分类
 
 HiCache Python probe target 必须显式写 `module` 和 target-level `fact`：
@@ -194,7 +224,8 @@ HiCache Python probe target 必须显式写 `module` 和 target-level `fact`：
 后端第一层分流只看：
 
 ```text
-model_input == true
+phase == "end"
+&& model_input == true
 && fact_class == "invariant_state"
 && fact_granularity == "atomic"
 && event_role is a known atomic invariant
@@ -217,7 +248,7 @@ model_input == true
 | role | 语义 |
 | --- | --- |
 | `request_bound_match_anchor` | request-scoped match-prefix token anchor |
-| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界 anchor |
+| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界 anchor；必须携带当前 committed/fill `token_dictionary`、`full_path_span` 和 `token_count` |
 | `request_admission` | admission boundary 的 request token path、admission kind 和 policy |
 | `prefetch_decision` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
 | `prefetch_check_point` | request 时间线上的 prefetch check/wait 边界 |
@@ -227,7 +258,7 @@ source evidence 可以与 invariant target 采自同一个 Python callable，但
 | evidence role family | fact class | 设计边界 |
 | --- | --- | --- |
 | cache-stage concrete path / lookup result | `source_actual` | 只描述 source run 已发生结果，不更新 target state |
-| lifecycle path/runtime | `source_actual` | 只作为 provenance，不混入 lifecycle anchor |
+| lifecycle path/runtime | `source_actual` | 只作为 provenance/quality 对照；normal model 只能消费 invariant lifecycle anchor 上的 path |
 | insert / capacity / lock / maintenance / storage/controller event | `source_actual` 或 `timing_observation` | 只能用于质量审计、oracle/debug 或后续 target-derived 机制设计 |
 
 `sglang.hicache` probe 在 `attribution` / `debug` / `full` 模式下可以 patch SGLang 内部方法并输出 `source_actual` 事件，例如 radix split/delete、
@@ -252,19 +283,19 @@ validation 路径使用。
 HiCache 从 state alignment 推进到 DAG patch / E2E prediction 时，不同阶段需要的 profiling 强度不同。配置和文档必须显式区分
 state 输入、物理执行证据和验证标签。
 
-| 层级 | Profiling 种类 | 高层含义 | 主要用途 |
+| 阶段 | Profiling 种类 | 高层含义 | 主要用途 |
 | --- | --- | --- | --- |
-| P0 | 不新增 profiling，只使用 schema / 文档 / 已有样本 | 统一概念和输出结构 | 设计边界、summary 结构、字段契约。 |
-| P1 | Python probe invariant-only | target-independent semantic anchors 和 token dictionary/span | target state、transition、target intent。 |
-| P2 | Python probe invariant + oracle snapshot | P1 加 validation label，不进入模型输入 | final state validation。 |
-| P3 | source physical profiling | torch / LD_PRELOAD / physical timing evidence，加 invariant anchors 做对齐 | source DAG 中 cache-owned node / edge 归因。 |
-| P4 | full faithful profiling | P1 + P3；必要时保留显式标记的 timing/source evidence | cache-neutral DAG、DAG patch、duration calibration、self reconstruction。 |
-| P5 | target E2E oracle profiling | 对真实 target config 跑 P4 级 profiling | cross-config E2E prediction 验收标签。 |
+| 概念整理 | 不新增 profiling，只使用 schema / 文档 / 已有样本 | 统一概念和输出结构 | 设计边界、summary 结构、字段契约。 |
+| 状态输入 | Python probe invariant-only | target-independent semantic anchors 和 token dictionary/span | target state、transition、target intent。 |
+| 状态验证 | Python probe invariant + oracle snapshot | 状态输入加 validation label，不进入模型输入 | final state validation。 |
+| 物理证据 | source physical profiling | torch / LD_PRELOAD / physical timing evidence，加 invariant anchors 做对齐 | source DAG 中 cache-owned node / edge 归因。 |
+| faithful profiling | full faithful profiling | 状态输入 + 物理证据；必要时保留显式标记的 timing/source evidence | cache-neutral DAG、DAG patch、duration calibration、self reconstruction。 |
+| target E2E oracle | target E2E oracle profiling | 对真实 target config 跑 full faithful profiling | cross-config E2E prediction 验收标签。 |
 
 当前 HiCache state / transition alignment 仍可使用 full Python probe，因为还需要 `source_actual`、`timing_observation` 和
-`oracle_state` 做排查、transition oracle 抽取和验证标签。进入 normal state / target intent 主线时，应优先退回 P1/P2，
-避免 full probe 自身开销污染 E2E 标签。进入 DAG patch / faithful replay 时，必须补 P3/P4；只有 Python probe 的 state-only
-trace 不能作为完整性能 DAG 证据。
+`oracle_state` 做排查、transition oracle 抽取和验证标签。进入 normal state / target intent 主线时，应优先退回状态输入或状态验证采集，
+避免 full probe 自身开销污染 E2E 标签。进入 DAG patch / faithful replay 时，必须补物理证据或 full faithful profiling；只有
+Python probe 的 state-only trace 不能作为完整性能 DAG 证据。
 
 ## Token / Range 主事实
 
@@ -273,7 +304,7 @@ invariant profile 以 token dictionary + span 引用为核心：
 | 字段 | 必需性 | 说明 |
 | --- | --- | --- |
 | `token_path_id` | 必需 | 完整 token 序列的内容 hash，当前为 `sha256_u32le:<hex>` |
-| `token_ids` | dictionary 首次出现必需 | 完整 token id 序列，只在 dictionary 事件首次携带 |
+| `token_ids` | dictionary 首次出现必需 | 完整 token id 序列；completed/end-phase normal model input 与 diagnostic evidence 分开去重，不能由 `source_actual` 补齐 invariant path |
 | `token_span` / `full_path_span` / `prefix_span` / `suffix_span` | 按 role 必需 | 引用 token path 的闭开区间 |
 | `hash_algo` | 必需 | 当前为 `sglang_radix_sha256_v1` |
 | `cache_scope` | 必需 | rank + cache object 作用域 |
@@ -281,6 +312,88 @@ invariant profile 以 token dictionary + span 引用为核心：
 
 后端根据 token 序列和 target `page_size` 生成 page identity。新增 target page size 不应要求新增
 `target_page_identity_page<page_size>` 字段。
+
+## Forced Token Profiling
+
+HiCache cross-config prediction 只有在同一 input 的 token timeline 跨配置一致时才可解释。greedy、固定 seed 和
+batch-invariant kernel 只能降低输出分叉概率，不能作为 hard contract。需要跨配置验证 generated continuation 时，使用
+`scripts/bench/hicache_phased_workload.py` 的 forced token 模式。
+
+forced token profiling 分成两步：
+
+```text
+capture:
+  text prompt -> real /generate
+  response.prompt_token_ids + response.output_ids -> forced_token_plan.json
+
+replay:
+  plan.origin_input_ids -> real /generate prefill/decode
+  plan.forced_output_ids -> SGLang committed output token override
+  workload_report 校验 actual output_ids == forced_output_ids
+```
+
+关键约束：
+
+- replay 必须提交 `input_ids`，不能提交完整 `prompt + output` 作为长 prefill；
+- replay 请求携带 `trace_sim_forced_output_ids`，SGLang 在 prefill/decode append `Req.output_ids` 前覆盖 token；
+- forward、sampling、scheduler、allocator、KV 写入、HiCache lifecycle 仍真实执行，只有 committed output token 被替换；
+- 第一版只支持普通非 streaming `/generate`、`n=1`、`ignore_eos=true`、无 stop/grammar/speculative/disaggregation 复杂路径；
+- C++ state model 不消费 forced token provenance，只消费 Python probe 输出的 invariant token dictionary/span。
+
+真实 profiling 主流程必须通过 `scripts/profile.sh`，capture / replay 使用显式 suite config：
+
+```bash
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_capture.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch
+
+CAPTURE_BUNDLE=data/profile_runs/sglang/<capture_suite>/forced_token_bundle.json
+
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_replay.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --forced-token-bundle "$CAPTURE_BUNDLE"
+```
+
+capture suite 只负责生成 plan contract：server 使用最小 deterministic 配置，不启用 HiCache，不启用 Python probe、torch profiler
+或 LD_PRELOAD。每个 capture experiment 默认在自己的 bench output 下写 `forced_token_plan.json`；suite 成功后 runner 聚合为：
+
+```text
+<capture_suite>/
+  forced_token_bundle.json
+  forced_token_plans/
+    <input_id>.json
+```
+
+capture artifact 不允许覆盖；需要新 token timeline 时必须生成新的 capture suite。replay config 只保留
+`{forced_token_plan}` 占位符，runner 根据显式 bundle 和 selected input 注入具体 plan。不存在固定 plan fallback，也不会自动读取
+latest capture。
+
+`forced_token_bundle.json` 使用 `trace_sim.hicache.forced_token_bundle.v1`，至少记录 bundle id、capture suite/config、
+model/server provenance，以及每个 input 的相对 plan path、plan hash、workload fingerprint、request count 和 capture report。
+相对 path 允许 capture suite 整体移动或归档。
+
+`scripts/bench/hicache_phased_workload.py` 仍是 suite 内部调用的 workload driver，可用于本地调试，但不作为真实 profiling
+主入口。replay profiling 开始前，`profile_runner.py` 会 preflight plan 文件存在、schema、`workload_id`、
+`workload_fingerprint` 和 request 顺序。
+
+suite 级 `suite_selection.json` / `suite_result.json` 会记录 `profile_mode`、selector、planned/attempted/completed/failure/aborted
+count 和 `forced_token_contracts` 聚合摘要。默认 fail-fast 也会先写失败结果再退出；preflight 失败发生在 suite 目录创建前。
+profiling 结束后先看 suite result，再进入 workload report 和 profile quality。
+
+`workload_report.json` 的 `forced_token` 字段是 profiling input contract：
+
+| 字段 | 语义 |
+| --- | --- |
+| `mode` | `none` / `capture` / `replay`。 |
+| `plan_schema` | 当前为 `trace_sim.hicache.forced_token_plan.v1`。 |
+| `plan_sha256` | plan 文件内容摘要；同 input 的 replay run 必须一致。 |
+| `plan_capture_run_id` / `plan_capture_config_id` | plan 的 capture provenance；只用于审计，不作为 replay oracle。 |
+| `bundle_schema` / `bundle_sha256` / `bundle_id` | replay 显式消费的 capture bundle provenance。 |
+| `bundle_plan_sha256` | bundle entry 声明的 plan hash；必须等于实际 `plan_sha256`。 |
+| `all_actual_outputs_match_plan` | replay run 的实际 `output_ids` 是否逐请求等于 plan。 |
+| `unchecked_count` / `mismatch_count` / `prompt_mismatch_count` | forced replay 的硬失败诊断。 |
+| `plan_ready` / `bundle_ready` / `ready` | plan/output 合同、bundle provenance 合同及两者合取；matrix 分别汇总 plan 与 bundle signature。 |
 
 ## Profile Quality
 
@@ -302,9 +415,35 @@ python3 scripts/internal/profile_quality.py \
 - `invariant_state` 是否具备 token dictionary/span、cache scope、seq_no；
 - token span 是否都能找到 dictionary；
 - `seq_no` 是否在 scope 内有序；
+- forced replay workload 是否使用合法 plan，且 actual `output_ids` 是否全部匹配 plan；
+- replay bundle schema/hash/id 是否存在，同 input 下 bundle 是否唯一，bundle entry hash 是否等于实际 plan hash；
+- run config 声明 forced capture/replay 时，workload report 必须存在且 mode 必须一致，不能缺失后退化成普通 generate；
+- `request_lifecycle_anchor` 是否携带可由 normal model input 自身解析的 committed/fill path，并与 observed path 对照一致；
+- source evidence 出现非空 prefetch intent/enqueue 时，`prefetch_decision` 是否也有非空 candidate path；
 - state trace 开启时是否采到 capacity snapshot。
 
-质量审计只输出采集质量和合同缺口，不判断 state model 是否正确。
+质量审计只输出采集质量和合同缺口，不判断 state model 是否正确。workflow 每次都基于当前代码重新审计 manifest，不复用旧
+`quality/*.profile_quality.json` 作为 gate。`profile_quality.py` 的 `quality_ready` 是严格采集覆盖率；
+HiCache state workflow 另外计算 `state_quality_ready` 和 `input_contract_ready`，用于判断 final-state / transition 是否能进入建模验证。
+
+严格 coverage 可因某个 workload 未触发声明机制而失败，但只要 invariant path、forced-token、oracle 和 state 输入合同完整，
+`state_quality_ready` 仍可为真。两者必须分别报告，不能用 state gate 掩盖 coverage 缺口。
+
+profiling 后的统一 HiCache validation 入口：
+
+```bash
+python3 scripts/internal/hicache_state_workflow.py \
+  --profile-run-dir <forced_replay_suite_dir> \
+  --output-dir <forced_replay_suite_dir>/modeling/hicache_state_workflow_manual_3inputs \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --stages quality,final-state,transition \
+  --prediction-scope self,cross \
+  --emit-transition-catalog \
+  --emit-transition-gates
+```
+
+`transition` 依赖同一次 workflow 生成或重新门禁后的 final-state rows，因此 `--stages` 包含 `transition` 时必须同时包含
+`final-state`。旧 `hicache_state_matrix_validation.py` 入口已删除。
 
 ## LD_PRELOAD
 

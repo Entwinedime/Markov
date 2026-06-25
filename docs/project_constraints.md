@@ -1,217 +1,131 @@
-# 项目约束规范
+# 项目约束
 
-维护方式：这是长期约束文档。更新时直接删改，不写流水账。
+本文只维护跨阶段稳定的工程边界。具体接口、实现细节和运行方法分别维护在 profiling、modeling 与 validation 文档中；
+实验过程记录在 `work_progress.md`。
 
-## Docs
+## 文档与证据
 
-`docs/` 顶级主线文档只维护四个文件：
+- 顶级主线文档维护 profiling、modeling、项目约束和工作进展；专项验证与长期模型限制维护在 `docs/validation/`。
+- 主线开发文档描述架构、职责和输入输出合同，不记录实验流水、临时诊断或具体结果。
+- 当前验证口径、有效结论和已知限制维护在 `docs/validation/`。
+- 尚未闭环的单一问题可以暂存于 `docs/tmp/`；完成后必须迁移稳定结论并删除临时文档。
+- `data/` 下的运行产物是可再生证据，不是长期事实来源。需要长期保留的结论必须写入文档，并附可复现入口。
+- 文档、配置和代码必须描述同一条 active workflow；行为变化时应同步更新，不保留相互矛盾的说明。
+- active 源码目录不单独维护模块 README；模块职责和使用方法应进入对应主线文档。
 
-- `profiling_development.md`
-- `modeling_development.md`
-- `work_progress.md`
-- `project_constraints.md`
+## 运行环境
 
-其中 `profiling_development.md` 和 `modeling_development.md` 只记录设计、接口、组件职责、输入输出契约和长期边界；
-不得携带具体实验结果、历史阶段分析、run 路径或数值 diff。实验进展写入 `work_progress.md`，当前有效验证口径和结果写入
-`docs/validation/`。
+- 真实 SGLang profiling 必须在 `sglang-profile` runtime 容器中执行；framework hook 也必须在相同 ABI 环境中构建。
+- C++ TraceGraph 构建、格式检查和 modeling 验证以独立的 `modeling` 容器为准；该环境不依赖 Ascend/CANN runtime。
+- 宿主机只负责外层编排和无运行时依赖的静态检查，不作为 framework profiling 或 C++ 构建验收环境。
+- Profiling 的宿主机入口是 `scripts/profile.sh`；modeling 的宿主机入口是 `scripts/model.sh`。
+- `scripts/internal/profile_runner.py` 和 `scripts/internal/model_runner.py` 是容器内执行器，不作为真实任务的宿主机入口。
 
-`docs/validation/` 只放纳入 git 追踪的专项验证记录。当前保留：
+## Profiling 边界
 
-- `docs/validation/hicache_state_validation.md`：当前有效验证口径、最新结果、剩余风险和复现入口。
-- `docs/validation/hicache_state_model_limitations.md`：当前仍存在的中长期建模缺口、临时妥协方案、风险和正确收敛方向。
+- Profiling 只采集事实，不预测 target 行为，也不执行建模规则。
+- 模型输入、诊断证据、时序观测和 validation oracle 必须显式分类，不能相互替代。
+- 缺失关键事实时必须报告合同缺口，不得使用默认值、推测值或诊断字段补齐。
+- 实验配置只描述 server、workload 和采集行为，不嵌入 modeling prediction 逻辑。
+- `profiling.channels` 只允许 `torch`、`python_probe` 和 `ld_preload`；各渠道的细节必须由自身配置段控制。
+- Python probe 的 native/runtime 不可见事件不得通过伪造 Python 事实补齐；需要时使用对应 runtime hook。
+- suite 共享同一套采集合同；server 和 workload 维度只能改变被测配置与输入，不能私自改变采集语义。
+- `matrix.servers[]`、`matrix.inputs[]` 和展开后的 experiment 不得覆盖或删除顶层 `profiling`。
+- suite preflight 必须在启动 server 前完成；运行失败时必须留下可审计的 suite result。
+- 真实 profiling 统一通过 `scripts/profile.sh` 启动；容器内 runner 不作为宿主机运行入口。
 
-不再保留单独的 legacy validation 文档、短期计划文档、顶级 `*_draft.md` 或 `docs/tmp_hicache*.md` 临时方案。旧结果如果还有参考价值，
-应压缩成 active 文档中的背景说明、长期限制项或 `work_progress.md` 时间线；不得作为当前验收依据。
+## Cache-State 输入合同
 
-不再维护任何 fixture。具体要求：
+- Cache-state 模型只消费显式标记的、已完成的原子不变量事实。
+- 可消费事件必须同时满足：
 
-- 不保留 `tests/`、`tests/fixtures/`、`run_*_fixtures.py` 或依赖 fixture trace 的 smoke modeling config；
-- 不新增 fixture-backed validation gate；
-- 不把长期验收建立在本地 synthetic fixture 文件上；
-- 需要长期保留的验证证据必须抽取成配置、命令、审计脚本、关键指标和结论，或指向真实 profile/modeling run 的可复现入口。
+  ```text
+  phase == "end"
+  model_input == true
+  fact_class == "invariant_state"
+  fact_granularity == "atomic"
+  event_role 为已知角色
+  ```
 
-文档不能依赖本地 `data/` 目录长期存在。真实 run 只能作为临时实验批次，长期证据必须抽取成配置、命令、commit、
-关键指标和结论。
+- 当前正常输入角色是 `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、
+  `prefetch_decision` 和 `prefetch_check_point`。新增角色必须同时更新采集 schema、质量审计和 C++ router。
+- 所有正常输入必须具有稳定的 `cache_scope` 与单调 `seq_no`；未知角色、缺字段和非法路由必须进入质量错误。
+- source run 已发生的命中、移动、淘汰、异步完成和状态快照只能用于诊断或验证，不能更新 target state。
+- `source_actual`、`timing_observation`、`oracle_state` 和 debug/provenance 数据必须保持 `model_input=false`。
+- token path 与 range 是跨配置输入身份的基础；page state 必须由 token 事实和 target 配置推导。
+- token span 必须能解析到同一输入合同中的 token dictionary，不能依赖诊断事件补齐。
+- 单次运行内的临时标识不能直接作为跨配置事实。跨配置比较必须使用规范化后的稳定签名。
+- target policy 和资源行为必须由显式 target config 与建模规则决定，不能读取 source 结果作为答案。
 
-active 源码子目录不维护独立 README。模块说明、设计说明和使用说明必须收敛到主线文档或专项验证文档。
+## Common 与 Forced Workflow
 
-## 语言与注释
+- Common suite 用于普通生成、采集诊断和 self-config prediction。
+- Cross-config prediction 必须使用 forced-token replay 或强度等价的输入合同。
+- Forced capture 产物不可覆盖，并由 suite 聚合为可移动、可校验的 bundle。
+- Capture plan 使用 `trace_sim.hicache.forced_token_plan.v1`，bundle 使用
+  `trace_sim.hicache.forced_token_bundle.v1`；bundle 内 plan path 必须相对 bundle 保存。
+- Forced replay 必须显式接收 bundle；禁止固定 plan、自动选择历史 capture 或无 bundle 回退。
+- Replay 启动前必须校验 bundle schema/id/hash、selected input 覆盖、plan path/hash、workload id/fingerprint、request count
+  和 logical request 顺序。
+- Replay 完成后必须逐请求验证实际输出与 plan 一致，并分别报告 plan contract、bundle contract 和总 readiness。
+- 同一 input 的 cross-config gate 必须同时满足 plan signature、bundle signature 和规范化 workload signature 一致。
+- bundle provenance 只参与输入合同审计，不进入 C++ state model。
 
-- C/C++ 主线统一使用 C++23，CMake 最低版本为 3.20。
-- 项目维护三个 Docker 环境，职责不能混用：
-  - `sglang-profile`：SGLang 真实 profiling / runtime 环境，包含 Ascend/CANN、torch_npu、SGLang 和对应 hook build
-    上下文；
-  - `ktransformers-profile`：KTransformers 真实 profiling / runtime 环境，包含 Ascend/CANN、torch_npu、KTransformers
-    和对应 hook build 上下文；
-  - `modeling`：干净 Ubuntu 24.04 C++23 环境，只用于 C++ TraceGraph 构建、clang-format/clang-tidy、modeling
-    runner 和 modeling-only 检查，不依赖 Ascend/CANN。
-- C++ TraceGraph 构建、clang-format dry-run 和 modeling 后端验证以 `modeling` Docker 容器为准；宿主机 toolchain
-  只允许用于无编译依赖的文本检查，不作为 C++ 构建验收环境。
-- `scripts/model.sh` 是宿主机侧唯一支持的 modeling run 入口；`scripts/internal/model_runner.py` 是容器内执行器，
-  必须拒绝宿主机直接执行，不维护旧 host build、`build/bin/trace_graph` 或 fixture-backed smoke 兼容路径。
-- LD_PRELOAD hook 的构建验收跟随对应 framework runtime 容器；需要 AscendCL wrapper 时不得在 `modeling` 容器中构建。
-- 项目文档统一使用中文。
-- 新增代码注释统一使用中文，保留必要的项目内英文术语、类型名、字段名和配置名。
-- 解释性 C/C++ 注释统一使用 Doxygen 风格，优先使用 `/** ... */` 与 `@brief`；文件、类型、函数、状态机边界、字段契约、错误处理和不变量说明都应按这个风格书写。
-- 同一组声明需要分区时使用 Doxygen 分组标记，例如 `@name`、`@{` 和 `@}`，不要用普通分隔线注释代替。
-- Python 解释性注释优先使用中文模块 docstring、类 docstring 和函数 docstring；只在局部非显然分支、不变量、错误处理或外部协议边界处使用 `#` 行注释。
-- shell 脚本使用 shebang 后的中文文件说明块和函数前中文 `#` 注释；保留必要的 `shellcheck` 指令、环境变量名、命令名和英文错误输出。
-- 注释解释“为什么这样做”和“维护什么不变量”，不要只复述代码。
-- 普通 `//` 只保留给 namespace 结尾标记。
-- 确定需要修改的问题必须显式说明影响面和期望修复方向：C/C++ 使用 Doxygen `@todo` 块；Python 和 shell 使用中文
-  `TODO:` 注释或 docstring 段落，不再使用 `// !` 标记。
-- 不确定假设或需要实验确认的问题必须显式说明假设边界、风险和验证证据：C/C++ 使用 Doxygen `@warning` 或
-  `@note` 块；Python 和 shell 使用中文 `NOTE:` / `WARNING:` 注释或 docstring 段落，不再使用 `// ?` 标记。
+## Modeling 边界
 
-## Profiling
+- Modeling 后端使用 C++ TraceGraph；Python 只负责配置生成、运行编排、trace 合并和 validation。
+- Cache-state 主流程使用 `mode=cache_state`；HiCacheModule 维护状态和 transition trace，不修改性能 DAG。
+- 状态子模块不得修改原始 profiling trace。
+- DAG 修改必须通过统一 mutation 接口记录，不能以隐式副作用改变图结构。
+- 非执行类 state snapshot、oracle 和质量事件不得成为默认 DAG 节点。
+- Cache-state prediction 必须同时具有显式 target config 和满足合同的 profile 输入。
+- target config 至少明确 page projection、容量和 policy；不得使用“observed”一类从 source 行为回填 target policy 的配置。
+- Target trace 只作为 oracle；cross-config prediction 不得把 target actual 行为作为模型事实源。
+- 状态模型、策略推导、验证摘要和 DAG mutation 应保持清晰组件边界，避免重新形成单体状态机。
+- 当前 target modeling config 由 workflow 根据 profile suite 动态生成，不作为手工长期配置维护。
+- `prediction.json` 中的 E2E 时间来自 TraceGraph 拓扑仿真，不是 cache-state 正确性的验收指标。
+- module summary、validation、DAG trace 和 debug 输出必须由显式开关生成。
 
-- Profiling 只采事实，不做建模推断。
-- Probe 不决定 target policy，不生成 target 行为。
-- Debug / oracle 字段不能成为默认模型输入。
-- 缺关键事实时必须暴露缺口，不能用默认值掩盖。
-- 实验配置描述采集和运行，不嵌入 modeling prediction 逻辑。
-- 真实 SGLang / KTransformers profiling 必须通过 `scripts/profile.sh` 外层容器入口启动。
-- `scripts/run.sh modeling` 只用于进入干净 C++23 modeling 环境，不能作为真实 framework profiling 入口。
-- `scripts/internal/profile_runner.py` 是容器内执行器，不能在宿主机上直接用于真实 server profiling。
-- `profiling.channels` 只接受 `torch`、`python_probe`、`ld_preload`。
-- `python_probe` 只由 `profiling.python_probe` 控制。
-- HiCache 最终 normal state / intent 主线 profiling 应使用 `profiling.python_probe.mode=invariant` 或显式等价的
-  `fact_classes=["invariant_state"]`，用于低扰动 state/intent 输入。当前尚未对齐的 alignment/debug suite 可以显式使用
-  `mode=full` 保留 source/timing evidence，但不得把这些 evidence 写入 target state，也不得把 full-probe wall time 当作低扰动
-  E2E 标签。
-- `ld_preload` 只由 `profiling.ld_preload` 控制注入和输出；具体 wrapper 由 C++ 硬编码。
-- suite config 中 `profiling` 必须共享；`matrix.servers[]`、`matrix.inputs[]`、`experiments[]` 不得覆盖或 unset `profiling`。
-- 改采集类别、probe target、torch profiler 或 LD_PRELOAD 行为时，新建 suite。
-- HiCache diagnostic 中 `--hicache-ratio` 必须大于 `1.0`；容量压力优先来自 workload 或显式 capacity config。
+## Validation 门禁
 
-### HiCache Profiling
+- Validation 必须先检查采集质量和输入合同，再解释模型差异。
+- Workflow 每次按当前代码重新审计 profile manifest，不使用旧质量报告绕过新门禁。
+- Common workflow 只允许 self prediction；cross prediction 必须证明 forced plan、bundle 和规范化 workload signature 一致。
+- 每个参与 prediction 的 run 必须具备可解析的不变量事实、token dictionary/span 和 validation oracle。
+- 正常 prediction 中只要消费了非不变量事实，就不能宣称 invariant-only validation 通过。
+- 输入合同未通过时，结果只能归类为输入、投影或控制边界问题，不能直接归因于模型规则。
+- Transition validation 必须建立在同一次 workflow 的 final-state 门禁上。
+- Oracle、debug 和质量事件不能进入默认性能 DAG。
 
-- HiCache state 主线只允许 target-level atomic fact contract。
-- 新采集目标必须显式写入 `fact.class`、`fact.role`、`fact.model_input`、`fact.dag_input` 和
-  `fact.granularity=atomic`。
-- `model_input=true && fact_class=invariant_state && fact_granularity=atomic` 才能进入 C++ HiCache state model；router
-  只接受已知 atomic invariant role。
-- 非 `invariant_state` 的 HiCache target 必须显式写 `model_input=false`。
-- `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不得更新 target state。
-- HiCache mainline 可以保留 source/evidence target，但正常 state model input 必须是显式枚举且通过 cross audit 的子集；
-  当前 33-target suite 的正常输入 role 是 `request_bound_match_anchor`、`request_lifecycle_anchor`、
-  `request_admission`、`prefetch_decision`、`prefetch_check_point`。
-- raw `request_id` 只是单次运行内的 correlation id；cross audit 不得把它当成跨配置 invariant fact，必须先用
-  path-bearing atomic facts 归一化 request scope。
-- source matched result、admission return、actual victim、actual movement、actual async completion 等 source 已发生结果不得作为
-  `invariant_state` 事件字段混入；需要保留时必须拆成并行 `source_actual` / `timing_observation` / `oracle_state` 事件。
-- cache-stage concrete match-prefix path、source `insert_path`、request lifecycle generated/committed suffix、
-  source `capacity_request`、source `lock_scope_delta` 和 source maintenance polling/check-kind 序列不得作为正常 cross
-  model input；需要使用时必须改成 target-derived 机制或新的 target-independent invariant。
-- `page_identity`、`target_page_identity`、`target_page_identity_page<page_size>` 不再是 state model 主输入。
-- target page identity 必须由 token dictionary/span、`hash_algo`、`cache_scope` 和 target `page_size` 推导。
-- 正常 state input 可以引用 token dictionary/span，但能否进入模型由 `fact_class` 和 atomic `event_role` 决定；普通事件应引用
-  span，避免重复携带完整 token 列表。
-- `cache_scope` 和 `seq_no` 是 HiCache invariant state fact 的必需路由字段。
-- validation-only `state_snapshot` 必须保持 `model_input=false` 且 `fact_class=oracle_state`。
-- 重跑真实 HiCache profile 前必须先通过本地契约检查：JSON config 校验和 invariant target source-result 字段审计；
-  不再使用 fixture 作为 profile gate。
-- `scripts/internal` 下 HiCache 专项工具只保留 active、只读、文档化的审计/验证入口。当前允许保留：
-  `hicache_state_cross_input_audit.py`、`hicache_state_matrix.py`、`hicache_state_matrix_validation.py`、
-  `hicache_state_provenance.py` 和 `hicache_transition_exactness.py`。
-- 不保留临时 residual/report spike、front-door workload 对照、async elision、timeline oracle replay alignment 或任何会生成
-  synthetic `model_input=true` 事件的 HiCache internal 脚本。
+## 配置与产物
 
-## Modeling
+`configs/experiments/hicache_state/` 只维护当前 cache-state 开发所需的三套 profiling 配置：
 
-- Modeling 后端必须使用 C++ TraceGraph；Python 侧只保留 runner、trace merger 和 validation 编排。
-- 所有 what-if 都必须规约为 C++ `SimulationModule`。
-- 子模块不能修改原始 profiling trace。
-- 子模块修改 DAG 必须通过统一 mutation API 记录。
-- 默认 E2E prediction 来自 DAG 拓扑仿真，不来自子模块 latency 求和。
-- `faithful_replay` 关闭的是子模块加载和 DAG patch，不是关闭事件消费。
-- `faithful_replay` 必须消费完整真实执行 trace；不能因为某个领域子模块关闭就过滤该领域真实执行事件。
-- `replay` 是保留术语，只能表示 `mode=faithful_replay`。
-- 启用 HiCacheModule 的 state 建模只能称为 `self-config prediction` 或 `cross-config prediction`。
-- HiCache state model 只能消费不变量事实和显式 target config。
-- target actual trace、state snapshot、source movement、oracle transient 和 debug 字段只能用于 validation/debug。
-- 显式 `write_policy=observed`、`prefetch_policy=observed`、`storage_prefetch_policy=observed` 都是非法配置。
-- HiCache 三种 storage prefetch policy 的 threshold、capacity limit、host release budget、storage hit 截断和 anchor protection
-  必须来自显式 target config 或 SGLang 源码语义：默认 threshold 是 `max(prefetch_threshold=256, page_size)` tokens 经
-  target page size 投影后的页数，capacity limit 是 `floor(0.8 * (host_pool_pages - device_pool_pages))`，host alloc 失败后的
-  cleanup budget 是本次 page-aligned prefetch request，storage hit query 只能保留连续命中前缀，prefetch 期间必须保护
-  anchor host pages，rate-limit 判断保持 `occupied >= capacity_limit`；不允许使用 L2 一半、deficit、最终 L2 差值、
-  超容量拟合预算或把 0 capacity limit 解释成无限制。
-- 正常 HiCache prediction 中 `non_invariant_fact_usage` 必须为空；只要非空，不能宣称 invariant-only prediction 通过。
-- `self-config prediction` 仍必须显式给出 target page size、capacity、write policy、prefetch policy。
-- `cross-config prediction` 只能用 target trace 做 oracle，不得偷读 target actual trace 作为模型事实源。
-- 非执行类 state snapshot、oracle state、probe debug、质量审计事件不能作为默认性能 DAG 节点。
-- 当前 HiCache mainline S1A/S1B profiling target count 是 33，但 profile quality 通过不代表全部 target 都是正常 state
-  input；cross-config state-rule diagnosis 必须先通过 hard `model_input_contract_ready=true`，确认 atomic invariant role
-  在 request-normalized canonical fact multiset 上逐项跨配置一致。sequence mismatch 是诊断信号，不是输入事实 hard
-  blocker。
-- 如果 `model_input_contract_ready=false`，state mismatch 先归类为输入契约、projection 或 async/control-flow boundary
-  问题，不能直接当作 backend model/rule bug 修。
-- 只有 profile quality 明确失败、进入 DLLM/disaggregation/streaming/abort/preemption 等新 scope，或 SGLang upstream hook
-  语义边界变化时，才允许重新讨论新增 HiCache 采集 target。
-- HiCache backend 重构不保留 page-level state machine 兼容性；token-level radix tree 是 source of truth，page set 只能是
-  target page projection。
-- HiCache backend 必须拆分 router/schema、token store、target pager、token radix tree、state index、policy、async state、
-  summary/validation 边界；不能继续把复杂状态机堆在 `hicache_model.cpp` 单体里。
+- `profiling_hicache_state_common.json`
+- `profiling_hicache_state_forced_capture.json`
+- `profiling_hicache_state_forced_replay.json`
 
-## 配置与数据
+Forced-token plan、bundle、动态 modeling config 和 validation 输出均属于运行产物，应写入对应的 `data/` 目录。
+配置目录不保存运行结果或由历史运行导出的固定输入。
 
-- `configs/experiments/` 按实验领域分组。
-- HiCache state profiling 配置放在 `configs/experiments/hicache_state/`。
-- smoke profiling 配置放在 `configs/experiments/smoke/`。
-- `configs/modeling/` 按建模领域分组。
-- HiCache state prediction 配置放在 `configs/modeling/hicache_state/`。
-- faithful replay 配置放在 `configs/modeling/hicache/`。
-- 不再维护依赖 fixture trace 的 smoke modeling 配置。
-- 新增配置必须放进已有语义分组；只有出现新的稳定领域时才新增子目录。
-- modeling 配置引用目标 experiment config 时使用仓库内相对路径。
-- `data/profile_runs/**`、`data/modeling_runs/**`、`data/traces/**` 是可再生运行产物，不纳入 git 追踪，不作为长期事实来源。
-- 提交前清理不再需要的大体积 profiling/modeling/debug 产物。
+运行产物至少应保持以下层级：
 
-## 输出
-
-默认主输出只包含：
-
-```json
-{
-  "predicted_e2e_ns": 0
-}
+```text
+profile suite
+  -> suite selection/result
+  -> per-run manifest/trace/workload report
+  -> optional forced-token bundle
+  -> workflow quality/final-state/transition outputs
 ```
 
-默认输出文件：
+## 工程质量
 
-- `prediction.json`
-
-其他输出必须显式打开：
-
-- `emit_dag_chrome_trace`
-- `emit_module_summary`
-- `emit_validation`
-- `debug`
-
-建模 CLI 主入口：
-
-```bash
-scripts/model.sh --config <config>
-```
-
-## Deprecated
-
-- active tree 中不保留可被误用的 deprecated 实现。
-- 不恢复 `tests/` 目录或任何 fixture suite。
-- 不恢复旧实验配置。
-- 不恢复旧实验结果。
-- 不恢复旧 profiling probe target。
-- 不恢复 page-identity state backend。
-- 不恢复 observed/default policy 兼容入口。
-- 新实现按当前 profiling / modeling 主线重新设计。
-
-## Git 与清理
-
-- 不回滚用户已经删除或移动的文件。
-- 不把 pycache、临时结果、debug 大文件纳入主线。
-- 提交信息必须规范、具体，优先使用 Conventional Commits，例如 `docs(hicache): sync token invariant state docs`。
-- 提交涉及大范围行为变化、验证状态或未闭环项时，commit body 需要写关键上下文和验证情况。
-- C/C++ 改动提交前运行 clang-format dry-run。
-- 复杂 C++ 子模块必须拆分 fact parser、state、policy/decision、summary 和 DAG mutation 边界。
-- 不允许把复杂状态机、fact parser、summary、policy 和 DAG mutation 全部堆在单个匿名 namespace 中。
+- 主线使用 C++23，CMake 最低版本为 3.20。
+- 代码、文档和解释性注释以中文为主，保留必要的英文协议名、类型名和配置字段。
+- C++ 公共接口、状态机边界和不变量说明使用 Doxygen 风格；Python 使用模块、类和函数 docstring 表达同类信息。
+- 注释应解释设计原因、不变量和边界，避免复述代码。
+- 修改行为后应删除失活代码和旧入口，不为当前主线保留向后兼容分支。
+- 不修改或覆盖用户未授权的运行产物和工作区改动。
+- 不把 pycache、临时诊断或大体积 debug 产物纳入主线。
+- 提交前至少完成与改动范围相符的 Python/Shell 语法、JSON 解析、diff whitespace、C++ 格式/构建和 workflow
+  合同检查。

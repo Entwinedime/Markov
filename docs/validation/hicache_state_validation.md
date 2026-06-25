@@ -1,6 +1,6 @@
 # HiCache State Validation
 
-维护方式：本文是 HiCache state validation 的 active 文档，直接维护当前有效口径、最新结果、仍未证明的风险和复现入口。历史实验只保留能解释当前边界的压缩结论；不再维护单独的短期计划或临时诊断文档。
+维护方式：本文是 HiCache state validation 的 active 文档，直接维护当前有效口径、当前保留基线、仍未证明的风险和复现入口。历史实验只保留能解释当前边界的压缩结论；尚未完成的短期根因分析可暂存于 `docs/tmp/`。
 
 ## 目标
 
@@ -41,14 +41,51 @@ HiCache state prediction 必须同时满足：
 
 HiCache state 主线使用 target-level atomic fact contract。
 
-- C++ backend 只消费 `model_input=true && fact_class=invariant_state && fact_granularity=atomic`，且 role 属于已知 atomic invariant。
+- C++ backend 只消费 completed/end-phase、`model_input=true && fact_class=invariant_state && fact_granularity=atomic`，且 role
+  属于已知 atomic invariant。
 - 当前正常 state model input 是 5 个 role：
   `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、`prefetch_decision`、`prefetch_check_point`。
-- `source_actual`、`timing_observation`、`oracle_state`、`debug_quality` 不更新 target state；它们只用于 token dictionary 水合、provenance、质量检查、target oracle 抽取和审计。
+- token dictionary 只从 completed atomic invariant `model_input=true` event 水合。`source_actual`、`timing_observation`、
+  `oracle_state`、`debug_quality` 不更新 target state，也不能为 normal model 补 token；它们只用于 provenance、质量检查、target oracle
+  抽取和审计。
+- path-bearing invariant 必须在 completed/end-phase normal model input 中自足：`token_dictionary`、`full_path_span` 和每个
+  referenced `path_id` 至少一次对应的 `token_ids` 都必须来自 normal model input，不能只在 diagnostic/source_actual 侧出现。
 - 旧 mixed/source-control role 不再是 normal input：`request_tokens`、`lookup_path`、`request_cache_lifecycle`、`insert_path`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 都不能进入 normal mutation path。
 - source matched result、source admission return、actual victim、actual movement、actual async completion、node remove result、storage hit result、host ref delta 等 source 已发生结果不得作为 `invariant_state` 字段混入。
 - raw `request_id` 只是单次运行内 correlation id；cross audit 必须使用 request-normalized canonical fact，不把 raw id 当跨配置 invariant。
 - `page_identity`、`target_page_identity`、`target_page_identity_page<page_size>` 不再是 state model 主输入；target page identity 由 token dictionary/span、`hash_algo`、`cache_scope` 和 target `page_size` 推导。
+- `request_lifecycle_anchor` 现在是 path-bearing invariant fact，必须携带当前 lifecycle committed/fill path；`request_lifecycle_path_observed`
+  仍是 `source_actual` 诊断证据，不能回流到 normal state model。
+
+## Forced Token Cross-Config Gate
+
+跨配置 prediction 的前提不是“prompt 一样”，而是同一 logical request 在 source/target 中看到的 token path 一样。
+如果 generated output token 已经分叉，后续 radix key、page hash、prefetch candidate、finished insert 和 writeback 对象都会一起分叉，
+此时 mismatch 不能归因到 C++ state model。
+
+forced token profiling 是当前用于关闭该前提的输入门：
+
+| 检查 | 要求 |
+| --- | --- |
+| workload report | `forced_token.enabled=true` 的 replay run 必须 `all_actual_outputs_match_plan=true`。 |
+| bundle | replay 必须显式记录 `trace_sim.hicache.forced_token_bundle.v1`、bundle hash/id，并覆盖 selected input。 |
+| bundle plan | bundle entry 的 plan hash、workload id/fingerprint、request count 必须与实际 plan 一致。 |
+| plan schema | `forced_token.plan_schema=trace_sim.hicache.forced_token_plan.v1`。 |
+| plan hash | 同 input 下所有 replay run 的 `forced_token.plan_sha256` 必须一致。 |
+| output check | `unchecked_count=0`、`mismatch_count=0`、`prompt_mismatch_count=0`。 |
+| invariant signature | forced plan 一致后，`hicache_state_matrix.py` 仍必须证明 same-input canonical workload signature match。 |
+
+`profile_quality.py` 把 forced replay 或 bundle provenance mismatch 视为 profiling input contract 错误；
+`hicache_state_matrix.py` 把 bundle signature、plan signature 和 canonical workload signature 并列作为 quality gate。C++ state
+model 不读取 bundle、`forced_output_ids` 或 capture provenance。
+单 run quality 分别输出 `plan_ready`、`bundle_ready` 和总 `ready`，避免 bundle 缺失污染 plan-hash 一致性诊断。
+
+run config 声明 forced capture/replay 时，workload report 缺失或 mode 不一致也属于合同错误。workflow 每次按当前代码重新审计
+manifest，不复用旧 quality cache；因此旧 run 不能靠历史 `profile_quality.json` 绕过新 gate。
+
+`hicache_state_workflow.py` 会把该检查压缩到 `workflow_summary.json.input_contracts`：同 input 下
+`signature_match=true`、`forced_token_plan_signature_match=true` 且 `forced_token_bundle_signature_match=true` 时，
+`input_contract_ready=true`；`workflow_summary.json.forced_token_bundles` 记录 capture bundle 到 replay/validation 的依赖链。
 
 ## 当前模型边界
 
@@ -56,29 +93,34 @@ HiCache state 主线使用 target-level atomic fact contract。
 
 | 机制 | 当前语义 |
 | --- | --- |
-| token/path | `HiCacheTokenPathStore` 收集 dictionary/span，`HiCacheTargetPager` 按 target page size 生成完整 page hash。 |
+| token/path | `HiCacheTokenDirectory` 保存 fact-local path snapshot 和 request timeline；resolver 按 match/admission/lifecycle/prefetch 语义显式取 path，`HiCacheTargetPager` 按 target page size 生成完整 page hash。 |
 | canonical radix | 每个 `cache_scope` 一棵 canonical token/page radix tree；device/host/storage/ref 是 node state，不再维护 device tree 与 host tree 两套事实源。 |
 | device allocator | `request_admission` 构造 `ExtendAllocationIntent`；eviction gate 使用 `DeviceAllocatorLedger.available_pages()`，不从 radix occupancy 反推。 |
-| request lifecycle | finished / unfinished 在 handler 内恢复 committed token path，插入 radix，并释放 duplicate / tail / overallocated KV 到 allocator ledger。 |
+| request lifecycle | finished / unfinished 只消费 anchor 自带 committed/fill path，插入 radix，并释放 duplicate / tail / overallocated KV 到 allocator ledger。 |
 | capacity index | `HiCacheCapacityIndex` mutation-driven 维护 device/host leaf、occupied pages、reserved host pages、victim choice 和 audit trace。 |
 | ref ledger | request / writeback / loadback / storage / prefetch owner 级 acquire/release，输出 ref mutation 和 tree ref audit。 |
 | storage directory | 区分 materialized page record 与 backend-readable hash record；prefetch storage hit query 只保留连续 readable prefix。 |
 | prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离。 |
 | host cleanup | host allocation 失败按 SGLang request budget cleanup；victim 是 host-visible、evicted、无 ref 保护且无 backuped child 的 host radix leaf。 |
-| write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK 时序当前按同步或 target control boundary 近似。 |
+| write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK 时序当前按同步或 target control boundary 近似，`c1/deeper` 的 ordinary lock release 尚未闭合。 |
 
 当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、transition exactness 和异步 ACK / host release 的近似边界。
 
-## 当前有效结果
+## 当前保留基线与 active validation 状态
 
-### HCSV-20260618-5x3-matrix-after-reconstruction
+### HCSV-20260624-pre-bundle-5x3-baseline
 
-这是当前 active final-state 结论。验证基于 5 个 HiCache config、3 个 manual input 的 full Python probe matrix；bench-generated input 已清理，不作为当前结果口径。
+这是 bundle workflow 落地前的最新模型回归基线。它基于 5 个 HiCache config、3 个 manual input 的 forced-token full Python
+probe matrix，并通过当时的 `hicache_state_workflow.py` 执行 quality、final-state self/cross 和 transition exactness。
 
-当前结果目录：
+该 run 使用仓库固定 plan，不携带 bundle provenance。当前代码重新审计时会得到
+`forced_token_bundle_signature_match=false` 和 `input_contract_ready=false`，因此不能作为新 workflow 的 active 输入合同验收。
+下面数值仍用于保留模型 failure set；新的 active 结论必须来自重新 capture bundle 后的 replay。
+
+结果目录：
 
 ```text
-data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe/modeling/hicache_state_matrix_validation_after_reconstruction
+data/profile_runs/sglang/20260624_150913_profiling_hicache_state_config_space_forced_python_probe/modeling/hicache_state_workflow_manual_3inputs
 ```
 
 参与的 target configs：
@@ -99,87 +141,107 @@ data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_py
 | `manual_pressure_prefetch` | 更强 capacity pressure 与 prefetch 交错。 |
 | `manual_deeper_pressure_prefetch` | 更深 host/storage/prefetch pressure。 |
 
-final-state matrix：
+旧 workflow 当时记录的 quality：
 
 | 项 | 结果 |
 | --- | ---: |
-| self prediction | `15 / 15` pass |
-| cross prediction，含 self 对角线 | `75 / 75` pass |
-| validation ready | `75 / 75` ready |
-| final-state pass rate | `1.0` |
+| replay runs | `15` |
+| `state_quality_ready` | `15 / 15` |
+| strict `profile_quality_ready` | `12 / 15` |
+| pre-bundle input contract ready | `3 / 3` |
+| canonical signature match | `3 / 3` |
+| forced-token plan signature match | `3 / 3` |
+
+3 个 strict profile coverage failure 都是 `expected_hicache_mechanisms_missing`，具体缺少 `prefetch_transfer`。此外，
+当前 bundle gate 会额外阻塞全部 3 个 input；这与模型状态是否匹配无关，而是旧 run 缺少新 provenance 合同。
+
+final-state matrix：
+
+| 范围 | prediction | ready / exact | pass rate |
+| --- | ---: | ---: | ---: |
+| self 对角线 | `15` | `14 / 15` | `0.9333` |
+| cross（不含 self） | `60` | `56 / 60` | `0.9333` |
+| full self/cross | `75` | `70 / 75` | `0.9333` |
 
 按 input：
 
-| input | self | cross |
+| input | full prediction | final-state exact |
 | --- | ---: | ---: |
-| `manual_phased_fast` | `5 / 5` | `25 / 25` |
-| `manual_pressure_prefetch` | `5 / 5` | `25 / 25` |
-| `manual_deeper_pressure_prefetch` | `5 / 5` | `25 / 25` |
+| `manual_phased_fast` | `25` | `25 / 25` |
+| `manual_pressure_prefetch` | `25` | `25 / 25` |
+| `manual_deeper_pressure_prefetch` | `25` | `20 / 25` |
 
-按 input × target config 的 cross final-state 结果全部为 `5 / 5`：
-
-| input | c0 | c1 | c2 | c3 | c4 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `manual_phased_fast` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
-| `manual_pressure_prefetch` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
-| `manual_deeper_pressure_prefetch` | `5/5` | `5/5` | `5/5` | `5/5` | `5/5` |
-
-结论：
-
-- 当前 5x3 manual matrix 的 active final state 已闭环。
-- 该闭环不依赖 `source_actual`、`timing_observation`、`oracle_state` 或 target run result 回写。
-- bench-generated input 不在当前结果口径中；恢复 bench 前必须先证明 workload 输入跨配置稳定。
-- final-state pass 不表示 transition exactness、operation intent 或 DAG patch 已通过。
-
-### Transition Exactness 当前结果
-
-transition exactness 使用同一 matrix 目录生成：
+5 个 final-state failure 具有同一目标：
 
 ```text
-transition_exactness_cross_matrix.json
+input:  manual_deeper_pressure_prefetch
+target: c1_wts_wait_p128_low_l1
+source: 任意 c0..c4，包括 c1 self
 ```
+
+失败只在 `locked_pages`：模型保留 10 个额外 prefix ancestor ordinary lock。当前根因是
+write-through-selective ACK 阶段没有完整表达：
+
+```text
+ordinary write lock
+  -> storage host protection
+  -> ordinary lock release
+```
+
+L1/L2/dirty/backuped/evicted 已对齐。这个问题属于真实 final-state regression，不能用 transition 过滤或比较器规则绕过。
+
+### Transition Exactness 当前结果
 
 当前结果：
 
 | 层级 | 结果 |
 | --- | ---: |
 | prediction count | `75` |
-| oracle / model self-check ready | `75 / 75` |
-| T0 final-state exact | `75 / 75` |
-| T1 transition-count exact | `25 / 75` |
-| T2 page-lifecycle multiset exact | `25 / 75` |
+| oracle / model self-check ready | `70 / 75` |
+| final-state exact | `70 / 75` |
+| transition-count exact | `65 / 75` |
+| page-lifecycle multiset exact | `65 / 75` |
 
 失败分类：
 
 | classification | count |
 | --- | ---: |
-| `matched` | `25` |
-| `transition_semantic_or_snapshot_observability_mismatch` | `50` |
+| `matched` | `65` |
+| `transition_semantic_or_snapshot_observability_mismatch` | `5` |
+| `real_semantic_mismatch_or_final_state_regression` | `5` |
 
 按 target config：
 
-| target config | exact | T0 | T1 | T2 |
+| target config | exact | final-state | transition-count | page-lifecycle |
 | --- | ---: | ---: | ---: | ---: |
 | `c0_wt_timeout_p128_balanced` | `10 / 15` | `15 / 15` | `10 / 15` | `10 / 15` |
-| `c1_wts_wait_p128_low_l1` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
-| `c2_wb_best_effort_p64_low_l1` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
-| `c3_wt_best_effort_p32_low_host` | `0 / 15` | `15 / 15` | `0 / 15` | `0 / 15` |
+| `c1_wts_wait_p128_low_l1` | `10 / 15` | `10 / 15` | `10 / 15` | `10 / 15` |
+| `c2_wb_best_effort_p64_low_l1` | `15 / 15` | `15 / 15` | `15 / 15` | `15 / 15` |
+| `c3_wt_best_effort_p32_low_host` | `15 / 15` | `15 / 15` | `15 / 15` | `15 / 15` |
 | `c4_wb_timeout_p64_low_capacity` | `15 / 15` | `15 / 15` | `15 / 15` | `15 / 15` |
 
 按 input：
 
-| input | exact | T0 | T1 | T2 |
+| input | exact | final-state | transition-count | page-lifecycle |
 | --- | ---: | ---: | ---: | ---: |
-| `manual_phased_fast` | `10 / 25` | `25 / 25` | `10 / 25` | `10 / 25` |
-| `manual_pressure_prefetch` | `10 / 25` | `25 / 25` | `10 / 25` | `10 / 25` |
-| `manual_deeper_pressure_prefetch` | `5 / 25` | `25 / 25` | `5 / 25` | `5 / 25` |
+| `manual_phased_fast` | `25 / 25` | `25 / 25` | `25 / 25` | `25 / 25` |
+| `manual_pressure_prefetch` | `25 / 25` | `25 / 25` | `25 / 25` | `25 / 25` |
+| `manual_deeper_pressure_prefetch` | `15 / 25` | `20 / 25` | `15 / 25` | `15 / 25` |
 
 解释：
 
-- T0 已经是 final-state hard pass。
-- T1/T2 的 50 个 mismatch 不是 final-state failure，而是 transition 语义或 snapshot 可观测性层面的差异。
-- `locked_pages` 仍参与 T0 final-state 检查，但暂不参与 T1/T2 transient exactness；真实 lock/ref inc/dec 来自 `source_actual` evidence，按约束不能作为 state model input。
-- `operation-intent` 当前只是 DAG patch 前的 scaffold，不能直接作为 patch 输入。
+- 65 个 prediction 已同时满足 final state、transition count 和 page lifecycle multiset exact；
+- 5 个 target=`c0`、input=`manual_deeper_pressure_prefetch` 的 prediction 只差
+  `mark_evicted` / `clear_evicted` marker oscillation，final state 和其它 residency/backup lifecycle exact；
+- 5 个 target=`c1`、input=`manual_deeper_pressure_prefetch` 的 prediction 被 final-state lock regression 阻塞，不能解释为
+  transition-only mismatch；
+- `locked_pages` 仍参与 final-state 检查，但暂不参与 transition-count / page-lifecycle transient exactness；真实 lock/ref inc/dec
+  来自 `source_actual` evidence，按约束不能作为 state model input。
+- transition patch gate artifact 已达到 schema/coverage/filter readiness，但 `patch_allowed=false`；它只证明诊断 gate 完整，
+  不代表 DAG patch 已可执行。
+
+token directory 重构已通过该基线回归：原 `c3/manual_deeper_pressure_prefetch` 缺失的 8 个 lifecycle page transition 已消失，
+`c2`、`c3`、`c4` 当前均为 `15 / 15` transition exact。剩余 failure 不再归因于 lifecycle path fallback。
 
 ## 验证脚本职责
 
@@ -187,11 +249,14 @@ transition_exactness_cross_matrix.json
 
 | 脚本 | 职责 |
 | --- | --- |
-| `scripts/internal/hicache_state_cross_input_audit.py` | 跨配置 normal atomic invariant input contract 审计。 |
+| `scripts/internal/hicache_state_cross_input_audit.py` | 跨配置 normal atomic invariant input contract 审计；比较前先检查 path-bearing invariant 是否可被 C++ token parser 消费。 |
 | `scripts/internal/hicache_state_matrix.py` | matrix profile discovery、target config 推导、quality/self/cross 共用编排逻辑。 |
-| `scripts/internal/hicache_state_matrix_validation.py` | 执行 final-state quality / self / cross matrix validation；S1A/B 一对一是矩阵特例。 |
+| `scripts/internal/hicache_state_workflow.py` | profiling 后 HiCache validation 主入口；编排 quality、final-state self/cross 和 transition exactness。 |
 | `scripts/internal/hicache_state_provenance.py` | 基于 validation / predicted trace / oracle snapshot 的 mismatch 页面证据汇总，不回写模型。 |
-| `scripts/internal/hicache_transition_exactness.py` | 只读 transition exactness 链路：model self-check、target oracle extraction、self/cross compare、operation intent scaffold。 |
+| `scripts/internal/hicache_transition_exactness.py` | 只读 transition exactness CLI：model self-check、target oracle extraction、self/cross/matrix compare。 |
+| `scripts/internal/hicache_transition_taxonomy.py` | transition family 分类、DAG patch gate 字段和 evidence 摘要 helper；不提供 CLI。 |
+| `scripts/internal/hicache_transition_catalog.py` | transition mismatch catalog JSON/Markdown 和 family sample 生成；不提供 CLI。 |
+| `scripts/internal/hicache_transition_gate.py` | diagnostic operation gate payload、coverage 和 scoreboard 生成；不提供 CLI。 |
 
 这些脚本都不能生成 synthetic `model_input=true` 事件，不能修改 profiling trace，也不能把 `source_actual` / `timing_observation` /
 `oracle_state` 写回 target state。
@@ -204,30 +269,47 @@ transition_exactness_cross_matrix.json
 scripts/run.sh modeling -- bash -lc \
   'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
 scripts/run.sh modeling -- bash -lc \
-  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_matrix.py scripts/internal/hicache_state_matrix_validation.py scripts/internal/hicache_state_provenance.py scripts/internal/hicache_transition_exactness.py'
+  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/hicache_state_cross_input_audit.py scripts/internal/hicache_state_matrix.py scripts/internal/hicache_state_workflow.py scripts/internal/hicache_state_provenance.py scripts/internal/hicache_transition_exactness.py scripts/internal/hicache_transition_taxonomy.py scripts/internal/hicache_transition_catalog.py scripts/internal/hicache_transition_gate.py'
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
 
-跑 3 个 manual input 下的 5x5 final-state matrix：
+跑 3 个 manual input 下的 forced replay final-state matrix：
 
 ```bash
-python3 scripts/internal/hicache_state_matrix_validation.py \
-  --profile-run-dir data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe \
-  --output-dir data/profile_runs/sglang/20260618_204416_profiling_hicache_state_config_space_python_probe/modeling/hicache_state_matrix_validation_after_reconstruction \
-  --stages quality,self,cross \
-  --input manual_phased_fast \
-  --input manual_pressure_prefetch \
-  --input manual_deeper_pressure_prefetch
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_capture.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch
+
+CAPTURE_BUNDLE=data/profile_runs/sglang/<capture_suite>/forced_token_bundle.json
+RUN_DIR=<forced_replay_suite_dir>
+
+scripts/profile.sh \
+  configs/experiments/hicache_state/profiling_hicache_state_forced_replay.json \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --forced-token-bundle "$CAPTURE_BUNDLE"
+
+python3 scripts/internal/hicache_state_workflow.py \
+  --profile-run-dir "$RUN_DIR" \
+  --output-dir "$RUN_DIR/modeling/hicache_state_workflow_manual_3inputs" \
+  --stages quality,final-state,transition \
+  --prediction-scope self,cross \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --emit-transition-catalog \
+  --emit-transition-gates
 ```
+
+common suite 使用 `profiling_hicache_state_common.json`，只允许 `--prediction-scope self`；cross-config workflow 会拒绝
+没有 forced bundle contract 的 common run。
 
 只跑某个 targeted 格子：
 
 ```bash
-python3 scripts/internal/hicache_state_matrix_validation.py \
+python3 scripts/internal/hicache_state_workflow.py \
   --profile-run-dir <profile_run_dir> \
   --output-dir <profile_run_dir>/modeling/<targeted_output_dir> \
-  --stages self \
+  --stages quality,final-state \
+  --prediction-scope self \
   --input <input_id> \
   --source-config <config_id> \
   --target-config <config_id> \
@@ -253,36 +335,48 @@ python3 scripts/internal/hicache_transition_exactness.py \
   --observed-target-trace <observed_target_transition_trace.json>
 
 python3 scripts/internal/hicache_transition_exactness.py \
-  --mode compare-cross-matrix \
-  --matrix-dir <hicache_state_matrix_validation_dir>
+  --mode compare-matrix \
+  --matrix-dir <hicache_state_workflow_dir> \
+  --emit-catalog \
+  --emit-gates
 ```
 
 矩阵模式默认复用已生成的 target oracle；`--force` 会重建 full Python probe oracle，耗时明显更高，仅在脚本或 oracle 抽取逻辑变化后使用。
+在统一 workflow 中请求 transition 时，`--stages` 必须同时包含 `final-state`；独立只读诊断仍使用上面的
+`hicache_transition_exactness.py` CLI。
 
 结果摘要读取：
 
 ```bash
+jq '{workflow_mode,
+     quality,
+     input_contracts,
+     final_state_self,
+     final_state_cross,
+     transition}' \
+  <matrix_dir>/workflow_summary.json
+
 jq '{prediction_count,
      validation_ready_count,
      final_state_match_count,
      final_state_pass_rate,
      by_input}' \
-  <matrix_dir>/final_state_cross_5x4.json
+  <matrix_dir>/final_state_cross.json
 
 jq '{prediction_count,
      ready_count,
      exact_count,
-     t0_final_state_exact_count,
-     t1_transition_count_exact_count,
-     t2_page_lifecycle_multiset_exact_count,
+     final_state_exact_count,
+     transition_count_exact_count,
+     page_lifecycle_multiset_exact_count,
      failure_classification_counts,
      by_input,
      by_target_config}' \
-  <matrix_dir>/transition_exactness_cross_matrix.json
+  <matrix_dir>/transition_exactness_matrix.json
 ```
 
-`final_state_self_5x4.json` 和 `final_state_cross_5x4.json` 是脚本沿用的历史文件名；当前 active 结果口径以文件内
-`prediction_count`、`by_input` 和本文记录为准。
+`final_state_self.json`、`final_state_cross.json` 和 `transition_exactness_matrix.json` 是当前 workflow 的规模无关输出；
+矩阵规模以文件内 `prediction_count`、`by_input` 和 `workflow_summary.json` 为准。
 
 ## 已关闭机制缺口
 
@@ -307,7 +401,9 @@ jq '{prediction_count,
 - prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 deferred release 近似；
 - write-through backup ACK 前持有普通 lock ref，并在下一条 target control fact 近似 drain。
 
-这些机制共同关闭了 15 个 manual self prediction 中的 L2/backuped/evicted/locked final-state mismatch，并在当前 75 个 prediction 中保持 final-state pass。
+这些机制关闭了旧矩阵中的 L2/backuped/evicted/locked mismatch。当前 forced-token 矩阵中 L1/L2/dirty/backuped/evicted
+仍保持对齐，但 `c1/manual_deeper_pressure_prefetch` 暴露了更精确的 ACK-stage ordinary lock release 缺口，因此不能继续声称
+75 个 prediction 全部 final-state pass。
 
 ## 历史阶段摘要
 
@@ -331,9 +427,14 @@ jq '{prediction_count,
 
 ## 下一步
 
-当前不再围绕 final-state count 做局部补丁。后续优先级：
+后续优先级：
 
-1. 针对 50 个 T1/T2 transition mismatch 做 family-level 逐 trace 诊断，优先 `c1` dirty oscillation、`c2` write-back/eviction 交错、`c3` low-host cleanup 和 deeper prefetch evicted marker。
-2. 把 raw transition 聚合成 stable `CacheIntentLog`，作为 DAG patch 的输入层，而不是直接把 page-level transition 转成 graph mutation。
-3. 为 loadback intent、batch-level allocation intent、maintenance/ACK boundary 设计 target-independent invariant；只有现有 target-derived 机制无法表达时才新增 profiling target。
-4. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。
+1. 先用新 capture bundle 重跑 5x3 replay 和完整 workflow，恢复当前 input contract 的 active 结果。
+2. 若旧 failure set 复现，修复 `c1_wts_wait_p128_low_l1` 在 deeper pressure 下的 write-through-selective ACK/ref lifecycle，明确区分 ordinary
+   write lock 与 storage host protection，并在 ACK 后释放 ordinary ancestor lock。
+3. 修复后重跑 5x3 forced-token workflow，确认 `c1/deeper` 5 个 final-state blocked prediction 收敛，并检查是否只剩 marker
+   mismatch。
+4. 再审查 `c0/deeper` 的 `mark_evicted` / `clear_evicted` oscillation；当前它是 state-marker-only，不能直接进入 DAG patch。
+5. 把 exact transition 聚合成 stable `CacheIntentLog`，同时保持 patch gate 的 `patch_allowed=false`，直到 source attribution、
+   duration 和 remaining semantic boundary 都具备证据。
+6. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。

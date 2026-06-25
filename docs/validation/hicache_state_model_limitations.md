@@ -251,8 +251,8 @@ rewrite。
 model-self-check
 extract-target-oracle
 compare-self / compare-cross
-compare-cross-matrix
-operation-intent
+compare-matrix
+transition catalog / operation gate artifacts
 ```
 
 这条链路证明了模型侧 transition 账本可以按 stable active state replay，并能从 target full Python probe 中抽取 validation-only
@@ -260,43 +260,36 @@ observed state delta。但这不等价于所有中间 transition 都已和 SGLan
 
 ### 当前证据
 
-在当前 5 config x 3 manual input 的 75 个 prediction 上，矩阵级 transition exactness 结果为：
+在 2026-06-24 pre-bundle forced-token 5 config x 3 manual input 的 75 个 prediction 上，矩阵级 transition exactness 结果为：
 
 ```text
-T0 final-state exact: 75 / 75
-model/target oracle ready: 75 / 75
-T1 transition-count exact: 25 / 75
-T2 page-lifecycle multiset exact: 25 / 75
+final-state exact: 70 / 75
+model/target oracle ready: 70 / 75
+transition-count exact: 65 / 75
+page-lifecycle multiset exact: 65 / 75
 ```
 
-通过集中在：
+该基线的 failure 只剩两组：
 
 ```text
-c4_wb_timeout_p64_low_capacity: 15 / 15
-c0_wt_timeout_p128_balanced:
-  manual_phased_fast 5 / 5
-  manual_pressure_prefetch 5 / 5
+c0 + manual_deeper_pressure_prefetch:
+  5 个 source -> c0 prediction final state exact；
+  只差 mark_evicted / clear_evicted marker oscillation。
+
+c1 + manual_deeper_pressure_prefetch:
+  5 个 source -> c1 prediction final state 不 exact；
+  模型多保留 10 个 prefix ancestor ordinary lock，transition compare 被阻塞。
 ```
 
-未通过的主要 mismatch family：
-
-- `c1_wts_wait_p128_low_l1` target 下存在大量 `mark_dirty` / `clear_dirty` observed delta，但模型的同步 write-through-selective
-  语义没有逐步复现这些 transient dirty oscillation；
-- `c2_wb_best_effort_p64_low_l1` target 下存在 dirty transition 与 evicted transition 交错差异，final state 对齐但中间
-  write-back / eviction exactness 未对齐；
-- `c3_wt_best_effort_p32_low_host` target 下有 `add/remove_l1`、`add/remove_l2`、`mark/clear_backuped` 和 `mark/clear_evicted`
-  mismatch，集中体现 low-host capacity 下 host cleanup、host-visible prefix 和 loadback/eviction transient 的顺序差异；
-- `manual_deeper_pressure_prefetch` 的 `c0`/`c1` target 即使 self prediction 也存在 `mark_evicted` / `clear_evicted`
-  transient 差异，说明更深 prefetch pressure 下模型和 SGLang 的 evicted marker oscillation 并非逐步 exact；
-- raw `operation-intent` scaffold 仍直接面对 full probe 的 source_actual 粒度，observed evidence 中包含大量
-  maintenance、lookup、config、lock/ref 事件，不能直接作为 DAG patch intent。
+此前 `c1` dirty oscillation、`c2` write-back/eviction、`c3` low-host lifecycle 和 token-directory 尾页缺失已不在该基线 failure
+set 中。尤其 `c2`、`c3`、`c4` 在该基线中均为 `15 / 15` transition exact。长期文档不能继续把已关闭 family 写成当前主要失败。
 
 ### 当前妥协方案
 
 transition exactness 的当前 hard gate 分层如下：
 
 ```text
-T0:
+final-state:
   final-state exact，继续作为 state model 通过条件。
 
 model-self-check:
@@ -304,17 +297,18 @@ model-self-check:
   page_hit_counts 只作为诊断 metadata；
   locked_pages 的 strict replay mismatch 只作为 advisory。
 
-T1/T2:
+transition-count / page-lifecycle:
   比较 strip_scope 后的 global-union state delta；
   暂不比较 locked_pages transient，因为 lock/ref inc/dec 来自 source_actual evidence，
   按约束不能作为 state model input。
 
-operation-intent:
-  仅作为 DAG patch 前的 scaffold，不作为 exact pass 条件。
+transition patch gate:
+  schema/coverage/filter readiness 只证明 diagnostic artifact 完整；
+  当前 patch_allowed=false，不是 DAG patch 通过。
 ```
 
-这不是把 mismatch 视为通过，而是先把“验证链路是否可用”和“模型是否逐步 exact”分开。当前 T1/T2 mismatch 不能用小的 Python
-比较器补丁修成语义通过；需要回到 SGLang 源码和 full probe 逐 trace 对齐具体机制。
+这不是把 mismatch 视为通过，而是先把“验证链路是否可用”和“模型是否逐步 exact”分开。当前 transition-count /
+page-lifecycle mismatch 不能用小的 Python 比较器补丁修成语义通过；需要回到 SGLang 源码和 full probe 逐 trace 对齐具体机制。
 
 ### 风险
 
@@ -329,11 +323,12 @@ operation-intent:
 
 后续应按以下顺序收敛：
 
-1. 针对 `c1` 的 dirty oscillation 做逐 trace 对齐，区分 write-through-selective 的真实 dirty marker 与 snapshot 包围差分重复计数；
-2. 针对 `c2` 的 write-back / eviction 交错，把同步 ACK 近似替换成可验证的 operation lifecycle 边界；
-3. 针对 `c3` low-host，沿 host cleanup victim、host-visible prefix、loadback promotion 和 host eviction 顺序做 source-level 对齐；
-4. 针对 deeper prefetch pressure，检查 prefetch apply / revoke / timeout 期间 evicted marker 的 node-level oscillation；
-5. 把 operation intent 聚合到 stable cache operation 层，再把该层作为 DAG patch 输入，而不是直接消费 raw transition rows。
+1. 先修 `c1/deeper` 的 write-through-selective ACK/ref lifecycle，表达 ordinary write lock 到 storage host protection 的
+   ownership 转移和 ordinary lock release；
+2. final state 恢复后，确认 `c1/deeper` 是否仍存在 marker-only transition mismatch；
+3. 再检查 `c0/deeper` 的 evicted marker node-level oscillation，判断它是纯派生 marker 边界还是仍对应物理 operation；
+4. 把 exact transition 聚合到 stable cache operation 层，再把该层作为 DAG patch 输入，而不是直接消费 raw transition rows；
+5. source attribution、duration 和 semantic boundary 未齐备前保持 `patch_allowed=false`。
 
 ### 当前状态
 
@@ -342,8 +337,9 @@ operation-intent:
 - `model-self-check` 输出 `model_transition_self_check.json`；
 - `extract-target-oracle` 输出 `observed_target_transition_trace.json`；
 - `compare-self` / `compare-cross` 输出 per-prediction transition exactness JSON；
-- `compare-cross-matrix` 输出 `transition_exactness_cross_matrix.json`；
-- `operation-intent` 输出 `operation_intent_exactness.json` scaffold。
+- `compare-matrix` 输出 `transition_exactness_matrix.json`；
+- 显式 `--emit-catalog` 输出 `transition_mismatch_catalog.json/.md` 和 family samples；
+- 显式 `--emit-gates` 输出 `transition_patch_gate_scoreboard.json` 以及 per-prediction diagnostic operation gate artifacts。
 
 该脚本不生成 `model_input=true` 事件，不修改 profiling trace，不替代 final-state validation。
 
@@ -351,8 +347,8 @@ operation-intent:
 
 ### 问题
 
-当前 5x3 manual matrix 的 final state 已经全部对齐，但其中若干 host/storage 机制仍使用 target-control 边界近似，而不是完整复现
-SGLang 后台线程、ACK、release queue drain 和 scheduler progress 的精确时序。
+2026-06-24 pre-bundle forced-token 5x3 matrix 的 final state 为 `70 / 75`。其中若干 host/storage 机制仍使用 target-control 边界近似，
+而不是完整复现 SGLang 后台线程、ACK、release queue drain 和 scheduler progress 的精确时序。
 
 这些近似包括：
 
@@ -371,10 +367,10 @@ SGLang 后台线程、ACK、release queue drain 和 scheduler progress 的精确
   host cleanup，最终多留 L2/backuped/evicted page；
 - `manual_pressure_prefetch/c1`、`manual_deeper_pressure_prefetch/c1` 和 `manual_deeper_pressure_prefetch/c0` 中，旧模型把 active
   prefetch reservation 保留过久，导致后续 host cleanup 比 SGLang 多执行一次；
-- `manual_deeper_pressure_prefetch/c1` 中，write-through-selective backup ACK 前的普通 lock ref 没有建模，导致 final
-  `locked_pages` 少 11 页。
+- 旧 `manual_deeper_pressure_prefetch/c1` 证据推动模型加入 write-through-selective backup ACK 前的 ordinary lock ref。
 
-修复后，当前 15 个 manual self prediction 和 75 个同 input cross prediction 的 final state 均通过。
+该 pre-bundle forced-token 回归进一步证明该近似仍不完整：`c1/deeper` 模型会多保留 10 个 prefix ancestor ordinary lock。真实 SGLang
+在 ACK 后把 storage backup 所需 host protection 与 ordinary write lock 分开，并释放后者；模型尚未完整表达这次 ownership 转移。
 
 ### 当前妥协方案
 
@@ -392,14 +388,17 @@ eviction result 和 oracle snapshot 只作为诊断证据；它们不进入 norm
 
 ### 风险
 
-这些近似对 final state 有效，但会影响 transition exactness：
+这些近似在多数场景能收敛 final state，但当前 `c1/deeper` 已证明 ACK/ref 近似仍可能直接造成 final-state failure；同时它们会影响
+transition exactness：
 
-- T1/T2 可能多出或少掉 `mark_dirty` / `clear_dirty`、`mark_evicted` / `clear_evicted`、`add_l2` / `remove_l2` 等 transient；
+- transition-count / page-lifecycle 可能多出或少掉 `mark_dirty` / `clear_dirty`、`mark_evicted` / `clear_evicted`、`add_l2` /
+  `remove_l2` 等 transient；
 - background release queue drain 的真实时机可能改变 host cleanup victim；
 - ACK 与 request boundary 之间的交错可能改变 locked transition 的数量和顺序；
 - loadback / write-back / prefetch 同时发生时，同步折叠可能让 operation order 与 SGLang 不一致。
 
-这也是当前 transition exactness 只有 `25 / 75` 严格通过的主要解释之一。
+该基线的 transition exactness 为 `65 / 75`；其中 5 个被上述 final-state lock regression 阻塞，另 5 个是
+`c0/deeper` evicted marker oscillation。coarse async boundary 仍阻塞 DAG patch，但不再能笼统解释成 50 个 transition failure。
 
 ### 正确方向
 
@@ -419,8 +418,57 @@ storage_control_drain_boundary
 
 ### 当前状态
 
-该限制不阻塞当前 final-state validation，但阻塞 transition exactness 和 DAG patch。后续应优先在 `c1`、`c2`、`c3` 和
-`manual_deeper_pressure_prefetch` 上做逐 trace 对齐，确认哪些 mismatch 是可观测性差异，哪些需要新增 invariant boundary。
+该限制当前直接阻塞 `c1/manual_deeper_pressure_prefetch` 的 final-state validation，并继续阻塞 transition intent 到 DAG patch。
+后续先修 ACK-stage ref lifecycle，再决定是否需要新增 target-independent ACK boundary；`c2`、`c3` 已不在当前 failure set 中。
+
+## HCSV-LIMIT-005: cross-config prediction 依赖外部 token timeline 合同
+
+### 问题
+
+相同 text prompt、greedy、固定 seed 和 deterministic kernel 都不能严格保证不同 HiCache 配置生成相同 continuation。
+一旦 output token 分叉，后续 radix key、page hash、prefetch candidate、finished insert 和 writeback 对象都会一起变化，此时
+cross-config state mismatch 不再能归因到 C++ model。
+
+### 当前妥协方案
+
+当前 manual 5x3 validation workflow 使用 forced-token capture/replay：
+
+```text
+capture real /generate -> forced_token_plan.json
+capture suite -> forced_token_bundle.json
+replay --forced-token-bundle -> resolve selected input plan
+real prefill/decode -> override committed output token
+quality -> verify actual output_ids == forced_output_ids
+```
+
+forward、sampling、scheduler、allocator、KV 写入和 HiCache lifecycle 仍真实执行。C++ model 不读取 plan，只消费 replay trace
+中的 invariant token dictionary/span。
+
+### 风险
+
+- forced token 固定 token path，但不固定 batch timing、scheduler interleaving 或 async completion；
+- streaming、parallel sampling、stop/grammar/speculative/disaggregation 路径不在第一版合同内；
+- workload、tokenizer 或模型变化后仍需要重新 capture；bundle gate 只能防止隐式误用，不能证明旧 token timeline 仍适用。
+
+### 正确方向
+
+跨配置 validation 必须继续把 token timeline 作为 profiling input contract，并同时检查：
+
+```text
+plan schema/hash
+workload id/fingerprint
+request ordering/count
+actual output match
+same-input canonical invariant signature
+```
+
+capture plan 已升级为 suite-level bundle，由 replay CLI 显式接收；runner 不保留 repo 固定 plan 或隐式 latest fallback。
+
+### 当前状态
+
+bundle workflow 已实现并通过本地 schema、聚合、plan 注入、preflight、workload provenance 和 replay dry-run 检查。
+2026-06-24 的 5x3 run 早于 bundle workflow；它的 70/75 final-state 与 65/75 transition 只保留为 pre-bundle 模型基线，
+当前 gate 会因缺少 bundle provenance 拒绝它。需要真实重跑后才能重新证明 generated output divergence 已被当前合同关闭。
 
 后续如果发现新的长期建模缺口，应继续按同一结构追加：
 

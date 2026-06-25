@@ -2,6 +2,85 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-25 21:42:23 +0800
+
+- 在高层重构基础上为 `docs/project_constraints.md` 补回必要的可执行约束：
+  - profiling channels、suite 继承规则和运行入口；
+  - cache-state 五字段输入 gate、当前原子 role、scope/sequence 与 token dictionary/span 合同；
+  - forced plan/bundle schema、preflight、输出匹配和 cross-config 三重签名门禁；
+  - target config、validation 前置条件、输出开关和提交前检查。
+- 未恢复历史阶段、具体实验参数、失活配置或兼容入口。
+
+## 2026-06-25 21:38:49 +0800
+
+- 重构 `docs/project_constraints.md`：
+  - 删除实现清单、具体参数、历史清理记录和已失活实体；
+  - 收敛为文档证据、运行环境、profiling、cache-state 输入、common/forced workflow、modeling、validation、配置产物和工程质量的高层边界；
+  - 当前配置和 workflow 约束保持对齐。
+
+## 2026-06-25 21:31:57 +0800
+
+- 收敛 `configs/` 为当前 cache-state 开发主链：
+  - 只保留 `profiling_hicache_state_common.json`、`profiling_hicache_state_forced_capture.json` 和
+    `profiling_hicache_state_forced_replay.json`；
+  - 删除 S1A/S1B、mainline-one、smoke、common/forced faithful profiling suite 和静态 faithful/cache-state modeling config；
+  - 移除保留配置中的 S1A/S1B 与 faithful pair 描述，common/forced 命名和 `profile_mode` 现在显式区分；
+  - cache-state target modeling config 统一由 `hicache_state_workflow.py` 动态生成。
+- workflow 同步收紧：common suite 只允许 self prediction，cross-config prediction 必须使用 forced replay suite；
+  common run 不再被空 forced-token 集合标记为 `input_contract_ready=true`。
+- README、profiling/modeling 开发文档、validation、project constraints 和 `scripts/model.sh` 用法已同步。
+
+## 2026-06-25 21:09:05 +0800
+
+- 完成 forced-token bundle workflow 和相关主线文档的终检：
+  - replay quality 改为无条件要求 bundle path/schema/hash/id 与 bundle-plan hash 对齐，旧无 bundle replay 不再能在单 run
+    quality 中通过；
+  - forced-token quality 拆分 `plan_ready`、`bundle_ready` 和总 `ready`，matrix 的 plan/bundle signature 保持独立诊断；
+  - profile quality 从 run config 校验预期 forced mode，workload report 缺失或 mode 不一致时直接失败；
+  - workflow quality 每次重新审计 manifest，不再复用旧 quality cache；
+  - transition stage 强制与 final-state stage 同次执行，避免复用未经过当前输入合同的旧 prediction rows；
+  - suite preflight 改为不留空目录，默认 fail-fast 也会先写 `suite_result.json` 再退出；
+  - 删除 deprecated `hicache_state_matrix_validation.py` 兼容入口，统一使用 `hicache_state_workflow.py`；
+  - README、profiling、validation、limitations、project constraints 和仍 active 的 transition 临时文档已同步当前
+    pre-bundle / active gate 边界。
+- 真实 capture/replay 仍未重跑；2026-06-24 5x3 结果继续只作为 pre-bundle 模型回归基线。
+
+## 2026-06-25 16:04:05 +0800
+
+- 完成 forced-token capture/replay bundle workflow：
+  - capture experiment 改为写 run-local immutable plan，capture suite 聚合 `forced_token_plans/` 和
+    `forced_token_bundle.json`；
+  - `scripts/profile.sh` / `profile_runner.py` 新增 `--forced-token-bundle`，forced replay 一律要求显式 bundle；
+  - replay config 改为 `{forced_token_plan}` 注入，不再保留仓库固定 plan 或 latest capture fallback；
+  - preflight 校验 bundle schema、selected input、plan path/hash、workload id/fingerprint、request count 和 logical request 顺序；
+  - suite selection/result、run config、workload report、profile quality、matrix quality 和 workflow summary 均记录并校验
+    bundle provenance；
+  - 删除 `configs/workloads/hicache/forced/` 下旧固定 plan 和说明。
+- 本地验证：
+  - Python compile、shell parse、全量 JSON parse 和 `git diff --check` 通过；
+  - 临时 plan/bundle replay preflight 通过，无 bundle replay 被拒绝；
+  - 模拟 3-input capture aggregation和 portable relative plan resolution 通过；
+  - 1x1 replay suite dry-run 证明 suite/run artifacts 记录显式 bundle 依赖；
+  - workload report 的 bundle-plan hash mismatch 能被 quality contract 拦截。
+- 2026-06-24 的旧 5x3 run 没有 bundle provenance；它保留为 pre-bundle 模型回归基线，不能作为当前 bundle gate 的
+  active validation。真实 capture/replay 尚未重跑。
+
+## 2026-06-25 15:37:58 +0800
+
+- 完成 HiCache 临时文档迁移和长期文档对齐：
+  - 将 forced-token profiling、profiling workflow 重构、Python probe API 审计和 token directory 重构的稳定内容拆入
+    `README.md`、profiling/modeling 主线文档、validation、model limitations 和 project constraints；
+  - 删除上述 4 份已完成临时文档；保留尚未实现的 forced-token bundle 设计和仍在处理的 transition exactness 根因文档；
+  - 用 2026-06-24 forced-token 5x3 workflow 产物替换 2026-06-18 旧 active baseline。
+- 当前有效结果：
+  - 15 个 replay run 中 `state_quality_ready=15/15`、strict `profile_quality_ready=12/15`；
+  - 3 个 input 的 canonical signature 和 forced-token plan signature 均 ready；
+  - final state self `14/15`、cross excluding self `56/60`、full self/cross `70/75`；
+  - transition ready/final-state exact `70/75`，transition-count 和 page-lifecycle exact `65/75`；
+  - 剩余 failure 为 5 个 `c1/deeper` ACK-stage ordinary lock release 缺口，以及 5 个 `c0/deeper`
+    evicted-marker-only mismatch。
+- 本轮只修改文档，没有修改 profiling/modeling 实现，也没有重跑真实 profiling。
+
 ## 2026-06-22 02:21:06 +0800
 
 - 完成 HiCache 文档收敛：

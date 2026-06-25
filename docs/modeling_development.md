@@ -65,6 +65,9 @@ scripts/run.sh modeling -- bash -lc \
 不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
 可复现 profile/modeling run。
 
+当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `hicache_state_workflow.py` 从 profile suite 的 target
+server metadata 动态生成 target config，写入 `<workflow_output>/configs/`。
+
 faithful replay：
 
 ```bash
@@ -180,7 +183,7 @@ HiCache backend 当前是 state-only `SimulationModule`：它消费 invariant fa
 ```text
 HiCacheFact
   -> HiCacheFactRouter
-  -> HiCacheTokenPathStore
+  -> HiCacheTokenDirectory / role-specific token resolver
   -> HiCacheTargetPager
   -> scoped canonical HiCacheTokenRadixTree
   -> StorageDirectory / RefLedger / CapacityIndex / AsyncOperationTable / TargetControlClock
@@ -193,22 +196,23 @@ HiCacheFact
 后端输入分流规则：
 
 ```text
-consume fact iff model_input == true
+consume fact iff phase == "end"
+    && model_input == true
     && fact_class == "invariant_state"
     && fact_granularity == "atomic"
     && role is a known atomic invariant
 ```
 
-其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。`source_actual`、`timing_observation`、
-`oracle_state` 和 debug/provenance 字段只能用于 token dictionary 水合、质量审计、validation label 或 transition
-归因；不能回写为 target state mutation。
+其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。token dictionary 也只从 completed
+atomic invariant `model_input=true` event 水合；`source_actual`、`timing_observation`、`oracle_state` 和
+debug/provenance 字段只能用于质量审计、validation label 或 transition 归因，不能回写为 target state mutation。
 
 当前正常 state input role：
 
 | role | 语义 |
 | --- | --- |
 | `request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path，并做 target lookup / touch。 |
-| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界；模型基于 token store 恢复 committed/fill path，插入 radix 并释放 request KV lifecycle。 |
+| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
 | `request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
 | `prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
 | `prefetch_check_point` | prefetch progress/wait 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
@@ -227,7 +231,7 @@ cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比
 | --- | --- |
 | `hicache_fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
 | `hicache_router.hpp/.cpp` | role enum、输入门禁和 required field 检查。 |
-| `hicache_token_store.hpp/.cpp` | request / operation scoped token path store；不保存 source page identity 作为状态输入。 |
+| `hicache_token_store.hpp/.cpp` | `HiCacheTokenDirectory`、event-local path snapshot、request timeline 和 role-specific resolver；不保存 source page identity 作为状态输入。 |
 | `hicache_target_pager.hpp/.cpp` | 按 target page size 投影完整 page hash、page id 和 page path。 |
 | `hicache_token_radix_tree.hpp/.cpp` | 每个 `cache_scope` 一棵 canonical compressed radix tree；device/host/storage/ref 都是 node residency/ref 字段，不再维护 device tree 与 host tree 两套事实源。 |
 | `hicache_storage_directory.hpp/.cpp` | target storage namespace；区分 materialized page record 与 backend-readable hash record，支持连续 storage hit prefix 查询。 |
@@ -290,6 +294,15 @@ request / allocator：
 - 当前 batch-level allocation intent 尚未由 profiling 提供，模型以 `extend_allocation_batch_size=1` 作为显式短期合同；
 - `request_lifecycle_anchor` 在 finished / unfinished 上插入 committed path，并释放 duplicate / tail / overallocated KV 到 allocator ledger。
 
+token directory：
+
+- `HiCacheTokenDirectory` 保存 event-local token path snapshot 和 request timeline；`request_id` 只表示请求身份，不表示静态 token path；
+- path 消费必须走 role-specific resolver：match/admission/lifecycle/prefetch 分别只消费对应 fact-local path；
+- lifecycle 缺少 committed path 时必须记录 missing 诊断并跳过 mutation，不能静默复用 admission path；
+- `prefetch_decision` path 只作为 prefetch candidate，不更新 request committed timeline；
+- directory 只接收 completed atomic invariant `model_input=true` 的 path；diagnostic/source path 不能为 normal model 水合 token；
+- lifecycle resolver 可以读取 earlier committed snapshot 做 duplicate/tail 计算，但本次 lifecycle mutation 的目标 path 必须来自当前 fact。
+
 host / storage / prefetch：
 
 - host cleanup victim 是 host radix leaf，必须 host-visible、evicted、无 lock/host ref protection，且没有 host-present backup child；
@@ -304,7 +317,10 @@ write policy：
 
 - `write_through`、`write_through_selective` 和 `write_back` 共享 device insert、host backup、storage readable、capacity cleanup helper；
 - `write_through_selective` 的 hit-count threshold 由 target policy 决定；
-- write-through backup ACK 前会持有普通 lock ref；当前按下一条 target control fact drain，最后一条 fact 后的 pending ACK 可以保留到 final；
+- write-through backup ACK 前会持有普通 lock ref；当前按 target control fact 近似 drain；
+- write-through-selective + storage backup 的 ACK 阶段尚未完整表达
+  `ordinary write lock -> storage host protection -> ordinary lock release`，在 deeper pressure 下会把部分 ancestor ordinary lock
+  错留到 final state；
 - write-back ACK 时序当前折叠为同步 completion，结果语义统一落到 host backup / storage readable / dirty clear；
 - source writeback ACK、storage hit result、node remove result 和 async wall-clock completion 不能作为 normal state input。
 
@@ -325,6 +341,7 @@ model_summary.json.modules[0].hicache
 | `skipped_non_invariant_events` | 跳过的 source_actual / timing / oracle / debug events。 |
 | `processed_events_by_role` | 各 role 消费计数。 |
 | `missing_invariant_facts` | 缺失或未知 invariant 输入。 |
+| `token_path_diagnostics` | role-specific path resolution、lifecycle missing/stale、timeline 和 direct-fact 使用情况。 |
 | `non_invariant_fact_usage` | 非不变量实际消费审计；正常必须为空。 |
 | `final_state` | `DerivedStateView` 派生的模型最终 state sets 和 counts。 |
 | `storage_directory_inclusive_state` | 包含 backend-readable hash 的 storage-inclusive projection。 |
