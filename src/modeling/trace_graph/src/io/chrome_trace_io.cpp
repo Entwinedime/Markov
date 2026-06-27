@@ -77,6 +77,20 @@ bool ignored_duration_event_name(const std::string & name) {
     return std::ranges::find(ignored_names, name) != std::end(ignored_names);
 }
 
+std::string fact_class_from_event(const TraceEvent & event) {
+    const auto raw = event.arg("fact");
+    if (raw.empty()) return "";
+    try {
+        auto value = Json::parse(raw);
+        if (value.is_string()) value = Json::parse(value.get<std::string>());
+        if (!value.is_object()) return "";
+        return lower_string(json_string(value, "class"));
+    }
+    catch (...) {
+        return "";
+    }
+}
+
 bool validation_only_event(const TraceEvent & event) {
     /**
      * @brief 判断事件是否只服务 validation/debug。
@@ -84,7 +98,7 @@ bool validation_only_event(const TraceEvent & event) {
      * validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
      * 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
      */
-    auto fact_class = lower_string(event.arg("fact_class"));
+    auto fact_class = fact_class_from_event(event);
     if (fact_class == "oracle_state" || fact_class == "debug_quality") return true;
     auto kind = lower_string(event.arg("event_kind"));
     return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff" || kind == "profiling_quality";

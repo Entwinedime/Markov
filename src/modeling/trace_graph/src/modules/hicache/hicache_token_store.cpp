@@ -56,8 +56,11 @@ HiCacheTokenSnapshotStage stage_for_fact(const HiCacheFact & fact) {
     return HiCacheTokenSnapshotStage::Unknown;
 }
 
-bool model_input_source_allowed(const HiCacheFact & fact) {
-    return fact.is_end && fact.model_input && fact.fact_class == "invariant_state" && fact.fact_granularity == "atomic";
+bool state_model_path_source_allowed(const HiCacheFact & fact) {
+    if (!fact.is_end || !fact.has_consumer("hicache_state_model")) return false;
+    if (fact.fact_class == "target_policy_input") return fact.role == "prefetch_decision";
+    if (fact.fact_class != "workload_identity") return false;
+    return fact.role == "request_bound_match_anchor" || fact.role == "request_lifecycle_anchor" || fact.role == "request_admission";
 }
 
 std::string snapshot_id_for_fact(const HiCacheFact & fact, HiCacheTokenSnapshotStage stage) {
@@ -94,7 +97,7 @@ HiCacheTokenResolution source_rejected_resolution(const HiCacheFact & fact) {
         .status = HiCacheTokenResolutionStatus::SourceClassRejected,
         .stage = stage_for_fact(fact),
         .token_count = fact.token_count,
-        .reason = "token path snapshot is not a model-input invariant fact",
+        .reason = "token path snapshot is not a state-model path fact",
     };
 }
 
@@ -167,7 +170,7 @@ std::string HiCacheTokenDirectory::scoped_request_key(const HiCacheFact & fact) 
 
 void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t page_size) {
     const auto key = scoped_request_key(fact);
-    if (key.empty() || !hicache_fact_has_resolved_full_path(fact) || !model_input_source_allowed(fact)) return;
+    if (key.empty() || !hicache_fact_has_resolved_full_path(fact) || !state_model_path_source_allowed(fact)) return;
 
     const auto stage = stage_for_fact(fact);
     if (!snapshot_stage_observable(stage)) return;
@@ -188,8 +191,6 @@ void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t
         .token_count = token_count,
         .page_aligned_token_count = aligned_token_count(token_count, page_size),
         .completeness = completeness_for_snapshot(fact, page_size),
-        .source_class = fact.fact_class,
-        .model_input = fact.model_input,
     };
 
     snapshots_.push_back(std::move(snapshot));
@@ -197,7 +198,7 @@ void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t
 }
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_match_path(const HiCacheFact & fact, uint64_t page_size) const {
-    if (!model_input_source_allowed(fact)) return source_rejected_resolution(fact);
+    if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
     if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::Match)
         return wrong_stage_resolution(fact, "match resolver only accepts request_bound_match_anchor facts");
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact, "request_bound_match_anchor requires a fact-local lookup token path");
@@ -205,7 +206,7 @@ HiCacheTokenResolution HiCacheTokenDirectory::resolve_match_path(const HiCacheFa
 }
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_admission_path(const HiCacheFact & fact, uint64_t page_size) const {
-    if (!model_input_source_allowed(fact)) return source_rejected_resolution(fact);
+    if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
     if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::Admission)
         return wrong_stage_resolution(fact, "admission resolver only accepts request_admission facts");
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact, "request_admission requires a fact-local admission token path");
@@ -213,7 +214,7 @@ HiCacheTokenResolution HiCacheTokenDirectory::resolve_admission_path(const HiCac
 }
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_lifecycle_path(const HiCacheFact & fact, uint64_t page_size) const {
-    if (!model_input_source_allowed(fact)) return source_rejected_resolution(fact);
+    if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
     const auto expected_stage = stage_for_fact(fact);
     if (expected_stage != HiCacheTokenSnapshotStage::LifecycleFinished && expected_stage != HiCacheTokenSnapshotStage::LifecycleUnfinished) {
         return wrong_stage_resolution(fact, "request_lifecycle_anchor has an unsupported lifecycle kind");
@@ -226,7 +227,7 @@ HiCacheTokenResolution HiCacheTokenDirectory::resolve_lifecycle_path(const HiCac
 }
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_prefetch_path(const HiCacheFact & fact, uint64_t page_size) const {
-    if (!model_input_source_allowed(fact)) return source_rejected_resolution(fact);
+    if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
     if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::PrefetchCandidate)
         return wrong_stage_resolution(fact, "prefetch resolver only accepts prefetch_decision facts");
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact, "prefetch_decision requires a fact-local prefetch candidate path");
@@ -246,7 +247,6 @@ const HiCacheTokenPathSnapshot * HiCacheTokenDirectory::previous_committed_snaps
     const HiCacheTokenPathSnapshot * best = nullptr;
     for (const auto index : it->second) {
         const auto & snapshot = snapshots_[index];
-        if (!snapshot.model_input || snapshot.source_class != "invariant_state") continue;
         if (!committed_stage(snapshot.stage)) continue;
         if (!snapshot_before_fact(snapshot, fact)) continue;
         if (best == nullptr) {

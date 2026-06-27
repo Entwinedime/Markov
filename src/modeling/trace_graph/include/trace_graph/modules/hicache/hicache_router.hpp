@@ -9,7 +9,7 @@
 namespace TraceGraph {
 
 /**
- * @brief C++ HiCache state model 当前接受的 atomic invariant role。
+ * @brief C++ HiCache state model 当前接受的 fact role。
  *
  * Unknown 只用于 summary 诊断，不能承载兼容性分支。
  */
@@ -26,8 +26,8 @@ enum class HiCacheFactRole {
 /**
  * @brief fact 路由结果。
  *
- * `model_fact` 表示通过硬输入契约；`known_role` 表示 role 在当前 state model
- * 白名单中。二者分开可区分非模型事实和模型事实 schema 漂移。
+ * `model_fact` 表示 fact 声明给 `hicache_state_model` 消费；`known_role` 表示
+ * class/role 在当前 state model 白名单中。二者分开可区分非模型事实和模型事实 schema 漂移。
  */
 struct HiCacheFactRoute {
     bool model_fact = false;
@@ -35,10 +35,7 @@ struct HiCacheFactRoute {
     HiCacheFactRole role = HiCacheFactRole::Unknown;
 };
 
-/** @brief 判断 fact 是否满足 HiCache target-state 输入契约。 */
-[[nodiscard]] bool is_hicache_state_model_fact(const HiCacheFact & fact);
-
-/** @brief 将 event_role 字符串解析成白名单枚举。 */
+/** @brief 将 fact.role 字符串解析成白名单枚举。 */
 [[nodiscard]] HiCacheFactRole parse_hicache_fact_role(const std::string & role);
 
 /** @brief 返回 role 的稳定字符串名。 */
@@ -51,7 +48,7 @@ struct HiCacheFactRoute {
 [[nodiscard]] bool hicache_fact_role_implemented(HiCacheFactRole role);
 
 /**
- * @brief 返回 role 对应的必需 invariant 字段缺口。
+ * @brief 返回 role 对应的必需 state-model 字段缺口。
  *
  * 缺口进入 summary，不触发 source result 兜底。
  */

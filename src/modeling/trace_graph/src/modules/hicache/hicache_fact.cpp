@@ -13,6 +13,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -47,13 +48,6 @@ bool completed_event(const TraceEvent & event) {
     const auto phase = lower_copy(trim_copy(event.arg("phase")));
     return phase == "end" || event.name.ends_with("_end");
 }
-
-bool model_input_invariant_event(const TraceEvent & event) {
-    return bool_value(event, "model_input", false) && lower_copy(trim_copy(event.arg("fact_class"))) == "invariant_state"
-           && lower_copy(trim_copy(event.arg("fact_granularity"))) == "atomic";
-}
-
-bool model_input_dictionary_source(const TraceEvent & event) { return completed_event(event) && model_input_invariant_event(event); }
 
 Json parse_json_arg(const std::string & raw) {
     const auto text = trim_copy(raw);
@@ -123,6 +117,43 @@ std::vector<std::string> json_strings(const Json & value) {
     if (value.is_array()) std::ranges::for_each(value, append);
     else if (!value.is_null()) append(value);
     return output;
+}
+
+struct FactMetadata {
+    std::string fact_class;
+    std::string role;
+    std::vector<std::string> consumers;
+};
+
+FactMetadata fact_metadata_from_event(const TraceEvent & event) {
+    FactMetadata metadata;
+    if (!event.has_arg("fact")) throw std::invalid_argument("HiCache trace event args must contain fact object");
+    const auto value = parse_json_arg(event.arg("fact"));
+    if (!value.is_object()) throw std::invalid_argument("HiCache trace event fact must be an object");
+    metadata.fact_class = json_string(value, "class");
+    metadata.role = json_string(value, "role");
+    const auto consumers = value.find("consumers");
+    if (consumers != value.end()) metadata.consumers = json_strings(*consumers);
+    if (metadata.fact_class.empty()) throw std::invalid_argument("HiCache trace event fact.class must be non-empty");
+    if (metadata.role.empty()) throw std::invalid_argument("HiCache trace event fact.role must be non-empty");
+    if (metadata.consumers.empty()) throw std::invalid_argument("HiCache trace event fact.consumers must be non-empty");
+    return metadata;
+}
+
+bool consumer_list_contains(const std::vector<std::string> & consumers, std::string_view expected) {
+    return std::ranges::any_of(consumers, [&](const auto & consumer) { return std::string_view{ consumer } == expected; });
+}
+
+bool state_model_path_fact(const FactMetadata & metadata) {
+    if (!consumer_list_contains(metadata.consumers, "hicache_state_model")) return false;
+    if (metadata.fact_class == "target_policy_input") return metadata.role == "prefetch_decision";
+    if (metadata.fact_class != "workload_identity") return false;
+    return metadata.role == "request_bound_match_anchor" || metadata.role == "request_lifecycle_anchor" || metadata.role == "request_admission";
+}
+
+bool state_model_dictionary_source(const TraceEvent & event) {
+    if (!completed_event(event)) return false;
+    return state_model_path_fact(fact_metadata_from_event(event));
 }
 
 std::vector<std::string> event_string_list(const TraceEvent & event, std::initializer_list<std::string_view> keys) {
@@ -196,7 +227,7 @@ bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
 
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     if (!is_hicache_event(event)) return;
-    if (!model_input_dictionary_source(event)) return;
+    if (!state_model_dictionary_source(event)) return;
     std::ranges::for_each(event.args, [&](const auto & item) {
         const auto & [key, value] = item;
         if (key.contains("dictionary")) observe_dictionary_value(value);
@@ -242,17 +273,22 @@ bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact) {
     return static_cast<uint64_t>(fact.full_path_tokens.size()) == fact.full_path_span.token_count;
 }
 
+bool HiCacheFact::has_consumer(const std::string & consumer) const {
+    return consumer_list_contains(consumers, consumer);
+}
+
 HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {
     HiCacheFact fact;
+    const auto metadata = fact_metadata_from_event(event);
     fact.source_node_id = node_id;
     fact.source_event_index = event.index;
     fact.ts = event.ts;
     fact.dur = event.dur;
     fact.event_name = event.name;
     fact.target_id = event.arg("target_id");
-    fact.fact_class = event.arg("fact_class");
-    fact.fact_granularity = event.arg("fact_granularity");
-    fact.role = event.arg("event_role", "unknown");
+    fact.fact_class = metadata.fact_class;
+    fact.role = metadata.role;
+    fact.consumers = metadata.consumers;
     fact.phase = event.arg("phase");
     if (fact.phase.empty()) {
         if (event.name.ends_with("_start")) fact.phase = "start";
@@ -266,7 +302,7 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.check_kind = event.arg("check_kind", event.arg("checkpoint_kind"));
     fact.lifecycle_kind = event.arg("lifecycle_kind");
     fact.admission_kind = event.arg("admission_kind");
-    fact.storage_source = event.arg("storage_source", event.arg("readable_source", "invariant_storage_backend_readable"));
+    fact.storage_source = event.arg("storage_source", event.arg("readable_source", "storage_backend_readable"));
     fact.seq_no = event.arg_u64("seq_no", 0);
     fact.source_page_size = event.arg_u64("source_page_size", event.arg_u64("page_size", 0));
     fact.token_count = event.arg_u64("token_count", 0);
@@ -275,8 +311,6 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.priority = static_cast<int64_t>(event.arg_u64("priority", 0));
     fact.has_chunked_req = bool_value(event, "has_chunked_req", false);
     fact.ignore_eos = bool_value(event, "ignore_eos", false);
-    fact.model_input = bool_value(event, "model_input", false);
-    fact.dag_input = bool_value(event, "dag_input", false);
     fact.full_path_span = parse_span(event, "full_path_span");
     fact.full_path_tokens = resolve_span(fact.full_path_span);
     fact.storage_page_hashes = event_string_list(event, { "page_hashes", "hash_pages", "storage_hashes", "storage_keys", "page_keys", "hit_hash_pages" });

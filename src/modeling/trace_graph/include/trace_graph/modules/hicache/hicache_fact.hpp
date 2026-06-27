@@ -40,9 +40,8 @@ struct HiCacheTokenSpan {
 /**
  * @brief 单条 HiCache trace event 解析后的 atomic fact。
  *
- * 该结构只承载 probe 显式声明的不变量字段。是否能进入 target state model，
- * 由 router 基于 `model_input`、`fact_class`、`fact_granularity` 和 `role`
- * 再做硬门禁。
+ * 该结构只承载 probe catalog 显式声明的字段。是否能进入 target state model，
+ * 由 router 基于 `fact.class`、`fact.role` 和 `fact.consumers` 再做硬门禁。
  */
 struct HiCacheFact {
     size_t source_node_id = 0;
@@ -53,8 +52,8 @@ struct HiCacheFact {
     std::string event_name;
     std::string target_id;
     std::string fact_class;
-    std::string fact_granularity;
     std::string role;
+    std::vector<std::string> consumers;
     std::string phase;
 
     std::string request_id;
@@ -73,14 +72,15 @@ struct HiCacheFact {
     int64_t priority = 0;
     bool has_chunked_req = false;
     bool ignore_eos = false;
-    bool model_input = false;
-    bool dag_input = false;
     bool is_start = false;
     bool is_end = false;
 
     HiCacheTokenSpan full_path_span;
     HiCacheTokenPath full_path_tokens;
     std::vector<std::string> storage_page_hashes;
+
+    /** @brief 判断 catalog fact 是否声明给指定 consumer 消费。 */
+    [[nodiscard]] bool has_consumer(const std::string & consumer) const;
 };
 
 /**
@@ -95,9 +95,9 @@ struct HiCacheFact {
 /**
  * @brief HiCache event parser 和 token dictionary 索引。
  *
- * parser 先从 completed atomic invariant model-input event 中观察 dictionary，
- * 再解析 span-only fact。source actual / oracle 中的 dictionary 只可用于诊断，
- * 不能水合 normal model 的 token path。
+ * parser 先从 completed state-model path fact 中观察 dictionary，再解析 span-only
+ * fact。source actual / oracle 中的 dictionary 只可用于诊断，不能水合 normal model
+ * 的 token path。
  */
 class HiCacheFactParser {
 public:

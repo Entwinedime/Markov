@@ -11,7 +11,7 @@ namespace TraceGraph {
 /**
  * @brief target control clock 中的一次 checkpoint 记录。
  *
- * checkpoint 由 target scheduler 生成；source invariant checkpoint 只作为触发锚点。
+ * checkpoint 由 target scheduler 生成；runtime model checkpoint 只作为触发锚点。
  * 该记录只描述 target state model 的推进顺序，不代表 source actual completion。
  */
 struct HiCacheControlCheckpoint {
@@ -40,7 +40,7 @@ public:
     /** @brief 生成 enqueue epoch，并推进 scheduler epoch。 */
     [[nodiscard]] uint64_t next_enqueue_epoch();
 
-    /** @brief 记录由 source invariant anchor 触发的 target scheduler checkpoint。 */
+    /** @brief 记录由 runtime model checkpoint 触发的 target scheduler checkpoint。 */
     [[nodiscard]] HiCacheControlCheckpoint record_target_checkpoint(const std::string & cache_scope, const std::string & request_key,
                                                                     const std::string & check_kind, uint64_t ts, bool terminal, size_t source_event_index);
 

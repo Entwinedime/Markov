@@ -68,7 +68,7 @@ uint64_t ceil_div(uint64_t value, uint64_t divisor) {
 /**
  * @brief 一次 SGLang extend allocator batch 的语义化输入。
  *
- * 当前 trace 还没有 `ScheduleBatch` 粒度 invariant，因此调用方显式传入
+ * 当前 trace 还没有 `ScheduleBatch` 粒度 state-model fact，因此调用方显式传入
  * resolved policy 中的 `batch_size=1`。结构体保留 batch 语义字段，后续接入
  * `extend_allocation_intent` 后只需要替换构造来源，不需要重写 capacity 链路。
  */
@@ -255,7 +255,7 @@ HiCacheState::PrefetchIoProgressEstimate HiCacheState::estimate_prefetch_io_prog
     return PrefetchIoProgressEstimate{
         .completed_pages = {},
         .model_name = "zero_progress",
-        .reason = "zero-progress IO model: invariant input has no calibrated storage transfer progress",
+        .reason = "zero-progress IO model: state-model input has no calibrated storage transfer progress",
     };
 }
 
@@ -320,7 +320,7 @@ void HiCacheState::record_token_resolution(const HiCacheFact & fact, HiCacheSumm
     summary.token_path_diagnostics[fact.role + "." + status]++;
 
     if (!resolution.ok()) {
-        summary.missing_invariant_facts["token_resolution_" + status]++;
+        summary.missing_state_model_facts["token_resolution_" + status]++;
         if (fact.role == "request_lifecycle_anchor" && resolution.status == HiCacheTokenResolutionStatus::Missing)
             summary.token_path_diagnostics["lifecycle_anchor_missing_committed_path_count"]++;
         return;
@@ -685,7 +685,7 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
      * readable 只说明 L3 可读，不等价于本轮已经完成 H2D loadback，因此这里不能
      * 使用 `visible_pages`；必须要求 radix 上已经有 host-visible residency。
      *
-     * 当前 normal invariant 还没有 scheduler `host_hit_length`、`mem_quota` 或 loadback
+     * 当前 state-model input 还没有 scheduler `host_hit_length`、`mem_quota` 或 loadback
      * intent。由于 write-back ACK 被折叠为同步，model 可能比真实 SGLang 更早看到
      * host-visible prefix；因此 loadback 只能 opportunistic 消费当前 free pages，不能
      * 由这个推导结果主动触发 device eviction。
@@ -1824,7 +1824,7 @@ void HiCacheState::apply_storage_backend_readable(const HiCacheFact & fact, HiCa
     auto & scope = scope_state(fact);
     const auto cache_scope = normalized_scope(fact);
     const auto before = digest();
-    scope.storage.seed_readable_hashes(cache_scope, page_hashes, fact.storage_source.empty() ? "invariant_storage_backend_readable" : fact.storage_source);
+    scope.storage.seed_readable_hashes(cache_scope, page_hashes, fact.storage_source.empty() ? "storage_backend_readable" : fact.storage_source);
 
     std::vector<std::string> page_ids;
     page_ids.reserve(page_hashes.size());
@@ -1896,16 +1896,16 @@ HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & confi
 
         auto route = route_hicache_fact(fact);
         if (!route.model_fact) {
-            summary.skipped_non_invariant_events++;
+            summary.skipped_non_state_model_events++;
             continue;
         }
         if (!route.known_role || !hicache_fact_role_implemented(route.role)) {
-            summary.missing_invariant_facts["unknown_invariant_role"]++;
+            summary.missing_state_model_facts["unknown_state_model_fact"]++;
             continue;
         }
         const auto required_errors = hicache_required_fact_errors(fact, route.role, config.page_size > 0 ? config.page_size : fact.source_page_size);
         if (!required_errors.empty()) {
-            std::ranges::for_each(required_errors, [&](const auto & error) { summary.missing_invariant_facts[error]++; });
+            std::ranges::for_each(required_errors, [&](const auto & error) { summary.missing_state_model_facts[error]++; });
             continue;
         }
 

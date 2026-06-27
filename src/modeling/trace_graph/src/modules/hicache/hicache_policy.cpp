@@ -114,7 +114,7 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
         .host_cleanup_budget_rule = "current_target_request_pages",
         .host_cleanup_budget_source = "sglang: cleanup budget follows current page-aligned target request",
         .extend_allocation_batch_size = kExplicitSingleRequestExtendBatchSize,
-        .extend_allocation_batch_source = "temporary model contract: explicit single-request ScheduleBatch until batch-level invariant is collected",
+        .extend_allocation_batch_source = "temporary model contract: explicit single-request ScheduleBatch until batch-level state-model fact is collected",
         .extend_allocation_rule = "sglang paged extend pressure: extend_num_tokens + batch_size * page_size; page_size=1 uses extend_num_tokens",
         .device_allocator_need_sort = config.device_allocator_need_sort,
         .device_allocator_need_sort_source = "target_config.device_allocator_need_sort or derived from target_config.disaggregation_mode",

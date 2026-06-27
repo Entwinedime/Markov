@@ -423,22 +423,14 @@ std::string HiCacheSummary::to_json() const {
     root["capacity_audit_issue_count"] = capacity_audit_issue_count;
     root["ref_mutation_count"] = ref_mutation_count;
     root["ref_audit_issue_count"] = ref_audit_issue_count;
-    root["skipped_non_invariant_events"] = skipped_non_invariant_events;
+    root["skipped_non_state_model_events"] = skipped_non_state_model_events;
     root["final_state_derivation_mode"] = final_state_derivation_mode;
     root["events_by_role"] = events_by_role;
     root["processed_events_by_role"] = processed_events_by_role;
     root["transitions_by_kind"] = transitions_by_kind;
-    root["missing_invariant_facts"] = missing_invariant_facts;
+    root["missing_state_model_facts"] = missing_state_model_facts;
     root["token_resolution_by_status"] = token_resolution_by_status;
     root["token_path_diagnostics"] = token_path_diagnostics;
-    root["non_invariant_fact_usage_by_role"] = non_invariant_fact_usage_by_role;
-    root["non_invariant_fact_usage"] = array_from(non_invariant_fact_usage_by_role, [](const auto & item) {
-        const auto & [role, count] = item;
-        return Json{
-            {  "role",  role },
-            { "count", count }
-        };
-    });
     root["transition_trace"] =
         array_from(transition_trace, [&](const auto & transition) { return transition_json(transition, target_config.emit_state_digests); });
     root["radix_split_trace"] = array_from(radix_split_trace, split_record_json);

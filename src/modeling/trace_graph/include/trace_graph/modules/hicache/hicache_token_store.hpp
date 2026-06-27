@@ -75,8 +75,6 @@ struct HiCacheTokenPathSnapshot {
     uint64_t token_count = 0;
     uint64_t page_aligned_token_count = 0;
     HiCacheTokenCompleteness completeness = HiCacheTokenCompleteness::Unknown;
-    std::string source_class;
-    bool model_input = false;
 };
 
 /**

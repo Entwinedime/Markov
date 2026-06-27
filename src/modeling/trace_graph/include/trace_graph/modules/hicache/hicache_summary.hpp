@@ -67,15 +67,14 @@ struct HiCacheSummary {
     uint64_t capacity_audit_issue_count = 0;
     uint64_t ref_mutation_count = 0;
     uint64_t ref_audit_issue_count = 0;
-    uint64_t skipped_non_invariant_events = 0;
+    uint64_t skipped_non_state_model_events = 0;
     std::string final_state_derivation_mode;
     std::map<std::string, uint64_t> events_by_role;
     std::map<std::string, uint64_t> processed_events_by_role;
     std::map<std::string, uint64_t> transitions_by_kind;
-    std::map<std::string, uint64_t> missing_invariant_facts;
+    std::map<std::string, uint64_t> missing_state_model_facts;
     std::map<std::string, uint64_t> token_resolution_by_status;
     std::map<std::string, uint64_t> token_path_diagnostics;
-    std::map<std::string, uint64_t> non_invariant_fact_usage_by_role;
     std::vector<HiCacheNodeSplitRecord> radix_split_trace;
     std::vector<HiCacheControlCheckpoint> control_checkpoint_trace;
     std::vector<HiCacheOperationLifecycleTransition> async_lifecycle_trace;

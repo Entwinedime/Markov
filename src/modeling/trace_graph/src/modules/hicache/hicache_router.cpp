@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache invariant fact 路由与 schema gate。
+ * @brief HiCache state-model fact 路由与 schema gate。
  */
 #include "trace_graph/modules/hicache/hicache_router.hpp"
 
@@ -37,11 +37,16 @@ bool has_projectable_path(const HiCacheFact & fact, uint64_t effective_page_size
     return hicache_fact_has_resolved_full_path(fact);
 }
 
-} // namespace
-
-bool is_hicache_state_model_fact(const HiCacheFact & fact) {
-    return fact.is_end && fact.model_input && fact.fact_class == "invariant_state" && fact.fact_granularity == "atomic";
+bool state_model_class_role(const HiCacheFact & fact) {
+    if (fact.fact_class == "workload_identity") {
+        return fact.role == "request_bound_match_anchor" || fact.role == "request_lifecycle_anchor" || fact.role == "request_admission";
+    }
+    if (fact.fact_class == "target_policy_input") return fact.role == "prefetch_decision";
+    if (fact.fact_class == "runtime_model_checkpoint") return fact.role == "prefetch_check_point";
+    return false;
 }
+
+} // namespace
 
 HiCacheFactRole parse_hicache_fact_role(const std::string & role) {
     const auto it = std::ranges::find(kRoles, role, &RoleMapping::name);
@@ -55,10 +60,10 @@ std::string hicache_fact_role_name(HiCacheFactRole role) {
 
 HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact) {
     HiCacheFactRoute route;
-    route.model_fact = is_hicache_state_model_fact(fact);
+    route.model_fact = fact.is_end && fact.has_consumer("hicache_state_model");
     if (!route.model_fact) return route;
     route.role = parse_hicache_fact_role(fact.role);
-    route.known_role = route.role != HiCacheFactRole::Unknown;
+    route.known_role = route.role != HiCacheFactRole::Unknown && state_model_class_role(fact);
     return route;
 }
 
@@ -70,7 +75,7 @@ bool hicache_fact_role_implemented(HiCacheFactRole role) {
 std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role, uint64_t effective_page_size) {
     std::vector<std::string> errors;
     if (role == HiCacheFactRole::Unknown) {
-        errors.push_back("unknown_invariant_role");
+        errors.push_back("unknown_state_model_role");
         return errors;
     }
     if (fact.cache_scope.empty()) errors.push_back("missing_cache_scope");
