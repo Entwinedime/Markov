@@ -4,7 +4,7 @@
 构建 DAG 或领域状态模型，最后用于 faithful replay、state prediction 和后续 what-if 性能预测。
 
 当前 active 工作重点是 SGLang HiCache state model。旧的 page-identity/observed 行为答案口径已经停止作为主线；
-当前采集和后端都按 token/range invariant contract 推进。
+当前采集和后端都按 token/range fact contract 推进。
 
 ## 当前结构
 
@@ -22,11 +22,8 @@
 ├── scripts/model.sh                     # 宿主机 modeling 入口，进入干净 modeling 容器运行
 ├── scripts/run.sh                       # 打开 framework runtime 或 modeling 容器
 ├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
-├── scripts/internal/profile_runner.py   # 容器内 profiling 执行器
-├── scripts/internal/profile_quality.py  # profiling 质量审计
-├── scripts/internal/hicache_state_workflow.py
-│                                         # HiCache profiling 后 validation 主入口
-├── scripts/internal/model_runner.py     # 容器内 modeling 执行器
+├── scripts/internal/entrypoints/        # 容器内 CLI：profile/model/quality/HiCache validation
+├── scripts/internal/markov_internal/    # 内部 Python 包：profiling、modeling、HiCache validation
 ├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
 ├── scripts/bench/hicache_phased_workload.py
 ├── configs/experiments/hicache_state/   # common / forced capture / forced replay
@@ -42,12 +39,12 @@
 | --- | --- |
 | `docs/profiling_development.md` | profiling 架构、runner、suite、Python probe 和 HiCache 采集契约。 |
 | `docs/modeling_development.md` | C++ TraceGraph、model runner、mode、HiCache state backend 和输出格式。 |
-| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、pre-bundle 5x3 基线、新 bundle gate 和复现命令。 |
+| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、forced-token bundle workflow、保留基线和复现命令。 |
 | `docs/validation/hicache_state_model_limitations.md` | 当前仍存在的中长期模型限制和收敛方向。 |
 | `docs/project_constraints.md` | 项目长期约束。 |
 | `docs/work_progress.md` | 时间戳流水记录；旧条目只代表当时状态。 |
 
-## Submodules
+## 子模块
 
 ```bash
 git submodule update --init --recursive
@@ -96,12 +93,12 @@ C/C++ 或 modeling runner 改动还需要：
 
 ```bash
 scripts/run.sh modeling -- bash -lc \
-  'python3 -m py_compile scripts/internal/model_runner.py scripts/internal/profile_quality.py'
+  'python3 -m py_compile $(find scripts/internal/entrypoints scripts/internal/markov_internal -name "*.py" -print)'
 scripts/run.sh modeling -- bash -lc \
   "git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror"
 ```
 
-## Profiling
+## 采集
 
 真实 SGLang / KTransformers profiling 通过宿主机入口启动：
 
@@ -112,11 +109,11 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_com
 ```
 
 `scripts/profile.sh` 负责选择 docker compose service、挂载仓库、设置 Ascend 环境，并在容器内调用
-`scripts/internal/profile_runner.py`。宿主机上不要直接用 `profile_runner.py` 启动真实 server profiling。
+`scripts/internal/entrypoints/profile.py`。宿主机上不要直接调用容器内 entrypoint 启动真实 server profiling。
 
 当前 HiCache state validation suite 只启用 `python_probe`。它采集：
 
-- target-level `fact` 描述的 atomic `invariant_state` 状态事实；
+- 声明给 `hicache_state_model` 的 `workload_identity`、`target_policy_input` 和 `runtime_model_checkpoint` 状态输入事实；
 - `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
 - `oracle_state` 的 validation-only state snapshot。
 
@@ -126,7 +123,7 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_com
 profiling 质量审计：
 
 ```bash
-python3 scripts/internal/profile_quality.py \
+python3 scripts/internal/entrypoints/profile_quality.py \
   --manifest <run_dir>/profile_manifest.json \
   --output <run_dir>/profile_quality.json
 ```
@@ -149,13 +146,13 @@ scripts/profile.sh \
 capture suite 在自身目录生成 `forced_token_bundle.json` 和 `forced_token_plans/`。forced replay 必须显式传 bundle；
 runner 不读取仓库固定 plan，也不自动选择最近一次 capture。
 
-## Modeling
+## 建模
 
-当前不维护静态 modeling config。`hicache_state_workflow.py` 根据 replay suite 中的 target server config 动态生成
+当前不维护静态 modeling config。`hicache_workflow.py` 根据 replay suite 中的 target server config 动态生成
 `<workflow_output>/configs/target_<config_id>.json` 并调用 `scripts/model.sh`：
 
 ```bash
-python3 scripts/internal/hicache_state_workflow.py \
+python3 scripts/internal/entrypoints/hicache_workflow.py \
   --profile-run-dir <profile_suite_dir> \
   --output-dir <profile_suite_dir>/modeling/hicache_state_workflow \
   --stages quality,final-state \
@@ -167,23 +164,20 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-06-25，当前主线状态是：
+截至 2026-06-27，当前主线状态是：
 
-- profiling 仍使用 33 个 atomic target，其中 7 个 target / 5 个 role 是 normal state model input；
-- `request_lifecycle_anchor` 已携带当前 committed/fill path；C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，
-  不再用 `request_id -> longest path` 或 admission path 回退；
-- Python probe 的 committed/fill/admission/prefetch path 已按当前 SGLang API 分开解析，normal model input 与
-  diagnostic evidence 使用独立 token dictionary 去重域；
-- forced-token capture bundle、显式 replay bundle 依赖、preflight、quality gate 和 `hicache_state_workflow.py` 已落地；
-- 2026-06-24 的旧固定-plan 5 config x 3 input 结果为 final state `70/75`、transition exact `65/75`，只作为
-  pre-bundle 模型回归基线；
-- 新 bundle gate 会拒绝该旧 run，因为它没有 bundle provenance；需要重新 capture/replay 后才能形成当前 active validation；
-- 该 pre-bundle 基线的 final-state failure 只出现在
-  `manual_deeper_pressure_prefetch -> c1_wts_wait_p128_low_l1` 的 5 个 source/target 组合；
-- 基线中另有 5 个 `c0/manual_deeper_pressure_prefetch` prediction 只差 evicted marker oscillation，final state exact。
+- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `57` 个 target；
+- `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
+- `hicache_state_model` 只消费 `7` 个 state-model target，覆盖 `5` 个 role；其余 target 只用于质量审计、输入合同、
+  transition validation 或 final-state oracle；
+- `oracle_state/state_snapshot` 只保留 `24` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
+  或 `Scheduler.*` snapshot 定义 HiCache cache-tree final state；
+- C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
+- forced-token capture bundle、显式 replay bundle 依赖、preflight、quality gate 和 `hicache_workflow.py` 已落地；
+- `scripts/internal/entrypoints/` 只放容器内 CLI，复用逻辑位于 `scripts/internal/markov_internal/`；旧平铺脚本只保留在
+  `scripts/internal/deprecated/` 供验证期人工对照，active 代码不 import deprecated。
 
-当前详细结果、失败语义和复现命令以 `docs/validation/hicache_state_validation.md` 为准。当前 transition 根因分析仍保留在
-`docs/tmp/`；bundle workflow 已迁入主线文档。
+当前详细结果、失败语义、临时根因和复现命令以 `docs/validation/hicache_state_validation.md` 与 `docs/tmp/` 中的专项记录为准。
 
 ## 数据约束
 

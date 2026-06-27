@@ -1,4 +1,4 @@
-# Modeling 开发文档
+# 建模开发文档
 
 维护方式：这是 modeling 主线设计文档。更新时直接删改本文件内容，不写流水账、实验结果或阶段分析。
 真实 run、验证结果和历史结论维护在 `docs/work_progress.md` 或 `docs/validation/`。
@@ -33,7 +33,7 @@ profile manifest / explicit trace
 Modeling 后端是 C++23 TraceGraph，构建和运行基线是独立的 `modeling` Docker service。该 service 基于干净
 Ubuntu 24.04，只提供 C++23、CMake、Ninja、clang-format/clang-tidy、Python 标准运行环境和 modeling 脚本依赖；
 不挂载 Ascend 设备，不依赖 CANN，不安装 SGLang / KTransformers runtime。宿主机只负责启动外层 wrapper 或执行无
-modeling runtime 依赖的文本检查；不再支持直接在宿主机运行 `scripts/internal/model_runner.py`、host build
+modeling runtime 依赖的文本检查；不再支持直接在宿主机用 `scripts/internal/entrypoints/model.py` 执行 modeling run、host build
 `trace_graph` 或旧 `build/bin` 产物。
 
 构建 modeling 环境：
@@ -65,7 +65,7 @@ scripts/run.sh modeling -- bash -lc \
 不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
 可复现 profile/modeling run。
 
-当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `hicache_state_workflow.py` 从 profile suite 的 target
+当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `scripts/internal/entrypoints/hicache_workflow.py` 从 profile suite 的 target
 server metadata 动态生成 target config，写入 `<workflow_output>/configs/`。
 
 faithful replay：
@@ -103,7 +103,7 @@ scripts/model.sh \
 | `--emit-module-summary` | 输出 `model_summary.json`。 |
 | `--emit-validation` | 输出 `validation.json`。 |
 
-## Modeling Mode
+## 建模模式
 
 | mode | 语义 |
 | --- | --- |
@@ -114,7 +114,7 @@ scripts/model.sh \
 `replay` 只允许指 `mode=faithful_replay`。启用 HiCacheModule 的场景必须称为 `self-config prediction` 或
 `cross-config prediction`。
 
-## Trace Merger
+## Trace 合并
 
 `scripts/trace/trace_merger.py` 在 manifest 模式下合并：
 
@@ -125,15 +125,13 @@ scripts/model.sh \
 Trace merger 不根据 modeling mode 删除真实执行事件。`faithful_replay`、`cache_state` 和 `cache_patch`
 应看到同一份 merged trace；差异只在是否加载子模块、是否产生 DAG mutation。
 
-非执行类事件需要通过字段路由隔离：
+非执行类 HiCache 事件需要通过 `args.fact` 路由隔离：
 
 | 字段 | 作用 |
 | --- | --- |
-| `model_input` | 是否进入 modeling 输入集合。 |
-| `dag_input` | 是否作为默认性能 DAG 节点。 |
-| `fact_class` | 子模块事实分类。 |
-| `event_role` | atomic fact role，供状态子模块二级路由。 |
-| `fact_granularity` | HiCache state 主线要求为 `atomic`。 |
+| `fact.class` | 子模块事实分类。 |
+| `fact.role` | class 内事实角色，供状态子模块二级路由。 |
+| `fact.consumers` | 允许消费该事实的模型、质量审计或 validator 列表。 |
 
 ## TraceGraph 结构
 
@@ -154,7 +152,7 @@ C++ 后端位于 `src/modeling/trace_graph`：
 scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace_graph -j2'
 ```
 
-## SimulationModule
+## SimulationModule 接口
 
 所有 what-if 都必须规约为 C++ `SimulationModule`。Python 侧只做配置、trace merge、validation 编排。
 
@@ -173,9 +171,9 @@ scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace
 | `NodeScaleModule` | smoke / 节点耗时缩放。 |
 | `HiCacheModule` | state-only；维护 cache state，不修改 DAG。 |
 
-## HiCache State Backend
+## HiCache 状态后端
 
-HiCache backend 当前是 state-only `SimulationModule`：它消费 invariant facts 和显式 target config，维护 target cache state，
+HiCache backend 当前是 state-only `SimulationModule`：它消费 state-model facts 和显式 target config，维护 target cache state，
 输出 final state、transition trace、policy decision trace 和 validation summary；它暂不修改 DAG。
 
 主链路：
@@ -197,31 +195,29 @@ HiCacheFact
 
 ```text
 consume fact iff phase == "end"
-    && model_input == true
-    && fact_class == "invariant_state"
-    && fact_granularity == "atomic"
-    && role is a known atomic invariant
+    && "hicache_state_model" in fact.consumers
+    && fact.class/fact.role is accepted by HiCacheFactRouter
 ```
 
-其它 HiCache 事件计入 `skipped_non_invariant_events`，不能更新 target state。token dictionary 也只从 completed
-atomic invariant `model_input=true` event 水合；`source_actual`、`timing_observation`、`oracle_state` 和
+其它 HiCache 事件计入 `skipped_non_state_model_events`，不能更新 target state。token dictionary 也只从 completed
+state-model path fact 水合；`source_actual`、`timing_observation`、`oracle_state` 和
 debug/provenance 字段只能用于质量审计、validation label 或 transition 归因，不能回写为 target state mutation。
 
-当前正常 state input role：
+当前正常 state model fact：
 
-| role | 语义 |
+| fact | 语义 |
 | --- | --- |
-| `request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path，并做 target lookup / touch。 |
-| `request_lifecycle_anchor` | finished/unfinished lifecycle 边界；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
-| `request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
-| `prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
-| `prefetch_check_point` | prefetch progress/wait 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
+| `workload_identity/request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path，并做 target lookup / touch。 |
+| `workload_identity/request_lifecycle_anchor` | finished/unfinished lifecycle 边界；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
+| `workload_identity/request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
+| `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
+| `runtime_model_checkpoint/prefetch_check_point` | prefetch progress/wait 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
 
 match-prefix concrete path、lookup result、source insert/capacity/lock/maintenance、storage/controller result 和 async completion
-只作为 `source_actual` / `timing_observation` evidence。unknown invariant role 必须进入 quality / summary error，不能静默消费。
+只作为 `source_actual` / `timing_observation` evidence。unknown state-model fact 必须进入 quality / summary error，不能静默消费。
 
-cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比较 atomic invariant facts，逐 role 对比 count
-和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 invariant。
+cross-config rule diagnosis 必须先通过 hard workload identity contract：只比较 `workload_identity` facts，逐 role 对比 count
+和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 workload identity。
 
 ### 组件边界
 
@@ -246,7 +242,7 @@ cross-config rule diagnosis 必须先通过 hard `model_input_contract`：只比
 | `hicache_summary.hpp/.cpp` | final state、transition trace、policy/capacity/ref/async 审计输出。 |
 | `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
 
-### Target Page Projection
+### 目标 Page 投影
 
 后端不消费 `page_identity` / `target_page_identity_page<page_size>` 作为主输入。page 由 token path 重建：
 
@@ -264,7 +260,7 @@ for each full target page:
 - `cache_scope` 参与内部 page id，validation 可用 `oracle_page_key_mode=strip_scope` 与 raw oracle hash 对齐；
 - page 级集合只能从 canonical node、operation lifecycle 和 storage directory 派生，不能作为独立事实源。
 
-### Target State
+### 目标状态
 
 summary 输出当前 validation 使用的集合，但集合来源必须是 canonical tree / storage / async projection：
 
@@ -284,7 +280,7 @@ summary 输出当前 validation 使用的集合，但集合来源必须是 canon
 | `prefetch_suppressed_pages` | storage miss / revoke / finalization / timeout 下被 target policy 放弃的 page projection。 |
 | `page_hit_counts` | policy-visible page hit count projection，仅作诊断 metadata。 |
 
-### Policy 与资源语义
+### 策略与资源语义
 
 request / allocator：
 
@@ -300,7 +296,7 @@ token directory：
 - path 消费必须走 role-specific resolver：match/admission/lifecycle/prefetch 分别只消费对应 fact-local path；
 - lifecycle 缺少 committed path 时必须记录 missing 诊断并跳过 mutation，不能静默复用 admission path；
 - `prefetch_decision` path 只作为 prefetch candidate，不更新 request committed timeline；
-- directory 只接收 completed atomic invariant `model_input=true` 的 path；diagnostic/source path 不能为 normal model 水合 token；
+- directory 只接收 completed state-model path fact；diagnostic/source path 不能为 state model 水合 token；
 - lifecycle resolver 可以读取 earlier committed snapshot 做 duplicate/tail 计算，但本次 lifecycle mutation 的目标 path 必须来自当前 fact。
 
 host / storage / prefetch：
@@ -317,14 +313,12 @@ write policy：
 
 - `write_through`、`write_through_selective` 和 `write_back` 共享 device insert、host backup、storage readable、capacity cleanup helper；
 - `write_through_selective` 的 hit-count threshold 由 target policy 决定；
-- write-through backup ACK 前会持有普通 lock ref；当前按 target control fact 近似 drain；
-- write-through-selective + storage backup 的 ACK 阶段尚未完整表达
-  `ordinary write lock -> storage host protection -> ordinary lock release`，在 deeper pressure 下会把部分 ancestor ordinary lock
-  错留到 final state；
+- write-through backup ACK 前会持有普通 lock ref；当前按 target control fact 近似 drain，真实 async ACK / rank 同步时序仍记录为
+  validation 限制；
 - write-back ACK 时序当前折叠为同步 completion，结果语义统一落到 host backup / storage readable / dirty clear；
-- source writeback ACK、storage hit result、node remove result 和 async wall-clock completion 不能作为 normal state input。
+- source writeback ACK、storage hit result、node remove result 和 async wall-clock completion 不能作为 state model input。
 
-### Summary
+### 摘要
 
 summary 输出位置：
 
@@ -337,12 +331,11 @@ model_summary.json.modules[0].hicache
 | 字段 | 说明 |
 | --- | --- |
 | `input_hicache_events` | 识别到的 HiCache events。 |
-| `processed_hicache_events` | 实际消费的 invariant end events。 |
-| `skipped_non_invariant_events` | 跳过的 source_actual / timing / oracle / debug events。 |
+| `processed_hicache_events` | 实际消费的 state-model end events。 |
+| `skipped_non_state_model_events` | 跳过的 source_actual / timing / oracle / debug events。 |
 | `processed_events_by_role` | 各 role 消费计数。 |
-| `missing_invariant_facts` | 缺失或未知 invariant 输入。 |
+| `missing_state_model_facts` | 缺失或未知 state-model 输入。 |
 | `token_path_diagnostics` | role-specific path resolution、lifecycle missing/stale、timeline 和 direct-fact 使用情况。 |
-| `non_invariant_fact_usage` | 非不变量实际消费审计；正常必须为空。 |
 | `final_state` | `DerivedStateView` 派生的模型最终 state sets 和 counts。 |
 | `storage_directory_inclusive_state` | 包含 backend-readable hash 的 storage-inclusive projection。 |
 | `transition_trace` | request / operation / page 级模型状态转移。 |
@@ -351,14 +344,14 @@ model_summary.json.modules[0].hicache
 | `capacity_mutation_trace` / `capacity_victim_choices` | capacity index 增量更新和 victim 选择证据。 |
 | `ref_mutation_trace` / `ref_audit` | owner 级 ref acquire/release 和 tree ref 一致性审计。 |
 
-### State 到 DAG / E2E 路线
+### 状态到 DAG / E2E 路线
 
 HiCache 的最终目标不是只让 final state 对齐，而是预测 target config 下的 E2E、关键路径和主要 cache 开销变化。
 后续链路按以下边界推进：
 
 ```text
 target semantic chain:
-  invariant probe events
+  state-model probe facts
     -> target state
     -> state transitions
     -> target cache operation intents
@@ -381,9 +374,9 @@ DAG rewrite chain:
 
 | 阶段 | 输入 | 输出 | 通过口径 |
 | --- | --- | --- | --- |
-| target state | invariant facts + target config + oracle label | final state / transition trace | final state 对齐，`non_invariant_fact_usage=[]`。 |
-| target intent | invariant facts + transition / policy / async / ref traces | cache operation intent stream | intent 可追溯到 state transition，source outcome 不混入。 |
-| source physical attribution | torch / LD_PRELOAD / timing evidence + invariant anchors | source cache-owned node / edge groups | physical op group 归因稳定且不重复占用 DAG node。 |
+| target state | state-model facts + target config + oracle label | final state / transition trace | final state 对齐，`state_model_fact_ready=true`。 |
+| target intent | state-model facts + transition / policy / async / ref traces | cache operation intent stream | intent 可追溯到 state transition，source outcome 不混入。 |
+| source physical attribution | torch / LD_PRELOAD / timing evidence + workload anchors | source cache-owned node / edge groups | physical op group 归因稳定且不重复占用 DAG node。 |
 | cache-neutral baseline | source full DAG + source physical groups | cache-neutral DAG | source cache cost 能拆出去并装回去。 |
 | source/target cache diff | source physical groups + target intents | delete / insert / replace / resize decisions | self-config diff 基本 identity，cross diff 可解释。 |
 | DAG patch | cache-neutral DAG + target intents | predicted target DAG | 无 dangling edge、无 cycle，blocking intent 位于正确依赖边界。 |
@@ -392,7 +385,7 @@ DAG rewrite chain:
 `transition` 解释 state 怎么变；`intent` 解释 target 下应该有哪些物理 cache 操作。DAG patch 应消费 intent，
 不能直接消费 raw page-level transition 或 final page set。
 
-## Validation
+## 验证
 
 validation 不是默认输出，只有 `--emit-validation` 或 config 中 `outputs.emit_validation=true` 时生成。
 
@@ -400,13 +393,12 @@ HiCache state validation 必须同时看：
 
 - `validation_ready`；
 - `validation_errors`；
-- `hicache_state.invariant_coverage_ready`；
-- `hicache_state.missing_invariant_facts`；
-- `hicache_state.non_invariant_fact_usage`；
+- `hicache_state.state_model_fact_ready`；
+- `hicache_state.missing_state_model_facts`；
 - `hicache_state.final_state_match` / `raw_final_state_match`；
 - normalized `sets_diff_by_tier`。
 
-只要 `non_invariant_fact_usage` 非空，即使 final state 偶然对齐，也不能宣称 invariant-only prediction 通过。
+只要 `state_model_fact_ready` 为 false，即使 final state 偶然对齐，也不能宣称 state-model prediction 通过。
 当前有效验证口径、结果和剩余风险维护在 `docs/validation/hicache_state_validation.md`。
 
 ## 未覆盖设计范围

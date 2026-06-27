@@ -1,482 +1,517 @@
-# HiCache State Model 长期限制记录
+# HiCache 状态模型近似限制记录
 
-本文记录 HiCache state model 当前仍存在的中长期建模缺口、临时妥协方案和后续收敛方向。这里的内容不是实验流水账，也不是一次性 debug
-记录；只有会影响后续 validation 解释、cross-config prediction 或 transition exactness 推进的模型边界才写入本文。
+本文只记录 HiCache state model 为了做 target-side prediction 而不得不近似的 SGLang 机制。
 
-## HCSV-LIMIT-001: batch-level KV allocation intent 尚未完整建模
+写入本文的内容需要同时满足：
+
+- 该机制属于 SGLang 运行语义的一部分，而不是一次实验的阶段性结论；
+- 当前模型没有足够的 target-independent state-model fact 精确复现它；
+- 模型已经用某种投影、折叠或边界近似继续推进 final-state / transition validation；
+- 该近似可能影响 cross-config prediction、final state、transition exactness 或后续 DAG patch。
+
+不写入本文的内容包括：
+
+- 单次 profiling / validation run 的通过率流水账；
+- transition exactness 脚本、catalog、gate 等验证链路本身的完成状态；
+- forced-token capture/replay 这类 validation 输入合同；
+- source_actual / oracle snapshot 的诊断证据清单。
+
+## HCSV-LIMIT-001: batch-level extend KV allocation intent 尚未完整建模
 
 ### 问题
 
-当前 HiCache state model 主要从 `request_admission` 这类 per-request invariant role 推导 device capacity pressure。模型在 admission
-阶段根据 target radix lookup 估算 request path 中尚未 resident 于 L1/device 的 page，并以此触发 modeled eviction。
+当前模型从 `request_admission` 这类 per-request fact 推导 device KV allocation pressure，并把一次 admission 投影成一次
+`extend_allocation_intent`。
 
-但 SGLang 在 paged KV allocator 链路中，device capacity pressure 的真实预算来自 batch-level allocation，而不是单个 request 的
-radix miss page 数。
-
-SGLang `alloc_paged_token_slots_extend()` 的预算语义是：
+但 SGLang 的 paged KV allocator 真实预算来自 `ScheduleBatch` 级别：
 
 ```text
 requested_tokens = extend_num_tokens + len(seq_lens_cpu) * page_size
 ```
 
-其中：
+其中 `len(seq_lens_cpu)` 是本次 allocator call 的 batch size，不一定等于单个 request。因此下面两种语义不等价：
 
 ```text
-len(seq_lens_cpu) == batch_size == len(batch.reqs)
+当前模型近似：
+  每个 request 独立产生一次 extend allocation pressure。
+
+SGLang 真实语义：
+  一个 ScheduleBatch 只产生一次 batch-level allocation pressure。
 ```
 
-也就是说，一次 `HiRadixCache.evict(EvictParams(num_tokens=...))` 对应的是一次 allocator batch，而不是必然对应一个 request。
+即使总 requested page 数接近，多次 per-request eviction 和一次 batch-level eviction 也可能因为中间 radix touch、lock/ref、
+host backup 或 writeback 状态不同，选出不同 victim。
 
-因此，当一个 allocation batch 中包含多个 request 时，下面两种预算不等价：
+### 当前近似
 
-```text
-模型当前近似：
-  对每个 request 独立估算 capacity pressure
-
-SGLang 实际语义：
-  对整个 ScheduleBatch 估算一次 allocation pressure
-```
-
-这会影响：
-
-- 是否触发 L1 eviction；
-- eviction requested page 数；
-- eviction 发生时机；
-- radix victim order；
-- 最终 L1 / evicted page set。
-
-### 当前证据
-
-在当前 `c0_wt_timeout_p128_balanced` self prediction 的 `manual_pressure_prefetch` slice 中，source trace 显示若干 `capacity_request`
-发生在：
-
-```text
-request_admission
-  -> capacity_request
-  -> request_lifecycle_anchor(unfinished)
-```
-
-之间。
-
-这些 `capacity_request` 的 `requested_tokens` 与 admission token count 满足：
-
-```text
-requested_tokens = token_count + 128
-```
-
-由于 c0 的 page size 为 128，因此该 slice 中可以反推出：
+模型显式把当前 manual workload 写成单请求 batch 合同：
 
 ```text
 batch_size = 1
-```
-
-这说明当前残差不是 storage prefetch 本身导致的，而是 `request_admission -> paged extend KV allocation -> device capacity pressure`
-这段链路尚未完整覆盖。
-
-### 当前妥协方案
-
-短期为了推进 c0 self prediction，模型先把 `request_admission` 显式提升成一个 extend allocation intent，再在该 intent 中指定：
-
-```text
-batch_size = 1
-```
-
-这不是消费 source `capacity_request`，而是把当前 manual workload 的同步单请求形态写成可审计的模型合同。对应的 paged extend allocation budget 为：
-
-```text
 requested_tokens = extend_num_tokens + batch_size * target_page_size
-requested_pages = ceil(requested_tokens / target_page_size)
 ```
 
-其中当前显式指定：
+并且只在 target radix 没有完全覆盖 request path 或仍有 partial tail allocator pressure 时触发 device capacity projection。
 
-```text
-batch_size = 1
-```
+代码锚点：
 
-模型落地时还有一个额外收紧条件：
+- `src/modeling/trace_graph/src/modules/hicache/hicache_policy.cpp` 中
+  `kExplicitSingleRequestExtendBatchSize = 1`；
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `apply_request_admission()` 从 admission path 推导 `ExtendAllocationIntent`；
+- `third_party/sglang/python/sglang/srt/mem_cache/common.py` 的
+  `alloc_paged_token_slots_extend()` 使用 batch-level `len(seq_lens_cpu)`。
 
-```text
-target radix lookup 已覆盖 request path 时，不触发该临时 allocation pressure。
-```
+### 为什么难以精确
 
-原因是 full-hit admission 不需要新增 paged extend KV 分配。如果在 full-hit 路径上仍强行套用 `token_count + page_size`，会把 SGLang
-不会执行的 allocator pressure 注入模型，导致 L1 victim set 偏离。
-
-该妥协只用于当前 final-state alignment 的阶段性推进，不能解释为完整 batch-level allocator model。它的价值是先把 batch
-语义建成一个单独层次，后续新增 `extend_allocation_intent` invariant 后，只替换 intent 来源，不再改散落的 request admission 逻辑。
+要精确建模这条链路，需要 state-model input 明确描述 scheduler batch grouping，而不是从单个 request lifecycle anchor 反推。
+如果直接消费 source `capacity_request` 或 eviction result，会把 source config 下的 victim / capacity 结果泄漏进 target model。
 
 ### 风险
 
-该妥协在以下场景中可能失效：
+该近似在以下场景可能失效：
 
 - 一个 `ScheduleBatch` 中包含多个 request；
-- chunked prefill 将多个 request 或 continuation 合并进同一 forward batch；
-- decode / prefill overlap 改变实际 batch grouping；
-- cross-config prediction 中 HiCache 配置变化间接影响 scheduler timing 或 request grouping；
-- allocator pressure 需要按 batch-level 一次性触发，而模型按 per-request 多次触发，导致 victim order 偏离。
+- chunked prefill、decode / prefill overlap 或 scheduler timing 改变 batch grouping；
+- cross-config prediction 中 HiCache 配置变化间接改变可运行 request 集合；
+- allocator pressure 应该一次性触发，但模型拆成多次触发，导致 victim order 偏离。
 
-即使总 requested page 数相近，多次 per-request eviction 与一次 batch-level eviction 也可能因为中间 radix touch、lock/ref、host backup
-状态变化而产生不同 victim set。
+### 收敛方向
 
-### 正确方向
-
-中长期应新增或调整一个 batch-level invariant role，例如：
+新增 batch-level state-model fact，例如：
 
 ```text
-extend_allocation_intent
+fact.class = runtime_model_checkpoint
+fact.role  = extend_allocation_intent
 ```
 
-推荐采集边界：
+建议字段只描述 target-independent intent：
 
 ```text
-sglang.srt.mem_cache.common.alloc_for_extend(batch)
-```
-
-或更底层：
-
-```text
-alloc_paged_token_slots_extend(...)
-```
-
-该 role 应记录 allocator intent，而不是 source eviction 结果。建议字段包括：
-
-```text
-allocation_kind = extend
 cache_scope
 seq_no
 batch_size
 extend_num_tokens
+request_ids / request spans
 source_page_size
-policy_params
 ```
 
-如果需要和 request 关联，可额外保留 request ids 或 request token span，但不得携带 source victim、source evicted count 或 actual movement
-result。
+模型侧继续按 target page size 重算 requested pages，并由 target capacity index 自己选择 victim。
 
-模型侧应基于 target config 重算：
-
-```text
-requested_tokens = extend_num_tokens + batch_size * target_page_size
-requested_pages = ceil(requested_tokens / target_page_size)
-```
-
-然后交给 target capacity model 判断是否需要 eviction：
-
-```text
-if target_free_pages < requested_pages:
-    enforce_device_capacity(requested_pages)
-```
-
-victim 仍由 modeled target radix tree、LRU/touch order、lock/ref eligibility 和 write policy 决定。
-
-### 当前状态
-
-该妥协已在 `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的 `request_admission` 链路中落地：
-
-- `HiCacheResolvedPolicyState.extend_allocation_batch_size` 当前显式固定为 `1`；
-- `request_admission` 先构造 `ExtendAllocationIntent`，再从 intent 派生 allocator pressure 和 active reservation；
-- 当 target radix 中存在缺失的 device page 时，模型按 `batch_size=1` 的 extend allocation intent 推导 paged extend allocation pressure；
-- capacity cleanup 的触发条件对齐 SGLang allocator：只有当前 free page 不足以满足本次 allocation request 时才触发 eviction；
-- 一旦触发 eviction，清理预算使用本次 allocation request 的 page 数，而不是只清理 free-space deficit；
-- host allocation fallback 采用同一源码语义：prefetch 失败后按 `prefetch_length` 清理，`write_backup` 失败后按
-  `len(node.value)` 清理，不再保留“只清理 host allocation deficit”的旧分支；
-- active request reservation 使用不含 conservative extra page 的实际占用页数，避免把临时 over-estimate 长期保留到后续 capacity check；
-- policy decision summary 会输出 `batch_size`、`extend_tokens`、`requested_tokens` 和 `allocated_pages`，用于审计当前 batch 合同；
-- source trace 中的 `capacity_request` 仍不作为 model input，只作为解释该限制的诊断证据。
-
-## HCSV-LIMIT-002: loadback intent / mem_quota 尚未作为 invariant 输入
+## HCSV-LIMIT-002: loadback intent、mem_quota 与异步完成边界尚未完整建模
 
 ### 问题
 
-HiRadix 的 host-to-device loadback 不是单纯由“radix 上存在 host-visible prefix”决定。SGLang 链路是：
+HiRadix 的 L2(host) -> L1(device) loadback 不是简单的“radix 上有 host-visible prefix 就立刻回到 device”。
+真实链路包含：
 
 ```text
 match_prefix()
   -> MatchResult.host_hit_length / best_match_node
   -> scheduler add_one_req()
-  -> if req.host_hit_length > 0:
-       init_load_back(best_match_node, host_hit_length, mem_quota)
+  -> init_load_back(best_match_node, host_hit_length, mem_quota)
+  -> load_back() threshold / mem_quota / allocator / possible eviction
+  -> async loading_check() release refs
 ```
 
-`init_load_back()` 内部还会检查 `load_back_threshold`、`mem_quota`，并先尝试 `mem_pool_device_allocator.alloc(len(host_indices))`；
-只有 allocation 失败且 loadback 本身成立时，才会调用 `tree_cache.evict(EvictParams(num_tokens=len(host_indices)))`。
+当前 state-model fact 没有完整提供 `host_hit_length`、`best_match_node`、`mem_quota`、loadback allocator intent 或 loadback
+completion boundary。
 
-当前 C++ model 没有 `host_hit_length`、`best_match_node`、`mem_quota` 或明确的 loadback intent invariant。另一方面，write-back ACK
-时序目前被折叠为同步结果，model 可能比真实 SGLang 更早看到 host-visible prefix。如果直接用 modeled host-visible prefix 触发
-device eviction，会把 source 中没有发生的 loadback capacity pressure 注入 L1 victim order。
+### 当前近似
 
-### 当前妥协方案
+模型在 `request_bound_match_anchor` 上只做 opportunistic loadback：
 
-`request_bound_match_anchor` 只做 target lookup / touch。loadback 只在当前 modeled allocator 的 `free_pages` 足够时，作为
-opportunistic promotion 消费 free pages；如果需要 device eviction 才能 loadback，则记录：
+- 只使用 modeled host-visible prefix，不使用 storage-readable backend-only hash；
+- 只有当前 device allocator free pages 足够时才同步 materialize 到 L1；
+- 如果需要触发 device eviction 才能 loadback，则记录 `skip_loadback_eviction_without_intent`，不主动发明这次 eviction；
+- loadback operation 的 enqueue、commit 和 ref release 在同一个模型边界内同步折叠。
 
-```text
-policy_area=device_allocator
-policy_name=loadback_allocation
-decision=skip_loadback_eviction_without_intent
-```
+代码锚点：
 
-这不是消费 source `load_start_observed` 或 source movement，也不是认为 SGLang 不会 loadback；它只是承认当前 normal invariant
-不足以安全地产生 loadback eviction。
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `apply_request_bound_match_anchor()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `load_back()` / `init_load_back()`；
+- `third_party/sglang/python/sglang/srt/managers/schedule_policy.py` 的
+  `req.needs_host_load_back()` 调用路径。
+
+### 为什么难以精确
+
+loadback 是否发生、是否允许 eviction、能 load 多少，不只取决于 radix state，还取决于 scheduler 当时传入的 host-hit 结果和
+mem quota。没有这些 target-independent intent 时，模型如果仅凭自身 host-visible state 触发 eviction，会把同步折叠后的
+host visibility 放大成真实 SGLang 未必执行的 device pressure。
 
 ### 风险
 
-该妥协会低估真实 loadback 成功后带来的 L1 residency，并可能影响 transition exactness。它对 final-state alignment 的价值是避免
-由同步 write-back 可见性放大的假阳性 device eviction。
+该近似可能：
 
-### 正确方向
+- 低估真实 loadback 后的 L1 residency；
+- 或者为了避免误触发 eviction，在 transition 层少掉真实 loadback operation；
+- 在 loadback、writeback、prefetch 同时发生时改变 L1 victim order。
 
-后续应新增 target-independent loadback intent 或 scheduler allocation intent，至少包含：
+### 收敛方向
+
+新增 loadback intent / boundary fact，至少包括：
 
 ```text
-request identity
 cache_scope
+request_id
 host_hit_length
-best_match_node / host-hit page span 的 target-independent 表达
-mem_quota 或等价 admission quota
-loadback 是否进入 allocator allocation path
+best_match_node 的 target-independent 表达
+mem_quota
+loadback_threshold
+loadback 是否进入 allocator path
 ```
 
-只有有了这类输入，model 才能按 SGLang 源码完整表达 loadback allocation、loadback-triggered eviction 和 subsequent prefix
-rewrite。
+模型拿到该 intent 后，才能按 target config 重算 loadback allocation、possible eviction 和 async completion lifecycle。
 
-## HCSV-LIMIT-003: transition exactness 已有验证链路，但中间状态仍非全量 exact
+## HCSV-LIMIT-003: storage control queue drain 仍是单队列全量释放近似
 
 ### 问题
 
-当前新增的 `scripts/internal/hicache_transition_exactness.py` 已能把 HiCache transition exactness 拆成独立阶段：
+SGLang 的 host/storage control cleanup 是两段式：
 
 ```text
-model-self-check
-extract-target-oracle
-compare-self / compare-cross
-compare-matrix
-transition catalog / operation gate artifacts
+append_host_mem_release()
+  -> 只把 host page 放入 host_mem_release_queue
+
+drain_storage_control_queues()
+  -> 同步决定本轮 drain 数量
+  -> FIFO drain prefetch_revoke_queue / ack_backup_queue / host_mem_release_queue
+  -> 真正 mem_pool_host.free()
 ```
 
-这条链路证明了模型侧 transition 账本可以按 stable active state replay，并能从 target full Python probe 中抽取 validation-only
-observed state delta。但这不等价于所有中间 transition 都已和 SGLang 完全 exact。
+正常 scheduler path 下，每个 rank 都有本地队列。`drain_storage_control_queues()` 读取各队列 `qsize()`，在 TP /
+attention group 上做 `all_reduce(MIN)`，然后每个 rank 只 drain 本地队列前 `n` 个元素。shutdown / detach 的 local cleanup
+才会 drain 到空。
 
-### 当前证据
+### 当前近似
 
-在 2026-06-24 pre-bundle forced-token 5 config x 3 manual input 的 75 个 prediction 上，矩阵级 transition exactness 结果为：
+模型不维护 rank-local queues，也不做 all-reduce MIN。当前用单个 scoped async table 的 `reserved_host_pages` 表示 pending
+host release：
 
-```text
-final-state exact: 70 / 75
-model/target oracle ready: 70 / 75
-transition-count exact: 65 / 75
-page-lifecycle multiset exact: 65 / 75
-```
+- revoked / late / suppressed / applied prefetch 仍可能占用 `reserved_host_pages`；
+- `drain_deferred_host_releases()` 在模型选择的若干 target boundary 上释放所有 eligible deferred reservation；
+- 释放边界主要包括新的 `prefetch_decision`、`request_admission`、部分 request-use prefetch boundary 和 `finalize`；
+- 模型目前不消费真实 `storage_control_checkpoint_observed` 作为 state mutation boundary。
 
-该基线的 failure 只剩两组：
+代码锚点：
 
-```text
-c0 + manual_deeper_pressure_prefetch:
-  5 个 source -> c0 prediction final state exact；
-  只差 mark_evicted / clear_evicted marker oscillation。
+- `src/modeling/trace_graph/src/modules/hicache/hicache_async_state.cpp` 的
+  `release_deferred_host_pages()`；
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `drain_deferred_host_releases()`、`apply_prefetch_decision()`、`apply_request_admission()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `_drain_storage_control_queues_impl()` / `drain_storage_control_queues()`；
+- `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
+  `append_host_mem_release()`。
 
-c1 + manual_deeper_pressure_prefetch:
-  5 个 source -> c1 prediction final state 不 exact；
-  模型多保留 10 个 prefix ancestor ordinary lock，transition compare 被阻塞。
-```
+### 为什么难以精确
 
-此前 `c1` dirty oscillation、`c2` write-back/eviction、`c3` low-host lifecycle 和 token-directory 尾页缺失已不在该基线 failure
-set 中。尤其 `c2`、`c3`、`c4` 在该基线中均为 `15 / 15` transition exact。长期文档不能继续把已关闭 family 写成当前主要失败。
-
-### 当前妥协方案
-
-transition exactness 的当前 hard gate 分层如下：
-
-```text
-final-state:
-  final-state exact，继续作为 state model 通过条件。
-
-model-self-check:
-  stable active state sets 必须能 replay；
-  page_hit_counts 只作为诊断 metadata；
-  locked_pages 的 strict replay mismatch 只作为 advisory。
-
-transition-count / page-lifecycle:
-  比较 strip_scope 后的 global-union state delta；
-  暂不比较 locked_pages transient，因为 lock/ref inc/dec 来自 source_actual evidence，
-  按约束不能作为 state model input。
-
-transition patch gate:
-  schema/coverage/filter readiness 只证明 diagnostic artifact 完整；
-  当前 patch_allowed=false，不是 DAG patch 通过。
-```
-
-这不是把 mismatch 视为通过，而是先把“验证链路是否可用”和“模型是否逐步 exact”分开。当前 transition-count /
-page-lifecycle mismatch 不能用小的 Python 比较器补丁修成语义通过；需要回到 SGLang 源码和 full probe 逐 trace 对齐具体机制。
+精确复现需要知道每个 rank 的 queue length、同步后的 MIN drain count、每个队列的 FIFO 前缀，以及 scheduler 何时调用
+`check_hicache_events()`。这些信息不能用 source victim 或 oracle final state 代替；否则 cross-config target prediction
+会被 source runtime 结果污染。
 
 ### 风险
 
-如果直接用当前 transition trace 做 DAG patch，会有以下风险：
+release drain 过早会让 host budget 太早变空，可能少触发一次 host cleanup；release drain 过晚会让 host budget 继续被占用，
+可能多触发一次 host cleanup。两者都会改变 L2/backuped/evicted page set 和 host victim order。
 
-- final state 正确，但中间 dirty / evicted / backuped / host-visible 变化次数或顺序错误；
-- device eviction 与 host cleanup 的 raw operation 数量不准确，导致 DAG 中 memcpy / storage IO / cleanup node 的增删不可靠；
-- operation intent 未聚合前，raw source_actual 会把 maintenance polling 和 diagnostic evidence 当成真实 patch intent；
-- low-host / deeper prefetch 场景下，transient mismatch 可能对应真实物理操作差异，而不是纯 state marker 差异。
+### 收敛方向
 
-### 正确方向
+新增 state-model 可消费的 storage control drain boundary，例如：
 
-后续应按以下顺序收敛：
+```text
+fact.class = runtime_model_checkpoint
+fact.role  = storage_control_drain_boundary
+```
 
-1. 先修 `c1/deeper` 的 write-through-selective ACK/ref lifecycle，表达 ordinary write lock 到 storage host protection 的
-   ownership 转移和 ordinary lock release；
-2. final state 恢复后，确认 `c1/deeper` 是否仍存在 marker-only transition mismatch；
-3. 再检查 `c0/deeper` 的 evicted marker node-level oscillation，判断它是纯派生 marker 边界还是仍对应物理 operation；
-4. 把 exact transition 聚合到 stable cache operation 层，再把该层作为 DAG patch 输入，而不是直接消费 raw transition rows；
-5. source attribution、duration 和 semantic boundary 未齐备前保持 `patch_allowed=false`。
+最小可行字段应描述同步后的 drain intent，而不是 source victim：
 
-### 当前状态
+```text
+cache_scope
+seq_no
+drain_revoke_count
+drain_backup_ack_count
+drain_host_release_count
+```
 
-`scripts/internal/hicache_transition_exactness.py` 已落地为 active 只读验证入口：
+如果后续要支持 TP/rank exactness，则需要显式建 rank-local queue 或至少记录 rank-synced FIFO drain count。
 
-- `model-self-check` 输出 `model_transition_self_check.json`；
-- `extract-target-oracle` 输出 `observed_target_transition_trace.json`；
-- `compare-self` / `compare-cross` 输出 per-prediction transition exactness JSON；
-- `compare-matrix` 输出 `transition_exactness_matrix.json`；
-- 显式 `--emit-catalog` 输出 `transition_mismatch_catalog.json/.md` 和 family samples；
-- 显式 `--emit-gates` 输出 `transition_patch_gate_scoreboard.json` 以及 per-prediction diagnostic operation gate artifacts。
-
-该脚本不生成 `model_input=true` 事件，不修改 profiling trace，不替代 final-state validation。
-
-## HCSV-LIMIT-004: host/storage 异步控制边界仍是 coarse approximation
+## HCSV-LIMIT-004: prefetch I/O progress 仍是未校准的完成度投影
 
 ### 问题
 
-2026-06-24 pre-bundle forced-token 5x3 matrix 的 final state 为 `70 / 75`。其中若干 host/storage 机制仍使用 target-control 边界近似，
-而不是完整复现 SGLang 后台线程、ACK、release queue drain 和 scheduler progress 的精确时序。
+Storage prefetch 的真实 lifecycle 包含后台 storage hit query、异步 page get、`completed_tokens` 增长、terminate/revoke、
+host-visible materialization 和 release queue enqueue。`storage readable prefix` 只说明 backend 有连续命中，不等价于这些 page
+已经完成 I/O 并进入 host memory。
 
-这些近似包括：
+### 当前近似
 
-- prefetch revoke / timeout incomplete 后，host reservation 先进入 deferred release，而不是立即从 host budget 消失；
-- completed prefetch 在 request reuse boundary 上 materialize / release，用来近似 `check_prefetch_progress()` 已经使 request 继续执行；
-- write-through backup ACK 前持有普通 lock ref，并在下一条 target control fact 开始时 drain；最后一条 fact 之后的 pending ACK 可以保留到 final；
-- write-back ACK 时序仍折叠为同步 completion，主要保留 dirty clear、host-visible、storage-readable 和 device free 的结果语义。
-
-这些机制都来自 SGLang 源码语义和逐 trace 诊断，但它们还不是完整的 target scheduler replay。
-
-### 当前证据
-
-这些近似关闭了此前的 final-state failure：
-
-- `manual_pressure_prefetch/c2` 中 best-effort prefetch revoke 后立即释放 host reservation，会导致模型少触发一次 SGLang-style
-  host cleanup，最终多留 L2/backuped/evicted page；
-- `manual_pressure_prefetch/c1`、`manual_deeper_pressure_prefetch/c1` 和 `manual_deeper_pressure_prefetch/c0` 中，旧模型把 active
-  prefetch reservation 保留过久，导致后续 host cleanup 比 SGLang 多执行一次；
-- 旧 `manual_deeper_pressure_prefetch/c1` 证据推动模型加入 write-through-selective backup ACK 前的 ordinary lock ref。
-
-该 pre-bundle forced-token 回归进一步证明该近似仍不完整：`c1/deeper` 模型会多保留 10 个 prefix ancestor ordinary lock。真实 SGLang
-在 ACK 后把 storage backup 所需 host protection 与 ordinary write lock 分开，并释放后者；模型尚未完整表达这次 ownership 转移。
-
-### 当前妥协方案
-
-模型只用 invariant request/control boundary 和 target config 推进这些近似：
+模型的 I/O progress 估计当前是 zero-progress placeholder：
 
 ```text
-prefetch_decision / prefetch_check_point
-request_bound_match_anchor / request_admission reuse boundary
-request_lifecycle_anchor
-target control fact boundary
+estimate_prefetch_io_progress() -> completed_pages = []
 ```
 
-full Python probe 中的 `prefetch_io_observed`、`prefetch_terminate_observed`、`hicache_flush_write_through_acks_end`、host
-eviction result 和 oracle snapshot 只作为诊断证据；它们不进入 normal state mutation。
+在不同 prefetch policy 下模型再做策略性折叠：
+
+- `best_effort`：可以立刻 terminate，但 completed prefix 使用 zero-progress，通常不会 materialize host prefix；
+- `wait_complete`：在需要完整 completion 的 boundary 上把 completed prefix 近似为 storage hit prefix；
+- `timeout`：request reuse boundary 未超时时把 completed prefix 近似为 storage hit prefix；非 terminal checkpoint 已超时时只暴露
+  zero-progress 并取消；terminal checkpoint 仍按完整 storage hit prefix 近似；
+- completed prefetch 的 host insertion 在 `prefetch_check_point` 或 request reuse boundary 上同步 apply。
+
+代码锚点：
+
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `estimate_prefetch_io_progress()`、`estimate_prefetch_progress()`、`apply_prefetch_ready()`、
+  `resolve_prefetch_before_request_use()`、`apply_prefetch_check_point()`；
+- `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
+  `prefetch_thread_func()`、`terminate_prefetch()`、`_page_get_zero_copy()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `prefetch_from_storage()` / `check_prefetch_progress()`。
+
+### 为什么难以精确
+
+真实 completed prefix 取决于后台线程、storage backend latency、rank synchronization 和 terminate 时刻。直接把 source
+`completed_tokens` 当 state-model input 会让 target prediction 依赖 source runtime timing；完全不记录 progress 又只能做保守
+projection。
 
 ### 风险
 
-这些近似在多数场景能收敛 final state，但当前 `c1/deeper` 已证明 ACK/ref 近似仍可能直接造成 final-state failure；同时它们会影响
-transition exactness：
+该近似会影响：
 
-- transition-count / page-lifecycle 可能多出或少掉 `mark_dirty` / `clear_dirty`、`mark_evicted` / `clear_evicted`、`add_l2` /
-  `remove_l2` 等 transient；
-- background release queue drain 的真实时机可能改变 host cleanup victim；
-- ACK 与 request boundary 之间的交错可能改变 locked transition 的数量和顺序；
-- loadback / write-back / prefetch 同时发生时，同步折叠可能让 operation order 与 SGLang 不一致。
+- prefetch 是否 materialize 成 L2 host-visible prefix；
+- unused host reservation 何时进入 pending release；
+- 后续 request match / loadback / host cleanup 的 victim order；
+- transition exactness 中 `prefetch_ready`、`apply_prefetch_host_visibility`、`add_l2` 等操作数量和顺序。
 
-该基线的 transition exactness 为 `65 / 75`；其中 5 个被上述 final-state lock regression 阻塞，另 5 个是
-`c0/deeper` evicted marker oscillation。coarse async boundary 仍阻塞 DAG patch，但不再能笼统解释成 50 个 transition failure。
+### 收敛方向
 
-### 正确方向
-
-中长期应把这些 coarse boundary 拆成 target-independent operation lifecycle facts 或 target scheduler replay：
+需要设计 target-independent prefetch progress fact 或校准模型。可选方向：
 
 ```text
-prefetch_progress_intent
-prefetch_apply_boundary
-host_mem_release_drain_boundary
-write_through_ack_boundary
+fact.role = prefetch_progress_boundary
+```
+
+字段应避免携带 source victim，但可以考虑记录可复算的边界条件：
+
+```text
+cache_scope
+request_id
+checkpoint kind
+elapsed time / enqueue timestamp
+storage hit prefix length
+target-independent completed prefix policy
+```
+
+如果要 exact 复现 backend I/O，则需要把 storage backend completion 抽象成独立可重放的 intent，而不是在 state model 中继续猜测。
+
+## HCSV-LIMIT-005: write-through backup ACK 与普通 lock lifetime 是边界近似
+
+### 问题
+
+在 write-through / write-through-selective 下，SGLang `write_backup()` 会先把 device KV 写到 host，并对非 write-back backup
+持有普通 lock ref。之后 `writing_check()` 轮询 async CPU write ACK，在 rank 间同步可处理 ACK 数量，再调用
+`_finish_write_through_ack()`：
+
+```text
+publish host backup
+optional write_backup_storage()
+release ordinary lock ref
+```
+
+这条链路的真实释放时刻由 async finish event、ack queue、all-reduce MIN 和 scheduler polling 决定。
+
+### 当前近似
+
+模型在 `commit_host_backup()` 中同步完成 host/storage 可见性，然后用 `PendingWriteThroughBackup` 暂存 ordinary lock：
+
+- backup 结果立即表现为 host-visible / storage-readable；
+- ordinary lock ref 不立即释放；
+- `apply_fact()` 在下一条 state-model fact 开始前调用 `drain_write_through_backup_refs()`；
+- 最后一条 fact 之后仍未 drain 的 pending ACK 可能保留到 final state。
+
+代码锚点：
+
+- `src/modeling/trace_graph/include/trace_graph/modules/hicache/hicache_model.hpp` 的
+  `PendingWriteThroughBackup`；
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `commit_host_backup()`、`hold_write_through_backup_ref()`、`drain_write_through_backup_refs()`、`apply_fact()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `write_backup()`、`writing_check()`、`_finish_write_through_ack()`。
+
+### 为什么难以精确
+
+要 exact 建模，需要知道 async write event 何时 query 为完成、ack queue 的 FIFO 前缀、rank 同步后的 finish count，以及 tree
+split 后 pending ACK publish nodes 如何映射回 target node。当前 state-model fact 只描述 request/prefetch/policy boundary，
+不足以还原 ACK polling timeline。
+
+### 风险
+
+ordinary lock 释放太早会让节点过早变成 evictable；释放太晚会导致 host/device victim 被保护过久。该近似既可能影响 final
+`locked_pages`，也可能影响 subsequent eviction 的 victim order。
+
+### 收敛方向
+
+新增 write-through ACK boundary，例如：
+
+```text
+fact.class = runtime_model_checkpoint
+fact.role  = write_through_ack_boundary
+```
+
+建议字段描述 ACK boundary，不携带 source final answer：
+
+```text
+cache_scope
+seq_no
+ack_count
+operation ids / stable node span
+release_lock = true
+```
+
+模型侧仍应基于 target tree/ref ledger 自己释放对应 owner。
+
+## HCSV-LIMIT-006: write-back dirty eviction ACK 时序被同步折叠
+
+### 问题
+
+write-back dirty eviction 的真实流程不是普通 `remove L1`：
+
+```text
+dirty device node
+  -> write_backup(write_back=True)
+  -> blocking writing_check(write_back=True)
+  -> host backup confirmed
+  -> evict backuped device value
+```
+
+它保留了后台 write queue / ACK 语义，只是在 eviction path 上阻塞等待完成。
+
+### 当前近似
+
+模型在 `evict_device_node()` 中把这条链路折叠到同一个 state-model boundary：
+
+```text
+enqueue_writeback
+commit_host_backup(storage_readable=true)
+set writeback committed
+release writeback ref
+evict_l1_node
+```
+
+也就是说，模型保留 dirty clear、host-visible、storage-readable 和 device free 的结果语义，但不模拟 ACK queue 的真实时间轴。
+模型 summary 也会在出现 dirty eviction 时输出：
+
+```text
+write_back eviction used synchronous modeled writeback; ack timing is intentionally not modeled yet.
+```
+
+代码锚点：
+
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `evict_device_node()` 和 `apply_hicache_model()` warning；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `evict()` 中 `write_back=True` path 和 `writing_check(write_back=True)`。
+
+### 为什么难以精确
+
+write-back eviction 处在 capacity cleanup 内部。要 exact 表达它，需要把 eviction loop、writeback enqueue、blocking ACK、host
+backup commit、device free 分成可比较的 target operation lifecycle；当前 state-model fact 只提供触发 allocation pressure 的外层
+boundary。
+
+### 风险
+
+同步折叠通常能维持 final state，但会改变中间 transition 顺序。与 host release queue、loadback 或其它 write-through ACK 交错时，
+也可能影响后续 victim eligibility。
+
+### 收敛方向
+
+新增 write-back ACK / blocking writeback lifecycle boundary，或把 capacity cleanup 建成稳定 operation graph：
+
+```text
+device_eviction_intent
+write_back_enqueue
 write_back_ack_boundary
-storage_control_drain_boundary
+device_eviction_commit
 ```
 
-这些 facts 必须描述 target-independent boundary 或 intent，不得携带 source victim、source completed page set、source ACK result 或 oracle
-状态答案。模型侧再基于 target policy、storage directory、ref ledger 和 capacity index 推导具体 state mutation。
+在此之前，write-back 路径的 transition exactness 只能解释为结果语义近似，而不是完整 async timeline exact。
 
-### 当前状态
-
-该限制当前直接阻塞 `c1/manual_deeper_pressure_prefetch` 的 final-state validation，并继续阻塞 transition intent 到 DAG patch。
-后续先修 ACK-stage ref lifecycle，再决定是否需要新增 target-independent ACK boundary；`c2`、`c3` 已不在当前 failure set 中。
-
-## HCSV-LIMIT-005: cross-config prediction 依赖外部 token timeline 合同
+## HCSV-LIMIT-007: host allocator 仍是 capacity/reservation 投影
 
 ### 问题
 
-相同 text prompt、greedy、固定 seed 和 deterministic kernel 都不能严格保证不同 HiCache 配置生成相同 continuation。
-一旦 output token 分叉，后续 radix key、page hash、prefetch candidate、finished insert 和 writeback 对象都会一起变化，此时
-cross-config state mismatch 不再能归因到 C++ model。
+SGLang host pool 是真实 allocator：prefetch 和 write backup 都会申请 host pages，申请失败后触发 `evict_host()`，prefetch
+还可能按当前 `available_size()` 截断到 threshold-sized prefix。释放则可能来自 storage control release queue 或其它 cleanup path。
 
-### 当前妥协方案
-
-当前 manual 5x3 validation workflow 使用 forced-token capture/replay：
+当前模型没有独立 host allocator/free-list，只从 canonical radix tree、capacity index 和 async reservation 推导：
 
 ```text
-capture real /generate -> forced_token_plan.json
-capture suite -> forced_token_bundle.json
-replay --forced-token-bundle -> resolve selected input plan
-real prefill/decode -> override committed output token
-quality -> verify actual output_ids == forced_output_ids
+occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 ```
 
-forward、sampling、scheduler、allocator、KV 写入和 HiCache lifecycle 仍真实执行。C++ model 不读取 plan，只消费 replay trace
-中的 invariant token dictionary/span。
+### 当前近似
+
+`request_host_allocation()` 只做 count-level 判断：
+
+- 先按 requested pages 执行 modeled host cleanup；
+- 再用 `occupied_host_pages + reserved_host_pages` 计算 available pages；
+- write backup 必须完整接受；
+- prefetch 可以在满足 threshold 的前提下截断；
+- 不建模 host pool index、fragmentation、extra host pools 或真实 `mem_pool_host.alloc()` 返回的 tensor。
+
+代码锚点：
+
+- `src/modeling/trace_graph/include/trace_graph/modules/hicache/hicache_model.hpp` 的
+  `HostAllocationResult` 注释；
+- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+  `request_host_allocation()`、`enforce_host_capacity()`、`apply_prefetch_decision()`、`commit_host_backup()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
+  `prefetch_from_storage()`、`write_backup()`、`evict_host()`。
+
+### 为什么难以精确
+
+真实 host allocator state 不只是一组 radix residency page。它还包含 allocator free-list、pending release queue、可能的 extra pool、
+以及后台 cleanup 已经归还但模型还没看到的 host indices。把这些全部纳入模型需要新增 host allocator ledger 和 storage-control
+queue boundary；直接用 source pool snapshot 又会把 source runtime timing 注入 target prediction。
 
 ### 风险
 
-- forced token 固定 token path，但不固定 batch timing、scheduler interleaving 或 async completion；
-- streaming、parallel sampling、stop/grammar/speculative/disaggregation 路径不在第一版合同内；
-- workload、tokenizer 或模型变化后仍需要重新 capture；bundle gate 只能防止隐式误用，不能证明旧 token timeline 仍适用。
+count-level 投影可能在以下场景偏离：
 
-### 正确方向
+- host pool 有 pending release 但尚未 drain；
+- prefetch allocation 因 available_size 截断；
+- write backup 与 prefetch 同时竞争 host pages；
+- host cleanup victim 顺序依赖真实 allocator / queue drain 时刻。
 
-跨配置 validation 必须继续把 token timeline 作为 profiling input contract，并同时检查：
+### 收敛方向
+
+中长期应把 host allocator 从 capacity index 中拆成独立 ledger：
 
 ```text
-plan schema/hash
-workload id/fingerprint
-request ordering/count
-actual output match
-same-input canonical invariant signature
+host_allocator_capacity
+host_allocator_free_pages
+host_allocator_reserved_pages
+host_release_queue
+host_allocation_intent
 ```
 
-capture plan 已升级为 suite-level bundle，由 replay CLI 显式接收；runner 不保留 repo 固定 plan 或隐式 latest fallback。
+在没有完整 allocator snapshot 的情况下，至少应把 storage-control drain boundary 接入 state model，避免 host release 只由模型自选
+boundary 触发。
 
-### 当前状态
+## 维护约定
 
-bundle workflow 已实现并通过本地 schema、聚合、plan 注入、preflight、workload provenance 和 replay dry-run 检查。
-2026-06-24 的 5x3 run 早于 bundle workflow；它的 70/75 final-state 与 65/75 transition 只保留为 pre-bundle 模型基线，
-当前 gate 会因缺少 bundle provenance 拒绝它。需要真实重跑后才能重新证明 generated output divergence 已被当前合同关闭。
-
-后续如果发现新的长期建模缺口，应继续按同一结构追加：
+新增限制时继续使用以下结构：
 
 ```text
 问题
-当前证据
-当前妥协方案
+当前近似
+为什么难以精确
 风险
-正确方向
-当前状态
+收敛方向
 ```
+
+如果某条内容只是“某个 run 当前通过/不通过”或“某个脚本已经存在”，不要写入本文；应放到对应的 validation run 记录或临时诊断文档。

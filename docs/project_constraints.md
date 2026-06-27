@@ -19,9 +19,9 @@
 - C++ TraceGraph 构建、格式检查和 modeling 验证以独立的 `modeling` 容器为准；该环境不依赖 Ascend/CANN runtime。
 - 宿主机只负责外层编排和无运行时依赖的静态检查，不作为 framework profiling 或 C++ 构建验收环境。
 - Profiling 的宿主机入口是 `scripts/profile.sh`；modeling 的宿主机入口是 `scripts/model.sh`。
-- `scripts/internal/profile_runner.py` 和 `scripts/internal/model_runner.py` 是容器内执行器，不作为真实任务的宿主机入口。
+- `scripts/internal/entrypoints/profile.py` 和 `scripts/internal/entrypoints/model.py` 是容器内执行器，不作为真实任务的宿主机入口。
 
-## Profiling 边界
+## 采集边界
 
 - Profiling 只采集事实，不预测 target 行为，也不执行建模规则。
 - 模型输入、诊断证据、时序观测和 validation oracle 必须显式分类，不能相互替代。
@@ -34,30 +34,29 @@
 - suite preflight 必须在启动 server 前完成；运行失败时必须留下可审计的 suite result。
 - 真实 profiling 统一通过 `scripts/profile.sh` 启动；容器内 runner 不作为宿主机运行入口。
 
-## Cache-State 输入合同
+## 缓存状态输入合同
 
-- Cache-state 模型只消费显式标记的、已完成的原子不变量事实。
+- Cache-state 模型只消费 catalog 显式声明给 `hicache_state_model` 的 completed/end-phase fact。
 - 可消费事件必须同时满足：
 
   ```text
   phase == "end"
-  model_input == true
-  fact_class == "invariant_state"
-  fact_granularity == "atomic"
-  event_role 为已知角色
+  "hicache_state_model" in fact.consumers
+  fact.class/fact.role 为 C++ router 已知组合
   ```
 
-- 当前正常输入角色是 `request_bound_match_anchor`、`request_lifecycle_anchor`、`request_admission`、
-  `prefetch_decision` 和 `prefetch_check_point`。新增角色必须同时更新采集 schema、质量审计和 C++ router。
+- 当前正常输入事实是 `workload_identity/request_bound_match_anchor`、`workload_identity/request_lifecycle_anchor`、
+  `workload_identity/request_admission`、`target_policy_input/prefetch_decision` 和
+  `runtime_model_checkpoint/prefetch_check_point`。新增事实必须同时更新 target catalog、质量审计和 C++ router。
 - 所有正常输入必须具有稳定的 `cache_scope` 与单调 `seq_no`；未知角色、缺字段和非法路由必须进入质量错误。
 - source run 已发生的命中、移动、淘汰、异步完成和状态快照只能用于诊断或验证，不能更新 target state。
-- `source_actual`、`timing_observation`、`oracle_state` 和 debug/provenance 数据必须保持 `model_input=false`。
+- `source_actual`、`timing_observation`、`oracle_state` 和 debug/provenance 数据不得声明给 `hicache_state_model` consumer。
 - token path 与 range 是跨配置输入身份的基础；page state 必须由 token 事实和 target 配置推导。
 - token span 必须能解析到同一输入合同中的 token dictionary，不能依赖诊断事件补齐。
 - 单次运行内的临时标识不能直接作为跨配置事实。跨配置比较必须使用规范化后的稳定签名。
 - target policy 和资源行为必须由显式 target config 与建模规则决定，不能读取 source 结果作为答案。
 
-## Common 与 Forced Workflow
+## 普通 / Forced 工作流
 
 - Common suite 用于普通生成、采集诊断和 self-config prediction。
 - Cross-config prediction 必须使用 forced-token replay 或强度等价的输入合同。
@@ -71,7 +70,7 @@
 - 同一 input 的 cross-config gate 必须同时满足 plan signature、bundle signature 和规范化 workload signature 一致。
 - bundle provenance 只参与输入合同审计，不进入 C++ state model。
 
-## Modeling 边界
+## 建模边界
 
 - Modeling 后端使用 C++ TraceGraph；Python 只负责配置生成、运行编排、trace 合并和 validation。
 - Cache-state 主流程使用 `mode=cache_state`；HiCacheModule 维护状态和 transition trace，不修改性能 DAG。
@@ -86,13 +85,13 @@
 - `prediction.json` 中的 E2E 时间来自 TraceGraph 拓扑仿真，不是 cache-state 正确性的验收指标。
 - module summary、validation、DAG trace 和 debug 输出必须由显式开关生成。
 
-## Validation 门禁
+## 验证门禁
 
 - Validation 必须先检查采集质量和输入合同，再解释模型差异。
 - Workflow 每次按当前代码重新审计 profile manifest，不使用旧质量报告绕过新门禁。
 - Common workflow 只允许 self prediction；cross prediction 必须证明 forced plan、bundle 和规范化 workload signature 一致。
 - 每个参与 prediction 的 run 必须具备可解析的不变量事实、token dictionary/span 和 validation oracle。
-- 正常 prediction 中只要消费了非不变量事实，就不能宣称 invariant-only validation 通过。
+- 正常 prediction 中只要消费了未声明给 `hicache_state_model` 的事实，就不能宣称 state-model fact validation 通过。
 - 输入合同未通过时，结果只能归类为输入、投影或控制边界问题，不能直接归因于模型规则。
 - Transition validation 必须建立在同一次 workflow 的 final-state 门禁上。
 - Oracle、debug 和质量事件不能进入默认性能 DAG。
@@ -121,7 +120,8 @@ profile suite
 ## 工程质量
 
 - 主线使用 C++23，CMake 最低版本为 3.20。
-- 代码、文档和解释性注释以中文为主，保留必要的英文协议名、类型名和配置字段。
+- 所有项目文档必须使用中文维护；只保留必要的英文协议名、类型名、配置字段、路径、命令和原始事件名。
+- 代码和解释性注释以中文为主，保留必要的英文协议名、类型名和配置字段，此外，所有的“输出性内容”，比如 CLI help，需要保持英文。
 - C++ 公共接口、状态机边界和不变量说明使用 Doxygen 风格；Python 使用模块、类和函数 docstring 表达同类信息。
 - 注释应解释设计原因、不变量和边界，避免复述代码。
 - 修改行为后应删除失活代码和旧入口，不为当前主线保留向后兼容分支。
