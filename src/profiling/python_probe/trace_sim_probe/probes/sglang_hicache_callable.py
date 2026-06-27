@@ -68,7 +68,7 @@ def _configured_consumer_order() -> tuple[str, ...]:
 
 
 def _internal_hooks_enabled() -> bool:
-    """判断是否安装 HiCache source/timing 归因用 internal hooks。"""
+    """判断是否安装 HiCache 内部 hooks。"""
 
     override = os.environ.get("TRACE_SIM_HICACHE_INTERNAL_HOOKS")
     if override is not None:
@@ -1614,7 +1614,6 @@ def _install_hiradix_hooks(module: ModuleType) -> None:
             ("_inc_hit_count", _wrap_hit_count_update),
             ("writing_check", _wrap_writing_check),
             ("loading_check", _wrap_loading_check),
-            ("drain_storage_control_queues", _wrap_drain_storage_control_queues),
             ("init_load_back", _wrap_init_load_back),
             ("load_back", _wrap_load_back),
             ("write_backup", _wrap_write_backup),
@@ -2173,28 +2172,6 @@ def _wrap_loading_check(method: Any) -> Any:
                 "load_ack_checkpoint_observed",
                 {"before": before, "after": after},
                 target="HiRadixCache.loading_check",
-                fact_class="source_actual",
-            )
-        return result
-
-    return wrapped
-
-
-def _wrap_drain_storage_control_queues(method: Any) -> Any:
-    """包装 storage control queue drain，记录维护性队列变化。"""
-
-    @functools.wraps(method)
-    def wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:
-        before = _async_queue_snapshot(self)
-        result = method(self, *args, **kwargs)
-        after = _async_queue_snapshot(self)
-        if before != after or probe_debug_enabled():
-            _emit_internal_event(
-                self,
-                "hicache_internal.storage_control_checkpoint",
-                "storage_control_checkpoint_observed",
-                {"before": before, "after": after},
-                target="HiRadixCache.drain_storage_control_queues",
                 fact_class="source_actual",
             )
         return result

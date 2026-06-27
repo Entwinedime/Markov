@@ -50,7 +50,12 @@ HICACHE_FACT_ROLES_BY_CLASS = {
         }
     ),
     "target_policy_input": frozenset({"prefetch_decision"}),
-    "runtime_model_checkpoint": frozenset({"prefetch_check_point"}),
+    "runtime_model_checkpoint": frozenset(
+        {
+            "prefetch_check_point",
+            "storage_control_drain_boundary",
+        }
+    ),
     "source_actual": frozenset(
         {
             "all_blocks_cleared_observed",
@@ -88,7 +93,6 @@ HICACHE_FACT_ROLES_BY_CLASS = {
             "request_admission_observed",
             "request_lifecycle_path_observed",
             "request_lifecycle_runtime_observed",
-            "storage_control_checkpoint_observed",
             "storage_hit_query_observed",
             "write_ack_checkpoint_observed",
             "write_counter_delta_observed",
@@ -122,6 +126,14 @@ _STATE_MODEL_CONSUMERS = frozenset(
     }
 )
 
+_STATE_MODEL_CONTROL_CONSUMERS = frozenset(
+    {
+        HICACHE_CONSUMER_STATE_MODEL,
+        HICACHE_CONSUMER_PROFILE_QUALITY,
+        HICACHE_CONSUMER_TRANSITION_VALIDATOR,
+    }
+)
+
 HICACHE_CONSUMERS_BY_CLASS = {
     "workload_identity": frozenset(
         {
@@ -131,7 +143,7 @@ HICACHE_CONSUMERS_BY_CLASS = {
         }
     ),
     "target_policy_input": _STATE_MODEL_CONSUMERS,
-    "runtime_model_checkpoint": _STATE_MODEL_CONSUMERS,
+    "runtime_model_checkpoint": _STATE_MODEL_CONTROL_CONSUMERS,
     "source_actual": frozenset(
         {
             HICACHE_CONSUMER_PROFILE_QUALITY,

@@ -55,8 +55,7 @@ class TargetSpec:
     module_name: str
     qualname: str
     target: str
-    events: tuple[str, ...]
-    phases: tuple[str, ...]
+    events: dict[str, str]
     fields: tuple[FieldSpec, ...]
     fact: FactSpec
     emit_when: tuple[EmitCondition, ...] = ()
@@ -164,14 +163,14 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         raise ValueError(f"python_probe target {target_id!r} target must be a non-empty string")
     if not isinstance(module_name, str) or not module_name:
         raise ValueError(f"python_probe target {target_id!r} module must be a non-empty string")
+    if "phases" in raw or "emit_phases" in raw:
+        raise ValueError(f"python_probe target {target_id!r} must declare phases only as keys of events")
     fields = []
     for item in raw.get("fields", []):
         field = _parse_field(item)
         if field is not None:
             fields.append(field)
-    events_raw = raw.get("events", [])
-    events = tuple(item for item in events_raw if isinstance(item, str))
-    phases = _parse_phases(raw)
+    events = _parse_events(raw.get("events"), target_id)
     emit_when = tuple(
         condition
         for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when")))
@@ -184,7 +183,6 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         qualname=target,
         target=target,
         events=events,
-        phases=phases,
         fields=tuple(fields),
         fact=fact,
         emit_when=emit_when,
@@ -256,16 +254,22 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
-def _parse_phases(raw: dict[str, Any]) -> tuple[str, ...]:
-    """解析 target 需要发射的调用阶段；默认只保留 end 事件。"""
+def _parse_events(raw: Any, target_id: str) -> dict[str, str]:
+    """解析 phase 到 trace event name 的显式映射。"""
 
-    value = raw.get("phases", raw.get("emit_phases"))
-    phases = tuple(str(item).strip() for item in _as_list(value) if str(item).strip())
-    if not phases:
-        phases = ("end",)
-    allowed = {"start", "end", "exception"}
-    normalized = tuple(phase for phase in phases if phase in allowed)
-    return normalized or ("end",)
+    allowed = {"start", "end", "exception", "instant"}
+    if not isinstance(raw, dict):
+        raise ValueError(f"python_probe target {target_id!r} events must be a phase-to-event-name object")
+    events: dict[str, str] = {}
+    for phase, event_name in raw.items():
+        if phase not in allowed:
+            raise ValueError(f"python_probe target {target_id!r} events contains unsupported phase {phase!r}")
+        if not isinstance(event_name, str) or not event_name:
+            raise ValueError(f"python_probe target {target_id!r} event name for phase {phase!r} must be a non-empty string")
+        events[phase] = event_name
+    if not events:
+        raise ValueError(f"python_probe target {target_id!r} events must not be empty")
+    return events
 
 
 def _parse_emit_condition(raw: Any) -> EmitCondition | None:
@@ -301,6 +305,7 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
                 raise
             ended = get_writer().now_us()
             _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
+            _emit_call_phase(targets, fn, args, kwargs, result, "instant", ended, ended)
             return result
 
         return async_wrapped
@@ -317,6 +322,7 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
             raise
         ended = get_writer().now_us()
         _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
+        _emit_call_phase(targets, fn, args, kwargs, result, "instant", ended, ended)
         return result
 
     return wrapped
@@ -350,7 +356,7 @@ def _emit_targets(
     """对同一个 callable 上绑定的多个 target 逐一发事件。"""
 
     for target in targets:
-        if phase not in target.phases:
+        if phase not in target.events:
             continue
         _emit(target, fn, args, kwargs, result, phase, start_us, end_us)
 
@@ -379,7 +385,7 @@ def _emit(
         "target_id": target.id,
         "target": target.target,
         "phase": phase,
-        "status": "completed" if phase == "end" else phase,
+        "status": "completed" if phase in {"end", "instant"} else phase,
         "missing_required_fields": missing,
     }
     get_writer().duration_event(
@@ -408,13 +414,7 @@ def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -
 def _event_name(target: TargetSpec, phase: str) -> str:
     """按 target 配置和 phase 生成事件名。"""
 
-    if not target.events:
-        return f"{target.id}:{phase}"
-    if phase == "start":
-        return target.events[0]
-    if phase == "end":
-        return target.events[-1]
-    return f"{target.events[-1]}:exception"
+    return target.events[phase]
 
 
 def _collect_fields(

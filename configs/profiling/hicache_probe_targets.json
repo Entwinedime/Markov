@@ -3,10 +3,9 @@
     "id": "hiradix.match_prefix.cache_stage_path_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_match_prefix_cache_stage_path_observed_start",
-      "hicache_match_prefix_cache_stage_path_observed_end"
-    ],
+    "events": {
+      "end": "hicache_match_prefix_cache_stage_path_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -51,10 +50,9 @@
     "id": "hiradix.match_prefix.request_bound_anchor",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_match_prefix_request_bound_anchor_start",
-      "hicache_match_prefix_request_bound_anchor_end"
-    ],
+    "events": {
+      "end": "hicache_match_prefix_request_bound_anchor_end"
+    },
     "fact": {
       "class": "workload_identity",
       "role": "request_bound_match_anchor",
@@ -105,10 +103,9 @@
     "id": "hiradix.lookup_result_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_lookup_result_observed_start",
-      "hicache_lookup_result_observed_end"
-    ],
+    "events": {
+      "end": "hicache_lookup_result_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -191,10 +188,9 @@
     "id": "hiradix.cache_config_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_cache_config_observed_start",
-      "hicache_cache_config_observed_end"
-    ],
+    "events": {
+      "end": "hicache_cache_config_observed_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -242,10 +238,9 @@
     "id": "hiradix.cache_finished_req.lifecycle_anchor",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_lifecycle_anchor_start",
-      "hicache_cache_finished_req_lifecycle_anchor_end"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_lifecycle_anchor_end"
+    },
     "fact": {
       "class": "workload_identity",
       "role": "request_lifecycle_anchor",
@@ -316,10 +311,9 @@
     "id": "hiradix.cache_finished_req.path_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_path_observed_start",
-      "hicache_cache_finished_req_path_observed_end"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_path_observed_end"
+    },
     "fields": [
       {
         "name": "lifecycle_kind",
@@ -383,10 +377,9 @@
     "id": "hiradix.cache_finished_req.runtime_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_runtime_observed_start",
-      "hicache_cache_finished_req_runtime_observed_end"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_runtime_observed_end"
+    },
     "fields": [
       {
         "name": "lifecycle_kind",
@@ -433,10 +426,9 @@
     "id": "hiradix.cache_unfinished_req.lifecycle_anchor",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_lifecycle_anchor_start",
-      "hicache_cache_unfinished_req_lifecycle_anchor_end"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_lifecycle_anchor_end"
+    },
     "fact": {
       "class": "workload_identity",
       "role": "request_lifecycle_anchor",
@@ -502,10 +494,9 @@
     "id": "hiradix.cache_unfinished_req.path_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_path_observed_start",
-      "hicache_cache_unfinished_req_path_observed_end"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_path_observed_end"
+    },
     "fields": [
       {
         "name": "lifecycle_kind",
@@ -564,10 +555,9 @@
     "id": "hiradix.cache_unfinished_req.runtime_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_runtime_observed_start",
-      "hicache_cache_unfinished_req_runtime_observed_end"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_runtime_observed_end"
+    },
     "fields": [
       {
         "name": "lifecycle_kind",
@@ -614,10 +604,9 @@
     "id": "scheduler.prefetch_decision",
     "module": "sglang.srt.managers.scheduler",
     "target": "Scheduler._prefetch_kvcache",
-    "events": [
-      "hicache_prefetch_decision_start",
-      "hicache_prefetch_decision_end"
-    ],
+    "events": {
+      "end": "hicache_prefetch_decision_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -665,10 +654,9 @@
     "id": "scheduler.prefetch_decision_observed",
     "module": "sglang.srt.managers.scheduler",
     "target": "Scheduler._prefetch_kvcache",
-    "events": [
-      "hicache_prefetch_decision_observed_start",
-      "hicache_prefetch_decision_observed_end"
-    ],
+    "events": {
+      "end": "hicache_prefetch_decision_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -705,10 +693,9 @@
     "id": "schedule_policy.prefill_admission",
     "module": "sglang.srt.managers.schedule_policy",
     "target": "PrefillAdder.add_one_req",
-    "events": [
-      "hicache_prefill_admission_start",
-      "hicache_prefill_admission_end"
-    ],
+    "events": {
+      "end": "hicache_prefill_admission_end"
+    },
     "fields": [
       {
         "name": "admission_kind",
@@ -785,10 +772,9 @@
     "id": "schedule_policy.prefill_admission_observed",
     "module": "sglang.srt.managers.schedule_policy",
     "target": "PrefillAdder.add_one_req",
-    "events": [
-      "hicache_prefill_admission_observed_start",
-      "hicache_prefill_admission_observed_end"
-    ],
+    "events": {
+      "end": "hicache_prefill_admission_observed_end"
+    },
     "fields": [
       {
         "name": "admission_kind",
@@ -864,10 +850,9 @@
     "id": "schedule_policy.chunked_admission",
     "module": "sglang.srt.managers.schedule_policy",
     "target": "PrefillAdder.add_chunked_req",
-    "events": [
-      "hicache_chunked_admission_start",
-      "hicache_chunked_admission_end"
-    ],
+    "events": {
+      "end": "hicache_chunked_admission_end"
+    },
     "fields": [
       {
         "name": "admission_kind",
@@ -930,10 +915,9 @@
     "id": "schedule_policy.chunked_admission_observed",
     "module": "sglang.srt.managers.schedule_policy",
     "target": "PrefillAdder.add_chunked_req",
-    "events": [
-      "hicache_chunked_admission_observed_start",
-      "hicache_chunked_admission_observed_end"
-    ],
+    "events": {
+      "end": "hicache_chunked_admission_observed_end"
+    },
     "fields": [
       {
         "name": "admission_kind",
@@ -1004,10 +988,9 @@
     "id": "hiradix.insert_path",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.insert",
-    "events": [
-      "hicache_insert_path_start",
-      "hicache_insert_path_end"
-    ],
+    "events": {
+      "end": "hicache_insert_path_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1077,10 +1060,9 @@
     "id": "hiradix.insert_result_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.insert",
-    "events": [
-      "hicache_insert_result_observed_start",
-      "hicache_insert_result_observed_end"
-    ],
+    "events": {
+      "end": "hicache_insert_result_observed_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -1133,10 +1115,9 @@
     "id": "hiradix.prefetch_intent",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.prefetch_from_storage",
-    "events": [
-      "hicache_prefetch_intent_start",
-      "hicache_prefetch_intent_end"
-    ],
+    "events": {
+      "end": "hicache_prefetch_intent_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1205,10 +1186,9 @@
     "id": "hiradix.prefetch_check_point",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_prefetch_progress",
-    "events": [
-      "hicache_prefetch_check_point_start",
-      "hicache_prefetch_check_point_end"
-    ],
+    "events": {
+      "instant": "hicache_prefetch_check_point"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1241,13 +1221,47 @@
     }
   },
   {
+    "id": "hiradix.storage_control_drain_boundary",
+    "module": "sglang.srt.mem_cache.hiradix_cache",
+    "target": "HiRadixCache.drain_storage_control_queues",
+    "events": {
+      "instant": "hicache_storage_control_drain_boundary"
+    },
+    "fields": [
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      },
+      {
+        "name": "seq_no",
+        "source": "hicache_seq:self"
+      },
+      {
+        "name": "source_page_size",
+        "source": "self.page_size"
+      },
+      {
+        "name": "check_kind",
+        "source": "const:storage_control_drain"
+      }
+    ],
+    "fact": {
+      "class": "runtime_model_checkpoint",
+      "role": "storage_control_drain_boundary",
+      "consumers": [
+        "hicache_state_model",
+        "hicache_profile_quality",
+        "hicache_transition_validator"
+      ]
+    }
+  },
+  {
     "id": "hiradix.prefetch_progress_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_prefetch_progress",
-    "events": [
-      "hicache_prefetch_progress_observed_start",
-      "hicache_prefetch_progress_observed_end"
-    ],
+    "events": {
+      "end": "hicache_prefetch_progress_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1284,10 +1298,9 @@
     "id": "hiradix.maintenance_check",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_hicache_events",
-    "events": [
-      "hicache_maintenance_check_start",
-      "hicache_maintenance_check_end"
-    ],
+    "events": {
+      "end": "hicache_maintenance_check_end"
+    },
     "fields": [
       {
         "name": "checkpoint_kind",
@@ -1323,10 +1336,9 @@
     "id": "hiradix.ready_to_load_host_cache",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.ready_to_load_host_cache",
-    "events": [
-      "hicache_ready_to_load_host_cache_start",
-      "hicache_ready_to_load_host_cache_end"
-    ],
+    "events": {
+      "end": "hicache_ready_to_load_host_cache_end"
+    },
     "fields": [
       {
         "name": "checkpoint_kind",
@@ -1362,10 +1374,9 @@
     "id": "hiradix.flush_write_through_acks",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.flush_write_through_acks",
-    "events": [
-      "hicache_flush_write_through_acks_start",
-      "hicache_flush_write_through_acks_end"
-    ],
+    "events": {
+      "end": "hicache_flush_write_through_acks_end"
+    },
     "fields": [
       {
         "name": "checkpoint_kind",
@@ -1401,10 +1412,9 @@
     "id": "hiradix.capacity_request",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.evict",
-    "events": [
-      "hicache_capacity_request_start",
-      "hicache_capacity_request_end"
-    ],
+    "events": {
+      "end": "hicache_capacity_request_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1457,10 +1467,9 @@
     "id": "hiradix.capacity_result_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.evict",
-    "events": [
-      "hicache_capacity_result_observed_start",
-      "hicache_capacity_result_observed_end"
-    ],
+    "events": {
+      "end": "hicache_capacity_result_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1507,10 +1516,9 @@
     "id": "hiradix.lock_scope_inc",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.inc_lock_ref",
-    "events": [
-      "hicache_lock_scope_inc_start",
-      "hicache_lock_scope_inc_end"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_inc_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -1550,10 +1558,9 @@
     "id": "hiradix.lock_scope_inc_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.inc_lock_ref",
-    "events": [
-      "hicache_lock_scope_inc_observed_start",
-      "hicache_lock_scope_inc_observed_end"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_inc_observed_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -1603,10 +1610,9 @@
     "id": "hiradix.lock_scope_dec",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.dec_lock_ref",
-    "events": [
-      "hicache_lock_scope_dec_start",
-      "hicache_lock_scope_dec_end"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_dec_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -1646,10 +1652,9 @@
     "id": "hiradix.lock_scope_dec_observed",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.dec_lock_ref",
-    "events": [
-      "hicache_lock_scope_dec_observed_start",
-      "hicache_lock_scope_dec_observed_end"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_dec_observed_end"
+    },
     "fields": [
       {
         "name": "cache_scope",
@@ -1699,10 +1704,9 @@
     "id": "hicache_controller.prefetch_io_observed",
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController._page_transfer",
-    "events": [
-      "hicache_prefetch_io_observed_start",
-      "hicache_prefetch_io_observed_end"
-    ],
+    "events": {
+      "end": "hicache_prefetch_io_observed_end"
+    },
     "fields": [
       {
         "name": "request_id",
@@ -1769,10 +1773,9 @@
     "id": "hicache_controller.writeback_io_observed",
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController._page_backup",
-    "events": [
-      "hicache_writeback_io_observed_start",
-      "hicache_writeback_io_observed_end"
-    ],
+    "events": {
+      "end": "hicache_writeback_io_observed_end"
+    },
     "fields": [
       {
         "name": "operation_id",
@@ -1834,10 +1837,9 @@
     "id": "hicache_controller.writeback_enqueue_observed",
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController.write_storage",
-    "events": [
-      "hicache_writeback_enqueue_observed_start",
-      "hicache_writeback_enqueue_observed_end"
-    ],
+    "events": {
+      "end": "hicache_writeback_enqueue_observed_end"
+    },
     "fields": [
       {
         "name": "operation_id",
@@ -1899,10 +1901,9 @@
     "id": "hiradix.match_prefix.cache_stage_path_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_match_prefix_cache_stage_path_observed_start:state_snapshot",
-      "hicache_match_prefix_cache_stage_path_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_match_prefix_cache_stage_path_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -1924,10 +1925,9 @@
     "id": "hiradix.match_prefix.request_bound_anchor.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_match_prefix_request_bound_anchor_start:state_snapshot",
-      "hicache_match_prefix_request_bound_anchor_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_match_prefix_request_bound_anchor_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -1955,10 +1955,9 @@
     "id": "hiradix.lookup_result_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_lookup_result_observed_start:state_snapshot",
-      "hicache_lookup_result_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_lookup_result_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -1980,10 +1979,9 @@
     "id": "hiradix.cache_config_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
-    "events": [
-      "hicache_cache_config_observed_start:state_snapshot",
-      "hicache_cache_config_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_config_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2005,10 +2003,9 @@
     "id": "hiradix.cache_finished_req.lifecycle_anchor.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_lifecycle_anchor_start:state_snapshot",
-      "hicache_cache_finished_req_lifecycle_anchor_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_lifecycle_anchor_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2036,10 +2033,9 @@
     "id": "hiradix.cache_finished_req.path_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_path_observed_start:state_snapshot",
-      "hicache_cache_finished_req_path_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_path_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2061,10 +2057,9 @@
     "id": "hiradix.cache_finished_req.runtime_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
-    "events": [
-      "hicache_cache_finished_req_runtime_observed_start:state_snapshot",
-      "hicache_cache_finished_req_runtime_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_finished_req_runtime_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2086,10 +2081,9 @@
     "id": "hiradix.cache_unfinished_req.lifecycle_anchor.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_lifecycle_anchor_start:state_snapshot",
-      "hicache_cache_unfinished_req_lifecycle_anchor_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_lifecycle_anchor_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2117,10 +2111,9 @@
     "id": "hiradix.cache_unfinished_req.path_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_path_observed_start:state_snapshot",
-      "hicache_cache_unfinished_req_path_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_path_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2142,10 +2135,9 @@
     "id": "hiradix.cache_unfinished_req.runtime_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
-    "events": [
-      "hicache_cache_unfinished_req_runtime_observed_start:state_snapshot",
-      "hicache_cache_unfinished_req_runtime_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_cache_unfinished_req_runtime_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2167,10 +2159,9 @@
     "id": "hiradix.insert_path.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.insert",
-    "events": [
-      "hicache_insert_path_start:state_snapshot",
-      "hicache_insert_path_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_insert_path_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2192,10 +2183,9 @@
     "id": "hiradix.insert_result_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.insert",
-    "events": [
-      "hicache_insert_result_observed_start:state_snapshot",
-      "hicache_insert_result_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_insert_result_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2217,10 +2207,9 @@
     "id": "hiradix.prefetch_intent.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.prefetch_from_storage",
-    "events": [
-      "hicache_prefetch_intent_start:state_snapshot",
-      "hicache_prefetch_intent_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_prefetch_intent_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2242,10 +2231,9 @@
     "id": "hiradix.prefetch_check_point.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_prefetch_progress",
-    "events": [
-      "hicache_prefetch_check_point_start:state_snapshot",
-      "hicache_prefetch_check_point_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_prefetch_check_point_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2267,10 +2255,9 @@
     "id": "hiradix.prefetch_progress_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_prefetch_progress",
-    "events": [
-      "hicache_prefetch_progress_observed_start:state_snapshot",
-      "hicache_prefetch_progress_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_prefetch_progress_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2292,10 +2279,9 @@
     "id": "hiradix.maintenance_check.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.check_hicache_events",
-    "events": [
-      "hicache_maintenance_check_start:state_snapshot",
-      "hicache_maintenance_check_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_maintenance_check_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2317,10 +2303,9 @@
     "id": "hiradix.ready_to_load_host_cache.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.ready_to_load_host_cache",
-    "events": [
-      "hicache_ready_to_load_host_cache_start:state_snapshot",
-      "hicache_ready_to_load_host_cache_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_ready_to_load_host_cache_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2342,10 +2327,9 @@
     "id": "hiradix.flush_write_through_acks.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.flush_write_through_acks",
-    "events": [
-      "hicache_flush_write_through_acks_start:state_snapshot",
-      "hicache_flush_write_through_acks_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_flush_write_through_acks_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2367,10 +2351,9 @@
     "id": "hiradix.capacity_request.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.evict",
-    "events": [
-      "hicache_capacity_request_start:state_snapshot",
-      "hicache_capacity_request_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_capacity_request_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2392,10 +2375,9 @@
     "id": "hiradix.capacity_result_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.evict",
-    "events": [
-      "hicache_capacity_result_observed_start:state_snapshot",
-      "hicache_capacity_result_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_capacity_result_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2417,10 +2399,9 @@
     "id": "hiradix.lock_scope_inc.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.inc_lock_ref",
-    "events": [
-      "hicache_lock_scope_inc_start:state_snapshot",
-      "hicache_lock_scope_inc_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_inc_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2442,10 +2423,9 @@
     "id": "hiradix.lock_scope_inc_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.inc_lock_ref",
-    "events": [
-      "hicache_lock_scope_inc_observed_start:state_snapshot",
-      "hicache_lock_scope_inc_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_inc_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2467,10 +2447,9 @@
     "id": "hiradix.lock_scope_dec.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.dec_lock_ref",
-    "events": [
-      "hicache_lock_scope_dec_start:state_snapshot",
-      "hicache_lock_scope_dec_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_dec_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
@@ -2492,10 +2471,9 @@
     "id": "hiradix.lock_scope_dec_observed.state_snapshot",
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.dec_lock_ref",
-    "events": [
-      "hicache_lock_scope_dec_observed_start:state_snapshot",
-      "hicache_lock_scope_dec_observed_end:state_snapshot"
-    ],
+    "events": {
+      "end": "hicache_lock_scope_dec_observed_end:state_snapshot"
+    },
     "fields": [
       {
         "name": "state_snapshot",
