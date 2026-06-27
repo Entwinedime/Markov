@@ -40,12 +40,14 @@ HiCache state prediction 必须同时满足：
 
 HiCache state 主线使用 catalog-level fact contract。
 
-- C++ backend 只消费 completed/end-phase 且 `fact.consumers` 包含 `hicache_state_model` 的 fact，并要求
-  `fact.class/fact.role` 属于已知 state-model 组合。
+- C++ backend 只消费 `fact.consumers` 包含 `hicache_state_model` 且 phase 满足该 role 合同的 fact，并要求
+  `fact.class/fact.role` 属于已知 state-model 组合。workload/policy duration fact 使用 end-phase，
+  `runtime_model_checkpoint` 使用 instant phase。
 - 当前正常 state model fact 是：
   `workload_identity/request_bound_match_anchor`、`workload_identity/request_lifecycle_anchor`、
   `workload_identity/request_admission`、`target_policy_input/prefetch_decision`、
-  `runtime_model_checkpoint/prefetch_check_point`。
+  `runtime_model_checkpoint/prefetch_check_point` 和 `runtime_model_checkpoint/storage_control_drain_boundary`。
+- 启用 `hicache_state_model` 的 run 必须具备完成态 `storage_control_drain_boundary` coverage；缺少该 role 时按当前合同缺口处理。
 - token dictionary 只从 completed state-model path fact 水合。`source_actual`、`timing_observation`、
   `oracle_state`、`debug_quality` 不更新 target state，也不能为 state model 补 token；它们只用于 provenance、质量检查、target oracle
   抽取和审计。
@@ -110,11 +112,62 @@ HiCache workflow entrypoint 会把该检查压缩到 `workflow_summary.json.inpu
 
 ## 当前保留基线与 active validation 状态
 
+### HCSV-20260627-forced-bundle-self-regression
+
+这是接入 `runtime_model_checkpoint/storage_control_drain_boundary` 并收紧当前 trace 合同后，用重新 profiling 数据跑出的
+3 input x 5 config self 对角线回归。该 run 只覆盖 self prediction，不覆盖 cross prediction；因此它是当前 self
+回归结论，不替代后续 full self/cross 矩阵。
+
+结果目录：
+
+```text
+data/profile_runs/sglang/20260627_134659_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs
+```
+
+workflow 摘要：
+
+| 项 | 结果 |
+| --- | ---: |
+| workflow mode | `forced_token_replay` |
+| prediction scope | `self` |
+| replay runs | `15` |
+| input contract ready | `3 / 3` |
+| state quality ready | `15 / 15` |
+| strict profile quality ready | `12 / 15` |
+| final-state self exact | `15 / 15` |
+| transition-count exact | `13 / 15` |
+
+quality 说明：
+
+- `quality_ready=true`，所有 state-model 输入合同均 ready；
+- 3 个 strict profile coverage failure 仍是 `expected_hicache_mechanisms_missing`，缺少的机制都是 `prefetch_transfer`；
+- 这 3 个格子的 `hicache_state_model_fact_coverage.ready=true`，没有 missing required roles、missing fields、route error 或
+  unknown state-model role，因此不影响本次 state model 验收。
+
+final-state 结论：
+
+- 15 个 self prediction 全部 `validation_ready=true` 且 final state exact；
+- 这证明 storage-control drain boundary 新合同没有造成 self final-state 回归；
+- 2026-06-26 full artifact 中的 Case A oracle snapshot 误报和 Case B best-effort revoke host-release mismatch，在当前 self
+  对角线上均已关闭。
+
+transition 结论：
+
+| input / config | final state | transition family | 差异 |
+| --- | --- | --- | --- |
+| `manual_deeper_pressure_prefetch / c0_wt_timeout_p128_balanced` | exact | `evicted_marker_oscillation` | 模型多 11 次 `mark_evicted` / `clear_evicted` marker lifecycle |
+| `manual_deeper_pressure_prefetch / c1_wts_wait_p128_low_l1` | exact | `dirty_evicted_marker_oscillation` | 模型多 2 次 `mark_evicted` / `clear_evicted` marker lifecycle |
+
+这两个 transition mismatch 都不改变 final state。`c0` 被 gate 分类为 `state_marker_only` / `drop`；`c1` 被分类为
+`transition_grouping` / `diagnostic_only`，后续若要追求 transition exactness，应单独诊断 write-through-selective dirty/evicted
+marker 分组边界，而不是回退 storage-control drain 语义。
+
 ### HCSV-20260626-forced-bundle-5x3-artifact
 
 这是当前 forced-token bundle workflow 的保留 full-matrix 产物，用于记录最新完整 5 config x 3 input replay 上发现的问题。
-该产物生成后，Case A 的 oracle snapshot 选择问题已经通过 targeted 单格验证修复；因此本节只把该 full run 当作问题发现证据，
-不能把它的 5x3 数值直接当作修复后的全矩阵结论。
+该产物生成后，Case A 的 oracle snapshot 选择问题已经通过 targeted 单格验证修复，Case B 也已由
+`storage_control_drain_boundary` 新合同在 2026-06-27 self 回归中关闭；因此本节只把该 full run 当作问题发现证据，
+不能把它的 5x3 数值直接当作当前修复后的全矩阵结论。
 
 结果目录：
 
@@ -163,9 +216,12 @@ failure classification：
 - Case A：`manual_deeper_pressure_prefetch / c1_wts_wait_p128_low_l1` 的 self mismatch 是 validation oracle snapshot 选择误报；
   当前 `latest_derived_state()`、timeline delta oracle 和 profiling catalog 已限制到 `HiRadixCache.*` state snapshot。
 - Case A 单格已用当前代码重跑通过：`validation_ready=true`、`final_state_match=true`。
-- Case B：`manual_pressure_prefetch / c2_wb_best_effort_p64_low_l1` 仍按真实模型差异处理，根因集中在 best-effort
-  prefetch revoke 后 host release drain 的 target-control 近似边界。
-- 完整 5x3 full matrix 需要在上述修复后重新运行，才能替换本节的 full-run 数值。
+- Case B：`manual_pressure_prefetch / c2_wb_best_effort_p64_low_l1` 的 mismatch 根因集中在 best-effort prefetch revoke 后
+  host release drain 的 target-control 近似边界。粗粒度地把 deferred release drain 前移到 admission / host allocation 前只对
+  CaseB 局部有效，随后会让其它格子提前释放 host reservation，因此已被新契约替换。
+- 当前代码改为消费 `runtime_model_checkpoint/storage_control_drain_boundary`，只在
+  `HiRadixCache.drain_storage_control_queues()` 边界释放 target-derived deferred prefetch host reservation。
+- 2026-06-27 self 对角线重新 profiling 已确认 15/15 final-state exact；完整 self/cross full matrix 仍需要重新 profiling 后才能刷新本节数值。
 
 ### HCSV-20260624-pre-bundle-5x3-baseline
 
@@ -463,7 +519,8 @@ jq '{prediction_count,
 - host cleanup 删除 host leaf subtree，并更新 parent/child topology 与 capacity index；
 - timeout prefetch 不再因为 storage directory hit 就直接落 host，必须等 target policy 的 completed/apply 边界；
 - target host/device capacity 从 SGLang server command 推导，包括 host pool page 对齐和 prefetch capacity limit；
-- prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 deferred release 近似；
+- prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 deferred release，并只在
+  `storage_control_drain_boundary` 上按 target-derived async table 全量 drain；
 - write-through backup ACK 前持有普通 lock ref，并在下一条 target control fact 近似 drain。
 
 这些机制关闭了旧矩阵中的多类 L2/backuped/evicted/locked mismatch。write-through ACK / ordinary lock lifetime 仍是近似边界，
@@ -494,10 +551,13 @@ oracle snapshot 选择误报。
 
 后续优先级：
 
-1. 用当前代码重跑 5x3 forced-token workflow，刷新 Case A oracle 修复后的 full-matrix 数值。
-2. 修复 Case B 中 best-effort prefetch revoke 后 host release drain 的 target-control 近似边界，再复查是否还存在独立 victim
-   selection 差异。
-3. 审查 `c0/deeper` 的 `mark_evicted` / `clear_evicted` oscillation；当前它是 state-marker-only，不能直接进入 DAG patch。
-4. 把 exact transition 聚合成 stable `CacheIntentLog`，同时保持 patch gate 的 `patch_allowed=false`，直到 source attribution、
+1. 用当前代码重新 profiling 并重跑 5x3 forced-token self/cross workflow，刷新 storage-control drain boundary 重构后的 full-matrix
+   数值。当前只有 2026-06-27 self 对角线是 active 通过结论。
+2. 审查 strict profile quality 中 `prefetch_transfer` 期望机制覆盖是否仍应作为 hard profile-quality failure；当前这 3 个 failure
+   不影响 state-model fact coverage。
+3. 单独诊断 `manual_deeper_pressure_prefetch/c1` 的 dirty/evicted marker transition grouping；当前它不是 final-state bug，也不是
+   storage-control boundary 回归。
+4. 保留 `manual_deeper_pressure_prefetch/c0` 的 `mark_evicted` / `clear_evicted` oscillation 为 state-marker-only，不直接进入 DAG patch。
+5. 把 exact transition 聚合成 stable `CacheIntentLog`，同时保持 patch gate 的 `patch_allowed=false`，直到 source attribution、
    duration 和 remaining semantic boundary 都具备证据。
-5. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。
+6. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。

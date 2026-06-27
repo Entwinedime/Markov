@@ -187,20 +187,27 @@ attention group 上做 `all_reduce(MIN)`，然后每个 rank 只 drain 本地队
 
 ### 当前近似
 
-模型不维护 rank-local queues，也不做 all-reduce MIN。当前用单个 scoped async table 的 `reserved_host_pages` 表示 pending
-host release：
+模型已经接入显式的 `runtime_model_checkpoint/storage_control_drain_boundary`，但仍不维护 rank-local queues，也不做
+all-reduce MIN。当前用单个 scoped async table 的 `reserved_host_pages` 表示 pending host release：
 
 - revoked / late / suppressed / applied prefetch 仍可能占用 `reserved_host_pages`；
-- `drain_deferred_host_releases()` 在模型选择的若干 target boundary 上释放所有 eligible deferred reservation；
-- 释放边界主要包括新的 `prefetch_decision`、`request_admission`、部分 request-use prefetch boundary 和 `finalize`；
-- 模型目前不消费真实 `storage_control_checkpoint_observed` 作为 state mutation boundary。
+- catalog 中的 `HiRadixCache.drain_storage_control_queues()` instant target 发出最小字段的
+  `storage_control_drain_boundary` checkpoint；
+- `apply_storage_control_drain_boundary()` 只在该 checkpoint 上调用 `drain_deferred_host_releases()`；
+- `drain_deferred_host_releases()` 释放该 `cache_scope` 下所有已经不再 active、但仍持有 `reserved_host_pages` 的
+  target-derived prefetch operation；
+- 模型不读取 source queue snapshot、source page identity 或 oracle final state 来决定释放哪些 page。
 
 代码锚点：
 
 - `src/modeling/trace_graph/src/modules/hicache/hicache_async_state.cpp` 的
   `release_deferred_host_pages()`；
 - `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
-  `drain_deferred_host_releases()`、`apply_prefetch_decision()`、`apply_request_admission()`；
+  `apply_storage_control_drain_boundary()`、`drain_deferred_host_releases()`；
+- `configs/profiling/hicache_probe_targets.json` 的
+  `hiradix.storage_control_drain_boundary`；
+- `src/profiling/python_probe/trace_sim_probe/probes/generic_callable.py` 的
+  `instant` phase；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `_drain_storage_control_queues_impl()` / `drain_storage_control_queues()`；
 - `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
@@ -219,24 +226,24 @@ release drain 过早会让 host budget 太早变空，可能少触发一次 host
 
 ### 收敛方向
 
-新增 state-model 可消费的 storage control drain boundary，例如：
+当前最小合同是：
 
 ```text
 fact.class = runtime_model_checkpoint
 fact.role  = storage_control_drain_boundary
 ```
 
-最小可行字段应描述同步后的 drain intent，而不是 source victim：
+当前字段只表达“这里发生了一次 storage-control drain 边界”：
 
 ```text
 cache_scope
 seq_no
-drain_revoke_count
-drain_backup_ack_count
-drain_host_release_count
+source_page_size
+check_kind = storage_control_drain
 ```
 
-如果后续要支持 TP/rank exactness，则需要显式建 rank-local queue 或至少记录 rank-synced FIFO drain count。
+如果后续要支持 TP/rank exactness，需要在新的合同中显式建 rank-local queue，或至少记录 rank-synced FIFO drain count。该信息必须作为
+model fact 的字段整体进入同一个 fact class/role，不能把诊断用 queue snapshot 混在当前最小 checkpoint 中。
 
 ## HCSV-LIMIT-004: prefetch I/O progress 仍是未校准的完成度投影
 
@@ -457,8 +464,9 @@ occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 
 `request_host_allocation()` 只做 count-level 判断：
 
-- 先按 requested pages 执行 modeled host cleanup；
-- 再用 `occupied_host_pages + reserved_host_pages` 计算 available pages；
+- 不直接 drain storage-control release queue；pending prefetch host release 只由 `storage_control_drain_boundary` 推进；
+- 按 requested pages 执行 modeled host cleanup；
+- 用 `occupied_host_pages + reserved_host_pages` 计算 available pages；
 - write backup 必须完整接受；
 - prefetch 可以在满足 threshold 的前提下截断；
 - 不建模 host pool index、fragmentation、extra host pools 或真实 `mem_pool_host.alloc()` 返回的 tensor。
@@ -475,8 +483,8 @@ occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 ### 为什么难以精确
 
 真实 host allocator state 不只是一组 radix residency page。它还包含 allocator free-list、pending release queue、可能的 extra pool、
-以及后台 cleanup 已经归还但模型还没看到的 host indices。把这些全部纳入模型需要新增 host allocator ledger 和 storage-control
-queue boundary；直接用 source pool snapshot 又会把 source runtime timing 注入 target prediction。
+以及后台 cleanup 已经归还但模型还没看到的 host indices。把这些全部纳入模型需要新增 host allocator ledger 和更精细的
+storage-control queue 合同；直接用 source pool snapshot 又会把 source runtime timing 注入 target prediction。
 
 ### 风险
 
@@ -499,8 +507,8 @@ host_release_queue
 host_allocation_intent
 ```
 
-在没有完整 allocator snapshot 的情况下，至少应把 storage-control drain boundary 接入 state model，避免 host release 只由模型自选
-boundary 触发。
+当前已经接入 storage-control drain boundary。下一步如果要继续收敛，需要把 host allocator ledger 和 rank-synced release count
+纳入当前合同，而不是在 allocation path 上重新加入模型自选 drain boundary。
 
 ## 维护约定
 

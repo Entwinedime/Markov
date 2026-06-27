@@ -171,11 +171,12 @@ profile config 的 `profiling.python_probe` 只声明本次需要的 consumer，
 runner 会读取 catalog，选择 `requested_consumers ∩ target.fact.consumers` 非空的 target，并把输出 target 中的
 `fact.consumers` 收紧为本次交集。profile config 不能内嵌 target、class filter 或 state-trace 开关。
 
-Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐 JSON 结尾。source/timing internal hooks
-由 requested consumers 推导：transition validator 或 profile quality 需要 source/timing evidence 时才安装。
+Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐 JSON 结尾。HiCache internal hooks
+由 requested consumers 推导：transition validator 或 profile quality 需要 source/timing evidence 时安装。
 
-单个 target 默认只发 `end` phase；需要 start/exception 事件时必须在 target 上显式写
-`"phases": ["start", "end", "exception"]` 或等价的 `emit_phases`。HiCache state 主线不需要 start phase。
+单个 target 只采集 `events` 中显式列出的 phase，不存在默认 `end` 采集。`events` 必须写成 phase 到 event name 的映射，
+例如 `{"end": "..."}`、`{"start": "...", "end": "..."}` 或 `{"instant": "..."}`。zero-duration checkpoint 使用
+`"instant"` key，由通用 callable wrapper 在被包装方法成功返回后发出一条 `phase=instant` 事件。
 
 通用 callable source 由 `generic_callable` 提供；HiCache 特化 source 只存在于
 `sglang_hicache_callable.py`：
@@ -238,10 +239,9 @@ catalog target 示例：
   "id": "hiradix.cache_finished_req.runtime_observed",
   "module": "sglang.srt.mem_cache.hiradix_cache",
   "target": "HiRadixCache.cache_finished_req",
-  "events": [
-    "hicache_cache_finished_req_runtime_observed_start",
-    "hicache_cache_finished_req_runtime_observed_end"
-  ],
+  "events": {
+    "end": "hicache_cache_finished_req_runtime_observed_end"
+  },
   "fields": [],
   "fact": {
     "class": "source_actual",
@@ -254,8 +254,9 @@ catalog target 示例：
 }
 ```
 
-后端第一层分流只看 completed/end-phase 的 `fact.consumers` 和 `fact.class/fact.role`。其它事件即使出现在
-trace 中，也只能作为 timing、source actual、oracle 或 debug 证据。
+后端第一层分流只看 `fact.consumers`、`fact.class/fact.role`，以及该 role 当前合同允许的完成态 phase。workload/policy
+这类 duration fact 使用 end-phase；`runtime_model_checkpoint` 使用 instant phase。其它事件即使出现在 trace 中，也只能作为 timing、
+source actual、oracle 或 debug 证据。
 
 | `fact.class` | 用途 |
 | --- | --- |
@@ -277,7 +278,11 @@ trace 中，也只能作为 timing、source actual、oracle 或 debug 证据。
 | `workload_identity/request_lifecycle_anchor` | finished/unfinished lifecycle 边界 anchor；必须携带当前 committed/fill `token_dictionary`、`full_path_span` 和 `token_count` |
 | `workload_identity/request_admission` | admission boundary 的 request token path、admission kind 和 policy |
 | `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
-| `runtime_model_checkpoint/prefetch_check_point` | request 时间线上的 prefetch check/wait 边界 |
+| `runtime_model_checkpoint/prefetch_check_point` | request 时间线上的 prefetch check/wait instant 边界 |
+| `runtime_model_checkpoint/storage_control_drain_boundary` | `drain_storage_control_queues()` 的 instant 控制边界；只表达 release queue drain 发生到该点，不携带 queue snapshot |
+
+启用 `hicache_state_model` 的 run 必须至少出现一个完成态 `storage_control_drain_boundary`。缺失该 role 表示 trace 不满足当前
+storage-control 合同，会在 quality 阶段以普通 required fact coverage 缺口失败。
 
 source evidence 可以与 state-model target 采自同一个 Python callable，但必须拆成独立 target：
 
@@ -287,10 +292,11 @@ source evidence 可以与 state-model target 采自同一个 Python callable，�
 | lifecycle path/runtime | `source_actual` | 只作为 provenance/quality 对照；state model 只能消费 workload lifecycle anchor 上的 path |
 | insert / capacity / lock / maintenance / storage/controller event | `source_actual` 或 `timing_observation` | 只能用于质量审计、oracle/debug 或后续 target-derived 机制设计 |
 
-`sglang.hicache` probe 在 requested consumers 需要 source/timing evidence 时可以 patch SGLang 内部方法并输出 `source_actual` 事件，例如 radix split/delete、
-device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back enqueue/start、
-write/load ack checkpoint、storage control checkpoint、controller prefetch enqueue、rate-limit、storage hit query、
-prefetch terminate、abort cleanup 和 host memory release enqueue。这些事件默认不是 normal state input。
+`storage_control_drain_boundary` 这类 runtime checkpoint 是 catalog target；`sglang.hicache` probe 同时会在 requested consumers 需要
+source/timing evidence 时 patch SGLang 内部方法并输出当前合同事件，例如 radix split/delete、device/host evictable delta、
+host ref delta、KV node store/remove、load-back、write-back enqueue/start、write/load ack checkpoint、controller prefetch enqueue、
+rate-limit、storage hit query、prefetch terminate、abort cleanup 和 host memory release enqueue。internal hook 产出的 source/timing
+evidence 不是 normal state input。
 
 注意：
 
@@ -329,7 +335,7 @@ state-model fact profile 以 token dictionary + span 引用为核心：
 | 字段 | 必需性 | 说明 |
 | --- | --- | --- |
 | `token_path_id` | 必需 | 完整 token 序列的内容 hash，当前为 `sha256_u32le:<hex>` |
-| `token_ids` | dictionary 首次出现必需 | 完整 token id 序列；completed/end-phase state-model fact 与 diagnostic evidence 分开去重，不能由 `source_actual` 补齐 state-model path |
+| `token_ids` | dictionary 首次出现必需 | 完整 token id 序列；path-bearing state-model fact 与 diagnostic evidence 分开去重，不能由 `source_actual` 补齐 state-model path |
 | `token_span` / `full_path_span` / `prefix_span` / `suffix_span` | 按 role 必需 | 引用 token path 的闭开区间 |
 | `hash_algo` | 必需 | 当前为 `sglang_radix_sha256_v1` |
 | `cache_scope` | 必需 | rank + cache object 作用域 |

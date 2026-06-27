@@ -25,7 +25,12 @@
 
 - Profiling 只采集事实，不预测 target 行为，也不执行建模规则。
 - 模型输入、诊断证据、时序观测和 validation oracle 必须显式分类，不能相互替代。
+- 单个 probe target 是原子 fact 单元；target 中的所有 fields 必须整体属于同一个 `fact.class`、`fact.role`
+  和 `fact.consumers`。不存在字段级 consumer 分流，也不得在同一 target 内混合“部分字段给模型、部分字段只给诊断”的语义。
+- 同一采集点如果确实需要产出不同语义的 fact，应拆成独立 target 或独立事件，并分别定义字段、consumer 和质量检查。
 - 缺失关键事实时必须报告合同缺口，不得使用默认值、推测值或诊断字段补齐。
+- 输入合同重构后只维护当前合同的 schema、required fields、consumer routing、phase 合法性和 readiness 检查；不为历史
+  role、历史字段或旧 trace 增加专项兼容检测，也不输出新旧双轨 ready 状态。任何输入不满足当前合同，都按普通合同缺口、字段缺失或 route error 处理。
 - 实验配置只描述 server、workload 和采集行为，不嵌入 modeling prediction 逻辑。
 - `profiling.channels` 只允许 `torch`、`python_probe` 和 `ld_preload`；各渠道的细节必须由自身配置段控制。
 - Python probe 的 native/runtime 不可见事件不得通过伪造 Python 事实补齐；需要时使用对应 runtime hook。
@@ -36,18 +41,22 @@
 
 ## 缓存状态输入合同
 
-- Cache-state 模型只消费 catalog 显式声明给 `hicache_state_model` 的 completed/end-phase fact。
+- Cache-state 模型只消费 catalog 显式声明给 `hicache_state_model` 的 fact；每个 role 的可消费 phase 必须由当前合同和
+  C++ router 明确声明。workload/policy 这类 duration fact 使用 end-phase，`runtime_model_checkpoint` 使用 instant phase。
 - 可消费事件必须同时满足：
 
   ```text
-  phase == "end"
   "hicache_state_model" in fact.consumers
   fact.class/fact.role 为 C++ router 已知组合
+  phase 满足该 role 的当前合同
   ```
 
 - 当前正常输入事实是 `workload_identity/request_bound_match_anchor`、`workload_identity/request_lifecycle_anchor`、
-  `workload_identity/request_admission`、`target_policy_input/prefetch_decision` 和
-  `runtime_model_checkpoint/prefetch_check_point`。新增事实必须同时更新 target catalog、质量审计和 C++ router。
+  `workload_identity/request_admission`、`target_policy_input/prefetch_decision`、
+  `runtime_model_checkpoint/prefetch_check_point` 和 `runtime_model_checkpoint/storage_control_drain_boundary`。新增事实必须同时更新
+  schema、采集入口、质量审计和 C++ router。
+- 启用 `hicache_state_model` 的 run 必须至少具备一个完成态 `storage_control_drain_boundary`；缺失时按当前合同 required
+  fact coverage 缺口处理，不引入历史格式识别或专项检测分支。
 - 所有正常输入必须具有稳定的 `cache_scope` 与单调 `seq_no`；未知角色、缺字段和非法路由必须进入质量错误。
 - source run 已发生的命中、移动、淘汰、异步完成和状态快照只能用于诊断或验证，不能更新 target state。
 - `source_actual`、`timing_observation`、`oracle_state` 和 debug/provenance 数据不得声明给 `hicache_state_model` consumer。

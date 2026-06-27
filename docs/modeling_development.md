@@ -211,7 +211,8 @@ debug/provenance 字段只能用于质量审计、validation label 或 transitio
 | `workload_identity/request_lifecycle_anchor` | finished/unfinished lifecycle 边界；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
 | `workload_identity/request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
 | `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
-| `runtime_model_checkpoint/prefetch_check_point` | prefetch progress/wait 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
+| `runtime_model_checkpoint/prefetch_check_point` | prefetch progress/wait instant 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
+| `runtime_model_checkpoint/storage_control_drain_boundary` | storage-control queue drain instant 边界；模型只释放 target-derived deferred prefetch host reservation，不读取 source queue identity。 |
 
 match-prefix concrete path、lookup result、source insert/capacity/lock/maintenance、storage/controller result 和 async completion
 只作为 `source_actual` / `timing_observation` evidence。unknown state-model fact 必须进入 quality / summary error，不能静默消费。
