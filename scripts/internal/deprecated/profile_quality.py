@@ -24,6 +24,15 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from hicache_forced_token_contract import forced_token_quality_from_workload_report  # noqa: E402
+from hicache_fact_contract import (  # noqa: E402
+    HICACHE_CONSUMER_FINAL_STATE_VALIDATOR,
+    HICACHE_CONSUMER_INPUT_CONTRACT,
+    HICACHE_CONSUMER_STATE_MODEL,
+    HICACHE_CONSUMER_TRANSITION_VALIDATOR,
+    parse_fact,
+    parse_fact_or_none,
+)
+from hicache_token_contract import token_dictionary_issues  # noqa: E402
 from trace_json import load_chrome_trace_events  # noqa: E402
 
 
@@ -121,7 +130,15 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         for channel in profiling.get("channels_enabled") or []
         if isinstance(channel, str)
     }
-    hicache_state_trace_enabled = bool(profiling.get("python_state_trace_enabled", False))
+    requested_consumers = {
+        str(consumer)
+        for consumer in profiling.get("python_consumers") or []
+        if isinstance(consumer, str)
+    }
+    hicache_state_trace_enabled = bool(
+        requested_consumers
+        & {HICACHE_CONSUMER_FINAL_STATE_VALIDATOR, HICACHE_CONSUMER_TRANSITION_VALIDATOR}
+    )
     python_channel_enabled = "python" in channels_enabled or bool(configured_targets)
     target_quality = {
         target_id: TargetQuality(
@@ -141,7 +158,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         for target in configured_targets.values()
     )
     mechanism_counts = Counter()
-    invariant_accumulator = _new_hicache_invariant_accumulator()
+    state_fact_accumulator = _new_hicache_state_fact_accumulator()
     capacity_accumulator = _new_hicache_capacity_accumulator()
     for event in events:
         raw_args = event.get("args")
@@ -149,7 +166,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
             continue
         _observe_hicache_capacity(capacity_accumulator, raw_args)
         _observe_mechanism(mechanism_counts, raw_args)
-        _observe_hicache_invariant(invariant_accumulator, raw_args)
+        _observe_hicache_state_fact(state_fact_accumulator, raw_args)
         target_id = str(raw_args.get("target_id") or "unknown")
         quality = target_quality.get(target_id)
         if quality is None:
@@ -205,18 +222,20 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     )
     if missing_mechanisms:
         errors.append("expected_hicache_mechanisms_missing")
-    invariant_coverage = _finalize_hicache_invariant(invariant_accumulator)
-    if invariant_coverage["missing_required_fact_events"] > 0:
-        errors.append("hicache_invariant_facts_missing")
-    if invariant_coverage["route_error_events"] > 0:
-        errors.append("hicache_invariant_route_invalid")
-    if invariant_coverage["missing_token_dictionary_refs"] or invariant_coverage["dictionary_ids_without_tokens"]:
+    state_fact_coverage = _finalize_hicache_state_facts(state_fact_accumulator)
+    if state_fact_coverage["missing_required_fact_events"] > 0:
+        errors.append("hicache_state_model_facts_missing")
+    if state_fact_coverage["route_error_events"] > 0:
+        errors.append("hicache_state_fact_route_invalid")
+    if state_fact_coverage["missing_token_dictionary_refs"] or state_fact_coverage["dictionary_ids_without_tokens"]:
         errors.append("hicache_token_dictionary_missing")
-    if invariant_coverage["seq_order_error_count"] > 0:
-        errors.append("hicache_invariant_seq_invalid")
-    if invariant_coverage.get("prefetch_path_contract_error_count", 0) > 0:
+    if state_fact_coverage["invalid_token_dictionary_issue_count"] > 0:
+        errors.append("hicache_token_dictionary_invalid")
+    if state_fact_coverage["seq_order_error_count"] > 0:
+        errors.append("hicache_state_fact_seq_invalid")
+    if state_fact_coverage.get("prefetch_path_contract_error_count", 0) > 0:
         errors.append("hicache_prefetch_decision_path_contract_invalid")
-    if lifecycle_observed_configured and invariant_coverage["lifecycle_path_contract_error_count"] > 0:
+    if lifecycle_observed_configured and state_fact_coverage["lifecycle_path_contract_error_count"] > 0:
         errors.append("hicache_lifecycle_path_contract_invalid")
     if hicache_state_trace_enabled and capacity_accumulator["snapshot_count"] <= 0:
         errors.append("hicache_capacity_snapshot_missing")
@@ -241,7 +260,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         "missing_targets": missing_targets,
         "targets_with_missing_required_fields": targets_with_missing_fields,
         "exception_targets": exception_targets,
-        "hicache_invariant_coverage": invariant_coverage,
+        "hicache_state_model_fact_coverage": state_fact_coverage,
         "workload_report": str(workload_report) if workload_report else None,
         "expected_forced_token_mode": expected_forced_token_mode,
         "forced_token_quality": forced_token_quality,
@@ -299,15 +318,29 @@ def map_repo_path(path: Path) -> Path:
 
 
 def _configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """从 manifest profiling fragment 读取已配置 Python probe target。"""
+    """按 manifest requested consumers 从 target catalog 重建已配置 targets。"""
 
     targets: dict[str, dict[str, Any]] = {}
-    raw_targets = profiling.get("python_targets")
-    if raw_targets is None:
-        python_probe = profiling.get("python_probe") if isinstance(profiling.get("python_probe"), dict) else {}
-        raw_targets = python_probe.get("targets")
-    for item in raw_targets or []:
+    requested = {
+        str(consumer)
+        for consumer in profiling.get("python_consumers") or []
+        if isinstance(consumer, str)
+    }
+    if not requested:
+        return targets
+    catalog_path = profiling.get("python_target_catalog")
+    path = map_repo_path(Path(str(catalog_path))) if isinstance(catalog_path, str) else ROOT_DIR / "configs/profiling/hicache_probe_targets.json"
+    if not path.is_file():
+        return targets
+    raw_targets = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw_targets, list):
+        return targets
+    for item in raw_targets:
         if not isinstance(item, dict):
+            continue
+        fact = item.get("fact") if isinstance(item.get("fact"), dict) else {}
+        consumers = fact.get("consumers") if isinstance(fact.get("consumers"), list) else []
+        if not (requested & {str(consumer) for consumer in consumers if isinstance(consumer, str)}):
             continue
         target_id = item.get("id")
         if isinstance(target_id, str) and target_id:
@@ -476,7 +509,7 @@ _ROLE_TO_MECHANISM = {
 }
 
 
-_INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
+_STATE_FACT_REQUIRED_FIELDS_BY_ROLE = {
     "request_bound_match_anchor": (
         "request_id",
         "cache_scope",
@@ -524,17 +557,17 @@ _INVARIANT_REQUIRED_FIELDS_BY_ROLE = {
     ),
 }
 
-_INVARIANT_EITHER_FIELDS_BY_ROLE = {
+_STATE_FACT_EITHER_FIELDS_BY_ROLE = {
 }
 
-_INVARIANT_DICTIONARY_FIELDS_BY_ROLE = {
+_STATE_FACT_DICTIONARY_FIELDS_BY_ROLE = {
     "request_bound_match_anchor": ("token_dictionary",),
     "request_lifecycle_anchor": ("token_dictionary",),
     "request_admission": ("token_dictionary",),
     "prefetch_decision": ("token_dictionary",),
 }
 
-_INVARIANT_SPAN_FIELDS_BY_ROLE = {
+_STATE_FACT_SPAN_FIELDS_BY_ROLE = {
     "request_bound_match_anchor": ("full_path_span",),
     "request_lifecycle_anchor": ("full_path_span",),
     "request_admission": ("full_path_span",),
@@ -547,8 +580,10 @@ def _observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
 
     if args.get("phase") != "end":
         return
-    event_role = str(args.get("event_role") or "")
-    mechanism = _ROLE_TO_MECHANISM.get(event_role)
+    fact = parse_fact_or_none(args)
+    if fact is None:
+        return
+    mechanism = _ROLE_TO_MECHANISM.get(fact.role)
     if mechanism:
         counter[mechanism] += 1
 
@@ -576,14 +611,20 @@ def _configured_fact_role(target: dict[str, Any]) -> str:
     return ""
 
 
-def _new_hicache_invariant_accumulator() -> dict[str, Any]:
-    """创建 HiCache invariant fact 覆盖率累加器。"""
+def _new_hicache_state_fact_accumulator() -> dict[str, Any]:
+    """创建 HiCache state fact 覆盖率累加器。"""
 
     return {
         "counts": Counter(),
+        "class_events": Counter(),
+        "role_events": Counter(),
+        "consumer_events": Counter(),
         "role_end_events": Counter(),
         "missing_fields": Counter(),
         "missing_fields_by_role": defaultdict(Counter),
+        "invalid_token_dictionary_issues": Counter(),
+        "invalid_token_dictionary_issues_by_role": defaultdict(Counter),
+        "invalid_token_dictionary_samples": [],
         "dictionary_ids": set(),
         "dictionary_ids_with_tokens": set(),
         "span_path_ids": set(),
@@ -600,49 +641,45 @@ def _new_hicache_invariant_accumulator() -> dict[str, Any]:
     }
 
 
-def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
-    """检查单个事件是否满足 HiCache invariant fact 合同。"""
+def _observe_hicache_state_fact(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
+    """检查单个事件是否满足 HiCache state fact 合同。"""
 
     if not _is_hicache_profile_event(args):
         return
+    fact = parse_fact_or_none(args)
+    if fact is None:
+        return
+    accumulator["class_events"][fact.fact_class] += 1
+    accumulator["role_events"][fact.role] += 1
+    for consumer in fact.consumers:
+        accumulator["consumer_events"][consumer] += 1
     _observe_prefetch_path_contract(accumulator, args)
-    if _is_completed_model_input_invariant(args):
+    if _is_completed_state_model_fact(args):
         _observe_token_references(accumulator, args)
     _observe_lifecycle_path_contract(accumulator, args)
-    fact_class = str(args.get("fact_class") or "")
-    model_input = _true_like(args.get("model_input"))
-    dag_input = not _false_like(args.get("dag_input"))
-    if fact_class != "invariant_state":
-        if model_input:
-            accumulator["counts"]["model_input_non_invariant_events"] += 1
+    if not fact.has_consumer(HICACHE_CONSUMER_STATE_MODEL):
         return
-
-    accumulator["counts"]["invariant_events"] += 1
-    if not model_input:
-        accumulator["counts"]["invariant_without_model_input"] += 1
-    if dag_input:
-        accumulator["counts"]["invariant_with_dag_input"] += 1
-    if str(args.get("fact_granularity") or "") != "atomic":
-        accumulator["counts"]["non_atomic_invariant_events"] += 1
-
-    role = str(args.get("event_role") or "")
-    if role not in _INVARIANT_REQUIRED_FIELDS_BY_ROLE:
-        accumulator["counts"]["unknown_invariant_role_events"] += 1
+    if fact.fact_class not in {"workload_identity", "target_policy_input", "runtime_model_checkpoint"}:
+        accumulator["counts"]["state_model_consumer_on_non_state_fact"] += 1
+        return
+    accumulator["counts"]["state_model_events"] += 1
+    if fact.role not in _STATE_FACT_REQUIRED_FIELDS_BY_ROLE:
+        accumulator["counts"]["unknown_state_model_role_events"] += 1
         if args.get("phase") == "end":
             accumulator["counts"]["missing_required_fact_events"] += 1
-            accumulator["missing_fields"]["event_role"] += 1
+            accumulator["missing_fields"]["fact.role"] += 1
         return
     if args.get("phase") != "end":
         return
 
     accumulator["counts"]["required_events"] += 1
-    accumulator["role_end_events"][role] += 1
-    missing = _missing_invariant_fields(args, role)
+    accumulator["role_end_events"][fact.role] += 1
+    missing = _missing_state_fact_fields(args, fact.role)
     if missing:
         accumulator["counts"]["missing_required_fact_events"] += 1
         for field in missing:
             accumulator["missing_fields"][field] += 1
-            accumulator["missing_fields_by_role"][role][field] += 1
+            accumulator["missing_fields_by_role"][fact.role][field] += 1
 
     scope = args.get("cache_scope")
     seq_no = _int_or_none(args.get("seq_no"))
@@ -651,9 +688,12 @@ def _observe_hicache_invariant(accumulator: dict[str, Any], args: dict[str, Any]
 
 
 def _observe_prefetch_path_contract(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
-    """记录 prefetch invariant path 与实际 enqueue 证据是否一致。"""
+    """记录 prefetch model path 与实际 enqueue 证据是否一致。"""
 
-    role = str(args.get("event_role") or "")
+    fact = parse_fact_or_none(args)
+    if fact is None:
+        return
+    role = fact.role
     if role == "prefetch_intent_observed":
         if args.get("phase") == "end":
             _observe_prefetch_actual_path(accumulator, args, "intent")
@@ -663,9 +703,9 @@ def _observe_prefetch_path_contract(accumulator: dict[str, Any], args: dict[str,
         return
     if args.get("phase") != "end":
         return
-    if role != "prefetch_decision" or not _is_completed_model_input_invariant(args):
+    if role != "prefetch_decision" or not _is_completed_state_model_fact(args):
         return
-    token_count = _model_input_token_count(args)
+    token_count = _state_model_token_count(args)
     if token_count is None or token_count <= 0:
         accumulator["prefetch_decision_empty_path_events"] += 1
     else:
@@ -712,8 +752,8 @@ def _prefetch_actual_token_count(args: dict[str, Any], source_kind: str) -> int 
     return max(candidates) if candidates else None
 
 
-def _model_input_token_count(args: dict[str, Any]) -> int | None:
-    """从 invariant fact 中读取可投影 path 的 token 数。"""
+def _state_model_token_count(args: dict[str, Any]) -> int | None:
+    """从 state model fact 中读取可投影 path 的 token 数。"""
 
     span = args.get("full_path_span")
     if isinstance(span, dict):
@@ -724,11 +764,14 @@ def _model_input_token_count(args: dict[str, Any]) -> int | None:
 
 
 def _observe_lifecycle_path_contract(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
-    """记录 lifecycle invariant anchor 与 source_actual path 证据。"""
+    """记录 lifecycle workload anchor 与 source_actual path 证据。"""
 
     if args.get("phase") != "end":
         return
-    role = str(args.get("event_role") or "")
+    fact = parse_fact_or_none(args)
+    if fact is None:
+        return
+    role = fact.role
     if role not in {"request_lifecycle_anchor", "request_lifecycle_path_observed"}:
         return
     key = _lifecycle_path_key(args)
@@ -769,10 +812,11 @@ def _lifecycle_path_signature(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
-    """记录 normal model 可消费的 token dictionary/span 引用。"""
+    """记录 state model 可消费的 token dictionary/span 引用。"""
 
-    role = str(args.get("event_role") or "")
-    for field in _INVARIANT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
+    fact = parse_fact(args)
+    role = fact.role
+    for field in _STATE_FACT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
         value = args.get(field)
         if not isinstance(value, dict):
             continue
@@ -781,7 +825,19 @@ def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any])
             accumulator["dictionary_ids"].add(token_path_id)
             if isinstance(value.get("token_ids"), list):
                 accumulator["dictionary_ids_with_tokens"].add(token_path_id)
-    for field in _INVARIANT_SPAN_FIELDS_BY_ROLE.get(role, ()):
+                for issue in token_dictionary_issues(value):
+                    issue_name = str(issue.get("issue") or "token_dictionary_invalid")
+                    accumulator["invalid_token_dictionary_issues"][issue_name] += 1
+                    accumulator["invalid_token_dictionary_issues_by_role"][role][issue_name] += 1
+                    if len(accumulator["invalid_token_dictionary_samples"]) < 8:
+                        accumulator["invalid_token_dictionary_samples"].append(
+                            {
+                                "role": role,
+                                "field": field,
+                                **issue,
+                            }
+                        )
+    for field in _STATE_FACT_SPAN_FIELDS_BY_ROLE.get(role, ()):
         value = args.get(field)
         if not isinstance(value, dict):
             continue
@@ -790,42 +846,37 @@ def _observe_token_references(accumulator: dict[str, Any], args: dict[str, Any])
             accumulator["span_path_ids"].add(path_id)
 
 
-def _missing_invariant_fields(args: dict[str, Any], role: str) -> list[str]:
-    """返回某个 invariant role 缺失的必需字段列表。"""
+def _missing_state_fact_fields(args: dict[str, Any], role: str) -> list[str]:
+    """返回某个 state fact role 缺失的必需字段列表。"""
 
     missing = [
         field
-        for field in _INVARIANT_REQUIRED_FIELDS_BY_ROLE.get(role, ())
+        for field in _STATE_FACT_REQUIRED_FIELDS_BY_ROLE.get(role, ())
         if not _has_fact(args.get(field))
     ]
-    for choices in _INVARIANT_EITHER_FIELDS_BY_ROLE.get(role, ()):
+    for choices in _STATE_FACT_EITHER_FIELDS_BY_ROLE.get(role, ()):
         if not any(_has_fact(args.get(field)) for field in choices):
             missing.append("|".join(choices))
 
-    for field in _INVARIANT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
+    for field in _STATE_FACT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
         value = args.get(field)
         if value is not None and not _has_token_dictionary(value):
             missing.append(f"{field}.token_path_id")
-    for field in _INVARIANT_SPAN_FIELDS_BY_ROLE.get(role, ()):
+    for field in _STATE_FACT_SPAN_FIELDS_BY_ROLE.get(role, ()):
         value = args.get(field)
         if value is not None and not _has_token_span(value):
             missing.append(f"{field}.path_id")
     return missing
 
 
-def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
-    """汇总 HiCache invariant fact 合同检查结果。"""
+def _finalize_hicache_state_facts(accumulator: dict[str, Any]) -> dict[str, Any]:
+    """汇总 HiCache state fact 合同检查结果。"""
 
     counts: Counter[str] = accumulator["counts"]
     missing_token_dictionary_refs = sorted(accumulator["span_path_ids"] - accumulator["dictionary_ids"])
     dictionary_ids_without_tokens = sorted(accumulator["dictionary_ids"] - accumulator["dictionary_ids_with_tokens"])
-    route_error_events = (
-        counts["model_input_non_invariant_events"]
-        + counts["invariant_without_model_input"]
-        + counts["invariant_with_dag_input"]
-        + counts["non_atomic_invariant_events"]
-        + counts["unknown_invariant_role_events"]
-    )
+    invalid_token_dictionary_issue_count = sum(accumulator["invalid_token_dictionary_issues"].values())
+    route_error_events = counts["state_model_consumer_on_non_state_fact"] + counts["unknown_state_model_role_events"]
     seq_order_error_count = 0
     for seq_values in accumulator["seq_by_scope"].values():
         previous = None
@@ -836,7 +887,14 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
     lifecycle_path_contract = _finalize_lifecycle_path_contract(accumulator)
     prefetch_path_contract = _finalize_prefetch_path_contract(accumulator)
     return {
-        "invariant_events": counts["invariant_events"],
+        "class_events": dict(sorted(accumulator["class_events"].items())),
+        "role_events": dict(sorted(accumulator["role_events"].items())),
+        "consumer_events": dict(sorted(accumulator["consumer_events"].items())),
+        "workload_identity_event_count": accumulator["class_events"]["workload_identity"],
+        "target_policy_input_event_count": accumulator["class_events"]["target_policy_input"],
+        "runtime_model_checkpoint_event_count": accumulator["class_events"]["runtime_model_checkpoint"],
+        "hicache_state_model_event_count": accumulator["consumer_events"][HICACHE_CONSUMER_STATE_MODEL],
+        "input_contract_event_count": accumulator["consumer_events"][HICACHE_CONSUMER_INPUT_CONTRACT],
         "required_events": counts["required_events"],
         "role_end_events": dict(sorted(accumulator["role_end_events"].items())),
         "missing_required_fact_events": counts["missing_required_fact_events"],
@@ -846,16 +904,20 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
             for role, counter in sorted(accumulator["missing_fields_by_role"].items())
         },
         "route_error_events": route_error_events,
-        "model_input_non_invariant_events": counts["model_input_non_invariant_events"],
-        "invariant_without_model_input": counts["invariant_without_model_input"],
-        "invariant_with_dag_input": counts["invariant_with_dag_input"],
-        "non_atomic_invariant_events": counts["non_atomic_invariant_events"],
-        "unknown_invariant_role_events": counts["unknown_invariant_role_events"],
+        "state_model_consumer_on_non_state_fact": counts["state_model_consumer_on_non_state_fact"],
+        "unknown_state_model_role_events": counts["unknown_state_model_role_events"],
         "token_dictionary_paths": len(accumulator["dictionary_ids"]),
         "token_dictionary_paths_with_token_ids": len(accumulator["dictionary_ids_with_tokens"]),
         "token_span_refs": len(accumulator["span_path_ids"]),
         "missing_token_dictionary_refs": missing_token_dictionary_refs,
         "dictionary_ids_without_tokens": dictionary_ids_without_tokens,
+        "invalid_token_dictionary_issue_count": invalid_token_dictionary_issue_count,
+        "invalid_token_dictionary_issues": dict(sorted(accumulator["invalid_token_dictionary_issues"].items())),
+        "invalid_token_dictionary_issues_by_role": {
+            role: dict(sorted(counter.items()))
+            for role, counter in sorted(accumulator["invalid_token_dictionary_issues_by_role"].items())
+        },
+        "invalid_token_dictionary_samples": accumulator["invalid_token_dictionary_samples"],
         "seq_scope_count": len(accumulator["seq_by_scope"]),
         "seq_order_error_count": seq_order_error_count,
         **lifecycle_path_contract,
@@ -864,13 +926,14 @@ def _finalize_hicache_invariant(accumulator: dict[str, Any]) -> dict[str, Any]:
         and route_error_events == 0
         and not missing_token_dictionary_refs
         and not dictionary_ids_without_tokens
+        and invalid_token_dictionary_issue_count == 0
         and seq_order_error_count == 0
         and prefetch_path_contract["prefetch_path_contract_error_count"] == 0,
     }
 
 
 def _finalize_prefetch_path_contract(accumulator: dict[str, Any]) -> dict[str, Any]:
-    """汇总 prefetch enqueue 与 invariant candidate path 的合同检查。"""
+    """汇总 prefetch enqueue 与 model candidate path 的合同检查。"""
 
     enqueue_events = int(accumulator["prefetch_actual_enqueue_events"])
     actual_path_events = int(accumulator["prefetch_actual_path_events"])
@@ -893,7 +956,7 @@ def _finalize_prefetch_path_contract(accumulator: dict[str, Any]) -> dict[str, A
 
 
 def _finalize_lifecycle_path_contract(accumulator: dict[str, Any]) -> dict[str, Any]:
-    """对照 lifecycle invariant path 与 source_actual observed path。"""
+    """对照 lifecycle workload path 与 source_actual observed path。"""
 
     anchors: dict[tuple[str, str, str], list[dict[str, Any]]] = accumulator["lifecycle_anchor_paths"]
     observed: dict[tuple[str, str, str], list[dict[str, Any]]] = accumulator["lifecycle_observed_paths"]
@@ -943,14 +1006,15 @@ def _lifecycle_token_count_signature(signature: dict[str, Any]) -> tuple[Any, ..
     )
 
 
-def _is_completed_model_input_invariant(args: dict[str, Any]) -> bool:
-    """判断事件是否是 normal model 可消费的 completed invariant fact。"""
+def _is_completed_state_model_fact(args: dict[str, Any]) -> bool:
+    """判断事件是否是 state model 可消费的 completed fact。"""
 
-    return (
-        args.get("phase") == "end"
-        and _true_like(args.get("model_input"))
-        and str(args.get("fact_class") or "") == "invariant_state"
-        and str(args.get("fact_granularity") or "") == "atomic"
+    fact = parse_fact_or_none(args)
+    return bool(
+        fact is not None
+        and args.get("phase") == "end"
+        and fact.has_consumer(HICACHE_CONSUMER_STATE_MODEL)
+        and fact.fact_class in {"workload_identity", "target_policy_input", "runtime_model_checkpoint"}
     )
 
 
@@ -1009,22 +1073,10 @@ def _is_hicache_profile_event(args: dict[str, Any]) -> bool:
     """识别需要参与 HiCache 专项质量审计的事件。"""
 
     target_id = str(args.get("target_id") or "").lower()
-    event_role = str(args.get("event_role") or "")
     if target_id.startswith(("hiradix.", "hicache.", "hicache_controller.")):
         return True
-    return event_role in _ROLE_TO_MECHANISM or event_role in _INVARIANT_REQUIRED_FIELDS_BY_ROLE
-
-
-def _false_like(value: Any) -> bool:
-    """解析常见 false 字符串。"""
-
-    return str(value).lower() in {"false", "0", "no", "off"}
-
-
-def _true_like(value: Any) -> bool:
-    """解析常见 true 字符串。"""
-
-    return str(value).lower() in {"true", "1", "yes", "on"}
+    fact = parse_fact_or_none(args)
+    return fact is not None and (fact.role in _ROLE_TO_MECHANISM or fact.role in _STATE_FACT_REQUIRED_FIELDS_BY_ROLE)
 
 
 def _new_hicache_capacity_accumulator() -> dict[str, Any]:
@@ -1032,7 +1084,7 @@ def _new_hicache_capacity_accumulator() -> dict[str, Any]:
 
     return {
         "snapshot_count": 0,
-        "object_type_counts": Counter(),
+        "object_id_prefix_counts": Counter(),
         "unique_values": defaultdict(set),
         "samples": [],
     }
@@ -1041,7 +1093,8 @@ def _new_hicache_capacity_accumulator() -> dict[str, Any]:
 def _observe_hicache_capacity(accumulator: dict[str, Any], args: dict[str, Any]) -> None:
     """从 validation-only state snapshot 中汇总 capacity/policy 证据。"""
 
-    if str(args.get("event_kind") or "") != "state_snapshot":
+    fact = parse_fact_or_none(args)
+    if fact is None or fact.fact_class != "oracle_state" or fact.role != "state_snapshot":
         return
     snapshot = args.get("state_snapshot")
     if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
@@ -1050,14 +1103,15 @@ def _observe_hicache_capacity(accumulator: dict[str, Any], args: dict[str, Any])
     if not isinstance(capacity, dict):
         return
     accumulator["snapshot_count"] += 1
-    object_type = str(snapshot.get("object_type") or "unknown")
-    accumulator["object_type_counts"][object_type] += 1
+    object_id = str(snapshot.get("object_id") or "unknown")
+    object_id_prefix = object_id.split(":", 1)[0] if object_id else "unknown"
+    accumulator["object_id_prefix_counts"][object_id_prefix] += 1
     for key, value in _flatten_capacity_scalars(capacity):
         accumulator["unique_values"][key].add(json.dumps(value, ensure_ascii=False, sort_keys=True))
     if len(accumulator["samples"]) < 5:
         accumulator["samples"].append(
             {
-                "object_type": object_type,
+                "object_id_prefix": object_id_prefix,
                 "page_size": capacity.get("page_size"),
                 "write_policy": capacity.get("write_policy"),
                 "prefetch_policy": capacity.get("prefetch_policy"),
@@ -1079,7 +1133,7 @@ def _finalize_hicache_capacity(accumulator: dict[str, Any]) -> dict[str, Any]:
     return {
         "ready": accumulator["snapshot_count"] > 0,
         "snapshot_count": accumulator["snapshot_count"],
-        "object_type_counts": dict(sorted(accumulator["object_type_counts"].items())),
+        "object_id_prefix_counts": dict(sorted(accumulator["object_id_prefix_counts"].items())),
         "unique_values": unique_values,
         "samples": accumulator["samples"],
     }

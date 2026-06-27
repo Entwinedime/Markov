@@ -25,7 +25,7 @@ INTERNAL_DIR = SCRIPT_DIR.parent / "internal"
 if str(INTERNAL_DIR) not in sys.path:
     sys.path.insert(0, str(INTERNAL_DIR))
 
-from hicache_forced_token_contract import (  # noqa: E402
+from markov_internal.profiling.forced_tokens import (  # noqa: E402
     FORCED_TOKEN_BUNDLE_SCHEMA,
     FORCED_TOKEN_PLAN_SCHEMA,
     forced_token_plan_summary,

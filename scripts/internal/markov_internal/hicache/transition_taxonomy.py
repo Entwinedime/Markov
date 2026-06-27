@@ -8,17 +8,11 @@ catalog 需要的证据摘要。它不读取 profile manifest，也不执行 mat
 from __future__ import annotations
 
 import collections
-import json
 from pathlib import Path
 from typing import Any
 
-from model_runner import normalize_hicache_page_key
-
-
-def load_json(path: Path) -> Any:
-    """读取 JSON 文件。"""
-
-    return json.loads(path.read_text(encoding="utf-8"))
+from ..common.io import load_json
+from .oracle_state import normalize_hicache_page_key
 
 
 def build_transition_classification_entry(
@@ -441,7 +435,7 @@ def summarize_observed_target_evidence(
         "observed_operation_count": len(operations),
         "snapshot_delta_count": len(deltas),
         "operation_kind_counts": count_by_field(operations, "operation_kind"),
-        "event_role_counts": count_by_field(operations, "event_role"),
+        "fact_role_counts": count_by_field(operations, "fact_role"),
         "snapshot_delta_kind_counts": count_by_field(deltas, "transition_kind"),
         "sample_observed_operations": sample_rows_by_pages(operations, sample_page_set, page_key_mode=page_key_mode, sample_limit=sample_limit),
         "sample_snapshot_deltas": sample_rows_by_pages(deltas, sample_page_set, page_key_mode=page_key_mode, sample_limit=sample_limit),
@@ -587,7 +581,7 @@ def physical_candidate_evidence_required(family: str) -> list[str]:
     if family == "low_host_cleanup_loadback_transient":
         return [
             "host cleanup victim choices",
-            "loadback boundary or invariant",
+            "loadback boundary or state fact",
             "prefetch apply evidence",
             "source cache physical ops",
             "duration calibration",
@@ -656,7 +650,7 @@ def compact_evidence_row(row: dict[str, Any]) -> dict[str, Any]:
         "transition_kind",
         "role",
         "event_name",
-        "event_role",
+        "fact_role",
         "event_kind",
         "source_event_index",
         "operation_id",

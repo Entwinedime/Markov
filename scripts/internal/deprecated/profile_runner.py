@@ -31,6 +31,7 @@ sys.path.insert(0, str(ROOT_DIR / "src"))
 
 from profiling import build_profile_manifest, normalize_profiling_config  # noqa: E402
 from profiling.config import ProfilingRuntimeConfig  # noqa: E402
+from profiling.python_probe.trace_sim_probe.schema import validate_hicache_fact  # noqa: E402
 
 
 INTERNAL_SUITE_KEYS = {"experiments", "matrix", "continue_on_error", "$unset"}
@@ -41,6 +42,7 @@ PROFILE_INPUTS_ENV = "TRACE_SIM_PROFILE_INPUTS"
 PROFILE_SERVERS_ENV = "TRACE_SIM_PROFILE_SERVERS"
 PROFILE_FORCED_TOKEN_BUNDLE_ENV = "TRACE_SIM_FORCED_TOKEN_BUNDLE"
 PYTHON_PROBE_ROOT = ROOT_DIR / "src/profiling/python_probe"
+DEFAULT_HICACHE_TARGET_CATALOG = ROOT_DIR / "configs/profiling/hicache_probe_targets.json"
 BENCH_SCRIPT_ROOT = ROOT_DIR / "scripts/bench"
 BENCH_ENV_REMOVE_KEYS = (
     "LD_PRELOAD",
@@ -51,8 +53,7 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_PYTHON_PROBE_OUTPUT",
     "TRACE_SIM_PYTHON_PROBE_DEBUG",
     "TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY",
-    "TRACE_SIM_HICACHE_STATE_TRACE",
-    "TRACE_SIM_HICACHE_PROBE_MODE",
+    "TRACE_SIM_HICACHE_CONSUMERS",
     "TRACE_SIM_HICACHE_INTERNAL_HOOKS",
 )
 
@@ -903,92 +904,77 @@ class ProfileRun:
         """注入 Python probe 环境变量和 target 配置。"""
 
         python_probe = channel_config(self.cfg, "python_probe")
+        selected_targets = self._python_probe_targets_for_env()
         prepend_pythonpath(env, PYTHON_PROBE_ROOT)
         env["TRACE_SIM_PYTHON_PROBE"] = "1"
         env["TRACE_SIM_PYTHON_PROBES"] = ",".join(self.runtime.python_probes)
-        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(
-            self._python_probe_targets_for_env(),
-            ensure_ascii=False,
-        )
+        env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(selected_targets, ensure_ascii=False)
         env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(self.layout.trace_dir / "python_probe")
-        env["TRACE_SIM_HICACHE_PROBE_MODE"] = str(python_probe.get("hicache_mode", python_probe.get("mode", "auto")))
+        env["TRACE_SIM_HICACHE_CONSUMERS"] = ",".join(self.runtime.python_consumers)
         flush_every = python_probe.get("flush_every", python_probe.get("flush_interval_events"))
         if flush_every is not None:
             env["TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY"] = str(flush_every)
         if "internal_hooks" in python_probe:
             env["TRACE_SIM_HICACHE_INTERNAL_HOOKS"] = "1" if bool(python_probe.get("internal_hooks")) else "0"
-        if self._hicache_state_trace_enabled():
-            env["TRACE_SIM_HICACHE_STATE_TRACE"] = "1"
         if self.runtime.debug:
             env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
 
     def _python_probe_targets_for_env(self) -> list[dict[str, Any]]:
-        """按本次 profiling 配置生成真正注入 server 的 target。
+        """按 requested consumers 从 target catalog 选择真正注入 server 的 targets。"""
 
-        state_trace 是验证开关，不要求用户手动把 `hicache_state:self` 写进每个
-        HiCache target。开启时给相关 target 追加 validation-only oracle 字段；probe
-        会把它拆成 `model_input=false` / `fact_class=oracle_state` 事件。
-        """
+        catalog_path = resolve_repo_path(self.runtime.python_target_catalog) or DEFAULT_HICACHE_TARGET_CATALOG
+        raw_targets = load_json(catalog_path)
+        if not isinstance(raw_targets, list):
+            raise ValueError(f"python probe target catalog must be a JSON array: {catalog_path}")
 
-        python_probe = channel_config(self.cfg, "python_probe")
-        targets = [dict(target) for target in self.runtime.python_targets]
-        fact_classes = self._python_probe_fact_class_filter(python_probe)
-        if fact_classes is not None:
-            targets = [target for target in targets if self._python_target_fact_class(target) in fact_classes]
-        if not self._hicache_state_trace_enabled():
-            return targets
-
-        for target in targets:
-            if not self._is_hicache_python_target(target):
+        selected: list[dict[str, Any]] = []
+        requested = tuple(self.runtime.python_consumers)
+        for index, raw_target in enumerate(raw_targets):
+            target = self._validated_catalog_target(raw_target, index, catalog_path)
+            fact = target["fact"]
+            allowed = set(fact["consumers"])
+            selected_consumers = [consumer for consumer in requested if consumer in allowed]
+            if not selected_consumers:
                 continue
-            fields = [dict(field) for field in target.get("fields", []) if isinstance(field, dict)]
-            if not any(field.get("source") == "hicache_state:self" for field in fields):
-                fields.append(
-                    {
-                        "name": "state_snapshot",
-                        "source": "hicache_state:self",
-                        "required": False,
-                    }
-                )
-            target["fields"] = fields
-        return targets
+            selected_fact = {
+                "class": fact["class"],
+                "role": fact["role"],
+                "consumers": selected_consumers,
+            }
+            target["fact"] = selected_fact
+            selected.append(target)
+        return selected
 
     @staticmethod
-    def _python_target_fact_class(target: dict[str, Any]) -> str:
-        """读取 target 声明的 fact class。"""
+    def _validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[str, Any]:
+        """Validate and clone a target catalog entry."""
 
-        fact = target.get("fact") if isinstance(target.get("fact"), dict) else {}
-        return str(fact.get("class") or "")
-
-    @staticmethod
-    def _python_probe_fact_class_filter(python_probe: dict[str, Any]) -> set[str] | None:
-        """根据 python_probe mode / fact_classes 过滤注入 target。"""
-
-        explicit = python_probe.get("fact_classes", python_probe.get("classes"))
-        if isinstance(explicit, str):
-            return {explicit}
-        if isinstance(explicit, list):
-            return {str(item) for item in explicit if isinstance(item, str)}
-        mode = str(python_probe.get("mode", "")).strip().lower()
-        if mode in {"state", "state_only", "invariant", "invariant_only"}:
-            return {"invariant_state"}
-        return None
-
-    def _hicache_state_trace_enabled(self) -> bool:
-        """判断是否开启 validation-only HiCache state snapshot。"""
-
-        python_probe = channel_config(self.cfg, "python_probe")
-        state_trace = python_probe.get("state_trace") if isinstance(python_probe.get("state_trace"), dict) else {}
-        return bool(state_trace.get("enabled", False))
-
-    @staticmethod
-    def _is_hicache_python_target(target: dict[str, Any]) -> bool:
-        """识别需要追加 HiCache state snapshot 字段的 target。"""
-
-        module = str(target.get("module") or "")
-        target_path = str(target.get("target") or "")
-        target_id = str(target.get("id") or "")
-        return "hicache" in target_id.lower() or "hiradix" in module.lower() or "cache_controller" in module.lower() or "HiCache" in target_path
+        if not isinstance(raw, dict):
+            raise ValueError(f"{catalog_path}: targets[{index}] must be an object")
+        target = copy.deepcopy(raw)
+        prefix = f"{catalog_path}: targets[{index}]"
+        for key in ("id", "module", "target"):
+            if not isinstance(target.get(key), str) or not target.get(key):
+                raise ValueError(f"{prefix}.{key} must be a non-empty string")
+        events = target.get("events")
+        if not isinstance(events, list) or not all(isinstance(item, str) and item for item in events):
+            raise ValueError(f"{prefix}.events must be an array of non-empty strings")
+        fact = target.get("fact")
+        if not isinstance(fact, dict):
+            raise ValueError(f"{prefix}.fact must be an object")
+        if set(fact) != {"class", "role", "consumers"}:
+            raise ValueError(f"{prefix}.fact must contain only class, role, and consumers")
+        fact_class = fact.get("class")
+        role = fact.get("role")
+        consumers = fact.get("consumers")
+        if not isinstance(fact_class, str) or not fact_class:
+            raise ValueError(f"{prefix}.fact.class must be a non-empty string")
+        if not isinstance(role, str) or not role:
+            raise ValueError(f"{prefix}.fact.role must be a non-empty string")
+        if not isinstance(consumers, list) or not all(isinstance(item, str) and item for item in consumers):
+            raise ValueError(f"{prefix}.fact.consumers must be a non-empty string array")
+        validate_hicache_fact(fact_class, role, consumers)
+        return target
 
     def _apply_ld_preload_env(self, env: dict[str, str]) -> None:
         """注入 LD_PRELOAD hook，并把输出固定到本次 run 目录。"""

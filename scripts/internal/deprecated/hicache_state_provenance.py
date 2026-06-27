@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """汇总 HiCache mismatch page 的 model/oracle provenance。
 
-该脚本是只读诊断工具。它不会输出 model_input fact，也不会把 oracle 数据回流到模型。
+该脚本是只读诊断工具。它不会输出 state-model fact，也不会把 oracle 数据回流到模型。
 它读取 validation diff、predicted transition trace 和 oracle state snapshot，按 page 汇总
-判断 backend 规则是否能基于当前 invariant fact 修复，还是需要新增 profiling 证据。
+判断 backend 规则是否能基于当前 state-model fact 修复，还是需要新增 profiling 证据。
 """
 
 from __future__ import annotations
@@ -189,11 +189,10 @@ def summarize_oracle_trace(trace_paths: list[Path], pages: set[str], max_changes
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
             continue
-        object_type = str(row.get("object_type") or snapshot.get("object_type") or "")
-        if "RadixCache" not in object_type:
-            continue
         object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
         if not object_id:
+            continue
+        if "RadixCache" not in object_id and not any(key in snapshot for key in ACTIVE_STATE_KEYS):
             continue
         key = (str(row.get("trace_path") or ""), str(row.get("pid") or ""), object_id)
         object_states[key] = derived_hicache_state_from_snapshot(snapshot)

@@ -5,7 +5,7 @@
 trace，以及 full Python probe 中的 validation-only evidence，完成 self、cross
 或 matrix 方向的 transition 比较。每个 compare 结果都会带上 family 分类和
 DAG patch gate 字段；matrix 级 catalog 与 gate scoreboard 是显式开关控制的
-派生产物。本脚本不生成 synthetic model_input，也不把 target actual / oracle
+派生产物。本脚本不生成 synthetic state-model fact，也不把 target actual / oracle
 信息回写到建模输入。
 """
 
@@ -37,6 +37,7 @@ from hicache_transition_taxonomy import (  # noqa: E402
     compare_result_classification_fields,
     load_hicache_summary,
 )
+from hicache_fact_contract import parse_fact_or_none  # noqa: E402
 from model_runner import (  # noqa: E402
     DELTA_KIND_BY_STATE_KEY,
     build_oracle_timeline_deltas,
@@ -497,7 +498,7 @@ def build_model_self_check(predicted_trace_path: Path, *, sample_limit: int) -> 
         "record_count": len(records),
         "schema_check": schema_check,
         "replay_check": replay_check,
-        "state_invariant_check": {
+        "state_constraint_check": {
             "state_constraint_violation_count": len(replay["state_constraint_violations"]),
             "state_constraint_violations": replay["state_constraint_violations"][:sample_limit],
             "ref_balance_issue_count": len(replay["ref_balance_issues"]),
@@ -1112,19 +1113,19 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
         statuses.append(status.to_dict())
         for ordinal, event in enumerate(events):
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            fact_class = str(args.get("fact_class") or "")
-            if fact_class not in {"source_actual", "timing_observation"}:
+            fact = parse_fact_or_none(args)
+            if fact is None or fact.fact_class not in {"source_actual", "timing_observation"}:
                 continue
-            role = str(args.get("event_role") or "")
+            role = fact.role
             event_kind = str(args.get("event_kind") or event.get("name") or "")
             operations.append(
                 {
                     "observed_operation_id": f"{path.name}:{ordinal}",
                     "operation_kind": observed_operation_kind(role, event_kind),
-                    "event_role": role,
+                    "fact_role": role,
                     "event_kind": event_kind,
                     "event_name": event.get("name") or "",
-                    "fact_class": fact_class,
+                    "fact_class": fact.fact_class,
                     "cache_scope": args.get("cache_scope") or "",
                     "request_id": args.get("request_id") or "",
                     "operation_id": args.get("operation_id") or "",
@@ -1133,7 +1134,7 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
                     "ts": event.get("ts"),
                     "dur": event.get("dur"),
                     "trace_path": str(path),
-                    "confidence": "source_actual" if fact_class == "source_actual" else "timing",
+                    "confidence": "source_actual" if fact.fact_class == "source_actual" else "timing",
                 }
             )
     return operations, statuses
@@ -1292,7 +1293,7 @@ def compare_prediction_to_observed(
         "observed_delta_count_by_kind": count_rows_by_transition_kind(observed_rows),
         "unsupported_or_unobservable_state_keys": observed.get("unsupported_or_unobservable_state_keys", []),
         "ignored_transition_state_keys": {
-            "locked_pages": "lock/ref transient is observed through source_actual evidence, but it is not invariant_state model input; final locked state remains checked through final-state exactness.",
+            "locked_pages": "lock/ref transient is observed through source_actual evidence, but it is not a state-model fact; final locked state remains checked through final-state exactness.",
         },
         "failure_classification": classify_transition_comparison_failure(self_check, observed, final_state, count_match, lifecycle_match),
         "notes": [
@@ -1625,6 +1626,7 @@ def compare_transition_matrix(
     catalog_output: Path | None,
     gate_output: Path | None,
     matrix_output_path: Path | None,
+    progress: bool = False,
 ) -> dict[str, Any]:
     """构建矩阵级 transition exactness 汇总。"""
 
@@ -1636,7 +1638,16 @@ def compare_transition_matrix(
     rebuilt_oracle_keys: set[tuple[str, str]] = set()
     rows = []
     classification_entries: list[dict[str, Any]] = []
-    for matrix_row_path in sorted((matrix_dir / "predictions").glob("*/*/matrix_row.json")):
+    matrix_row_paths = sorted((matrix_dir / "predictions").glob("*/*/matrix_row.json"))
+    total = len(matrix_row_paths)
+    if progress:
+        print_transition_stage_start(
+            total,
+            force=force,
+            emit_catalog=emit_catalog,
+            emit_gates=emit_gates,
+        )
+    for index, matrix_row_path in enumerate(matrix_row_paths, start=1):
         matrix_row = load_json(matrix_row_path)
         prediction_dir = resolve_repo_path(Path(str(matrix_row.get("output_dir") or matrix_row_path.parent)))
         prediction_paths = PathsForPrediction(
@@ -1651,14 +1662,6 @@ def compare_transition_matrix(
         should_rebuild_oracle = target_run is not None and (
             (force and target_key not in rebuilt_oracle_keys) or not observed_path.is_file()
         )
-        if should_rebuild_oracle:
-            oracle = extract_target_oracle(
-                [Path(path) for path in target_run["python_probe_files"]],
-                target_run,
-                sample_limit=sample_limit,
-            )
-            write_json(observed_path, oracle)
-            rebuilt_oracle_keys.add(target_key)
         comparison_path = prediction_dir / (
             "transition_exactness_self.json"
             if matrix_row.get("is_self")
@@ -1670,6 +1673,30 @@ def compare_transition_matrix(
             or transition_comparison_needs_rebuild(comparison_path)
             or (emit_catalog and transition_comparison_lacks_catalog_evidence(comparison_path))
         )
+        comparison_can_run = should_rebuild_comparison and prediction_paths.predicted_trace.is_file() and (
+            observed_path.is_file() or target_run is not None
+        )
+        transition_should_run = should_rebuild_oracle or comparison_can_run
+        if progress:
+            print_transition_progress(
+                index,
+                total,
+                matrix_row,
+                matrix_row_path,
+                should_run=transition_should_run,
+                observed_path=observed_path,
+                predicted_trace=prediction_paths.predicted_trace,
+                target_run=target_run,
+                should_rebuild_comparison=should_rebuild_comparison,
+            )
+        if should_rebuild_oracle:
+            oracle = extract_target_oracle(
+                [Path(path) for path in target_run["python_probe_files"]],
+                target_run,
+                sample_limit=sample_limit,
+            )
+            write_json(observed_path, oracle)
+            rebuilt_oracle_keys.add(target_key)
         if observed_path.is_file() and prediction_paths.predicted_trace.is_file() and should_rebuild_comparison:
             comparison = compare_prediction_to_observed(
                 prediction_paths,
@@ -1686,6 +1713,8 @@ def compare_transition_matrix(
         if isinstance(row.get("transition_classification"), dict):
             classification_entries.append(row["transition_classification"])
         rows.append(row)
+        if progress and transition_should_run:
+            print_transition_result(index, total, row)
 
     summary = {
         "schema": "trace_sim.hicache.transition_exactness_matrix.v1",
@@ -1730,6 +1759,120 @@ def compare_transition_matrix(
         write_json(gate_path, scoreboard)
         summary["gate_scoreboard_path"] = str(gate_path)
     return summary
+
+
+def print_transition_stage_start(
+    prediction_count: int,
+    *,
+    force: bool,
+    emit_catalog: bool,
+    emit_gates: bool,
+) -> None:
+    """打印 transition 阶段开始行。"""
+
+    extras = []
+    if force:
+        extras.append("force=true")
+    if emit_catalog:
+        extras.append("catalog=true")
+    if emit_gates:
+        extras.append("gates=true")
+    suffix = f" {' '.join(extras)}" if extras else ""
+    print(
+        f"[running transition] transition exactness matrix: predictions={prediction_count}{suffix}",
+        flush=True,
+    )
+
+
+def print_transition_progress(
+    index: int,
+    total: int,
+    matrix_row: dict[str, Any],
+    matrix_row_path: Path,
+    *,
+    should_run: bool,
+    observed_path: Path,
+    predicted_trace: Path,
+    target_run: dict[str, Any] | None,
+    should_rebuild_comparison: bool,
+) -> None:
+    """打印 transition matrix 进度行。"""
+
+    label = transition_progress_label(matrix_row, matrix_row_path)
+    if should_run:
+        print(f"[{index}/{total}] run {label}", flush=True)
+        return
+    reason = transition_skip_reason(
+        observed_path,
+        predicted_trace,
+        target_run=target_run,
+        should_rebuild_comparison=should_rebuild_comparison,
+    )
+    suffix = f": {reason}" if reason else ""
+    print(f"[{index}/{total}] skip {label}{suffix}", flush=True)
+
+
+def print_transition_result(index: int, total: int, row: dict[str, Any]) -> None:
+    """打印 transition exactness 的简短结果行。"""
+
+    ready = row.get("ready")
+    exact = row.get("exact")
+    final_state_exact = row.get("final_state_exact")
+    if ready is not True:
+        status = "not_ready"
+    elif exact is True:
+        status = "ok"
+    elif final_state_exact is False:
+        status = "final_state_mismatch"
+    else:
+        status = "mismatch"
+    print(
+        f"[{index}/{total}] result {status} "
+        f"ready={progress_value(ready)} exact={progress_value(exact)} "
+        f"final_state_exact={progress_value(final_state_exact)} "
+        f"transition_count_exact={progress_value(row.get('transition_count_exact'))}",
+        flush=True,
+    )
+
+
+def progress_value(value: Any) -> str:
+    """把进度行中的 Python 值转成短字符串。"""
+
+    if isinstance(value, bool) or value is None:
+        return json.dumps(value)
+    return str(value)
+
+
+def transition_progress_label(matrix_row: dict[str, Any], matrix_row_path: Path) -> str:
+    """返回 transition 进度行中的矩阵标签。"""
+
+    label = matrix_row.get("label")
+    if label:
+        return str(label)
+    input_id = str(matrix_row.get("input_id") or matrix_row_path.parent.parent.name)
+    source_config_id = str(matrix_row.get("source_config_id") or "")
+    target_config_id = str(matrix_row.get("target_config_id") or "")
+    if source_config_id or target_config_id:
+        return f"{input_id}/{source_config_id}->{target_config_id}"
+    return str(matrix_row_path.parent)
+
+
+def transition_skip_reason(
+    observed_path: Path,
+    predicted_trace: Path,
+    *,
+    target_run: dict[str, Any] | None,
+    should_rebuild_comparison: bool,
+) -> str:
+    """返回 transition 进度 skip 的简短原因。"""
+
+    if not predicted_trace.is_file():
+        return "missing_predicted_trace"
+    if not observed_path.is_file() and target_run is None:
+        return "missing_observed_target_trace"
+    if not should_rebuild_comparison:
+        return ""
+    return "not_ready"
 
 
 def observed_transition_path(matrix_dir: Path, target_key: tuple[str, str]) -> Path:

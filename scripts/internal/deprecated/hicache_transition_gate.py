@@ -527,7 +527,7 @@ def build_observed_operation_gates(
         operation_id = str(row.get("operation_id") or "")
         request_key = str(row.get("canonical_request_key") or "")
         cache_scope = str(row.get("cache_scope") or "")
-        grouping_key = f"{cache_scope}:{request_key}:{operation_id}:{operation_kind}:{row.get('event_role') or ''}"
+        grouping_key = f"{cache_scope}:{request_key}:{operation_id}:{operation_kind}:{row.get('fact_role') or ''}"
         item = grouped.setdefault(
             grouping_key,
             {
@@ -547,7 +547,7 @@ def build_observed_operation_gates(
                 "evidence_class": observed_evidence_class(row),
                 "provenance": {
                     "observed_event_ids": [],
-                    "event_roles": [],
+                    "fact_roles": [],
                     "event_kinds": [],
                     "transition_ids": [],
                     "policy_decision_epochs": [],
@@ -560,7 +560,7 @@ def build_observed_operation_gates(
         item["pages"] = sorted(set(item["pages"]) | set(normalized_pages))
         item["page_count"] = len(item["pages"])
         append_unique(item["provenance"]["observed_event_ids"], row.get("observed_operation_id") or ordinal, limit=sample_limit)
-        append_unique(item["provenance"]["event_roles"], row.get("event_role"))
+        append_unique(item["provenance"]["fact_roles"], row.get("fact_role"))
         append_unique(item["provenance"]["event_kinds"], row.get("event_kind"))
     return sorted(grouped.values(), key=lambda item: str(item.get("gate_id") or "")), {
         "input_operation_count": len(operations),
@@ -573,8 +573,8 @@ def operation_gate_kind_from_observed(row: dict[str, Any]) -> str:
     """把 observed operation 规整为 patch gate operation kind。"""
 
     operation_kind = str(row.get("operation_kind") or "")
-    event_role = str(row.get("event_role") or "")
-    mapped = OBSERVED_ROLE_TO_OPERATION_KIND.get(event_role) or operation_kind or "unknown"
+    fact_role = str(row.get("fact_role") or "")
+    mapped = OBSERVED_ROLE_TO_OPERATION_KIND.get(fact_role) or operation_kind or "unknown"
     if mapped in {"capacity_request", "capacity_result"}:
         return "allocator_pressure"
     if mapped in {"lock_ref"}:
@@ -594,12 +594,12 @@ def observed_evidence_class(row: dict[str, Any]) -> str:
     """标记 observed operation evidence 的证据等级。"""
 
     fact_class = str(row.get("fact_class") or "")
-    event_role = str(row.get("event_role") or "")
-    if fact_class == "source_actual" and event_role.endswith("_observed"):
+    fact_role = str(row.get("fact_role") or "")
+    if fact_class == "source_actual" and fact_role.endswith("_observed"):
         return "exact_physical"
-    if event_role in {"capacity_request", "capacity_result_observed"}:
+    if fact_role in {"capacity_request", "capacity_result_observed"}:
         return "diagnostic_anchor"
-    if "snapshot" in event_role:
+    if "snapshot" in fact_role:
         return "snapshot_delta"
     return "physical_boundary"
 

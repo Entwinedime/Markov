@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from hicache_state_cross_input_audit import canonical_json, extract_audit_events, model_input_path_contract
+from hicache_fact_contract import HICACHE_CONSUMER_STATE_MODEL, parse_fact_or_none
+from hicache_state_cross_input_audit import canonical_json, extract_audit_events, workload_identity_path_contract
 from profile_quality import audit_profile, map_repo_path
 from trace_json import TraceLoadStatus, load_chrome_trace_events
 
@@ -356,60 +357,67 @@ def build_prediction_specs(
     return specs
 
 
-def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, Any]:
+def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: bool = False) -> dict[str, Any]:
     """执行阶段一 profile quality gate，并写出 per-run 质量详情。"""
 
     rows: list[dict[str, Any]] = []
     signature_by_input: dict[str, dict[str, Any]] = {}
     quality_dir = output_dir / "quality"
-    for run in runs:
+    total = len(runs)
+    for index, run in enumerate(runs, start=1):
+        if progress:
+            print(f"[{index}/{total}] run {run.input_id}/{run.config_id}", flush=True)
         profile_quality_path = quality_dir / f"{safe_slug(run.run_id)}.profile_quality.json"
         profile_quality = audit_profile(run.manifest_path)
         write_json(profile_quality_path, profile_quality)
         trace_summary = summarize_profile_trace(run)
         workload_signature = build_workload_signature(run)
         forced_token_quality = normalize_forced_token_quality(profile_quality)
-        rows.append(
-            {
-                "run_id": run.run_id,
-                "config_id": run.config_id,
-                "input_id": run.input_id,
-                "input_class": run.input_class,
-                "manifest_path": str(run.manifest_path),
-                "run_dir": str(run.run_dir),
-                "python_probe_files": [str(path) for path in run.python_probe_files],
-                "python_probe_file_count": len(run.python_probe_files),
-                "trace_load_status": trace_summary["trace_load_status"],
-                "invariant_event_count": trace_summary["fact_class_counts"].get("invariant_state", 0),
-                "oracle_snapshot_count": trace_summary["oracle_snapshot_count"],
-                "source_actual_count": trace_summary["fact_class_counts"].get("source_actual", 0),
-                "timing_count": trace_summary["fact_class_counts"].get("timing_observation", 0),
-                "fact_class_counts": trace_summary["fact_class_counts"],
-                "missing_required_fields": profile_quality.get("hicache_invariant_coverage", {}).get(
-                    "missing_fields",
-                    {},
-                ),
-                "canonical_request_count": workload_signature["request_event_count"],
-                "canonical_workload_signature": workload_signature["signature"],
-                "canonical_workload_ready": workload_signature["ready"],
-                "profile_quality_ready": bool(profile_quality.get("quality_ready")),
-                "profile_quality_errors": profile_quality.get("quality_errors", []),
-                "state_quality_ready": state_quality_ready(profile_quality, trace_summary, workload_signature),
-                "forced_token_enabled": bool(forced_token_quality.get("enabled")),
-                "forced_token_ready": bool(forced_token_quality.get("ready")),
-                "forced_token_plan_ready": bool(forced_token_quality.get("plan_ready")),
-                "forced_token_bundle_ready": bool(forced_token_quality.get("bundle_ready")),
-                "forced_token_mode": forced_token_quality.get("mode"),
-                "forced_token_plan_sha256": forced_token_quality.get("plan_sha256"),
-                "forced_token_bundle_sha256": forced_token_quality.get("bundle_sha256"),
-                "forced_token_bundle_id": forced_token_quality.get("bundle_id"),
-                "forced_token_bundle_path": forced_token_quality.get("bundle_path"),
-                "forced_token_quality": forced_token_quality,
-                "hicache_invariant_coverage": profile_quality.get("hicache_invariant_coverage", {}),
-                "hicache_capacity": profile_quality.get("hicache_capacity", {}),
-                "workload_signature_detail": workload_signature,
-            }
-        )
+        row = {
+            "run_id": run.run_id,
+            "config_id": run.config_id,
+            "input_id": run.input_id,
+            "input_class": run.input_class,
+            "manifest_path": str(run.manifest_path),
+            "run_dir": str(run.run_dir),
+            "python_probe_files": [str(path) for path in run.python_probe_files],
+            "python_probe_file_count": len(run.python_probe_files),
+            "trace_load_status": trace_summary["trace_load_status"],
+            "workload_event_count": trace_summary["fact_class_counts"].get("workload_identity", 0),
+            "hicache_state_model_event_count": trace_summary["consumer_counts"].get(HICACHE_CONSUMER_STATE_MODEL, 0),
+            "oracle_snapshot_count": trace_summary["oracle_snapshot_count"],
+            "source_actual_count": trace_summary["fact_class_counts"].get("source_actual", 0),
+            "timing_count": trace_summary["fact_class_counts"].get("timing_observation", 0),
+            "fact_class_counts": trace_summary["fact_class_counts"],
+            "fact_role_counts": trace_summary["fact_role_counts"],
+            "consumer_counts": trace_summary["consumer_counts"],
+            "missing_required_fields": profile_quality.get("hicache_state_model_fact_coverage", {}).get(
+                "missing_fields",
+                {},
+            ),
+            "canonical_request_count": workload_signature["request_event_count"],
+            "canonical_workload_signature": workload_signature["signature"],
+            "canonical_workload_ready": workload_signature["ready"],
+            "profile_quality_ready": bool(profile_quality.get("quality_ready")),
+            "profile_quality_errors": profile_quality.get("quality_errors", []),
+            "state_quality_ready": state_quality_ready(profile_quality, trace_summary, workload_signature),
+            "forced_token_enabled": bool(forced_token_quality.get("enabled")),
+            "forced_token_ready": bool(forced_token_quality.get("ready")),
+            "forced_token_plan_ready": bool(forced_token_quality.get("plan_ready")),
+            "forced_token_bundle_ready": bool(forced_token_quality.get("bundle_ready")),
+            "forced_token_mode": forced_token_quality.get("mode"),
+            "forced_token_plan_sha256": forced_token_quality.get("plan_sha256"),
+            "forced_token_bundle_sha256": forced_token_quality.get("bundle_sha256"),
+            "forced_token_bundle_id": forced_token_quality.get("bundle_id"),
+            "forced_token_bundle_path": forced_token_quality.get("bundle_path"),
+            "forced_token_quality": forced_token_quality,
+            "hicache_state_model_fact_coverage": profile_quality.get("hicache_state_model_fact_coverage", {}),
+            "hicache_capacity": profile_quality.get("hicache_capacity", {}),
+            "workload_signature_detail": workload_signature,
+        }
+        rows.append(row)
+        if progress:
+            print_quality_result(index, total, row)
 
     by_input: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
@@ -456,14 +464,55 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path) -> dict[str, 
         "input_workload_signatures": signature_by_input,
         "runs": rows,
         "note": (
-            "quality_ready uses state modeling requirements: invariant facts, token dictionary/span, oracle snapshots, "
-            "same-input canonical workload signatures, and forced-token plan/bundle consistency when forced replay "
-            "is enabled. "
+            "quality_ready uses state modeling requirements: state model facts, token dictionary/span, "
+            "oracle snapshots, same-input workload signatures, and forced-token plan/bundle consistency "
+            "when forced replay is enabled. "
             "profile_quality_ready keeps the stricter collection audit for source_actual/timing diagnostics."
         ),
     }
     write_json(output_dir / "profile_quality.json", report)
     return report
+
+
+def print_quality_result(index: int, total: int, row: dict[str, Any]) -> None:
+    """打印 profile quality 的简短结果行。"""
+
+    status = "ok" if row.get("state_quality_ready") is True else "fail"
+    issue_text = quality_issue_text(row)
+    print(
+        f"[{index}/{total}] result {status} "
+        f"state_ready={progress_value(row.get('state_quality_ready'))} "
+        f"profile_ready={progress_value(row.get('profile_quality_ready'))} "
+        f"workload_events={row.get('canonical_request_count')} "
+        f"oracle_snapshots={row.get('oracle_snapshot_count')} "
+        f"state_model_events={row.get('hicache_state_model_event_count')}"
+        f"{issue_text}",
+        flush=True,
+    )
+
+
+def quality_issue_text(row: dict[str, Any]) -> str:
+    """返回 quality result 行中的短问题摘要。"""
+
+    errors = [str(item) for item in row.get("profile_quality_errors", []) if item]
+    coverage = row.get("hicache_state_model_fact_coverage")
+    invalid_count = 0
+    if isinstance(coverage, dict):
+        invalid_count = int(coverage.get("invalid_token_dictionary_issue_count") or 0)
+    parts = []
+    if errors:
+        parts.append("issues=" + ",".join(errors[:3]))
+    if invalid_count:
+        parts.append(f"token_dict_invalid={invalid_count}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def progress_value(value: Any) -> str:
+    """把进度行中的 Python 值转成短字符串。"""
+
+    if isinstance(value, bool) or value is None:
+        return json.dumps(value)
+    return str(value)
 
 
 def normalize_forced_token_quality(profile_quality: dict[str, Any]) -> dict[str, Any]:
@@ -536,10 +585,11 @@ def summarize_forced_token_input_group(input_rows: list[dict[str, Any]]) -> dict
 
 
 def summarize_profile_trace(run: ProfileRun) -> dict[str, Any]:
-    """汇总一个 profile 的 fact class 和 oracle snapshot 覆盖情况。"""
+    """汇总一个 profile 的 fact class、role、consumer 和 oracle snapshot 覆盖情况。"""
 
     fact_class_counts: collections.Counter[str] = collections.Counter()
-    event_role_counts: collections.Counter[str] = collections.Counter()
+    fact_role_counts: collections.Counter[str] = collections.Counter()
+    consumer_counts: collections.Counter[str] = collections.Counter()
     oracle_snapshot_count = 0
     statuses: list[TraceLoadStatus] = []
     for path in run.python_probe_files:
@@ -547,28 +597,29 @@ def summarize_profile_trace(run: ProfileRun) -> dict[str, Any]:
         statuses.append(status)
         for event in events:
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
-            fact_class = str(args.get("fact_class") or "")
-            if fact_class:
-                fact_class_counts[fact_class] += 1
-            role = str(args.get("event_role") or "")
-            if role:
-                event_role_counts[role] += 1
-            if str(args.get("event_kind") or "") == "state_snapshot":
+            fact = parse_fact_or_none(args)
+            if fact is not None:
+                fact_class_counts[fact.fact_class] += 1
+                fact_role_counts[fact.role] += 1
+                for consumer in fact.consumers:
+                    consumer_counts[consumer] += 1
+            if fact is not None and fact.fact_class == "oracle_state" and fact.role == "state_snapshot":
                 oracle_snapshot_count += 1
     return {
         "fact_class_counts": dict(sorted(fact_class_counts.items())),
-        "event_role_counts": dict(sorted(event_role_counts.items())),
+        "fact_role_counts": dict(sorted(fact_role_counts.items())),
+        "consumer_counts": dict(sorted(consumer_counts.items())),
         "oracle_snapshot_count": oracle_snapshot_count,
         "trace_load_status": [status.to_dict() for status in statuses],
     }
 
 
 def build_workload_signature(run: ProfileRun) -> dict[str, Any]:
-    """基于 atomic invariant fact 构造同 input 可比较的 workload 签名。"""
+    """基于 workload identity fact 构造同 input 可比较的 workload 签名。"""
 
     roles = set(WORKLOAD_SIGNATURE_ROLES)
     events, unknown_roles, unmapped_requests = extract_audit_events(list(run.python_probe_files), run.run_id, roles)
-    path_contract = model_input_path_contract(list(run.python_probe_files), roles, sample=0)
+    path_contract = workload_identity_path_contract(list(run.python_probe_files), roles, sample=0)
     by_role: dict[str, collections.Counter[str]] = {role: collections.Counter() for role in roles}
     for event in events:
         by_role.setdefault(event.role, collections.Counter())[event.signature] += 1
@@ -591,9 +642,9 @@ def build_workload_signature(run: ProfileRun) -> dict[str, Any]:
         "request_event_count": len(events),
         "roles": sorted(roles),
         "role_counts": {role: sum(counter.values()) for role, counter in sorted(by_role.items())},
-        "unknown_invariant_roles": unknown,
+        "unknown_workload_identity_roles": unknown,
         "unmapped_request_id_events": unmapped,
-        "model_input_path_contract": path_contract,
+        "workload_identity_path_contract": path_contract,
     }
 
 
@@ -604,12 +655,12 @@ def state_quality_ready(
 ) -> bool:
     """判断 profile 是否满足 final-state 建模输入要求。"""
 
-    invariant = profile_quality.get("hicache_invariant_coverage")
-    if not isinstance(invariant, dict) or not invariant.get("ready", False):
+    state_model_fact = profile_quality.get("hicache_state_model_fact_coverage")
+    if not isinstance(state_model_fact, dict) or not state_model_fact.get("ready", False):
         return False
     if trace_summary.get("oracle_snapshot_count", 0) <= 0:
         return False
-    if trace_summary.get("fact_class_counts", {}).get("invariant_state", 0) <= 0:
+    if trace_summary.get("consumer_counts", {}).get(HICACHE_CONSUMER_STATE_MODEL, 0) <= 0:
         return False
     forced_token_quality = profile_quality.get("forced_token_quality")
     if isinstance(forced_token_quality, dict) and forced_token_quality.get("enabled"):
@@ -691,11 +742,9 @@ def summarize_prediction(validation_path: Path) -> dict[str, Any]:
             "state_trace_ready": hicache.get("state_trace_ready"),
             "state_trace_events": hicache.get("state_trace_events"),
             "model_transition_events": hicache.get("model_transition_events"),
-            "invariant_coverage_ready": hicache.get("invariant_coverage_ready"),
-            "missing_invariant_facts": hicache.get("missing_invariant_facts", []),
-            "missing_invariant_fact_counts": hicache.get("missing_invariant_fact_counts", {}),
-            "non_invariant_fact_usage": hicache.get("non_invariant_fact_usage", []),
-            "non_invariant_fact_usage_by_role": hicache.get("non_invariant_fact_usage_by_role", {}),
+            "state_model_fact_ready": hicache.get("state_model_fact_ready"),
+            "missing_state_model_facts": hicache.get("missing_state_model_facts", []),
+            "missing_state_model_fact_counts": hicache.get("missing_state_model_fact_counts", {}),
             "final_state_match": hicache.get("final_state_match"),
             "raw_final_state_match": hicache.get("raw_final_state_match"),
             "normalized_model_final_state_counts": hicache.get("normalized_model_final_state_counts", {}),
@@ -713,12 +762,7 @@ def matrix_summary(rows: list[dict[str, Any]], *, schema: str, stage: str) -> di
 
     pass_rows = [row for row in rows if row.get("hicache_state", {}).get("final_state_match") is True]
     ready_rows = [row for row in rows if row.get("validation_ready")]
-    invariant_ready_rows = [
-        row
-        for row in rows
-        if row.get("hicache_state", {}).get("invariant_coverage_ready") is True
-        and not row.get("hicache_state", {}).get("non_invariant_fact_usage")
-    ]
+    state_model_fact_ready_rows = [row for row in rows if row.get("hicache_state", {}).get("state_model_fact_ready") is True]
     by_input: dict[str, dict[str, Any]] = {}
     for input_id in sorted({str(row.get("input_id")) for row in rows}):
         input_rows = [row for row in rows if row.get("input_id") == input_id]
@@ -736,7 +780,7 @@ def matrix_summary(rows: list[dict[str, Any]], *, schema: str, stage: str) -> di
         "stage": stage,
         "prediction_count": len(rows),
         "validation_ready_count": len(ready_rows),
-        "invariant_ready_count": len(invariant_ready_rows),
+        "state_model_fact_ready_count": len(state_model_fact_ready_rows),
         "final_state_match_count": len(pass_rows),
         "final_state_pass_rate": len(pass_rows) / len(rows) if rows else None,
         "by_input": by_input,

@@ -3,7 +3,7 @@
 #
 # 外层入口只负责编排 Docker service、路径投影和容器标记。真实配置解析、
 # trace merge、C++ TraceGraph 调用与 validation 输出都保留在容器内
-# `scripts/internal/model_runner.py` 中，避免宿主机 Python/C++ 环境成为隐式依赖。
+# `scripts/internal/entrypoints/model.py` 中，避免宿主机 Python/C++ 环境成为隐式依赖。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,10 +14,10 @@ CONTAINER_ROOT="/workspace/trace-sim"
 cd "$ROOT_DIR"
 
 # 打印外层 modeling 入口的用法。runner 自身的参数通过 `scripts/model.sh --help`
-# 转发到容器内 `model_runner.py` 查看。
+# 转发到容器内 modeling entrypoint 查看。
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/model.sh <model_runner.py arguments...>
+usage: scripts/model.sh <modeling arguments...>
 
 Runs the container-internal modeling runner inside the clean Ubuntu 24.04
 modeling Docker service. Use --wrapper-help for this wrapper help.
@@ -78,4 +78,4 @@ done
 docker compose -f "$(compose_file)" run --rm \
     -e TRACE_SIM_MODELING_CONTAINER=1 \
     modeling \
-    python3 scripts/internal/model_runner.py "${container_args[@]}"
+    python3 scripts/internal/entrypoints/model.py "${container_args[@]}"

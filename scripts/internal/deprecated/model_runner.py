@@ -24,6 +24,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from hicache_fact_contract import parse_fact_or_none  # noqa: E402
 from trace_json import load_chrome_trace_events  # noqa: E402
 
 
@@ -585,8 +586,8 @@ def write_hicache_predicted_state_trace_if_available(module_summary_path: Path, 
             "record_count": len(rows),
             "records": rows,
             "final_state": hicache_summary.get("final_state", {}),
-            "missing_invariant_facts": hicache_summary.get("missing_invariant_facts", {}),
-            "skipped_non_invariant_events": hicache_summary.get("skipped_non_invariant_events", 0),
+            "missing_state_model_facts": hicache_summary.get("missing_state_model_facts", {}),
+            "skipped_non_state_model_events": hicache_summary.get("skipped_non_state_model_events", 0),
             "target_config": hicache_summary.get("target_config", {}),
             "dag_mutations": hicache_summary.get("dag_mutations", 0),
         },
@@ -824,8 +825,8 @@ def build_validation(
                 errors.append("hicache_state_trace_not_ready")
             if hicache_validation.get("state_trace_ready") and hicache_validation.get("final_state_match") is False:
                 errors.append("hicache_final_state_mismatch")
-        if not hicache_validation.get("invariant_coverage_ready", False):
-            errors.append("hicache_invariant_coverage_not_ready")
+        if not hicache_validation.get("state_model_fact_ready", False):
+            errors.append("hicache_state_model_fact_not_ready")
         result["validation_errors"] = errors
         result["validation_ready"] = not errors
     return result
@@ -885,14 +886,11 @@ def build_hicache_state_validation_if_enabled(
     transition_coverage = build_transition_coverage(predicted_records, snapshots)
     event_delta_validation = build_event_delta_validation(predicted_records, snapshots)
     timeline_delta_validation = build_timeline_delta_validation(predicted_records, snapshots)
-    skipped_non_invariant = int(hicache_summary.get("skipped_non_invariant_events", 0) or 0) if hicache_summary else 0
-    missing_invariants = []
-    missing_invariant_counts = hicache_summary.get("missing_invariant_facts", {}) if hicache_summary else {}
-    if isinstance(missing_invariant_counts, dict):
-        missing_invariants.extend(sorted(str(key) for key, value in missing_invariant_counts.items() if int(value or 0) > 0))
-    non_invariant_usage = hicache_summary.get("non_invariant_fact_usage", []) if hicache_summary else []
-    if isinstance(non_invariant_usage, list) and non_invariant_usage:
-        missing_invariants.append("non_invariant_fact_usage")
+    skipped_non_state_model = int(hicache_summary.get("skipped_non_state_model_events", 0) or 0) if hicache_summary else 0
+    missing_state_model_facts = []
+    missing_state_model_counts = hicache_summary.get("missing_state_model_facts", {}) if hicache_summary else {}
+    if isinstance(missing_state_model_counts, dict):
+        missing_state_model_facts.extend(sorted(str(key) for key, value in missing_state_model_counts.items() if int(value or 0) > 0))
 
     return {
         "state_trace_ready": bool(snapshots),
@@ -921,13 +919,11 @@ def build_hicache_state_validation_if_enabled(
         "timeline_delta_validation": timeline_delta_validation,
         "oracle_capacity_summary": capacity_oracle,
         "capacity_config_audit": capacity_config_audit,
-        "skipped_non_invariant_events": skipped_non_invariant,
+        "skipped_non_state_model_events": skipped_non_state_model,
         "unmatched_state_trace_events": 0 if snapshots else None,
-        "invariant_coverage_ready": bool(hicache_summary) and not missing_invariants,
-        "missing_invariant_facts": missing_invariants,
-        "missing_invariant_fact_counts": missing_invariant_counts if isinstance(missing_invariant_counts, dict) else {},
-        "non_invariant_fact_usage": non_invariant_usage if isinstance(non_invariant_usage, list) else [],
-        "non_invariant_fact_usage_by_role": hicache_summary.get("non_invariant_fact_usage_by_role", {}) if hicache_summary else {},
+        "state_model_fact_ready": bool(hicache_summary) and not missing_state_model_facts,
+        "missing_state_model_facts": missing_state_model_facts,
+        "missing_state_model_fact_counts": missing_state_model_counts if isinstance(missing_state_model_counts, dict) else {},
         "oracle_trace_files": [str(path) for path in oracle_paths],
         "model_summary_ready": bool(hicache_summary),
         "predicted_state_trace_path": str(predicted_state_trace_path) if predicted_state_trace_path else None,
@@ -973,9 +969,8 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
             if not isinstance(args, dict):
                 continue
-            if str(args.get("event_kind") or "") != "state_snapshot":
-                continue
-            if not false_like(args.get("model_input")):
+            fact = parse_fact_or_none(args)
+            if fact is None or fact.fact_class != "oracle_state" or fact.role != "state_snapshot":
                 continue
             snapshot = args.get("state_snapshot")
             if isinstance(snapshot, dict):
@@ -993,7 +988,6 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
                         "operation_id": args.get("operation_id"),
                         "ts": event.get("ts"),
                         "dur": event.get("dur"),
-                        "object_type": snapshot.get("object_type"),
                         "object_id": snapshot.get("object_id"),
                         "state_snapshot": snapshot,
                     }
@@ -1009,7 +1003,7 @@ def extract_hicache_capacity_oracle_state(snapshots: list[dict[str, Any]]) -> di
     跨配置 prediction 对手工 capacity 配置的依赖。
     """
 
-    object_type_counts: dict[str, int] = {}
+    object_id_prefix_counts: dict[str, int] = {}
     unique_values: dict[str, set[str]] = {}
     samples: list[dict[str, Any]] = []
     snapshot_count = 0
@@ -1021,14 +1015,14 @@ def extract_hicache_capacity_oracle_state(snapshots: list[dict[str, Any]]) -> di
         if not isinstance(capacity, dict):
             continue
         snapshot_count += 1
-        object_type = str(snapshot.get("object_type") or row.get("object_type") or "unknown")
-        object_type_counts[object_type] = object_type_counts.get(object_type, 0) + 1
+        object_id_prefix = snapshot_object_id_prefix(row, snapshot)
+        object_id_prefix_counts[object_id_prefix] = object_id_prefix_counts.get(object_id_prefix, 0) + 1
         for key, value in flatten_hicache_capacity_scalars(capacity):
             unique_values.setdefault(key, set()).add(json.dumps(value, ensure_ascii=False, sort_keys=True))
         if len(samples) < 5:
             samples.append(
                 {
-                    "object_type": object_type,
+                    "object_id_prefix": object_id_prefix,
                     "page_size": capacity.get("page_size"),
                     "write_policy": capacity.get("write_policy"),
                     "prefetch_policy": capacity.get("prefetch_policy"),
@@ -1044,7 +1038,7 @@ def extract_hicache_capacity_oracle_state(snapshots: list[dict[str, Any]]) -> di
     return {
         "ready": snapshot_count > 0,
         "snapshot_count": snapshot_count,
-        "object_type_counts": dict(sorted(object_type_counts.items())),
+        "object_id_prefix_counts": dict(sorted(object_id_prefix_counts.items())),
         "unique_values": {
             key: [json.loads(value) for value in sorted(values)]
             for key, values in sorted(unique_values.items())
@@ -1439,8 +1433,7 @@ def observed_max_derived_state_counts(snapshots: list[dict[str, Any]]) -> dict[s
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
             continue
-        object_type = str(row.get("object_type") or snapshot.get("object_type") or "")
-        if "RadixCache" not in object_type or not snapshot_is_completed_state(row):
+        if not snapshot_is_hiradix_cache_state(row, snapshot) or not snapshot_is_completed_state(row):
             continue
         state = derived_hicache_state_from_snapshot(snapshot)
         fallback_states.append(state)
@@ -1483,6 +1476,8 @@ def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
             continue
+        if not snapshot_is_hiradix_cache_state(row, snapshot):
+            continue
         derived = derived_hicache_state_from_snapshot(snapshot)
         if isinstance(derived, dict) and any(isinstance(derived.get(key), list) for key in derived):
             key = (str(row.get("trace_path") or ""), str(row.get("pid") or ""))
@@ -1494,6 +1489,8 @@ def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
     for row in latest_by_process.values():
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict):
+            continue
+        if not snapshot_is_hiradix_cache_state(row, snapshot):
             continue
         derived = derived_hicache_state_from_snapshot(snapshot)
         if not isinstance(derived, dict):
@@ -1858,8 +1855,7 @@ def timeline_visible_state_keys(snapshots: list[dict[str, Any]]) -> set[str]:
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
             continue
-        object_type = str(row.get("object_type") or snapshot.get("object_type") or "")
-        if "RadixCache" not in object_type or not snapshot_is_completed_state(row):
+        if not snapshot_is_hiradix_cache_state(row, snapshot) or not snapshot_is_completed_state(row):
             continue
         state = derived_hicache_state_from_snapshot(snapshot)
         for key, value in state.items():
@@ -1885,10 +1881,9 @@ def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_k
         if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
             ignored_snapshot_count += 1
             continue
-        object_type = str(row.get("object_type") or snapshot.get("object_type") or "")
-        # controller snapshot 只描述队列，不是 radix tree state。timeline oracle 只比较
+        # controller snapshot 只描述队列，不是 HiRadixCache tree state。timeline oracle 只比较
         # cache tree object，避免空 controller snapshot 把 page 集合反复清空。
-        if "RadixCache" not in object_type:
+        if not snapshot_is_hiradix_cache_state(row, snapshot):
             ignored_snapshot_count += 1
             continue
         object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
@@ -1954,6 +1949,19 @@ def union_hicache_states(states: Any) -> dict[str, list[str]]:
             target = union.setdefault(str(key), set())
             target.update(str(item) for item in value if item is not None)
     return {key: sorted(value) for key, value in union.items()}
+
+
+def snapshot_object_id_prefix(row: dict[str, Any], snapshot: dict[str, Any]) -> str:
+    """Return the class-like prefix embedded in snapshot object_id."""
+
+    object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
+    return object_id.split(":", 1)[0] if object_id else "unknown"
+
+
+def snapshot_is_hiradix_cache_state(row: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+    """判断 snapshot 是否来自 HiCache state model 要验证的 HiRadixCache 对象。"""
+
+    return snapshot_object_id_prefix(row, snapshot) == "HiRadixCache"
 
 
 def snapshot_is_completed_state(row: dict[str, Any]) -> bool:

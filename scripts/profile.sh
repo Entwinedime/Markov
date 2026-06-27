@@ -2,7 +2,7 @@
 # 从宿主机进入框架容器，执行 JSON 配置驱动的 profiling run 或 suite。
 #
 # 真实 profiling 必须经过该入口，确保 repo 路径、Ascend 环境和容器内
-# `profile_runner.py` 的执行边界一致。
+# `scripts/internal/entrypoints/profile.py` 的执行边界一致。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -248,7 +248,7 @@ fi
 if [ -n "${TRACE_SIM_FORCED_TOKEN_BUNDLE:-}" ]; then
     runner_args+=(--forced-token-bundle "$TRACE_SIM_FORCED_TOKEN_BUNDLE")
 fi
-python3 scripts/internal/profile_runner.py "${runner_args[@]}"
+python3 scripts/internal/entrypoints/profile.py "${runner_args[@]}"
 '
 
 env_args=(

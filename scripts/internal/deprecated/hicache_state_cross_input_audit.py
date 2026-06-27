@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""跨配置审计 HiCache atomic invariant model-input facts。
+"""跨配置审计 HiCache workload identity facts。
 
-该脚本只读真实 trace，比较 source/target 中已声明为 model_input 的 atomic invariant
+该脚本只读真实 trace，比较 source/target 中声明给 input contract 的 workload identity
 事实集合是否在 request 归一化后匹配。它不生成 synthetic fact，也不把 target actual
 或 oracle 信息写回模型输入。
 """
@@ -21,6 +21,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+from hicache_fact_contract import HICACHE_CONSUMER_INPUT_CONTRACT, parse_fact_or_none  # noqa: E402
+from hicache_token_contract import (  # noqa: E402
+    token_dictionary_issues,
+    token_id_path,
+    token_path_count,
+    token_path_hash,
+)
 from trace_json import load_chrome_trace_events  # noqa: E402
 
 
@@ -28,15 +35,12 @@ DEFAULT_ROLES = (
     "request_bound_match_anchor",
     "request_lifecycle_anchor",
     "request_admission",
-    "prefetch_decision",
-    "prefetch_check_point",
 )
 
 PATH_ROLES = {
     "request_bound_match_anchor",
     "request_lifecycle_anchor",
     "request_admission",
-    "prefetch_decision",
 }
 
 ROLE_SCALAR_FIELDS = {
@@ -51,17 +55,15 @@ ROLE_SCALAR_FIELDS = {
         "ignore_eos",
         "max_new_tokens",
     ),
-    "prefetch_decision": ("token_count",),
-    "prefetch_check_point": ("check_kind",),
 }
 
-KNOWN_ATOMIC_INVARIANT_ROLES = set(DEFAULT_ROLES)
+KNOWN_WORKLOAD_IDENTITY_ROLES = set(DEFAULT_ROLES)
 REQUEST_SCOPED_ROLES = set(DEFAULT_ROLES)
 
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """可比较的 atomic invariant fact 摘要。
+    """可比较的 workload identity fact 摘要。
 
     signature 是跨配置比较的 canonical key；原始 request_id 只保留为诊断字段，
     不直接参与 source/target 匹配。
@@ -85,7 +87,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析 cross-input audit CLI 参数。"""
 
     parser = argparse.ArgumentParser(
-        description="Audit cross-config HiCache atomic invariant model-input facts."
+        description="Audit cross-config HiCache workload identity model-input facts."
     )
     parser.add_argument(
         "--source-trace",
@@ -150,20 +152,6 @@ def maybe_int(value: Any) -> int | None:
         return None
 
 
-def true_like(value: Any) -> bool:
-    """解析 trace args 中可能出现的宽松布尔值。"""
-
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
-
-
 def maybe_json(value: Any) -> Any:
     """解析可能被双重 JSON 编码的 trace arg。"""
 
@@ -189,53 +177,18 @@ def canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
-def completed_model_invariant(event: dict[str, Any]) -> bool:
-    """判断 event 是否是已完成的 atomic invariant model-input fact。"""
+def completed_workload_identity(event: dict[str, Any]) -> bool:
+    """判断 event 是否是已完成的 workload identity input-contract fact。"""
 
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
-    if not true_like(args.get("model_input")):
+    fact = parse_fact_or_none(args)
+    if fact is None:
         return False
-    if str(args.get("fact_class") or "") != "invariant_state":
-        return False
-    if str(args.get("fact_granularity") or "") != "atomic":
+    if fact.fact_class != "workload_identity" or not fact.has_consumer(HICACHE_CONSUMER_INPUT_CONTRACT):
         return False
     phase = str(args.get("phase") or "").lower()
     name = str(event.get("name") or "")
     return phase == "end" or name.endswith("_end")
-
-
-def token_ids(value: Any) -> tuple[int, ...]:
-    """从 token dictionary JSON 中提取 token id 序列。"""
-
-    tokens = token_id_list(value)
-    return () if tokens is None else tokens
-
-
-def token_id_list(value: Any) -> tuple[int, ...] | None:
-    """从 token dictionary JSON 中提取 token id 序列，缺失时返回 None。"""
-
-    value = maybe_json(value)
-    if not isinstance(value, dict):
-        return None
-    raw_tokens = value.get("token_ids")
-    if not isinstance(raw_tokens, list):
-        return None
-    parsed: list[int] = []
-    for token in raw_tokens:
-        try:
-            parsed.append(int(token[0] if isinstance(token, list) else token))
-        except (TypeError, ValueError, IndexError):
-            return None
-    return tuple(parsed)
-
-
-def token_hash(tokens: tuple[int, ...]) -> str:
-    """按 u32 little-endian token 序列生成稳定 path hash。"""
-
-    hasher = hashlib.sha256()
-    for token in tokens:
-        hasher.update(int(token).to_bytes(4, byteorder="little", signed=False))
-    return "sha256_u32le:" + hasher.hexdigest()
 
 
 def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
@@ -244,11 +197,14 @@ def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
     value = maybe_json(args.get(key))
     if not isinstance(value, dict):
         return {}
-    tokens = token_ids(value)
+    tokens = token_id_path(value)
     path_id = str(value.get("token_path_id") or value.get("path_id") or "")
     return {
-        "path_id": path_id or (token_hash(tokens) if tokens else ""),
-        "token_count": optional_int(value.get("token_count"), len(tokens)),
+        "path_id": path_id or (token_path_hash(tokens) if tokens else ""),
+        "token_count": optional_int(
+            value.get("token_count"),
+            token_path_count(tokens) if tokens is not None else None,
+        ),
         "hash_algo": str(value.get("hash_algo") or ""),
     }
 
@@ -281,8 +237,8 @@ def path_signature(args: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def model_input_path_contract(paths: list[Path], roles: set[str], sample: int) -> dict[str, Any]:
-    """检查 path-bearing invariant event 是否能被 C++ token parser 直接消费。"""
+def workload_identity_path_contract(paths: list[Path], roles: set[str], sample: int) -> dict[str, Any]:
+    """检查 path-bearing workload identity event 是否能被 C++ token parser 直接消费。"""
 
     issue_counts: collections.Counter[str] = collections.Counter()
     issue_counts_by_role: collections.Counter[str] = collections.Counter()
@@ -311,7 +267,7 @@ def model_input_path_contract(paths: list[Path], roles: set[str], sample: int) -
 
     events = trace_events(paths)
     for _path, event in events:
-        if not completed_model_invariant(event):
+        if not completed_workload_identity(event):
             continue
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
         for key, value in args.items():
@@ -321,15 +277,18 @@ def model_input_path_contract(paths: list[Path], roles: set[str], sample: int) -
             if not isinstance(dictionary, dict):
                 continue
             path_id = str(dictionary.get("token_path_id") or dictionary.get("path_id") or "")
-            tokens = token_id_list(dictionary)
+            tokens = token_id_path(dictionary)
             if path_id and tokens is not None:
                 path_ids_with_tokens.add(path_id)
 
     for _path, event in events:
-        if not completed_model_invariant(event):
+        if not completed_workload_identity(event):
             continue
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        role = str(args.get("event_role") or "")
+        fact = parse_fact_or_none(args)
+        if fact is None:
+            continue
+        role = fact.role
         if role not in roles or role not in PATH_ROLES:
             continue
 
@@ -353,28 +312,11 @@ def model_input_path_contract(paths: list[Path], roles: set[str], sample: int) -
             if not str(dictionary.get("hash_algo") or ""):
                 record_issue(role, "missing_token_dictionary_hash_algo", event, {"path_id": dictionary_path_id})
 
-            tokens = token_id_list(dictionary)
+            tokens = token_id_path(dictionary)
             if tokens is not None and dictionary_path_id:
                 path_ids_with_tokens.add(dictionary_path_id)
-                computed_path_id = token_hash(tokens)
-                if computed_path_id != dictionary_path_id:
-                    record_issue(
-                        role,
-                        "token_dictionary_hash_mismatch",
-                        event,
-                        {"path_id": dictionary_path_id, "computed_path_id": computed_path_id},
-                    )
-                if dictionary_token_count is not None and dictionary_token_count != len(tokens):
-                    record_issue(
-                        role,
-                        "token_dictionary_token_count_mismatch",
-                        event,
-                        {
-                            "path_id": dictionary_path_id,
-                            "token_count": dictionary_token_count,
-                            "token_ids": len(tokens),
-                        },
-                    )
+            for issue in token_dictionary_issues(dictionary):
+                record_issue(role, str(issue.get("issue") or "token_dictionary_invalid"), event, issue)
 
         span_path_id = ""
         span_begin: int | None = None
@@ -468,15 +410,18 @@ def build_request_fingerprints(events: list[tuple[Path, dict[str, Any]]]) -> dic
     """把 run-local request id 映射成 path fact 派生的稳定 fingerprint。
 
     SGLang request id 每次运行都会重新生成；它在单次 trace 内仍用于关联
-    lifecycle/checkpoint fact 和 path-bearing fact，但自身不是跨配置 invariant fact。
+    lifecycle/checkpoint fact 和 path-bearing fact，但自身不是跨配置 workload identity fact。
     """
 
     anchors_by_request: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
     for _path, event in events:
-        if not completed_model_invariant(event):
+        if not completed_workload_identity(event):
             continue
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        role = str(args.get("event_role") or "")
+        fact = parse_fact_or_none(args)
+        if fact is None:
+            continue
+        role = fact.role
         if role not in PATH_ROLES:
             continue
         request_id = str(args.get("request_id") or "")
@@ -507,7 +452,7 @@ def scalar_value(args: dict[str, Any], field: str) -> Any:
 
 
 def build_signature(role: str, event: dict[str, Any], request_fingerprint: str) -> tuple[str, dict[str, Any]]:
-    """为单个 atomic invariant fact 构造 canonical signature。"""
+    """为单个 workload identity fact 构造 canonical signature。"""
 
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     fields: dict[str, Any] = {"role": role}
@@ -530,7 +475,7 @@ def extract_audit_events(
     """从 trace 中抽取可比较的 AuditEvent 列表。"""
 
     rows: list[AuditEvent] = []
-    unknown_invariant_roles: collections.Counter[str] = collections.Counter()
+    unknown_workload_identity_roles: collections.Counter[str] = collections.Counter()
     unmapped_request_id_events: collections.Counter[str] = collections.Counter()
     ordered = sorted(
         trace_events(paths),
@@ -543,12 +488,15 @@ def extract_audit_events(
     )
     request_fingerprints = build_request_fingerprints(ordered)
     for _path, event in ordered:
-        if not completed_model_invariant(event):
+        if not completed_workload_identity(event):
             continue
         args = event.get("args") if isinstance(event.get("args"), dict) else {}
-        role = str(args.get("event_role") or "")
-        if role not in KNOWN_ATOMIC_INVARIANT_ROLES:
-            unknown_invariant_roles[role or "missing_event_role"] += 1
+        fact = parse_fact_or_none(args)
+        if fact is None:
+            continue
+        role = fact.role
+        if role not in KNOWN_WORKLOAD_IDENTITY_ROLES:
+            unknown_workload_identity_roles[role or "missing_fact_role"] += 1
             continue
         if role not in roles:
             continue
@@ -577,7 +525,7 @@ def extract_audit_events(
                 fields=fields,
             )
         )
-    return rows, unknown_invariant_roles, unmapped_request_id_events
+    return rows, unknown_workload_identity_roles, unmapped_request_id_events
 
 
 def summarize_event(event: AuditEvent | None) -> dict[str, Any] | None:
@@ -660,11 +608,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     """构造 cross-input audit 完整报告。"""
 
     roles = set(args.role or DEFAULT_ROLES)
-    unknown_roles = sorted(roles - KNOWN_ATOMIC_INVARIANT_ROLES)
+    unknown_roles = sorted(roles - KNOWN_WORKLOAD_IDENTITY_ROLES)
     source_events, source_unknown, source_unmapped = extract_audit_events(args.source_trace, args.source_label, roles)
     target_events, target_unknown, target_unmapped = extract_audit_events(args.target_trace, args.target_label, roles)
-    source_path_contract = model_input_path_contract(args.source_trace, roles, args.sample)
-    target_path_contract = model_input_path_contract(args.target_trace, roles, args.sample)
+    source_path_contract = workload_identity_path_contract(args.source_trace, roles, args.sample)
+    target_path_contract = workload_identity_path_contract(args.target_trace, roles, args.sample)
 
     source_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
     target_by_role: dict[str, list[AuditEvent]] = {role: [] for role in roles}
@@ -687,7 +635,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         for row in role_summaries
         if row["count_match"] and row["signature_multiset_match"] and not row["sequence_match"]
     ]
-    unknown_invariant_roles = {
+    unknown_workload_identity_roles = {
         "source": dict(sorted(source_unknown.items())),
         "target": dict(sorted(target_unknown.items())),
     }
@@ -709,7 +657,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         and target_path_contract["ready"]
     )
     return {
-        "schema": "trace_sim.hicache.atomic_cross_input_audit.v3",
+        "schema": "trace_sim.hicache.workload_identity_cross_input_audit.v1",
         "source_label": args.source_label,
         "target_label": args.target_label,
         "source_traces": [str(path) for path in args.source_trace],
@@ -717,28 +665,28 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "roles": sorted(roles),
         "source_event_count": len(source_events),
         "target_event_count": len(target_events),
-        "model_input_contract_ready": ready,
+        "input_contract_ready": ready,
         "input_contract_ready_for_cross_state_rule_diagnosis": ready,
-        "model_input_blocking_roles": blocking_roles,
-        "model_input_fact_mismatch_roles": fact_mismatch_roles,
-        "model_input_path_contract_blocking_roles": path_contract_roles,
-        "source_model_input_path_contract": source_path_contract,
-        "target_model_input_path_contract": target_path_contract,
+        "input_contract_blocking_roles": blocking_roles,
+        "input_contract_fact_mismatch_roles": fact_mismatch_roles,
+        "workload_identity_path_contract_blocking_roles": path_contract_roles,
+        "source_workload_identity_path_contract": source_path_contract,
+        "target_workload_identity_path_contract": target_path_contract,
         "non_blocking_sequence_mismatch_roles": sequence_mismatch_roles,
         "unknown_requested_roles": unknown_roles,
-        "unknown_invariant_roles": unknown_invariant_roles,
+        "unknown_workload_identity_roles": unknown_workload_identity_roles,
         "unmapped_request_id_events": unmapped_request_id_events,
         "role_summaries": role_summaries,
         "request_id_policy": (
             "Raw request_id is run-local and is not part of the cross-config canonical fact. "
             "Request-scoped facts are compared with a request_fingerprint derived from path-bearing "
-            "atomic invariant facts in the same run."
+            "workload identity facts in the same run."
         ),
         "pass_condition": (
-            "For every selected atomic invariant role, source and target streams must match by event count "
-            "and canonical fact multiset after request_id normalization. Unknown invariant roles and "
-            "unmapped request-scoped facts are hard failures. Path-bearing invariant facts must be directly "
-            "consumable by the C++ token parser, including at least one model-input token_ids dictionary for "
+            "For every selected workload identity role, source and target streams must match by event count "
+            "and canonical fact multiset after request_id normalization. Unknown workload identity roles and "
+            "unmapped request-scoped facts are hard failures. Path-bearing workload identity facts must be directly "
+            "consumable by the C++ token parser, including at least one token_ids dictionary for "
             "every referenced path_id. Sequence mismatch is diagnostic only."
         ),
     }
@@ -758,11 +706,11 @@ def main(argv: list[str] | None = None) -> int:
             "target_label": report["target_label"],
             "source_event_count": report["source_event_count"],
             "target_event_count": report["target_event_count"],
-            "model_input_contract_ready": report["model_input_contract_ready"],
-            "model_input_blocking_roles": report["model_input_blocking_roles"],
-            "model_input_path_contract_blocking_roles": report["model_input_path_contract_blocking_roles"],
+            "input_contract_ready": report["input_contract_ready"],
+            "input_contract_blocking_roles": report["input_contract_blocking_roles"],
+            "workload_identity_path_contract_blocking_roles": report["workload_identity_path_contract_blocking_roles"],
             "non_blocking_sequence_mismatch_roles": report["non_blocking_sequence_mismatch_roles"],
-            "unknown_invariant_roles": report["unknown_invariant_roles"],
+            "unknown_workload_identity_roles": report["unknown_workload_identity_roles"],
             "unmapped_request_id_events": report["unmapped_request_id_events"],
         }
         print(json.dumps(summary, ensure_ascii=False, indent=2))
