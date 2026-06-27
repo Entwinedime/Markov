@@ -46,7 +46,7 @@ bool bool_value(const TraceEvent & event, const std::string & key, bool fallback
 
 bool completed_event(const TraceEvent & event) {
     const auto phase = lower_copy(trim_copy(event.arg("phase")));
-    return phase == "end" || event.name.ends_with("_end");
+    return phase == "end";
 }
 
 Json parse_json_arg(const std::string & raw) {
@@ -290,21 +290,17 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.role = metadata.role;
     fact.consumers = metadata.consumers;
     fact.phase = event.arg("phase");
-    if (fact.phase.empty()) {
-        if (event.name.ends_with("_start")) fact.phase = "start";
-        if (event.name.ends_with("_end")) fact.phase = "end";
-    }
-    fact.is_start = fact.phase == "start" || event.name.ends_with("_start");
-    fact.is_end = fact.phase == "end" || event.name.ends_with("_end");
+    fact.is_start = fact.phase == "start";
+    fact.is_end = fact.phase == "end";
     fact.request_id = event.arg("request_id");
     fact.operation_id = event.arg("operation_id", event.arg("node_id"));
-    fact.cache_scope = event.arg("cache_scope", event.pid.empty() ? "-1" : event.pid);
-    fact.check_kind = event.arg("check_kind", event.arg("checkpoint_kind"));
+    fact.cache_scope = event.arg("cache_scope");
+    fact.check_kind = event.arg("check_kind");
     fact.lifecycle_kind = event.arg("lifecycle_kind");
     fact.admission_kind = event.arg("admission_kind");
     fact.storage_source = event.arg("storage_source", event.arg("readable_source", "storage_backend_readable"));
     fact.seq_no = event.arg_u64("seq_no", 0);
-    fact.source_page_size = event.arg_u64("source_page_size", event.arg_u64("page_size", 0));
+    fact.source_page_size = event.arg_u64("source_page_size", 0);
     fact.token_count = event.arg_u64("token_count", 0);
     fact.max_new_tokens = event.arg_u64("max_new_tokens", 0);
     fact.truncation_align_size = event.arg_u64("truncation_align_size", 0);

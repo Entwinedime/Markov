@@ -20,6 +20,7 @@ enum class HiCacheFactRole {
     RequestAdmission,
     PrefetchDecision,
     PrefetchCheckPoint,
+    StorageControlDrainBoundary,
     StorageBackendReadable,
 };
 

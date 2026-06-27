@@ -67,7 +67,7 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "lookup_result_observed": "request_lookup",
     "request_lifecycle_path_observed": "request_lifecycle",
     "request_lifecycle_runtime_observed": "request_lifecycle",
-    "storage_control_checkpoint_observed": "storage_control",
+    "storage_control_drain_boundary": "storage_control",
 }
 
 
@@ -582,6 +582,8 @@ def observed_evidence_class(row: dict[str, Any]) -> str:
 
     fact_class = str(row.get("fact_class") or "")
     fact_role = str(row.get("fact_role") or "")
+    if fact_class == "runtime_model_checkpoint":
+        return "control_boundary"
     if fact_class == "source_actual" and fact_role.endswith("_observed"):
         return "exact_physical"
     if fact_role in {"capacity_request", "capacity_result_observed"}:

@@ -21,6 +21,7 @@ from ..common.paths import CONTAINER_REPO_PREFIXES, ROOT_DIR
 from ..common.trace import load_chrome_trace_events
 from ..hicache.facts import (
     HICACHE_CONSUMER_FINAL_STATE_VALIDATOR,
+    HICACHE_CONSUMER_STATE_MODEL,
     HICACHE_CONSUMER_TRANSITION_VALIDATOR,
 )
 from .forced_tokens import forced_token_quality_from_workload_report
@@ -136,6 +137,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         for consumer in profiling.get("python_consumers") or []
         if isinstance(consumer, str)
     }
+    hicache_state_model_enabled = HICACHE_CONSUMER_STATE_MODEL in requested_consumers
     hicache_state_trace_enabled = bool(
         requested_consumers
         & {HICACHE_CONSUMER_FINAL_STATE_VALIDATOR, HICACHE_CONSUMER_TRANSITION_VALIDATOR}
@@ -224,20 +226,21 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
     if missing_mechanisms:
         errors.append("expected_hicache_mechanisms_missing")
     state_fact_coverage = _finalize_hicache_state_facts(state_fact_accumulator)
-    if state_fact_coverage["missing_required_fact_events"] > 0:
-        errors.append("hicache_state_model_facts_missing")
-    if state_fact_coverage["route_error_events"] > 0:
-        errors.append("hicache_state_fact_route_invalid")
-    if state_fact_coverage["missing_token_dictionary_refs"] or state_fact_coverage["dictionary_ids_without_tokens"]:
-        errors.append("hicache_token_dictionary_missing")
-    if state_fact_coverage["invalid_token_dictionary_issue_count"] > 0:
-        errors.append("hicache_token_dictionary_invalid")
-    if state_fact_coverage["seq_order_error_count"] > 0:
-        errors.append("hicache_state_fact_seq_invalid")
-    if state_fact_coverage.get("prefetch_path_contract_error_count", 0) > 0:
-        errors.append("hicache_prefetch_decision_path_contract_invalid")
-    if lifecycle_observed_configured and state_fact_coverage["lifecycle_path_contract_error_count"] > 0:
-        errors.append("hicache_lifecycle_path_contract_invalid")
+    if hicache_state_model_enabled:
+        if state_fact_coverage["missing_required_fact_events"] > 0 or state_fact_coverage.get("missing_required_role_count", 0) > 0:
+            errors.append("hicache_state_model_facts_missing")
+        if state_fact_coverage["route_error_events"] > 0:
+            errors.append("hicache_state_fact_route_invalid")
+        if state_fact_coverage["missing_token_dictionary_refs"] or state_fact_coverage["dictionary_ids_without_tokens"]:
+            errors.append("hicache_token_dictionary_missing")
+        if state_fact_coverage["invalid_token_dictionary_issue_count"] > 0:
+            errors.append("hicache_token_dictionary_invalid")
+        if state_fact_coverage["seq_order_error_count"] > 0:
+            errors.append("hicache_state_fact_seq_invalid")
+        if state_fact_coverage.get("prefetch_path_contract_error_count", 0) > 0:
+            errors.append("hicache_prefetch_decision_path_contract_invalid")
+        if lifecycle_observed_configured and state_fact_coverage["lifecycle_path_contract_error_count"] > 0:
+            errors.append("hicache_lifecycle_path_contract_invalid")
     if hicache_state_trace_enabled and capacity_accumulator["snapshot_count"] <= 0:
         errors.append("hicache_capacity_snapshot_missing")
 
@@ -270,6 +273,7 @@ def audit_profile(manifest_path: Path) -> dict[str, Any]:
         "expected_configured_cache_mechanisms": expected_configured_mechanisms,
         "observed_cache_mechanisms": dict(sorted(mechanism_counts.items())),
         "missing_cache_mechanisms": missing_mechanisms,
+        "hicache_state_model_enabled": hicache_state_model_enabled,
         "lifecycle_observed_configured": lifecycle_observed_configured,
         "hicache_state_trace_enabled": hicache_state_trace_enabled,
         "hicache_capacity_observed": capacity_accumulator["snapshot_count"] > 0,
@@ -319,7 +323,7 @@ def map_repo_path(path: Path) -> Path:
 
 
 def _configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """按 manifest requested consumers 从 target catalog 重建已配置 targets。"""
+    """按 manifest requested consumers 从 catalog 重建本次 run 的采集合同。"""
 
     targets: dict[str, dict[str, Any]] = {}
     requested = {

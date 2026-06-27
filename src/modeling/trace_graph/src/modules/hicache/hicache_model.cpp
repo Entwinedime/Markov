@@ -617,7 +617,7 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
 std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary) {
     std::vector<HiCacheStateTransition> transitions;
     token_directory_.observe_fact_path(fact, pager_.page_size_for_fact(fact));
-    if (role != HiCacheFactRole::Unknown) {
+    if (role != HiCacheFactRole::Unknown && role != HiCacheFactRole::StorageControlDrainBoundary) {
         auto & scope = scope_state(fact);
         drain_write_through_backup_refs(fact, summary, transitions, scope, "write_through_backup_ack_boundary");
     }
@@ -637,6 +637,9 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
         break;
     case HiCacheFactRole::PrefetchCheckPoint:
         apply_prefetch_check_point(fact, summary, transitions);
+        break;
+    case HiCacheFactRole::StorageControlDrainBoundary:
+        apply_storage_control_drain_boundary(fact, summary, transitions);
         break;
     case HiCacheFactRole::StorageBackendReadable:
         apply_storage_backend_readable(fact, summary, transitions);
@@ -850,7 +853,6 @@ void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSumm
                                .pages = request.full_pages,
                            });
     record_transition(fact, summary, transitions, "acquire_request_ref", "node_ref", request.device_pages, digest());
-    drain_deferred_host_releases(fact, scope);
 }
 
 HiCacheInsertResult HiCacheState::insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
@@ -1306,10 +1308,21 @@ void HiCacheState::drain_deferred_host_releases(const HiCacheFact & fact, Scoped
             .policy_area = "host_allocation",
             .policy_name = "prefetch_host_release_queue",
             .decision = "drain_deferred_host_release_pages",
-            .reason = "sglang frees revoked or unused prefetch host pages through the storage control release queue after allocation pressure",
+            .reason = "sglang drain_storage_control_queues boundary releases target-derived deferred prefetch host reservations",
             .accepted = true,
             .allocator_released_pages = released_pages,
         });
+}
+
+void HiCacheState::apply_storage_control_drain_boundary(const HiCacheFact & fact, HiCacheSummary & summary,
+                                                        std::vector<HiCacheStateTransition> & transitions) {
+    (void)summary;
+    (void)transitions;
+    auto & scope = scope_state(fact);
+    const auto cache_scope = normalized_scope(fact);
+    const auto checkpoint = scope.clock.record_target_checkpoint(cache_scope, "", fact.check_kind, fact.ts, false, fact.source_event_index);
+    (void)checkpoint;
+    drain_deferred_host_releases(fact, scope);
 }
 
 HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary,
@@ -1359,7 +1372,6 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
     auto & scope = scope_state(fact);
     scope.storage.observe_path(page_path);
     scope.tree.observe_page_path(page_path);
-    drain_deferred_host_releases(fact, scope);
     auto lookup = scope.tree.lookup(pages);
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "prefetch_lookup_touch");
     const auto memory_prefix = scope.tree.contiguous_prefix(pages, true, true, false);
@@ -1615,7 +1627,6 @@ void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact,
                                });
         op->completed_pages = std::move(progress.completed_pages);
         apply_prefetch_ready(fact, summary, transitions, scope, *op);
-        drain_deferred_host_releases(fact, scope);
         return;
     }
 
@@ -1645,7 +1656,6 @@ void HiCacheState::resolve_prefetch_before_request_use(const HiCacheFact & fact,
         else {
             op->completed_pages = std::move(progress.completed_pages);
             apply_prefetch_ready(fact, summary, transitions, scope, *op);
-            drain_deferred_host_releases(fact, scope);
         }
     }
 }

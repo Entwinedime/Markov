@@ -56,7 +56,7 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "lookup_result_observed": "request_lookup",
     "request_lifecycle_path_observed": "request_lifecycle",
     "request_lifecycle_runtime_observed": "request_lifecycle",
-    "storage_control_checkpoint_observed": "storage_control",
+    "storage_control_drain_boundary": "storage_control",
 }
 
 
@@ -97,7 +97,7 @@ def extract_target_oracle(trace_paths: list[Path], target_metadata: dict[str, An
         "unsupported_or_unobservable_state_keys": unsupported_keys,
         "notes": [
             "snapshot_delta_rows are derived from validation-only state_snapshot timeline and are labels only.",
-            "observed_operations are source_actual/timing evidence from the target run and must not be model input.",
+            "observed_operations are source_actual/timing evidence plus explicit runtime control boundaries from the target run.",
             "L3 and prefetch internal sets are model-side state unless a future probe exposes them directly.",
         ],
         "samples": {
@@ -136,7 +136,7 @@ def observed_transitions_from_snapshot_rows(rows: list[dict[str, Any]]) -> list[
 
 
 def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """从 target full probe 中抽取 source_actual/timing operation evidence。"""
+    """从 target full probe 中抽取 transition validator 可消费的 operation / control evidence。"""
 
     _ = sample_limit
     operations: list[dict[str, Any]] = []
@@ -147,7 +147,7 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
         for ordinal, event in enumerate(events):
             args = event.get("args") if isinstance(event.get("args"), dict) else {}
             fact = parse_fact_or_none(args)
-            if fact is None or fact.fact_class not in {"source_actual", "timing_observation"}:
+            if fact is None or not _transition_observed_fact(args, fact.fact_class, fact.role):
                 continue
             role = fact.role
             event_kind = str(args.get("event_kind") or event.get("name") or "")
@@ -167,10 +167,32 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
                     "ts": event.get("ts"),
                     "dur": event.get("dur"),
                     "trace_path": str(path),
-                    "confidence": "source_actual" if fact.fact_class == "source_actual" else "timing",
+                    "confidence": observed_confidence(fact.fact_class),
                 }
             )
     return operations, statuses
+
+
+def _transition_observed_fact(args: dict[str, Any], fact_class: str, role: str) -> bool:
+    """判断 fact 是否能作为 transition validator 的 target-side 边界证据。"""
+
+    if fact_class in {"source_actual", "timing_observation"}:
+        return True
+    return (
+        fact_class == "runtime_model_checkpoint"
+        and role == "storage_control_drain_boundary"
+        and str(args.get("phase") or "").lower() == "instant"
+    )
+
+
+def observed_confidence(fact_class: str) -> str:
+    """返回 observed operation 的证据来源等级。"""
+
+    if fact_class == "source_actual":
+        return "source_actual"
+    if fact_class == "runtime_model_checkpoint":
+        return "runtime_model_checkpoint"
+    return "timing"
 
 
 def observed_operation_kind(role: str, event_kind: str) -> str:

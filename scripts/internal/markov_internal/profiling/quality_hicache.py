@@ -31,6 +31,7 @@ ROLE_TO_MECHANISM = {
     "prefetch_intent": "prefetch_schedule",
     "prefetch_intent_observed": "prefetch_schedule",
     "prefetch_check_point": "prefetch_progress",
+    "storage_control_drain_boundary": "storage_control",
     "prefetch_progress_observed": "prefetch_progress",
     "maintenance_checkpoint": "maintenance",
     "capacity_request": "evict",
@@ -63,7 +64,6 @@ ROLE_TO_MECHANISM = {
     "write_counter_delta_observed": "write_storage",
     "write_ack_checkpoint_observed": "write_storage",
     "load_ack_checkpoint_observed": "load_back",
-    "storage_control_checkpoint_observed": "maintenance",
     "prefetch_io_observed": "prefetch_transfer",
     "writeback_io_observed": "write_storage",
     "writeback_enqueue_observed": "write_storage",
@@ -116,6 +116,12 @@ STATE_FACT_REQUIRED_FIELDS_BY_ROLE = {
         "seq_no",
         "check_kind",
     ),
+    "storage_control_drain_boundary": (
+        "cache_scope",
+        "seq_no",
+        "source_page_size",
+        "check_kind",
+    ),
 }
 
 STATE_FACT_EITHER_FIELDS_BY_ROLE = {
@@ -135,14 +141,18 @@ STATE_FACT_SPAN_FIELDS_BY_ROLE = {
     "prefetch_decision": ("full_path_span",),
 }
 
+REQUIRED_COMPLETED_STATE_FACT_ROLES = (
+    "storage_control_drain_boundary",
+)
+
 
 def observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
-    """把 end-phase 事件角色映射为 workload 机制命中。"""
+    """把完成态事件角色映射为 workload 机制命中。"""
 
-    if args.get("phase") != "end":
-        return
     fact = parse_fact_or_none(args)
     if fact is None:
+        return
+    if not _is_completed_fact_role(args, fact.role):
         return
     mechanism = ROLE_TO_MECHANISM.get(fact.role)
     if mechanism:
@@ -180,7 +190,7 @@ def new_hicache_state_fact_accumulator() -> dict[str, Any]:
         "class_events": Counter(),
         "role_events": Counter(),
         "consumer_events": Counter(),
-        "role_end_events": Counter(),
+        "role_completed_events": Counter(),
         "missing_fields": Counter(),
         "missing_fields_by_role": defaultdict(Counter),
         "invalid_token_dictionary_issues": Counter(),
@@ -226,15 +236,15 @@ def observe_hicache_state_fact(accumulator: dict[str, Any], args: dict[str, Any]
     accumulator["counts"]["state_model_events"] += 1
     if fact.role not in STATE_FACT_REQUIRED_FIELDS_BY_ROLE:
         accumulator["counts"]["unknown_state_model_role_events"] += 1
-        if args.get("phase") == "end":
+        if _is_completed_fact_role(args, fact.role):
             accumulator["counts"]["missing_required_fact_events"] += 1
             accumulator["missing_fields"]["fact.role"] += 1
         return
-    if args.get("phase") != "end":
+    if not _is_completed_fact_role(args, fact.role):
         return
 
     accumulator["counts"]["required_events"] += 1
-    accumulator["role_end_events"][fact.role] += 1
+    accumulator["role_completed_events"][fact.role] += 1
     missing = _missing_state_fact_fields(args, fact.role)
     if missing:
         accumulator["counts"]["missing_required_fact_events"] += 1
@@ -418,6 +428,12 @@ def _missing_state_fact_fields(args: dict[str, Any], role: str) -> list[str]:
     for choices in STATE_FACT_EITHER_FIELDS_BY_ROLE.get(role, ()):
         if not any(_has_fact(args.get(field)) for field in choices):
             missing.append("|".join(choices))
+    if (
+        role == "storage_control_drain_boundary"
+        and _has_fact(args.get("check_kind"))
+        and str(args.get("check_kind")) != "storage_control_drain"
+    ):
+        missing.append("check_kind.storage_control_drain")
 
     for field in STATE_FACT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
         value = args.get(field)
@@ -438,6 +454,11 @@ def finalize_hicache_state_facts(accumulator: dict[str, Any]) -> dict[str, Any]:
     dictionary_ids_without_tokens = sorted(accumulator["dictionary_ids"] - accumulator["dictionary_ids_with_tokens"])
     invalid_token_dictionary_issue_count = sum(accumulator["invalid_token_dictionary_issues"].values())
     route_error_events = counts["state_model_consumer_on_non_state_fact"] + counts["unknown_state_model_role_events"]
+    missing_required_roles = [
+        role
+        for role in REQUIRED_COMPLETED_STATE_FACT_ROLES
+        if accumulator["role_completed_events"].get(role, 0) <= 0
+    ]
     seq_order_error_count = 0
     for seq_values in accumulator["seq_by_scope"].values():
         previous = None
@@ -457,7 +478,9 @@ def finalize_hicache_state_facts(accumulator: dict[str, Any]) -> dict[str, Any]:
         "hicache_state_model_event_count": accumulator["consumer_events"][HICACHE_CONSUMER_STATE_MODEL],
         "input_contract_event_count": accumulator["consumer_events"][HICACHE_CONSUMER_INPUT_CONTRACT],
         "required_events": counts["required_events"],
-        "role_end_events": dict(sorted(accumulator["role_end_events"].items())),
+        "role_completed_events": dict(sorted(accumulator["role_completed_events"].items())),
+        "missing_required_roles": missing_required_roles,
+        "missing_required_role_count": len(missing_required_roles),
         "missing_required_fact_events": counts["missing_required_fact_events"],
         "missing_fields": dict(sorted(accumulator["missing_fields"].items())),
         "missing_fields_by_role": {
@@ -484,6 +507,7 @@ def finalize_hicache_state_facts(accumulator: dict[str, Any]) -> dict[str, Any]:
         **lifecycle_path_contract,
         **prefetch_path_contract,
         "ready": counts["missing_required_fact_events"] == 0
+        and not missing_required_roles
         and route_error_events == 0
         and not missing_token_dictionary_refs
         and not dictionary_ids_without_tokens
@@ -573,10 +597,19 @@ def _is_completed_state_model_fact(args: dict[str, Any]) -> bool:
     fact = parse_fact_or_none(args)
     return bool(
         fact is not None
-        and args.get("phase") == "end"
+        and _is_completed_fact_role(args, fact.role)
         and fact.has_consumer(HICACHE_CONSUMER_STATE_MODEL)
         and fact.fact_class in {"workload_identity", "target_policy_input", "runtime_model_checkpoint"}
     )
+
+
+def _is_completed_fact_role(args: dict[str, Any], role: str) -> bool:
+    """判断当前 role 在合同中是否处于可消费完成态。"""
+
+    phase = str(args.get("phase") or "").lower()
+    if role in {"prefetch_check_point", "storage_control_drain_boundary"}:
+        return phase == "instant"
+    return phase == "end"
 
 
 def _has_fact(value: Any) -> bool:
