@@ -16,6 +16,7 @@ from types import ModuleType
 from typing import Any, Callable
 
 from trace_sim_probe.patching import PATCH_MARKER
+from trace_sim_probe.schema import validate_hicache_fact
 from trace_sim_probe.writer import get_writer, probe_debug_enabled
 
 
@@ -30,17 +31,11 @@ class FieldSpec:
 
 @dataclass(frozen=True)
 class FactSpec:
-    """target 级 atomic fact 元数据。
-
-    fact 分类必须显式落在 target 上，避免字段列表隐式决定 `model_input`、
-    `dag_input` 或 HiCache invariant role。
-    """
+    """target 级 fact 元数据。"""
 
     fact_class: str
-    event_role: str
-    dag_input: bool
-    model_input: bool
-    granularity: str
+    role: str
+    consumers: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -68,23 +63,20 @@ class TargetSpec:
     enabled: bool = True
 
 
-@dataclass(frozen=True)
-class ExtractedField:
-    """source extractor 返回的字段包装。
-
-    普通字段进入真实执行事件；validation-only 字段会被拆成独立事件，避免
-    state snapshot / oracle 这类验证数据污染性能 DAG。
-    """
-
-    value: Any
-    model_input: bool = True
-    event_kind: str = ""
-    extra_args: dict[str, Any] | None = None
-
-
 _TARGETS = None
 _PATCHED: set[str] = set()
-_KNOWN_FACT_CLASSES = {"invariant_state", "timing_observation", "source_actual", "oracle_state", "debug_quality"}
+_FULL_LIST_KEYS = {
+    "token_ids",
+    "node_chain",
+    "last_node_chain",
+    "last_host_node_chain",
+    "best_match_node_chain",
+    "operation_hash_pages",
+    "hash_value",
+    "hash_pages",
+    "hit_hash_pages",
+    "prefix_keys",
+}
 SourceExtractor = Callable[
     [str, str, dict[str, Any], tuple[Any, ...], dict[str, Any], Any],
     tuple[bool, bool, Any],
@@ -126,10 +118,10 @@ def _load_targets() -> list[TargetSpec]:
     return targets
 
 
-def configured_fact_classes() -> set[str]:
-    """返回当前 target 配置声明的 fact class 集合，供专用 probe 判断工作模式。"""
+def configured_consumers() -> set[str]:
+    """返回当前 target 配置实际声明的 consumer 集合。"""
 
-    return {target.fact.fact_class for target in _load_targets()}
+    return {consumer for target in _load_targets() for consumer in target.fact.consumers}
 
 
 def install(module: ModuleType) -> None:
@@ -239,30 +231,19 @@ def _parse_fact(raw: Any, target_id: str) -> FactSpec:
 
     if not isinstance(raw, dict):
         raise ValueError(f"python_probe target {target_id!r} must define fact")
+    if set(raw) != {"class", "role", "consumers"}:
+        raise ValueError(f"python_probe target {target_id!r} fact must contain only class, role, and consumers")
     fact_class = raw.get("class")
-    event_role = raw.get("role")
-    granularity = raw.get("granularity")
-    model_input = raw.get("model_input")
-    dag_input = raw.get("dag_input")
+    role = raw.get("role")
+    consumers = raw.get("consumers")
     if not isinstance(fact_class, str) or not fact_class:
         raise ValueError(f"python_probe target {target_id!r} fact.class must be a non-empty string")
-    if fact_class not in _KNOWN_FACT_CLASSES:
-        raise ValueError(f"python_probe target {target_id!r} fact.class must be one of {sorted(_KNOWN_FACT_CLASSES)}")
-    if not isinstance(event_role, str) or not event_role:
+    if not isinstance(role, str) or not role:
         raise ValueError(f"python_probe target {target_id!r} fact.role must be a non-empty string")
-    if not isinstance(granularity, str) or granularity != "atomic":
-        raise ValueError(f"python_probe target {target_id!r} fact.granularity must be 'atomic'")
-    if not isinstance(model_input, bool):
-        raise ValueError(f"python_probe target {target_id!r} fact.model_input must be true or false")
-    if not isinstance(dag_input, bool):
-        raise ValueError(f"python_probe target {target_id!r} fact.dag_input must be true or false")
-    return FactSpec(
-        fact_class=fact_class,
-        event_role=event_role,
-        dag_input=dag_input,
-        model_input=model_input,
-        granularity=granularity,
-    )
+    if not isinstance(consumers, list) or not all(isinstance(item, str) and item for item in consumers):
+        raise ValueError(f"python_probe target {target_id!r} fact.consumers must be a non-empty string array")
+    validate_hicache_fact(fact_class, role, consumers)
+    return FactSpec(fact_class=fact_class, role=role, consumers=tuple(consumers))
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -384,13 +365,13 @@ def _emit(
     start_us: int,
     end_us: int,
 ) -> None:
-    """构造 Chrome trace event，并把 validation-only 字段拆成旁路事件。"""
+    """构造 Chrome trace event。"""
 
     bound = _bind_arguments(fn, args, kwargs)
     _bind_trace_context(bound, target, phase)
     if not _should_emit_target(target, bound, args, kwargs, result):
         return
-    fields, validation_fields, missing = _collect_fields(target, bound, args, kwargs, result)
+    fields, missing = _collect_fields(target, bound, args, kwargs, result)
     event_name = _event_name(target, phase)
     base_args = {
         "schema_version": 1,
@@ -413,21 +394,6 @@ def _emit(
             **_fact_args(target),
         },
     )
-    if validation_fields:
-        event_kind = str(validation_fields.pop("_event_kind", "validation"))
-        get_writer().duration_event(
-            f"{event_name}:{event_kind}",
-            start_us,
-            end_us,
-            "python_probe",
-            {
-                **base_args,
-                "model_input": False,
-                "event_kind": event_kind,
-                "source_event_name": event_name,
-                **validation_fields,
-            },
-        )
 
 
 def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -> None:
@@ -435,10 +401,8 @@ def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -
 
     bound["__trace_sim_phase"] = phase
     bound["__trace_sim_fact_class"] = target.fact.fact_class
-    bound["__trace_sim_fact_granularity"] = target.fact.granularity
-    bound["__trace_sim_model_input"] = target.fact.model_input
-    bound["__trace_sim_dag_input"] = target.fact.dag_input
-    bound["__trace_sim_event_role"] = target.fact.event_role
+    bound["__trace_sim_fact_role"] = target.fact.role
+    bound["__trace_sim_fact_consumers"] = target.fact.consumers
 
 
 def _event_name(target: TargetSpec, phase: str) -> str:
@@ -459,39 +423,18 @@ def _collect_fields(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
-) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
-    """采集 target 字段，并区分模型输入字段与 validation-only 字段。"""
+) -> tuple[dict[str, Any], list[str]]:
+    """采集 target 字段。"""
 
     fields: dict[str, Any] = {}
-    validation_fields: dict[str, Any] = {}
     missing: list[str] = []
     for field in target.fields:
         found, value = _extract_field(field, bound, args, kwargs, result)
         if found:
-            _store_extracted_field(field.name, value, fields, validation_fields)
+            fields[field.name] = value
         elif field.required:
             missing.append(field.name)
-    return fields, validation_fields, missing
-
-
-def _store_extracted_field(
-    field_name: str,
-    value: Any,
-    fields: dict[str, Any],
-    validation_fields: dict[str, Any],
-) -> None:
-    """按 ExtractedField 的 model_input 标记分流字段。"""
-
-    if not isinstance(value, ExtractedField):
-        fields[field_name] = value
-        return
-
-    target_fields = fields if value.model_input else validation_fields
-    if value.extra_args:
-        target_fields.update(value.extra_args)
-    target_fields[field_name] = value.value
-    if not value.model_input and value.event_kind:
-        validation_fields.setdefault("_event_kind", value.event_kind)
+    return fields, missing
 
 
 def _fact_args(target: TargetSpec) -> dict[str, Any]:
@@ -499,11 +442,11 @@ def _fact_args(target: TargetSpec) -> dict[str, Any]:
 
     fact = target.fact
     return {
-        "model_input": fact.model_input,
-        "dag_input": fact.dag_input,
-        "fact_class": fact.fact_class,
-        "event_role": fact.event_role,
-        "fact_granularity": fact.granularity,
+        "fact": {
+            "class": fact.fact_class,
+            "role": fact.role,
+            "consumers": list(fact.consumers),
+        }
     }
 
 
@@ -585,9 +528,7 @@ def _extract_field(
     source = field.source.strip()
     try:
         found, value = _extract_raw_value(source, field.name, bound, args, kwargs, result)
-        if found and isinstance(value, ExtractedField):
-            return (True, value)
-        return (found, _jsonable(value) if found else None)
+        return (found, _jsonable(value, key=field.name) if found else None)
     except Exception as exc:
         return (False, {"extract_error": type(exc).__name__})
     return (False, None)
@@ -795,15 +736,16 @@ def _safe_list(value: Any) -> list[Any] | None:
         return None
 
 
-def _jsonable(value: Any) -> Any:
-    """把任意 Python 对象收敛成短 JSON 值，避免 trace 过大。"""
+def _jsonable(value: Any, *, key: str | None = None) -> Any:
+    """把任意 Python 对象收敛成 JSON 值，保留建模所需 token/path 列表。"""
 
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, (list, tuple)):
-        return [_jsonable(item) for item in value[:32]]
+        items = value if key in _FULL_LIST_KEYS else value[:32]
+        return [_jsonable(item) for item in items]
     if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in list(value.items())[:64]}
+        return {str(child_key): _jsonable(item, key=str(child_key)) for child_key, item in list(value.items())[:64]}
     return str(value)
 
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS
+
 
 DEFAULT_PYTHON_PROBES = ("generic_callable",)
 KNOWN_CHANNELS = {"torch", "python_probe", "ld_preload"}
-KNOWN_FACT_CLASSES = {"invariant_state", "timing_observation", "source_actual", "oracle_state", "debug_quality"}
 
 
 @dataclass(frozen=True)
@@ -18,8 +19,8 @@ class ProfilingRuntimeConfig:
     enabled: bool
     channels: tuple[str, ...]
     python_probes: tuple[str, ...]
-    python_targets: tuple[dict[str, Any], ...]
-    python_state_trace_enabled: bool
+    python_consumers: tuple[str, ...]
+    python_target_catalog: str | None
     debug: bool
 
     def to_manifest_fragment(self) -> dict[str, Any]:
@@ -29,8 +30,8 @@ class ProfilingRuntimeConfig:
             "enabled": self.enabled,
             "channels_enabled": list(self.channels),
             "python_probes_enabled": list(self.python_probes),
-            "python_targets": list(self.python_targets),
-            "python_state_trace_enabled": self.python_state_trace_enabled,
+            "python_consumers": list(self.python_consumers),
+            "python_target_catalog": self.python_target_catalog,
             "debug": self.debug,
         }
 
@@ -54,24 +55,27 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
         raise TypeError("profiling.python_probe must be an object")
 
     if "python_probe" in channels:
+        _reject_unknown_python_probe_config(python_probe_cfg)
         python_probes = _as_str_tuple(
-            python_probe_cfg.get("probes", profiling.get("probes")),
+            python_probe_cfg.get("probes", python_probe_cfg.get("name", profiling.get("probes"))),
             default=DEFAULT_PYTHON_PROBES,
             field_name="profiling.python_probe.probes",
         )
-        python_targets = _parse_python_targets(python_probe_cfg.get("targets", []))
-        state_trace = python_probe_cfg.get("state_trace") if isinstance(python_probe_cfg.get("state_trace"), dict) else {}
-        python_state_trace_enabled = _as_bool(state_trace.get("enabled"), default=False)
+        python_consumers = _parse_python_consumers(python_probe_cfg.get("consumers"))
+        catalog = python_probe_cfg.get("target_catalog")
+        if catalog is not None and not isinstance(catalog, str):
+            raise TypeError("profiling.python_probe.target_catalog must be a string")
+        python_target_catalog = catalog
     else:
         python_probes = ()
-        python_targets = ()
-        python_state_trace_enabled = False
+        python_consumers = ()
+        python_target_catalog = None
     return ProfilingRuntimeConfig(
         enabled=enabled,
         channels=channels,
         python_probes=python_probes,
-        python_targets=python_targets,
-        python_state_trace_enabled=python_state_trace_enabled,
+        python_consumers=python_consumers,
+        python_target_catalog=python_target_catalog,
         debug=_as_bool(profiling.get("debug", cfg.get("debug")), default=False),
     )
 
@@ -117,56 +121,34 @@ def _channel_cfg(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
     return {}
 
 
-def _parse_python_targets(raw: Any) -> tuple[dict[str, Any], ...]:
-    """解析 Python probe target 列表并校验 fact contract。"""
+def _reject_unknown_python_probe_config(python_probe_cfg: dict[str, Any]) -> None:
+    """Reject python_probe config outside the active target-catalog contract."""
 
-    if raw is None:
-        return ()
-    if not isinstance(raw, list):
-        raise TypeError("profiling.python_probe.targets must be an array")
-    result: list[dict[str, Any]] = []
-    for index, item in enumerate(raw):
-        if not isinstance(item, dict):
-            raise TypeError(f"profiling.python_probe.targets[{index}] must be an object")
-        target_id = item.get("id")
-        target = item.get("target")
-        module = item.get("module")
-        if not isinstance(target_id, str) or not target_id:
-            raise ValueError(f"profiling.python_probe.targets[{index}].id must be a non-empty string")
-        if not isinstance(target, str) or not target:
-            raise ValueError(f"profiling.python_probe.targets[{index}].target must be a non-empty string")
-        if not isinstance(module, str) or not module:
-            raise ValueError(f"profiling.python_probe.targets[{index}].module must be a non-empty string")
-        _validate_python_target_fact(item, index)
-        result.append(dict(item))
-    return tuple(result)
+    allowed = {
+        "enabled",
+        "name",
+        "probes",
+        "consumers",
+        "target_catalog",
+        "flush_every",
+        "flush_interval_events",
+        "internal_hooks",
+    }
+    unknown = sorted(set(python_probe_cfg) - allowed)
+    if unknown:
+        raise ValueError(f"unknown profiling.python_probe fields: {unknown}")
 
 
-def _validate_python_target_fact(item: dict[str, Any], index: int) -> None:
-    """校验 Python probe target 的 fact 元数据。
+def _parse_python_consumers(raw: Any) -> tuple[str, ...]:
+    """解析本次 Python probe 请求的 consumer 列表。"""
 
-    这里强制声明 class/role/granularity/model_input/dag_input，避免 probe 配置隐式生成
-    可进入模型的事实。
-    """
-
-    fact = item.get("fact")
-    prefix = f"profiling.python_probe.targets[{index}].fact"
-    if not isinstance(fact, dict):
-        raise ValueError(f"{prefix} must be an object")
-    fact_class = fact.get("class")
-    if not isinstance(fact_class, str) or not fact_class:
-        raise ValueError(f"{prefix}.class must be a non-empty string")
-    if fact_class not in KNOWN_FACT_CLASSES:
-        raise ValueError(f"{prefix}.class must be one of {sorted(KNOWN_FACT_CLASSES)}")
-    role = fact.get("role")
-    if not isinstance(role, str) or not role:
-        raise ValueError(f"{prefix}.role must be a non-empty string")
-    if fact.get("granularity") != "atomic":
-        raise ValueError(f"{prefix}.granularity must be 'atomic'")
-    if not isinstance(fact.get("model_input"), bool):
-        raise ValueError(f"{prefix}.model_input must be true or false")
-    if not isinstance(fact.get("dag_input"), bool):
-        raise ValueError(f"{prefix}.dag_input must be true or false")
+    consumers = _as_str_tuple(raw, default=(), field_name="profiling.python_probe.consumers")
+    if not consumers:
+        raise ValueError("profiling.python_probe.consumers must list at least one consumer")
+    unknown = [consumer for consumer in consumers if consumer not in HICACHE_FACT_CONSUMERS]
+    if unknown:
+        raise ValueError(f"unknown profiling.python_probe.consumers: {unknown}")
+    return _unique(consumers)
 
 
 def _as_str_tuple(value: Any, *, default: tuple[str, ...], field_name: str) -> tuple[str, ...]:

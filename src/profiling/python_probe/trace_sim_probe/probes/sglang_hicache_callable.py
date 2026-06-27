@@ -15,6 +15,12 @@ from typing import Any
 
 from trace_sim_probe.patching import PATCH_MARKER
 from trace_sim_probe.probes import generic_callable as _base
+from trace_sim_probe.schema import (
+    HICACHE_CONSUMER_PROFILE_QUALITY,
+    HICACHE_CONSUMER_TRANSITION_VALIDATOR,
+    allowed_consumers_for_fact,
+    validate_hicache_fact,
+)
 from trace_sim_probe.writer import get_writer, probe_debug_enabled
 
 
@@ -36,6 +42,31 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
+def _configured_consumers() -> set[str]:
+    """读取本次 probe 配置实际启用的 consumer 集合。"""
+
+    return set(_configured_consumer_order())
+
+
+def _configured_consumer_order() -> tuple[str, ...]:
+    """按配置顺序读取本次 probe 实际启用的 consumers。"""
+
+    result: list[str] = []
+    seen: set[str] = set()
+    raw = os.environ.get("TRACE_SIM_HICACHE_CONSUMERS", "")
+    for item in raw.split(","):
+        consumer = item.strip()
+        if consumer and consumer not in seen:
+            seen.add(consumer)
+            result.append(consumer)
+    consumers = set(_base.configured_consumers())
+    for consumer in sorted(consumers):
+        if consumer not in seen:
+            seen.add(consumer)
+            result.append(consumer)
+    return tuple(result)
+
+
 def _internal_hooks_enabled() -> bool:
     """判断是否安装 HiCache source/timing 归因用 internal hooks。"""
 
@@ -43,14 +74,8 @@ def _internal_hooks_enabled() -> bool:
     if override is not None:
         return _truthy(override)
 
-    mode = os.environ.get("TRACE_SIM_HICACHE_PROBE_MODE", "auto").strip().lower()
-    if mode in {"off", "state", "state_only", "invariant", "invariant_only"}:
-        return False
-    if mode in {"on", "full", "debug", "attribution", "physical"}:
-        return True
-
-    fact_classes = _base.configured_fact_classes()
-    return any(fact_class != "invariant_state" for fact_class in fact_classes)
+    consumers = _configured_consumers()
+    return bool(consumers & {HICACHE_CONSUMER_PROFILE_QUALITY, HICACHE_CONSUMER_TRANSITION_VALIDATOR})
 
 
 def _source_spec(source: str, prefix: str) -> str | None:
@@ -69,40 +94,14 @@ def _hicache_state_source(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
-    """处理 `hicache_state:self`，只生成 validation-only state snapshot。"""
+    """处理 `hicache_state:self`，生成 state snapshot 字段。"""
 
     if source != "hicache_state:self":
         return (False, False, None)
-    if not _truthy(os.environ.get("TRACE_SIM_HICACHE_STATE_TRACE")):
-        return (
-            True,
-            True,
-            _base.ExtractedField(
-                {"enabled": False},
-                model_input=False,
-                event_kind="state_snapshot",
-                extra_args={
-                    "dag_input": False,
-                    "fact_class": "oracle_state",
-                },
-            ),
-        )
     if not args:
         return (True, False, None)
     snapshot = _snapshot_hicache_object(args[0])
-    return (
-        True,
-        True,
-        _base.ExtractedField(
-            snapshot,
-            model_input=False,
-            event_kind="state_snapshot",
-            extra_args={
-                "dag_input": False,
-                "fact_class": "oracle_state",
-            },
-        ),
-    )
+    return (True, True, snapshot)
 
 
 def _token_path_source(
@@ -119,7 +118,7 @@ def _token_path_source(
     if spec is None:
         return (False, False, None)
     found, value = _extract_token_path(spec, bound, args, kwargs, result)
-    return (True, found, _base.ExtractedField(value) if found else None)
+    return (True, found, value if found else None)
 
 
 def _token_span_source(
@@ -153,7 +152,7 @@ def _request_token_path_source(
     if spec is None:
         return (False, False, None)
     found, value = _extract_request_token_path(spec, bound, args, kwargs, result)
-    return (True, found, _base.ExtractedField(value) if found else None)
+    return (True, found, value if found else None)
 
 
 def _request_token_span_source(
@@ -204,7 +203,7 @@ def _token_path_concat_source(
     if spec is None:
         return (False, False, None)
     found, value = _extract_token_path_concat(spec, bound, args, kwargs, result)
-    return (True, found, _base.ExtractedField(value) if found else None)
+    return (True, found, value if found else None)
 
 
 def _token_span_concat_source(
@@ -238,7 +237,7 @@ def _node_token_path_source(
     if spec is None:
         return (False, False, None)
     found, value = _extract_node_token_path(spec, bound, args, kwargs, result)
-    return (True, found, _base.ExtractedField(value) if found else None)
+    return (True, found, value if found else None)
 
 
 def _node_token_span_source(
@@ -407,7 +406,7 @@ def _node_token_path_concat_source(
     if spec is None:
         return (False, False, None)
     found, value = _extract_node_token_path_concat(spec, bound, args, kwargs, result)
-    return (True, found, _base.ExtractedField(value) if found else None)
+    return (True, found, value if found else None)
 
 
 def _node_token_span_concat_source(
@@ -816,16 +815,14 @@ def _token_path_record(tokens: list[Any], scope: str = "", bucket: str = "unknow
 
 
 def _token_dictionary_bucket(bound: dict[str, Any]) -> str:
-    """区分 normal model input 与诊断证据的 token dictionary 去重域。"""
+    """区分 state model 输入与诊断证据的 token dictionary 去重域。"""
 
     phase = str(bound.get("__trace_sim_phase") or "")
-    model_input = bool(bound.get("__trace_sim_model_input"))
-    fact_class = str(bound.get("__trace_sim_fact_class") or "")
-    granularity = str(bound.get("__trace_sim_fact_granularity") or "")
-    if model_input and fact_class == "invariant_state" and granularity == "atomic" and phase == "end":
-        return "model_input_end"
-    if model_input and fact_class == "invariant_state" and granularity == "atomic":
-        return f"model_input_{phase or 'unknown'}"
+    consumers = set(bound.get("__trace_sim_fact_consumers") or ())
+    if "hicache_state_model" in consumers and phase == "end":
+        return "state_model_end"
+    if "hicache_state_model" in consumers:
+        return f"state_model_{phase or 'unknown'}"
     return "diagnostic"
 
 
@@ -1042,7 +1039,6 @@ def _snapshot_hicache_object(obj: Any) -> dict[str, Any]:
     derived = _derive_page_sets(nodes)
     return {
         "enabled": True,
-        "object_type": type(obj).__name__,
         "object_id": f"{type(obj).__name__}:{id(obj)}",
         "page_size": _safe_int(getattr(obj, "page_size", None)),
         "nodes": nodes,
@@ -2438,25 +2434,23 @@ def _wrap_append_host_mem_release(method: Any) -> Any:
 def _emit_internal_event(
     cache: Any,
     target_id: str,
-    event_role: str,
+    role: str,
     payload: dict[str, Any],
     *,
     target: str,
     fact_class: str,
-    dag_input: bool = False,
-    model_input: bool = False,
 ) -> None:
-    """发出 HiCache 内部 source_actual/debug 事件。
-
-    默认 `model_input=false`、`dag_input=false`，确保 source actual 只用于质量
-    审计和 oracle 对齐，不会被正常 C++ state model 当作输入事实消费。
-    """
+    """发出 HiCache 内部 source/debug 事件。"""
 
     try:
+        consumers = _selected_internal_consumers(fact_class, role)
+        if not consumers:
+            return
+        validate_hicache_fact(fact_class, role, list(consumers))
         timestamp = get_writer().now_us()
         scope, seq_no = _next_scope_seq(cache)
         get_writer().duration_event(
-            f"hicache_{event_role}",
+            f"hicache_{role}",
             timestamp,
             timestamp,
             "python_probe",
@@ -2468,12 +2462,12 @@ def _emit_internal_event(
                 "phase": "instant",
                 "status": "completed",
                 "missing_required_fields": [],
-                "model_input": model_input,
-                "event_kind": f"hicache_{event_role}",
-                "dag_input": dag_input,
-                "fact_class": fact_class,
-                "event_role": event_role,
-                "fact_granularity": "atomic",
+                "event_kind": f"hicache_{role}",
+                "fact": {
+                    "class": fact_class,
+                    "role": role,
+                    "consumers": list(consumers),
+                },
                 "cache_scope": scope,
                 "seq_no": seq_no,
                 "source_page_size": _safe_int(getattr(cache, "page_size", None)),
@@ -2483,6 +2477,13 @@ def _emit_internal_event(
     except Exception as exc:
         if probe_debug_enabled():
             print(f"[trace_sim_probe] failed to emit HiCache internal event {target_id}: {exc}", flush=True)
+
+
+def _selected_internal_consumers(fact_class: str, role: str) -> tuple[str, ...]:
+    """选择当前 run 允许读取 direct internal event 的 consumers。"""
+
+    allowed = allowed_consumers_for_fact(fact_class, role)
+    return tuple(consumer for consumer in _configured_consumer_order() if consumer in allowed)
 
 
 def _next_scope_seq(cache: Any) -> tuple[str, int]:

@@ -20,11 +20,8 @@
     },
     "python_probe": {
       "enabled": false,
-      "probes": [],
-      "targets": [],
-      "state_trace": {
-        "enabled": false
-      }
+      "name": "sglang.hicache",
+      "consumers": []
     },
     "ld_preload": {
       "enabled": false

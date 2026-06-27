@@ -2,7 +2,7 @@
 
 trace_merger 是 profiling 到 C++ modeling 之间的 trace 合流层。它只把 runtime
 wrapper 参数注入对应 profiler event，并把 Python sidecar 事实附加到 merged trace；
-它不推导 HiCache policy，也不生成 synthetic model_input 事件。
+它不推导 HiCache policy，也不生成 synthetic state-model fact。
 """
 
 import argparse

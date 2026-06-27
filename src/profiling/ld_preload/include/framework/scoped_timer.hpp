@@ -50,7 +50,6 @@ public:
         const uint64_t dur_us{ GetRealtimeUs() - start_us_ };
         const std::string args_str{ "\"args\": {"
                                     "\"schema_version\": 1, "
-                                    "\"model_input\": true, "
                                     "\"domain\": \"ld_preload\", "
                                     "\"event_kind\": \"runtime_op\", "
                                     "\"hook_profile\": \""
