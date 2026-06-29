@@ -1205,10 +1205,6 @@
       {
         "name": "source_page_size",
         "source": "self.page_size"
-      },
-      {
-        "name": "check_kind",
-        "source": "const:progress"
       }
     ],
     "fact": {
@@ -1217,41 +1213,6 @@
       "consumers": [
         "hicache_state_model",
         "hicache_profile_quality"
-      ]
-    }
-  },
-  {
-    "id": "hiradix.storage_control_drain_boundary",
-    "module": "sglang.srt.mem_cache.hiradix_cache",
-    "target": "HiRadixCache.drain_storage_control_queues",
-    "events": {
-      "instant": "hicache_storage_control_drain_boundary"
-    },
-    "fields": [
-      {
-        "name": "cache_scope",
-        "source": "hicache_cache_scope:self"
-      },
-      {
-        "name": "seq_no",
-        "source": "hicache_seq:self"
-      },
-      {
-        "name": "source_page_size",
-        "source": "self.page_size"
-      },
-      {
-        "name": "check_kind",
-        "source": "const:storage_control_drain"
-      }
-    ],
-    "fact": {
-      "class": "runtime_model_checkpoint",
-      "role": "storage_control_drain_boundary",
-      "consumers": [
-        "hicache_state_model",
-        "hicache_profile_quality",
-        "hicache_transition_validator"
       ]
     }
   },

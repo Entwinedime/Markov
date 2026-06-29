@@ -53,7 +53,6 @@ HICACHE_FACT_ROLES_BY_CLASS = {
     "runtime_model_checkpoint": frozenset(
         {
             "prefetch_check_point",
-            "storage_control_drain_boundary",
         }
     ),
     "source_actual": frozenset(
@@ -126,13 +125,9 @@ _STATE_MODEL_CONSUMERS = frozenset(
     }
 )
 
-_STATE_MODEL_CONTROL_CONSUMERS = frozenset(
-    {
-        HICACHE_CONSUMER_STATE_MODEL,
-        HICACHE_CONSUMER_PROFILE_QUALITY,
-        HICACHE_CONSUMER_TRANSITION_VALIDATOR,
-    }
-)
+_RUNTIME_MODEL_CHECKPOINT_CONSUMERS_BY_ROLE = {
+    "prefetch_check_point": _STATE_MODEL_CONSUMERS,
+}
 
 HICACHE_CONSUMERS_BY_CLASS = {
     "workload_identity": frozenset(
@@ -143,7 +138,6 @@ HICACHE_CONSUMERS_BY_CLASS = {
         }
     ),
     "target_policy_input": _STATE_MODEL_CONSUMERS,
-    "runtime_model_checkpoint": _STATE_MODEL_CONTROL_CONSUMERS,
     "source_actual": frozenset(
         {
             HICACHE_CONSUMER_PROFILE_QUALITY,
@@ -179,6 +173,8 @@ def allowed_consumers_for_fact(fact_class: str, role: str) -> frozenset[str]:
     roles = HICACHE_FACT_ROLES_BY_CLASS.get(fact_class)
     if roles is None or role not in roles:
         return frozenset()
+    if fact_class == "runtime_model_checkpoint":
+        return _RUNTIME_MODEL_CHECKPOINT_CONSUMERS_BY_ROLE.get(role, frozenset())
     return HICACHE_CONSUMERS_BY_CLASS.get(fact_class, frozenset())
 
 
