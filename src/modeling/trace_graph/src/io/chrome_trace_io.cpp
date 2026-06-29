@@ -1,6 +1,6 @@
-#include "trace_graph/io/chrome_trace_io.hpp"
+#include "markov/trace_graph/io/chrome_trace_io.hpp"
 
-#include "trace_graph/core/logger.hpp"
+#include "markov/trace_graph/core/logger.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -13,9 +13,15 @@
 #include <string_view>
 #include <unordered_map>
 
-namespace TraceGraph {
+namespace markov::trace_graph::io {
 
-namespace {
+using core::DagGraph;
+using core::DagNode;
+using core::escape_json;
+using core::Logger;
+using core::TraceEvent;
+
+namespace chrome_trace_io_detail {
 
 using Json = nlohmann::json;
 
@@ -177,7 +183,7 @@ private:
          * @warning 轻量 scanner 只跳过转义字符，不真正反转义。
          *
          * 这对当前构图字段可能足够；如果 name/args 中需要精确保留转义内容，需要改成完整 JSON
-         * string parser。
+         * 字符串 parser。
          */
         if (p_ >= end_ || *p_ != '"') return "";
         ++p_;
@@ -424,7 +430,12 @@ std::string json_scalar_literal(const std::string & value) {
     return Json(value).dump();
 }
 
-} // namespace
+} // namespace chrome_trace_io_detail
+
+using chrome_trace_io_detail::json_scalar_literal;
+using chrome_trace_io_detail::output_pid;
+using chrome_trace_io_detail::output_tid;
+using chrome_trace_io_detail::TraceScanner;
 
 std::vector<TraceEvent> read_chrome_trace(const std::string & filename) {
     /**
@@ -531,4 +542,4 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
     ofs << "\n  ]\n}\n";
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::io

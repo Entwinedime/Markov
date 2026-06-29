@@ -1,6 +1,6 @@
-#include "trace_graph/frontend/model_config.hpp"
+#include "markov/trace_graph/frontend/model_config.hpp"
 
-#include "trace_graph/core/logger.hpp"
+#include "markov/trace_graph/core/logger.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -14,9 +14,9 @@
 #include <stdexcept>
 #include <string>
 
-namespace TraceGraph {
+namespace markov::trace_graph::frontend {
 
-namespace {
+namespace model_config_detail {
 
 using Json = nlohmann::json;
 
@@ -192,13 +192,17 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
         number_value(object, "prefetch_timeout_per_ki_token_sec", number_value(object, "prefetch_timeout_per_ki_token", 0.0));
     config.prefetch_timeout_max_sec = number_value(object, "prefetch_timeout_max_sec", number_value(object, "prefetch_timeout_max", 0.0));
     const auto disaggregation_mode = lower(string_value(object, "disaggregation_mode", ""));
-    config.device_allocator_need_sort =
-        bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
+    config.device_allocator_need_sort = bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
     config.emit_state_digests = bool_value(object, "emit_state_digests", false);
     return config;
 }
 
-} // namespace
+} // namespace model_config_detail
+
+using model_config_detail::parse_hicache;
+using model_config_detail::parse_node_scale;
+using model_config_detail::read_json_file;
+using model_config_detail::string_array;
 
 bool ModelConfig::module_enabled(const std::string & name) const { return std::ranges::find(modules, name) != modules.end(); }
 
@@ -214,8 +218,8 @@ ModelConfig ModelConfig::from_file(const std::string & filename) {
     config.node_scale = parse_node_scale(root, config.module_enabled("node_scale"));
     config.hicache = parse_hicache(root, config.module_enabled("hicache"));
 
-    Logger::instance().info() << "Loaded model config from " << filename;
+    core::Logger::instance().info() << "Loaded model config from " << filename;
     return config;
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::frontend

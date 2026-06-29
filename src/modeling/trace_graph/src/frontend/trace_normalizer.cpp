@@ -1,18 +1,18 @@
-#include "trace_graph/frontend/trace_normalizer.hpp"
+#include "markov/trace_graph/frontend/trace_normalizer.hpp"
 
 #include <algorithm>
 #include <ranges>
 #include <string>
 
-namespace TraceGraph {
+namespace markov::trace_graph::frontend {
 
-void normalize_trace_events(std::vector<TraceEvent> & events) {
+void normalize_trace_events(std::vector<core::TraceEvent> & events) {
     /**
      * @brief normalizer 只补“来源事实”和统一类别，不做建模判断。
      *
      * 例如 hicache 事件只标记 domain/producer，是否命中、是否写回由后续 HiCacheModule 决定。
      */
-    std::ranges::for_each(events, [](TraceEvent & event) {
+    std::ranges::for_each(events, [](core::TraceEvent & event) {
         if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) {
             event.cat = "hicache";
             event.args.emplace("domain", "hicache");
@@ -38,4 +38,4 @@ void normalize_trace_events(std::vector<TraceEvent> & events) {
     });
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::frontend

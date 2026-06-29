@@ -1,8 +1,8 @@
-#include "trace_graph/core/trace_event.hpp"
+#include "markov/trace_graph/core/trace_event.hpp"
 
 #include <cctype>
 
-namespace TraceGraph {
+namespace markov::trace_graph::core {
 
 bool TraceEvent::has_arg(const std::string & key) const { return args.contains(key); }
 
@@ -68,4 +68,4 @@ std::string escape_json(const std::string & input) {
     return escaped;
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::core

@@ -1,4 +1,4 @@
-#include "trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/core/dag_graph.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -6,9 +6,9 @@
 #include <stdexcept>
 #include <utility>
 
-namespace TraceGraph {
+namespace markov::trace_graph::core {
 
-namespace {
+namespace dag_graph_detail {
 
 /**
  * @brief summary 中使用的边类型名称。
@@ -54,7 +54,11 @@ uint64_t node_time(const DagNode & node) {
     }
 }
 
-} // namespace
+} // namespace dag_graph_detail
+
+using dag_graph_detail::contains_hccl_name;
+using dag_graph_detail::edge_kind_name;
+using dag_graph_detail::node_time;
 
 DagGraph::DagGraph(std::vector<TraceEvent> events, int gpu_id) : events_(std::move(events)), gpu_id_(gpu_id) {}
 
@@ -270,4 +274,4 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     return merged;
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::core

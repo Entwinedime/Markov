@@ -1,31 +1,31 @@
 /**
  * @file
- * @brief HiCache SimulationModule wrapper。
+ * @brief HiCache SimulationModule 包装层实现。
  */
-#include "trace_graph/modules/hicache/hicache_module.hpp"
+#include "markov/trace_graph/modules/hicache/hicache_module.hpp"
 
 #include <string_view>
 #include <utility>
 
-namespace TraceGraph {
+namespace markov::trace_graph::modules::hicache {
 
-namespace {
+namespace hicache_module_detail {
 
 constexpr std::string_view kModuleName = "HiCacheModule";
 
-} // namespace
+} // namespace hicache_module_detail
 
-HiCacheModule::HiCacheModule(HiCacheConfig config) : config_(std::move(config)) {}
+using hicache_module_detail::kModuleName;
+
+HiCacheModule::HiCacheModule(frontend::HiCacheConfig config) : config_(std::move(config)) {}
 
 std::string HiCacheModule::name() const { return std::string{ kModuleName }; }
 
-void HiCacheModule::apply(DagGraph & graph) {
-    summary_ = apply_hicache_model(graph, config_);
+void HiCacheModule::apply(core::DagGraph & graph) {
+    summary_ = model::apply_hicache_model(graph, config_);
     applied_ = true;
 }
 
 bool HiCacheModule::has_summary() const { return applied_; }
 
-std::string HiCacheModule::summary_json() const { return "{\"name\":\"" + std::string{ kModuleName } + "\",\"hicache\":" + summary_.to_json() + "}"; }
-
-} // namespace TraceGraph
+} // namespace markov::trace_graph::modules::hicache

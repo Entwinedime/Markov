@@ -1,4 +1,4 @@
-#include "trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/core/dag_builder.hpp"
 
 #include <algorithm>
 #include <optional>
@@ -6,9 +6,9 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace TraceGraph {
+namespace markov::trace_graph::core {
 
-namespace {
+namespace dag_builder_detail {
 
 /**
  * @brief 用包含关系识别不同 trace 来源中的 HCCL 命名。
@@ -61,7 +61,16 @@ bool is_device_sync_event(const std::string & name) {
     return name == "AscendCL@aclrtSynchronizeDevice" || name == "AscendCL@aclrtSynchronizeDeviceWithTimeout";
 }
 
-} // namespace
+} // namespace dag_builder_detail
+
+using dag_builder_detail::contains_any_hccl_name;
+using dag_builder_detail::event_id_from_cpu_record;
+using dag_builder_detail::event_launch_ts;
+using dag_builder_detail::is_device_sync_event;
+using dag_builder_detail::is_event_sync_event;
+using dag_builder_detail::is_stream_sync_event;
+using dag_builder_detail::is_usable_lane_value;
+using dag_builder_detail::node_end_ts;
 
 DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto parsed_count = events.size();
@@ -732,4 +741,4 @@ void DagBuilder::finalize_sync_nodes(DagGraph & graph, const BuildIndex & index)
     set_fixed_sync_duration(index.notify_wait_nodes);
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::core

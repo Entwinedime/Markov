@@ -1,4 +1,4 @@
-#include "trace_graph/core/logger.hpp"
+#include "markov/trace_graph/core/logger.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +12,7 @@
 #include <unistd.h>
 #endif
 
-namespace TraceGraph {
+namespace markov::trace_graph::core {
 
 Logger & Logger::instance() {
     /**
@@ -22,7 +22,7 @@ Logger & Logger::instance() {
     return logger;
 }
 
-namespace {
+namespace logger_detail {
 
 bool use_color() {
     /**
@@ -54,13 +54,13 @@ const char * ansi(Logger::Level lv) {
      */
     if (!use_color()) return "";
     switch (lv) {
-    case Logger::ERROR:
+    case Logger::Error:
         return "\x1b[1;31m";
-    case Logger::WARN:
+    case Logger::Warn:
         return "\x1b[33m";
-    case Logger::INFO:
+    case Logger::Info:
         return "\x1b[32m";
-    case Logger::DEBUG:
+    case Logger::Debug:
         return "\x1b[2;36m";
     default:
         return "\x1b[0m";
@@ -71,13 +71,13 @@ const char * reset() { return use_color() ? "\x1b[0m" : ""; }
 
 const char * label(Logger::Level lv) {
     switch (lv) {
-    case Logger::ERROR:
+    case Logger::Error:
         return "ERROR";
-    case Logger::WARN:
+    case Logger::Warn:
         return "WARN ";
-    case Logger::INFO:
+    case Logger::Info:
         return "INFO ";
-    case Logger::DEBUG:
+    case Logger::Debug:
         return "DEBUG";
     default:
         return "?????";
@@ -96,7 +96,12 @@ std::string timestamp() {
     return ss.str();
 }
 
-} // namespace
+} // namespace logger_detail
+
+using logger_detail::ansi;
+using logger_detail::label;
+using logger_detail::reset;
+using logger_detail::timestamp;
 
 Logger::Line::Line(Level lv, bool active, std::mutex * mtx) : lv_(lv), active_(active), mtx_(mtx) {
     /**
@@ -116,4 +121,4 @@ Logger::Line::~Line() {
     }
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::core

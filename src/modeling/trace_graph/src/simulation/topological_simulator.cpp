@@ -1,6 +1,6 @@
-#include "trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/simulation/topological_simulator.hpp"
 
-#include "trace_graph/core/logger.hpp"
+#include "markov/trace_graph/core/logger.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -10,9 +10,9 @@
 #include <stdexcept>
 #include <vector>
 
-namespace TraceGraph {
+namespace markov::trace_graph::simulation {
 
-namespace {
+namespace topological_simulator_detail {
 
 constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
 
@@ -22,7 +22,7 @@ constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
  * 子模块可能只更新 attrs["time"]，也可能通过 DagGraph::set_node_duration 更新。
  * 仿真阶段优先读取 attrs["time"]，保证兼容老版字段。
  */
-uint64_t read_u64_attr(const DagNode & node, const std::string & key, uint64_t fallback = 0) {
+uint64_t read_u64_attr(const core::DagNode & node, const std::string & key, uint64_t fallback = 0) {
     const auto it = node.attrs.find(key);
     if (it == node.attrs.end()) return fallback;
     try {
@@ -33,9 +33,12 @@ uint64_t read_u64_attr(const DagNode & node, const std::string & key, uint64_t f
     }
 }
 
-} // namespace
+} // namespace topological_simulator_detail
 
-SimulationResult run_topological_simulation(DagGraph & graph) {
+using topological_simulator_detail::INVALID_NODE;
+using topological_simulator_detail::read_u64_attr;
+
+SimulationResult run_topological_simulation(core::DagGraph & graph) {
     SimulationResult result;
     const size_t node_count = graph.node_count();
 
@@ -144,7 +147,7 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
             if (indegree[node_id] > 0 && visit_state[node_id] == 0 && dfs(node_id)) break;
         }
 
-        auto log = Logger::instance().error();
+        auto log = core::Logger::instance().error();
         log << result.error << " Processed " << result.processed_nodes << " out of " << node_count << " nodes.";
         if (!result.cycle_nodes.empty()) {
             log << " Cycle nodes:";
@@ -155,9 +158,9 @@ SimulationResult run_topological_simulation(DagGraph & graph) {
 
     result.e2e_ns = e2e;
     graph.set_e2e_time(e2e);
-    Logger::instance().info() << "Simulation completed. End-to-End time: " << e2e << " ns | nodes: " << result.processed_nodes
-                              << " edges: " << graph.edge_count();
+    core::Logger::instance().info() << "Simulation completed. End-to-End time: " << e2e << " ns | nodes: " << result.processed_nodes
+                                    << " edges: " << graph.edge_count();
     return result;
 }
 
-} // namespace TraceGraph
+} // namespace markov::trace_graph::simulation
