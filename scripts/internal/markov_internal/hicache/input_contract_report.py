@@ -1,4 +1,4 @@
-"""HiCache input-contract source/target report assembly."""
+"""HiCache 输入合同 source/target 报告组装。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Profiling runtime configuration helpers."""
+"""profiling runtime 配置辅助工具。"""
 
 from __future__ import annotations
 
@@ -104,6 +104,8 @@ def expand_config_placeholders(value: str, cfg: dict[str, Any]) -> str:
     pattern = re.compile(r"\{([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+)\}")
 
     def replace(match: re.Match[str]) -> str:
+        """把单个配置占位符替换成最终字符串。"""
+
         path = match.group(1)
         replacement = config_placeholder_value(cfg, path)
         if replacement is None:

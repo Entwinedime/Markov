@@ -1,4 +1,4 @@
-"""HiCache matrix shared types."""
+"""HiCache 矩阵共享类型。"""
 
 from __future__ import annotations
 

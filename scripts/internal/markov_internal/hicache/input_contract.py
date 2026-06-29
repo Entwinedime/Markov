@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""HiCache workload identity input-contract audit CLI."""
+"""HiCache workload identity 输入合同审计 CLI。"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 from ..common.io import write_json
@@ -72,9 +73,9 @@ def print_report_or_summary(args: argparse.Namespace, report: dict[str, object])
             "unknown_workload_identity_roles": report["unknown_workload_identity_roles"],
             "unmapped_request_id_events": report["unmapped_request_id_events"],
         }
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        sys.stdout.write(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")
         return
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    sys.stdout.write(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
 
 
 def main(argv: list[str] | None = None) -> int:

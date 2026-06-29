@@ -1,11 +1,11 @@
-"""Matrix-level HiCache transition exactness orchestration."""
+"""矩阵级 HiCache transition exactness 编排。"""
 
 from __future__ import annotations
 
 import collections
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..common.io import load_json, write_json
 from .matrix_discovery import profile_run_from_manifest
@@ -39,11 +39,11 @@ def compare_transition_matrix(
     catalog_output: Path | None,
     gate_output: Path | None,
     matrix_output_path: Path | None,
-    progress: bool = False,
+    on_row: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """构建矩阵级 transition exactness 汇总。"""
 
-    plan_path = matrix_dir / "matrix_plan.json"
+    plan_path = matrix_dir / "artifacts" / "matrix_plan.json"
     if not plan_path.is_file():
         raise FileNotFoundError(f"missing matrix plan: {plan_path}")
     plan = load_json(plan_path)
@@ -52,15 +52,7 @@ def compare_transition_matrix(
     rows = []
     classification_entries: list[dict[str, Any]] = []
     matrix_row_paths = sorted((matrix_dir / "predictions").glob("*/*/matrix_row.json"))
-    total = len(matrix_row_paths)
-    if progress:
-        print_transition_stage_start(
-            total,
-            force=force,
-            emit_catalog=emit_catalog,
-            emit_gates=emit_gates,
-        )
-    for index, matrix_row_path in enumerate(matrix_row_paths, start=1):
+    for matrix_row_path in matrix_row_paths:
         matrix_row = load_json(matrix_row_path)
         prediction_dir = resolve_repo_path(Path(str(matrix_row.get("output_dir") or matrix_row_path.parent)))
         prediction_paths = PathsForPrediction(
@@ -90,18 +82,6 @@ def compare_transition_matrix(
             observed_path.is_file() or target_run is not None
         )
         transition_should_run = should_rebuild_oracle or comparison_can_run
-        if progress:
-            print_transition_progress(
-                index,
-                total,
-                matrix_row,
-                matrix_row_path,
-                should_run=transition_should_run,
-                observed_path=observed_path,
-                predicted_trace=prediction_paths.predicted_trace,
-                target_run=target_run,
-                should_rebuild_comparison=should_rebuild_comparison,
-            )
         if should_rebuild_oracle:
             oracle = extract_target_oracle(
                 [Path(path) for path in target_run["python_probe_files"]],
@@ -126,8 +106,8 @@ def compare_transition_matrix(
         if isinstance(row.get("transition_classification"), dict):
             classification_entries.append(row["transition_classification"])
         rows.append(row)
-        if progress and transition_should_run:
-            print_transition_result(index, total, row)
+        if on_row is not None:
+            on_row(row)
 
     summary = {
         "schema": "trace_sim.hicache.transition_exactness_matrix.v1",
@@ -156,7 +136,7 @@ def compare_transition_matrix(
         catalog = build_transition_mismatch_catalog_from_entries(
             matrix_dir,
             classification_entries,
-            source_matrix_path=str(matrix_output_path or matrix_dir / "transition_exactness_matrix.json"),
+            source_matrix_path=str(matrix_output_path or matrix_dir / "stages" / "transition" / "summary.json"),
             sample_limit=sample_limit,
         )
         write_transition_catalog_outputs(matrix_dir, catalog_path, catalog, sample_limit=sample_limit)
@@ -174,126 +154,13 @@ def compare_transition_matrix(
     return summary
 
 
-def print_transition_stage_start(
-    prediction_count: int,
-    *,
-    force: bool,
-    emit_catalog: bool,
-    emit_gates: bool,
-) -> None:
-    """打印 transition 阶段开始行。"""
-
-    extras = []
-    if force:
-        extras.append("force=true")
-    if emit_catalog:
-        extras.append("catalog=true")
-    if emit_gates:
-        extras.append("gates=true")
-    suffix = f" {' '.join(extras)}" if extras else ""
-    print(
-        f"[running transition] transition exactness matrix: predictions={prediction_count}{suffix}",
-        flush=True,
-    )
-
-
-def print_transition_progress(
-    index: int,
-    total: int,
-    matrix_row: dict[str, Any],
-    matrix_row_path: Path,
-    *,
-    should_run: bool,
-    observed_path: Path,
-    predicted_trace: Path,
-    target_run: dict[str, Any] | None,
-    should_rebuild_comparison: bool,
-) -> None:
-    """打印 transition matrix 进度行。"""
-
-    label = transition_progress_label(matrix_row, matrix_row_path)
-    if should_run:
-        print(f"[{index}/{total}] run {label}", flush=True)
-        return
-    reason = transition_skip_reason(
-        observed_path,
-        predicted_trace,
-        target_run=target_run,
-        should_rebuild_comparison=should_rebuild_comparison,
-    )
-    suffix = f": {reason}" if reason else ""
-    print(f"[{index}/{total}] skip {label}{suffix}", flush=True)
-
-
-def print_transition_result(index: int, total: int, row: dict[str, Any]) -> None:
-    """打印 transition exactness 的简短结果行。"""
-
-    ready = row.get("ready")
-    exact = row.get("exact")
-    final_state_exact = row.get("final_state_exact")
-    if ready is not True:
-        status = "not_ready"
-    elif exact is True:
-        status = "ok"
-    elif final_state_exact is False:
-        status = "final_state_mismatch"
-    else:
-        status = "mismatch"
-    print(
-        f"[{index}/{total}] result {status} "
-        f"ready={progress_value(ready)} exact={progress_value(exact)} "
-        f"final_state_exact={progress_value(final_state_exact)} "
-        f"transition_count_exact={progress_value(row.get('transition_count_exact'))}",
-        flush=True,
-    )
-
-
-def progress_value(value: Any) -> str:
-    """把进度行中的 Python 值转成短字符串。"""
-
-    if isinstance(value, bool) or value is None:
-        return json.dumps(value)
-    return str(value)
-
-
-def transition_progress_label(matrix_row: dict[str, Any], matrix_row_path: Path) -> str:
-    """返回 transition 进度行中的矩阵标签。"""
-
-    label = matrix_row.get("label")
-    if label:
-        return str(label)
-    input_id = str(matrix_row.get("input_id") or matrix_row_path.parent.parent.name)
-    source_config_id = str(matrix_row.get("source_config_id") or "")
-    target_config_id = str(matrix_row.get("target_config_id") or "")
-    if source_config_id or target_config_id:
-        return f"{input_id}/{source_config_id}->{target_config_id}"
-    return str(matrix_row_path.parent)
-
-
-def transition_skip_reason(
-    observed_path: Path,
-    predicted_trace: Path,
-    *,
-    target_run: dict[str, Any] | None,
-    should_rebuild_comparison: bool,
-) -> str:
-    """返回 transition 进度 skip 的简短原因。"""
-
-    if not predicted_trace.is_file():
-        return "missing_predicted_trace"
-    if not observed_path.is_file() and target_run is None:
-        return "missing_observed_target_trace"
-    if not should_rebuild_comparison:
-        return ""
-    return "not_ready"
-
-
 def observed_transition_path(matrix_dir: Path, target_key: tuple[str, str]) -> Path:
     """返回某个 input/config 的 target-side transition oracle 路径。"""
 
     input_id, target_config_id = target_key
     return (
         matrix_dir
+        / "artifacts"
         / "observed_target_transitions"
         / safe_slug(input_id)
         / f"{safe_slug(target_config_id)}.observed_target_transition_trace.json"

@@ -82,7 +82,8 @@ def write_transition_catalog_outputs(matrix_dir: Path, output_path: Path, catalo
 
     write_json(output_path, catalog)
     write_transition_catalog_markdown(output_path.with_suffix(".md"), catalog)
-    samples_dir = matrix_dir / "transition_family_samples"
+    _ = matrix_dir
+    samples_dir = output_path.parent / "family_samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
     for family, item in catalog.get("families", {}).items():
         if not isinstance(item, dict):

@@ -1,4 +1,4 @@
-"""Trace input preparation for C++ modeling runs."""
+"""C++ modeling run 的 trace input 准备工具。"""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def load_reusable_merge_summary(merged_dir: Path, manifest_path: Path) -> list[P
 
 
 def required_repo_path(value: Any) -> Path:
-    """Resolve a required repo path."""
+    """解析必填 repo path，缺失时抛出错误。"""
 
     path = resolve_repo_path(value)
     if path is None:

@@ -1,4 +1,4 @@
-"""Workflow-level summary payload helpers for HiCache validation."""
+"""HiCache validation 的 workflow 级 summary payload 工具。"""
 
 from __future__ import annotations
 
@@ -23,15 +23,15 @@ def write_workflow_summary(
     forced_token_bundles = summarize_forced_token_bundles(quality)
     final_state_self = summarize_stage_for_workflow(
         summaries.get("final_state_self"),
-        output_dir / "final_state_self.json",
+        output_dir / "stages" / "final_state" / "self_summary.json",
     )
     final_state_cross = summarize_stage_for_workflow(
         summaries.get("final_state_cross"),
-        output_dir / "final_state_cross.json",
+        output_dir / "stages" / "final_state" / "cross_summary.json",
     )
     transition = summarize_stage_for_workflow(
         summaries.get("transition"),
-        output_dir / "transition_exactness_matrix.json",
+        output_dir / "stages" / "transition" / "summary.json",
     )
     payload = {
         "schema": "trace_sim.hicache.state_workflow.summary.v1",
@@ -46,14 +46,16 @@ def write_workflow_summary(
         "input_ids": sorted({run.input_id for run in runs}),
         "config_ids": sorted({run.config_id for run in runs}),
         "final_state_prediction_rows": len(final_rows),
-        "quality_ready": quality.get("quality_ready"),
+        "workflow_input_ready": quality.get("workflow_input_ready"),
         "input_contract_ready_count": input_contracts["ready_count"],
         "input_contract_count": input_contracts["input_count"],
         "quality": {
-            "path": str(output_dir / "profile_quality.json") if quality else None,
-            "ready": quality.get("quality_ready"),
-            "state_quality_ready_count": quality.get("state_quality_ready_count"),
-            "profile_quality_ready_count": quality.get("profile_quality_ready_count"),
+            "path": str(output_dir / "stages" / "quality" / "summary.json") if quality else None,
+            "ready": quality.get("workflow_input_ready"),
+            "workflow_input_ready_count": quality.get("workflow_input_ready_count"),
+            "state_model_input_ready_count": quality.get("state_model_input_ready_count"),
+            "strict_diagnostic_coverage_ready_count": quality.get("strict_diagnostic_coverage_ready_count"),
+            "artifact_ready_count": quality.get("artifact_ready_count"),
             "run_count": quality.get("run_count"),
         },
         "input_contracts": input_contracts,

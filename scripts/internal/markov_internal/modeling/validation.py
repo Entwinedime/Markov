@@ -1,4 +1,4 @@
-"""Validation artifact assembly for modeling runs."""
+"""modeling run 的 validation artifact 组装工具。"""
 
 from __future__ import annotations
 
@@ -353,7 +353,7 @@ def extract_hicache_summary(model_summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def required_repo_path(value: Any) -> Path:
-    """Resolve a required repo path."""
+    """解析必填 repo path，缺失时抛出错误。"""
 
     path = resolve_repo_path(value)
     if path is None:

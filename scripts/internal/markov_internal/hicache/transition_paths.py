@@ -1,4 +1,4 @@
-"""HiCache transition validation path helpers."""
+"""HiCache transition validation 路径辅助工具。"""
 
 from __future__ import annotations
 

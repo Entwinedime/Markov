@@ -1,4 +1,4 @@
-"""HiCache input-contract fact extraction and canonical signatures."""
+"""HiCache 输入合同 fact 抽取与 canonical signature 生成。"""
 
 from __future__ import annotations
 
@@ -189,6 +189,8 @@ def workload_identity_path_contract(paths: list[Path], roles: set[str], sample: 
     path_event_count = 0
 
     def record_issue(role: str, issue: str, event: dict[str, Any], detail: dict[str, Any] | None = None) -> None:
+        """记录 path-bearing fact 的合同缺口，并保留有限样本。"""
+
         issue_counts[issue] += 1
         issue_counts_by_role[role] += 1
         if len(samples) >= sample:

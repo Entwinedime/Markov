@@ -1,4 +1,4 @@
-"""SGLang torch profiler API helpers."""
+"""SGLang torch profiler API 辅助工具。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Workload timing window discovery for modeling validation."""
+"""modeling validation 使用的 workload 时间窗口发现工具。"""
 
 from __future__ import annotations
 
@@ -106,7 +106,7 @@ def optional_float(value: Any) -> float | None:
 
 
 def required_repo_path(value: Any) -> Path:
-    """Resolve a required repo path."""
+    """解析必填 repo path，缺失时抛出错误。"""
 
     path = resolve_repo_path(value)
     if path is None:

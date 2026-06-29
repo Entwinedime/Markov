@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entrypoint for HiCache mismatch provenance diagnostics."""
+"""HiCache mismatch provenance 诊断的容器内入口。"""
 
 from __future__ import annotations
 

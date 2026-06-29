@@ -335,6 +335,8 @@ def filter_suite_experiments(
         )
 
     def metadata_value(experiment: dict[str, Any], key: str) -> str:
+        """读取 suite experiment metadata 中的字符串值。"""
+
         metadata = experiment.get("metadata") if isinstance(experiment.get("metadata"), dict) else {}
         value = metadata.get(key)
         return str(value) if isinstance(value, str) else ""

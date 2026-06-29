@@ -1,4 +1,4 @@
-"""C++ TraceGraph model config helpers."""
+"""C++ TraceGraph model config 辅助工具。"""
 
 from __future__ import annotations
 
@@ -124,7 +124,7 @@ def hicache_config_from_target_experiment(config: dict[str, Any]) -> dict[str, A
 
 
 def copy_hicache_config_keys(result: dict[str, Any], hicache: dict[str, Any], *, source_label: str) -> None:
-    """Copy explicit HiCache config keys into a C++ model config payload."""
+    """把显式 HiCache config key 复制到 C++ model config payload。"""
 
     for key in (
         "page_size",
@@ -222,21 +222,18 @@ def trace_graph_executable(config: dict[str, Any]) -> Path:
         executable = required_repo_path(cpp["executable"])
         if executable.is_file():
             return executable
-    candidate_paths = (
-        ROOT_DIR / "build/modeling/bin/trace_graph",
-    )
-    for path in candidate_paths:
-        if path.is_file():
-            return path
+    executable = ROOT_DIR / "build/modeling/trace_graph/trace_graph"
+    if executable.is_file():
+        return executable
     raise FileNotFoundError(
-        "missing trace_graph executable at build/modeling/bin/trace_graph; "
-        "run scripts/run.sh modeling -- bash -lc 'cmake -S . -B build/modeling -G Ninja "
-        "&& cmake --build build/modeling --target trace_graph -j2'"
+        "missing trace_graph executable at build/modeling/trace_graph/trace_graph; "
+        "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja "
+        "&& cmake --build build/modeling/trace_graph --target trace_graph -j2'"
     )
 
 
 def required_repo_path(value: Any) -> Path:
-    """Resolve a required repo path."""
+    """解析必填 repo path，缺失时抛出错误。"""
 
     path = resolve_repo_path(value)
     if path is None:

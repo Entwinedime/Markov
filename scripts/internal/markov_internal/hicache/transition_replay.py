@@ -1,4 +1,4 @@
-"""Replay predicted HiCache transition records into comparable state deltas."""
+"""把 predicted HiCache transition record replay 成可比较的 state delta。"""
 
 from __future__ import annotations
 

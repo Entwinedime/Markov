@@ -1,4 +1,4 @@
-"""Predicted HiCache state-record helpers for validation diagnostics."""
+"""validation diagnostics 使用的 predicted HiCache state record 工具。"""
 
 from __future__ import annotations
 

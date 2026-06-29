@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entrypoint for HiCache post-profile validation workflows."""
+"""HiCache profiling 后 validation workflow 的容器内入口。"""
 
 from __future__ import annotations
 

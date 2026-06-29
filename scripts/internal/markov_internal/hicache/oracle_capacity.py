@@ -1,4 +1,4 @@
-"""HiCache capacity and target-config oracle audit helpers."""
+"""HiCache capacity 与 target config oracle 审计辅助工具。"""
 
 from __future__ import annotations
 

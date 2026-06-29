@@ -1,4 +1,4 @@
-"""Final-state mismatch explanation helpers."""
+"""final-state mismatch 解释辅助工具。"""
 
 from __future__ import annotations
 

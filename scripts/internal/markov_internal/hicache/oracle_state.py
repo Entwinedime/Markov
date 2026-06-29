@@ -1,4 +1,4 @@
-"""HiCache state snapshot extraction and final-state helpers."""
+"""HiCache state snapshot 抽取与 final-state 辅助工具。"""
 
 from __future__ import annotations
 
@@ -263,7 +263,7 @@ def union_hicache_states(states: Any) -> dict[str, list[str]]:
 
 
 def snapshot_object_id_prefix(row: dict[str, Any], snapshot: dict[str, Any]) -> str:
-    """Return the class-like prefix embedded in snapshot object_id."""
+    """返回 snapshot object_id 中类似 class name 的前缀。"""
 
     object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
     return object_id.split(":", 1)[0] if object_id else "unknown"

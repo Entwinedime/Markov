@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entrypoint for HiCache cross-input contract diagnostics."""
+"""HiCache 跨输入合同诊断的容器内入口。"""
 
 from __future__ import annotations
 

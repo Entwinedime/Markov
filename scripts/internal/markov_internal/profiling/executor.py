@@ -1,4 +1,4 @@
-"""Single profiling run executor."""
+"""单个 profiling run 执行器。"""
 
 from __future__ import annotations
 

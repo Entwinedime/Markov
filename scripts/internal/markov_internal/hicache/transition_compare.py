@@ -1,4 +1,4 @@
-"""Single-prediction HiCache transition exactness comparison."""
+"""单个 prediction 的 HiCache transition exactness 比较。"""
 
 from __future__ import annotations
 

@@ -1,19 +1,18 @@
-"""Transition exactness stage for HiCache validation workflows."""
+"""HiCache validation workflow 的 transition exactness 阶段。"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..common.io import write_json
 from .transition_matrix import compare_transition_matrix
-from .workflow_progress import print_stage_start
 
 
 @dataclass(frozen=True)
 class TransitionOptions:
-    """Transition stage options independent from argparse."""
+    """与 argparse 解耦的 transition 阶段选项。"""
 
     page_key_mode: str = "strip_scope"
     force: bool = False
@@ -23,11 +22,17 @@ class TransitionOptions:
     dry_run: bool = False
 
 
-def run_transition_stage(output_dir: Path, options: TransitionOptions) -> dict[str, Any]:
+def run_transition_stage(
+    output_dir: Path,
+    options: TransitionOptions,
+    *,
+    summary_path: Path,
+    catalog_dir: Path,
+    on_row: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """运行 transition exactness 矩阵比较。"""
 
     if options.dry_run:
-        print_stage_start("transition", "dry run: no transition comparisons will be executed")
         summary = {
             "schema": "trace_sim.hicache.transition_exactness_matrix.v1",
             "matrix_dir": str(output_dir),
@@ -36,7 +41,7 @@ def run_transition_stage(output_dir: Path, options: TransitionOptions) -> dict[s
             "ready_count": 0,
             "exact_count": 0,
         }
-        write_json(output_dir / "transition_exactness_matrix.json", summary)
+        write_json(summary_path, summary)
         return summary
 
     summary = compare_transition_matrix(
@@ -46,10 +51,10 @@ def run_transition_stage(output_dir: Path, options: TransitionOptions) -> dict[s
         sample_limit=options.sample_limit,
         emit_catalog=options.emit_catalog,
         emit_gates=options.emit_gates,
-        catalog_output=None,
-        gate_output=None,
-        matrix_output_path=output_dir / "transition_exactness_matrix.json",
-        progress=True,
+        catalog_output=catalog_dir / "transition_mismatch_catalog.json",
+        gate_output=catalog_dir / "transition_patch_gate_scoreboard.json",
+        matrix_output_path=summary_path,
+        on_row=on_row,
     )
-    write_json(output_dir / "transition_exactness_matrix.json", summary)
+    write_json(summary_path, summary)
     return summary

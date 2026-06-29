@@ -1,15 +1,137 @@
-"""Human-readable progress output for HiCache validation workflows."""
+"""HiCache workflow 面向用户的统一进度输出。"""
 
 from __future__ import annotations
 
-import json
-from typing import Any
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Any, TextIO
 
 from .workflow_summary import summarize_input_contracts
 
 
-def print_final_state_rows_summary(rows: list[dict[str, Any]]) -> None:
-    """打印 final-state 整体阶段摘要。"""
+@dataclass
+class StageProgress:
+    """stage runner 用于报告阶段级进度的生命周期对象。"""
+
+    reporter: WorkflowProgressReporter
+    name: str
+    total: int
+    detail: str = ""
+    unit: str = "item"
+    started_at: float = field(default_factory=time.monotonic)
+    completed: int = 0
+    metrics: dict[str, Any] = field(default_factory=dict)
+
+    def advance(self, metrics: dict[str, Any] | None = None, *, step: int = 1) -> None:
+        """推进阶段进度，并在 TTY 中刷新运行行。"""
+
+        self.completed = min(self.total, self.completed + step) if self.total else self.completed + step
+        if metrics is not None:
+            self.metrics = metrics
+        self.reporter.update(self)
+
+    def finish(self, status: str, summary: str) -> None:
+        """结束阶段并输出最终 summary 行。"""
+
+        self.reporter.finish(self, status, summary)
+
+
+class WorkflowProgressReporter:
+    """所有 workflow stage 共享的 TTY-aware progress reporter。"""
+
+    def __init__(self, stream: TextIO | None = None) -> None:
+        """初始化输出流，并检测当前是否支持动态 TTY 刷新。"""
+
+        self.stream = stream or sys.stdout
+        self.is_tty = bool(getattr(self.stream, "isatty", lambda: False)())
+        self._dynamic_line_active = False
+
+    def start_stage(self, name: str, total: int, detail: str = "", *, unit: str = "item") -> StageProgress:
+        """启动阶段并返回进度 handle。"""
+
+        stage = StageProgress(reporter=self, name=name, total=total, detail=detail, unit=unit)
+        suffix = f" | {detail}" if detail else ""
+        self._write_line(f"{name:<13} start  {value_text(total)} {unit_text(total, unit)}{suffix}")
+        return stage
+
+    def update(self, stage: StageProgress) -> None:
+        """在 TTY session 中刷新运行中的阶段行。"""
+
+        if not self.is_tty:
+            return
+        line = self._running_line(stage)
+        self.stream.write("\r" + line + "\033[K")
+        self.stream.flush()
+        self._dynamic_line_active = True
+
+    def finish(self, stage: StageProgress, status: str, summary: str) -> None:
+        """写出阶段最终 summary 行。"""
+
+        if self._dynamic_line_active:
+            self.stream.write("\n")
+            self._dynamic_line_active = False
+        elapsed = elapsed_text(time.monotonic() - stage.started_at)
+        elapsed_suffix = f" | {elapsed}" if elapsed else ""
+        self._write_line(f"{stage.name:<13} {status:<5} {summary}{elapsed_suffix}")
+
+    def _running_line(self, stage: StageProgress) -> str:
+        """生成 TTY 动态进度行。"""
+
+        progress = count_text(stage.completed, stage.total)
+        metrics = stage_metric_text(stage.metrics)
+        metrics_suffix = f"  {metrics}" if metrics else ""
+        return f"{stage.name:<13} {progress:<8} {progress_bar(stage.completed, stage.total)}{metrics_suffix}"
+
+    def _write_line(self, text: str) -> None:
+        """向输出流写一行并立即 flush。"""
+
+        self.stream.write(text + "\n")
+        self.stream.flush()
+
+
+def quality_running_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """从已完成 run rows 生成 compact quality counters。"""
+
+    total = len(rows)
+    return {
+        "workflow": count_text(sum(1 for row in rows if row.get("workflow_input_ready") is True), total),
+        "state": count_text(sum(1 for row in rows if row.get("state_model_input_ready") is True), total),
+        "strict": count_text(
+            sum(1 for row in rows if row.get("strict_diagnostic_coverage_ready") is True),
+            total,
+        ),
+    }
+
+
+def quality_done_summary(report: dict[str, Any]) -> tuple[str, str]:
+    """生成 quality stage 的状态和 summary 文案。"""
+
+    run_count = report.get("run_count")
+    input_contracts = summarize_input_contracts(report)
+    status = "OK" if report.get("workflow_input_ready") is True else "CHECK"
+    summary = (
+        f"{value_text(run_count)} runs | "
+        f"workflow {count_text(report.get('workflow_input_ready_count'), run_count)} | "
+        f"state {count_text(report.get('state_model_input_ready_count'), run_count)} | "
+        f"strict {count_text(report.get('strict_diagnostic_coverage_ready_count'), run_count)} | "
+        f"inputs {count_text(input_contracts['ready_count'], input_contracts['input_count'])}"
+    )
+    return status, summary
+
+
+def final_state_running_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """从已完成 prediction rows 生成 compact final-state counters。"""
+
+    total = len(rows)
+    return {
+        "ready": count_text(sum(1 for row in rows if row.get("validation_ready") is True), total),
+        "exact": count_text(sum(1 for row in rows if row.get("final_state_match") is True), total),
+    }
+
+
+def final_state_rows_done_summary(rows: list[dict[str, Any]]) -> tuple[str, str]:
+    """生成所有 final-state prediction rows 的状态和 summary 文案。"""
 
     prediction_count = len(rows)
     validation_ready_count = sum(1 for row in rows if row.get("validation_ready") is True)
@@ -21,122 +143,59 @@ def print_final_state_rows_summary(rows: list[dict[str, Any]]) -> None:
         final_state_match_count,
         error_count=error_count,
     )
-    print(
-        f"[finished final-state] {status} "
-        f"predictions={prediction_count} "
-        f"validation_ready={count_text(validation_ready_count, prediction_count)} "
-        f"final_state_match={count_text(final_state_match_count, prediction_count)} "
-        f"errors={error_count}",
-        flush=True,
+    summary = (
+        f"{prediction_count} predictions | "
+        f"exact {count_text(final_state_match_count, prediction_count)} | "
+        f"ready {count_text(validation_ready_count, prediction_count)}"
     )
+    if error_count:
+        summary += f" | errors {error_count}"
+    return status, summary
 
 
-def print_prediction_result(index: int, total: int, row: dict[str, Any]) -> None:
-    """打印 final-state prediction 的简短结果行。"""
+def transition_running_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """从已完成 comparison rows 生成 compact transition counters。"""
 
-    return_code = row.get("return_code")
-    validation_ready = row.get("validation_ready")
-    final_state_match = row.get("final_state_match")
-    if return_code != 0:
-        status = "error"
-    elif validation_ready is not True:
-        status = "not_ready"
-    elif final_state_match is True:
-        status = "ok"
-    elif final_state_match is False:
-        status = "mismatch"
-    else:
-        status = "unknown"
-    elapsed_sec = row.get("elapsed_sec")
-    elapsed_text = f" elapsed_sec={float(elapsed_sec):.2f}" if isinstance(elapsed_sec, (int, float)) else ""
-    print(
-        f"[{index}/{total}] result {status} "
-        f"return_code={return_code} validation_ready={progress_value(validation_ready)} "
-        f"final_state_match={progress_value(final_state_match)}{elapsed_text}",
-        flush=True,
-    )
+    total = len(rows)
+    return {
+        "ready": count_text(sum(1 for row in rows if row.get("ready") is True), total),
+        "exact": count_text(sum(1 for row in rows if row.get("exact") is True), total),
+        "count": count_text(sum(1 for row in rows if row.get("transition_count_exact") is True), total),
+    }
 
 
-def progress_value(value: Any) -> str:
-    """把进度行中的 Python 值转成短字符串。"""
-
-    if isinstance(value, bool) or value is None:
-        return json.dumps(value)
-    return str(value)
-
-
-def print_summary(stage: str, report: dict[str, Any]) -> None:
-    """向终端输出短摘要。"""
-
-    if stage == "quality":
-        input_contracts = summarize_input_contracts(report)
-        run_count = report.get("run_count")
-        status = "ok" if report.get("quality_ready") is True else "needs_attention"
-        print(
-            f"[finished {stage}] {status} "
-            f"runs={value_text(run_count)} "
-            f"state_ready={count_text(report.get('state_quality_ready_count'), run_count)} "
-            f"profile_ready={count_text(report.get('profile_quality_ready_count'), run_count)} "
-            f"input_contracts={count_text(input_contracts['ready_count'], input_contracts['input_count'])}",
-            flush=True,
-        )
-        return
-    if stage == "transition":
-        prediction_count = report.get("prediction_count")
-        status = transition_stage_status(report)
-        print(
-            f"[finished {stage}] {status} "
-            f"predictions={value_text(prediction_count)} "
-            f"ready={count_text(report.get('ready_count'), prediction_count)} "
-            f"exact={count_text(report.get('exact_count'), prediction_count)} "
-            f"transition_count_exact={count_text(report.get('transition_count_exact_count'), prediction_count)}",
-            flush=True,
-        )
-        return
+def transition_done_summary(report: dict[str, Any]) -> tuple[str, str]:
+    """生成 transition stage 的状态和 summary 文案。"""
 
     prediction_count = report.get("prediction_count")
-    status = final_state_stage_status(report)
-    prefix = "summary" if stage.startswith("final-state:") else "finished"
-    print(
-        f"[{prefix} {stage}] {status} "
-        f"predictions={value_text(prediction_count)} "
-        f"validation_ready={count_text(report.get('validation_ready_count'), prediction_count)} "
-        f"final_state_match={count_text(report.get('final_state_match_count'), prediction_count)} "
-        f"pass_rate={percent_text(report.get('final_state_pass_rate'))}",
-        flush=True,
+    status = transition_stage_status(report)
+    summary = (
+        f"{value_text(prediction_count)} predictions | "
+        f"exact {count_text(report.get('exact_count'), prediction_count)} | "
+        f"ready {count_text(report.get('ready_count'), prediction_count)} | "
+        f"count {count_text(report.get('transition_count_exact_count'), prediction_count)}"
     )
+    return status, summary
 
 
-def print_stage_start(stage: str, detail: str) -> None:
-    """向终端输出一个人读的阶段开始行。"""
+def stage_metric_text(metrics: dict[str, Any]) -> str:
+    """渲染运行指标，避免把内部 boolean 字段名平铺给用户。"""
 
-    print(f"[running {stage}] {detail}", flush=True)
-
-
-def quality_stage_detail(runs: list[Any]) -> str:
-    """返回 quality 阶段的人读说明。"""
-
-    return (
-        f"profile quality audit: runs={len(runs)} "
-        f"inputs={len({run.input_id for run in runs})} "
-        f"configs={len({run.config_id for run in runs})}"
-    )
+    return "  ".join(f"{key} {value}" for key, value in metrics.items())
 
 
-def final_state_stage_detail(specs: list[Any], *, dry_run: bool) -> str:
-    """返回 final-state 阶段的人读说明。"""
+def progress_bar(done: int, total: int, *, width: int = 20) -> str:
+    """渲染 ASCII 进度条。"""
 
-    self_count = sum(1 for spec in specs if spec.is_self)
-    cross_count = len(specs) - self_count
-    dry_run_text = " dry_run=true" if dry_run else ""
-    return (
-        f"state prediction matrix: predictions={len(specs)} "
-        f"self={self_count} cross={cross_count}{dry_run_text}"
-    )
+    if total <= 0:
+        filled = 0
+    else:
+        filled = min(width, int(round(width * done / total)))
+    return "[" + "#" * filled + "-" * (width - filled) + "]"
 
 
 def final_state_stage_status(report: dict[str, Any]) -> str:
-    """把 final-state summary 规整成人读状态。"""
+    """根据 final-state summary 返回状态 token。"""
 
     prediction_count = report.get("prediction_count")
     validation_ready_count = report.get("validation_ready_count")
@@ -145,7 +204,7 @@ def final_state_stage_status(report: dict[str, Any]) -> str:
         is_plain_int(value)
         for value in (prediction_count, validation_ready_count, final_state_match_count)
     ):
-        return "unknown"
+        return "UNKNOWN"
     return final_state_status_from_counts(
         prediction_count,
         validation_ready_count,
@@ -161,67 +220,65 @@ def final_state_status_from_counts(
     *,
     error_count: int,
 ) -> str:
-    """根据 final-state 计数字段返回人读状态。"""
+    """根据 final-state counters 返回状态 token。"""
 
     if prediction_count == 0:
-        return "empty"
+        return "EMPTY"
     if error_count:
-        return "error"
+        return "ERROR"
     if validation_ready_count != prediction_count:
-        return "not_ready"
+        return "NOT_READY"
     if final_state_match_count == prediction_count:
-        return "ok"
-    return "mismatch"
+        return "OK"
+    return "MISMATCH"
 
 
 def transition_stage_status(report: dict[str, Any]) -> str:
-    """把 transition summary 规整成人读状态。"""
+    """根据 transition counters 返回状态 token。"""
 
     prediction_count = report.get("prediction_count")
     ready_count = report.get("ready_count")
     exact_count = report.get("exact_count")
     if not all(is_plain_int(value) for value in (prediction_count, ready_count, exact_count)):
-        return "unknown"
-    return transition_status_from_counts(prediction_count, ready_count, exact_count)
-
-
-def transition_status_from_counts(
-    prediction_count: int,
-    ready_count: int,
-    exact_count: int,
-) -> str:
-    """根据 transition 计数字段返回人读状态。"""
-
+        return "UNKNOWN"
     if prediction_count == 0:
-        return "empty"
+        return "EMPTY"
     if ready_count != prediction_count:
-        return "not_ready"
+        return "NOT_READY"
     if exact_count == prediction_count:
-        return "ok"
-    return "mismatch"
+        return "OK"
+    return "MISMATCH"
 
 
 def count_text(count: Any, total: Any) -> str:
-    """把 count/total 转成人读短字符串。"""
+    """渲染 count/total 字段。"""
 
     return f"{value_text(count)}/{value_text(total)}"
 
 
 def is_plain_int(value: Any) -> bool:
-    """判断摘要计数字段是否为普通整数。"""
+    """判断 summary count 是否为普通 int，并排除 bool。"""
 
     return isinstance(value, int) and not isinstance(value, bool)
 
 
 def value_text(value: Any) -> str:
-    """把摘要值转成人读短字符串。"""
+    """渲染带 unknown 兜底的 compact value。"""
 
     return "unknown" if value is None else str(value)
 
 
-def percent_text(value: Any) -> str:
-    """把 0-1 pass rate 转成人读百分比。"""
+def unit_text(count: int, singular: str) -> str:
+    """按数量渲染简单英文单位。"""
 
-    if isinstance(value, (int, float)):
-        return f"{value * 100:.1f}%"
-    return "unknown"
+    return singular if count == 1 else singular + "s"
+
+
+def elapsed_text(seconds: float) -> str:
+    """把 elapsed seconds 渲染为 compact 人读文本。"""
+
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remaining = int(seconds % 60)
+    return f"{minutes}m{remaining:02d}s"

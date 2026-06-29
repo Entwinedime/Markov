@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HiCache transition exactness 诊断的容器内入口。"""
+"""通用 profile artifact audit 的容器内入口。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ INTERNAL_ROOT = Path(__file__).resolve().parents[1]
 if str(INTERNAL_ROOT) not in sys.path:
     sys.path.insert(0, str(INTERNAL_ROOT))
 
-from markov_internal.hicache.transition import main  # noqa: E402
+from markov_internal.audit.profile_artifacts import main  # noqa: E402
 
 
 if __name__ == "__main__":

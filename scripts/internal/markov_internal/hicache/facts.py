@@ -1,4 +1,4 @@
-"""HiCache fact parsing helpers for profiling/modeling scripts."""
+"""HiCache fact 解析与 consumer 路由 helper。"""
 
 from __future__ import annotations
 
@@ -25,20 +25,20 @@ from profiling.python_probe.trace_sim_probe.schema import (  # noqa: E402
 
 @dataclass(frozen=True)
 class HiCacheFact:
-    """Parsed fact contract from a Chrome trace event args object."""
+    """从 Chrome trace event args 中解析出的 fact 合同。"""
 
     fact_class: str
     role: str
     consumers: tuple[str, ...]
 
     def has_consumer(self, consumer: str) -> bool:
-        """Return whether this event is declared for a consumer."""
+        """判断该 fact 是否声明给指定 consumer。"""
 
         return consumer in self.consumers
 
 
 def parse_fact(args: dict[str, Any]) -> HiCacheFact:
-    """Parse and validate the required HiCache fact object from event args."""
+    """解析并校验 event args 中必须存在的 HiCache fact 对象。"""
 
     fact = args.get("fact")
     if not isinstance(fact, dict):
@@ -59,7 +59,7 @@ def parse_fact(args: dict[str, Any]) -> HiCacheFact:
 
 
 def parse_fact_or_none(args: dict[str, Any]) -> HiCacheFact | None:
-    """Return a parsed fact for events that carry one, otherwise None."""
+    """解析携带 fact 的 event；非 HiCache event 不携带 fact 时返回 None。"""
 
     if "fact" not in args:
         if _is_hicache_probe_args(args):
@@ -69,21 +69,21 @@ def parse_fact_or_none(args: dict[str, Any]) -> HiCacheFact | None:
 
 
 def _is_hicache_probe_args(args: dict[str, Any]) -> bool:
-    """Return whether args look like a HiCache Python probe event."""
+    """判断 args 是否看起来来自 HiCache Python probe。"""
 
     target_id = str(args.get("target_id") or "").lower()
     return target_id.startswith(("hiradix.", "hicache.", "hicache_controller."))
 
 
 def fact_has_consumer(args: dict[str, Any], consumer: str) -> bool:
-    """Return whether event args declare a fact for a consumer."""
+    """判断 event args 是否声明了指定 consumer。"""
 
     fact = parse_fact_or_none(args)
     return fact is not None and fact.has_consumer(consumer)
 
 
 def fact_key(args: dict[str, Any]) -> tuple[str, str] | None:
-    """Return `(class, role)` for fact-bearing events."""
+    """返回 fact event 的 `(class, role)` 路由键。"""
 
     fact = parse_fact_or_none(args)
     if fact is None:

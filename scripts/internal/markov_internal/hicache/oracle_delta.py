@@ -1,4 +1,4 @@
-"""HiCache state-snapshot delta oracle helpers."""
+"""HiCache state snapshot delta oracle 辅助工具。"""
 
 from __future__ import annotations
 

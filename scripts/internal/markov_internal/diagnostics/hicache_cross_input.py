@@ -1,4 +1,4 @@
-"""HiCache cross-input contract diagnostic entry wrapper."""
+"""HiCache 跨输入合同诊断入口封装。"""
 
 from __future__ import annotations
 

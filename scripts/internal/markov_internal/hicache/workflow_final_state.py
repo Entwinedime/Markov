@@ -1,4 +1,4 @@
-"""Final-state prediction stage for HiCache validation workflows."""
+"""HiCache validation workflow 的 final-state prediction 阶段。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..common.io import write_json
 from ..common.paths import ROOT_DIR
@@ -18,19 +18,13 @@ from .matrix_prediction import (
     prediction_output_dir,
     summarize_prediction,
     tier_count_delta,
-    write_target_model_config,
 )
 from .matrix_types import PredictionSpec
-from .workflow_progress import (
-    final_state_stage_detail,
-    print_prediction_result,
-    print_stage_start,
-)
 
 
 @dataclass(frozen=True)
 class FinalStateOptions:
-    """Final-state stage options independent from argparse."""
+    """与 argparse 解耦的 final-state 阶段选项。"""
 
     source_config_ids: set[str]
     target_config_ids: set[str]
@@ -47,7 +41,7 @@ def prediction_specs_for_options(
     *,
     scope: set[str] | None = None,
 ) -> list[PredictionSpec]:
-    """Build prediction specs for the selected configs and scope."""
+    """根据选中的 config 和 scope 构造 prediction spec。"""
 
     specs = build_prediction_specs(
         runs,
@@ -81,23 +75,26 @@ def run_final_state_predictions(
     output_dir: Path,
     options: FinalStateOptions,
     quality_report: dict[str, Any],
+    *,
+    runner_configs: dict[str, Path],
+    on_row: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     """执行 final-state prediction，并写出每个格子的 matrix_row。"""
 
     specs = prediction_specs_for_options(runs, options)
-    print_stage_start("final-state", final_state_stage_detail(specs, dry_run=options.dry_run))
     quality_gate = build_quality_gate(quality_report)
     rows: list[dict[str, Any]] = []
-    for index, spec in enumerate(specs, start=1):
+    for spec in specs:
         row = run_or_summarize_prediction(
             spec,
             output_dir,
             options,
-            index,
-            len(specs),
             quality_gate,
+            runner_configs,
         )
         rows.append(row)
+        if on_row is not None:
+            on_row(row)
         if row.get("return_code", 0) != 0 and not options.continue_on_error:
             raise SystemExit(f"Prediction failed: {row.get('label')}; see {row.get('log_path')}")
     return rows
@@ -124,10 +121,10 @@ def skip_prediction_reason(spec: PredictionSpec, quality_gate: dict[str, Any]) -
     rows_by_run = quality_gate.get("runs") if isinstance(quality_gate.get("runs"), dict) else {}
     source_quality = rows_by_run.get(spec.source.run_id)
     target_quality = rows_by_run.get(spec.target.run_id)
-    if isinstance(source_quality, dict) and not source_quality.get("state_quality_ready"):
-        return "source_state_quality_not_ready"
-    if isinstance(target_quality, dict) and not target_quality.get("state_quality_ready"):
-        return "target_state_quality_not_ready"
+    if isinstance(source_quality, dict) and not source_quality.get("state_model_input_ready"):
+        return "source_state_model_input_not_ready"
+    if isinstance(target_quality, dict) and not target_quality.get("state_model_input_ready"):
+        return "target_state_model_input_not_ready"
     if spec.is_self:
         return ""
 
@@ -148,37 +145,33 @@ def run_or_summarize_prediction(
     spec: PredictionSpec,
     output_dir: Path,
     options: FinalStateOptions,
-    index: int,
-    total: int,
     quality_gate: dict[str, Any],
+    runner_configs: dict[str, Path],
 ) -> dict[str, Any]:
     """执行或复用一个 prediction，并返回矩阵行摘要。"""
 
     pred_dir = prediction_output_dir(output_dir, spec)
     validation_path = pred_dir / "validation.json"
-    config_path = write_target_model_config(spec.target, output_dir / "configs")
+    config_path = runner_configs.get(spec.target.config_id)
+    if config_path is None:
+        raise ValueError(f"missing runner config for target config: {spec.target.config_id}")
     command = build_model_command(spec, pred_dir, config_path)
     write_json(pred_dir / "command.json", {"command": command, "label": spec.label})
 
     skip_reason = skip_prediction_reason(spec, quality_gate)
     if skip_reason:
-        print(f"[{index}/{total}] skip {spec.label}: {skip_reason}", flush=True)
         row = build_skipped_prediction_row(spec, output_dir, command, skip_reason)
         write_json(pred_dir / "matrix_row.json", row)
         return row
 
     should_run = not options.dry_run and (options.force or not validation_path.is_file())
     if should_run:
-        print(f"[{index}/{total}] run {spec.label}", flush=True)
         return_code, elapsed_sec = execute_command(command, pred_dir / "model.log")
     else:
-        print(f"[{index}/{total}] skip {spec.label}", flush=True)
         return_code, elapsed_sec = (0, 0.0)
 
     row = build_prediction_row(spec, output_dir, return_code, elapsed_sec, command)
     write_json(pred_dir / "matrix_row.json", row)
-    if should_run:
-        print_prediction_result(index, total, row)
     return row
 
 

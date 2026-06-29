@@ -24,7 +24,7 @@ from ..common.commands import command_from_config, command_tokens
 from ..common.io import load_json, write_json
 from ..common.naming import sanitize
 from ..common.paths import ROOT_DIR, resolve_repo_path
-from .forced_tokens import (
+from ..contracts.forced_token import (
     FORCED_TOKEN_BUNDLE_SCHEMA,
     FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE,
     FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE,

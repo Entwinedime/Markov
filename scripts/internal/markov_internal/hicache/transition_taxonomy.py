@@ -169,7 +169,6 @@ NOISE_OBSERVED_OPERATION_KINDS = {
     "maintenance_checkpoint",
     "request_lookup",
     "request_lifecycle",
-    "storage_control",
 }
 
 STATE_ONLY_OPERATION_KINDS = {

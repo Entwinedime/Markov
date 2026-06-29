@@ -1,4 +1,4 @@
-"""Predicted HiCache transition trace schema helpers."""
+"""predicted HiCache transition trace schema 辅助工具。"""
 
 from __future__ import annotations
 

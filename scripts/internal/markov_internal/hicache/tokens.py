@@ -1,4 +1,4 @@
-"""Shared HiCache token path contract helpers."""
+"""HiCache token path 合同共享 helper。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ TokenPath = tuple[TokenUnit, ...]
 
 
 def maybe_json(value: Any) -> Any:
-    """Decode JSON-encoded values when traces stored nested fields as strings."""
+    """解析 trace 中以字符串保存的嵌套 JSON 值。"""
 
     if isinstance(value, str):
         text = value.strip()
@@ -24,7 +24,7 @@ def maybe_json(value: Any) -> Any:
 
 
 def token_id_path(value: Any) -> TokenPath | None:
-    """Parse a token_dictionary token_ids field without losing composite tokens."""
+    """解析 token_dictionary.token_ids，同时保留 composite token 结构。"""
 
     value = maybe_json(value)
     if not isinstance(value, dict):
@@ -46,13 +46,13 @@ def token_id_path(value: Any) -> TokenPath | None:
 
 
 def token_path_count(tokens: TokenPath) -> int:
-    """Return the model token count represented by a parsed token path."""
+    """返回解析后 token path 表示的模型 token 数。"""
 
     return len(tokens)
 
 
 def token_path_hash(tokens: TokenPath) -> str:
-    """Hash a token path with the same u32le algorithm used by the probe."""
+    """用 probe 相同的 u32le 算法计算 token path hash。"""
 
     hasher = hashlib.sha256()
     for token in tokens:
@@ -62,7 +62,7 @@ def token_path_hash(tokens: TokenPath) -> str:
 
 
 def token_dictionary_issues(value: Any) -> list[dict[str, Any]]:
-    """Validate token_ids against token_count and token_path_id when token_ids exist."""
+    """在 token_ids 存在时校验 token_count 与 token_path_id。"""
 
     value = maybe_json(value)
     if not isinstance(value, dict) or "token_ids" not in value:
@@ -99,6 +99,8 @@ def token_dictionary_issues(value: Any) -> list[dict[str, Any]]:
 
 
 def _int_or_none(value: Any) -> int | None:
+    """宽松解析整数；None、bool 或非法值按缺失处理。"""
+
     if value is None or isinstance(value, bool):
         return None
     try:

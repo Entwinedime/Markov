@@ -1,4 +1,4 @@
-"""Profile run discovery and prediction spec expansion for HiCache matrices."""
+"""HiCache 矩阵使用的 profile run 发现与 prediction spec 展开。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json
-from ..profiling.quality import map_repo_path
+from ..common.paths import map_repo_path
 from .matrix_types import PredictionSpec, ProfileRun
 
 

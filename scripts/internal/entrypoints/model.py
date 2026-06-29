@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Container entrypoint for modeling runs."""
+"""modeling run 的容器内入口。"""
 
 from __future__ import annotations
 

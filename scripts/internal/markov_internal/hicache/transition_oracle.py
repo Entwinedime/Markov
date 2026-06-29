@@ -1,4 +1,4 @@
-"""Target-side observed transition oracle extraction for HiCache validation."""
+"""HiCache validation 使用的 target-side observed transition oracle 抽取。"""
 
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "writeback_io_observed": "write_back_flush",
     "writeback_schedule_observed": "write_back_flush",
     "writeback_storage_schedule_observed": "write_back_flush",
-    "prefetch_check_point": "prefetch_checkpoint",
     "prefetch_decision_observed": "prefetch_plan",
     "prefetch_enqueue_observed": "prefetch_plan",
     "prefetch_intent_observed": "prefetch_plan",
@@ -56,7 +55,6 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "lookup_result_observed": "request_lookup",
     "request_lifecycle_path_observed": "request_lifecycle",
     "request_lifecycle_runtime_observed": "request_lifecycle",
-    "storage_control_drain_boundary": "storage_control",
 }
 
 
@@ -97,7 +95,7 @@ def extract_target_oracle(trace_paths: list[Path], target_metadata: dict[str, An
         "unsupported_or_unobservable_state_keys": unsupported_keys,
         "notes": [
             "snapshot_delta_rows are derived from validation-only state_snapshot timeline and are labels only.",
-            "observed_operations are source_actual/timing evidence plus explicit runtime control boundaries from the target run.",
+            "observed_operations are source_actual/timing evidence from the target run.",
             "L3 and prefetch internal sets are model-side state unless a future probe exposes them directly.",
         ],
         "samples": {
@@ -176,13 +174,8 @@ def extract_observed_operations(trace_paths: list[Path], *, sample_limit: int) -
 def _transition_observed_fact(args: dict[str, Any], fact_class: str, role: str) -> bool:
     """判断 fact 是否能作为 transition validator 的 target-side 边界证据。"""
 
-    if fact_class in {"source_actual", "timing_observation"}:
-        return True
-    return (
-        fact_class == "runtime_model_checkpoint"
-        and role == "storage_control_drain_boundary"
-        and str(args.get("phase") or "").lower() == "instant"
-    )
+    _ = args, role
+    return fact_class in {"source_actual", "timing_observation"}
 
 
 def observed_confidence(fact_class: str) -> str:
@@ -190,8 +183,6 @@ def observed_confidence(fact_class: str) -> str:
 
     if fact_class == "source_actual":
         return "source_actual"
-    if fact_class == "runtime_model_checkpoint":
-        return "runtime_model_checkpoint"
     return "timing"
 
 

@@ -51,7 +51,6 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "writeback_io_observed": "write_back_flush",
     "writeback_schedule_observed": "write_back_flush",
     "writeback_storage_schedule_observed": "write_back_flush",
-    "prefetch_check_point": "prefetch_checkpoint",
     "prefetch_decision_observed": "prefetch_plan",
     "prefetch_enqueue_observed": "prefetch_plan",
     "prefetch_intent_observed": "prefetch_plan",
@@ -67,7 +66,6 @@ OBSERVED_ROLE_TO_OPERATION_KIND = {
     "lookup_result_observed": "request_lookup",
     "request_lifecycle_path_observed": "request_lifecycle",
     "request_lifecycle_runtime_observed": "request_lifecycle",
-    "storage_control_drain_boundary": "storage_control",
 }
 
 
@@ -570,9 +568,7 @@ def operation_gate_kind_from_observed(row: dict[str, Any]) -> str:
         return "host_backup"
     if mapped == "prefetch_ready":
         return "prefetch_read"
-    if mapped == "prefetch_checkpoint":
-        return "prefetch_apply"
-    if mapped in {"maintenance_checkpoint", "request_lookup", "request_lifecycle", "storage_control"}:
+    if mapped in {"maintenance_checkpoint", "request_lookup", "request_lifecycle"}:
         return mapped
     return mapped
 
@@ -582,8 +578,6 @@ def observed_evidence_class(row: dict[str, Any]) -> str:
 
     fact_class = str(row.get("fact_class") or "")
     fact_role = str(row.get("fact_role") or "")
-    if fact_class == "runtime_model_checkpoint":
-        return "control_boundary"
     if fact_class == "source_actual" and fact_role.endswith("_observed"):
         return "exact_physical"
     if fact_role in {"capacity_request", "capacity_result_observed"}:

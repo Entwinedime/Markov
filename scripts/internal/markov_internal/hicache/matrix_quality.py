@@ -1,17 +1,16 @@
-"""Profile quality gate for HiCache workflow matrices."""
+"""HiCache workflow 矩阵的 profile quality gate。"""
 
 from __future__ import annotations
 
 import collections
 import hashlib
-import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ..common.io import write_json
 from ..common.trace import TraceLoadStatus, load_chrome_trace_events
-from ..profiling.quality import audit_profile
 from .facts import HICACHE_CONSUMER_STATE_MODEL, parse_fact_or_none
+from .quality.profile_audit import audit_hicache_profile
 from .input_contract_core import canonical_json, extract_audit_events, workload_identity_path_contract
 from .matrix_types import ProfileRun, safe_slug
 
@@ -23,22 +22,27 @@ WORKLOAD_SIGNATURE_ROLES = (
 )
 
 
-def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: bool = False) -> dict[str, Any]:
-    """执行阶段一 profile quality gate，并写出 per-run 质量详情。"""
+def build_quality_report(
+    runs: list[ProfileRun],
+    output_dir: Path,
+    *,
+    audit_dir: Path | None = None,
+    summary_path: Path | None = None,
+    on_row: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """执行阶段一 workflow input gate，并写出 per-run HiCache audit。"""
 
     rows: list[dict[str, Any]] = []
     signature_by_input: dict[str, dict[str, Any]] = {}
-    quality_dir = output_dir / "quality"
-    total = len(runs)
-    for index, run in enumerate(runs, start=1):
-        if progress:
-            print(f"[{index}/{total}] run {run.input_id}/{run.config_id}", flush=True)
-        profile_quality_path = quality_dir / f"{safe_slug(run.run_id)}.profile_quality.json"
-        profile_quality = audit_profile(run.manifest_path)
-        write_json(profile_quality_path, profile_quality)
+    quality_dir = audit_dir or output_dir / "artifacts" / "quality"
+    for run in runs:
+        profile_audit_path = quality_dir / f"{safe_slug(run.run_id)}.hicache_profile_audit.json"
+        profile_audit = audit_hicache_profile(run.manifest_path)
+        write_json(profile_audit_path, profile_audit)
         trace_summary = summarize_profile_trace(run)
         workload_signature = build_workload_signature(run)
-        forced_token_quality = normalize_forced_token_quality(profile_quality)
+        forced_token_quality = normalize_forced_token_quality(profile_audit)
+        state_ready = state_model_input_ready(profile_audit, trace_summary, workload_signature)
         row = {
             "run_id": run.run_id,
             "config_id": run.config_id,
@@ -46,6 +50,7 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: 
             "input_class": run.input_class,
             "manifest_path": str(run.manifest_path),
             "run_dir": str(run.run_dir),
+            "hicache_profile_audit_path": str(profile_audit_path),
             "python_probe_files": [str(path) for path in run.python_probe_files],
             "python_probe_file_count": len(run.python_probe_files),
             "trace_load_status": trace_summary["trace_load_status"],
@@ -57,16 +62,21 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: 
             "fact_class_counts": trace_summary["fact_class_counts"],
             "fact_role_counts": trace_summary["fact_role_counts"],
             "consumer_counts": trace_summary["consumer_counts"],
-            "missing_required_fields": profile_quality.get("hicache_state_model_fact_coverage", {}).get(
+            "missing_required_fields": profile_audit.get("hicache_state_model_fact_coverage", {}).get(
                 "missing_fields",
                 {},
             ),
             "canonical_request_count": workload_signature["request_event_count"],
             "canonical_workload_signature": workload_signature["signature"],
             "canonical_workload_ready": workload_signature["ready"],
-            "profile_quality_ready": bool(profile_quality.get("quality_ready")),
-            "profile_quality_errors": profile_quality.get("quality_errors", []),
-            "state_quality_ready": state_quality_ready(profile_quality, trace_summary, workload_signature),
+            "artifact_ready": bool(profile_audit.get("artifact_ready")),
+            "artifact_errors": profile_audit.get("artifact_errors", []),
+            "strict_diagnostic_coverage_ready": bool(profile_audit.get("strict_diagnostic_coverage_ready")),
+            "diagnostic_coverage_errors": profile_audit.get("diagnostic_coverage_errors", []),
+            "state_model_input_ready": state_ready,
+            "state_model_input_errors": profile_audit.get("state_model_input_errors", []),
+            "workflow_input_ready": state_ready,
+            "workflow_input_errors": profile_audit.get("workflow_input_errors", []),
             "forced_token_enabled": bool(forced_token_quality.get("enabled")),
             "forced_token_ready": bool(forced_token_quality.get("ready")),
             "forced_token_plan_ready": bool(forced_token_quality.get("plan_ready")),
@@ -77,13 +87,13 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: 
             "forced_token_bundle_id": forced_token_quality.get("bundle_id"),
             "forced_token_bundle_path": forced_token_quality.get("bundle_path"),
             "forced_token_quality": forced_token_quality,
-            "hicache_state_model_fact_coverage": profile_quality.get("hicache_state_model_fact_coverage", {}),
-            "hicache_capacity": profile_quality.get("hicache_capacity", {}),
+            "hicache_state_model_fact_coverage": profile_audit.get("hicache_state_model_fact_coverage", {}),
+            "hicache_capacity": profile_audit.get("hicache_capacity", {}),
             "workload_signature_detail": workload_signature,
         }
         rows.append(row)
-        if progress:
-            print_quality_result(index, total, row)
+        if on_row is not None:
+            on_row(row)
 
     by_input: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
     for row in rows:
@@ -112,79 +122,42 @@ def build_quality_report(runs: list[ProfileRun], output_dir: Path, *, progress: 
             and signature_by_input[input_id]["forced_token_bundle_signature_match"]
         )
 
-    quality_ready = (
-        all(row["state_quality_ready"] for row in rows)
+    workflow_input_ready = (
+        all(row["state_model_input_ready"] for row in rows)
         and all(row["signature_match"] for row in signature_by_input.values())
         and all(row["forced_token_plan_signature_match"] for row in signature_by_input.values())
         and all(row["forced_token_bundle_signature_match"] for row in signature_by_input.values())
     )
     report = {
-        "schema": "trace_sim.hicache.state_matrix.profile_quality.v1",
+        "schema": "trace_sim.hicache.state_matrix.workflow_input_quality.v1",
         "stage": "quality",
         "run_count": len(rows),
         "config_ids": sorted({run.config_id for run in runs}),
         "input_ids": sorted({run.input_id for run in runs}),
-        "quality_ready": quality_ready,
-        "state_quality_ready_count": sum(1 for row in rows if row["state_quality_ready"]),
-        "profile_quality_ready_count": sum(1 for row in rows if row["profile_quality_ready"]),
+        "workflow_input_ready": workflow_input_ready,
+        "workflow_input_ready_count": sum(1 for row in rows if row["workflow_input_ready"]),
+        "state_model_input_ready_count": sum(1 for row in rows if row["state_model_input_ready"]),
+        "strict_diagnostic_coverage_ready_count": sum(
+            1 for row in rows if row["strict_diagnostic_coverage_ready"]
+        ),
+        "artifact_ready_count": sum(1 for row in rows if row["artifact_ready"]),
         "input_workload_signatures": signature_by_input,
         "runs": rows,
         "note": (
-            "quality_ready uses state modeling requirements: state model facts, token dictionary/span, "
-            "oracle snapshots, same-input workload signatures, and forced-token plan/bundle consistency "
-            "when forced replay is enabled. "
-            "profile_quality_ready keeps the stricter collection audit for source_actual/timing diagnostics."
+            "workflow_input_ready gates modeling workflow execution. "
+            "state_model_input_ready covers state facts, token dictionary/span, oracle snapshots, "
+            "workload identity, and forced-token readiness. strict_diagnostic_coverage_ready is reported "
+            "separately and does not block the default workflow gate."
         ),
     }
-    write_json(output_dir / "profile_quality.json", report)
+    write_json(summary_path or output_dir / "stages" / "quality" / "summary.json", report)
     return report
 
 
-def print_quality_result(index: int, total: int, row: dict[str, Any]) -> None:
-    """打印 profile quality 的简短结果行。"""
+def normalize_forced_token_quality(profile_audit: dict[str, Any]) -> dict[str, Any]:
+    """从 HiCache profile audit 中提取稳定的 forced-token gate 摘要。"""
 
-    status = "ok" if row.get("state_quality_ready") is True else "fail"
-    issue_text = quality_issue_text(row)
-    print(
-        f"[{index}/{total}] result {status} "
-        f"state_ready={progress_value(row.get('state_quality_ready'))} "
-        f"profile_ready={progress_value(row.get('profile_quality_ready'))} "
-        f"workload_events={row.get('canonical_request_count')} "
-        f"oracle_snapshots={row.get('oracle_snapshot_count')} "
-        f"state_model_events={row.get('hicache_state_model_event_count')}"
-        f"{issue_text}",
-        flush=True,
-    )
-
-
-def quality_issue_text(row: dict[str, Any]) -> str:
-    """返回 quality result 行中的短问题摘要。"""
-
-    errors = [str(item) for item in row.get("profile_quality_errors", []) if item]
-    coverage = row.get("hicache_state_model_fact_coverage")
-    invalid_count = 0
-    if isinstance(coverage, dict):
-        invalid_count = int(coverage.get("invalid_token_dictionary_issue_count") or 0)
-    parts = []
-    if errors:
-        parts.append("issues=" + ",".join(errors[:3]))
-    if invalid_count:
-        parts.append(f"token_dict_invalid={invalid_count}")
-    return (" " + " ".join(parts)) if parts else ""
-
-
-def progress_value(value: Any) -> str:
-    """把进度行中的 Python 值转成短字符串。"""
-
-    if isinstance(value, bool) or value is None:
-        return json.dumps(value)
-    return str(value)
-
-
-def normalize_forced_token_quality(profile_quality: dict[str, Any]) -> dict[str, Any]:
-    """从 profile_quality 中提取稳定的 forced-token gate 摘要。"""
-
-    quality = profile_quality.get("forced_token_quality")
+    quality = profile_audit.get("forced_token_quality")
     if not isinstance(quality, dict):
         return {"enabled": False, "ready": True, "mode": "none", "plan_sha256": None}
     return {
@@ -314,21 +287,23 @@ def build_workload_signature(run: ProfileRun) -> dict[str, Any]:
     }
 
 
-def state_quality_ready(
-    profile_quality: dict[str, Any],
+def state_model_input_ready(
+    profile_audit: dict[str, Any],
     trace_summary: dict[str, Any],
     workload_signature: dict[str, Any],
 ) -> bool:
     """判断 profile 是否满足 final-state 建模输入要求。"""
 
-    state_model_fact = profile_quality.get("hicache_state_model_fact_coverage")
+    if profile_audit.get("state_model_input_ready") is not True:
+        return False
+    state_model_fact = profile_audit.get("hicache_state_model_fact_coverage")
     if not isinstance(state_model_fact, dict) or not state_model_fact.get("ready", False):
         return False
     if trace_summary.get("oracle_snapshot_count", 0) <= 0:
         return False
     if trace_summary.get("consumer_counts", {}).get(HICACHE_CONSUMER_STATE_MODEL, 0) <= 0:
         return False
-    forced_token_quality = profile_quality.get("forced_token_quality")
+    forced_token_quality = profile_audit.get("forced_token_quality")
     if isinstance(forced_token_quality, dict) and forced_token_quality.get("enabled"):
         if not forced_token_quality.get("ready"):
             return False

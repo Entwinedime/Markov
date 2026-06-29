@@ -1,4 +1,4 @@
-"""Model-side self checks for predicted HiCache transition traces."""
+"""predicted HiCache transition trace 的模型侧自检。"""
 
 from __future__ import annotations
 

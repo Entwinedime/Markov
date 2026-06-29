@@ -13,19 +13,15 @@ from pathlib import Path
 from typing import Any
 
 
-from ..common.io import write_json
 from ..common.paths import ROOT_DIR
 from .matrix_discovery import discover_profile_runs, filter_runs
-from .workflow_final_state import (
-    FinalStateOptions,
-    run_final_state_predictions,
-    summarize_existing_predictions,
-)
+from .workflow_context import WorkflowArtifactPolicy, WorkflowRunContext
+from .workflow_final_state import FinalStateOptions
 from .workflow_plan import write_workflow_plan
-from .workflow_progress import print_final_state_rows_summary, print_summary
-from .workflow_quality import run_quality_stage
+from .workflow_progress import WorkflowProgressReporter
+from .workflow_stage_runner import FinalStateStageRunner, QualityStageRunner, TransitionStageRunner
 from .workflow_summary import workflow_mode_from_quality, write_workflow_summary
-from .workflow_transition import TransitionOptions, run_transition_stage
+from .workflow_transition import TransitionOptions
 
 
 DEFAULT_STAGES = ("quality", "final-state")
@@ -128,12 +124,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("The transition stage requires final-state in the same workflow run.")
     output_dir = resolve_output_dir(args)
     runs = discover_selected_runs(args)
-    write_workflow_plan(output_dir, runs, stages, final_state_options)
+    artifacts = WorkflowArtifactPolicy(output_dir)
+    artifacts.ensure_base_dirs()
+    write_workflow_plan(
+        output_dir,
+        runs,
+        stages,
+        final_state_options,
+        plan_path=artifacts.matrix_plan_path,
+    )
+    context = WorkflowRunContext(
+        runs=runs,
+        output_dir=output_dir,
+        stages=stages,
+        prediction_scope=prediction_scope,
+        final_state_options=final_state_options,
+        transition_options=transition_options,
+        artifacts=artifacts,
+        reporter=WorkflowProgressReporter(),
+    )
 
     summaries: dict[str, Any] = {}
     quality_report: dict[str, Any] | None = None
     if "quality" in stages or "final-state" in stages or "transition" in stages:
-        quality_report = run_quality_stage(runs, output_dir, selected="quality" in stages)
+        quality_report = QualityStageRunner().run(context, summaries)
         summaries["quality"] = quality_report
     workflow_mode = workflow_mode_from_quality(quality_report or {})
     if "final-state" in stages and "cross" in prediction_scope and workflow_mode != "forced_token_replay":
@@ -144,42 +158,10 @@ def main(argv: list[str] | None = None) -> int:
 
     final_rows: list[dict[str, Any]] = []
     if "final-state" in stages:
-        final_rows = run_final_state_predictions(
-            runs,
-            output_dir,
-            final_state_options,
-            quality_report or {},
-        )
-        print_final_state_rows_summary(final_rows)
-        if "self" in prediction_scope:
-            self_summary = summarize_existing_predictions(
-                runs,
-                output_dir,
-                final_state_options,
-                scope={"self"},
-                schema="trace_sim.hicache.state_workflow.final_state_self.v1",
-                stage="final-state:self",
-            )
-            write_json(output_dir / "final_state_self.json", self_summary)
-            summaries["final_state_self"] = self_summary
-            print_summary("final-state:self", self_summary)
-        if "cross" in prediction_scope:
-            cross_summary = summarize_existing_predictions(
-                runs,
-                output_dir,
-                final_state_options,
-                scope={"cross"},
-                schema="trace_sim.hicache.state_workflow.final_state_cross.v1",
-                stage="final-state:cross",
-            )
-            write_json(output_dir / "final_state_cross.json", cross_summary)
-            summaries["final_state_cross"] = cross_summary
-            print_summary("final-state:cross", cross_summary)
+        final_rows = FinalStateStageRunner().run(context, summaries)
 
     if "transition" in stages:
-        transition_summary = run_transition_stage(output_dir, transition_options)
-        summaries["transition"] = transition_summary
-        print_summary("transition", transition_summary)
+        TransitionStageRunner().run(context, summaries)
 
     write_workflow_summary(output_dir, runs, stages, prediction_scope, summaries, final_rows)
     return 0

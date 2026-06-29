@@ -1,4 +1,4 @@
-"""Coverage summaries between predicted transitions and state snapshots."""
+"""predicted transition 与 state snapshot 之间的覆盖率汇总。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Python probe target catalog selection."""
+"""Python probe target catalog 选择工具。"""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def select_python_probe_targets(
 
 
 def validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[str, Any]:
-    """Validate and clone a target catalog entry."""
+    """校验并复制一个 target catalog entry。"""
 
     if not isinstance(raw, dict):
         raise ValueError(f"{catalog_path}: targets[{index}] must be an object")

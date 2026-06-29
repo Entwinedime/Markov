@@ -1,4 +1,4 @@
-"""Workflow plan artifact writer for HiCache validation workflows."""
+"""HiCache validation workflow 的 plan artifact 写出工具。"""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ def write_workflow_plan(
     runs: list[Any],
     stages: set[str],
     final_state_options: FinalStateOptions,
+    *,
+    plan_path: Path | None = None,
 ) -> None:
     """写出 workflow 执行计划，同时保持 transition compare 需要的 matrix_plan 结构。"""
 
@@ -53,4 +55,4 @@ def write_workflow_plan(
             for run in runs
         ],
     }
-    write_json(output_dir / "matrix_plan.json", plan)
+    write_json(plan_path or output_dir / "artifacts" / "matrix_plan.json", plan)

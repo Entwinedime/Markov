@@ -1,12 +1,11 @@
-"""Quality stage wrapper for HiCache validation workflows."""
+"""HiCache validation workflow 的 quality 阶段封装。"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .matrix_quality import build_quality_report
-from .workflow_progress import print_stage_start, print_summary, quality_stage_detail
 
 
 def run_quality_stage(
@@ -14,12 +13,17 @@ def run_quality_stage(
     output_dir: Path,
     *,
     selected: bool,
+    audit_dir: Path | None = None,
+    summary_path: Path | None = None,
+    on_row: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Build the quality report and optionally emit user-facing stage output."""
+    """构造 quality report，但不直接负责终端输出。"""
 
-    if selected:
-        print_stage_start("quality", quality_stage_detail(runs))
-    report = build_quality_report(runs, output_dir, progress=selected)
-    if selected:
-        print_summary("quality", report)
-    return report
+    _ = selected
+    return build_quality_report(
+        runs,
+        output_dir,
+        audit_dir=audit_dir,
+        summary_path=summary_path,
+        on_row=on_row,
+    )

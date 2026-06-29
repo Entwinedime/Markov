@@ -20,7 +20,7 @@ from ..common.logging import log
 from ..common.naming import sanitize
 from ..common.paths import ROOT_DIR, resolve_repo_path
 from .executor import preflight_profile_config, run_profile
-from .forced_tokens import forced_token_bundle_summary
+from ..contracts.forced_token import forced_token_bundle_summary
 from .forced_workflow import (
     build_forced_token_bundle,
     inject_forced_token_bundle_plan,
