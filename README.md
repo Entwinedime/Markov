@@ -16,14 +16,14 @@
 │       └── sglang_hicache_callable.py   # HiCache token/span、scope、seq、oracle snapshot source
 ├── src/profiling/ld_preload/            # C++ LD_PRELOAD hook 框架和硬编码 wrapper
 ├── src/modeling/trace_graph/            # C++ TraceGraph、DAG 仿真和 SimulationModule 后端
-│   ├── include/trace_graph/modules/hicache/
+│   ├── include/markov/trace_graph/modules/hicache/
 │   └── src/modules/hicache/             # HiCache fact parser、radix tree、state model、summary
 ├── scripts/profile.sh                   # 宿主机 profiling 入口，进入框架容器运行
 ├── scripts/model.sh                     # 宿主机 modeling 入口，进入干净 modeling 容器运行
 ├── scripts/run.sh                       # 打开 framework runtime 或 modeling 容器
 ├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
-├── scripts/internal/entrypoints/        # 容器内 CLI：profile/model/quality/HiCache validation
-├── scripts/internal/markov_internal/    # 内部 Python 包：profiling、modeling、HiCache validation
+├── scripts/internal/entrypoints/        # 容器内 CLI：profile/model/audit/HiCache validation
+├── scripts/internal/markov_internal/    # 内部 Python 包：profiling、audit、contracts、modeling、HiCache validation
 ├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
 ├── scripts/bench/hicache_phased_workload.py
 ├── configs/experiments/hicache_state/   # common / forced capture / forced replay
@@ -70,7 +70,7 @@ git submodule update --init --recursive
 ```bash
 scripts/build.sh modeling
 scripts/run.sh modeling -- bash -lc \
-  'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja && cmake --build build/modeling/trace_graph --target trace_graph -j2'
 ```
 
 构建 framework runtime 和对应 hook：
@@ -95,7 +95,7 @@ C/C++ 或 modeling runner 改动还需要：
 scripts/run.sh modeling -- bash -lc \
   'python3 -m py_compile $(find scripts/internal/entrypoints scripts/internal/markov_internal -name "*.py" -print)'
 scripts/run.sh modeling -- bash -lc \
-  "git ls-files '*.c' '*.cc' '*.cpp' '*.h' '*.hpp' | xargs clang-format --dry-run --Werror"
+  "find src/modeling/trace_graph src/profiling/ld_preload -type f \\( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \\) -print0 | xargs -0 clang-format --dry-run --Werror"
 ```
 
 ## 采集
@@ -120,12 +120,20 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_com
 需要 base DAG faithful replay 或 cache patch 时，应另建完整执行 trace suite，同时启用 torch / LD_PRELOAD / Python
 真实执行事件。HiCache state-only suite 不能替代性能 DAG 采集。
 
-profiling 质量审计：
+profiling 后通用 artifact audit：
 
 ```bash
-python3 scripts/internal/entrypoints/profile_quality.py \
+python3 scripts/internal/entrypoints/profile_audit.py \
   --manifest <run_dir>/profile_manifest.json \
-  --output <run_dir>/profile_quality.json
+  --output <run_dir>/profile_artifact_audit.json
+```
+
+HiCache workflow readiness audit：
+
+```bash
+python3 scripts/internal/entrypoints/hicache_profile_audit.py \
+  --manifest <run_dir>/profile_manifest.json \
+  --output <run_dir>/hicache_profile_audit.json
 ```
 
 跨配置验证使用 forced-token capture/replay suite，保证同一 input 的 generated token timeline 一致：
@@ -149,7 +157,8 @@ runner 不读取仓库固定 plan，也不自动选择最近一次 capture。
 ## 建模
 
 当前不维护静态 modeling config。`hicache_workflow.py` 根据 replay suite 中的 target server config 动态生成
-`<workflow_output>/configs/target_<config_id>.json` 并调用 `scripts/model.sh`：
+`<workflow_output>/artifacts/runner_configs/target_<config_id>.json` 并调用 `scripts/model.sh`；每个 prediction 输出目录下的
+`cpp_model_config.json` 是 C++ TraceGraph backend narrow config：
 
 ```bash
 python3 scripts/internal/entrypoints/hicache_workflow.py \
@@ -164,7 +173,7 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-06-27，当前主线状态是：
+截至 2026-06-29，当前主线状态是：
 
 - Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `57` 个 target；
 - `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
@@ -173,11 +182,12 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 - `oracle_state/state_snapshot` 只保留 `24` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
   或 `Scheduler.*` snapshot 定义 HiCache cache-tree final state；
 - C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
-- forced-token capture bundle、显式 replay bundle 依赖、preflight、quality gate 和 `hicache_workflow.py` 已落地；
-- `scripts/internal/entrypoints/` 只放容器内 CLI，复用逻辑位于 `scripts/internal/markov_internal/`；旧平铺脚本只保留在
-  `scripts/internal/deprecated/` 供验证期人工对照，active 代码不 import deprecated。
+- forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和 `hicache_workflow.py` 已落地；
+- `scripts/internal/entrypoints/` 只放容器内 CLI，复用逻辑位于 `scripts/internal/markov_internal/`；旧平铺脚本和
+  `scripts/internal/deprecated/` 人工对照已删除，不保留兼容入口。
 
-当前详细结果、失败语义、临时根因和复现命令以 `docs/validation/hicache_state_validation.md` 与 `docs/tmp/` 中的专项记录为准。
+当前详细结果、已关闭诊断问题、已知限制和复现命令以 `docs/validation/hicache_state_validation.md` 与
+`docs/validation/hicache_state_model_limitations.md` 为准。
 
 ## 数据约束
 

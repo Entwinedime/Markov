@@ -51,22 +51,23 @@ scripts/run.sh modeling
 在 modeling 容器内构建 TraceGraph：
 
 ```bash
-cmake -S . -B build/modeling -G Ninja
-cmake --build build/modeling --target trace_graph -j2
+cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja
+cmake --build build/modeling/trace_graph --target trace_graph -j2
 ```
 
 宿主机也可以通过一次性命令执行同一检查：
 
 ```bash
 scripts/run.sh modeling -- bash -lc \
-  'cmake -S . -B build/modeling -G Ninja && cmake --build build/modeling --target trace_graph -j2'
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja && cmake --build build/modeling/trace_graph --target trace_graph -j2'
 ```
 
 不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
 可复现 profile/modeling run。
 
-当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `scripts/internal/entrypoints/hicache_workflow.py` 从 profile suite 的 target
-server metadata 动态生成 target config，写入 `<workflow_output>/configs/`。
+当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `scripts/internal/entrypoints/hicache_workflow.py` 从 profile suite 的
+target server metadata 动态生成 Python runner config，写入 `<workflow_output>/artifacts/runner_configs/`；每个 prediction
+输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow config。
 
 faithful replay：
 
@@ -102,6 +103,94 @@ scripts/model.sh \
 | `--emit-dag-chrome-trace` | 输出 DAG Chrome trace。 |
 | `--emit-module-summary` | 输出 `model_summary.json`。 |
 | `--emit-validation` | 输出 `validation.json`。 |
+
+## 脚本分层
+
+Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
+
+| 层级 | 路径 | 职责 |
+| --- | --- | --- |
+| 宿主机 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发 CLI。 |
+| 容器内入口 | `scripts/internal/entrypoints/model.py` | 解析 modeling CLI，调用 `markov_internal.modeling.runner`。 |
+| C++ 输入准备 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 处理 profile manifest / raw trace 输入、调用 trace merger、检查 merge summary。 |
+| C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数和定位 `build/modeling/trace_graph/trace_graph`。 |
+| validation payload | `scripts/internal/markov_internal/modeling/validation.py` | 组装 validation 输出、HiCache state validation 和 recommended config audit。 |
+| workload helper | `scripts/internal/markov_internal/modeling/workload.py` | 读取 workload report / bench JSONL 中的实际运行窗口。 |
+
+HiCache workflow 是 profiling 后的 validation 编排，不属于 C++ 后端主体：
+
+| 路径 | 职责 |
+| --- | --- |
+| `scripts/internal/entrypoints/hicache_workflow.py` | 统一入口，解析 workflow CLI。 |
+| `scripts/internal/markov_internal/hicache/workflow_context.py` / `workflow_stage_runner.py` | 面向对象 stage runner、artifact policy 和 workflow lifecycle。 |
+| `scripts/internal/markov_internal/hicache/workflow_progress.py` | quality、final-state、transition 共用的阶段级进度输出。 |
+| `scripts/internal/markov_internal/hicache/workflow_modeling_config.py` | 写出 Python runner config，供 `scripts/model.sh --config` 使用。 |
+| `scripts/internal/markov_internal/hicache/matrix_*` | profile discovery、prediction spec、workflow input quality、prediction 输出路径和 matrix summary。 |
+| `scripts/internal/entrypoints/hicache_transition.py` / `hicache/transition_*` | 只读 transition oracle、model self-check、single/matrix compare、catalog 和 gate 输出。 |
+| `scripts/internal/markov_internal/hicache/oracle_*` | oracle snapshot、capacity、coverage、delta、records 和 mismatch helper。 |
+
+transition oracle 只消费 `source_actual` / `timing_observation` evidence 和 `oracle_state` snapshot 来做验证标签；
+它不生成 state-model fact，也不消费 runtime storage-control checkpoint。C++ state model 的输入仍只由 fact contract 和 router
+决定。
+
+HiCache workflow 的 Python 编排以 stage runner 为顶层结构：
+
+```text
+WorkflowRunContext
+  -> WorkflowArtifactPolicy
+  -> WorkflowProgressReporter
+  -> QualityStageRunner
+  -> FinalStateStageRunner
+  -> TransitionStageRunner
+```
+
+约束：
+
+- `workflow.py` 只负责解析 CLI、发现 runs、创建 context、按固定顺序调用 stage runner 和写 workflow summary；
+- quality、final-state、transition 阶段共享 `WorkflowStageRunner` 生命周期，不在各自矩阵模块中直接打印进度；
+- `matrix_quality.py`、`workflow_final_state.py`、`transition_matrix.py` 保留为可测试业务函数或 stage helper，不拥有终端输出策略；
+- `WorkflowProgressReporter` 是 workflow 用户可见进度的唯一 owner；TTY 下刷新动态进度行，非 TTY 下只输出阶段 start/done summary；
+- 新增阶段必须接入同一套 stage runner / progress / artifact policy，而不是复制一套阶段脚手架。
+
+当前 workflow artifact 布局：
+
+```text
+<workflow_output>/
+  workflow_summary.json
+  stages/
+    quality/summary.json
+    final_state/self_summary.json
+    final_state/cross_summary.json
+    transition/summary.json
+  artifacts/
+    matrix_plan.json
+    runner_configs/
+    quality/
+    transition_catalog/
+  predictions/
+    <input>/<source>__to__<target>/
+```
+
+使用约束：
+
+- `workflow_summary.json` 和 `stages/*/summary.json` 是用户第一入口；
+- `artifacts/runner_configs/target_<config>.json` 是 Python runner config，供 `scripts/model.sh --config` 使用；
+- `predictions/.../cpp_model_config.json` 是 C++ TraceGraph backend narrow config，供 `trace_graph --model-config` 使用；
+- per-run audit、transition catalog、gate、prediction cell 产物都是复现/诊断 artifact，不应和用户第一入口混称；
+- 默认 console 输出不逐 run/cell 打印 `result ok ...`；失败时只补充失败数量、少量 sample 和关键 artifact 路径。
+
+HiCache Python helper 的当前职责分组：
+
+| 分组 | 模块 | 职责 |
+| --- | --- | --- |
+| 输入合同 | `facts.py`、`tokens.py`、`input_contract*.py` | fact envelope、token dictionary/span、canonical workload signature 和 cross-input report。 |
+| 矩阵 | `matrix_types.py`、`matrix_discovery.py`、`matrix_quality.py`、`matrix_prediction.py` | 发现 profile runs、构造 prediction specs、workflow input gate 和 prediction row summary。 |
+| oracle | `oracle_state.py`、`oracle_capacity.py`、`oracle_records.py`、`oracle_coverage.py`、`oracle_delta.py`、`oracle_mismatch.py` | final-state oracle、capacity/config audit、predicted records、coverage、delta 和 mismatch provenance helper。 |
+| transition | `transition*.py` | predicted transition schema/replay/self-check、target oracle、single/matrix compare、catalog、gate 和 taxonomy。 |
+| workflow | `workflow*.py` | post-profile quality、final-state prediction、transition exactness、artifact policy、progress 和 workflow summary。 |
+
+当前仍允许 `hicache/` 包保持扁平文件布局；如果继续增长，应优先按 `quality`、`contract`、`matrix`、`oracle`、`transition`、
+`workflow` 分包拆分，而不是继续依赖文件名前缀维持边界。
 
 ## 建模模式
 
@@ -139,18 +228,42 @@ C++ 后端位于 `src/modeling/trace_graph`：
 
 | 目录 | 内容 |
 | --- | --- |
-| `include/trace_graph/core` / `src/core` | `TraceEvent`、`DagGraph` 等基础结构。 |
-| `include/trace_graph/frontend` / `src/frontend` | model config 和 trace normalize。 |
-| `include/trace_graph/io` / `src/io` | Chrome trace 读取输出。 |
-| `include/trace_graph/simulation` / `src/simulation` | 拓扑仿真。 |
-| `include/trace_graph/modules` / `src/modules` | SimulationModule 子模块。 |
-| `modules/hicache` | HiCache fact parser、radix tree、state model、summary。 |
+| `include/markov/trace_graph/core` / `src/core` | `TraceEvent`、`DagGraph`、`DagBuilder` 和日志等基础结构。 |
+| `include/markov/trace_graph/frontend` / `src/frontend` | 窄 model config 和 trace normalize。 |
+| `include/markov/trace_graph/io` / `src/io` | Chrome trace 读取输出 adapter。 |
+| `include/markov/trace_graph/simulation` / `src/simulation` | 拓扑仿真。 |
+| `include/markov/trace_graph/modules` / `src/modules` | `SimulationModule`、业务模块、diagnostics 和 validation。 |
+| `modules/hicache/model` | HiCache target-derived 状态机。 |
+| `modules/hicache/runtime` | async operation、capacity、ref ledger、token directory 和 target-control clock。 |
+| `modules/hicache/radix` | canonical token radix tree 和 split policy。 |
+| `modules/hicache/storage` | storage directory 和 backend-readable 投影。 |
+| `modules/hicache/diagnostics` | HiCache summary JSON 序列化和诊断输出。 |
 
 构建目标：
 
 ```bash
-scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace_graph -j2'
+scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling/trace_graph --target trace_graph -j2'
 ```
+
+旧 C++ TraceGraph 对照目录已移除，不参与 active build，也不提供旧 include path 或 namespace 兼容层。
+active public include 根固定为 `include/markov/trace_graph/...`，命名空间固定为
+`markov::trace_graph::...`。
+
+构建 target 按职责分层：
+
+| target | 职责 |
+| --- | --- |
+| `trace_graph_core` | DAG、trace event、builder 和 logger。 |
+| `trace_graph_frontend` | config 解析和 trace normalize。 |
+| `trace_graph_io` | Chrome trace I/O。 |
+| `trace_graph_simulation` | 拓扑仿真。 |
+| `trace_graph_hicache` | HiCache fact、policy、runtime、radix、storage 和 state model。 |
+| `trace_graph_modules` | 业务 `SimulationModule` 包装层。 |
+| `trace_graph_diagnostics` | module summary、HiCache summary JSON 和调试输出 adapter。 |
+| `trace_graph_validation` | C++ 轻量结构 validation；oracle 对比仍由 Python validation pipeline 负责。 |
+
+业务层不得依赖 diagnostics / validation target；diagnostics / validation 可以消费业务层暴露的结构化结果。调试和验证裁剪只使用单一
+`DEBUG` 宏，由 CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
 
 ## SimulationModule 接口
 
@@ -162,7 +275,7 @@ scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace
 - 解析自身事实；
 - 维护内部状态；
 - 必要时通过统一 mutation API 修改 DAG；
-- 输出可选 summary/debug。
+- 输出结构化 summary/debug 数据；JSON summary 由 diagnostics writer 生成。
 
 当前 active 子模块：
 
@@ -174,7 +287,8 @@ scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling --target trace
 ## HiCache 状态后端
 
 HiCache backend 当前是 state-only `SimulationModule`：它消费 state-model facts 和显式 target config，维护 target cache state，
-输出 final state、transition trace、policy decision trace 和 validation summary；它暂不修改 DAG。
+输出 final state、transition trace、policy decision trace 等结构化 summary；oracle validation 由 Python pipeline 消费这些输出完成。
+它暂不修改 DAG。
 
 主链路：
 
@@ -186,7 +300,8 @@ HiCacheFact
   -> scoped canonical HiCacheTokenRadixTree
   -> StorageDirectory / RefLedger / CapacityIndex / AsyncOperationTable / TargetControlClock
   -> HiCachePolicy
-  -> DerivedStateView / transition summary / validation
+  -> DerivedStateView / structured summary
+  -> diagnostics summary / Python validation
 ```
 
 ### 输入边界
@@ -194,9 +309,9 @@ HiCacheFact
 后端输入分流规则：
 
 ```text
-consume fact iff phase == "end"
-    && "hicache_state_model" in fact.consumers
+consume fact iff "hicache_state_model" in fact.consumers
     && fact.class/fact.role is accepted by HiCacheFactRouter
+    && phase matches the role contract
 ```
 
 其它 HiCache 事件计入 `skipped_non_state_model_events`，不能更新 target state。token dictionary 也只从 completed
@@ -212,10 +327,11 @@ debug/provenance 字段只能用于质量审计、validation label 或 transitio
 | `workload_identity/request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
 | `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
 | `runtime_model_checkpoint/prefetch_check_point` | prefetch progress/wait instant 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
-| `runtime_model_checkpoint/storage_control_drain_boundary` | storage-control queue drain instant 边界；模型只释放 target-derived deferred prefetch host reservation，不读取 source queue identity。 |
 
 match-prefix concrete path、lookup result、source insert/capacity/lock/maintenance、storage/controller result 和 async completion
-只作为 `source_actual` / `timing_observation` evidence。unknown state-model fact 必须进入 quality / summary error，不能静默消费。
+只作为 `source_actual` / `timing_observation` evidence。`drain_storage_control_queues()` 不再声明 runtime checkpoint；
+host/storage release 的 target 时机由模型内 target-derived 近似负责。unknown state-model fact 必须进入 quality / summary
+error，不能静默消费。
 
 cross-config rule diagnosis 必须先通过 hard workload identity contract：只比较 `workload_identity` facts，逐 role 对比 count
 和 request-normalized canonical fact multiset。raw `request_id` 是 run-local correlation id，不是跨配置 workload identity。
@@ -226,22 +342,29 @@ cross-config rule diagnosis 必须先通过 hard workload identity contract：�
 
 | 文件 | 作用 |
 | --- | --- |
-| `hicache_fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
-| `hicache_router.hpp/.cpp` | role enum、输入门禁和 required field 检查。 |
-| `hicache_token_store.hpp/.cpp` | `HiCacheTokenDirectory`、event-local path snapshot、request timeline 和 role-specific resolver；不保存 source page identity 作为状态输入。 |
-| `hicache_target_pager.hpp/.cpp` | 按 target page size 投影完整 page hash、page id 和 page path。 |
-| `hicache_token_radix_tree.hpp/.cpp` | 每个 `cache_scope` 一棵 canonical compressed radix tree；device/host/storage/ref 都是 node residency/ref 字段，不再维护 device tree 与 host tree 两套事实源。 |
-| `hicache_storage_directory.hpp/.cpp` | target storage namespace；区分 materialized page record 与 backend-readable hash record，支持连续 storage hit prefix 查询。 |
-| `hicache_ref_ledger.hpp/.cpp` | request / writeback / loadback / storage / prefetch owner 级 ref 账本，负责同步 tree 上的 lock ref 和 host ref。 |
-| `hicache_capacity_index.hpp/.cpp` | mutation-driven device/host leaf index、capacity snapshot、victim choice 和 audit trace。 |
-| `hicache_async_state.hpp/.cpp` | prefetch、writeback、loadback、storage operation table 和 lifecycle transition。 |
-| `hicache_target_control_clock.hpp/.cpp` | target-side control checkpoint 与内部 operation id，避免把 source timestamp 当作 target 调度事实。 |
-| `hicache_node_split_policy.hpp/.cpp` | radix split 时 residency/ref/hit count/page projection 的结构化迁移策略。 |
-| `hicache_policy.hpp/.cpp` | 显式 target config 解析、SGLang-derived default 和 policy decision trace。 |
-| `hicache_state_index.hpp/.cpp` | `DerivedStateView`，从 tree / storage / async 派生 validation-facing state sets。 |
-| `hicache_model.hpp/.cpp` | role dispatch 和 state orchestration；不承担 fact schema、summary 或 DAG patch 职责。 |
-| `hicache_summary.hpp/.cpp` | final state、transition trace、policy/capacity/ref/async 审计输出。 |
-| `hicache_module.hpp/.cpp` | SimulationModule registry glue。 |
+| `fact.hpp/.cpp` | 识别 HiCache event、收集 token dictionary、解析 span 和事实字段。 |
+| `router.hpp/.cpp` | role enum、输入门禁和 required field 检查。 |
+| `runtime/token_store.hpp/.cpp` | `HiCacheTokenDirectory`、event-local path snapshot、request timeline 和 role-specific resolver；不保存 source page identity 作为状态输入。 |
+| `runtime/target_pager.hpp/.cpp` | 按 target page size 投影完整 page hash、page id 和 page path。 |
+| `radix/token_radix_tree.hpp/.cpp` | 每个 `cache_scope` 一棵 canonical compressed radix tree；device/host/storage/ref 都是 node residency/ref 字段，不再维护 device tree 与 host tree 两套事实源。 |
+| `storage/storage_directory.hpp/.cpp` | target storage namespace；区分 materialized page record 与 backend-readable hash record，支持连续 storage hit prefix 查询。 |
+| `runtime/ref_ledger.hpp/.cpp` | request / writeback / loadback / storage / prefetch owner 级 ref 账本，负责同步 tree 上的 lock ref 和 host ref。 |
+| `runtime/capacity_index.hpp/.cpp` | mutation-driven device/host leaf index、capacity snapshot、victim choice 和 audit trace。 |
+| `runtime/async_state.hpp/.cpp` | prefetch、writeback、loadback、storage operation table 和 lifecycle transition。 |
+| `runtime/target_control_clock.hpp/.cpp` | target-side control checkpoint 与内部 operation id，避免把 source timestamp 当作 target 调度事实。 |
+| `radix/node_split_policy.hpp/.cpp` | radix split 时 residency/ref/hit count/page projection 的结构化迁移策略。 |
+| `policy.hpp/.cpp` | 显式 target config 解析、SGLang-derived default 和 policy decision trace。 |
+| `runtime/state_index.hpp/.cpp` | `DerivedStateView`，从 tree / storage / async 派生 validation-facing state sets。 |
+| `model/state.hpp/.cpp` | `HiCacheState` 聚合状态、scope 管理、digest、公共 apply/finalize 入口。 |
+| `model/request_model.cpp` | request bound match、admission、lifecycle 和 insert/loadback 相关 transition。 |
+| `model/prefetch_model.cpp` | prefetch decision、checkpoint、ready/apply/cancel 和 host reservation。 |
+| `model/host_storage_model.cpp` | host cleanup、host allocation 和 capacity eviction。 |
+| `model/writeback_model.cpp` | write-through / write-back、backup ACK、dirty clear 和 ref hold/release。 |
+| `model/finalizer.cpp` | finalize 时 pending operation 收束。 |
+| `model/terminal_checkpoint_scan.cpp` | 预扫描 request-local prefetch process 的最后 checkpoint。 |
+| `model/summary.hpp` | HiCache state model 的结构化执行结果；不包含 JSON。 |
+| `diagnostics/summary.hpp/.cpp` | HiCache summary JSON 序列化；不参与状态机决策。 |
+| `hicache_module.hpp/.cpp` | `SimulationModule` registry glue，只持有结构化 summary。 |
 
 ### 目标 Page 投影
 
@@ -308,7 +431,8 @@ host / storage / prefetch：
 - storage hit query 只保留连续命中前缀；storage-readable 不等于 host-visible；
 - prefetch operation 保存 planned path、hit prefix、requested host pages、reserved host pages 和 anchor ref；
 - wait-complete 完成后 apply ready pages，best-effort 在 checkpoint terminate，timeout 在 completed 或 timeout 边界 terminate/late；
-- revoke / timeout incomplete 的 host reservation 进入 deferred release 近似，不立即从 host budget 中消失。
+- revoke / timeout incomplete 的 host reservation 进入 pending release 近似，不立即从 host budget 中消失；同 request 的
+  `request_admission` side effect 完成后做 request-local release drain。
 
 write policy：
 

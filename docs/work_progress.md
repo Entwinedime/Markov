@@ -2,6 +2,47 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-06-30 00:39:24 +0800
+
+- 收敛 `docs/tmp/` 剩余 inactive internal 文档：
+  - 将 `tmp_internal_refactor_guidance_20260629.md` 中仍有效的职责边界迁移到 profiling/modeling 开发文档和 project constraints；
+  - 将 `tmp_internal_scripts_audit_20260629.md` 中仍有效的 current script ownership、workflow artifact/progress 和后续维护关注点拆入主线文档；
+  - 不迁移旧调用链、旧 `profiling.quality` / `quality_hicache` 表格和已完成任务清单为 active spec；
+  - 删除上述两份 inactive 临时文档，`docs/tmp/` 当前不再保留 active 文档。
+
+## 2026-06-29 12:37:24 +0800
+
+- 完成 `scripts/internal` HiCache workflow 职责收紧：
+  - `markov_internal/profiling/` 不再持有 post-profile quality/readiness；通用 artifact audit 移到 `audit.profile_artifacts`，
+    HiCache readiness 移到 `hicache.quality.profile_audit`；
+  - forced-token schema/hash/report helper 移到 `contracts.forced_token`，profiling 只保留 capture/replay 运行期注入与聚合；
+  - workflow 使用 `WorkflowRunContext`、`WorkflowArtifactPolicy`、`WorkflowProgressReporter` 和面向对象 stage runner 编排
+    quality/final-state/transition；
+  - 默认 console 输出改为阶段级 start/done summary，不再逐 run/cell 打印 `result ok ...`；
+  - workflow summary / stage summary / runner configs / per-run audit / transition catalog 已分层到
+    `workflow_summary.json`、`stages/` 和 `artifacts/`。
+- 验证：
+  - `python3 -m py_compile $(find scripts/internal/entrypoints scripts/internal/markov_internal -name "*.py" -print)` 通过；
+  - 1x1 self smoke 通过，输出目录：
+    `data/profile_runs/sglang/20260628_154748_profiling_hicache_state_forced_replay/modeling/internal_refactor_smoke`；
+  - 1x1 cross smoke 通过，输出目录：
+    `data/profile_runs/sglang/20260628_154748_profiling_hicache_state_forced_replay/modeling/internal_refactor_cross_smoke`。
+
+## 2026-06-29 10:16:00 +0800
+
+- 对齐 HiCache state validation、model limitations、profiling/modeling 开发文档和 project constraints：
+  - `HCSV-20260628-forced-bundle-full-matrix` 成为当前 active validation baseline；
+  - 最新 forced replay workflow 路径为
+    `data/profile_runs/sglang/20260628_154748_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs`；
+  - input contract `3/3` ready，state quality `15/15` ready，strict profile quality `12/15` ready；
+  - final-state self `15/15`、cross `60/60`、full `75/75` exact；
+  - transition exactness `75/75` exact，transition-count 和 page-lifecycle multiset 也均为 `75/75`。
+- 明确当前合同不采集、不消费 `storage_control_drain_boundary`，也不维护 `check_kind` 字段；Case B 由
+  terminal prefetch 后 pending host reservation + 同 request post-admission release drain 的 target-derived 近似关闭。
+- 将 `docs/tmp/` 中仍成立的结论拆回主线文档，废弃的 storage-control checkpoint 合同只保留为历史回退说明；已迁移/已废弃的临时文档已删除。
+- 将 `scripts/internal` 的当前分层写入主线文档：宿主机 wrapper、`entrypoints/` 容器内 CLI、`markov_internal/` 可复用包、
+  不再保留旧平铺脚本或 `deprecated/` 人工对照目录。
+
 ## 2026-06-25 21:42:23 +0800
 
 - 在高层重构基础上为 `docs/project_constraints.md` 补回必要的可执行约束：

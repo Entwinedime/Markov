@@ -55,9 +55,9 @@ requested_tokens = extend_num_tokens + batch_size * target_page_size
 
 代码锚点：
 
-- `src/modeling/trace_graph/src/modules/hicache/hicache_policy.cpp` 中
+- `src/modeling/trace_graph/src/modules/hicache/policy.cpp` 中
   `kExplicitSingleRequestExtendBatchSize = 1`；
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+- `src/modeling/trace_graph/src/modules/hicache/model/request_model.cpp` 的
   `apply_request_admission()` 从 admission path 推导 `ExtendAllocationIntent`；
 - `third_party/sglang/python/sglang/srt/mem_cache/common.py` 的
   `alloc_paged_token_slots_extend()` 使用 batch-level `len(seq_lens_cpu)`。
@@ -128,7 +128,7 @@ completion boundary。
 
 代码锚点：
 
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+- `src/modeling/trace_graph/src/modules/hicache/model/request_model.cpp` 的
   `apply_request_bound_match_anchor()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `load_back()` / `init_load_back()`；
@@ -165,7 +165,7 @@ loadback 是否进入 allocator path
 
 模型拿到该 intent 后，才能按 target config 重算 loadback allocation、possible eviction 和 async completion lifecycle。
 
-## HCSV-LIMIT-003: storage control queue drain 仍是单队列全量释放近似
+## HCSV-LIMIT-003: storage control queue drain 仍是 post-admission 释放近似
 
 ### 问题
 
@@ -187,27 +187,30 @@ attention group 上做 `all_reduce(MIN)`，然后每个 rank 只 drain 本地队
 
 ### 当前近似
 
-模型已经接入显式的 `runtime_model_checkpoint/storage_control_drain_boundary`，但仍不维护 rank-local queues，也不做
-all-reduce MIN。当前用单个 scoped async table 的 `reserved_host_pages` 表示 pending host release：
+profiling 合同不再采集 `drain_storage_control_queues()` runtime checkpoint。该函数属于 source scheduler round
+边界，跨配置不能稳定映射到 target request timeline；profile quality、transition validator 和 C++ mutation path 都不消费
+这个 source boundary。
+
+当前用 async table 的 `reserved_host_pages` 表示 pending host release，并把释放时机改成 target-derived request-local
+近似：
 
 - revoked / late / suppressed / applied prefetch 仍可能占用 `reserved_host_pages`；
-- catalog 中的 `HiRadixCache.drain_storage_control_queues()` instant target 发出最小字段的
-  `storage_control_drain_boundary` checkpoint；
-- `apply_storage_control_drain_boundary()` 只在该 checkpoint 上调用 `drain_deferred_host_releases()`；
-- `drain_deferred_host_releases()` 释放该 `cache_scope` 下所有已经不再 active、但仍持有 `reserved_host_pages` 的
-  target-derived prefetch operation；
+- terminal `prefetch_check_point` 只结算 ready / revoked / late / suppressed，不把剩余 reservation 立刻从 host budget
+  中删除；
+- 同 request 的 `request_admission` side effect 完成后，模型释放该 request 下所有非 active prefetch 的 pending reservation；
+- `finalize()` 只兜底释放没有后续 request admission 的残留 reservation；
 - 模型不读取 source queue snapshot、source page identity 或 oracle final state 来决定释放哪些 page。
+
+2026-06-28 forced replay 全矩阵在该近似下达到 self/cross final-state `75 / 75` exact 和 transition `75 / 75` exact。
+这只说明当前 5x3 manual matrix 已覆盖该边界的已知失败形态，不说明 rank-synced FIFO release queue 已被精确复现。
 
 代码锚点：
 
-- `src/modeling/trace_graph/src/modules/hicache/hicache_async_state.cpp` 的
-  `release_deferred_host_pages()`；
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
-  `apply_storage_control_drain_boundary()`、`drain_deferred_host_releases()`；
-- `configs/profiling/hicache_probe_targets.json` 的
-  `hiradix.storage_control_drain_boundary`；
-- `src/profiling/python_probe/trace_sim_probe/probes/generic_callable.py` 的
-  `instant` phase；
+- `src/modeling/trace_graph/src/modules/hicache/runtime/async_state.cpp` 的
+  `release_prefetch_pending_host_pages_for_request()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/request_model.cpp` 的
+  `apply_request_admission()` post-admission drain；
+- `src/modeling/trace_graph/src/modules/hicache/model/finalizer.cpp` 的 pending release finalize fallback；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `_drain_storage_control_queues_impl()` / `drain_storage_control_queues()`；
 - `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
@@ -221,29 +224,16 @@ all-reduce MIN。当前用单个 scoped async table 的 `reserved_host_pages` �
 
 ### 风险
 
+post-admission drain 不是 SGLang rank-synced FIFO queue 的精确复现。它保守保证同 request admission 期间仍能看到 terminal
+prefetch 的 host pressure，但不能表达其它 request、其它 rank 或后续 scheduler round 对同一 release queue 的精确交错。
 release drain 过早会让 host budget 太早变空，可能少触发一次 host cleanup；release drain 过晚会让 host budget 继续被占用，
 可能多触发一次 host cleanup。两者都会改变 L2/backuped/evicted page set 和 host victim order。
 
 ### 收敛方向
 
-当前最小合同是：
-
-```text
-fact.class = runtime_model_checkpoint
-fact.role  = storage_control_drain_boundary
-```
-
-当前字段只表达“这里发生了一次 storage-control drain 边界”：
-
-```text
-cache_scope
-seq_no
-source_page_size
-check_kind = storage_control_drain
-```
-
-如果后续要支持 TP/rank exactness，需要在新的合同中显式建 rank-local queue，或至少记录 rank-synced FIFO drain count。该信息必须作为
-model fact 的字段整体进入同一个 fact class/role，不能把诊断用 queue snapshot 混在当前最小 checkpoint 中。
+如果后续要支持 TP/rank exactness，需要新增真正 target-independent 的 scheduler / release-queue intent，显式描述 rank-local
+queue、rank-synced FIFO drain count 或 scheduler batch round。不能把 source run 的 `drain_storage_control_queues()`
+重新包装成跨配置 profiling checkpoint。
 
 ## HCSV-LIMIT-004: prefetch I/O progress 仍是未校准的完成度投影
 
@@ -265,15 +255,20 @@ estimate_prefetch_io_progress() -> completed_pages = []
 
 - `best_effort`：可以立刻 terminate，但 completed prefix 使用 zero-progress，通常不会 materialize host prefix；
 - `wait_complete`：在需要完整 completion 的 boundary 上把 completed prefix 近似为 storage hit prefix；
-- `timeout`：request reuse boundary 未超时时把 completed prefix 近似为 storage hit prefix；非 terminal checkpoint 已超时时只暴露
+- `timeout`：terminal checkpoint 未超时时把 completed prefix 近似为 storage hit prefix；非 terminal checkpoint 已超时时只暴露
   zero-progress 并取消；terminal checkpoint 仍按完整 storage hit prefix 近似；
-- completed prefetch 的 host insertion 在 `prefetch_check_point` 或 request reuse boundary 上同步 apply。
+- completed prefetch 的 host insertion 当前只在模型判定可 apply 的 `prefetch_check_point` 边界同步发生；如果 completed prefix
+  不可知，模型会保守保留 pending release / suppressed / late 状态，而不是再用 request reuse 边界补齐 host-visible page。
+
+跨 rank / cache scope 的真实 backend I/O 仍可能存在更细的阶段边界：例如先整体完成 `storage -> host` materialize，再在后续
+request reuse / lock 边界推进 `host -> L1/GPU` loadback。当前模型只保证在现有 fact 边界上做 target-derived 折叠，不承诺重放
+后台线程和 rank 同步的真实时间轴。
 
 代码锚点：
 
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
+- `src/modeling/trace_graph/src/modules/hicache/model/prefetch_model.cpp` 的
   `estimate_prefetch_io_progress()`、`estimate_prefetch_progress()`、`apply_prefetch_ready()`、
-  `resolve_prefetch_before_request_use()`、`apply_prefetch_check_point()`；
+  `apply_prefetch_check_point()`；
 - `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
   `prefetch_thread_func()`、`terminate_prefetch()`、`_page_get_zero_copy()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
@@ -292,7 +287,10 @@ projection。
 - prefetch 是否 materialize 成 L2 host-visible prefix；
 - unused host reservation 何时进入 pending release；
 - 后续 request match / loadback / host cleanup 的 victim order；
-- transition exactness 中 `prefetch_ready`、`apply_prefetch_host_visibility`、`add_l2` 等操作数量和顺序。
+- transition exactness 中 `prefetch_ready`、`apply_prefetch_host_visibility`、`add_l2` 等操作数量和顺序；
+- 多 rank/cache scope 的 union transition timeline 中，`storage -> host` 和 `host -> L1/GPU` 的阶段边界如果被折叠到
+  不同粒度，仍可能改变 marker 顺序。2026-06-28 full matrix 已关闭当前 manual matrix 的该类 mismatch，但不能证明后台 I/O
+  exactness。
 
 ### 收敛方向
 
@@ -307,13 +305,15 @@ fact.role = prefetch_progress_boundary
 ```text
 cache_scope
 request_id
-checkpoint kind
+progress boundary kind
 elapsed time / enqueue timestamp
 storage hit prefix length
 target-independent completed prefix policy
 ```
 
 如果要 exact 复现 backend I/O，则需要把 storage backend completion 抽象成独立可重放的 intent，而不是在 state model 中继续猜测。
+同时需要保留跨 scope 的阶段边界：先在 prefetch progress boundary 上整体 materialize host-visible prefix，再在后续 request reuse /
+loadback boundary 上整体推进 L1/GPU materialization，避免 `scope A: mark+clear`、`scope B: mark+clear` 这种伪 transition。
 
 ## HCSV-LIMIT-005: write-through backup ACK 与普通 lock lifetime 是边界近似
 
@@ -342,10 +342,12 @@ release ordinary lock ref
 
 代码锚点：
 
-- `src/modeling/trace_graph/include/trace_graph/modules/hicache/hicache_model.hpp` 的
+- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/model/state.hpp` 的
   `PendingWriteThroughBackup`；
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
-  `commit_host_backup()`、`hold_write_through_backup_ref()`、`drain_write_through_backup_refs()`、`apply_fact()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/writeback_model.cpp` 的
+  `commit_host_backup()`、`hold_write_through_backup_ref()`、`drain_write_through_backup_refs()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/state.cpp` 的
+  `apply_fact()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `write_backup()`、`writing_check()`、`_finish_write_through_ack()`。
 
@@ -418,8 +420,10 @@ write_back eviction used synchronous modeled writeback; ack timing is intentiona
 
 代码锚点：
 
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
-  `evict_device_node()` 和 `apply_hicache_model()` warning；
+- `src/modeling/trace_graph/src/modules/hicache/model/host_storage_model.cpp` 的
+  `evict_device_node()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/terminal_checkpoint_scan.cpp` 的
+  `apply_hicache_model()` warning；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `evict()` 中 `write_back=True` path 和 `writing_check(write_back=True)`。
 
@@ -464,7 +468,7 @@ occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 
 `request_host_allocation()` 只做 count-level 判断：
 
-- 不直接 drain storage-control release queue；pending prefetch host release 只由 `storage_control_drain_boundary` 推进；
+- 不直接 drain source storage-control release queue；pending prefetch host release 只由 request-local post-admission drain 推进；
 - 按 requested pages 执行 modeled host cleanup；
 - 用 `occupied_host_pages + reserved_host_pages` 计算 available pages；
 - write backup 必须完整接受；
@@ -473,10 +477,14 @@ occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 
 代码锚点：
 
-- `src/modeling/trace_graph/include/trace_graph/modules/hicache/hicache_model.hpp` 的
+- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/model/state.hpp` 的
   `HostAllocationResult` 注释；
-- `src/modeling/trace_graph/src/modules/hicache/hicache_model.cpp` 的
-  `request_host_allocation()`、`enforce_host_capacity()`、`apply_prefetch_decision()`、`commit_host_backup()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/host_storage_model.cpp` 的
+  `request_host_allocation()`、`enforce_host_capacity()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/prefetch_model.cpp` 的
+  `apply_prefetch_decision()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/writeback_model.cpp` 的
+  `commit_host_backup()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `prefetch_from_storage()`、`write_backup()`、`evict_host()`。
 
@@ -507,8 +515,9 @@ host_release_queue
 host_allocation_intent
 ```
 
-当前已经接入 storage-control drain boundary。下一步如果要继续收敛，需要把 host allocator ledger 和 rank-synced release count
-纳入当前合同，而不是在 allocation path 上重新加入模型自选 drain boundary。
+当前 profiling 合同不采集 source storage-control boundary。下一步如果要继续收敛，需要新增 target-derived host allocator
+ledger、release queue 和 rank-synced release count 合同，而不是在 allocation path 上重新加入 source scheduler boundary
+或模型自选 scope-level drain。
 
 ## 维护约定
 
