@@ -36,8 +36,11 @@ std::string lower_copy(std::string value) {
 bool in_set(std::string_view value, std::initializer_list<std::string_view> allowed) { return std::ranges::find(allowed, value) != allowed.end(); }
 
 uint64_t derived_prefetch_threshold_pages(uint64_t configured_pages, uint64_t page_size, uint64_t & threshold_tokens, std::string & source) {
-    /* SGLang 默认 prefetch threshold 以 token 表达；模型内部统一换算成 target
-       page 数，使跨 page_size 配置的 policy decision 可比较。 */
+    /**
+     * @brief SGLang 默认 prefetch threshold 以 token 表达。
+     *
+     * 模型内部统一换算成 target page 数，使跨 page_size 配置的 policy decision 可比较。
+     */
     if (configured_pages > 0) {
         threshold_tokens = configured_pages * page_size;
         source = "target_config.prefetch_threshold_pages";
@@ -49,8 +52,11 @@ uint64_t derived_prefetch_threshold_pages(uint64_t configured_pages, uint64_t pa
 }
 
 uint64_t derived_prefetch_capacity_limit_pages(const HiCacheConfig & config, std::string & source) {
-    /* 这里建模的是 SGLang host side prefetch reservation 上限，而不是 L3 backend
-       可读 page 数。limit=0 表示 prefetch 被 rate-limit 完全抑制。 */
+    /**
+     * @brief 建模 SGLang host side prefetch reservation 上限。
+     *
+     * 这里不表示 L3 backend 可读 page 数；limit=0 表示 prefetch 被 rate-limit 完全抑制。
+     */
     if (config.prefetch_capacity_limit_pages > 0) {
         source = "target_config.prefetch_capacity_limit_pages";
         return config.prefetch_capacity_limit_pages;
@@ -87,8 +93,12 @@ using policy_detail::kExplicitSingleRequestExtendBatchSize;
 using policy_detail::lower_copy;
 
 HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) {
-    /* policy resolution 是 target config 的纯函数。它不能读取 source trace 中观测到的
-       timeout、hit count 或 cleanup 结果；这些都必须由状态机从输入 fact 推导。 */
+    /**
+     * @brief policy resolution 是 target config 的纯函数。
+     *
+     * 该边界不能读取 source trace 中观测到的 timeout、hit count 或 cleanup 结果；
+     * 这些都必须由状态机从输入 fact 推导。
+     */
     const auto page_size = config.page_size == 0 ? uint64_t{ 1 } : config.page_size;
     const auto write_policy = lower_copy(config.write_policy.empty() ? std::string{ "write_through" } : config.write_policy);
     const auto prefetch_policy = lower_copy(config.prefetch_policy.empty() ? std::string{ "timeout" } : config.prefetch_policy);

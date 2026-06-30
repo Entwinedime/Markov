@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief TraceEvent 参数读取和最小 JSON 输出工具实现。
+ */
 #include "markov/trace_graph/core/trace_event.hpp"
 
 #include <cctype>

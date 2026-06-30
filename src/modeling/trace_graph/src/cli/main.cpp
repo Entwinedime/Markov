@@ -1,3 +1,10 @@
+/**
+ * @file
+ * @brief trace_graph C++ CLI 的主执行入口。
+ *
+ * CLI 只负责把输入 trace、model config、模块执行和 summary 输出串成稳定 workflow；
+ * 建模判断保留在 DagBuilder、SimulationModule 和 diagnostics 层。
+ */
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"

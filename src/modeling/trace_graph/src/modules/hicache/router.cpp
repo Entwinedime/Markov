@@ -58,8 +58,12 @@ bool state_model_class_role(const HiCacheFact & fact) {
 }
 
 bool completed_model_phase(const HiCacheFact & fact, HiCacheFactRole role) {
-    /* workload/policy fact 是 duration event，只有 end phase 表示字段完整；
-       runtime checkpoint 是 instant event，本身就是完整事实。 */
+    /**
+     * @brief workload/policy fact 只有 completed phase 能驱动模型。
+     *
+     * 这些 fact 是 duration event，只有 end phase 表示字段完整；runtime checkpoint
+     * 是 instant event，本身就是完整事实。
+     */
     if (role == HiCacheFactRole::PrefetchCheckPoint) return fact.phase == "instant";
     if (role == HiCacheFactRole::Unknown && fact.fact_class == "runtime_model_checkpoint" && fact.phase == "instant") return true;
     return fact.is_end;
@@ -85,8 +89,11 @@ std::string hicache_fact_role_name(HiCacheFactRole role) {
 }
 
 HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact) {
-    /* route 先检查 consumer，再检查 phase 和 class/role。这样 diagnostics/source_actual
-       即使 role 名字碰巧相同，也不会误入 target state model。 */
+    /**
+     * @brief route 先检查 consumer，再检查 phase 和 class/role。
+     *
+     * 这样 diagnostics/source_actual 即使 role 名字碰巧相同，也不会误入 target state model。
+     */
     HiCacheFactRoute route;
     if (!fact.has_consumer("hicache_state_model")) return route;
     route.role = parse_hicache_fact_role(fact.role);

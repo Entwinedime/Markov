@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief TraceGraph DAG 容器、跨 rank merge 和 summary 统计实现。
+ */
 #include "markov/trace_graph/core/dag_graph.hpp"
 
 #include <algorithm>

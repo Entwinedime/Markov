@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief NodeScaleModule 的简单耗时缩放实现。
+ */
 #include "markov/trace_graph/modules/node_scale/node_scale_module.hpp"
 
 #include "markov/trace_graph/core/trace_event.hpp"

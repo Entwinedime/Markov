@@ -42,8 +42,12 @@ std::string to_hex(std::span<const unsigned char> bytes) {
 }
 
 std::string hash_page(const HiCacheTokenPath & tokens, size_t begin, size_t end, const std::string & prior_hash) {
-    /* HiCache page hash 是链式投影：后一页把前一页 hash 纳入输入。这样同一 token
-       序列在不同 page_size 下会自然产生不同 target page identity。 */
+    /**
+     * @brief HiCache page hash 是链式投影。
+     *
+     * 后一页把前一页 hash 纳入输入，使同一 token 序列在不同 page_size 下自然产生不同
+     * target page identity。
+     */
     auto * ctx = EVP_MD_CTX_new();
     if (ctx == nullptr) return "";
     EVP_DigestInit_ex(ctx, EVP_sha256(), nullptr);
@@ -83,21 +87,31 @@ std::vector<std::string> HiCachePagePath::page_ids() const {
 HiCacheTargetPager::HiCacheTargetPager(frontend::HiCacheConfig config) : config_(std::move(config)) {}
 
 uint64_t HiCacheTargetPager::page_size_for_fact(const HiCacheFact & fact) const {
-    /* target config 的 page_size 优先；缺失时只用 source_page_size 做合同内兜底，
-       不能使用 source 已生成的 page id。 */
+    /**
+     * @brief target config 的 page_size 优先。
+     *
+     * 缺失时只用 source_page_size 做合同内兜底，不能使用 source 已生成的 page id。
+     */
     if (config_.page_size > 0) return config_.page_size;
     return fact.source_page_size;
 }
 
 std::string HiCacheTargetPager::scoped_page_id(const std::string & cache_scope, const std::string & page_hash) const {
-    /* cache_scope 是 page identity 的一部分。不同 rank/scope 的同 hash page 不能
-       在模型中合并，否则跨 rank capacity 和 storage readable 会串扰。 */
+    /**
+     * @brief cache_scope 是 page identity 的一部分。
+     *
+     * 不同 rank/scope 的同 hash page 不能在模型中合并，否则跨 rank capacity 和
+     * storage readable 会串扰。
+     */
     return (cache_scope.empty() ? std::string("-1") : cache_scope) + "|" + page_hash;
 }
 
 HiCachePagePath HiCacheTargetPager::project(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
-    /* projection 只产生完整 page。尾部不足 page_size 的 tokens 属于 request
-       lifecycle 信息，但不能形成 HiCache page residency。 */
+    /**
+     * @brief projection 只产生完整 page。
+     *
+     * 尾部不足 page_size 的 tokens 属于 request lifecycle 信息，但不能形成 HiCache page residency。
+     */
     HiCachePagePath path;
     path.cache_scope = fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope;
     path.page_size = page_size_for_fact(fact);

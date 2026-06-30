@@ -13,6 +13,7 @@ bool ValidationReport::ok() const {
     return std::ranges::none_of(issues, [](const auto & issue) { return issue.severity == ValidationSeverity::Error; });
 }
 
+/** @brief validation severity 名称是 summary/CLI 里使用的稳定英文枚举值。 */
 std::string validation_severity_name(ValidationSeverity severity) {
     switch (severity) {
     case ValidationSeverity::Info:
@@ -25,6 +26,11 @@ std::string validation_severity_name(ValidationSeverity severity) {
     return "unknown";
 }
 
+/**
+ * @brief 检查已经构造出的模块列表是否满足最小执行合同。
+ *
+ * validation runner 不重新解释 model config，只验证 CLI 即将执行的模块对象是否可用。
+ */
 ValidationReport validate_applied_modules(const std::vector<std::unique_ptr<SimulationModule>> & modules) {
     ValidationReport report;
     for (const auto & module : modules) {

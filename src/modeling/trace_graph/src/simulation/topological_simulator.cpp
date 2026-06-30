@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief TraceGraph DAG 的拓扑仿真执行器实现。
+ */
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"

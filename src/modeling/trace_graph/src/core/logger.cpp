@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief trace_graph C++ 后端的进程内日志实现。
+ */
 #include "markov/trace_graph/core/logger.hpp"
 
 #include <algorithm>

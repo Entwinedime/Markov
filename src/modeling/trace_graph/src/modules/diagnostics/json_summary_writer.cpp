@@ -47,6 +47,12 @@ using json_summary_writer_detail::hicache_summary_json;
 using json_summary_writer_detail::Json;
 using json_summary_writer_detail::node_scale_summary_json;
 
+/**
+ * @brief 按模块动态类型输出 diagnostics summary。
+ *
+ * summary 只作为显式 debug/validation 辅助输出；未知模块保留稳定 JSON envelope，
+ * 避免新增模块时破坏 CLI 的 summary 写出路径。
+ */
 std::string module_summary_json(const SimulationModule & module) {
     if (const auto * node_scale = dynamic_cast<const node_scale::NodeScaleModule *>(&module)) return node_scale_summary_json(*node_scale).dump();
     if (const auto * hicache = dynamic_cast<const hicache::HiCacheModule *>(&module)) return hicache_summary_json(*hicache).dump();

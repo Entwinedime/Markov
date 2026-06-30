@@ -117,9 +117,11 @@ HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & confi
     summary.transition_trace.insert(summary.transition_trace.end(), final_transitions.begin(), final_transitions.end());
     summary.state_transition_count = summary.transition_trace.size();
 
-    /*
-     * validation 默认使用 materialized-only final state；storage-directory-inclusive
-     * 视图只用于诊断 L3/backend 已知但尚未 materialize 到 radix tree 的 page。
+    /**
+     * @brief validation 默认使用 materialized-only final state。
+     *
+     * storage-directory-inclusive 视图只用于诊断 L3/backend 已知但尚未 materialize 到
+     * radix tree 的 page。
      */
     const auto final_state = state.derived_state(HiCacheDerivedStateMode::MaterializedOnly);
     const auto inclusive_state = state.derived_state(HiCacheDerivedStateMode::StorageDirectoryInclusive);

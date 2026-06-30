@@ -1,3 +1,10 @@
+/**
+ * @file
+ * @brief Chrome trace event 到 TraceGraph DAG 的构图实现。
+ *
+ * 构图阶段只从 trace 中提取可证明的执行顺序、提交链和同步边；what-if 模块和
+ * HiCache state model 的策略判断必须在 DAG 建好后执行。
+ */
 #include "markov/trace_graph/core/dag_builder.hpp"
 
 #include <algorithm>

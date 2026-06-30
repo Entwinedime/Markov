@@ -111,9 +111,11 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
     scope.tree.observe_page_path(page_path);
     auto lookup = scope.tree.lookup(pages);
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "prefetch_lookup_touch");
-    /*
-     * memory prefix 覆盖 device/host residency，不把 storage-readable 算成 request
-     * 已可直接复用的 memory hit；storage hit 只用于后面的 prefetch I/O candidate。
+    /**
+     * @brief memory prefix 覆盖 device/host residency。
+     *
+     * storage-readable 不算 request 已可直接复用的 memory hit；storage hit 只用于后面的
+     * prefetch I/O candidate。
      */
     const auto memory_prefix = scope.tree.contiguous_prefix(pages, true, true, false);
     auto planned_pages = suffix_from(pages, memory_prefix.size());
@@ -227,9 +229,10 @@ void HiCacheState::apply_prefetch_decision(const HiCacheFact & fact, HiCacheSumm
     }
     const auto effective_requested_pages = static_cast<uint64_t>(planned_pages.size());
 
-    /*
-     * hit_pages 是 L3 backend 中连续可读 prefix。它决定 prefetch 是否值得发起，以及
-     * terminate 后最多能 materialize 哪段 host-visible prefix。
+    /**
+     * @brief hit_pages 是 L3 backend 中连续可读 prefix。
+     *
+     * 它决定 prefetch 是否值得发起，以及 terminate 后最多能 materialize 哪段 host-visible prefix。
      */
     const auto hit_pages = storage_hit_prefix(scope.storage, planned_projected_pages);
     if (auto * prior = scope.async_ops.prefetch_for_request(request_key); prior != nullptr) {
@@ -335,9 +338,11 @@ void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary
                                              HiCacheOperationState::Committed,
                                              "apply_host_visibility",
                                              fact.ts);
-    /*
-     * completed prefix 立即转成 host residency；未完成的 reservation 不在这里直接清零，
-     * 而是作为 pending release 留给 request admission / finalize 边界 drain。
+    /**
+     * @brief completed prefix 立即转成 host residency。
+     *
+     * 未完成的 reservation 不在这里直接清零，而是作为 pending release 留给 request
+     * admission / finalize 边界 drain。
      */
     op.reserved_host_pages = bounded_subtract(op.reserved_host_pages, static_cast<uint64_t>(op.completed_pages.size()));
     const auto ref = scope.refs.release_owner(scope.tree, op.header.owner);

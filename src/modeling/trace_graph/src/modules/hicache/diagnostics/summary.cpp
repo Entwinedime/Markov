@@ -436,6 +436,12 @@ using summary_detail::split_record_json;
 using summary_detail::target_config_json;
 using summary_detail::transition_json;
 
+/**
+ * @brief 将 HiCacheSummary 投影成稳定 diagnostics JSON。
+ *
+ * 该函数只序列化 state model 已经生成的事实、trace 和派生视图，不重新计算模型状态，
+ * 也不把 diagnostics-only inclusive state 写回 final_state。
+ */
 std::string summary_json(const HiCacheSummary & summary) {
     Json root;
     root["status"] = summary.status;

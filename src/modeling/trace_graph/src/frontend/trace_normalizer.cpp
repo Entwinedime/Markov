@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief 输入 trace event 的前端来源归一化实现。
+ */
 #include "markov/trace_graph/frontend/trace_normalizer.hpp"
 
 #include <algorithm>

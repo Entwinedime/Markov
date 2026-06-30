@@ -255,8 +255,11 @@ bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
     if (!is_hicache_event(event)) return;
     if (!state_model_dictionary_source(event)) return;
-    /* dictionary 是 span-only fact 的同合同 side table；只从 completed state-model
-       path fact 中观察，避免 start phase 的半成品或诊断事实污染模型。 */
+    /**
+     * @brief dictionary 是 span-only fact 的同合同 side table。
+     *
+     * 只从 completed state-model path fact 中观察，避免 start phase 的半成品或诊断事实污染模型。
+     */
     std::ranges::for_each(event.args, [&](const auto & item) {
         const auto & [key, value] = item;
         if (key.contains("dictionary")) observe_dictionary_value(value);
@@ -276,8 +279,11 @@ void HiCacheFactParser::observe_dictionary_value(const std::string & raw) {
 }
 
 HiCacheTokenSpan HiCacheFactParser::parse_span(const TraceEvent & event, const std::string & key) const {
-    /* span 只记录 token path 的半开区间。page identity 必须由 target config 重新投影，
-       不能直接沿用 source trace 中的 page id。 */
+    /**
+     * @brief span 只记录 token path 的半开区间。
+     *
+     * page identity 必须由 target config 重新投影，不能直接沿用 source trace 中的 page id。
+     */
     HiCacheTokenSpan span;
     const auto value = parse_json_arg(event.arg(key));
     if (!value.is_object()) return span;
@@ -292,8 +298,11 @@ HiCacheTokenSpan HiCacheFactParser::parse_span(const TraceEvent & event, const s
 }
 
 HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) const {
-    /* 解析失败时返回空 path，让 router/quality 报合同缺口；这里不从其他 role
-       或 source actual 中寻找替代 path。 */
+    /**
+     * @brief 解析失败时返回空 path，让 router/quality 报合同缺口。
+     *
+     * 这里不从其他 role 或 source actual 中寻找替代 path。
+     */
     if (!span.valid) return {};
     const auto it = token_paths_.find(span.path_id);
     if (it == token_paths_.end()) return {};
@@ -309,8 +318,12 @@ bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact) {
 bool HiCacheFact::has_consumer(const std::string & consumer) const { return consumer_list_contains(consumers, consumer); }
 
 HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {
-    /* parse 只做字段规范化和 token span 水合。fact 是否能驱动状态机，由
-       route_hicache_fact() 根据 consumer、class/role 和 phase 再做硬门禁。 */
+    /**
+     * @brief parse 只做字段规范化和 token span 水合。
+     *
+     * fact 是否能驱动状态机，由 route_hicache_fact() 根据 consumer、class/role 和
+     * phase 再做硬门禁。
+     */
     HiCacheFact fact;
     const auto metadata = fact_metadata_from_event(event);
     fact.source_node_id = node_id;

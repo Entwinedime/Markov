@@ -62,7 +62,11 @@ using token_radix_tree_detail::slice_pages;
 using token_radix_tree_detail::suffix_pages;
 
 HiCacheTokenRadixTree::HiCacheTokenRadixTree() {
-    /* root 不承载 page residency，仅作为所有 cache_scope/page path 的拓扑根。 */
+    /**
+     * @brief root 不承载 page residency。
+     *
+     * 它仅作为所有 cache_scope/page path 的拓扑根，避免把真实 page 归属混入根节点。
+     */
     HiCacheCacheNode root;
     root.id = 0;
     root.last_access_order = ++access_clock_;
@@ -110,14 +114,20 @@ std::vector<std::string> HiCacheTokenRadixTree::flattened_pages(HiCacheNodeId te
 }
 
 void HiCacheTokenRadixTree::observe_page_path(const HiCachePagePath & path) {
-    /* projection metadata 只服务 split diagnostics 和 storage key 还原；真正 residency
-       状态仍保存在 radix node 上。 */
+    /**
+     * @brief projection metadata 只服务 split diagnostics 和 storage key 还原。
+     *
+     * 真正 residency 状态仍保存在 radix node 上。
+     */
     std::ranges::for_each(path.pages, [&](const auto & page) { page_projection_[page.id] = page; });
 }
 
 HiCacheNodeSplitProjection HiCacheTokenRadixTree::split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const {
-    /* split 发生后 prefix/suffix 仍需能解释到原 token/page 区间。缺 projection
-       metadata 时继续保留 page hash，但把 token_span_known 标成 false。 */
+    /**
+     * @brief split 后 prefix/suffix 仍需能解释到原 token/page 区间。
+     *
+     * 缺 projection metadata 时继续保留 page hash，但把 token_span_known 标成 false。
+     */
     HiCacheNodeSplitProjection projection{
         .depth_page_begin = depth_page_begin,
         .depth_page_end = depth_page_begin + static_cast<uint64_t>(pages.size()),
@@ -165,8 +175,11 @@ HiCacheNodeId HiCacheTokenRadixTree::create_child(HiCacheNodeId parent, std::vec
 }
 
 HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNodeId child_id, size_t split_pages) {
-    /* radix split 会把旧 child 的 residency/ref/hit_count 复制到 prefix node，
-       suffix node 再承接剩余 pages。这模拟 SGLang radix cache 中共享前缀节点的语义。 */
+    /**
+     * @brief radix split 会把旧 child 的 residency/ref/hit_count 复制到 prefix node。
+     *
+     * suffix node 再承接剩余 pages；这模拟 SGLang radix cache 中共享前缀节点的语义。
+     */
     const auto child_pages = nodes_[child_id].pages;
     if (split_pages == 0 || split_pages >= child_pages.size()) return child_id;
 
@@ -195,8 +208,12 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNo
 }
 
 HiCacheNodeId HiCacheTokenRadixTree::insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & suffix) {
-    /* 插入只改变拓扑；L1/L2/L3 residency 由 insert_device_path/insert_host_path 等
-       higher-level 操作在 touched chain 上赋值。 */
+    /**
+     * @brief 插入只改变拓扑。
+     *
+     * L1/L2/L3 residency 由 insert_device_path/insert_host_path 等 higher-level
+     * 操作在 touched chain 上赋值。
+     */
     if (suffix.empty()) return parent;
     const auto child_it = nodes_[parent].children.find(suffix.front());
     if (child_it == nodes_[parent].children.end()) return create_child(parent, suffix);
@@ -257,8 +274,12 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup(const std::vector<std::string> &
 HiCachePathLookup HiCacheTokenRadixTree::lookup_peek(const std::vector<std::string> & pages) { return lookup_impl(pages, false); }
 
 HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::string> & pages, bool refresh_access) {
-    /* lookup 会按需 split 部分命中的 child，使后续 residency/ref 变更能落在精确
-       prefix node 上。lookup_peek 关闭 access refresh，但仍可能规范化拓扑。 */
+    /**
+     * @brief lookup 会按需 split 部分命中的 child。
+     *
+     * 这样后续 residency/ref 变更能落在精确 prefix node 上。lookup_peek 关闭
+     * access refresh，但仍可能规范化拓扑。
+     */
     HiCachePathLookup result;
     if (pages.empty()) return result;
 
@@ -319,7 +340,11 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::stri
 
 std::vector<std::string> HiCacheTokenRadixTree::contiguous_prefix(const std::vector<std::string> & pages, bool include_device, bool include_host,
                                                                   bool include_storage) {
-    /* prefix 查询要求从第一页开始连续可见；任一层级断开后不能跳过缺口继续命中。 */
+    /**
+     * @brief prefix 查询要求从第一页开始连续可见。
+     *
+     * 任一层级断开后不能跳过缺口继续命中。
+     */
     (void)lookup_peek(pages);
     std::vector<std::string> prefix;
     prefix.reserve(pages.size());
@@ -337,8 +362,11 @@ std::vector<std::string> HiCacheTokenRadixTree::contiguous_prefix(const std::vec
 }
 
 HiCacheInsertResult HiCacheTokenRadixTree::insert_device_path(const std::vector<std::string> & pages, int64_t priority, bool dirty) {
-    /* L1 insert 会沿 terminal chain 标记 device_present。若节点已有 host backup，
-       该 device value 视为从 backup 恢复，不再因为本次 insert 变成 dirty。 */
+    /**
+     * @brief L1 insert 会沿 terminal chain 标记 device_present。
+     *
+     * 若节点已有 host backup，该 device value 视为从 backup 恢复，不再因为本次 insert 变成 dirty。
+     */
     HiCacheInsertResult result;
     if (pages.empty()) return result;
     auto existing = lookup(pages);
@@ -377,8 +405,11 @@ HiCacheInsertResult HiCacheTokenRadixTree::insert_host_path(const std::vector<st
 
 HiCacheInsertResult HiCacheTokenRadixTree::insert_host_path(const std::vector<std::string> & pages, const std::set<std::string> & visible_pages,
                                                             bool storage_readable) {
-    /* Host insertion 可以只 materialize 可见 prefix。visible_pages 之外的 topology
-       node 可能已因 split/insert 创建，但不能被标成 host_visible。 */
+    /**
+     * @brief Host insertion 可以只 materialize 可见 prefix。
+     *
+     * visible_pages 之外的 topology node 可能已因 split/insert 创建，但不能被标成 host_visible。
+     */
     HiCacheInsertResult result;
     if (pages.empty()) return result;
     auto existing = lookup(pages);
@@ -424,8 +455,12 @@ void HiCacheTokenRadixTree::add_host_ref(const std::vector<HiCacheNodeId> & chai
 }
 
 void HiCacheTokenRadixTree::release_refs_by_owner(const std::string & owner) {
-    /* ref counter 以 owner 为删除单位，和 HiCacheRefLedger::release_owner 保持同一
-       语义；计数用 saturating subtract 防止诊断路径重复释放造成 underflow。 */
+    /**
+     * @brief ref counter 以 owner 为删除单位。
+     *
+     * 这里和 HiCacheRefLedger::release_owner 保持同一语义；计数用 saturating subtract
+     * 防止诊断路径重复释放造成 underflow。
+     */
     if (owner.empty()) return;
     for (auto & current : nodes_) {
         if (!current.active) continue;
@@ -454,8 +489,11 @@ void HiCacheTokenRadixTree::clear_dirty(HiCacheNodeId node_id) {
 }
 
 void HiCacheTokenRadixTree::demote_device_to_host(HiCacheNodeId node_id, bool ensure_host) {
-    /* write-back eviction 可以把 dirty device 同步为 host/storage-readable 后再释放
-       L1；普通 device eviction 则不会凭空创建 host backup。 */
+    /**
+     * @brief write-back eviction 可以把 dirty device 同步为 host/storage-readable 后再释放 L1。
+     *
+     * 普通 device eviction 不会凭空创建 host backup。
+     */
     if (auto * current = mutable_node(node_id); current != nullptr) {
         if (ensure_host) {
             current->residency.host_present = true;
@@ -476,8 +514,11 @@ void HiCacheTokenRadixTree::remove_device_regular(HiCacheNodeId node_id) {
 }
 
 HiCacheHostEvictionResult HiCacheTokenRadixTree::evict_host_leaf(HiCacheNodeId node_id) {
-    /* L2 cleanup 删除的是 host-visible leaf/subtree，而不是简单清掉一个 flag。
-       有 device value、ref 或 backup child 时都不能驱逐，保持 radix topology 可解释。 */
+    /**
+     * @brief L2 cleanup 删除的是 host-visible leaf/subtree，而不是简单清掉一个 flag。
+     *
+     * 有 device value、ref 或 backup child 时都不能驱逐，保持 radix topology 可解释。
+     */
     auto result = HiCacheHostEvictionResult{
         .node_id = node_id,
     };

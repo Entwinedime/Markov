@@ -53,8 +53,11 @@ std::string HiCacheDerivedStateSnapshot::digest() const {
 HiCacheDerivedStateView::HiCacheDerivedStateView(HiCacheDerivedStateMode mode) { snapshot_.mode = mode; }
 
 void HiCacheDerivedStateView::include_tree(const HiCacheTokenRadixTree & tree) {
-    /* final-state 的 materialized 口径只从 canonical radix tree 派生。这里不读取
-       source oracle，也不把 storage directory 的 backend-only hash 当成 host value。 */
+    /**
+     * @brief final-state 的 materialized 口径只从 canonical radix tree 派生。
+     *
+     * 这里不读取 source oracle，也不把 storage directory 的 backend-only hash 当成 host value。
+     */
     for (const auto & node : tree.nodes()) {
         if (!node.active || node.id == 0 || node.pages.empty()) continue;
         if (node.residency.device_present) insert_all(snapshot_.l1, node.pages);
@@ -71,8 +74,11 @@ void HiCacheDerivedStateView::include_tree(const HiCacheTokenRadixTree & tree) {
 }
 
 void HiCacheDerivedStateView::include_storage_directory(const HiCacheStorageDirectory & storage) {
-    /* inclusive 口径只用于诊断“backend 已可读但尚未 materialize”的 page/hash；
-       validation 默认不应把它当成最终 residency 事实。 */
+    /**
+     * @brief inclusive 口径只用于诊断 backend 已可读但尚未 materialize 的 page/hash。
+     *
+     * validation 默认不应把它当成最终 residency 事实。
+     */
     if (snapshot_.mode != HiCacheDerivedStateMode::StorageDirectoryInclusive) return;
     for (const auto & page : storage.readable_page_ids(true)) {
         snapshot_.l3.insert(page);
@@ -82,7 +88,11 @@ void HiCacheDerivedStateView::include_storage_directory(const HiCacheStorageDire
 }
 
 void HiCacheDerivedStateView::include_async(const HiCacheAsyncOperationTable & async_ops) {
-    /* async 派生字段解释 prefetch/writeback 生命周期，不改变 L1/L2/L3 residency 集合。 */
+    /**
+     * @brief async 派生字段解释 prefetch/writeback 生命周期。
+     *
+     * 这些字段不改变 L1/L2/L3 residency 集合。
+     */
     for (const auto & op : async_ops.prefetch_ops() | std::views::values) {
         insert_all(snapshot_.prefetch_planned, op.planned_pages);
         if (op.prefetch_state == HiCachePrefetchState::Ready || op.prefetch_state == HiCachePrefetchState::Applied)

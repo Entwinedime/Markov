@@ -63,8 +63,11 @@ void HiCacheRefLedger::record_mutation(HiCacheRefMutation mutation) {
 }
 
 HiCacheRefMutation HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id) {
-    /* release_owner 是唯一按 owner 批量回收 ref 的入口。它同时更新 radix node
-       counter 和 ledger owner 状态，避免两份 ref copy 漂移。 */
+    /**
+     * @brief release_owner 是唯一按 owner 批量回收 ref 的入口。
+     *
+     * 它同时更新 radix node counter 和 ledger owner 状态，避免两份 ref copy 漂移。
+     */
     HiCacheRefMutation mutation{
         .action = "release",
         .owner_id = owner_id,
@@ -96,8 +99,11 @@ HiCacheRefMutation HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree,
 
 HiCacheRefMutation HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
                                                   const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
-    /* lock ref 保护 device/host eviction 路径，常用于 request 执行或 backup ACK
-       尚未完成的窗口。 */
+    /**
+     * @brief lock ref 保护 device/host eviction 路径。
+     *
+     * 常见用途是 request 执行或 backup ACK 尚未完成的窗口。
+     */
     HiCacheRefMutation mutation{
         .action = "acquire_lock",
         .owner_id = owner_id,
@@ -123,8 +129,11 @@ HiCacheRefMutation HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, 
 
 HiCacheRefMutation HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
                                                   const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
-    /* host ref 保护 L2 value，尤其是 prefetch materialize 前后的 reservation/use
-       窗口；capacity cleanup 会跳过仍有 host ref 的 leaf。 */
+    /**
+     * @brief host ref 保护 L2 value。
+     *
+     * 它覆盖 prefetch materialize 前后的 reservation/use 窗口；capacity cleanup 会跳过仍有 host ref 的 leaf。
+     */
     HiCacheRefMutation mutation{
         .action = "acquire_host",
         .owner_id = owner_id,
@@ -149,8 +158,12 @@ HiCacheRefMutation HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, 
 }
 
 void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, const std::string & reason) {
-    /* radix split 会把 child ref 复制到新 prefix node。ledger 需要追平这些复制出来的
-       owner 计数，否则后续 release_owner 只能释放原 node，留下幽灵 ref。 */
+    /**
+     * @brief radix split 会把 child ref 复制到新 prefix node。
+     *
+     * ledger 需要追平这些复制出来的 owner 计数，否则后续 release_owner 只能释放原 node，
+     * 留下不可释放的 ref。
+     */
     for (const auto & node : tree.nodes()) {
         if (!node.active || node.id == 0) continue;
         for (const auto & [owner_id, tree_count] : node.refs.lock_refs_by_owner) {
@@ -210,8 +223,11 @@ const HiCacheRefOwnerRecord * HiCacheRefLedger::owner(const std::string & owner_
 }
 
 HiCacheRefAudit HiCacheRefLedger::audit(const HiCacheTokenRadixTree & tree) const {
-    /* audit 比较 owner ledger 与 radix node ref maps。它用于调试和 summary，
-       不是 ref 状态的第三份业务真相源。 */
+    /**
+     * @brief audit 比较 owner ledger 与 radix node ref maps。
+     *
+     * 它用于调试和 summary，不是 ref 状态的第三份业务真相源。
+     */
     HiCacheRefAudit audit;
     std::map<NodeOwnerKey, uint64_t> ledger_lock_refs;
     std::map<NodeOwnerKey, uint64_t> ledger_host_refs;

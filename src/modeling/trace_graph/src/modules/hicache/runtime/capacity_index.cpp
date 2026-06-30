@@ -100,8 +100,11 @@ HiCacheCapacityNodeRecord HiCacheCapacityIndex::make_record(const HiCacheTokenRa
 }
 
 std::set<HiCacheNodeId> HiCacheCapacityIndex::observation_closure(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes) const {
-    /* radix split/insert/ref mutation 会影响祖先和直接孩子的 leaf eligibility；
-       增量同步必须覆盖这个闭包，而不是只刷新 seed node。 */
+    /**
+     * @brief radix split/insert/ref mutation 会影响祖先和直接孩子的 leaf eligibility。
+     *
+     * 增量同步必须覆盖这个闭包，而不是只刷新 seed node。
+     */
     std::set<HiCacheNodeId> nodes;
     auto add_with_ancestors = [&](HiCacheNodeId node_id) {
         nodes.insert(node_id);
@@ -202,8 +205,11 @@ std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> HiCacheCapacityIndex::derive_
 }
 
 HiCacheCapacityMutation HiCacheCapacityIndex::sync_reservation(uint64_t reserved_host_pages, const std::string & reason) {
-    /* prefetch reservation 不在 radix tree 中，但会占用 L2 budget；单独同步它可以让
-       host cleanup 的压力计算和 node residency 索引保持同一 snapshot。 */
+    /**
+     * @brief prefetch reservation 不在 radix tree 中，但会占用 L2 budget。
+     *
+     * 单独同步它可以让 host cleanup 的压力计算和 node residency 索引保持同一 snapshot。
+     */
     reserved_host_pages_ = reserved_host_pages;
     const auto epoch = ++mutation_epoch_;
     update_snapshot();
@@ -218,8 +224,11 @@ HiCacheCapacityMutation HiCacheCapacityIndex::sync_reservation(uint64_t reserved
 
 HiCacheCapacityMutation HiCacheCapacityIndex::sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes,
                                                          uint64_t reserved_host_pages, const std::string & reason) {
-    /* capacity index 是 mutation-driven cache。所有状态推进必须显式给出受影响 node，
-       audit 会把该缓存和 radix tree 全量推导结果对齐。 */
+    /**
+     * @brief capacity index 是 mutation-driven cache。
+     *
+     * 所有状态推进必须显式给出受影响 node；audit 会把该缓存和 radix tree 全量推导结果对齐。
+     */
     reserved_host_pages_ = reserved_host_pages;
     const auto epoch = ++mutation_epoch_;
     auto mutation = HiCacheCapacityMutation{
@@ -271,8 +280,12 @@ std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_device_victim() const {
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_host_victim() const {
-    /* host victim 还要二次检查 host_ref：host_ref 通常表示 request/prefetch 仍可能
-       读取该 host value，不能只靠 leaf set 排序结果直接驱逐。 */
+    /**
+     * @brief host victim 还要二次检查 host_ref。
+     *
+     * host_ref 通常表示 request/prefetch 仍可能读取该 host value，不能只靠 leaf set
+     * 排序结果直接驱逐。
+     */
     for (const auto & candidate : evictable_host_leaves_) {
         const auto record_it = records_.find(candidate.node_id);
         if (record_it == records_.end()) continue;
@@ -299,8 +312,11 @@ std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_host_victim(uint64_t c
 }
 
 HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & tree, uint64_t expected_reserved_host_pages) const {
-    /* audit 从 radix tree 重新全量派生期望值，用于证明增量 index 没有漏同步。
-       它不参与业务决策，避免把验证逻辑反向喂给模型。 */
+    /**
+     * @brief audit 从 radix tree 重新全量派生期望值。
+     *
+     * 它用于证明增量 index 没有漏同步，不参与业务决策，避免把验证逻辑反向喂给模型。
+     */
     HiCacheCapacityAudit audit{
         .indexed_device_pages = snapshot_.occupied_device_pages,
         .indexed_host_pages = snapshot_.occupied_host_pages,

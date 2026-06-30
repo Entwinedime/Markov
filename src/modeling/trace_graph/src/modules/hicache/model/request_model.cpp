@@ -60,10 +60,11 @@ void HiCacheState::apply_request_bound_match_anchor(const HiCacheFact & fact, Hi
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain, "match_anchor_touch");
 
     const auto request_key = scoped_request_key(fact);
-    /*
-     * modeled loadback 只把 host-visible prefix 同步 materialize 到 L1。storage-readable
-     * 只说明 L3 可读，不等价于本轮已经完成 H2D loadback，因此这里必须要求 radix
-     * 上已经有 host-visible residency。
+    /**
+     * @brief modeled loadback 只把 host-visible prefix 同步 materialize 到 L1。
+     *
+     * storage-readable 只说明 L3 可读，不等价于本轮已经完成 H2D loadback；这里必须要求
+     * radix 上已经有 host-visible residency。
      */
     const auto promotable_pages = lookup.host_pages;
     if (promotable_pages.size() > lookup.device_pages.size()) {
@@ -232,10 +233,11 @@ void HiCacheState::apply_request_admission(const HiCacheFact & fact, HiCacheSumm
                            });
     record_transition(fact, summary, transitions, "acquire_request_ref", "node_ref", request.device_pages, digest());
 
-    /*
-     * terminal prefetch 的 host reservation 不在 revoke/apply 当场释放，而是在后续同
-     * request admission 后 drain。这个 target-derived 边界近似 SGLang 后台队列和
-     * scheduler progress 的交互，同时避免跨配置复用 source scheduler checkpoint。
+    /**
+     * @brief terminal prefetch 的 host reservation 不在 revoke/apply 当场释放。
+     *
+     * 它在后续同 request admission 后 drain；这个 target-derived 边界近似 SGLang
+     * 后台队列和 scheduler progress 的交互，同时避免跨配置复用 source scheduler checkpoint。
      */
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;

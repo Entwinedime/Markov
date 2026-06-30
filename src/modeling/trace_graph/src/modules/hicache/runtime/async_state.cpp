@@ -12,14 +12,20 @@ namespace markov::trace_graph::modules::hicache::runtime {
 
 namespace async_state_detail {
 
-/* active_requested_pages 近似 SGLang rate-limit 中“仍在请求 host 空间”的 prefetch
-   规模；ready 仍算 active，因为它尚未在 request 使用边界 materialize。 */
+/**
+ * @brief active_requested_pages 近似 SGLang rate-limit 中仍在请求 host 空间的 prefetch 规模。
+ *
+ * ready 仍算 active，因为它尚未在 request 使用边界 materialize。
+ */
 bool prefetch_has_active_request_budget(const HiCachePrefetchOperation & op) {
     return op.prefetch_state == HiCachePrefetchState::Pending || op.prefetch_state == HiCachePrefetchState::Ready;
 }
 
-/* reserved_host_pages 是 L2 capacity pressure：prefetch 失败/取消后不会立即消失，
-   需要等 target-derived drain boundary 或 finalize 回收。 */
+/**
+ * @brief reserved_host_pages 表示 L2 capacity pressure。
+ *
+ * prefetch 失败/取消后不会立即消失，需要等 target-derived drain boundary 或 finalize 回收。
+ */
 bool prefetch_occupies_host_budget(const HiCachePrefetchOperation & op) {
     if (op.reserved_host_pages == 0) return false;
     return op.prefetch_state == HiCachePrefetchState::Pending || op.prefetch_state == HiCachePrefetchState::Ready
@@ -33,8 +39,11 @@ using async_state_detail::prefetch_has_active_request_budget;
 using async_state_detail::prefetch_occupies_host_budget;
 
 void HiCacheAsyncOperationTable::index_operation(const HiCacheOperationHeader & header) {
-    /* operation 同时按 request 和 node 建索引。request 维度服务 prefetch release
-       drain，node 维度服务 diagnostics 和 ref/capacity 解释。 */
+    /**
+     * @brief operation 同时按 request 和 node 建索引。
+     *
+     * request 维度服务 prefetch release drain，node 维度服务 diagnostics 和 ref/capacity 解释。
+     */
     if (!header.request_key.empty()) {
         auto & request_ops = operation_ids_by_request_[header.request_key];
         if (std::ranges::find(request_ops, header.operation_id) == request_ops.end()) request_ops.push_back(header.operation_id);
@@ -48,8 +57,12 @@ void HiCacheAsyncOperationTable::index_operation(const HiCacheOperationHeader & 
 void HiCacheAsyncOperationTable::transition_header(HiCacheOperationHeader & header, HiCacheOperationState state, const std::string & reason,
                                                    uint64_t transition_ts) {
     if (header.state == state) return;
-    /* lifecycle epoch 是模型内部单调时钟，用来解释 async op 的排队、ready、
-       commit/cancel 顺序；它不代表 source runtime 线程的真实调度 tick。 */
+    /**
+     * @brief lifecycle epoch 是模型内部单调时钟。
+     *
+     * 它用来解释 async op 的排队、ready、commit/cancel 顺序；不代表 source runtime
+     * 线程的真实调度 tick。
+     */
     const auto epoch = ++lifecycle_epoch_;
     lifecycle_transitions_.push_back(HiCacheOperationLifecycleTransition{
         .operation_id = header.operation_id,
@@ -83,8 +96,11 @@ void HiCacheAsyncOperationTable::transition_header(HiCacheOperationHeader & head
 }
 
 void HiCacheAsyncOperationTable::upsert_prefetch(HiCachePrefetchOperation op) {
-    /* 同一 request 可能出现多次 prefetch decision；普通查询只返回最新 operation，
-       但旧 operation 仍保留在 request 索引里，便于后续释放它遗留的 reservation。 */
+    /**
+     * @brief 同一 request 可能出现多次 prefetch decision。
+     *
+     * 普通查询只返回最新 operation，但旧 operation 仍保留在 request 索引里，便于后续释放它遗留的 reservation。
+     */
     index_operation(op.header);
     transition_header(op.header, HiCacheOperationState::Queued, "enqueue_prefetch", op.header.enqueue_ts);
     latest_prefetch_id_by_request_[op.header.request_key] = op.header.operation_id;
@@ -124,8 +140,11 @@ uint64_t HiCacheAsyncOperationTable::reserved_pages(const std::string & cache_sc
 }
 
 uint64_t HiCacheAsyncOperationTable::release_prefetch_pending_host_pages_for_request(const std::string & request_key) {
-    /* 只回收已经不再 active-request-budget 的 reservation。pending/ready prefetch
-       仍可能被当前 request 使用，不能在 drain 时提前释放。 */
+    /**
+     * @brief 只回收已经不再 active-request-budget 的 reservation。
+     *
+     * pending/ready prefetch 仍可能被当前 request 使用，不能在 drain 时提前释放。
+     */
     const auto request_ops = operation_ids_by_request_.find(request_key);
     if (request_ops == operation_ids_by_request_.end()) return 0;
     uint64_t pages = 0;

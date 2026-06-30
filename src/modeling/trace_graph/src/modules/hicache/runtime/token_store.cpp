@@ -195,8 +195,12 @@ void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t
     const auto key = scoped_request_key(fact);
     if (key.empty() || !hicache_fact_has_resolved_full_path(fact) || !state_model_path_source_allowed(fact)) return;
 
-    /* snapshot 只记录当前 fact 明确携带的 path 语义阶段。prefetch candidate 不会覆盖
-       admission/lifecycle committed path，避免把投机路径当成 request 已提交状态。 */
+    /**
+     * @brief snapshot 只记录当前 fact 明确携带的 path 语义阶段。
+     *
+     * prefetch candidate 不会覆盖 admission/lifecycle committed path，避免把投机路径当成
+     * request 已提交状态。
+     */
     const auto stage = stage_for_fact(fact);
     if (!snapshot_stage_observable(stage)) return;
     const auto token_count = static_cast<uint64_t>(fact.full_path_tokens.size());
@@ -223,8 +227,11 @@ void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t
 }
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_match_path(const HiCacheFact & fact, uint64_t page_size) const {
-    /* match/admission/lifecycle/prefetch resolver 都采用 fact-local direct resolution。
-       早期 timeline fallback 已被移除，因为它会在合同缺 path 时静默复用旧阶段 path。 */
+    /**
+     * @brief match/admission/lifecycle/prefetch resolver 都采用 fact-local direct resolution。
+     *
+     * 早期 timeline fallback 已被移除，因为它会在合同缺 path 时静默复用旧阶段 path。
+     */
     if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
     if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::Match)
         return wrong_stage_resolution(fact, "match resolver only accepts request_bound_match_anchor facts");
@@ -265,8 +272,11 @@ HiCacheTokenResolution HiCacheTokenDirectory::resolve_prefetch_path(const HiCach
 }
 
 const HiCacheTokenPathSnapshot * HiCacheTokenDirectory::previous_committed_snapshot(const HiCacheFact & fact) const {
-    /* 仅供诊断和增长检查使用。正常状态推进不应靠这个接口补齐当前 fact 的 path，
-       否则会重新引入跨 role fallback。 */
+    /**
+     * @brief 仅供诊断和增长检查使用。
+     *
+     * 正常状态推进不应靠这个接口补齐当前 fact 的 path，否则会重新引入跨 role fallback。
+     */
     const auto key = scoped_request_key(fact);
     if (key.empty()) return nullptr;
 

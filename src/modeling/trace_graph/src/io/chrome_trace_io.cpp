@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief Chrome trace JSON 读取和 DAG debug trace 写出实现。
+ */
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"

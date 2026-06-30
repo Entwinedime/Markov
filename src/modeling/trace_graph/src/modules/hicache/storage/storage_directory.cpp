@@ -55,8 +55,12 @@ HiCacheStorageBackendRecord & HiCacheStorageDirectory::ensure_backend_record(con
 }
 
 HiCacheStorageRecord & HiCacheStorageDirectory::ensure_record(const std::string & cache_scope, const std::string & page_id) {
-    /* page record 是 target page id 维度的视图；如果 backend hash 已经可读，新
-       page record 创建时会继承 readable，而不是重新等待一次 source observation。 */
+    /**
+     * @brief page record 是 target page id 维度的视图。
+     *
+     * 如果 backend hash 已经可读，新 page record 创建时会继承 readable，
+     * 而不是重新等待一次 source observation。
+     */
     auto & record = records_by_page_[page_id];
     if (record.page_id.empty()) {
         record.page_id = page_id;
@@ -113,8 +117,11 @@ void HiCacheStorageDirectory::observe_path(const HiCachePagePath & path) {
 }
 
 void HiCacheStorageDirectory::seed_readable_path(const HiCachePagePath & path, const std::string & source) {
-    /* seed_readable_path 用于模型自己已经确认的 target page path，例如 write-back/
-       write-through commit 后的 L3 readable。 */
+    /**
+     * @brief 记录模型自己已经确认的 target page path。
+     *
+     * 典型来源是 write-back/write-through commit 后的 L3 readable。
+     */
     std::ranges::for_each(path.pages, [&](const auto & page) {
         auto & record = ensure_record(page);
         record.known = true;
@@ -123,8 +130,12 @@ void HiCacheStorageDirectory::seed_readable_path(const HiCachePagePath & path, c
 }
 
 void HiCacheStorageDirectory::seed_readable_hashes(const std::string & cache_scope, const std::vector<std::string> & page_hashes, const std::string & source) {
-    /* storage hash fact 只给 backend namespace 加可读性。若对应 target page 已经
-       被投影出来，同步更新 page record；尚未投影的 hash 保留为 backend-only hit。 */
+    /**
+     * @brief storage hash fact 只给 backend namespace 加可读性。
+     *
+     * 若对应 target page 已经被投影出来，同步更新 page record；尚未投影的 hash
+     * 保留为 backend-only hit。
+     */
     std::ranges::for_each(page_hashes, [&](const auto & page_hash) {
         auto & backend = ensure_backend_record(cache_scope, page_hash);
         mark_backend_readable(backend, source);
@@ -143,8 +154,11 @@ void HiCacheStorageDirectory::mark_readable_pages(const std::string & cache_scop
 }
 
 void HiCacheStorageDirectory::mark_materialized_pages(const std::vector<std::string> & page_ids, HiCacheNodeId node_id) {
-    /* materialized 表示 storage/host prefix 已经落到 radix node 上。它不改变
-       backend readable 语义，只记录 page id 到 canonical tree node 的关联。 */
+    /**
+     * @brief materialized 表示 storage/host prefix 已经落到 radix node 上。
+     *
+     * 它不改变 backend readable 语义，只记录 page id 到 canonical tree node 的关联。
+     */
     std::ranges::for_each(page_ids, [&](const auto & page_id) {
         auto & record = ensure_record("", page_id);
         record.known = true;
@@ -183,8 +197,11 @@ std::vector<std::string> HiCacheStorageDirectory::contiguous_readable_prefix(con
 }
 
 std::vector<std::string> HiCacheStorageDirectory::contiguous_readable_prefix(const std::vector<HiCacheProjectedPage> & pages) const {
-    /* SGLang storage hit 只接受连续 prefix；中间断点之后的 backend readable page
-       不能被本次 prefetch 当成可用结果。 */
+    /**
+     * @brief SGLang storage hit 只接受连续 prefix。
+     *
+     * 中间断点之后的 backend readable page 不能被本次 prefetch 当成可用结果。
+     */
     std::vector<std::string> prefix;
     prefix.reserve(pages.size());
     for (const auto & page : pages) {

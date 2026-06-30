@@ -1,3 +1,7 @@
+/**
+ * @file
+ * @brief C++ trace_graph 后端窄 model config 解析实现。
+ */
 #include "markov/trace_graph/frontend/model_config.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
