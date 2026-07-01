@@ -291,8 +291,7 @@ def filter_suite_experiments(
         {
             str((experiment.get("metadata") or {}).get("suite_input_id"))
             for _index, experiment in experiments
-            if isinstance(experiment.get("metadata"), dict)
-            and (experiment.get("metadata") or {}).get("suite_input_id")
+            if isinstance(experiment.get("metadata"), dict) and (experiment.get("metadata") or {}).get("suite_input_id")
         }
     )
     available_servers = sorted(
@@ -364,13 +363,7 @@ def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> d
     """汇总 suite 中 forced-token preflight 合同，便于顶层审计。"""
 
     modes = sorted({str(contract.get("mode") or "none") for contract in contracts})
-    errors = sorted(
-        {
-            str(error)
-            for contract in contracts
-            for error in contract.get("errors", [])
-        }
-    )
+    errors = sorted({str(error) for contract in contracts for error in contract.get("errors", [])})
     plan_hashes = sorted(
         {
             str(plan.get("sha256"))
@@ -395,15 +388,11 @@ def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> d
             if isinstance(bundle, dict) and bundle.get("bundle_id")
         }
     )
-    workloads = sorted(
-        {
-            str(contract.get("workload_id"))
-            for contract in contracts
-            if contract.get("workload_id")
-        }
-    )
+    workloads = sorted({str(contract.get("workload_id")) for contract in contracts if contract.get("workload_id")})
     return {
-        "mode_count": {mode: sum(1 for contract in contracts if str(contract.get("mode") or "none") == mode) for mode in modes},
+        "mode_count": {
+            mode: sum(1 for contract in contracts if str(contract.get("mode") or "none") == mode) for mode in modes
+        },
         "errors": errors,
         "ready": not errors,
         "workload_ids": workloads,

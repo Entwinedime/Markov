@@ -39,6 +39,7 @@ from .suite import (
     summarize_suite_forced_token_contracts,
 )
 
+
 def run_profile_suite(
     cfg: dict[str, Any],
     dry_run: bool,
@@ -98,7 +99,9 @@ def run_profile_suite(
             "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
             if forced_token_bundle is not None
             else None,
-            "available_experiments": [describe_suite_experiment(index, experiment) for index, experiment in all_experiments],
+            "available_experiments": [
+                describe_suite_experiment(index, experiment) for index, experiment in all_experiments
+            ],
             "planned_experiments": [
                 {
                     **describe_suite_experiment(index, exp_cfg),
@@ -192,7 +195,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", required=True, help="JSON profile config path")
     parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
     parser.add_argument("--experiment", action="append", default=[], help="run one experiment id/name; may be repeated")
-    parser.add_argument("--experiments", action="append", default=[], help="comma-separated experiment ids/names to run")
+    parser.add_argument(
+        "--experiments", action="append", default=[], help="comma-separated experiment ids/names to run"
+    )
     parser.add_argument("--input", action="append", default=[], help="run one suite input id; may be repeated")
     parser.add_argument("--inputs", action="append", default=[], help="comma-separated suite input ids to run")
     parser.add_argument("--server", action="append", default=[], help="run one suite server id; may be repeated")
@@ -201,7 +206,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--forced-token-bundle",
         help="Explicit forced_token_bundle.json required by forced-token replay suites.",
     )
-    parser.add_argument("--list-experiments", action="store_true", help="print expanded experiment ids without running them")
+    parser.add_argument(
+        "--list-experiments", action="store_true", help="print expanded experiment ids without running them"
+    )
     return parser.parse_args(argv)
 
 
@@ -225,9 +232,7 @@ def main(argv: list[str] | None = None) -> int:
         [*args.server, *args.servers],
         os.environ.get(PROFILE_SERVERS_ENV),
     )
-    forced_token_bundle = resolve_repo_path(
-        args.forced_token_bundle or os.environ.get(PROFILE_FORCED_TOKEN_BUNDLE_ENV)
-    )
+    forced_token_bundle = resolve_repo_path(args.forced_token_bundle or os.environ.get(PROFILE_FORCED_TOKEN_BUNDLE_ENV))
     if args.list_experiments:
         experiments = filter_suite_experiments(
             list(enumerate(expand_suite(cfg), start=1)),

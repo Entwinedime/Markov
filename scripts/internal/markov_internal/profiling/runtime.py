@@ -46,7 +46,7 @@ class RunLayout:
         )
 
     def prepare(self, *, clean: bool) -> None:
-        """创建本次 run 需要的目录，必要时清理旧 run 目录。"""
+        """创建本次 run 需要的目录，必要时清理已有 run 目录。"""
 
         if clean and self.run_dir.exists():
             shutil.rmtree(self.run_dir)
@@ -220,9 +220,7 @@ def apply_model_config_overrides(
         raise TypeError("model_config_overrides must be an object")
 
     model_path_value = (
-        cfg.get("model_path")
-        or cfg.get("server", {}).get("model_path")
-        or parse_model_path(server_command)
+        cfg.get("model_path") or cfg.get("server", {}).get("model_path") or parse_model_path(server_command)
     )
     model_path = resolve_repo_path(model_path_value) if model_path_value else None
     if model_path is None:

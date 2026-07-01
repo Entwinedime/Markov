@@ -37,16 +37,14 @@ def _load_probe(name: str):
 
     module_name = {
         "generic_callable": "trace_sim_probe.probes.generic_callable",
-        "sglang.hicache": "trace_sim_probe.probes.sglang_hicache_callable",
-        "sglang_hicache": "trace_sim_probe.probes.sglang_hicache_callable",
-        "sglang_hicache_callable": "trace_sim_probe.probes.sglang_hicache_callable",
+        "sglang.hicache": "trace_sim_probe.probes.hicache.callable",
         "sglang.kvcacheio": "trace_sim_probe.probes.sglang_kvcacheio",
     }.get(name, name)
     return importlib.import_module(module_name)
 
 
 def _iter_selected_probes():
-    """迭代已选择且成功加载的 probe；失败只在 debug 模式输出 stderr。"""
+    """迭代已选择的 probe；profiling 开启后加载失败必须中止进程。"""
 
     for name in _selected_probe_names():
         try:
@@ -54,6 +52,7 @@ def _iter_selected_probes():
         except Exception as exc:
             if probe_debug_enabled():
                 print(f"[trace_sim_probe] failed to load probe {name}: {exc}", file=sys.stderr)
+            raise
 
 
 def _apply_probe_to_loaded_modules(probe) -> None:
@@ -67,13 +66,14 @@ def _apply_probe_to_loaded_modules(probe) -> None:
 
 
 def _safe_install(probe, module: ModuleType) -> None:
-    """安装 probe 时隔离异常，避免插桩破坏被测进程启动。"""
+    """安装 probe；profiling 合同错误必须直接暴露。"""
 
     try:
         probe.install(module)
     except Exception as exc:
         if probe_debug_enabled():
             print(f"[trace_sim_probe] probe install failed for {module.__name__}: {exc}", file=sys.stderr)
+        raise
 
 
 def _post_import_apply(module_name: str) -> None:
@@ -100,15 +100,12 @@ def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
     finally:
         _IMPORT_GUARD.active = False
 
-    try:
-        resolved_name = getattr(module, "__name__", name)
-        _post_import_apply(resolved_name)
-        for item in fromlist or ():
-            child = f"{resolved_name}.{item}"
-            if child in sys.modules:
-                _post_import_apply(child)
-    except Exception:
-        pass
+    resolved_name = getattr(module, "__name__", name)
+    _post_import_apply(resolved_name)
+    for item in fromlist or ():
+        child = f"{resolved_name}.{item}"
+        if child in sys.modules:
+            _post_import_apply(child)
     return module
 
 

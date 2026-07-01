@@ -59,22 +59,13 @@ class TargetSpec:
     fields: tuple[FieldSpec, ...]
     fact: FactSpec
     emit_when: tuple[EmitCondition, ...] = ()
-    enabled: bool = True
 
 
 _TARGETS = None
 _PATCHED: set[str] = set()
 _FULL_LIST_KEYS = {
     "token_ids",
-    "node_chain",
-    "last_node_chain",
-    "last_host_node_chain",
-    "best_match_node_chain",
-    "operation_hash_pages",
     "hash_value",
-    "hash_pages",
-    "hit_hash_pages",
-    "prefix_keys",
 }
 SourceExtractor = Callable[
     [str, str, dict[str, Any], tuple[Any, ...], dict[str, Any], Any],
@@ -111,8 +102,7 @@ def _load_targets() -> list[TargetSpec]:
         if not isinstance(item, dict):
             raise ValueError(f"TRACE_SIM_PYTHON_PROBE_TARGETS[{index}] must be an object")
         target = _parse_target(item)
-        if target.enabled:
-            targets.append(target)
+        targets.append(target)
     _TARGETS = targets
     return targets
 
@@ -163,19 +153,12 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         raise ValueError(f"python_probe target {target_id!r} target must be a non-empty string")
     if not isinstance(module_name, str) or not module_name:
         raise ValueError(f"python_probe target {target_id!r} module must be a non-empty string")
-    if "phases" in raw or "emit_phases" in raw:
-        raise ValueError(f"python_probe target {target_id!r} must declare phases only as keys of events")
-    fields = []
-    for item in raw.get("fields", []):
-        field = _parse_field(item)
-        if field is not None:
-            fields.append(field)
+    raw_fields = raw.get("fields")
+    if not isinstance(raw_fields, list):
+        raise ValueError(f"python_probe target {target_id!r} fields must be an array")
+    fields = [_parse_field(item, target_id, index) for index, item in enumerate(raw_fields)]
     events = _parse_events(raw.get("events"), target_id)
-    emit_when = tuple(
-        condition
-        for condition in (_parse_emit_condition(item) for item in _as_list(raw.get("emit_when")))
-        if condition is not None
-    )
+    emit_when = _parse_emit_conditions(raw.get("emit_when"), target_id)
     fact = _parse_fact(raw.get("fact"), target_id)
     return TargetSpec(
         id=target_id,
@@ -186,7 +169,6 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         fields=tuple(fields),
         fact=fact,
         emit_when=emit_when,
-        enabled=bool(raw.get("enabled", True)),
     )
 
 
@@ -210,18 +192,21 @@ def _resolve_target(module: ModuleType, target: TargetSpec) -> tuple[Any, str, A
     return owner, attr_name, original
 
 
-def _parse_field(raw: Any) -> FieldSpec | None:
-    """解析字段配置；无效字段返回 None 由调用方忽略。"""
+def _parse_field(raw: Any, target_id: str, index: int) -> FieldSpec:
+    """解析字段配置；字段是当前 catalog 合同的一部分，格式错误直接失败。"""
 
-    if isinstance(raw, str) and raw:
-        return FieldSpec(name=raw)
-    if isinstance(raw, dict) and isinstance(raw.get("name"), str):
-        return FieldSpec(
-            name=raw["name"],
-            source=str(raw.get("source") or ""),
-            required=bool(raw.get("required", True)),
-        )
-    return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"python_probe target {target_id!r} fields[{index}] must be an object")
+    name = raw.get("name")
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"python_probe target {target_id!r} fields[{index}].name must be a non-empty string")
+    source = raw.get("source", "")
+    if source is not None and not isinstance(source, str):
+        raise ValueError(f"python_probe target {target_id!r} fields[{index}].source must be a string")
+    required = raw.get("required", True)
+    if not isinstance(required, bool):
+        raise ValueError(f"python_probe target {target_id!r} fields[{index}].required must be a boolean")
+    return FieldSpec(name=name, source=source or "", required=required)
 
 
 def _parse_fact(raw: Any, target_id: str) -> FactSpec:
@@ -229,8 +214,6 @@ def _parse_fact(raw: Any, target_id: str) -> FactSpec:
 
     if not isinstance(raw, dict):
         raise ValueError(f"python_probe target {target_id!r} must define fact")
-    if set(raw) != {"class", "role", "consumers"}:
-        raise ValueError(f"python_probe target {target_id!r} fact must contain only class, role, and consumers")
     fact_class = raw.get("class")
     role = raw.get("role")
     consumers = raw.get("consumers")
@@ -244,16 +227,6 @@ def _parse_fact(raw: Any, target_id: str) -> FactSpec:
     return FactSpec(fact_class=fact_class, role=role, consumers=tuple(consumers))
 
 
-def _as_list(value: Any) -> list[Any]:
-    """把单值配置规整成列表，便于统一处理 emit_when。"""
-
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
 def _parse_events(raw: Any, target_id: str) -> dict[str, str]:
     """解析 phase 到 trace event name 的显式映射。"""
 
@@ -265,34 +238,45 @@ def _parse_events(raw: Any, target_id: str) -> dict[str, str]:
         if phase not in allowed:
             raise ValueError(f"python_probe target {target_id!r} events contains unsupported phase {phase!r}")
         if not isinstance(event_name, str) or not event_name:
-            raise ValueError(f"python_probe target {target_id!r} event name for phase {phase!r} must be a non-empty string")
+            raise ValueError(
+                f"python_probe target {target_id!r} event name for phase {phase!r} must be a non-empty string"
+            )
         events[phase] = event_name
     if not events:
         raise ValueError(f"python_probe target {target_id!r} events must not be empty")
     return events
 
 
-def _parse_emit_condition(raw: Any) -> EmitCondition | None:
+def _parse_emit_conditions(raw: Any, target_id: str) -> tuple[EmitCondition, ...]:
     """解析 target 的条件发射规则。"""
 
-    if isinstance(raw, str) and raw:
-        if raw.startswith("has:"):
-            return EmitCondition(source=raw.split(":", 1)[1], op="present")
-        if raw.startswith("missing:"):
-            return EmitCondition(source=raw.split(":", 1)[1], op="absent")
-        return EmitCondition(source=raw, op="truthy")
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ValueError(f"python_probe target {target_id!r} emit_when must be an array")
+    return tuple(_parse_emit_condition(item, target_id, index) for index, item in enumerate(raw))
+
+
+def _parse_emit_condition(raw: Any, target_id: str, index: int) -> EmitCondition:
+    """解析单条条件发射规则。"""
+
     if not isinstance(raw, dict):
-        return None
+        raise ValueError(f"python_probe target {target_id!r} emit_when[{index}] must be an object")
     source = raw.get("source")
     if not isinstance(source, str) or not source:
-        return None
-    return EmitCondition(source=source, op=str(raw.get("op") or "present"), value=raw.get("value"))
+        raise ValueError(f"python_probe target {target_id!r} emit_when[{index}].source must be a non-empty string")
+    op = str(raw.get("op") or "present")
+    allowed = {"present", "exists", "has", "absent", "missing", "truthy", "falsey", "equals", "eq", "not_equals", "ne"}
+    if op not in allowed:
+        raise ValueError(f"python_probe target {target_id!r} emit_when[{index}].op is unsupported: {op!r}")
+    return EmitCondition(source=source, op=op, value=raw.get("value"))
 
 
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
     """包装同步或异步 callable，并按 target phase 配置发事件。"""
 
     if inspect.iscoroutinefunction(fn):
+
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             started = get_writer().now_us()

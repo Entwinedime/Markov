@@ -141,8 +141,7 @@ def forced_token_contract_report(
         return report
 
     expected_request_ids = [
-        hicache_logical_request_id(workload_args, item, sequence_id)
-        for sequence_id, item in enumerate(workload_plan)
+        hicache_logical_request_id(workload_args, item, sequence_id) for sequence_id, item in enumerate(workload_plan)
     ]
     report["errors"] = validate_plan_contract(
         plan,
@@ -222,9 +221,7 @@ def preflight_forced_token_contract(
     report = forced_token_contract_report(bench_command, bundle_provenance)
     forced_errors = [str(error) for error in report.get("errors", [])]
     if forced_errors:
-        raise ValueError(
-            f"forced token preflight failed for {experiment_id}: {', '.join(forced_errors)}"
-        )
+        raise ValueError(f"forced token preflight failed for {experiment_id}: {', '.join(forced_errors)}")
     return report
 
 
@@ -243,9 +240,7 @@ def single_run_artifact(run_dir: Path, pattern: str) -> Path:
 
     candidates = sorted(run_dir.glob(pattern))
     if len(candidates) != 1:
-        raise ValueError(
-            f"expected exactly one {pattern} under {run_dir}, found {len(candidates)}"
-        )
+        raise ValueError(f"expected exactly one {pattern} under {run_dir}, found {len(candidates)}")
     return candidates[0]
 
 
@@ -276,10 +271,7 @@ def build_forced_token_bundle(
         workload_report = single_run_artifact(run_dir, "bench/**/workload_report.json")
         quality = forced_token_quality_from_workload_report(workload_report)
         if quality.get("mode") != "capture" or not quality.get("ready"):
-            raise ValueError(
-                f"capture forced-token contract is not ready for {input_id}: "
-                f"{quality.get('errors', [])}"
-            )
+            raise ValueError(f"capture forced-token contract is not ready for {input_id}: {quality.get('errors', [])}")
         plan = load_forced_token_plan(source_plan)
         if (
             quality.get("plan_workload_id") != input_id
@@ -314,9 +306,7 @@ def build_forced_token_bundle(
     if len(model_paths) != 1:
         raise ValueError(f"capture bundle requires exactly one model path, found: {sorted(model_paths)}")
     if len(server_config_ids) != 1:
-        raise ValueError(
-            f"capture bundle requires exactly one server config, found: {sorted(server_config_ids)}"
-        )
+        raise ValueError(f"capture bundle requires exactly one server config, found: {sorted(server_config_ids)}")
     model_path = next(iter(model_paths))
     server_config_id = next(iter(server_config_ids))
     stable_identity = {

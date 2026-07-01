@@ -51,7 +51,9 @@ class ProfileRun:
         self.runtime = normalize_profiling_config(cfg)
         self.layout = RunLayout.from_config(cfg, framework=self.framework)
         self.server_cfg = cfg.get("server", {})
-        self.server_command = expand_command_placeholders(command_from_config(self.server_cfg["command"]), self.layout, self.cfg)
+        self.server_command = expand_command_placeholders(
+            command_from_config(self.server_cfg["command"]), self.layout, self.cfg
+        )
         self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout, self.cfg)
 
     def run(self) -> Path:

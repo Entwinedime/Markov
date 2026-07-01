@@ -29,7 +29,6 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_PYTHON_PROBE_DEBUG",
     "TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY",
     "TRACE_SIM_HICACHE_CONSUMERS",
-    "TRACE_SIM_HICACHE_INTERNAL_HOOKS",
 )
 
 
@@ -80,8 +79,6 @@ def apply_python_probe_env(env: dict[str, str], cfg: dict[str, Any], runtime: An
     flush_every = python_probe.get("flush_every", python_probe.get("flush_interval_events"))
     if flush_every is not None:
         env["TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY"] = str(flush_every)
-    if "internal_hooks" in python_probe:
-        env["TRACE_SIM_HICACHE_INTERNAL_HOOKS"] = "1" if bool(python_probe.get("internal_hooks")) else "0"
     if runtime.debug:
         env["TRACE_SIM_PYTHON_PROBE_DEBUG"] = "1"
 

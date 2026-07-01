@@ -26,7 +26,6 @@
       "name": "sglang.hicache",
       "consumers": [
         "hicache_state_model",
-        "hicache_profile_quality",
         "hicache_input_contract",
         "hicache_final_state_validator",
         "hicache_transition_validator"

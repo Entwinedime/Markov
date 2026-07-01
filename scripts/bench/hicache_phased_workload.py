@@ -25,7 +25,7 @@ INTERNAL_DIR = SCRIPT_DIR.parent / "internal"
 if str(INTERNAL_DIR) not in sys.path:
     sys.path.insert(0, str(INTERNAL_DIR))
 
-from markov_internal.profiling.forced_tokens import (  # noqa: E402
+from markov_internal.contracts.forced_token import (  # noqa: E402
     FORCED_TOKEN_BUNDLE_SCHEMA,
     FORCED_TOKEN_PLAN_SCHEMA,
     forced_token_plan_summary,
@@ -147,14 +147,10 @@ def response_payload_digest(payload: bytes) -> Dict[str, Any]:
         result.update(
             {
                 "generated_text_chars": len(text),
-                "generated_text_sha256": hashlib.sha256(
-                    text.encode("utf-8")
-                ).hexdigest(),
+                "generated_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
             }
         )
-    output_ids = (
-        int_list(decoded.get("output_ids")) if isinstance(decoded, dict) else None
-    )
+    output_ids = int_list(decoded.get("output_ids")) if isinstance(decoded, dict) else None
     if output_ids is not None:
         result.update(
             {
@@ -162,11 +158,7 @@ def response_payload_digest(payload: bytes) -> Dict[str, Any]:
                 "actual_output_ids_sha256_u32le": token_ids_sha256_u32le(output_ids),
             }
         )
-    prompt_token_ids = (
-        int_list(decoded.get("prompt_token_ids"))
-        if isinstance(decoded, dict)
-        else None
-    )
+    prompt_token_ids = int_list(decoded.get("prompt_token_ids")) if isinstance(decoded, dict) else None
     if prompt_token_ids is not None:
         result.update(
             {
@@ -185,9 +177,7 @@ def sampling_params(
     """生成显式 greedy sampling 参数，避免继承模型默认采样配置。"""
 
     return {
-        "max_new_tokens": (
-            args.max_new_tokens if max_new_tokens is None else max_new_tokens
-        ),
+        "max_new_tokens": (args.max_new_tokens if max_new_tokens is None else max_new_tokens),
         "temperature": 0,
         "top_p": args.top_p,
         "top_k": args.top_k,
@@ -264,10 +254,7 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
     prefix_b = make_shared_prefix("B", args.shared_prefix_repeat)
     prefix_c = make_shared_prefix("C", args.shared_prefix_repeat)
     prefix_dirty = make_shared_prefix("D", args.shared_prefix_repeat)
-    seed_prompts = [
-        make_prompt(prefix_a, "A", index, args.unique_suffix_repeat)
-        for index in range(args.seed_requests)
-    ]
+    seed_prompts = [make_prompt(prefix_a, "A", index, args.unique_suffix_repeat) for index in range(args.seed_requests)]
     if args.pressure_unique_prefix:
         pressure_prompts = [
             make_prompt(
@@ -280,12 +267,10 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
         ]
     else:
         pressure_prompts = [
-            make_prompt(prefix_b, "B", index, args.unique_suffix_repeat)
-            for index in range(args.pressure_requests)
+            make_prompt(prefix_b, "B", index, args.unique_suffix_repeat) for index in range(args.pressure_requests)
         ]
     prefetch_prompts = [
-        make_prompt(prefix_c, "C", index, args.unique_suffix_repeat)
-        for index in range(args.prefetch_seed_requests)
+        make_prompt(prefix_c, "C", index, args.unique_suffix_repeat) for index in range(args.prefetch_seed_requests)
     ]
     dirty_prompts = [
         make_prompt(prefix_dirty, "D", index, args.unique_suffix_repeat)
@@ -333,9 +318,7 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
             }
         )
     for index, prompt in enumerate(prefetch_prompts):
-        plan.append(
-            {"phase": "prefetch_seed_C", "prompt_id": f"C_{index}", "prompt": prompt}
-        )
+        plan.append({"phase": "prefetch_seed_C", "prompt_id": f"C_{index}", "prompt": prompt})
     for index in range(args.prefetch_reuse_requests):
         source_index = index % max(1, len(prefetch_prompts))
         plan.append(
@@ -346,9 +329,7 @@ def build_plan(args: argparse.Namespace) -> List[Dict[str, Any]]:
             }
         )
     for index, prompt in enumerate(dirty_prompts):
-        plan.append(
-            {"phase": "dirty_eviction", "prompt_id": f"D_{index}", "prompt": prompt}
-        )
+        plan.append({"phase": "dirty_eviction", "prompt_id": f"D_{index}", "prompt": prompt})
     return plan
 
 
@@ -360,11 +341,7 @@ def expected_mechanisms_for_phase(phase: str, args: argparse.Namespace) -> List[
     """
 
     policy = str(args.cache_write_policy or "write_through").lower()
-    table = (
-        WRITE_BACK_PHASE_EXPECTED_MECHANISMS
-        if policy == "write_back"
-        else PHASE_EXPECTED_MECHANISMS
-    )
+    table = WRITE_BACK_PHASE_EXPECTED_MECHANISMS if policy == "write_back" else PHASE_EXPECTED_MECHANISMS
     return list(table.get(phase, []))
 
 
@@ -418,11 +395,7 @@ def workload_args_digest(args: argparse.Namespace) -> str:
         "forced_token_plan",
         "cache_write_policy",
     }
-    payload = {
-        key: value
-        for key, value in sorted(vars(args).items())
-        if key not in ignored and value is not None
-    }
+    payload = {key: value for key, value in sorted(vars(args).items()) if key not in ignored and value is not None}
     payload["script"] = "scripts/bench/hicache_phased_workload.py"
     return sha256_json(payload)
 
@@ -441,10 +414,7 @@ def validate_forced_plan_matches_workload(
     """确认 replay 时当前 workload shape 与 capture plan 一致。"""
 
     indexed = forced_plan_by_request(forced_plan)
-    expected_ids = [
-        logical_request_id(args, item, sequence_id)
-        for sequence_id, item in enumerate(plan_items)
-    ]
+    expected_ids = [logical_request_id(args, item, sequence_id) for sequence_id, item in enumerate(plan_items)]
     contract_errors = validate_plan_contract(
         forced_plan,
         workload_id=workload_id(args),
@@ -452,24 +422,17 @@ def validate_forced_plan_matches_workload(
         expected_request_ids=expected_ids,
     )
     if contract_errors:
-        raise ValueError(
-            "forced token plan does not match the current workload: "
-            + ",".join(contract_errors)
-        )
+        raise ValueError("forced token plan does not match the current workload: " + ",".join(contract_errors))
     for sequence_id, item in enumerate(plan_items):
         descriptor = plan_prompt_descriptor(args, item, sequence_id)
         request = indexed[descriptor["logical_request_id"]]
         for key in ("phase", "prompt_id", "prompt_sha256", "prompt_chars"):
             if request.get(key) != descriptor[key]:
-                raise ValueError(
-                    f"forced token plan request {descriptor['logical_request_id']} mismatches {key}"
-                )
+                raise ValueError(f"forced token plan request {descriptor['logical_request_id']} mismatches {key}")
         origin_input_ids = int_list(request.get("origin_input_ids"))
         forced_output_ids = int_list(request.get("forced_output_ids"))
         if origin_input_ids is None or forced_output_ids is None:
-            raise ValueError(
-                f"forced token plan request {descriptor['logical_request_id']} is missing token ids"
-            )
+            raise ValueError(f"forced token plan request {descriptor['logical_request_id']} is missing token ids")
     return indexed
 
 
@@ -566,12 +529,7 @@ def write_outputs(
 def rows_for_selected_latency(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """筛选长期对比使用的关键 latency phase。"""
 
-    return [
-        row
-        for row in rows
-        if row.get("phase")
-        in {"reuse_A_after_pressure", "prefetch_reuse_C", "backup_wait_A"}
-    ]
+    return [row for row in rows if row.get("phase") in {"reuse_A_after_pressure", "prefetch_reuse_C", "backup_wait_A"}]
 
 
 def base_request_row(
@@ -644,30 +602,20 @@ def apply_replay_checks(row: Dict[str, Any], request_plan: Dict[str, Any]) -> No
     expected_output_ids = int_list(request_plan.get("forced_output_ids")) or []
     origin_input_ids = int_list(request_plan.get("origin_input_ids")) or []
     decoded = response_json(row)
-    actual_output_ids = (
-        int_list(decoded.get("output_ids")) if decoded is not None else None
-    )
-    actual_prompt_ids = (
-        int_list(decoded.get("prompt_token_ids")) if decoded is not None else None
-    )
+    actual_output_ids = int_list(decoded.get("output_ids")) if decoded is not None else None
+    actual_prompt_ids = int_list(decoded.get("prompt_token_ids")) if decoded is not None else None
     row.update(
         {
             "origin_input_count": len(origin_input_ids),
             "origin_input_ids_sha256_u32le": token_ids_sha256_u32le(origin_input_ids),
             "max_new_tokens": len(expected_output_ids),
             "forced_output_count": len(expected_output_ids),
-            "forced_output_ids_sha256_u32le": token_ids_sha256_u32le(
-                expected_output_ids
-            ),
-            "forced_full_path_sha256_u32le": token_ids_sha256_u32le(
-                origin_input_ids + expected_output_ids
-            ),
+            "forced_output_ids_sha256_u32le": token_ids_sha256_u32le(expected_output_ids),
+            "forced_full_path_sha256_u32le": token_ids_sha256_u32le(origin_input_ids + expected_output_ids),
             "forced_token_output_checked": actual_output_ids is not None,
             "actual_output_matches_forced": actual_output_ids == expected_output_ids,
             "actual_prompt_matches_plan": (
-                actual_prompt_ids == origin_input_ids
-                if actual_prompt_ids is not None
-                else False
+                actual_prompt_ids == origin_input_ids if actual_prompt_ids is not None else False
             ),
         }
     )
@@ -675,12 +623,8 @@ def apply_replay_checks(row: Dict[str, Any], request_plan: Dict[str, Any]) -> No
         row.update(
             {
                 "actual_output_count": len(actual_output_ids),
-                "actual_output_ids_sha256_u32le": token_ids_sha256_u32le(
-                    actual_output_ids
-                ),
-                "actual_full_path_sha256_u32le": token_ids_sha256_u32le(
-                    origin_input_ids + actual_output_ids
-                ),
+                "actual_output_ids_sha256_u32le": token_ids_sha256_u32le(actual_output_ids),
+                "actual_full_path_sha256_u32le": token_ids_sha256_u32le(origin_input_ids + actual_output_ids),
             }
         )
     if row.get("status") == "ok" and actual_output_ids is None:
@@ -715,9 +659,7 @@ def build_forced_token_plan(
 def capture_provenance(args: argparse.Namespace) -> Dict[str, Any]:
     """从 runner 传入的环境变量中提取 capture 审计信息。"""
 
-    tokenizer_summary = tokenizer_digest_for_model_path(
-        os.environ.get("TRACE_SIM_PROFILE_MODEL_PATH")
-    )
+    tokenizer_summary = tokenizer_digest_for_model_path(os.environ.get("TRACE_SIM_PROFILE_MODEL_PATH"))
     return {
         "source": "scripts/bench/hicache_phased_workload.py",
         "profile_manifest_path": os.environ.get("TRACE_SIM_PROFILE_MANIFEST_PATH"),
@@ -840,13 +782,9 @@ def finalize_forced_token_summary(
             summary["plan_written"] = True
     if mode == "replay":
         output_checked = [row for row in rows if row.get("forced_token_output_checked")]
-        mismatches = [
-            row for row in rows if row.get("actual_output_matches_forced") is False
-        ]
+        mismatches = [row for row in rows if row.get("actual_output_matches_forced") is False]
         unchecked = [row for row in rows if not row.get("forced_token_output_checked")]
-        prompt_mismatches = [
-            row for row in rows if row.get("actual_prompt_matches_plan") is False
-        ]
+        prompt_mismatches = [row for row in rows if row.get("actual_prompt_matches_plan") is False]
         summary.update(
             {
                 "output_checked_count": len(output_checked),
@@ -854,10 +792,7 @@ def finalize_forced_token_summary(
                 "unchecked_count": len(unchecked),
                 "prompt_mismatch_count": len(prompt_mismatches),
                 "all_actual_outputs_match_plan": (
-                    bool(rows)
-                    and not mismatches
-                    and not unchecked
-                    and not prompt_mismatches
+                    bool(rows) and not mismatches and not unchecked and not prompt_mismatches
                 ),
             }
         )
@@ -1026,11 +961,7 @@ def main() -> int:
             f"status={row['status']} latency_ms={row['latency_ms']:.3f}",
             flush=True,
         )
-        if (
-            args.max_errors > 0
-            and sum(1 for item in rows if item.get("status") != "ok")
-            >= args.max_errors
-        ):
+        if args.max_errors > 0 and sum(1 for item in rows if item.get("status") != "ok") >= args.max_errors:
             print(
                 f"abort_after_error_count={args.max_errors} phase={row['phase']} seq={sequence_id}",
                 flush=True,
@@ -1039,11 +970,7 @@ def main() -> int:
         if args.sleep_sec > 0:
             time.sleep(args.sleep_sec)
         next_item = plan[sequence_id + 1] if sequence_id + 1 < len(plan) else None
-        if (
-            next_item is not None
-            and next_item.get("phase") != item.get("phase")
-            and args.phase_wait_sec > 0
-        ):
+        if next_item is not None and next_item.get("phase") != item.get("phase") and args.phase_wait_sec > 0:
             time.sleep(args.phase_wait_sec)
 
     if (

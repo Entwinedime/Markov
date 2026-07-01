@@ -60,8 +60,6 @@ def validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[s
     for key in ("id", "module", "target"):
         if not isinstance(target.get(key), str) or not target.get(key):
             raise ValueError(f"{prefix}.{key} must be a non-empty string")
-    if "phases" in target or "emit_phases" in target:
-        raise ValueError(f"{prefix} must declare phases only as keys of events")
     events = target.get("events")
     if not isinstance(events, dict) or not events:
         raise ValueError(f"{prefix}.events must be a non-empty phase-to-event-name object")
@@ -74,8 +72,6 @@ def validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[s
     fact = target.get("fact")
     if not isinstance(fact, dict):
         raise ValueError(f"{prefix}.fact must be an object")
-    if set(fact) != {"class", "role", "consumers"}:
-        raise ValueError(f"{prefix}.fact must contain only class, role, and consumers")
     fact_class = fact.get("class")
     role = fact.get("role")
     consumers = fact.get("consumers")

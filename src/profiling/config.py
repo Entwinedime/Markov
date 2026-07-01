@@ -39,9 +39,9 @@ class ProfilingRuntimeConfig:
 def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
     """规整 profiling 配置。
 
-    新主线把采集渠道统一放到 `profiling` 下。`profiling.torch` 描述 SGLang
+    当前主线把采集渠道统一放到 `profiling` 下。`profiling.torch` 描述 SGLang
     torch profiler，`profiling.python_probe` 描述 Python 侧插桩，
-    `profiling.ld_preload` 描述 LD_PRELOAD。这里不读取旧顶层兼容字段。
+    `profiling.ld_preload` 描述 LD_PRELOAD。
     """
 
     profiling = cfg.get("profiling") or {}
@@ -55,7 +55,6 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
         raise TypeError("profiling.python_probe must be an object")
 
     if "python_probe" in channels:
-        _reject_unknown_python_probe_config(python_probe_cfg)
         python_probes = _as_str_tuple(
             python_probe_cfg.get("probes", python_probe_cfg.get("name", profiling.get("probes"))),
             default=DEFAULT_PYTHON_PROBES,
@@ -112,31 +111,15 @@ def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
 
 
 def _channel_cfg(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
-    """读取 `profiling.<channel>` 对象；缺失或类型错误时返回空配置。"""
+    """读取 `profiling.<channel>` 对象；显式配置必须是 object。"""
 
     profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
     current = profiling.get(profiling_key)
+    if current is not None and not isinstance(current, dict):
+        raise TypeError(f"profiling.{profiling_key} must be an object")
     if isinstance(current, dict):
         return current
     return {}
-
-
-def _reject_unknown_python_probe_config(python_probe_cfg: dict[str, Any]) -> None:
-    """Reject python_probe config outside the active target-catalog contract."""
-
-    allowed = {
-        "enabled",
-        "name",
-        "probes",
-        "consumers",
-        "target_catalog",
-        "flush_every",
-        "flush_interval_events",
-        "internal_hooks",
-    }
-    unknown = sorted(set(python_probe_cfg) - allowed)
-    if unknown:
-        raise ValueError(f"unknown profiling.python_probe fields: {unknown}")
 
 
 def _parse_python_consumers(raw: Any) -> tuple[str, ...]:

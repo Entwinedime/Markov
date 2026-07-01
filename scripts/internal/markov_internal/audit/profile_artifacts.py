@@ -106,11 +106,7 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
     sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
 
     configured = configured_targets(profiling)
-    channels_enabled = {
-        str(channel)
-        for channel in profiling.get("channels_enabled") or []
-        if isinstance(channel, str)
-    }
+    channels_enabled = {str(channel) for channel in profiling.get("channels_enabled") or [] if isinstance(channel, str)}
     python_channel_enabled = "python" in channels_enabled or bool(configured)
     target_audits = {
         target_id: TargetArtifactAudit(
@@ -136,15 +132,9 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
             )
         target.observe(args)
 
-    missing_targets = sorted(
-        target_id
-        for target_id, audit in target_audits.items()
-        if audit.events_total == 0
-    )
+    missing_targets = sorted(target_id for target_id, audit in target_audits.items() if audit.events_total == 0)
     targets_with_missing_fields = sorted(
-        target_id
-        for target_id, audit in target_audits.items()
-        if audit.missing_required_fields
+        target_id for target_id, audit in target_audits.items() if audit.missing_required_fields
     )
     exception_targets = sorted(
         target_id
@@ -185,14 +175,8 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
         "targets_with_missing_required_fields": targets_with_missing_fields,
         "exception_targets": exception_targets,
         "unknown_targets": sorted(unknown_targets),
-        "targets": {
-            target_id: audit.to_dict()
-            for target_id, audit in sorted(target_audits.items())
-        },
-        "unknown_target_details": {
-            target_id: audit.to_dict()
-            for target_id, audit in sorted(unknown_targets.items())
-        },
+        "targets": {target_id: audit.to_dict() for target_id, audit in sorted(target_audits.items())},
+        "unknown_target_details": {target_id: audit.to_dict() for target_id, audit in sorted(unknown_targets.items())},
         "artifact_errors": artifact_errors,
         "artifact_ready": not artifact_errors,
     }
@@ -202,11 +186,7 @@ def configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """按 requested consumers 重建本次应配置的 Python probe targets。"""
 
     targets: dict[str, dict[str, Any]] = {}
-    requested = {
-        str(consumer)
-        for consumer in profiling.get("python_consumers") or []
-        if isinstance(consumer, str)
-    }
+    requested = {str(consumer) for consumer in profiling.get("python_consumers") or [] if isinstance(consumer, str)}
     if not requested:
         return targets
     catalog_path = profiling.get("python_target_catalog")

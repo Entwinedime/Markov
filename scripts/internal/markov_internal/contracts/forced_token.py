@@ -220,8 +220,7 @@ def resolve_forced_token_bundle_plan(bundle_path: Path, input_id: str) -> Forced
     )
     if entry_metadata != plan_metadata or plan_metadata[0] != input_id:
         raise ValueError(
-            f"{FORCED_TOKEN_ERROR_BUNDLE_PLAN_METADATA}:{input_id}:"
-            f"entry={entry_metadata}:plan={plan_metadata}"
+            f"{FORCED_TOKEN_ERROR_BUNDLE_PLAN_METADATA}:{input_id}:entry={entry_metadata}:plan={plan_metadata}"
         )
 
     return ForcedTokenBundlePlan(
@@ -387,16 +386,11 @@ def validate_plan_contract(
         if not isinstance(request, dict):
             errors.append(FORCED_TOKEN_ERROR_REQUEST_COUNT)
             continue
-        if (
-            int_list(request.get("origin_input_ids")) is None
-            or int_list(request.get("forced_output_ids")) is None
-        ):
+        if int_list(request.get("origin_input_ids")) is None or int_list(request.get("forced_output_ids")) is None:
             errors.append(FORCED_TOKEN_ERROR_REQUEST_TOKENS)
     if expected_request_ids is not None:
         actual_request_ids = [
-            str(request.get("logical_request_id"))
-            for request in requests or []
-            if isinstance(request, dict)
+            str(request.get("logical_request_id")) for request in requests or [] if isinstance(request, dict)
         ]
         if actual_request_ids != expected_request_ids:
             errors.append(FORCED_TOKEN_ERROR_REQUEST_IDS)
@@ -519,13 +513,7 @@ def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
         errors.append(FORCED_TOKEN_ERROR_MODE_UNKNOWN)
 
     result["errors"] = sorted(set(errors))
-    result["plan_ready"] = not any(
-        error != FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE
-        for error in result["errors"]
-    )
-    result["bundle_ready"] = (
-        mode != "replay"
-        or FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE not in result["errors"]
-    )
+    result["plan_ready"] = not any(error != FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE for error in result["errors"])
+    result["bundle_ready"] = mode != "replay" or FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE not in result["errors"]
     result["ready"] = result["plan_ready"] and result["bundle_ready"]
     return result
