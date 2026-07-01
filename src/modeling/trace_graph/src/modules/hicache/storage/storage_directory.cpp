@@ -40,7 +40,7 @@ std::string HiCacheStorageDirectory::storage_key(const std::string & cache_scope
  * @brief 确保 backend hash namespace 记录存在。
  *
  * backend record 表示“某 scope/hash 在 L3 backend 可读”，不要求该 page 已经在
- * radix tree 中 materialize。prefetch 可以先通过 hash 命中，再在 checkpoint/admission
+ * radix tree 中 materialize。prefetch 可以先通过 hash 命中，再在 target cache extend
  * 边界把可读 prefix 插入 host tree。
  */
 HiCacheStorageBackendRecord & HiCacheStorageDirectory::ensure_backend_record(const std::string & cache_scope, const std::string & page_hash) {

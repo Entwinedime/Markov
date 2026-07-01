@@ -23,10 +23,10 @@ Runs the container-internal modeling runner inside the clean Ubuntu 24.04
 modeling Docker service. Use --wrapper-help for this wrapper help.
 
 examples:
-  scripts/model.sh --config <workflow_output>/configs/target_<config_id>.json \
+  scripts/model.sh --config <workflow_output>/artifacts/runner_configs/target_<config_id>.json \
     --profile-manifest <run_dir>/profile_manifest.json \
     --output-dir <run_dir>/modeling/cache_state \
-    --mode cache_state --emit-validation --emit-module-summary
+    --mode cache_state
 EOF
 }
 

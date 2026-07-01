@@ -21,6 +21,7 @@ uint64_t excess(uint64_t occupied, uint64_t capacity) {
 
 bool has_host_backup(const HiCacheCacheNode & node) { return node.residency.host_present; }
 
+#ifdef DEBUG
 bool same_residency(const HiCacheNodeResidency & left, const HiCacheNodeResidency & right) {
     return left.device_present == right.device_present && left.device_dirty == right.device_dirty && left.host_present == right.host_present
            && left.host_visible == right.host_visible && left.storage_known == right.storage_known && left.storage_readable == right.storage_readable;
@@ -30,13 +31,16 @@ bool same_refs(const HiCacheNodeRefState & left, const HiCacheNodeRefState & rig
     return left.lock_ref_total == right.lock_ref_total && left.host_ref_total == right.host_ref_total && left.lock_refs_by_owner == right.lock_refs_by_owner
            && left.host_refs_by_owner == right.host_refs_by_owner;
 }
+#endif
 
 } // namespace capacity_index_detail
 
 using capacity_index_detail::excess;
 using capacity_index_detail::has_host_backup;
+#ifdef DEBUG
 using capacity_index_detail::same_refs;
 using capacity_index_detail::same_residency;
+#endif
 
 bool HiCacheCapacityIndex::VictimKey::operator<(const VictimKey & other) const {
     if (priority != other.priority) return priority < other.priority;
@@ -163,7 +167,13 @@ void HiCacheCapacityIndex::update_snapshot() {
     };
 }
 
-void HiCacheCapacityIndex::record_mutation(HiCacheCapacityMutation mutation) { mutation_trace_.push_back(std::move(mutation)); }
+void HiCacheCapacityIndex::record_mutation(HiCacheCapacityMutation mutation) {
+#ifdef DEBUG
+    mutation_trace_.push_back(std::move(mutation));
+#else
+    (void)mutation;
+#endif
+}
 
 std::optional<HiCacheCapacityNodeRecord> HiCacheCapacityIndex::indexed_record(HiCacheNodeId node_id) const {
     const auto it = records_.find(node_id);
@@ -195,6 +205,7 @@ HiCacheCapacityVictimChoice HiCacheCapacityIndex::make_victim_choice(const std::
     return choice;
 }
 
+#ifdef DEBUG
 std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> HiCacheCapacityIndex::derive_tree_records(const HiCacheTokenRadixTree & tree) const {
     std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> records;
     for (const auto & node : tree.nodes()) {
@@ -203,6 +214,7 @@ std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> HiCacheCapacityIndex::derive_
     }
     return records;
 }
+#endif
 
 HiCacheCapacityMutation HiCacheCapacityIndex::sync_reservation(uint64_t reserved_host_pages, const std::string & reason) {
     /**
@@ -297,20 +309,35 @@ std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_host_victim() const {
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_device_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason) {
     const auto victim = first_device_victim();
+#ifdef DEBUG
     auto choice = make_victim_choice("L1", reason, capacity_pages, requested_pages, victim);
     choice.selection_epoch = ++victim_selection_epoch_;
     victim_choices_.push_back(std::move(choice));
+#else
+    (void)capacity_pages;
+    (void)requested_pages;
+    (void)reason;
+    ++victim_selection_epoch_;
+#endif
     return victim;
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_host_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason) {
     const auto victim = first_host_victim();
+#ifdef DEBUG
     auto choice = make_victim_choice("L2", reason, capacity_pages, requested_pages, victim);
     choice.selection_epoch = ++victim_selection_epoch_;
     victim_choices_.push_back(std::move(choice));
+#else
+    (void)capacity_pages;
+    (void)requested_pages;
+    (void)reason;
+    ++victim_selection_epoch_;
+#endif
     return victim;
 }
 
+#ifdef DEBUG
 HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & tree, uint64_t expected_reserved_host_pages) const {
     /**
      * @brief audit 从 radix tree 重新全量派生期望值。
@@ -412,5 +439,6 @@ HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & t
     }
     return audit;
 }
+#endif
 
 } // namespace markov::trace_graph::modules::hicache::runtime

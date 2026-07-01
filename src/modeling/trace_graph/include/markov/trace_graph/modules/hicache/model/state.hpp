@@ -23,7 +23,6 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::model {
@@ -42,7 +41,7 @@ using runtime::HiCacheCapacityAuditIssue;
 using runtime::HiCacheCapacityIndex;
 using runtime::HiCacheCapacityMutation;
 using runtime::HiCacheCapacityVictimChoice;
-using runtime::HiCacheControlCheckpoint;
+using runtime::HiCacheControlBoundary;
 using runtime::HiCacheDerivedStateMode;
 using runtime::HiCacheDerivedStateSnapshot;
 using runtime::HiCacheDerivedStateView;
@@ -76,14 +75,14 @@ using storage::HiCacheStorageDirectory;
  */
 class HiCacheState {
 public:
-    /** @brief 使用显式 target config 和预扫描出的 terminal checkpoint 集合初始化状态机。 */
-    explicit HiCacheState(frontend::HiCacheConfig config = frontend::HiCacheConfig{}, std::unordered_set<size_t> terminal_prefetch_checkpoint_events = {});
+    /** @brief 使用显式 target config 初始化状态机。 */
+    explicit HiCacheState(frontend::HiCacheConfig config = frontend::HiCacheConfig{});
 
-    /** @brief 按 fact role 推进 canonical state，并返回本 fact 造成的 transition。 */
-    [[nodiscard]] std::vector<HiCacheStateTransition> apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary);
+    /** @brief 按 fact role 推进 canonical state，Debug 构建才写入 transition buffer。 */
+    void apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
 
-    /** @brief 在 trace 结束时收敛 pending 生命周期，并生成最终 transition。 */
-    [[nodiscard]] std::vector<HiCacheStateTransition> finalize(HiCacheSummary & summary);
+    /** @brief 在 trace 结束时收敛 pending 生命周期，Debug 构建才写入 transition buffer。 */
+    void finalize(HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
 
     /** @brief 从 canonical tree/async/storage 结构派生可验证的 final-state snapshot。 */
     [[nodiscard]] HiCacheDerivedStateSnapshot derived_state(HiCacheDerivedStateMode mode = HiCacheDerivedStateMode::MaterializedOnly) const;
@@ -94,26 +93,34 @@ public:
     /** @brief 已发生的 radix split 次数。 */
     [[nodiscard]] uint64_t radix_split_count() const;
 
+#ifdef DEBUG
     /** @brief 返回 radix split 的结构化审计 trace。 */
     [[nodiscard]] std::vector<HiCacheNodeSplitRecord> radix_split_trace() const;
+#endif
 
-    /** @brief target control clock 已记录的 checkpoint 数。 */
-    [[nodiscard]] uint64_t control_checkpoint_count() const;
+    /** @brief target control clock 已记录的 boundary 数。 */
+    [[nodiscard]] uint64_t control_boundary_count() const;
 
-    /** @brief 返回 target control checkpoint 的结构化 trace。 */
-    [[nodiscard]] std::vector<HiCacheControlCheckpoint> control_checkpoint_trace() const;
+#ifdef DEBUG
+    /** @brief 返回 target control boundary 的结构化 trace。 */
+    [[nodiscard]] std::vector<HiCacheControlBoundary> control_boundary_trace() const;
+#endif
 
     /** @brief async operation lifecycle transition 数。 */
     [[nodiscard]] uint64_t async_lifecycle_transition_count() const;
 
+#ifdef DEBUG
     /** @brief 返回 async operation lifecycle 的结构化审计 trace。 */
     [[nodiscard]] std::vector<HiCacheOperationLifecycleTransition> async_lifecycle_trace() const;
+#endif
 
     /** @brief target policy 决策记录数。 */
     [[nodiscard]] uint64_t policy_decision_count() const;
 
+#ifdef DEBUG
     /** @brief 返回 target policy 决策 trace；用于解释模型为什么接受、等待、截断或回退。 */
     [[nodiscard]] const std::vector<HiCachePolicyDecisionRecord> & policy_decision_trace() const { return policy_decisions_; }
+#endif
 
     /** @brief target storage directory 中已知 page 数。 */
     [[nodiscard]] uint64_t storage_known_page_count() const;
@@ -133,6 +140,7 @@ public:
     /** @brief capacity victim 选择记录数。 */
     [[nodiscard]] uint64_t capacity_victim_choice_count() const;
 
+#ifdef DEBUG
     /** @brief 返回 capacity index mutation 的审计 trace。 */
     [[nodiscard]] std::vector<HiCacheCapacityMutation> capacity_mutation_trace() const;
 
@@ -141,15 +149,18 @@ public:
 
     /** @brief 返回 capacity index 与 canonical tree 的一致性审计问题。 */
     [[nodiscard]] std::vector<HiCacheCapacityAuditIssue> capacity_audit_issues() const;
+#endif
 
     /** @brief ref ledger mutation 数。 */
     [[nodiscard]] uint64_t ref_mutation_count() const;
 
+#ifdef DEBUG
     /** @brief 返回 ref lifecycle mutation 的审计 trace。 */
     [[nodiscard]] std::vector<HiCacheRefMutation> ref_mutation_trace() const;
 
     /** @brief 返回 ref ledger 与 canonical tree 的一致性审计问题。 */
     [[nodiscard]] std::vector<HiCacheRefAuditIssue> ref_audit_issues() const;
+#endif
 
     /** @brief 生成当前 canonical state 的稳定摘要，用于自检和日志定位。 */
     [[nodiscard]] std::string digest() const;
@@ -172,7 +183,7 @@ private:
         std::string lifecycle_state;
     };
 
-    /** @brief 等待下一轮 target control 边界 drain 的 write-through backup lock。 */
+    /** @brief 等待下一轮 target control 或 finalize 边界 drain 的 write-through backup lock。 */
     struct PendingWriteThroughBackup {
         std::string owner;
         std::vector<std::string> pages;
@@ -261,7 +272,7 @@ private:
     };
 
     /**
-     * @brief 单次 prefetch checkpoint/request 边界的 target progress 估计。
+     * @brief 单次 prefetch target boundary 的 progress 估计。
      *
      * storage hit 只说明 L3 中存在连续 prefix；completed pages 才表示 terminate
      * 时已经传输到 host，可安全插入 host radix。
@@ -271,19 +282,45 @@ private:
         uint64_t storage_hit_pages = 0;
         bool storage_hit_sufficient = false;
         bool fully_completed = false;
-        bool terminal_checkpoint = false;
+        bool terminal_boundary = false;
         bool timeout_elapsed = false;
         std::string reason;
+    };
+
+    /** @brief batch-level cache extend 中单个 request 的 allocator intent。 */
+    struct CacheExtendRequestIntent {
+        std::string request_key;
+        std::string request_id;
+        uint64_t accepted_tokens = 0;
+        uint64_t target_device_prefix_tokens = 0;
+        uint64_t prior_committed_prefix_tokens = 0;
+        uint64_t allocation_prefix_tokens = 0;
+        uint64_t extend_tokens = 0;
+        uint64_t requested_pages = 0;
+        uint64_t allocated_pages = 0;
+        std::vector<std::string> full_pages;
+        std::vector<std::string> device_pages;
+        std::vector<std::string> host_pages;
+    };
+
+    /** @brief 一次 `cache_extend_input` fact 对应的 batch allocator intent。 */
+    struct CacheExtendBatchIntent {
+        uint64_t batch_size = 0;
+        uint64_t total_extend_tokens = 0;
+        uint64_t requested_pages = 0;
+        uint64_t allocated_pages = 0;
+        std::vector<CacheExtendRequestIntent> requests;
     };
 
     frontend::HiCacheConfig config_;
     HiCacheTargetPager pager_;
     HiCacheTokenDirectory token_directory_;
     HiCachePolicy policy_;
-    std::unordered_set<size_t> terminal_prefetch_checkpoint_events_;
     std::unordered_map<std::string, ScopedState> scopes_;
     uint64_t policy_decision_epoch_ = 0;
+#ifdef DEBUG
     std::vector<HiCachePolicyDecisionRecord> policy_decisions_;
+#endif
 
     /** @brief 归一化 fact 所属 cache scope，缺失时回退到默认 scope。 */
     [[nodiscard]] std::string normalized_scope(const HiCacheFact & fact) const;
@@ -308,11 +345,9 @@ private:
     [[nodiscard]] PrefetchIoProgressEstimate estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact) const;
     /** @brief 估计 SGLang terminate_prefetch 边界可见的 completed prefix。 */
     [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
-                                                                      bool terminal_checkpoint) const;
-    /** @brief 当前 checkpoint 是否是预扫描出的 request-local prefetch 流程最后一个 checkpoint。 */
-    [[nodiscard]] bool terminal_prefetch_checkpoint(const HiCacheFact & fact) const;
-    void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                         ScopedState & scope, const std::string & reason);
+                                                                      bool terminal_boundary) const;
+    void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                         const std::string & reason);
 
     /** @brief 将 tree/ref/reservation mutation 同步到 capacity index。 */
     void sync_capacity(ScopedState & scope, const std::string & cache_scope, const std::vector<HiCacheNodeId> & node_ids, const std::string & reason);
@@ -326,64 +361,82 @@ private:
     /** @brief 记录一次 target policy 决策，并分配稳定 epoch。 */
     void record_policy_decision(const HiCacheFact & fact, HiCachePolicyDecisionRecord decision);
 
-    /** @brief 处理 request match 边界，建立可复用 prefix 的 request-local 保护。 */
-    void apply_request_bound_match_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief 当前构建是否需要构造 Debug/validation 行级记录。 */
+    [[nodiscard]] static constexpr bool debug_records_enabled() {
+#ifdef DEBUG
+        return true;
+#else
+        return false;
+#endif
+    }
 
-    /** @brief 处理 request admission 边界，申请 KV page 并 materialize request path。 */
-    void apply_request_admission(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief Release 构建不为 transition/debug 证据派生 state digest。 */
+    [[nodiscard]] std::string debug_state_digest() const {
+        if constexpr (debug_records_enabled()) return digest();
+        return {};
+    }
 
-    /** @brief 处理 request lifecycle 完成/未完成边界，释放 request-local 保护。 */
-    void apply_request_lifecycle_anchor(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief 处理 cache lookup 输入，建立可复用 prefix 的 request-local 保护。 */
+    void apply_cache_lookup_input(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
 
-    /** @brief 处理 target policy 输入中的 prefetch decision。 */
-    void apply_prefetch_decision(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief 处理 batch-level cache extend 输入，申请 KV page 并更新 request ownership。 */
+    void apply_cache_extend_input(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
 
-    /** @brief 处理 runtime model checkpoint，用于推进 target-derived prefetch lifecycle。 */
-    void apply_prefetch_check_point(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions);
+    /** @brief 处理 request lifecycle commit 边界，释放 request-local 保护。 */
+    void apply_cache_lifecycle_commit(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+
+    /** @brief 处理 prefetch candidate 输入。 */
+    void apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+
     /** @brief 将已完成的 target prefetch prefix 统一落到 host radix / storage directory。 */
-    void apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+    void apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                               HiCachePrefetchOperation & op);
     /** @brief 取消 prefetch operation，并保留尚未 drain 的 host reservation。 */
-    void cancel_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                         ScopedState & scope, HiCachePrefetchOperation & op, const std::string & transition_kind,
-                                         HiCachePrefetchState prefetch_state);
+    void cancel_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                         HiCachePrefetchOperation & op, const std::string & transition_kind, HiCachePrefetchState prefetch_state);
+    /** @brief 在 cache extend side effect 前结算同 request 的 active prefetch。 */
+    void settle_prefetch_before_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                             const std::string & request_key);
+    /** @brief 在 cache extend side effect 后释放 terminal prefetch 的 pending host reservation。 */
+    void drain_prefetch_release_after_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
+                                                   ScopedState & scope, const std::string & request_key);
 
     /** @brief 更新 request-local committed path 和保护 page 统计。 */
     void update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);
 
     /** @brief 将 request path 插入 device radix，并返回 insert 审计结果。 */
-    [[nodiscard]] HiCacheInsertResult insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
+    [[nodiscard]] HiCacheInsertResult insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
                                                           ScopedState & scope, const std::vector<std::string> & pages);
 
     /** @brief 根据 write policy 处理 request path 的 host/storage backup。 */
-    void apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+    void apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                   const std::vector<std::string> & pages);
 
     /** @brief 在 device allocation 前执行 target-derived device capacity enforcement。 */
-    void enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+    void enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                  uint64_t requested_pages);
 
     /** @brief 在 host insertion/reservation 前执行 target-derived host capacity enforcement。 */
-    void enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, ScopedState & scope,
+    void enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                uint64_t requested_pages);
 
     /** @brief 申请 host reservation，可按调用方语义截断或拒绝。 */
-    [[nodiscard]] HostAllocationResult request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary,
-                                                               std::vector<HiCacheStateTransition> & transitions, ScopedState & scope, uint64_t requested_pages,
-                                                               uint64_t minimum_pages, bool allow_truncate, const std::string & reason);
+    [[nodiscard]] HostAllocationResult request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
+                                                               ScopedState & scope, uint64_t requested_pages, uint64_t minimum_pages, bool allow_truncate,
+                                                               const std::string & reason);
 
     /** @brief 驱逐单个 device node，并同步 tree、allocator、capacity index 和 transition。 */
-    [[nodiscard]] uint64_t evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                             ScopedState & scope, HiCacheNodeId node_id);
+    [[nodiscard]] uint64_t evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                             HiCacheNodeId node_id);
 
     /** @brief 驱逐单个 host leaf，并同步 tree、capacity index 和 transition。 */
-    [[nodiscard]] uint64_t evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                           ScopedState & scope, HiCacheNodeId node_id);
-    [[nodiscard]] bool commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                          ScopedState & scope, HiCacheNodeId node_id, bool storage_readable);
-    void hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                       ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages);
-    void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions, const std::string & kind,
+    [[nodiscard]] uint64_t evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                           HiCacheNodeId node_id);
+    [[nodiscard]] bool commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                          HiCacheNodeId node_id, bool storage_readable);
+    void hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                       HiCacheNodeId node_id, const std::vector<std::string> & pages);
+    void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, const std::string & kind,
                            const std::string & tier, const std::vector<std::string> & pages, const std::string & before_digest);
 };
 

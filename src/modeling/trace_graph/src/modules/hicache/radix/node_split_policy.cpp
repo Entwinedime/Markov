@@ -21,7 +21,7 @@ HiCacheNodeSplitPlan HiCacheNodeSplitPolicy::plan(HiCacheNodeId parent, const Hi
                                                   const std::vector<std::string> & prefix_pages, const std::vector<std::string> & suffix_pages,
                                                   const HiCacheNodeSplitContext & context) const {
     /**
-     * @brief split policy 采用“prefix 继承旧 child residency/ref/hit_count”的语义。
+     * @brief split policy 采用“prefix 继承原 child residency/ref/hit_count”的语义。
      *
      * 这是后续 ref ledger sync 和 capacity index 重新判定 leaf eligibility 的前提。
      */

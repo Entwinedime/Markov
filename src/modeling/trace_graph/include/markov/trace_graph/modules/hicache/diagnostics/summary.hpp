@@ -16,8 +16,7 @@ namespace markov::trace_graph::modules::hicache::diagnostics {
 /**
  * @brief 把 HiCache 结构化模型结果写成 JSON 字符串。
  *
- * 输出 schema 与旧 `HiCacheSummary::to_json()` 保持一致；本函数只负责 diagnostics
- * 表达，不改变 summary 内容。
+ * 本函数只负责 Debug/validation diagnostics 表达，不改变 summary 内容。
  */
 [[nodiscard]] std::string summary_json(const model::HiCacheSummary & summary);
 

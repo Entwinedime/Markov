@@ -74,18 +74,22 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
     parser.add_argument("--config", required=True, help="modeling config path")
     parser.add_argument("--output-dir", help="override config.output_dir")
     parser.add_argument("--profile-manifest", help="override config.input.profile_manifest")
-    parser.add_argument("--cpp-model-config", help="override config.cpp_model_config with a ready-to-use C++ model config JSON")
+    parser.add_argument(
+        "--cpp-model-config", help="override config.cpp_model_config with a ready-to-use C++ model config JSON"
+    )
     parser.add_argument(
         "--hicache-oracle-trace",
         action="append",
         default=[],
         help="override validation.hicache_state.oracle_trace_paths; may be repeated",
     )
-    parser.add_argument("--mode", choices=("faithful_replay", "cache_state", "cache_patch"), help="override config.mode")
+    parser.add_argument(
+        "--mode", choices=("faithful_replay", "cache_state", "cache_patch"), help="override config.mode"
+    )
     parser.add_argument("--emit-dag-chrome-trace", action="store_true", help="emit DAG as Chrome trace JSON")
     parser.add_argument("--emit-module-summary", action="store_true", help="emit C++ module summary JSON")
     parser.add_argument("--emit-validation", action="store_true", help="emit validation.json")
-    parser.add_argument("--debug", action="store_true", help="enable C++ TraceGraph debug mode")
+    parser.add_argument("--debug", action="store_true", help="enable C++ TraceGraph debug logging")
     args = parser.parse_args(argv)
 
     config_path = resolve_repo_path(args.config)
@@ -114,7 +118,9 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
 
     config = load_json(options.config_path)
     mode = options.mode or str(config.get("mode") or "faithful_replay")
-    output_dir = options.output_dir or resolve_repo_path(str(config.get("output_dir") or "data/modeling_runs/cpp_trace_graph"))
+    output_dir = options.output_dir or resolve_repo_path(
+        str(config.get("output_dir") or "data/modeling_runs/cpp_trace_graph")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs_cfg = config.get("outputs") if isinstance(config.get("outputs"), dict) else {}
     emit_dag_chrome_trace = options.emit_dag_chrome_trace or bool(outputs_cfg.get("emit_dag_chrome_trace", False))
@@ -122,6 +128,7 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     emit_validation = options.emit_validation or bool(outputs_cfg.get("emit_validation", False))
     if emit_validation and hicache_state_validation_enabled(config):
         # HiCache state validation 依赖 C++ module summary 中的 state trace。
+        require_validation_backend(config)
         emit_module_summary = True
     debug = options.debug or bool(outputs_cfg.get("debug", False))
 
@@ -168,7 +175,9 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     summary = load_json(run_summary)
     prediction = {"predicted_e2e_ns": int(summary.get("simulated_e2e_ns", 0))}
     write_json(output_dir / "prediction.json", prediction)
-    predicted_state_trace = write_hicache_predicted_state_trace_if_available(module_summary, output_dir)
+    predicted_state_trace = (
+        write_hicache_predicted_state_trace_if_available(module_summary, output_dir) if emit_validation else None
+    )
     if emit_validation:
         validation = build_validation(
             mode,
@@ -186,6 +195,16 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
             validation["hicache_state"]["recommended_hicache_cpp_model_config_path"] = str(recommended_config_path)
         write_json(output_dir / "validation.json", validation)
     return prediction
+
+
+def require_validation_backend(config: dict[str, Any]) -> None:
+    """HiCache validation 必须显式选择 Debug/validation C++ backend。"""
+
+    cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
+    backend_kind = str(cpp.get("backend_kind") or "").strip().lower()
+    if backend_kind == "validation" or cpp.get("require_debug") is True:
+        return
+    raise ValueError("emit_validation for HiCache state requires cpp_trace_graph.backend_kind='validation'")
 
 
 def main(argv: list[str] | None = None) -> int:

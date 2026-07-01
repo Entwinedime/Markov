@@ -23,8 +23,8 @@ constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
 /**
  * @brief 读取仿真阶段使用的节点耗时字段。
  *
- * 子模块可能只更新 attrs["time"]，也可能通过 DagGraph::set_node_duration 更新。
- * 仿真阶段优先读取 attrs["time"]，保证兼容老版字段。
+ * 子模块可能直接修改 attrs["time"]，也可能通过 DagGraph::set_node_duration 更新。
+ * 仿真阶段优先读取 attrs["time"]，使 DAG patch 与基础节点 duration 使用同一入口。
  */
 uint64_t read_u64_attr(const core::DagNode & node, const std::string & key, uint64_t fallback = 0) {
     const auto it = node.attrs.find(key);
@@ -77,8 +77,8 @@ SimulationResult run_topological_simulation(core::DagGraph & graph) {
         /**
          * @brief 当前节点自身耗时优先从 attrs["time"] 读取。
          *
-         * node.duration 与 attrs["time"] 理论上应一致；这里保留 attrs 优先级，是为了兼容历史
-         * 子模块直接写 attrs 的行为。
+         * node.duration 与 attrs["time"] 理论上应一致；attrs 优先级用于承接当前子模块
+         * 对节点耗时的显式 patch。
          */
         uint64_t node_time = node.duration;
         auto attr_time = read_u64_attr(node, "time", node.duration);
@@ -94,7 +94,7 @@ SimulationResult run_topological_simulation(core::DagGraph & graph) {
         if (pred != INVALID_NODE) complete_time[node_id] += complete_time[pred];
 
         /**
-         * @brief 老版 TraceGraph 会把 CPU 顺序间隔计入关键路径上前驱节点之后。
+         * @brief CPU 顺序间隔计入关键路径上前驱节点之后。
          */
         if (pred != INVALID_NODE) {
             const auto & pred_node = graph.node(pred);

@@ -377,7 +377,7 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
         if (event.name == "EVENT_RECORD") index.event_record_nodes.push_back(node_id);
         else if (event.name == "EVENT_WAIT") {
             /**
-             * @brief 老版 TraceGraph 把 EVENT_WAIT 向后挪 1ns，并把正 duration 减 1ns。
+             * @brief 把 EVENT_WAIT 向后挪 1ns，并把正 duration 减 1ns。
              *
              * 这样 record/wait 在相同 timestamp 附近时不会形成自相矛盾边界。
              */
@@ -418,10 +418,10 @@ void DagBuilder::add_correlation_edges(DagGraph & graph, BuildIndex & index) con
     }
 
     /**
-     * @brief 根据 connection_id 建立旧 TraceGraph / CANN trace 中的连接链。
+     * @brief 根据 connection_id 建立 CANN runtime 与 device event 的连接链。
      *
-     * 如果链长度 >=3 且首个事件不是 Node@launch，历史上容易把不相关 runtime 误串起来，
-     * 因此当前保持跳过这类链的兼容策略。
+     * 如果链长度 >=3 且首个事件不是 Node@launch，容易把不相关 runtime 误串起来，
+     * 因此这类链不作为可靠的提交证据。
      */
     for (auto & item : index.connection_to_nodes) {
         auto & nodes = item.second;
@@ -473,7 +473,7 @@ void DagBuilder::add_sequential_edges(DagGraph & graph, BuildIndex & index) cons
                 /**
                  * @brief cpuinterval 是两个 CPU leaf 之间的空洞。
                  *
-                 * 老版仿真会把它计入关键路径上的前驱后面，用来表达 CPU lane 空闲但实际 wall time
+                 * 仿真会把它计入关键路径上的前驱后面，用来表达 CPU lane 空闲但实际 wall time
                  * 仍在推进的情况。
                  */
                 auto interval = event.ts > prev.ts + prev.dur ? event.ts - (prev.ts + prev.dur) : 0;
@@ -570,7 +570,7 @@ void DagBuilder::add_event_wait_edges(DagGraph & graph, BuildIndex & index) cons
 
 void DagBuilder::add_notify_wait_edges(DagGraph & graph, BuildIndex & index) const {
     /**
-     * @brief 为旧 trace 中的 NOTIFY_RECORD/NOTIFY_WAIT 模型执行同步锚点建边。
+     * @brief 为 NOTIFY_RECORD/NOTIFY_WAIT 模型执行同步锚点建边。
      *
      * 当前策略是为每个 wait 找到 wait_end 之前 200ns 窗口内最近的 record。
      */
@@ -591,9 +591,8 @@ void DagBuilder::add_model_execute_edges(DagGraph & graph, BuildIndex & index) c
     /**
      * @brief 建立 MODEL_EXECUTE 到 device lane 的保守同步边。
      *
-     * 这是老版 TraceGraph 的保守同步逻辑：在 model_start 到最早 notify_wait_end 之间，
-     * 每条 device lane 的首个节点依赖 MODEL_EXECUTE。这样能避免模型执行窗口内的 device 工作
-     * 被拓扑仿真提前到 CPU 调度之前。
+     * 在 model_start 到最早 notify_wait_end 之间，每条 device lane 的首个节点依赖
+     * MODEL_EXECUTE。这样能避免模型执行窗口内的 device 工作被拓扑仿真提前到 CPU 调度之前。
      */
     for (size_t model_node : index.model_execute_nodes) {
         const auto & model_event = graph.event_for_node(model_node);

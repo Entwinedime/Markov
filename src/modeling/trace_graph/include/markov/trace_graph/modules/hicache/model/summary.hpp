@@ -1,13 +1,15 @@
 /**
  * @file
- * @brief HiCache 状态模型的结构化结果。
+ * @brief HiCache 状态模型的 Debug/validation 结构化结果。
  *
- * 本文件只定义模型执行后产生的业务数据，不包含 JSON 序列化、文件输出或
- * validation oracle 对比。diagnostics 层可以消费这些结构生成 summary/debug 输出，
- * 但状态机核心不反向依赖 diagnostics。
+ * 本文件只定义模型执行后供 Debug/validation 消费的结构化数据，不包含 JSON
+ * 序列化、文件输出或 validation oracle 对比。Release 业务 backend 执行 state replay
+ * 后不暴露也不长期保存这些结构；diagnostics 层可以在 Debug 构建中消费这些结构生成
+ * summary/debug 输出，但状态机核心不反向依赖 diagnostics。
  */
 #pragma once
 
+#ifdef DEBUG
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/policy.hpp"
 #include "markov/trace_graph/modules/hicache/radix/token_radix_tree.hpp"
@@ -22,14 +24,16 @@
 #include <map>
 #include <string>
 #include <vector>
+#endif
 
 namespace markov::trace_graph::modules::hicache::model {
 
+#ifdef DEBUG
 using radix::HiCacheNodeSplitRecord;
 using runtime::HiCacheCapacityAuditIssue;
 using runtime::HiCacheCapacityMutation;
 using runtime::HiCacheCapacityVictimChoice;
-using runtime::HiCacheControlCheckpoint;
+using runtime::HiCacheControlBoundary;
 using runtime::HiCacheDerivedStateSnapshot;
 using runtime::HiCacheOperationLifecycleTransition;
 using runtime::HiCacheRefAuditIssue;
@@ -58,12 +62,18 @@ struct HiCacheStateTransition {
     std::string after_state_digest;
 };
 
+using HiCacheTransitionBuffer = std::vector<HiCacheStateTransition>;
+#else
+struct HiCacheTransitionBuffer {};
+#endif
+
 /**
- * @brief HiCache state model 的完整执行结果。
+ * @brief HiCache state model 的 Debug/validation 执行结果。
  *
- * 该结构是业务层和 diagnostics/validation 层之间的唯一汇总边界：状态机负责填充
- * fact 计数、policy 决策、async lifecycle、capacity/ref 审计和 final derived
- * state；JSON 字段名、pretty print 和 oracle 对比逻辑均在外层完成。
+ * 该结构是 state replay 与 diagnostics/validation 层之间的唯一汇总边界：Debug 构建
+ * 会填充 fact 计数、policy 决策、async lifecycle、capacity/ref 审计和 final
+ * derived state；JSON 字段名、pretty print 和 oracle 对比逻辑均在外层完成。Release
+ * 构建不把这些字段作为业务输出持有。
  *
  * 关键不变量：
  * - `dag_mutations` 目前固定为 0，表示该模型只做 state alignment，不 patch DAG；
@@ -73,6 +83,7 @@ struct HiCacheStateTransition {
  *   不替代 `final_state` 中的 materialized-only 页面集合。
  */
 struct HiCacheSummary {
+#ifdef DEBUG
     std::string status = "state_model";
     frontend::HiCacheConfig target_config;
     HiCacheResolvedPolicyState resolved_policy;
@@ -83,7 +94,7 @@ struct HiCacheSummary {
     uint64_t dirty_eviction_events = 0;
     uint64_t active_ref_owner_count = 0;
     uint64_t radix_split_count = 0;
-    uint64_t control_checkpoint_count = 0;
+    uint64_t control_boundary_count = 0;
     uint64_t async_lifecycle_transition_count = 0;
     uint64_t policy_decision_count = 0;
     uint64_t storage_known_page_count = 0;
@@ -104,7 +115,7 @@ struct HiCacheSummary {
     std::map<std::string, uint64_t> token_resolution_by_status;
     std::map<std::string, uint64_t> token_path_diagnostics;
     std::vector<HiCacheNodeSplitRecord> radix_split_trace;
-    std::vector<HiCacheControlCheckpoint> control_checkpoint_trace;
+    std::vector<HiCacheControlBoundary> control_boundary_trace;
     std::vector<HiCacheOperationLifecycleTransition> async_lifecycle_trace;
     std::vector<HiCachePolicyDecisionRecord> policy_decision_trace;
     std::vector<std::string> l1_resident_pages;
@@ -128,6 +139,7 @@ struct HiCacheSummary {
     std::vector<HiCacheRefAuditIssue> ref_audit_issues;
     std::vector<HiCacheStateTransition> transition_trace;
     std::vector<std::string> warnings;
+#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache::model

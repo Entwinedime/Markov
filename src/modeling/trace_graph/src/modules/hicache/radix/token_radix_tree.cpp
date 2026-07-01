@@ -176,7 +176,7 @@ HiCacheNodeId HiCacheTokenRadixTree::create_child(HiCacheNodeId parent, std::vec
 
 HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNodeId child_id, size_t split_pages) {
     /**
-     * @brief radix split 会把旧 child 的 residency/ref/hit_count 复制到 prefix node。
+     * @brief radix split 会把原 child 的 residency/ref/hit_count 复制到 prefix node。
      *
      * suffix node 再承接剩余 pages；这模拟 SGLang radix cache 中共享前缀节点的语义。
      */
@@ -202,7 +202,10 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNo
     nodes_[split_id].children[suffix.front()] = child_id;
     nodes_[child_id].parent = split_id;
     policy.apply_suffix(nodes_[child_id], plan);
+    ++split_count_;
+#ifdef DEBUG
     split_history_.push_back(std::move(plan.record));
+#endif
     rebuild_page_index();
     return split_id;
 }

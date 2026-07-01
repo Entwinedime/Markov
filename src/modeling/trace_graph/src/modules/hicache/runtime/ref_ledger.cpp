@@ -13,22 +13,28 @@ namespace markov::trace_graph::modules::hicache::runtime {
 
 namespace ref_ledger_detail {
 
+#ifdef DEBUG
 using NodeOwnerKey = std::pair<HiCacheNodeId, std::string>;
+#endif
 
 uint64_t count_node(const std::vector<HiCacheNodeId> & nodes, HiCacheNodeId node_id) { return static_cast<uint64_t>(std::ranges::count(nodes, node_id)); }
 
+#ifdef DEBUG
 uint64_t map_value(const std::map<NodeOwnerKey, uint64_t> & values, const NodeOwnerKey & key) {
     const auto it = values.find(key);
     return it == values.end() ? 0 : it->second;
 }
+#endif
 
 std::vector<HiCacheNodeId> repeated_nodes(HiCacheNodeId node_id, uint64_t count) { return std::vector<HiCacheNodeId>(static_cast<size_t>(count), node_id); }
 
 } // namespace ref_ledger_detail
 
 using ref_ledger_detail::count_node;
+#ifdef DEBUG
 using ref_ledger_detail::map_value;
 using ref_ledger_detail::NodeOwnerKey;
+#endif
 using ref_ledger_detail::repeated_nodes;
 
 std::vector<std::string> HiCacheRefLedger::flatten_pages(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & nodes) {
@@ -59,7 +65,11 @@ HiCacheRefOwnerRecord & HiCacheRefLedger::ensure_owner(const std::string & owner
 void HiCacheRefLedger::record_mutation(HiCacheRefMutation mutation) {
     if (!mutation.changed) return;
     if (mutation.mutation_epoch == 0) mutation.mutation_epoch = ++epoch_;
+#ifdef DEBUG
     mutation_trace_.push_back(std::move(mutation));
+#else
+    (void)mutation;
+#endif
 }
 
 HiCacheRefMutation HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id) {
@@ -222,6 +232,7 @@ const HiCacheRefOwnerRecord * HiCacheRefLedger::owner(const std::string & owner_
     return it == owners_.end() ? nullptr : &it->second;
 }
 
+#ifdef DEBUG
 HiCacheRefAudit HiCacheRefLedger::audit(const HiCacheTokenRadixTree & tree) const {
     /**
      * @brief audit 比较 owner ledger 与 radix node ref maps。
@@ -304,6 +315,7 @@ HiCacheRefAudit HiCacheRefLedger::audit(const HiCacheTokenRadixTree & tree) cons
     compare_refs("host", ledger_host_refs, tree_host_refs);
     return audit;
 }
+#endif
 
 uint64_t HiCacheRefLedger::active_owner_count() const {
     return static_cast<uint64_t>(std::ranges::count_if(owners_, [](const auto & item) { return item.second.active; }));

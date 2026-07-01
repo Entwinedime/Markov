@@ -105,7 +105,7 @@ struct HiCacheInsertResult {
  * @brief SGLang `evict_host()` 删除 host leaf 后的结构化结果。
  *
  * SGLang 释放 host leaf 时会从 parent.children 中移除整棵子树，而不是只清
- * host_value。模型必须显式返回被移除的 node，供 capacity/ref 审计同步旧 record。
+ * host_value。模型必须显式返回被移除的 node，供 capacity/ref 审计同步原 record。
  */
 struct HiCacheHostEvictionResult {
     bool evicted = false;
@@ -173,8 +173,13 @@ public:
     /** @brief 读取所有 node 的稳定数组视图。 */
     [[nodiscard]] const std::vector<HiCacheCacheNode> & nodes() const { return nodes_; }
 
+#ifdef DEBUG
     /** @brief 返回 radix split 的结构化历史。 */
     [[nodiscard]] const std::vector<HiCacheNodeSplitRecord> & split_history() const { return split_history_; }
+#endif
+
+    /** @brief 已发生的 radix split 次数。 */
+    [[nodiscard]] uint64_t split_count() const { return split_count_; }
 
     /** @brief 按 node id 读取 node；不存在时返回空指针。 */
     [[nodiscard]] const HiCacheCacheNode * node(HiCacheNodeId node_id) const;
@@ -248,10 +253,13 @@ public:
 
 private:
     std::vector<HiCacheCacheNode> nodes_;
+#ifdef DEBUG
     std::vector<HiCacheNodeSplitRecord> split_history_;
+#endif
     std::unordered_map<std::string, HiCacheNodeId> page_to_node_;
     std::unordered_map<std::string, HiCacheProjectedPage> page_projection_;
     uint64_t access_clock_ = 0;
+    uint64_t split_count_ = 0;
 
     [[nodiscard]] HiCacheNodeId create_child(HiCacheNodeId parent, std::vector<std::string> pages);
     [[nodiscard]] HiCacheNodeId insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & suffix);

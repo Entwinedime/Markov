@@ -138,8 +138,4 @@ HiCachePagePath HiCacheTargetPager::project(const HiCacheFact & fact, const HiCa
     return path;
 }
 
-std::vector<std::string> HiCacheTargetPager::pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const {
-    return project(fact, tokens).page_ids();
-}
-
 } // namespace markov::trace_graph::modules::hicache::runtime

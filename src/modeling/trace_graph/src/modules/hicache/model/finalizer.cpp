@@ -19,40 +19,42 @@ using core::DagGraph;
 using frontend::HiCacheConfig;
 
 /**
- * @brief trace 结束时取消仍 active 的 prefetch，并释放没有后续 admission drain 的 reservation。
+ * @brief trace 结束时收敛 target-derived pending lifecycle。
  *
  * finalize 不补 source actual 结果，只把 target-derived pending lifecycle 收敛到一个可验证
- * final state：active prefetch 不再 apply，未被后续 request admission 消费的 host
- * reservation 在 final 边界释放。
+ * final state：write-through backup ACK 释放尾部 ordinary lock；active prefetch 不再
+ * apply，未被后续 cache extend 消费的 host reservation 在 final 边界释放。
  */
-std::vector<HiCacheStateTransition> HiCacheState::finalize(HiCacheSummary & summary) {
-    std::vector<HiCacheStateTransition> transitions;
+void HiCacheState::finalize(HiCacheSummary & summary, HiCacheTransitionBuffer & transitions) {
     HiCacheFact fact;
     fact.event_name = "hicache_finalize";
-    fact.role = "prefetch_finalize";
     for (auto & [scope_name, scope] : scopes_) {
         fact.cache_scope = scope_name;
-        const auto checkpoint = scope.clock.record_target_finalize_checkpoint(scope_name, fact.ts);
+        const auto boundary = scope.clock.record_target_finalize_boundary(scope_name, fact.ts);
+        fact.role = "write_through_backup_finalize";
+        drain_write_through_backup_refs(fact, summary, transitions, scope, "write_through_backup_finalize_boundary");
+        fact.role = "prefetch_finalize";
         for (auto & op : scope.async_ops.prefetch_ops() | std::views::values) {
             if (op.prefetch_state != HiCachePrefetchState::Pending && op.prefetch_state != HiCachePrefetchState::Ready) continue;
-            op.header.checkpoint_epoch = checkpoint.checkpoint_epoch;
-            op.header.checkpoint_ts = fact.ts;
-            const auto before = digest();
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .operation_id = op.header.operation_id,
-                                       .policy_area = "prefetch_finalize",
-                                       .policy_name = policy_.prefetch_policy(),
-                                       .decision = "cancel_pending_prefetch",
-                                       .reason = "target finalize cancels active prefetch without terminal apply",
-                                       .accepted = false,
-                                       .requested_pages = op.requested_host_pages,
-                                       .candidate_pages = static_cast<uint64_t>(op.planned_pages.size()),
-                                       .hit_pages = static_cast<uint64_t>(op.hit_pages.size()),
-                                       .reserved_pages = op.reserved_host_pages,
-                                       .threshold_pages = policy_.prefetch_threshold_pages(),
-                                       .pages = op.planned_pages,
-                                   });
+            op.header.boundary_epoch = boundary.boundary_epoch;
+            op.header.boundary_ts = fact.ts;
+            const auto before = debug_state_digest();
+            if constexpr (debug_records_enabled())
+                record_policy_decision(fact,
+                                       HiCachePolicyDecisionRecord{
+                                           .operation_id = op.header.operation_id,
+                                           .policy_area = "prefetch_finalize",
+                                           .policy_name = policy_.prefetch_policy(),
+                                           .decision = "cancel_pending_prefetch",
+                                           .reason = "target finalize cancels active prefetch without terminal apply",
+                                           .accepted = false,
+                                           .requested_pages = op.requested_host_pages,
+                                           .candidate_pages = static_cast<uint64_t>(op.planned_pages.size()),
+                                           .hit_pages = static_cast<uint64_t>(op.hit_pages.size()),
+                                           .reserved_pages = op.reserved_host_pages,
+                                           .threshold_pages = policy_.prefetch_threshold_pages(),
+                                           .pages = op.planned_pages,
+                                       });
             scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
                                                      HiCachePrefetchState::Suppressed,
                                                      HiCacheOperationState::Cancelled,
@@ -62,32 +64,32 @@ std::vector<HiCacheStateTransition> HiCacheState::finalize(HiCacheSummary & summ
             const auto ref = scope.refs.release_owner(scope.tree, op.header.owner);
             sync_capacity_for_ref(scope, scope_name, ref, "prefetch_finalize_ref_release");
             sync_capacity(scope, scope_name, {}, "prefetch_finalize_reservation");
-            record_transition(fact, summary, transitions, "prefetch_suppressed", "prefetch", op.planned_pages, before);
+            if constexpr (debug_records_enabled()) record_transition(fact, summary, transitions, "prefetch_suppressed", "prefetch", op.planned_pages, before);
         }
         for (auto & op : scope.async_ops.prefetch_ops() | std::views::values) {
             if (op.reserved_host_pages == 0) continue;
             const auto released_pages = op.reserved_host_pages;
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .operation_id = op.header.operation_id,
-                                       .policy_area = "prefetch_finalize",
-                                       .policy_name = "prefetch_host_release_queue",
-                                       .decision = "release_unadmitted_prefetch_pending_host_pages",
-                                       .reason = "finalize releases terminal prefetch host reservation that had no later request admission drain",
-                                       .accepted = true,
-                                       .requested_pages = op.requested_host_pages,
-                                       .candidate_pages = static_cast<uint64_t>(op.planned_pages.size()),
-                                       .hit_pages = static_cast<uint64_t>(op.hit_pages.size()),
-                                       .reserved_pages = released_pages,
-                                       .allocator_released_pages = released_pages,
-                                       .threshold_pages = policy_.prefetch_threshold_pages(),
-                                       .pages = op.planned_pages,
-                                   });
+            if constexpr (debug_records_enabled())
+                record_policy_decision(fact,
+                                       HiCachePolicyDecisionRecord{
+                                           .operation_id = op.header.operation_id,
+                                           .policy_area = "prefetch_finalize",
+                                           .policy_name = "prefetch_host_release_queue",
+                                           .decision = "release_unadmitted_prefetch_pending_host_pages",
+                                           .reason = "finalize releases terminal prefetch host reservation that had no later cache extend drain",
+                                           .accepted = true,
+                                           .requested_pages = op.requested_host_pages,
+                                           .candidate_pages = static_cast<uint64_t>(op.planned_pages.size()),
+                                           .hit_pages = static_cast<uint64_t>(op.hit_pages.size()),
+                                           .reserved_pages = released_pages,
+                                           .allocator_released_pages = released_pages,
+                                           .threshold_pages = policy_.prefetch_threshold_pages(),
+                                           .pages = op.planned_pages,
+                                       });
             op.reserved_host_pages = 0;
             sync_capacity(scope, scope_name, {}, "prefetch_finalize_pending_host_release");
         }
     }
-    return transitions;
 }
 
 

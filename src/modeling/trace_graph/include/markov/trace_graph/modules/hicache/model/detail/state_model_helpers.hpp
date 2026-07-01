@@ -98,9 +98,9 @@ inline uint64_t ceil_div(uint64_t value, uint64_t divisor) {
 /**
  * @brief 一次 SGLang extend allocator batch 的语义化输入。
  *
- * 当前 trace 还没有 `ScheduleBatch` 粒度 state-model fact，因此调用方显式传入
- * resolved policy 中的 `batch_size=1`。结构体保留 batch 语义字段，后续接入
- * `extend_allocation_intent` 后只需要替换构造来源，不需要重写 capacity 链路。
+ * `cache_extend_input` 提供 batch-level state-model fact；调用方可以用真实 batch size
+ * 汇总 eviction pressure，也可以在构造单个 request intent 时传入 1 只计算该 request
+ * 自身新增 page 数。
  */
 struct ExtendAllocationIntent {
     uint64_t batch_size = 1;
@@ -144,7 +144,7 @@ inline uint64_t extend_allocated_pages(uint64_t seq_tokens, uint64_t prefix_toke
 }
 
 /**
- * @brief 用当前显式 single-request batch 合同构造 extend allocation intent。
+ * @brief 构造 extend allocation intent。
  */
 inline ExtendAllocationIntent make_extend_allocation_intent(uint64_t token_count, uint64_t prefix_tokens, uint64_t page_size, uint64_t batch_size) {
     auto intent = ExtendAllocationIntent{

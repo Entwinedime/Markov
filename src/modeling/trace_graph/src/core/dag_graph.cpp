@@ -180,7 +180,7 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     std::vector<size_t> node_offsets(graphs.size() + 1, 0);
     /**
      * @warning HCCL group 的 key 当前只使用 kernel name，value 是 graph_index -> global node ids。
-     * 这是老版兼容策略；如果能拿到 group/correlation，应验证是否需要收窄匹配条件。
+     * 如果后续能稳定采到 group/correlation，应把匹配条件收窄到更精确的通信身份。
      */
     std::unordered_map<std::string, std::unordered_map<int, std::vector<size_t>>> hccl_groups;
     uint64_t real_min = 0;

@@ -19,22 +19,20 @@ struct RoleMapping {
 };
 
 constexpr std::array kRoles = {
-    RoleMapping{ "request_bound_match_anchor", HiCacheFactRole::RequestBoundMatchAnchor },
-    RoleMapping{   "request_lifecycle_anchor",  HiCacheFactRole::RequestLifecycleAnchor },
-    RoleMapping{          "request_admission",        HiCacheFactRole::RequestAdmission },
-    RoleMapping{          "prefetch_decision",        HiCacheFactRole::PrefetchDecision },
-    RoleMapping{       "prefetch_check_point",      HiCacheFactRole::PrefetchCheckPoint },
+    RoleMapping{ "prefetch_candidate_anchor", HiCacheFactRole::PrefetchCandidateAnchor },
+    RoleMapping{        "cache_lookup_input",        HiCacheFactRole::CacheLookupInput },
+    RoleMapping{        "cache_extend_input",        HiCacheFactRole::CacheExtendInput },
+    RoleMapping{    "cache_lifecycle_commit",    HiCacheFactRole::CacheLifecycleCommit },
 };
 
 /**
  * @brief 需要 target page projection 的 role。
  *
- * checkpoint role 只提供调度边界，不携带 path；其他 state-model role 都必须能从
- * fact-local span/dictionary 解析出 token path，不能从 request timeline 猜测补齐。
+ * scalar workload role 必须能从 fact-local span/dictionary 解析出 token path；
+ * batch workload role 使用 batch path 数组，不能从 request timeline 猜测补齐。
  */
 bool needs_full_path(HiCacheFactRole role) {
-    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestLifecycleAnchor || role == HiCacheFactRole::RequestAdmission
-           || role == HiCacheFactRole::PrefetchDecision;
+    return role == HiCacheFactRole::PrefetchCandidateAnchor || role == HiCacheFactRole::CacheLookupInput || role == HiCacheFactRole::CacheLifecycleCommit;
 }
 
 bool has_projectable_path(const HiCacheFact & fact, uint64_t effective_page_size) {
@@ -42,36 +40,42 @@ bool has_projectable_path(const HiCacheFact & fact, uint64_t effective_page_size
     return hicache_fact_has_resolved_full_path(fact);
 }
 
+bool has_projectable_batch_paths(const HiCacheFact & fact) {
+    if (fact.batch_paths.empty()) return false;
+    return std::ranges::all_of(fact.batch_paths, [](const auto & entry) {
+        if (entry.request_id.empty() || !entry.full_path_span.valid) return false;
+        if (entry.full_path_span.token_count == 0) return entry.full_path_span.begin == entry.full_path_span.end;
+        return static_cast<uint64_t>(entry.full_path_tokens.size()) == entry.full_path_span.token_count;
+    });
+}
+
 /**
  * @brief 当前 C++ state model 的 class/role 白名单。
  *
  * 这张表是 active 输入合同的一部分。新增可建模 fact 时必须同时更新 probe
- * catalog、Python quality gate 和这里的 router；未知组合不进入兼容分支。
+ * catalog、Python quality gate 和这里的 router；未知组合不进入 state model。
  */
 bool state_model_class_role(const HiCacheFact & fact) {
-    if (fact.fact_class == "workload_identity") {
-        return fact.role == "request_bound_match_anchor" || fact.role == "request_lifecycle_anchor" || fact.role == "request_admission";
-    }
-    if (fact.fact_class == "target_policy_input") return fact.role == "prefetch_decision";
-    if (fact.fact_class == "runtime_model_checkpoint") return fact.role == "prefetch_check_point";
-    return false;
+    if (fact.fact_class != "workload_identity") return false;
+    return fact.role == "prefetch_candidate_anchor" || fact.role == "cache_lookup_input" || fact.role == "cache_extend_input"
+           || fact.role == "cache_lifecycle_commit";
 }
 
 bool completed_model_phase(const HiCacheFact & fact, HiCacheFactRole role) {
     /**
-     * @brief workload/policy fact 只有 completed phase 能驱动模型。
+     * @brief state model fact 的可消费 phase 是 active 输入合同的一部分。
      *
-     * 这些 fact 是 duration event，只有 end phase 表示字段完整；runtime checkpoint
-     * 是 instant event，本身就是完整事实。
+     * `cache_extend_input` 必须在 `prepare_for_extend` start phase 读取，其他
+     * workload identity fact 使用 completed end phase。
      */
-    if (role == HiCacheFactRole::PrefetchCheckPoint) return fact.phase == "instant";
-    if (role == HiCacheFactRole::Unknown && fact.fact_class == "runtime_model_checkpoint" && fact.phase == "instant") return true;
+    if (role == HiCacheFactRole::CacheExtendInput) return fact.is_start;
     return fact.is_end;
 }
 
 } // namespace router_detail
 
 using router_detail::completed_model_phase;
+using router_detail::has_projectable_batch_paths;
 using router_detail::has_projectable_path;
 using router_detail::kRoles;
 using router_detail::needs_full_path;
@@ -104,8 +108,8 @@ HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact) {
 }
 
 bool hicache_fact_role_implemented(HiCacheFactRole role) {
-    return role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestLifecycleAnchor || role == HiCacheFactRole::RequestAdmission
-           || role == HiCacheFactRole::PrefetchDecision || role == HiCacheFactRole::PrefetchCheckPoint;
+    return role == HiCacheFactRole::PrefetchCandidateAnchor || role == HiCacheFactRole::CacheLookupInput || role == HiCacheFactRole::CacheExtendInput
+           || role == HiCacheFactRole::CacheLifecycleCommit;
 }
 
 std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role, uint64_t effective_page_size) {
@@ -116,12 +120,29 @@ std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, 
     }
     if (fact.cache_scope.empty()) errors.push_back("missing_cache_scope");
     if (fact.seq_no == 0) errors.push_back("missing_seq_no");
-    if ((role == HiCacheFactRole::RequestBoundMatchAnchor || role == HiCacheFactRole::RequestLifecycleAnchor || role == HiCacheFactRole::RequestAdmission
-         || role == HiCacheFactRole::PrefetchDecision || role == HiCacheFactRole::PrefetchCheckPoint)
+    if ((role == HiCacheFactRole::PrefetchCandidateAnchor || role == HiCacheFactRole::CacheLookupInput || role == HiCacheFactRole::CacheLifecycleCommit)
         && fact.request_id.empty())
         errors.push_back("missing_request_id");
-    if (role == HiCacheFactRole::RequestLifecycleAnchor && fact.lifecycle_kind.empty()) errors.push_back("missing_lifecycle_kind");
-    if (role == HiCacheFactRole::RequestAdmission && fact.admission_kind.empty()) errors.push_back("missing_admission_kind");
+    if (role == HiCacheFactRole::CacheLifecycleCommit && fact.lifecycle_kind.empty()) errors.push_back("missing_lifecycle_kind");
+    if (role == HiCacheFactRole::CacheExtendInput) {
+        if (fact.batch_kind != "extend") errors.push_back("missing_batch_kind_extend");
+        if (!fact.batch_request_ids_array) errors.push_back("request_ids_not_array");
+        if (!fact.batch_positions_array) errors.push_back("request_positions_not_array");
+        if (!fact.batch_token_dictionaries_array) errors.push_back("token_dictionaries_not_array");
+        if (!fact.batch_spans_array) errors.push_back("full_path_spans_not_array");
+        if (!fact.batch_token_counts_array) errors.push_back("token_counts_not_array");
+        if (fact.batch_paths.empty()) errors.push_back("missing_batch_paths");
+        if (fact.batch_request_id_count == 0) errors.push_back("missing_batch_request_ids");
+        if (fact.batch_size != fact.batch_paths.size()) errors.push_back("batch_size_mismatch");
+        if (fact.batch_position_count != fact.batch_request_id_count) errors.push_back("request_positions_length_mismatch");
+        if (fact.batch_token_dictionary_count != fact.batch_request_id_count) errors.push_back("token_dictionaries_length_mismatch");
+        if (fact.batch_span_count != fact.batch_request_id_count) errors.push_back("full_path_spans_length_mismatch");
+        if (fact.batch_token_count_count != fact.batch_request_id_count) errors.push_back("token_counts_length_mismatch");
+        if (!fact.batch_request_ids_unique) errors.push_back("duplicate_batch_request_id");
+        if (!fact.batch_positions_cover_indexes) errors.push_back("request_positions_coverage");
+        if (!fact.batch_positions_match_request_ids) errors.push_back("request_positions_request_id_mismatch");
+        if (!has_projectable_batch_paths(fact)) errors.push_back("batch_token_dictionary_or_full_path_span");
+    }
     if (needs_full_path(role) && !has_projectable_path(fact, effective_page_size)) errors.push_back("token_dictionary_or_full_path_span");
     return errors;
 }

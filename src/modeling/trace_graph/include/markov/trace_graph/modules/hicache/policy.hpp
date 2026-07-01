@@ -40,8 +40,6 @@ struct HiCacheResolvedPolicyState {
     std::string prefetch_capacity_limit_source;
     std::string host_cleanup_budget_rule;
     std::string host_cleanup_budget_source;
-    uint64_t extend_allocation_batch_size = 1;
-    std::string extend_allocation_batch_source;
     std::string extend_allocation_rule;
     bool device_allocator_need_sort = false;
     std::string device_allocator_need_sort_source;
@@ -60,7 +58,7 @@ struct HiCacheResolvedPolicyState {
 /**
  * @brief 单次 runtime policy 分支的审计记录。
  *
- * resolved policy 解释静态配置来源；该记录解释某个 request/checkpoint 在当时的
+ * resolved policy 解释静态配置来源；该记录解释某个 request/boundary 在当时的
  * target state 下为什么被接受、拒绝、等待或截断。
  */
 struct HiCachePolicyDecisionRecord {
@@ -81,8 +79,13 @@ struct HiCachePolicyDecisionRecord {
     uint64_t hit_pages = 0;
     uint64_t hit_count = 0;
     uint64_t batch_size = 0;
+    uint64_t accepted_tokens = 0;
+    uint64_t target_device_prefix_tokens = 0;
+    uint64_t prior_committed_prefix_tokens = 0;
+    uint64_t allocation_prefix_tokens = 0;
     uint64_t extend_tokens = 0;
     uint64_t allocated_pages = 0;
+    uint64_t active_request_pages = 0;
     uint64_t active_requested_pages = 0;
     uint64_t capacity_pages = 0;
     uint64_t occupied_pages = 0;
@@ -130,11 +133,8 @@ public:
     /** @brief 判断 active prefetch page 是否已经触发 target rate limit。 */
     [[nodiscard]] bool prefetch_rate_limited(uint64_t active_requested_pages) const;
 
-    /** @brief 判断当前 checkpoint 是否已经超过 target prefetch timeout。 */
-    [[nodiscard]] bool prefetch_timeout_elapsed(uint64_t enqueue_ts, uint64_t checkpoint_ts, uint64_t token_count) const;
-
-    /** @brief SGLang paged extend allocation 使用的 batch size 投影。 */
-    [[nodiscard]] uint64_t extend_allocation_batch_size() const { return resolved_.extend_allocation_batch_size; }
+    /** @brief 判断当前 target boundary 是否已经超过 target prefetch timeout。 */
+    [[nodiscard]] bool prefetch_timeout_elapsed(uint64_t enqueue_ts, uint64_t boundary_ts, uint64_t token_count) const;
 
     /** @brief target L1/device capacity page 数。 */
     [[nodiscard]] uint64_t l1_capacity_pages() const { return resolved_.l1_capacity_pages; }

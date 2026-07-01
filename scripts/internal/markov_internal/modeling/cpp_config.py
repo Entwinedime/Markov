@@ -8,7 +8,7 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, resolve_repo_path
-from ..hicache.oracle_capacity import normalize_policy_value, optional_int
+from ..hicache.oracle.evidence.capacity import normalize_policy_value, optional_int
 
 
 def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) -> Path | None:
@@ -218,17 +218,29 @@ def trace_graph_executable(config: dict[str, Any]) -> Path:
     """解析 C++ trace_graph 可执行文件路径。"""
 
     cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
+    backend_kind = str(cpp.get("backend_kind") or "").strip().lower()
+    if backend_kind == "validation" or cpp.get("require_debug") is True:
+        executable = ROOT_DIR / "build/modeling/trace_graph-debug/trace_graph"
+        if executable.is_file():
+            return executable
+        raise FileNotFoundError(
+            "missing validation trace_graph executable at build/modeling/trace_graph-debug/trace_graph; "
+            "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
+            "-B build/modeling/trace_graph-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTRACE_GRAPH_DEBUG=ON "
+            "&& cmake --build build/modeling/trace_graph-debug --target trace_graph -j2'"
+        )
     if isinstance(cpp.get("executable"), str):
         executable = required_repo_path(cpp["executable"])
         if executable.is_file():
             return executable
-    executable = ROOT_DIR / "build/modeling/trace_graph/trace_graph"
+    executable = ROOT_DIR / "build/modeling/trace_graph-release/trace_graph"
     if executable.is_file():
         return executable
     raise FileNotFoundError(
-        "missing trace_graph executable at build/modeling/trace_graph/trace_graph; "
-        "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja "
-        "&& cmake --build build/modeling/trace_graph --target trace_graph -j2'"
+        "missing release trace_graph executable at build/modeling/trace_graph-release/trace_graph; "
+        "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
+        "-B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF "
+        "&& cmake --build build/modeling/trace_graph-release --target trace_graph -j2'"
     )
 
 

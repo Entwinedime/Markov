@@ -8,26 +8,26 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import resolve_repo_path
-from ..hicache.oracle_coverage import (
+from ..hicache.oracle.evidence.coverage import (
     build_request_transition_coverage,
     build_transition_coverage,
 )
-from ..hicache.oracle_delta import (
+from ..hicache.oracle.diff.delta import (
     build_event_delta_validation,
     build_timeline_delta_validation,
 )
-from ..hicache.oracle_mismatch import (
+from ..hicache.oracle.diff.mismatch import (
     first_hicache_mismatch,
 )
-from ..hicache.oracle_records import (
+from ..hicache.oracle.snapshot.records import (
     load_predicted_state_records,
 )
-from ..hicache.oracle_capacity import (
+from ..hicache.oracle.evidence.capacity import (
     build_hicache_capacity_config_audit,
     extract_hicache_capacity_oracle_state,
     observed_max_derived_state_counts,
 )
-from ..hicache.oracle_state import (
+from ..hicache.oracle.snapshot.state import (
     diff_hicache_sets,
     event_base_name,
     extract_hicache_state_snapshots,
@@ -251,7 +251,9 @@ def build_hicache_state_validation_if_enabled(
 
     oracle_paths = list(oracle_trace_paths_override or [])
     if not oracle_paths:
-        oracle_paths = [required_repo_path(path) for path in hicache_cfg.get("oracle_trace_paths", []) if isinstance(path, str)]
+        oracle_paths = [
+            required_repo_path(path) for path in hicache_cfg.get("oracle_trace_paths", []) if isinstance(path, str)
+        ]
     if not oracle_paths:
         oracle_paths = trace_paths
     oracle_required = bool(hicache_cfg.get("require_oracle_state_trace", False))
@@ -286,11 +288,15 @@ def build_hicache_state_validation_if_enabled(
     transition_coverage = build_transition_coverage(predicted_records, snapshots)
     event_delta_validation = build_event_delta_validation(predicted_records, snapshots)
     timeline_delta_validation = build_timeline_delta_validation(predicted_records, snapshots)
-    skipped_non_state_model = int(hicache_summary.get("skipped_non_state_model_events", 0) or 0) if hicache_summary else 0
+    skipped_non_state_model = (
+        int(hicache_summary.get("skipped_non_state_model_events", 0) or 0) if hicache_summary else 0
+    )
     missing_state_model_facts = []
     missing_state_model_counts = hicache_summary.get("missing_state_model_facts", {}) if hicache_summary else {}
     if isinstance(missing_state_model_counts, dict):
-        missing_state_model_facts.extend(sorted(str(key) for key, value in missing_state_model_counts.items() if int(value or 0) > 0))
+        missing_state_model_facts.extend(
+            sorted(str(key) for key, value in missing_state_model_counts.items() if int(value or 0) > 0)
+        )
 
     return {
         "state_trace_ready": bool(snapshots),
@@ -323,7 +329,9 @@ def build_hicache_state_validation_if_enabled(
         "unmatched_state_trace_events": 0 if snapshots else None,
         "state_model_fact_ready": bool(hicache_summary) and not missing_state_model_facts,
         "missing_state_model_facts": missing_state_model_facts,
-        "missing_state_model_fact_counts": missing_state_model_counts if isinstance(missing_state_model_counts, dict) else {},
+        "missing_state_model_fact_counts": missing_state_model_counts
+        if isinstance(missing_state_model_counts, dict)
+        else {},
         "oracle_trace_files": [str(path) for path in oracle_paths],
         "model_summary_ready": bool(hicache_summary),
         "predicted_state_trace_path": str(predicted_state_trace_path) if predicted_state_trace_path else None,

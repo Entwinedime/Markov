@@ -5,16 +5,15 @@
  * CLI 只负责把输入 trace、model config、模块执行和 summary 输出串成稳定 workflow；
  * 建模判断保留在 DagBuilder、SimulationModule 和 diagnostics 层。
  */
+#include "markov/trace_graph/cli/debug_support.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/frontend/trace_normalizer.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
-#include "markov/trace_graph/modules/diagnostics/json_summary_writer.hpp"
 #include "markov/trace_graph/modules/hicache/hicache_module.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 #include "markov/trace_graph/modules/node_scale/node_scale_module.hpp"
-#include "markov/trace_graph/modules/validation/validation_runner.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <nlohmann/json.hpp>
@@ -85,7 +84,7 @@ bool consume_value(int & i, int argc, char ** argv, std::string & out, const std
 
 CliOptions parse_cli(int argc, char ** argv) {
     /**
-     * @brief CLI 只保留当前主线需要的参数，不再提供旧版 --scale/-s 等快捷入口。
+     * @brief CLI 只保留当前主线需要的参数，不提供 --scale/-s 等快捷入口。
      *
      * what-if 必须通过 --model-config 进入 C++ SimulationModule。
      */
@@ -163,21 +162,6 @@ void write_json_file(const std::string & filename, const Json & value) {
     ofs << value.dump(2) << "\n";
 }
 
-void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<SimulationModule>> & modules) {
-    /**
-     * @brief summary 只收集已经 apply 且声明 has_summary 的模块。
-     *
-     * 默认预测输出不读取 summary，避免 debug 信息参与功能路径。
-     */
-    Json root;
-    root["modules"] = Json::array();
-    std::ranges::for_each(modules, [&](const auto & module) {
-        if (!module || !module->has_summary()) return;
-        root["modules"].push_back(Json::parse(markov::trace_graph::modules::diagnostics::module_summary_json(*module)));
-    });
-    write_json_file(filename, root);
-}
-
 void write_run_summary(const std::string & filename, const CliOptions & opts, const DagGraph & graph, const Json & stage_timings) {
     /**
      * @brief run_summary 是 runner/validation 使用的辅助输出。
@@ -214,7 +198,6 @@ using cli_detail::Json;
 using cli_detail::Logger;
 using cli_detail::parse_cli;
 using cli_detail::print_usage;
-using cli_detail::write_module_summary;
 using cli_detail::write_run_summary;
 
 int main(int argc, char ** argv) {
@@ -270,13 +253,7 @@ int main(int argc, char ** argv) {
             logger.info() << "Applying module: " << module->name();
             module->apply(graph);
         });
-#ifdef DEBUG
-        const auto module_validation = markov::trace_graph::modules::validation::validate_applied_modules(modules);
-        for (const auto & issue : module_validation.issues) {
-            logger.warn() << "validation/" << markov::trace_graph::modules::validation::validation_severity_name(issue.severity) << " " << issue.subject << ": "
-                          << issue.message;
-        }
-#endif
+        markov::trace_graph::cli::validate_modules(modules, logger);
         auto module_end = std::chrono::steady_clock::now();
         timings["module_ms"] = elapsed_ms(module_start, module_end);
 
@@ -288,7 +265,7 @@ int main(int argc, char ** argv) {
         auto simulation_end = std::chrono::steady_clock::now();
         timings["simulation_ms"] = elapsed_ms(simulation_start, simulation_end);
         if (!opts.graph_output.empty()) markov::trace_graph::io::write_chrome_trace_dag(opts.graph_output, graph, opts.full_output);
-        if (!opts.model_summary_file.empty()) write_module_summary(opts.model_summary_file, modules);
+        if (!opts.model_summary_file.empty()) markov::trace_graph::cli::write_module_summary(opts.model_summary_file, modules);
         write_run_summary(opts.run_summary_file, opts, graph, timings);
     }
     catch (const std::exception & e) {

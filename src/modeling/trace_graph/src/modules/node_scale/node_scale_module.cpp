@@ -67,7 +67,7 @@ void NodeScaleModule::apply(core::DagGraph & graph) {
         if (!read_u64(graph.node(node_id).attrs, "ori_time", original_time)) continue;
 
         /**
-         * @brief 旧 C++ 图对极短 CPU 节点保留固定开销。
+         * @brief base DAG 对极短 CPU 节点保留固定开销。
          *
          * 子模块沿用该约定以保持 base DAG 行为。3000ns 以下节点不缩放，
          * 3000ns 以上只缩放超出固定开销的部分。
@@ -78,7 +78,8 @@ void NodeScaleModule::apply(core::DagGraph & graph) {
         /**
          * @warning 如果节点带 cpuinterval，缩放后会把 interval 也加到节点耗时上。
          *
-         * 这沿用旧逻辑，但与拓扑仿真中的 interval 计入方式存在交叉，需要审查是否重复计入。
+         * 当前缩放规则保留 interval 加法，但与拓扑仿真中的 interval 计入方式存在交叉，
+         * 需要审查是否重复计入。
          */
         uint64_t cpu_interval = 0;
         if (read_u64(graph.node(node_id).attrs, "cpuinterval", cpu_interval)) new_time += cpu_interval;

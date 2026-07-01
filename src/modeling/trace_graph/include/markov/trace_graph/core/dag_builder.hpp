@@ -21,7 +21,7 @@ namespace markov::trace_graph::core {
  * - 同 device stream/lane 的顺序边；
  * - runtime launch 到 kernel 的 correlation 边；
  * - event/stream sync 边；
- * - 少量老版 TraceGraph 兼容的 notify/model_execute 边。
+ * - notify/model_execute 这类模型执行同步锚点边。
  *
  * what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
  */

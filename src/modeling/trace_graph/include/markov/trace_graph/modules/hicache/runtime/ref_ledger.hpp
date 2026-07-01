@@ -113,19 +113,26 @@ public:
     /** @brief 所有 owner 记录。 */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheRefOwnerRecord> & owners() const { return owners_; }
 
+#ifdef DEBUG
     /** @brief ref lifecycle mutation 的审计 trace。 */
     [[nodiscard]] const std::vector<HiCacheRefMutation> & mutation_trace() const { return mutation_trace_; }
 
     /** @brief 审计 ledger 与 tree ref counter 是否一致。 */
     [[nodiscard]] HiCacheRefAudit audit(const HiCacheTokenRadixTree & tree) const;
+#endif
 
     /** @brief 当前 active owner 数。 */
     [[nodiscard]] uint64_t active_owner_count() const;
 
+    /** @brief 已记录的 ref mutation 次数。 */
+    [[nodiscard]] uint64_t mutation_count() const { return epoch_; }
+
 private:
     uint64_t epoch_ = 0;
     std::unordered_map<std::string, HiCacheRefOwnerRecord> owners_;
+#ifdef DEBUG
     std::vector<HiCacheRefMutation> mutation_trace_;
+#endif
 
     [[nodiscard]] HiCacheRefOwnerRecord & ensure_owner(const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
                                                        const std::string & operation_id);

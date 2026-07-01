@@ -69,6 +69,7 @@ def write_report(report: MergeReport, report_path: str) -> None:
     with open(report_path, "w", encoding="utf-8") as report_file:
         json.dump(report.to_dict(), report_file, indent=2, sort_keys=True)
 
+
 def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dict]]:
     """读取 Chrome trace JSON。
 
@@ -82,7 +83,7 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
         return None, []
 
     logging.info(f"Loading '{file_path}' ...")
-    with open(file_path, 'r', encoding='utf-8') as file_object:
+    with open(file_path, "r", encoding="utf-8") as file_object:
         content = file_object.read().strip()
 
     if auto_repair:
@@ -99,6 +100,7 @@ def load_trace(file_path: str, auto_repair: bool = False) -> Tuple[Any, List[Dic
         logging.error(f"Failed to parse JSON: {error}")
         return None, []
 
+
 def repair_trace_tail(content: str) -> str:
     """补齐流式 Chrome trace 常见的尾部未闭合。"""
 
@@ -113,22 +115,29 @@ def repair_trace_tail(content: str) -> str:
             return stripped[: end + 1].rstrip(",") + "\n]"
     return content
 
+
 def get_cann_pid(events: List[Dict]) -> int:
     """从 metadata event 中查找 CANN 进程 pid。"""
 
-    return next((
-        event.get("pid", 0) for event in events 
-        if event.get("name") == "process_name" and event.get("args", {}).get("name") == "CANN"
-    ), 0)
+    return next(
+        (
+            event.get("pid", 0)
+            for event in events
+            if event.get("name") == "process_name" and event.get("args", {}).get("name") == "CANN"
+        ),
+        0,
+    )
+
 
 def get_earliest_timestamp(events: List[Dict]) -> float:
     """读取 trace 中最早 timestamp，用于过滤 profiler 开始前的 sidecar 事件。"""
 
-    earliest = float('inf')
+    earliest = float("inf")
     for event in events:
-        if 'ts' in event:
-            earliest = min(earliest, float(event['ts']))
+        if "ts" in event:
+            earliest = min(earliest, float(event["ts"]))
     return earliest
+
 
 def build_custom_event_map(custom_events: List[Dict]) -> Dict[Tuple[int, str], Tuple[List[float], List[Dict]]]:
     """按 `(tid, name)` 建立 LD_PRELOAD event 查找表。"""
@@ -136,17 +145,16 @@ def build_custom_event_map(custom_events: List[Dict]) -> Dict[Tuple[int, str], T
     temp_map = defaultdict(list)
     for event in custom_events:
         if event.get("ph") == "X" and "args" in event:
-            temp_map[(event.get("tid"), event.get("name"))].append(
-                (float(event.get("ts", 0)), event["args"])
-            )
+            temp_map[(event.get("tid"), event.get("name"))].append((float(event.get("ts", 0)), event["args"]))
 
     custom_map = {}
     for key, values in temp_map.items():
         values.sort(key=lambda item: item[0])
         # 将 timestamp 与 args 分离，search 模式可以直接对 timestamp 数组做 bisect。
         custom_map[key] = ([item[0] for item in values], [item[1] for item in values])
-        
+
     return custom_map
+
 
 def inject_custom_args(profiler_event: Dict, custom_args: Dict):
     """把 LD_PRELOAD 采集到的 wrapper 参数注入 profiler event。"""
@@ -161,8 +169,15 @@ def inject_custom_args(profiler_event: Dict, custom_args: Dict):
 
     profiler_args.update(custom_args)
 
-def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int,
-                             earliest_profiler_ts: float, margin_us: float, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
+
+def execute_sequential_match(
+    profiler_events: List[Dict],
+    custom_map: Dict,
+    cann_pid: int,
+    earliest_profiler_ts: float,
+    margin_us: float,
+    tolerance_us: float,
+) -> Tuple[int, int, Dict[str, Any]]:
     """按同 key 顺序一一匹配 profiler event 和 LD_PRELOAD event。
 
     sequential 模式要求每个 `(tid, name)` 下 profiler/custom 数量完全一致，适合
@@ -179,7 +194,7 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
     }
 
     logging.info("Using 'sequential' matching mode.")
-    
+
     # 第一步：按 `(tid, name)` 分组，只处理 CANN pid 下能和 custom_map 对齐的 event。
     profiler_groups = defaultdict(list)
     for event in profiler_events:
@@ -192,37 +207,40 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
     # 第二步：分组内按 timestamp 顺序注入，超过 tolerance 的样本保留为未匹配。
     for key, profiler_event_list in profiler_groups.items():
         profiler_event_list.sort(key=lambda e: float(e.get("ts", 0)))
-        
+
         custom_timestamps, custom_args_list = custom_map[key]
-        
+
         valid_custom_indices = [
-            idx for idx, ts in enumerate(custom_timestamps) 
-            if ts >= earliest_profiler_ts - margin_us
+            idx for idx, ts in enumerate(custom_timestamps) if ts >= earliest_profiler_ts - margin_us
         ]
-        
+
         need_to_be_matched += len(profiler_event_list)
-        
+
         if len(profiler_event_list) != len(valid_custom_indices):
             diagnostics["count_mismatch_count"] += 1
-            logging.warning(f"Key {key}: Count mismatch. Profiler needs {len(profiler_event_list)}, "
-                            f"Custom has {len(valid_custom_indices)}. Skipping sequential match.")
+            logging.warning(
+                f"Key {key}: Count mismatch. Profiler needs {len(profiler_event_list)}, "
+                f"Custom has {len(valid_custom_indices)}. Skipping sequential match."
+            )
             continue
-            
+
         logging.info(f"Key {key}: Exact count match ({len(profiler_event_list)}). Injecting sequentially.")
-        
+
         for profiler_index, profiler_event in enumerate(profiler_event_list):
             custom_index = valid_custom_indices[profiler_index]
-            
+
             profiler_timestamp = float(profiler_event.get("ts", 0))
             custom_timestamp = custom_timestamps[custom_index]
             time_difference = abs(profiler_timestamp - custom_timestamp)
             diagnostics["max_match_diff_us"] = max(diagnostics["max_match_diff_us"], time_difference)
-            
+
             if time_difference > tolerance_us:
                 diagnostics["rejected_count"] += 1
-                logging.warning(f"Key {key}: Match rejected due to time diff {time_difference} us > tolerance {tolerance_us} us.")
+                logging.warning(
+                    f"Key {key}: Match rejected due to time diff {time_difference} us > tolerance {tolerance_us} us."
+                )
                 continue
-                
+
             if profiler_timestamp < custom_timestamp:
                 diagnostics["later_match_count"] += 1
 
@@ -231,8 +249,10 @@ def execute_sequential_match(profiler_events: List[Dict], custom_map: Dict, cann
 
     return need_to_be_matched, successfully_matched, diagnostics
 
-def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid: int,
-                         search_window: int, tolerance_us: float) -> Tuple[int, int, Dict[str, Any]]:
+
+def execute_search_match(
+    profiler_events: List[Dict], custom_map: Dict, cann_pid: int, search_window: int, tolerance_us: float
+) -> Tuple[int, int, Dict[str, Any]]:
     """用 timestamp 附近窗口搜索匹配 LD_PRELOAD event。
 
     search 模式允许 profiler/custom 数量不完全一致，但每个 custom event 只能被占用一次；
@@ -256,44 +276,48 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
         key = (event.get("tid"), event["name"])
         if key not in custom_map:
             continue
-            
+
         need_to_be_matched += 1
         profiler_ts = float(event.get("ts", 0))
         custom_timestamps, custom_args_list = custom_map[key]
 
         insert_index = bisect.bisect_right(custom_timestamps, profiler_ts)
-        
+
         candidates = []
         start_index = max(0, insert_index - search_window)
         end_index = min(len(custom_timestamps), insert_index + search_window)
-        
+
         for custom_index in range(start_index, end_index):
             time_difference = abs(profiler_ts - custom_timestamps[custom_index])
             if time_difference <= tolerance_us:
-                candidates.append({
-                    'diff': time_difference,
-                    'key': (key[0], key[1], custom_index),
-                    'args': custom_args_list[custom_index],
-                    'ts': custom_timestamps[custom_index]
-                })
+                candidates.append(
+                    {
+                        "diff": time_difference,
+                        "key": (key[0], key[1], custom_index),
+                        "args": custom_args_list[custom_index],
+                        "ts": custom_timestamps[custom_index],
+                    }
+                )
 
-        candidates.sort(key=lambda item: item['diff'])
-        
+        candidates.sort(key=lambda item: item["diff"])
+
         best_candidate = None
         fallback_triggered = False
-        
+
         for candidate in candidates:
-            candidate_key = candidate['key']
+            candidate_key = candidate["key"]
             if candidate_key in used_custom_indices:
                 fallback_triggered = True
                 diagnostics["occupied_collision_count"] += 1
-                logging.warning(f"Custom event {candidate_key} at {candidate['ts']} is already occupied by earlier profiler event at {used_custom_indices[candidate_key]}.\n"
-                                f"Profiler event '{event['name']}' at {profiler_ts} trying next best.")
+                logging.warning(
+                    f"Custom event {candidate_key} at {candidate['ts']} is already occupied by earlier profiler event at {used_custom_indices[candidate_key]}.\n"
+                    f"Profiler event '{event['name']}' at {profiler_ts} trying next best."
+                )
                 continue
 
-            if profiler_ts < candidate['ts']:
+            if profiler_ts < candidate["ts"]:
                 diagnostics["later_match_count"] += 1
-            
+
             best_candidate = candidate
             break
 
@@ -301,14 +325,17 @@ def execute_search_match(profiler_events: List[Dict], custom_map: Dict, cann_pid
             diagnostics["max_match_diff_us"] = max(diagnostics["max_match_diff_us"], best_candidate["diff"])
             if fallback_triggered:
                 diagnostics["fallback_count"] += 1
-                logging.warning(f"Profiler event '{event['name']}' at {profiler_ts} used fallback custom event "
-                                f"with {best_candidate['diff']} us difference.")
+                logging.warning(
+                    f"Profiler event '{event['name']}' at {profiler_ts} used fallback custom event "
+                    f"with {best_candidate['diff']} us difference."
+                )
 
-            used_custom_indices[best_candidate['key']] = profiler_ts
-            inject_custom_args(event, best_candidate['args'])
+            used_custom_indices[best_candidate["key"]] = profiler_ts
+            inject_custom_args(event, best_candidate["args"])
             successfully_matched += 1
 
     return need_to_be_matched, successfully_matched, diagnostics
+
 
 def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: List[Dict], cutoff_ts: float) -> int:
     """把不需要匹配 profiler event 的事实事件直接附加到 merged trace。"""
@@ -322,6 +349,7 @@ def append_unmatched_custom_events(profiler_events: List[Dict], custom_events: L
     logging.info(f"Appended {appended_count} standalone custom events to the merged trace.")
     return appended_count
 
+
 def should_append_standalone_event(event: Dict[str, Any]) -> bool:
     """判断 custom event 是否应作为独立事实保留。"""
 
@@ -334,7 +362,10 @@ def should_append_standalone_event(event: Dict[str, Any]) -> bool:
     domain = str(args.get("domain") or event.get("cat") or "").lower()
     return domain in {"hicache", "cache_io", "python_probe"}
 
-def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List[str]) -> Tuple[int, List[Dict[str, Any]]]:
+
+def append_sidecar_trace_events(
+    profiler_events: List[Dict], sidecar_paths: List[str]
+) -> Tuple[int, List[Dict[str, Any]]]:
     """附加 Python probe sidecar trace，并返回可审计的路径明细。"""
 
     appended_count = 0
@@ -352,14 +383,31 @@ def append_sidecar_trace_events(profiler_events: List[Dict], sidecar_paths: List
         logging.info(f"Appended {appended_count} sidecar trace events.")
     return appended_count, details
 
+
 def sort_events(events: List[Dict[str, Any]]) -> None:
     """按 Chrome trace 可读性稳定排序 merged event。"""
 
-    events.sort(key=lambda event: (float(event.get("ts", 0) or 0), str(event.get("pid", "")), str(event.get("tid", "")), str(event.get("name", ""))))
+    events.sort(
+        key=lambda event: (
+            float(event.get("ts", 0) or 0),
+            str(event.get("pid", "")),
+            str(event.get("tid", "")),
+            str(event.get("name", "")),
+        )
+    )
 
-def merge_traces(profiler_path: str, custom_path: str, out_path: str,
-                 tolerance_us: float = 10000.0, search_window: int = 5, margin_us: float = 0.0, mode: str = "search",
-                 sidecar_paths: Optional[List[str]] = None, report_path: Optional[str] = None) -> Dict[str, Any]:
+
+def merge_traces(
+    profiler_path: str,
+    custom_path: str,
+    out_path: str,
+    tolerance_us: float = 10000.0,
+    search_window: int = 5,
+    margin_us: float = 0.0,
+    mode: str = "search",
+    sidecar_paths: Optional[List[str]] = None,
+    report_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """合并单组 torch profiler、LD_PRELOAD 和可选 Python sidecar trace。"""
 
     report = MergeReport(
@@ -412,26 +460,35 @@ def merge_traces(profiler_path: str, custom_path: str, out_path: str,
         logging.warning(f"Matched {matched} out of {need_match} events. Some events missing/not properly merged.")
     else:
         logging.info(f"Successfully matched and injected args into {matched} events.")
-        
+
     cutoff_ts = earliest_profiler_ts - margin_us
     report.standalone_custom_appended = append_unmatched_custom_events(profiler_events, custom_events, cutoff_ts)
-    report.sidecar_events_appended, report.sidecar_details = append_sidecar_trace_events(profiler_events, sidecar_paths or [])
+    report.sidecar_events_appended, report.sidecar_details = append_sidecar_trace_events(
+        profiler_events, sidecar_paths or []
+    )
     sort_events(profiler_events)
 
     logging.info(f"Saving merged trace to '{out_path}' ...")
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, 'w', encoding='utf-8') as output_file:
+    with open(out_path, "w", encoding="utf-8") as output_file:
         json.dump(raw_data, output_file)
 
     report.success = True
     if report_path:
         write_report(report, report_path)
-        
+
     logging.info("Merge complete! Drag it into https://ui.perfetto.dev to view.")
     return report.to_dict()
 
-def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000.0, search_window: int = 5,
-                   margin_us: float = 100.0, mode: str = "search") -> Dict[str, Any]:
+
+def merge_manifest(
+    manifest_path: str,
+    out_dir: str,
+    tolerance_us: float = 10000.0,
+    search_window: int = 5,
+    margin_us: float = 100.0,
+    mode: str = "search",
+) -> Dict[str, Any]:
     """按 profile_manifest.json 批量合并一次 profiling run 的所有 trace channel。"""
 
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
@@ -488,6 +545,7 @@ def merge_manifest(manifest_path: str, out_dir: str, tolerance_us: float = 10000
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return summary
 
+
 def existing_paths(items: Any) -> List[str]:
     """从 manifest 路径条目中筛出真实存在的文件。"""
 
@@ -505,6 +563,7 @@ def existing_paths(items: Any) -> List[str]:
                 paths.append(path)
     return paths
 
+
 def map_repo_path(path: str) -> str:
     """把容器内 trace-sim 路径映射回当前仓库路径。"""
 
@@ -512,8 +571,9 @@ def map_repo_path(path: str) -> str:
         if path == prefix:
             return str(Path(__file__).resolve().parents[2])
         if path.startswith(prefix + "/"):
-            return str(Path(__file__).resolve().parents[2] / path[len(prefix) + 1:])
+            return str(Path(__file__).resolve().parents[2] / path[len(prefix) + 1 :])
     return path
+
 
 def pid_from_path(path: str) -> Optional[str]:
     """从 trace 文件名中提取 pid，用于多进程 trace 对齐。"""
@@ -526,6 +586,7 @@ def pid_from_path(path: str) -> Optional[str]:
         return match.group(1)
     return None
 
+
 def select_by_pid_or_index(paths: List[str], pid: Optional[str], index: int) -> Optional[str]:
     """优先按 pid 选择 trace；缺 pid 时回退到输入顺序。"""
 
@@ -537,6 +598,7 @@ def select_by_pid_or_index(paths: List[str], pid: Optional[str], index: int) -> 
         return paths[index]
     return None
 
+
 def select_sidecars(paths: List[str], pid: Optional[str]) -> List[str]:
     """选择同 pid 的 Python sidecar；无法判定 pid 时保守返回全部 sidecar。"""
 
@@ -545,7 +607,10 @@ def select_sidecars(paths: List[str], pid: Optional[str]) -> List[str]:
     selected = [path for path in paths if pid_from_path(path) == pid]
     return selected or paths
 
-def merge_sidecar_only(ld_paths: List[str], sidecar_paths: List[str], out_path: str, report_path: str) -> Dict[str, Any]:
+
+def merge_sidecar_only(
+    ld_paths: List[str], sidecar_paths: List[str], out_path: str, report_path: str
+) -> Dict[str, Any]:
     """没有 torch trace 时生成 state-only merged trace。
 
     faithful replay / cache patch 仍应使用完整 torch+ld+python trace；这个 fallback
@@ -581,7 +646,10 @@ def merge_sidecar_only(ld_paths: List[str], sidecar_paths: List[str], out_path: 
     write_report(report, report_path)
     return report.to_dict()
 
-def copy_profiler_with_sidecars(profiler_path: str, out_path: str, sidecar_paths: List[str], report_path: str) -> Dict[str, Any]:
+
+def copy_profiler_with_sidecars(
+    profiler_path: str, out_path: str, sidecar_paths: List[str], report_path: str
+) -> Dict[str, Any]:
     """缺 LD_PRELOAD trace 时复制 profiler trace 并附加 Python sidecar。"""
 
     raw_data, profiler_events = load_trace(profiler_path)
@@ -613,20 +681,29 @@ def copy_profiler_with_sidecars(profiler_path: str, out_path: str, sidecar_paths
     write_report(report, report_path)
     return report.to_dict()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Merge Prefill, Decode, and Custom CPU Traces.")
-    parser.add_argument("--manifest", help="Path to profile_manifest.json; when set, merge all trace channels listed in manifest")
+    parser.add_argument(
+        "--manifest", help="Path to profile_manifest.json; when set, merge all trace channels listed in manifest"
+    )
     parser.add_argument("--out-dir", help="Output directory for manifest mode")
     parser.add_argument("--profiler", help="Path to profiler trace json")
     parser.add_argument("--custom", help="Path to custom cpu hook trace json")
     parser.add_argument("--out", help="Path to output merged json")
     parser.add_argument("--tolerance", type=float, default=10000.0, help="Max time difference in microseconds")
-    parser.add_argument("--window", type=int, default=5, help="Binary search neighbor window size (used in search mode)")
-    parser.add_argument("--margin", type=float, default=100.0, help="Margin in microseconds before earliest profiler event")
-    parser.add_argument("--mode", type=str, choices=["search", "sequential"], default="search", help="Matching logic mode")
+    parser.add_argument(
+        "--window", type=int, default=5, help="Binary search neighbor window size (used in search mode)"
+    )
+    parser.add_argument(
+        "--margin", type=float, default=100.0, help="Margin in microseconds before earliest profiler event"
+    )
+    parser.add_argument(
+        "--mode", type=str, choices=["search", "sequential"], default="search", help="Matching logic mode"
+    )
     parser.add_argument("--sidecar", action="append", default=[], help="Additional Chrome trace JSON to append")
     parser.add_argument("--report", help="Optional JSON merge report output")
-    
+
     args = parser.parse_args()
 
     if args.manifest:
@@ -636,4 +713,14 @@ if __name__ == "__main__":
     else:
         if not args.profiler or not args.custom or not args.out:
             parser.error("single-file mode requires --profiler, --custom and --out")
-        merge_traces(args.profiler, args.custom, args.out, args.tolerance, args.window, args.margin, args.mode, args.sidecar, args.report)
+        merge_traces(
+            args.profiler,
+            args.custom,
+            args.out,
+            args.tolerance,
+            args.window,
+            args.margin,
+            args.mode,
+            args.sidecar,
+            args.report,
+        )

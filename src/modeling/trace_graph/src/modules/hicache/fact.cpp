@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 
 namespace markov::trace_graph::modules::hicache {
 
@@ -38,16 +39,10 @@ std::string lower_copy(std::string text) {
     return text;
 }
 
-bool bool_value(const TraceEvent & event, const std::string & key, bool fallback) {
-    if (!event.has_arg(key)) return fallback;
-    const auto value = lower_copy(trim_copy(event.arg(key)));
-    if (value == "true" || value == "1" || value == "yes" || value == "on") return true;
-    if (value == "false" || value == "0" || value == "no" || value == "off") return false;
-    return fallback;
-}
-
-bool completed_event(const TraceEvent & event) {
+bool state_model_dictionary_phase(const TraceEvent & event, const std::string & fact_class, const std::string & role) {
+    if (fact_class != "workload_identity") return false;
     const auto phase = lower_copy(trim_copy(event.arg("phase")));
+    if (role == "cache_extend_input") return phase == "start";
     return phase == "end";
 }
 
@@ -104,6 +99,29 @@ uint64_t json_u64(const Json & object, const std::string & key, uint64_t fallbac
     return fallback;
 }
 
+uint64_t json_u64_value(const Json & value, uint64_t fallback = 0) {
+    try {
+        if (value.is_number_unsigned()) return value.get<uint64_t>();
+        if (value.is_number_integer()) {
+            const auto number = value.get<int64_t>();
+            return number >= 0 ? static_cast<uint64_t>(number) : fallback;
+        }
+        if (value.is_number_float()) {
+            const auto number = value.get<double>();
+            return number >= 0.0 ? static_cast<uint64_t>(number) : fallback;
+        }
+        if (value.is_string()) {
+            const auto text = trim_copy(value.get<std::string>());
+            if (text.empty() || lower_copy(text) == "none") return fallback;
+            const auto number = std::stod(text);
+            return number >= 0.0 ? static_cast<uint64_t>(number) : fallback;
+        }
+    }
+    catch (...) {
+    }
+    return fallback;
+}
+
 std::vector<std::string> json_strings(const Json & value) {
     std::vector<std::string> output;
     auto append = [&](const Json & item) {
@@ -121,6 +139,29 @@ std::vector<std::string> json_strings(const Json & value) {
     return output;
 }
 
+std::vector<uint64_t> json_u64_values(const Json & value) {
+    std::vector<uint64_t> output;
+    if (value.is_array()) {
+        output.reserve(value.size());
+        std::ranges::transform(value, std::back_inserter(output), [](const Json & item) { return json_u64_value(item); });
+    }
+    else if (!value.is_null()) { output.push_back(json_u64_value(value)); }
+    return output;
+}
+
+HiCacheTokenSpan token_span_from_json(const Json & value) {
+    HiCacheTokenSpan span;
+    if (!value.is_object()) return span;
+    span.path_id = json_string(value, "path_id");
+    if (span.path_id.empty()) span.path_id = json_string(value, "token_path_id");
+    span.begin = json_u64(value, "begin");
+    span.end = json_u64(value, "end");
+    span.token_count = json_u64(value, "token_count", span.end >= span.begin ? span.end - span.begin : 0);
+    span.hash_algo = json_string(value, "hash_algo");
+    span.valid = !span.path_id.empty() && span.end >= span.begin;
+    return span;
+}
+
 struct FactMetadata {
     std::string fact_class;
     std::string role;
@@ -128,10 +169,10 @@ struct FactMetadata {
 };
 
 /**
- * @brief 解析 catalog 写入的 fact envelope。
+ * @brief 解析 catalog 写入的 fact metadata。
  *
- * C++ 侧只接受当前 schema 中的 `class`、`role`、`consumers` 三元组。这里不做旧
- * role/旧字段兼容检测；历史 trace 如果不满足当前合同，会在普通 schema gate 中失败。
+ * C++ 侧只接受当前 schema 中的 `class`、`role`、`consumers` 三元组。
+ * 不满足当前合同的 trace 会在普通 schema gate 中失败。
  */
 FactMetadata fact_metadata_from_event(const TraceEvent & event) {
     FactMetadata metadata;
@@ -161,14 +202,15 @@ bool consumer_list_contains(const std::vector<std::string> & consumers, std::str
  */
 bool state_model_path_fact(const FactMetadata & metadata) {
     if (!consumer_list_contains(metadata.consumers, "hicache_state_model")) return false;
-    if (metadata.fact_class == "target_policy_input") return metadata.role == "prefetch_decision";
     if (metadata.fact_class != "workload_identity") return false;
-    return metadata.role == "request_bound_match_anchor" || metadata.role == "request_lifecycle_anchor" || metadata.role == "request_admission";
+    return metadata.role == "prefetch_candidate_anchor" || metadata.role == "cache_lookup_input" || metadata.role == "cache_extend_input"
+           || metadata.role == "cache_lifecycle_commit";
 }
 
 bool state_model_dictionary_source(const TraceEvent & event) {
-    if (!completed_event(event)) return false;
-    return state_model_path_fact(fact_metadata_from_event(event));
+    const auto metadata = fact_metadata_from_event(event);
+    if (!state_model_dictionary_phase(event, metadata.fact_class, metadata.role)) return false;
+    return state_model_path_fact(metadata);
 }
 
 std::vector<std::string> event_string_list(const TraceEvent & event, std::initializer_list<std::string_view> keys) {
@@ -231,17 +273,18 @@ HiCacheTokenPath slice_path(const HiCacheTokenPath & tokens, uint64_t begin, uin
 
 } // namespace fact_detail
 
-using fact_detail::bool_value;
 using fact_detail::consumer_list_contains;
 using fact_detail::event_string_list;
 using fact_detail::fact_metadata_from_event;
 using fact_detail::json_string;
 using fact_detail::json_u64;
+using fact_detail::json_u64_values;
 using fact_detail::lower_copy;
 using fact_detail::parse_json_arg;
 using fact_detail::slice_path;
 using fact_detail::state_model_dictionary_source;
 using fact_detail::token_path_from_json;
+using fact_detail::token_span_from_json;
 
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
     const auto target = lower_copy(event.arg("target_id"));
@@ -268,6 +311,10 @@ void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
 
 void HiCacheFactParser::observe_dictionary_value(const std::string & raw) {
     const auto value = parse_json_arg(raw);
+    if (value.is_array()) {
+        for (const auto & item : value) observe_dictionary_value(item.dump());
+        return;
+    }
     if (!value.is_object()) return;
     auto path_id = json_string(value, "token_path_id");
     if (path_id.empty()) path_id = json_string(value, "path_id");
@@ -286,15 +333,7 @@ HiCacheTokenSpan HiCacheFactParser::parse_span(const TraceEvent & event, const s
      */
     HiCacheTokenSpan span;
     const auto value = parse_json_arg(event.arg(key));
-    if (!value.is_object()) return span;
-    span.path_id = json_string(value, "path_id");
-    if (span.path_id.empty()) span.path_id = json_string(value, "token_path_id");
-    span.begin = json_u64(value, "begin");
-    span.end = json_u64(value, "end");
-    span.token_count = json_u64(value, "token_count", span.end >= span.begin ? span.end - span.begin : 0);
-    span.hash_algo = json_string(value, "hash_algo");
-    span.valid = !span.path_id.empty() && span.end >= span.begin;
-    return span;
+    return token_span_from_json(value);
 }
 
 HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) const {
@@ -316,6 +355,93 @@ bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact) {
 }
 
 bool HiCacheFact::has_consumer(const std::string & consumer) const { return consumer_list_contains(consumers, consumer); }
+
+std::vector<HiCacheBatchPathEntry> HiCacheFactParser::parse_batch_paths(const TraceEvent & event) const {
+    const auto request_ids_value = parse_json_arg(event.arg("request_ids"));
+    const auto request_ids = request_ids_value.is_array() ? fact_detail::json_strings(request_ids_value) : std::vector<std::string>{};
+    const auto positions = parse_json_arg(event.arg("request_positions"));
+    const auto spans = parse_json_arg(event.arg("full_path_spans"));
+    const auto token_counts_value = parse_json_arg(event.arg("token_counts"));
+    const auto token_counts = token_counts_value.is_array() ? json_u64_values(token_counts_value) : std::vector<uint64_t>{};
+
+    std::vector<HiCacheBatchPathEntry> entries;
+    entries.reserve(request_ids.size());
+    for (size_t index = 0; index < request_ids.size(); ++index) {
+        HiCacheBatchPathEntry entry;
+        entry.request_id = request_ids[index];
+        entry.position = index;
+        if (positions.is_array() && index < positions.size() && positions[index].is_object()) entry.position = json_u64(positions[index], "index", index);
+        if (spans.is_array() && index < spans.size()) {
+            entry.full_path_span = token_span_from_json(spans[index]);
+            entry.full_path_tokens = resolve_span(entry.full_path_span);
+        }
+        entry.token_count = index < token_counts.size() ? token_counts[index] : entry.full_path_span.token_count;
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+void parse_batch_contract_fields(HiCacheFact & fact, const TraceEvent & event) {
+    const auto request_ids = parse_json_arg(event.arg("request_ids"));
+    const auto positions = parse_json_arg(event.arg("request_positions"));
+    const auto dictionaries = parse_json_arg(event.arg("token_dictionaries"));
+    const auto spans = parse_json_arg(event.arg("full_path_spans"));
+    const auto token_counts = parse_json_arg(event.arg("token_counts"));
+
+    fact.batch_request_ids_array = request_ids.is_array();
+    fact.batch_positions_array = positions.is_array();
+    fact.batch_token_dictionaries_array = dictionaries.is_array();
+    fact.batch_spans_array = spans.is_array();
+    fact.batch_token_counts_array = token_counts.is_array();
+    fact.batch_request_id_count = request_ids.is_array() ? static_cast<uint64_t>(request_ids.size()) : 0;
+    fact.batch_position_count = positions.is_array() ? static_cast<uint64_t>(positions.size()) : 0;
+    fact.batch_token_dictionary_count = dictionaries.is_array() ? static_cast<uint64_t>(dictionaries.size()) : 0;
+    fact.batch_span_count = spans.is_array() ? static_cast<uint64_t>(spans.size()) : 0;
+    fact.batch_token_count_count = token_counts.is_array() ? static_cast<uint64_t>(token_counts.size()) : 0;
+
+    std::unordered_set<std::string> request_ids_seen;
+    if (request_ids.is_array()) {
+        for (const auto & item : request_ids) {
+            const auto text = item.is_string() ? item.get<std::string>()
+                                               : json_string(
+                                                     nlohmann::json{
+                                                         { "value", item }
+            },
+                                                     "value");
+            if (!text.empty()) request_ids_seen.insert(text);
+        }
+    }
+    fact.batch_request_ids_unique = request_ids.is_array() && request_ids_seen.size() == request_ids.size();
+
+    if (!positions.is_array() || !request_ids.is_array() || positions.size() != request_ids.size()) {
+        fact.batch_positions_cover_indexes = false;
+        fact.batch_positions_match_request_ids = positions.is_array() && request_ids.is_array();
+        return;
+    }
+    std::unordered_set<uint64_t> indexes_seen;
+    bool request_ids_match = true;
+    for (size_t index = 0; index < positions.size(); ++index) {
+        if (!positions[index].is_object()) {
+            request_ids_match = false;
+            continue;
+        }
+        const auto position_index = json_u64(positions[index], "index", request_ids.size());
+        indexes_seen.insert(position_index);
+        const auto position_request_id = json_string(positions[index], "request_id");
+        const auto expected_request_id = request_ids[index].is_string() ? request_ids[index].get<std::string>()
+                                                                        : json_string(
+                                                                              nlohmann::json{
+                                                                                  { "value", request_ids[index] }
+        },
+                                                                              "value");
+        if (!position_request_id.empty() && position_request_id != expected_request_id) request_ids_match = false;
+    }
+    fact.batch_positions_cover_indexes = indexes_seen.size() == request_ids.size();
+    for (size_t index = 0; index < request_ids.size() && fact.batch_positions_cover_indexes; ++index) {
+        if (!indexes_seen.contains(index)) fact.batch_positions_cover_indexes = false;
+    }
+    fact.batch_positions_match_request_ids = request_ids_match;
+}
 
 HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {
     /**
@@ -342,18 +468,19 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     fact.operation_id = event.arg("operation_id", event.arg("node_id"));
     fact.cache_scope = event.arg("cache_scope");
     fact.lifecycle_kind = event.arg("lifecycle_kind");
-    fact.admission_kind = event.arg("admission_kind");
     fact.storage_source = event.arg("storage_source", event.arg("readable_source", "storage_backend_readable"));
+    fact.batch_kind = event.arg("batch_kind");
     fact.seq_no = event.arg_u64("seq_no", 0);
     fact.source_page_size = event.arg_u64("source_page_size", 0);
     fact.token_count = event.arg_u64("token_count", 0);
-    fact.max_new_tokens = event.arg_u64("max_new_tokens", 0);
-    fact.truncation_align_size = event.arg_u64("truncation_align_size", 0);
+    fact.batch_size = event.arg_u64("batch_size", 0);
     fact.priority = static_cast<int64_t>(event.arg_u64("priority", 0));
-    fact.has_chunked_req = bool_value(event, "has_chunked_req", false);
-    fact.ignore_eos = bool_value(event, "ignore_eos", false);
     fact.full_path_span = parse_span(event, "full_path_span");
     fact.full_path_tokens = resolve_span(fact.full_path_span);
+    if (fact.role == "cache_extend_input") {
+        parse_batch_contract_fields(fact, event);
+        fact.batch_paths = parse_batch_paths(event);
+    }
     fact.storage_page_hashes = event_string_list(event, { "page_hashes", "hash_pages", "storage_hashes", "storage_keys", "page_keys", "hit_hash_pages" });
     return fact;
 }

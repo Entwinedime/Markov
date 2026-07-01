@@ -20,7 +20,6 @@ namespace policy_detail {
 constexpr uint64_t kSglangDefaultPrefetchThresholdTokens = 256;
 constexpr uint64_t kSglangWriteThroughThreshold = 1;
 constexpr uint64_t kSglangWriteThroughSelectiveThreshold = 2;
-constexpr uint64_t kExplicitSingleRequestExtendBatchSize = 1;
 constexpr double kSglangPrefetchCapacityRatio = 0.8;
 
 uint64_t ceil_div(uint64_t value, uint64_t divisor) {
@@ -89,7 +88,6 @@ using policy_detail::derived_prefetch_capacity_limit_pages;
 using policy_detail::derived_prefetch_threshold_pages;
 using policy_detail::derived_write_threshold;
 using policy_detail::in_set;
-using policy_detail::kExplicitSingleRequestExtendBatchSize;
 using policy_detail::lower_copy;
 
 HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) {
@@ -138,8 +136,6 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
         .prefetch_capacity_limit_source = prefetch_capacity_limit_source,
         .host_cleanup_budget_rule = "current_target_request_pages",
         .host_cleanup_budget_source = "sglang: cleanup budget follows current page-aligned target request",
-        .extend_allocation_batch_size = kExplicitSingleRequestExtendBatchSize,
-        .extend_allocation_batch_source = "temporary model contract: explicit single-request ScheduleBatch until batch-level state-model fact is collected",
         .extend_allocation_rule = "sglang paged extend pressure: extend_num_tokens + batch_size * page_size; page_size=1 uses extend_num_tokens",
         .device_allocator_need_sort = config.device_allocator_need_sort,
         .device_allocator_need_sort_source = "target_config.device_allocator_need_sort or derived from target_config.disaggregation_mode",
@@ -181,12 +177,12 @@ bool HiCachePolicy::prefetch_rate_limited(uint64_t active_requested_pages) const
     return active_requested_pages >= limit;
 }
 
-bool HiCachePolicy::prefetch_timeout_elapsed(uint64_t enqueue_ts, uint64_t checkpoint_ts, uint64_t token_count) const {
-    if (!resolved_.prefetch_timeout_configured || checkpoint_ts <= enqueue_ts) return false;
+bool HiCachePolicy::prefetch_timeout_elapsed(uint64_t enqueue_ts, uint64_t boundary_ts, uint64_t token_count) const {
+    if (!resolved_.prefetch_timeout_configured || boundary_ts <= enqueue_ts) return false;
     const double timeout_sec =
         std::min(resolved_.prefetch_timeout_max_sec,
                  resolved_.prefetch_timeout_base_sec + resolved_.prefetch_timeout_per_ki_token_sec * static_cast<double>(token_count) / 1024.0);
-    const auto elapsed_sec = static_cast<double>(checkpoint_ts - enqueue_ts) / 1'000'000.0;
+    const auto elapsed_sec = static_cast<double>(boundary_ts - enqueue_ts) / 1'000'000.0;
     return elapsed_sec > timeout_sec;
 }
 

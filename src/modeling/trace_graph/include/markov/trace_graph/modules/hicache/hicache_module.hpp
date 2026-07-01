@@ -25,16 +25,20 @@ public:
     /** @brief 从 DAG 中抽取 HiCache fact，并驱动 canonical state model。 */
     void apply(core::DagGraph & graph) override;
 
-    /** @brief HiCache 模块总是提供结构化 summary。 */
+    /** @brief Debug/validation 构建在 apply 后暴露结构化 summary；Release 不暴露 diagnostics summary。 */
     [[nodiscard]] bool has_summary() const override;
 
+#ifdef DEBUG
     /** @brief 读取最近一次 apply 后生成的 HiCache summary。 */
     [[nodiscard]] const model::HiCacheSummary & summary() const { return summary_; }
+#endif
 
 private:
     frontend::HiCacheConfig config_;
+#ifdef DEBUG
     model::HiCacheSummary summary_;
     bool applied_ = false;
+#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache

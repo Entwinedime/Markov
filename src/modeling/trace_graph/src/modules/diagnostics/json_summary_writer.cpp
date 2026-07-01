@@ -50,7 +50,7 @@ using json_summary_writer_detail::node_scale_summary_json;
 /**
  * @brief 按模块动态类型输出 diagnostics summary。
  *
- * summary 只作为显式 debug/validation 辅助输出；未知模块保留稳定 JSON envelope，
+ * summary 只作为显式 debug/validation 辅助输出；未知模块保留稳定 JSON 对象，
  * 避免新增模块时破坏 CLI 的 summary 写出路径。
  */
 std::string module_summary_json(const SimulationModule & module) {

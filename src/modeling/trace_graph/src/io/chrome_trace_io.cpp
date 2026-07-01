@@ -109,9 +109,9 @@ bool validation_only_event(const TraceEvent & event) {
      * 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
      */
     auto fact_class = fact_class_from_event(event);
-    if (fact_class == "oracle_state" || fact_class == "debug_quality") return true;
+    if (fact_class == "oracle_state") return true;
     auto kind = lower_string(event.arg("event_kind"));
-    return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff" || kind == "profiling_quality";
+    return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff";
 }
 
 void flatten_args(const Json & value, const std::string & prefix, std::unordered_map<std::string, std::string> & args) {

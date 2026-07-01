@@ -64,6 +64,7 @@ void HiCacheAsyncOperationTable::transition_header(HiCacheOperationHeader & head
      * 线程的真实调度 tick。
      */
     const auto epoch = ++lifecycle_epoch_;
+#ifdef DEBUG
     lifecycle_transitions_.push_back(HiCacheOperationLifecycleTransition{
         .operation_id = header.operation_id,
         .kind = header.kind,
@@ -75,6 +76,7 @@ void HiCacheAsyncOperationTable::transition_header(HiCacheOperationHeader & head
         .request_key = header.request_key,
         .reason = reason,
     });
+#endif
     if (state == HiCacheOperationState::Ready && header.eligible_epoch == 0) header.eligible_epoch = epoch;
     if (state == HiCacheOperationState::Completed && header.complete_epoch == 0) {
         header.complete_epoch = epoch;
@@ -99,7 +101,7 @@ void HiCacheAsyncOperationTable::upsert_prefetch(HiCachePrefetchOperation op) {
     /**
      * @brief 同一 request 可能出现多次 prefetch decision。
      *
-     * 普通查询只返回最新 operation，但旧 operation 仍保留在 request 索引里，便于后续释放它遗留的 reservation。
+     * 普通查询只返回最新 operation，但较早 operation 仍保留在 request 索引里，便于后续释放它遗留的 reservation。
      */
     index_operation(op.header);
     transition_header(op.header, HiCacheOperationState::Queued, "enqueue_prefetch", op.header.enqueue_ts);

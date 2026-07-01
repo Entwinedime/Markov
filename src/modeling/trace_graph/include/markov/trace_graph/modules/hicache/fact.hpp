@@ -42,6 +42,20 @@ struct HiCacheTokenSpan {
 };
 
 /**
+ * @brief `cache_extend_input` batch 中单个 request 的 accepted fill path。
+ *
+ * batch entry 独立于 scalar request path，避免把 batch 第一项误写进
+ * `HiCacheFact::full_path_tokens` 并退化回 per-request 输入语义。
+ */
+struct HiCacheBatchPathEntry {
+    std::string request_id;
+    uint64_t position = 0;
+    HiCacheTokenSpan full_path_span;
+    HiCacheTokenPath full_path_tokens;
+    uint64_t token_count = 0;
+};
+
+/**
  * @brief 单条 HiCache trace event 解析后的 atomic fact。
  *
  * 该结构只承载 probe catalog 显式声明的字段。是否能进入 target state model，
@@ -64,22 +78,33 @@ struct HiCacheFact {
     std::string operation_id;
     std::string cache_scope;
     std::string lifecycle_kind;
-    std::string admission_kind;
     std::string storage_source;
+    std::string batch_kind;
 
     uint64_t seq_no = 0;
     uint64_t source_page_size = 0;
     uint64_t token_count = 0;
-    uint64_t max_new_tokens = 0;
-    uint64_t truncation_align_size = 0;
+    uint64_t batch_size = 0;
+    uint64_t batch_request_id_count = 0;
+    uint64_t batch_position_count = 0;
+    uint64_t batch_token_dictionary_count = 0;
+    uint64_t batch_span_count = 0;
+    uint64_t batch_token_count_count = 0;
     int64_t priority = 0;
-    bool has_chunked_req = false;
-    bool ignore_eos = false;
     bool is_start = false;
     bool is_end = false;
+    bool batch_request_ids_array = false;
+    bool batch_positions_array = false;
+    bool batch_token_dictionaries_array = false;
+    bool batch_spans_array = false;
+    bool batch_token_counts_array = false;
+    bool batch_request_ids_unique = false;
+    bool batch_positions_cover_indexes = false;
+    bool batch_positions_match_request_ids = true;
 
     HiCacheTokenSpan full_path_span;
     HiCacheTokenPath full_path_tokens;
+    std::vector<HiCacheBatchPathEntry> batch_paths;
     std::vector<std::string> storage_page_hashes;
 
     /** @brief 判断 catalog fact 是否声明给指定 consumer 消费。 */
@@ -118,6 +143,7 @@ private:
 
     [[nodiscard]] HiCacheTokenSpan parse_span(const core::TraceEvent & event, const std::string & key) const;
     [[nodiscard]] HiCacheTokenPath resolve_span(const HiCacheTokenSpan & span) const;
+    [[nodiscard]] std::vector<HiCacheBatchPathEntry> parse_batch_paths(const core::TraceEvent & event) const;
     void observe_dictionary_value(const std::string & raw);
 };
 

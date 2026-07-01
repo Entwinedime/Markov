@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache target-control checkpoint 的逻辑时钟。
+ * @brief HiCache target-control boundary 的逻辑时钟。
  */
 #pragma once
 
@@ -13,14 +13,14 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 /**
- * @brief target control clock 中的一次 checkpoint 记录。
+ * @brief target control clock 中的一次 boundary 记录。
  *
- * checkpoint 由 target scheduler 生成；runtime model checkpoint 只作为触发锚点。
- * 该记录只描述 target state model 的推进顺序，不代表 source actual completion。
+ * boundary 由 target model 生成，只描述 target state model 的推进顺序，不代表
+ * source actual completion。
  */
-struct HiCacheControlCheckpoint {
+struct HiCacheControlBoundary {
     uint64_t scheduler_epoch = 0;
-    uint64_t checkpoint_epoch = 0;
+    uint64_t boundary_epoch = 0;
     std::string cache_scope;
     std::string request_key;
     std::string kind;
@@ -33,7 +33,7 @@ struct HiCacheControlCheckpoint {
 /**
  * @brief HiCache target-derived control clock 的统一封装。
  *
- * 该 clock 统一生成 operation id、enqueue epoch 和 checkpoint epoch。当前模型仍然把
+ * 该 clock 统一生成 operation id、enqueue epoch 和 boundary epoch。当前模型仍然把
  * ack 时序同步折叠，但不再把 control-flow clock 分散在 async operation table 里。
  */
 class HiCacheTargetControlClock {
@@ -44,28 +44,28 @@ public:
     /** @brief 生成 enqueue epoch，并推进 scheduler epoch。 */
     [[nodiscard]] uint64_t next_enqueue_epoch();
 
-    /** @brief 记录由 runtime model checkpoint 触发的 target scheduler checkpoint。 */
-    [[nodiscard]] HiCacheControlCheckpoint record_target_checkpoint(const std::string & cache_scope, const std::string & request_key, uint64_t ts,
-                                                                    bool terminal, size_t source_event_index);
+    /** @brief 记录 target finalize 生成的 boundary。 */
+    [[nodiscard]] HiCacheControlBoundary record_target_finalize_boundary(const std::string & cache_scope, uint64_t ts);
 
-    /** @brief 记录 target finalize 生成的 checkpoint。 */
-    [[nodiscard]] HiCacheControlCheckpoint record_target_finalize_checkpoint(const std::string & cache_scope, uint64_t ts);
+#ifdef DEBUG
+    /** @brief 所有 modeled boundary。 */
+    [[nodiscard]] const std::vector<HiCacheControlBoundary> & boundaries() const { return boundaries_; }
+#endif
 
-    /** @brief 所有 modeled checkpoint。 */
-    [[nodiscard]] const std::vector<HiCacheControlCheckpoint> & checkpoints() const { return checkpoints_; }
-
-    /** @brief 当前 checkpoint 数。 */
-    [[nodiscard]] uint64_t checkpoint_count() const { return static_cast<uint64_t>(checkpoints_.size()); }
+    /** @brief 当前 boundary 数。 */
+    [[nodiscard]] uint64_t boundary_count() const { return boundary_epoch_; }
 
 private:
     uint64_t scheduler_epoch_ = 0;
     uint64_t enqueue_epoch_ = 0;
-    uint64_t checkpoint_epoch_ = 0;
+    uint64_t boundary_epoch_ = 0;
     uint64_t operation_epoch_ = 0;
-    std::vector<HiCacheControlCheckpoint> checkpoints_;
+#ifdef DEBUG
+    std::vector<HiCacheControlBoundary> boundaries_;
+#endif
 
-    [[nodiscard]] HiCacheControlCheckpoint record_checkpoint(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
-                                                             const std::string & source, size_t source_event_index, uint64_t ts, bool terminal);
+    [[nodiscard]] HiCacheControlBoundary record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
+                                                         const std::string & source, size_t source_event_index, uint64_t ts, bool terminal);
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

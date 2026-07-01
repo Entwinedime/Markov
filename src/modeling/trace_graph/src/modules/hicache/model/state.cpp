@@ -8,12 +8,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <iterator>
 #include <ranges>
 #include <set>
-#include <sstream>
-#include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
@@ -87,11 +83,7 @@ uint64_t HiCacheState::DeviceAllocatorLedger::release(uint64_t pages) {
     return released;
 }
 
-HiCacheState::HiCacheState(HiCacheConfig config, std::unordered_set<size_t> terminal_prefetch_checkpoint_events)
-    : config_(std::move(config)),
-      pager_(config_),
-      policy_(config_),
-      terminal_prefetch_checkpoint_events_(std::move(terminal_prefetch_checkpoint_events)) {}
+HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)), pager_(config_), policy_(config_) {}
 
 std::string HiCacheState::normalized_scope(const HiCacheFact & fact) const { return fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope; }
 
@@ -124,23 +116,29 @@ bool HiCacheState::inserted_device_dirty_visible_at_insert_boundary() const {
  * token directory 的错误语义。
  */
 void HiCacheState::record_token_resolution(const HiCacheFact & fact, HiCacheSummary & summary, const HiCacheTokenResolution & resolution) const {
+#ifdef DEBUG
     const auto status = hicache_token_resolution_status_name(resolution.status);
     summary.token_resolution_by_status[status]++;
     summary.token_path_diagnostics[fact.role + "." + status]++;
 
     if (!resolution.ok()) {
         summary.missing_state_model_facts["token_resolution_" + status]++;
-        if (fact.role == "request_lifecycle_anchor" && resolution.status == HiCacheTokenResolutionStatus::Missing)
-            summary.token_path_diagnostics["lifecycle_anchor_missing_committed_path_count"]++;
+        if (fact.role == "cache_lifecycle_commit" && resolution.status == HiCacheTokenResolutionStatus::Missing)
+            summary.token_path_diagnostics["cache_lifecycle_commit_missing_committed_path_count"]++;
         return;
     }
 
-    if (fact.role == "prefetch_decision") summary.token_path_diagnostics["prefetch_path_not_committed_count"]++;
-    if (fact.role == "request_lifecycle_anchor") {
+    if (fact.role == "prefetch_candidate_anchor") summary.token_path_diagnostics["prefetch_candidate_path_not_committed_count"]++;
+    if (fact.role == "cache_lifecycle_commit") {
         const auto * previous = token_directory_.previous_committed_snapshot(fact);
         if (previous != nullptr && resolution.page_aligned_token_count > previous->page_aligned_token_count)
             summary.token_path_diagnostics["lifecycle_path_growth_cross_page_boundary_count"]++;
     }
+#else
+    (void)fact;
+    (void)summary;
+    (void)resolution;
+#endif
 }
 
 HiCachePagePath HiCacheState::page_path_from_resolution(const HiCacheFact & fact, const HiCacheTokenResolution & resolution) const {
@@ -169,10 +167,11 @@ uint64_t HiCacheState::active_ref_owner_count() const {
 
 uint64_t HiCacheState::radix_split_count() const {
     uint64_t count = 0;
-    for (const auto & scope : scopes_ | std::views::values) { count += scope.tree.split_history().size(); }
+    for (const auto & scope : scopes_ | std::views::values) { count += scope.tree.split_count(); }
     return count;
 }
 
+#ifdef DEBUG
 std::vector<HiCacheNodeSplitRecord> HiCacheState::radix_split_trace() const {
     std::vector<HiCacheNodeSplitRecord> splits;
     for (const auto & [scope_name, scope] : scopes_) {
@@ -188,26 +187,29 @@ std::vector<HiCacheNodeSplitRecord> HiCacheState::radix_split_trace() const {
     });
     return splits;
 }
+#endif
 
-uint64_t HiCacheState::control_checkpoint_count() const {
+uint64_t HiCacheState::control_boundary_count() const {
     uint64_t count = 0;
-    for (const auto & scope : scopes_ | std::views::values) { count += scope.clock.checkpoint_count(); }
+    for (const auto & scope : scopes_ | std::views::values) { count += scope.clock.boundary_count(); }
     return count;
 }
 
-std::vector<HiCacheControlCheckpoint> HiCacheState::control_checkpoint_trace() const {
-    std::vector<HiCacheControlCheckpoint> checkpoints;
+#ifdef DEBUG
+std::vector<HiCacheControlBoundary> HiCacheState::control_boundary_trace() const {
+    std::vector<HiCacheControlBoundary> boundaries;
     for (const auto & scope : scopes_ | std::views::values) {
-        const auto & scope_checkpoints = scope.clock.checkpoints();
-        checkpoints.insert(checkpoints.end(), scope_checkpoints.begin(), scope_checkpoints.end());
+        const auto & scope_boundaries = scope.clock.boundaries();
+        boundaries.insert(boundaries.end(), scope_boundaries.begin(), scope_boundaries.end());
     }
-    std::ranges::sort(checkpoints, [](const auto & left, const auto & right) {
+    std::ranges::sort(boundaries, [](const auto & left, const auto & right) {
         if (left.cache_scope != right.cache_scope) return left.cache_scope < right.cache_scope;
         if (left.scheduler_epoch != right.scheduler_epoch) return left.scheduler_epoch < right.scheduler_epoch;
-        return left.checkpoint_epoch < right.checkpoint_epoch;
+        return left.boundary_epoch < right.boundary_epoch;
     });
-    return checkpoints;
+    return boundaries;
 }
+#endif
 
 uint64_t HiCacheState::async_lifecycle_transition_count() const {
     uint64_t count = 0;
@@ -215,6 +217,7 @@ uint64_t HiCacheState::async_lifecycle_transition_count() const {
     return count;
 }
 
+#ifdef DEBUG
 std::vector<HiCacheOperationLifecycleTransition> HiCacheState::async_lifecycle_trace() const {
     std::vector<HiCacheOperationLifecycleTransition> transitions;
     for (const auto & scope : scopes_ | std::views::values) {
@@ -228,8 +231,9 @@ std::vector<HiCacheOperationLifecycleTransition> HiCacheState::async_lifecycle_t
     });
     return transitions;
 }
+#endif
 
-uint64_t HiCacheState::policy_decision_count() const { return static_cast<uint64_t>(policy_decisions_.size()); }
+uint64_t HiCacheState::policy_decision_count() const { return policy_decision_epoch_; }
 
 uint64_t HiCacheState::storage_known_page_count() const {
     uint64_t count = 0;
@@ -263,10 +267,11 @@ uint64_t HiCacheState::capacity_mutation_count() const {
 
 uint64_t HiCacheState::capacity_victim_choice_count() const {
     uint64_t count = 0;
-    for (const auto & scope : scopes_ | std::views::values) { count += scope.capacity.victim_choices().size(); }
+    for (const auto & scope : scopes_ | std::views::values) { count += scope.capacity.victim_selection_count(); }
     return count;
 }
 
+#ifdef DEBUG
 std::vector<HiCacheCapacityMutation> HiCacheState::capacity_mutation_trace() const {
     std::vector<HiCacheCapacityMutation> mutations;
     for (const auto & [scope_name, scope] : scopes_) {
@@ -318,13 +323,15 @@ std::vector<HiCacheCapacityAuditIssue> HiCacheState::capacity_audit_issues() con
     });
     return issues;
 }
+#endif
 
 uint64_t HiCacheState::ref_mutation_count() const {
     uint64_t count = 0;
-    for (const auto & scope : scopes_ | std::views::values) { count += scope.refs.mutation_trace().size(); }
+    for (const auto & scope : scopes_ | std::views::values) { count += scope.refs.mutation_count(); }
     return count;
 }
 
+#ifdef DEBUG
 std::vector<HiCacheRefMutation> HiCacheState::ref_mutation_trace() const {
     std::vector<HiCacheRefMutation> mutations;
     for (const auto & [scope_name, scope] : scopes_) {
@@ -361,6 +368,7 @@ std::vector<HiCacheRefAuditIssue> HiCacheState::ref_audit_issues() const {
     });
     return issues;
 }
+#endif
 
 /**
  * @brief 将 canonical tree/ref/async reservation 变化同步到 capacity index。
@@ -403,12 +411,18 @@ void HiCacheState::sync_capacity_for_ref(ScopedState & scope, const std::string 
 
 /** @brief 给 policy decision 分配全局 epoch，并补齐 fact/source 归属字段。 */
 void HiCacheState::record_policy_decision(const HiCacheFact & fact, HiCachePolicyDecisionRecord decision) {
-    decision.decision_epoch = ++policy_decision_epoch_;
+    ++policy_decision_epoch_;
+#ifdef DEBUG
+    decision.decision_epoch = policy_decision_epoch_;
     decision.cache_scope = normalized_scope(fact);
     decision.request_key = scoped_request_key(fact);
     decision.role = fact.role;
     decision.event_name = fact.event_name;
     policy_decisions_.push_back(std::move(decision));
+#else
+    (void)fact;
+    (void)decision;
+#endif
 }
 
 /**
@@ -418,9 +432,9 @@ void HiCacheState::record_policy_decision(const HiCacheFact & fact, HiCachePolic
  * prefetch suppressed/late。这样 transition trace 既能审计关键 lifecycle，又不会被无效
  * page set 刷屏。
  */
-void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & summary, std::vector<HiCacheStateTransition> & transitions,
-                                     const std::string & kind, const std::string & tier, const std::vector<std::string> & pages,
-                                     const std::string & before_digest) {
+void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, const std::string & kind,
+                                     const std::string & tier, const std::vector<std::string> & pages, const std::string & before_digest) {
+#ifdef DEBUG
     if (pages.empty() && kind != "release_ref" && kind != "prefetch_suppressed" && kind != "prefetch_late") return;
     HiCacheStateTransition transition;
     transition.transition_id = std::to_string(summary.state_transition_count + transitions.size() + 1);
@@ -440,6 +454,15 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
     }
     summary.transitions_by_kind[kind]++;
     transitions.push_back(std::move(transition));
+#else
+    (void)fact;
+    (void)summary;
+    (void)transitions;
+    (void)kind;
+    (void)tier;
+    (void)pages;
+    (void)before_digest;
+#endif
 }
 
 /**
@@ -449,8 +472,7 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
  * 之后才按 role 推进具体状态机，保证多个 handler 看到一致的 token timeline 和 ref/capacity
  * 基线。
  */
-std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary) {
-    std::vector<HiCacheStateTransition> transitions;
+void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions) {
     token_directory_.observe_fact_path(fact, pager_.page_size_for_fact(fact));
     if (role != HiCacheFactRole::Unknown) {
         auto & scope = scope_state(fact);
@@ -458,25 +480,21 @@ std::vector<HiCacheStateTransition> HiCacheState::apply_fact(const HiCacheFact &
     }
 
     switch (role) {
-    case HiCacheFactRole::RequestBoundMatchAnchor:
-        apply_request_bound_match_anchor(fact, summary, transitions);
+    case HiCacheFactRole::PrefetchCandidateAnchor:
+        apply_prefetch_candidate_anchor(fact, summary, transitions);
         break;
-    case HiCacheFactRole::RequestAdmission:
-        apply_request_admission(fact, summary, transitions);
+    case HiCacheFactRole::CacheLookupInput:
+        apply_cache_lookup_input(fact, summary, transitions);
         break;
-    case HiCacheFactRole::RequestLifecycleAnchor:
-        apply_request_lifecycle_anchor(fact, summary, transitions);
+    case HiCacheFactRole::CacheExtendInput:
+        apply_cache_extend_input(fact, summary, transitions);
         break;
-    case HiCacheFactRole::PrefetchDecision:
-        apply_prefetch_decision(fact, summary, transitions);
-        break;
-    case HiCacheFactRole::PrefetchCheckPoint:
-        apply_prefetch_check_point(fact, summary, transitions);
+    case HiCacheFactRole::CacheLifecycleCommit:
+        apply_cache_lifecycle_commit(fact, summary, transitions);
         break;
     case HiCacheFactRole::Unknown:
         break;
     }
-    return transitions;
 }
 
 

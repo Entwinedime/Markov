@@ -20,6 +20,9 @@ target_include_directories(trace_graph_options
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/ktransformers/archive/third_party
 )
+if(TRACE_GRAPH_DEBUG)
+    target_compile_definitions(trace_graph_options INTERFACE DEBUG)
+endif()
 
 add_library(trace_graph_core STATIC)
 target_sources(trace_graph_core
@@ -75,7 +78,7 @@ target_sources(trace_graph_hicache
         src/modules/hicache/model/host_storage_model.cpp
         src/modules/hicache/model/writeback_model.cpp
         src/modules/hicache/model/finalizer.cpp
-        src/modules/hicache/model/terminal_checkpoint_scan.cpp
+        src/modules/hicache/model/apply_model.cpp
 )
 target_link_libraries(trace_graph_hicache PUBLIC trace_graph_core trace_graph_frontend crypto)
 
@@ -92,20 +95,29 @@ target_link_libraries(trace_graph_modules
         trace_graph_hicache
 )
 
-add_library(trace_graph_diagnostics STATIC)
-target_sources(trace_graph_diagnostics
-    PRIVATE
-        src/modules/diagnostics/json_summary_writer.cpp
-        src/modules/hicache/diagnostics/summary.cpp
-)
-target_link_libraries(trace_graph_diagnostics PUBLIC trace_graph_modules)
+add_library(trace_graph_cli_support STATIC)
+if(TRACE_GRAPH_DEBUG)
+    add_library(trace_graph_diagnostics STATIC)
+    target_sources(trace_graph_diagnostics
+        PRIVATE
+            src/modules/diagnostics/json_summary_writer.cpp
+            src/modules/hicache/diagnostics/summary.cpp
+    )
+    target_link_libraries(trace_graph_diagnostics PUBLIC trace_graph_modules)
 
-add_library(trace_graph_validation STATIC)
-target_sources(trace_graph_validation
-    PRIVATE
-        src/modules/validation/validation_runner.cpp
-)
-target_link_libraries(trace_graph_validation PUBLIC trace_graph_modules)
+    add_library(trace_graph_validation STATIC)
+    target_sources(trace_graph_validation
+        PRIVATE
+            src/modules/validation/validation_runner.cpp
+    )
+    target_link_libraries(trace_graph_validation PUBLIC trace_graph_modules)
+
+    target_sources(trace_graph_cli_support PRIVATE src/cli/debug_support_debug.cpp)
+    target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_diagnostics trace_graph_validation)
+else()
+    target_sources(trace_graph_cli_support PRIVATE src/cli/debug_support_release.cpp)
+    target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_modules)
+endif()
 
 add_executable(trace_graph)
 target_sources(trace_graph
@@ -119,15 +131,8 @@ target_link_libraries(trace_graph
         trace_graph_frontend
         trace_graph_simulation
         trace_graph_modules
-        trace_graph_diagnostics
-        trace_graph_validation
+        trace_graph_cli_support
 )
-
-if(TRACE_GRAPH_DEBUG)
-    target_compile_definitions(trace_graph_diagnostics PRIVATE DEBUG)
-    target_compile_definitions(trace_graph_validation PRIVATE DEBUG)
-    target_compile_definitions(trace_graph PRIVATE DEBUG)
-endif()
 
 set_target_properties(trace_graph PROPERTIES
     OUTPUT_NAME trace_graph

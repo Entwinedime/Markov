@@ -65,9 +65,6 @@ public:
     /** @brief 将 token path 投影成 page path，只保留完整 page。 */
     [[nodiscard]] HiCachePagePath project(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
 
-    /** @brief 兼容旧调用点的 page id 序列投影。 */
-    [[nodiscard]] std::vector<std::string> pages_for_tokens(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
-
 private:
     frontend::HiCacheConfig config_;
 };

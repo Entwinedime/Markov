@@ -146,6 +146,7 @@ public:
     /** @brief 已发生的 capacity index mutation 次数。 */
     [[nodiscard]] uint64_t mutation_epoch() const { return mutation_epoch_; }
 
+#ifdef DEBUG
     /** @brief capacity leaf mutation 的审计 trace。 */
     [[nodiscard]] const std::vector<HiCacheCapacityMutation> & mutation_trace() const { return mutation_trace_; }
 
@@ -154,6 +155,10 @@ public:
 
     /** @brief 审计 index 与 canonical tree 是否一致。 */
     [[nodiscard]] HiCacheCapacityAudit audit(const HiCacheTokenRadixTree & tree, uint64_t expected_reserved_host_pages) const;
+#endif
+
+    /** @brief 已发生的 capacity victim 选择次数。 */
+    [[nodiscard]] uint64_t victim_selection_count() const { return victim_selection_epoch_; }
 
     /** @brief device 层超过 target capacity 的 page 数。 */
     [[nodiscard]] uint64_t device_excess_pages(uint64_t capacity_pages) const;
@@ -192,8 +197,10 @@ private:
     std::set<VictimKey> evictable_device_leaves_;
     std::set<VictimKey> evictable_host_leaves_;
     HiCacheCapacitySnapshot snapshot_;
+#ifdef DEBUG
     std::vector<HiCacheCapacityMutation> mutation_trace_;
     std::vector<HiCacheCapacityVictimChoice> victim_choices_;
+#endif
 
     [[nodiscard]] HiCacheCapacityNodeRecord make_record(const HiCacheTokenRadixTree & tree, HiCacheNodeId node_id) const;
     [[nodiscard]] std::set<HiCacheNodeId> observation_closure(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes) const;
@@ -205,7 +212,9 @@ private:
     [[nodiscard]] std::optional<HiCacheCapacityNodeRecord> indexed_record(HiCacheNodeId node_id) const;
     [[nodiscard]] HiCacheCapacityVictimChoice make_victim_choice(const std::string & tier, const std::string & reason, uint64_t capacity_pages,
                                                                  uint64_t requested_pages, std::optional<HiCacheNodeId> node_id) const;
+#ifdef DEBUG
     [[nodiscard]] std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> derive_tree_records(const HiCacheTokenRadixTree & tree) const;
+#endif
     void update_snapshot();
     [[nodiscard]] static VictimKey victim_key(const HiCacheCapacityNodeRecord & record);
 };

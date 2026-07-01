@@ -17,7 +17,7 @@ namespace markov::trace_graph::modules::hicache::diagnostics {
 using model::HiCacheCapacityAuditIssue;
 using model::HiCacheCapacityMutation;
 using model::HiCacheCapacityVictimChoice;
-using model::HiCacheControlCheckpoint;
+using model::HiCacheControlBoundary;
 using model::HiCacheNodeSplitRecord;
 using model::HiCacheOperationLifecycleTransition;
 using model::HiCacheRefAuditIssue;
@@ -84,8 +84,6 @@ Json resolved_policy_json(const HiCacheResolvedPolicyState & policy) {
         {    "prefetch_capacity_limit_source",    policy.prefetch_capacity_limit_source },
         {          "host_cleanup_budget_rule",          policy.host_cleanup_budget_rule },
         {        "host_cleanup_budget_source",        policy.host_cleanup_budget_source },
-        {      "extend_allocation_batch_size",      policy.extend_allocation_batch_size },
-        {    "extend_allocation_batch_source",    policy.extend_allocation_batch_source },
         {            "extend_allocation_rule",            policy.extend_allocation_rule },
         {        "device_allocator_need_sort",        policy.device_allocator_need_sort },
         { "device_allocator_need_sort_source", policy.device_allocator_need_sort_source },
@@ -169,17 +167,17 @@ Json async_lifecycle_json(const HiCacheOperationLifecycleTransition & transition
     };
 }
 
-Json control_checkpoint_json(const HiCacheControlCheckpoint & checkpoint) {
+Json control_boundary_json(const HiCacheControlBoundary & boundary) {
     return Json{
-        {    "scheduler_epoch",    checkpoint.scheduler_epoch },
-        {   "checkpoint_epoch",   checkpoint.checkpoint_epoch },
-        {        "cache_scope",        checkpoint.cache_scope },
-        {        "request_key",        checkpoint.request_key },
-        {               "kind",               checkpoint.kind },
-        {             "source",             checkpoint.source },
-        { "source_event_index", checkpoint.source_event_index },
-        {                 "ts",                 checkpoint.ts },
-        {           "terminal",           checkpoint.terminal },
+        {    "scheduler_epoch",    boundary.scheduler_epoch },
+        {     "boundary_epoch",     boundary.boundary_epoch },
+        {        "cache_scope",        boundary.cache_scope },
+        {        "request_key",        boundary.request_key },
+        {               "kind",               boundary.kind },
+        {             "source",             boundary.source },
+        { "source_event_index", boundary.source_event_index },
+        {                 "ts",                 boundary.ts },
+        {           "terminal",           boundary.terminal },
     };
 }
 
@@ -202,8 +200,13 @@ Json policy_decision_json(const HiCachePolicyDecisionRecord & decision) {
         {                        "hit_pages",                        decision.hit_pages },
         {                        "hit_count",                        decision.hit_count },
         {                       "batch_size",                       decision.batch_size },
+        {                  "accepted_tokens",                  decision.accepted_tokens },
+        {      "target_device_prefix_tokens",      decision.target_device_prefix_tokens },
+        {    "prior_committed_prefix_tokens",    decision.prior_committed_prefix_tokens },
+        {         "allocation_prefix_tokens",         decision.allocation_prefix_tokens },
         {                    "extend_tokens",                    decision.extend_tokens },
         {                  "allocated_pages",                  decision.allocated_pages },
+        {             "active_request_pages",             decision.active_request_pages },
         {           "active_requested_pages",           decision.active_requested_pages },
         {                   "capacity_pages",                   decision.capacity_pages },
         {                   "occupied_pages",                   decision.occupied_pages },
@@ -424,7 +427,7 @@ using summary_detail::async_lifecycle_json;
 using summary_detail::capacity_audit_issue_json;
 using summary_detail::capacity_mutation_json;
 using summary_detail::capacity_victim_choice_json;
-using summary_detail::control_checkpoint_json;
+using summary_detail::control_boundary_json;
 using summary_detail::derived_snapshot_json;
 using summary_detail::final_state_json;
 using summary_detail::Json;
@@ -454,7 +457,7 @@ std::string summary_json(const HiCacheSummary & summary) {
     root["dirty_eviction_events"] = summary.dirty_eviction_events;
     root["active_ref_owner_count"] = summary.active_ref_owner_count;
     root["radix_split_count"] = summary.radix_split_count;
-    root["control_checkpoint_count"] = summary.control_checkpoint_count;
+    root["control_boundary_count"] = summary.control_boundary_count;
     root["async_lifecycle_transition_count"] = summary.async_lifecycle_transition_count;
     root["policy_decision_count"] = summary.policy_decision_count;
     root["storage_known_page_count"] = summary.storage_known_page_count;
@@ -477,7 +480,7 @@ std::string summary_json(const HiCacheSummary & summary) {
     root["transition_trace"] =
         array_from(summary.transition_trace, [&](const auto & transition) { return transition_json(transition, summary.target_config.emit_state_digests); });
     root["radix_split_trace"] = array_from(summary.radix_split_trace, split_record_json);
-    root["control_checkpoint_trace"] = array_from(summary.control_checkpoint_trace, control_checkpoint_json);
+    root["control_boundary_trace"] = array_from(summary.control_boundary_trace, control_boundary_json);
     root["async_lifecycle_trace"] = array_from(summary.async_lifecycle_trace, async_lifecycle_json);
     root["policy_decision_trace"] = array_from(summary.policy_decision_trace, policy_decision_json);
     root["capacity_mutation_trace"] = array_from(summary.capacity_mutation_trace, capacity_mutation_json);

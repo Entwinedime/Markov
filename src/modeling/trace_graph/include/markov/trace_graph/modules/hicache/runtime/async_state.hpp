@@ -58,11 +58,11 @@ struct HiCacheOperationHeader {
     HiCacheOperationState state = HiCacheOperationState::Created;
     uint64_t enqueue_epoch = 0;
     uint64_t eligible_epoch = 0;
-    uint64_t checkpoint_epoch = 0;
+    uint64_t boundary_epoch = 0;
     uint64_t complete_epoch = 0;
     uint64_t commit_epoch = 0;
     uint64_t enqueue_ts = 0;
-    uint64_t checkpoint_ts = 0;
+    uint64_t boundary_ts = 0;
     uint64_t complete_ts = 0;
     uint64_t commit_ts = 0;
     uint64_t cancel_ts = 0;
@@ -192,11 +192,13 @@ public:
     /** @brief 所有 storage operation 的只读索引。 */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() const { return storage_by_id_; }
 
+#ifdef DEBUG
     /** @brief operation lifecycle 变更的结构化审计 trace。 */
     [[nodiscard]] const std::vector<HiCacheOperationLifecycleTransition> & lifecycle_transitions() const { return lifecycle_transitions_; }
+#endif
 
     /** @brief operation lifecycle transition 数。 */
-    [[nodiscard]] uint64_t lifecycle_transition_count() const { return static_cast<uint64_t>(lifecycle_transitions_.size()); }
+    [[nodiscard]] uint64_t lifecycle_transition_count() const { return lifecycle_epoch_; }
 
     /** @brief 返回指定 request 关联的所有 operation id。 */
     [[nodiscard]] std::vector<std::string> operations_for_request(const std::string & request_key) const;
@@ -213,7 +215,9 @@ private:
     std::unordered_map<std::string, HiCacheStorageOperation> storage_by_id_;
     std::unordered_map<std::string, std::vector<std::string>> operation_ids_by_request_;
     std::unordered_map<HiCacheNodeId, std::vector<std::string>> operation_ids_by_node_;
+#ifdef DEBUG
     std::vector<HiCacheOperationLifecycleTransition> lifecycle_transitions_;
+#endif
 
     /** @brief 把 operation header 写入 request/node 辅助索引。 */
     void index_operation(const HiCacheOperationHeader & header);

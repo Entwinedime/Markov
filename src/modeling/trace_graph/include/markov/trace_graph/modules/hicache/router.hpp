@@ -15,15 +15,14 @@ namespace markov::trace_graph::modules::hicache {
 /**
  * @brief C++ HiCache state model 当前接受的 fact role。
  *
- * Unknown 只用于 summary 诊断，不能承载兼容性分支。
+ * Unknown 只用于 summary 诊断，不能承载当前合同外的处理分支。
  */
 enum class HiCacheFactRole {
     Unknown,
-    RequestBoundMatchAnchor,
-    RequestLifecycleAnchor,
-    RequestAdmission,
-    PrefetchDecision,
-    PrefetchCheckPoint,
+    PrefetchCandidateAnchor,
+    CacheLookupInput,
+    CacheExtendInput,
+    CacheLifecycleCommit,
 };
 
 /**
