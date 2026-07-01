@@ -11,7 +11,7 @@ INTERNAL_ROOT = Path(__file__).resolve().parents[1]
 if str(INTERNAL_ROOT) not in sys.path:
     sys.path.insert(0, str(INTERNAL_ROOT))
 
-from markov_internal.hicache.quality.profile_audit import main  # noqa: E402
+from markov_internal.hicache.quality.audit.profile import main  # noqa: E402
 
 
 if __name__ == "__main__":

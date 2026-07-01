@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json
-from ..hicache.oracle_state import (
+from ..hicache.oracle.snapshot.state import (
     derived_hicache_state_from_snapshot,
     extract_hicache_state_snapshots,
     latest_derived_state,
@@ -40,7 +40,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--validation", type=Path, required=True)
     parser.add_argument("--predicted-trace", type=Path, required=True)
     parser.add_argument("--oracle-trace", type=Path, action="append", default=[])
-    parser.add_argument("--page", action="append", default=[], help="Normalized or scoped page key to include explicitly.")
+    parser.add_argument(
+        "--page", action="append", default=[], help="Normalized or scoped page key to include explicitly."
+    )
     parser.add_argument("--sample-per-set", type=int, default=3)
     parser.add_argument("--max-model-transitions", type=int, default=24)
     parser.add_argument("--max-oracle-changes", type=int, default=24)
@@ -70,7 +72,9 @@ def normalized_memberships(state: dict[str, Any], page: str) -> list[str]:
     return memberships
 
 
-def collect_pages(validation: dict[str, Any], explicit_pages: list[str], sample_per_set: int) -> dict[str, dict[str, Any]]:
+def collect_pages(
+    validation: dict[str, Any], explicit_pages: list[str], sample_per_set: int
+) -> dict[str, dict[str, Any]]:
     """从 validation diff 和显式参数中选择需要解释的 page。"""
 
     selected: dict[str, dict[str, Any]] = {}
@@ -104,7 +108,9 @@ def collect_pages(validation: dict[str, Any], explicit_pages: list[str], sample_
     return selected
 
 
-def summarize_model_trace(predicted_trace: dict[str, Any], pages: set[str], max_transitions: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def summarize_model_trace(
+    predicted_trace: dict[str, Any], pages: set[str], max_transitions: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """汇总模型 transition trace 中每个 page 的最终状态和样本 transition。"""
 
     records = predicted_trace.get("records")
@@ -157,7 +163,9 @@ def summarize_model_trace(predicted_trace: dict[str, Any], pages: set[str], max_
     )
 
 
-def union_normalized_memberships(object_states: dict[tuple[str, str, str], dict[str, Any]], pages: set[str]) -> dict[str, list[str]]:
+def union_normalized_memberships(
+    object_states: dict[tuple[str, str, str], dict[str, Any]], pages: set[str]
+) -> dict[str, list[str]]:
     """把多个 RadixCache object snapshot 合并成 page membership 视图。"""
 
     result = {page: [] for page in pages}
@@ -170,7 +178,9 @@ def union_normalized_memberships(object_states: dict[tuple[str, str, str], dict[
     return result
 
 
-def summarize_oracle_trace(trace_paths: list[Path], pages: set[str], max_changes: int) -> tuple[dict[str, Any], dict[str, Any]]:
+def summarize_oracle_trace(
+    trace_paths: list[Path], pages: set[str], max_changes: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """从 oracle snapshot timeline 中提取 page membership 变化。"""
 
     snapshots = extract_hicache_state_snapshots(trace_paths)
@@ -228,9 +238,17 @@ def classify_fixability(model: dict[str, Any], oracle: dict[str, Any]) -> str:
     model_memberships = set(model.get("final_memberships") or [])
     oracle_memberships = set(oracle.get("final_memberships") or [])
     transition_counts = model.get("transition_counts") if isinstance(model.get("transition_counts"), dict) else {}
-    if "locked_pages" in oracle_memberships and "locked_pages" not in model_memberships and transition_counts.get("mark_locked", 0) == 0:
+    if (
+        "locked_pages" in oracle_memberships
+        and "locked_pages" not in model_memberships
+        and transition_counts.get("mark_locked", 0) == 0
+    ):
         return "needs_lock_ref_provenance_or_collection"
-    if "l1_resident_pages" in oracle_memberships and "evicted_pages" in model_memberships and transition_counts.get("mark_evicted", 0) > 0:
+    if (
+        "l1_resident_pages" in oracle_memberships
+        and "evicted_pages" in model_memberships
+        and transition_counts.get("mark_evicted", 0) > 0
+    ):
         return "likely_fixable_capacity_or_promotion_rule"
     if "l2_resident_pages" in oracle_memberships and "l2_resident_pages" not in model_memberships:
         return "likely_fixable_l2_backup_or_prefetch_visibility_rule"
@@ -247,7 +265,9 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     selected = collect_pages(validation, args.page, args.sample_per_set)
     pages = set(selected)
     model_by_page, model_final = summarize_model_trace(predicted_trace, pages, args.max_model_transitions)
-    oracle_by_page, oracle_final = summarize_oracle_trace(args.oracle_trace, pages, args.max_oracle_changes) if args.oracle_trace else ({}, {})
+    oracle_by_page, oracle_final = (
+        summarize_oracle_trace(args.oracle_trace, pages, args.max_oracle_changes) if args.oracle_trace else ({}, {})
+    )
 
     pages_report: dict[str, Any] = {}
     for page in sorted(pages):
