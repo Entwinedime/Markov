@@ -77,21 +77,22 @@ scripts/model.sh \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/faithful_replay \
   --mode faithful_replay \
-  --emit-validation \
-  --emit-module-summary
+  --emit-validation
 ```
 
-HiCache state prediction：
+HiCache state validation prediction 通常由 workflow 生成 runner config 后调用：
 
 ```bash
 scripts/model.sh \
-  --config <hicache-state-modeling-config.json> \
+  --config <workflow_output>/artifacts/runner_configs/target_<config_id>.json \
   --profile-manifest <run_dir>/profile_manifest.json \
   --output-dir <run_dir>/modeling/cache_state \
-  --mode cache_state \
-  --emit-module-summary \
-  --emit-validation
+  --mode cache_state
 ```
+
+该 runner config 必须包含 `cpp_trace_graph.backend_kind="validation"` 和
+`outputs.emit_validation=true`。普通 business cache-state prediction 不生成 `model_summary.json` /
+`validation.json`，也不使用 Debug backend。
 
 常用覆盖项：
 
@@ -113,7 +114,7 @@ Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
 | 宿主机 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发 CLI。 |
 | 容器内入口 | `scripts/internal/entrypoints/model.py` | 解析 modeling CLI，调用 `markov_internal.modeling.runner`。 |
 | C++ 输入准备 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 处理 profile manifest / raw trace 输入、调用 trace merger、检查 merge summary。 |
-| C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数和定位 `build/modeling/trace_graph/trace_graph`。 |
+| C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数，并按 backend 定位 Release 或 Debug/validation binary。 |
 | validation payload | `scripts/internal/markov_internal/modeling/validation.py` | 组装 validation 输出、HiCache state validation 和 recommended config audit。 |
 | workload helper | `scripts/internal/markov_internal/modeling/workload.py` | 读取 workload report / bench JSONL 中的实际运行窗口。 |
 
@@ -122,12 +123,16 @@ HiCache workflow 是 profiling 后的 validation 编排，不属于 C++ 后端�
 | 路径 | 职责 |
 | --- | --- |
 | `scripts/internal/entrypoints/hicache_workflow.py` | 统一入口，解析 workflow CLI。 |
-| `scripts/internal/markov_internal/hicache/workflow_context.py` / `workflow_stage_runner.py` | 面向对象 stage runner、artifact policy 和 workflow lifecycle。 |
-| `scripts/internal/markov_internal/hicache/workflow_progress.py` | quality、final-state、transition 共用的阶段级进度输出。 |
-| `scripts/internal/markov_internal/hicache/workflow_modeling_config.py` | 写出 Python runner config，供 `scripts/model.sh --config` 使用。 |
-| `scripts/internal/markov_internal/hicache/matrix_*` | profile discovery、prediction spec、workflow input quality、prediction 输出路径和 matrix summary。 |
-| `scripts/internal/entrypoints/hicache_transition.py` / `hicache/transition_*` | 只读 transition oracle、model self-check、single/matrix compare、catalog 和 gate 输出。 |
-| `scripts/internal/markov_internal/hicache/oracle_*` | oracle snapshot、capacity、coverage、delta、records 和 mismatch helper。 |
+| `scripts/internal/markov_internal/hicache/workflow/core/` | workflow context 与 artifact policy。 |
+| `scripts/internal/markov_internal/hicache/workflow/stages/` | 面向对象 stage runner、final-state stage 和 transition stage。 |
+| `scripts/internal/markov_internal/hicache/workflow/output/` | TTY progress 与 stage/workflow summary 输出。 |
+| `scripts/internal/markov_internal/hicache/workflow/config/` / `planning/` | workflow runner config 与 matrix plan 写出。 |
+| `scripts/internal/markov_internal/hicache/matrix/runs/` | profile discovery、run metadata 和 prediction spec。 |
+| `scripts/internal/markov_internal/hicache/matrix/predictions/` / `reports/` | prediction 输出路径、final-state matrix summary 和 workflow input quality report。 |
+| `scripts/internal/entrypoints/hicache_transition.py` / `hicache/transition/` | 只读 transition oracle、model self-check、single/matrix compare、catalog 和 gate 输出。 |
+| `scripts/internal/markov_internal/hicache/transition/artifacts/` / `replay/` / `validation/` | transition path/catalog 产物、model replay schema 和 exactness validation。 |
+| `scripts/internal/markov_internal/hicache/oracle/snapshot/` / `diff/` / `evidence/` | oracle snapshot 读取、state delta/mismatch 和 capacity/coverage evidence。 |
+| `scripts/internal/markov_internal/hicache/core/` | HiCache fact 解析、consumer 路由和 token dictionary/span helper。 |
 
 transition oracle 只消费 `source_actual` / `timing_observation` evidence 和 `oracle_state` snapshot 来做验证标签；
 它不生成 state-model fact，也不消费 runtime storage-control checkpoint。C++ state model 的输入仍只由 fact contract 和 router
@@ -139,16 +144,16 @@ HiCache workflow 的 Python 编排以 stage runner 为顶层结构：
 WorkflowRunContext
   -> WorkflowArtifactPolicy
   -> WorkflowProgressReporter
-  -> QualityStageRunner
-  -> FinalStateStageRunner
-  -> TransitionStageRunner
+  -> workflow.stages.QualityStageRunner
+  -> workflow.stages.FinalStateStageRunner
+  -> workflow.stages.TransitionStageRunner
 ```
 
 约束：
 
-- `workflow.py` 只负责解析 CLI、发现 runs、创建 context、按固定顺序调用 stage runner 和写 workflow summary；
+- `workflow/cli.py` 只负责解析 CLI、发现 runs、创建 context、按固定顺序调用 stage runner 和写 workflow summary；
 - quality、final-state、transition 阶段共享 `WorkflowStageRunner` 生命周期，不在各自矩阵模块中直接打印进度；
-- `matrix_quality.py`、`workflow_final_state.py`、`transition_matrix.py` 保留为可测试业务函数或 stage helper，不拥有终端输出策略；
+- `matrix/quality.py`、`workflow/final_state.py`、`transition/matrix.py` 保留为可测试业务函数或 stage helper，不拥有终端输出策略；
 - `WorkflowProgressReporter` 是 workflow 用户可见进度的唯一 owner；TTY 下刷新动态进度行，非 TTY 下只输出阶段 start/done summary；
 - 新增阶段必须接入同一套 stage runner / progress / artifact policy，而不是复制一套阶段脚手架。
 
@@ -173,7 +178,7 @@ WorkflowRunContext
 
 使用约束：
 
-- `workflow_summary.json` 和 `stages/*/summary.json` 是用户第一入口；
+- `workflow_summary.json` 和 `stages/*/summary.json` 是用户第一入口，只保留阶段级计数和分组摘要，不嵌入 per-run/per-cell rows；
 - `artifacts/runner_configs/target_<config>.json` 是 Python runner config，供 `scripts/model.sh --config` 使用；
 - `predictions/.../cpp_model_config.json` 是 C++ TraceGraph backend narrow config，供 `trace_graph --model-config` 使用；
 - per-run audit、transition catalog、gate、prediction cell 产物都是复现/诊断 artifact，不应和用户第一入口混称；
@@ -183,14 +188,14 @@ HiCache Python helper 的当前职责分组：
 
 | 分组 | 模块 | 职责 |
 | --- | --- | --- |
-| 输入合同 | `facts.py`、`tokens.py`、`input_contract*.py` | fact envelope、token dictionary/span、canonical workload signature 和 cross-input report。 |
-| 矩阵 | `matrix_types.py`、`matrix_discovery.py`、`matrix_quality.py`、`matrix_prediction.py` | 发现 profile runs、构造 prediction specs、workflow input gate 和 prediction row summary。 |
-| oracle | `oracle_state.py`、`oracle_capacity.py`、`oracle_records.py`、`oracle_coverage.py`、`oracle_delta.py`、`oracle_mismatch.py` | final-state oracle、capacity/config audit、predicted records、coverage、delta 和 mismatch provenance helper。 |
-| transition | `transition*.py` | predicted transition schema/replay/self-check、target oracle、single/matrix compare、catalog、gate 和 taxonomy。 |
-| workflow | `workflow*.py` | post-profile quality、final-state prediction、transition exactness、artifact policy、progress 和 workflow summary。 |
+| 共享核心 | `hicache/core/` | fact metadata、consumer 路由和 token dictionary/span helper。 |
+| 输入合同 | `hicache/input_contract/` | canonical workload signature 和 cross-input report。 |
+| 矩阵 | `hicache/matrix/` | 发现 profile runs、构造 prediction specs、workflow input gate 和 prediction row summary。 |
+| oracle | `hicache/oracle/` | final-state oracle、capacity/config audit、predicted records、coverage、delta 和 mismatch provenance helper。 |
+| transition | `hicache/transition/` | predicted transition schema/replay/self-check、target oracle、single/matrix compare、catalog、gate 和 taxonomy。 |
+| workflow | `hicache/workflow/` | post-profile quality、final-state prediction、transition exactness、artifact policy、progress 和 workflow summary。 |
 
-当前仍允许 `hicache/` 包保持扁平文件布局；如果继续增长，应优先按 `quality`、`contract`、`matrix`、`oracle`、`transition`、
-`workflow` 分包拆分，而不是继续依赖文件名前缀维持边界。
+`hicache/` 根目录不再新增业务模块；新 helper 必须落到上述职责子包，避免重新依赖文件名前缀维持边界。
 
 ## 建模模式
 
@@ -259,11 +264,13 @@ active public include 根固定为 `include/markov/trace_graph/...`，命名空�
 | `trace_graph_simulation` | 拓扑仿真。 |
 | `trace_graph_hicache` | HiCache fact、policy、runtime、radix、storage 和 state model。 |
 | `trace_graph_modules` | 业务 `SimulationModule` 包装层。 |
-| `trace_graph_diagnostics` | module summary、HiCache summary JSON 和调试输出 adapter。 |
-| `trace_graph_validation` | C++ 轻量结构 validation；oracle 对比仍由 Python validation pipeline 负责。 |
+| `trace_graph_cli_support` | CLI Debug/Release 边界；Release stub 不链接 diagnostics / validation。 |
+| `trace_graph_diagnostics` | Debug-only module summary、HiCache summary JSON 和调试输出 adapter。 |
+| `trace_graph_validation` | Debug-only C++ 轻量结构 validation；oracle 对比仍由 Python validation pipeline 负责。 |
 
-业务层不得依赖 diagnostics / validation target；diagnostics / validation 可以消费业务层暴露的结构化结果。调试和验证裁剪只使用单一
-`DEBUG` 宏，由 CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
+业务层不得依赖 diagnostics / validation target；diagnostics / validation 可以消费业务层暴露的结构化结果。Release 构建不链接
+diagnostics / validation，`--model-summary` 会明确要求 `TRACE_GRAPH_DEBUG=ON`。调试和验证裁剪只使用单一 `DEBUG` 宏，由
+CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
 
 ## SimulationModule 接口
 
@@ -322,14 +329,13 @@ debug/provenance 字段只能用于质量审计、validation label 或 transitio
 
 | fact | 语义 |
 | --- | --- |
-| `workload_identity/request_bound_match_anchor` | request-scoped match-prefix token anchor；用于把 request id 绑定到可重建 token path，并做 target lookup / touch。 |
-| `workload_identity/request_lifecycle_anchor` | finished/unfinished lifecycle 边界；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
-| `workload_identity/request_admission` | admission 边界；模型构造 target-side extend allocation intent、request ref 和 device allocator pressure。 |
-| `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
-| `runtime_model_checkpoint/prefetch_check_point` | prefetch progress/wait instant 边界；模型推进 wait-complete / best-effort / timeout 的 ready、apply、late、revoked 或 suppressed。 |
+| `workload_identity/cache_lookup_input` | `match_prefix` cache lookup key；用于按 target radix lookup / touch 和 opportunistic host-visible loadback。 |
+| `workload_identity/cache_extend_input` | `prepare_for_extend` start-phase batch 输入；模型按 batch accepted fill path 统一计算 extend allocation pressure 和 request refs。 |
+| `workload_identity/cache_lifecycle_commit` | finished/unfinished lifecycle commit；fact 必须显式携带当前 committed/fill path，模型基于该 path 插入 radix 并释放 request KV lifecycle。 |
+| `workload_identity/prefetch_candidate_anchor` | scheduler prefetch candidate path；模型按 target policy 重新判断 planned pages、storage hit prefix、host reservation 和 anchor ref。 |
 
 match-prefix concrete path、lookup result、source insert/capacity/lock/maintenance、storage/controller result 和 async completion
-只作为 `source_actual` / `timing_observation` evidence。`drain_storage_control_queues()` 不再声明 runtime checkpoint；
+只作为 `source_actual` / `timing_observation` evidence。`drain_storage_control_queues()` 不声明 profiling checkpoint；
 host/storage release 的 target 时机由模型内 target-derived 近似负责。unknown state-model fact 必须进入 quality / summary
 error，不能静默消费。
 
@@ -351,20 +357,19 @@ cross-config rule diagnosis 必须先通过 hard workload identity contract：�
 | `runtime/ref_ledger.hpp/.cpp` | request / writeback / loadback / storage / prefetch owner 级 ref 账本，负责同步 tree 上的 lock ref 和 host ref。 |
 | `runtime/capacity_index.hpp/.cpp` | mutation-driven device/host leaf index、capacity snapshot、victim choice 和 audit trace。 |
 | `runtime/async_state.hpp/.cpp` | prefetch、writeback、loadback、storage operation table 和 lifecycle transition。 |
-| `runtime/target_control_clock.hpp/.cpp` | target-side control checkpoint 与内部 operation id，避免把 source timestamp 当作 target 调度事实。 |
+| `runtime/target_control_clock.hpp/.cpp` | target-side control boundary 与内部 operation id，避免把 source timestamp 当作 target 调度事实。 |
 | `radix/node_split_policy.hpp/.cpp` | radix split 时 residency/ref/hit count/page projection 的结构化迁移策略。 |
 | `policy.hpp/.cpp` | 显式 target config 解析、SGLang-derived default 和 policy decision trace。 |
 | `runtime/state_index.hpp/.cpp` | `DerivedStateView`，从 tree / storage / async 派生 validation-facing state sets。 |
 | `model/state.hpp/.cpp` | `HiCacheState` 聚合状态、scope 管理、digest、公共 apply/finalize 入口。 |
-| `model/request_model.cpp` | request bound match、admission、lifecycle 和 insert/loadback 相关 transition。 |
-| `model/prefetch_model.cpp` | prefetch decision、checkpoint、ready/apply/cancel 和 host reservation。 |
+| `model/request_model.cpp` | cache lookup、batch cache extend、lifecycle commit 和 insert/loadback 相关 transition。 |
+| `model/prefetch_model.cpp` | prefetch candidate、cache-extend terminal boundary、ready/apply/cancel 和 host reservation。 |
 | `model/host_storage_model.cpp` | host cleanup、host allocation 和 capacity eviction。 |
 | `model/writeback_model.cpp` | write-through / write-back、backup ACK、dirty clear 和 ref hold/release。 |
 | `model/finalizer.cpp` | finalize 时 pending operation 收束。 |
-| `model/terminal_checkpoint_scan.cpp` | 预扫描 request-local prefetch process 的最后 checkpoint。 |
-| `model/summary.hpp` | HiCache state model 的结构化执行结果；不包含 JSON。 |
+| `model/summary.hpp` | HiCache state model 的 Debug/validation 结构化执行结果；Release 下为空标记类型，不包含 JSON。 |
 | `diagnostics/summary.hpp/.cpp` | HiCache summary JSON 序列化；不参与状态机决策。 |
-| `hicache_module.hpp/.cpp` | `SimulationModule` registry glue，只持有结构化 summary。 |
+| `hicache_module.hpp/.cpp` | `SimulationModule` registry glue；Debug 才持有结构化 summary，Release 只执行 state replay。 |
 
 ### 目标 Page 投影
 
@@ -408,18 +413,17 @@ summary 输出当前 validation 使用的集合，但集合来源必须是 canon
 
 request / allocator：
 
-- `request_admission` 先用 target radix lookup 得到 prefix，再构造 `ExtendAllocationIntent`；
+- `cache_extend_input` 使用 batch accepted fill path 构造 `CacheExtendBatchIntent`，统一计算 batch-level extend pressure；
 - eviction gate 对齐 SGLang allocator：用 `DeviceAllocatorLedger.available_pages()` 判断是否需要 eviction，不从 radix occupancy 反推；
 - eviction budget 使用完整 allocation request；实际 active request reservation 使用本次真正分配/占用的 page；
-- 当前 batch-level allocation intent 尚未由 profiling 提供，模型以 `extend_allocation_batch_size=1` 作为显式短期合同；
-- `request_lifecycle_anchor` 在 finished / unfinished 上插入 committed path，并释放 duplicate / tail / overallocated KV 到 allocator ledger。
+- `cache_lifecycle_commit` 在 finished / unfinished 上插入 committed path，并释放 duplicate / tail / overallocated KV 到 allocator ledger。
 
 token directory：
 
 - `HiCacheTokenDirectory` 保存 event-local token path snapshot 和 request timeline；`request_id` 只表示请求身份，不表示静态 token path；
-- path 消费必须走 role-specific resolver：match/admission/lifecycle/prefetch 分别只消费对应 fact-local path；
-- lifecycle 缺少 committed path 时必须记录 missing 诊断并跳过 mutation，不能静默复用 admission path；
-- `prefetch_decision` path 只作为 prefetch candidate，不更新 request committed timeline；
+- path 消费必须走 role-specific resolver：lookup/extend/lifecycle/prefetch 分别只消费对应 fact-local path；
+- lifecycle 缺少 committed path 时必须记录 missing 诊断并跳过 mutation，不能静默复用 extend path；
+- `prefetch_candidate_anchor` path 只作为 prefetch candidate，不更新 request committed timeline；
 - directory 只接收 completed state-model path fact；diagnostic/source path 不能为 state model 水合 token；
 - lifecycle resolver 可以读取 earlier committed snapshot 做 duplicate/tail 计算，但本次 lifecycle mutation 的目标 path 必须来自当前 fact。
 
@@ -430,16 +434,16 @@ host / storage / prefetch：
   `evict_host(len(node.value))`；
 - storage hit query 只保留连续命中前缀；storage-readable 不等于 host-visible；
 - prefetch operation 保存 planned path、hit prefix、requested host pages、reserved host pages 和 anchor ref；
-- wait-complete 完成后 apply ready pages，best-effort 在 checkpoint terminate，timeout 在 completed 或 timeout 边界 terminate/late；
+- wait-complete 完成后 apply ready pages，best-effort 在 cache-extend terminal boundary terminate，timeout 在 completed 或 timeout 边界 terminate/late；
 - revoke / timeout incomplete 的 host reservation 进入 pending release 近似，不立即从 host budget 中消失；同 request 的
-  `request_admission` side effect 完成后做 request-local release drain。
+  `cache_extend_input` side effect 完成后做 request-local release drain。
 
 write policy：
 
 - `write_through`、`write_through_selective` 和 `write_back` 共享 device insert、host backup、storage readable、capacity cleanup helper；
 - `write_through_selective` 的 hit-count threshold 由 target policy 决定；
-- write-through backup ACK 前会持有普通 lock ref；当前按 target control fact 近似 drain，真实 async ACK / rank 同步时序仍记录为
-  validation 限制；
+- write-through backup ACK 前会持有普通 lock ref；当前按 target control fact 近似 drain，并在 finalize 收敛尾部
+  pending ACK，真实 async ACK / rank 同步时序仍记录为 validation 限制；
 - write-back ACK 时序当前折叠为同步 completion，结果语义统一落到 host backup / storage readable / dirty clear；
 - source writeback ACK、storage hit result、node remove result 和 async wall-clock completion 不能作为 state model input。
 
@@ -510,9 +514,27 @@ DAG rewrite chain:
 `transition` 解释 state 怎么变；`intent` 解释 target 下应该有哪些物理 cache 操作。DAG patch 应消费 intent，
 不能直接消费 raw page-level transition 或 final page set。
 
+## Backend 选择
+
+业务 modeling 默认使用 Release backend：
+
+- 默认可执行文件是 `build/modeling/trace_graph-release/trace_graph`；
+- 不链接 diagnostics / validation；
+- 不支持 `--model-summary`；
+- 不执行 module summary writer、C++ validation runner 或 HiCache debug summary JSON adapter；
+- 不保存 HiCache transition/policy/ref/capacity/radix/async 行级 debug history。
+
+HiCache validation workflow 必须使用 Debug/validation backend：
+
+- workflow 生成的 runner config 写入 `cpp_trace_graph.backend_kind="validation"`；
+- runner 只查找 `build/modeling/trace_graph-debug/trace_graph`，不回退到 Release；
+- 缺少 Debug backend 时直接失败，并提示 Debug build 命令；
+- `outputs.emit_validation=true` 代表执行 validation 路径，而不是只多写一个输出文件。
+
 ## 验证
 
-validation 不是默认输出，只有 `--emit-validation` 或 config 中 `outputs.emit_validation=true` 时生成。
+validation 不是默认输出，只有 `--emit-validation` 或 config 中 `outputs.emit_validation=true` 时生成，并且必须使用
+Debug/validation backend。
 
 HiCache state validation 必须同时看：
 

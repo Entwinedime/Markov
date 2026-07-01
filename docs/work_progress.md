@@ -2,6 +2,36 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-07-01 19:15:28 +0800
+
+- 对齐当前 active HiCache state validation baseline：
+  - 最新 forced replay workflow 路径为
+    `data/profile_runs/sglang/20260701_060552_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs_first_fix`；
+  - input contract `3/3` ready，workflow input `15/15` ready，state-model input `15/15` ready，strict diagnostic coverage
+    `12/15` ready；
+  - final-state self `15/15`、cross `60/60`、full `75/75` exact；
+  - transition exactness、transition-count exactness 和 page-lifecycle multiset exactness 均为 `75/75`。
+- 本轮修复和收口：
+  - canonical workload signature 继续以 role/signature multiset 作为 hard gate，raw event sequence 只作为可显示诊断；
+  - transition schema / replay / taxonomy 已同步当前 C++ transition kind；
+  - write-through backup ACK 的尾部 ordinary lock ref 在 finalize boundary 收敛；
+  - `docs/validation/hicache_state_validation.md` 已把 2026-07-01 run 提升为当前 active baseline，2026-06-28 run 降级为历史上一版合同证据。
+- Python 格式化约束落地：
+  - 根目录 `pyproject.toml` 新增 Ruff formatter 配置；
+  - 一方 Python 源码已执行 `python3 -m ruff format .`；
+  - `docs/project_constraints.md` 和 README 常用检查记录 `python3 -m ruff format --check .`。
+
+## 2026-07-01 03:25:33 +0800
+
+- 继续收紧 `scripts/internal/markov_internal/hicache` 文件组织：
+  - `workflow` 拆成 `core`、`config`、`planning`、`stages`、`output`；
+  - `transition` 拆成 `artifacts`、`replay`、`validation`；
+  - `oracle` 拆成 `snapshot`、`diff`、`evidence`；
+  - `matrix` 拆成 `runs`、`predictions`、`reports`；
+  - `quality` 拆成 `audit`。
+- 保留 `markov_internal.hicache.workflow.main`、`markov_internal.hicache.transition.main` 和
+  `markov_internal.hicache.input_contract.main` 作为稳定入口，不保留旧平铺模块 wrapper。
+
 ## 2026-06-30 00:39:24 +0800
 
 - 收敛 `docs/tmp/` 剩余 inactive internal 文档：
@@ -433,7 +463,7 @@
     `token_dictionary_or_full_path_span`；
   - state model 仍停在旧语义：`request_bound_match_anchor` 不执行 lookup，`request_lifecycle_anchor` 不触发 insert。
 - 完成 C++ backend alignment：
-  - Chrome trace reader 只过滤 `oracle_state` / `debug_quality` / state snapshot 等 validation-only event，不再把所有
+  - Chrome trace reader 只过滤 `oracle_state` / state snapshot 等 validation-only event，不再把所有
     `model_input=false` 当成不可读事件；
   - source_actual/timing 事件仍不进入 state mutation，只用于 token dictionary 水合和 provenance；
   - router 接受有效 `full_path_span` descriptor，把是否能投影 target pages 留给 state model 机制判断；

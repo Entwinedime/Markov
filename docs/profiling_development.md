@@ -116,8 +116,8 @@ Profiling 相关脚本按“外层 wrapper、容器内入口、可复用包”�
 | `scripts/internal/entrypoints/profile_audit.py` | 容器内通用 artifact audit 入口；只审计 profile manifest、trace 文件和采集 target 命中等低层事实。 |
 | `scripts/internal/markov_internal/audit/profile_artifacts.py` | 通用采集产物审计，不判断某个模型的 consumer contract。 |
 | `scripts/internal/entrypoints/hicache_profile_audit.py` | 容器内 HiCache profile audit 入口。 |
-| `scripts/internal/markov_internal/hicache/quality/profile_audit.py` | HiCache state-model input readiness、strict diagnostic coverage、forced-token workload report 和 workflow gate 所需的单 run 审计。 |
-| `scripts/internal/markov_internal/hicache/quality/state_facts.py` | HiCache state-model fact required fields、token dictionary/span、sequence 和 role coverage 规则。 |
+| `scripts/internal/markov_internal/hicache/quality/audit/profile.py` | HiCache 单 run 审计；默认只检查 artifact/state input，forced-token、oracle evidence 和 strict diagnostic coverage 由 validation 开关执行。 |
+| `scripts/internal/markov_internal/hicache/quality/audit/state_facts.py` | HiCache state-model fact required fields、token dictionary/span、sequence 和 role coverage 规则。 |
 | `scripts/internal/markov_internal/contracts/forced_token.py` | forced-token plan/bundle schema、hash、summary 和 workload report contract helper；profiling capture/replay 与后续 audit 共用。 |
 
 命名约束：
@@ -157,6 +157,8 @@ suite 的设计语义：
 - `matrix.servers[]` 定义 server 配置维度；
 - `matrix.inputs[]` 定义 workload 维度；
 - `experiments[]` 可以显式选择 server/input 组合；
+- suite 展开后的 run-local config 必须保留 `metadata.suite_server_id` 和 `metadata.suite_input_id`；
+  HiCache workflow 只读取这两个字段作为 config/input 身份，不从 `run_id` 反向猜测；
 - suite 内不允许 server/input/experiment 覆盖或 unset `profiling`；
 - suite 只能用于组合和复现采集配置，不能把实验结果写回设计文档。
 
@@ -179,7 +181,7 @@ suite 输出目录保留：
 sitecustomize.py
   -> import hook
   -> trace_sim_probe.probes.generic_callable
-  -> trace_sim_probe.probes.sglang_hicache_callable
+  -> trace_sim_probe.probes.hicache.callable
 ```
 
 关键环境变量：
@@ -192,7 +194,6 @@ sitecustomize.py
 | `TRACE_SIM_PYTHON_PROBE_OUTPUT` | Chrome trace 输出目录 |
 | `TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY` | streaming writer 每多少条 event flush 一次，默认 256 |
 | `TRACE_SIM_HICACHE_CONSUMERS` | 本次 profile 请求的 HiCache fact consumers |
-| `TRACE_SIM_HICACHE_INTERNAL_HOOKS` | 显式开关 HiCache internal source/timing hooks |
 | `TRACE_SIM_PYTHON_PROBE_DEBUG=1` | probe debug 日志 |
 
 HiCache Python probe target 由共享 catalog 维护，默认路径为 `configs/profiling/hicache_probe_targets.json`。
@@ -204,7 +205,6 @@ profile config 的 `profiling.python_probe` 只声明本次需要的 consumer，
   "name": "sglang.hicache",
   "consumers": [
     "hicache_state_model",
-    "hicache_profile_quality",
     "hicache_input_contract",
     "hicache_final_state_validator",
     "hicache_transition_validator"
@@ -216,38 +216,28 @@ profile config 的 `profiling.python_probe` 只声明本次需要的 consumer，
 runner 会读取 catalog，选择 `requested_consumers ∩ target.fact.consumers` 非空的 target，并把输出 target 中的
 `fact.consumers` 收紧为本次交集。profile config 不能内嵌 target、class filter 或 state-trace 开关。
 
-Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐 JSON 结尾。HiCache internal hooks
-由 requested consumers 推导：transition validator 或 HiCache profile audit 需要 source/timing evidence 时安装。
+Python probe 启用后，probe module 加载、target 安装和 catalog 解析错误必须让本次 profiling 失败；不能只在 debug
+日志中吞掉错误后继续运行。这样可以避免配置写错后得到“成功运行但没有关键 trace”的产物。
+
+Python probe writer 使用 streaming Chrome trace 输出；正常退出时补齐 JSON 结尾。当前 HiCache 采集不维护额外 internal hook
+子系统；需要的 source/timing/oracle 证据都必须显式落在 catalog callable target 上，并由 consumer 选择。
 
 单个 target 只采集 `events` 中显式列出的 phase，不存在默认 `end` 采集。`events` 必须写成 phase 到 event name 的映射，
 例如 `{"end": "..."}`、`{"start": "...", "end": "..."}` 或 `{"instant": "..."}`。zero-duration checkpoint 使用
 `"instant"` key，由通用 callable wrapper 在被包装方法成功返回后发出一条 `phase=instant` 事件。
 
-通用 callable source 由 `generic_callable` 提供；HiCache 特化 source 只存在于
-`sglang_hicache_callable.py`：
+通用 callable source 由 `generic_callable` 提供；HiCache 特化 source 位于
+`trace_sim_probe.probes.hicache` package：
 
 | source | 作用 |
 | --- | --- |
 | `token_path:<source>[,<scope_source>]` | 输出 token dictionary；同一 scope/path 在 state-model fact 与 diagnostic evidence 各自去重域内首次包含完整 `token_ids` |
 | `token_span:<source>` | 输出 `{path_id, begin, end, token_count, hash_algo}` |
-| `request_token_path:<req>,<mode>[,<scope>]` | 从 SGLang `Req` 输出 request token dictionary；`mode=fill/committed/admission/prefetch/origin_output` |
+| `request_token_path:<req>,<mode>[,<scope>]` | 从 SGLang `Req` 输出 request token dictionary；`mode=fill/committed/extend/prefetch/origin_output` |
 | `request_token_span:<req>,<mode>` | 从 SGLang `Req` 输出 request token span |
 | `request_token_count:<req>,<mode>` | 从 SGLang `Req` 输出 request token 数 |
-| `token_path_concat:<prefix>,<suffix>[,<scope>]` | 拼接两段 token 后输出 dictionary |
-| `token_span_concat:<prefix>,<suffix>` | 拼接两段 token 后输出 span |
-| `node_token_path:<node>[,<scope>]` | 从 radix node 的 parent chain 还原完整 token path |
-| `node_token_span:<node>` | 从 radix node 输出完整 path span |
-| `node_token_count:<node>` | 统计 radix node full key token 数 |
-| `hicache_node_summary:<node>` | 输出 node id、parent、token span、hash、device/host/ref/child 摘要 |
-| `hicache_node_chain:<node>` | 输出 root 到 node 的链式摘要 |
-| `hicache_evictable_snapshot:<cache>` | 输出 device/host evictable 候选数量和样本 |
-| `hicache_prefetch_progress:<cache>,<req_id>` | 输出 source prefetch progress 证据；只用于 observed/debug |
-| `hicache_request_runtime:<req>` | 输出 source request runtime 摘要；只用于 observed/debug |
-| `hicache_scheduler_prefetch_state:<scheduler>,<req>` | 输出 source scheduler prefetch 判定摘要；只用于 observed/debug |
 | `hicache_cache_scope:<source>` | 输出 rank + cache object 作用域 |
 | `hicache_seq:<source>` | 在 cache scope 内生成单调逻辑序号 |
-| `hicache_config:<source>[,<field>]` | 读取 source cache 配置摘要，用于质量审计和解释 |
-| `hicache_requested_pages:<tokens>,<cache>` | 按 source page size 计算请求页数摘要 |
 | `hicache_state:self` | validation-only state snapshot，写成 `oracle_state/state_snapshot` fact |
 
 旧的 `page_hashes:*` / `target_page_identity_page<page_size>` 不再是当前 HiCache state 主契约。
@@ -257,15 +247,15 @@ request path mode 必须对应当前 SGLang 调用边界：
 
 | mode | 当前读取语义 |
 | --- | --- |
-| `fill` | `cache_unfinished_req()` 使用的 `Req.get_fill_ids()`；仅在 API 不可用时回退旧字段。 |
+| `fill` | `cache_unfinished_req()` 使用的 `Req.get_fill_ids()`；仅在当前 SGLang 对象没有该 API 时回退等价字段。 |
 | `committed` | `origin_input_ids + output_ids` 按 `kv_committed_len` / `_cache_commit_len()` 截断。 |
-| `admission` | `PrefillAdder` 接受本轮请求后可见的 fill path，优先使用 `get_fill_ids()`。 |
+| `extend` | `ScheduleBatch.prepare_for_extend()` 已形成 batch 后的 accepted fill path，优先使用 `Req.get_fill_ids()`。 |
 | `prefetch` | `_prefetch_kvcache()` 的 `full_untruncated_fill_ids[:_compute_max_prefix_len(...)]` 候选 path；不能用 fill path 代替。 |
 | `origin_output` | 完整 `origin_input_ids + output_ids`，只在明确需要完整 request path 时使用。 |
 
 `RadixKey` 必须按其迭代和长度语义读取，不能直接绕过 `limit` / bigram view 读取底层 `.token_ids`。
-配置 target 与 full/debug internal hook 需要跟随当前 SGLang callable 签名；缺少 request 归属的 `InsertParams` /
-`EvictParams` 只能输出 optional `request_id`，不能伪造归属。
+配置 target 需要跟随当前 SGLang callable 签名；缺少 request 归属的 `InsertParams` / `EvictParams` 只能输出 optional
+`request_id`，不能伪造归属。
 
 ## HiCache 事件分类
 
@@ -273,45 +263,49 @@ HiCache Python probe target 必须在共享 catalog 中显式写 `module` 和 ta
 
 | 字段 | 语义 |
 | --- | --- |
-| `fact.class` | `workload_identity`、`target_policy_input`、`runtime_model_checkpoint`、`source_actual`、`timing_observation`、`oracle_state`、`debug_quality` |
+| `fact.class` | `workload_identity`、`source_actual`、`timing_observation`、`oracle_state` |
 | `fact.role` | class 内的事实角色，供 consumer 二级分发 |
-| `fact.consumers` | 可消费该事实的模型、质量审计或 validator 列表 |
+| `fact.consumers` | 可消费该事实的模型、input contract 或 validator 列表 |
 
 catalog target 示例：
 
 ```json
 {
-  "id": "hiradix.cache_finished_req.runtime_observed",
+  "id": "hiradix.insert_result_observed",
   "module": "sglang.srt.mem_cache.hiradix_cache",
-  "target": "HiRadixCache.cache_finished_req",
+  "target": "HiRadixCache.insert",
   "events": {
-    "end": "hicache_cache_finished_req_runtime_observed_end"
+    "end": "hicache_insert_result_observed_end"
   },
-  "fields": [],
   "fact": {
     "class": "source_actual",
-    "role": "request_lifecycle_runtime_observed",
+    "role": "insert_result_observed",
     "consumers": [
-      "hicache_profile_quality",
       "hicache_transition_validator"
     ]
-  }
+  },
+  "fields": [
+    {
+      "name": "cache_scope",
+      "source": "hicache_cache_scope:self"
+    }
+  ]
 }
 ```
 
-后端第一层分流只看 `fact.consumers`、`fact.class/fact.role`，以及该 role 当前合同允许的完成态 phase。workload/policy
-这类 duration fact 使用 end-phase；`runtime_model_checkpoint` 使用 instant phase。其它事件即使出现在 trace 中，也只能作为 timing、
+后端第一层分流只看 `fact.consumers`、`fact.class/fact.role`，以及该 role 当前合同允许的完成态 phase。`cache_extend_input`
+使用 start-phase，其它当前 workload identity fact 使用 end-phase。其它事件即使出现在 trace 中，也只能作为 timing、
 source actual、oracle 或 debug 证据。
 
 | `fact.class` | 用途 |
 | --- | --- |
 | `workload_identity` | 跨配置 workload/request lifecycle 身份事实，可供 state model 和 input contract 消费 |
-| `target_policy_input` | target policy 需要重新决策的输入事实 |
-| `runtime_model_checkpoint` | source runtime 暴露的模型推进 checkpoint；可随 config 变化 |
-| `timing_observation` | latency/bandwidth 样本，不能直接决定 target state |
-| `source_actual` | source run 实际 movement/policy 结果，不能作为 target answer |
+| `timing_observation` | source run 的异步 I/O 边界与 duration evidence，不能直接决定 target state |
+| `source_actual` | source run 实际 control/operation 边界，不能作为 target answer |
 | `oracle_state` | validation-only state snapshot / transition oracle |
-| `debug_quality` | probe 内部质量审计和排查 |
+
+当前 active consumer 只有 state model、input contract、final-state validator 和 transition validator。临时 debug 采集需要先
+在 catalog 中成为明确 target，再声明给对应 validator consumer；不维护独立 debug consumer。
 
 ## HiCache 状态采集目标合同
 
@@ -319,39 +313,40 @@ source actual、oracle 或 debug 证据。
 
 | fact | 语义 |
 | --- | --- |
-| `workload_identity/request_bound_match_anchor` | request-scoped match-prefix token anchor |
-| `workload_identity/request_lifecycle_anchor` | finished/unfinished lifecycle 边界 anchor；必须携带当前 committed/fill `token_dictionary`、`full_path_span` 和 `token_count` |
-| `workload_identity/request_admission` | admission boundary 的 request token path、admission kind 和 policy |
-| `target_policy_input/prefetch_decision` | scheduler prefetch decision checkpoint 的 request token path 和策略参数 |
-| `runtime_model_checkpoint/prefetch_check_point` | request 时间线上的 prefetch check/wait instant 边界 |
+| `workload_identity/cache_lookup_input` | `HiRadixCache.match_prefix` 的 cache lookup key；只描述输入 path，不描述 source lookup 结果。 |
+| `workload_identity/cache_extend_input` | `ScheduleBatch.prepare_for_extend` start-phase 的 batch-level cache extend 输入；包含 request id、位置和 accepted fill path 数组。 |
+| `workload_identity/cache_lifecycle_commit` | finished/unfinished lifecycle commit 边界；必须携带当前 committed/fill `token_dictionary`、`full_path_span` 和 `token_count`。 |
+| `workload_identity/prefetch_candidate_anchor` | `Scheduler._prefetch_kvcache` 的 prefetch candidate path；target policy 由后端按 target config 重算。 |
 
 `drain_storage_control_queues()` 不再作为 profiling runtime checkpoint 采集。它是 source scheduler round 边界，
-跨配置不能稳定映射到 target request timeline；HiCache profile audit 和 transition validator 只消费 `source_actual` /
+跨配置不能稳定映射到 target request timeline；transition validator 只消费 `source_actual` /
 `timing_observation` evidence 与 oracle snapshot label。
 
 source evidence 可以与 state-model target 采自同一个 Python callable，但必须拆成独立 target：
 
 | evidence role family | fact class | 设计边界 |
 | --- | --- | --- |
-| cache-stage concrete path / lookup result | `source_actual` | 只描述 source run 已发生结果，不更新 target state |
-| lifecycle path/runtime | `source_actual` | 只作为 provenance/quality 对照；state model 只能消费 workload lifecycle anchor 上的 path |
-| insert / capacity / lock / maintenance / storage/controller event | `source_actual` 或 `timing_observation` | 只能用于质量审计、oracle/debug 或后续 target-derived 机制设计 |
+| scheduler admission | `source_actual` | 只用于解释 target run admission 边界；state model 消费 batch-level `cache_extend_input`。 |
+| insert / capacity / lock | `source_actual` | 只作为 transition validator 的 operation evidence，不更新 target state。 |
+| prefetch / writeback | `source_actual` 或 `timing_observation` | 只作为 transition validator 的 operation evidence；target 行为仍由模型按 target config 重算。 |
 
-`sglang.hicache` probe 会在 requested consumers 需要 source/timing evidence 时 patch SGLang 内部方法并输出当前合同事件，
-例如 radix split/delete、device/host evictable delta、host ref delta、KV node store/remove、load-back、write-back
-enqueue/start、write/load ack checkpoint、controller prefetch enqueue、rate-limit、storage hit query、prefetch terminate、
-abort cleanup 和 host memory release enqueue。internal hook 产出的 source/timing evidence 不是 normal state input。
+当前 source/timing evidence 字段只保留 operation-level 关联信息：`cache_scope`、必要的 run-local `request_id` 和异步
+`operation_id`。page/state label 来自 `oracle_state/state_snapshot`，不从 source/timing target 中扫描 page/hash 字段。
+
+`sglang.hicache` probe 只安装 catalog 中声明的 callable target。当前不维护额外 internal hook 子系统；如果某个 source/timing
+证据需要进入验证链路，必须先成为 catalog target 并声明对应 consumer。
 
 注意：
 
 - match-prefix path 不再以 `request_tokens` / `lookup_path` 混合 role 出现；
-- request-bound anchor 只在 request id 存在时发出；
-- concrete cache-stage path 另作为 evidence 保留；
+- `cache_lookup_input` 只在 request id 存在时发出；
 - raw `request_id` 只用于单 run 内关联 request-scoped fact，不能作为跨配置 workload identity；
 - 跨配置签名必须归一化到 token path / request fingerprint。
 
 validation-only state snapshot 由 `hicache_final_state_validator` 或 `hicache_transition_validator` consumer 请求。它写成
-`oracle_state/state_snapshot` fact，只能给 HiCache profile audit 和 modeling validation 路径使用。
+`oracle_state/state_snapshot` fact，只能给 HiCache profile audit 和 modeling validation 路径使用。当前 snapshot payload
+只保留 HiRadixCache node state、object/page identity 和 capacity/policy evidence，不再包含 controller queue、ongoing
+operation 或重复的 derived state 摘要。
 
 ## HiCache 采集输入层级
 
@@ -495,31 +490,36 @@ python3 scripts/internal/entrypoints/hicache_profile_audit.py \
   --output <run_dir>/hicache_profile_audit.json
 ```
 
-HiCache audit 检查：
+HiCache audit 的默认路径检查：
 
 - state-model fact 是否误带 source-result 字段；
-- workload 声明的 HiCache 机制是否实际出现；
 - state-model fact 是否具备 token dictionary/span、cache scope、seq_no；
 - token span 是否都能找到 dictionary；
 - `seq_no` 是否在 scope 内有序；
+- `cache_lifecycle_commit` 是否携带可由 state-model fact 自身解析的 committed/fill path。
+
+HiCache validation 路径按 workflow/stage 显式开启后才检查：
+
+- workload 声明的 HiCache 机制是否实际出现；
 - forced replay workload 是否使用合法 plan，且 actual `output_ids` 是否全部匹配 plan；
 - replay bundle schema/hash/id 是否存在，同 input 下 bundle 是否唯一，bundle entry hash 是否等于实际 plan hash；
 - run config 声明 forced capture/replay 时，workload report 必须存在且 mode 必须一致，不能缺失后退化成普通 generate；
-- `request_lifecycle_anchor` 是否携带可由 state-model fact 自身解析的 committed/fill path，并与 observed path 对照一致；
-- source evidence 出现非空 prefetch intent/enqueue 时，`prefetch_decision` 是否也有非空 candidate path；
+- `cache_lifecycle_commit` 是否与 observed path 对照一致；
+- source evidence 出现非空 prefetch intent/enqueue 时，`prefetch_candidate_anchor` 是否也有非空 candidate path；
 - state trace 开启时是否采到 capacity snapshot。
 
-workflow 每次都基于当前代码重新审计 manifest，不复用旧 audit JSON 作为 gate。HiCache workflow quality summary 使用三层
-readiness：
+workflow 每次都基于当前代码重新审计 manifest，不复用旧 audit JSON 作为 gate；profile discovery 要求当前 suite metadata
+明确给出 config/input 身份，缺失时直接作为合同错误失败。HiCache workflow quality summary 使用三层 readiness：
 
 | 字段 | 语义 |
 | --- | --- |
 | `workflow_input_ready` | workflow 是否可继续执行 final-state / transition。 |
-| `state_model_input_ready` | 单 run 是否具备 state model fact、token dictionary/span、oracle snapshot、forced-token readiness 和 workload identity。 |
-| `strict_diagnostic_coverage_ready` | source/timing 诊断覆盖率是否完整；默认不阻塞 state-model workflow。 |
+| `state_model_input_ready` | 单 run 是否具备 state model fact、token dictionary/span 和 workload identity。 |
+| `strict_diagnostic_coverage_ready` | source/timing 诊断覆盖率是否完整；只在 transition/diagnostic coverage 路径执行。 |
 
-严格 coverage 可因某个 workload 未触发声明机制而失败，但只要 state-model path、forced-token、oracle 和 state 输入合同完整，
-`state_model_input_ready` 仍可为真。两者必须分别报告，不能用 state gate 掩盖 coverage 缺口。
+forced-token 一致性、oracle/capacity evidence 和 strict diagnostic coverage 是 validation 路径。关闭时不能只是不输出对应
+JSON 字段，而是不能执行对应 trace 遍历、workload report 读取和诊断对象构造。两者必须分别报告，不能用 state gate 掩盖 coverage
+缺口。
 
 profiling 后的统一 HiCache validation 入口：
 
@@ -548,6 +548,10 @@ workflow 默认 console 输出是阶段级 start/done summary。TTY 中运行行
 <workflow_output>/artifacts/{matrix_plan.json,runner_configs,quality,transition_catalog}/
 <workflow_output>/predictions/<input>/<source>__to__<target>/
 ```
+
+`workflow_summary.json` 和 `stages/*/summary.json` 只保留阶段级计数、按 input/config/family 的分组摘要和关键 ready/exact
+状态。per-run audit、per-prediction matrix row、transition exactness payload、catalog/gate 和日志只保留在
+`artifacts/` 或 `predictions/` 下。
 
 ## LD_PRELOAD
 

@@ -41,26 +41,26 @@ HiCache state prediction 必须同时满足：
 HiCache state 主线使用 catalog-level fact contract。
 
 - C++ backend 只消费 `fact.consumers` 包含 `hicache_state_model` 且 phase 满足该 role 合同的 fact，并要求
-  `fact.class/fact.role` 属于已知 state-model 组合。workload/policy duration fact 使用 end-phase，
-  `runtime_model_checkpoint` 使用 instant phase。
+  `fact.class/fact.role` 属于已知 state-model 组合。`cache_extend_input` 使用 start-phase，其它当前 workload identity fact 使用
+  end-phase。
 - 当前正常 state model fact 是：
-  `workload_identity/request_bound_match_anchor`、`workload_identity/request_lifecycle_anchor`、
-  `workload_identity/request_admission`、`target_policy_input/prefetch_decision`、
-  `runtime_model_checkpoint/prefetch_check_point`。
+  `workload_identity/cache_lookup_input`、`workload_identity/cache_extend_input`、
+  `workload_identity/cache_lifecycle_commit`、`workload_identity/prefetch_candidate_anchor`。
 - `drain_storage_control_queues()` 不再作为 profiling runtime checkpoint 采集；HiCache profile audit 和 transition validator
   不依赖 source scheduler round boundary。
-- token dictionary 只从 completed state-model path fact 水合。`source_actual`、`timing_observation`、
-  `oracle_state`、`debug_quality` 不更新 target state，也不能为 state model 补 token；它们只用于 provenance、质量检查、target oracle
-  抽取和审计。
+- token dictionary 只从 completed state-model path fact 水合。`source_actual`、`timing_observation` 和 `oracle_state`
+  不更新 target state，也不能为 state model 补 token；它们只用于 provenance、质量检查、target oracle 抽取和审计。
+- `source_actual` / `timing_observation` 的当前字段只保留 operation-level correlation，例如 `cache_scope`、run-local
+  `request_id` 和异步 `operation_id`；transition page/state label 必须来自 `oracle_state/state_snapshot` 或模型自身 trace。
 - path-bearing state-model fact 必须自足：`token_dictionary`、`full_path_span` 和每个 referenced `path_id`
   至少一次对应的 `token_ids` 都必须来自 state-model fact，不能只在 diagnostic/source_actual 侧出现。
-- source/control-flow role 不是 state-model input：`insert_path`、`capacity_request`、`lock_scope_delta`、
-  `maintenance_checkpoint` 等都不能进入 mutation path。
+- source/control-flow role 不是 state-model input：`capacity_request`、`capacity_result_observed`、`lock_scope_delta`、
+  `request_admission_observed` 等都不能进入 mutation path。
 - source matched result、source admission return、actual victim、actual movement、actual async completion、node remove result、storage hit result、host ref delta 等 source 已发生结果不得混入 state-model fact。
 - raw `request_id` 只是单次运行内 correlation id；cross audit 必须使用 request-normalized canonical fact，不把 raw id 当跨配置 workload identity。
 - `page_identity`、`target_page_identity`、`target_page_identity_page<page_size>` 不再是 state model 主输入；target page identity 由 token dictionary/span、`hash_algo`、`cache_scope` 和 target `page_size` 推导。
-- `request_lifecycle_anchor` 是 path-bearing workload identity fact，必须携带当前 lifecycle committed/fill path；
-  `request_lifecycle_path_observed` 仍是 `source_actual` 诊断证据，不能回流到 state model。
+- `cache_lifecycle_commit` 是 path-bearing workload identity fact，必须携带当前 lifecycle committed/fill path；当前 catalog
+  不再采集单独的 lifecycle source path observed target。
 
 ## Forced Token 跨配置门禁
 
@@ -98,30 +98,37 @@ HiCache workflow entrypoint 会把该检查压缩到 `workflow_summary.json.inpu
 
 | 机制 | 当前语义 |
 | --- | --- |
-| token/path | `HiCacheTokenDirectory` 保存 fact-local path snapshot 和 request timeline；resolver 按 match/admission/lifecycle/prefetch 语义显式取 path，`HiCacheTargetPager` 按 target page size 生成完整 page hash。 |
+| token/path | `HiCacheTokenDirectory` 保存 fact-local path snapshot 和 request timeline；resolver 按 lookup/extend/lifecycle/prefetch 语义显式取 path，`HiCacheTargetPager` 按 target page size 生成完整 page hash。 |
 | canonical radix | 每个 `cache_scope` 一棵 canonical token/page radix tree；device/host/storage/ref 是 node state，不再维护 device tree 与 host tree 两套事实源。 |
-| device allocator | `request_admission` 构造 `ExtendAllocationIntent`；eviction gate 使用 `DeviceAllocatorLedger.available_pages()`，不从 radix occupancy 反推。 |
-| request lifecycle | finished / unfinished 只消费 anchor 自带 committed/fill path，插入 radix，并释放 duplicate / tail / overallocated KV 到 allocator ledger。 |
+| device allocator | `cache_extend_input` 构造 batch-level `CacheExtendBatchIntent`；eviction gate 使用 `DeviceAllocatorLedger.available_pages()`，不从 radix occupancy 反推。 |
+| request lifecycle | finished / unfinished 只消费 `cache_lifecycle_commit` 自带 committed/fill path，插入 radix，并释放 duplicate / tail / overallocated KV 到 allocator ledger。 |
 | capacity index | `HiCacheCapacityIndex` mutation-driven 维护 device/host leaf、occupied pages、reserved host pages、victim choice 和 audit trace。 |
 | ref ledger | request / writeback / loadback / storage / prefetch owner 级 acquire/release，输出 ref mutation 和 tree ref audit。 |
 | storage directory | 区分 materialized page record 与 backend-readable hash record；prefetch storage hit query 只保留连续 readable prefix。 |
 | prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离。 |
 | host cleanup | host allocation 失败按 SGLang request budget cleanup；victim 是 host-visible、evicted、无 ref 保护且无 backuped child 的 host radix leaf。 |
-| write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK / ref lifetime 仍按 target control boundary 近似，具体风险维护在限制文档。 |
+| write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK / ref lifetime 仍按 target control boundary 近似，并在 finalize 收敛尾部 write-through pending ACK，具体风险维护在限制文档。 |
 
 当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、backend I/O / transition timeline 和异步 ACK / host release 的近似边界。
 
-## 当前保留基线与 active validation 状态
+## 当前合同状态与保留验证基线
 
-### HCSV-20260628-forced-bundle-full-matrix
+### HCSV-20260701-forced-bundle-full-matrix
 
-这是当前 active HiCache state validation 基线。该 run 使用最新 profiling 合同重新采集 forced-token replay，覆盖 3 个 manual input、5
-个 HiCache config、self/cross final-state 和 transition exactness。
+这是当前 active profiling 合同下的 full-matrix 基线。该 run 使用
+`cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
+作为 state-model 输入，不采集 runtime prefetch checkpoint、per-request admission 或 storage-control drain checkpoint。
+
+该基线包含本轮回归修复后的三项收口：
+
+- canonical workload signature 使用 role/signature multiset 作为 hard gate，raw event sequence 只作为可显示诊断；
+- transition schema / replay / taxonomy 统一到当前 C++ transition kind，例如 `cache_extend_acquire_request_ref`；
+- write-through backup ACK 的尾部普通 lock ref 在 `finalize()` boundary 收敛，避免 trace 尾部 pending ACK 污染 final state。
 
 结果目录：
 
 ```text
-data/profile_runs/sglang/20260628_154748_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs
+data/profile_runs/sglang/20260701_060552_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs_first_fix
 ```
 
 workflow 摘要：
@@ -133,7 +140,9 @@ workflow 摘要：
 | input contract ready | `3 / 3` |
 | workflow input ready | `15 / 15` |
 | state-model input ready | `15 / 15` |
+| artifact ready | `15 / 15` |
 | strict diagnostic coverage ready | `12 / 15` |
+| workload sequence diagnostic match | `2 / 3` |
 | final-state self exact | `15 / 15` |
 | final-state cross exact | `60 / 60` |
 | full final-state exact | `75 / 75` |
@@ -141,12 +150,16 @@ workflow 摘要：
 | transition-count exact | `75 / 75` |
 | page-lifecycle multiset exact | `75 / 75` |
 
-合同状态：
+input contract 状态：
 
 - `workflow_input_ready=true`，所有 state-model 输入合同均 ready；
-- 3 个 input 的 forced-token plan signature、bundle signature 和 canonical workload signature 均一致；
-- 当前 trace / catalog 合同中没有 `storage_control_drain_boundary`、`hicache_storage_control_drain_boundary` 或 `check_kind`；
-- `runtime_model_checkpoint` 只保留 `prefetch_check_point`，storage-control release 时机由 target-derived 模型近似负责。
+- 3 个 input 的 forced-token plan signature、bundle signature 和 canonical workload signature 均一致，bundle id 为
+  `sha256_json:dc1e389c53fc49face219d27bc4b264c19ccd097a33cd66660f84217b0cfcb03`；
+- `manual_deeper_pressure_prefetch` 的 raw sequence signature 有 3 种，`sequence_match=false`，但 canonical workload
+  signature 仍为 1 种；这说明当前跨配置 hard gate 检查的是规范化 workload multiset，不把 source runtime event 排序误当成
+  target-independent workload 差异；
+- 当前 trace / catalog 合同中没有 storage-control drain boundary、runtime prefetch checkpoint 或 `check_kind`；
+  storage-control release 时机由 target-derived 模型近似负责。
 
 quality 说明：
 
@@ -158,16 +171,36 @@ quality 说明：
 结论：
 
 - 当前 5x3 manual matrix 的 self/cross final-state 已全部对齐；
-- 当前 75 个 transition prediction 也全部 exact；
+- 当前 75 个 transition prediction 也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
 - 这关闭了 2026-06-26 forced-bundle 产物发现的 Case A oracle final snapshot 误报、Case B host-side release boundary
-  mismatch，以及 2026-06-27 self 对角线中残留的 transition marker mismatch；
+  mismatch、2026-06-27 self 对角线中残留的 transition marker mismatch，以及 2026-07-01 重构后暴露的
+  workload sequence hard-gate、transition kind schema drift 和尾部 write-through ACK lock lifetime 回归；
 - 上述通过只证明当前 manual matrix 和当前近似边界成立，不等价于完整 SGLang scheduler / backend I/O / rank-synced queue
   exactness，长期近似仍维护在限制文档。
 
+### HCSV-20260628-forced-bundle-full-matrix（历史上一版合同）
+
+这是上一版 HiCache profiling 合同下的 full-matrix 基线。该 run 使用当时最新 profiling 合同重新采集 forced-token replay，覆盖
+3 个 manual input、5 个 HiCache config、self/cross final-state 和 transition exactness。
+
+结果目录：
+
+```text
+data/profile_runs/sglang/20260628_154748_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs
+```
+
+历史结果是：input contract `3 / 3` ready，workflow input `15 / 15` ready，strict diagnostic coverage `12 / 15`
+ready，final-state self `15 / 15` exact，final-state cross `60 / 60` exact，transition exact / transition-count exact /
+page-lifecycle multiset exact 均为 `75 / 75`。
+
+该 run 证明上一版不采集、不消费 `storage_control_drain_boundary` 的合同下，5x3 manual matrix 曾经完整对齐。由于当前
+state-model 输入和 workflow 质量口径已经收紧，它只保留为历史对照；当前 active exactness 结论以
+`HCSV-20260701-forced-bundle-full-matrix` 为准。
+
 ### HCSV-20260627-forced-bundle-self-regression（历史 self 回归）
 
-这是 2026-06-27 重新 profiling 数据跑出的 3 input x 5 config self 对角线回归。该 run 只覆盖 self prediction，不覆盖 cross prediction；因此它是当前 self
-回归结论，不替代 2026-06-28 full self/cross 矩阵。
+这是 2026-06-27 重新 profiling 数据跑出的 3 input x 5 config self 对角线回归。该 run 只覆盖 self prediction，不覆盖 cross prediction；因此它是历史 self
+回归证据，不替代当前 2026-07-01 full self/cross 矩阵。
 
 结果目录：
 
@@ -198,21 +231,21 @@ quality 说明：
 final-state 结论：
 
 - 15 个 self prediction 全部 `validation_ready=true` 且 final state exact；
-- 这证明当前 post-admission prefetch release 近似没有造成 self final-state 回归；
+- 这证明当时的 post-extend prefetch release 近似没有造成 self final-state 回归；
 - 2026-06-26 full artifact 中的 Case A oracle snapshot 误报和 Case B best-effort revoke host-release mismatch，在当前 self
   对角线上均已关闭。
 
 历史 transition 说明：
 
 - 该 run 曾暴露 2 个 self transition marker mismatch，final state 均 exact；
-- 后续 2026-06-28 全矩阵在不采集、不消费 `storage_control_drain_boundary` 的新合同下已达到 `75 / 75` transition exact；
+- 后续 2026-06-28 全矩阵在当时不采集、不消费 `storage_control_drain_boundary` 的合同下达到 `75 / 75` transition exact；
 - 因此这两个 marker mismatch 不再作为 active limitation 或下一步修复项维护。
 
 ### HCSV-20260626-forced-bundle-5x3-artifact
 
 这是 forced-token bundle workflow 的历史 full-matrix 产物，用于记录 2026-06-26 这次 5 config x 3 input replay 上发现的问题。
 该产物生成后，Case A 的 oracle snapshot 选择问题已经通过 targeted 单格验证修复，Case B 也已由
-后续 post-admission prefetch release 近似在 2026-06-27 self 回归中关闭；因此本节只把该 full run 当作问题发现证据，
+后续 post-extend prefetch release 近似在 2026-06-27 self 回归中关闭；因此本节只把该 full run 当作问题发现证据，
 不能把它的 5x3 数值直接当作当前修复后的全矩阵结论。
 
 结果目录：
@@ -263,12 +296,13 @@ failure classification：
   当前 `latest_derived_state()`、timeline delta oracle 和 profiling catalog 已限制到 `HiRadixCache.*` state snapshot。
 - Case A 单格已用当前代码重跑通过：`validation_ready=true`、`final_state_match=true`。
 - Case B：`manual_pressure_prefetch / c2_wb_best_effort_p64_low_l1` 的 mismatch 根因集中在 best-effort prefetch revoke 后
-  host release drain 的 target-control 近似边界。粗粒度地把 deferred release drain 前移到 admission / host allocation 前只对
+  host release drain 的 target-control 近似边界。粗粒度地把 deferred release drain 前移到 extend / host allocation 前只对
   CaseB 局部有效，随后会让其它格子提前释放 host reservation，因此已被新契约替换。
-- 当前 profiling 合同不再采集 `drain_storage_control_queues()` checkpoint。terminal prefetch 后的剩余 host reservation
-  保留到同 request 的 `request_admission` side effect 完成后，再做 request-local post-admission release drain。
-- 2026-06-28 forced replay 全矩阵已经刷新 active 结论：self/cross final-state `75 / 75` exact，transition `75 / 75`
-  exact。本节只保留为历史问题发现证据。
+- 当前 profiling 合同不采集 `drain_storage_control_queues()` checkpoint。terminal prefetch 后的剩余 host reservation
+  保留到同 request 的 `cache_extend_input` side effect 完成后，再做 request-local post-extend release drain。
+- 2026-06-28 forced replay 全矩阵曾在上一版合同下刷新结论：self/cross final-state `75 / 75` exact，transition
+  `75 / 75` exact。2026-06-30 合同收紧后，该 run 只保留为历史问题发现证据；当前 active exactness 结论以
+  `HCSV-20260701-forced-bundle-full-matrix` 为准。
 
 ### HCSV-20260624-pre-bundle-5x3-baseline
 
@@ -413,32 +447,19 @@ token directory 重构已通过该基线回归：原 `c3/manual_deeper_pressure_
 | 脚本 | 职责 |
 | --- | --- |
 | `scripts/internal/entrypoints/hicache_cross_input_audit.py` | 跨配置 workload identity input contract 审计；比较前先检查 path-bearing state-model fact 是否可被 C++ token parser 消费。 |
-| `scripts/internal/markov_internal/hicache/matrix_types.py` | matrix 中的 profile run、prediction spec 和 slug 类型。 |
-| `scripts/internal/markov_internal/hicache/matrix_discovery.py` | profile discovery、config/input 过滤和 prediction spec 展开。 |
-| `scripts/internal/markov_internal/hicache/quality/profile_audit.py` | 单 run HiCache profile audit，输出 artifact/state/strict diagnostic/forced-token readiness。 |
-| `scripts/internal/markov_internal/hicache/matrix_quality.py` | workflow input quality gate、workload signature 和输入合同汇总。 |
-| `scripts/internal/markov_internal/hicache/workflow_modeling_config.py` | 写出 Python runner config；C++ backend narrow config 仍由 modeling runner 生成。 |
-| `scripts/internal/markov_internal/hicache/matrix_prediction.py` | prediction 输出路径、validation 提取和 final-state matrix summary。 |
+| `scripts/internal/markov_internal/hicache/core/` | HiCache fact 解析、consumer 路由和 token dictionary/span helper。 |
+| `scripts/internal/markov_internal/hicache/matrix/runs/` | matrix 中的 profile run、prediction spec、slug 类型、profile discovery 和 config/input 过滤。 |
+| `scripts/internal/markov_internal/hicache/quality/audit/` | 单 run HiCache profile audit、state fact required fields、token dictionary/span、sequence 和 role coverage。 |
+| `scripts/internal/markov_internal/hicache/matrix/reports/quality.py` | workflow input quality gate、workload signature 和输入合同汇总；按 workflow stage/scope 打开 validation 审计路径。 |
+| `scripts/internal/markov_internal/hicache/workflow/config/modeling.py` | 写出 Python runner config；C++ backend narrow config 仍由 modeling runner 生成。 |
+| `scripts/internal/markov_internal/hicache/matrix/predictions/prediction.py` | prediction 输出路径、validation 提取和 final-state matrix summary。 |
 | `scripts/internal/entrypoints/hicache_workflow.py` | profiling 后 HiCache validation 主入口；解析 CLI 并交给 workflow 包。 |
-| `scripts/internal/markov_internal/hicache/workflow.py` | workflow CLI 编排，创建 context 并调度 stage runner。 |
-| `scripts/internal/markov_internal/hicache/workflow_context.py` | workflow run context、artifact policy 和输出目录约定。 |
-| `scripts/internal/markov_internal/hicache/workflow_stage_runner.py` | quality、final-state、transition 的面向对象 stage runner。 |
-| `scripts/internal/markov_internal/hicache/workflow_quality.py` | quality stage 的薄调用层，不持有终端输出。 |
-| `scripts/internal/markov_internal/hicache/workflow_final_state.py` | final-state prediction 执行、model command、matrix row 和 self/cross summary。 |
-| `scripts/internal/markov_internal/hicache/workflow_transition.py` | transition stage 薄调用层，调用 transition matrix compare。 |
-| `scripts/internal/markov_internal/hicache/workflow_progress.py` | 统一阶段级进度输出；不再打印逐 run/cell `result ok ...`。 |
-| `scripts/internal/markov_internal/hicache/workflow_summary.py` | workflow 顶层 summary、forced-token bundle 摘要和 input contract 摘要。 |
+| `scripts/internal/markov_internal/hicache/workflow/core/` / `config/` / `planning/` / `stages/` / `output/` | workflow context、runner config、plan、stage runner、final-state/transition stage、进度输出和顶层 summary。 |
 | `scripts/internal/entrypoints/hicache_provenance.py` | 基于 validation / predicted trace / oracle snapshot 的 mismatch 页面证据汇总，不回写模型。 |
 | `scripts/internal/entrypoints/hicache_transition.py` | 只读 transition exactness CLI：model self-check、target oracle extraction、self/cross/matrix compare。 |
-| `scripts/internal/markov_internal/hicache/input_contract_core.py` / `input_contract_report.py` | workload identity fact 抽取、token/path 合同、canonical signature 和 source/target report。 |
-| `scripts/internal/markov_internal/hicache/oracle_state.py` | state snapshot 读取、HiRadixCache-only final-state 派生和 state set diff。 |
-| `scripts/internal/markov_internal/hicache/oracle_delta.py` | event / timeline delta oracle 与 predicted transition 覆盖诊断。 |
-| `scripts/internal/markov_internal/hicache/transition_oracle.py` | 从 target probe trace 抽取 observed transition oracle，只读 `source_actual` / `timing_observation` / `oracle_state` evidence。 |
-| `scripts/internal/markov_internal/hicache/transition_self_check.py` | model-side transition trace schema、replay 和 lifecycle 自检。 |
-| `scripts/internal/markov_internal/hicache/transition_compare.py` / `transition_matrix.py` | 单格和矩阵级 transition exactness compare 和汇总；终端输出由 workflow progress 统一负责。 |
-| `scripts/internal/markov_internal/hicache/transition_taxonomy.py` | transition family 分类、DAG patch gate 字段和 evidence 摘要 helper；不提供 CLI。 |
-| `scripts/internal/markov_internal/hicache/transition_catalog.py` | transition mismatch catalog JSON/Markdown 和 family sample 生成；不提供 CLI。 |
-| `scripts/internal/markov_internal/hicache/transition_gate.py` | diagnostic operation gate payload、coverage 和 scoreboard 生成；不提供 CLI。 |
+| `scripts/internal/markov_internal/hicache/input_contract/` | workload identity fact 抽取、token/path 合同、canonical signature 和 source/target report。 |
+| `scripts/internal/markov_internal/hicache/oracle/snapshot/` / `diff/` / `evidence/` | state snapshot 读取、HiRadixCache-only final-state 派生、capacity、coverage、delta、records 和 mismatch helper。 |
+| `scripts/internal/markov_internal/hicache/transition/artifacts/` / `replay/` / `validation/` | transition path/catalog 产物、model self-check/replay schema、target oracle、single/matrix compare、taxonomy 和 gate 输出。 |
 
 这些脚本都不能生成 synthetic state-model fact，不能修改 profiling trace，也不能把 `source_actual` / `timing_observation` /
 `oracle_state` 写回 target state。
@@ -567,8 +588,8 @@ jq '{prediction_count,
 | 问题 | 当前结论 |
 | --- | --- |
 | Case A：`manual_deeper_pressure_prefetch/c1` oracle final 为空 | 这是 validation oracle snapshot 选择误报。final oracle、timeline delta oracle 和 profiling catalog 均已限制到 `HiRadixCache.*` cache-tree snapshot；`HiCacheController.*` 等辅助对象 snapshot 不参与 final cache-tree 派生。 |
-| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已废弃；当前不采集也不消费 `storage_control_drain_boundary`，而是在 terminal prefetch 后保留 pending host reservation，并在同 request `request_admission` side effect 后做 request-local post-admission drain。 |
-| 2026-06-27 self transition marker mismatch | 历史 self run 曾有 2 个 marker-only transition mismatch；2026-06-28 全矩阵已在当前合同下达到 `75 / 75` transition exact，不再作为 active 修复项维护。 |
+| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已废弃；当前不采集也不消费 `storage_control_drain_boundary`，而是在 terminal prefetch 后保留 pending host reservation，并在同 request `cache_extend_input` side effect 后做 request-local post-extend drain。 |
+| 2026-06-27 self transition marker mismatch | 历史 self run 曾有 2 个 marker-only transition mismatch；2026-06-28 全矩阵在上一版合同下达到 `75 / 75` transition exact，不再作为 active 修复项维护。 |
 
 注意：`drain_storage_control_queues()` 是 source scheduler round boundary。它不能重新包装成 cross-config state-model input，
 也不能作为 HiCache profile audit 或 transition validator 的必需 checkpoint。后续如果要精确建模 rank-synced release queue，
@@ -584,7 +605,7 @@ jq '{prediction_count,
 - gate 对齐 SGLang `allocator.available_size() < requested_tokens`，其中 available 来自 allocator ledger；
 - eviction budget 使用完整 allocation request，而不是只清理 deficit；
 - request lifecycle 在 finished / unfinished 时释放 duplicate、tail 和 overallocated KV；
-- `request_bound_match_anchor` 的 loadback allocation 当前只做 opportunistic promotion；需要 eviction 的 loadback 等待新的 loadback intent。
+- `cache_lookup_input` 的 loadback allocation 当前只做 opportunistic promotion；需要 eviction 的 loadback 等待新的 loadback intent。
 
 该机制关闭了早期 c2 self prediction 的 L1 mismatch。batch-level allocator 仍以 `batch_size=1` 为短期合同，详见限制文档。
 
@@ -594,8 +615,8 @@ jq '{prediction_count,
 - host cleanup 删除 host leaf subtree，并更新 parent/child topology 与 capacity index；
 - timeout prefetch 不再因为 storage directory hit 就直接落 host，必须等 target policy 的 completed/apply 边界；
 - target host/device capacity 从 SGLang server command 推导，包括 host pool page 对齐和 prefetch capacity limit；
-- prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 pending release；同 request admission 完成后
-  做 request-local release drain，finalize 只兜底释放没有后续 admission 的残留 reservation；
+- prefetch revoke / timeout incomplete 的 host reservation 不立即释放，而是保留 pending release；同 request cache extend 完成后
+  做 request-local release drain，finalize 只兜底释放没有后续 cache extend 的残留 reservation；
 - write-through backup ACK 前持有普通 lock ref，并在下一条 target control fact 近似 drain。
 
 这些机制关闭了旧矩阵中的多类 L2/backuped/evicted/locked mismatch。write-through ACK / ordinary lock lifetime 仍是近似边界，
@@ -613,12 +634,13 @@ oracle snapshot 选择误报。
 ### HCSV-20260612-atomic-input-contract
 
 - 旧 mixed roles 被拆掉：`request_tokens`、`lookup_path`、`request_cache_lifecycle` 不再是 normal role；
-- source/control-flow 事实降级为 evidence：`insert_path`、`capacity_request`、`lock_scope_delta`、`maintenance_checkpoint` 等不更新 target state；
+- source/control-flow 事实降级为 evidence：`capacity_request`、`capacity_result_observed`、`lock_scope_delta`、
+  `request_admission_observed` 等不更新 target state；
 - 双向 cross audit 证明 workload identity contract 可以作为 state model 输入边界。
 
 ### HCSV-20260612-target-resource-mechanism
 
-- request-derived device lock/ref、admission reservation、target L1 capacity pressure 和 dynamic device radix leaf victim 初步闭合；
+- request-derived device lock/ref、cache extend reservation、target L1 capacity pressure 和 dynamic device radix leaf victim 初步闭合；
 - S1A target self/cross 已 final-state pass；
 - S1B 剩余差异集中在 host/L2/storage/prefetch visibility，推动后续 host/device/async 边界重构。
 

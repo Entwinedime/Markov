@@ -13,7 +13,7 @@
 ├── src/profiling/python_probe/          # sitecustomize + import hook + Python callable probes
 │   └── trace_sim_probe/probes/
 │       ├── generic_callable.py          # 通用 callable 插桩
-│       └── sglang_hicache_callable.py   # HiCache token/span、scope、seq、oracle snapshot source
+│       └── hicache/                     # HiCache source、token、snapshot、internal wrapper package
 ├── src/profiling/ld_preload/            # C++ LD_PRELOAD hook 框架和硬编码 wrapper
 ├── src/modeling/trace_graph/            # C++ TraceGraph、DAG 仿真和 SimulationModule 后端
 │   ├── include/markov/trace_graph/modules/hicache/
@@ -70,7 +70,7 @@ git submodule update --init --recursive
 ```bash
 scripts/build.sh modeling
 scripts/run.sh modeling -- bash -lc \
-  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja && cmake --build build/modeling/trace_graph --target trace_graph -j2'
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
 ```
 
 构建 framework runtime 和对应 hook：
@@ -85,6 +85,7 @@ scripts/build.sh ktransformers
 ## 常用检查
 
 ```bash
+python3 -m ruff format --check .
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
@@ -113,7 +114,8 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_com
 
 当前 HiCache state validation suite 只启用 `python_probe`。它采集：
 
-- 声明给 `hicache_state_model` 的 `workload_identity`、`target_policy_input` 和 `runtime_model_checkpoint` 状态输入事实；
+- 声明给 `hicache_state_model` 的 `workload_identity` 状态输入事实，包括 cache lookup、cache extend、cache lifecycle commit
+  和 prefetch candidate；
 - `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
 - `oracle_state` 的 validation-only state snapshot。
 
@@ -173,13 +175,14 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-06-29，当前主线状态是：
+截至 2026-07-01，当前主线状态是：
 
-- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `57` 个 target；
+- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `54` 个 target；
 - `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
-- `hicache_state_model` 只消费 `7` 个 state-model target，覆盖 `5` 个 role；其余 target 只用于质量审计、输入合同、
+- `hicache_state_model` 只消费 `5` 个 workload identity target，覆盖 `4` 个 role；其余 target 只用于输入合同、
   transition validation 或 final-state oracle；
-- `oracle_state/state_snapshot` 只保留 `24` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
+- `hicache_profile_quality` 不再作为采集 consumer；quality 审计按当前 run 实际请求的 input/final/transition consumer 判断 readiness；
+- `oracle_state/state_snapshot` 只保留 `23` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
   或 `Scheduler.*` snapshot 定义 HiCache cache-tree final state；
 - C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
 - forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和 `hicache_workflow.py` 已落地；
