@@ -2,6 +2,22 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-07-03 00:58:05 +0800
+
+- 完成 unified `modeling_workflow` Python 重构后的主线文档对齐：
+  - `docs/tmp/` 中三份 2026-07-02 modeling workflow 重构计划/审计文档已拆分迁移到
+    `docs/project_constraints.md`、`docs/modeling_development.md`、`docs/profiling_development.md` 和
+    `docs/validation/hicache_state_validation.md`；
+  - 当前 active internal 入口收敛为 `profile.py`、`model.py` 和 `modeling_workflow.py`；
+  - HiCache validation 逻辑归属 `markov_internal/modeling_workflow/validations/hicache/`，不再维护独立
+    `markov_internal/hicache/` 或 standalone HiCache workflow/transition CLI；
+  - workflow artifact 布局对齐为 `workflow_summary.json`、`preflight_summary.json`、
+    `artifacts/model_runs_summary.json`、`artifacts/validations/<name>/summary.json` 和 `model_runs/<model_run_id>/`。
+- 注意：新的 unified workflow 当前只完成 Ruff / compileall / dry-run smoke 验证，尚未生成 full-matrix 结果；HiCache
+  state/transition 正确性仍以
+  `data/profile_runs/sglang/20260701_060552_profiling_hicache_state_forced_replay/modeling/hicache_state_workflow_manual_3inputs_first_fix`
+  旧 workflow 基线为准。
+
 ## 2026-07-01 19:15:28 +0800
 
 - 对齐当前 active HiCache state validation baseline：

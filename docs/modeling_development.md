@@ -65,9 +65,10 @@ scripts/run.sh modeling -- bash -lc \
 不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
 可复现 profile/modeling run。
 
-当前也不维护静态 `configs/modeling/` 文件。cache-state 主流程由 `scripts/internal/entrypoints/hicache_workflow.py` 从 profile suite 的
-target server metadata 动态生成 Python runner config，写入 `<workflow_output>/artifacts/runner_configs/`；每个 prediction
-输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow config。
+当前也不维护静态 `configs/modeling/` 文件。post-profile modeling 主流程由
+`scripts/internal/entrypoints/modeling_workflow.py` 统一编排。该 workflow 根据选中的 validation object 从 profile suite 的
+target server metadata 动态生成 Python runner config，写入 `<workflow_output>/model_runs/<model_run_id>/runner_config.json`；
+每个 model run 输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow config。
 
 faithful replay：
 
@@ -80,13 +81,13 @@ scripts/model.sh \
   --emit-validation
 ```
 
-HiCache state validation prediction 通常由 workflow 生成 runner config 后调用：
+低层单次 modeling execution 仍可由 workflow 生成 runner config 后调用：
 
 ```bash
 scripts/model.sh \
-  --config <workflow_output>/artifacts/runner_configs/target_<config_id>.json \
+  --config <workflow_output>/model_runs/<model_run_id>/runner_config.json \
   --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/cache_state \
+  --output-dir <workflow_output>/model_runs/<model_run_id> \
   --mode cache_state
 ```
 
@@ -104,6 +105,7 @@ scripts/model.sh \
 | `--emit-dag-chrome-trace` | 输出 DAG Chrome trace。 |
 | `--emit-module-summary` | 输出 `model_summary.json`。 |
 | `--emit-validation` | 输出 `validation.json`。 |
+| `--emit-dag-analysis` | 输出 Debug-only `dag_quality.json`、`dag_analysis.json`、`dag_anchor_coverage.json` 和 `dag_operation_visibility.json`。 |
 
 ## 脚本分层
 
@@ -115,87 +117,99 @@ Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
 | 容器内入口 | `scripts/internal/entrypoints/model.py` | 解析 modeling CLI，调用 `markov_internal.modeling.runner`。 |
 | C++ 输入准备 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 处理 profile manifest / raw trace 输入、调用 trace merger、检查 merge summary。 |
 | C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数，并按 backend 定位 Release 或 Debug/validation binary。 |
-| validation payload | `scripts/internal/markov_internal/modeling/validation.py` | 组装 validation 输出、HiCache state validation 和 recommended config audit。 |
+| validation payload | `scripts/internal/markov_internal/modeling/hicache_validation_artifacts.py` | 组装 `validation.json`、HiCache state validation、predicted state trace 和 recommended config audit。 |
 | workload helper | `scripts/internal/markov_internal/modeling/workload.py` | 读取 workload report / bench JSONL 中的实际运行窗口。 |
+| workflow 入口 | `scripts/internal/entrypoints/modeling_workflow.py` | profiling 后统一 modeling workflow 入口；用户选择 validation object，不选择底层 C++ debug flag。 |
+| workflow 包 | `scripts/internal/markov_internal/modeling_workflow/` | preflight、plan、model-runs、validations、artifact layout、runner adapter 和 workflow summary。 |
 
-HiCache workflow 是 profiling 后的 validation 编排，不属于 C++ 后端主体：
+Unified modeling workflow 是 profiling 后的 validation / analysis 编排，不属于 C++ 后端主体。它的固定阶段是：
+
+```text
+preflight -> plan -> model-runs -> validations -> workflow-summary
+```
+
+validation object 是 C++ output 的读取视角，不是独立 workflow：
 
 | 路径 | 职责 |
 | --- | --- |
-| `scripts/internal/entrypoints/hicache_workflow.py` | 统一入口，解析 workflow CLI。 |
-| `scripts/internal/markov_internal/hicache/workflow/core/` | workflow context 与 artifact policy。 |
-| `scripts/internal/markov_internal/hicache/workflow/stages/` | 面向对象 stage runner、final-state stage 和 transition stage。 |
-| `scripts/internal/markov_internal/hicache/workflow/output/` | TTY progress 与 stage/workflow summary 输出。 |
-| `scripts/internal/markov_internal/hicache/workflow/config/` / `planning/` | workflow runner config 与 matrix plan 写出。 |
-| `scripts/internal/markov_internal/hicache/matrix/runs/` | profile discovery、run metadata 和 prediction spec。 |
-| `scripts/internal/markov_internal/hicache/matrix/predictions/` / `reports/` | prediction 输出路径、final-state matrix summary 和 workflow input quality report。 |
-| `scripts/internal/entrypoints/hicache_transition.py` / `hicache/transition/` | 只读 transition oracle、model self-check、single/matrix compare、catalog 和 gate 输出。 |
-| `scripts/internal/markov_internal/hicache/transition/artifacts/` / `replay/` / `validation/` | transition path/catalog 产物、model replay schema 和 exactness validation。 |
-| `scripts/internal/markov_internal/hicache/oracle/snapshot/` / `diff/` / `evidence/` | oracle snapshot 读取、state delta/mismatch 和 capacity/coverage evidence。 |
-| `scripts/internal/markov_internal/hicache/core/` | HiCache fact 解析、consumer 路由和 token dictionary/span helper。 |
+| `validations/base_dag/` | 请求 faithful replay + base DAG diagnostics，解释 `dag_quality.json` / `dag_analysis.json`。 |
+| `validations/hicache/dag_mapping.py` | 复用 base DAG faithful replay run，解释 HiCache anchor coverage / operation visibility。 |
+| `validations/hicache/final_state.py` | 请求或复用 cache-state run，解释 `validation.json` / `model_summary.json` 的 final-state 结果。 |
+| `validations/hicache/transition/` | 复用 cache-state run 和 validation artifact，调用 transition comparator 解释 transition exactness。 |
+| `validations/final_dag/` | 当前读取 faithful replay DAG diagnostics；在 patch artifact 稳定前 `final DAG == base DAG`。 |
+| `scripts/internal/markov_internal/modeling_workflow/progress.py` | workflow 共享 TTY progress reporter。 |
 
 transition oracle 只消费 `source_actual` / `timing_observation` evidence 和 `oracle_state` snapshot 来做验证标签；
 它不生成 state-model fact，也不消费 runtime storage-control checkpoint。C++ state model 的输入仍只由 fact contract 和 router
 决定。
 
-HiCache workflow 的 Python 编排以 stage runner 为顶层结构：
+Unified modeling workflow 的 Python 编排以 validation object 和 model-run planner 为顶层结构：
 
 ```text
-WorkflowRunContext
-  -> WorkflowArtifactPolicy
+WorkflowContext
+  -> WorkflowArtifactLayout
   -> WorkflowProgressReporter
-  -> workflow.stages.QualityStageRunner
-  -> workflow.stages.FinalStateStageRunner
-  -> workflow.stages.TransitionStageRunner
+  -> selected ValidationRequest
+  -> PreflightRunner
+  -> ModelRunSpec planner
+  -> runner adapter / model executor
+  -> validation artifact analyzers
 ```
 
 约束：
 
-- `workflow/cli.py` 只负责解析 CLI、发现 runs、创建 context、按固定顺序调用 stage runner 和写 workflow summary；
-- quality、final-state、transition 阶段共享 `WorkflowStageRunner` 生命周期，不在各自矩阵模块中直接打印进度；
-- `matrix/quality.py`、`workflow/final_state.py`、`transition/matrix.py` 保留为可测试业务函数或 stage helper，不拥有终端输出策略；
+- `modeling_workflow/cli.py` 只负责解析 CLI 并进入 `WorkflowRunner`；run discovery、preflight、plan、execute、validation 和 summary 由 workflow 对象分层负责；
+- validation object 只声明 preflight checks、model-run requests、output requirements 和 artifact 解释逻辑，不直接拼 `scripts/model.sh` 命令；
+- runner adapter 负责把 semantic output requirement 翻译成当前 `model.py` runner config / output flag；
 - `WorkflowProgressReporter` 是 workflow 用户可见进度的唯一 owner；TTY 下刷新动态进度行，非 TTY 下只输出阶段 start/done summary；
-- 新增阶段必须接入同一套 stage runner / progress / artifact policy，而不是复制一套阶段脚手架。
+- selected validation 未请求的 quality check、C++ debug output 和 Python artifact 读取路径都不能执行。
 
-当前 workflow artifact 布局：
+当前 unified workflow artifact 布局：
 
 ```text
 <workflow_output>/
   workflow_summary.json
-  stages/
-    quality/summary.json
-    final_state/self_summary.json
-    final_state/cross_summary.json
-    transition/summary.json
+  preflight_summary.json
+  model_runs/
+    <model_run_id>/
+      runner_config.json
+      command.json
+      prediction.json
+      run_summary.json
+      cpp_model_config.json
+      model_summary.json
+      validation.json
   artifacts/
-    matrix_plan.json
-    runner_configs/
-    quality/
-    transition_catalog/
-  predictions/
-    <input>/<source>__to__<target>/
+    model_run_plan.json
+    preflight/
+    model_runs_summary.json
+    validations/<validation_name>/
+      summary.json
+      <model_run_id>.json
 ```
 
 使用约束：
 
-- `workflow_summary.json` 和 `stages/*/summary.json` 是用户第一入口，只保留阶段级计数和分组摘要，不嵌入 per-run/per-cell rows；
-- `artifacts/runner_configs/target_<config>.json` 是 Python runner config，供 `scripts/model.sh --config` 使用；
-- `predictions/.../cpp_model_config.json` 是 C++ TraceGraph backend narrow config，供 `trace_graph --model-config` 使用；
-- per-run audit、transition catalog、gate、prediction cell 产物都是复现/诊断 artifact，不应和用户第一入口混称；
+- `workflow_summary.json`、`preflight_summary.json`、`artifacts/model_runs_summary.json` 和
+  `artifacts/validations/<validation_name>/summary.json` 是用户第一入口，只保留阶段级计数和分组摘要，不嵌入 per-run/per-cell rows；
+- `model_runs/<model_run_id>/runner_config.json` 是 Python runner config，供 `scripts/model.sh --config` 使用；
+- `model_runs/<model_run_id>/cpp_model_config.json` 是 C++ TraceGraph backend narrow config，供 `trace_graph --model-config` 使用；
+- per-run audit、transition catalog、gate、model run cell 产物都是复现/诊断 artifact，不应和用户第一入口混称；
 - 默认 console 输出不逐 run/cell 打印 `result ok ...`；失败时只补充失败数量、少量 sample 和关键 artifact 路径。
 
 HiCache Python helper 的当前职责分组：
 
 | 分组 | 模块 | 职责 |
 | --- | --- | --- |
-| 共享核心 | `hicache/core/` | fact metadata、consumer 路由和 token dictionary/span helper。 |
-| 输入合同 | `hicache/input_contract/` | canonical workload signature 和 cross-input report。 |
-| 矩阵 | `hicache/matrix/` | 发现 profile runs、构造 prediction specs、workflow input gate 和 prediction row summary。 |
-| oracle | `hicache/oracle/` | final-state oracle、capacity/config audit、predicted records、coverage、delta 和 mismatch provenance helper。 |
-| transition | `hicache/transition/` | predicted transition schema/replay/self-check、target oracle、single/matrix compare、catalog、gate 和 taxonomy。 |
-| workflow | `hicache/workflow/` | post-profile quality、final-state prediction、transition exactness、artifact policy、progress 和 workflow summary。 |
+| 共享核心 | `modeling_workflow/validations/hicache/core/` | fact metadata、consumer 路由和 token dictionary/span 辅助工具。 |
+| 输入合同 | `modeling_workflow/validations/hicache/input_contract/` | canonical workload signature、path contract 和 source/target report。 |
+| preflight | `modeling_workflow/validations/hicache/preflight/` | HiCache workflow input gate、state fact coverage、forced-token、sequence 诊断和 strict diagnostic coverage。 |
+| oracle | `modeling_workflow/validations/hicache/oracle/` | final-state oracle、capacity/config audit、predicted records、coverage、delta 和 mismatch provenance。 |
+| transition | `modeling_workflow/validations/hicache/transition/` | predicted transition schema/replay/self-check、target oracle、single/prediction-set compare、catalog、gate 和 taxonomy。 |
+| workflow | `modeling_workflow/` | post-profile preflight、model-run planning/execution、validation object、artifact layout、progress 和 workflow summary。 |
 
-`hicache/` 根目录不再新增业务模块；新 helper 必须落到上述职责子包，避免重新依赖文件名前缀维持边界。
+不再维护独立 `markov_internal/hicache/` 包；HiCache validation helper 必须落到 unified workflow 的 HiCache validation 子包，
+避免重新依赖文件名前缀维持边界。
 
 ## 建模模式
 
@@ -243,6 +257,7 @@ C++ 后端位于 `src/modeling/trace_graph`：
 | `modules/hicache/radix` | canonical token radix tree 和 split policy。 |
 | `modules/hicache/storage` | storage directory 和 backend-readable 投影。 |
 | `modules/hicache/diagnostics` | HiCache summary JSON 序列化和诊断输出。 |
+| `modules/dag_analysis` | Debug-only DAG faithful replay、结构画像、anchor coverage 和 operation visibility artifact。 |
 
 构建目标：
 
@@ -265,12 +280,12 @@ active public include 根固定为 `include/markov/trace_graph/...`，命名空�
 | `trace_graph_hicache` | HiCache fact、policy、runtime、radix、storage 和 state model。 |
 | `trace_graph_modules` | 业务 `SimulationModule` 包装层。 |
 | `trace_graph_cli_support` | CLI Debug/Release 边界；Release stub 不链接 diagnostics / validation。 |
-| `trace_graph_diagnostics` | Debug-only module summary、HiCache summary JSON 和调试输出 adapter。 |
+| `trace_graph_diagnostics` | Debug-only module summary、HiCache summary JSON、DAG analysis 和调试输出 adapter。 |
 | `trace_graph_validation` | Debug-only C++ 轻量结构 validation；oracle 对比仍由 Python validation pipeline 负责。 |
 
 业务层不得依赖 diagnostics / validation target；diagnostics / validation 可以消费业务层暴露的结构化结果。Release 构建不链接
-diagnostics / validation，`--model-summary` 会明确要求 `TRACE_GRAPH_DEBUG=ON`。调试和验证裁剪只使用单一 `DEBUG` 宏，由
-CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
+diagnostics / validation，`--model-summary` 和 `--dag-analysis-output-dir` 会明确要求 `TRACE_GRAPH_DEBUG=ON`。调试和验证裁剪只使用单一
+`DEBUG` 宏，由 CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
 
 ## SimulationModule 接口
 
@@ -524,12 +539,56 @@ DAG rewrite chain:
 - 不执行 module summary writer、C++ validation runner 或 HiCache debug summary JSON adapter；
 - 不保存 HiCache transition/policy/ref/capacity/radix/async 行级 debug history。
 
-HiCache validation workflow 必须使用 Debug/validation backend：
+需要 validation/debug artifact 的 unified modeling workflow 必须使用 Debug/validation backend：
 
 - workflow 生成的 runner config 写入 `cpp_trace_graph.backend_kind="validation"`；
 - runner 只查找 `build/modeling/trace_graph-debug/trace_graph`，不回退到 Release；
 - 缺少 Debug backend 时直接失败，并提示 Debug build 命令；
 - `outputs.emit_validation=true` 代表执行 validation 路径，而不是只多写一个输出文件。
+- `outputs.emit_dag_analysis=true` 同样要求 Debug backend，并执行 DAG analysis artifact 构造路径。
+
+## DAG Analysis Validation
+
+`base_dag` / `hicache_dag_mapping` 是 profiling 后的 per-run validation object，用来理解真实 DAG，而不是执行 cache patch。
+它的粒度是真实 `input_id / config_id / profile_manifest`，不是 source-to-target prediction cell。两者共享同一批
+`mode=faithful_replay` model run：`base_dag` 解释 faithful replay / DAG quality，`hicache_dag_mapping` 解释 HiCache
+anchor coverage / operation visibility。
+
+运行入口示例：
+
+```bash
+python3 scripts/internal/entrypoints/modeling_workflow.py \
+  --profile-run-dir <suite> \
+  --output-dir <suite>/modeling/modeling_workflow_dag \
+  --validations base_dag,hicache_dag_mapping \
+  --inputs <input_id> \
+  --configs <config_id>
+```
+
+阶段产物：
+
+```text
+workflow_summary.json
+preflight_summary.json
+artifacts/preflight/full_dag_trace_channels/<input>/<config>/profile_artifact_audit.json
+artifacts/model_runs_summary.json
+artifacts/validations/base_dag/<model_run_id>.json
+artifacts/validations/base_dag/summary.json
+artifacts/validations/hicache_dag_mapping/<model_run_id>.json
+artifacts/validations/hicache_dag_mapping/summary.json
+model_runs/<model_run_id>/dag_quality.json
+model_runs/<model_run_id>/dag_analysis.json
+model_runs/<model_run_id>/dag_anchor_coverage.json
+model_runs/<model_run_id>/dag_operation_visibility.json
+```
+
+`dag_quality.json` 记录 faithful replay sanity 和 channel coverage；`dag_analysis.json` 记录 node / edge / lane /
+critical path 摘要；`dag_anchor_coverage.json` 只审计当前 workload identity facts 的 DAG anchor；`dag_operation_visibility.json`
+把候选 HiCache operation 标记为 visible / partially visible / invisible。这里的 `patchable_candidate` 只表示阶段二可继续评估，
+不代表当前业务路径已经支持 patch。
+
+后续 scheduler、storage、runtime 或 communication 子模块不应新增独立 DAG workflow，而应在 unified modeling workflow
+下新增 validation object，并声明自己需要的 C++ output requirement。
 
 ## 验证
 

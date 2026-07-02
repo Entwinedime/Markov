@@ -22,20 +22,22 @@
 - 宿主机只负责外层编排和无运行时依赖的静态检查，不作为 framework profiling 或 C++ 构建验收环境。
 - Profiling 的宿主机入口是 `scripts/profile.sh`；modeling 的宿主机入口是 `scripts/model.sh`。
 - `scripts/internal/entrypoints/profile.py` 和 `scripts/internal/entrypoints/model.py` 是容器内执行器，不作为真实任务的宿主机入口。
-- `scripts/internal/entrypoints/` 只维护容器内 CLI glue；可复用逻辑必须放在 `scripts/internal/markov_internal/` 下按
-  `common`、`profiling`、`audit`、`contracts`、`modeling`、`hicache`、`diagnostics` 分层。
+- `scripts/internal/entrypoints/` 只维护容器内 CLI glue；当前只保留 `profile.py`、`model.py` 和
+  `modeling_workflow.py` 三个主入口。可复用逻辑必须放在 `scripts/internal/markov_internal/` 下按
+  `common`、`profiling`、`audit`、`contracts`、`modeling` 和 `modeling_workflow` 分层。
 - CLI 解析可以保留在容器内 entrypoint 或包内 `main()` 边界；可复用业务函数应接收显式 typed option / path / config
   参数，不把 `argparse.Namespace` 继续向深层传递。
-- `scripts/internal` 不保留旧平铺脚本、deprecated 兼容入口或人工对照副本；旧逻辑若仍有长期价值，必须迁移到主线包或文档。
+- `scripts/internal` 不保留旧平铺脚本、可继续执行旧逻辑的兼容入口或人工对照副本；旧逻辑若仍有长期价值，必须迁移到主线包或文档。
 - 不为旧 `scripts/internal/*.py` 平铺入口保留兼容 wrapper；入口迁移后，主线文档和 shell wrapper 必须指向新 entrypoint。
+  迁移完成后旧入口必须直接删除，不保留失败提示入口。
 - `scripts/internal` 下不应保留 `__pycache__/`、临时 spike 输出或一次性审计脚本；需要长期保留的经验应迁移到主线文档。
 
 ## 采集边界
 
 - Profiling 只采集事实，不预测 target 行为，也不执行建模规则。
 - `markov_internal/profiling/` 只负责 config 展开、运行期环境、server/bench 生命周期、trace/artifact 写出和 forced-token
-  replay/capture 注入；采集后的 artifact audit、HiCache readiness、workflow gate 和 validation 归属 `audit` / `hicache.quality`
-  / workflow 模块。
+  replay/capture 注入；采集后的通用 artifact audit 归属 `audit`，HiCache readiness、workflow gate 和 validation 归属
+  `modeling_workflow/validations/hicache`。
 - 模型输入、诊断证据、时序观测和 validation oracle 必须显式分类，不能相互替代。
 - 单个 probe target 是原子 fact 单元；target 中的所有 fields 必须整体属于同一个 `fact.class`、`fact.role`
   和 `fact.consumers`。不存在字段级 consumer 分流，也不得在同一 target 内混合“部分字段给模型、部分字段只给诊断”的语义。
@@ -114,17 +116,22 @@
 - Target trace 只作为 oracle；cross-config prediction 不得把 target actual 行为作为模型事实源。
 - 状态模型、策略推导、验证摘要和 DAG mutation 应保持清晰组件边界，避免重新形成单体状态机。
 - 当前 target modeling config 由 workflow 根据 profile suite 动态生成，不作为手工长期配置维护。
-- HiCache workflow 维护两层 modeling config：`artifacts/runner_configs/target_<config>.json` 是 Python runner config，供
-  `scripts/model.sh --config` 使用；每个 prediction 输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow
+- Unified modeling workflow 维护两层 modeling config：`model_runs/<model_run_id>/runner_config.json` 是 Python runner config，供
+  `scripts/model.sh --config` 使用；同一 model run 输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow
   config。两者不能混称为同一种目标建模配置。
-- HiCache workflow 必须使用统一 stage runner、artifact policy 和 `WorkflowProgressReporter`；quality、final-state、transition
-  业务模块不直接拥有终端进度输出。
-- Workflow 用户第一入口是 `workflow_summary.json` 和 `stages/*/summary.json`；这些 summary 只保留阶段级计数和分组摘要，
+- Unified modeling workflow 必须使用统一 validation object、artifact policy、runner adapter 和 `WorkflowProgressReporter`；
+  preflight、plan、model-runs、validations 业务模块不直接拥有终端进度输出。
+- DAG analysis、HiCache final-state、HiCache transition 和未来 cache patch 都是同一个 modeling workflow 的 validation
+  object，不再维护独立 DAG workflow 或 HiCache state workflow 主入口。
+- workflow 共享进度条、count/value 渲染等公共编排能力维护在
+  `scripts/internal/markov_internal/modeling_workflow/progress.py`；具体 validation 只保留自身 stage metrics 和业务 summary。
+- Workflow 用户第一入口是 `workflow_summary.json`、`preflight_summary.json`、`artifacts/model_runs_summary.json` 和
+  `artifacts/validations/<name>/summary.json`；这些 summary 只保留阶段级计数和分组摘要，
   不嵌入 per-run / per-cell rows。per-run audit、per-cell prediction、transition catalog、gate、model log 和 debug trace
-  属于 `artifacts/` 或 `predictions/` 下的诊断/复现产物。
+  属于 `artifacts/` 或 `model_runs/` 下的诊断/复现产物。
 - `prediction.json` 中的 E2E 时间来自 TraceGraph 拓扑仿真，不是 cache-state 正确性的验收指标。
 - module summary、validation、DAG trace 和 debug 输出必须由显式开关生成；Release backend 不链接 diagnostics/validation，
-  不暴露 module summary，也不保存 HiCache transition/policy/ref/capacity/radix/async 的行级 debug history。
+  不暴露 module summary 或 DAG analysis artifacts，也不保存 HiCache transition/policy/ref/capacity/radix/async 的行级 debug history。
 
 ## 验证门禁
 
@@ -141,7 +148,8 @@
   validation oracle。
 - 正常 prediction 中只要消费了未声明给 `hicache_state_model` 的事实，就不能宣称 state-model fact validation 通过。
 - 输入合同未通过时，结果只能归类为输入、投影或控制边界问题，不能直接归因于模型规则。
-- Transition validation 必须建立在同一次 workflow 的 final-state 门禁上。
+- Transition validation 必须复用同一次 workflow 的 cache-state model run、validation artifact 和 target oracle gate；不单独重跑
+  C++ prediction。
 - Oracle、debug 和质量事件不能进入默认性能 DAG。
 
 ## 配置与产物
@@ -162,10 +170,11 @@ profile suite
   -> suite selection/result
   -> per-run manifest/trace/workload report
   -> optional forced-token bundle
-  -> workflow_summary.json
-  -> stages/{quality,final_state,transition}/summary.json
-  -> artifacts/{matrix_plan.json,runner_configs,quality,transition_catalog}
-  -> predictions/<input>/<source>__to__<target>/
+  -> modeling workflow
+       -> workflow_summary.json
+       -> preflight_summary.json
+       -> artifacts/{model_run_plan.json,preflight,model_runs_summary.json,validations}
+       -> model_runs/<model_run_id>/{runner_config.json,command.json,prediction.json,run_summary.json,...}
 ```
 
 ## 工程质量
@@ -175,22 +184,26 @@ profile suite
 - 代码和解释性注释以中文为主，保留必要的英文协议名、类型名和配置字段，此外，所有的“输出性内容”，比如 CLI help，需要保持英文。
 - C++ 公共接口、状态机边界和不变量说明使用 Doxygen 风格；Python 使用模块、类和函数 docstring 表达同类信息。
 - 注释应解释设计原因、不变量和边界，避免复述代码。
+- Python 和 C++ 都优先用清晰的对象、接口和小模块表达有生命周期、有共享状态或多阶段的流程；短小纯函数不强行类化。
+- 单文件长度是可维护性信号，不设硬性数字门禁；文件持续膨胀时应优先按职责拆分，而不是用长函数、匿名 helper 或文件名前缀掩盖边界。
+- 源码结构应体现业务层次：入口只做 CLI glue，编排层只做 plan/execute/summary，业务模型、诊断、validation 和 artifact writer
+  必须分层。非业务逻辑代码不能大量穿插在主体业务状态机中。
+- Debug、diagnostics、validation、summary 输出和临时审计都应由显式开关或独立模块隔离；业务主路径不应长期携带大段非业务输出逻辑。
 - Python 代码统一使用 Ruff formatter，配置只维护在仓库根目录 `pyproject.toml`。格式化命令为
   `python3 -m ruff format .`，提交前检查命令为 `python3 -m ruff format --check .`。
 - Ruff formatter 覆盖一方 Python 源码；`build/`、`data/`、`docs/tmp/` 和 `third_party/` 只包含可再生产物、临时文档或
   vendored 代码，不进入项目 Python 格式化范围。
 - 每轮重构都必须同步审视删减面：删除失活代码、旧入口、旧字段、旧文档入口和临时对照脚本，不为当前主线保留向后兼容分支。
-- `markov_internal/modeling` 保持通用 runner / trace input / C++ config 边界；HiCache-heavy validation、oracle 和 workflow
-  逻辑应继续归属 `markov_internal/hicache`，避免 generic modeling 包重新膨胀。
-- `markov_internal/hicache` 不再使用平铺文件结构；新增 HiCache 内部模块必须落到 `core`、`quality`、`input_contract`、
-  `matrix`、`oracle`、`transition` 或 `workflow` 等职责子包中。只有入口 package 的 `__init__.py` 可以暴露稳定 `main`。
-- HiCache 内部脚本应继续按多级子目录拆分职责，`workflow`、`transition`、`oracle`、`matrix`、`quality`
-  等大域下必须继续使用 `stages` / `validation` / `snapshot` / `runs` / `audit` 这类语义子目录；不能依赖
-  `workflow_xxx.py`、`transition_xxx.py`、`oracle_xxx.py` 这类文件名前缀模拟分层。单个子包文件继续膨胀时，应优先拆成更小的
-  同职责模块，而不是把逻辑重新堆回包根。
+- `markov_internal/modeling` 保持通用 runner / trace input / C++ config 边界；HiCache-heavy validation、oracle、transition
+  和 input contract 逻辑归属 `markov_internal/modeling_workflow/validations/hicache`，避免 generic modeling 包重新膨胀。
+- `modeling_workflow/validations` 顶层只保留 validation registry 和公共模板；base DAG、final DAG、HiCache 等领域逻辑必须下沉到
+  对应 validation 子包。
+- HiCache validation 内部继续按多级子目录拆分职责，`core`、`input_contract`、`oracle`、`preflight`、`transition`
+  等大域下必须继续使用 `signature` / `reporting` / `snapshot` / `diff` / `evidence` / `exactness` / `replay` 等语义子目录；
+  不能依赖 `workflow_xxx.py`、`transition_xxx.py`、`oracle_xxx.py` 这类文件名前缀模拟分层。
 - one-shot subprocess 执行、命令记录、stdout/stderr capture、log path 和失败 payload 应逐步收敛到公共 helper，避免
   profiling、modeling 和 workflow 各自维护不一致的命令执行风格。
-- `scripts/internal` 不新增 `deprecated/` 人工对照目录；重构时应直接删除失活入口，并把仍有效的经验迁移到主线文档。
+- `scripts/internal` 不新增旧代码人工对照目录；重构时应直接删除失活入口，并把仍有效的经验迁移到主线文档。
 - 不修改或覆盖用户未授权的运行产物和工作区改动。
 - 不把 pycache、临时诊断或大体积 debug 产物纳入主线。
 - 提交前至少完成与改动范围相符的 Ruff 格式检查、Python/Shell 语法、JSON 解析、diff whitespace、C++ 格式/构建和 workflow

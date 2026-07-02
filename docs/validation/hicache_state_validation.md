@@ -78,19 +78,19 @@ forced token profiling 是当前用于关闭该前提的输入门：
 | plan schema | `forced_token.plan_schema=trace_sim.hicache.forced_token_plan.v1`。 |
 | plan hash | 同 input 下所有 replay run 的 `forced_token.plan_sha256` 必须一致。 |
 | output check | `unchecked_count=0`、`mismatch_count=0`、`prompt_mismatch_count=0`。 |
-| workload signature | forced plan 一致后，HiCache matrix 模块仍必须证明 same-input canonical workload signature match。 |
+| workload signature | forced plan 一致后，HiCache validation preflight 仍必须证明 same-input canonical workload signature match。 |
 
-HiCache profile audit 把 forced replay 或 bundle provenance mismatch 视为 profiling input contract 错误；
-HiCache matrix 模块把 bundle signature、plan signature 和 canonical workload signature 并列作为 workflow input quality gate。C++ state
-model 不读取 bundle、`forced_output_ids` 或 capture provenance。
+HiCache validation preflight 把 forced replay 或 bundle provenance mismatch 视为 profiling input contract 错误；
+它把 bundle signature、plan signature 和 canonical workload signature 并列作为 workflow input gate。C++ state model
+不读取 bundle、`forced_output_ids` 或 capture provenance。
 单 run quality 分别输出 `plan_ready`、`bundle_ready` 和总 `ready`，避免 bundle 缺失污染 plan-hash 一致性诊断。
 
 run config 声明 forced capture/replay 时，workload report 缺失或 mode 不一致也属于合同错误。workflow 每次按当前代码重新审计
 manifest，不复用旧 audit/quality cache；因此旧 run 不能靠历史审计 JSON 绕过新 gate。
 
-HiCache workflow entrypoint 会把该检查压缩到 `workflow_summary.json.input_contracts`：同 input 下
-`signature_match=true`、`forced_token_plan_signature_match=true` 且 `forced_token_bundle_signature_match=true` 时，
-`input_contract_ready=true`；`workflow_summary.json.forced_token_bundles` 记录 capture bundle 到 replay/validation 的依赖链。
+Unified modeling workflow 的 HiCache validation preflight 会把该检查压缩到 `preflight_summary.json` 和
+`workflow_summary.json`：同 input 下 `signature_match=true`、`forced_token_plan_signature_match=true` 且
+`forced_token_bundle_signature_match=true` 时，workflow input 才能 ready。
 
 ## 当前模型边界
 
@@ -112,6 +112,10 @@ HiCache workflow entrypoint 会把该检查压缩到 `workflow_summary.json.inpu
 当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、backend I/O / transition timeline 和异步 ACK / host release 的近似边界。
 
 ## 当前合同状态与保留验证基线
+
+说明：2026-07-02 完成的 unified `modeling_workflow` Python 重构已经通过 Ruff、`compileall` 和两条 dry-run smoke，
+但尚未产生新的 full-matrix modeling 结果。因此当前 state/transition 正确性仍以
+`HCSV-20260701-forced-bundle-full-matrix` 的旧 workflow 结果为保留基线；新 workflow 的 full-run 结果生成后再更新本节。
 
 ### HCSV-20260701-forced-bundle-full-matrix
 
@@ -307,7 +311,7 @@ failure classification：
 ### HCSV-20260624-pre-bundle-5x3-baseline
 
 这是 bundle workflow 落地前的最新模型回归基线。它基于 5 个 HiCache config、3 个 manual input 的 forced-token full Python
-probe matrix，并通过当时的 HiCache workflow 执行 quality、final-state self/cross 和 transition exactness。
+probe matrix，并通过当时的旧 HiCache workflow 执行 quality、final-state self/cross 和 transition exactness。
 
 该 run 使用仓库固定 plan，不携带 bundle provenance。当前代码重新审计时会得到
 `forced_token_bundle_signature_match=false` 和 `input_contract_ready=false`，因此不能作为新 workflow 的 active 输入合同验收。
@@ -446,20 +450,16 @@ token directory 重构已通过该基线回归：原 `c3/manual_deeper_pressure_
 
 | 脚本 | 职责 |
 | --- | --- |
-| `scripts/internal/entrypoints/hicache_cross_input_audit.py` | 跨配置 workload identity input contract 审计；比较前先检查 path-bearing state-model fact 是否可被 C++ token parser 消费。 |
-| `scripts/internal/markov_internal/hicache/core/` | HiCache fact 解析、consumer 路由和 token dictionary/span helper。 |
-| `scripts/internal/markov_internal/hicache/matrix/runs/` | matrix 中的 profile run、prediction spec、slug 类型、profile discovery 和 config/input 过滤。 |
-| `scripts/internal/markov_internal/hicache/quality/audit/` | 单 run HiCache profile audit、state fact required fields、token dictionary/span、sequence 和 role coverage。 |
-| `scripts/internal/markov_internal/hicache/matrix/reports/quality.py` | workflow input quality gate、workload signature 和输入合同汇总；按 workflow stage/scope 打开 validation 审计路径。 |
-| `scripts/internal/markov_internal/hicache/workflow/config/modeling.py` | 写出 Python runner config；C++ backend narrow config 仍由 modeling runner 生成。 |
-| `scripts/internal/markov_internal/hicache/matrix/predictions/prediction.py` | prediction 输出路径、validation 提取和 final-state matrix summary。 |
-| `scripts/internal/entrypoints/hicache_workflow.py` | profiling 后 HiCache validation 主入口；解析 CLI 并交给 workflow 包。 |
-| `scripts/internal/markov_internal/hicache/workflow/core/` / `config/` / `planning/` / `stages/` / `output/` | workflow context、runner config、plan、stage runner、final-state/transition stage、进度输出和顶层 summary。 |
-| `scripts/internal/entrypoints/hicache_provenance.py` | 基于 validation / predicted trace / oracle snapshot 的 mismatch 页面证据汇总，不回写模型。 |
-| `scripts/internal/entrypoints/hicache_transition.py` | 只读 transition exactness CLI：model self-check、target oracle extraction、self/cross/matrix compare。 |
-| `scripts/internal/markov_internal/hicache/input_contract/` | workload identity fact 抽取、token/path 合同、canonical signature 和 source/target report。 |
-| `scripts/internal/markov_internal/hicache/oracle/snapshot/` / `diff/` / `evidence/` | state snapshot 读取、HiRadixCache-only final-state 派生、capacity、coverage、delta、records 和 mismatch helper。 |
-| `scripts/internal/markov_internal/hicache/transition/artifacts/` / `replay/` / `validation/` | transition path/catalog 产物、model self-check/replay schema、target oracle、single/matrix compare、taxonomy 和 gate 输出。 |
+| `scripts/internal/entrypoints/modeling_workflow.py` | profiling 后统一 modeling workflow 主入口；通过 validation object 选择 HiCache final-state / transition。 |
+| `scripts/internal/markov_internal/modeling_workflow/` | preflight、model-run planner、runner adapter、validation object、进度输出和顶层 summary。 |
+| `scripts/internal/markov_internal/modeling_workflow/planning/profile_runs.py` | unified profile run discovery、prediction ref、slug 类型和 config/input 过滤。 |
+| `scripts/internal/markov_internal/modeling_workflow/execution/runner_adapter.py` | 写出 Python runner config；C++ backend narrow config 仍由 modeling runner 生成。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/core/` | HiCache fact 解析、consumer 路由和 token dictionary/span 辅助工具。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/preflight/` | HiCache workflow input gate、state fact coverage、workload signature、sequence 诊断、forced-token 和 strict diagnostic coverage。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/prediction_rows.py` | final-state validation row 提取和 summary。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/input_contract/` | workload identity fact 抽取、token/path 合同、canonical signature 和 source/target report。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/oracle/` | state snapshot 读取、HiRadixCache-only final-state 派生、capacity、coverage、delta、records 和 mismatch provenance。 |
+| `scripts/internal/markov_internal/modeling_workflow/validations/hicache/transition/` | transition path/catalog 产物、model self-check/replay schema、target oracle、prediction-set compare、taxonomy 和 gate 输出。 |
 
 这些脚本都不能生成 synthetic state-model fact，不能修改 profiling trace，也不能把 `source_actual` / `timing_observation` /
 `oracle_state` 写回 target state。
@@ -492,10 +492,10 @@ scripts/profile.sh \
   --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
   --forced-token-bundle "$CAPTURE_BUNDLE"
 
-python3 scripts/internal/entrypoints/hicache_workflow.py \
+python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir "$RUN_DIR" \
-  --output-dir "$RUN_DIR/modeling/hicache_state_workflow_manual_3inputs" \
-  --stages quality,final-state,transition \
+  --output-dir "$RUN_DIR/modeling/modeling_workflow_hicache_state_manual_3inputs" \
+  --validations hicache_final_state,hicache_transition \
   --prediction-scope self,cross \
   --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
   --emit-transition-catalog \
@@ -508,10 +508,10 @@ common suite 使用 `profiling_hicache_state_common.json`，只允许 `--predict
 只跑某个 targeted 格子：
 
 ```bash
-python3 scripts/internal/entrypoints/hicache_workflow.py \
+python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir <profile_run_dir> \
   --output-dir <profile_run_dir>/modeling/<targeted_output_dir> \
-  --stages quality,final-state \
+  --validations hicache_final_state \
   --prediction-scope self \
   --input <input_id> \
   --source-config <config_id> \
@@ -520,51 +520,28 @@ python3 scripts/internal/entrypoints/hicache_workflow.py \
   --max-predictions 1
 ```
 
-Transition exactness：
-
-```bash
-python3 scripts/internal/entrypoints/hicache_transition.py \
-  --mode model-self-check \
-  --prediction-dir <prediction_dir>
-
-python3 scripts/internal/entrypoints/hicache_transition.py \
-  --mode extract-target-oracle \
-  --target-manifest <target_profile_manifest.json> \
-  --output <matrix_dir>/observed_target_transitions/<input_id>/<config_id>.observed_target_transition_trace.json
-
-python3 scripts/internal/entrypoints/hicache_transition.py \
-  --mode compare-self \
-  --prediction-dir <prediction_dir> \
-  --observed-target-trace <observed_target_transition_trace.json>
-
-python3 scripts/internal/entrypoints/hicache_transition.py \
-  --mode compare-matrix \
-  --matrix-dir <hicache_state_workflow_dir> \
-  --emit-catalog \
-  --emit-gates
-```
-
-矩阵模式默认复用已生成的 target oracle；`--force` 会重建 full Python probe oracle，耗时明显更高，仅在脚本或 oracle 抽取逻辑变化后使用。
-在统一 workflow 中请求 transition 时，`--stages` 必须同时包含 `final-state`；独立只读诊断仍使用上面的
-`scripts/internal/entrypoints/hicache_transition.py` CLI。
+Transition exactness 不再维护 standalone `hicache_transition.py` CLI。选择 `hicache_transition` validation 时，
+workflow 会复用同一次 cache-state model run 和 validation artifact，按需抽取 target oracle、写出 transition exactness payload、
+catalog 和 gate scoreboard。需要重建这些产物时对 unified workflow 使用 `--force`。
 
 结果摘要读取：
 
 ```bash
-jq '{workflow_mode,
-     quality,
-     input_contracts,
-     final_state_self,
-     final_state_cross,
-     transition}' \
-  <matrix_dir>/workflow_summary.json
+jq '{selected_validations,
+     profile_run_count,
+     model_run_count,
+     model_run_ok_count,
+     model_run_skipped_count,
+     preflight_ready,
+     validations}' \
+  <workflow_output>/workflow_summary.json
 
 jq '{prediction_count,
      validation_ready_count,
      final_state_match_count,
      final_state_pass_rate,
      by_input}' \
-  <matrix_dir>/stages/final_state/cross_summary.json
+  <workflow_output>/artifacts/validations/hicache_final_state/summary.json
 
 jq '{prediction_count,
      ready_count,
@@ -575,11 +552,12 @@ jq '{prediction_count,
      failure_classification_counts,
      by_input,
      by_target_config}' \
-  <matrix_dir>/stages/transition/summary.json
+  <workflow_output>/artifacts/validations/hicache_transition/summary.json
 ```
 
-`stages/final_state/self_summary.json`、`stages/final_state/cross_summary.json` 和 `stages/transition/summary.json`
-是当前 workflow 的规模无关输出；矩阵规模以文件内 `prediction_count`、`by_input` 和 `workflow_summary.json` 为准。
+`workflow_summary.json`、`preflight_summary.json`、`artifacts/model_runs_summary.json` 和
+`artifacts/validations/<name>/summary.json` 是当前 unified workflow 的规模无关输出；矩阵规模以文件内
+`prediction_count`、`by_input` 和 `workflow_summary.json` 为准。
 
 ## 已关闭诊断问题
 
@@ -588,7 +566,7 @@ jq '{prediction_count,
 | 问题 | 当前结论 |
 | --- | --- |
 | Case A：`manual_deeper_pressure_prefetch/c1` oracle final 为空 | 这是 validation oracle snapshot 选择误报。final oracle、timeline delta oracle 和 profiling catalog 均已限制到 `HiRadixCache.*` cache-tree snapshot；`HiCacheController.*` 等辅助对象 snapshot 不参与 final cache-tree 派生。 |
-| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已废弃；当前不采集也不消费 `storage_control_drain_boundary`，而是在 terminal prefetch 后保留 pending host reservation，并在同 request `cache_extend_input` side effect 后做 request-local post-extend drain。 |
+| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已回退；当前不采集也不消费 `storage_control_drain_boundary`，而是在 terminal prefetch 后保留 pending host reservation，并在同 request `cache_extend_input` side effect 后做 request-local post-extend drain。 |
 | 2026-06-27 self transition marker mismatch | 历史 self run 曾有 2 个 marker-only transition mismatch；2026-06-28 全矩阵在上一版合同下达到 `75 / 75` transition exact，不再作为 active 修复项维护。 |
 
 注意：`drain_storage_control_queues()` 是 source scheduler round boundary。它不能重新包装成 cross-config state-model input，
