@@ -13,7 +13,6 @@ from .common import (
     _safe_call_int,
     _safe_int,
 )
-from .tokens import _tokens_for_path
 
 
 def _snapshot_hicache_object(obj: Any) -> dict[str, Any]:

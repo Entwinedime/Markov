@@ -14,4 +14,8 @@ void write_module_summary(const std::string & /*filename*/, const std::vector<st
     throw std::runtime_error("--model-summary requires TRACE_GRAPH_DEBUG=ON");
 }
 
+void write_dag_analysis_artifacts(const std::string & /*output_dir*/, const core::DagGraph & /*graph*/) {
+    throw std::runtime_error("--dag-analysis-output-dir requires TRACE_GRAPH_DEBUG=ON");
+}
+
 } // namespace markov::trace_graph::cli

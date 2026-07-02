@@ -48,6 +48,7 @@ struct CliOptions {
     std::string graph_output;
     std::string model_config_file;
     std::string model_summary_file;
+    std::string dag_analysis_output_dir;
     std::string run_summary_file;
     std::string scenario_name = "trace_graph";
     bool full_output = false;
@@ -67,6 +68,7 @@ void print_usage(const char * prog) {
               << "  --full-output               Include simulated nodes and edge flow events in --graph-output\n"
               << "  --model-config FILE         Optional C++ model config for SimulationModule execution\n"
               << "  --model-summary FILE        Optional model summary JSON output\n"
+              << "  --dag-analysis-output-dir DIR Optional Debug-only DAG analysis artifact directory\n"
               << "  --run-summary FILE          Required run summary JSON output\n"
               << "  --scenario-name NAME        Scenario name in run summary\n"
               << "  -d, --debug                 Enable debug logging\n"
@@ -112,6 +114,9 @@ CliOptions parse_cli(int argc, char ** argv) {
         }
         else if (arg == "--model-summary") {
             if (!consume_value(i, argc, argv, opts.model_summary_file, arg)) opts.show_help = true;
+        }
+        else if (arg == "--dag-analysis-output-dir") {
+            if (!consume_value(i, argc, argv, opts.dag_analysis_output_dir, arg)) opts.show_help = true;
         }
         else if (arg == "--run-summary") {
             if (!consume_value(i, argc, argv, opts.run_summary_file, arg)) opts.show_help = true;
@@ -174,6 +179,7 @@ void write_run_summary(const std::string & filename, const CliOptions & opts, co
     root["graph_output"] = opts.graph_output;
     root["model_config"] = opts.model_config_file;
     root["model_summary"] = opts.model_summary_file;
+    root["dag_analysis_output_dir"] = opts.dag_analysis_output_dir;
     root["parsed_record_count"] = graph.parsed_record_count();
     root["simulated_e2e_ns"] = graph.e2e_time();
     root["real_e2e_ns"] = graph.real_e2e_time();
@@ -266,6 +272,7 @@ int main(int argc, char ** argv) {
         timings["simulation_ms"] = elapsed_ms(simulation_start, simulation_end);
         if (!opts.graph_output.empty()) markov::trace_graph::io::write_chrome_trace_dag(opts.graph_output, graph, opts.full_output);
         if (!opts.model_summary_file.empty()) markov::trace_graph::cli::write_module_summary(opts.model_summary_file, modules);
+        if (!opts.dag_analysis_output_dir.empty()) markov::trace_graph::cli::write_dag_analysis_artifacts(opts.dag_analysis_output_dir, graph);
         write_run_summary(opts.run_summary_file, opts, graph, timings);
     }
     catch (const std::exception & e) {

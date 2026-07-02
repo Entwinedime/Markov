@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
@@ -26,5 +27,12 @@ void validate_modules(const std::vector<std::unique_ptr<modules::SimulationModul
  * Release 实现直接报错，避免默认业务路径链接 diagnostics writer。
  */
 void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules);
+
+/**
+ * @brief 写出 Debug-only DAG analysis artifacts。
+ *
+ * Release 实现直接报错；该输出只服务阶段一 DAG 理解和验证，不参与业务 prediction。
+ */
+void write_dag_analysis_artifacts(const std::string & output_dir, const core::DagGraph & graph);
 
 } // namespace markov::trace_graph::cli

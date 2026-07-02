@@ -100,6 +100,7 @@ if(TRACE_GRAPH_DEBUG)
     add_library(trace_graph_diagnostics STATIC)
     target_sources(trace_graph_diagnostics
         PRIVATE
+            src/modules/dag_analysis/diagnostics.cpp
             src/modules/diagnostics/json_summary_writer.cpp
             src/modules/hicache/diagnostics/summary.cpp
     )
