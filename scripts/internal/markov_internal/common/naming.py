@@ -10,3 +10,9 @@ def sanitize(value: str) -> str:
 
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("._-") or "profile"
+
+
+def safe_slug(value: str, *, fallback: str = "unknown") -> str:
+    """把内部 id 规整成稳定路径片段。"""
+
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._") or fallback

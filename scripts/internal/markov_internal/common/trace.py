@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Chrome trace JSON 读取工具。
 
 Python probe 采用流式写入后，真实 profiling 进程被外层停止时可能来不及执行

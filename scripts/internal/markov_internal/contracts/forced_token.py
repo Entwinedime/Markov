@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """HiCache forced-token profiling 输入契约。
 
 该模块只描述 capture plan 与 replay workload 之间的稳定契约。它不启动

@@ -22,7 +22,7 @@ from ..common.paths import resolve_repo_path as common_resolve_repo_path
 from ..common.paths import running_in_modeling_container
 from .cpp_config import trace_graph_executable, write_cpp_model_config
 from .trace_inputs import prepare_trace_inputs
-from .validation import (
+from .hicache_validation_artifacts import (
     build_validation,
     hicache_state_validation_enabled,
     write_hicache_predicted_state_trace_if_available,
@@ -44,6 +44,7 @@ class ModelingOptions:
     emit_dag_chrome_trace: bool
     emit_module_summary: bool
     emit_validation: bool
+    emit_dag_analysis: bool
     debug: bool
 
 
@@ -89,6 +90,7 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
     parser.add_argument("--emit-dag-chrome-trace", action="store_true", help="emit DAG as Chrome trace JSON")
     parser.add_argument("--emit-module-summary", action="store_true", help="emit C++ module summary JSON")
     parser.add_argument("--emit-validation", action="store_true", help="emit validation.json")
+    parser.add_argument("--emit-dag-analysis", action="store_true", help="emit Debug-only DAG analysis artifacts")
     parser.add_argument("--debug", action="store_true", help="enable C++ TraceGraph debug logging")
     args = parser.parse_args(argv)
 
@@ -105,6 +107,7 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
         emit_dag_chrome_trace=bool(args.emit_dag_chrome_trace),
         emit_module_summary=bool(args.emit_module_summary),
         emit_validation=bool(args.emit_validation),
+        emit_dag_analysis=bool(args.emit_dag_analysis),
         debug=bool(args.debug),
     )
 
@@ -126,10 +129,13 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     emit_dag_chrome_trace = options.emit_dag_chrome_trace or bool(outputs_cfg.get("emit_dag_chrome_trace", False))
     emit_module_summary = options.emit_module_summary or bool(outputs_cfg.get("emit_module_summary", False))
     emit_validation = options.emit_validation or bool(outputs_cfg.get("emit_validation", False))
+    emit_dag_analysis = options.emit_dag_analysis or bool(outputs_cfg.get("emit_dag_analysis", False))
     if emit_validation and hicache_state_validation_enabled(config):
         # HiCache state validation 依赖 C++ module summary 中的 state trace。
         require_validation_backend(config)
         emit_module_summary = True
+    if emit_dag_analysis:
+        require_validation_backend(config)
     debug = options.debug or bool(outputs_cfg.get("debug", False))
 
     input_cfg = config.get("input") if isinstance(config.get("input"), dict) else {}
@@ -161,6 +167,8 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
         command.extend(["--graph-output", str(graph_output), "--full-output"])
     if emit_module_summary:
         command.extend(["--model-summary", str(module_summary)])
+    if emit_dag_analysis:
+        command.extend(["--dag-analysis-output-dir", str(output_dir)])
     if model_config_path is not None:
         command.extend(["--model-config", str(model_config_path)])
 
@@ -194,6 +202,8 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
         if recommended_config_path is not None and isinstance(validation.get("hicache_state"), dict):
             validation["hicache_state"]["recommended_hicache_cpp_model_config_path"] = str(recommended_config_path)
         write_json(output_dir / "validation.json", validation)
+    if emit_dag_analysis:
+        enrich_dag_quality(output_dir / "dag_quality.json", manifest_path, trace_paths, mode)
     return prediction
 
 
@@ -204,7 +214,45 @@ def require_validation_backend(config: dict[str, Any]) -> None:
     backend_kind = str(cpp.get("backend_kind") or "").strip().lower()
     if backend_kind == "validation" or cpp.get("require_debug") is True:
         return
-    raise ValueError("emit_validation for HiCache state requires cpp_trace_graph.backend_kind='validation'")
+    raise ValueError("Debug-only modeling outputs require cpp_trace_graph.backend_kind='validation'")
+
+
+def enrich_dag_quality(
+    dag_quality_path: Path,
+    manifest_path: Path | None,
+    trace_paths: list[Path],
+    mode: str,
+) -> None:
+    """把 manifest 侧 channel coverage 补写进 C++ DAG quality artifact。"""
+
+    dag_quality = load_json(dag_quality_path)
+    manifest = load_json(manifest_path) if manifest_path is not None else {}
+    profiling = manifest.get("profiling") if isinstance(manifest.get("profiling"), dict) else {}
+    trace = manifest.get("trace") if isinstance(manifest.get("trace"), dict) else {}
+    sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
+    python_probe_files = (
+        sidecar.get("python_probe_files") if isinstance(sidecar.get("python_probe_files"), list) else []
+    )
+    dag_quality["trace_channel_coverage"] = {
+        "torch_trace_files": len(
+            trace.get("torch_trace_files", []) if isinstance(trace.get("torch_trace_files"), list) else []
+        ),
+        "ld_preload_trace_files": len(
+            trace.get("ld_preload_trace_files", []) if isinstance(trace.get("ld_preload_trace_files"), list) else []
+        ),
+        "python_probe_trace_files": len(python_probe_files),
+        "requested_consumers": profiling.get("python_consumers", []),
+        "selected_probe_target_count": None,
+        "observed_probe_target_count": None,
+        "input_trace_files": [str(path) for path in trace_paths],
+    }
+    dag_quality["run"] = {
+        "run_id": manifest.get("run_id") or manifest.get("experiment_id"),
+        "manifest": str(manifest_path) if manifest_path is not None else None,
+        "config_path": manifest.get("config_path"),
+        "mode": mode,
+    }
+    write_json(dag_quality_path, dag_quality)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -3,7 +3,7 @@
 
 该模块只检查 profiling run 结束后留下的文件、trace channel 和 Python probe
 target 命中情况。它不判断某个后端模型是否可以消费该 run；consumer-specific
-readiness 归属 `markov_internal.hicache.quality` 等领域模块。
+readiness 归属 `markov_internal.modeling_workflow.validations` 下的领域 validation 模块。
 """
 
 from __future__ import annotations
@@ -107,7 +107,7 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
 
     configured = configured_targets(profiling)
     channels_enabled = {str(channel) for channel in profiling.get("channels_enabled") or [] if isinstance(channel, str)}
-    python_channel_enabled = "python" in channels_enabled or bool(configured)
+    python_channel_enabled = "python_probe" in channels_enabled or bool(configured)
     target_audits = {
         target_id: TargetArtifactAudit(
             target_id=target_id,
@@ -142,7 +142,23 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
         if audit.phases.get("exception", 0) > 0 or audit.statuses.get("exception", 0) > 0
     )
 
+    torch_files = existing_paths(trace.get("torch_trace_files", []))
+    if not torch_files:
+        torch_files = existing_dir_files(trace.get("torch_trace_dir"), "**/trace_view.json")
+    ld_preload_files = existing_paths(trace.get("ld_preload_trace_files", []))
+    trace_channel_coverage = {
+        "torch_trace_files": len(torch_files),
+        "ld_preload_trace_files": len(ld_preload_files),
+        "python_probe_trace_files": len(python_probe_files),
+        "channels_enabled": sorted(channels_enabled),
+    }
+    missing_channels = trace_channel_missing_channels(channels_enabled, trace_channel_coverage)
+
     artifact_errors: list[str] = []
+    if missing_channels:
+        artifact_errors.append("trace_channel_missing")
+    if full_dag_channels_enabled(channels_enabled) and python_probe_files and not torch_files and not ld_preload_files:
+        artifact_errors.append("sidecar_only_trace")
     if python_channel_enabled and not python_probe_files:
         artifact_errors.append("missing_python_probe_files")
     if configured and len(missing_targets) == len(configured):
@@ -151,10 +167,6 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
         artifact_errors.append("python_probe_required_fields_missing")
     if exception_targets:
         artifact_errors.append("python_probe_exception_events")
-
-    torch_files = existing_paths(trace.get("torch_trace_files", []))
-    if not torch_files:
-        torch_files = existing_dir_files(trace.get("torch_trace_dir"), "**/trace_view.json")
 
     return {
         "schema": "trace_sim.profile_artifact_audit.v1",
@@ -165,9 +177,11 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
         "dry_run": bool(manifest.get("dry_run")),
         "trace_files": {
             "torch": len(torch_files),
-            "ld_preload": len(existing_paths(trace.get("ld_preload_trace_files", []))),
+            "ld_preload": len(ld_preload_files),
             "python_probe": len(python_probe_files),
         },
+        "trace_channel_coverage": trace_channel_coverage,
+        "missing_trace_channels": missing_channels,
         "python_probe_events": len(events),
         "configured_target_count": len(configured),
         "observed_target_count": sum(1 for audit in target_audits.values() if audit.events_total > 0),
@@ -180,6 +194,30 @@ def audit_profile_artifacts(manifest_path: Path) -> dict[str, Any]:
         "artifact_errors": artifact_errors,
         "artifact_ready": not artifact_errors,
     }
+
+
+def trace_channel_missing_channels(
+    channels_enabled: set[str],
+    coverage: dict[str, Any],
+) -> list[str]:
+    """返回已启用但没有产出文件的采集 channel。"""
+
+    required = {
+        "torch": "torch_trace_files",
+        "ld_preload": "ld_preload_trace_files",
+        "python_probe": "python_probe_trace_files",
+    }
+    return sorted(
+        channel
+        for channel, count_key in required.items()
+        if channel in channels_enabled and int(coverage.get(count_key) or 0) <= 0
+    )
+
+
+def full_dag_channels_enabled(channels_enabled: set[str]) -> bool:
+    """判断本 run 是否声明了 full-DAG 三通道采集合同。"""
+
+    return {"torch", "ld_preload", "python_probe"}.issubset(channels_enabled)
 
 
 def configured_targets(profiling: dict[str, Any]) -> dict[str, dict[str, Any]]:

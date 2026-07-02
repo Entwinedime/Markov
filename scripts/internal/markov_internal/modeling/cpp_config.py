@@ -8,7 +8,10 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, resolve_repo_path
-from ..hicache.oracle.evidence.capacity import normalize_policy_value, optional_int
+from markov_internal.modeling_workflow.validations.hicache.oracle.evidence.capacity import (
+    normalize_policy_value,
+    optional_int,
+)
 
 
 def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) -> Path | None:
