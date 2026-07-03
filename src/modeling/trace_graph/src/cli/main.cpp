@@ -68,7 +68,7 @@ void print_usage(const char * prog) {
               << "  --full-output               Include simulated nodes and edge flow events in --graph-output\n"
               << "  --model-config FILE         Optional C++ model config for SimulationModule execution\n"
               << "  --model-summary FILE        Optional model summary JSON output\n"
-              << "  --dag-analysis-output-dir DIR Optional Debug-only DAG analysis artifact directory\n"
+              << "  --dag-analysis-output-dir DIR Optional validation DAG analysis artifact directory\n"
               << "  --run-summary FILE          Required run summary JSON output\n"
               << "  --scenario-name NAME        Scenario name in run summary\n"
               << "  -d, --debug                 Enable debug logging\n"

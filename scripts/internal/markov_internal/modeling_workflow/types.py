@@ -96,7 +96,7 @@ class ModelRunResult:
 
     @property
     def ok(self) -> bool:
-        return self.return_code == 0
+        return not self.skipped and self.return_code == 0
 
 
 @dataclass

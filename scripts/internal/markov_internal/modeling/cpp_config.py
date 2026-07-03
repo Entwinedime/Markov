@@ -8,9 +8,23 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, resolve_repo_path
-from markov_internal.modeling_workflow.validations.hicache.oracle.evidence.capacity import (
+from markov_internal.modeling_workflow.validations.hicache.oracle.evidence.capacity_values import (
     normalize_policy_value,
-    optional_int,
+    parse_int_or_none,
+)
+
+TRACE_GRAPH_RELEASE_EXECUTABLE = ROOT_DIR / "build/modeling/trace_graph-release/trace_graph"
+TRACE_GRAPH_VALIDATION_EXECUTABLE = ROOT_DIR / "build/modeling/trace_graph-validation/trace_graph"
+
+TRACE_GRAPH_RELEASE_BUILD_COMMAND = (
+    "scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
+    "-B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF "
+    "&& cmake --build build/modeling/trace_graph-release --target trace_graph -j2'"
+)
+TRACE_GRAPH_VALIDATION_BUILD_COMMAND = (
+    "scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
+    "-B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=ON "
+    "&& cmake --build build/modeling/trace_graph-validation --target trace_graph -j2'"
 )
 
 
@@ -178,7 +192,7 @@ def _copy_command_int_option(result: dict[str, Any], command: list[str], option:
     """从 target experiment command 中复制整数型 HiCache 选项。"""
 
     raw = _command_option_value(command, option)
-    value = optional_int(raw)
+    value = parse_int_or_none(raw)
     if value is not None and value > 0:
         result[key] = value
 
@@ -223,27 +237,21 @@ def trace_graph_executable(config: dict[str, Any]) -> Path:
     cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
     backend_kind = str(cpp.get("backend_kind") or "").strip().lower()
     if backend_kind == "validation" or cpp.get("require_debug") is True:
-        executable = ROOT_DIR / "build/modeling/trace_graph-debug/trace_graph"
-        if executable.is_file():
-            return executable
+        if TRACE_GRAPH_VALIDATION_EXECUTABLE.is_file():
+            return TRACE_GRAPH_VALIDATION_EXECUTABLE
         raise FileNotFoundError(
-            "missing validation trace_graph executable at build/modeling/trace_graph-debug/trace_graph; "
-            "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
-            "-B build/modeling/trace_graph-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTRACE_GRAPH_DEBUG=ON "
-            "&& cmake --build build/modeling/trace_graph-debug --target trace_graph -j2'"
+            "missing validation trace_graph executable at build/modeling/trace_graph-validation/trace_graph; "
+            f"run {TRACE_GRAPH_VALIDATION_BUILD_COMMAND}"
         )
     if isinstance(cpp.get("executable"), str):
         executable = required_repo_path(cpp["executable"])
         if executable.is_file():
             return executable
-    executable = ROOT_DIR / "build/modeling/trace_graph-release/trace_graph"
-    if executable.is_file():
-        return executable
+    if TRACE_GRAPH_RELEASE_EXECUTABLE.is_file():
+        return TRACE_GRAPH_RELEASE_EXECUTABLE
     raise FileNotFoundError(
         "missing release trace_graph executable at build/modeling/trace_graph-release/trace_graph; "
-        "run scripts/run.sh modeling -- bash -lc 'cmake -S src/modeling/trace_graph "
-        "-B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF "
-        "&& cmake --build build/modeling/trace_graph-release --target trace_graph -j2'"
+        f"run {TRACE_GRAPH_RELEASE_BUILD_COMMAND}"
     )
 
 

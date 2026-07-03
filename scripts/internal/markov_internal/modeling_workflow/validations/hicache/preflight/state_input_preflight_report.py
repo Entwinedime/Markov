@@ -80,7 +80,7 @@ class StateInputPreflightReportBuilder:
         write_json(profile_audit_path, profile_audit)
         workload_signature = WorkloadSignatureBuilder(
             run,
-            include_sequence_events=self.options.show_workload_sequence,
+            include_sequence_diagnostics=self.options.show_workload_sequence,
         ).build()
         forced_token_preflight = (
             normalize_forced_token_preflight(profile_audit) if self.options.require_cross_config_contract else None
@@ -117,8 +117,8 @@ class StateInputPreflightReportBuilder:
             "canonical_request_count": workload_signature["request_event_count"],
             "canonical_workload_signature": workload_signature["signature"],
             "canonical_workload_ready": workload_signature["ready"],
-            "canonical_workload_sequence_signature": workload_signature["sequence_signature"],
-            "canonical_workload_sequence_ready": workload_signature["sequence_ready"],
+            "workload_sequence_diagnostic_signature": workload_signature["sequence_diagnostic_signature"],
+            "workload_sequence_diagnostic_ready": workload_signature["sequence_diagnostic_ready"],
             "artifact_ready": bool(profile_audit.get("artifact_ready")),
             "artifact_errors": profile_audit.get("artifact_errors", []),
             "state_model_input_ready": state_ready,
@@ -127,7 +127,7 @@ class StateInputPreflightReportBuilder:
             "workflow_input_errors": profile_audit.get("workflow_input_errors", []),
         }
         if self.options.show_workload_sequence:
-            row["_workload_sequence_events"] = workload_signature.get("sequence_events", [])
+            row["_workload_sequence_diagnostic_events"] = workload_signature.get("sequence_diagnostic_events", [])
         return row
 
     def _add_optional_row_fields(
@@ -230,16 +230,17 @@ class StateInputPreflightReportBuilder:
             "workflow_input_ready_count": sum(1 for row in rows if row["workflow_input_ready"]),
             "state_model_input_ready_count": sum(1 for row in rows if row["state_model_input_ready"]),
             "artifact_ready_count": sum(1 for row in rows if row["artifact_ready"]),
-            "sequence_check_display_enabled": self.options.show_workload_sequence,
-            "input_sequence_match_count": sum(
-                1 for item in signature_by_input.values() if item.get("sequence_match") is True
+            "sequence_diagnostic_enabled": self.options.show_workload_sequence,
+            "input_sequence_diagnostic_match_count": sum(
+                1 for item in signature_by_input.values() if item.get("sequence_diagnostic_match") is True
             ),
             "input_workload_signatures": signature_by_input,
             "runs": [public_preflight_row(row) for row in rows],
             "note": (
                 "workflow_input_ready gates modeling workflow execution. "
                 "state_model_input_ready covers workload identity state facts, token dictionary/span, "
-                "and workload identity signatures. Validation-only fields are omitted when disabled."
+                "and workload identity signatures. Sequence diagnostics explain cross-config ordering "
+                "differences only and never gate workflow readiness. Validation-only fields are omitted when disabled."
             ),
         }
         if self.options.validate_diagnostic_coverage:
@@ -296,10 +297,13 @@ def compact_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
         "workflow_input_ready_count": report.get("workflow_input_ready_count"),
         "state_model_input_ready_count": report.get("state_model_input_ready_count"),
         "artifact_ready_count": report.get("artifact_ready_count"),
-        "sequence_check_display_enabled": report.get("sequence_check_display_enabled"),
-        "input_sequence_match_count": report.get("input_sequence_match_count"),
+        "sequence_diagnostic_enabled": report.get("sequence_diagnostic_enabled"),
+        "input_sequence_diagnostic_match_count": report.get("input_sequence_diagnostic_match_count"),
         "input_workload_signatures": compact_input_workload_signatures(report.get("input_workload_signatures")),
-        "note": "This summary keeps only stage-level workflow gate fields. Full audits live under artifacts/preflight.",
+        "note": (
+            "This summary keeps only stage-level workflow gate fields. Sequence diagnostics explain ordering only "
+            "and never gate readiness. Full audits live under artifacts/preflight."
+        ),
     }
     if "strict_diagnostic_coverage_ready_count" in report:
         compact["strict_diagnostic_coverage_ready_count"] = report.get("strict_diagnostic_coverage_ready_count")
@@ -320,13 +324,13 @@ def compact_input_workload_signatures(value: Any) -> dict[str, dict[str, Any]]:
             "config_ids": item.get("config_ids", []),
             "signature_count": item.get("signature_count"),
             "signature_match": item.get("signature_match"),
-            "sequence_signature_count": item.get("sequence_signature_count"),
-            "sequence_match": item.get("sequence_match"),
+            "sequence_diagnostic_signature_count": item.get("sequence_diagnostic_signature_count"),
+            "sequence_diagnostic_match": item.get("sequence_diagnostic_match"),
             "canonical_workload_ready": item.get("canonical_workload_ready"),
             "input_contract_ready": item.get("input_contract_ready"),
         }
-        if "sequence_check" in item:
-            row["sequence_check"] = item.get("sequence_check")
+        if "sequence_diagnostic" in item:
+            row["sequence_diagnostic"] = item.get("sequence_diagnostic")
         for key in (
             "forced_token_enabled_count",
             "forced_token_plan_signature_count",

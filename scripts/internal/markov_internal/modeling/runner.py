@@ -208,13 +208,13 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
 
 
 def require_validation_backend(config: dict[str, Any]) -> None:
-    """HiCache validation 必须显式选择 Debug/validation C++ backend。"""
+    """HiCache validation 必须显式选择 validation C++ backend。"""
 
     cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
     backend_kind = str(cpp.get("backend_kind") or "").strip().lower()
     if backend_kind == "validation" or cpp.get("require_debug") is True:
         return
-    raise ValueError("Debug-only modeling outputs require cpp_trace_graph.backend_kind='validation'")
+    raise ValueError("validation/debug modeling outputs require cpp_trace_graph.backend_kind='validation'")
 
 
 def enrich_dag_quality(

@@ -116,20 +116,20 @@ class ModelRunExecutor:
         return row
 
     def _running_metrics(self) -> dict[str, Any]:
-        total = len(self.rows)
-        return {
-            "ok": count_text(sum(1 for row in self.rows if row.get("return_code") == 0), total),
-            "skipped": str(sum(1 for row in self.rows if row.get("skipped"))),
-        }
+        stats = self._stats()
+        metrics: dict[str, Any] = {"usable": count_text(stats["usable_count"], stats["runnable_count"])}
+        if stats["skipped_count"]:
+            metrics["skipped"] = str(stats["skipped_count"])
+        if stats["error_count"]:
+            metrics["errors"] = str(stats["error_count"])
+        return metrics
 
     def _write_summary(self) -> dict[str, Any]:
+        stats = self._stats()
         summary = {
             "schema": "trace_sim.modeling_workflow.model_runs.v1",
             "run_count": len(self.rows),
-            "ok_count": sum(1 for row in self.rows if row.get("return_code") == 0),
-            "error_count": sum(1 for row in self.rows if row.get("return_code") not in (0, None)),
-            "skipped_count": sum(1 for row in self.rows if row.get("skipped")),
-            "dry_run_count": sum(1 for row in self.rows if row.get("dry_run")),
+            **stats,
             "rows": self.rows,
         }
         write_json(self.context.artifacts.model_runs_summary_path, summary)
@@ -145,16 +145,29 @@ class ModelRunExecutor:
         return "OK"
 
     def _done_text(self) -> str:
-        total = len(self.rows)
-        ok_count = sum(1 for row in self.rows if row.get("return_code") == 0)
-        skipped_count = sum(1 for row in self.rows if row.get("skipped"))
-        error_count = sum(1 for row in self.rows if row.get("return_code") not in (0, None))
-        text = f"{total} runs | ok {count_text(ok_count, total)}"
-        if skipped_count:
-            text += f" | skipped {skipped_count}"
-        if error_count:
-            text += f" | errors {error_count}"
+        stats = self._stats()
+        text = f"{len(self.rows)} runs | usable {count_text(stats['usable_count'], stats['runnable_count'])}"
+        if stats["skipped_count"]:
+            text += f" | skipped {stats['skipped_count']}"
+        if stats["dry_run_count"]:
+            text += f" | dry-run {stats['dry_run_count']}"
+        if stats["error_count"]:
+            text += f" | errors {stats['error_count']}"
         return text
+
+    def _stats(self) -> dict[str, int]:
+        runnable_count = sum(1 for row in self.rows if not row.get("skipped"))
+        usable_count = sum(1 for row in self.rows if not row.get("skipped") and row.get("return_code") == 0)
+        return {
+            "handled_count": len(self.rows),
+            "runnable_count": runnable_count,
+            "usable_count": usable_count,
+            "error_count": sum(
+                1 for row in self.rows if not row.get("skipped") and row.get("return_code") not in (0, None)
+            ),
+            "skipped_count": sum(1 for row in self.rows if row.get("skipped")),
+            "dry_run_count": sum(1 for row in self.rows if row.get("dry_run")),
+        }
 
 
 def primary_artifact_ready(spec: ModelRunSpec, artifacts: ModelRunArtifacts) -> bool:

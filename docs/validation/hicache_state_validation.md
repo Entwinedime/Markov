@@ -470,7 +470,9 @@ token directory 重构已通过该基线回归：原 `c3/manual_deeper_pressure_
 
 ```bash
 scripts/run.sh modeling -- bash -lc \
-  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja && cmake --build build/modeling/trace_graph --target trace_graph -j2'
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=ON && cmake --build build/modeling/trace_graph-validation --target trace_graph -j2'
 scripts/run.sh modeling -- bash -lc \
   'python3 -m py_compile $(find scripts/internal/entrypoints scripts/internal/markov_internal -name "*.py" -print)'
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty

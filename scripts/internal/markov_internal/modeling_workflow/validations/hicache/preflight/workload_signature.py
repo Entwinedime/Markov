@@ -21,11 +21,11 @@ WORKLOAD_SIGNATURE_ROLES = (
 
 
 class WorkloadSignatureBuilder:
-    """从 workload identity facts 构造 multiset 与 sequence signature。"""
+    """从 workload identity facts 构造 multiset gate 与 sequence 诊断。"""
 
-    def __init__(self, run: ProfileRunRef, *, include_sequence_events: bool = False) -> None:
+    def __init__(self, run: ProfileRunRef, *, include_sequence_diagnostics: bool = False) -> None:
         self.run = run
-        self.include_sequence_events = include_sequence_events
+        self.include_sequence_diagnostics = include_sequence_diagnostics
         self.roles = set(WORKLOAD_SIGNATURE_ROLES)
 
     def build(self) -> dict[str, Any]:
@@ -45,14 +45,14 @@ class WorkloadSignatureBuilder:
             }
         }
         signature = sha256_json(payload)
-        sequence_payload = workload_sequence_payload(events)
+        sequence_payload = workload_sequence_diagnostic_payload(events)
         unknown = dict(sorted(unknown_roles.items()))
         unmapped = dict(sorted(unmapped_requests.items()))
         result = {
             "signature": signature,
             "ready": bool(events) and not unknown and not unmapped and bool(path_contract.get("ready")),
-            "sequence_signature": sha256_json(sequence_payload),
-            "sequence_ready": bool(events) and not unknown and not unmapped,
+            "sequence_diagnostic_signature": sha256_json(sequence_payload),
+            "sequence_diagnostic_ready": bool(events) and not unknown and not unmapped,
             "request_event_count": len(events),
             "roles": sorted(self.roles),
             "role_counts": {role: sum(counter.values()) for role, counter in sorted(by_role.items())},
@@ -60,8 +60,8 @@ class WorkloadSignatureBuilder:
             "unmapped_request_id_events": unmapped,
             "workload_identity_path_contract": path_contract,
         }
-        if self.include_sequence_events:
-            result["sequence_events"] = workload_sequence_events(events)
+        if self.include_sequence_diagnostics:
+            result["sequence_diagnostic_events"] = workload_sequence_diagnostic_events(events)
         return result
 
 
@@ -72,8 +72,8 @@ def sha256_json(payload: Any) -> str:
     return "sha256_json:" + hashlib.sha256(encoded).hexdigest()
 
 
-def workload_sequence_payload(events: list[Any]) -> list[dict[str, str]]:
-    """构造 strict sequence signature 的最小 payload。"""
+def workload_sequence_diagnostic_payload(events: list[Any]) -> list[dict[str, str]]:
+    """构造 sequence 诊断 hash 的最小 payload。"""
 
     return [
         {
@@ -84,7 +84,7 @@ def workload_sequence_payload(events: list[Any]) -> list[dict[str, str]]:
     ]
 
 
-def workload_sequence_events(events: list[Any]) -> list[dict[str, Any]]:
+def workload_sequence_diagnostic_events(events: list[Any]) -> list[dict[str, Any]]:
     """构造 mismatch 诊断使用的可读 sequence events。"""
 
     return [
@@ -109,32 +109,32 @@ def summarize_workload_sequence_input_group(
     include_details: bool,
     sample_limit: int = 8,
 ) -> dict[str, Any]:
-    """汇总同一个 input 下跨 config 的 workload sequence 一致性。"""
+    """汇总同一个 input 下跨 config 的 workload sequence 诊断信息。"""
 
     sequence_signatures = sorted(
         {
-            str(row.get("canonical_workload_sequence_signature"))
+            str(row.get("workload_sequence_diagnostic_signature"))
             for row in input_rows
-            if row.get("canonical_workload_sequence_signature")
+            if row.get("workload_sequence_diagnostic_signature")
         }
     )
-    sequence_match = len(sequence_signatures) == 1
+    sequence_diagnostic_match = len(sequence_signatures) == 1
     summary: dict[str, Any] = {
-        "sequence_signature_count": len(sequence_signatures),
-        "sequence_match": sequence_match,
+        "sequence_diagnostic_signature_count": len(sequence_signatures),
+        "sequence_diagnostic_match": sequence_diagnostic_match,
     }
     if not include_details:
         return summary
 
     sorted_rows = sorted(input_rows, key=lambda row: str(row.get("config_id") or ""))
     baseline = sorted_rows[0] if sorted_rows else {}
-    baseline_events = baseline.get("_workload_sequence_events")
+    baseline_events = baseline.get("_workload_sequence_diagnostic_events")
     baseline_sequence = baseline_events if isinstance(baseline_events, list) else []
     mismatches: list[dict[str, Any]] = []
     for row in sorted_rows[1:]:
-        current_events = row.get("_workload_sequence_events")
+        current_events = row.get("_workload_sequence_diagnostic_events")
         current_sequence = current_events if isinstance(current_events, list) else []
-        mismatch = first_workload_sequence_mismatch(baseline_sequence, current_sequence)
+        mismatch = first_workload_sequence_diagnostic_mismatch(baseline_sequence, current_sequence)
         if mismatch is None:
             continue
         mismatches.append(
@@ -145,9 +145,9 @@ def summarize_workload_sequence_input_group(
             }
         )
 
-    summary["sequence_check"] = {
+    summary["sequence_diagnostic"] = {
         "enabled": True,
-        "match": sequence_match,
+        "match": sequence_diagnostic_match,
         "baseline_config_id": baseline.get("config_id"),
         "mismatch_count": len(mismatches),
         "mismatch_samples": mismatches[:sample_limit],
@@ -155,7 +155,7 @@ def summarize_workload_sequence_input_group(
     return summary
 
 
-def first_workload_sequence_mismatch(
+def first_workload_sequence_diagnostic_mismatch(
     source: list[dict[str, Any]],
     target: list[dict[str, Any]],
 ) -> dict[str, Any] | None:

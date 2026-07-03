@@ -8,6 +8,12 @@ from dataclasses import dataclass, field
 from typing import Any, TextIO
 
 
+STAGE_COLUMN_WIDTH = 24
+STATE_COLUMN_WIDTH = 10
+COUNT_COLUMN_WIDTH = 9
+SEPARATOR_WIDTH = 104
+
+
 @dataclass
 class StageProgress:
     """单个 workflow stage 的进度句柄。"""
@@ -48,7 +54,8 @@ class WorkflowProgressReporter:
 
         stage = StageProgress(reporter=self, name=name, total=total, detail=detail, unit=unit)
         suffix = f" | {detail}" if detail else ""
-        self._write_line(f"{name:<15} start  {value_text(total)} {unit_text(total, unit)}{suffix}")
+        self._write_separator()
+        self._write_line(self._format_line(name, "START", f"{value_text(total)} {unit_text(total, unit)}{suffix}"))
         return stage
 
     def update(self, stage: StageProgress) -> None:
@@ -69,13 +76,23 @@ class WorkflowProgressReporter:
             self._dynamic_line_active = False
         elapsed = elapsed_text(time.monotonic() - stage.started_at)
         elapsed_suffix = f" | {elapsed}" if elapsed else ""
-        self._write_line(f"{stage.name:<15} {status:<7} {summary}{elapsed_suffix}")
+        self._write_line(self._format_line(stage.name, status.upper(), f"{summary}{elapsed_suffix}"))
 
     def _running_line(self, stage: StageProgress) -> str:
         progress = count_text(stage.completed, stage.total)
         metrics = stage_metric_text(stage.metrics)
         metrics_suffix = f"  {metrics}" if metrics else ""
-        return f"{stage.name:<15} {progress:<8} {progress_bar(stage.completed, stage.total)}{metrics_suffix}"
+        payload = f"{progress:<{COUNT_COLUMN_WIDTH}} {progress_bar(stage.completed, stage.total)}{metrics_suffix}"
+        return self._format_line(stage.name, "RUNNING", payload)
+
+    def _format_line(self, stage_name: str, state: str, payload: str) -> str:
+        return f"{stage_name:<{STAGE_COLUMN_WIDTH}} {state:<{STATE_COLUMN_WIDTH}} {payload}"
+
+    def _write_separator(self) -> None:
+        if self._dynamic_line_active:
+            self.stream.write("\n")
+            self._dynamic_line_active = False
+        self._write_line("-" * SEPARATOR_WIDTH)
 
     def _write_line(self, text: str) -> None:
         self.stream.write(text + "\n")
@@ -85,7 +102,7 @@ class WorkflowProgressReporter:
 def stage_metric_text(metrics: dict[str, Any]) -> str:
     """渲染紧凑的 running metrics。"""
 
-    return "  ".join(f"{key} {value}" for key, value in metrics.items())
+    return " | ".join(f"{key} {value}" for key, value in metrics.items())
 
 
 def progress_bar(done: int, total: int, *, width: int = 20) -> str:

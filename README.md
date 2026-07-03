@@ -71,6 +71,8 @@ git submodule update --init --recursive
 scripts/build.sh modeling
 scripts/run.sh modeling -- bash -lc \
   'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=ON && cmake --build build/modeling/trace_graph-validation --target trace_graph -j2'
 ```
 
 构建 framework runtime 和对应 hook：

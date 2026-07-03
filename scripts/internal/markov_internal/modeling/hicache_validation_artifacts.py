@@ -8,12 +8,12 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import resolve_repo_path
-from markov_internal.modeling_workflow.validations.hicache.oracle.diff.delta import (
-    build_event_delta_validation,
-    build_timeline_delta_validation,
-)
+from markov_internal.modeling_workflow.validations.hicache.oracle.diff.event_delta import build_event_delta_validation
 from markov_internal.modeling_workflow.validations.hicache.oracle.diff.mismatch import (
     first_hicache_mismatch,
+)
+from markov_internal.modeling_workflow.validations.hicache.oracle.diff.timeline_delta import (
+    build_timeline_delta_validation,
 )
 from markov_internal.modeling_workflow.validations.hicache.oracle.evidence.capacity import (
     build_hicache_capacity_config_audit,

@@ -93,7 +93,7 @@ scripts/model.sh \
 
 该 runner config 必须包含 `cpp_trace_graph.backend_kind="validation"` 和
 `outputs.emit_validation=true`。普通 business cache-state prediction 不生成 `model_summary.json` /
-`validation.json`，也不使用 Debug backend。
+`validation.json`，也不使用 validation backend。
 
 常用覆盖项：
 
@@ -539,13 +539,15 @@ DAG rewrite chain:
 - 不执行 module summary writer、C++ validation runner 或 HiCache debug summary JSON adapter；
 - 不保存 HiCache transition/policy/ref/capacity/radix/async 行级 debug history。
 
-需要 validation/debug artifact 的 unified modeling workflow 必须使用 Debug/validation backend：
+需要 validation/debug artifact 的 unified modeling workflow 必须使用 validation backend：
 
 - workflow 生成的 runner config 写入 `cpp_trace_graph.backend_kind="validation"`；
-- runner 只查找 `build/modeling/trace_graph-debug/trace_graph`，不回退到 Release；
-- 缺少 Debug backend 时直接失败，并提示 Debug build 命令；
+- runner 只查找 `build/modeling/trace_graph-validation/trace_graph`，不回退到 Release 或 Debug；
+- validation backend 使用优化构建，例如 `Release + TRACE_GRAPH_DEBUG=ON`，保留 diagnostics / validation 代码但避免
+  `-O0` Debug 二进制处理大 trace；
+- 缺少 validation backend 时直接失败，并提示 validation build 命令；
 - `outputs.emit_validation=true` 代表执行 validation 路径，而不是只多写一个输出文件。
-- `outputs.emit_dag_analysis=true` 同样要求 Debug backend，并执行 DAG analysis artifact 构造路径。
+- `outputs.emit_dag_analysis=true` 同样要求 validation backend，并执行 DAG analysis artifact 构造路径。
 
 ## DAG Analysis Validation
 
@@ -593,7 +595,7 @@ critical path 摘要；`dag_anchor_coverage.json` 只审计当前 workload ident
 ## 验证
 
 validation 不是默认输出，只有 `--emit-validation` 或 config 中 `outputs.emit_validation=true` 时生成，并且必须使用
-Debug/validation backend。
+validation backend。
 
 HiCache state validation 必须同时看：
 

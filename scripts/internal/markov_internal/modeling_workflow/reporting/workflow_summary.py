@@ -24,7 +24,14 @@ def write_workflow_summary(
         "selected_validations": list(context.options.validations),
         "profile_run_count": len(runs),
         "model_run_count": len(specs),
-        "model_run_ok_count": sum(1 for result in results.values() if result.return_code == 0),
+        "model_run_handled_count": len(results),
+        "model_run_runnable_count": sum(1 for result in results.values() if not result.skipped),
+        "model_run_usable_count": sum(
+            1 for result in results.values() if not result.skipped and result.return_code == 0
+        ),
+        "model_run_error_count": sum(
+            1 for result in results.values() if not result.skipped and result.return_code not in (0, None)
+        ),
         "model_run_skipped_count": sum(1 for result in results.values() if result.skipped),
         "preflight_ready": preflight_report.get("ready"),
         "validations": {
