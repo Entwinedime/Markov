@@ -20,10 +20,12 @@
 - 真实 SGLang profiling 必须在 `sglang-profile` runtime 容器中执行；framework hook 也必须在相同 ABI 环境中构建。
 - C++ TraceGraph 构建、格式检查和 modeling 验证以独立的 `modeling` 容器为准；该环境不依赖 Ascend/CANN runtime。
 - 宿主机只负责外层编排和无运行时依赖的静态检查，不作为 framework profiling 或 C++ 构建验收环境。
-- Profiling 的宿主机入口是 `scripts/profile.sh`；modeling 的宿主机入口是 `scripts/model.sh`。
-- `scripts/internal/entrypoints/profile.py` 和 `scripts/internal/entrypoints/model.py` 是容器内执行器，不作为真实任务的宿主机入口。
-- `scripts/internal/entrypoints/` 只维护容器内 CLI glue；当前只保留 `profile.py`、`model.py` 和
-  `modeling_workflow.py` 三个主入口。可复用逻辑必须放在 `scripts/internal/markov_internal/` 下按
+- Profiling 的宿主机入口是 `scripts/profile.sh`；post-profile modeling workflow 的用户入口是
+  `python3 scripts/internal/entrypoints/modeling_workflow.py`。`scripts/model.sh` 只作为 workflow/诊断调用单次 runner 的低层
+  container wrapper。
+- `scripts/internal/entrypoints/profile.py` 和 `scripts/internal/entrypoints/model.py` 是容器内执行器，不作为真实任务的宿主机入口；
+  `scripts/internal/entrypoints/modeling_workflow.py` 是 profiling 后 modeling validation / analysis 的直接入口。
+- `scripts/internal/entrypoints/` 当前只保留 `profile.py`、`model.py` 和 `modeling_workflow.py` 三个主入口。可复用逻辑必须放在 `scripts/internal/markov_internal/` 下按
   `common`、`profiling`、`audit`、`contracts`、`modeling` 和 `modeling_workflow` 分层。
 - CLI 解析可以保留在容器内 entrypoint 或包内 `main()` 边界；可复用业务函数应接收显式 typed option / path / config
   参数，不把 `argparse.Namespace` 继续向深层传递。
@@ -100,7 +102,8 @@
 
 ## 建模边界
 
-- Modeling 后端使用 C++ TraceGraph；Python 只负责配置生成、运行编排、trace 合并和 validation。
+- Modeling 后端使用 C++ TraceGraph；Python 只负责配置生成、运行编排和 validation。profile manifest 中的 torch /
+  LD_PRELOAD / Python probe trace 由 C++ 后端直接读取，并在进程内完成合流，不物化大型 merged trace。
 - Active C++ TraceGraph public include 根为 `include/markov/trace_graph/...`，命名空间为
   `markov::trace_graph::...`；不维护旧 `include/trace_graph/...` 转发层、旧 `namespace TraceGraph` alias 或兼容 target。
 - 不保留旧 C++ TraceGraph 对照目录；重构后的 active tree 必须直接位于 `src/modeling/trace_graph`。

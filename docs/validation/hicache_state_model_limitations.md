@@ -153,7 +153,7 @@ loadback 是否进入 allocator path
 
 模型拿到该 intent 后，才能按 target config 重算 loadback allocation、possible eviction 和 async completion lifecycle。
 
-## HCSV-LIMIT-003: storage control queue drain 仍是 post-extend 释放近似
+## HCSV-LIMIT-003: storage control queue drain 仍是 request-local 边界近似
 
 ### 问题
 
@@ -179,26 +179,36 @@ profiling 合同不采集 `drain_storage_control_queues()` runtime checkpoint。
 边界，跨配置不能稳定映射到 target request timeline；profile quality、transition validator 和 C++ mutation path 都不消费
 这个 source boundary。
 
-当前用 async table 的 `reserved_host_pages` 表示 pending host release，并把释放时机改成 target-derived request-local
-近似：
+当前用 async table 的 `reserved_host_pages` 表示 pending host release，并把释放时机建成 target-derived request-local
+三段近似：
 
 - revoked / late / suppressed / applied prefetch 仍可能占用 `reserved_host_pages`；
-- `cache_extend_input` 进入前被视为同 request prefetch 的 target-derived terminal boundary；
-- terminal boundary 只结算 ready / revoked / late / suppressed，不把剩余 reservation 立刻从 host budget 中删除；
-- 同 request 的 `cache_extend_input` side effect 完成后，模型释放该 request 下所有非 active prefetch 的 pending reservation；
+- `cache_extend_input` 进入前先 drain 同 request 已经存在的 pending release，模拟上一轮 scheduler drain 已经让 release
+  对本轮 allocation 可见的情况；
+- `cache_extend_input` 被视为同 request active prefetch 的 target-derived terminal boundary，用于结算 ready / revoked / late /
+  suppressed；
+- 对 best-effort below-threshold revoke，若模型认为后台 storage query 已经早于本次 `cache_extend_input` 可见，则在 cache
+  extend side effect 前释放 reservation；
+- 其它同 request terminal prefetch 的 pending reservation 在 `cache_extend_input` side effect 后做 post-extend release drain；
 - `finalize()` 只兜底释放没有后续 cache extend 的残留 reservation；
 - 模型不读取 source queue snapshot、source page identity 或 oracle final state 来决定释放哪些 page。
 
-2026-07-01 forced replay 全矩阵已经在当前 profiling 合同下达到 self/cross final-state `75 / 75` exact 和 transition
-`75 / 75` exact。这说明当前 5x3 manual matrix 覆盖了该边界的已知失败形态，但不说明 rank-synced FIFO release
-queue 已被精确复现。
+2026-07-06 forced replay suite 上的 unified workflow 75 格矩阵已经在当前 profiling 合同下达到 self/cross
+final-state `75 / 75` exact 和 transition `75 / 75` exact。这说明当前 5x3 manual matrix 覆盖了该边界的已知失败形态，
+但不说明 rank-synced FIFO release queue 已被精确复现。
+
+当前 active 结果目录：
+
+```text
+data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75
+```
 
 代码锚点：
 
 - `src/modeling/trace_graph/src/modules/hicache/runtime/async_state.cpp` 的
   `release_prefetch_pending_host_pages_for_request()`；
 - `src/modeling/trace_graph/src/modules/hicache/model/request_model.cpp` 的
-  `apply_cache_extend_input()` post-extend drain；
+  `apply_cache_extend_input()` pre-existing / pre-cache-extend / post-cache-extend drain；
 - `src/modeling/trace_graph/src/modules/hicache/model/finalizer.cpp` 的 pending release finalize fallback；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
   `_drain_storage_control_queues_impl()` / `drain_storage_control_queues()`；
@@ -213,8 +223,8 @@ queue 已被精确复现。
 
 ### 风险
 
-post-extend drain 不是 SGLang rank-synced FIFO queue 的精确复现。它保守保证同 request cache extend 期间仍能看到 terminal
-prefetch 的 host pressure，但不能表达其它 request、其它 rank 或后续 scheduler round 对同一 release queue 的精确交错。
+request-local drain 不是 SGLang rank-synced FIFO queue 的精确复现。它保守保证同 request cache extend 附近能看到
+terminal prefetch 的 host pressure，但不能表达其它 request、其它 rank 或后续 scheduler round 对同一 release queue 的精确交错。
 release drain 过早会让 host budget 太早变空，可能少触发一次 host cleanup；release drain 过晚会让 host budget 继续被占用，
 可能多触发一次 host cleanup。两者都会改变 L2/backuped/evicted page set 和 host victim order。
 
@@ -224,7 +234,85 @@ release drain 过早会让 host budget 太早变空，可能少触发一次 host
 queue、rank-synced FIFO drain count 或 scheduler batch round。不能把 source run 的 `drain_storage_control_queues()`
 重新包装成跨配置 profiling checkpoint。
 
-## HCSV-LIMIT-004: prefetch I/O progress 仍是未校准的完成度投影
+## HCSV-LIMIT-004: best-effort prefetch revoke 可见性使用 worker-ready 时间投影
+
+### 问题
+
+SGLang `best_effort` prefetch below threshold 的关键分歧不在 lookup，而在后台线程和 scheduler drain 谁先让 revoke
+对本次 cache extend 可见：
+
+```text
+prefetch_from_storage()
+  -> enqueue prefetch operation / reserve host pages
+
+prefetch_thread_func()
+  -> storage hit query
+  -> all-reduce MIN
+  -> hit < threshold 时把 request 放入 prefetch_revoke_queue
+  -> append_host_mem_release()
+
+scheduler path
+  -> check_hicache_events() / drain_storage_control_queues()
+  -> check_prefetch_progress()
+  -> cache_extend_input
+```
+
+如果后台线程足够早完成 below-threshold 判定，后一次 scheduler drain 可能在 cache extend 前释放 host reservation；
+否则 release 只能在同 request cache extend 后才对模型可见。
+
+### 当前近似
+
+C++ state model 仍只消费 `cache_lookup_input`、`cache_extend_input`、`cache_lifecycle_commit` 和
+`prefetch_candidate_anchor` 四类 state facts。不新增 source runtime checkpoint，不消费 source actual、oracle state、
+observed gate 或 Python probe 的最终答案。
+
+在 `prefetch_candidate_anchor` 上，模型用 target-derived 信息估计后台 worker 的 storage query 可见时刻：
+
+- 以 modeled storage readable prefix 计算 below-threshold 首个 miss 之前需要查询的 page 数；
+- query page 数按 SGLang storage batch 粒度折叠，batch size 当前为 `128` pages，并被 planned prefetch pages 截断；
+- 每个 `cache_scope` 维护一个串行 `prefetch_worker_available_ts`；
+- ready time 近似为 `max(candidate_anchor.ts, prefetch_worker_available_ts) + query_duration`；
+- `query_duration = 2000us + 1250us * query_pages`，当 `query_pages > 16` 时再加 `2500us`；
+- 在 `cache_extend_input` 上，如果 `storage_query_ready_ts + 2500us <= cache_extend_input.ts`，则把 below-threshold
+  host release 视为 pre-extend drain 可见；否则走 post-extend drain。
+
+非 `best_effort` 的 below-threshold revoke 仍按原语义在 cache extend 前可见；这个 worker-ready 投影只特化
+`best_effort` 的 A/B 分岔。
+
+代码锚点：
+
+- `src/modeling/trace_graph/src/modules/hicache/model/prefetch_model.cpp` 的
+  `prefetch_storage_query_pages()`、`estimate_prefetch_storage_query_duration()`、
+  `prefetch_release_visible_before_cache_extend()`、`apply_prefetch_candidate_anchor()` 和
+  `settle_prefetch_before_cache_extend()`；
+- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/model/state.hpp` 的
+  `ScopedState::prefetch_worker_available_ts`；
+- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/runtime/async_state.hpp` 的
+  `HiCachePrefetchOperation::storage_query_ready_ts` 和 `release_before_cache_extend`；
+- `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的 `prefetch_thread_func()`；
+- `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的 `prefetch_from_storage()`、
+  `check_prefetch_progress()` 和 `drain_storage_control_queues()`。
+
+### 为什么难以精确
+
+精确判断需要知道后台 prefetch thread 的真实排队、storage backend latency、rank all-reduce、queue size snapshot、
+以及 scheduler 何时执行 `check_hicache_events()`。这些都是 source runtime timing，不能直接变成 cross-config
+state-model 输入。只看 lookup 也不够，因为改变状态的是后续 cache extend 边界附近的 revoke visibility。
+
+### 风险
+
+该近似依赖固定的 storage query latency 常数和每 scope 单 worker 假设。如果 storage backend 延迟、prefetch candidate
+大小分布、scheduler round 间隔、rank 同步或后台线程并发度变化，pre-extend / post-extend drain 判定可能翻转。翻转后会改变
+host budget、cleanup victim order、L2 host-visible page set 和 transition multiset。
+
+### 收敛方向
+
+长期应引入 target-independent 的 scheduler round / storage-control drain intent，或把 prefetch worker queue 抽象成
+可校准的 target operation graph。允许记录的应是可复算边界条件，例如 cache scope、request id、enqueue order、query page
+count、scheduler round id 或 drain intent；不应记录 source run 的 actual completion、oracle final state 或 observed gate
+答案。
+
+## HCSV-LIMIT-005: prefetch I/O progress 仍是未校准的完成度投影
 
 ### 问题
 
@@ -278,7 +366,7 @@ projection。
 - 后续 request match / loadback / host cleanup 的 victim order；
 - transition exactness 中 `prefetch_ready`、`apply_prefetch_host_visibility`、`add_l2` 等操作数量和顺序；
 - 多 rank/cache scope 的 union transition timeline 中，`storage -> host` 和 `host -> L1/GPU` 的阶段边界如果被折叠到
-  不同粒度，仍可能改变 marker 顺序。2026-07-01 full matrix 已关闭当前 manual matrix 的该类 mismatch，但不能证明后台 I/O
+  不同粒度，仍可能改变 marker 顺序。2026-07-06/07 full matrix 已关闭当前 manual matrix 的该类 mismatch，但不能证明后台 I/O
   exactness。
 
 ### 收敛方向
@@ -304,7 +392,7 @@ target-independent completed prefix policy
 同时需要保留跨 scope 的阶段边界：先在 prefetch progress boundary 上整体 materialize host-visible prefix，再在后续 request reuse /
 loadback boundary 上整体推进 L1/GPU materialization，避免 `scope A: mark+clear`、`scope B: mark+clear` 这种伪 transition。
 
-## HCSV-LIMIT-005: write-through backup ACK 与普通 lock lifetime 是边界近似
+## HCSV-LIMIT-006: write-through backup ACK 与普通 lock lifetime 是边界近似
 
 ### 问题
 
@@ -371,7 +459,7 @@ release_lock = true
 
 模型侧仍应基于 target tree/ref ledger 自己释放对应 owner。
 
-## HCSV-LIMIT-006: write-back dirty eviction ACK 时序被同步折叠
+## HCSV-LIMIT-007: write-back dirty eviction ACK 时序被同步折叠
 
 ### 问题
 
@@ -439,7 +527,7 @@ device_eviction_commit
 
 在此之前，write-back 路径的 transition exactness 只能解释为结果语义近似，而不是完整 async timeline exact。
 
-## HCSV-LIMIT-007: host allocator 仍是 capacity/reservation 投影
+## HCSV-LIMIT-008: host allocator 仍是 capacity/reservation 投影
 
 ### 问题
 
@@ -456,7 +544,8 @@ occupied_host_pages + reserved_host_pages <= l2_capacity_pages
 
 `request_host_allocation()` 只做 count-level 判断：
 
-- 不直接 drain source storage-control release queue；pending prefetch host release 只由 request-local post-extend drain 推进；
+- 不直接 drain source storage-control release queue；pending prefetch host release 由 request-local pre-existing /
+  worker-ready pre-extend / post-extend drain 推进；
 - 按 requested pages 执行 modeled host cleanup；
 - 用 `occupied_host_pages + reserved_host_pages` 计算 available pages；
 - write backup 必须完整接受；

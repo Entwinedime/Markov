@@ -2,6 +2,24 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-07-07 19:00:41 +0800
+
+- 对齐 README、当前 unified modeling workflow 与 HiCache validation 文档：
+  - 当前 post-profile modeling 主入口明确为 `python3 scripts/internal/entrypoints/modeling_workflow.py`；
+  - `scripts/model.sh` 只作为 workflow/诊断调用单次 runner 的低层 container wrapper；
+  - C++ backend 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace 并在进程内合流，不再物化大型
+    `merged_trace` 中间产物。
+- 记录当前 active HiCache full-matrix 基线：
+  - suite 为 `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay`；
+  - workflow 输出为
+    `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75`；
+  - HiCache final-state self/cross `75/75` exact，transition exactness、transition-count exactness 和 page-lifecycle
+    multiset exactness 均为 `75/75`。
+- `docs/validation/hicache_state_model_limitations.md` 新增当前 best-effort below-threshold prefetch revoke 可见性近似：
+  C++ 不扩大 state-model fact 输入范围，只在 `prefetch_candidate_anchor` 上用 target-derived prefetch worker ready-time
+  投影判断 release 是否能在本次 `cache_extend_input` 前被 scheduler drain 看到；该近似仍不等价于 rank-synced
+  `drain_storage_control_queues()` exact timeline。
+
 ## 2026-07-03 00:58:05 +0800
 
 - 完成 unified `modeling_workflow` Python 重构后的主线文档对齐：

@@ -105,21 +105,65 @@ Unified modeling workflow 的 HiCache validation preflight 会把该检查压缩
 | capacity index | `HiCacheCapacityIndex` mutation-driven 维护 device/host leaf、occupied pages、reserved host pages、victim choice 和 audit trace。 |
 | ref ledger | request / writeback / loadback / storage / prefetch owner 级 acquire/release，输出 ref mutation 和 tree ref audit。 |
 | storage directory | 区分 materialized page record 与 backend-readable hash record；prefetch storage hit query 只保留连续 readable prefix。 |
-| prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离。 |
+| prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离；best-effort below-threshold revoke 可见性使用 target-derived prefetch worker ready-time 投影。 |
 | host cleanup | host allocation 失败按 SGLang request budget cleanup；victim 是 host-visible、evicted、无 ref 保护且无 backuped child 的 host radix leaf。 |
 | write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK / ref lifetime 仍按 target control boundary 近似，并在 finalize 收敛尾部 write-through pending ACK，具体风险维护在限制文档。 |
 
-当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、backend I/O / transition timeline 和异步 ACK / host release 的近似边界。
+当前仍属于妥协或中长期缺口的部分记录在 `docs/validation/hicache_state_model_limitations.md`，包括 batch-level allocation intent、loadback intent / mem_quota、backend I/O / transition timeline、best-effort prefetch revoke 可见性和异步 ACK / host release 的近似边界。
 
 ## 当前合同状态与保留验证基线
 
-说明：2026-07-02 完成的 unified `modeling_workflow` Python 重构已经通过 Ruff、`compileall` 和两条 dry-run smoke，
-但尚未产生新的 full-matrix modeling 结果。因此当前 state/transition 正确性仍以
-`HCSV-20260701-forced-bundle-full-matrix` 的旧 workflow 结果为保留基线；新 workflow 的 full-run 结果生成后再更新本节。
+说明：当前 active state/transition 正确性以 2026-07-06 forced replay suite 上的 unified `modeling_workflow`
+full-matrix 结果为准。2026-07-01 旧 workflow 结果只保留为上一版合同证据。
+
+### HCSV-20260706-unified-workflow-full-matrix
+
+这是当前 active profiling 合同和 unified workflow 下的 full-matrix 基线。该 run 使用
+`cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
+作为 state-model 输入，不采集 runtime prefetch checkpoint、per-request admission、storage-control drain checkpoint、
+source actual、oracle state 或 observed gate 作为模型输入。
+
+该基线包含本轮 C++ backend / workflow 收口后的三项前提：
+
+- Python workflow 入口统一为 `python3 scripts/internal/entrypoints/modeling_workflow.py`；
+- C++ backend 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace，并在进程内合流，不再写大型
+  `merged_trace` 中间产物；
+- HiCache best-effort below-threshold revoke 的 pre-extend / post-extend 分岔由 target-derived prefetch worker
+  ready-time 投影决定，具体限制见 `docs/validation/hicache_state_model_limitations.md`。
+
+结果目录：
+
+```text
+data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75
+```
+
+workflow 摘要：
+
+| 项 | 结果 |
+| --- | ---: |
+| workflow entry | `modeling_workflow.py` |
+| profile suite | `20260706_020716_profiling_hicache_dag_analysis_forced_replay` |
+| selected validations | `hicache_final_state,hicache_transition` |
+| inputs | `3` |
+| configs | `5` |
+| prediction scopes | `self,cross` |
+| full final-state exact | `75 / 75` |
+| transition exact | `75 / 75` |
+| transition-count exact | `75 / 75` |
+| page-lifecycle multiset exact | `75 / 75` |
+
+结论：
+
+- 当前 5x3 manual matrix 的 self/cross final-state 已全部对齐；
+- 当前 75 个 transition prediction 也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
+- 该 run 证明当前 unified workflow、C++ manifest trace input、HiCache state facts 和 best-effort revoke visibility
+  投影在这批数据下对齐；
+- 上述通过仍只证明当前 manual matrix 和当前近似边界成立，不等价于完整 SGLang scheduler / backend I/O /
+  rank-synced queue exactness，长期近似仍维护在限制文档。
 
 ### HCSV-20260701-forced-bundle-full-matrix
 
-这是当前 active profiling 合同下的 full-matrix 基线。该 run 使用
+这是旧 workflow 下的 full-matrix 基线。该 run 使用
 `cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
 作为 state-model 输入，不采集 runtime prefetch checkpoint、per-request admission 或 storage-control drain checkpoint。
 
@@ -198,13 +242,13 @@ ready，final-state self `15 / 15` exact，final-state cross `60 / 60` exact，t
 page-lifecycle multiset exact 均为 `75 / 75`。
 
 该 run 证明上一版不采集、不消费 `storage_control_drain_boundary` 的合同下，5x3 manual matrix 曾经完整对齐。由于当前
-state-model 输入和 workflow 质量口径已经收紧，它只保留为历史对照；当前 active exactness 结论以
-`HCSV-20260701-forced-bundle-full-matrix` 为准。
+state-model 输入、C++ trace input 和 workflow 质量口径已经收紧，它只保留为历史对照；当前 active exactness 结论以
+`HCSV-20260706-unified-workflow-full-matrix` 为准。
 
 ### HCSV-20260627-forced-bundle-self-regression（历史 self 回归）
 
 这是 2026-06-27 重新 profiling 数据跑出的 3 input x 5 config self 对角线回归。该 run 只覆盖 self prediction，不覆盖 cross prediction；因此它是历史 self
-回归证据，不替代当前 2026-07-01 full self/cross 矩阵。
+回归证据，不替代当前 2026-07-06 unified workflow full self/cross 矩阵。
 
 结果目录：
 
@@ -302,11 +346,11 @@ failure classification：
 - Case B：`manual_pressure_prefetch / c2_wb_best_effort_p64_low_l1` 的 mismatch 根因集中在 best-effort prefetch revoke 后
   host release drain 的 target-control 近似边界。粗粒度地把 deferred release drain 前移到 extend / host allocation 前只对
   CaseB 局部有效，随后会让其它格子提前释放 host reservation，因此已被新契约替换。
-- 当前 profiling 合同不采集 `drain_storage_control_queues()` checkpoint。terminal prefetch 后的剩余 host reservation
-  保留到同 request 的 `cache_extend_input` side effect 完成后，再做 request-local post-extend release drain。
+- 当前 profiling 合同不采集 `drain_storage_control_queues()` checkpoint。terminal prefetch 后的 host reservation
+  由 request-local pre-existing drain、best-effort worker-ready pre-extend drain 和 post-extend drain 三段近似推进。
 - 2026-06-28 forced replay 全矩阵曾在上一版合同下刷新结论：self/cross final-state `75 / 75` exact，transition
   `75 / 75` exact。2026-06-30 合同收紧后，该 run 只保留为历史问题发现证据；当前 active exactness 结论以
-  `HCSV-20260701-forced-bundle-full-matrix` 为准。
+  `HCSV-20260706-unified-workflow-full-matrix` 为准。
 
 ### HCSV-20260624-pre-bundle-5x3-baseline
 
@@ -479,7 +523,7 @@ find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
 
-跑 3 个 manual input 下的 forced replay final-state matrix：
+跑 3 个 manual input 下的 forced replay HiCache final-state / transition full matrix：
 
 ```bash
 scripts/profile.sh \
@@ -498,28 +542,35 @@ python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir "$RUN_DIR" \
   --output-dir "$RUN_DIR/modeling/modeling_workflow_hicache_state_manual_3inputs" \
   --validations hicache_final_state,hicache_transition \
-  --prediction-scope self,cross \
   --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
-  --emit-transition-catalog \
-  --emit-transition-gates
+  --configs c0_wt_timeout_p128_balanced,c1_wts_wait_p128_low_l1,c2_wb_best_effort_p64_low_l1,c3_wt_best_effort_p32_low_host,c4_wb_timeout_p64_low_capacity \
+  --prediction-scope self,cross \
+  --page-key-mode strip_scope \
+  --trace-threads 4 \
+  --trace-file-threads 4 \
+  --model-run-jobs 3 \
+  --force \
+  --continue-on-error
 ```
 
 common suite 使用 `profiling_hicache_state_common.json`，只允许 `--prediction-scope self`；cross-config workflow 会拒绝
 没有 forced bundle contract 的 common run。
 
-只跑某个 targeted 格子：
+缩小到某个 targeted 格子时仍使用同一个 workflow 入口，只收窄 input/source/target config selector：
 
 ```bash
 python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir <profile_run_dir> \
   --output-dir <profile_run_dir>/modeling/<targeted_output_dir> \
-  --validations hicache_final_state \
-  --prediction-scope self \
-  --input <input_id> \
-  --source-config <config_id> \
-  --target-config <config_id> \
-  --force \
-  --max-predictions 1
+  --validations hicache_final_state,hicache_transition \
+  --inputs <input_id> \
+  --source-configs <source_config_id> \
+  --target-configs <target_config_id> \
+  --prediction-scope self,cross \
+  --page-key-mode strip_scope \
+  --trace-threads 4 \
+  --trace-file-threads 4 \
+  --force
 ```
 
 Transition exactness 不再维护 standalone `hicache_transition.py` CLI。选择 `hicache_transition` validation 时，
@@ -568,7 +619,7 @@ jq '{prediction_count,
 | 问题 | 当前结论 |
 | --- | --- |
 | Case A：`manual_deeper_pressure_prefetch/c1` oracle final 为空 | 这是 validation oracle snapshot 选择误报。final oracle、timeline delta oracle 和 profiling catalog 均已限制到 `HiRadixCache.*` cache-tree snapshot；`HiCacheController.*` 等辅助对象 snapshot 不参与 final cache-tree 派生。 |
-| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已回退；当前不采集也不消费 `storage_control_drain_boundary`，而是在 terminal prefetch 后保留 pending host reservation，并在同 request `cache_extend_input` side effect 后做 request-local post-extend drain。 |
+| Case B：`manual_pressure_prefetch/c2` host-side final-state mismatch | 这是模型 release 边界问题，不是 oracle 误报。曾经尝试把 `drain_storage_control_queues()` 做成 state-model checkpoint，但该方案已回退；当前不采集也不消费 `storage_control_drain_boundary`，而是用 async reservation 表示 pending host release，并在同 request `cache_extend_input` 附近执行 request-local pre-existing / best-effort worker-ready pre-extend / post-extend drain。 |
 | 2026-06-27 self transition marker mismatch | 历史 self run 曾有 2 个 marker-only transition mismatch；2026-06-28 全矩阵在上一版合同下达到 `75 / 75` transition exact，不再作为 active 修复项维护。 |
 
 注意：`drain_storage_control_queues()` 是 source scheduler round boundary。它不能重新包装成 cross-config state-model input，

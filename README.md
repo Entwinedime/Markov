@@ -19,12 +19,11 @@
 │   ├── include/markov/trace_graph/modules/hicache/
 │   └── src/modules/hicache/             # HiCache fact parser、radix tree、state model、summary
 ├── scripts/profile.sh                   # 宿主机 profiling 入口，进入框架容器运行
-├── scripts/model.sh                     # 宿主机 modeling 入口，进入干净 modeling 容器运行
+├── scripts/model.sh                     # 低层单次 modeling runner wrapper，进入干净 modeling 容器运行
 ├── scripts/run.sh                       # 打开 framework runtime 或 modeling 容器
 ├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
-├── scripts/internal/entrypoints/        # 容器内 CLI：profile/model/audit/HiCache validation
+├── scripts/internal/entrypoints/        # active CLI：profile/model/modeling_workflow
 ├── scripts/internal/markov_internal/    # 内部 Python 包：profiling、audit、contracts、modeling、HiCache validation
-├── scripts/trace/trace_merger.py        # torch / ld_preload / python_probe trace 合并
 ├── scripts/bench/hicache_phased_workload.py
 ├── configs/experiments/hicache_state/   # common / forced capture / forced replay
 ├── docs/                                # 主线文档和专项验证记录
@@ -124,20 +123,12 @@ scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_com
 需要 base DAG faithful replay 或 cache patch 时，应另建完整执行 trace suite，同时启用 torch / LD_PRELOAD / Python
 真实执行事件。HiCache state-only suite 不能替代性能 DAG 采集。
 
-profiling 后通用 artifact audit：
+profiling 后的通用 artifact audit 和 HiCache workflow readiness 不再维护单独 host CLI。`modeling_workflow.py`
+preflight 每次基于当前代码重新审计 manifest，并把结果写入：
 
-```bash
-python3 scripts/internal/entrypoints/profile_audit.py \
-  --manifest <run_dir>/profile_manifest.json \
-  --output <run_dir>/profile_artifact_audit.json
-```
-
-HiCache workflow readiness audit：
-
-```bash
-python3 scripts/internal/entrypoints/hicache_profile_audit.py \
-  --manifest <run_dir>/profile_manifest.json \
-  --output <run_dir>/hicache_profile_audit.json
+```text
+<workflow_output>/preflight_summary.json
+<workflow_output>/artifacts/preflight/
 ```
 
 跨配置验证使用 forced-token capture/replay suite，保证同一 input 的 generated token timeline 一致：
@@ -160,16 +151,26 @@ runner 不读取仓库固定 plan，也不自动选择最近一次 capture。
 
 ## 建模
 
-当前不维护静态 modeling config。`hicache_workflow.py` 根据 replay suite 中的 target server config 动态生成
-`<workflow_output>/artifacts/runner_configs/target_<config_id>.json` 并调用 `scripts/model.sh`；每个 prediction 输出目录下的
-`cpp_model_config.json` 是 C++ TraceGraph backend narrow config：
+当前不维护静态 modeling config。post-profile modeling 主流程直接运行 unified workflow。它根据 replay suite 中的
+target server config 动态生成 `<workflow_output>/model_runs/<model_run_id>/runner_config.json`，低层 runner 再生成每个
+model run 输出目录下的 `cpp_model_config.json` 作为 C++ TraceGraph backend narrow config：
 
 ```bash
-python3 scripts/internal/entrypoints/hicache_workflow.py \
-  --profile-run-dir <profile_suite_dir> \
-  --output-dir <profile_suite_dir>/modeling/hicache_state_workflow \
-  --stages quality,final-state \
-  --prediction-scope self
+RUN_DIR=<forced_replay_suite_dir>
+
+python3 scripts/internal/entrypoints/modeling_workflow.py \
+  --profile-run-dir "$RUN_DIR" \
+  --output-dir "$RUN_DIR/modeling/modeling_workflow_hicache_state_manual_3inputs" \
+  --validations hicache_final_state,hicache_transition \
+  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
+  --configs c0_wt_timeout_p128_balanced,c1_wts_wait_p128_low_l1,c2_wb_best_effort_p64_low_l1,c3_wt_best_effort_p32_low_host,c4_wb_timeout_p64_low_capacity \
+  --prediction-scope self,cross \
+  --page-key-mode strip_scope \
+  --trace-threads 4 \
+  --trace-file-threads 4 \
+  --model-run-jobs 3 \
+  --force \
+  --continue-on-error
 ```
 
 HiCacheModule 当前是 state-only backend：它维护 cache state 和 transition trace，不修改 DAG，
@@ -177,19 +178,27 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 
 ## HiCache 当前进展
 
-截至 2026-07-01，当前主线状态是：
+截至 2026-07-07，当前主线状态是：
 
 - Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `54` 个 target；
 - `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
-- `hicache_state_model` 只消费 `5` 个 workload identity target，覆盖 `4` 个 role；其余 target 只用于输入合同、
+- `hicache_state_model` 正常输入只消费 `cache_lookup_input`、`cache_extend_input`、`cache_lifecycle_commit` 和
+  `prefetch_candidate_anchor` 四类 state fact；其余 target 只用于输入合同、
   transition validation 或 final-state oracle；
+- C++ TraceGraph 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace，并在进程内合流，不再写大型
+  `merged_trace` 中间产物；
 - `hicache_profile_quality` 不再作为采集 consumer；quality 审计按当前 run 实际请求的 input/final/transition consumer 判断 readiness；
 - `oracle_state/state_snapshot` 只保留 `23` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
   或 `Scheduler.*` snapshot 定义 HiCache cache-tree final state；
 - C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
-- forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和 `hicache_workflow.py` 已落地；
-- `scripts/internal/entrypoints/` 只放容器内 CLI，复用逻辑位于 `scripts/internal/markov_internal/`；旧平铺脚本和
-  `scripts/internal/deprecated/` 人工对照已删除，不保留兼容入口。
+- forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和
+  `modeling_workflow.py` 已落地；
+- 当前 active full-matrix baseline 是
+  `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75`，
+  HiCache final-state self/cross `75/75` exact，transition exactness、transition-count exactness 和 page-lifecycle multiset
+  exactness 均为 `75/75`；
+- `scripts/internal/entrypoints/` 只保留 `profile.py`、`model.py` 和 `modeling_workflow.py` 三个主入口，复用逻辑位于
+  `scripts/internal/markov_internal/`；旧平铺脚本和人工对照入口已删除，不保留兼容入口。
 
 当前详细结果、已关闭诊断问题、已知限制和复现命令以 `docs/validation/hicache_state_validation.md` 与
 `docs/validation/hicache_state_model_limitations.md` 为准。

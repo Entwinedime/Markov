@@ -10,8 +10,9 @@ Modeling 基于 profiling 事实构建 C++ TraceGraph，并在目标配置下通
 默认流程：
 
 ```text
-profile manifest / explicit trace
-  -> scripts/trace/trace_merger.py
+profile manifest
+  -> C++ manifest trace input
+  -> in-memory torch / LD_PRELOAD / Python probe event merge
   -> C++ TraceGraph
   -> optional SimulationModule
   -> topological simulation
@@ -32,9 +33,9 @@ profile manifest / explicit trace
 
 Modeling 后端是 C++23 TraceGraph，构建和运行基线是独立的 `modeling` Docker service。该 service 基于干净
 Ubuntu 24.04，只提供 C++23、CMake、Ninja、clang-format/clang-tidy、Python 标准运行环境和 modeling 脚本依赖；
-不挂载 Ascend 设备，不依赖 CANN，不安装 SGLang / KTransformers runtime。宿主机只负责启动外层 wrapper 或执行无
-modeling runtime 依赖的文本检查；不再支持直接在宿主机用 `scripts/internal/entrypoints/model.py` 执行 modeling run、host build
-`trace_graph` 或旧 `build/bin` 产物。
+不挂载 Ascend 设备，不依赖 CANN，不安装 SGLang / KTransformers runtime。宿主机负责外层编排，包括直接运行
+`modeling_workflow.py` 和启动低层 container wrapper；不再支持直接在宿主机用 `scripts/internal/entrypoints/model.py`
+执行 modeling run、host build `trace_graph` 或旧 `build/bin` 产物。
 
 构建 modeling 环境：
 
@@ -62,13 +63,14 @@ scripts/run.sh modeling -- bash -lc \
   'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph -G Ninja && cmake --build build/modeling/trace_graph --target trace_graph -j2'
 ```
 
-不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest、显式 trace，或专项验证文档中记录的
+不维护 fixture-backed smoke modeling 入口。Modeling 验证必须基于真实 profile manifest，或专项验证文档中记录的
 可复现 profile/modeling run。
 
-当前也不维护静态 `configs/modeling/` 文件。post-profile modeling 主流程由
-`scripts/internal/entrypoints/modeling_workflow.py` 统一编排。该 workflow 根据选中的 validation object 从 profile suite 的
-target server metadata 动态生成 Python runner config，写入 `<workflow_output>/model_runs/<model_run_id>/runner_config.json`；
-每个 model run 输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow config。
+当前也不维护静态 `configs/modeling/` 文件。post-profile modeling 主流程从仓库根目录直接运行
+`python3 scripts/internal/entrypoints/modeling_workflow.py`，由 unified workflow 统一编排。该 workflow 根据选中的
+validation object 从 profile suite 的 target server metadata 动态生成 Python runner config，写入
+`<workflow_output>/model_runs/<model_run_id>/runner_config.json`；每个 model run 输出目录下的 `cpp_model_config.json`
+是 C++ TraceGraph backend narrow config。
 
 faithful replay：
 
@@ -113,13 +115,13 @@ Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
 
 | 层级 | 路径 | 职责 |
 | --- | --- | --- |
-| 宿主机 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发 CLI。 |
+| 低层 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发单次 runner CLI；workflow 用户不以它作为主入口。 |
 | 容器内入口 | `scripts/internal/entrypoints/model.py` | 解析 modeling CLI，调用 `markov_internal.modeling.runner`。 |
-| C++ 输入准备 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 处理 profile manifest / raw trace 输入、调用 trace merger、检查 merge summary。 |
+| C++ 输入记录 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 展开 profile manifest 中的原始 trace 路径，供 validation artifact 记录。 |
 | C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数，并按 backend 定位 Release 或 Debug/validation binary。 |
 | validation payload | `scripts/internal/markov_internal/modeling/hicache_validation_artifacts.py` | 组装 `validation.json`、HiCache state validation、predicted state trace 和 recommended config audit。 |
 | workload helper | `scripts/internal/markov_internal/modeling/workload.py` | 读取 workload report / bench JSONL 中的实际运行窗口。 |
-| workflow 入口 | `scripts/internal/entrypoints/modeling_workflow.py` | profiling 后统一 modeling workflow 入口；用户选择 validation object，不选择底层 C++ debug flag。 |
+| workflow 入口 | `scripts/internal/entrypoints/modeling_workflow.py` | profiling 后统一 modeling workflow 入口；用户直接运行该 Python entrypoint，选择 validation object，不选择底层 C++ debug flag。 |
 | workflow 包 | `scripts/internal/markov_internal/modeling_workflow/` | preflight、plan、model-runs、validations、artifact layout、runner adapter 和 workflow summary。 |
 
 Unified modeling workflow 是 profiling 后的 validation / analysis 编排，不属于 C++ 后端主体。它的固定阶段是：
@@ -222,16 +224,21 @@ HiCache Python helper 的当前职责分组：
 `replay` 只允许指 `mode=faithful_replay`。启用 HiCacheModule 的场景必须称为 `self-config prediction` 或
 `cross-config prediction`。
 
-## Trace 合并
+## Trace 输入
 
-`scripts/trace/trace_merger.py` 在 manifest 模式下合并：
+C++ TraceGraph 直接读取 profile manifest 中的 trace channel，并在进程内完成合流：
 
 - torch profiler trace；
 - LD_PRELOAD trace；
 - Python probe sidecar。
 
-Trace merger 不根据 modeling mode 删除真实执行事件。`faithful_replay`、`cache_state` 和 `cache_patch`
-应看到同一份 merged trace；差异只在是否加载子模块、是否产生 DAG mutation。
+Python modeling runner 不再调用 trace 合并脚本，也不写长期 `merged_trace` 中间产物。C++ manifest input 层按 torch trace
+pid / manifest 顺序选择 LD_PRELOAD trace 和 Python probe sidecar，执行 wrapper args 注入、standalone HiCache/cache_io/python_probe
+事件附加和稳定排序。`faithful_replay`、`cache_state` 和 `cache_patch` 应看到同一份 manifest source 合同；差异只在是否加载子模块、
+是否产生 DAG mutation。
+
+Chrome trace reader 只立即解析顶层 event 字段，`args` 保留原始 JSON，并在模型查询具体 key 时懒加载。需要遍历全部
+args 的模块必须显式走 materialized view，不能在 reader 阶段全量展开。
 
 非执行类 HiCache 事件需要通过 `args.fact` 路由隔离：
 
@@ -289,7 +296,7 @@ diagnostics / validation，`--model-summary` 和 `--dag-analysis-output-dir` 会
 
 ## SimulationModule 接口
 
-所有 what-if 都必须规约为 C++ `SimulationModule`。Python 侧只做配置、trace merge、validation 编排。
+所有 what-if 都必须规约为 C++ `SimulationModule`。Python 侧只做配置生成、运行编排和 validation。
 
 子模块职责：
 

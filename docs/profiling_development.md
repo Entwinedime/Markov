@@ -604,12 +604,12 @@ python3 scripts/internal/entrypoints/modeling_workflow.py \
   --output-dir <forced_replay_suite_dir>/modeling/modeling_workflow_hicache_state_manual_3inputs \
   --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
   --validations hicache_final_state,hicache_transition \
-  --prediction-scope self,cross \
-  --emit-transition-catalog \
-  --emit-transition-gates
+  --prediction-scope self,cross
 ```
 
 `hicache_transition` 复用同一次 unified workflow 生成的 cache-state model run 和 validation artifact，不单独重跑 C++。
+HiCache workload sequence、transition mismatch catalog 和 transition patch gate scoreboard 由对应 HiCache validation
+自动输出，不作为 workflow 顶层 CLI 开关暴露。
 旧 `hicache_state_matrix_validation.py` 和 `hicache_workflow.py` 入口均已删除。
 
 workflow 默认 console 输出是阶段级 start/done summary。TTY 中运行行可以动态刷新；非 TTY/log 中不逐 run 或逐 prediction
