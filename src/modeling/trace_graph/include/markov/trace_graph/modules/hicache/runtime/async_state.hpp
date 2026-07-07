@@ -104,6 +104,9 @@ struct HiCachePrefetchOperation {
     std::vector<std::string> completed_pages;
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
+    uint64_t storage_query_start_ts = 0;
+    uint64_t storage_query_ready_ts = 0;
+    bool release_before_cache_extend = false;
     int64_t priority = 0;
     HiCachePrefetchState prefetch_state = HiCachePrefetchState::Pending;
 };

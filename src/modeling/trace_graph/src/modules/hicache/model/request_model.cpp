@@ -191,7 +191,32 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact, HiCacheSum
 
     for (const auto & entry_fact : entry_facts) {
         const auto key = scoped_request_key(entry_fact);
+        if (!key.empty())
+            drain_prefetch_pending_release(entry_fact,
+                                           summary,
+                                           transitions,
+                                           scope,
+                                           key,
+                                           "prefetch_pre_cache_extend_host_release",
+                                           "SGLang drains pre-existing storage-control host release queue before scheduling cache extend allocation");
+    }
+    for (const auto & entry_fact : entry_facts) {
+        const auto key = scoped_request_key(entry_fact);
         if (!key.empty()) settle_prefetch_before_cache_extend(entry_fact, summary, transitions, scope, key);
+    }
+    for (const auto & entry_fact : entry_facts) {
+        const auto key = scoped_request_key(entry_fact);
+        if (key.empty()) continue;
+        auto * prefetch = scope.async_ops.prefetch_for_request(key);
+        if (prefetch == nullptr || !prefetch->release_before_cache_extend) continue;
+        prefetch->release_before_cache_extend = false;
+        drain_prefetch_pending_release(entry_fact,
+                                       summary,
+                                       transitions,
+                                       scope,
+                                       key,
+                                       "prefetch_storage_control_pre_cache_extend_host_release",
+                                       "Target-derived storage-control revoke releases host reservation before cache extend side effects");
     }
 
     CacheExtendBatchIntent batch_intent;
@@ -299,7 +324,14 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact, HiCacheSum
 
     for (const auto & entry_fact : entry_facts) {
         const auto key = scoped_request_key(entry_fact);
-        if (!key.empty()) drain_prefetch_release_after_cache_extend(entry_fact, summary, transitions, scope, key);
+        if (!key.empty())
+            drain_prefetch_pending_release(entry_fact,
+                                           summary,
+                                           transitions,
+                                           scope,
+                                           key,
+                                           "prefetch_post_cache_extend_host_release",
+                                           "Current-round prefetch termination release is drained after cache extend side effects in the target model");
     }
 }
 

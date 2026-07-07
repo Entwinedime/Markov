@@ -241,6 +241,7 @@ private:
         DeviceAllocatorLedger device_allocator;
         std::unordered_map<std::string, RequestState> requests;
         std::vector<PendingWriteThroughBackup> pending_write_through_backups;
+        uint64_t prefetch_worker_available_ts = 0;
     };
 
     /**
@@ -346,6 +347,8 @@ private:
     /** @brief 估计 SGLang terminate_prefetch 边界可见的 completed prefix。 */
     [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
                                                                       bool terminal_boundary) const;
+    /** @brief 判断 revoke 产生的 storage-control release 是否会在当前 extend side effect 前可见。 */
+    [[nodiscard]] bool prefetch_release_visible_before_cache_extend(const HiCachePrefetchOperation & op, const HiCacheFact & boundary_fact) const;
     void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                          const std::string & reason);
 
@@ -397,9 +400,9 @@ private:
     /** @brief 在 cache extend side effect 前结算同 request 的 active prefetch。 */
     void settle_prefetch_before_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                              const std::string & request_key);
-    /** @brief 在 cache extend side effect 后释放 terminal prefetch 的 pending host reservation。 */
-    void drain_prefetch_release_after_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                   ScopedState & scope, const std::string & request_key);
+    /** @brief 在明确的 scheduler/extend 边界释放 terminal prefetch 的 pending host reservation。 */
+    void drain_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                        const std::string & request_key, const std::string & capacity_reason, const std::string & policy_reason);
 
     /** @brief 更新 request-local committed path 和保护 page 统计。 */
     void update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);

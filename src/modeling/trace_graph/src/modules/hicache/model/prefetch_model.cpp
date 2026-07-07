@@ -12,6 +12,32 @@ namespace markov::trace_graph::modules::hicache::model {
 using core::DagGraph;
 using frontend::HiCacheConfig;
 
+namespace {
+
+constexpr uint64_t kStorageBatchPages = 128;
+constexpr uint64_t kPrefetchStorageQueryBaseUs = 2000;
+constexpr uint64_t kPrefetchStorageQueryPerPageUs = 1250;
+constexpr uint64_t kPrefetchStorageLargeQueryPages = 16;
+constexpr uint64_t kPrefetchStorageLargeQueryExtraUs = 2500;
+constexpr uint64_t kPrefetchStorageVisibilityGuardUs = 2500;
+
+uint64_t prefetch_storage_query_pages(uint64_t planned_pages, uint64_t hit_pages) {
+    if (planned_pages == 0) return 0;
+    if (hit_pages >= planned_pages) return planned_pages;
+    const auto pages_until_first_miss = hit_pages + 1;
+    const auto queried_batches = detail::ceil_div(pages_until_first_miss, kStorageBatchPages);
+    return std::min(planned_pages, queried_batches * kStorageBatchPages);
+}
+
+uint64_t estimate_prefetch_storage_query_duration(uint64_t queried_pages) {
+    if (queried_pages == 0) return 0;
+    auto duration = kPrefetchStorageQueryBaseUs + queried_pages * kPrefetchStorageQueryPerPageUs;
+    if (queried_pages > kPrefetchStorageLargeQueryPages) duration += kPrefetchStorageLargeQueryExtraUs;
+    return duration;
+}
+
+} // namespace
+
 /**
  * @brief 估计 storage prefetch 在当前 target boundary 已传输完成的 host prefix。
  *
@@ -75,6 +101,23 @@ HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(
     }
     estimate.reason = "prefetch has not reached a modeled completion or timeout boundary";
     return estimate;
+}
+
+/**
+ * @brief 近似 storage-control revoke 的 release 相对 cache extend side effect 的可见性。
+ *
+ * C++ state model 不能消费 source observed/probe 结果。best-effort 的 below-threshold
+ * revoke 来自 cache controller prefetch worker：只有当该 worker 已经完成本 op 的
+ * storage hit query，最后一次 check_progress/cache_extend 边界才可能 drain 到对应的
+ * release。这里不把 lookup 当成状态分界；唯一可改变状态的判定点是当前
+ * cache_extend_input fact。
+ */
+bool HiCacheState::prefetch_release_visible_before_cache_extend(const HiCachePrefetchOperation & op, const HiCacheFact & boundary_fact) const {
+    if (op.reserved_host_pages == 0) return false;
+    if (op.hit_pages.size() >= policy_.prefetch_threshold_pages()) return false;
+    if (policy_.prefetch_policy() != "best_effort") return true;
+    if (op.storage_query_ready_ts == 0) return false;
+    return op.storage_query_ready_ts + kPrefetchStorageVisibilityGuardUs <= boundary_fact.ts;
 }
 
 /**
@@ -223,6 +266,10 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
      * 它决定 prefetch 是否值得发起，以及 terminate 后最多能 materialize 哪段 host-visible prefix。
      */
     const auto hit_pages = storage_hit_prefix(scope.storage, planned_projected_pages);
+    const auto storage_query_pages = prefetch_storage_query_pages(effective_requested_pages, static_cast<uint64_t>(hit_pages.size()));
+    const auto storage_query_start_ts = std::max(fact.ts, scope.prefetch_worker_available_ts);
+    const auto storage_query_ready_ts = storage_query_start_ts + estimate_prefetch_storage_query_duration(storage_query_pages);
+    scope.prefetch_worker_available_ts = storage_query_ready_ts;
     if (auto * prior = scope.async_ops.prefetch_for_request(request_key); prior != nullptr) {
         if (prefetch_active(*prior)) {
             if constexpr (debug_records_enabled())
@@ -271,6 +318,8 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
         .hit_pages = hit_pages,
         .requested_host_pages = effective_requested_pages,
         .reserved_host_pages = reservable,
+        .storage_query_start_ts = storage_query_start_ts,
+        .storage_query_ready_ts = storage_query_ready_ts,
         .priority = fact.priority,
         .prefetch_state = HiCachePrefetchState::Pending,
     };
@@ -398,6 +447,7 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
     };
 
     if (op->hit_pages.size() < policy_.prefetch_threshold_pages()) {
+        op->release_before_cache_extend = prefetch_release_visible_before_cache_extend(*op, fact);
         if constexpr (debug_records_enabled())
             record_policy_decision(fact,
                                    HiCachePolicyDecisionRecord{
@@ -405,7 +455,9 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
                                        .policy_area = "prefetch_cache_extend_boundary",
                                        .policy_name = policy_.prefetch_policy(),
                                        .decision = "revoke_prefetch",
-                                       .reason = "storage readable prefix is below prefetch threshold",
+                                       .reason = op->release_before_cache_extend
+                                                     ? "storage readable prefix is below prefetch threshold; prefetch worker query is ready before cache extend"
+                                                     : "storage readable prefix is below prefetch threshold; prefetch worker query is not ready before cache extend",
                                        .accepted = false,
                                        .requested_pages = op->requested_host_pages,
                                        .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
@@ -510,10 +562,11 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
 }
 
 /**
- * @brief 在 cache extend side effect 后释放 terminal prefetch 的 pending host reservation。
+ * @brief 在 scheduler/extend 边界释放 terminal prefetch 的 pending host reservation。
  */
-void HiCacheState::drain_prefetch_release_after_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                             ScopedState & scope, const std::string & request_key) {
+void HiCacheState::drain_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
+                                                  ScopedState & scope, const std::string & request_key, const std::string & capacity_reason,
+                                                  const std::string & policy_reason) {
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
     uint64_t released_operation_count = 0;
@@ -532,7 +585,7 @@ void HiCacheState::drain_prefetch_release_after_cache_extend(const HiCacheFact &
     if (reserved_host_pages == 0) return;
     const auto released_pages = scope.async_ops.release_prefetch_pending_host_pages_for_request(request_key);
     if (released_pages == 0) return;
-    sync_capacity(scope, normalized_scope(fact), {}, "prefetch_post_cache_extend_host_release");
+    sync_capacity(scope, normalized_scope(fact), {}, capacity_reason);
     if constexpr (debug_records_enabled())
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
@@ -540,7 +593,7 @@ void HiCacheState::drain_prefetch_release_after_cache_extend(const HiCacheFact &
                                    .policy_area = "host_allocation",
                                    .policy_name = "prefetch_host_release_queue",
                                    .decision = "drain_request_prefetch_pending_release_pages",
-                                   .reason = "target-derived post-cache-extend boundary releases terminal prefetch host reservation for the extended request",
+                                   .reason = policy_reason,
                                    .accepted = true,
                                    .requested_pages = requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(planned_pages.size()),
