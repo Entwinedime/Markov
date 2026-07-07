@@ -7,8 +7,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <charconv>
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <initializer_list>
@@ -35,6 +36,7 @@ constexpr size_t kSampleLimit = 8;
 constexpr size_t kCycleWitnessNodeLimit = 256;
 constexpr size_t kCycleRemainingSampleLimit = 64;
 constexpr size_t kInvalidNode = std::numeric_limits<size_t>::max();
+constexpr uint64_t kMaxCpuIntervalNs = 1'000'000'000'000ull;
 
 struct FactInfo {
     bool present = false;
@@ -69,6 +71,7 @@ struct AnchorFact {
 
 struct EvidenceNodes {
     size_t count = 0;
+    uint64_t duration_ns = 0;
     std::vector<size_t> samples;
 };
 
@@ -453,6 +456,46 @@ Json lane_summary_json(const LaneSummaryStats & summary) {
     };
 }
 
+uint64_t read_u64_attr(const core::DagNode & node, const char * key, uint64_t fallback = 0) {
+    auto it = node.attrs.find(key);
+    if (it == node.attrs.end()) return fallback;
+    uint64_t value = 0;
+    const auto & text = it->second;
+    const auto * first = text.data();
+    const auto * last = first + text.size();
+    auto result = std::from_chars(first, last, value);
+    if (result.ec != std::errc{} || result.ptr != last) return fallback;
+    return value;
+}
+
+void add_json_counter(Json & target, const std::string & key, uint64_t value) { target[key] = target.value(key, 0ULL) + value; }
+
+void add_critical_path_node(Json & counts_by_source, Json & durations_by_source, Json & counts_by_domain, Json & durations_by_domain, Json & counts_by_category,
+                            Json & durations_by_category, const core::DagGraph & graph, size_t node_id) {
+    const auto & node = graph.node(node_id);
+    const auto & event = graph.event_for_node(node_id);
+    const auto source = event_source(event);
+    const auto domain = event_domain(event);
+    const auto category = event.cat.empty() ? std::string("unknown") : event.cat;
+    add_json_counter(counts_by_source, source, 1);
+    add_json_counter(durations_by_source, source, node.duration);
+    add_json_counter(counts_by_domain, domain, 1);
+    add_json_counter(durations_by_domain, domain, node.duration);
+    add_json_counter(counts_by_category, category, 1);
+    add_json_counter(durations_by_category, category, node.duration);
+}
+
+void add_critical_path_interval(Json & intervals_by_source, Json & intervals_by_domain, Json & intervals_by_category, const core::DagGraph & graph,
+                                size_t node_id, uint64_t interval_ns) {
+    const auto & event = graph.event_for_node(node_id);
+    const auto source = event_source(event);
+    const auto domain = event_domain(event);
+    const auto category = event.cat.empty() ? std::string("unknown") : event.cat;
+    add_json_counter(intervals_by_source, source, interval_ns);
+    add_json_counter(intervals_by_domain, domain, interval_ns);
+    add_json_counter(intervals_by_category, category, interval_ns);
+}
+
 Json critical_path_sample(const core::DagGraph & graph) {
     constexpr size_t invalid = std::numeric_limits<size_t>::max();
     if (graph.node_count() == 0)
@@ -480,21 +523,76 @@ Json critical_path_sample(const core::DagGraph & graph) {
 
     std::vector<Json> reversed;
     std::unordered_set<size_t> seen;
-    std::string incoming_edge_kind;
-    while (current != invalid && reversed.size() < kCriticalPathSampleLimit && seen.insert(current).second) {
-        auto item = compact_node_json(graph, current);
-        if (!incoming_edge_kind.empty()) item["incoming_edge_kind"] = incoming_edge_kind;
-        reversed.push_back(std::move(item));
+    Json node_counts_by_source = Json::object();
+    Json duration_by_source = Json::object();
+    Json node_counts_by_domain = Json::object();
+    Json duration_by_domain = Json::object();
+    Json node_counts_by_category = Json::object();
+    Json duration_by_category = Json::object();
+    Json cpu_interval_by_source = Json::object();
+    Json cpu_interval_by_domain = Json::object();
+    Json cpu_interval_by_category = Json::object();
+    Json edge_counts_by_kind = Json::object();
+    size_t path_node_count = 0;
+    uint64_t path_node_duration_ns = 0;
+    uint64_t path_cpu_interval_ns = 0;
+    uint64_t cpu_duration_ns = 0;
+    uint64_t device_duration_ns = 0;
+    while (current != invalid && seen.insert(current).second) {
+        const auto & node = graph.node(current);
+        path_node_count++;
+        path_node_duration_ns += node.duration;
+        if (node.is_cpu) cpu_duration_ns += node.duration;
+        else device_duration_ns += node.duration;
+        add_critical_path_node(node_counts_by_source,
+                               duration_by_source,
+                               node_counts_by_domain,
+                               duration_by_domain,
+                               node_counts_by_category,
+                               duration_by_category,
+                               graph,
+                               current);
 
         size_t best_pred = best_pred_by_node[current];
+        std::string incoming_edge_kind;
+        if (best_pred != invalid) {
+            incoming_edge_kind = edge_kind_name(best_kind_by_node[current]);
+            add_json_counter(edge_counts_by_kind, incoming_edge_kind, 1);
+            const auto & pred_node = graph.node(best_pred);
+            const auto interval = read_u64_attr(pred_node, "cpuinterval", 0);
+            if (interval <= kMaxCpuIntervalNs) {
+                path_cpu_interval_ns += interval;
+                add_critical_path_interval(cpu_interval_by_source, cpu_interval_by_domain, cpu_interval_by_category, graph, best_pred, interval);
+            }
+        }
+
+        auto item = compact_node_json(graph, current);
+        if (!incoming_edge_kind.empty()) item["incoming_edge_kind"] = incoming_edge_kind;
+        if (reversed.size() < kCriticalPathSampleLimit) reversed.push_back(std::move(item));
+
         if (best_pred == invalid) break;
-        incoming_edge_kind = edge_kind_name(best_kind_by_node[current]);
         current = best_pred;
     }
     std::ranges::reverse(reversed);
     return Json{
-        { "total_duration_ns", graph.e2e_time() },
-        {      "sample_nodes",         reversed },
+        {        "total_duration_ns",                             graph.e2e_time() },
+        {          "path_node_count",                              path_node_count },
+        {    "path_node_duration_ns",                        path_node_duration_ns },
+        {     "path_cpu_interval_ns",                         path_cpu_interval_ns },
+        {     "path_modeled_cost_ns", path_node_duration_ns + path_cpu_interval_ns },
+        {          "cpu_duration_ns",                              cpu_duration_ns },
+        {       "device_duration_ns",                           device_duration_ns },
+        {     "node_count_by_source",                        node_counts_by_source },
+        {       "duration_by_source",                           duration_by_source },
+        {   "cpu_interval_by_source",                       cpu_interval_by_source },
+        {     "node_count_by_domain",                        node_counts_by_domain },
+        {       "duration_by_domain",                           duration_by_domain },
+        {   "cpu_interval_by_domain",                       cpu_interval_by_domain },
+        {   "node_count_by_category",                      node_counts_by_category },
+        {     "duration_by_category",                         duration_by_category },
+        { "cpu_interval_by_category",                     cpu_interval_by_category },
+        {       "edge_count_by_kind",                          edge_counts_by_kind },
+        {             "sample_nodes",                                     reversed },
     };
 }
 
@@ -711,9 +809,10 @@ bool operation_match(const std::string & text, std::initializer_list<std::string
     return std::ranges::any_of(needles, [&](std::string_view needle) { return contains(text, needle); });
 }
 
-void record_evidence(EvidenceNodes & nodes, size_t node_id) {
+void record_evidence(EvidenceNodes & nodes, const core::DagNode & node) {
     nodes.count++;
-    if (nodes.samples.size() < kSampleLimit) nodes.samples.push_back(node_id);
+    nodes.duration_ns += node.duration;
+    if (nodes.samples.size() < kSampleLimit) nodes.samples.push_back(node.id);
 }
 
 std::vector<OperationEvidence> make_operation_evidence() {
@@ -754,9 +853,9 @@ void observe_operation_event(std::vector<OperationEvidence> & operations, const 
     if (text.empty() && !fact.present) return;
     auto observe = [&](size_t operation_index, bool direct_match, bool control_match, bool state_match) {
         auto & operation = operations[operation_index];
-        if (direct_match && is_runtime_node(event)) record_evidence(operation.direct_runtime_nodes, node.id);
-        if (control_match && fact.present) record_evidence(operation.control_fact_nodes, node.id);
-        if (state_match && fact.present) record_evidence(operation.state_fact_nodes, node.id);
+        if (direct_match && is_runtime_node(event)) record_evidence(operation.direct_runtime_nodes, node);
+        if (control_match && fact.present) record_evidence(operation.control_fact_nodes, node);
+        if (state_match && fact.present) record_evidence(operation.state_fact_nodes, node);
     };
 
     observe(kDeviceAllocationOrEviction, operation_match(text, { "alloc", "evict", "revoke" }), fact.role == "capacity_result_observed", false);
@@ -788,6 +887,7 @@ void observe_operation_event(std::vector<OperationEvidence> & operations, const 
 
 void append_samples(EvidenceNodes & target, const EvidenceNodes & source) {
     target.count += source.count;
+    target.duration_ns += source.duration_ns;
     for (size_t node_id : source.samples) {
         if (target.samples.size() >= kSampleLimit) break;
         target.samples.push_back(node_id);
@@ -850,19 +950,22 @@ Json operation_json(const core::DagGraph & graph, const OperationEvidence & evid
     if (visibility == "invisible") blockers.push_back("operation_invisible");
     if (duration_source == "none" || duration_source == "state_fact_only" || duration_source == "control_fact") blockers.push_back("duration_source_missing");
     return Json{
-        {          "visibility",                                                                           visibility                                },
+        {          "visibility",                                                                              visibility                                },
         {            "evidence",
          Json{
          { "direct_runtime_node_count", evidence.direct_runtime_nodes.count },
+         { "direct_runtime_duration_ns", evidence.direct_runtime_nodes.duration_ns },
          { "control_fact_node_count", evidence.control_fact_nodes.count },
+         { "control_fact_duration_ns", evidence.control_fact_nodes.duration_ns },
          { "state_fact_node_count", evidence.state_fact_nodes.count },
+         { "state_fact_duration_ns", evidence.state_fact_nodes.duration_ns },
          { "direct_runtime_node_samples", node_samples(graph, evidence.direct_runtime_nodes.samples) },
          { "control_fact_node_samples", node_samples(graph, evidence.control_fact_nodes.samples) },
-         }                                                                                                                                           },
+         }                                                                                                                                              },
         {    "possible_anchors", evidence.direct_runtime_nodes.count == 0 ? Json::array({ "state_fact_or_timestamp" }) : Json::array({ "runtime_node" }) },
-        {     "duration_source",                                                                                                      duration_source },
-        { "patchable_candidate",                                                                                              visibility == "visible" },
-        {            "blockers",                                                                                                             blockers },
+        {     "duration_source",                                                                                                         duration_source },
+        { "patchable_candidate",                                                                                                 visibility == "visible" },
+        {            "blockers",                                                                                                                blockers },
     };
 }
 
