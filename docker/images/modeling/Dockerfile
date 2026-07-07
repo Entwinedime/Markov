@@ -19,6 +19,7 @@ RUN apt-get update \
         file \
         g++ \
         gcc \
+        gdb \
         git \
         jq \
         less \
