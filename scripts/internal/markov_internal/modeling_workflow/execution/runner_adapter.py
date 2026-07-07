@@ -53,9 +53,9 @@ class RunnerConfigBuilder:
             },
             "outputs": outputs,
         }
-        if self.spec.mode == "cache_state":
+        if self.spec.mode in {"cache_state", "cache_patch"}:
             target = require_target_profile(self.spec)
-            payload.update(hicache_module_payload(target, outputs))
+            payload.update(hicache_module_payload(target, outputs, enable_dag_patch=self.spec.mode == "cache_patch"))
         return payload
 
     def command(self, runner_config_path: Path) -> list[str]:
@@ -111,18 +111,21 @@ class RunnerConfigBuilder:
 
 
 def require_target_profile(spec: ModelRunSpec) -> ProfileRunRef:
-    """返回 cache-state 运行必须具备的 target profile。"""
+    """返回 HiCache target-config 运行必须具备的 target profile。"""
 
     if spec.target_profile is None:
-        raise ValueError(f"cache_state model run requires target profile: {spec.run_id}")
+        raise ValueError(f"{spec.mode} model run requires target profile: {spec.run_id}")
     if spec.target_profile.hicache_config is None:
         raise ValueError(f"target profile has no HiCache config: {spec.target_profile.label}")
     return spec.target_profile
 
 
-def hicache_module_payload(target: ProfileRunRef, outputs: dict[str, bool]) -> dict[str, Any]:
-    """构造 cache-state runner config 中的 HiCache module 部分。"""
+def hicache_module_payload(
+    target: ProfileRunRef, outputs: dict[str, bool], *, enable_dag_patch: bool = False
+) -> dict[str, Any]:
+    """构造 HiCache runner config 中的 module 部分。"""
 
+    hicache_config = {**target.hicache_config, "enable_dag_patch": enable_dag_patch}
     return {
         "validation": {
             "hicache_state": {
@@ -137,7 +140,7 @@ def hicache_module_payload(target: ProfileRunRef, outputs: dict[str, bool]) -> d
                 "name": "HiCacheModule",
                 "enabled": True,
                 "config": {
-                    "hicache": target.hicache_config,
+                    "hicache": hicache_config,
                 },
             }
         ],

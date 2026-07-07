@@ -57,6 +57,7 @@ def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) 
             merged_hicache.update(experiment_hicache)
         if hicache is not None:
             merged_hicache.update(hicache)
+        merged_hicache["enable_dag_patch"] = mode == "cache_patch"
         generated["hicache"] = merged_hicache
     if not modules:
         return None
@@ -163,6 +164,7 @@ def copy_hicache_config_keys(result: dict[str, Any], hicache: dict[str, Any], *,
         "device_allocator_need_sort",
         "disaggregation_mode",
         "emit_state_digests",
+        "enable_dag_patch",
     ):
         if key not in hicache:
             continue

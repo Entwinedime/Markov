@@ -114,6 +114,12 @@ class PreflightSkipPolicy:
         if request.mode == "cache_state":
             hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
             return self._hicache_prediction_reason(request.prediction, hicache)
+        if request.mode == "cache_patch":
+            faithful_reason = self._faithful_replay_reason(request, checks)
+            if faithful_reason:
+                return faithful_reason
+            hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
+            return self._hicache_prediction_reason(request.prediction, hicache)
         return ""
 
     def _faithful_replay_reason(self, request: ModelRunRequest, checks: dict[str, object]) -> str:
@@ -150,9 +156,7 @@ class PreflightSkipPolicy:
             return "source_preflight_missing"
         if not isinstance(target_preflight, dict):
             return "target_preflight_missing"
-        if source_preflight.get("canonical_workload_signature") != target_preflight.get(
-            "canonical_workload_signature"
-        ):
+        if source_preflight.get("canonical_workload_signature") != target_preflight.get("canonical_workload_signature"):
             return "workload_signature_mismatch"
         if not forced_token_plan_matches(source_preflight, target_preflight):
             return "forced_token_plan_signature_mismatch"

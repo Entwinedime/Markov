@@ -198,6 +198,7 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     const auto disaggregation_mode = lower(string_value(object, "disaggregation_mode", ""));
     config.device_allocator_need_sort = bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
     config.emit_state_digests = bool_value(object, "emit_state_digests", false);
+    config.enable_dag_patch = bool_value(object, "enable_dag_patch", false);
     return config;
 }
 

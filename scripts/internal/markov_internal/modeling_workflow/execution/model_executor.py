@@ -247,6 +247,11 @@ def primary_artifact_ready(spec: ModelRunSpec, artifacts: ModelRunArtifacts) -> 
 
     if ModelOutputRequirement.MODULE_VALIDATION in spec.output_requirements:
         return artifacts.validation_json.is_file()
+    if (
+        ModelOutputRequirement.MODULE_SUMMARY in spec.output_requirements
+        or ModelOutputRequirement.MODULE_TRANSITION_DIAGNOSTICS in spec.output_requirements
+    ):
+        return artifacts.model_summary_json.is_file()
     if ModelOutputRequirement.BASE_DAG_DIAGNOSTICS in spec.output_requirements:
         return artifacts.dag_quality_json.is_file()
     return artifacts.run_summary_json.is_file()

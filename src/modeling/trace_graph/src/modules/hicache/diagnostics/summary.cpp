@@ -58,6 +58,7 @@ Json target_config_json(const frontend::HiCacheConfig & config) {
         {          "prefetch_timeout_max_sec",          config.prefetch_timeout_max_sec },
         {        "device_allocator_need_sort",        config.device_allocator_need_sort },
         {                "emit_state_digests",                config.emit_state_digests },
+        {                "enable_dag_patch",                config.enable_dag_patch },
     };
 }
 

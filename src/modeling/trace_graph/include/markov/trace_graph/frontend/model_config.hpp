@@ -49,6 +49,7 @@ struct HiCacheConfig {
     double prefetch_timeout_max_sec = 0.0;
     bool device_allocator_need_sort = false;
     bool emit_state_digests = false;
+    bool enable_dag_patch = false;
 };
 
 /**
