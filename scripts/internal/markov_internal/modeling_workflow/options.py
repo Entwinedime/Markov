@@ -37,9 +37,9 @@ class WorkflowOptionsBuilder:
             max_predictions=max(0, int(args.max_predictions)),
             page_key_mode=str(args.page_key_mode),
             sample_limit=int(args.sample),
-            emit_transition_catalog=bool(args.emit_transition_catalog),
-            emit_transition_gates=bool(args.emit_transition_gates),
-            show_workload_sequence=bool(args.show_workload_sequence),
+            trace_threads=max(1, int(args.trace_threads)),
+            trace_file_threads=max(1, int(args.trace_file_threads)),
+            model_run_jobs=max(1, int(args.model_run_jobs)),
         )
 
     def _output_dir(self, args: argparse.Namespace) -> Path:

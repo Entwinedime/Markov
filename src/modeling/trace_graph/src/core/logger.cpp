@@ -5,9 +5,11 @@
 #include "markov/trace_graph/core/logger.hpp"
 
 #include <algorithm>
+#ifdef DEBUG
 #include <chrono>
 #include <ctime>
 #include <iomanip>
+#endif
 #include <iostream>
 #include <ranges>
 #include <string_view>
@@ -88,6 +90,7 @@ const char * label(Logger::Level lv) {
     }
 }
 
+#ifdef DEBUG
 std::string timestamp() {
     /**
      * @brief 日志时间只用于人工调试，不参与性能预测或 validation。
@@ -99,19 +102,25 @@ std::string timestamp() {
     ss << std::put_time(std::localtime(&t), "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
     return ss.str();
 }
+#endif
+
+std::string prefix(Logger::Level lv) {
+#ifdef DEBUG
+    return std::string(ansi(lv)) + "[" + label(lv) + " " + timestamp() + "] " + reset();
+#else
+    return std::string(ansi(lv)) + "[" + label(lv) + "] " + reset();
+#endif
+}
 
 } // namespace logger_detail
 
-using logger_detail::ansi;
-using logger_detail::label;
-using logger_detail::reset;
-using logger_detail::timestamp;
+using logger_detail::prefix;
 
 Logger::Line::Line(Level lv, bool active, std::mutex * mtx) : lv_(lv), active_(active), mtx_(mtx) {
     /**
      * @brief active=false 时仍允许调用方继续 << 拼接，但不会产生实际输出。
      */
-    if (active_) ss_ << ansi(lv) << "[" << label(lv) << " " << timestamp() << "] " << reset();
+    if (active_) ss_ << prefix(lv);
 }
 
 Logger::Line::~Line() {

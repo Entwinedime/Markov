@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <future>
+#include <memory>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
@@ -82,36 +84,39 @@ std::string lower_string(std::string value) {
     return value;
 }
 
+bool contains_ascii_case_insensitive(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) return true;
+    if (haystack.size() < needle.size()) return false;
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool matched = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            auto a = static_cast<char>(std::tolower(static_cast<unsigned char>(haystack[i + j])));
+            auto b = static_cast<char>(std::tolower(static_cast<unsigned char>(needle[j])));
+            if (a != b) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) return true;
+    }
+    return false;
+}
+
 bool ignored_duration_event_name(const std::string & name) {
     constexpr std::string_view ignored_names[] = { "Free", "Computing", "Communication", "Communication(Not Overlapped)" };
     return std::ranges::find(ignored_names, name) != std::end(ignored_names);
-}
-
-std::string fact_class_from_event(const TraceEvent & event) {
-    const auto raw = event.arg("fact");
-    if (raw.empty()) return "";
-    try {
-        auto value = Json::parse(raw);
-        if (value.is_string()) value = Json::parse(value.get<std::string>());
-        if (!value.is_object()) return "";
-        return lower_string(json_string(value, "class"));
-    }
-    catch (...) {
-        return "";
-    }
 }
 
 bool validation_only_event(const TraceEvent & event) {
     /**
      * @brief 判断事件是否只服务 validation/debug。
      *
-     * validation-only 事件属于辅助输入，不是业务执行路径。它们可以保留在 merged trace 中，
-     * 但不能进入性能 DAG，否则 faithful replay 会被 state snapshot / oracle debug 污染。
+     * 读取阶段保持 args 懒加载，因此这里只做 raw args JSON 的轻量 marker 判断。
+     * 需要精确解释 validation evidence 的路径应在 diagnostics/validation 层显式解析。
      */
-    auto fact_class = fact_class_from_event(event);
-    if (fact_class == "oracle_state") return true;
-    auto kind = lower_string(event.arg("event_kind"));
-    return kind == "state_snapshot" || kind == "oracle_state" || kind == "validation_diff";
+    auto raw = event.args_json_view();
+    return contains_ascii_case_insensitive(raw, "state_snapshot") || contains_ascii_case_insensitive(raw, "oracle_state")
+           || contains_ascii_case_insensitive(raw, "validation_diff");
 }
 
 void flatten_args(const Json & value, const std::string & prefix, std::unordered_map<std::string, std::string> & args) {
@@ -146,7 +151,16 @@ Json load_json_file(const std::string & filename) {
 
 class TraceScanner {
 public:
-    explicit TraceScanner(std::string buffer) : buffer_(std::move(buffer)), p_(buffer_.data()), end_(buffer_.data() + buffer_.size()) {}
+    explicit TraceScanner(std::shared_ptr<const std::string> buffer, TraceReadOptions options = {})
+        : buffer_(std::move(buffer)),
+          p_(buffer_->data()),
+          end_(buffer_->data() + buffer_->size()),
+          options_(options) {}
+
+    TraceScanner(std::shared_ptr<const std::string> buffer, const char * begin, const char * end, TraceReadOptions options)
+        : buffer_(std::move(buffer)), p_(begin), end_(end), options_(options) {}
+
+    TraceEvent parse_single_event(bool & valid) { return parse_event(valid); }
 
     std::vector<TraceEvent> parse() {
         /**
@@ -165,11 +179,11 @@ public:
          * @brief 部分 Chrome trace 输入使用 {"traceEvents": [...]}，真实 merged trace 通常是数组。
          */
         if (*p_ == '{') {
-            auto marker = buffer_.find("\"traceEvents\"");
+            auto marker = buffer_->find("\"traceEvents\"");
             if (marker != std::string::npos) {
-                auto bracket = buffer_.find('[', marker);
+                auto bracket = buffer_->find('[', marker);
                 if (bracket != std::string::npos) {
-                    p_ = buffer_.data() + bracket + 1;
+                    p_ = buffer_->data() + bracket + 1;
                     return parse_array();
                 }
             }
@@ -277,47 +291,17 @@ private:
         return parse_primitive();
     }
 
-    std::string parse_compound_value_literal() {
+    void parse_compound_value_literal(TraceEvent & event) {
         /**
          * @brief 保留 args 中对象/数组的原始 JSON 片段。
          *
-         * scanner 只保证完整越过该值；需要参与建模的结构化字段应由 trace_merger 展平成稳定标量 key。
+         * scanner 只保证完整越过该值；需要参与建模的结构化字段由 TraceEvent 懒加载读取。
          */
         skip_ws();
         const char * start = p_;
         skip_value();
-        return std::string(start, p_ - start);
-    }
-
-    void parse_args(std::unordered_map<std::string, std::string> & args) {
-        /**
-         * @brief 当前 args 解析只保存一层 key -> string。
-         *
-         * 标量直接收敛成字符串，对象/数组保留原始 JSON 片段，避免结构化值打乱后续字段扫描。
-         */
-        if (p_ >= end_ || *p_ != '{') {
-            skip_value();
-            return;
-        }
-        ++p_;
-        while (p_ < end_) {
-            skip_ws();
-            if (p_ >= end_ || *p_ == '}') {
-                if (p_ < end_) ++p_;
-                break;
-            }
-            if (*p_ == '"') {
-                auto key = parse_string();
-                skip_ws();
-                if (p_ < end_ && *p_ == ':') ++p_;
-                skip_ws();
-                if (p_ < end_ && (*p_ == '{' || *p_ == '[')) args[key] = parse_compound_value_literal();
-                else args[key] = parse_scalar_value();
-            }
-            else { ++p_; }
-            skip_ws();
-            if (p_ < end_ && *p_ == ',') ++p_;
-        }
+        const auto offset = static_cast<size_t>(start - buffer_->data());
+        event.set_args_json_slice(buffer_, offset, static_cast<size_t>(p_ - start));
     }
 
     TraceEvent parse_event(bool & valid) {
@@ -352,7 +336,7 @@ private:
                 else if (key == "pid") event.pid = parse_scalar_value();
                 else if (key == "tid") event.tid = parse_scalar_value();
                 else if (key == "event_id") event.event_id = parse_scalar_value();
-                else if (key == "args") parse_args(event.args);
+                else if (key == "args") parse_compound_value_literal(event);
                 else skip_value();
             }
             else { ++p_; }
@@ -363,19 +347,15 @@ private:
         if (event.pid.empty()) event.pid = "-1";
         if (event.tid.empty()) event.tid = "-1";
         /**
-         * @brief 把顶层 pid/tid 也写入 args，方便后续统一走 event.arg()。
-         *
-         * DagBuilder::lane_key 直接读取 event.tid，不依赖这里的 args["tid"] fallback。
-         */
-        event.args["pid"] = event.pid;
-        event.args["tid"] = event.tid;
-        /**
          * @brief 当前后端只支持完整 duration event。
          *
          * metadata 和 flow event 不是可执行节点；如果未来需要使用 flow，需要单独解析为依赖边，
          * 而不是当作 0 时长节点。
          */
-        valid = saw_phase && event.ph == "X" && !event.name.empty() && !validation_only_event(event) && !ignored_duration_event_name(event.name);
+        valid = !event.name.empty()
+                && ((saw_phase && event.ph == "X" && (options_.include_validation_only || !validation_only_event(event))
+                     && (options_.include_ignored_duration || !ignored_duration_event_name(event.name)))
+                    || (options_.include_metadata && event.ph == "M"));
         return event;
     }
 
@@ -402,10 +382,161 @@ private:
         return events;
     }
 
-    std::string buffer_;
+    std::shared_ptr<const std::string> buffer_;
     const char * p_ = nullptr;
     const char * end_ = nullptr;
+    TraceReadOptions options_;
 };
+
+struct ObjectRange {
+    size_t begin = 0;
+    size_t end = 0;
+    size_t ordinal = 0;
+};
+
+std::string read_file_buffer(const std::string & filename, size_t threads) {
+    std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open()) { throw std::runtime_error("Failed to open trace file: " + filename); }
+    const auto end_pos = ifs.tellg();
+    if (end_pos < 0) { throw std::runtime_error("Failed to determine trace file size: " + filename); }
+    const auto size = static_cast<size_t>(end_pos);
+    std::string buffer(size, '\0');
+    if (size == 0) return buffer;
+
+    constexpr size_t kMinParallelReadBytes = 64ull * 1024ull * 1024ull;
+    const size_t partition_count = threads > 1 && size >= kMinParallelReadBytes ? std::min<size_t>(threads, (size + kMinParallelReadBytes - 1) / kMinParallelReadBytes) : 1;
+    if (partition_count <= 1) {
+        ifs.seekg(0, std::ios::beg);
+        if (!ifs.read(buffer.data(), static_cast<std::streamsize>(size))) { throw std::runtime_error("Failed to read trace file: " + filename); }
+        return buffer;
+    }
+
+    std::vector<std::future<void>> futures;
+    futures.reserve(partition_count);
+    const auto chunk = (size + partition_count - 1) / partition_count;
+    for (size_t part = 0; part < partition_count; ++part) {
+        const size_t begin = part * chunk;
+        const size_t length = begin < size ? std::min(chunk, size - begin) : 0;
+        if (length == 0) continue;
+        futures.push_back(std::async(std::launch::async, [filename, &buffer, begin, length] {
+            std::ifstream part_stream(filename, std::ios::binary);
+            if (!part_stream.is_open()) { throw std::runtime_error("Failed to open trace file partition: " + filename); }
+            part_stream.seekg(static_cast<std::streamoff>(begin), std::ios::beg);
+            if (!part_stream.read(buffer.data() + begin, static_cast<std::streamsize>(length))) {
+                throw std::runtime_error("Failed to read trace file partition: " + filename);
+            }
+        }));
+    }
+    for (auto & future : futures) future.get();
+    return buffer;
+}
+
+std::string repair_trace_tail(std::string buffer) {
+    auto trim_end = [](std::string & value) {
+        while (!value.empty() && static_cast<unsigned char>(value.back()) <= ' ') value.pop_back();
+    };
+    trim_end(buffer);
+    if (buffer.starts_with("{\"traceEvents\":[") && !buffer.ends_with("]}")) {
+        auto end = buffer.rfind('}');
+        if (end != std::string::npos) {
+            buffer.resize(end + 1);
+            trim_end(buffer);
+            while (!buffer.empty() && buffer.back() == ',') {
+                buffer.pop_back();
+                trim_end(buffer);
+            }
+            buffer += "]}";
+        }
+    }
+    else if (buffer.starts_with("[") && !buffer.ends_with("]")) {
+        auto end = buffer.rfind('}');
+        if (end != std::string::npos) {
+            buffer.resize(end + 1);
+            trim_end(buffer);
+            while (!buffer.empty() && buffer.back() == ',') {
+                buffer.pop_back();
+                trim_end(buffer);
+            }
+            buffer += "\n]";
+        }
+    }
+    return buffer;
+}
+
+size_t trace_array_begin(const std::string & buffer) {
+    size_t pos = 0;
+    while (pos < buffer.size() && static_cast<unsigned char>(buffer[pos]) <= ' ') ++pos;
+    if (pos < buffer.size() && buffer[pos] == '[') return pos + 1;
+    if (pos < buffer.size() && buffer[pos] == '{') {
+        auto marker = buffer.find("\"traceEvents\"", pos);
+        if (marker != std::string::npos) {
+            auto bracket = buffer.find('[', marker);
+            if (bracket != std::string::npos) return bracket + 1;
+        }
+    }
+    return std::string::npos;
+}
+
+std::vector<ObjectRange> scan_event_object_ranges(const std::string & buffer) {
+    std::vector<ObjectRange> ranges;
+    auto pos = trace_array_begin(buffer);
+    if (pos == std::string::npos) return ranges;
+    size_t ordinal = 0;
+    while (pos < buffer.size()) {
+        while (pos < buffer.size() && buffer[pos] != '{' && buffer[pos] != ']') ++pos;
+        if (pos >= buffer.size() || buffer[pos] == ']') break;
+        const size_t begin = pos;
+        int depth = 0;
+        bool in_string = false;
+        bool escape = false;
+        for (; pos < buffer.size(); ++pos) {
+            char c = buffer[pos];
+            if (in_string) {
+                if (escape) escape = false;
+                else if (c == '\\') escape = true;
+                else if (c == '"') in_string = false;
+                continue;
+            }
+            if (c == '"') {
+                in_string = true;
+                continue;
+            }
+            if (c == '{') ++depth;
+            else if (c == '}') {
+                --depth;
+                if (depth == 0) {
+                    ++pos;
+                    ranges.push_back(ObjectRange{ begin, pos, ordinal++ });
+                    break;
+                }
+            }
+        }
+    }
+    return ranges;
+}
+
+std::vector<std::vector<ObjectRange>> partition_ranges(const std::vector<ObjectRange> & ranges, size_t partition_count) {
+    partition_count = std::max<size_t>(1, std::min(partition_count, ranges.size()));
+    std::vector<std::vector<ObjectRange>> partitions(partition_count);
+    const size_t chunk = (ranges.size() + partition_count - 1) / partition_count;
+    for (size_t i = 0; i < ranges.size(); ++i) partitions[i / chunk].push_back(ranges[i]);
+    return partitions;
+}
+
+std::vector<TraceEvent> parse_ranges(std::shared_ptr<const std::string> buffer, const std::vector<ObjectRange> & ranges, TraceReadOptions options) {
+    std::vector<TraceEvent> events;
+    events.reserve(ranges.size());
+    for (const auto & range : ranges) {
+        bool valid = false;
+        TraceScanner scanner(buffer, buffer->data() + range.begin, buffer->data() + range.end, options);
+        auto event = scanner.parse_single_event(valid);
+        if (valid) {
+            event.index = range.ordinal;
+            events.push_back(std::move(event));
+        }
+    }
+    return events;
+}
 
 std::string output_pid(const TraceEvent & event, const DagNode & node) {
     if (const auto it = node.attrs.find("sim_pid"); it != node.attrs.end()) return it->second;
@@ -442,35 +573,58 @@ using chrome_trace_io_detail::output_tid;
 using chrome_trace_io_detail::TraceScanner;
 
 std::vector<TraceEvent> read_chrome_trace(const std::string & filename) {
+    return read_chrome_trace(filename, TraceReadOptions{});
+}
+
+std::vector<TraceEvent> read_chrome_trace(const std::string & filename, const TraceReadOptions & options) {
     /**
      * @brief 一次性读入文件后使用 streaming scanner 扫描。
      *
      * 这样仍需要一份文件大小的内存，但避免了 nlohmann::json DOM 的多倍放大。
      */
-    std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
-    if (!ifs.is_open()) { throw std::runtime_error("Failed to open trace file: " + filename); }
-    auto size = ifs.tellg();
-    ifs.seekg(0, std::ios::beg);
-    std::string buffer(static_cast<size_t>(size), '\0');
-    if (!ifs.read(buffer.data(), size)) { throw std::runtime_error("Failed to read trace file: " + filename); }
+    std::string buffer = chrome_trace_io_detail::read_file_buffer(filename, std::max<size_t>(1, options.threads));
+    if (options.auto_repair) buffer = chrome_trace_io_detail::repair_trace_tail(std::move(buffer));
+    auto shared_buffer = std::make_shared<const std::string>(std::move(buffer));
 
-    TraceScanner scanner(std::move(buffer));
-    auto events = scanner.parse();
+    std::vector<TraceEvent> events;
+    if (options.threads <= 1) {
+        TraceScanner scanner(shared_buffer, options);
+        events = scanner.parse();
+    }
+    else {
+        auto ranges = chrome_trace_io_detail::scan_event_object_ranges(*shared_buffer);
+        if (ranges.empty()) {
+            TraceScanner scanner(shared_buffer, options);
+            events = scanner.parse();
+        }
+        else {
+            auto partitions = chrome_trace_io_detail::partition_ranges(ranges, options.threads);
+            std::vector<std::future<std::vector<TraceEvent>>> futures;
+            futures.reserve(partitions.size());
+            for (auto & partition : partitions) {
+                futures.push_back(std::async(std::launch::async, [shared_buffer, partition = std::move(partition), options] {
+                    return chrome_trace_io_detail::parse_ranges(shared_buffer, partition, options);
+                }));
+            }
+            for (auto & future : futures) {
+                auto part = future.get();
+                events.insert(events.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+            }
+            std::ranges::sort(events, [](const TraceEvent & a, const TraceEvent & b) { return a.index < b.index; });
+        }
+    }
+
     Logger::instance().info() << "Read " << events.size() << " Chrome trace events from " << filename;
     return events;
 }
 
-void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph, bool full_output) {
+void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph) {
     /**
      * @brief DAG Chrome trace 是显式 debug 输出，不参与默认 prediction。
      */
     std::ofstream ofs(filename);
     if (!ofs.is_open()) { throw std::runtime_error("Failed to write Chrome trace DAG: " + filename); }
     ofs << "{\n  \"traceEvents\": [\n";
-    if (!full_output) {
-        ofs << "\n  ]\n}\n";
-        return;
-    }
 
     /**
      * @brief 输出时把 simulation_start 平移到原 trace 的 real_min 附近。

@@ -303,7 +303,7 @@ void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
      *
      * 只从 completed state-model path fact 中观察，避免 start phase 的半成品或诊断事实污染模型。
      */
-    std::ranges::for_each(event.args, [&](const auto & item) {
+    std::ranges::for_each(event.args_map(), [&](const auto & item) {
         const auto & [key, value] = item;
         if (key.contains("dictionary")) observe_dictionary_value(value);
     });

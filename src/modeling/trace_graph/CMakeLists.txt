@@ -38,6 +38,7 @@ add_library(trace_graph_io STATIC)
 target_sources(trace_graph_io
     PRIVATE
         src/io/chrome_trace_io.cpp
+        src/io/trace_manifest_input.cpp
 )
 target_link_libraries(trace_graph_io PUBLIC trace_graph_core)
 

@@ -93,6 +93,9 @@ class ModelRunPlanner:
             output_dir=self.artifacts.model_run_dir(run_id),
             prediction=first.prediction,
             skip_reason=PreflightSkipPolicy(self.preflight_report).reason_for(first),
+            trace_threads=self.context.options.trace_threads,
+            trace_file_threads=self.context.options.trace_file_threads,
+            trace_channels=model_run_trace_channels(first),
         )
 
 
@@ -143,17 +146,17 @@ class PreflightSkipPolicy:
         if prediction.is_self:
             return ""
 
-        inputs = (
-            check.get("input_workload_signatures") if isinstance(check.get("input_workload_signatures"), dict) else {}
-        )
-        input_preflight = inputs.get(prediction.input_id)
-        if not isinstance(input_preflight, dict):
-            return "input_preflight_missing"
-        if input_preflight.get("signature_match") is not True:
+        if not isinstance(source_preflight, dict):
+            return "source_preflight_missing"
+        if not isinstance(target_preflight, dict):
+            return "target_preflight_missing"
+        if source_preflight.get("canonical_workload_signature") != target_preflight.get(
+            "canonical_workload_signature"
+        ):
             return "workload_signature_mismatch"
-        if input_preflight.get("forced_token_plan_signature_match") is not True:
+        if not forced_token_plan_matches(source_preflight, target_preflight):
             return "forced_token_plan_signature_mismatch"
-        if input_preflight.get("forced_token_bundle_signature_match") is not True:
+        if not forced_token_bundle_matches(source_preflight, target_preflight):
             return "forced_token_bundle_signature_mismatch"
         return ""
 
@@ -164,6 +167,43 @@ def cache_prediction_key(prediction: CacheStatePredictionRef | None) -> str:
     if prediction is None:
         return ""
     return f"{prediction.input_id}:{prediction.source.config_id}->{prediction.target.config_id}"
+
+
+def model_run_trace_channels(request: ModelRunRequest) -> tuple[str, ...]:
+    """返回一次 C++ run 应实际消费的 manifest trace channel。"""
+
+    if request.mode == "cache_state":
+        return ("python_probe",)
+    return ()
+
+
+def forced_token_plan_matches(source: dict[str, object], target: dict[str, object]) -> bool:
+    """判断一对 cross-config prediction 是否使用相同 forced-token plan。"""
+
+    if source.get("forced_token_enabled") is not True or target.get("forced_token_enabled") is not True:
+        return False
+    if source.get("forced_token_plan_ready") is not True or target.get("forced_token_plan_ready") is not True:
+        return False
+    source_plan = source.get("forced_token_plan_sha256")
+    target_plan = target.get("forced_token_plan_sha256")
+    return bool(source_plan) and source_plan == target_plan
+
+
+def forced_token_bundle_matches(source: dict[str, object], target: dict[str, object]) -> bool:
+    """判断一对 cross-config prediction 是否使用相同 forced-token bundle。"""
+
+    if source.get("forced_token_bundle_ready") is not True or target.get("forced_token_bundle_ready") is not True:
+        return False
+    source_bundle = source.get("forced_token_bundle_sha256")
+    target_bundle = target.get("forced_token_bundle_sha256")
+    source_bundle_id = source.get("forced_token_bundle_id")
+    target_bundle_id = target.get("forced_token_bundle_id")
+    return (
+        bool(source_bundle)
+        and source_bundle == target_bundle
+        and bool(source_bundle_id)
+        and source_bundle_id == target_bundle_id
+    )
 
 
 def model_run_id(

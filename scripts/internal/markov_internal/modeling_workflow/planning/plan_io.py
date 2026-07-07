@@ -58,6 +58,7 @@ def model_run_spec_payload(spec: ModelRunSpec) -> dict[str, Any]:
         "validation_requests": list(spec.validation_requests),
         "output_dir": str(spec.output_dir),
         "skip_reason": spec.skip_reason or None,
+        "trace_channels": list(spec.trace_channels),
     }
     if spec.prediction is not None:
         payload["prediction"] = {

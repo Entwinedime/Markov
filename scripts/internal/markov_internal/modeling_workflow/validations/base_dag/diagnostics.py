@@ -109,12 +109,15 @@ class DagDiagnosticsValidation(RowValidation):
     def _base_row(result: ModelRunResult) -> dict[str, Any]:
         artifacts = result.artifacts
         dag_quality = artifacts.load_if_present(artifacts.dag_quality_json)
+        run_summary = artifacts.load_if_present(artifacts.run_summary_json)
         faithful = dag_quality.get("faithful_replay") if isinstance(dag_quality.get("faithful_replay"), dict) else {}
         blockers = []
         if result.skipped:
             blockers.append(result.skip_reason or "skipped")
         if result.return_code != 0:
             blockers.append("model_command_failed")
+        if run_summary.get("debug_artifacts_enabled") is False and not result.skipped:
+            blockers.append("debug_artifacts_disabled")
         for path in (artifacts.dag_quality_json, artifacts.dag_analysis_json):
             if not path.is_file() and not result.skipped:
                 blockers.append(f"missing_artifact:{path.name}")
@@ -129,6 +132,7 @@ class DagDiagnosticsValidation(RowValidation):
             "skipped": result.skipped,
             "skip_reason": result.skip_reason or None,
             "ready": not blockers and faithful.get("ready") is True,
+            "debug_artifacts_enabled": run_summary.get("debug_artifacts_enabled"),
             "faithful_replay_ready": faithful.get("ready"),
             "faithful_replay_relative_error": faithful.get("relative_error"),
             "blockers": blockers,

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Modeling CLI。
 
-本脚本只做编排：读取配置、调用 trace merger、启动 C++ TraceGraph 后端。
-建模逻辑、DAG 构建、拓扑仿真和子模块执行都在 C++ 中完成。
+本脚本只做编排：读取配置、记录 manifest 中的原始 trace、启动 C++ TraceGraph 后端。
+建模逻辑、trace 合流、DAG 构建、拓扑仿真和子模块执行都在 C++ 中完成。
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ class ModelingOptions:
     profile_manifest: Path | None
     cpp_model_config: Path | None
     hicache_oracle_traces: list[Path]
+    trace_channels: tuple[str, ...] | None
     mode: str | None
     emit_dag_chrome_trace: bool
     emit_module_summary: bool
@@ -85,6 +86,10 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
         help="override validation.hicache_state.oracle_trace_paths; may be repeated",
     )
     parser.add_argument(
+        "--trace-channels",
+        help="comma-separated trace channels passed to C++: torch,ld_preload,python_probe",
+    )
+    parser.add_argument(
         "--mode", choices=("faithful_replay", "cache_state", "cache_patch"), help="override config.mode"
     )
     parser.add_argument("--emit-dag-chrome-trace", action="store_true", help="emit DAG as Chrome trace JSON")
@@ -103,6 +108,7 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
         profile_manifest=resolve_repo_path(args.profile_manifest) if args.profile_manifest else None,
         cpp_model_config=resolve_repo_path(args.cpp_model_config) if args.cpp_model_config else None,
         hicache_oracle_traces=[resolve_repo_path(path) for path in args.hicache_oracle_trace],
+        trace_channels=parse_trace_channels(args.trace_channels),
         mode=args.mode,
         emit_dag_chrome_trace=bool(args.emit_dag_chrome_trace),
         emit_module_summary=bool(args.emit_module_summary),
@@ -115,11 +121,14 @@ def parse_args(argv: list[str] | None = None) -> ModelingOptions:
 def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     """执行一次 modeling run。
 
-    Python 侧只准备输入 trace、C++ model config 和输出路径；实际 DAG 构建、模块执行和拓扑仿真
+    Python 侧只准备 profile manifest、C++ model config 和输出路径；实际 trace 合流、DAG 构建、模块执行和拓扑仿真
     均由 C++ TraceGraph 完成。
     """
 
     config = load_json(options.config_path)
+    if options.trace_channels is not None:
+        cpp_cfg = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
+        config["cpp_trace_graph"] = {**cpp_cfg, "trace_channels": list(options.trace_channels)}
     mode = options.mode or str(config.get("mode") or "faithful_replay")
     output_dir = options.output_dir or resolve_repo_path(
         str(config.get("output_dir") or "data/modeling_runs/cpp_trace_graph")
@@ -134,7 +143,7 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
         # HiCache state validation 依赖 C++ module summary 中的 state trace。
         require_validation_backend(config)
         emit_module_summary = True
-    if emit_dag_analysis:
+    if emit_module_summary or emit_dag_analysis:
         require_validation_backend(config)
     debug = options.debug or bool(outputs_cfg.get("debug", False))
 
@@ -142,6 +151,8 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     manifest_path = options.profile_manifest
     if manifest_path is None and isinstance(input_cfg.get("profile_manifest"), str):
         manifest_path = resolve_repo_path(input_cfg["profile_manifest"])
+    if manifest_path is None:
+        raise ValueError("modeling runner requires --profile-manifest or input.profile_manifest")
 
     trace_paths = prepare_trace_inputs(config, input_cfg, manifest_path, output_dir)
     model_config_path = options.cpp_model_config or write_cpp_model_config(config, output_dir, mode)
@@ -159,12 +170,13 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
         "--scenario-name",
         mode,
     ]
-    for path in trace_paths:
-        command.extend(["--input", str(path)])
+    cpp_cfg = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
+    command.extend(["--profile-manifest", str(manifest_path)])
+    append_cpp_trace_options(command, config, cpp_cfg)
     if debug:
         command.append("--debug")
     if emit_dag_chrome_trace:
-        command.extend(["--graph-output", str(graph_output), "--full-output"])
+        command.extend(["--graph-output", str(graph_output)])
     if emit_module_summary:
         command.extend(["--model-summary", str(module_summary)])
     if emit_dag_analysis:
@@ -207,8 +219,78 @@ def run_from_cli(options: ModelingOptions) -> dict[str, Any]:
     return prediction
 
 
+def append_cpp_trace_options(command: list[str], config: dict[str, Any], cpp_cfg: dict[str, Any]) -> None:
+    """把 Python runner 的 trace 读取/合流配置透传到 C++ 后端。"""
+
+    threads = cpp_cfg.get("threads", config.get("trace_threads"))
+    if threads is not None:
+        command.extend(["--threads", str(threads)])
+    file_threads = cpp_cfg.get("file_threads", config.get("trace_file_threads"))
+    if file_threads is not None:
+        command.extend(["--file-threads", str(file_threads)])
+    trace_channels = trace_channels_from_config(config, cpp_cfg)
+    if trace_channels:
+        command.extend(["--trace-channels", ",".join(trace_channels)])
+
+    merge_cfg = config.get("trace_merge") if isinstance(config.get("trace_merge"), dict) else {}
+    if "tolerance_us" in merge_cfg:
+        command.extend(["--trace-merge-tolerance-us", str(merge_cfg["tolerance_us"])])
+    if "search_window" in merge_cfg:
+        command.extend(["--trace-merge-window", str(merge_cfg["search_window"])])
+    if "margin_us" in merge_cfg:
+        command.extend(["--trace-merge-margin-us", str(merge_cfg["margin_us"])])
+    if "mode" in merge_cfg:
+        command.extend(["--trace-merge-mode", str(merge_cfg["mode"])])
+
+
+def parse_trace_channels(raw: str | None) -> tuple[str, ...] | None:
+    """解析 CLI trace channel 列表；None 表示未覆盖配置。"""
+
+    if raw is None:
+        return None
+    return tuple(normalize_trace_channels(raw.split(",")))
+
+
+def trace_channels_from_config(config: dict[str, Any], cpp_cfg: dict[str, Any]) -> list[str]:
+    """返回 C++ trace channel 白名单；空列表表示使用 C++ 默认全量。"""
+
+    raw = cpp_cfg.get("trace_channels", config.get("trace_channels"))
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        return normalize_trace_channels(raw.split(","))
+    if isinstance(raw, list):
+        return normalize_trace_channels(raw)
+    return []
+
+
+def normalize_trace_channels(raw_items: list[Any]) -> list[str]:
+    aliases = {
+        "torch": "torch",
+        "ld": "ld_preload",
+        "ld-preload": "ld_preload",
+        "ld_preload": "ld_preload",
+        "probe": "python_probe",
+        "python-probe": "python_probe",
+        "python_probe": "python_probe",
+    }
+    channels: list[str] = []
+    for item in raw_items:
+        token = str(item).strip().lower()
+        if not token:
+            continue
+        if token == "all":
+            return []
+        if token not in aliases:
+            raise ValueError(f"unknown trace channel: {token}")
+        channel = aliases[token]
+        if channel not in channels:
+            channels.append(channel)
+    return channels
+
+
 def require_validation_backend(config: dict[str, Any]) -> None:
-    """HiCache validation 必须显式选择 validation C++ backend。"""
+    """Debug/validation artifact 必须显式选择 validation C++ backend。"""
 
     cpp = config.get("cpp_trace_graph") if isinstance(config.get("cpp_trace_graph"), dict) else {}
     backend_kind = str(cpp.get("backend_kind") or "").strip().lower()

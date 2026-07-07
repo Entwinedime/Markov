@@ -63,8 +63,8 @@ void NodeScaleModule::apply(core::DagGraph & graph) {
         const auto * rule = find_matching_rule(config_.rules, record.name);
         if (rule == nullptr) continue;
 
-        uint64_t original_time = 0;
-        if (!read_u64(graph.node(node_id).attrs, "ori_time", original_time)) continue;
+        uint64_t original_time = graph.node(node_id).original_duration;
+        (void)read_u64(graph.node(node_id).attrs, "ori_time", original_time);
 
         /**
          * @brief base DAG 对极短 CPU 节点保留固定开销。

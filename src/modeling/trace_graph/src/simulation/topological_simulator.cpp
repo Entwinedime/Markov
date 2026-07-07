@@ -20,6 +20,11 @@ namespace topological_simulator_detail {
 
 constexpr size_t INVALID_NODE = std::numeric_limits<size_t>::max();
 
+struct DfsFrame {
+    size_t node_id = INVALID_NODE;
+    size_t next_edge_index = 0;
+};
+
 /**
  * @brief 读取仿真阶段使用的节点耗时字段。
  *
@@ -37,9 +42,64 @@ uint64_t read_u64_attr(const core::DagNode & node, const std::string & key, uint
     }
 }
 
+std::vector<size_t> find_cycle_nodes(const std::vector<std::vector<size_t>> & outgoing, const std::vector<int> & indegree) {
+    const size_t node_count = outgoing.size();
+    std::vector<int> visit_state(node_count, 0);
+    std::vector<size_t> path_stack;
+    std::vector<size_t> path_position(node_count, INVALID_NODE);
+    std::vector<DfsFrame> dfs_stack;
+
+    for (size_t start = 0; start < node_count; ++start) {
+        if (indegree[start] <= 0 || visit_state[start] != 0) continue;
+
+        dfs_stack.clear();
+        path_stack.clear();
+        dfs_stack.push_back(DfsFrame{ .node_id = start, .next_edge_index = 0 });
+        visit_state[start] = 1;
+        path_position[start] = path_stack.size();
+        path_stack.push_back(start);
+
+        while (!dfs_stack.empty()) {
+            auto & frame = dfs_stack.back();
+            const auto & edges = outgoing[frame.node_id];
+            bool descended = false;
+
+            while (frame.next_edge_index < edges.size()) {
+                const size_t dst = edges[frame.next_edge_index++];
+                if (dst >= node_count || indegree[dst] <= 0) continue;
+
+                if (visit_state[dst] == 0) {
+                    visit_state[dst] = 1;
+                    path_position[dst] = path_stack.size();
+                    path_stack.push_back(dst);
+                    dfs_stack.push_back(DfsFrame{ .node_id = dst, .next_edge_index = 0 });
+                    descended = true;
+                    break;
+                }
+                if (visit_state[dst] == 1) {
+                    const auto position = path_position[dst];
+                    if (position != INVALID_NODE && position < path_stack.size()) {
+                        return std::vector<size_t>(path_stack.begin() + static_cast<std::ptrdiff_t>(position), path_stack.end());
+                    }
+                    return { dst };
+                }
+            }
+            if (descended) continue;
+
+            const size_t done = frame.node_id;
+            dfs_stack.pop_back();
+            visit_state[done] = 2;
+            path_position[done] = INVALID_NODE;
+            if (!path_stack.empty()) path_stack.pop_back();
+        }
+    }
+    return {};
+}
+
 } // namespace topological_simulator_detail
 
 using topological_simulator_detail::INVALID_NODE;
+using topological_simulator_detail::find_cycle_nodes;
 using topological_simulator_detail::read_u64_attr;
 
 SimulationResult run_topological_simulation(core::DagGraph & graph) {
@@ -106,7 +166,6 @@ SimulationResult run_topological_simulation(core::DagGraph & graph) {
 
         node.simulation_start = complete_time[node_id] >= node_time ? complete_time[node_id] - node_time : 0;
         node.completion_time = complete_time[node_id];
-        node.attrs["simulationtime"] = std::to_string(node.simulation_start);
         if (complete_time[node_id] > e2e) e2e = complete_time[node_id];
 
         for (size_t dst : outgoing[node_id]) {
@@ -123,33 +182,7 @@ SimulationResult run_topological_simulation(core::DagGraph & graph) {
         result.cycle_detected = true;
         result.error = "Cycle detected in DAG. Simulation aborted.";
 
-        /**
-         * @brief 拓扑排序失败时再做一次 DFS，尽量输出一段具体 cycle node id，方便定位错误边。
-         */
-        std::vector<int> visit_state(node_count, 0);
-        std::vector<size_t> path_stack;
-        std::function<bool(size_t)> dfs = [&](size_t node_id) {
-            visit_state[node_id] = 1;
-            path_stack.push_back(node_id);
-            for (size_t dst : outgoing[node_id]) {
-                if (indegree[dst] == 0) continue;
-                if (visit_state[dst] == 0) {
-                    if (dfs(dst)) return true;
-                }
-                else if (visit_state[dst] == 1) {
-                    auto it = std::ranges::find(path_stack, dst);
-                    if (it != path_stack.end()) result.cycle_nodes.assign(it, path_stack.end());
-                    return true;
-                }
-            }
-            path_stack.pop_back();
-            visit_state[node_id] = 2;
-            return false;
-        };
-
-        for (const auto node_id : std::views::iota(size_t{ 0 }, node_count)) {
-            if (indegree[node_id] > 0 && visit_state[node_id] == 0 && dfs(node_id)) break;
-        }
+        result.cycle_nodes = find_cycle_nodes(outgoing, indegree);
 
         auto log = core::Logger::instance().error();
         log << result.error << " Processed " << result.processed_nodes << " out of " << node_count << " nodes.";

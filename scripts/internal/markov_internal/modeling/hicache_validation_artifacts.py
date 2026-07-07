@@ -186,6 +186,16 @@ def build_validation(
         errors.append("missing_trace_real_e2e")
     if mode == "faithful_replay" and actual and rel_error is not None and rel_error > threshold:
         errors.append("faithful_replay_full_e2e_error_too_high")
+    dag = {
+        "node_count": run_summary.get("node_count"),
+        "edge_count": run_summary.get("edge_count"),
+        "parsed_record_count": run_summary.get("parsed_record_count"),
+        "edge_counts_by_kind": run_summary.get("edge_counts_by_kind"),
+        "dag_mutation_count": 0,
+    }
+    if "stage_timings_ms" in run_summary:
+        dag["stage_timings_ms"] = run_summary.get("stage_timings_ms")
+
     result = {
         "mode": mode,
         "engine": "cpp_trace_graph",
@@ -193,14 +203,7 @@ def build_validation(
         "validation_errors": errors,
         "thresholds": {"faithful_replay_full_e2e_rel_error_max": threshold},
         "trace_files": [str(path) for path in trace_paths],
-        "dag": {
-            "node_count": run_summary.get("node_count"),
-            "edge_count": run_summary.get("edge_count"),
-            "parsed_record_count": run_summary.get("parsed_record_count"),
-            "edge_counts_by_kind": run_summary.get("edge_counts_by_kind"),
-            "stage_timings_ms": run_summary.get("stage_timings_ms"),
-            "dag_mutation_count": 0,
-        },
+        "dag": dag,
         "workload_window": {
             "used": workload_window is not None,
             "report_path": str(workload_window.report_path) if workload_window else None,

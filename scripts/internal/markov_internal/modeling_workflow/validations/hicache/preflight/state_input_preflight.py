@@ -17,18 +17,18 @@ class HiCacheStateInputPreflightCheck(PreflightCheck):
         """在统一 artifact 布局下执行 HiCache input preflight audit。"""
 
         selected = set(context.options.validations)
+        state_validation_selected = bool({"hicache_final_state", "hicache_transition"} & selected)
         report = build_state_input_preflight_report(
             context.runs,
             context.options.output_dir,
             audit_dir=context.artifacts.preflight_dir / self.name,
             summary_path=context.artifacts.preflight_dir / self.name / "summary.json",
-            require_validation_evidence=bool({"hicache_final_state", "hicache_transition"} & selected),
+            require_validation_evidence=state_validation_selected,
             validate_diagnostic_coverage="hicache_transition" in selected,
             require_cross_config_contract=(
-                bool({"hicache_final_state", "hicache_transition"} & selected)
-                and "cross" in context.options.prediction_scope
+                state_validation_selected and "cross" in context.options.prediction_scope
             ),
-            show_workload_sequence=context.options.show_workload_sequence,
+            show_workload_sequence=state_validation_selected,
         )
         return {
             "schema": "trace_sim.modeling_workflow.preflight.hicache_state_inputs.v1",

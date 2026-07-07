@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from ..common.paths import running_in_modeling_container
 from .options import WorkflowOptionsBuilder
 from .validations import validation_names
 from .workflow import WorkflowRunner
@@ -57,21 +58,36 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-predictions", type=int, default=0, help="Maximum cache-state predictions; 0 is all.")
     parser.add_argument("--page-key-mode", default="strip_scope", choices=("strip_scope", "raw"))
     parser.add_argument("--sample", type=int, default=20, help="Maximum transition mismatch/evidence sample size.")
+    parser.add_argument("--trace-threads", type=int, default=1, help="C++ logical trace input read/build threads.")
+    parser.add_argument("--trace-file-threads", type=int, default=1, help="C++ per-file trace parse threads.")
     parser.add_argument(
-        "--show-workload-sequence",
-        action="store_true",
-        help="Execute and show workload sequence diagnostics in HiCache preflight checks.",
+        "--model-run-jobs",
+        "--parallel-jobs",
+        dest="model_run_jobs",
+        type=int,
+        default=1,
+        help="Maximum model-run subprocesses to execute concurrently.",
     )
-    parser.add_argument("--emit-transition-catalog", action="store_true", help="Emit transition mismatch catalog.")
-    parser.add_argument("--emit-transition-gates", action="store_true", help="Emit transition patch gate scoreboard.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     """执行统一建模 workflow。"""
 
+    require_host_workflow_entrypoint()
     args = parse_args(argv)
     return WorkflowRunner(WorkflowOptionsBuilder().from_args(args)).run()
+
+
+def require_host_workflow_entrypoint() -> None:
+    """workflow 只允许从宿主机 Python 入口启动。"""
+
+    if not running_in_modeling_container():
+        return
+    raise SystemExit(
+        "modeling_workflow.py must be started from the host checkout. "
+        "Use: python3 scripts/internal/entrypoints/modeling_workflow.py ..."
+    )
 
 
 if __name__ == "__main__":

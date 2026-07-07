@@ -8,10 +8,18 @@
 #include "markov/trace_graph/core/dag_builder.hpp"
 
 #include <algorithm>
+#ifdef DEBUG
+#include <chrono>
+#endif
+#include <future>
+#include <numeric>
 #include <optional>
 #include <ranges>
+#include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace markov::trace_graph::core {
 
@@ -25,15 +33,26 @@ namespace dag_builder_detail {
 bool contains_any_hccl_name(const std::string & name) { return name.contains("hcom") || name.contains("HCCL") || name.contains("hccl"); }
 
 /**
- * @brief 读取 stream sync 查找前驱时使用的 launch timestamp。
+ * @brief 读取 stream sync 查找前驱时使用的 submit timestamp。
  *
- * launchts 来自 correlation/connection 链的首个 CPU event，目的是让同步点按 launch 时刻而不是
- * kernel 完成时刻匹配目标 lane 上最近的已提交工作。
+ * submitts 来自 correlation/connection 链内第一个 device 节点之前的 CPU 提交锚点。
+ * 缺少提交锚点时退回 event.ts；这只会把已经开始执行的 device 节点纳入 sync frontier，
+ * 不会把 sync 之后才开始执行且缺证据的节点误判为已提交。
  */
-uint64_t event_launch_ts(const DagGraph & graph, size_t node_id) {
+uint64_t event_submit_ts(const DagGraph & graph, size_t node_id) {
     const auto & event = graph.event_for_node(node_id);
-    auto launch = event.arg_u64("launchts", 0);
-    return launch > 0 ? launch : event.ts;
+    auto submit = event.arg_u64("submitts", 0);
+    return submit > 0 ? submit : event.ts;
+}
+
+bool is_submit_anchor_event(const TraceEvent & event) {
+    if (event.name.starts_with("Enqueue@")) return true;
+    if (event.name == "Node@launch") return true;
+    if (event.cat == "enqueue") return true;
+    if (event.name.starts_with("AscendCL@aclrtLaunch")) return true;
+    if (event.name.starts_with("AscendCL@aclrtMemcpyAsync")) return true;
+    if (event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent") return true;
+    return false;
 }
 
 /**
@@ -68,28 +87,227 @@ bool is_device_sync_event(const std::string & name) {
     return name == "AscendCL@aclrtSynchronizeDevice" || name == "AscendCL@aclrtSynchronizeDeviceWithTimeout";
 }
 
+bool raw_contains_key_hint(const TraceEvent & event, std::string_view key) {
+    return event.args_json_view().find(key) != std::string_view::npos;
+}
+
 } // namespace dag_builder_detail
 
 using dag_builder_detail::contains_any_hccl_name;
 using dag_builder_detail::event_id_from_cpu_record;
-using dag_builder_detail::event_launch_ts;
+using dag_builder_detail::event_submit_ts;
+using dag_builder_detail::is_submit_anchor_event;
 using dag_builder_detail::is_device_sync_event;
 using dag_builder_detail::is_event_sync_event;
 using dag_builder_detail::is_stream_sync_event;
 using dag_builder_detail::is_usable_lane_value;
 using dag_builder_detail::node_end_ts;
+using dag_builder_detail::raw_contains_key_hint;
+
+namespace {
+
+#ifdef DEBUG
+uint64_t elapsed_ms(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+}
+
+template <typename Fn>
+auto timed_value(uint64_t & target_ms, Fn && fn) {
+    const auto start = std::chrono::steady_clock::now();
+    auto value = std::forward<Fn>(fn)();
+    const auto end = std::chrono::steady_clock::now();
+    target_ms = elapsed_ms(start, end);
+    return value;
+}
+
+template <typename Fn>
+void timed_void(uint64_t & target_ms, Fn && fn) {
+    const auto start = std::chrono::steady_clock::now();
+    std::forward<Fn>(fn)();
+    const auto end = std::chrono::steady_clock::now();
+    target_ms = elapsed_ms(start, end);
+}
+#endif
+
+struct PendingEdge {
+    size_t src = 0;
+    size_t dst = 0;
+    DagEdgeKind kind = DagEdgeKind::Sequential;
+};
+
+struct PendingAttr {
+    size_t node_id = 0;
+    std::string key;
+    std::string value;
+};
+
+struct CorrelationGroupResult {
+    std::string key;
+    std::vector<PendingEdge> edges;
+    std::vector<PendingAttr> attrs;
+};
+
+struct SubmitFrontierNode {
+    size_t node_id = 0;
+    uint64_t effective_submit_ts = 0;
+};
+
+template <typename Result, typename Entry, typename Fn>
+std::vector<Result> map_entries_parallel(const std::vector<Entry> & entries, size_t threads, Fn fn) {
+    std::vector<Result> results;
+    results.reserve(entries.size());
+    if (entries.empty()) return results;
+    const size_t concurrency = std::max<size_t>(1, std::min(threads, entries.size()));
+    if (concurrency == 1 || entries.size() < 64) {
+        for (const auto & entry : entries) results.push_back(fn(entry));
+        return results;
+    }
+
+    std::vector<std::future<std::vector<Result>>> futures;
+    futures.reserve(concurrency);
+    const size_t chunk = (entries.size() + concurrency - 1) / concurrency;
+    for (size_t begin = 0; begin < entries.size(); begin += chunk) {
+        const size_t end = std::min(entries.size(), begin + chunk);
+        futures.push_back(std::async(std::launch::async, [&entries, begin, end, &fn] {
+            std::vector<Result> local;
+            local.reserve(end - begin);
+            for (size_t i = begin; i < end; ++i) local.push_back(fn(entries[i]));
+            return local;
+        }));
+    }
+    for (auto & future : futures) {
+        auto local = future.get();
+        results.insert(results.end(), std::make_move_iterator(local.begin()), std::make_move_iterator(local.end()));
+    }
+    return results;
+}
+
+bool nodes_sorted_by_event_ts(const DagGraph & graph, const std::vector<size_t> & nodes) {
+    return std::ranges::is_sorted(nodes, [&](size_t a, size_t b) {
+        if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
+        return a < b;
+    });
+}
+
+void sort_nodes_by_event_ts_if_needed(const DagGraph & graph, std::vector<size_t> & nodes) {
+    if (nodes.size() <= 1 || nodes_sorted_by_event_ts(graph, nodes)) return;
+    std::ranges::sort(nodes, [&](size_t a, size_t b) {
+        if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
+        return a < b;
+    });
+}
+
+std::optional<std::pair<size_t, std::string>> submit_anchor_before_first_device(const DagGraph & graph, const std::vector<size_t> & nodes) {
+    std::optional<size_t> fallback_cpu;
+    std::optional<size_t> submit_like_cpu;
+    for (size_t node_id : nodes) {
+        const auto & node = graph.node(node_id);
+        if (!node.is_cpu) break;
+        fallback_cpu = node_id;
+        if (is_submit_anchor_event(graph.event_for_node(node_id))) submit_like_cpu = node_id;
+    }
+    if (submit_like_cpu) return std::make_pair(*submit_like_cpu, std::string("submit_like"));
+    if (fallback_cpu) return std::make_pair(*fallback_cpu, std::string("fallback_pre_device_cpu"));
+    return std::nullopt;
+}
+
+void add_submit_attrs_for_device_suffix(const DagGraph & graph, const std::vector<size_t> & nodes, CorrelationGroupResult & result) {
+    auto anchor = submit_anchor_before_first_device(graph, nodes);
+    if (!anchor) return;
+    const auto anchor_node = anchor->first;
+    const auto & anchor_event = graph.event_for_node(anchor_node);
+    const auto submit_ts = std::to_string(anchor_event.ts);
+    for (size_t node_id : nodes) {
+        if (graph.node(node_id).is_cpu) continue;
+        result.attrs.push_back(PendingAttr{ .node_id = node_id, .key = "submitts", .value = submit_ts });
+        result.attrs.push_back(PendingAttr{ .node_id = node_id, .key = "submit_anchor_name", .value = anchor_event.name });
+        result.attrs.push_back(PendingAttr{ .node_id = node_id, .key = "submit_anchor_source", .value = anchor->second });
+    }
+}
+
+uint64_t parse_u64_or_zero(const std::string & value) {
+    if (value.empty()) return 0;
+    try {
+        return std::stoull(value);
+    }
+    catch (...) {
+        return 0;
+    }
+}
+
+std::unordered_map<std::string, std::vector<SubmitFrontierNode>> build_submit_frontiers(
+    const DagGraph & graph,
+    const std::unordered_map<std::string, std::vector<size_t>> & lane_to_nodes) {
+    std::unordered_map<std::string, std::vector<SubmitFrontierNode>> frontiers;
+    frontiers.reserve(lane_to_nodes.size());
+    for (const auto & item : lane_to_nodes) {
+        if (graph.is_cpu_lane(item.first)) continue;
+        uint64_t effective_submit_ts = 0;
+        auto & frontier = frontiers[item.first];
+        frontier.reserve(item.second.size());
+        for (size_t node_id : item.second) {
+            const auto submit_ts = event_submit_ts(graph, node_id);
+            effective_submit_ts = std::max(effective_submit_ts, submit_ts);
+            frontier.push_back(SubmitFrontierNode{ .node_id = node_id, .effective_submit_ts = effective_submit_ts });
+        }
+    }
+    return frontiers;
+}
+
+std::optional<size_t> find_submitted_frontier_node(const std::vector<SubmitFrontierNode> & frontier, uint64_t sync_ts) {
+    auto bound = std::lower_bound(frontier.begin(), frontier.end(), sync_ts, [](const SubmitFrontierNode & node, uint64_t value) {
+        return node.effective_submit_ts < value;
+    });
+    if (bound == frontier.begin()) return std::nullopt;
+    --bound;
+    return bound->node_id;
+}
+
+} // namespace
+
+DagBuilder::DagBuilder(size_t threads) : threads_(std::max<size_t>(1, threads)) {}
 
 DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto parsed_count = events.size();
     auto normalized = normalize_events(std::move(events));
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);
+    graph.reserve(graph.events().size(), graph.events().size() * 3);
 
+    add_base_edges(graph);
+    set_real_e2e_time(graph);
+    return graph;
+}
+
+#ifdef DEBUG
+DagGraph DagBuilder::build_with_timings(std::vector<TraceEvent> events, int gpu_id, BuildTimings & timings) const {
+    auto parsed_count = events.size();
+    auto normalized = timed_value(timings.normalize_ms, [&] { return normalize_events(std::move(events)); });
+    DagGraph graph(std::move(normalized), gpu_id);
+    graph.set_parsed_record_count(parsed_count);
+    graph.reserve(graph.events().size(), graph.events().size() * 3);
+
+    auto index = timed_value(timings.create_nodes_ms, [&] { return create_nodes(graph); });
+    timed_void(timings.correlation_ms, [&] { add_correlation_edges(graph, index); });
+    timed_void(timings.sequential_ms, [&] { add_sequential_edges(graph, index); });
+    timed_void(timings.event_wait_ms, [&] { add_event_wait_edges(graph, index); });
+    timed_void(timings.notify_wait_ms, [&] { add_notify_wait_edges(graph, index); });
+    timed_void(timings.model_execute_ms, [&] { add_model_execute_edges(graph, index); });
+    timed_void(timings.stream_sync_ms, [&] { add_stream_sync_edges(graph, index); });
+    timed_void(timings.event_sync_ms, [&] { add_event_sync_edges(graph, index); });
+    timed_void(timings.device_sync_ms, [&] { add_device_sync_edges(graph, index); });
+    timed_void(timings.finalize_ms, [&] { finalize_sync_nodes(graph, index); });
+    timed_void(timings.real_e2e_ms, [&] { set_real_e2e_time(graph); });
+    return graph;
+}
+#endif
+
+void DagBuilder::add_base_edges(DagGraph & graph) const {
     /**
      * @brief 构图顺序有依赖。
      *
      * 1. create_nodes 建立节点和索引；
-     * 2. correlation 先写 launchts，后续 stream sync 会使用；
+     * 2. correlation 先写 submitts，后续 stream sync 会使用；
      * 3. sequential 写 cpuinterval 和 hccl_sync；
      * 4. sync 类边再消费上面生成的辅助字段；
      * 5. finalize 将 sync 节点耗时统一收敛为固定开销。
@@ -104,7 +322,9 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     add_event_sync_edges(graph, index);
     add_device_sync_edges(graph, index);
     finalize_sync_nodes(graph, index);
+}
 
+void DagBuilder::set_real_e2e_time(DagGraph & graph) {
     /**
      * @brief real_e2e_time 是 trace 自身的真实时间窗口，仅用于 validation 对照。
      *
@@ -121,11 +341,9 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
         has_real_time = true;
     }
     graph.set_real_e2e_time(has_real_time && real_max > real_min ? real_max - real_min : 0);
-    return graph;
 }
 
 std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> events) {
-    std::unordered_map<std::string, std::vector<size_t>> groups_by_ts_dur;
     std::vector<bool> dropped(events.size(), false);
 
     /**
@@ -134,38 +352,58 @@ std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> eve
      * @warning 当前 key 只有 ts+dur，这是为大 trace 性能做的简化；如果不同事件碰巧完全同时间同耗时，
      * 这里可能误合并。是否需要加入 pid/tid/name/correlation 等字段收紧，需要用真实 trace 统计验证。
      */
-    for (const auto i : std::views::iota(size_t{ 0 }, events.size())) {
-        auto key = std::to_string(events[i].ts) + "_" + std::to_string(events[i].dur);
-        groups_by_ts_dur[key].push_back(i);
+    const bool sorted_by_ts = std::ranges::is_sorted(events, [](const TraceEvent & a, const TraceEvent & b) { return a.ts < b.ts; });
+    std::vector<size_t> by_ts;
+    if (!sorted_by_ts) {
+        by_ts.resize(events.size());
+        std::iota(by_ts.begin(), by_ts.end(), size_t{ 0 });
+        std::ranges::sort(by_ts, [&](size_t a, size_t b) { return std::tie(events[a].ts, a) < std::tie(events[b].ts, b); });
     }
-    for (auto & item : groups_by_ts_dur) {
-        auto & indices = item.second;
-        if (indices.size() <= 1) continue;
-        /**
-         * @brief 合并同一时间窗口内 NPU 事件和 wrapper 事件的参数。
-         *
-         * 如果同一时间窗口内存在带 Physic Stream Id 的 NPU 事件，就把其他 wrapper 事件的 args
-         * 合并到这个 NPU 事件上，避免同一 runtime 边界被建成多个可执行节点。
-         */
-        size_t npu_index = static_cast<size_t>(-1);
-        for (size_t index : indices) {
-            if (events[index].has_arg("Physic Stream Id")) {
-                npu_index = index;
-                break;
+
+    auto event_index_at = [&](size_t pos) { return sorted_by_ts ? pos : by_ts[pos]; };
+    for (size_t ts_begin = 0; ts_begin < events.size();) {
+        size_t ts_end = ts_begin + 1;
+        const auto ts = events[event_index_at(ts_begin)].ts;
+        while (ts_end < events.size() && events[event_index_at(ts_end)].ts == ts) ++ts_end;
+        if (ts_end - ts_begin <= 1) {
+            ts_begin = ts_end;
+            continue;
+        }
+
+        std::vector<size_t> by_dur;
+        by_dur.reserve(ts_end - ts_begin);
+        for (size_t pos = ts_begin; pos < ts_end; ++pos) by_dur.push_back(event_index_at(pos));
+        std::ranges::sort(by_dur, [&](size_t a, size_t b) { return std::tie(events[a].dur, a) < std::tie(events[b].dur, b); });
+
+        for (size_t begin = 0; begin < by_dur.size();) {
+            size_t end = begin + 1;
+            while (end < by_dur.size() && events[by_dur[end]].dur == events[by_dur[begin]].dur) ++end;
+            if (end - begin <= 1) {
+                begin = end;
+                continue;
             }
+            size_t npu_index = static_cast<size_t>(-1);
+            for (size_t pos = begin; pos < end; ++pos) {
+                size_t index = by_dur[pos];
+                if (events[index].has_arg("Physic Stream Id")) {
+                    npu_index = index;
+                    break;
+                }
+            }
+            if (npu_index == static_cast<size_t>(-1)) {
+                begin = end;
+                continue;
+            }
+            for (size_t pos = begin; pos < end; ++pos) {
+                size_t index = by_dur[pos];
+                if (index == npu_index) continue;
+                events[npu_index].merge_args_from(events[index]);
+                if (events[index].tid == "0") events[npu_index].name = events[index].name;
+                dropped[index] = true;
+            }
+            begin = end;
         }
-        if (npu_index == static_cast<size_t>(-1)) continue;
-        for (size_t index : indices) {
-            if (index == npu_index) continue;
-            for (const auto & kv : events[index].args) events[npu_index].args[kv.first] = kv.second;
-            /**
-             * @brief 老 trace 中 tid=0 的 CPU wrapper 名称通常更接近 runtime API 名称。
-             *
-             * 这里保留其 name，方便后续特殊事件识别。
-             */
-            if (events[index].tid == "0") events[npu_index].name = events[index].name;
-            dropped[index] = true;
-        }
+        ts_begin = ts_end;
     }
 
     std::vector<TraceEvent> deduped;
@@ -174,11 +412,27 @@ std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> eve
         if (dropped[i] && !is_hicache_event(events[i])) continue;
         deduped.push_back(std::move(events[i]));
     }
-    std::ranges::sort(deduped, [](const TraceEvent & a, const TraceEvent & b) {
-        if (a.ts != b.ts) return a.ts < b.ts;
-        if (a.dur != b.dur) return a.dur > b.dur;
-        return a.index < b.index;
-    });
+    if (!sorted_by_ts) {
+        std::ranges::sort(deduped, [](const TraceEvent & a, const TraceEvent & b) {
+            if (a.ts != b.ts) return a.ts < b.ts;
+            if (a.dur != b.dur) return a.dur > b.dur;
+            return a.index < b.index;
+        });
+    }
+    else {
+        for (size_t begin = 0; begin < deduped.size();) {
+            size_t end = begin + 1;
+            while (end < deduped.size() && deduped[end].ts == deduped[begin].ts) ++end;
+            if (end - begin > 1) {
+                std::sort(deduped.begin() + static_cast<std::ptrdiff_t>(begin), deduped.begin() + static_cast<std::ptrdiff_t>(end),
+                          [](const TraceEvent & a, const TraceEvent & b) {
+                              if (a.dur != b.dur) return a.dur > b.dur;
+                              return a.index < b.index;
+                          });
+            }
+            begin = end;
+        }
+    }
 
     /**
      * @brief 按 lane 建立 CPU 嵌套过滤所需的局部序列。
@@ -187,10 +441,12 @@ std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> eve
      */
     std::unordered_map<std::string, std::vector<size_t>> lane_to_indices;
     std::unordered_set<std::string> cpu_lanes;
+    std::vector<bool> device_event(deduped.size(), false);
     for (const auto i : std::views::iota(size_t{ 0 }, deduped.size())) {
-        auto lane = lane_key(deduped[i]);
+        device_event[i] = is_device_event(deduped[i]);
+        auto lane = lane_key(deduped[i], device_event[i]);
         lane_to_indices[lane].push_back(i);
-        if (!is_device_event(deduped[i])) cpu_lanes.insert(lane);
+        if (!device_event[i]) cpu_lanes.insert(lane);
     }
 
     std::vector<bool> is_leaf(deduped.size(), true);
@@ -248,24 +504,13 @@ std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> eve
                     /**
                      * @brief 子事件缺 correlation_id 时继承父事件 id，让后续 launch->kernel 链仍能连起来。
                      */
-                    if (top.has_arg("correlation_id") && !curr.has_arg("correlation_id")) curr.args["correlation_id"] = top.arg("correlation_id");
+                    if (top.has_arg("correlation_id") && !curr.has_arg("correlation_id")) curr.set_arg("correlation_id", top.arg("correlation_id"));
                     break;
                 }
                 stack.pop_back();
             }
 
             if (discarded[curr_idx]) continue;
-            if (!stack.empty()) {
-                /**
-                 * @brief parent_seq 只用于 debug/导出，帮助审查某个 CPU leaf 是从哪条嵌套路径保留下来的。
-                 */
-                std::string parent_seq;
-                for (size_t i = 0; i < stack.size(); ++i) {
-                    if (i > 0) parent_seq += " -> ";
-                    parent_seq += deduped[stack[i]].name + "(" + std::to_string(stack[i]) + ")";
-                }
-                curr.args["parent_seq"] = parent_seq;
-            }
             stack.push_back(curr_idx);
         }
     }
@@ -283,22 +528,27 @@ bool DagBuilder::is_device_event(const TraceEvent & event) {
     /**
      * @brief Physic Stream Id 是 CANN/Ascend 侧最明确的 device 执行证据。
      */
-    if (event.has_arg("Physic Stream Id")) return true;
+    if (raw_contains_key_hint(event, "Physic Stream Id") && event.has_arg("Physic Stream Id")) return true;
     /**
      * @brief 部分 torch trace 没有 Physic Stream Id，但 Kernel/cpu_op 带 streamId 时也应进入 device lane。
      */
-    if ((event.cat == "Kernel" || event.cat == "cpu_op") && event.has_arg("streamId")) return true;
+    if ((event.cat == "Kernel" || event.cat == "cpu_op") && raw_contains_key_hint(event, "streamId") && event.has_arg("streamId")) return true;
     return false;
 }
 
 bool DagBuilder::is_hicache_event(const TraceEvent & event) {
+    if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) return true;
+    if (!raw_contains_key_hint(event, "domain") && !raw_contains_key_hint(event, "python_probe")) return false;
     auto domain = event.arg("domain");
-    return event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_") || domain == "hicache"
-           || (domain == "python_probe" && event.name.contains("hicache"));
+    return domain == "hicache" || (domain == "python_probe" && event.name.contains("hicache"));
 }
 
 std::string DagBuilder::lane_key(const TraceEvent & event) {
-    if (!is_device_event(event)) return "CPU_MERGED";
+    return lane_key(event, is_device_event(event));
+}
+
+std::string DagBuilder::lane_key(const TraceEvent & event, bool is_device) {
+    if (!is_device) return "CPU_MERGED";
     /**
      * @brief 对齐老版 TraceGraph 的 device lane 选择规则。
      *
@@ -307,9 +557,12 @@ std::string DagBuilder::lane_key(const TraceEvent & event) {
      * args["tid"]，这里必须直接读 event.tid，避免 args fallback 抢先命中。
      */
     if (is_usable_lane_value(event.tid)) return event.tid;
-    auto stream_id = event.arg("streamId", event.arg("stream id"));
+    std::string stream_id;
+    if (raw_contains_key_hint(event, "streamId")) stream_id = event.arg("streamId");
+    if (!is_usable_lane_value(stream_id) && raw_contains_key_hint(event, "stream id")) stream_id = event.arg("stream id");
     if (is_usable_lane_value(stream_id)) return stream_id;
-    auto physic_stream_id = event.arg("Physic Stream Id");
+    std::string physic_stream_id;
+    if (raw_contains_key_hint(event, "Physic Stream Id")) physic_stream_id = event.arg("Physic Stream Id");
     if (is_usable_lane_value(physic_stream_id)) return physic_stream_id;
     return "NPU_UNKNOWN";
 }
@@ -318,13 +571,20 @@ std::string DagBuilder::event_arg(const TraceEvent & event, const std::string & 
 
 DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
     BuildIndex index;
+    index.lane_to_nodes.reserve(256);
+    index.raw_stream_to_stream.reserve(256);
+    index.stream_alias_to_lane.reserve(512);
+    index.device_sync_nodes.reserve(16);
+    index.notify_record_nodes.reserve(64);
+    index.notify_wait_nodes.reserve(64);
+    index.model_execute_nodes.reserve(64);
     std::string cpu_merged_pid = "-1";
     std::string cpu_merged_tid = "-1";
 
     for (const auto event_index : std::views::iota(size_t{ 0 }, graph.events().size())) {
         auto & event = graph.mutable_event(event_index);
         bool is_device = is_device_event(event);
-        auto lane = lane_key(event);
+        auto lane = lane_key(event, is_device);
         auto node_id = graph.add_node(event_index, !is_device, lane);
         auto & node = graph.mutable_node(node_id);
         index.lane_to_nodes[lane].push_back(node_id);
@@ -352,15 +612,19 @@ DagBuilder::BuildIndex DagBuilder::create_nodes(DagGraph & graph) const {
              * 或 LD_PRELOAD 的 Raw Stream 描述。这里登记可确认别名，供 sync wrapper 反查真实 lane。
              */
             if (is_usable_lane_value(event.tid)) index.stream_alias_to_lane[event.tid] = lane;
-            auto stream_id = event.arg("streamId");
-            if (is_usable_lane_value(stream_id)) index.stream_alias_to_lane[stream_id] = lane;
-            auto stream_id_alt = event.arg("stream id");
-            if (is_usable_lane_value(stream_id_alt)) index.stream_alias_to_lane[stream_id_alt] = lane;
-            auto physic_stream_id = event.arg("Physic Stream Id");
-            if (is_usable_lane_value(physic_stream_id)) index.stream_alias_to_lane[physic_stream_id] = lane;
+            if (raw_contains_key_hint(event, "streamId")) {
+                auto stream_id = event.arg("streamId");
+                if (is_usable_lane_value(stream_id)) index.stream_alias_to_lane[stream_id] = lane;
+            }
+            if (raw_contains_key_hint(event, "stream id")) {
+                auto stream_id_alt = event.arg("stream id");
+                if (is_usable_lane_value(stream_id_alt)) index.stream_alias_to_lane[stream_id_alt] = lane;
+            }
+            if (raw_contains_key_hint(event, "Physic Stream Id")) {
+                auto physic_stream_id = event.arg("Physic Stream Id");
+                if (is_usable_lane_value(physic_stream_id)) index.stream_alias_to_lane[physic_stream_id] = lane;
+            }
         }
-        if (event.has_arg("parent_seq")) node.attrs["parent_seq"] = event.arg("parent_seq");
-
         /**
          * @brief connection_id/correlation_id 后续都用于建立 CPU runtime 与 device event 的因果链。
          */
@@ -401,21 +665,21 @@ void DagBuilder::add_correlation_edges(DagGraph & graph, BuildIndex & index) con
      * correlation_id 是 torch profiler 中 CPU runtime 与 device kernel 的常见关联字段。
      * 同一个 id 下按时间排序后串起来，表示 launch/runtime/kernel 的提交链。
      */
+    std::vector<std::pair<std::string, std::vector<size_t> *>> correlation_entries;
+    correlation_entries.reserve(index.correlation_to_nodes.size());
     for (auto & item : index.correlation_to_nodes) {
-        auto & nodes = item.second;
-        if (nodes.size() <= 1) continue;
-        std::ranges::sort(nodes, [&](size_t a, size_t b) {
-            if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
-            return a < b;
-        });
-        for (size_t i = 1; i < nodes.size(); ++i) {
-            /**
-             * @brief launchts 记录这条链的第一个事件时间，用于后续 stream sync 匹配。
-             */
-            graph.mutable_event_for_node(nodes[i]).args["launchts"] = std::to_string(graph.event_for_node(nodes.front()).ts);
-            graph.add_edge(nodes[i - 1], nodes[i], DagEdgeKind::Correlation);
-        }
+        if (item.second.size() > 1) correlation_entries.push_back({ item.first, &item.second });
     }
+    auto correlation_results = map_entries_parallel<CorrelationGroupResult>(correlation_entries, threads_, [&](const auto & item) {
+        auto & nodes = *item.second;
+        sort_nodes_by_event_ts_if_needed(graph, nodes);
+        CorrelationGroupResult result{ .key = item.first };
+        result.edges.reserve(nodes.size() - 1);
+        result.attrs.reserve(nodes.size() - 1);
+        add_submit_attrs_for_device_suffix(graph, nodes, result);
+        for (size_t i = 1; i < nodes.size(); ++i) result.edges.push_back(PendingEdge{ .src = nodes[i - 1], .dst = nodes[i], .kind = DagEdgeKind::Correlation });
+        return result;
+    });
 
     /**
      * @brief 根据 connection_id 建立 CANN runtime 与 device event 的连接链。
@@ -423,18 +687,52 @@ void DagBuilder::add_correlation_edges(DagGraph & graph, BuildIndex & index) con
      * 如果链长度 >=3 且首个事件不是 Node@launch，容易把不相关 runtime 误串起来，
      * 因此这类链不作为可靠的提交证据。
      */
+    std::vector<std::pair<std::string, std::vector<size_t> *>> connection_entries;
+    connection_entries.reserve(index.connection_to_nodes.size());
     for (auto & item : index.connection_to_nodes) {
-        auto & nodes = item.second;
-        if (nodes.size() <= 1) continue;
-        std::ranges::sort(nodes, [&](size_t a, size_t b) {
-            if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
-            return a < b;
-        });
-        if (nodes.size() >= 3 && graph.event_for_node(nodes.front()).name != "Node@launch") continue;
-        auto launch_ts = graph.event_for_node(nodes.front()).ts;
-        for (size_t node_id : nodes) graph.mutable_event_for_node(node_id).args["launchts"] = std::to_string(launch_ts);
-        for (size_t i = 1; i < nodes.size(); ++i) graph.add_edge(nodes[i - 1], nodes[i], DagEdgeKind::Correlation);
+        if (item.second.size() > 1) connection_entries.push_back({ item.first, &item.second });
     }
+    auto connection_results = map_entries_parallel<CorrelationGroupResult>(connection_entries, threads_, [&](const auto & item) {
+        auto & nodes = *item.second;
+        sort_nodes_by_event_ts_if_needed(graph, nodes);
+        CorrelationGroupResult result{ .key = item.first };
+        if (nodes.size() >= 3 && graph.event_for_node(nodes.front()).name != "Node@launch") {
+            return result;
+        }
+        result.attrs.reserve(nodes.size() * 3);
+        add_submit_attrs_for_device_suffix(graph, nodes, result);
+        result.edges.reserve(nodes.size() - 1);
+        for (size_t i = 1; i < nodes.size(); ++i) result.edges.push_back(PendingEdge{ .src = nodes[i - 1], .dst = nodes[i], .kind = DagEdgeKind::Correlation });
+        return result;
+    });
+
+    auto apply_correlation_results = [&](std::vector<CorrelationGroupResult> & results, auto & target) {
+        std::ranges::sort(results, [](const auto & a, const auto & b) { return a.key < b.key; });
+        for (const auto & result : results) {
+            for (size_t i = 0; i < result.attrs.size(); ++i) {
+                const auto & attr = result.attrs[i];
+                if (attr.key != "submitts") {
+                    graph.mutable_event_for_node(attr.node_id).set_arg(attr.key, attr.value);
+                    continue;
+                }
+                auto & event = graph.mutable_event_for_node(attr.node_id);
+                const auto current_submit_ts = event.arg_u64("submitts", 0);
+                const auto next_submit_ts = parse_u64_or_zero(attr.value);
+                if (current_submit_ts > 0 && current_submit_ts >= next_submit_ts) {
+                    while (i + 1 < result.attrs.size() && result.attrs[i + 1].node_id == attr.node_id && result.attrs[i + 1].key != "submitts") ++i;
+                    continue;
+                }
+                event.set_arg(attr.key, attr.value);
+                for (size_t j = i + 1; j < result.attrs.size() && result.attrs[j].node_id == attr.node_id && result.attrs[j].key != "submitts"; ++j) {
+                    graph.mutable_event_for_node(result.attrs[j].node_id).set_arg(result.attrs[j].key, result.attrs[j].value);
+                    i = j;
+                }
+            }
+            for (const auto & edge : result.edges) graph.add_edge(edge.src, edge.dst, edge.kind);
+        }
+    };
+    apply_correlation_results(correlation_results, index.correlation_to_nodes);
+    apply_correlation_results(connection_results, index.connection_to_nodes);
 }
 
 void DagBuilder::add_sequential_edges(DagGraph & graph, BuildIndex & index) const {
@@ -447,23 +745,12 @@ void DagBuilder::add_sequential_edges(DagGraph & graph, BuildIndex & index) cons
     for (auto & item : index.lane_to_nodes) {
         auto & nodes = item.second;
         bool is_cpu = graph.is_cpu_lane(item.first);
-        std::ranges::sort(nodes, [&](size_t a, size_t b) {
-            if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
-            return a < b;
-        });
+        sort_nodes_by_event_ts_if_needed(graph, nodes);
         if (nodes.empty()) continue;
 
         for (size_t i = 0; i < nodes.size(); ++i) {
             auto node_id = nodes[i];
-            auto & node = graph.mutable_node(node_id);
             const auto & event = graph.event_for_node(node_id);
-            node.attrs["tid"] = item.first;
-            node.attrs["name"] = event.name;
-            node.attrs["cat"] = event.cat;
-            node.attrs["time"] = std::to_string(event.dur);
-            node.attrs["ori_time"] = node.attrs["time"];
-            node.duration = event.dur;
-            node.original_duration = event.dur;
 
             if (i == 0) continue;
             auto prev_node_id = nodes[i - 1];
@@ -627,6 +914,7 @@ void DagBuilder::add_stream_sync_edges(DagGraph & graph, BuildIndex & index) con
      * aclrtSynchronizeStream 表示 CPU 等待某个 stream 上已经提交的工作完成。因此需要把目标 lane 上
      * sync 开始前最近的 device 节点连到这个 CPU sync 节点。
      */
+    const auto submit_frontiers = build_submit_frontiers(graph, index.lane_to_nodes);
     for (size_t sync_node : index.stream_sync_nodes) {
         auto & sync_event = graph.mutable_event_for_node(sync_node);
         std::vector<std::string> target_lanes;
@@ -663,18 +951,11 @@ void DagBuilder::add_stream_sync_edges(DagGraph & graph, BuildIndex & index) con
         }
 
         for (const auto & lane : target_lanes) {
-            auto & nodes = index.lane_to_nodes[lane];
-            /**
-             * @brief lower_bound 查找 launch time 早于 sync 开始的最后一个节点。
-             *
-             * 使用 launchts 而不是 event.ts，是为了把 CPU launch 与 device kernel 的提交关系考虑进去。
-             */
-            auto bound = std::lower_bound(nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) {
-                return event_launch_ts(graph, node_id) < value;
-            });
-            if (bound == nodes.begin()) continue;
-            --bound;
-            graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
+            auto frontier_it = submit_frontiers.find(lane);
+            if (frontier_it == submit_frontiers.end()) continue;
+            auto submitted_node = find_submitted_frontier_node(frontier_it->second, sync_event.ts);
+            if (!submitted_node) continue;
+            graph.add_edge(*submitted_node, sync_node, DagEdgeKind::Sync);
         }
     }
 }
@@ -715,17 +996,16 @@ void DagBuilder::add_device_sync_edges(DagGraph & graph, BuildIndex & index) con
      * aclrtSynchronizeDevice 等价于 CPU 等待当前 device 上所有已提交 stream。在单 rank graph 内
      * 保守连接每条 device lane 上 sync 开始前最近的节点。
      */
+    const auto submit_frontiers = build_submit_frontiers(graph, index.lane_to_nodes);
     for (size_t sync_node : index.device_sync_nodes) {
         const auto & sync_event = graph.event_for_node(sync_node);
         for (const auto & item : index.lane_to_nodes) {
             if (graph.is_cpu_lane(item.first)) continue;
-            auto & nodes = index.lane_to_nodes[item.first];
-            auto bound = std::lower_bound(nodes.begin(), nodes.end(), sync_event.ts, [&](size_t node_id, uint64_t value) {
-                return event_launch_ts(graph, node_id) < value;
-            });
-            if (bound == nodes.begin()) continue;
-            --bound;
-            graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
+            auto frontier_it = submit_frontiers.find(item.first);
+            if (frontier_it == submit_frontiers.end()) continue;
+            auto submitted_node = find_submitted_frontier_node(frontier_it->second, sync_event.ts);
+            if (!submitted_node) continue;
+            graph.add_edge(*submitted_node, sync_node, DagEdgeKind::Sync);
         }
     }
 }

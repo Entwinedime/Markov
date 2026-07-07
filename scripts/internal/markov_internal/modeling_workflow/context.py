@@ -29,9 +29,9 @@ class WorkflowOptions:
     max_predictions: int = 0
     page_key_mode: str = "strip_scope"
     sample_limit: int = 20
-    emit_transition_catalog: bool = False
-    emit_transition_gates: bool = False
-    show_workload_sequence: bool = False
+    trace_threads: int = 1
+    trace_file_threads: int = 1
+    model_run_jobs: int = 1
 
 
 @dataclass

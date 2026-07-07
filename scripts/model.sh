@@ -2,7 +2,7 @@
 # 从宿主机进入 modeling 容器，执行 JSON 配置驱动的 modeling run。
 #
 # 外层入口只负责编排 Docker service、路径投影和容器标记。真实配置解析、
-# trace merge、C++ TraceGraph 调用与 validation 输出都保留在容器内
+# C++ TraceGraph 调用与 validation 输出都保留在容器内
 # `scripts/internal/entrypoints/model.py` 中，避免宿主机 Python/C++ 环境成为隐式依赖。
 set -euo pipefail
 

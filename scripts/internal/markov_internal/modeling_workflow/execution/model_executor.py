@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -33,21 +34,88 @@ class ModelRunExecutor:
         progress = self.context.reporter.start_stage(
             "model-runs",
             len(self.specs),
-            f"validations {','.join(self.context.options.validations)}",
+            f"validations {','.join(self.context.options.validations)} | jobs {self.context.options.model_run_jobs}",
             unit="run",
         )
+        if self.context.options.model_run_jobs > 1:
+            return self._run_parallel(progress)
+        return self._run_serial(progress)
+
+    def _run_serial(self, progress: Any) -> dict[str, ModelRunResult]:
+        """顺序执行 model-runs。"""
+
         for spec in self.specs:
             result = self._run_one(spec)
-            self.results[spec.run_id] = result
-            self.rows.append(self._row(result))
-            progress.advance(self._running_metrics())
-            if result.return_code != 0 and not self.context.options.continue_on_error:
-                self._write_summary()
-                progress.finish("ERROR", self._done_text())
-                raise SystemExit(f"Model run failed: {spec.label}; see {result.artifacts.model_log}")
+            self._record_result(result, progress)
+            self._raise_if_failed(result, progress)
         summary = self._write_summary()
         progress.finish(self._status(summary), self._done_text())
         return self.results
+
+    def _run_parallel(self, progress: Any) -> dict[str, ModelRunResult]:
+        """并发执行 model-runs。"""
+
+        max_workers = min(self.context.options.model_run_jobs, max(1, len(self.specs)))
+        stop_after_failure = False
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures: dict[concurrent.futures.Future[ModelRunResult], ModelRunSpec] = {}
+            pending = iter(self.specs)
+            while len(futures) < max_workers:
+                try:
+                    spec = next(pending)
+                except StopIteration:
+                    break
+                futures[executor.submit(self._run_one, spec)] = spec
+            while futures:
+                done, _pending = concurrent.futures.wait(
+                    futures,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for future in done:
+                    spec = futures.pop(future)
+                    if future.cancelled():
+                        continue
+                    result = future.result()
+                    self._record_result(result, progress, inflight=len(futures))
+                    if result.return_code != 0 and not self.context.options.continue_on_error:
+                        stop_after_failure = True
+                        continue
+                    if stop_after_failure:
+                        continue
+                    try:
+                        next_spec = next(pending)
+                    except StopIteration:
+                        continue
+                    futures[executor.submit(self._run_one, next_spec)] = next_spec
+                if stop_after_failure:
+                    for future in list(futures):
+                        if future.cancel():
+                            futures.pop(future, None)
+        summary = self._write_summary()
+        if summary.get("error_count") and not self.context.options.continue_on_error:
+            progress.finish("ERROR", self._done_text())
+            failed = next((result for result in self.results.values() if result.return_code != 0), None)
+            if failed is not None:
+                raise SystemExit(f"Model run failed: {failed.spec.label}; see {failed.artifacts.model_log}")
+            raise SystemExit("Model run failed.")
+        progress.finish(self._status(summary), self._done_text())
+        return self.results
+
+    def _record_result(self, result: ModelRunResult, progress: Any, *, inflight: int = 0) -> None:
+        """记录一次执行结果并推进进度。"""
+
+        self.results[result.spec.run_id] = result
+        self.rows.append(self._row(result))
+        progress.advance(self._running_metrics(inflight=inflight))
+
+    def _raise_if_failed(self, result: ModelRunResult, progress: Any) -> None:
+        """在非 continue-on-error 模式下处理失败。"""
+
+        if result.return_code == 0 or self.context.options.continue_on_error:
+            return
+        self._write_summary()
+        progress.finish("ERROR", self._done_text())
+        raise SystemExit(f"Model run failed: {result.spec.label}; see {result.artifacts.model_log}")
 
     def _run_one(self, spec: ModelRunSpec) -> ModelRunResult:
         spec.output_dir.mkdir(parents=True, exist_ok=True)
@@ -115,9 +183,11 @@ class ModelRunExecutor:
             row["execution_error_tail"] = result.execution_error_tail
         return row
 
-    def _running_metrics(self) -> dict[str, Any]:
+    def _running_metrics(self, *, inflight: int = 0) -> dict[str, Any]:
         stats = self._stats()
         metrics: dict[str, Any] = {"usable": count_text(stats["usable_count"], stats["runnable_count"])}
+        if self.context.options.model_run_jobs > 1:
+            metrics["inflight"] = str(inflight)
         if stats["skipped_count"]:
             metrics["skipped"] = str(stats["skipped_count"])
         if stats["error_count"]:
@@ -126,11 +196,13 @@ class ModelRunExecutor:
 
     def _write_summary(self) -> dict[str, Any]:
         stats = self._stats()
+        order = {spec.run_id: index for index, spec in enumerate(self.specs)}
+        rows = sorted(self.rows, key=lambda row: order.get(str(row.get("model_run_id")), len(order)))
         summary = {
             "schema": "trace_sim.modeling_workflow.model_runs.v1",
-            "run_count": len(self.rows),
+            "run_count": len(rows),
             **stats,
-            "rows": self.rows,
+            "rows": rows,
         }
         write_json(self.context.artifacts.model_runs_summary_path, summary)
         return summary

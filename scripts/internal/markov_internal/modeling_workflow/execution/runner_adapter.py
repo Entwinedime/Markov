@@ -18,7 +18,7 @@ class RunnerConfigBuilder:
     spec: ModelRunSpec
 
     def write_config(self, path: Path) -> Path:
-        """写出 `scripts/model.sh --config` 消费的 JSON。"""
+        """写出底层 modeling runner 消费的 JSON。"""
 
         write_json(path, self.payload())
         return path
@@ -47,6 +47,9 @@ class RunnerConfigBuilder:
             "mode": self.spec.mode,
             "cpp_trace_graph": {
                 "backend_kind": "validation" if self._requires_validation_backend() else "release",
+                "threads": self.spec.trace_threads,
+                "file_threads": self.spec.trace_file_threads,
+                "trace_channels": list(self.spec.trace_channels),
             },
             "outputs": outputs,
         }
@@ -58,8 +61,7 @@ class RunnerConfigBuilder:
     def command(self, runner_config_path: Path) -> list[str]:
         """构造当前底层建模执行命令。"""
 
-        command = [
-            str(ROOT_DIR / "scripts/model.sh"),
+        command = self._runner_entrypoint() + [
             "--config",
             str(runner_config_path),
             "--profile-manifest",
@@ -74,6 +76,11 @@ class RunnerConfigBuilder:
             for oracle_path in target.python_probe_files:
                 command.extend(["--hicache-oracle-trace", str(oracle_path)])
         return command
+
+    def _runner_entrypoint(self) -> list[str]:
+        """返回宿主侧单次 modeling runner 入口。"""
+
+        return [str(ROOT_DIR / "scripts/model.sh")]
 
     def _outputs_for_requirements(self) -> dict[str, bool]:
         requirements = self.spec.output_requirements

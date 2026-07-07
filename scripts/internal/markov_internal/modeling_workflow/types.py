@@ -73,6 +73,9 @@ class ModelRunSpec:
     output_dir: Path
     prediction: CacheStatePredictionRef | None = None
     skip_reason: str = ""
+    trace_threads: int = 1
+    trace_file_threads: int = 1
+    trace_channels: tuple[str, ...] = ()
 
     @property
     def label(self) -> str:

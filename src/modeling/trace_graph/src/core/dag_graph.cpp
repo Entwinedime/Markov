@@ -66,6 +66,11 @@ using dag_graph_detail::node_time;
 
 DagGraph::DagGraph(std::vector<TraceEvent> events, int gpu_id) : events_(std::move(events)), gpu_id_(gpu_id) {}
 
+void DagGraph::reserve(size_t node_capacity, size_t edge_capacity) {
+    nodes_.reserve(node_capacity);
+    edges_.reserve(edge_capacity);
+}
+
 size_t DagGraph::add_node(size_t event_index, bool is_cpu, const std::string & lane_key) {
     if (event_index >= events_.size()) { throw std::out_of_range("event index out of range while adding DAG node"); }
     size_t node_id = nodes_.size();
@@ -78,17 +83,6 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, const std::string & l
     node.lane_key = lane_key;
     node.duration = event.dur;
     node.original_duration = event.dur;
-    /**
-     * @brief attrs["time"] / attrs["ori_time"] 是老版 TraceGraph 与 NodeScaleModule 都会读取的字段。
-     *
-     * duration 字段和 attrs["time"] 必须保持同步，否则拓扑仿真和 debug 输出会看到不同耗时。
-     */
-    node.attrs["time"] = std::to_string(event.dur);
-    node.attrs["ori_time"] = std::to_string(event.dur);
-    node.attrs["tid"] = lane_key;
-    node.attrs["name"] = event.name;
-    node.attrs["cat"] = event.cat;
-    if (!is_cpu) node.attrs["gpuid"] = std::to_string(gpu_id_);
     nodes_.push_back(std::move(node));
     if (is_cpu) cpu_lanes_.insert(lane_key);
     return node_id;
@@ -158,23 +152,19 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     if (graphs.size() == 1) return std::move(graphs.front());
 
     /**
-     * @brief 先合并事件数组，再按 offset 平移每个子图的 node id / event_index / edge endpoint。
+     * @brief 先按 offset 平移每个子图的 node id / event_index / edge endpoint，并在原 graph 上收集 merge 索引。
      *
-     * 这样每个 per-rank graph 内部的边保持不变，后面只追加跨 rank 边。
+     * 事件数组最后再 move 到 merged graph，避免复制数百万 TraceEvent，也避免读取 moved-from 事件。
      */
-    std::vector<TraceEvent> merged_events;
     const auto total_events =
         std::accumulate(graphs.begin(), graphs.end(), size_t{ 0 }, [](size_t total, const auto & graph) { return total + graph.events_.size(); });
-    merged_events.reserve(total_events);
-    std::ranges::for_each(graphs, [&](const auto & graph) {
-        for (const auto & event : graph.events_) {
-            TraceEvent copy = event;
-            copy.index = merged_events.size();
-            merged_events.push_back(std::move(copy));
-        }
-    });
-
-    DagGraph merged(std::move(merged_events), 0);
+    const auto total_nodes =
+        std::accumulate(graphs.begin(), graphs.end(), size_t{ 0 }, [](size_t total, const auto & graph) { return total + graph.nodes_.size(); });
+    const auto total_edges =
+        std::accumulate(graphs.begin(), graphs.end(), size_t{ 0 }, [](size_t total, const auto & graph) { return total + graph.edges_.size(); });
+    DagGraph merged({}, 0);
+    merged.events_.reserve(total_events);
+    merged.reserve(total_nodes, total_edges);
     size_t event_offset = 0;
     size_t node_offset = 0;
     std::vector<size_t> node_offsets(graphs.size() + 1, 0);
@@ -200,11 +190,8 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
                               [&](const auto & edge) { merged.edges_.push_back(DagEdge{ edge.src + node_offset, edge.dst + node_offset, edge.kind }); });
         merged.cpu_lanes_.insert(graph.cpu_lanes_.begin(), graph.cpu_lanes_.end());
         for (const auto & node : graph.nodes_) {
-            auto it = node.attrs.find("name");
-            if (it != node.attrs.end() && !node.is_cpu && contains_hccl_name(it->second)) {
-                hccl_groups[it->second][static_cast<int>(graph_index)].push_back(node.id + node_offset);
-            }
             const auto & event = graph.event_for_node(node.id);
+            if (!node.is_cpu && contains_hccl_name(event.name)) { hccl_groups[event.name][static_cast<int>(graph_index)].push_back(node.id + node_offset); }
             if (!has_real_time || event.ts < real_min) real_min = event.ts;
             auto event_end = event.ts + event.dur;
             if (event_end > real_max) real_max = event_end;
@@ -214,6 +201,12 @@ DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
         node_offset += graph.nodes_.size();
     }
     node_offsets[graphs.size()] = node_offset;
+    for (auto & graph : graphs) {
+        for (auto & event : graph.events_) {
+            event.index = merged.events_.size();
+            merged.events_.push_back(std::move(event));
+        }
+    }
     merged.real_e2e_time_ = has_real_time && real_max > real_min ? real_max - real_min : 0;
 
     /**

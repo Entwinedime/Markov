@@ -11,6 +11,10 @@
 #include <unordered_map>
 #include <vector>
 
+#ifdef DEBUG
+#include <cstdint>
+#endif
+
 namespace markov::trace_graph::core {
 
 /**
@@ -27,8 +31,32 @@ namespace markov::trace_graph::core {
  */
 class DagBuilder {
 public:
+    /** @brief threads 控制单 logical input 内部可并行构图阶段的最大并行度。 */
+    explicit DagBuilder(size_t threads = 1);
+
     /** @brief 构建单 rank / 单输入 trace 的 base DAG。 */
     [[nodiscard]] DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
+
+#ifdef DEBUG
+    /** @brief 单个 logical input 的 DAG build 子阶段耗时，单位毫秒；只用于 validation/debug build。 */
+    struct BuildTimings {
+        uint64_t normalize_ms = 0;
+        uint64_t create_nodes_ms = 0;
+        uint64_t correlation_ms = 0;
+        uint64_t sequential_ms = 0;
+        uint64_t event_wait_ms = 0;
+        uint64_t notify_wait_ms = 0;
+        uint64_t model_execute_ms = 0;
+        uint64_t stream_sync_ms = 0;
+        uint64_t event_sync_ms = 0;
+        uint64_t device_sync_ms = 0;
+        uint64_t finalize_ms = 0;
+        uint64_t real_e2e_ms = 0;
+    };
+
+    /** @brief 构建 DAG 并记录 Debug/validation 使用的阶段耗时。 */
+    [[nodiscard]] DagGraph build_with_timings(std::vector<TraceEvent> events, int gpu_id, BuildTimings & timings) const;
+#endif
 
 private:
     /**
@@ -83,9 +111,16 @@ private:
 
     /** @brief 计算顺序边使用的资源身份；该函数是 faithful replay 精度的关键点。 */
     [[nodiscard]] static std::string lane_key(const TraceEvent & event);
+    [[nodiscard]] static std::string lane_key(const TraceEvent & event, bool is_device);
 
     /** @brief 从统一 args 表读取事件参数；只在缺失时返回 fallback。 */
     [[nodiscard]] static std::string event_arg(const TraceEvent & event, const std::string & key, const std::string & fallback = "");
+
+    /** @brief 对已经初始化好的 graph 添加 base DAG 边。 */
+    void add_base_edges(DagGraph & graph) const;
+
+    /** @brief 从 trace timestamp 窗口计算真实 E2E；该值是模型语义，不是性能 profiling timing。 */
+    static void set_real_e2e_time(DagGraph & graph);
 
     /**
      * @name 构图阶段
@@ -124,6 +159,8 @@ private:
     /** @brief 把同步 wait 节点耗时压缩为固定开销，避免重复计入观测阻塞。 */
     void finalize_sync_nodes(DagGraph & graph, const BuildIndex & index) const;
     /** @} */
+
+    size_t threads_ = 1;
 };
 
 } // namespace markov::trace_graph::core

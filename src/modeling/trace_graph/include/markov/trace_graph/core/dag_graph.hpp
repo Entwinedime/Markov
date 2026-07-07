@@ -38,21 +38,29 @@ struct DagEdge {
  */
 struct DagNode {
     size_t id = 0;
+
     /** @brief 指向 events_ 中的原始事件；merge 多 rank 时会随 event_offset 重写。 */
     size_t event_index = 0;
+
     /** @brief 单输入 trace 构图时由 CLI 输入序号生成；merge 后主要用于输出和 HCCL 分组。 */
     int gpu_id = 0;
+
     /** @brief CPU 节点和 device 节点的顺序约束不同：CPU 使用 Sequential，device 使用 Stream。 */
     bool is_cpu = true;
+
     /** @brief 逻辑执行 lane；CPU 当前可以被合并为 CPU_MERGED，device lane 通常来自 tid/stream。 */
     std::string lane_key;
+
     /** @brief 当前用于仿真的耗时；子模块修改 duration 时必须同步 attrs["time"]。 */
     uint64_t duration = 0;
+
     /** @brief 原始耗时，用于 what-if 缩放和 debug 对比。 */
     uint64_t original_duration = 0;
+
     /** @brief 拓扑仿真后写入的相对开始/结束时间。 */
     uint64_t simulation_start = 0;
     uint64_t completion_time = 0;
+
     /** @brief 松散元数据区，承载历史字段和后续子模块 mutation metadata。 */
     std::unordered_map<std::string, std::string> attrs;
 };
@@ -68,6 +76,9 @@ public:
 
     /** @brief 创建节点时只设置基础属性，不自动加任何依赖边。 */
     size_t add_node(size_t event_index, bool is_cpu, const std::string & lane_key);
+
+    /** @brief 预留节点和边容量，用于大 trace 构图减少重复扩容。 */
+    void reserve(size_t node_capacity, size_t edge_capacity);
 
     /** @brief 添加一条硬依赖边；当前不做去重，调用方需要避免重复边导致 indegree 膨胀。 */
     void add_edge(size_t src, size_t dst, DagEdgeKind kind);
@@ -162,12 +173,15 @@ private:
     std::vector<TraceEvent> events_;
     std::vector<DagNode> nodes_;
     std::vector<DagEdge> edges_;
+
     /** @brief CPU lane 被单独记录，是因为 lane_key 本身只是字符串，不能从字符串判断资源类型。 */
     std::unordered_set<std::string> cpu_lanes_;
     int gpu_id_ = 0;
+
     /** @brief e2e_time_ 是拓扑仿真结果；real_e2e_time_ 是输入 trace 自身的真实时间窗口。 */
     uint64_t e2e_time_ = 0;
     uint64_t real_e2e_time_ = 0;
+
     /** @brief parser 接受的 duration event 数；命名沿用历史 summary 字段。 */
     size_t parsed_record_count_ = 0;
 };

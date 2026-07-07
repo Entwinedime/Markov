@@ -19,9 +19,9 @@ void normalize_trace_events(std::vector<core::TraceEvent> & events) {
     std::ranges::for_each(events, [](core::TraceEvent & event) {
         if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) {
             event.cat = "hicache";
-            event.args.emplace("domain", "hicache");
-            event.args.emplace("producer", "python_probe");
-            event.args.emplace("framework", "sglang");
+            event.set_arg("domain", "hicache");
+            event.set_arg("producer", "python_probe");
+            event.set_arg("framework", "sglang");
             return;
         }
 
@@ -29,7 +29,7 @@ void normalize_trace_events(std::vector<core::TraceEvent> & events) {
             /**
              * @brief LD_PRELOAD 事件常用于补充 torch trace 缺失的 runtime 参数或 sync 边界。
              */
-            event.args.emplace("producer", "ld_preload");
+            event.set_arg("producer", "ld_preload");
             return;
         }
 
@@ -37,7 +37,7 @@ void normalize_trace_events(std::vector<core::TraceEvent> & events) {
             /**
              * @brief torch profiler 是 base DAG 的主要来源。
              */
-            event.args.emplace("producer", "torch_profiler");
+            event.set_arg("producer", "torch_profiler");
         }
     });
 }
