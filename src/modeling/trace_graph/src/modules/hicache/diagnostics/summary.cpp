@@ -58,7 +58,7 @@ Json target_config_json(const frontend::HiCacheConfig & config) {
         {          "prefetch_timeout_max_sec",          config.prefetch_timeout_max_sec },
         {        "device_allocator_need_sort",        config.device_allocator_need_sort },
         {                "emit_state_digests",                config.emit_state_digests },
-        {                "enable_dag_patch",                config.enable_dag_patch },
+        {                  "enable_dag_patch",                  config.enable_dag_patch },
     };
 }
 
@@ -455,6 +455,15 @@ std::string summary_json(const HiCacheSummary & summary) {
     root["processed_hicache_events"] = summary.processed_hicache_events;
     root["state_transition_count"] = summary.state_transition_count;
     root["dag_mutations"] = summary.dag_mutations;
+    root["dag_patch"] = Json{
+        {                       "model",                       summary.dag_patch_model },
+        {               "workload_band",               summary.dag_patch_workload_band },
+        {               "source_e2e_ns",               summary.dag_patch_source_e2e_ns },
+        { "source_critical_interval_ns", summary.dag_patch_source_critical_interval_ns },
+        { "target_critical_interval_ns", summary.dag_patch_target_critical_interval_ns },
+        {         "interval_node_count",         summary.dag_patch_interval_node_count },
+        {              "interval_scale",              summary.dag_patch_interval_scale },
+    };
     root["dirty_eviction_events"] = summary.dirty_eviction_events;
     root["active_ref_owner_count"] = summary.active_ref_owner_count;
     root["radix_split_count"] = summary.radix_split_count;

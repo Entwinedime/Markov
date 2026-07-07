@@ -76,7 +76,7 @@ struct HiCacheTransitionBuffer {};
  * 构建不把这些字段作为业务输出持有。
  *
  * 关键不变量：
- * - `dag_mutations` 目前固定为 0，表示该模型只做 state alignment，不 patch DAG；
+ * - `dag_mutations` 表示 HiCache module 在显式开启 DAG patch 后写入的 DAG mutation 数；
  * - `*_trace` 中的 page/node 单位均为模型 canonical page/node，不是原始 token；
  * - `final_state_derivation_mode` 说明 final state 使用的 derived-state 投影模式；
  * - `storage_directory_inclusive_state` 是包含 storage directory 投影的补充视图，
@@ -91,6 +91,13 @@ struct HiCacheSummary {
     uint64_t processed_hicache_events = 0;
     uint64_t state_transition_count = 0;
     uint64_t dag_mutations = 0;
+    std::string dag_patch_model;
+    std::string dag_patch_workload_band;
+    uint64_t dag_patch_source_e2e_ns = 0;
+    uint64_t dag_patch_source_critical_interval_ns = 0;
+    uint64_t dag_patch_target_critical_interval_ns = 0;
+    uint64_t dag_patch_interval_node_count = 0;
+    double dag_patch_interval_scale = 1.0;
     uint64_t dirty_eviction_events = 0;
     uint64_t active_ref_owner_count = 0;
     uint64_t radix_split_count = 0;
