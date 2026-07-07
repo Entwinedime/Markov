@@ -115,11 +115,11 @@ class PreflightSkipPolicy:
             hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
             return self._hicache_prediction_reason(request.prediction, hicache)
         if request.mode == "cache_patch":
-            faithful_reason = self._faithful_replay_reason(request, checks)
-            if faithful_reason:
-                return faithful_reason
+            full_dag_reason = self._faithful_replay_reason(request, checks)
+            if full_dag_reason:
+                return full_dag_reason
             hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
-            return self._hicache_prediction_reason(request.prediction, hicache)
+            return self._hicache_prediction_reason(request.prediction, hicache, require_signature_match=False)
         return ""
 
     def _faithful_replay_reason(self, request: ModelRunRequest, checks: dict[str, object]) -> str:
@@ -138,7 +138,13 @@ class PreflightSkipPolicy:
             return "full_dag_trace_not_ready"
         return ""
 
-    def _hicache_prediction_reason(self, prediction: CacheStatePredictionRef | None, check: dict[str, object]) -> str:
+    def _hicache_prediction_reason(
+        self,
+        prediction: CacheStatePredictionRef | None,
+        check: dict[str, object],
+        *,
+        require_signature_match: bool = True,
+    ) -> str:
         if prediction is None:
             return ""
         rows = check.get("runs") if isinstance(check.get("runs"), list) else []
@@ -156,6 +162,8 @@ class PreflightSkipPolicy:
             return "source_preflight_missing"
         if not isinstance(target_preflight, dict):
             return "target_preflight_missing"
+        if not require_signature_match:
+            return ""
         if source_preflight.get("canonical_workload_signature") != target_preflight.get("canonical_workload_signature"):
             return "workload_signature_mismatch"
         if not forced_token_plan_matches(source_preflight, target_preflight):
