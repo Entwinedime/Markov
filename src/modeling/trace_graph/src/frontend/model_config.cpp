@@ -13,6 +13,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <ranges>
 #include <sstream>
 #include <stdexcept>
@@ -158,32 +159,21 @@ NodeScaleConfig parse_node_scale(const Json & root, bool module_enabled) {
     return config;
 }
 
-HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
-    /**
-     * @brief 解析 HiCache state 模块的显式 target config。
-     *
-     * HiCache state prediction 只读取配置事实，不在这里推导策略结果。
-     */
+HiCacheConfig parse_hicache_object(const Json & object, bool default_enabled, const std::string & config_name) {
     HiCacheConfig config{};
-    auto it = root.find("hicache");
-    if (it == root.end() || !it->is_object()) {
-        config.enabled = module_enabled;
-        return config;
-    }
-    const auto & object = *it;
-    config.enabled = bool_value(object, "enabled", true);
+    config.enabled = bool_value(object, "enabled", default_enabled);
     config.page_size = u64_value(object, "page_size", 0);
     config.l1_capacity_pages = u64_value(object, "l1_capacity_pages", u64_value(object, "l1_capacity", 0));
     config.l2_capacity_pages = u64_value(object, "l2_capacity_pages", u64_value(object, "l2_capacity", 0));
     config.write_policy = lower(string_value(object, "write_policy", "write_through"));
-    if (config.write_policy == "observed") throw std::runtime_error("hicache.write_policy=observed is not supported; use an explicit target write policy");
+    if (config.write_policy == "observed") throw std::runtime_error(config_name + ".write_policy=observed is not supported; use an explicit write policy");
     if (config.write_policy.empty()) config.write_policy = "write_through";
     if (!is_allowed_policy(config.write_policy, { "write_through", "write_through_selective", "write_back" }))
-        throw std::runtime_error("Invalid hicache.write_policy: " + config.write_policy);
+        throw std::runtime_error("Invalid " + config_name + ".write_policy: " + config.write_policy);
     config.write_through_threshold = u64_value(object, "write_through_threshold", 0);
     config.prefetch_policy = lower(string_value(object, "prefetch_policy", "timeout"));
     if (config.prefetch_policy == "observed")
-        throw std::runtime_error("hicache.prefetch_policy=observed is not supported; use an explicit target prefetch policy");
+        throw std::runtime_error(config_name + ".prefetch_policy=observed is not supported; use an explicit prefetch policy");
     if (config.prefetch_policy.empty()) config.prefetch_policy = "timeout";
     config.prefetch_threshold_pages = u64_value(object, "prefetch_threshold_pages", 0);
     config.prefetch_capacity_limit_pages = u64_value(object, "prefetch_capacity_limit_pages", 0);
@@ -202,10 +192,32 @@ HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
     return config;
 }
 
+HiCacheConfig parse_hicache(const Json & root, bool module_enabled) {
+    /**
+     * @brief 解析 HiCache state 模块的显式 target config。
+     *
+     * HiCache state prediction 只读取配置事实，不在这里推导策略结果。
+     */
+    auto it = root.find("hicache");
+    if (it == root.end() || !it->is_object()) {
+        HiCacheConfig config{};
+        config.enabled = module_enabled;
+        return config;
+    }
+    return parse_hicache_object(*it, true, "hicache");
+}
+
+std::optional<HiCacheConfig> parse_source_hicache(const Json & root) {
+    auto it = root.find("source_hicache");
+    if (it == root.end() || !it->is_object() || it->empty()) return std::nullopt;
+    return parse_hicache_object(*it, true, "source_hicache");
+}
+
 } // namespace model_config_detail
 
 using model_config_detail::parse_hicache;
 using model_config_detail::parse_node_scale;
+using model_config_detail::parse_source_hicache;
 using model_config_detail::read_json_file;
 using model_config_detail::string_array;
 
@@ -222,6 +234,7 @@ ModelConfig ModelConfig::from_file(const std::string & filename) {
     config.modules = string_array(root, "modules");
     config.node_scale = parse_node_scale(root, config.module_enabled("node_scale"));
     config.hicache = parse_hicache(root, config.module_enabled("hicache"));
+    config.source_hicache = parse_source_hicache(root);
 
     core::Logger::instance().info() << "Loaded model config from " << filename;
     return config;

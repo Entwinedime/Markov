@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,7 @@ struct ModelConfig {
     std::vector<std::string> modules;
     NodeScaleConfig node_scale;
     HiCacheConfig hicache;
+    std::optional<HiCacheConfig> source_hicache;
 
     /** @brief 判断 modules 列表中是否显式启用了某个模块。 */
     [[nodiscard]] bool module_enabled(const std::string & name) const;

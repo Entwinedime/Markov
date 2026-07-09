@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/frontend/model_config.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -63,6 +64,10 @@ struct HiCacheResolvedPolicyState {
  */
 struct HiCachePolicyDecisionRecord {
     uint64_t decision_epoch = 0;
+    size_t source_node_id = 0;
+    size_t source_event_index = 0;
+    uint64_t source_ts = 0;
+    uint64_t source_dur = 0;
     std::string cache_scope;
     std::string request_key;
     std::string operation_id;

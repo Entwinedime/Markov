@@ -414,6 +414,10 @@ void HiCacheState::record_policy_decision(const HiCacheFact & fact, HiCachePolic
     ++policy_decision_epoch_;
 #ifdef DEBUG
     decision.decision_epoch = policy_decision_epoch_;
+    decision.source_node_id = fact.source_node_id;
+    decision.source_event_index = fact.source_event_index;
+    decision.source_ts = fact.ts;
+    decision.source_dur = fact.dur;
     decision.cache_scope = normalized_scope(fact);
     decision.request_key = scoped_request_key(fact);
     decision.role = fact.role;
@@ -445,7 +449,9 @@ void HiCacheState::record_transition(const HiCacheFact & fact, HiCacheSummary & 
     transition.event_name = fact.event_name;
     transition.cache_scope = normalized_scope(fact);
     transition.ts = fact.ts;
+    transition.source_node_id = fact.source_node_id;
     transition.source_event_index = fact.source_event_index;
+    transition.source_dur = fact.dur;
     transition.tier = tier;
     transition.pages = pages;
     if (config_.emit_state_digests) {

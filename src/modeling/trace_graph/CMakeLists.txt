@@ -94,7 +94,6 @@ target_link_libraries(trace_graph_modules
         trace_graph_core
         trace_graph_frontend
         trace_graph_hicache
-        trace_graph_simulation
 )
 
 add_library(trace_graph_cli_support STATIC)

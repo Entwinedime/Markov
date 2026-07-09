@@ -18,7 +18,7 @@ class FinalDagValidation(RowValidation):
 
     name = "final_dag"
     schema = "trace_sim.modeling_workflow.validation.final_dag.v1"
-    progress_detail = "final DAG cache patch baseline"
+    progress_detail = "final DAG cache patch"
     progress_unit = "prediction"
     e2e_relative_error_threshold = 0.10
 
@@ -107,7 +107,15 @@ class FinalDagValidation(RowValidation):
             if predicted_e2e_ns is not None and target_actual_e2e_ns
             else None
         )
+        dag_patch = hicache_summary.get("dag_patch") if isinstance(hicache_summary.get("dag_patch"), dict) else {}
         dag_mutations = optional_int(hicache_summary.get("dag_mutations")) or 0
+        cost_mutation_count = dag_patch.get("cost_mutation_count")
+        cost_mutation_count_int = cost_mutation_count if isinstance(cost_mutation_count, int) else 0
+        physical_duration_mutation_count = dag_patch.get("physical_duration_mutation_count")
+        physical_duration_mutation_count_int = (
+            physical_duration_mutation_count if isinstance(physical_duration_mutation_count, int) else 0
+        )
+        patch_applied = dag_mutations > 0 or cost_mutation_count_int > 0 or physical_duration_mutation_count_int > 0
         blockers = row_blockers(result, predicted_e2e_ns, target_actual_e2e_ns, artifacts.model_summary_json.is_file())
         ready = not blockers and relative_error is not None
         return {
@@ -144,8 +152,145 @@ class FinalDagValidation(RowValidation):
                 if isinstance(hicache_summary.get("target_config"), dict)
                 else False
             ),
-            "patch_applied": dag_mutations > 0,
+            "patch_applied": patch_applied,
             "dag_mutations": dag_mutations,
+            "dag_patch_model": dag_patch.get("model"),
+            "dag_patch_policy_decision_count": dag_patch.get("policy_decision_count"),
+            "dag_patch_transition_count": dag_patch.get("transition_count"),
+            "dag_patch_scoped_node_count": dag_patch.get("scoped_node_count"),
+            "dag_patch_scoped_interval_node_count": dag_patch.get("scoped_interval_node_count"),
+            "dag_patch_scoped_interval_ns": dag_patch.get("scoped_interval_ns"),
+            "dag_patch_shape_edge_count": dag_patch.get("shape_edge_count"),
+            "dag_patch_skipped_reverse_shape_edge_count": dag_patch.get("skipped_reverse_shape_edge_count"),
+            "dag_patch_window_count": dag_patch.get("window_count"),
+            "dag_patch_window_interval_node_count": dag_patch.get("window_interval_node_count"),
+            "dag_patch_window_interval_ns": dag_patch.get("window_interval_ns"),
+            "dag_patch_physical_window_count": dag_patch.get("physical_window_count"),
+            "dag_patch_physical_node_count": dag_patch.get("physical_node_count"),
+            "dag_patch_physical_interval_node_count": dag_patch.get("physical_interval_node_count"),
+            "dag_patch_physical_interval_ns": dag_patch.get("physical_interval_ns"),
+            "dag_patch_physical_shape_edge_count": dag_patch.get("physical_shape_edge_count"),
+            "dag_patch_physical_duration_mutation_count": physical_duration_mutation_count,
+            "dag_patch_physical_source_duration_ns": dag_patch.get("physical_source_duration_ns"),
+            "dag_patch_physical_mutated_duration_ns": dag_patch.get("physical_mutated_duration_ns"),
+            "dag_patch_physical_duration_delta_ns": dag_patch.get("physical_duration_delta_ns"),
+            "dag_patch_target_wait_carrier_count": dag_patch.get("target_wait_carrier_count"),
+            "dag_patch_target_wait_carrier_duration_ns": dag_patch.get("target_wait_carrier_duration_ns"),
+            "dag_patch_source_wait_gap_mutation_count": dag_patch.get("source_wait_gap_mutation_count"),
+            "dag_patch_source_wait_gap_interval_node_count": dag_patch.get("source_wait_gap_interval_node_count"),
+            "dag_patch_source_wait_gap_source_interval_ns": dag_patch.get("source_wait_gap_source_interval_ns"),
+            "dag_patch_source_wait_gap_mutated_interval_ns": dag_patch.get("source_wait_gap_mutated_interval_ns"),
+            "dag_patch_source_wait_gap_interval_delta_ns": dag_patch.get("source_wait_gap_interval_delta_ns"),
+            "dag_patch_source_wait_gap_base_scale": dag_patch.get("source_wait_gap_base_scale"),
+            "dag_patch_source_wait_gap_device_host_scale": dag_patch.get("source_wait_gap_device_host_scale"),
+            "dag_patch_source_best_effort_cleanup_gap_mutation_count": dag_patch.get(
+                "source_best_effort_cleanup_gap_mutation_count"
+            ),
+            "dag_patch_source_best_effort_cleanup_gap_interval_node_count": dag_patch.get(
+                "source_best_effort_cleanup_gap_interval_node_count"
+            ),
+            "dag_patch_source_best_effort_cleanup_gap_source_interval_ns": dag_patch.get(
+                "source_best_effort_cleanup_gap_source_interval_ns"
+            ),
+            "dag_patch_source_best_effort_cleanup_gap_mutated_interval_ns": dag_patch.get(
+                "source_best_effort_cleanup_gap_mutated_interval_ns"
+            ),
+            "dag_patch_source_best_effort_cleanup_gap_interval_delta_ns": dag_patch.get(
+                "source_best_effort_cleanup_gap_interval_delta_ns"
+            ),
+            "dag_patch_source_best_effort_cleanup_gap_scale": dag_patch.get("source_best_effort_cleanup_gap_scale"),
+            "dag_patch_cost_mutation_count": cost_mutation_count,
+            "dag_patch_cost_interval_node_count": dag_patch.get("cost_interval_node_count"),
+            "dag_patch_cost_source_interval_ns": dag_patch.get("cost_source_interval_ns"),
+            "dag_patch_cost_mutated_interval_ns": dag_patch.get("cost_mutated_interval_ns"),
+            "dag_patch_cost_interval_delta_ns": dag_patch.get("cost_interval_delta_ns"),
+            "dag_patch_cost_interval_scale": dag_patch.get("cost_interval_scale"),
+            "dag_patch_cost_unattributed_interval_node_count": dag_patch.get("cost_unattributed_interval_node_count"),
+            "dag_patch_cost_unattributed_interval_ns": dag_patch.get("cost_unattributed_interval_ns"),
+            "dag_patch_cost_source_work_units": dag_patch.get("cost_source_work_units"),
+            "dag_patch_cost_target_work_units": dag_patch.get("cost_target_work_units"),
+            "dag_patch_cost_source_intent_units": dag_patch.get("cost_source_intent_units"),
+            "dag_patch_cost_target_intent_units": dag_patch.get("cost_target_intent_units"),
+            "dag_patch_cost_source_blocking_result_score": dag_patch.get("cost_source_blocking_result_score"),
+            "dag_patch_cost_target_blocking_result_score": dag_patch.get("cost_target_blocking_result_score"),
+            "dag_patch_cost_source_wait_score": dag_patch.get("cost_source_wait_score"),
+            "dag_patch_cost_target_wait_score": dag_patch.get("cost_target_wait_score"),
+            "dag_patch_cost_source_wait_residue_scale": dag_patch.get("cost_source_wait_residue_scale"),
+            "dag_patch_cost_target_wait_carrier_score": dag_patch.get("cost_target_wait_carrier_score"),
+            "dag_patch_cost_source_best_effort_cleanup_scale": dag_patch.get("cost_source_best_effort_cleanup_scale"),
+            "dag_patch_cost_result_cleanup_policy_scale": dag_patch.get("cost_result_cleanup_policy_scale"),
+            "dag_patch_cost_result_effect_scale": dag_patch.get("cost_result_effect_scale"),
+            "dag_patch_cost_prefill_compute_scale": dag_patch.get("cost_prefill_compute_scale"),
+            "dag_patch_cost_result_io_blocking_scale": dag_patch.get("cost_result_io_blocking_scale"),
+            "dag_patch_critical_path_interval_node_count": dag_patch.get("critical_path_interval_node_count"),
+            "dag_patch_critical_path_interval_ns": dag_patch.get("critical_path_interval_ns"),
+            "dag_patch_critical_path_hicache_interval_node_count": dag_patch.get(
+                "critical_path_hicache_interval_node_count"
+            ),
+            "dag_patch_critical_path_hicache_interval_ns": dag_patch.get("critical_path_hicache_interval_ns"),
+            "dag_patch_critical_path_hicache_edge_count": dag_patch.get("critical_path_hicache_edge_count"),
+            "dag_patch_cost_work_unit_model": dag_patch.get("cost_work_unit_model"),
+            "dag_patch_cost_interval_attribution_model": dag_patch.get("cost_interval_attribution_model"),
+            "dag_patch_cost_source_interval_by_effect": dag_patch.get("cost_source_interval_by_effect", {}),
+            "dag_patch_cost_mutated_interval_by_effect": dag_patch.get("cost_mutated_interval_by_effect", {}),
+            "dag_patch_cost_source_interval_by_impact": dag_patch.get("cost_source_interval_by_impact", {}),
+            "dag_patch_cost_mutated_interval_by_impact": dag_patch.get("cost_mutated_interval_by_impact", {}),
+            "dag_patch_cost_interval_scale_by_effect": dag_patch.get("cost_interval_scale_by_effect", {}),
+            "dag_patch_cost_model_scale_by_effect": dag_patch.get("cost_model_scale_by_effect", {}),
+            "dag_patch_cost_interval_node_count_by_effect": dag_patch.get("cost_interval_node_count_by_effect", {}),
+            "dag_patch_cost_interval_node_count_by_impact": dag_patch.get("cost_interval_node_count_by_impact", {}),
+            "dag_patch_cost_source_work_units_by_effect": dag_patch.get("cost_source_work_units_by_effect", {}),
+            "dag_patch_cost_target_work_units_by_effect": dag_patch.get("cost_target_work_units_by_effect", {}),
+            "dag_patch_cost_source_work_units_by_impact": dag_patch.get("cost_source_work_units_by_impact", {}),
+            "dag_patch_cost_target_work_units_by_impact": dag_patch.get("cost_target_work_units_by_impact", {}),
+            "dag_patch_cost_source_work_units_by_effect_policy_area": dag_patch.get(
+                "cost_source_work_units_by_effect_policy_area", {}
+            ),
+            "dag_patch_cost_target_work_units_by_effect_policy_area": dag_patch.get(
+                "cost_target_work_units_by_effect_policy_area", {}
+            ),
+            "dag_patch_cost_source_work_units_by_impact_policy_area": dag_patch.get(
+                "cost_source_work_units_by_impact_policy_area", {}
+            ),
+            "dag_patch_cost_target_work_units_by_impact_policy_area": dag_patch.get(
+                "cost_target_work_units_by_impact_policy_area", {}
+            ),
+            "dag_patch_cost_source_intent_units_by_effect_policy_area": dag_patch.get(
+                "cost_source_intent_units_by_effect_policy_area", {}
+            ),
+            "dag_patch_cost_target_intent_units_by_effect_policy_area": dag_patch.get(
+                "cost_target_intent_units_by_effect_policy_area", {}
+            ),
+            "dag_patch_cost_source_intent_units_by_impact_policy_area": dag_patch.get(
+                "cost_source_intent_units_by_impact_policy_area", {}
+            ),
+            "dag_patch_cost_target_intent_units_by_impact_policy_area": dag_patch.get(
+                "cost_target_intent_units_by_impact_policy_area", {}
+            ),
+            "dag_patch_critical_path_hicache_interval_by_kind": dag_patch.get(
+                "critical_path_hicache_interval_by_kind", {}
+            ),
+            "dag_patch_critical_path_hicache_interval_by_effect": dag_patch.get(
+                "critical_path_hicache_interval_by_effect", {}
+            ),
+            "dag_patch_critical_path_hicache_interval_by_impact": dag_patch.get(
+                "critical_path_hicache_interval_by_impact", {}
+            ),
+            "dag_patch_critical_path_hicache_edges_by_kind": dag_patch.get("critical_path_hicache_edges_by_kind", {}),
+            "dag_patch_critical_path_hicache_edges_by_impact": dag_patch.get(
+                "critical_path_hicache_edges_by_impact", {}
+            ),
+            "dag_patch_shape_edges_by_impact": dag_patch.get("shape_edges_by_impact", {}),
+            "dag_patch_physical_nodes_by_impact": dag_patch.get("physical_nodes_by_impact", {}),
+            "dag_patch_physical_interval_by_impact": dag_patch.get("physical_interval_by_impact", {}),
+            "dag_patch_physical_shape_edges_by_impact": dag_patch.get("physical_shape_edges_by_impact", {}),
+            "dag_patch_physical_source_duration_by_effect": dag_patch.get("physical_source_duration_by_effect", {}),
+            "dag_patch_physical_mutated_duration_by_effect": dag_patch.get("physical_mutated_duration_by_effect", {}),
+            "dag_patch_physical_duration_node_count_by_effect": dag_patch.get(
+                "physical_duration_node_count_by_effect", {}
+            ),
+            "dag_patch_physical_duration_scale_by_effect": dag_patch.get("physical_duration_scale_by_effect", {}),
+            "dag_patch_warnings": dag_patch.get("warnings", []),
             "blockers": blockers,
             "prediction_path": str(artifacts.prediction_json),
             "run_summary_path": str(artifacts.run_summary_json),

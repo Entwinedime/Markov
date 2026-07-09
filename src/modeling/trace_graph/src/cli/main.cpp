@@ -268,7 +268,9 @@ std::vector<std::unique_ptr<SimulationModule>> build_modules(const std::string &
 
     auto config = ModelConfig::from_file(model_config_file);
     if (config.node_scale.enabled) { modules.push_back(std::make_unique<markov::trace_graph::modules::node_scale::NodeScaleModule>(config.node_scale)); }
-    if (config.hicache.enabled) { modules.push_back(std::make_unique<markov::trace_graph::modules::hicache::HiCacheModule>(config.hicache)); }
+    if (config.hicache.enabled) {
+        modules.push_back(std::make_unique<markov::trace_graph::modules::hicache::HiCacheModule>(config.hicache, config.source_hicache));
+    }
     return modules;
 }
 
@@ -324,8 +326,7 @@ uint64_t elapsed_ms(std::chrono::steady_clock::time_point start, std::chrono::st
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 }
 
-template <typename Fn>
-auto timed_json(Json & timings, const char * key, Fn && fn) {
+template <typename Fn> auto timed_json(Json & timings, const char * key, Fn && fn) {
     const auto start = std::chrono::steady_clock::now();
     auto value = std::forward<Fn>(fn)();
     const auto end = std::chrono::steady_clock::now();
@@ -333,8 +334,7 @@ auto timed_json(Json & timings, const char * key, Fn && fn) {
     return value;
 }
 
-template <typename Fn>
-void timed_json_void(Json & timings, const char * key, Fn && fn) {
+template <typename Fn> void timed_json_void(Json & timings, const char * key, Fn && fn) {
     const auto start = std::chrono::steady_clock::now();
     std::forward<Fn>(fn)();
     const auto end = std::chrono::steady_clock::now();
@@ -430,8 +430,8 @@ std::vector<DagGraph> build_graphs_from_manifest(const CliOptions & opts) {
 
 #ifdef DEBUG
 std::vector<DagGraph> build_graphs_from_manifest_with_timings(const CliOptions & opts, Json & timings) {
-    auto inputs = timed_json(timings, "read_ms",
-                             [&] { return markov::trace_graph::io::load_trace_inputs_from_manifest(opts.profile_manifest, manifest_options(opts)); });
+    auto inputs =
+        timed_json(timings, "read_ms", [&] { return markov::trace_graph::io::load_trace_inputs_from_manifest(opts.profile_manifest, manifest_options(opts)); });
 
     std::vector<DagGraph> graphs(inputs.size());
     Json build_inputs = Json::array();
@@ -486,15 +486,18 @@ void simulate_graph(DagGraph & graph) {
     (void)markov::trace_graph::simulation::run_topological_simulation(graph);
 }
 
+void notify_modules_after_simulation(DagGraph & graph, const std::vector<std::unique_ptr<SimulationModule>> & modules) {
+    std::ranges::for_each(modules, [&](const auto & module) {
+        if (module) module->after_simulation(graph);
+    });
+}
+
 void maybe_write_graph_output(const CliOptions & opts, const DagGraph & graph) {
     if (!opts.graph_output.empty()) markov::trace_graph::io::write_chrome_trace_dag(opts.graph_output, graph);
 }
 
 #ifdef DEBUG
-void write_debug_artifacts(const CliOptions & opts,
-                           const DagGraph & graph,
-                           const std::vector<std::unique_ptr<SimulationModule>> & modules,
-                           Json & timings) {
+void write_debug_artifacts(const CliOptions & opts, const DagGraph & graph, const std::vector<std::unique_ptr<SimulationModule>> & modules, Json & timings) {
     if (!opts.model_summary_file.empty()) markov::trace_graph::cli::write_module_summary(opts.model_summary_file, modules);
     if (opts.dag_analysis_output_dir.empty()) return;
 
@@ -529,6 +532,7 @@ int run_workflow(const CliOptions & opts, Logger & logger) {
         write_debug_failure_artifacts(opts, graph, e.what(), logger);
         throw;
     }
+    timed_json_void(timings, "post_simulation_module_ms", [&] { notify_modules_after_simulation(graph, modules); });
     maybe_write_graph_output(opts, graph);
     write_debug_artifacts(opts, graph, modules, timings);
     write_debug_run_summary(opts.run_summary_file, opts, graph, timings);
@@ -538,6 +542,7 @@ int run_workflow(const CliOptions & opts, Logger & logger) {
     auto modules = build_modules(opts.model_config_file);
     apply_modules(graph, modules, logger);
     simulate_graph(graph);
+    notify_modules_after_simulation(graph, modules);
     maybe_write_graph_output(opts, graph);
     write_run_summary(opts.run_summary_file, opts, graph);
 #endif

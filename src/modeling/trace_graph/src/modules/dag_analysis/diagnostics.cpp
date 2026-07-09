@@ -31,6 +31,7 @@ using Json = nlohmann::json;
 
 constexpr double kFaithfulReplayRelErrorMax = 0.05;
 constexpr size_t kCriticalPathSampleLimit = 50;
+constexpr size_t kCriticalPathTopIntervalLimit = 64;
 constexpr uint64_t kNearbyAnchorWindowNs = 1'000'000;
 constexpr size_t kSampleLimit = 8;
 constexpr size_t kCycleWitnessNodeLimit = 256;
@@ -522,6 +523,7 @@ Json critical_path_sample(const core::DagGraph & graph) {
     }
 
     std::vector<Json> reversed;
+    std::vector<Json> top_cpu_intervals;
     std::unordered_set<size_t> seen;
     Json node_counts_by_source = Json::object();
     Json duration_by_source = Json::object();
@@ -563,6 +565,14 @@ Json critical_path_sample(const core::DagGraph & graph) {
             if (interval <= kMaxCpuIntervalNs) {
                 path_cpu_interval_ns += interval;
                 add_critical_path_interval(cpu_interval_by_source, cpu_interval_by_domain, cpu_interval_by_category, graph, best_pred, interval);
+                if (interval > 0) {
+                    auto interval_item = compact_node_json(graph, best_pred);
+                    interval_item["cpuinterval_ns"] = interval;
+                    interval_item["edge_to_node_id"] = current;
+                    interval_item["edge_to_name"] = graph.event_for_node(current).name;
+                    interval_item["edge_to_incoming_kind"] = incoming_edge_kind;
+                    top_cpu_intervals.push_back(std::move(interval_item));
+                }
             }
         }
 
@@ -574,6 +584,10 @@ Json critical_path_sample(const core::DagGraph & graph) {
         current = best_pred;
     }
     std::ranges::reverse(reversed);
+    std::ranges::sort(top_cpu_intervals, [](const Json & lhs, const Json & rhs) {
+        return lhs.value("cpuinterval_ns", uint64_t{ 0 }) > rhs.value("cpuinterval_ns", uint64_t{ 0 });
+    });
+    if (top_cpu_intervals.size() > kCriticalPathTopIntervalLimit) top_cpu_intervals.resize(kCriticalPathTopIntervalLimit);
     return Json{
         {        "total_duration_ns",                             graph.e2e_time() },
         {          "path_node_count",                              path_node_count },
@@ -593,6 +607,7 @@ Json critical_path_sample(const core::DagGraph & graph) {
         { "cpu_interval_by_category",                     cpu_interval_by_category },
         {       "edge_count_by_kind",                          edge_counts_by_kind },
         {             "sample_nodes",                                     reversed },
+        {        "top_cpu_intervals",                            top_cpu_intervals },
     };
 }
 

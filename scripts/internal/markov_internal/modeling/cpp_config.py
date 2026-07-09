@@ -45,6 +45,7 @@ def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) 
     node_scale = node_scale_config_from_modules(config)
     experiment_hicache = hicache_config_from_target_experiment(config)
     hicache = hicache_config_from_modules(config)
+    source_hicache = source_hicache_config_from_modules(config)
     modules: list[str] = []
     generated: dict[str, Any] = {"modules": modules}
     if node_scale is not None:
@@ -59,6 +60,8 @@ def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) 
             merged_hicache.update(hicache)
         merged_hicache["enable_dag_patch"] = mode == "cache_patch"
         generated["hicache"] = merged_hicache
+        if source_hicache is not None:
+            generated["source_hicache"] = source_hicache
     if not modules:
         return None
     path = output_dir / "cpp_model_config.json"
@@ -105,6 +108,25 @@ def hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None
         result: dict[str, Any] = {"enabled": bool(hicache.get("enabled", True))}
         copy_hicache_config_keys(result, hicache, source_label="HiCache")
         return result
+    return None
+
+
+def source_hicache_config_from_modules(config: dict[str, Any]) -> dict[str, Any] | None:
+    """从 modules 配置中提取 HiCacheModule 的显式 source config。"""
+
+    for module in config.get("modules") or []:
+        if not isinstance(module, dict) or not module.get("enabled", True):
+            continue
+        name = str(module.get("name") or "").replace("-", "_").lower()
+        if name not in {"hicachemodule", "hicache"}:
+            continue
+        module_cfg = module.get("config") if isinstance(module.get("config"), dict) else {}
+        source_hicache = module_cfg.get("source_hicache")
+        if not isinstance(source_hicache, dict) or not source_hicache:
+            return None
+        result: dict[str, Any] = {"enabled": bool(source_hicache.get("enabled", True))}
+        copy_hicache_config_keys(result, source_hicache, source_label="source HiCache")
+        return result if len(result) > 1 else None
     return None
 
 

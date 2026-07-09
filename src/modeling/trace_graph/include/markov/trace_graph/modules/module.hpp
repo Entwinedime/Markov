@@ -26,6 +26,13 @@ public:
     /** @brief 唯一执行入口；模块之间的顺序由 CLI 根据 model config 固定。 */
     virtual void apply(core::DagGraph & graph) = 0;
 
+    /**
+     * @brief 拓扑仿真完成后的可选回调。
+     *
+     * 只用于依赖 completion_time 的 diagnostics；不应在这里修改会影响 prediction 的 DAG 结构或耗时。
+     */
+    virtual void after_simulation(core::DagGraph & graph) { (void)graph; }
+
     /** @brief summary 是显式打开的辅助输出；默认预测路径不依赖它。 */
     [[nodiscard]] virtual bool has_summary() const { return false; }
 };

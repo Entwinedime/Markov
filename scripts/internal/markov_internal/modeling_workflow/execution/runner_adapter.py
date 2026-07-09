@@ -55,7 +55,14 @@ class RunnerConfigBuilder:
         }
         if self.spec.mode in {"cache_state", "cache_patch"}:
             target = require_target_profile(self.spec)
-            payload.update(hicache_module_payload(target, outputs, enable_dag_patch=self.spec.mode == "cache_patch"))
+            payload.update(
+                hicache_module_payload(
+                    self.spec.source_profile,
+                    target,
+                    outputs,
+                    enable_dag_patch=self.spec.mode == "cache_patch",
+                )
+            )
         return payload
 
     def command(self, runner_config_path: Path) -> list[str]:
@@ -121,10 +128,15 @@ def require_target_profile(spec: ModelRunSpec) -> ProfileRunRef:
 
 
 def hicache_module_payload(
-    target: ProfileRunRef, outputs: dict[str, bool], *, enable_dag_patch: bool = False
+    source: ProfileRunRef,
+    target: ProfileRunRef,
+    outputs: dict[str, bool],
+    *,
+    enable_dag_patch: bool = False,
 ) -> dict[str, Any]:
     """构造 HiCache runner config 中的 module 部分。"""
 
+    source_hicache_config = {**source.hicache_config} if source.hicache_config is not None else {}
     hicache_config = {**target.hicache_config, "enable_dag_patch": enable_dag_patch}
     return {
         "validation": {
@@ -141,6 +153,7 @@ def hicache_module_payload(
                 "enabled": True,
                 "config": {
                     "hicache": hicache_config,
+                    "source_hicache": source_hicache_config,
                 },
             }
         ],
