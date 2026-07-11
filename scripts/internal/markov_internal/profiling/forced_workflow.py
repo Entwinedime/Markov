@@ -1,12 +1,10 @@
 """HiCache forced-token profiling workflow helpers.
 
-该模块连接 profiling suite 与 HiCache phased workload 的 forced-token 契约：
-
-- 解析 workload 命令中的 forced-token 参数；
-- 在 replay suite 中按 input 注入 bundle 内的 plan；
-- 在 capture suite 结束后聚合 suite-level bundle。
-
-这里不启动 server，也不写 profile manifest；这些仍属于 profiling runner。
+This module connects profiling suites to the phased workload contract. It
+parses forced-token command arguments, injects an input-specific bundle plan
+for replay, and aggregates run-local capture plans into one suite bundle. It
+does not start servers or write profile manifests; those lifecycles remain
+owned by the profiling runner.
 """
 
 from __future__ import annotations
@@ -21,23 +19,26 @@ from pathlib import Path
 from typing import Any
 
 from ..common.commands import command_from_config, command_tokens
+from ..common.digests import sha256_file, sha256_json
 from ..common.io import load_json, write_json
 from ..common.naming import sanitize
 from ..common.paths import ROOT_DIR, resolve_repo_path
-from ..contracts.forced_token import (
+from ..contracts.forced_token.bundle import (
+    forced_token_bundle_summary,
+    resolve_forced_token_bundle_plan,
+)
+from ..contracts.forced_token.constants import (
     FORCED_TOKEN_BUNDLE_SCHEMA,
     FORCED_TOKEN_ERROR_BUNDLE_PROVENANCE,
     FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE,
     FORCED_TOKEN_ERROR_PLAN_MISSING,
-    forced_token_bundle_summary,
+)
+from ..contracts.forced_token.plan import (
     forced_token_plan_summary,
-    forced_token_quality_from_workload_report,
     load_forced_token_plan,
-    resolve_forced_token_bundle_plan,
-    sha256_file,
-    sha256_json,
     validate_plan_contract,
 )
+from ..contracts.forced_token.quality import forced_token_quality_from_workload_report
 
 
 BENCH_SCRIPT_ROOT = ROOT_DIR / "scripts/bench"
@@ -54,7 +55,7 @@ from hicache_phased_workload import (  # noqa: E402
 
 
 def hicache_workload_argv(tokens: list[str]) -> list[str] | None:
-    """从命令中提取 hicache_phased_workload.py 的参数段。"""
+    """Extract the argument suffix for ``hicache_phased_workload.py``."""
 
     for index, token in enumerate(tokens):
         if token.endswith("hicache_phased_workload.py"):
@@ -63,7 +64,7 @@ def hicache_workload_argv(tokens: list[str]) -> list[str] | None:
 
 
 def parse_hicache_workload_args(command: list[str] | str | None) -> argparse.Namespace | None:
-    """解析 HiCache phased workload 参数；其他 workload 返回 None。"""
+    """Parse phased-workload arguments, returning ``None`` for other drivers."""
 
     argv = hicache_workload_argv(command_tokens(command))
     if argv is None:
@@ -75,7 +76,7 @@ def parse_hicache_workload_args(command: list[str] | str | None) -> argparse.Nam
 
 
 def forced_token_plan_path_from_args(args: argparse.Namespace) -> Path | None:
-    """按 workload CLI 语义解析 forced-token plan 路径。"""
+    """Resolve the plan path according to phased-workload CLI semantics."""
 
     if args.forced_token_plan:
         return resolve_repo_path(str(args.forced_token_plan))
@@ -88,7 +89,7 @@ def forced_token_contract_report(
     bench_command: list[str] | str | None,
     bundle_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """解析并校验一次 workload 命令中的 forced-token contract。"""
+    """Parse and validate the forced-token contract in one workload command."""
 
     workload_args = parse_hicache_workload_args(bench_command)
     if workload_args is None:
@@ -117,17 +118,31 @@ def forced_token_contract_report(
     if plan_path is None:
         report["errors"] = [FORCED_TOKEN_ERROR_PLAN_MISSING]
         return report
-
     if mode == "capture":
-        report["plan"] = forced_token_plan_summary(plan_path).to_dict()
-        if plan_path.exists():
-            report["errors"] = [FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE]
-            return report
-        return report
+        return _capture_contract_report(report, plan_path)
+    if mode == "replay":
+        return _replay_contract_report(report, plan_path, workload_args, workload_plan, bundle_provenance)
+    report["errors"] = [f"unsupported_forced_token_mode:{mode}"]
+    return report
 
-    if mode != "replay":
-        report["errors"] = [f"unsupported_forced_token_mode:{mode}"]
-        return report
+
+def _capture_contract_report(report: dict[str, Any], plan_path: Path) -> dict[str, Any]:
+    """Validate that capture will create, rather than overwrite, its plan."""
+
+    report["plan"] = forced_token_plan_summary(plan_path).to_dict()
+    if plan_path.exists():
+        report["errors"] = [FORCED_TOKEN_ERROR_CAPTURE_OVERWRITE]
+    return report
+
+
+def _replay_contract_report(
+    report: dict[str, Any],
+    plan_path: Path,
+    workload_args: argparse.Namespace,
+    workload_plan: list[dict[str, Any]],
+    bundle_provenance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Validate replay plan identity, request coverage, and bundle provenance."""
 
     summary = forced_token_plan_summary(plan_path)
     report["plan"] = summary.to_dict()
@@ -157,7 +172,7 @@ def forced_token_contract_report(
 
 
 def forced_token_mode_from_config(cfg: dict[str, Any]) -> str:
-    """读取已展开 experiment 的 forced-token workload mode。"""
+    """Read the forced-token mode from an expanded experiment command."""
 
     bench = cfg.get("bench") if isinstance(cfg.get("bench"), dict) else {}
     command = command_from_config(bench.get("command")) if "command" in bench else None
@@ -174,7 +189,7 @@ def inject_forced_token_bundle_plan(
     cfg: dict[str, Any],
     bundle_path: Path | None,
 ) -> dict[str, Any]:
-    """按 suite input 从显式 bundle 注入 replay plan 和 provenance。"""
+    """Inject the replay plan and provenance for one suite input."""
 
     result = copy.deepcopy(cfg)
     mode = forced_token_mode_from_config(result)
@@ -214,7 +229,7 @@ def preflight_forced_token_contract(
     *,
     experiment_id: str,
 ) -> dict[str, Any]:
-    """校验单个 expanded profile config 的 forced-token contract。"""
+    """Validate the forced-token contract of one expanded profile config."""
 
     bundle = metadata.get("forced_token_bundle")
     bundle_provenance = bundle if isinstance(bundle, dict) else None
@@ -226,7 +241,7 @@ def preflight_forced_token_contract(
 
 
 def repo_relative_text(path: Path) -> str:
-    """优先把 artifact 路径写成仓库相对形式。"""
+    """Prefer repository-relative artifact paths when the path is internal."""
 
     resolved = path.resolve()
     try:
@@ -236,7 +251,7 @@ def repo_relative_text(path: Path) -> str:
 
 
 def single_run_artifact(run_dir: Path, pattern: str) -> Path:
-    """查找 run 中唯一 artifact，避免 bundle 聚合静默选错文件。"""
+    """Require exactly one run artifact so bundle aggregation cannot guess."""
 
     candidates = sorted(run_dir.glob(pattern))
     if len(candidates) != 1:
@@ -250,7 +265,7 @@ def build_forced_token_bundle(
     *,
     capture_config_path: Path,
 ) -> dict[str, Any]:
-    """把 capture experiment 的 run-local plan 聚合成 suite-level bundle。"""
+    """Aggregate run-local capture plans into one immutable suite bundle."""
 
     plans_dir = suite_dir / "forced_token_plans"
     plans_dir.mkdir(parents=True, exist_ok=True)

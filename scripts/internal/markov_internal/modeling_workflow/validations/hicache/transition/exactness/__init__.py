@@ -1,1 +1,1 @@
-"""HiCache transition exactness validation 辅助工具。"""
+"""Comparison and diagnostics for HiCache transition exactness."""

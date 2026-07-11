@@ -1,1 +1,1 @@
-"""C++ TraceGraph modeling runner 的 Python 编排工具。"""
+"""Generic Python adapter for one C++ TraceGraph modeling run."""

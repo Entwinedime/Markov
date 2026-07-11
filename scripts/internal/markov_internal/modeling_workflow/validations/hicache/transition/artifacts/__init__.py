@@ -1,1 +1,1 @@
-"""HiCache transition artifact path 与 catalog 辅助工具。"""
+"""Artifact paths and writers for HiCache transition validation."""

@@ -1,4 +1,4 @@
-"""modeling validation 使用的 workload 时间窗口发现工具。"""
+"""Discover real workload timing windows used by modeling validation."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json
-from ..common.paths import map_repo_path, resolve_repo_path
+from ..common.paths import map_repo_path, require_repo_path
 
 
 @dataclass(frozen=True)
 class WorkloadWindow:
-    """workload 真实耗时窗口。"""
+    """Observed workload interval represented in nanoseconds."""
 
     report_path: Path
     start_ns: int
@@ -23,11 +23,11 @@ class WorkloadWindow:
 
 
 def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | None) -> WorkloadWindow | None:
-    """从显式配置或 profile manifest 中发现 workload 真实时间窗。"""
+    """Discover a workload interval from explicit config or profile artifacts."""
 
     explicit = input_cfg.get("workload_report")
     if isinstance(explicit, str):
-        return load_workload_window(required_repo_path(explicit))
+        return load_workload_window(require_repo_path(explicit))
     if manifest_path is None or not manifest_path.is_file():
         return None
     manifest = load_json(manifest_path)
@@ -45,7 +45,7 @@ def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | No
 
 
 def load_workload_window(path: Path) -> WorkloadWindow | None:
-    """从 workload_report.json 读取请求开始/结束时间窗。"""
+    """Derive the request envelope from a ``workload_report.json`` file."""
 
     if not path.is_file():
         return None
@@ -70,7 +70,7 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
 
 
 def load_bench_serving_window(path: Path) -> WorkloadWindow | None:
-    """从 SGLang bench serving JSONL 读取整体 duration。"""
+    """Read aggregate duration from the final SGLang bench-serving JSONL row."""
 
     if not path.is_file():
         return None
@@ -97,18 +97,9 @@ def load_bench_serving_window(path: Path) -> WorkloadWindow | None:
 
 
 def optional_float(value: Any) -> float | None:
-    """宽松解析 float，失败时返回 None。"""
+    """Parse a float candidate, returning ``None`` on conversion failure."""
 
     try:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def required_repo_path(value: Any) -> Path:
-    """解析必填 repo path，缺失时抛出错误。"""
-
-    path = resolve_repo_path(value)
-    if path is None:
-        raise ValueError("expected a non-empty path")
-    return path

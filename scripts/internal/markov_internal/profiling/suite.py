@@ -1,4 +1,4 @@
-"""Profiling suite 展开、选择和摘要逻辑。"""
+"""Profiling-suite expansion, selection, and contract summaries."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ PROFILE_FORCED_TOKEN_BUNDLE_ENV = "TRACE_SIM_FORCED_TOKEN_BUNDLE"
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    """递归合并 suite common 配置和单个 experiment 配置。"""
+    """Recursively merge suite-common config with an experiment override."""
 
     merged = copy.deepcopy(base)
     for key, value in override.items():
@@ -32,7 +32,7 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 
 def delete_path(value: dict[str, Any], path: str) -> None:
-    """按点分路径删除字段，用于 suite experiment 覆盖 common 配置。"""
+    """Delete a dotted config path after common/experiment merging."""
 
     parts = [part for part in path.split(".") if part]
     if not parts:
@@ -48,7 +48,7 @@ def delete_path(value: dict[str, Any], path: str) -> None:
 
 
 def apply_unset(value: dict[str, Any], paths: Any) -> None:
-    """应用 suite `$unset` 列表，删除已合并配置中的字段。"""
+    """Apply the suite ``$unset`` list to a merged configuration."""
 
     if paths is None:
         return
@@ -59,7 +59,7 @@ def apply_unset(value: dict[str, Any], paths: Any) -> None:
 
 
 def parse_experiment_selection(raw_values: list[str] | None, env_value: str | None = None) -> set[str]:
-    """解析命令行或环境变量中的实验选择器。"""
+    """Parse comma-separated selectors from CLI values and an environment value."""
 
     selected: set[str] = set()
     for raw in [*(raw_values or []), env_value or ""]:
@@ -71,7 +71,7 @@ def parse_experiment_selection(raw_values: list[str] | None, env_value: str | No
 
 
 def experiment_identity(cfg: dict[str, Any], index: int) -> str:
-    """返回实验的稳定 id/name，缺省时使用序号兜底。"""
+    """Return a stable experiment identity with an ordinal fallback."""
 
     for key in ("id", "name"):
         value = cfg.get(key)
@@ -81,7 +81,7 @@ def experiment_identity(cfg: dict[str, Any], index: int) -> str:
 
 
 def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
-    """返回可用于命令行选择同一个实验的稳定选择器。"""
+    """Return every stable CLI selector accepted for an experiment."""
 
     selectors = {str(index), f"{index:02d}"}
     for key in ("id", "name"):
@@ -93,7 +93,7 @@ def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
 
 
 def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]:
-    """生成 `--list-experiments` 和 suite_selection 使用的实验摘要。"""
+    """Build the experiment descriptor used by listing and selection artifacts."""
 
     metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
     return {
@@ -108,7 +108,7 @@ def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]
 
 
 def reject_profiling_override(value: dict[str, Any], context: str) -> None:
-    """禁止 suite 局部覆盖 profiling 配置，保证采集合同在 suite 内一致。"""
+    """Reject local profiling overrides so one suite has one capture contract."""
 
     if "profiling" in value:
         raise ValueError(f"{context} must not override profiling; suite experiments share one profiling config")
@@ -120,7 +120,7 @@ def reject_profiling_override(value: dict[str, Any], context: str) -> None:
 
 
 def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]]:
-    """读取并校验 matrix.servers 或 matrix.inputs 列表。"""
+    """Read and validate either ``matrix.servers`` or ``matrix.inputs``."""
 
     raw_entries = matrix.get(key)
     if not isinstance(raw_entries, list) or not raw_entries:
@@ -142,7 +142,7 @@ def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]
 
 
 def matrix_entry_override(entry: dict[str, Any]) -> dict[str, Any]:
-    """去掉 matrix entry 元字段，只保留参与配置合并的覆盖项。"""
+    """Strip matrix metadata while preserving fields that participate in merge."""
 
     return {key: value for key, value in entry.items() if key not in MATRIX_ENTRY_META_KEYS}
 
@@ -154,7 +154,7 @@ def attach_suite_metadata(
     server_id: str | None,
     input_id: str | None,
 ) -> None:
-    """给展开后的实验补充 suite 来源 metadata。"""
+    """Attach suite provenance to one expanded experiment."""
 
     metadata = cfg.get("metadata")
     if metadata is None:
@@ -171,7 +171,7 @@ def attach_suite_metadata(
 
 
 def generated_matrix_experiments(matrix: dict[str, Any]) -> list[dict[str, Any]]:
-    """在未显式列出 experiments 时生成 server/input 笛卡尔积。"""
+    """Generate the server/input Cartesian product when experiments are omitted."""
 
     servers = matrix_entries(matrix, "servers")
     inputs = matrix_entries(matrix, "inputs")
@@ -196,7 +196,7 @@ def expand_matrix_experiment(
     experiment: dict[str, Any],
     index: int,
 ) -> dict[str, Any]:
-    """把一个 matrix experiment 展开为可直接运行的单次配置。"""
+    """Expand one matrix experiment into an executable single-run config."""
 
     servers = matrix_entries(matrix, "servers")
     inputs = matrix_entries(matrix, "inputs")
@@ -238,7 +238,7 @@ def expand_matrix_experiment(
 
 
 def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
-    """展开 suite 配置；普通单 run 配置原样返回。"""
+    """Expand a suite, returning a plain single-run config unchanged."""
 
     matrix = cfg.get("matrix")
     experiments = cfg.get("experiments")
@@ -283,7 +283,7 @@ def filter_suite_experiments(
     selected_inputs: set[str] | None = None,
     selected_servers: set[str] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
-    """根据 CLI/env 选择器过滤 suite 实验。"""
+    """Filter expanded experiments by validated CLI/environment selectors."""
 
     selected_inputs = selected_inputs or set()
     selected_servers = selected_servers or set()
@@ -334,7 +334,7 @@ def filter_suite_experiments(
         )
 
     def metadata_value(experiment: dict[str, Any], key: str) -> str:
-        """读取 suite experiment metadata 中的字符串值。"""
+        """Read one string-valued suite metadata field."""
 
         metadata = experiment.get("metadata") if isinstance(experiment.get("metadata"), dict) else {}
         value = metadata.get(key)
@@ -352,7 +352,7 @@ def filter_suite_experiments(
 
 
 def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
-    """读取 suite metadata 中的 profile mode。"""
+    """Return the optional profile mode declared by suite metadata."""
 
     metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
     value = metadata.get("profile_mode")
@@ -360,7 +360,7 @@ def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
 
 
 def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总 suite 中 forced-token preflight 合同，便于顶层审计。"""
+    """Summarize forced-token preflight identities across a suite."""
 
     modes = sorted({str(contract.get("mode") or "none") for contract in contracts})
     errors = sorted({str(error) for contract in contracts for error in contract.get("errors", [])})

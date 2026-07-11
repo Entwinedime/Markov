@@ -1,4 +1,4 @@
-"""HiCache state-model fact 覆盖率累加器。"""
+"""Streaming coverage accumulator for HiCache state-model facts."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ from typing import Any
 from ..core.facts import (
     HICACHE_CONSUMER_INPUT_CONTRACT,
     HICACHE_CONSUMER_STATE_MODEL,
-    parse_fact,
+    HiCacheFact,
     parse_fact_or_none,
 )
-from ..core.tokens import token_dictionary_issues
+from ..core.tokens import fact_items, token_dictionary_issues
 from .mechanisms import completed_fact_role, is_hicache_profile_event
 from .state_fact_checks import (
     batch_state_fact_errors,
-    fact_items,
     has_fact,
     has_token_dictionary,
     has_token_span,
@@ -81,12 +80,10 @@ STATE_FACT_SPAN_FIELDS_BY_ROLE = {
     "prefetch_candidate_anchor": ("full_path_span",),
 }
 
-REQUIRED_COMPLETED_STATE_FACT_ROLES = ()
-
 
 @dataclass
 class HiCacheStateFactAccumulator:
-    """检查 HiCache state-model fact 合同。"""
+    """Accumulate field, routing, token, and sequence contract evidence."""
 
     counts: Counter[str] = field(default_factory=Counter)
     class_events: Counter[str] = field(default_factory=Counter)
@@ -106,7 +103,7 @@ class HiCacheStateFactAccumulator:
     seq_by_scope: dict[str, list[int]] = field(default_factory=lambda: defaultdict(list))
 
     def observe(self, args: dict[str, Any]) -> None:
-        """检查单个事件是否满足 HiCache state fact 合同。"""
+        """Observe one event without retaining the complete trace payload."""
 
         if not is_hicache_profile_event(args, set(STATE_FACT_REQUIRED_FIELDS_BY_ROLE)):
             return
@@ -117,8 +114,8 @@ class HiCacheStateFactAccumulator:
         self.role_events[fact.role] += 1
         for consumer in fact.consumers:
             self.consumer_events[consumer] += 1
-        if self._is_completed_state_model_fact(args):
-            self._observe_token_references(args)
+        if self._is_completed_state_model_fact(args, fact):
+            self._observe_token_references(args, fact.role)
         if not fact.has_consumer(HICACHE_CONSUMER_STATE_MODEL):
             return
         if fact.fact_class != "workload_identity":
@@ -133,7 +130,7 @@ class HiCacheStateFactAccumulator:
         self._observe_completed_required_fact(args, fact.role)
 
     def finalize(self) -> dict[str, Any]:
-        """汇总 HiCache state fact 合同检查结果。"""
+        """Return an immutable-style summary of all accumulated evidence."""
 
         missing_token_dictionary_refs = sorted(self.span_path_ids - self.dictionary_ids)
         dictionary_ids_without_tokens = sorted(self.dictionary_ids - self.dictionary_ids_with_tokens)
@@ -141,9 +138,6 @@ class HiCacheStateFactAccumulator:
         route_error_events = (
             self.counts["state_model_consumer_on_non_state_fact"] + self.counts["unknown_state_model_role_events"]
         )
-        missing_required_roles = [
-            role for role in REQUIRED_COMPLETED_STATE_FACT_ROLES if self.role_completed_events.get(role, 0) <= 0
-        ]
         seq_order_error_count = self._seq_order_error_count()
         return {
             "class_events": dict(sorted(self.class_events.items())),
@@ -154,8 +148,6 @@ class HiCacheStateFactAccumulator:
             "input_contract_event_count": self.consumer_events[HICACHE_CONSUMER_INPUT_CONTRACT],
             "required_events": self.counts["required_events"],
             "role_completed_events": dict(sorted(self.role_completed_events.items())),
-            "missing_required_roles": missing_required_roles,
-            "missing_required_role_count": len(missing_required_roles),
             "missing_required_fact_events": self.counts["missing_required_fact_events"],
             "missing_fields": dict(sorted(self.missing_fields.items())),
             "missing_fields_by_role": {
@@ -179,7 +171,6 @@ class HiCacheStateFactAccumulator:
             "seq_scope_count": len(self.seq_by_scope),
             "seq_order_error_count": seq_order_error_count,
             "ready": self._ready(
-                missing_required_roles,
                 route_error_events,
                 missing_token_dictionary_refs,
                 dictionary_ids_without_tokens,
@@ -210,9 +201,7 @@ class HiCacheStateFactAccumulator:
         if has_fact(scope) and seq_no is not None:
             self.seq_by_scope[str(scope)].append(seq_no)
 
-    def _observe_token_references(self, args: dict[str, Any]) -> None:
-        fact = parse_fact(args)
-        role = fact.role
+    def _observe_token_references(self, args: dict[str, Any], role: str) -> None:
         for field_name in STATE_FACT_DICTIONARY_FIELDS_BY_ROLE.get(role, ()):
             for item in fact_items(args.get(field_name)):
                 if isinstance(item, dict):
@@ -252,11 +241,9 @@ class HiCacheStateFactAccumulator:
                 missing.append(f"{field_name}.path_id")
         return missing
 
-    def _is_completed_state_model_fact(self, args: dict[str, Any]) -> bool:
-        fact = parse_fact_or_none(args)
+    def _is_completed_state_model_fact(self, args: dict[str, Any], fact: HiCacheFact) -> bool:
         return bool(
-            fact is not None
-            and completed_fact_role(args, fact.role)
+            completed_fact_role(args, fact.role)
             and fact.has_consumer(HICACHE_CONSUMER_STATE_MODEL)
             and fact.fact_class == "workload_identity"
         )
@@ -273,7 +260,6 @@ class HiCacheStateFactAccumulator:
 
     def _ready(
         self,
-        missing_required_roles: list[str],
         route_error_events: int,
         missing_token_dictionary_refs: list[str],
         dictionary_ids_without_tokens: list[str],
@@ -282,7 +268,6 @@ class HiCacheStateFactAccumulator:
     ) -> bool:
         return (
             self.counts["missing_required_fact_events"] == 0
-            and not missing_required_roles
             and route_error_events == 0
             and not missing_token_dictionary_refs
             and not dictionary_ids_without_tokens

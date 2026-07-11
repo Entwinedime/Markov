@@ -1,43 +1,23 @@
-"""HiCache DAG 映射验证对象。"""
+"""Validation of HiCache operation visibility and DAG-anchor coverage."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from ...planning.specs import ModelRunRequest
-from ...types import ModelRunResult, ModelOutputRequirement, ValidationSummary
-from ..base_dag.preflight import DagTracePreflightCheck
-from ..registry import RowValidation, count_blockers
+from ...progress import count_text
+from ...types import ModelRunResult, ValidationSummary
+from ..dag import DagArtifactValidation
+from ..registry import count_blockers, readiness_status
 
 
-class HiCacheDagMappingValidation(RowValidation):
-    """验证 HiCache 事件到 Base DAG 的锚点覆盖和操作可见性。"""
+class HiCacheDagMappingValidation(DagArtifactValidation):
+    """Validate HiCache operation visibility and anchors in the base DAG."""
 
     name = "hicache_dag_mapping"
     progress_detail = "HiCache DAG mapping"
-    progress_unit = "run"
-
-    def preflight_checks(self) -> tuple[type[DagTracePreflightCheck], ...]:
-        """返回 full-DAG trace 通道检查。"""
-
-        return (DagTracePreflightCheck,)
-
-    def build_model_run_requests(self, context: Any) -> list[ModelRunRequest]:
-        """请求 faithful replay DAG 诊断产物。"""
-
-        return [
-            ModelRunRequest(
-                mode="faithful_replay",
-                source_profile=run,
-                target_profile=None,
-                output_requirements=frozenset({ModelOutputRequirement.BASE_DAG_DIAGNOSTICS}),
-                validation_name=self.name,
-            )
-            for run in context.runs
-        ]
 
     def build_row(self, context: Any, result: ModelRunResult) -> dict[str, Any]:
-        """读取 HiCache DAG mapping 诊断产物并构造 row。"""
+        """Read mapping diagnostics and construct one per-profile row."""
 
         artifacts = result.artifacts
         anchor = artifacts.load_if_present(artifacts.dag_anchor_coverage_json)
@@ -48,9 +28,11 @@ class HiCacheDagMappingValidation(RowValidation):
             blockers.append(result.skip_reason or "skipped")
         if result.return_code != 0:
             blockers.append("model_command_failed")
-        for path in (artifacts.dag_anchor_coverage_json, artifacts.dag_operation_visibility_json):
-            if not path.is_file() and not result.skipped:
-                blockers.append(f"missing_artifact:{path.name}")
+        blockers.extend(
+            f"missing_artifact:{path.name}"
+            for path in (artifacts.dag_anchor_coverage_json, artifacts.dag_operation_visibility_json)
+            if not path.is_file() and not result.skipped
+        )
         anchor_blockers = anchor.get("blockers") if isinstance(anchor.get("blockers"), list) else []
         return {
             "model_run_id": result.spec.run_id,
@@ -72,29 +54,26 @@ class HiCacheDagMappingValidation(RowValidation):
         }
 
     def running_metrics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """返回 HiCache DAG mapping 的运行中指标。"""
+        """Return the running anchor-readiness metric."""
 
-        return {"anchor": f"{sum(1 for row in rows if row.get('anchor_coverage_ready'))}/{len(rows)}"}
+        return {
+            "anchor": count_text(
+                sum(1 for row in rows if row.get("anchor_coverage_ready")),
+                len(rows),
+            )
+        }
 
     def build_summary(self, context: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """汇总 HiCache DAG mapping 验证结果。"""
+        """Aggregate anchor readiness and operation-visibility counts."""
 
         run_count = len(rows)
         skipped_count = sum(1 for row in rows if row.get("skipped"))
         error_count = sum(1 for row in rows if row.get("return_code") not in (0, None))
         anchor_ready_count = sum(1 for row in rows if row.get("anchor_coverage_ready") is True)
-        if run_count == 0:
-            status = "EMPTY"
-        elif error_count:
-            status = "ERROR"
-        elif anchor_ready_count == run_count:
-            status = "OK"
-        else:
-            status = "CHECK"
         return {
             "schema": "trace_sim.modeling_workflow.validation.hicache_dag_mapping.v1",
             "validation": self.name,
-            "status": status,
+            "status": readiness_status(run_count, error_count, anchor_ready_count),
             "run_count": run_count,
             "anchor_ready_count": anchor_ready_count,
             "skipped_count": skipped_count,
@@ -105,11 +84,10 @@ class HiCacheDagMappingValidation(RowValidation):
             ),
             "invisible_operation_count": sum(int(row.get("invisible_operation_count") or 0) for row in rows),
             "blocker_counts": count_blockers(rows, "anchor_blockers"),
-            "rows": rows,
         }
 
     def summary_text(self, summary: dict[str, Any]) -> str:
-        """返回最终进度摘要。"""
+        """Render the final mapping-validation progress summary."""
 
         return (
             f"{summary['run_count']} runs | "
@@ -123,7 +101,7 @@ class HiCacheDagMappingValidation(RowValidation):
         rows: list[dict[str, Any]],
         summary: dict[str, Any],
     ) -> ValidationSummary:
-        """转换成 workflow 统一 summary。"""
+        """Convert mapping results to the workflow summary contract."""
 
         return ValidationSummary(
             name=self.name,

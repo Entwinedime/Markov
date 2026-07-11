@@ -1,12 +1,13 @@
-"""基于 workflow prediction rows 的 HiCache transition exactness 验证。"""
+"""Prediction-set orchestration for HiCache transition exactness."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
-from markov_internal.common.io import write_json
+from markov_internal.common.io import load_json, output_is_current, write_json
 
 from ..artifacts.catalog import (
     build_transition_mismatch_catalog_from_entries,
@@ -40,22 +41,18 @@ def compare_transition_prediction_rows(
     page_key_mode: str,
     force: bool,
     sample_limit: int,
-    emit_catalog: bool,
-    emit_gates: bool,
     catalog_output: Path | None,
     gate_output: Path | None,
     summary_output_path: Path | None,
     on_row: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """验证一组 transition prediction rows。"""
+    """Validate a complete set of transition prediction rows."""
 
     options = TransitionPredictionSetOptions(
         artifact_root=artifact_root,
         page_key_mode=page_key_mode,
         force=force,
         sample_limit=sample_limit,
-        emit_catalog=emit_catalog,
-        emit_gates=emit_gates,
         catalog_output=catalog_output,
         gate_output=gate_output,
         summary_output_path=summary_output_path,
@@ -66,14 +63,12 @@ def compare_transition_prediction_rows(
 
 @dataclass(frozen=True)
 class TransitionPredictionSetOptions:
-    """transition prediction set 验证的运行选项。"""
+    """Options governing oracle reuse, comparison, and diagnostics."""
 
     artifact_root: Path
     page_key_mode: str
     force: bool
     sample_limit: int
-    emit_catalog: bool
-    emit_gates: bool
     catalog_output: Path | None
     gate_output: Path | None
     summary_output_path: Path | None
@@ -82,7 +77,7 @@ class TransitionPredictionSetOptions:
 
 @dataclass
 class TransitionPredictionSetValidator:
-    """管理 target oracle 复用、逐 prediction 比较和汇总产物写出。"""
+    """Manage target-oracle reuse, per-cell comparison, and summaries."""
 
     prediction_rows: list[dict[str, Any]]
     target_runs: dict[tuple[str, str], dict[str, Any]]
@@ -92,16 +87,16 @@ class TransitionPredictionSetValidator:
     classification_entries: list[dict[str, Any]] = field(default_factory=list)
 
     def run(self) -> dict[str, Any]:
-        """执行完整 prediction set 验证。"""
+        """Execute the complete prediction-set validation."""
 
         for prediction_row in self.prediction_rows:
             self.process_prediction(prediction_row)
         summary = self.build_summary()
-        self.write_optional_artifacts(summary)
+        self.write_diagnostic_artifacts(summary)
         return summary
 
     def process_prediction(self, prediction_row: dict[str, Any]) -> None:
-        """处理单个 source->target prediction。"""
+        """Process one source-to-target prediction cell."""
 
         prediction_dir = prediction_dir_from_row(prediction_row, self.options.artifact_root)
         prediction_paths = prediction_paths_for_dir(prediction_dir)
@@ -118,11 +113,12 @@ class TransitionPredictionSetValidator:
             self.options.on_row(row)
 
     def ensure_target_oracle(self, target_key: tuple[str, str], observed_path: Path) -> None:
-        """必要时构造 target-side observed transition oracle。"""
+        """Build the target-side oracle when its reuse contract is stale."""
 
         target_run = self.target_runs.get(target_key)
         should_rebuild = target_run is not None and (
-            (self.options.force and target_key not in self.rebuilt_oracle_keys) or not observed_path.is_file()
+            (self.options.force and target_key not in self.rebuilt_oracle_keys)
+            or not target_oracle_is_current(observed_path, target_run, sample_limit=self.options.sample_limit)
         )
         if not should_rebuild:
             return
@@ -142,27 +138,42 @@ class TransitionPredictionSetValidator:
         observed_path: Path,
         comparison_path: Path,
     ) -> None:
-        """必要时构造单个 prediction 的 exactness payload。"""
+        """Build one exactness payload when its inputs or options changed."""
 
-        should_rebuild = self.options.force or self.options.emit_catalog or not comparison_path.is_file()
+        comparison_mode = "self" if prediction_row.get("is_self") else "cross"
+        input_paths = [
+            prediction_paths.predicted_trace,
+            prediction_paths.validation,
+            observed_path,
+        ]
+        model_summary_path = prediction_dir / "model_summary.json"
+        if model_summary_path.is_file():
+            input_paths.append(model_summary_path)
+        should_rebuild = self.options.force or not comparison_is_current(
+            comparison_path,
+            input_paths,
+            comparison_mode=comparison_mode,
+            page_key_mode=self.options.page_key_mode,
+            sample_limit=self.options.sample_limit,
+        )
         if not observed_path.is_file() or not prediction_paths.predicted_trace.is_file() or not should_rebuild:
             return
         comparison = compare_prediction_to_observed(
             prediction_paths,
             observed_path,
-            comparison_mode="self" if prediction_row.get("is_self") else "cross",
+            comparison_mode=comparison_mode,
             page_key_mode=self.options.page_key_mode,
             sample_limit=self.options.sample_limit,
             force_self_check=self.options.force,
             context=comparison_context_from_prediction_row(
                 prediction_row, prediction_dir, observed_path, comparison_path
             ),
-            include_classification_evidence=self.options.emit_catalog,
+            include_classification_evidence=True,
         )
         write_json(comparison_path, comparison)
 
     def build_summary(self) -> dict[str, Any]:
-        """汇总整组 prediction 的 transition exactness 结果。"""
+        """Aggregate exactness results across all prediction cells."""
 
         rows = self.rows
         return {
@@ -171,6 +182,7 @@ class TransitionPredictionSetValidator:
             "prediction_count": len(rows),
             "ready_count": sum(1 for row in rows if row.get("ready")),
             "exact_count": sum(1 for row in rows if row.get("exact")),
+            "skipped_count": sum(1 for row in rows if row.get("skipped")),
             "final_state_exact_count": sum(1 for row in rows if row.get("final_state_exact")),
             "transition_count_exact_count": sum(1 for row in rows if row.get("transition_count_exact")),
             "page_lifecycle_multiset_exact_count": sum(1 for row in rows if row.get("page_lifecycle_multiset_exact")),
@@ -187,16 +199,14 @@ class TransitionPredictionSetValidator:
             ],
         }
 
-    def write_optional_artifacts(self, summary: dict[str, Any]) -> None:
-        """按 CLI 开关写出 catalog 和 gate 诊断产物。"""
+    def write_diagnostic_artifacts(self, summary: dict[str, Any]) -> None:
+        """Write the mandatory HiCache catalog and gate diagnostics."""
 
-        if self.options.emit_catalog:
-            self.write_catalog(summary)
-        if self.options.emit_gates:
-            self.write_gate_scoreboard(summary)
+        self.write_catalog(summary)
+        self.write_gate_scoreboard(summary)
 
     def write_catalog(self, summary: dict[str, Any]) -> None:
-        """写出 transition mismatch catalog。"""
+        """Write the mandatory transition mismatch catalog."""
 
         catalog_path = resolve_output(
             self.options.catalog_output,
@@ -211,7 +221,6 @@ class TransitionPredictionSetValidator:
             sample_limit=self.options.sample_limit,
         )
         write_transition_catalog_outputs(
-            self.options.artifact_root,
             catalog_path,
             catalog,
             sample_limit=self.options.sample_limit,
@@ -219,7 +228,7 @@ class TransitionPredictionSetValidator:
         summary["catalog_path"] = str(catalog_path)
 
     def write_gate_scoreboard(self, summary: dict[str, Any]) -> None:
-        """写出 transition patch gate scoreboard。"""
+        """Write the mandatory diagnostic patch-gate scoreboard."""
 
         gate_path = resolve_output(
             self.options.gate_output,
@@ -233,3 +242,52 @@ class TransitionPredictionSetValidator:
         )
         write_json(gate_path, scoreboard)
         summary["gate_scoreboard_path"] = str(gate_path)
+
+
+def target_oracle_is_current(
+    observed_path: Path,
+    target_run: dict[str, Any],
+    *,
+    sample_limit: int,
+) -> bool:
+    """Validate target-oracle metadata and modification-time dependencies."""
+
+    trace_paths = [Path(path) for path in target_run.get("python_probe_files", [])]
+    if not output_is_current(observed_path, trace_paths):
+        return False
+    try:
+        payload = load_json(observed_path)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    metadata_fields = ("target_run_id", "target_config_id", "input_id", "input_class")
+    return (
+        payload.get("sample_limit") == sample_limit
+        and payload.get("oracle_trace_files") == [str(path) for path in trace_paths]
+        and all(payload.get(field) == target_run.get(field) for field in metadata_fields)
+    )
+
+
+def comparison_is_current(
+    comparison_path: Path,
+    input_paths: list[Path],
+    *,
+    comparison_mode: str,
+    page_key_mode: str,
+    sample_limit: int,
+) -> bool:
+    """Validate comparison options and ensure no input artifact is newer."""
+
+    if not output_is_current(comparison_path, input_paths):
+        return False
+    try:
+        payload = load_json(comparison_path)
+    except (OSError, ValueError):
+        return False
+    return bool(
+        isinstance(payload, dict)
+        and payload.get("comparison_mode") == comparison_mode
+        and payload.get("page_key_mode") == page_key_mode
+        and payload.get("sample_limit") == sample_limit
+    )

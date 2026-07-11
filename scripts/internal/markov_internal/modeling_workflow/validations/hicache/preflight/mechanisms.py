@@ -1,4 +1,4 @@
-"""HiCache profile event role 到机制覆盖率的映射。"""
+"""Mapping from HiCache fact roles to diagnostic mechanism coverage."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ ROLE_TO_MECHANISM = {
 
 
 def observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
-    """把完成态事件角色映射为 workload 机制命中。"""
+    """Count the mechanism represented by one completed fact."""
 
     fact = parse_fact_or_none(args)
     if fact is None or not completed_fact_role(args, fact.role):
@@ -40,7 +40,7 @@ def observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
 
 
 def configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list[str]:
-    """根据配置 target 的 fact.role 推导理论可观测机制。"""
+    """Derive theoretically observable mechanisms from configured targets."""
 
     mechanisms: set[str] = set()
     for target in configured_targets.values():
@@ -51,7 +51,7 @@ def configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list
 
 
 def configured_fact_role(target: dict[str, Any]) -> str:
-    """读取 target 配置中的 fact.role。"""
+    """Read the declared fact role from one configured probe target."""
 
     fact = target.get("fact")
     if isinstance(fact, dict):
@@ -62,7 +62,7 @@ def configured_fact_role(target: dict[str, Any]) -> str:
 
 
 def completed_fact_role(args: dict[str, Any], role: str) -> bool:
-    """判断当前 role 在合同中是否处于可消费完成态。"""
+    """Return whether a role is at its contract-defined consumable phase."""
 
     phase = str(args.get("phase") or "").lower()
     if role == "cache_extend_input":
@@ -71,7 +71,7 @@ def completed_fact_role(args: dict[str, Any], role: str) -> bool:
 
 
 def is_hicache_profile_event(args: dict[str, Any], state_roles: set[str]) -> bool:
-    """识别需要参与 HiCache 专项质量审计的事件。"""
+    """Identify events included in the HiCache-specific quality audit."""
 
     target_id = str(args.get("target_id") or "").lower()
     if target_id.startswith(("hiradix.", "hicache.", "hicache_controller.")):

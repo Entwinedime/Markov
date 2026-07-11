@@ -1,4 +1,4 @@
-"""DAG trace 通道前置检查。"""
+"""Preflight audit for trace channels required to build a full DAG."""
 
 from __future__ import annotations
 
@@ -6,17 +6,23 @@ from typing import Any
 
 from ....audit.profile_artifacts import audit_profile_artifacts
 from ....common.io import write_json
-from markov_internal.common.naming import safe_slug
+from ....common.naming import safe_slug
 from ...preflight import PreflightCheck
+from ...progress import count_text
 
 
 class DagTracePreflightCheck(PreflightCheck):
-    """检查 DAG 验证所需的 torch、LD_PRELOAD 和 Python probe 通道。"""
+    """Require torch, LD_PRELOAD, and Python-probe channels for each run."""
 
     name = "full_dag_trace_channels"
 
+    def progress_text(self, summary: dict[str, Any]) -> str:
+        """Render ready full-DAG inputs against the selected run count."""
+
+        return "full-dag " + count_text(summary.get("full_trace_ready_count"), summary.get("run_count"))
+
     def run(self, context: Any) -> dict[str, Any]:
-        """对已选择 profile run 执行 full-DAG trace 通道审计。"""
+        """Audit full-DAG trace-channel readiness for selected profiles."""
 
         rows: list[dict[str, Any]] = []
         root = context.artifacts.preflight_dir / self.name
@@ -56,7 +62,7 @@ class DagTracePreflightCheck(PreflightCheck):
 
 
 def summarize_dag_trace_preflight(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总 DAG trace 通道前置检查结果。"""
+    """Aggregate per-profile trace-channel readiness and blockers."""
 
     run_count = len(rows)
     full_trace_ready_count = sum(1 for row in rows if row.get("full_trace_ready") is True)

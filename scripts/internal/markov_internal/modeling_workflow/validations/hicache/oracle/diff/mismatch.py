@@ -1,4 +1,4 @@
-"""final-state mismatch 解释辅助工具。"""
+"""Evidence helpers for explaining a final-state mismatch."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 def first_hicache_mismatch(
     sets_diff: dict[str, Any], predicted_records: list[dict[str, Any]] | None = None
 ) -> dict[str, Any] | None:
-    """返回第一个 final-state mismatch 及其候选 transition 证据。"""
+    """Return the first final-state mismatch and candidate transition evidence."""
 
     predicted_records = predicted_records or []
     for key, value in sets_diff.items():
@@ -27,7 +27,7 @@ def first_hicache_mismatch(
 
 
 def first_transition_touching_page(records: list[dict[str, Any]], page: str) -> dict[str, Any] | None:
-    """查找第一条触达指定 page 的 predicted transition。"""
+    """Find the first predicted transition that touches a page."""
 
     if not page:
         return None

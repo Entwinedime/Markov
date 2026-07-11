@@ -1,1 +1,1 @@
-"""统一 modeling workflow 的 planning 辅助工具。"""
+"""Discovery and execution-plan construction for the modeling workflow."""

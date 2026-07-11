@@ -1,11 +1,11 @@
-"""单个 prediction 的 HiCache transition exactness 比较。"""
+"""HiCache transition exactness comparison for one prediction cell."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
-from markov_internal.common.io import load_json, write_json
+from markov_internal.common.io import load_json, output_is_current, write_json
 from ...oracle.diff.multiset import count_rows_by_transition_kind
 from ..artifacts.paths import PathsForPrediction
 from ..replay.engine import replay_predicted_records
@@ -40,12 +40,16 @@ def compare_prediction_to_observed(
     context: dict[str, Any] | None = None,
     include_classification_evidence: bool = False,
 ) -> dict[str, Any]:
-    """构建单格 transition exactness 对比，并同步生成分类与 patch gate 字段。"""
+    """Compare one prediction and attach classification and patch-gate fields."""
 
     self_check_path = prediction_paths.model_self_check
-    if self_check_path.is_file() and not force_self_check:
-        self_check = load_json(self_check_path)
-    else:
+    self_check = load_current_self_check(
+        self_check_path,
+        prediction_paths.predicted_trace,
+        sample_limit=sample_limit,
+        force=force_self_check,
+    )
+    if self_check is None:
         self_check = build_model_self_check(prediction_paths.predicted_trace, sample_limit=sample_limit)
         write_json(self_check_path, self_check)
 
@@ -73,6 +77,8 @@ def compare_prediction_to_observed(
     result = {
         "schema": f"trace_sim.hicache.transition_exactness_{comparison_mode}.v1",
         "comparison_mode": comparison_mode,
+        "page_key_mode": page_key_mode,
+        "sample_limit": sample_limit,
         "ready": ready,
         "exact": exact,
         "prediction_dir": str(prediction_paths.prediction_dir),
@@ -124,8 +130,28 @@ def compare_prediction_to_observed(
     return result
 
 
+def load_current_self_check(
+    self_check_path: Path,
+    predicted_trace_path: Path,
+    *,
+    sample_limit: int,
+    force: bool,
+) -> dict[str, Any] | None:
+    """Load a self-check only when it matches the current prediction input."""
+
+    if force or not output_is_current(self_check_path, [predicted_trace_path]):
+        return None
+    try:
+        payload = load_json(self_check_path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("sample_limit") != sample_limit:
+        return None
+    return payload
+
+
 def load_validation_summary(path: Path) -> dict[str, Any]:
-    """读取 validation.json 中与 transition exactness 相关的摘要。"""
+    """Read transition-relevant fields from ``validation.json``."""
 
     if not path.is_file():
         return {}
@@ -146,7 +172,7 @@ def classify_transition_comparison_failure(
     count_match: dict[str, Any],
     lifecycle_match: dict[str, Any],
 ) -> str:
-    """把 transition exactness failure 粗分流。"""
+    """Classify the broad failure boundary of an exactness comparison."""
 
     if not self_check.get("ready"):
         return "model_trace_incomplete"
@@ -164,7 +190,7 @@ def comparison_context_from_prediction(
     observed_path: Path,
     comparison: dict[str, Any],
 ) -> dict[str, Any]:
-    """从单格 prediction 路径构造比较上下文。"""
+    """Build fallback comparison context from prediction artifact paths."""
 
     return {
         "label": prediction_paths.prediction_dir.name,
@@ -186,7 +212,7 @@ def comparison_context_from_prediction_row(
     observed_path: Path,
     comparison_path: Path,
 ) -> dict[str, Any]:
-    """从 prediction row 构造比较上下文。"""
+    """Build complete comparison context from a workflow prediction row."""
 
     return {
         "label": prediction_row.get("label"),

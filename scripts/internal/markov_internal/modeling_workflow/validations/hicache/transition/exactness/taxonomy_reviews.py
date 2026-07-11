@@ -1,4 +1,4 @@
-"""transition family review 与 DAG patch gate 字段。"""
+"""Transition-family reviews and diagnostic DAG-patch gate fields."""
 
 from __future__ import annotations
 
@@ -12,14 +12,12 @@ def family_review(
     observed_evidence: str,
     recommended_fix: str,
 ) -> dict[str, Any]:
-    """生成 catalog 使用的精简 family review。"""
+    """Build the compact family review embedded in the catalog."""
 
     return {
         "status": status,
         "patch_risk": patch_risk,
         "classification": classification,
-        "sglang_source_anchor": [],
-        "model_call_site": [],
         "observed_evidence": observed_evidence,
         "recommended_fix": recommended_fix,
     }
@@ -61,14 +59,7 @@ FAMILY_REVIEWS = {
         "Write-back and device eviction deltas may be interleaved differently.",
         "Compare writeback and device-eviction gate evidence before DAG patching.",
     ),
-    "host_cleanup_evicted_marker_boundary": family_review(
-        "transition_grouping",
-        "medium",
-        "transition_grouping",
-        "Low-host targets shift evicted marker boundaries around cleanup.",
-        "Promote only if host-cleanup gate evidence diverges.",
-    ),
-    "low_host_cleanup_loadback_transient": family_review(
+    "host_cleanup_loadback_visibility": family_review(
         "physical_candidate",
         "high",
         "physical_candidate",
@@ -100,13 +91,13 @@ FAMILY_REVIEWS = {
 
 
 def review_for_transition_family(family: str) -> dict[str, Any]:
-    """返回阶段二 family 机制审查模板。"""
+    """Return the mechanism-review template for one transition family."""
 
     return dict(FAMILY_REVIEWS.get(family, FAMILY_REVIEWS["unresolved_transition_mismatch"]))
 
 
 def dag_patch_gate_fields(classification: str, family: str) -> dict[str, Any]:
-    """为 DAG patch 阶段生成最小 gate 字段。"""
+    """Build minimum diagnostic gate fields for future DAG patching."""
 
     if classification == "matched":
         return gate("drop", False, False, [])
@@ -118,22 +109,13 @@ def dag_patch_gate_fields(classification: str, family: str) -> dict[str, Any]:
         return gate(
             "diagnostic_only", False, False, ["checkpoint/control boundary evidence", "storage progress evidence"]
         )
-    if classification == "capacity_victim":
-        return gate(
-            "requires_source_attribution",
-            True,
-            True,
-            ["capacity victim choices", "source cache physical ops", "duration calibration"],
-        )
     if classification == "physical_candidate":
         return gate("requires_source_attribution", True, True, physical_candidate_evidence_required(family))
-    if classification == "model_bug":
-        return gate("blocked", False, False, ["state model fix", "final-state regression check"])
     return gate("blocked", False, False, ["observed oracle gap analysis"])
 
 
 def gate(action: str, source_attribution: bool, duration: bool, evidence: list[str]) -> dict[str, Any]:
-    """构造 patch gate 字段。"""
+    """Construct one patch-gate decision payload."""
 
     return {
         "patch_filter_action": action,
@@ -144,7 +126,7 @@ def gate(action: str, source_attribution: bool, duration: bool, evidence: list[s
 
 
 def physical_candidate_evidence_required(family: str) -> list[str]:
-    """按 high-risk family 给出 DAG patch 前置 evidence。"""
+    """Return source evidence required by a high-risk physical family."""
 
     if family == "writeback_eviction_interleaving":
         return [
@@ -153,7 +135,7 @@ def physical_candidate_evidence_required(family: str) -> list[str]:
             "source cache physical ops",
             "duration calibration",
         ]
-    if family == "low_host_cleanup_loadback_transient":
+    if family == "host_cleanup_loadback_visibility":
         return [
             "host cleanup victim choices",
             "loadback boundary or state fact",

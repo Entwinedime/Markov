@@ -1,1 +1,1 @@
-"""HiCache workload identity/input contract 库。"""
+"""HiCache workload-identity input contracts."""

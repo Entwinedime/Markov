@@ -1,1 +1,1 @@
-"""内部脚本共享的基础工具包。"""
+"""Low-level utilities shared by internal Python workflows."""

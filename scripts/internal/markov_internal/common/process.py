@@ -1,4 +1,4 @@
-"""内部脚本共用的 HTTP 与子进程生命周期工具。"""
+"""HTTP requests and subprocess lifecycle helpers for internal workflows."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from .paths import ROOT_DIR
 
 
 def api_base_from_ready_url(ready_url: str) -> str:
-    """从 ready URL 提取 API base URL。"""
+    """Extract the API origin from an absolute readiness URL."""
 
     parsed = urllib.parse.urlsplit(ready_url)
     if not parsed.scheme or not parsed.netloc:
@@ -26,7 +26,7 @@ def api_base_from_ready_url(ready_url: str) -> str:
 
 
 def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
-    """发送 JSON POST 并宽松解析响应。"""
+    """Send a JSON POST request and decode JSON or text responses."""
 
     data = None
     headers = {}
@@ -45,7 +45,7 @@ def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
 
 
 def wait_for_ready(process: subprocess.Popen[Any], ready_url: str, timeout_sec: int) -> None:
-    """等待 server ready，同时监控进程是否提前退出。"""
+    """Wait for server readiness while detecting an early process exit."""
 
     start = time.monotonic()
     while True:
@@ -68,7 +68,12 @@ def start_process(
     log_path: Path,
     env: dict[str, str],
 ) -> subprocess.Popen[Any]:
-    """启动子进程并把 stdout/stderr 写入日志文件。"""
+    """Start a process group and redirect both output streams to ``log_path``.
+
+    ``start_new_session`` creates the process group without running Python code
+    between ``fork`` and ``exec``, which keeps this helper safe when callers use
+    threads.
+    """
 
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_file = log_path.open("wb")
@@ -80,15 +85,16 @@ def start_process(
             stdout=log_file,
             stderr=subprocess.STDOUT,
             shell=isinstance(command, str),
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
     finally:
-        # Popen 已经复制 fd，父进程这里可以关闭，避免长时间 suite 泄漏文件句柄。
+        # Popen duplicates the descriptor, so the parent can close its copy and
+        # avoid leaking one descriptor for every long-running suite process.
         log_file.close()
 
 
 def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -> None:
-    """终止进程组，超时后升级为 SIGKILL。"""
+    """Terminate a process group and escalate to SIGKILL after the timeout."""
 
     if process is None or process.poll() is not None:
         return
@@ -100,3 +106,39 @@ def stop_process(process: subprocess.Popen[Any] | None, timeout_sec: int = 20) -
         process.wait()
     except ProcessLookupError:
         pass
+
+
+def run_command(
+    command: list[str],
+    *,
+    log_path: Path | None = None,
+    capture_output: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run a one-shot repository command with one explicit output policy.
+
+    Exactly one of ``log_path`` and ``capture_output`` may be selected. Callers
+    receive the completed process and retain responsibility for interpreting a
+    nonzero return code.
+    """
+
+    if log_path is not None and capture_output:
+        raise ValueError("log_path and capture_output are mutually exclusive")
+    if log_path is None:
+        return subprocess.run(
+            command,
+            cwd=ROOT_DIR,
+            text=True,
+            capture_output=capture_output,
+            check=False,
+        )
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8") as log_file:
+        return subprocess.run(
+            command,
+            cwd=ROOT_DIR,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )

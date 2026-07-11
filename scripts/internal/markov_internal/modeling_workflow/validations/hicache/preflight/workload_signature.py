@@ -1,15 +1,17 @@
-"""HiCache workload identity signature 与 sequence 诊断。"""
+"""HiCache workload-identity signatures and sequence diagnostics."""
 
 from __future__ import annotations
 
 import collections
-import hashlib
+from pathlib import Path
 from typing import Any
 
+from markov_internal.common.digests import sha256_json
 from ....types import ProfileRunRef
 from ..input_contract.signature.extractor import extract_audit_events
 from ..input_contract.signature.path_contract import workload_identity_path_contract
-from ..input_contract.signature.primitives import canonical_json
+from ..input_contract.signature.primitives import trace_events
+from ..input_contract.signature.types import AuditEvent
 
 
 WORKLOAD_SIGNATURE_ROLES = (
@@ -21,20 +23,40 @@ WORKLOAD_SIGNATURE_ROLES = (
 
 
 class WorkloadSignatureBuilder:
-    """从 workload identity facts 构造 multiset gate 与 sequence 诊断。"""
+    """Build the multiset gate and optional sequence diagnostics."""
 
-    def __init__(self, run: ProfileRunRef, *, include_sequence_diagnostics: bool = False) -> None:
+    def __init__(
+        self,
+        run: ProfileRunRef,
+        *,
+        include_sequence_diagnostics: bool = False,
+        event_rows: list[tuple[Path, dict[str, Any]]] | None = None,
+    ) -> None:
+        """Create a builder, optionally reusing already decoded trace rows."""
+
         self.run = run
         self.include_sequence_diagnostics = include_sequence_diagnostics
         self.roles = set(WORKLOAD_SIGNATURE_ROLES)
+        self.event_rows = event_rows
 
     def build(self) -> dict[str, Any]:
-        """构造当前 run 的 workload signature。"""
+        """Build the canonical workload signature for this profile run."""
 
+        event_rows = self.event_rows
+        if event_rows is None:
+            event_rows = trace_events(list(self.run.python_probe_files))
         events, unknown_roles, unmapped_requests = extract_audit_events(
-            list(self.run.python_probe_files), self.run.run_id, self.roles
+            list(self.run.python_probe_files),
+            self.run.run_id,
+            self.roles,
+            event_rows=event_rows,
         )
-        path_contract = workload_identity_path_contract(list(self.run.python_probe_files), self.roles, sample=0)
+        path_contract = workload_identity_path_contract(
+            list(self.run.python_probe_files),
+            self.roles,
+            sample=0,
+            event_rows=event_rows,
+        )
         by_role: dict[str, collections.Counter[str]] = {role: collections.Counter() for role in self.roles}
         for event in events:
             by_role.setdefault(event.role, collections.Counter())[event.signature] += 1
@@ -65,15 +87,8 @@ class WorkloadSignatureBuilder:
         return result
 
 
-def sha256_json(payload: Any) -> str:
-    """对 canonical JSON payload 生成 sha256_json 摘要。"""
-
-    encoded = canonical_json(payload).encode("utf-8")
-    return "sha256_json:" + hashlib.sha256(encoded).hexdigest()
-
-
-def workload_sequence_diagnostic_payload(events: list[Any]) -> list[dict[str, str]]:
-    """构造 sequence 诊断 hash 的最小 payload。"""
+def workload_sequence_diagnostic_payload(events: list[AuditEvent]) -> list[dict[str, str]]:
+    """Build the minimal sequence payload used for diagnostic hashing."""
 
     return [
         {
@@ -84,8 +99,8 @@ def workload_sequence_diagnostic_payload(events: list[Any]) -> list[dict[str, st
     ]
 
 
-def workload_sequence_diagnostic_events(events: list[Any]) -> list[dict[str, Any]]:
-    """构造 mismatch 诊断使用的可读 sequence events。"""
+def workload_sequence_diagnostic_events(events: list[AuditEvent]) -> list[dict[str, Any]]:
+    """Build readable sequence rows used to explain a mismatch."""
 
     return [
         {
@@ -109,7 +124,7 @@ def summarize_workload_sequence_input_group(
     include_details: bool,
     sample_limit: int = 8,
 ) -> dict[str, Any]:
-    """汇总同一个 input 下跨 config 的 workload sequence 诊断信息。"""
+    """Summarize cross-config sequence diagnostics for one input."""
 
     sequence_signatures = sorted(
         {
@@ -159,7 +174,7 @@ def first_workload_sequence_diagnostic_mismatch(
     source: list[dict[str, Any]],
     target: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    """定位两条 workload sequence 的第一个 `(role, signature)` 差异。"""
+    """Locate the first ``(role, signature)`` difference between sequences."""
 
     limit = min(len(source), len(target))
     for index in range(limit):
@@ -179,6 +194,6 @@ def first_workload_sequence_diagnostic_mismatch(
 
 
 def sequence_compare_key(event: dict[str, Any]) -> tuple[str, str]:
-    """返回 strict sequence 比较 key。"""
+    """Return the strict comparison key for a sequence event."""
 
     return str(event.get("role") or ""), str(event.get("signature") or "")

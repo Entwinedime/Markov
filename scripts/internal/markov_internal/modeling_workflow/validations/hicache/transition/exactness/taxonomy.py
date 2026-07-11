@@ -1,4 +1,4 @@
-"""HiCache transition family 分类。"""
+"""Semantic family classification for HiCache transition mismatches."""
 
 from __future__ import annotations
 
@@ -15,6 +15,9 @@ from .taxonomy_evidence import summarize_hicache_evidence, summarize_observed_ta
 from .taxonomy_reviews import dag_patch_gate_fields, review_for_transition_family
 
 
+TransitionClassification = tuple[str, str]
+
+
 def build_transition_classification_entry(
     context: dict[str, Any],
     comparison: dict[str, Any],
@@ -25,10 +28,10 @@ def build_transition_classification_entry(
     sample_limit: int,
     include_evidence: bool,
 ) -> dict[str, Any]:
-    """把单次 compare 结果规整成 transition family 和 patch gate。"""
+    """Project one comparison to a transition family and patch gate."""
 
     mismatch_kinds = transition_mismatch_kinds(comparison)
-    family, reason = classify_transition_family(context, comparison, hicache_summary, mismatch_kinds)
+    family, reason = classify_transition_family(comparison, hicache_summary, mismatch_kinds)
     review = review_for_transition_family(family)
     gate = dag_patch_gate_fields(str(review.get("classification") or ""), family)
     sample_mismatches = comparison.get("page_lifecycle_multiset_comparison", {}).get("top_mismatches", [])
@@ -94,7 +97,7 @@ def build_transition_classification_entry(
 
 
 def compare_result_classification_fields(classification_entry: dict[str, Any]) -> dict[str, Any]:
-    """抽取 compare 主结果中的分类与 gate 字段。"""
+    """Extract compact classification and gate fields for comparison output."""
 
     return {
         "transition_family": classification_entry.get("family"),
@@ -114,7 +117,7 @@ def compare_result_classification_fields(classification_entry: dict[str, Any]) -
 
 
 def transition_mismatch_kinds(comparison: dict[str, Any]) -> list[str]:
-    """提取单格 transition mismatch kind 集合。"""
+    """Collect transition mismatch kinds from one comparison cell."""
 
     kinds = set()
     lifecycle = comparison.get("page_lifecycle_multiset_comparison", {}) if isinstance(comparison, dict) else {}
@@ -132,32 +135,72 @@ def transition_mismatch_kinds(comparison: dict[str, Any]) -> list[str]:
 
 
 def classify_transition_family(
-    prediction_row: dict[str, Any],
     comparison: dict[str, Any],
     hicache_summary: dict[str, Any],
     mismatch_kinds: list[str],
 ) -> tuple[str, str]:
-    """把 transition mismatch kind 组合规整成阶段一 family。"""
+    """Classify a mismatch from semantic deltas and resolved target policy.
 
-    del hicache_summary
-    target_config = str(prediction_row.get("target_config_id") or comparison.get("target_config_id") or "")
+    Configuration identifiers are deliberately excluded: names such as ``c2``
+    are experiment labels, not model parameters, and cannot justify a mechanism
+    classification.
+    """
+
+    resolved_policy = (
+        hicache_summary.get("resolved_policy") if isinstance(hicache_summary.get("resolved_policy"), dict) else {}
+    )
+    target_config = (
+        hicache_summary.get("target_config") if isinstance(hicache_summary.get("target_config"), dict) else {}
+    )
+    write_policy = str(resolved_policy.get("write_policy") or target_config.get("write_policy") or "")
     kind_set = set(mismatch_kinds)
+    for classification in (
+        _hard_gate_classification(comparison, kind_set),
+        _visibility_classification(kind_set),
+        _policy_classification(write_policy, kind_set),
+        _marker_classification(kind_set),
+    ):
+        if classification is not None:
+            return classification
+    return "unresolved_transition_mismatch", "no family rule matched this transition mismatch shape"
+
+
+def _hard_gate_classification(comparison: dict[str, Any], kind_set: set[str]) -> TransitionClassification | None:
+    """Apply readiness, final-state, and exactness gates before mechanism rules."""
+
     if not comparison or not comparison.get("ready"):
         return "model_or_oracle_not_ready", "transition exactness output is missing or not ready"
     if not comparison.get("final_state_exact"):
         return "model_or_oracle_not_ready", "final-state hard gate is not exact; transition catalog must not continue"
     if comparison.get("exact") and not kind_set:
         return "transition_exact", "final state, transition count and page lifecycle are exact"
+    return None
+
+
+def _visibility_classification(kind_set: set[str]) -> TransitionClassification | None:
+    """Classify prefetch and cross-tier visibility mismatches before policy markers."""
+
     if kind_set & PREFETCH_DELTA_KINDS:
         return "prefetch_visibility", "prefetch visible state delta mismatch"
-    if target_config.startswith("c3_"):
-        if kind_set & (HOST_VISIBLE_DELTA_KINDS | DEVICE_VISIBLE_DELTA_KINDS):
-            return "low_host_cleanup_loadback_transient", "low-host target has host/device visible delta mismatch"
-        if kind_set <= {"mark_evicted", "clear_evicted"}:
-            return "host_cleanup_evicted_marker_boundary", "low-host target only diverges in evicted marker lifecycle"
-    if target_config.startswith("c2_") and kind_set <= {"mark_dirty", "clear_dirty", "mark_evicted", "clear_evicted"}:
+    if kind_set & HOST_VISIBLE_DELTA_KINDS and kind_set & DEVICE_VISIBLE_DELTA_KINDS:
+        return (
+            "host_cleanup_loadback_visibility",
+            "host-visible and device-visible residency deltas diverge in the same prediction",
+        )
+    return None
+
+
+def _policy_classification(write_policy: str, kind_set: set[str]) -> TransitionClassification | None:
+    """Apply target write-policy rules to marker-only mismatch shapes."""
+
+    if write_policy == "write_back" and kind_set <= {
+        "mark_dirty",
+        "clear_dirty",
+        "mark_evicted",
+        "clear_evicted",
+    }:
         return "writeback_eviction_interleaving", "write-back target dirty/evicted lifecycle mismatch"
-    if target_config.startswith("c1_"):
+    if write_policy == "write_through_selective":
         if kind_set <= {"mark_dirty", "clear_dirty"}:
             return "dirty_oscillation", "write-through-selective target dirty marker lifecycle mismatch"
         if kind_set <= {"mark_dirty", "clear_dirty", "mark_evicted", "clear_evicted"}:
@@ -165,6 +208,12 @@ def classify_transition_family(
                 "dirty_evicted_marker_oscillation",
                 "write-through-selective dirty marker also shifts evicted marker boundary",
             )
+    return None
+
+
+def _marker_classification(kind_set: set[str]) -> TransitionClassification | None:
+    """Classify policy-independent marker-only mismatch shapes."""
+
     if kind_set <= {"mark_evicted", "clear_evicted"}:
         return "evicted_marker_oscillation", "only evicted marker lifecycle differs"
     if kind_set <= {"mark_dirty", "clear_dirty"}:
@@ -174,4 +223,4 @@ def classify_transition_family(
             "dirty_evicted_marker_oscillation",
             "only marker deltas differ, but kind combination is not target-specific",
         )
-    return "unresolved_transition_mismatch", "no family rule matched this transition mismatch shape"
+    return None

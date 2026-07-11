@@ -1,8 +1,9 @@
-"""建模验证对象的接口、公共模板和注册表。"""
+"""Validation interfaces, reusable templates, and lazy type registry."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 from ...common.io import write_json
@@ -16,46 +17,46 @@ if TYPE_CHECKING:
 
 
 class ValidationRequest(ABC):
-    """Python 侧验证对象接口。"""
+    """Python-side contract for one independently selectable validation."""
 
     name: str
 
     @abstractmethod
-    def preflight_checks(self) -> tuple[type["PreflightCheck"], ...]:
-        """返回该验证依赖的前置检查。"""
+    def preflight_checks(self) -> tuple[type[PreflightCheck], ...]:
+        """Return profile-input checks required before planning model runs."""
 
     @abstractmethod
-    def build_model_run_requests(self, context: "WorkflowContext") -> list["ModelRunRequest"]:
-        """返回该验证需要的 C++ 运行请求。"""
+    def build_model_run_requests(self, context: WorkflowContext) -> list[ModelRunRequest]:
+        """Return semantic C++ executions required by this validation."""
 
     @abstractmethod
     def analyze(
         self,
-        context: "WorkflowContext",
+        context: WorkflowContext,
         specs: list[ModelRunSpec],
         results: dict[str, ModelRunResult],
     ) -> ValidationSummary:
-        """读取 C++ 产物并写出验证结果。"""
+        """Read C++ artifacts, persist validation results, and summarize them."""
 
     def selected_specs(self, specs: list[ModelRunSpec]) -> list[ModelRunSpec]:
-        """筛选属于当前验证对象的模型运行。"""
+        """Select merged model runs that satisfy this validation request."""
 
         return [spec for spec in specs if self.name in spec.validation_requests]
 
 
 class RowValidation(ValidationRequest):
-    """以逐运行 row 为核心的验证模板。"""
+    """Template for validations represented by one row per model run."""
 
     progress_detail: str
     progress_unit = "run"
 
     def analyze(
         self,
-        context: "WorkflowContext",
+        context: WorkflowContext,
         specs: list[ModelRunSpec],
         results: dict[str, ModelRunResult],
     ) -> ValidationSummary:
-        """执行通用 row -> summary 验证流程。"""
+        """Execute the shared model-result to row to summary pipeline."""
 
         rows: list[dict[str, Any]] = []
         selected = self.selected_specs(specs)
@@ -77,38 +78,38 @@ class RowValidation(ValidationRequest):
         return self.validation_summary(context, rows, summary)
 
     @abstractmethod
-    def build_row(self, context: "WorkflowContext", result: ModelRunResult) -> dict[str, Any]:
-        """从单个模型运行结果构造验证 row。"""
+    def build_row(self, context: WorkflowContext, result: ModelRunResult) -> dict[str, Any]:
+        """Build one persisted validation row from a model-run result."""
 
     @abstractmethod
     def running_metrics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """返回动态进度条上的精简指标。"""
+        """Return compact metrics for the transient progress line."""
 
     @abstractmethod
-    def build_summary(self, context: "WorkflowContext", rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """从验证 row 构造 summary payload。"""
+    def build_summary(self, context: WorkflowContext, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Aggregate validation rows into the persisted summary payload."""
 
     @abstractmethod
     def summary_text(self, summary: dict[str, Any]) -> str:
-        """返回最终进度行上的摘要文本。"""
+        """Render the durable final progress-line summary."""
 
     @abstractmethod
     def validation_summary(
         self,
-        context: "WorkflowContext",
+        context: WorkflowContext,
         rows: list[dict[str, Any]],
         summary: dict[str, Any],
     ) -> ValidationSummary:
-        """转换成 workflow 统一 summary 数据结构。"""
+        """Convert validation-specific data to the workflow summary contract."""
 
 
 class PredictionValidation(ValidationRequest):
-    """基于同一 workload prediction matrix 的 cache-state 验证模板。"""
+    """Mixin that requests cache-state cells from one prediction matrix."""
 
     cache_state_output_requirements: frozenset[ModelOutputRequirement]
 
-    def build_model_run_requests(self, context: "WorkflowContext") -> list[ModelRunRequest]:
-        """为选中 prediction matrix 构造 cache-state 模型运行请求。"""
+    def build_model_run_requests(self, context: WorkflowContext) -> list[ModelRunRequest]:
+        """Build one cache-state request for each selected matrix cell."""
 
         predictions = PredictionMatrixBuilder(
             runs=context.runs,
@@ -130,46 +131,37 @@ class PredictionValidation(ValidationRequest):
         ]
 
 
-def validation_names() -> tuple[str, ...]:
-    """返回 CLI 支持的验证对象名称。"""
+VALIDATION_TYPES = {
+    "base_dag": (".base_dag.request", "BaseDagValidation"),
+    "final_dag": (".final_dag.request", "FinalDagValidation"),
+    "hicache_dag_mapping": (".hicache.dag_mapping", "HiCacheDagMappingValidation"),
+    "hicache_final_state": (".hicache.final_state", "HiCacheFinalStateValidation"),
+    "hicache_transition": (".hicache.transition.request", "HiCacheTransitionValidation"),
+}
 
-    return (
-        "base_dag",
-        "final_dag",
-        "hicache_dag_mapping",
-        "hicache_final_state",
-        "hicache_transition",
-    )
+
+def validation_names() -> tuple[str, ...]:
+    """Return stable validation names accepted by the CLI."""
+
+    return tuple(VALIDATION_TYPES)
 
 
 def validation_by_name(name: str) -> ValidationRequest:
-    """按稳定 CLI 名称构造验证对象。"""
+    """Construct a registered validation while preserving lazy imports."""
 
-    if name == "base_dag":
-        from .base_dag.request import BaseDagValidation
-
-        return BaseDagValidation()
-    if name == "final_dag":
-        from .final_dag.request import FinalDagValidation
-
-        return FinalDagValidation()
-    if name == "hicache_dag_mapping":
-        from .hicache.dag_mapping import HiCacheDagMappingValidation
-
-        return HiCacheDagMappingValidation()
-    if name == "hicache_final_state":
-        from .hicache.final_state import HiCacheFinalStateValidation
-
-        return HiCacheFinalStateValidation()
-    if name == "hicache_transition":
-        from .hicache.transition.request import HiCacheTransitionValidation
-
-        return HiCacheTransitionValidation()
-    raise KeyError(name)
+    try:
+        module_name, class_name = VALIDATION_TYPES[name]
+    except KeyError as error:
+        raise KeyError(f"unknown validation: {name}") from error
+    validation_type = getattr(import_module(module_name, package=__package__), class_name)
+    validation = validation_type()
+    if not isinstance(validation, ValidationRequest):
+        raise TypeError(f"Registered validation {name!r} does not implement ValidationRequest")
+    return validation
 
 
 def count_blockers(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    """统计 row 中的阻塞原因。"""
+    """Count scalar or list-valued blockers across validation rows."""
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -182,3 +174,13 @@ def count_blockers(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
             text = str(values)
             counts[text] = counts.get(text, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def readiness_status(total: int, error_count: int, ready_count: int) -> str:
+    """Return the common status for validations governed by readiness only."""
+
+    if total == 0:
+        return "EMPTY"
+    if error_count:
+        return "ERROR"
+    return "OK" if ready_count == total else "CHECK"

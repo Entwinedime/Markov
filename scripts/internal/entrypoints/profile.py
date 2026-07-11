@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""profiling run 的容器内入口。"""
+"""Container entry point for one profiling run or suite."""
 
 from __future__ import annotations
 

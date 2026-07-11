@@ -1,53 +1,39 @@
-"""HiCache transition delta multiset 比较工具。"""
+"""Multiset comparison helpers for HiCache transition deltas."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
-
-
-@dataclass(frozen=True)
-class DeltaMultisetComparator:
-    """按 `(transition_kind, page)` multiset 比较两组 delta rows。"""
-
-    predicted_rows: list[dict[str, Any]]
-    oracle_rows: list[dict[str, Any]]
-
-    def mismatches(self) -> list[dict[str, Any]]:
-        """返回 predicted/oracle multiset 差异行。"""
-
-        predicted_counts = delta_multiset_counts(self.predicted_rows)
-        oracle_counts = delta_multiset_counts(self.oracle_rows)
-        mismatches: list[dict[str, Any]] = []
-        for key in sorted(set(predicted_counts) | set(oracle_counts)):
-            predicted_count = predicted_counts.get(key, 0)
-            oracle_count = oracle_counts.get(key, 0)
-            if predicted_count == oracle_count:
-                continue
-            transition_kind, page = key
-            mismatches.append(
-                {
-                    "transition_kind": transition_kind,
-                    "page": page,
-                    "predicted_count": predicted_count,
-                    "oracle_count": oracle_count,
-                    "missing_in_predicted": max(oracle_count - predicted_count, 0),
-                    "extra_in_predicted": max(predicted_count - oracle_count, 0),
-                }
-            )
-        return mismatches
 
 
 def compare_delta_multisets(
     predicted_rows: list[dict[str, Any]], oracle_rows: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """按 `(transition_kind, page)` multiset 比较 predicted/oracle delta。"""
+    """Compare predicted and oracle ``(transition_kind, page)`` multisets."""
 
-    return DeltaMultisetComparator(predicted_rows, oracle_rows).mismatches()
+    predicted_counts = delta_multiset_counts(predicted_rows)
+    oracle_counts = delta_multiset_counts(oracle_rows)
+    mismatches: list[dict[str, Any]] = []
+    for key in sorted(set(predicted_counts) | set(oracle_counts)):
+        predicted_count = predicted_counts.get(key, 0)
+        oracle_count = oracle_counts.get(key, 0)
+        if predicted_count == oracle_count:
+            continue
+        transition_kind, page = key
+        mismatches.append(
+            {
+                "transition_kind": transition_kind,
+                "page": page,
+                "predicted_count": predicted_count,
+                "oracle_count": oracle_count,
+                "missing_in_predicted": max(oracle_count - predicted_count, 0),
+                "extra_in_predicted": max(predicted_count - oracle_count, 0),
+            }
+        )
+    return mismatches
 
 
 def delta_multiset_counts(rows: list[dict[str, Any]]) -> dict[tuple[str, str], int]:
-    """统计 delta rows 中每个 transition/page 出现次数。"""
+    """Count each ``(transition_kind, page)`` occurrence in delta rows."""
 
     counts: dict[tuple[str, str], int] = {}
     for row in rows:
@@ -63,7 +49,7 @@ def delta_multiset_counts(rows: list[dict[str, Any]]) -> dict[tuple[str, str], i
 
 
 def count_rows_by_transition_kind(rows: list[dict[str, Any]]) -> dict[str, int]:
-    """按 transition kind 汇总触达页数。"""
+    """Count touched pages by transition kind."""
 
     counts: dict[str, int] = {}
     for row in rows:
@@ -75,7 +61,7 @@ def count_rows_by_transition_kind(rows: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def mismatch_value_count(value: Any) -> int:
-    """把 mismatch 字段里的 list/count 统一折算成数量。"""
+    """Normalize a list-valued or scalar mismatch field to a count."""
 
     if isinstance(value, list):
         return len([item for item in value if item is not None])
@@ -93,7 +79,7 @@ def summarize_delta_mismatches_by_kind(
     predicted_key: str = "predicted_count",
     oracle_key: str = "oracle_count",
 ) -> dict[str, dict[str, int]]:
-    """按 transition kind 汇总 delta mismatch。"""
+    """Aggregate delta mismatches by transition kind."""
 
     summary: dict[str, dict[str, int]] = {}
     for row in mismatches:

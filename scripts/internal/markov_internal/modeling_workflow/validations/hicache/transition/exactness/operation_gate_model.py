@@ -1,4 +1,4 @@
-"""模型侧 transition operation gate 构造。"""
+"""Model-side transition operation-gate construction."""
 
 from __future__ import annotations
 
@@ -6,22 +6,46 @@ from typing import Any
 
 from ...oracle.snapshot.state import normalize_hicache_page_key
 from ..replay.record_schema import record_pages
+from .request_identity import canonical_request_key
 from .taxonomy_aggregation import append_unique
 from .taxonomy_constants import PHYSICAL_CANDIDATE_OPERATION_KINDS, STATE_ONLY_OPERATION_KINDS
 from .taxonomy_evidence import list_dicts
 
 
-def canonical_request_key_from_row(row: dict[str, Any]) -> str:
-    """生成保守的 run-local canonical request key。"""
-
-    request_id = str(row.get("request_id") or "")
-    cache_scope = str(row.get("cache_scope") or "")
-    operation_id = str(row.get("operation_id") or "")
-    if request_id:
-        return f"{cache_scope}:{request_id}"
-    if operation_id:
-        return f"{cache_scope}:operation:{operation_id}"
-    return cache_scope
+OPERATION_KIND_BY_TRANSITION = {
+    "add_l1_residency": "request_insert",
+    "apply_prefetch_host_visibility": "prefetch_apply",
+    "cache_extend_acquire_request_ref": "ref_protection",
+    "cancel_writeback": "write_back_flush",
+    "clear_backuped": "backuped_marker",
+    "clear_dirty": "dirty_marker",
+    "clear_evicted": "evicted_marker",
+    "commit_host_backup": "host_backup",
+    "commit_host_storage_backup": "storage_backup",
+    "complete_loadback": "device_loadback",
+    "complete_storage_backup": "storage_backup",
+    "complete_write_through_backup": "host_backup",
+    "complete_writeback": "write_back_flush",
+    "enqueue_loadback": "device_loadback",
+    "enqueue_storage_backup": "storage_backup",
+    "enqueue_write_through_backup": "host_backup",
+    "enqueue_writeback": "write_back_flush",
+    "evict_host_node": "host_cleanup",
+    "evict_l1_node": "device_eviction",
+    "increment_hit_count": "hit_count_update",
+    "mark_backuped": "backuped_marker",
+    "mark_dirty": "dirty_marker",
+    "mark_evicted": "evicted_marker",
+    "prefetch_planned": "prefetch_plan",
+    "prefetch_ready": "prefetch_read",
+    "prefetch_revoked": "prefetch_revoke",
+    "prefetch_suppressed": "prefetch_revoke",
+    "prefetch_terminated": "prefetch_control",
+    "prefetch_timeout_incomplete": "prefetch_revoke",
+    "promote_visible_prefix_to_l1": "device_loadback",
+    "release_request_ref": "ref_protection",
+    "restore_l1_residency": "request_insert",
+}
 
 
 def build_model_operation_gates(
@@ -30,11 +54,9 @@ def build_model_operation_gates(
     prediction_entry: dict[str, Any],
     *,
     page_key_mode: str,
-    sample_limit: int,
 ) -> list[dict[str, Any]]:
-    """从模型 transition trace 聚合 patch gate 诊断行。"""
+    """Aggregate model transitions into diagnostic patch-gate operations."""
 
-    del sample_limit
     operation_provenance = collect_operation_provenance(hicache_summary)
     grouped: dict[str, dict[str, Any]] = {}
     for ordinal, record in enumerate(records):
@@ -53,7 +75,7 @@ def build_model_operation_gates(
                 "patch_allowed": False,
                 "operation_class": operation_gate_class(operation_kind),
                 "cache_scope": record.get("cache_scope") or "",
-                "request_key": canonical_request_key_from_row(record),
+                "request_key": canonical_request_key(record),
                 "operation_id": operation_id,
                 "pages": [],
                 "page_count": 0,
@@ -85,7 +107,7 @@ def build_model_operation_gates(
 
 
 def collect_operation_provenance(hicache_summary: dict[str, Any]) -> dict[str, dict[str, list[Any]]]:
-    """按 operation_id 汇总 C++ 账本 provenance。"""
+    """Index C++ ledger provenance by operation identifier."""
 
     provenance: dict[str, dict[str, list[Any]]] = {}
     ledger_specs = (
@@ -105,7 +127,7 @@ def collect_operation_provenance(hicache_summary: dict[str, Any]) -> dict[str, d
 
 
 def merge_operation_provenance(target: dict[str, list[Any]], source: dict[str, list[Any]]) -> None:
-    """把 operation-level provenance 合并到 gate provenance。"""
+    """Merge operation-level ledger provenance into one gate."""
 
     for key, values in source.items():
         if not isinstance(values, list):
@@ -116,14 +138,15 @@ def merge_operation_provenance(target: dict[str, list[Any]], source: dict[str, l
 
 
 def operation_gate_grouping_key(record: dict[str, Any], operation_kind: str, ordinal: int) -> str:
-    """生成 operation gate grouping key。"""
+    """Build the strongest available operation-gate grouping key."""
 
     operation_id = str(record.get("operation_id") or "")
     cache_scope = str(record.get("cache_scope") or "")
     if operation_id:
         return f"{cache_scope}:op:{operation_id}:{operation_kind}"
-    request_key = canonical_request_key_from_row(record)
-    source_event_index = str(record.get("source_event_index") or "")
+    request_key = canonical_request_key(record)
+    source_event_index_value = record.get("source_event_index")
+    source_event_index = "" if source_event_index_value is None else str(source_event_index_value)
     event_name = str(record.get("source_event_name") or record.get("event_base_name") or "")
     if request_key or source_event_index or event_name:
         return f"{cache_scope}:weak:{request_key}:{source_event_index}:{event_name}:{operation_kind}"
@@ -131,47 +154,13 @@ def operation_gate_grouping_key(record: dict[str, Any], operation_kind: str, ord
 
 
 def operation_gate_kind_from_transition(transition_kind: str) -> str:
-    """把模型 transition kind 映射到 patch gate operation taxonomy。"""
+    """Map a model transition to the patch-gate operation taxonomy."""
 
-    if transition_kind in {"mark_dirty", "clear_dirty"}:
-        return "dirty_marker"
-    if transition_kind in {"mark_evicted", "clear_evicted"}:
-        return "evicted_marker"
-    if transition_kind in {"mark_backuped", "clear_backuped"}:
-        return "backuped_marker"
-    if transition_kind in {"cache_extend_acquire_request_ref", "release_request_ref"}:
-        return "ref_protection"
-    if transition_kind == "increment_hit_count":
-        return "hit_count_update"
-    if transition_kind in {"add_l1_residency", "restore_l1_residency"}:
-        return "request_insert"
-    if transition_kind in {"promote_visible_prefix_to_l1", "enqueue_loadback", "complete_loadback"}:
-        return "device_loadback"
-    if transition_kind == "evict_l1_node":
-        return "device_eviction"
-    if transition_kind == "evict_host_node":
-        return "host_cleanup"
-    if transition_kind in {"enqueue_write_through_backup", "complete_write_through_backup", "commit_host_backup"}:
-        return "host_backup"
-    if transition_kind in {"enqueue_storage_backup", "commit_host_storage_backup", "complete_storage_backup"}:
-        return "storage_backup"
-    if transition_kind in {"enqueue_writeback", "complete_writeback", "cancel_writeback"}:
-        return "write_back_flush"
-    if transition_kind == "prefetch_planned":
-        return "prefetch_plan"
-    if transition_kind == "prefetch_ready":
-        return "prefetch_read"
-    if transition_kind == "apply_prefetch_host_visibility":
-        return "prefetch_apply"
-    if transition_kind == "prefetch_terminated":
-        return "prefetch_control"
-    if transition_kind in {"prefetch_revoked", "prefetch_suppressed", "prefetch_timeout_incomplete"}:
-        return "prefetch_revoke"
-    return "unresolved"
+    return OPERATION_KIND_BY_TRANSITION.get(transition_kind, "unresolved")
 
 
 def operation_gate_class(operation_kind: str) -> str:
-    """返回 operation gate 的粗粒度 class。"""
+    """Return the coarse physical/control class of an operation gate."""
 
     if operation_kind in {"write_back_flush", "storage_backup", "prefetch_read"}:
         return "physical_io"
@@ -185,7 +174,7 @@ def operation_gate_class(operation_kind: str) -> str:
 
 
 def operation_gate_classification(operation_kind: str) -> str:
-    """返回 patch gate coverage 使用的 classification。"""
+    """Return the classification consumed by gate-coverage checks."""
 
     if operation_kind in STATE_ONLY_OPERATION_KINDS:
         return "state_marker_only"

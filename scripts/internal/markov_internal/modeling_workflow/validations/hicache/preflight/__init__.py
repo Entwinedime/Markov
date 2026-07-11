@@ -1,1 +1,1 @@
-"""HiCache preflight 检查。"""
+"""Preflight checks for HiCache state and oracle inputs."""

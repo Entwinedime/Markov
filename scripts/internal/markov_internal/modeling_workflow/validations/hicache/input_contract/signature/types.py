@@ -1,4 +1,4 @@
-"""HiCache workload signature 的基础类型和角色集合。"""
+"""Role sets and records used by HiCache workload signatures."""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ REQUEST_SCOPED_ROLES = {
 
 @dataclass(frozen=True)
 class AuditEvent:
-    """可比较的 workload identity fact 摘要。"""
+    """Comparable projection of one workload-identity fact."""
 
     stream: str
     ordinal: int

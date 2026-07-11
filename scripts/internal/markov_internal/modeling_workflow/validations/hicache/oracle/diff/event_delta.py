@@ -1,4 +1,4 @@
-"""HiCache state snapshot 的事件级 delta oracle。"""
+"""Event-scoped delta oracle derived from HiCache state snapshots."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from ..snapshot.state import (
 def build_event_delta_validation(
     predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """把 state snapshot 的 start/end 差分变成事件级 oracle。"""
+    """Compare predicted transitions with paired start/end snapshot deltas."""
 
     active_state_keys = active_delta_state_keys(predicted_records)
     oracle = build_oracle_event_deltas(snapshots, active_state_keys)
@@ -67,7 +67,7 @@ def build_event_delta_validation(
 
 
 def active_delta_state_keys(predicted_records: list[dict[str, Any]]) -> set[str]:
-    """根据模型实际输出决定事件级 oracle 需要比较哪些状态集合。"""
+    """Select state sets represented by actual model transition output."""
 
     active_kinds = {
         str(record.get("transition_kind") or "") for record in predicted_records if isinstance(record, dict)
@@ -80,7 +80,7 @@ def active_delta_state_keys(predicted_records: list[dict[str, Any]]) -> set[str]
 
 
 def build_oracle_event_deltas(snapshots: list[dict[str, Any]], active_state_keys: set[str]) -> dict[str, Any]:
-    """把 start/end 成对 snapshot 转成事件包围区间差分。"""
+    """Convert paired snapshots to inclusive and non-nested event deltas."""
 
     groups: dict[tuple[str, str, str, str, str, str, int, str], dict[str, dict[str, Any]]] = {}
     for row in snapshots:
@@ -144,7 +144,7 @@ def event_has_nested_snapshots(
     group: dict[str, dict[str, Any]],
     paired_groups: list[tuple[tuple[str, str, str, str, str, str, int, str], dict[str, dict[str, Any]]]],
 ) -> bool:
-    """判断某个 start/end snapshot 包围区间内是否存在其他 HiCache snapshot。"""
+    """Return whether another paired snapshot intersects this event interval."""
 
     start = group.get("start")
     end = group.get("end")
@@ -176,6 +176,8 @@ def event_has_nested_snapshots(
 def nested_group_intersects(
     other_group: dict[str, dict[str, Any]], interval_start: int, interval_end: int, order_start: int, order_end: int
 ) -> bool:
+    """Return whether a paired group starts or ends inside an interval."""
+
     other_start = other_group.get("start")
     other_end = other_group.get("end")
     if other_start is None or other_end is None:
@@ -192,7 +194,7 @@ def nested_group_intersects(
 
 
 def snapshot_event_key(row: dict[str, Any], source_name: str) -> tuple[str, str, str, str, str, str, int, str]:
-    """生成 start/end snapshot 配对使用的事件身份。"""
+    """Build the identity used to pair start and end snapshots."""
 
     return (
         str(row.get("trace_path") or ""),
@@ -212,14 +214,14 @@ def delta_rows_for_event_key(
     end_state: dict[str, Any],
     active_state_keys: set[str],
 ) -> dict[str, Any]:
-    """把两个集合状态之间的差分展开成 transition rows。"""
+    """Expand set differences between two states into transition rows."""
 
     trace_path, pid, tid, target_id, request_id, operation_id, ts, base_name = key
     rows: list[dict[str, Any]] = []
     ignored_state_keys: set[str] = set()
     for state_key, (add_kind, remove_kind) in DELTA_KIND_BY_STATE_KEY.items():
-        start_set = set(str(item) for item in start_state.get(state_key, []) if item is not None)
-        end_set = set(str(item) for item in end_state.get(state_key, []) if item is not None)
+        start_set = {str(item) for item in start_state.get(state_key, []) if item is not None}
+        end_set = {str(item) for item in end_state.get(state_key, []) if item is not None}
         if state_key not in active_state_keys:
             if start_set != end_set:
                 ignored_state_keys.add(state_key)
@@ -246,6 +248,8 @@ def event_delta_row(
     ts: int,
     base_name: str,
 ) -> dict[str, Any]:
+    """Construct one normalized event-delta row."""
+
     return {
         "event_key": event_delta_key(pid, ts, base_name),
         "trace_path": trace_path,
@@ -264,7 +268,7 @@ def event_delta_row(
 def build_predicted_event_deltas(
     predicted_records: list[dict[str, Any]], active_state_keys: set[str] | None = None
 ) -> dict[str, Any]:
-    """把 C++ transition 明细规整成事件级可比较 delta rows。"""
+    """Normalize C++ transition records to comparable event-delta rows."""
 
     state_keys = active_state_keys if active_state_keys is not None else set(DELTA_KIND_BY_STATE_KEY)
     comparable_kinds = {
@@ -303,7 +307,7 @@ def build_predicted_event_deltas(
 
 
 def event_delta_key(cache_scope: str, ts: int, base_name: str) -> str:
-    """生成 prediction/oracle 事件级 delta 的紧凑匹配键。"""
+    """Build the compact key shared by predicted and oracle event deltas."""
 
     return f"{cache_scope}:{ts}:{base_name}"
 
@@ -313,7 +317,7 @@ def compare_event_delta_rows(
     oracle_rows: list[dict[str, Any]],
     allowed_event_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """按事件键和 transition kind 比较 predicted/oracle 页集合。"""
+    """Compare predicted and oracle page sets by event key and transition."""
 
     predicted_by_key = {
         (str(row.get("event_key") or ""), str(row.get("transition_kind") or "")): row for row in predicted_rows
@@ -327,8 +331,8 @@ def compare_event_delta_rows(
             continue
         predicted = predicted_by_key.get(key)
         oracle = oracle_by_key.get(key)
-        predicted_pages = set(str(page) for page in (predicted or {}).get("pages", []) if page is not None)
-        oracle_pages = set(str(page) for page in (oracle or {}).get("pages", []) if page is not None)
+        predicted_pages = {str(page) for page in (predicted or {}).get("pages", []) if page is not None}
+        oracle_pages = {str(page) for page in (oracle or {}).get("pages", []) if page is not None}
         missing = sorted(oracle_pages - predicted_pages)
         extra = sorted(predicted_pages - oracle_pages)
         if missing or extra:

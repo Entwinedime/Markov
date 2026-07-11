@@ -1,4 +1,4 @@
-"""HiCache state snapshot 抽取与 final-state 辅助工具。"""
+"""Extraction and final-state projection of HiCache oracle snapshots."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from ...core.facts import parse_fact_or_none
 
 
 def optional_float(value: Any) -> float | None:
-    """严格解析数字候选；bool 和非法值返回 None。"""
+    """Parse a numeric candidate while rejecting booleans and invalid values."""
 
     if value is None or isinstance(value, bool):
         return None
@@ -21,7 +21,7 @@ def optional_float(value: Any) -> float | None:
 
 
 def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, Any]]:
-    """从 oracle trace 中提取 validation-only HiCache state snapshot。"""
+    """Extract validation-only HiCache state snapshots from oracle traces."""
 
     snapshots: list[dict[str, Any]] = []
     for path in trace_paths:
@@ -37,9 +37,11 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
                 continue
             snapshot = args.get("state_snapshot")
             if isinstance(snapshot, dict):
+                # C++ aggregates processes in one DagGraph. Preserve process
+                # and object identity here so final-state projection can union
+                # the corresponding latest snapshots without overwriting them.
                 snapshots.append(
                     {
-                        # C++ state model 当前在一个 DagGraph 内聚合所有进程事件；oracle 也必须先按进程取最终快照，再做集合 union。
                         "order": len(snapshots),
                         "trace_path": str(path),
                         "pid": event.get("pid"),
@@ -59,9 +61,9 @@ def extract_hicache_state_snapshots(trace_paths: list[Path]) -> list[dict[str, A
 
 
 def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
-    """按进程取最后一个 completed snapshot，并合并成 oracle final state。"""
+    """Union the latest completed snapshot for every process/cache object."""
 
-    latest_by_process: dict[tuple[str, str], dict[str, Any]] = {}
+    latest_by_object: dict[tuple[str, str, str], dict[str, Any]] = {}
     completed_snapshots = [row for row in snapshots if snapshot_is_completed_state(row)]
     source_snapshots = completed_snapshots if completed_snapshots else snapshots
     for row in source_snapshots:
@@ -72,36 +74,27 @@ def latest_derived_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         derived = derived_hicache_state_from_snapshot(snapshot)
         if isinstance(derived, dict) and any(isinstance(derived.get(key), list) for key in derived):
-            key = (str(row.get("trace_path") or ""), str(row.get("pid") or ""))
-            current = latest_by_process.get(key)
+            object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
+            key = (str(row.get("trace_path") or ""), str(row.get("pid") or ""), object_id)
+            current = latest_by_object.get(key)
             if current is None or snapshot_sort_key(row) >= snapshot_sort_key(current):
-                latest_by_process[key] = row
+                latest_by_object[key] = row
 
-    union: dict[str, list[str]] = {}
-    for row in latest_by_process.values():
+    states: list[dict[str, Any]] = []
+    for row in latest_by_object.values():
         snapshot = row.get("state_snapshot")
         if not isinstance(snapshot, dict):
             continue
         if not snapshot_is_hiradix_cache_state(row, snapshot):
             continue
         derived = derived_hicache_state_from_snapshot(snapshot)
-        if not isinstance(derived, dict):
-            continue
-        for key, value in derived.items():
-            if not isinstance(value, list):
-                continue
-            current = union.setdefault(key, [])
-            seen = set(current)
-            for item in value:
-                page = str(item)
-                if page not in seen:
-                    current.append(page)
-                    seen.add(page)
-    return {key: sorted(value) for key, value in union.items()}
+        if isinstance(derived, dict):
+            states.append(derived)
+    return union_hicache_states(states)
 
 
 def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """从 state snapshot 原始节点重新派生集合状态。"""
+    """Derive canonical state sets from raw snapshot nodes."""
 
     nodes = snapshot.get("nodes")
     if not isinstance(nodes, list):
@@ -127,7 +120,8 @@ def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, A
             result["l1_resident_pages"].update(pages)
         if has_host_value:
             result["l2_resident_pages"].update(pages)
-        # SGLang HiRadixCache 目前没有可靠暴露 dirty 字段；write-back 下 device-resident 且未备份到 host 的页就是 state model 需要维护的 dirty 页。
+        # SGLang does not reliably expose a dirty bit. Under write-back, a
+        # device-resident page without a host backup is the observable proxy.
         if node.get("dirty") or (has_device_value and not backuped and not evicted):
             result["dirty_pages"].update(pages)
         if backuped:
@@ -143,7 +137,7 @@ def derived_hicache_state_from_snapshot(snapshot: dict[str, Any]) -> dict[str, A
 
 
 def page_keys_from_snapshot_hash(value: Any) -> list[str]:
-    """从 snapshot hash_value 字段提取 page key 列表。"""
+    """Extract page keys from a snapshot ``hash_value`` field."""
 
     if value is None:
         return []
@@ -153,7 +147,7 @@ def page_keys_from_snapshot_hash(value: Any) -> list[str]:
 
 
 def normalize_hicache_state_for_oracle_compare(state: dict[str, Any], page_key_mode: str) -> dict[str, Any]:
-    """按 page_key_mode 归一化 state 中的集合字段。"""
+    """Normalize every set-valued state field under the page-key mode."""
 
     normalized: dict[str, Any] = {}
     for key, value in state.items():
@@ -167,7 +161,7 @@ def normalize_hicache_state_for_oracle_compare(state: dict[str, Any], page_key_m
 
 
 def normalize_hicache_page_key(value: Any, page_key_mode: str) -> str:
-    """归一化单个 page key；strip_scope 模式会去掉 scope 前缀。"""
+    """Normalize one page key, optionally removing its scope prefix."""
 
     page = str(value)
     if page_key_mode == "strip_scope" and "|" in page:
@@ -176,10 +170,11 @@ def normalize_hicache_page_key(value: Any, page_key_mode: str) -> str:
 
 
 def snapshot_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
-    """state snapshot 的逻辑顺序。
+    """Return the stable logical order of a state snapshot.
 
-    Python probe 的 start/end 事件在 merged trace 中可能同 timestamp 且顺序反转。
-    同一时刻优先使用 end 快照，它更接近一次调用完成后的真实状态。
+    Probe start/end rows may share a timestamp and appear in reverse file
+    order. At equal timestamps, the completed end snapshot wins because it is
+    the closer representation of post-call state.
     """
 
     ts = int(optional_float(row.get("ts")) or 0)
@@ -190,7 +185,7 @@ def snapshot_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def diff_hicache_sets(model_final: dict[str, Any], oracle_final: dict[str, Any]) -> dict[str, Any]:
-    """比较 model final state 和 oracle final state 的集合字段。"""
+    """Compare model and oracle final-state sets visible to both sides."""
 
     keys = [
         "l1_resident_pages",
@@ -209,8 +204,8 @@ def diff_hicache_sets(model_final: dict[str, Any], oracle_final: dict[str, Any])
     for key in keys:
         if key not in oracle_final:
             continue
-        model_set = set(str(item) for item in model_final.get(key, []) if item is not None)
-        oracle_set = set(str(item) for item in oracle_final.get(key, []) if item is not None)
+        model_set = {str(item) for item in model_final.get(key, []) if item is not None}
+        oracle_set = {str(item) for item in oracle_final.get(key, []) if item is not None}
         missing = sorted(oracle_set - model_set)
         extra = sorted(model_set - oracle_set)
         diff[key] = {
@@ -224,7 +219,7 @@ def diff_hicache_sets(model_final: dict[str, Any], oracle_final: dict[str, Any])
 
 
 def final_state_counts(state: dict[str, Any]) -> dict[str, int]:
-    """统计 final state 中所有集合字段的大小，帮助暴露未参与 diff 的状态。"""
+    """Count all set-valued final-state fields, including unchecked fields."""
 
     counts: dict[str, int] = {}
     for key, value in sorted(state.items()):
@@ -234,9 +229,10 @@ def final_state_counts(state: dict[str, Any]) -> dict[str, int]:
 
 
 def unchecked_model_state_keys(model_final: dict[str, Any], oracle_final: dict[str, Any]) -> list[str]:
-    """列出 model 有、但 oracle snapshot 没有的集合字段。
+    """List non-empty model state sets absent from oracle snapshots.
 
-    这些字段不会参与 `final_state_match`，但必须在文档和后续 probe 设计中显式处理。
+    These fields cannot participate in ``final_state_match`` and remain
+    explicit so future probe coverage does not silently change exactness.
     """
 
     keys: list[str] = []
@@ -247,7 +243,7 @@ def unchecked_model_state_keys(model_final: dict[str, Any], oracle_final: dict[s
 
 
 def union_hicache_states(states: Any) -> dict[str, list[str]]:
-    """把多个 cache object 的集合状态合并成一次全局可见状态。"""
+    """Union set-valued state from multiple cache objects."""
 
     union: dict[str, set[str]] = {}
     for state in states:
@@ -262,26 +258,26 @@ def union_hicache_states(states: Any) -> dict[str, list[str]]:
 
 
 def snapshot_object_id_prefix(row: dict[str, Any], snapshot: dict[str, Any]) -> str:
-    """返回 snapshot object_id 中类似 class name 的前缀。"""
+    """Return the class-like prefix of a snapshot object identifier."""
 
     object_id = str(row.get("object_id") or snapshot.get("object_id") or "")
     return object_id.split(":", 1)[0] if object_id else "unknown"
 
 
 def snapshot_is_hiradix_cache_state(row: dict[str, Any], snapshot: dict[str, Any]) -> bool:
-    """判断 snapshot 是否来自 HiCache state model 要验证的 HiRadixCache 对象。"""
+    """Return whether a snapshot represents a modeled ``HiRadixCache``."""
 
     return snapshot_object_id_prefix(row, snapshot) == "HiRadixCache"
 
 
 def snapshot_is_completed_state(row: dict[str, Any]) -> bool:
-    """判断 state snapshot 是否代表一次调用完成后的状态。
+    """Return whether a snapshot represents state after a completed call.
 
-    Python probe 会同时输出 start/end 包围快照。start 快照描述调用前状态，
-    如果把它当作最终状态，trace 尾部缺少对应 end snapshot 时会把尚未释放的
-    lock/ref 误判为最终 cache state。因此 final oracle 和 timeline oracle 只
-    使用 end 或无 phase 的快照；完全没有 completed snapshot 时 final oracle
-    才由调用方 fallback 到原始快照集合。
+    Probe wrappers emit both pre-call start and post-call end snapshots. Using
+    a trailing unmatched start row as final state would preserve transient
+    lock/reference ownership. Final and timeline oracles therefore prefer end
+    or phase-less rows; the final-state caller falls back only when no completed
+    snapshot exists at all.
     """
 
     source_name = str(row.get("source_event_name") or row.get("event_name") or "")
@@ -289,9 +285,10 @@ def snapshot_is_completed_state(row: dict[str, Any]) -> bool:
 
 
 def snapshot_logical_time_us(row: dict[str, Any]) -> int:
-    """返回 snapshot 参与 timeline 排序的逻辑时间。
+    """Return the logical timestamp used by snapshot timelines.
 
-    end snapshot 的真实状态变化点在 duration 末尾，因此使用 `ts + dur`。
+    An end snapshot represents the state change at the end of its duration, so
+    its logical timestamp is ``ts + dur``.
     """
 
     ts = int(optional_float(row.get("ts")) or 0)
@@ -302,7 +299,7 @@ def snapshot_logical_time_us(row: dict[str, Any]) -> int:
 
 
 def snapshot_timeline_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
-    """生成稳定 timeline 排序键，确保同时间戳下 start 先于 end。"""
+    """Build a stable timeline key that orders start before end on ties."""
 
     source_name = str(row.get("source_event_name") or row.get("event_name") or "")
     phase_score = 0 if event_phase(source_name) == "start" else 1
@@ -310,7 +307,7 @@ def snapshot_timeline_sort_key(row: dict[str, Any]) -> tuple[int, int, int]:
 
 
 def event_phase(name: str) -> str:
-    """从 probe event name 后缀解析 start/end phase。"""
+    """Parse a start/end phase from a probe event-name suffix."""
 
     clean = name.split(":", 1)[0]
     if clean.endswith("_start"):
@@ -321,7 +318,7 @@ def event_phase(name: str) -> str:
 
 
 def event_base_name(name: str) -> str:
-    """去掉 start/end 后缀，得到 prediction 和 oracle 共享的事件基名。"""
+    """Remove phase suffixes to obtain the shared event base name."""
 
     clean = name.split(":", 1)[0]
     if clean.endswith("_start"):

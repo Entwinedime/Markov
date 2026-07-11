@@ -1,4 +1,4 @@
-"""workload identity 中携带 path 的 fact 合同审计。"""
+"""Audit path-bearing workload facts against the C++ token contract."""
 
 from __future__ import annotations
 
@@ -8,18 +8,19 @@ from pathlib import Path
 from typing import Any
 
 from ...core.facts import parse_fact_or_none
-from ...core.tokens import token_dictionary_issues, token_id_path
-from .primitives import completed_workload_identity, fact_items, maybe_int, maybe_json, optional_int, trace_events
+from ...core.tokens import fact_items, token_dictionary_issues, token_id_path
+from .primitives import completed_workload_identity, maybe_int, maybe_json, optional_int, trace_events
 from .types import PATH_ROLES
 
 
 @dataclass
 class TokenPathContractAuditor:
-    """检查 C++ token parser 可直接消费的 path-bearing workload fact。"""
+    """Verify that path-bearing facts are directly consumable by C++."""
 
     paths: list[Path]
     roles: set[str]
     sample_limit: int
+    event_rows: list[tuple[Path, dict[str, Any]]] | None = None
     issue_counts: collections.Counter[str] = field(default_factory=collections.Counter)
     issue_counts_by_role: collections.Counter[str] = field(default_factory=collections.Counter)
     samples: list[dict[str, Any]] = field(default_factory=list)
@@ -28,9 +29,9 @@ class TokenPathContractAuditor:
     path_event_count: int = 0
 
     def audit(self) -> dict[str, Any]:
-        """执行 path 合同审计并返回 summary。"""
+        """Audit all selected path facts and return aggregate diagnostics."""
 
-        events = trace_events(self.paths)
+        events = self.event_rows if self.event_rows is not None else trace_events(self.paths)
         self._collect_dictionary_payloads(events)
         for _path, event in events:
             self._audit_event(event)
@@ -87,7 +88,7 @@ class TokenPathContractAuditor:
         self._audit_batch_positions(role, event, expected, request_ids, request_positions)
         if batch_size != expected:
             self._record_issue(role, "batch_size_mismatch", event, {"expected": expected, "actual": batch_size})
-        string_ids = [str(item) for item in request_ids if item is not None]
+        string_ids = [str(item or "") for item in request_ids]
         if len(string_ids) != expected or any(not item for item in string_ids):
             self._record_issue(role, "request_ids_invalid", event)
         elif len(set(string_ids)) != len(string_ids):
@@ -145,7 +146,7 @@ class TokenPathContractAuditor:
             )
             return
         indexes: list[int] = []
-        string_ids = [str(item) for item in request_ids if item is not None]
+        string_ids = [str(item or "") for item in request_ids]
         for position in request_positions:
             if not isinstance(position, dict):
                 self._record_issue(role, "request_positions_item_invalid", event)
@@ -156,7 +157,7 @@ class TokenPathContractAuditor:
                 continue
             indexes.append(index)
             row_request_id = str(position.get("request_id") or "")
-            if 0 <= index < expected and row_request_id and row_request_id != string_ids[index]:
+            if 0 <= index < expected and row_request_id and string_ids[index] and row_request_id != string_ids[index]:
                 self._record_issue(
                     role,
                     "request_positions_request_id_mismatch",
@@ -301,7 +302,18 @@ class TokenPathContractAuditor:
         }
 
 
-def workload_identity_path_contract(paths: list[Path], roles: set[str], sample: int) -> dict[str, Any]:
-    """检查 path-bearing workload identity event 是否满足 token path 合同。"""
+def workload_identity_path_contract(
+    paths: list[Path],
+    roles: set[str],
+    sample: int,
+    *,
+    event_rows: list[tuple[Path, dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Validate path-bearing workload facts using paths or preloaded rows."""
 
-    return TokenPathContractAuditor(paths=paths, roles=roles, sample_limit=sample).audit()
+    return TokenPathContractAuditor(
+        paths=paths,
+        roles=roles,
+        sample_limit=sample,
+        event_rows=event_rows,
+    ).audit()

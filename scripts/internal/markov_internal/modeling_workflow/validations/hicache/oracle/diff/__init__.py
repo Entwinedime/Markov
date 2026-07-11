@@ -1,1 +1,1 @@
-"""HiCache oracle/prediction state diff 辅助工具。"""
+"""State-delta comparisons between HiCache predictions and oracles."""

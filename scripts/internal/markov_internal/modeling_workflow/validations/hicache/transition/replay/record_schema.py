@@ -1,4 +1,4 @@
-"""predicted HiCache transition trace schema 辅助工具。"""
+"""Schema helpers for predicted HiCache transition traces."""
 
 from __future__ import annotations
 
@@ -87,21 +87,18 @@ ADVISORY_RECORD_FIELDS = (
 
 
 def load_predicted_trace(path: Path) -> dict[str, Any]:
-    """读取 predicted state trace，并做基本结构检查。"""
+    """Load a predicted state trace while preserving malformed fields for audit."""
 
     if not path.is_file():
         raise FileNotFoundError(f"missing predicted trace: {path}")
     payload = load_json(path)
     if not isinstance(payload, dict):
         raise ValueError(f"predicted trace is not a JSON object: {path}")
-    records = payload.get("records")
-    if not isinstance(records, list):
-        payload["records"] = []
     return payload
 
 
 def predicted_records(predicted: dict[str, Any]) -> list[dict[str, Any]]:
-    """读取 predicted trace 中的 transition records。"""
+    """Return structured transition records from a predicted trace."""
 
     records = predicted.get("records")
     if not isinstance(records, list):
@@ -110,14 +107,14 @@ def predicted_records(predicted: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def predicted_final_state(predicted: dict[str, Any]) -> dict[str, Any]:
-    """读取 predicted trace 中的 final_state。"""
+    """Return the structured final state from a predicted trace."""
 
     final_state = predicted.get("final_state")
     return final_state if isinstance(final_state, dict) else {}
 
 
 def record_pages(record: dict[str, Any]) -> list[str]:
-    """读取 transition record 的 page 集合。"""
+    """Return normalized string pages from one transition record."""
 
     pages = record.get("target_page_set")
     if not isinstance(pages, list):
@@ -126,7 +123,7 @@ def record_pages(record: dict[str, Any]) -> list[str]:
 
 
 def missing_core_field(record: dict[str, Any], field: str) -> bool:
-    """判断 record 字段是否缺失。"""
+    """Return whether a required transition field is structurally absent."""
 
     if field not in record:
         return True
@@ -137,7 +134,7 @@ def missing_core_field(record: dict[str, Any], field: str) -> bool:
 
 
 def state_counts(state: dict[str, Any]) -> dict[str, int]:
-    """统计 state 集合字段规模。"""
+    """Count set-valued and page-counter fields in a state projection."""
 
     counts: dict[str, int] = {}
     for key, value in sorted(state.items()):
@@ -149,8 +146,10 @@ def state_counts(state: dict[str, Any]) -> dict[str, int]:
 
 
 def optional_int(value: Any, default: int = 0) -> int:
-    """宽松解析整数。"""
+    """Parse an integer permissively while rejecting booleans."""
 
+    if isinstance(value, bool):
+        return default
     try:
         return int(float(value))
     except (TypeError, ValueError):

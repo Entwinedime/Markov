@@ -1,1 +1,1 @@
-"""HiCache oracle evidence summary 辅助工具。"""
+"""Diagnostic evidence summaries derived from HiCache oracles."""

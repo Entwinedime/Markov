@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""SGLang profiling runner。
+"""SGLang profiling runner.
 
-本脚本只负责启动被测进程、注入采集环境、运行 workload，并写出 profile manifest。
-建模判断不放在这里，避免 profiling 阶段和 modeling 阶段互相污染。
+This module starts the profiled process, injects capture state, runs the
+workload, and writes profile manifests. Modeling decisions are intentionally
+excluded so capture facts cannot be contaminated by prediction policy.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import argparse
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +22,7 @@ from ..common.logging import log
 from ..common.naming import sanitize
 from ..common.paths import ROOT_DIR, resolve_repo_path
 from .executor import preflight_profile_config, run_profile
-from ..contracts.forced_token import forced_token_bundle_summary
+from ..contracts.forced_token.bundle import forced_token_bundle_summary
 from .forced_workflow import (
     build_forced_token_bundle,
     inject_forced_token_bundle_plan,
@@ -40,6 +42,27 @@ from .suite import (
 )
 
 
+@dataclass(frozen=True)
+class _PreparedExperiment:
+    """One validated suite experiment with stable display and artifact metadata."""
+
+    ordinal: int
+    index: int
+    name: str
+    config: dict[str, Any]
+    forced_token_contract: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class _SuiteExecution:
+    """Execution outcome retained until the aggregate suite artifact is written."""
+
+    run_dirs: list[Path]
+    failures: list[dict[str, Any]]
+    attempted_count: int
+    fatal_error: Exception | None
+
+
 def run_profile_suite(
     cfg: dict[str, Any],
     dry_run: bool,
@@ -50,7 +73,7 @@ def run_profile_suite(
     forced_token_bundle: Path | None = None,
     config_path: Path | None = None,
 ) -> list[Path]:
-    """执行普通 run 或 suite，并写出 suite 级选择/结果文件。"""
+    """Execute one run or suite and persist suite selection/result artifacts."""
 
     is_suite = "experiments" in cfg or "matrix" in cfg
     all_experiments = list(enumerate(expand_suite(cfg), start=1))
@@ -70,17 +93,8 @@ def run_profile_suite(
     suite_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / str(framework)
     suite_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{suite_name}"
     suite_dir = suite_root / sanitize(str(suite_id))
-    run_dirs: list[Path] = []
-    failures: list[dict[str, Any]] = []
     continue_on_error = bool(cfg.get("continue_on_error", False))
-    prepared_experiments: list[tuple[int, int, str, dict[str, Any], dict[str, Any]]] = []
-    for ordinal, (index, experiment) in enumerate(experiments, start=1):
-        exp_name = sanitize(str(experiment.get("name", f"experiment-{index}")))
-        exp_cfg = inject_forced_token_bundle_plan(experiment, forced_token_bundle)
-        exp_cfg["run_root"] = str(suite_dir)
-        exp_cfg["run_id"] = f"{index:02d}_{exp_name}"
-        forced_token_contract = preflight_profile_config(exp_cfg)
-        prepared_experiments.append((ordinal, index, exp_name, exp_cfg, forced_token_contract))
+    prepared_experiments = _prepare_suite_experiments(experiments, suite_dir, forced_token_bundle)
 
     suite_dir.mkdir(parents=True, exist_ok=True)
     dump_json(suite_dir / "suite_config.json", cfg)
@@ -104,42 +118,29 @@ def run_profile_suite(
             ],
             "planned_experiments": [
                 {
-                    **describe_suite_experiment(index, exp_cfg),
-                    "forced_token_contract": forced_token_contract,
+                    **describe_suite_experiment(experiment.index, experiment.config),
+                    "forced_token_contract": experiment.forced_token_contract,
                 }
-                for _ordinal, index, _exp_name, exp_cfg, forced_token_contract in prepared_experiments
+                for experiment in prepared_experiments
             ],
         },
     )
 
-    fatal_error: Exception | None = None
-    attempted_count = 0
-    for ordinal, index, exp_name, exp_cfg, forced_token_contract in prepared_experiments:
-        attempted_count += 1
-        log(f"Suite experiment {ordinal}/{len(experiments)} (#{index}): {exp_name}")
-        try:
-            run_dirs.append(run_profile(exp_cfg, dry_run))
-        except Exception as exc:
-            failures.append({"name": exp_name, "error": str(exc), "forced_token_contract": forced_token_contract})
-            if not continue_on_error:
-                fatal_error = exc
-                break
-
-    generated_bundle: dict[str, Any] | None = None
-    bundle_error: str | None = None
-    if suite_profile_mode(cfg) == "forced_token_capture" and not dry_run and not failures:
-        try:
-            if config_path is None:
-                raise ValueError("capture suite requires its source config path")
-            generated_bundle = build_forced_token_bundle(
-                suite_dir,
-                run_dirs,
-                capture_config_path=config_path,
-            )
-            log(f"Forced token bundle: {generated_bundle.get('path')}")
-        except Exception as exc:
-            bundle_error = str(exc)
-            failures.append({"name": "forced_token_bundle", "error": bundle_error})
+    execution = _execute_suite_experiments(
+        prepared_experiments,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+    )
+    generated_bundle, bundle_error = _build_capture_bundle_if_requested(
+        cfg,
+        dry_run=dry_run,
+        suite_dir=suite_dir,
+        run_dirs=execution.run_dirs,
+        failures=execution.failures,
+        config_path=config_path,
+    )
+    if bundle_error:
+        execution.failures.append({"name": "forced_token_bundle", "error": bundle_error})
 
     dump_json(
         suite_dir / "suite_result.json",
@@ -155,18 +156,15 @@ def run_profile_suite(
             "selected_inputs": sorted(selected_inputs or []),
             "selected_servers": sorted(selected_servers or []),
             "planned_count": len(prepared_experiments),
-            "attempted_count": attempted_count,
-            "completed_count": len(run_dirs),
-            "failure_count": len(failures),
-            "aborted_count": len(prepared_experiments) - attempted_count,
-            "status": "failed" if failures else "completed",
-            "runs": [str(path) for path in run_dirs],
-            "failures": failures,
+            "attempted_count": execution.attempted_count,
+            "completed_count": len(execution.run_dirs),
+            "failure_count": len(execution.failures),
+            "aborted_count": len(prepared_experiments) - execution.attempted_count,
+            "status": "failed" if execution.failures else "completed",
+            "runs": [str(path) for path in execution.run_dirs],
+            "failures": execution.failures,
             "forced_token_contracts": summarize_suite_forced_token_contracts(
-                [
-                    forced_token_contract
-                    for _ordinal, _index, _exp_name, _exp_cfg, forced_token_contract in prepared_experiments
-                ]
+                [experiment.forced_token_contract for experiment in prepared_experiments]
             ),
             "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
             if forced_token_bundle is not None
@@ -174,22 +172,107 @@ def run_profile_suite(
             "generated_forced_token_bundle": generated_bundle,
             "selected_experiments": [
                 {
-                    **describe_suite_experiment(index, exp_cfg),
-                    "forced_token_contract": forced_token_contract,
+                    **describe_suite_experiment(experiment.index, experiment.config),
+                    "forced_token_contract": experiment.forced_token_contract,
                 }
-                for _ordinal, index, _exp_name, exp_cfg, forced_token_contract in prepared_experiments
+                for experiment in prepared_experiments
             ],
         },
     )
     if bundle_error:
         raise ValueError(f"forced token bundle aggregation failed: {bundle_error}")
-    if fatal_error is not None:
-        raise RuntimeError(f"profile suite failed: {failures[-1]['name']}: {fatal_error}") from fatal_error
-    return run_dirs
+    if execution.fatal_error is not None:
+        raise RuntimeError(
+            f"profile suite failed: {execution.failures[-1]['name']}: {execution.fatal_error}"
+        ) from execution.fatal_error
+    return execution.run_dirs
+
+
+def _prepare_suite_experiments(
+    experiments: list[tuple[int, dict[str, Any]]],
+    suite_dir: Path,
+    forced_token_bundle: Path | None,
+) -> list[_PreparedExperiment]:
+    """Inject run-local paths and validate every selected experiment upfront."""
+
+    prepared: list[_PreparedExperiment] = []
+    for ordinal, (index, experiment) in enumerate(experiments, start=1):
+        name = sanitize(str(experiment.get("name", f"experiment-{index}")))
+        config = inject_forced_token_bundle_plan(experiment, forced_token_bundle)
+        config["run_root"] = str(suite_dir)
+        config["run_id"] = f"{index:02d}_{name}"
+        prepared.append(
+            _PreparedExperiment(
+                ordinal=ordinal,
+                index=index,
+                name=name,
+                config=config,
+                forced_token_contract=preflight_profile_config(config),
+            )
+        )
+    return prepared
+
+
+def _execute_suite_experiments(
+    experiments: list[_PreparedExperiment],
+    *,
+    dry_run: bool,
+    continue_on_error: bool,
+) -> _SuiteExecution:
+    """Run prepared experiments sequentially under the suite failure policy."""
+
+    run_dirs: list[Path] = []
+    failures: list[dict[str, Any]] = []
+    fatal_error: Exception | None = None
+    attempted_count = 0
+    for experiment in experiments:
+        attempted_count += 1
+        log(f"Suite experiment {experiment.ordinal}/{len(experiments)} (#{experiment.index}): {experiment.name}")
+        try:
+            run_dirs.append(run_profile(experiment.config, dry_run))
+        except Exception as error:
+            failures.append(
+                {
+                    "name": experiment.name,
+                    "error": str(error),
+                    "forced_token_contract": experiment.forced_token_contract,
+                }
+            )
+            if not continue_on_error:
+                fatal_error = error
+                break
+    return _SuiteExecution(run_dirs, failures, attempted_count, fatal_error)
+
+
+def _build_capture_bundle_if_requested(
+    cfg: dict[str, Any],
+    *,
+    dry_run: bool,
+    suite_dir: Path,
+    run_dirs: list[Path],
+    failures: list[dict[str, Any]],
+    config_path: Path | None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Build a capture bundle only after every selected experiment succeeds."""
+
+    if suite_profile_mode(cfg) != "forced_token_capture" or dry_run or failures:
+        return None, None
+    try:
+        if config_path is None:
+            raise ValueError("capture suite requires its source config path")
+        bundle = build_forced_token_bundle(
+            suite_dir,
+            run_dirs,
+            capture_config_path=config_path,
+        )
+        log(f"Forced token bundle: {bundle.get('path')}")
+        return bundle, None
+    except Exception as error:
+        return None, str(error)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """解析容器内 runner CLI 参数。"""
+    """Parse the container-side profiling runner CLI."""
 
     parser = argparse.ArgumentParser(description="Run SGLang profiling experiments.")
     parser.add_argument("--config", required=True, help="JSON profile config path")
@@ -213,7 +296,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI 入口：执行 profiling run/suite 或列出展开后的实验。"""
+    """Execute profiling or list the selected expanded experiments."""
 
     args = parse_args(argv)
     config_path = resolve_repo_path(args.config)
@@ -269,6 +352,6 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except (FileNotFoundError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     except KeyboardInterrupt:
-        raise SystemExit(130)
+        raise SystemExit(130) from None

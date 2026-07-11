@@ -1,1 +1,1 @@
-"""HiCache workload identity signature 构造。"""
+"""Canonical signatures for HiCache workload-identity facts."""

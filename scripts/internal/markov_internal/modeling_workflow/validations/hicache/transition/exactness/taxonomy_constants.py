@@ -1,4 +1,4 @@
-"""HiCache transition taxonomy 共享常量。"""
+"""Shared operation and delta sets for HiCache transition taxonomy."""
 
 OBSERVED_ROLE_TO_OPERATION_KIND = {
     "capacity_request": "capacity_request",

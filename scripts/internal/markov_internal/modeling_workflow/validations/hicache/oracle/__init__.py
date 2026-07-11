@@ -1,1 +1,1 @@
-"""HiCache validation oracle 与 state snapshot 辅助工具。"""
+"""Oracle extraction and state-snapshot helpers for HiCache validation."""

@@ -1,4 +1,4 @@
-"""SGLang torch profiler API 辅助工具。"""
+"""SGLang torch-profiler API helpers."""
 
 from __future__ import annotations
 
@@ -11,21 +11,21 @@ from .runtime import RunLayout, build_profile_body, channel_config
 
 
 def profiler_api_base(server_cfg: dict[str, Any], profile_cfg: dict[str, Any]) -> str:
-    """返回 profiler API base，默认从 server ready_url 推导。"""
+    """Return the profiler API origin, defaulting to the readiness URL origin."""
 
     ready_url = server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
     return profile_cfg.get("api_base_url") or api_base_from_ready_url(ready_url)
 
 
 def torch_profile_enabled(runtime: Any, cfg: dict[str, Any]) -> bool:
-    """判断本次 run 是否调用 SGLang torch profiler API。"""
+    """Return whether this run should invoke the SGLang torch-profiler API."""
 
     profile = channel_config(cfg, "torch")
     return runtime.enabled and "torch" in runtime.channels and profile.get("enabled", True)
 
 
 def should_stop_torch_profiler_after_workload(profile_cfg: dict[str, Any]) -> bool:
-    """判断 runner 是否需要在 workload 结束后手动停止 profiler。"""
+    """Return whether the runner must stop profiling after the workload."""
 
     if not profile_cfg.get("stop_after_workload", True):
         return False
@@ -33,7 +33,7 @@ def should_stop_torch_profiler_after_workload(profile_cfg: dict[str, Any]) -> bo
 
 
 def start_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_cfg: dict[str, Any]) -> None:
-    """调用 `/start_profile` 并保存请求体和响应。"""
+    """Invoke ``/start_profile`` and persist both request and response."""
 
     body = build_profile_body(profile_cfg, layout)
     write_json(layout.run_dir / "profile_start_body.json", body)
@@ -47,7 +47,7 @@ def start_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_
 
 
 def stop_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_cfg: dict[str, Any]) -> None:
-    """调用 `/stop_profile`，非 strict 模式下把错误降级成响应记录。"""
+    """Invoke ``/stop_profile``, recording failures unless strict stop is enabled."""
 
     log("Stopping SGLang profiler via /stop_profile.")
     try:

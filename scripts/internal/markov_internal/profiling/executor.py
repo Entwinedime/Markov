@@ -1,16 +1,15 @@
-"""单个 profiling run 执行器。"""
+"""Lifecycle executor for one expanded profiling run."""
 
 from __future__ import annotations
 
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from ..common.commands import command_from_config
 from ..common.logging import log
-from ..common.paths import ROOT_DIR
+from ..common.paths import prepend_repo_src_to_sys_path
 from ..common.process import start_process, stop_process, wait_for_ready
 from .artifacts import write_profile_manifest, write_run_inputs
 from .environments import build_bench_env, build_server_env
@@ -31,16 +30,16 @@ from .runtime import (
     restore_model_config,
 )
 
-sys.path.insert(0, str(ROOT_DIR / "src"))
+prepend_repo_src_to_sys_path()
 
 from profiling import normalize_profiling_config  # noqa: E402
 
 
 class ProfileRun:
-    """单次 profiling 运行的执行器。"""
+    """Own the server, profiler, workload, restoration, and manifest lifecycle."""
 
     def __init__(self, cfg: dict[str, Any], *, dry_run: bool) -> None:
-        """规整单次 run 的配置、目录和 server/workload 命令。"""
+        """Normalize config, layout, and server/workload commands for one run."""
 
         self.cfg = cfg
         self.dry_run = dry_run
@@ -57,7 +56,7 @@ class ProfileRun:
         self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout, self.cfg)
 
     def run(self) -> Path:
-        """执行一次 profiling run，并在 finally 中写出 manifest。"""
+        """Execute the run and always persist a terminal profile manifest."""
 
         self.layout.prepare(clean=bool(self.cfg.get("clean_run_dir", False)))
         write_run_inputs(
@@ -121,19 +120,17 @@ class ProfileRun:
                 error=error,
             )
 
-        if status == "failed" and error:
-            raise RuntimeError(error)
         log("Profile run completed.")
         return self.layout.run_dir
 
     def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
-        """等待 server ready，超时时暴露进程提前退出或健康检查失败。"""
+        """Wait for readiness while surfacing early exit and timeout failures."""
 
         ready_url = self.server_cfg.get("ready_url", "http://127.0.0.1:30000/get_model_info")
         wait_for_ready(process, ready_url, int(self.server_cfg.get("ready_timeout_sec", 1800)))
 
     def _run_bench(self, server_env: dict[str, str]) -> None:
-        """运行 workload，并移除只应注入 server 的采集环境。"""
+        """Run the workload with server-only capture variables removed."""
 
         log("Running workload.")
         bench_env = build_bench_env(
@@ -150,13 +147,13 @@ class ProfileRun:
 
 
 def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
-    """执行单个已展开 profiling 配置。"""
+    """Execute one already expanded profiling configuration."""
 
     return ProfileRun(cfg, dry_run=dry_run).run()
 
 
 def preflight_profile_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    """对单个已展开配置做只读/轻量 preflight。"""
+    """Run read-only contract preflight for one expanded configuration."""
 
     probe = ProfileRun(cfg, dry_run=True)
     metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}

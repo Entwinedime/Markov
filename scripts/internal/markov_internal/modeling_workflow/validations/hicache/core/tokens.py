@@ -1,4 +1,4 @@
-"""HiCache token path 合同共享辅助工具。"""
+"""Shared parsing and identity helpers for the HiCache token-path contract."""
 
 from __future__ import annotations
 
@@ -8,23 +8,45 @@ from typing import Any
 
 TokenUnit = tuple[int, ...]
 TokenPath = tuple[TokenUnit, ...]
+UINT32_MAX = (1 << 32) - 1
+
+
+def fact_items(value: Any) -> list[Any]:
+    """Normalize a scalar or array-valued fact field to a list."""
+
+    if isinstance(value, list):
+        return value
+    if value is None:
+        return []
+    return [value]
 
 
 def maybe_json(value: Any) -> Any:
-    """解析 trace 中以字符串保存的嵌套 JSON 值。"""
+    """Decode a trace argument that may contain one or two JSON string layers."""
 
-    if isinstance(value, str):
-        text = value.strip()
-        if text.startswith("{") or text.startswith("["):
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return value
-    return value
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return value
+    try:
+        decoded = json.loads(text)
+        if isinstance(decoded, str):
+            nested = decoded.strip()
+            if nested.startswith(("{", "[")):
+                return json.loads(nested)
+        return decoded
+    except json.JSONDecodeError:
+        return value
 
 
 def token_id_path(value: Any) -> TokenPath | None:
-    """解析 token_dictionary.token_ids，同时保留 composite token 结构。"""
+    """Parse ``token_dictionary.token_ids`` while preserving composite tokens.
+
+    The C++ hash contract serializes every token component as unsigned 32-bit
+    little-endian data. Values outside that domain are rejected here so quality
+    audit reports an invalid dictionary instead of failing during hashing.
+    """
 
     value = maybe_json(value)
     if not isinstance(value, dict):
@@ -35,24 +57,43 @@ def token_id_path(value: Any) -> TokenPath | None:
 
     parsed: list[TokenUnit] = []
     for token in raw_tokens:
-        try:
-            if isinstance(token, (list, tuple)):
-                parsed.append(tuple(int(item) for item in token))
-            else:
-                parsed.append((int(token),))
-        except (TypeError, ValueError):
+        unit = _token_unit_or_none(token)
+        if unit is None:
             return None
+        parsed.append(unit)
     return tuple(parsed)
 
 
+def _token_unit_or_none(token: Any) -> TokenUnit | None:
+    """Parse one scalar or composite token without leaking conversion errors."""
+
+    raw_unit = token if isinstance(token, (list, tuple)) else (token,)
+    try:
+        unit = tuple(_u32_token_component(item) for item in raw_unit)
+    except (TypeError, ValueError):
+        return None
+    return unit or None
+
+
+def _u32_token_component(value: Any) -> int:
+    """Parse one token component under the shared unsigned-32-bit contract."""
+
+    if isinstance(value, bool):
+        raise ValueError("boolean token components are invalid")
+    parsed = int(value)
+    if parsed < 0 or parsed > UINT32_MAX:
+        raise ValueError("token component is outside the unsigned 32-bit range")
+    return parsed
+
+
 def token_path_count(tokens: TokenPath) -> int:
-    """返回解析后 token path 表示的模型 token 数。"""
+    """Return the number of model tokens represented by a parsed path."""
 
     return len(tokens)
 
 
 def token_path_hash(tokens: TokenPath) -> str:
-    """用 probe 相同的 u32le 算法计算 token path hash。"""
+    """Hash a token path with the probe's unsigned-32-bit LE algorithm."""
 
     hasher = hashlib.sha256()
     for token in tokens:
@@ -62,7 +103,7 @@ def token_path_hash(tokens: TokenPath) -> str:
 
 
 def token_dictionary_issues(value: Any) -> list[dict[str, Any]]:
-    """在 token_ids 存在时校验 token_count 与 token_path_id。"""
+    """Validate count and path identity when ``token_ids`` are available."""
 
     value = maybe_json(value)
     if not isinstance(value, dict) or "token_ids" not in value:
@@ -99,7 +140,7 @@ def token_dictionary_issues(value: Any) -> list[dict[str, Any]]:
 
 
 def _int_or_none(value: Any) -> int | None:
-    """宽松解析整数；None、bool 或非法值按缺失处理。"""
+    """Parse an integer while treating booleans and invalid values as absent."""
 
     if value is None or isinstance(value, bool):
         return None

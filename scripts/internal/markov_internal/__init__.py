@@ -1,1 +1,1 @@
-"""Markov 内部脚本的可复用 Python 包。"""
+"""Reusable Python implementation behind Markov's internal entry points."""

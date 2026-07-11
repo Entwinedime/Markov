@@ -1,4 +1,4 @@
-"""HiCache state snapshot 的 timeline delta oracle。"""
+"""Timeline delta oracle derived from HiCache state snapshots."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from ..snapshot.state import (
 def build_timeline_delta_validation(
     predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """按 cache object 的 snapshot 时间线生成一次性状态变化 oracle。"""
+    """Compare predictions with global state changes along object timelines."""
 
     active_state_keys = active_delta_state_keys(predicted_records)
     visible_state_keys = timeline_visible_state_keys(snapshots)
@@ -48,8 +48,6 @@ def build_timeline_delta_validation(
         "ignored_unobservable_state_keys": sorted(active_state_keys - comparison_state_keys),
         "oracle_transition_count_by_kind": oracle_counts,
         "predicted_transition_count_by_kind": predicted_counts,
-        "raw_mismatch_count": len(mismatches),
-        "raw_top_mismatches": mismatches[:20],
         "object_group_count": oracle["object_group_count"],
         "snapshot_count_with_object_id": oracle["snapshot_count_with_object_id"],
         "snapshot_count_without_object_id": oracle["snapshot_count_without_object_id"],
@@ -63,7 +61,7 @@ def build_timeline_delta_validation(
 
 
 def timeline_visible_state_keys(snapshots: list[dict[str, Any]]) -> set[str]:
-    """返回 raw snapshot timeline 实际暴露过的 state key。"""
+    """Return state keys made observable by completed raw snapshots."""
 
     visible: set[str] = set()
     for row in snapshots:
@@ -80,7 +78,7 @@ def timeline_visible_state_keys(snapshots: list[dict[str, Any]]) -> set[str]:
 
 
 def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_keys: set[str]) -> dict[str, Any]:
-    """沿 raw state snapshot 时间线构造 oracle transition multiset。"""
+    """Build an oracle transition multiset along raw snapshot timelines."""
 
     timeline: list[tuple[tuple[int, int, int], tuple[str, str, str], dict[str, Any]]] = []
     snapshot_count_with_object_id = 0
@@ -108,22 +106,17 @@ def build_oracle_timeline_deltas(snapshots: list[dict[str, Any]], active_state_k
     rows: list[dict[str, Any]] = []
     ignored_state_keys: set[str] = set()
     object_states: dict[tuple[str, str, str], dict[str, Any]] = {}
-    previous_union: dict[str, Any] | None = {}
-    object_groups_seen: set[tuple[str, str, str]] = set()
+    previous_union: dict[str, Any] = {}
     for _sort_key, key, row in sorted(timeline, key=lambda item: item[0]):
-        object_groups_seen.add(key)
         object_states[key] = derived_hicache_state_from_snapshot(row.get("state_snapshot", {}))
         current_union = union_hicache_states(object_states.values())
-        if previous_union is not None:
-            append_timeline_delta_rows(
-                rows, ignored_state_keys, key, row, previous_union, current_union, active_state_keys
-            )
+        append_timeline_delta_rows(rows, ignored_state_keys, key, row, previous_union, current_union, active_state_keys)
         previous_union = current_union
 
     return {
         "rows": rows,
-        "final_state": previous_union or {},
-        "object_group_count": len(object_groups_seen),
+        "final_state": previous_union,
+        "object_group_count": len(object_states),
         "snapshot_count_with_object_id": snapshot_count_with_object_id,
         "snapshot_count_without_object_id": snapshot_count_without_object_id,
         "ignored_snapshot_count": ignored_snapshot_count,
@@ -140,7 +133,7 @@ def append_timeline_delta_rows(
     current_union: dict[str, Any],
     active_state_keys: set[str],
 ) -> None:
-    """把一次 union state 差分追加到 timeline rows。"""
+    """Append one global union-state difference to timeline rows."""
 
     trace_path, pid, object_id = key
     delta_key = (

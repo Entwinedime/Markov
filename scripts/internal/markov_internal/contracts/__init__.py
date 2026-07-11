@@ -1,1 +1,1 @@
-"""profiling、audit 和 validation 共享的内部合同。"""
+"""Stable internal contracts shared by profiling, audit, and validation."""

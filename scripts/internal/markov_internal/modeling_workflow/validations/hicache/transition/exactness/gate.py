@@ -1,7 +1,7 @@
-"""HiCache transition operation gate 产物生成。
+"""Generation of diagnostic HiCache transition operation-gate artifacts.
 
-本模块只负责编排 gate 产物的读取、组装和写出。model-side gate、
-observed-side gate 与 coverage 检查分别由独立模块维护。
+This module only orchestrates loading, assembly, and persistence. Model-side
+gates, observed-side gates, and coverage checks remain in focused modules.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def build_transition_patch_gate_scoreboard_from_entries(
     page_key_mode: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """从 compare 分类 entries 构建 patch gate scoreboard。"""
+    """Build a patch-gate scoreboard from comparison classifications."""
 
     rows: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -78,7 +78,7 @@ def build_transition_patch_gate_scoreboard_from_entries(
 
 
 def prediction_gate_input_paths(prediction_entry: dict[str, Any]) -> dict[str, Any]:
-    """解析 gate 生成所需路径，缺失时返回可报告的 skip reason。"""
+    """Resolve gate inputs or return a serializable skip reason."""
 
     prediction_dir_raw = str(prediction_entry.get("prediction_dir") or "")
     observed_path_raw = str(prediction_entry.get("observed_target_trace_path") or "")
@@ -105,7 +105,7 @@ def prediction_gate_input_paths(prediction_entry: dict[str, Any]) -> dict[str, A
 
 
 def serializable_gate_skip(paths: dict[str, Any]) -> dict[str, Any]:
-    """把 gate skip 诊断行转成 JSON 可写结构。"""
+    """Convert a gate-skip row to JSON-compatible path strings."""
 
     result = dict(paths)
     for key in ("prediction_dir", "observed_path"):
@@ -122,7 +122,7 @@ def write_prediction_gate_outputs(
     page_key_mode: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """为单个 prediction 写出 operation gate 产物并返回 scoreboard row。"""
+    """Write operation-gate artifacts and return one scoreboard row."""
 
     model_payload, observed_payload, coverage, row = build_prediction_gate_artifacts(
         prediction_dir,
@@ -145,7 +145,7 @@ def build_prediction_gate_artifacts(
     page_key_mode: str,
     sample_limit: int,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """构造单个 prediction 的 model/observed gate payload 和 scoreboard row。"""
+    """Build model/observed gate payloads, coverage, and scoreboard row."""
 
     predicted = load_predicted_trace(prediction_dir / "predicted_target_cache_state_trace.json")
     observed = load_json(observed_path) if observed_path.is_file() else {}
@@ -156,7 +156,6 @@ def build_prediction_gate_artifacts(
         hicache_summary,
         prediction_entry,
         page_key_mode=page_key_mode,
-        sample_limit=sample_limit,
     )
     observed_gates, observed_filter = build_observed_operation_gates(
         observed, prediction_entry, page_key_mode=page_key_mode, sample_limit=sample_limit
@@ -173,7 +172,7 @@ def build_prediction_gate_artifacts(
 def build_model_gate_payload(
     prediction_dir: Path, prediction_entry: dict[str, Any], model_gates: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """组装 model-side operation gate JSON payload。"""
+    """Assemble the model-side operation-gate JSON payload."""
 
     return {
         "schema": "trace_sim.hicache.transition_operation_gate_model.v1",
@@ -200,7 +199,7 @@ def build_observed_gate_payload(
     observed_gates: list[dict[str, Any]],
     observed_filter: dict[str, Any],
 ) -> dict[str, Any]:
-    """组装 observed-side operation gate JSON payload。"""
+    """Assemble the observed-side operation-gate JSON payload."""
 
     return {
         "schema": "trace_sim.hicache.transition_operation_gate_observed.v1",
@@ -228,7 +227,7 @@ def build_gate_scoreboard_row(
     observed_gates: list[dict[str, Any]],
     coverage: dict[str, Any],
 ) -> dict[str, Any]:
-    """组装单个 prediction 的 scoreboard 行。"""
+    """Assemble one prediction's gate-scoreboard row."""
 
     return {
         "label": prediction_entry.get("label"),

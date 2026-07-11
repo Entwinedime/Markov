@@ -1,8 +1,9 @@
-"""项目内部脚本的路径约定。"""
+"""Repository and container path conventions for internal scripts."""
 
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -11,7 +12,7 @@ MODELING_CONTAINER_ENV = "TRACE_SIM_MODELING_CONTAINER"
 
 
 def repo_root() -> Path:
-    """从当前文件向上查找仓库根目录。"""
+    """Locate the repository root from this module's resolved path."""
 
     current = Path(__file__).resolve()
     for parent in (current, *current.parents):
@@ -23,8 +24,22 @@ def repo_root() -> Path:
 ROOT_DIR = repo_root()
 
 
+def prepend_repo_src_to_sys_path() -> None:
+    """Expose repository-owned ``src`` Python packages for internal scripts.
+
+    Internal entrypoints install only ``scripts/internal`` on ``sys.path``.
+    Profiling schema and manifest modules intentionally remain under ``src``,
+    so callers invoke this boundary immediately before importing those modules.
+    The operation is idempotent and never reorders an existing path entry.
+    """
+
+    src_dir = str(ROOT_DIR / "src")
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
+
+
 def map_repo_path(path: Path) -> Path:
-    """把容器内仓库前缀映射为当前 checkout 路径。"""
+    """Project a supported container repository path into this checkout."""
 
     raw = str(path)
     for prefix in CONTAINER_REPO_PREFIXES:
@@ -36,7 +51,7 @@ def map_repo_path(path: Path) -> Path:
 
 
 def resolve_repo_path(value: str | os.PathLike[str] | None) -> Path | None:
-    """解析 repo-relative、host absolute 或 container absolute 路径。"""
+    """Resolve repository-relative, host-absolute, or container-absolute input."""
 
     if value is None:
         return None
@@ -46,8 +61,27 @@ def resolve_repo_path(value: str | os.PathLike[str] | None) -> Path | None:
     return ROOT_DIR / path
 
 
+def require_repo_path(value: str | os.PathLike[str] | None) -> Path:
+    """Resolve a required repository path."""
+
+    path = resolve_repo_path(value)
+    if path is None:
+        raise ValueError("expected a non-empty repository path")
+    return path
+
+
+def repo_relative_path(value: str | os.PathLike[str]) -> Path:
+    """Return a stable repository-relative path for generated config files."""
+
+    path = require_repo_path(value).resolve()
+    try:
+        return path.relative_to(ROOT_DIR.resolve())
+    except ValueError as error:
+        raise ValueError(f"path must be inside the repository: {path}") from error
+
+
 def running_in_modeling_container() -> bool:
-    """判断当前进程是否在受支持的 modeling 容器内。"""
+    """Return whether execution is inside a supported modeling container."""
 
     root = str(ROOT_DIR)
     under_container_repo = any(root == prefix or root.startswith(prefix + "/") for prefix in CONTAINER_REPO_PREFIXES)

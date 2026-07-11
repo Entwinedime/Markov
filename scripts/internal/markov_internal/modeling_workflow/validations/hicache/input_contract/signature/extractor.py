@@ -1,4 +1,4 @@
-"""workload identity fact 抽取与 signature 构造。"""
+"""Extraction and canonical signatures for workload-identity facts."""
 
 from __future__ import annotations
 
@@ -31,19 +31,22 @@ from .types import (
 
 @dataclass
 class WorkloadIdentityExtractor:
-    """从 trace 中抽取可比较的 workload identity AuditEvent。"""
+    """Extract comparable workload-identity events from trace rows."""
 
     paths: list[Path]
     label: str
     roles: set[str]
+    event_rows: list[tuple[Path, dict[str, Any]]] | None = None
 
     def extract(self) -> tuple[list[AuditEvent], collections.Counter[str], collections.Counter[str]]:
-        """返回事件列表、未知 role 计数和无法映射 request 计数。"""
+        """Return events plus unknown-role and unmapped-request counts."""
 
         rows: list[AuditEvent] = []
         unknown_roles: collections.Counter[str] = collections.Counter()
         unmapped_requests: collections.Counter[str] = collections.Counter()
-        ordered = sorted(trace_events(self.paths), key=self._event_sort_key)
+        ordered = sorted(
+            self.event_rows if self.event_rows is not None else trace_events(self.paths), key=self._event_sort_key
+        )
         request_fingerprints = self._build_request_fingerprints(ordered)
         for _path, event in ordered:
             item = self._audit_event(event, rows, request_fingerprints, unknown_roles, unmapped_requests)
@@ -160,7 +163,7 @@ class WorkloadIdentityExtractor:
 
 
 def request_anchor_signature(role: str, args: dict[str, Any]) -> str:
-    """生成 request fingerprint 使用的 path-bearing anchor signature。"""
+    """Build the path-bearing anchor used for a request fingerprint."""
 
     return canonical_json(request_anchor_signature_fields(role, args))
 
@@ -171,7 +174,7 @@ def build_signature(
     request_fingerprint: str,
     request_fingerprints: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """为单个 workload identity fact 构造 canonical signature。"""
+    """Build canonical fields and a signature for one identity fact."""
 
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     fields: dict[str, Any] = {"role": role}
@@ -197,7 +200,9 @@ def extract_audit_events(
     paths: list[Path],
     label: str,
     roles: set[str],
+    *,
+    event_rows: list[tuple[Path, dict[str, Any]]] | None = None,
 ) -> tuple[list[AuditEvent], collections.Counter[str], collections.Counter[str]]:
-    """从 trace 中抽取可比较的 AuditEvent 列表。"""
+    """Extract comparable audit events from paths or preloaded trace rows."""
 
-    return WorkloadIdentityExtractor(paths=paths, label=label, roles=roles).extract()
+    return WorkloadIdentityExtractor(paths=paths, label=label, roles=roles, event_rows=event_rows).extract()

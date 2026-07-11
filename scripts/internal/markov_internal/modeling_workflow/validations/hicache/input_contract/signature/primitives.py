@@ -1,4 +1,4 @@
-"""workload signature 的无状态解析与 canonical 辅助工具。"""
+"""Stateless parsing and canonicalization for workload signatures."""
 
 from __future__ import annotations
 
@@ -8,12 +8,12 @@ from typing import Any
 
 from markov_internal.common.trace import load_chrome_trace_events
 from ...core.facts import HICACHE_CONSUMER_INPUT_CONTRACT, parse_fact_or_none
-from ...core.tokens import token_id_path, token_path_count, token_path_hash
+from ...core.tokens import maybe_json, token_id_path, token_path_count, token_path_hash
 from .types import ROLE_SCALAR_FIELDS
 
 
 def trace_events(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
-    """从一个或多个 Chrome trace 文件中提取 event 行。"""
+    """Load event rows from one or more Chrome trace files."""
 
     rows: list[tuple[Path, dict[str, Any]]] = []
     for path in paths:
@@ -22,8 +22,8 @@ def trace_events(paths: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
     return rows
 
 
-def optional_int(value: Any, default: int = 0) -> int:
-    """宽松解析整数，失败时返回 default。"""
+def optional_int(value: Any, default: int | None = 0) -> int | None:
+    """Parse an integer and return ``default`` when conversion fails."""
 
     try:
         return int(float(value))
@@ -32,7 +32,7 @@ def optional_int(value: Any, default: int = 0) -> int:
 
 
 def maybe_int(value: Any) -> int | None:
-    """宽松解析整数，失败时返回 None。"""
+    """Parse an integer permissively, returning ``None`` on failure."""
 
     try:
         return int(float(value))
@@ -40,33 +40,14 @@ def maybe_int(value: Any) -> int | None:
         return None
 
 
-def maybe_json(value: Any) -> Any:
-    """解析可能被双重 JSON 编码的 trace arg。"""
-
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return value
-    try:
-        parsed = json.loads(text)
-        if isinstance(parsed, str):
-            nested = parsed.strip()
-            if nested.startswith("{") or nested.startswith("["):
-                return json.loads(nested)
-        return parsed
-    except json.JSONDecodeError:
-        return value
-
-
 def canonical_json(value: Any) -> str:
-    """生成稳定 canonical JSON 字符串，用作 fact signature。"""
+    """Serialize deterministic canonical JSON for a fact signature."""
 
     return json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
 
 
 def completed_workload_identity(event: dict[str, Any]) -> bool:
-    """判断 event 是否是已完成的 workload identity input-contract fact。"""
+    """Return whether an event is the consumable phase of an identity fact."""
 
     args = event.get("args") if isinstance(event.get("args"), dict) else {}
     fact = parse_fact_or_none(args)
@@ -82,7 +63,7 @@ def completed_workload_identity(event: dict[str, Any]) -> bool:
 
 
 def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
-    """提取 token dictionary 的跨配置比较描述。"""
+    """Project a token dictionary to its cross-config identity fields."""
 
     value = maybe_json(args.get(key))
     if not isinstance(value, dict):
@@ -100,13 +81,13 @@ def dictionary_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def span_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
-    """提取 token span 的跨配置比较描述。"""
+    """Project a token span to its cross-config identity fields."""
 
     value = maybe_json(args.get(key))
     if not isinstance(value, dict):
         return {}
-    begin = optional_int(value.get("begin"))
-    end = optional_int(value.get("end"))
+    begin = optional_int(value.get("begin"), 0) or 0
+    end = optional_int(value.get("end"), 0) or 0
     return {
         "path_id": str(value.get("path_id") or value.get("token_path_id") or ""),
         "begin": begin,
@@ -117,7 +98,7 @@ def span_descriptor(args: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def path_signature(args: dict[str, Any]) -> dict[str, Any]:
-    """组合 dictionary/span，形成 path-bearing fact 的稳定描述。"""
+    """Combine dictionary and span descriptors into a stable path identity."""
 
     return {
         "dictionary": dictionary_descriptor(args, "token_dictionary"),
@@ -126,7 +107,7 @@ def path_signature(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def batch_path_signatures(args: dict[str, Any], fingerprints: dict[str, str] | None = None) -> list[dict[str, Any]]:
-    """组合 cache_extend_input 的 batch path 数组。"""
+    """Project aligned ``cache_extend_input`` arrays to batch path identities."""
 
     request_ids = maybe_json(args.get("request_ids"))
     positions = maybe_json(args.get("request_positions"))
@@ -164,18 +145,8 @@ def batch_path_signatures(args: dict[str, Any], fingerprints: dict[str, str] | N
     return rows
 
 
-def fact_items(value: Any) -> list[Any]:
-    """把 scalar fact 字段和数组 fact 字段统一成列表。"""
-
-    if isinstance(value, list):
-        return value
-    if value is None:
-        return []
-    return [value]
-
-
 def scalar_value(args: dict[str, Any], field: str) -> Any:
-    """读取 signature 中允许参与比较的标量或结构化字段。"""
+    """Read a scalar or structured field admitted to a signature."""
 
     value = maybe_json(args.get(field))
     if isinstance(value, (dict, list)):
@@ -186,7 +157,7 @@ def scalar_value(args: dict[str, Any], field: str) -> Any:
 
 
 def request_anchor_signature_fields(role: str, args: dict[str, Any]) -> dict[str, Any]:
-    """构造 request fingerprint anchor 的 canonical 字段。"""
+    """Build canonical fields for a request-fingerprint anchor."""
 
     fields: dict[str, Any] = {"role": role}
     for field in ROLE_SCALAR_FIELDS.get(role, ()):

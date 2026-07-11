@@ -1,4 +1,4 @@
-"""统一 modeling workflow 的运行时上下文。"""
+"""Runtime options and shared state for the modeling workflow."""
 
 from __future__ import annotations
 
@@ -12,7 +12,11 @@ from .types import ProfileRunRef
 
 @dataclass(frozen=True)
 class WorkflowOptions:
-    """已经规整到 workflow 内部格式的 CLI options。"""
+    """Validated, repository-resolved options consumed by the workflow.
+
+    CLI parsing remains outside this record so importing workflow modules never
+    loads arguments or observes process-global command-line state.
+    """
 
     profile_run_dirs: tuple[Path, ...]
     manifests: tuple[Path, ...]
@@ -36,7 +40,7 @@ class WorkflowOptions:
 
 @dataclass
 class WorkflowContext:
-    """planner、preflight 和 validation 共享的运行时状态。"""
+    """State shared by planning, preflight checks, execution, and validation."""
 
     options: WorkflowOptions
     runs: list[ProfileRunRef]

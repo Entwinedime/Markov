@@ -1,4 +1,4 @@
-"""内部脚本共用的名称规整工具。"""
+"""Filesystem-safe naming helpers for generated artifacts."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ import re
 
 
 def sanitize(value: str) -> str:
-    """把用户可配置名称规整成可作为目录名的短字符串。"""
+    """Normalize a user-facing name into a non-empty directory component."""
 
     value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
     return value.strip("._-") or "profile"
 
 
 def safe_slug(value: str, *, fallback: str = "unknown") -> str:
-    """把内部 id 规整成稳定路径片段。"""
+    """Normalize an internal identifier into a stable path component."""
 
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip()).strip("._") or fallback

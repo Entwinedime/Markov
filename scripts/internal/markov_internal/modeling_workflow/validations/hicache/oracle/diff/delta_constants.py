@@ -1,4 +1,4 @@
-"""HiCache state delta oracle 的共享常量。"""
+"""Shared state-to-transition mapping for HiCache delta oracles."""
 
 DELTA_KIND_BY_STATE_KEY: dict[str, tuple[str, str]] = {
     "l1_resident_pages": ("add_l1_resident", "remove_l1_resident"),

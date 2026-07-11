@@ -1,1 +1,1 @@
-"""HiCache transition validation 包。"""
+"""HiCache transition exactness validation."""

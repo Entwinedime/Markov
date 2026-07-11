@@ -1,4 +1,4 @@
-"""HiCache validation 使用的 target-side observed transition oracle 抽取。"""
+"""Target-side observed transition oracle for HiCache validation."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from ...oracle.snapshot.state import (
     snapshot_is_completed_state,
 )
 from ..replay.record_schema import ACTIVE_STATE_KEYS, state_counts
+from .request_identity import canonical_request_key
 from .taxonomy_constants import OBSERVED_ROLE_TO_OPERATION_KIND
 
 
@@ -26,18 +27,19 @@ TRANSITION_COMPARABLE_STATE_KEYS = tuple(key for key in SNAPSHOT_VISIBLE_STATE_K
 def extract_target_oracle(
     trace_paths: list[Path], target_metadata: dict[str, Any], *, sample_limit: int
 ) -> dict[str, Any]:
-    """构建第 2 阶段 target-side observed transition oracle。"""
+    """Build the target-side observed transition oracle."""
 
     snapshots = extract_hicache_state_snapshots(trace_paths)
     timeline_oracle = build_oracle_timeline_deltas(snapshots, set(SNAPSHOT_VISIBLE_STATE_KEYS))
     observed_transitions = observed_transitions_from_snapshot_rows(timeline_oracle["rows"])
-    observed_operations, event_status = extract_observed_operations(trace_paths, sample_limit=sample_limit)
+    observed_operations, event_status = extract_observed_operations(trace_paths)
     final_state = latest_derived_state(snapshots)
     visible_keys = sorted(timeline_visible_keys_from_snapshots(snapshots))
     unsupported_keys = sorted(set(ACTIVE_STATE_KEYS) - set(SNAPSHOT_VISIBLE_STATE_KEYS))
     ready = bool(snapshots) and (bool(observed_operations) or bool(observed_transitions))
     return {
         "schema": "trace_sim.hicache.observed_target_transition_trace.v1",
+        "sample_limit": sample_limit,
         "oracle_ready": ready,
         **target_metadata,
         "oracle_trace_files": [str(path) for path in trace_paths],
@@ -73,7 +75,7 @@ def extract_target_oracle(
 
 
 def observed_transitions_from_snapshot_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """把 snapshot delta rows 规整成 observed transition rows。"""
+    """Normalize snapshot deltas to observed transition rows."""
 
     result: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
@@ -92,7 +94,7 @@ def observed_transitions_from_snapshot_rows(rows: list[dict[str, Any]]) -> list[
                 "cache_scope": row.get("cache_scope") or "",
                 "request_id": row.get("request_id") or "",
                 "operation_id": row.get("operation_id") or "",
-                "canonical_request_key": canonical_request_key_from_row(row),
+                "canonical_request_key": canonical_request_key(row),
                 "event_base_name": row.get("event_base_name") or "",
                 "source_event_name": row.get("source_event_name") or "",
                 "ts": row.get("ts"),
@@ -104,12 +106,9 @@ def observed_transitions_from_snapshot_rows(rows: list[dict[str, Any]]) -> list[
     return result
 
 
-def extract_observed_operations(
-    trace_paths: list[Path], *, sample_limit: int
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """从 target full probe 中抽取 transition validator 可消费的 operation / control evidence。"""
+def extract_observed_operations(trace_paths: list[Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Extract operation/control evidence consumable by transition validation."""
 
-    _ = sample_limit
     operations: list[dict[str, Any]] = []
     statuses: list[dict[str, Any]] = []
     for path in trace_paths:
@@ -133,7 +132,7 @@ def extract_observed_operations(
                     "cache_scope": args.get("cache_scope") or "",
                     "request_id": args.get("request_id") or "",
                     "operation_id": args.get("operation_id") or "",
-                    "canonical_request_key": canonical_request_key_from_row(args),
+                    "canonical_request_key": canonical_request_key(args),
                     "pages": [],
                     "ts": event.get("ts"),
                     "dur": event.get("dur"),
@@ -145,13 +144,13 @@ def extract_observed_operations(
 
 
 def _transition_observed_fact(fact_class: str) -> bool:
-    """判断 fact 是否能作为 transition validator 的 target-side 边界证据。"""
+    """Return whether a fact class is target-side transition evidence."""
 
     return fact_class in {"source_actual", "timing_observation"}
 
 
 def observed_confidence(fact_class: str) -> str:
-    """返回 observed operation 的证据来源等级。"""
+    """Return the evidence confidence class for an observed operation."""
 
     if fact_class == "source_actual":
         return "source_actual"
@@ -159,25 +158,26 @@ def observed_confidence(fact_class: str) -> str:
 
 
 def observed_operation_kind(role: str, event_kind: str) -> str:
-    """把 probe role 归一化为 transition patch gate 使用的 operation kind。"""
+    """Normalize a probe role to the operation taxonomy used by patch gates."""
 
     if role in OBSERVED_ROLE_TO_OPERATION_KIND:
         return OBSERVED_ROLE_TO_OPERATION_KIND[role]
+    operation_kind = role or event_kind or "unknown"
     if "prefetch" in role or "prefetch" in event_kind:
-        return "prefetch"
-    if "writeback" in role or "writeback" in event_kind:
-        return "write_back_flush"
-    if "write" in role or "write" in event_kind:
-        return "write_through_backup"
-    if "lock" in role or "ref" in role:
-        return "lock_ref"
-    if "capacity" in role or "evict" in role:
-        return "capacity"
-    return role or event_kind or "unknown"
+        operation_kind = "prefetch"
+    elif "writeback" in role or "writeback" in event_kind:
+        operation_kind = "write_back_flush"
+    elif "write" in role or "write" in event_kind:
+        operation_kind = "write_through_backup"
+    elif "lock" in role or "ref" in role:
+        operation_kind = "lock_ref"
+    elif "capacity" in role or "evict" in role:
+        operation_kind = "capacity"
+    return operation_kind
 
 
 def timeline_visible_keys_from_snapshots(snapshots: list[dict[str, Any]]) -> set[str]:
-    """统计 target snapshot 实际暴露过的状态 key。"""
+    """Return state keys actually exposed by target snapshots."""
 
     visible: set[str] = set()
     for row in snapshots:
@@ -188,16 +188,3 @@ def timeline_visible_keys_from_snapshots(snapshots: list[dict[str, Any]]) -> set
             if isinstance(value, list):
                 visible.add(str(key))
     return visible
-
-
-def canonical_request_key_from_row(row: dict[str, Any]) -> str:
-    """生成保守的 run-local canonical request key。"""
-
-    request_id = str(row.get("request_id") or "")
-    cache_scope = str(row.get("cache_scope") or "")
-    operation_id = str(row.get("operation_id") or "")
-    if request_id:
-        return f"{cache_scope}:{request_id}"
-    if operation_id:
-        return f"{cache_scope}:operation:{operation_id}"
-    return cache_scope

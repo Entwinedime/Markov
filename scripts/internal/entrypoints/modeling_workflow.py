@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unified post-profile modeling workflow entrypoint."""
+"""Host entry point for the unified post-profile modeling workflow."""
 
 from __future__ import annotations
 

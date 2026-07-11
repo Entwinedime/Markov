@@ -1,6 +1,1 @@
-"""统一 modeling workflow 包。"""
-
-from .cli import main
-
-
-__all__ = ["main"]
+"""Host-side orchestration for post-profile modeling and validation."""

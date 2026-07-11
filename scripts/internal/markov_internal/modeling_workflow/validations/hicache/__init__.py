@@ -1,1 +1,1 @@
-"""统一建模 workflow 的 HiCache 验证对象。"""
+"""HiCache validation objects and supporting domain logic."""

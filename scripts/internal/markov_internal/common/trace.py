@@ -1,8 +1,10 @@
-"""Chrome trace JSON 读取工具。
+"""Chrome trace loading with one bounded repair policy.
 
-Python probe 采用流式写入后，真实 profiling 进程被外层停止时可能来不及执行
-``atexit`` 收尾，导致文件缺少最后的 ``]}``。这里把这类“尾部未闭合但事件对象
-完整”的情况集中修复，避免每个审计脚本各自实现一套宽松解析逻辑。
+Python probes stream events while the profiled process is running. External
+shutdown can bypass ``atexit`` and leave a file without its final ``]}``, even
+when every event object is complete. This module centralizes repair of that one
+known truncation shape so audits do not implement inconsistent permissive JSON
+parsers.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class TraceLoadStatus:
-    """单个 trace 文件的读取状态。"""
+    """Observable outcome of loading one trace file."""
 
     path: str
     loaded: bool
@@ -24,7 +26,7 @@ class TraceLoadStatus:
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        """转换为稳定 JSON 摘要。"""
+        """Return the stable JSON representation used by audit artifacts."""
 
         return {
             "path": self.path,
@@ -36,7 +38,7 @@ class TraceLoadStatus:
 
 
 def load_chrome_trace(path: Path, *, auto_repair: bool = True) -> tuple[Any, list[dict[str, Any]], TraceLoadStatus]:
-    """读取 Chrome trace payload、event 列表和读取状态。"""
+    """Load a Chrome trace payload, dictionary events, and status metadata."""
 
     if not path.is_file():
         return None, [], TraceLoadStatus(str(path), loaded=False, event_count=0, error="missing_file")
@@ -62,14 +64,14 @@ def load_chrome_trace(path: Path, *, auto_repair: bool = True) -> tuple[Any, lis
 
 
 def load_chrome_trace_events(path: Path, *, auto_repair: bool = True) -> tuple[list[dict[str, Any]], TraceLoadStatus]:
-    """只读取 Chrome trace event 列表。"""
+    """Load only dictionary events plus trace status metadata."""
 
     _payload, events, status = load_chrome_trace(path, auto_repair=auto_repair)
     return events, status
 
 
 def trace_events_from_payload(payload: Any) -> list[dict[str, Any]]:
-    """从 Chrome trace payload 中提取 dict event。"""
+    """Extract dictionary events from object-style or array-style payloads."""
 
     raw_events = payload.get("traceEvents", []) if isinstance(payload, dict) else payload
     if not isinstance(raw_events, list):
@@ -78,7 +80,7 @@ def trace_events_from_payload(payload: Any) -> list[dict[str, Any]]:
 
 
 def repair_streamed_chrome_trace_text(text: str) -> str:
-    """修复流式 Chrome trace 最常见的尾部未闭合情况。"""
+    """Close a streamed trace only when its final event object is complete."""
 
     stripped = text.strip()
     if not stripped:

@@ -1,4 +1,4 @@
-"""operation gate 覆盖率与 readiness 检查。"""
+"""Coverage and readiness checks for diagnostic operation gates."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .taxonomy_constants import MARKER_DELTA_KINDS
 def build_transition_patch_gate_coverage(
     records: list[dict[str, Any]], operation_gates: list[dict[str, Any]], *, sample_limit: int
 ) -> dict[str, Any]:
-    """检查 operation gate 是否覆盖所有模型 transition。"""
+    """Check whether operation gates account for every model transition."""
 
     covered_ordinals: set[int] = set()
     unresolved: list[dict[str, Any]] = []
@@ -19,10 +19,9 @@ def build_transition_patch_gate_coverage(
     for gate in operation_gates:
         provenance = gate.get("provenance", {}) if isinstance(gate.get("provenance"), dict) else {}
         for ordinal in provenance.get("transition_ordinals", []):
-            try:
-                covered_ordinals.add(int(ordinal))
-            except (TypeError, ValueError):
-                continue
+            parsed_ordinal = _integer_or_none(ordinal)
+            if parsed_ordinal is not None:
+                covered_ordinals.add(parsed_ordinal)
         if gate.get("classification") == "unresolved":
             unresolved.append(
                 {"gate_id": gate.get("gate_id"), "operation_kind": gate.get("operation_kind"), "provenance": provenance}
@@ -60,7 +59,9 @@ def build_transition_patch_gate_coverage(
         "state_only_operation_gate_count": int(gate_counts_by_classification.get("state_marker_only", 0)),
         "coverage_ready": not missing,
         "state_marker_filter_ready": not physical_with_marker_kind,
-        "unresolved_report_ready": not unresolved or bool(unresolved[:sample_limit]),
+        "unresolved_report_ready": all(
+            bool(row.get("gate_id")) and isinstance(row.get("provenance"), dict) for row in unresolved
+        ),
         "missing_transitions": missing[:sample_limit],
         "unresolved_operation_gates": unresolved[:sample_limit],
         "physical_candidate_marker_violations": physical_with_marker_kind[:sample_limit],
@@ -71,8 +72,17 @@ def build_transition_patch_gate_coverage(
     }
 
 
+def _integer_or_none(value: Any) -> int | None:
+    """Convert one provenance ordinal while rejecting malformed values."""
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def operation_gate_schema_ready(operation_gates: list[dict[str, Any]]) -> bool:
-    """检查 operation gate 最小 schema 是否齐备。"""
+    """Check the minimum schema required from every operation gate."""
 
     required = (
         "gate_id",
@@ -92,13 +102,13 @@ def operation_gate_schema_ready(operation_gates: list[dict[str, Any]]) -> bool:
 
 
 def count_gates_by_field(operation_gates: list[dict[str, Any]], field: str) -> dict[str, int]:
-    """按 operation gate 字段计数。"""
+    """Count operation gates by one field."""
 
     return dict(sorted(collections.Counter(str(row.get(field) or "") for row in operation_gates).items()))
 
 
 def count_gates_by_kind(operation_gates: list[dict[str, Any]]) -> dict[str, int]:
-    """按 operation kind 计数。"""
+    """Count operation gates by operation kind."""
 
     counts: collections.Counter[str] = collections.Counter(
         str(row.get("operation_kind") or "") for row in operation_gates
@@ -107,7 +117,7 @@ def count_gates_by_kind(operation_gates: list[dict[str, Any]]) -> dict[str, int]
 
 
 def summarize_gate_rows_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
-    """按 prediction 字段汇总 patch gate readiness。"""
+    """Aggregate patch-gate readiness by a prediction field."""
 
     result: dict[str, Any] = {}
     for value in sorted({str(row.get(key) or "") for row in rows}):

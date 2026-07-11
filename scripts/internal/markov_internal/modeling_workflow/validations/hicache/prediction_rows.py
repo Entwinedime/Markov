@@ -1,10 +1,12 @@
-"""HiCache cache-state prediction row 辅助工具。"""
+"""Construction and aggregation of HiCache cache-state prediction rows."""
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
-from markov_internal.common.io import load_json
+from ....common.io import load_json
+from ...types import ModelRunResult
 
 
 ACTIVE_STATE_TIERS = (
@@ -17,8 +19,8 @@ ACTIVE_STATE_TIERS = (
 )
 
 
-def build_prediction_row(result: Any) -> dict[str, Any]:
-    """从一次 cache-state model run 构造紧凑 final-state row。"""
+def build_prediction_row(result: ModelRunResult) -> dict[str, Any]:
+    """Construct a compact final-state row from one cache-state model run."""
 
     spec = result.spec
     if spec.prediction is None:
@@ -45,9 +47,12 @@ def build_prediction_row(result: Any) -> dict[str, Any]:
         "skip_reason": result.skip_reason or None,
         **validation_summary,
     }
-    row["tier_count_deltas"] = {
-        tier: tier_count_delta(row, tier) for tier in ACTIVE_STATE_TIERS if tier_count_delta(row, tier) is not None
-    }
+    tier_deltas: dict[str, int] = {}
+    for tier in ACTIVE_STATE_TIERS:
+        delta = tier_count_delta(row, tier)
+        if delta is not None:
+            tier_deltas[tier] = delta
+    row["tier_count_deltas"] = tier_deltas
     if result.return_code != 0:
         row["execution_error_tail"] = result.execution_error_tail
         errors = row.get("validation_errors")
@@ -67,7 +72,7 @@ def build_prediction_row(result: Any) -> dict[str, Any]:
 
 
 def summarize_final_state_rows(rows: list[dict[str, Any]], *, scope: str) -> dict[str, Any]:
-    """汇总指定 scope 的 final-state rows。"""
+    """Aggregate final-state rows for one prediction scope."""
 
     return prediction_summary(
         rows,
@@ -76,8 +81,8 @@ def summarize_final_state_rows(rows: list[dict[str, Any]], *, scope: str) -> dic
     )
 
 
-def summarize_prediction(validation_path: Any) -> dict[str, Any]:
-    """从 validation.json 提取紧凑验证字段。"""
+def summarize_prediction(validation_path: Path) -> dict[str, Any]:
+    """Extract the compact workflow-facing fields from ``validation.json``."""
 
     if not validation_path.is_file():
         return {
@@ -86,6 +91,12 @@ def summarize_prediction(validation_path: Any) -> dict[str, Any]:
             "hicache_state": {},
         }
     validation = load_json(validation_path)
+    if not isinstance(validation, dict):
+        return {
+            "validation_ready": False,
+            "validation_errors": ["invalid_validation_json"],
+            "hicache_state": {},
+        }
     hicache = validation.get("hicache_state") if isinstance(validation.get("hicache_state"), dict) else {}
     return {
         "validation_ready": bool(validation.get("validation_ready")),
@@ -112,7 +123,7 @@ def summarize_prediction(validation_path: Any) -> dict[str, Any]:
 
 
 def prediction_summary(rows: list[dict[str, Any]], *, schema: str, stage: str) -> dict[str, Any]:
-    """汇总 final-state prediction rows。"""
+    """Aggregate final-state prediction rows without duplicating row details."""
 
     pass_rows = [row for row in rows if row.get("hicache_state", {}).get("final_state_match") is True]
     ready_rows = [row for row in rows if row.get("validation_ready")]
@@ -146,7 +157,7 @@ def prediction_summary(rows: list[dict[str, Any]], *, schema: str, stage: str) -
 
 
 def tier_count_delta(row: dict[str, Any], tier: str) -> int | None:
-    """计算单个 state tier 的 model/oracle count delta。"""
+    """Return the model-minus-oracle count delta for one state tier."""
 
     hicache = row.get("hicache_state") if isinstance(row.get("hicache_state"), dict) else {}
     model_counts = hicache.get("normalized_model_final_state_counts")

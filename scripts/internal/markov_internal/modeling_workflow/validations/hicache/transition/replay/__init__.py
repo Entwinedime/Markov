@@ -1,1 +1,1 @@
-"""HiCache transition replay schema 与 replay engine。"""
+"""Schema and replay engine for predicted HiCache transitions."""

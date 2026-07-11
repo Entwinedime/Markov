@@ -1,4 +1,4 @@
-"""final DAG 验证请求。"""
+"""Validation request for the current final DAG."""
 
 from __future__ import annotations
 
@@ -9,20 +9,20 @@ from ...types import ModelRunResult
 
 
 class FinalDagValidation(DagDiagnosticsValidation):
-    """验证最终 DAG；当前无有效 patch，因此 final DAG 等同 base DAG。"""
+    """Validate the final DAG, which remains the base DAG in Phase 0/1."""
 
     name = "final_dag"
     schema = "trace_sim.modeling_workflow.validation.final_dag.v1"
     progress_detail = "final DAG diagnostics"
 
     def extend_row(self, row: dict[str, Any], result: ModelRunResult) -> None:
-        """标记当前 final DAG 的实际来源。"""
+        """Record that the empty Phase 0/1 patch leaves the base DAG active."""
 
         row["final_dag_source"] = "base_dag"
         row["patch_applied"] = False
 
     def build_summary(self, context: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """汇总当前 final DAG 验证结果。"""
+        """Add final-DAG provenance to the common diagnostic summary."""
 
         summary = super().build_summary(context, rows)
         summary["final_dag_source"] = "base_dag"

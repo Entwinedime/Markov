@@ -1,4 +1,4 @@
-"""predicted transition replay final state 自洽比较。"""
+"""Consistency comparison for a replayed predicted final state."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from .record_schema import ACTIVE_STATE_KEYS, SELF_CHECK_HARD_STATE_KEYS, state_
 def compare_replay_final_state(
     replay: dict[str, Any], final_state: dict[str, Any], *, sample_limit: int
 ) -> dict[str, Any]:
-    """比较 replay final state 和模型 summary final state。"""
+    """Compare replayed state with the final state emitted by the model."""
 
     replay_final = replay["final_state"]
     diffs: dict[str, Any] = {}
@@ -56,7 +56,6 @@ def compare_replay_final_state(
         "model_final_state_counts": state_counts(final_state),
         "sets_diff_by_tier": diffs,
         "page_hit_counts_diff": hit_mismatch,
-        "unreplayed_state_transition_count": 0,
         "advisory_replay_state_keys": {
             "locked_pages": "predicted transition trace does not currently expose every source_actual lock/ref or prefetch anchor protection mutation; strict mismatch is reported but stable state exactness does not gate on it.",
             "page_hit_counts": "hit count is diagnostic metadata and is reported separately from active-state replay.",
@@ -65,7 +64,7 @@ def compare_replay_final_state(
 
 
 def normalize_page_set(value: Any, page_key_mode: str) -> set[str]:
-    """把页面列表归一化成集合。"""
+    """Normalize a page-list field to a set under the selected key mode."""
 
     if not isinstance(value, list):
         return set()
@@ -73,7 +72,7 @@ def normalize_page_set(value: Any, page_key_mode: str) -> set[str]:
 
 
 def compare_counter_dicts(expected: dict[str, int], actual: dict[str, int], *, sample_limit: int) -> dict[str, Any]:
-    """比较两个 page counter 字典。"""
+    """Compare two page-counter mappings with bounded mismatch samples."""
 
     mismatches: list[dict[str, Any]] = []
     for key in sorted(set(expected) | set(actual)):

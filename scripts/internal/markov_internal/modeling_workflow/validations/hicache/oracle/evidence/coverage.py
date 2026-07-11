@@ -1,4 +1,4 @@
-"""predicted transition 与 state snapshot 之间的覆盖率汇总。"""
+"""Coverage summaries between predicted transitions and state snapshots."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from ..snapshot.state import derived_hicache_state_from_snapshot
 def build_request_transition_coverage(
     predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """生成 request 级 state trace 覆盖摘要。
+    """Build request-level state-trace coverage.
 
-    真实 state snapshot 目前不是严格的一次 transition oracle；它更像调用点快照。
-    因此这里先做 request id 覆盖检查，帮助后续把 final set mismatch 下钻到请求。
-    缺少 request_id 的 snapshot 不参与 request 级覆盖判定。
+    State snapshots are call-site observations, not a strict per-transition
+    oracle. Request coverage helps attribute a final-set mismatch, while
+    snapshots without a request identifier remain outside this diagnostic.
     """
 
     predicted_requests = sorted(
@@ -38,10 +38,11 @@ def build_request_transition_coverage(
 def build_transition_coverage(
     predicted_records: list[dict[str, Any]], snapshots: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """生成 transition 级覆盖摘要。
+    """Build transition-level diagnostic coverage.
 
-    这里不把 coverage 作为验证通过条件。state snapshot 是稀疏观测，不是逐步
-    transition oracle；该摘要用于定位“哪些 transition / page / request 缺少解释”。
+    Coverage is not a pass condition because snapshots are sparse observations,
+    not a stepwise transition oracle. The output identifies transitions, pages,
+    or requests that lack corresponding evidence.
     """
 
     predicted_pages = sorted(

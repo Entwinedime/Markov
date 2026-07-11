@@ -1,4 +1,4 @@
-"""transition exactness 的 delta row 归一化与比较。"""
+"""Normalization and comparison of transition-exactness delta rows."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from .oracle import SNAPSHOT_VISIBLE_STATE_KEYS, TRANSITION_COMPARABLE_STATE_KEY
 
 
 def comparable_model_delta_rows(rows: list[dict[str, Any]], page_key_mode: str) -> list[dict[str, Any]]:
-    """筛出 snapshot 可见状态的模型 replay delta。"""
+    """Select model replay deltas visible through target snapshots."""
 
     visible_delta_kinds = {
         kind for state_key in TRANSITION_COMPARABLE_STATE_KEYS for kind in STATE_DELTA_KINDS[state_key]
@@ -28,7 +28,7 @@ def comparable_model_delta_rows(rows: list[dict[str, Any]], page_key_mode: str) 
 
 
 def comparable_observed_delta_rows(rows: Any, page_key_mode: str) -> list[dict[str, Any]]:
-    """规整 observed snapshot delta rows。"""
+    """Normalize observed snapshot-delta rows."""
 
     if not isinstance(rows, list):
         return []
@@ -42,7 +42,7 @@ def comparable_observed_delta_rows(rows: Any, page_key_mode: str) -> list[dict[s
 
 
 def normalize_delta_rows(rows: list[dict[str, Any]], page_key_mode: str) -> list[dict[str, Any]]:
-    """归一化 delta rows 的 page key。"""
+    """Normalize page keys in delta rows."""
 
     result: list[dict[str, Any]] = []
     for row in rows:
@@ -61,7 +61,7 @@ def normalize_delta_rows(rows: list[dict[str, Any]], page_key_mode: str) -> list
 
 
 def normalize_delta_rows_to_union_timeline(rows: list[dict[str, Any]], page_key_mode: str) -> list[dict[str, Any]]:
-    """按归一化 page key 重建全局 union 口径的 delta rows。"""
+    """Rebuild deltas against a global union state after key normalization."""
 
     counts: collections.Counter[tuple[str, str]] = collections.Counter()
     result: list[dict[str, Any]] = []
@@ -80,9 +80,7 @@ def normalize_delta_rows_to_union_timeline(rows: list[dict[str, Any]], page_key_
                 counts.pop(key, None)
             else:
                 counts[key] = after
-            if direction > 0 and before == 0 and after > 0:
-                changed.append(str(page))
-            elif direction < 0 and before > 0 and after == 0:
+            if (direction > 0 and before == 0 and after > 0) or (direction < 0 and before > 0 and after == 0):
                 changed.append(str(page))
         if changed:
             result.append({**row, "state_key": state_key, "pages": sorted(set(changed))})
@@ -90,7 +88,7 @@ def normalize_delta_rows_to_union_timeline(rows: list[dict[str, Any]], page_key_
 
 
 def state_effect_from_delta_kind(kind: str) -> tuple[str, int]:
-    """从 delta kind 反推 state key 和方向。"""
+    """Resolve a delta kind to its state key and add/remove direction."""
 
     for state_key, (add_kind, remove_kind) in STATE_DELTA_KINDS.items():
         if kind == add_kind:
@@ -107,7 +105,7 @@ def final_state_comparison(
     page_key_mode: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """比较 model/oracle final state 的 snapshot 可见字段。"""
+    """Compare snapshot-visible final-state fields from model and oracle."""
 
     normalized_model = normalize_hicache_state_for_oracle_compare(model_final, page_key_mode)
     normalized_observed = normalize_hicache_state_for_oracle_compare(observed_final, page_key_mode)
@@ -138,7 +136,7 @@ def final_state_comparison(
 
 
 def page_set(value: Any) -> set[str]:
-    """把 page list 字段转成字符串集合。"""
+    """Convert a page-list field to a string set."""
 
     return {str(page) for page in value if page is not None} if isinstance(value, list) else set()
 
@@ -146,7 +144,7 @@ def page_set(value: Any) -> set[str]:
 def compare_transition_kind_counts(
     model_rows: list[dict[str, Any]], observed_rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    """比较 transition kind 触达页数。"""
+    """Compare page-touch counts by transition kind."""
 
     model_counts = count_rows_by_transition_kind(model_rows)
     observed_counts = count_rows_by_transition_kind(observed_rows)
@@ -173,7 +171,7 @@ def compare_page_lifecycle_multiset(
     *,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """比较 `(transition_kind, page)` multiset。"""
+    """Compare ``(transition_kind, page)`` multisets."""
 
     mismatches = [
         {

@@ -1,1 +1,1 @@
-"""profiling 前端之外的采集后审计工具。"""
+"""Post-capture artifact audits independent of profiling front ends."""

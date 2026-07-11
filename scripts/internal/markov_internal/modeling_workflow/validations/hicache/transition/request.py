@@ -1,4 +1,4 @@
-"""HiCache transition 验证对象。"""
+"""Workflow validation object for HiCache transition exactness."""
 
 from __future__ import annotations
 
@@ -13,19 +13,13 @@ from .exactness.prediction_set import compare_transition_prediction_rows
 
 
 class HiCacheTransitionValidation(PredictionValidation):
-    """用 cache-state 模型产物验证 HiCache transition exactness。"""
+    """Validate transition exactness using cache-state model artifacts."""
 
     name = "hicache_transition"
-    cache_state_output_requirements = frozenset(
-        {
-            ModelOutputRequirement.MODULE_SUMMARY,
-            ModelOutputRequirement.MODULE_VALIDATION,
-            ModelOutputRequirement.MODULE_TRANSITION_DIAGNOSTICS,
-        }
-    )
+    cache_state_output_requirements = frozenset({ModelOutputRequirement.HICACHE_VALIDATION})
 
     def preflight_checks(self) -> tuple[type[HiCacheStateInputPreflightCheck], ...]:
-        """返回 HiCache state/oracle 输入检查。"""
+        """Require the shared HiCache state and oracle-input preflight."""
 
         return (HiCacheStateInputPreflightCheck,)
 
@@ -35,10 +29,11 @@ class HiCacheTransitionValidation(PredictionValidation):
         specs: list[ModelRunSpec],
         results: dict[str, ModelRunResult],
     ) -> ValidationSummary:
-        """比较 cache-state prediction rows 与目标 transition oracle。"""
+        """Compare cache-state prediction rows with target transition oracles."""
 
         selected = [spec for spec in specs if self.name in spec.validation_requests]
         prediction_rows = [build_prediction_row(results[spec.run_id]) for spec in selected]
+        model_run_ids_by_label = {str(row.get("label") or ""): row.get("model_run_id") for row in prediction_rows}
         target_runs = self._target_runs(context)
         artifact_root = context.artifacts.validations_dir / self.name
         rows: list[dict[str, Any]] = []
@@ -48,14 +43,7 @@ class HiCacheTransitionValidation(PredictionValidation):
 
         def on_row(row: dict[str, Any]) -> None:
             rows.append(row)
-            model_run_id = next(
-                (
-                    item.get("model_run_id")
-                    for item in prediction_rows
-                    if str(item.get("label") or "") == str(row.get("label") or "")
-                ),
-                None,
-            )
+            model_run_id = model_run_ids_by_label.get(str(row.get("label") or ""))
             if model_run_id:
                 write_json(context.artifacts.validation_row_path(self.name, str(model_run_id)), row)
             progress.advance(
@@ -73,6 +61,7 @@ class HiCacheTransitionValidation(PredictionValidation):
                 "prediction_count": len(prediction_rows),
                 "ready_count": 0,
                 "exact_count": 0,
+                "skipped_count": len(prediction_rows),
                 "final_state_exact_count": 0,
                 "transition_count_exact_count": 0,
                 "status": "CHECK" if prediction_rows else "EMPTY",
@@ -86,8 +75,6 @@ class HiCacheTransitionValidation(PredictionValidation):
                 page_key_mode=context.options.page_key_mode,
                 force=context.options.force,
                 sample_limit=context.options.sample_limit,
-                emit_catalog=True,
-                emit_gates=True,
                 catalog_output=context.artifacts.validations_dir / self.name / "transition_mismatch_catalog.json",
                 gate_output=context.artifacts.validations_dir / self.name / "transition_patch_gate_scoreboard.json",
                 summary_output_path=context.artifacts.validation_summary_path(self.name),
@@ -108,14 +95,14 @@ class HiCacheTransitionValidation(PredictionValidation):
             selected_run_count=int(summary.get("prediction_count") or 0),
             ready_count=int(summary.get("ready_count") or 0),
             exact_count=int(summary.get("exact_count") or 0),
-            skipped_count=0,
+            skipped_count=int(summary.get("skipped_count") or 0),
             artifact_paths={"summary": str(context.artifacts.validation_summary_path(self.name))},
             payload=summary,
         )
 
     @staticmethod
     def _target_runs(context: Any) -> dict[tuple[str, str], dict[str, Any]]:
-        """构造 transition oracle 需要的 target run 元数据。"""
+        """Index target-run metadata required to build transition oracles."""
 
         return {
             (run.input_id, run.config_id): {

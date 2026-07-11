@@ -1,4 +1,4 @@
-"""validation diagnostics 使用的 predicted HiCache state record 工具。"""
+"""Predicted HiCache state records consumed by validation diagnostics."""
 
 from __future__ import annotations
 
@@ -10,10 +10,10 @@ from markov_internal.common.io import load_json
 
 
 def load_predicted_state_records(path: Path | None) -> list[dict[str, Any]]:
-    """读取 C++ HiCache state model 输出的 transition 明细。
+    """Load transition details emitted by the C++ HiCache state model.
 
-    缺失或损坏的文件只代表该次验证没有 transition 明细，不应让上层
-    profiling/modeling 编排因为诊断附件不可用而失败。
+    A missing or malformed optional attachment yields no diagnostic records;
+    it does not abort the higher-level profiling or modeling orchestration.
     """
 
     if path is None or not path.is_file():
@@ -27,14 +27,14 @@ def load_predicted_state_records(path: Path | None) -> list[dict[str, Any]]:
 
 
 def page_set_from_predicted_record(record: dict[str, Any]) -> list[Any]:
-    """读取 C++ transition 明细中的目标页集合。"""
+    """Return the target page set carried by a predicted transition."""
 
     pages = record.get("target_page_set")
     return pages if isinstance(pages, list) else []
 
 
 def count_records_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
-    """按指定字段统计记录数量，忽略空字段值。"""
+    """Count records by a non-empty field value."""
 
     counts: dict[str, int] = {}
     for row in rows:

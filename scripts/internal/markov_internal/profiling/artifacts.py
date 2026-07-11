@@ -1,17 +1,16 @@
-"""profiling run artifact 写出工具。"""
+"""Writers for reproducible profiling-run artifacts."""
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from ..common.commands import command_to_text
 from ..common.io import write_json
-from ..common.paths import ROOT_DIR
+from ..common.paths import prepend_repo_src_to_sys_path
 
-sys.path.insert(0, str(ROOT_DIR / "src"))
+prepend_repo_src_to_sys_path()
 
 from profiling import build_profile_manifest  # noqa: E402
 
@@ -22,7 +21,7 @@ def write_run_inputs(
     server_command: list[str] | str,
     bench_command: list[str] | str | None,
 ) -> None:
-    """保存本次运行的原始配置和展开后的命令，供复现使用。"""
+    """Persist the source config and expanded commands needed to reproduce a run."""
 
     write_json(run_dir / "config.json", cfg)
     (run_dir / "server_cmd.txt").write_text(
@@ -46,7 +45,7 @@ def write_profile_manifest(
     dry_run: bool,
     error: str | None = None,
 ) -> None:
-    """写出 profile manifest，作为后续 merge/modeling 的入口。"""
+    """Write the profile manifest consumed by downstream C++ modeling."""
 
     manifest = build_profile_manifest(
         run_dir=run_dir,

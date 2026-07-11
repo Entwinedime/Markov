@@ -1,4 +1,4 @@
-"""target-side observed operation gate 构造。"""
+"""Construction of target-side observed operation gates."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def build_observed_operation_gates(
     page_key_mode: str,
     sample_limit: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """把 target-side observed operations 聚合成 validation-only operation gate。"""
+    """Aggregate target operations into validation-only operation gates."""
 
     operations = list_dicts(observed.get("observed_operations", []))
     grouped: dict[str, dict[str, Any]] = {}
@@ -75,7 +75,7 @@ def build_observed_operation_gates(
 
 
 def operation_gate_kind_from_observed(row: dict[str, Any]) -> str:
-    """把 observed operation 规整为 patch gate operation kind。"""
+    """Normalize an observed operation to the patch-gate taxonomy."""
 
     operation_kind = str(row.get("operation_kind") or "")
     fact_role = str(row.get("fact_role") or "")
@@ -92,7 +92,7 @@ def operation_gate_kind_from_observed(row: dict[str, Any]) -> str:
 
 
 def observed_evidence_class(row: dict[str, Any]) -> str:
-    """标记 observed operation evidence 的证据等级。"""
+    """Classify the evidence strength of an observed operation."""
 
     fact_class = str(row.get("fact_class") or "")
     fact_role = str(row.get("fact_role") or "")

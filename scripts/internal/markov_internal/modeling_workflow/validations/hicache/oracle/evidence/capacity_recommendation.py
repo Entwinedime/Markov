@@ -1,4 +1,4 @@
-"""HiCache target config 推荐配置生成。"""
+"""Conservative target-config recommendations from HiCache oracle evidence."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ def recommend_hicache_target_config(
     oracle_observed_max_counts: dict[str, int],
     target_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """从 target oracle 事实推荐 C++ HiCache target config。"""
+    """Recommend a C++ HiCache target config from target-oracle facts."""
 
     target_config = target_config or {}
     page_size_values = unique_int_values(capacity_unique_values, ["page_size"])
@@ -76,7 +76,7 @@ def recommend_single_value(
     field: str,
     values: list[Any],
 ) -> None:
-    """从唯一观测值生成推荐配置字段；多值或缺失时只写 warning。"""
+    """Recommend a field only when the oracle exposes one unique value."""
 
     if len(values) == 1:
         result[field] = values[0]
@@ -99,7 +99,7 @@ def recommend_capacity_value(
     final_count: int | None,
     explicit_target_value: int | None = None,
 ) -> None:
-    """推荐容量字段；容量只从显式 target config 复制。"""
+    """Copy capacity only from explicit target config and attach evidence."""
 
     raw_pool = pool_values[0] if len(pool_values) == 1 else None
     if len(pool_values) > 1:

@@ -1,4 +1,4 @@
-"""model run plan artifact 序列化。"""
+"""Serialization of the complete model-run execution plan."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ def write_model_run_plan(
     *,
     selected_validations: tuple[str, ...],
 ) -> dict[str, Any]:
-    """写出统一 workflow 的 model run plan artifact。"""
+    """Persist selected profiles and every normalized model-run cell."""
 
     payload: dict[str, Any] = {
         "schema": "trace_sim.modeling_workflow.model_run_plan.v1",
@@ -43,7 +43,7 @@ def write_model_run_plan(
 
 
 def model_run_spec_payload(spec: ModelRunSpec) -> dict[str, Any]:
-    """把 ModelRunSpec 转成 JSON payload。"""
+    """Convert one immutable model-run specification to JSON data."""
 
     payload: dict[str, Any] = {
         "run_id": spec.run_id,
@@ -54,11 +54,12 @@ def model_run_spec_payload(spec: ModelRunSpec) -> dict[str, Any]:
         "input_id": spec.source_profile.input_id,
         "target_run_id": spec.target_profile.run_id if spec.target_profile is not None else None,
         "target_config_id": spec.target_profile.config_id if spec.target_profile is not None else None,
-        "output_requirements": sorted(requirement.value for requirement in spec.output_requirements),
+        "output_requirements": list(spec.output_requirement_names),
         "validation_requests": list(spec.validation_requests),
         "output_dir": str(spec.output_dir),
         "skip_reason": spec.skip_reason or None,
         "trace_channels": list(spec.trace_channels),
+        "page_key_mode": spec.page_key_mode,
     }
     if spec.prediction is not None:
         payload["prediction"] = {

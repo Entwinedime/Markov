@@ -1,4 +1,4 @@
-"""profiling 进程环境构造工具。"""
+"""Environment construction for profiled server and workload processes."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ BENCH_ENV_REMOVE_KEYS = (
 
 
 def build_server_env(cfg: dict[str, Any], runtime: Any, layout: RunLayout) -> dict[str, str]:
-    """构造 server 环境。"""
+    """Build the server environment with only enabled capture channels."""
 
     env = os.environ.copy()
     for key, value in cfg.get("env", {}).items():
@@ -52,7 +52,7 @@ def build_server_env(cfg: dict[str, Any], runtime: Any, layout: RunLayout) -> di
 
 
 def apply_sglang_defaults(env: dict[str, str]) -> None:
-    """写入 SGLang / Ascend 常用默认值，但不覆盖用户显式 env。"""
+    """Apply SGLang and Ascend defaults without overriding explicit values."""
 
     env.setdefault("HOOK_ASCENDCL_SO_PATH", "/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so")
     env.setdefault("SGLANG_SET_CPU_AFFINITY", "1")
@@ -63,7 +63,7 @@ def apply_sglang_defaults(env: dict[str, str]) -> None:
 
 
 def apply_python_probe_env(env: dict[str, str], cfg: dict[str, Any], runtime: Any, layout: RunLayout) -> None:
-    """注入 Python probe 环境变量和 target 配置。"""
+    """Inject Python probe activation, target contracts, and output paths."""
 
     python_probe = channel_config(cfg, "python_probe")
     selected_targets = select_python_probe_targets(
@@ -84,7 +84,7 @@ def apply_python_probe_env(env: dict[str, str], cfg: dict[str, Any], runtime: An
 
 
 def apply_ld_preload_env(env: dict[str, str], cfg: dict[str, Any], layout: RunLayout) -> None:
-    """注入 LD_PRELOAD hook，并把输出固定到本次 run 目录。"""
+    """Inject the LD_PRELOAD hook and bind its output to the current run."""
 
     ld_preload = channel_config(cfg, "ld_preload")
     if not ld_preload.get("enabled", True):
@@ -107,7 +107,7 @@ def build_bench_env(
     server_env: dict[str, str],
     layout: RunLayout,
 ) -> dict[str, str]:
-    """构造 workload 环境，并移除只应注入 server 的采集变量。"""
+    """Build the workload environment after removing server-only instrumentation."""
 
     bench_env = server_env.copy()
     for key in BENCH_ENV_REMOVE_KEYS:
@@ -143,14 +143,14 @@ def build_bench_env(
 
 
 def prepend_pythonpath(env: dict[str, str], path: Path) -> None:
-    """把 probe 路径放到 PYTHONPATH 前面，确保 sitecustomize 可以被 Python 发现。"""
+    """Prepend the probe root so Python discovers its ``sitecustomize`` module."""
 
     current = env.get("PYTHONPATH")
     env["PYTHONPATH"] = str(path) + (os.pathsep + current if current else "")
 
 
 def remove_pythonpath_entry(env: dict[str, str], path: Path) -> None:
-    """从 PYTHONPATH 移除 runner 注入项，避免 bench client 被误插桩。"""
+    """Remove the injected probe root so the benchmark client is not instrumented."""
 
     current = env.get("PYTHONPATH")
     if not current:

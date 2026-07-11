@@ -1,4 +1,4 @@
-"""HiCache transition validation 路径辅助工具。"""
+"""Path contracts for HiCache transition-validation artifacts."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from markov_internal.common.paths import resolve_repo_path
 
 @dataclass(frozen=True)
 class PathsForPrediction:
-    """一个 prediction 输出目录内的标准产物路径。"""
+    """Standard transition artifacts located under one prediction directory."""
 
     prediction_dir: Path
     predicted_trace: Path
@@ -19,7 +19,7 @@ class PathsForPrediction:
 
 
 def resolve_required_path(path: Path | None, flag_name: str) -> Path:
-    """解析必需路径参数。"""
+    """Resolve a required repository path or terminate with a CLI error."""
 
     if path is None:
         raise SystemExit(f"missing required {flag_name}")
@@ -30,7 +30,7 @@ def resolve_required_path(path: Path | None, flag_name: str) -> Path:
 
 
 def resolve_output(path: Path | None, default: Path) -> Path:
-    """解析输出路径。"""
+    """Resolve an optional output path or use its stable default."""
 
     resolved = resolve_repo_path(path) if path is not None else default
     if resolved is None:

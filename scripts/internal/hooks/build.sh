@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# 构建 LD_PRELOAD hook 的内部入口。
+# Internal build entrypoint for the LD_PRELOAD hook.
 #
-# 该脚本既支持宿主机本地 `ld_preload` profile，也支持 Docker runtime 中的
-# 框架 profile；构建目录按 profile 隔离，避免 CMake cache 串用。
+# Supports both the host-local `ld_preload` profile and framework profiles in
+# Docker runtimes. Each profile has an isolated CMake build directory.
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 SOURCE_DIR="${ROOT_DIR}/src/profiling/ld_preload"
 
-# 清理来源目录不匹配的旧 CMake cache。
+# Remove a CMake build directory only when its configured source changed.
 prepare_build_dir() {
     local build_dir="$1"
     local source_dir="$2"
@@ -23,8 +23,9 @@ prepare_build_dir() {
     if [ ! -f "$cache_file" ]; then
         return
     fi
-    # 旧实现曾从仓库根 CMake 构建 hook。active 实现迁移到 src/profiling/ld_preload
-    # 后，残留 cache 会让 CMake 拒绝重新配置，因此这里仅清理本 profile 的构建目录。
+    # The hook source moved to src/profiling/ld_preload. A cache configured for
+    # another source cannot be reconfigured in place, so only this profile's
+    # isolated build directory is removed.
     local cached_source
     cached_source="$(sed -n 's/^CMAKE_HOME_DIRECTORY:INTERNAL=//p' "$cache_file" | tail -1)"
     if [ "$cached_source" != "$source_dir" ]; then

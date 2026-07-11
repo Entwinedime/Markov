@@ -1,13 +1,12 @@
-"""HiCache capacity 与 target config oracle 审计辅助工具。"""
+"""Audit of target HiCache configuration against capacity oracle evidence."""
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from .capacity_recommendation import recommend_hicache_target_config
 from .capacity_values import (
-    flatten_hicache_capacity_scalars,
+    HiCacheCapacityEvidence,
     normalize_policy_value,
     parse_int_or_none,
     unique_int_values,
@@ -17,61 +16,25 @@ from ..snapshot.state import (
     derived_hicache_state_from_snapshot,
     snapshot_is_completed_state,
     snapshot_is_hiradix_cache_state,
-    snapshot_object_id_prefix,
     snapshot_timeline_sort_key,
     union_hicache_states,
 )
 
 
 def extract_hicache_capacity_oracle_state(snapshots: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总 oracle trace 中的 capacity/policy 快照。
+    """Aggregate capacity and policy snapshots from oracle traces.
 
-    这部分只作为验证解释输出，不参与 state diff。它的用途是把真实运行中
-    暴露的 L1/L2 pool 容量、可用量和 policy 参数沉淀出来，后续用于减少
-    跨配置 prediction 对手工 capacity 配置的依赖。
+    This evidence explains validation results but does not participate in state
+    exactness. It records observed pool sizes, availability, and policies so a
+    cross-config prediction need not infer them from state occupancy.
     """
 
-    object_id_prefix_counts: dict[str, int] = {}
-    unique_values: dict[str, set[str]] = {}
-    samples: list[dict[str, Any]] = []
-    snapshot_count = 0
+    evidence = HiCacheCapacityEvidence()
     for row in snapshots:
         snapshot = row.get("state_snapshot")
-        if not isinstance(snapshot, dict) or not snapshot.get("enabled", False):
-            continue
-        capacity = snapshot.get("capacity")
-        if not isinstance(capacity, dict):
-            continue
-        snapshot_count += 1
-        object_id_prefix = snapshot_object_id_prefix(row, snapshot)
-        object_id_prefix_counts[object_id_prefix] = object_id_prefix_counts.get(object_id_prefix, 0) + 1
-        for key, value in flatten_hicache_capacity_scalars(capacity):
-            unique_values.setdefault(key, set()).add(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        if len(samples) < 5:
-            samples.append(
-                {
-                    "object_id_prefix": object_id_prefix,
-                    "page_size": capacity.get("page_size"),
-                    "write_policy": capacity.get("write_policy"),
-                    "prefetch_policy": capacity.get("prefetch_policy"),
-                    "l1_capacity_pages": capacity.get("l1_capacity_pages"),
-                    "l1_available_pages": capacity.get("l1_available_pages"),
-                    "l2_capacity_pages": capacity.get("l2_capacity_pages"),
-                    "l2_available_pages": capacity.get("l2_available_pages"),
-                    "prefetch_threshold_pages": capacity.get("prefetch_threshold_pages"),
-                    "prefetch_capacity_limit_pages": capacity.get("prefetch_capacity_limit_pages"),
-                }
-            )
-
-    return {
-        "ready": snapshot_count > 0,
-        "snapshot_count": snapshot_count,
-        "object_id_prefix_counts": dict(sorted(object_id_prefix_counts.items())),
-        "unique_values": {
-            key: [json.loads(value) for value in sorted(values)] for key, values in sorted(unique_values.items())
-        },
-        "samples": samples,
-    }
+        if isinstance(snapshot, dict):
+            evidence.observe_snapshot(snapshot)
+    return evidence.as_payload()
 
 
 def build_hicache_capacity_config_audit(
@@ -80,11 +43,11 @@ def build_hicache_capacity_config_audit(
     oracle_final_counts: dict[str, int],
     oracle_observed_max_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """检查 C++ target config 与真实 capacity/policy 事实的一致性。
+    """Compare C++ target config with observed capacity and policy facts.
 
-    该结果只做诊断，不直接决定 validation_ready。raw pool capacity 可能大于
-    HiCache 对应 tier 的有效可用 budget，因此“低于 observed pool capacity”
-    是需要解释的提示，不一定是错误。
+    This audit is diagnostic and does not directly gate ``validation_ready``.
+    Raw pool capacity can exceed the effective HiCache budget, so a target below
+    the observed pool is noteworthy but not inherently incorrect.
     """
 
     unique_values = (
@@ -174,7 +137,7 @@ def build_hicache_capacity_config_audit(
 
 
 def _compare_int_config(field: str, target_value: int | None, observed_values: list[int]) -> dict[str, Any]:
-    """比较整数型 target config 和 oracle 观测值。"""
+    """Compare one integer target setting with observed oracle values."""
 
     if target_value is None or target_value <= 0:
         status = "not_configured"
@@ -193,7 +156,7 @@ def _compare_int_config(field: str, target_value: int | None, observed_values: l
 
 
 def _compare_policy_config(field: str, target_value: str, observed_values: list[str]) -> dict[str, Any]:
-    """比较 policy 型 target config 和 oracle 观测值。"""
+    """Compare one policy target setting with observed oracle values."""
 
     if target_value in {"", "observed"}:
         status = "not_configured"
@@ -218,41 +181,15 @@ def _compare_capacity_config(
     oracle_final_count: int | None,
     oracle_observed_max_count: int | None,
 ) -> dict[str, Any]:
-    """比较容量 config、oracle final count 和 oracle observed max count。"""
+    """Compare configured capacity with pool, final, and peak occupancy."""
 
-    if target_value is None or target_value <= 0:
-        status = "not_configured"
-    elif not observed_values:
-        status = "no_observed_value"
-    elif target_value in observed_values:
-        status = "matches_observed_pool"
-    elif target_value > max(observed_values):
-        status = "target_exceeds_observed_pool"
-    else:
-        status = "target_below_observed_pool"
-
-    if oracle_final_count is None:
-        final_status = "no_oracle_final_count"
-    elif target_value is None or target_value <= 0:
-        final_status = "not_configured"
-    elif target_value < oracle_final_count:
-        final_status = "target_below_oracle_final_count"
-    elif target_value == oracle_final_count:
-        final_status = "matches_oracle_final_count"
-    else:
-        final_status = "target_above_oracle_final_count"
-
-    if oracle_observed_max_count is None:
-        observed_max_status = "no_oracle_observed_max_count"
-    elif target_value is None or target_value <= 0:
-        observed_max_status = "not_configured"
-    elif target_value < oracle_observed_max_count:
-        observed_max_status = "target_below_oracle_observed_max_count"
-    elif target_value == oracle_observed_max_count:
-        observed_max_status = "matches_oracle_observed_max_count"
-    else:
-        observed_max_status = "target_above_oracle_observed_max_count"
-
+    status = _capacity_pool_status(target_value, observed_values)
+    final_status = _capacity_count_status(target_value, oracle_final_count, "oracle_final_count")
+    observed_max_status = _capacity_count_status(
+        target_value,
+        oracle_observed_max_count,
+        "oracle_observed_max_count",
+    )
     return {
         "field": field,
         "target_value": target_value,
@@ -265,12 +202,40 @@ def _compare_capacity_config(
     }
 
 
-def observed_max_derived_state_counts(snapshots: list[dict[str, Any]]) -> dict[str, int]:
-    """计算 raw snapshot 时间线上每个状态集合达到过的最大规模。
+def _capacity_pool_status(target_value: int | None, observed_values: list[int]) -> str:
+    """Classify a target capacity against configured source-pool values."""
 
-    final state 只描述 run 结束时的状态，不能代表容量压力峰值。这里按
-    HiRadixCache object 时间线更新多进程 state union，再统计峰值，用于
-    capacity config audit 判断 target budget 是否低于真实曾经达到过的 resident set。
+    if target_value is None or target_value <= 0:
+        return "not_configured"
+    if not observed_values:
+        return "no_observed_value"
+    if target_value in observed_values:
+        return "matches_observed_pool"
+    if target_value > max(observed_values):
+        return "target_exceeds_observed_pool"
+    return "target_below_observed_pool"
+
+
+def _capacity_count_status(target_value: int | None, observed_count: int | None, label: str) -> str:
+    """Classify target capacity against one oracle occupancy count."""
+
+    if observed_count is None:
+        return f"no_{label}"
+    if target_value is None or target_value <= 0:
+        return "not_configured"
+    if target_value < observed_count:
+        return f"target_below_{label}"
+    if target_value == observed_count:
+        return f"matches_{label}"
+    return f"target_above_{label}"
+
+
+def observed_max_derived_state_counts(snapshots: list[dict[str, Any]]) -> dict[str, int]:
+    """Compute peak set sizes along the raw snapshot timeline.
+
+    Final state does not represent peak capacity pressure. This projection
+    updates each HiRadixCache object independently, unions visible process state,
+    and records maxima used to detect a target budget below observed residency.
     """
 
     timeline: list[tuple[tuple[int, int, int], tuple[str, str, str], dict[str, Any]]] = []
@@ -303,7 +268,7 @@ def observed_max_derived_state_counts(snapshots: list[dict[str, Any]]) -> dict[s
 
 
 def _update_max_state_counts(max_counts: dict[str, int], state: dict[str, Any]) -> None:
-    """用一个 state 更新每个集合字段达到过的最大规模。"""
+    """Update peak counts with one set-valued state projection."""
 
     for key, value in state.items():
         if not isinstance(value, list):

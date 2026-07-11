@@ -1,4 +1,4 @@
-"""统一 modeling workflow 的核心数据类型。"""
+"""Core immutable contracts shared across modeling-workflow layers."""
 
 from __future__ import annotations
 
@@ -12,18 +12,15 @@ if TYPE_CHECKING:
 
 
 class ModelOutputRequirement(str, Enum):
-    """一次 C++ modeling 执行需要产出的语义结果。"""
+    """Semantic artifact families required from one C++ invocation."""
 
-    BASE_DAG_DIAGNOSTICS = "base_dag_diagnostics"
-    MODULE_SUMMARY = "module_summary"
-    MODULE_VALIDATION = "module_validation"
-    MODULE_TRANSITION_DIAGNOSTICS = "module_transition_diagnostics"
-    CHROME_TRACE = "chrome_trace"
+    DAG_ANALYSIS = "dag_analysis"
+    HICACHE_VALIDATION = "hicache_validation"
 
 
 @dataclass(frozen=True)
 class ProfileRunRef:
-    """workflow 选中的一次真实 profiling run。"""
+    """One concrete profiling run selected as workflow input."""
 
     manifest_path: Path
     run_dir: Path
@@ -37,32 +34,40 @@ class ProfileRunRef:
 
     @property
     def label(self) -> str:
+        """Return the compact input/config label used in progress and artifacts."""
+
         return f"{self.input_id}/{self.config_id}"
 
 
 @dataclass(frozen=True)
 class CacheStatePredictionRef:
-    """把 source profile 放到 target config/oracle 下重放的 prediction。"""
+    """Replay a source profile under a target configuration and oracle."""
 
     source: ProfileRunRef
     target: ProfileRunRef
 
     @property
     def input_id(self) -> str:
+        """Return the shared workload input identity for this prediction."""
+
         return self.source.input_id
 
     @property
     def is_self(self) -> bool:
+        """Return whether source and target configurations are identical."""
+
         return self.source.config_id == self.target.config_id
 
     @property
     def label(self) -> str:
+        """Return the compact source-to-target prediction label."""
+
         return f"{self.input_id}/{self.source.config_id}->{self.target.config_id}"
 
 
 @dataclass(frozen=True)
 class ModelRunSpec:
-    """validation requests 合并后的一次 C++ modeling 执行计划。"""
+    """One normalized C++ execution after validation-request merging."""
 
     run_id: str
     mode: str
@@ -76,35 +81,47 @@ class ModelRunSpec:
     trace_threads: int = 1
     trace_file_threads: int = 1
     trace_channels: tuple[str, ...] = ()
+    page_key_mode: str = "strip_scope"
 
     @property
     def label(self) -> str:
+        """Return the prediction label or faithful source-profile label."""
+
         if self.prediction is not None:
             return self.prediction.label
         return self.source_profile.label
 
+    @property
+    def output_requirement_names(self) -> tuple[str, ...]:
+        """Return deterministic schema names for requested artifact families."""
+
+        return tuple(sorted(requirement.value for requirement in self.output_requirements))
+
 
 @dataclass(frozen=True)
 class ModelRunResult:
-    """一次 ModelRunSpec 执行或复用后的结果。"""
+    """Outcome of executing, reusing, skipping, or dry-running one spec."""
 
     spec: ModelRunSpec
     return_code: int
     elapsed_sec: float
-    artifacts: "ModelRunArtifacts"
+    artifacts: ModelRunArtifacts
     skipped: bool = False
     dry_run: bool = False
+    reused: bool = False
     skip_reason: str = ""
     execution_error_tail: str = ""
 
     @property
     def ok(self) -> bool:
+        """Return whether the spec actually ran or was reused successfully."""
+
         return not self.skipped and self.return_code == 0
 
 
 @dataclass
 class ValidationSummary:
-    """单个 validation object 输出的紧凑摘要。"""
+    """Compact workflow-facing result from one validation object."""
 
     name: str
     status: str
@@ -115,3 +132,44 @@ class ValidationSummary:
     blocker_counts: dict[str, int] = field(default_factory=dict)
     artifact_paths: dict[str, str] = field(default_factory=dict)
     payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ModelRunCounts:
+    """Canonical model-run counts shared by progress and JSON summaries."""
+
+    handled: int
+    runnable: int
+    usable: int
+    errors: int
+    skipped: int
+    dry_run: int
+    reused: int
+
+    @classmethod
+    def from_results(cls, results: list[ModelRunResult] | tuple[ModelRunResult, ...]) -> ModelRunCounts:
+        """Derive mutually consistent progress counters from completed results."""
+
+        runnable = [result for result in results if not result.skipped]
+        return cls(
+            handled=len(results),
+            runnable=len(runnable),
+            usable=sum(result.return_code == 0 for result in runnable),
+            errors=sum(result.return_code != 0 for result in runnable),
+            skipped=sum(result.skipped for result in results),
+            dry_run=sum(result.dry_run for result in results),
+            reused=sum(result.reused for result in results),
+        )
+
+    def as_payload(self) -> dict[str, int]:
+        """Serialize counters under stable workflow-summary field names."""
+
+        return {
+            "handled_count": self.handled,
+            "runnable_count": self.runnable,
+            "usable_count": self.usable,
+            "error_count": self.errors,
+            "skipped_count": self.skipped,
+            "dry_run_count": self.dry_run,
+            "reused_count": self.reused,
+        }

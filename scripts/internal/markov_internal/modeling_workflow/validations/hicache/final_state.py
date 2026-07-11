@@ -1,4 +1,4 @@
-"""HiCache final-state 验证对象。"""
+"""HiCache final-state exactness validation."""
 
 from __future__ import annotations
 
@@ -11,27 +11,25 @@ from .preflight.state_input_preflight import HiCacheStateInputPreflightCheck
 
 
 class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
-    """验证 HiCache 预测 final state 是否匹配目标 oracle snapshot。"""
+    """Compare each predicted final state with its target oracle snapshot."""
 
     name = "hicache_final_state"
     progress_detail = "HiCache final state"
     progress_unit = "prediction"
-    cache_state_output_requirements = frozenset(
-        {ModelOutputRequirement.MODULE_SUMMARY, ModelOutputRequirement.MODULE_VALIDATION}
-    )
+    cache_state_output_requirements = frozenset({ModelOutputRequirement.HICACHE_VALIDATION})
 
     def preflight_checks(self) -> tuple[type[HiCacheStateInputPreflightCheck], ...]:
-        """返回 HiCache state/oracle 输入检查。"""
+        """Require the shared HiCache state and oracle-input preflight."""
 
         return (HiCacheStateInputPreflightCheck,)
 
     def build_row(self, context: Any, result: ModelRunResult) -> dict[str, Any]:
-        """读取 cache-state 验证产物并构造 prediction row。"""
+        """Read cache-state artifacts and construct one prediction row."""
 
         return build_prediction_row(result)
 
     def running_metrics(self, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """返回 final-state 验证的运行中指标。"""
+        """Return running readiness and exactness counters."""
 
         return {
             "ready": f"{sum(1 for row in rows if row.get('validation_ready'))}/{len(rows)}",
@@ -39,7 +37,7 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
         }
 
     def build_summary(self, context: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        """汇总 final-state 验证结果。"""
+        """Aggregate final-state readiness and exactness by prediction scope."""
 
         prediction_count = len(rows)
         validation_ready_count = sum(1 for row in rows if row.get("validation_ready") is True)
@@ -76,11 +74,10 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
             "error_count": error_count,
             "blocker_counts": count_blockers(rows, "validation_errors"),
             "by_scope": by_scope,
-            "rows": rows,
         }
 
     def summary_text(self, summary: dict[str, Any]) -> str:
-        """返回最终进度摘要。"""
+        """Render the final-state validation progress summary."""
 
         return (
             f"{summary['prediction_count']} predictions | "
@@ -94,7 +91,7 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
         rows: list[dict[str, Any]],
         summary: dict[str, Any],
     ) -> ValidationSummary:
-        """转换成 workflow 统一 summary。"""
+        """Convert final-state results to the workflow summary contract."""
 
         return ValidationSummary(
             name=self.name,

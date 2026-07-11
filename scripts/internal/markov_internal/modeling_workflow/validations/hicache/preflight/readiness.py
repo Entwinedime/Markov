@@ -1,4 +1,4 @@
-"""HiCache state input preflight 的 ready gate 辅助工具。"""
+"""Readiness gates shared by HiCache state-input preflight reporting."""
 
 from __future__ import annotations
 
@@ -6,13 +6,13 @@ from typing import Any
 
 
 def public_preflight_row(row: dict[str, Any]) -> dict[str, Any]:
-    """移除 report 内部临时字段。"""
+    """Remove private builder fields from a persisted preflight row."""
 
     return {key: value for key, value in row.items() if not str(key).startswith("_")}
 
 
 def normalize_forced_token_preflight(profile_audit: dict[str, Any]) -> dict[str, Any]:
-    """从 HiCache profile audit 中提取稳定 forced-token gate 字段。"""
+    """Project a profile audit to stable forced-token gate fields."""
 
     quality = profile_audit.get("forced_token_quality")
     if not isinstance(quality, dict):
@@ -27,7 +27,7 @@ def normalize_forced_token_preflight(profile_audit: dict[str, Any]) -> dict[str,
 
 
 def summarize_forced_token_input_group(input_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """汇总同一个 input 下 forced-token plan/bundle 的跨 config 一致性。"""
+    """Summarize cross-config token-plan and bundle identity for one input."""
 
     forced_rows = [row for row in input_rows if row.get("forced_token_enabled")]
     plan_signatures = sorted(
@@ -66,7 +66,7 @@ def state_model_input_ready(
     profile_audit: dict[str, Any],
     workload_signature: dict[str, Any],
 ) -> bool:
-    """判断 profile 是否满足 state-model workload identity 输入要求。"""
+    """Return whether a profile satisfies state-model identity requirements."""
 
     if profile_audit.get("state_model_input_ready") is not True:
         return False
@@ -84,7 +84,7 @@ def workflow_input_ready(
     *,
     require_validation_evidence: bool,
 ) -> bool:
-    """判断选中的 validation workflow 是否可以继续。"""
+    """Return whether all evidence required by selected validations is ready."""
 
     if not state_ready:
         return False

@@ -1,4 +1,4 @@
-"""transition family catalog 聚合。"""
+"""Aggregation of transition-family catalog entries."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from .taxonomy_reviews import review_for_transition_family
 
 
 def aggregate_transition_families(entries: list[dict[str, Any]], *, sample_limit: int) -> dict[str, Any]:
-    """按 family 聚合 transition catalog，并嵌入阶段二机制审查。"""
+    """Aggregate transition entries by family and attach mechanism reviews."""
 
     families: dict[str, Any] = {}
     for entry in entries:
@@ -47,7 +47,7 @@ def aggregate_transition_families(entries: list[dict[str, Any]], *, sample_limit
 
 
 def update_family_item(item: dict[str, Any], entry: dict[str, Any], sample_limit: int) -> None:
-    """把单个 prediction classification entry 合入 family 聚合项。"""
+    """Merge one prediction classification into a family aggregate."""
 
     item["prediction_count"] += 1
     item["exact_count"] += int(bool(entry.get("exact")))
@@ -73,7 +73,7 @@ def update_family_item(item: dict[str, Any], entry: dict[str, Any], sample_limit
 
 
 def append_unique(values: list[Any], value: Any, *, limit: int | None = None) -> None:
-    """向列表追加唯一值。"""
+    """Append one unique, non-empty value within an optional limit."""
 
     if value is None or value == "":
         return
@@ -85,14 +85,14 @@ def append_unique(values: list[Any], value: Any, *, limit: int | None = None) ->
 
 
 def increment_nested_count(item: dict[str, Any], key: str, value: str, amount: int) -> None:
-    """更新 dict 中的 counter-like 字段。"""
+    """Increment one nested counter-like field."""
 
     counts = item.setdefault(key, {})
     counts[value] = int(counts.get(value, 0)) + amount
 
 
 def merge_mismatch_totals(target: dict[str, Any], source: Any) -> None:
-    """合并 mismatch_totals_by_kind。"""
+    """Merge per-kind mismatch totals into an aggregate."""
 
     if not isinstance(source, dict):
         return

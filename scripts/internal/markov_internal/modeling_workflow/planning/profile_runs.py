@@ -1,4 +1,4 @@
-"""profile run 发现、解析、筛选和 prediction matrix 构造。"""
+"""Profile discovery, selection, parsing, and prediction-matrix construction."""
 
 from __future__ import annotations
 
@@ -8,19 +8,20 @@ from pathlib import Path
 from typing import Any
 
 from ...common.io import load_json
+from ...common.manifest import existing_manifest_files
 from ...common.paths import map_repo_path
 from ..types import CacheStatePredictionRef, ProfileRunRef
 
 
 @dataclass(frozen=True)
 class ProfileRunDiscovery:
-    """从 suite 目录和显式 manifest 路径发现 profile run。"""
+    """Discover profile runs from suite directories and explicit manifests."""
 
     profile_run_dirs: tuple[Path, ...]
     manifests: tuple[Path, ...]
 
     def discover(self) -> list[ProfileRunRef]:
-        """返回按 input/config/run 排序后的 profile run。"""
+        """Return parsed profile runs in deterministic input/config/run order."""
 
         manifest_paths: set[Path] = {path.resolve() for path in self.manifests}
         for run_dir in self.profile_run_dirs:
@@ -35,15 +36,15 @@ class ProfileRunDiscovery:
 
 @dataclass(frozen=True)
 class ProfileRunParser:
-    """把 `profile_manifest.json` 转成 workflow 内部 run 描述。"""
+    """Convert one ``profile_manifest.json`` into the workflow run contract."""
 
     def from_manifest(self, manifest_path: Path) -> ProfileRunRef:
-        """解析一个 profile manifest。"""
+        """Parse a manifest and its referenced profiling configuration."""
 
-        manifest = load_json(manifest_path)
+        manifest = require_json_object(load_json(manifest_path), manifest_path)
         run_dir = map_repo_path(Path(str(manifest.get("run_dir") or manifest_path.parent)))
         config_path = map_repo_path(Path(str(manifest.get("config_path") or run_dir / "config.json")))
-        config = load_json(config_path)
+        config = require_json_object(load_json(config_path), config_path)
         metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
         sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
         return ProfileRunRef(
@@ -71,14 +72,14 @@ class ProfileRunParser:
                 "default_input",
             ),
             input_class=first_non_empty(metadata.get("input_class"), "unknown"),
-            python_probe_files=tuple(existing_sidecar_paths(sidecar.get("python_probe_files", []))),
+            python_probe_files=tuple(existing_manifest_files(sidecar.get("python_probe_files", []))),
             hicache_config=extract_hicache_modeling_config(config, run_dir),
         )
 
 
 @dataclass(frozen=True)
 class RunSelector:
-    """按 CLI selector 从已发现的 run 中筛选候选集。"""
+    """Filter discovered runs using independent CLI membership selectors."""
 
     input_ids: frozenset[str]
     config_ids: frozenset[str]
@@ -86,7 +87,7 @@ class RunSelector:
     target_config_ids: frozenset[str]
 
     def filter(self, runs: list[ProfileRunRef]) -> list[ProfileRunRef]:
-        """返回满足 input/config selector 的 run。"""
+        """Return runs admitted by the requested input and config selectors."""
 
         config_filter = self.config_ids | self.source_config_ids | self.target_config_ids
         return [
@@ -99,7 +100,7 @@ class RunSelector:
 
 @dataclass(frozen=True)
 class PredictionMatrixBuilder:
-    """为同一 workload input 内的 source/target config 构造 prediction matrix。"""
+    """Build source-to-target predictions within each workload input."""
 
     runs: list[ProfileRunRef]
     source_config_ids: frozenset[str]
@@ -108,19 +109,19 @@ class PredictionMatrixBuilder:
     max_predictions: int = 0
 
     def build(self) -> list[CacheStatePredictionRef]:
-        """返回稳定排序后的 prediction 列表。"""
+        """Return a deterministic, optionally bounded prediction matrix."""
 
         selected: dict[tuple[str, str, str], CacheStatePredictionRef] = {}
-        for _input_id, by_config in group_runs_by_input(self.runs).items():
+        for by_config in group_runs_by_input(self.runs).values():
             sources = [
                 run
-                for config_id, run in by_config.items()
-                if not self.source_config_ids or config_id in self.source_config_ids
+                for run in by_config.values()
+                if not self.source_config_ids or run.config_id in self.source_config_ids
             ]
             targets = [
                 run
-                for config_id, run in by_config.items()
-                if not self.target_config_ids or config_id in self.target_config_ids
+                for run in by_config.values()
+                if not self.target_config_ids or run.config_id in self.target_config_ids
             ]
             for source in sources:
                 for target in targets:
@@ -137,7 +138,7 @@ class PredictionMatrixBuilder:
 
 
 def first_non_empty(*values: Any) -> str:
-    """返回第一个非空字符串值。"""
+    """Return the first non-empty string candidate or ``unknown``."""
 
     for value in values:
         if isinstance(value, str) and value.strip():
@@ -145,24 +146,8 @@ def first_non_empty(*values: Any) -> str:
     return "unknown"
 
 
-def existing_sidecar_paths(entries: Any) -> list[Path]:
-    """从 manifest sidecar 中提取存在的文件路径。"""
-
-    paths: list[Path] = []
-    if not isinstance(entries, list):
-        return paths
-    for entry in entries:
-        raw = entry.get("path") if isinstance(entry, dict) and entry.get("exists", True) else entry
-        if not isinstance(raw, str):
-            continue
-        path = map_repo_path(Path(raw))
-        if path.is_file():
-            paths.append(path)
-    return sorted(paths)
-
-
 def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
-    """提取 HiCache cache-state 模型需要的目标配置。"""
+    """Extract the target HiCache model configuration from a profile config."""
 
     modeling = config.get("modeling") if isinstance(config.get("modeling"), dict) else {}
     hicache = modeling.get("hicache") if isinstance(modeling.get("hicache"), dict) else {}
@@ -172,7 +157,7 @@ def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> di
 
 
 def apply_sglang_capacity_from_server_cmd(run_dir: Path, hicache_config: dict[str, Any]) -> dict[str, Any]:
-    """用 SGLang server command 对齐建模侧 capacity 配置。"""
+    """Resolve model capacities from the exact SGLang server command."""
 
     flags = parse_server_command_flags(run_dir / "server_cmd.txt")
     if not flags:
@@ -202,7 +187,7 @@ def apply_sglang_capacity_from_server_cmd(run_dir: Path, hicache_config: dict[st
 
 
 def parse_server_command_flags(path: Path) -> dict[str, str]:
-    """解析 `--key value` 和 `--key=value` 形式的 server 参数。"""
+    """Parse ``--key value`` and ``--key=value`` server arguments."""
 
     if not path.is_file():
         return {}
@@ -235,7 +220,7 @@ def parse_server_command_flags(path: Path) -> dict[str, str]:
 
 
 def parse_nonnegative_int_or_none(value: Any) -> int | None:
-    """解析非负整数；无法解析时返回 None。"""
+    """Parse a non-negative integer, returning ``None`` when invalid."""
 
     try:
         if value is None:
@@ -247,7 +232,7 @@ def parse_nonnegative_int_or_none(value: Any) -> int | None:
 
 
 def parse_nonnegative_float_or_none(value: Any) -> float | None:
-    """解析非负浮点数；无法解析时返回 None。"""
+    """Parse a non-negative float, returning ``None`` when invalid."""
 
     try:
         if value is None:
@@ -259,9 +244,29 @@ def parse_nonnegative_float_or_none(value: Any) -> float | None:
 
 
 def group_runs_by_input(runs: list[ProfileRunRef]) -> dict[str, dict[str, ProfileRunRef]]:
-    """按 input/config 把 profile run 分组。"""
+    """Index one unambiguous profile run per input/config cell.
+
+    A prediction matrix has no run-generation dimension. Silently choosing one
+    of two manifests for the same input/config pair would make every downstream
+    source/target cell depend on path ordering, so duplicate cells fail here.
+    """
 
     grouped: dict[str, dict[str, ProfileRunRef]] = {}
     for run in runs:
-        grouped.setdefault(run.input_id, {})[run.config_id] = run
+        by_config = grouped.setdefault(run.input_id, {})
+        existing = by_config.get(run.config_id)
+        if existing is not None and existing.manifest_path != run.manifest_path:
+            raise ValueError(
+                f"Duplicate profile cell for input={run.input_id!r}, config={run.config_id!r}: "
+                f"{existing.manifest_path} and {run.manifest_path}"
+            )
+        by_config[run.config_id] = run
     return {input_id: dict(sorted(by_config.items())) for input_id, by_config in sorted(grouped.items())}
+
+
+def require_json_object(value: Any, path: Path) -> dict[str, Any]:
+    """Require a top-level JSON object at a workflow contract boundary."""
+
+    if not isinstance(value, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return value

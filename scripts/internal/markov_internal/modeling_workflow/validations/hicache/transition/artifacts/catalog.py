@@ -1,7 +1,8 @@
-"""HiCache transition mismatch catalog 产物生成。
+"""Artifact generation for the HiCache transition mismatch catalog.
 
-本模块只负责把 compare 阶段已经生成的分类结果聚合成 JSON、Markdown 和
-family sample 文件，不重新解释模型输入或 oracle。
+This module aggregates classifications already produced by comparison into
+JSON, Markdown, and bounded family samples. It never reinterprets model inputs
+or oracle evidence.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ def build_transition_mismatch_catalog_from_entries(
     source_summary_path: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """从 compare 已生成的分类 entries 聚合 transition mismatch catalog。"""
+    """Aggregate comparison classifications into a mismatch catalog."""
 
     families = aggregate_transition_families(prediction_entries, sample_limit=sample_limit)
     unresolved = [entry for entry in prediction_entries if entry.get("family") == "unresolved_transition_mismatch"]
@@ -79,16 +80,21 @@ def build_transition_mismatch_catalog_from_entries(
     }
 
 
-def write_transition_catalog_outputs(
-    artifact_root: Path, output_path: Path, catalog: dict[str, Any], *, sample_limit: int
-) -> None:
-    """写出阶段一/二 catalog JSON、Markdown 和 family samples。"""
+def write_transition_catalog_outputs(output_path: Path, catalog: dict[str, Any], *, sample_limit: int) -> None:
+    """Write catalog JSON, Markdown, and bounded per-family samples."""
 
     write_json(output_path, catalog)
     write_transition_catalog_markdown(output_path.with_suffix(".md"), catalog)
-    _ = artifact_root
     samples_dir = output_path.parent / "family_samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
+    expected_paths = {
+        samples_dir / f"{safe_slug(str(family))}.json"
+        for family, item in catalog.get("families", {}).items()
+        if isinstance(item, dict)
+    }
+    for stale_path in samples_dir.glob("*.json"):
+        if stale_path not in expected_paths:
+            stale_path.unlink()
     for family, item in catalog.get("families", {}).items():
         if not isinstance(item, dict):
             continue
@@ -99,7 +105,7 @@ def write_transition_catalog_outputs(
 
 
 def write_transition_catalog_markdown(path: Path, catalog: dict[str, Any]) -> None:
-    """写出人读的 transition catalog 摘要。"""
+    """Write the human-readable transition-catalog summary."""
 
     lines = [
         "# HiCache Transition Mismatch Catalog",
@@ -160,24 +166,12 @@ def write_transition_catalog_markdown(path: Path, catalog: dict[str, Any]) -> No
                 f"- recommended_fix: {review.get('recommended_fix', '')}",
             ]
         )
-        anchors = review.get("sglang_source_anchor", [])
-        if anchors:
-            lines.append("- sglang_source_anchor:")
-            lines.extend(f"  - `{anchor}`" for anchor in anchors)
-        call_sites = review.get("model_call_site", [])
-        if call_sites:
-            lines.append("- model_call_site:")
-            lines.extend(f"  - `{call_site}`" for call_site in call_sites)
-        if review.get("does_not_block_patch_reason"):
-            lines.append(f"- does_not_block_patch_reason: {review.get('does_not_block_patch_reason')}")
-        if review.get("physical_fix_plan"):
-            lines.append(f"- physical_fix_plan: {review.get('physical_fix_plan')}")
         lines.append("")
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def family_sample_payload(family_item: dict[str, Any], catalog: dict[str, Any], *, sample_limit: int) -> dict[str, Any]:
-    """构建单个 family sample JSON。"""
+    """Build the bounded sample artifact for one transition family."""
 
     family = str(family_item.get("family") or "")
     predictions = [

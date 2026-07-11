@@ -1,1 +1,1 @@
-"""HiCache oracle snapshot 读取与规整。"""
+"""Loading and normalization of HiCache oracle snapshots."""

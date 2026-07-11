@@ -1,4 +1,4 @@
-"""统一建模 workflow 编排器。"""
+"""Top-level orchestration for the host-side modeling workflow."""
 
 from __future__ import annotations
 
@@ -6,25 +6,30 @@ from dataclasses import dataclass
 
 from .artifacts import WorkflowArtifactLayout
 from .context import WorkflowContext, WorkflowOptions
-from .execution import ModelRunExecutor
+from .execution.model_executor import ModelRunExecutor
 from .planning.plan_io import write_model_run_plan
 from .planning.profile_runs import ProfileRunDiscovery, RunSelector
 from .planning.specs import ModelRunPlanner
 from .preflight import PreflightRunner
 from .progress import WorkflowProgressReporter
-from .reporting import write_workflow_summary
-from .types import ProfileRunRef, ValidationSummary
-from .validations import ValidationRequest, validation_by_name
+from .reporting.workflow_summary import write_workflow_summary
+from .types import ModelRunResult, ModelRunSpec, ProfileRunRef, ValidationSummary
+from .validations.registry import ValidationRequest, validation_by_name
 
 
 @dataclass(frozen=True)
 class WorkflowRunner:
-    """串联 preflight、C++ 建模运行和 Python validation 分析。"""
+    """Run preflight, C++ modeling cells, and Python validation analysis.
+
+    The runner owns sequencing only. Validation objects define their required
+    C++ cells and analyze the resulting artifacts; the runner does not encode
+    validation-specific fixture or comparison behavior.
+    """
 
     options: WorkflowOptions
 
     def run(self) -> int:
-        """执行完整 workflow。"""
+        """Execute the complete workflow and write its aggregate summary."""
 
         artifacts = WorkflowArtifactLayout(self.options.output_dir)
         artifacts.ensure_base_dirs()
@@ -40,12 +45,10 @@ class WorkflowRunner:
         preflight_report = PreflightRunner(context, self._preflight_checks(validations)).run()
         specs = ModelRunPlanner(context, artifacts, preflight_report).build(validations)
         write_model_run_plan(artifacts, runs, specs, selected_validations=self.options.validations)
-        self._report_plan(context, len(specs))
         results = ModelRunExecutor(context, specs).run()
         validation_summaries = self._analyze_validations(context, validations, specs, results)
         write_workflow_summary(
             context,
-            runs=runs,
             specs=specs,
             preflight_report=preflight_report,
             results=results,
@@ -71,17 +74,11 @@ class WorkflowRunner:
     def _preflight_checks(self, validations: list[ValidationRequest]) -> list[type]:
         return [check for validation in validations for check in validation.preflight_checks()]
 
-    def _report_plan(self, context: WorkflowContext, spec_count: int) -> None:
-        context.reporter.start_stage("plan", 1, f"model-runs {spec_count}", unit="item").finish(
-            "OK",
-            f"{spec_count} model runs | validations {','.join(self.options.validations)}",
-        )
-
     def _analyze_validations(
         self,
         context: WorkflowContext,
         validations: list[ValidationRequest],
-        specs: list,
-        results: dict,
+        specs: list[ModelRunSpec],
+        results: dict[str, ModelRunResult],
     ) -> list[ValidationSummary]:
         return [validation.analyze(context, specs, results) for validation in validations]

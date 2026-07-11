@@ -1,4 +1,4 @@
-"""profiling runtime 配置辅助工具。"""
+"""Runtime layout, placeholder, command, and temporary-config helpers."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from ..common.paths import ROOT_DIR, resolve_repo_path
 
 @dataclass(frozen=True)
 class RunLayout:
-    """一次 profiling 运行的目录布局。"""
+    """Stable directory layout owned by one profiling run."""
 
     run_dir: Path
     log_dir: Path
@@ -28,8 +28,8 @@ class RunLayout:
     bench_dir: Path
 
     @classmethod
-    def from_config(cls, cfg: dict[str, Any], *, framework: str) -> "RunLayout":
-        """从运行配置生成稳定目录布局。"""
+    def from_config(cls, cfg: dict[str, Any], *, framework: str) -> RunLayout:
+        """Derive a stable run layout from an expanded configuration."""
 
         name = sanitize(str(cfg.get("name", f"{framework}-profile")))
         run_root = resolve_repo_path(cfg.get("run_root")) or ROOT_DIR / "data/profile_runs" / framework
@@ -46,7 +46,7 @@ class RunLayout:
         )
 
     def prepare(self, *, clean: bool) -> None:
-        """创建本次 run 需要的目录，必要时清理已有 run 目录。"""
+        """Create required directories, optionally replacing the existing run."""
 
         if clean and self.run_dir.exists():
             shutil.rmtree(self.run_dir)
@@ -62,14 +62,14 @@ class RunLayout:
 
 @dataclass(frozen=True)
 class ModelConfigBackup:
-    """被临时修改的模型 config 备份信息。"""
+    """Backup identity for a model config temporarily modified during capture."""
 
     config_path: Path
     backup_path: Path
 
 
 def resolve_run_path(value: str | None, run_dir: Path) -> Path | None:
-    """把 run-dir 相对路径解析为绝对路径。"""
+    """Resolve a path relative to the current run directory."""
 
     if not value:
         return None
@@ -83,7 +83,7 @@ CONFIG_PLACEHOLDER_ROOTS = {"metadata", "server", "bench", "env", "modeling"}
 
 
 def config_placeholder_value(cfg: dict[str, Any], path: str) -> str | None:
-    """解析 `{metadata.foo}` 等配置占位符的替换值。"""
+    """Resolve a dotted config placeholder such as ``{metadata.foo}``."""
 
     parts = [part for part in path.split(".") if part]
     if len(parts) < 2 or parts[0] not in CONFIG_PLACEHOLDER_ROOTS:
@@ -99,12 +99,12 @@ def config_placeholder_value(cfg: dict[str, Any], path: str) -> str | None:
 
 
 def expand_config_placeholders(value: str, cfg: dict[str, Any]) -> str:
-    """替换 `{metadata.foo}` 这类点分配置占位符。"""
+    """Expand all dotted config placeholders in a string."""
 
     pattern = re.compile(r"\{([A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)+)\}")
 
     def replace(match: re.Match[str]) -> str:
-        """把单个配置占位符替换成最终字符串。"""
+        """Replace one regex-matched placeholder or reject an unknown path."""
 
         path = match.group(1)
         replacement = config_placeholder_value(cfg, path)
@@ -116,7 +116,7 @@ def expand_config_placeholders(value: str, cfg: dict[str, Any]) -> str:
 
 
 def expand_layout_placeholders(value: str, layout: RunLayout, cfg: dict[str, Any] | None = None) -> str:
-    """替换配置字符串中的运行目录占位符。"""
+    """Expand run-layout placeholders and optional dotted config values."""
 
     replacements = {
         "{run_dir}": str(layout.run_dir),
@@ -137,7 +137,7 @@ def expand_command_placeholders(
     layout: RunLayout,
     cfg: dict[str, Any] | None = None,
 ) -> list[str] | str:
-    """替换显式命令中的运行目录占位符。"""
+    """Expand placeholders while preserving a command's list/string form."""
 
     if isinstance(command, list):
         return [expand_layout_placeholders(item, layout, cfg) for item in command]
@@ -145,7 +145,7 @@ def expand_command_placeholders(
 
 
 def expand_runtime_value(value: Any, layout: RunLayout, cfg: dict[str, Any]) -> Any:
-    """递归展开 runtime 配置中的 run-dir 和配置占位符。"""
+    """Recursively expand strings in list-valued runtime configuration."""
 
     if isinstance(value, str):
         return expand_layout_placeholders(value, layout, cfg)
@@ -155,7 +155,7 @@ def expand_runtime_value(value: Any, layout: RunLayout, cfg: dict[str, Any]) -> 
 
 
 def append_cli_arg(command: list[str], key: str, value: Any) -> None:
-    """按 bench_serving 约定把 JSON 参数追加为 CLI 选项。"""
+    """Append one JSON config value using bench-serving CLI conventions."""
 
     option = "--" + key.replace("_", "-")
     if isinstance(value, bool):
@@ -169,7 +169,7 @@ def append_cli_arg(command: list[str], key: str, value: Any) -> None:
 
 
 def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str, Any]) -> list[str] | str | None:
-    """从配置构造 workload driver 命令。"""
+    """Build an explicit or standard SGLang workload-driver command."""
 
     if not bench:
         return None
@@ -190,7 +190,7 @@ def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str,
 
 
 def parse_model_path(server_command: list[str] | str) -> str | None:
-    """从 server 命令中解析模型路径，用于临时覆盖 config.json。"""
+    """Extract the model path needed for temporary ``config.json`` overrides."""
 
     tokens = command_tokens(server_command)
     if not tokens:
@@ -211,7 +211,7 @@ def apply_model_config_overrides(
     server_command: list[str] | str,
     layout: RunLayout,
 ) -> ModelConfigBackup | None:
-    """临时修改模型 config.json，并保留备份以便 finally 恢复。"""
+    """Apply model-config overrides after saving a run-local byte-for-byte backup."""
 
     overrides = cfg.get("model_config_overrides") or {}
     if not overrides:
@@ -241,14 +241,14 @@ def apply_model_config_overrides(
 
 
 def restore_model_config(backup: ModelConfigBackup | None) -> None:
-    """恢复 profiling 前临时覆盖的模型 config.json。"""
+    """Restore a model config from the backup created before profiling."""
 
     if backup and backup.backup_path.is_file():
         backup.config_path.write_bytes(backup.backup_path.read_bytes())
 
 
 def build_profile_body(profile: dict[str, Any], layout: RunLayout) -> dict[str, Any]:
-    """构造传给 SGLang `/start_profile` 的请求体。"""
+    """Build the request body accepted by SGLang ``/start_profile``."""
 
     output_dir = resolve_run_path(profile.get("output_dir", "trace/torch"), layout.run_dir)
     body: dict[str, Any] = {"output_dir": str(output_dir)}
@@ -269,7 +269,7 @@ def build_profile_body(profile: dict[str, Any], layout: RunLayout) -> dict[str, 
 
 
 def channel_config(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
-    """读取采集渠道配置。"""
+    """Return one capture-channel object from the profiling config."""
 
     profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
     current = profiling.get(profiling_key)

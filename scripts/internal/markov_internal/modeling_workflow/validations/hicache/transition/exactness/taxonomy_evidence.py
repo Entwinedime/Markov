@@ -1,4 +1,4 @@
-"""transition family 分类使用的证据摘要辅助工具。"""
+"""Bounded evidence summaries used by transition-family classification."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .taxonomy_constants import TRANSITION_PAGE_FIELDS
 
 
 def load_hicache_summary(path: Path) -> dict[str, Any]:
-    """读取 model_summary 中的 HiCache summary。"""
+    """Load the structured HiCache section from a model summary."""
 
     if not path.is_file():
         return {}
@@ -33,7 +33,7 @@ def summarize_hicache_evidence(
     page_key_mode: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """从 C++ HiCache summary 抽取 family 诊断所需证据摘要。"""
+    """Extract bounded family evidence from a C++ HiCache summary."""
 
     ledgers = {
         "transition_trace": hicache_summary.get("transition_trace", []),
@@ -94,7 +94,7 @@ def summarize_observed_target_evidence(
     page_key_mode: str,
     sample_limit: int,
 ) -> dict[str, Any]:
-    """从 observed target oracle 抽取 validation-only evidence 摘要。"""
+    """Extract validation-only evidence from an observed target oracle."""
 
     if not observed_path.is_file():
         return {"oracle_ready": False, "reason": "missing observed target trace"}
@@ -120,7 +120,7 @@ def summarize_observed_target_evidence(
 
 
 def list_dicts(value: Any) -> list[dict[str, Any]]:
-    """过滤出 dict 列表。"""
+    """Return only mapping entries from a list-like value."""
 
     if not isinstance(value, list):
         return []
@@ -128,13 +128,13 @@ def list_dicts(value: Any) -> list[dict[str, Any]]:
 
 
 def list_len(value: Any) -> int:
-    """安全读取列表长度。"""
+    """Return list length or zero for a non-list value."""
 
     return len(value) if isinstance(value, list) else 0
 
 
 def count_by_field(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
-    """按字段计数。"""
+    """Count rows by one field value."""
 
     return dict(sorted(collections.Counter(str(row.get(field) or "") for row in rows).items()))
 
@@ -146,7 +146,7 @@ def sample_rows_by_pages(
     page_key_mode: str,
     sample_limit: int,
 ) -> list[dict[str, Any]]:
-    """优先抽取和 sample pages 相交的 ledger rows。"""
+    """Prefer bounded ledger samples that intersect mismatch pages."""
 
     if not rows:
         return []
@@ -157,7 +157,7 @@ def sample_rows_by_pages(
 
 
 def row_intersects_pages(row: dict[str, Any], sample_pages: set[str], page_key_mode: str) -> bool:
-    """判断 row 是否和 sample pages 相交。"""
+    """Return whether a row intersects normalized mismatch pages."""
 
     if not sample_pages:
         return False
@@ -172,7 +172,7 @@ def row_intersects_pages(row: dict[str, Any], sample_pages: set[str], page_key_m
 
 
 def compact_evidence_row(row: dict[str, Any]) -> dict[str, Any]:
-    """压缩 evidence row，避免 catalog 过大。"""
+    """Project an evidence row to bounded catalog fields."""
 
     keep_fields = (
         "transition_id",
@@ -212,5 +212,5 @@ def compact_evidence_row(row: dict[str, Any]) -> dict[str, Any]:
     result = {field: row.get(field) for field in keep_fields if field in row}
     for field in ("pages", "host_pages", "lock_pages"):
         if isinstance(result.get(field), list) and len(result[field]) > 12:
-            result[field] = result[field][:12] + [f"...({len(result[field])} total)"]
+            result[field] = [*result[field][:12], f"...({len(result[field])} total)"]
     return result

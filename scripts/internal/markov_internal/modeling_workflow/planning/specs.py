@@ -1,4 +1,4 @@
-"""模型运行请求规划。"""
+"""Planning and deduplication of semantic C++ model-run requests."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 from ...common.naming import safe_slug
 from ..artifacts import WorkflowArtifactLayout
-from ..types import ModelRunSpec, ModelOutputRequirement, CacheStatePredictionRef, ProfileRunRef
+from ..types import CacheStatePredictionRef, ModelOutputRequirement, ModelRunSpec, ProfileRunRef
 
 if TYPE_CHECKING:
     from ..validations.registry import ValidationRequest
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ModelRunRequest:
-    """单个 validation 提出的 C++ 运行请求。"""
+    """Semantic C++ execution requested by one validation object."""
 
     mode: str
     source_profile: ProfileRunRef
@@ -26,37 +26,24 @@ class ModelRunRequest:
     validation_name: str
     prediction: CacheStatePredictionRef | None = None
 
-    @property
-    def merge_key(self) -> tuple[str, str, str, str, tuple[str, ...]]:
-        """返回可合并到同一个 C++ 运行的语义 key。"""
-
-        target_config = self.target_profile.config_id if self.target_profile is not None else ""
-        target_run = self.target_profile.run_id if self.target_profile is not None else ""
-        return (
-            self.mode,
-            self.source_profile.run_id,
-            target_config,
-            target_run,
-            tuple(sorted(requirement.value for requirement in self.output_requirements)),
-        )
-
 
 @dataclass(frozen=True)
 class ModelRunPlanner:
-    """把 validation request 合并成稳定的 C++ 执行计划。"""
+    """Merge validation requests into a deterministic C++ execution plan."""
 
-    context: "WorkflowContext"
+    context: WorkflowContext
     artifacts: WorkflowArtifactLayout
     preflight_report: dict[str, object]
 
-    def build(self, validations: list["ValidationRequest"]) -> list[ModelRunSpec]:
-        """构造最终模型运行计划。"""
+    def build(self, validations: list[ValidationRequest]) -> list[ModelRunSpec]:
+        """Build the final plan after applying preflight skip decisions."""
 
         requests = self._collect_requests(validations)
-        specs = [self._spec_from_group(group) for group in self._merge_requests(requests).values()]
+        skip_policy = PreflightSkipPolicy.from_report(self.preflight_report)
+        specs = [self._spec_from_group(group, skip_policy) for group in self._merge_requests(requests).values()]
         return sorted(specs, key=lambda spec: spec.run_id)
 
-    def _collect_requests(self, validations: list["ValidationRequest"]) -> list[ModelRunRequest]:
+    def _collect_requests(self, validations: list[ValidationRequest]) -> list[ModelRunRequest]:
         requests: list[ModelRunRequest] = []
         for validation in validations:
             requests.extend(validation.build_model_run_requests(self.context))
@@ -76,7 +63,11 @@ class ModelRunPlanner:
             merged.setdefault(key, []).append(request)
         return merged
 
-    def _spec_from_group(self, group_requests: list[ModelRunRequest]) -> ModelRunSpec:
+    def _spec_from_group(
+        self,
+        group_requests: list[ModelRunRequest],
+        skip_policy: PreflightSkipPolicy,
+    ) -> ModelRunSpec:
         first = group_requests[0]
         requirements = frozenset(
             requirement for request in group_requests for requirement in request.output_requirements
@@ -92,37 +83,46 @@ class ModelRunPlanner:
             validation_requests=validations_for_run,
             output_dir=self.artifacts.model_run_dir(run_id),
             prediction=first.prediction,
-            skip_reason=PreflightSkipPolicy(self.preflight_report).reason_for(first),
+            skip_reason=skip_policy.reason_for(first),
             trace_threads=self.context.options.trace_threads,
             trace_file_threads=self.context.options.trace_file_threads,
             trace_channels=model_run_trace_channels(first),
+            page_key_mode=self.context.options.page_key_mode,
         )
 
 
 @dataclass(frozen=True)
 class PreflightSkipPolicy:
-    """根据 preflight 结果决定某个模型运行是否应跳过。"""
+    """Translate preflight evidence into stable per-cell skip reasons."""
 
-    preflight_report: dict[str, object]
+    full_dag_by_run: dict[str, dict[str, object]]
+    hicache_by_run: dict[str, dict[str, object]]
 
-    def reason_for(self, request: ModelRunRequest) -> str:
-        """返回空字符串或稳定 skip reason。"""
+    @classmethod
+    def from_report(cls, report: dict[str, object]) -> PreflightSkipPolicy:
+        """Index shared preflight detail rows used by deterministic skip decisions."""
 
-        checks = self.preflight_report.get("checks") if isinstance(self.preflight_report.get("checks"), dict) else {}
-        if request.mode == "faithful_replay":
-            return self._faithful_replay_reason(request, checks)
-        if request.mode == "cache_state":
-            hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
-            return self._hicache_prediction_reason(request.prediction, hicache)
-        return ""
-
-    def _faithful_replay_reason(self, request: ModelRunRequest, checks: dict[str, object]) -> str:
+        checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
         full_dag = (
             checks.get("full_dag_trace_channels") if isinstance(checks.get("full_dag_trace_channels"), dict) else {}
         )
-        rows = full_dag.get("rows") if isinstance(full_dag.get("rows"), list) else []
-        row_by_run = {str(row.get("run_id")): row for row in rows if isinstance(row, dict)}
-        row = row_by_run.get(request.source_profile.run_id)
+        hicache = checks.get("hicache_state_inputs") if isinstance(checks.get("hicache_state_inputs"), dict) else {}
+        return cls(
+            full_dag_by_run=index_rows(full_dag.get("rows")),
+            hicache_by_run=index_rows(hicache.get("runs")),
+        )
+
+    def reason_for(self, request: ModelRunRequest) -> str:
+        """Return an empty string or a stable machine-readable skip reason."""
+
+        if request.mode == "faithful_replay":
+            return self._faithful_replay_reason(request)
+        if request.mode == "cache_state":
+            return self._hicache_prediction_reason(request.prediction)
+        return ""
+
+    def _faithful_replay_reason(self, request: ModelRunRequest) -> str:
+        row = self.full_dag_by_run.get(request.source_profile.run_id)
         if not isinstance(row, dict):
             return "preflight_missing:full_dag_trace_channels"
         if row.get("full_trace_ready") is not True:
@@ -132,45 +132,68 @@ class PreflightSkipPolicy:
             return "full_dag_trace_not_ready"
         return ""
 
-    def _hicache_prediction_reason(self, prediction: CacheStatePredictionRef | None, check: dict[str, object]) -> str:
+    def _hicache_prediction_reason(self, prediction: CacheStatePredictionRef | None) -> str:
         if prediction is None:
             return ""
-        rows = check.get("runs") if isinstance(check.get("runs"), list) else []
-        row_by_run = {str(row.get("run_id")): row for row in rows if isinstance(row, dict)}
-        source_preflight = row_by_run.get(prediction.source.run_id)
-        target_preflight = row_by_run.get(prediction.target.run_id)
-        if isinstance(source_preflight, dict) and source_preflight.get("workflow_input_ready") is not True:
-            return "source_workflow_input_not_ready"
-        if isinstance(target_preflight, dict) and target_preflight.get("workflow_input_ready") is not True:
-            return "target_workflow_input_not_ready"
-        if prediction.is_self:
-            return ""
+        source_preflight = self.hicache_by_run.get(prediction.source.run_id)
+        target_preflight = self.hicache_by_run.get(prediction.target.run_id)
+        readiness_reason = _hicache_readiness_reason(source_preflight, target_preflight)
+        if readiness_reason or prediction.is_self:
+            return readiness_reason
+        return _cross_prediction_reason(source_preflight, target_preflight)
 
-        if not isinstance(source_preflight, dict):
-            return "source_preflight_missing"
-        if not isinstance(target_preflight, dict):
-            return "target_preflight_missing"
-        if source_preflight.get("canonical_workload_signature") != target_preflight.get(
-            "canonical_workload_signature"
-        ):
-            return "workload_signature_mismatch"
-        if not forced_token_plan_matches(source_preflight, target_preflight):
-            return "forced_token_plan_signature_mismatch"
-        if not forced_token_bundle_matches(source_preflight, target_preflight):
-            return "forced_token_bundle_signature_mismatch"
-        return ""
+
+def _hicache_readiness_reason(
+    source_preflight: dict[str, object] | None,
+    target_preflight: dict[str, object] | None,
+) -> str:
+    """Return source or target readiness blockers before scope-specific checks."""
+
+    reason = ""
+    if isinstance(source_preflight, dict) and source_preflight.get("workflow_input_ready") is not True:
+        reason = "source_workflow_input_not_ready"
+    elif isinstance(target_preflight, dict) and target_preflight.get("workflow_input_ready") is not True:
+        reason = "target_workflow_input_not_ready"
+    return reason
+
+
+def _cross_prediction_reason(
+    source_preflight: dict[str, object] | None,
+    target_preflight: dict[str, object] | None,
+) -> str:
+    """Require cross-config workload and forced-token identity equivalence."""
+
+    if not isinstance(source_preflight, dict):
+        return "source_preflight_missing"
+    if not isinstance(target_preflight, dict):
+        return "target_preflight_missing"
+    if source_preflight.get("canonical_workload_signature") != target_preflight.get("canonical_workload_signature"):
+        return "workload_signature_mismatch"
+    if not forced_token_plan_matches(source_preflight, target_preflight):
+        return "forced_token_plan_signature_mismatch"
+    if not forced_token_bundle_matches(source_preflight, target_preflight):
+        return "forced_token_bundle_signature_mismatch"
+    return ""
 
 
 def cache_prediction_key(prediction: CacheStatePredictionRef | None) -> str:
-    """返回 cache-state prediction 的合并 key。"""
+    """Return the semantic merge key for a cache-state prediction."""
 
     if prediction is None:
         return ""
     return f"{prediction.input_id}:{prediction.source.config_id}->{prediction.target.config_id}"
 
 
+def index_rows(value: object) -> dict[str, dict[str, object]]:
+    """Index well-formed preflight detail rows by run identifier."""
+
+    if not isinstance(value, list):
+        return {}
+    return {str(row.get("run_id")): row for row in value if isinstance(row, dict) and row.get("run_id") is not None}
+
+
 def model_run_trace_channels(request: ModelRunRequest) -> tuple[str, ...]:
-    """返回一次 C++ run 应实际消费的 manifest trace channel。"""
+    """Select manifest trace channels that the C++ backend may consume."""
 
     if request.mode == "cache_state":
         return ("python_probe",)
@@ -178,32 +201,39 @@ def model_run_trace_channels(request: ModelRunRequest) -> tuple[str, ...]:
 
 
 def forced_token_plan_matches(source: dict[str, object], target: dict[str, object]) -> bool:
-    """判断一对 cross-config prediction 是否使用相同 forced-token plan。"""
+    """Return whether a cross-config pair shares one ready forced-token plan."""
 
-    if source.get("forced_token_enabled") is not True or target.get("forced_token_enabled") is not True:
-        return False
-    if source.get("forced_token_plan_ready") is not True or target.get("forced_token_plan_ready") is not True:
-        return False
-    source_plan = source.get("forced_token_plan_sha256")
-    target_plan = target.get("forced_token_plan_sha256")
-    return bool(source_plan) and source_plan == target_plan
+    return matching_preflight_identity(
+        source,
+        target,
+        ready_fields=("forced_token_enabled", "forced_token_plan_ready"),
+        identity_fields=("forced_token_plan_sha256",),
+    )
 
 
 def forced_token_bundle_matches(source: dict[str, object], target: dict[str, object]) -> bool:
-    """判断一对 cross-config prediction 是否使用相同 forced-token bundle。"""
+    """Return whether a cross-config pair shares one ready token bundle."""
 
-    if source.get("forced_token_bundle_ready") is not True or target.get("forced_token_bundle_ready") is not True:
-        return False
-    source_bundle = source.get("forced_token_bundle_sha256")
-    target_bundle = target.get("forced_token_bundle_sha256")
-    source_bundle_id = source.get("forced_token_bundle_id")
-    target_bundle_id = target.get("forced_token_bundle_id")
-    return (
-        bool(source_bundle)
-        and source_bundle == target_bundle
-        and bool(source_bundle_id)
-        and source_bundle_id == target_bundle_id
+    return matching_preflight_identity(
+        source,
+        target,
+        ready_fields=("forced_token_bundle_ready",),
+        identity_fields=("forced_token_bundle_sha256", "forced_token_bundle_id"),
     )
+
+
+def matching_preflight_identity(
+    source: dict[str, object],
+    target: dict[str, object],
+    *,
+    ready_fields: tuple[str, ...],
+    identity_fields: tuple[str, ...],
+) -> bool:
+    """Require both contracts to be ready with equal non-empty identities."""
+
+    if any(source.get(field) is not True or target.get(field) is not True for field in ready_fields):
+        return False
+    return all(bool(source.get(field)) and source.get(field) == target.get(field) for field in identity_fields)
 
 
 def model_run_id(
@@ -213,7 +243,7 @@ def model_run_id(
     prediction: CacheStatePredictionRef | None,
     requirements: frozenset[ModelOutputRequirement],
 ) -> str:
-    """根据语义输入构造可读的 model run id。"""
+    """Build a readable model-run identifier from semantic inputs."""
 
     req_text = ",".join(sorted(requirement.value for requirement in requirements))
     req_digest = hashlib.sha1(req_text.encode("utf-8")).hexdigest()[:8]
@@ -228,6 +258,6 @@ def model_run_id(
 
 
 def prediction_config_slug(prediction: CacheStatePredictionRef) -> str:
-    """构造 source->target config 的路径片段。"""
+    """Build the source-to-target configuration component of a path."""
 
     return f"{safe_slug(prediction.source.config_id)}_to_{safe_slug(prediction.target.config_id)}"

@@ -1,4 +1,4 @@
-"""transition prediction row 的路径与汇总工具。"""
+"""Artifact paths and summaries for transition prediction rows."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from ..artifacts.paths import PathsForPrediction, resolve_repo_path
 
 
 def prediction_paths_for_dir(prediction_dir: Path) -> PathsForPrediction:
-    """生成单个 prediction 的标准 transition artifact 路径。"""
+    """Derive standard transition artifact paths for one prediction."""
 
     return PathsForPrediction(
         prediction_dir=prediction_dir,
@@ -24,20 +24,20 @@ def prediction_paths_for_dir(prediction_dir: Path) -> PathsForPrediction:
 
 
 def target_key_from_row(prediction_row: dict[str, Any]) -> tuple[str, str]:
-    """提取 transition oracle 复用使用的 target key。"""
+    """Return the target key used to reuse an observed transition oracle."""
 
     return str(prediction_row.get("input_id") or ""), str(prediction_row.get("target_config_id") or "")
 
 
 def comparison_path_for_prediction(prediction_dir: Path, prediction_row: dict[str, Any]) -> Path:
-    """返回单个 prediction 的 exactness payload 路径。"""
+    """Return the exactness payload path for one prediction."""
 
     filename = "transition_exactness_self.json" if prediction_row.get("is_self") else "transition_exactness_cross.json"
     return prediction_dir / filename
 
 
 def prediction_dir_from_row(prediction_row: dict[str, Any], artifact_root: Path) -> Path:
-    """返回 transition row 记录的 prediction 输出目录。"""
+    """Resolve the prediction output directory recorded in a workflow row."""
 
     raw_output_dir = prediction_row.get("output_dir")
     if raw_output_dir:
@@ -54,7 +54,7 @@ def prediction_dir_from_row(prediction_row: dict[str, Any], artifact_root: Path)
 
 
 def observed_transition_path(artifact_root: Path, target_key: tuple[str, str]) -> Path:
-    """返回某个 input/config 的 target-side transition oracle 路径。"""
+    """Return the target-side oracle path for one input/config pair."""
 
     input_id, target_config_id = target_key
     return (
@@ -66,13 +66,13 @@ def observed_transition_path(artifact_root: Path, target_key: tuple[str, str]) -
 
 
 def count_rows_by_value(rows: list[dict[str, Any]], field: str) -> dict[str, int]:
-    """按 prediction row 字段值计数。"""
+    """Count prediction rows by a scalar field value."""
 
     return dict(sorted(collections.Counter(str(row.get(field) or "") for row in rows).items()))
 
 
 def count_patch_risks(rows: list[dict[str, Any]]) -> dict[str, int]:
-    """按 patch gate 风险字段计数。"""
+    """Count prediction rows by patch-gate risk."""
 
     return dict(
         sorted(
@@ -88,7 +88,7 @@ def count_patch_risks(rows: list[dict[str, Any]]) -> dict[str, int]:
 def summarize_transition_prediction_row(
     prediction_row: dict[str, Any], comparison_path: Path, observed_path: Path
 ) -> dict[str, Any]:
-    """从 per-prediction exactness 输出提取 prediction row。"""
+    """Project one exactness payload to its workflow prediction row."""
 
     base = {
         "label": prediction_row.get("label"),
@@ -102,6 +102,9 @@ def summarize_transition_prediction_row(
         "observed_target_trace_path": str(observed_path),
         "transition_exactness_path": str(comparison_path),
         "final_state_match": prediction_row.get("final_state_match"),
+        "return_code": prediction_row.get("return_code"),
+        "skipped": bool(prediction_row.get("skipped")),
+        "skip_reason": prediction_row.get("skip_reason"),
     }
     if not comparison_path.is_file():
         return {
@@ -155,7 +158,7 @@ def summarize_transition_prediction_row(
 
 
 def summarize_rows_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
-    """按 prediction 字段汇总通过数。"""
+    """Aggregate readiness and exactness by a prediction field."""
 
     result: dict[str, Any] = {}
     for value in sorted({str(row.get(key) or "") for row in rows}):

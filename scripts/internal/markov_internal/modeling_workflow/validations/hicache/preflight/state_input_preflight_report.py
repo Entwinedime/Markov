@@ -1,11 +1,12 @@
-"""HiCache state-model input preflight report 构造器。"""
+"""Builder for the complete HiCache state-input preflight report."""
 
 from __future__ import annotations
 
 import collections
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 from markov_internal.common.io import write_json
 from markov_internal.common.naming import safe_slug
@@ -18,22 +19,23 @@ from .readiness import (
     summarize_forced_token_input_group,
     workflow_input_ready,
 )
+from ..input_contract.signature.primitives import trace_events
 from .workload_signature import WorkloadSignatureBuilder, summarize_workload_sequence_input_group
 
 
 @dataclass(frozen=True)
 class StateInputPreflightOptions:
-    """HiCache state input preflight 的执行开关。"""
+    """Internal evidence options derived from selected validations."""
 
     require_validation_evidence: bool = False
     validate_diagnostic_coverage: bool = False
     require_cross_config_contract: bool = False
-    show_workload_sequence: bool = False
+    include_sequence_diagnostics: bool = False
 
 
 @dataclass
 class StateInputPreflightReportBuilder:
-    """构造 HiCache state input preflight report。"""
+    """Build per-run audits, per-input contracts, and aggregate readiness."""
 
     runs: list[ProfileRunRef]
     output_dir: Path
@@ -43,7 +45,7 @@ class StateInputPreflightReportBuilder:
     on_row: Callable[[dict[str, Any]], None] | None = None
 
     def build(self) -> dict[str, Any]:
-        """构造完整 report 并写出 compact summary。"""
+        """Build the complete report and persist its compact stage summary."""
 
         rows = self._run_rows()
         signature_by_input = self._input_groups(rows)
@@ -76,11 +78,17 @@ class StateInputPreflightReportBuilder:
         audit_options: HiCacheProfileAuditOptions,
     ) -> dict[str, Any]:
         profile_audit_path = preflight_dir / f"{safe_slug(run.run_id)}.hicache_profile_audit.json"
-        profile_audit = audit_hicache_profile(run.manifest_path, options=audit_options)
+        event_rows = trace_events(list(run.python_probe_files))
+        profile_audit = audit_hicache_profile(
+            run.manifest_path,
+            options=audit_options,
+            event_rows=event_rows,
+        )
         write_json(profile_audit_path, profile_audit)
         workload_signature = WorkloadSignatureBuilder(
             run,
-            include_sequence_diagnostics=self.options.show_workload_sequence,
+            include_sequence_diagnostics=self.options.include_sequence_diagnostics,
+            event_rows=event_rows,
         ).build()
         forced_token_preflight = (
             normalize_forced_token_preflight(profile_audit) if self.options.require_cross_config_contract else None
@@ -126,7 +134,7 @@ class StateInputPreflightReportBuilder:
             "workflow_input_ready": workflow_ready,
             "workflow_input_errors": profile_audit.get("workflow_input_errors", []),
         }
-        if self.options.show_workload_sequence:
+        if self.options.include_sequence_diagnostics:
             row["_workload_sequence_diagnostic_events"] = workload_signature.get("sequence_diagnostic_events", [])
         return row
 
@@ -180,7 +188,7 @@ class StateInputPreflightReportBuilder:
         )
         sequence_summary = summarize_workload_sequence_input_group(
             input_rows,
-            include_details=self.options.show_workload_sequence,
+            include_details=self.options.include_sequence_diagnostics,
         )
         signature_match = len(signatures) == 1 if self.options.require_cross_config_contract else None
         row = {
@@ -221,7 +229,7 @@ class StateInputPreflightReportBuilder:
                 "require_validation_evidence": self.options.require_validation_evidence,
                 "validate_diagnostic_coverage": self.options.validate_diagnostic_coverage,
                 "require_cross_config_contract": self.options.require_cross_config_contract,
-                "show_workload_sequence": self.options.show_workload_sequence,
+                "sequence_diagnostics_enabled": self.options.include_sequence_diagnostics,
             },
             "run_count": len(rows),
             "config_ids": sorted({run.config_id for run in self.runs}),
@@ -230,7 +238,7 @@ class StateInputPreflightReportBuilder:
             "workflow_input_ready_count": sum(1 for row in rows if row["workflow_input_ready"]),
             "state_model_input_ready_count": sum(1 for row in rows if row["state_model_input_ready"]),
             "artifact_ready_count": sum(1 for row in rows if row["artifact_ready"]),
-            "sequence_diagnostic_enabled": self.options.show_workload_sequence,
+            "sequence_diagnostic_enabled": self.options.include_sequence_diagnostics,
             "input_sequence_diagnostic_match_count": sum(
                 1 for item in signature_by_input.values() if item.get("sequence_diagnostic_match") is True
             ),
@@ -263,15 +271,15 @@ def build_state_input_preflight_report(
     require_validation_evidence: bool = False,
     validate_diagnostic_coverage: bool = False,
     require_cross_config_contract: bool = False,
-    show_workload_sequence: bool = False,
+    include_sequence_diagnostics: bool = False,
 ) -> dict[str, Any]:
-    """构造 HiCache state-input preflight gate 并写出 per-run audits。"""
+    """Build the HiCache state-input gate and persist per-run audits."""
 
     options = StateInputPreflightOptions(
         require_validation_evidence=require_validation_evidence,
         validate_diagnostic_coverage=validate_diagnostic_coverage,
         require_cross_config_contract=require_cross_config_contract,
-        show_workload_sequence=show_workload_sequence,
+        include_sequence_diagnostics=include_sequence_diagnostics,
     )
     return StateInputPreflightReportBuilder(
         runs=runs,
@@ -284,7 +292,7 @@ def build_state_input_preflight_report(
 
 
 def compact_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
-    """构造写入 stage summary 的 compact payload。"""
+    """Project the full report to its compact stage-summary payload."""
 
     compact = {
         "schema": report.get("schema"),
@@ -311,7 +319,7 @@ def compact_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
 
 
 def compact_input_workload_signatures(value: Any) -> dict[str, dict[str, Any]]:
-    """压缩 per-input workload contract summary。"""
+    """Project per-input workload contracts to stable summary fields."""
 
     inputs = value if isinstance(value, dict) else {}
     result: dict[str, dict[str, Any]] = {}

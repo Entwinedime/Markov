@@ -1,4 +1,4 @@
-"""把 predicted HiCache transition record replay 成可比较的 state delta。"""
+"""Replay predicted HiCache transition records into comparable state deltas."""
 
 from __future__ import annotations
 
@@ -18,22 +18,51 @@ LOCK_ACQUIRE_KINDS = {
     "enqueue_loadback",
     "enqueue_storage_backup",
     "enqueue_write_through_backup",
-    "enqueue_writeback",
 }
 
-LOCK_RELEASE_BY_KIND = {
-    "release_request_ref": "request_ref",
-    "complete_loadback": "loadback",
-    "complete_storage_backup": "storage",
-    "complete_write_through_backup": "write_through_backup",
-    "complete_writeback": "writeback",
-    "cancel_writeback": "writeback",
+LOCK_RELEASE_KINDS = {
+    "release_request_ref",
+    "complete_loadback",
+    "complete_storage_backup",
+    "complete_write_through_backup",
+    "complete_writeback",
+    "cancel_writeback",
+}
+
+L1_RESIDENCY_KINDS = {
+    "add_l1_residency",
+    "restore_l1_residency",
+    "promote_visible_prefix_to_l1",
+}
+
+PREFETCH_STATE_KEY_BY_KIND = {
+    "prefetch_planned": "prefetch_planned_pages",
+    "prefetch_ready": "prefetch_ready_pages",
+    "prefetch_revoked": "prefetch_suppressed_pages",
+    "prefetch_suppressed": "prefetch_suppressed_pages",
+    "prefetch_timeout_incomplete": "prefetch_late_pages",
 }
 
 
 @dataclass
+class DiagnosticSamples:
+    """Count every diagnostic while retaining only a bounded row sample."""
+
+    sample_limit: int
+    count: int = 0
+    rows: list[dict[str, Any]] = field(default_factory=list)
+
+    def add(self, row: dict[str, Any]) -> None:
+        """Record one occurrence and retain it when sample capacity remains."""
+
+        self.count += 1
+        if len(self.rows) < self.sample_limit:
+            self.rows.append(row)
+
+
+@dataclass
 class PredictedTransitionReplay:
-    """按 transition 顺序回放模型侧 active state。"""
+    """Replay model-side active state in transition order."""
 
     records: list[dict[str, Any]]
     sample_limit: int
@@ -41,12 +70,19 @@ class PredictedTransitionReplay:
     page_hit_counts: collections.Counter[str] = field(default_factory=collections.Counter)
     ref_counts: collections.Counter[str] = field(default_factory=collections.Counter)
     delta_rows: list[dict[str, Any]] = field(default_factory=list)
-    violations: list[dict[str, Any]] = field(default_factory=list)
-    ref_issues: list[dict[str, Any]] = field(default_factory=list)
-    noop_rows: list[dict[str, Any]] = field(default_factory=list)
+    violations: DiagnosticSamples = field(init=False)
+    ref_issues: DiagnosticSamples = field(init=False)
+    noop_rows: DiagnosticSamples = field(init=False)
+
+    def __post_init__(self) -> None:
+        """Create bounded diagnostic collectors after `sample_limit` is available."""
+
+        self.violations = DiagnosticSamples(self.sample_limit)
+        self.ref_issues = DiagnosticSamples(self.sample_limit)
+        self.noop_rows = DiagnosticSamples(self.sample_limit)
 
     def replay(self) -> dict[str, Any]:
-        """执行 replay 并返回 final state、delta rows 和诊断。"""
+        """Execute replay and return final state, deltas, and diagnostics."""
 
         for ordinal, record in enumerate(self.records):
             self._replay_one(record, ordinal)
@@ -56,62 +92,25 @@ class PredictedTransitionReplay:
         return {
             "final_state": final_state,
             "delta_rows": self.delta_rows,
-            "state_constraint_violations": self.violations[: max(self.sample_limit, len(self.violations))],
-            "ref_balance_issues": self.ref_issues[: max(self.sample_limit, len(self.ref_issues))],
-            "derived_noop_transitions": self.noop_rows[: max(self.sample_limit, len(self.noop_rows))],
+            "state_constraint_violation_count": self.violations.count,
+            "state_constraint_violations": self.violations.rows,
+            "ref_balance_issue_count": self.ref_issues.count,
+            "ref_balance_issues": self.ref_issues.rows,
+            "derived_noop_transition_count": self.noop_rows.count,
+            "derived_noop_transitions": self.noop_rows.rows,
         }
 
     def _replay_one(self, record: dict[str, Any], ordinal: int) -> None:
         kind = str(record.get("transition_kind") or "")
         pages = record_pages(record)
         before_delta_count = len(self.delta_rows)
-        if kind in {"add_l1_residency", "restore_l1_residency", "promote_visible_prefix_to_l1"}:
-            add_pages(self.state, self.delta_rows, "l1_resident_pages", pages, record, ordinal)
-            remove_pages(self.state, self.delta_rows, "evicted_pages", pages, record, ordinal, strict=False)
-        elif kind == "mark_dirty":
-            add_pages(self.state, self.delta_rows, "dirty_pages", pages, record, ordinal)
-        elif kind in {"commit_host_storage_backup", "commit_host_backup"}:
-            self._replay_host_backup(kind, pages, record, ordinal)
-        elif kind == "apply_prefetch_host_visibility":
-            self._replay_prefetch_host_visibility(pages, record, ordinal)
-        elif kind == "evict_l1_node":
-            self._replay_l1_evict(pages, record, ordinal)
-        elif kind == "evict_host_node":
-            self._replay_host_evict(pages, record, ordinal)
-        elif kind == "prefetch_planned":
-            add_pages(self.state, self.delta_rows, "prefetch_planned_pages", pages, record, ordinal)
-        elif kind == "prefetch_ready":
-            add_pages(self.state, self.delta_rows, "prefetch_ready_pages", pages, record, ordinal)
-        elif kind in {"prefetch_revoked", "prefetch_suppressed"}:
-            add_pages(self.state, self.delta_rows, "prefetch_suppressed_pages", pages, record, ordinal)
-        elif kind == "prefetch_timeout_incomplete":
-            add_pages(self.state, self.delta_rows, "prefetch_late_pages", pages, record, ordinal)
-        elif kind == "prefetch_terminated":
-            pass
-        elif kind == "increment_hit_count":
-            for page in pages:
-                self.page_hit_counts[page] += 1
-        elif kind == "enqueue_writeback":
-            add_pages(self.state, self.delta_rows, "pending_writeback_pages", pages, record, ordinal)
-            acquire_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal)
-        elif kind in LOCK_ACQUIRE_KINDS:
-            acquire_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal)
-        elif kind in LOCK_RELEASE_BY_KIND:
-            if kind in {"complete_writeback", "cancel_writeback"}:
-                remove_pages(
-                    self.state, self.delta_rows, "pending_writeback_pages", pages, record, ordinal, strict=False
-                )
-            release_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal, self.ref_issues)
-        elif kind in {
-            "enqueue_storage_backup",
-            "enqueue_write_through_backup",
-            "enqueue_loadback",
-            "complete_storage_backup",
-            "complete_loadback",
-        }:
-            pass
-        elif kind:
-            self.violations.append(
+        handled = (
+            self._replay_residency_or_storage(kind, pages, record, ordinal)
+            or self._replay_prefetch(kind, pages, record, ordinal)
+            or self._replay_reference_lifecycle(kind, pages, record, ordinal)
+        )
+        if not handled and kind:
+            self.violations.add(
                 {
                     "kind": "unknown_transition_kind",
                     "ordinal": ordinal,
@@ -120,6 +119,75 @@ class PredictedTransitionReplay:
                 }
             )
         self._record_noop_if_needed(kind, pages, record, ordinal, before_delta_count)
+
+    def _replay_residency_or_storage(
+        self,
+        kind: str,
+        pages: list[str],
+        record: dict[str, Any],
+        ordinal: int,
+    ) -> bool:
+        """Replay residency, backup visibility, and eviction transitions."""
+
+        if kind in L1_RESIDENCY_KINDS:
+            add_pages(self.state, self.delta_rows, "l1_resident_pages", pages, record, ordinal)
+            remove_pages(self.state, self.delta_rows, "evicted_pages", pages, record, ordinal, strict=False)
+        elif kind == "mark_dirty":
+            add_pages(self.state, self.delta_rows, "dirty_pages", pages, record, ordinal)
+        elif kind in {"commit_host_storage_backup", "commit_host_backup"}:
+            self._replay_host_backup(kind, pages, record, ordinal)
+        elif kind == "evict_l1_node":
+            self._replay_l1_evict(pages, record, ordinal)
+        elif kind == "evict_host_node":
+            self._replay_host_evict(pages, record, ordinal)
+        else:
+            return False
+        return True
+
+    def _replay_prefetch(
+        self,
+        kind: str,
+        pages: list[str],
+        record: dict[str, Any],
+        ordinal: int,
+    ) -> bool:
+        """Replay prefetch visibility and diagnostic lifecycle markers."""
+
+        if kind == "apply_prefetch_host_visibility":
+            self._replay_prefetch_host_visibility(pages, record, ordinal)
+            return True
+        state_key = PREFETCH_STATE_KEY_BY_KIND.get(kind)
+        if state_key is not None:
+            add_pages(self.state, self.delta_rows, state_key, pages, record, ordinal)
+            return True
+        return kind == "prefetch_terminated"
+
+    def _replay_reference_lifecycle(
+        self,
+        kind: str,
+        pages: list[str],
+        record: dict[str, Any],
+        ordinal: int,
+    ) -> bool:
+        """Replay hit counters, request references, and writeback references."""
+
+        if kind == "increment_hit_count":
+            for page in pages:
+                self.page_hit_counts[page] += 1
+        elif kind == "enqueue_writeback":
+            add_pages(self.state, self.delta_rows, "pending_writeback_pages", pages, record, ordinal)
+            acquire_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal)
+        elif kind in LOCK_ACQUIRE_KINDS:
+            acquire_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal)
+        elif kind in LOCK_RELEASE_KINDS:
+            if kind in {"complete_writeback", "cancel_writeback"}:
+                remove_pages(
+                    self.state, self.delta_rows, "pending_writeback_pages", pages, record, ordinal, strict=False
+                )
+            release_refs(self.state, self.delta_rows, self.ref_counts, pages, record, ordinal, self.ref_issues)
+        else:
+            return False
+        return True
 
     def _replay_host_backup(self, kind: str, pages: list[str], record: dict[str, Any], ordinal: int) -> None:
         add_pages(self.state, self.delta_rows, "l2_resident_pages", pages, record, ordinal)
@@ -181,7 +249,7 @@ class PredictedTransitionReplay:
             }
         ):
             return
-        self.noop_rows.append(
+        self.noop_rows.add(
             {
                 "ordinal": ordinal,
                 "transition_kind": kind,
@@ -192,7 +260,7 @@ class PredictedTransitionReplay:
 
 
 def replay_predicted_records(records: list[dict[str, Any]], *, sample_limit: int) -> dict[str, Any]:
-    """按 transition 顺序回放模型侧 active state。"""
+    """Replay model-side active state in transition order."""
 
     return PredictedTransitionReplay(records=records, sample_limit=sample_limit).replay()
 
@@ -205,7 +273,7 @@ def add_pages(
     record: dict[str, Any],
     ordinal: int,
 ) -> None:
-    """向某个状态集合添加页，并记录实际 delta。"""
+    """Add pages to a state set and record the effective delta."""
 
     changed = [page for page in pages if page not in state[key]]
     if not changed:
@@ -223,13 +291,13 @@ def remove_pages(
     ordinal: int,
     *,
     strict: bool,
-    violations: list[dict[str, Any]] | None = None,
+    violations: DiagnosticSamples | None = None,
 ) -> None:
-    """从某个状态集合删除页，并记录实际 delta。"""
+    """Remove pages from a state set and record the effective delta."""
 
     missing = [page for page in pages if page not in state[key]]
     if strict and missing and violations is not None:
-        violations.append(
+        violations.add(
             {
                 "kind": "remove_missing_page",
                 "state_key": key,
@@ -255,7 +323,7 @@ def acquire_refs(
     record: dict[str, Any],
     ordinal: int,
 ) -> None:
-    """按 page 维护简化 ref 计数。"""
+    """Acquire simplified page references and expose newly locked pages."""
 
     newly_locked: list[str] = []
     for page in pages:
@@ -274,9 +342,9 @@ def release_refs(
     pages: list[str],
     record: dict[str, Any],
     ordinal: int,
-    ref_issues: list[dict[str, Any]],
+    ref_issues: DiagnosticSamples,
 ) -> None:
-    """释放简化 ref 计数，并报告负计数风险。"""
+    """Release simplified page references and report unmatched releases."""
 
     cleared: list[str] = []
     missing: list[str] = []
@@ -292,7 +360,7 @@ def release_refs(
                 state["locked_pages"].remove(page)
                 cleared.append(page)
     if missing:
-        ref_issues.append(
+        ref_issues.add(
             {
                 "kind": "release_ref_without_replay_acquire",
                 "ordinal": ordinal,
@@ -314,7 +382,7 @@ def emit_delta(
     record: dict[str, Any],
     ordinal: int,
 ) -> None:
-    """记录 replay 产生的可比较状态 delta。"""
+    """Record one comparable state delta produced by replay."""
 
     kinds = STATE_DELTA_KINDS.get(state_key)
     if kinds is None or not pages:
