@@ -20,7 +20,7 @@ base profiling state-model facts + explicit target cache config
 | final state alignment | L1/L2/L3/dirty/backuped/evicted/locked 等最终集合对齐 | hard gate。 |
 | transition exactness | 中间状态变化、operation lifecycle、policy/ref/capacity 账本可与 target run 证据分层比较 | diagnostic / next gate。 |
 
-它不是 DAG patch 验收，也不是 E2E 性能预测验收。`prediction.json.predicted_e2e_ns` 只能作为 runner / DAG sanity check，不能证明 HiCache state 正确。
+它不是 DAG patch 验收，也不是 E2E 性能预测验收。`prediction.json.predicted_e2e_us` 只能作为 runner / DAG sanity check，不能证明 HiCache state 正确。
 
 ## 硬门槛
 
@@ -32,7 +32,7 @@ HiCache state prediction 必须同时满足：
 | missing state-model facts | `hicache_state.missing_state_model_facts=[]` 或 `{}`。 |
 | validation | `validation_ready=true` 且 `validation_errors=[]`。 |
 | final state | 有 oracle 时必须 `hicache_state.final_state_match=true` 才能称该场景 state 通过。 |
-| DAG | state-only 阶段 `dag_mutations=0` 是预期，不代表 DAG patch 已实现。 |
+| DAG | Phase 0/1 的 `run_summary.json.module_results.hicache_dag_patch.mutation_count=0` 是预期，不代表 effect-specific DAG patch 已实现。 |
 
 只要 `state_model_fact_ready=false`，即使 final state 偶然对齐，也不能宣称 state-model prediction 通过。
 
@@ -123,18 +123,20 @@ full-matrix 结果为准。2026-07-01 旧 workflow 结果只保留为上一版�
 作为 state-model 输入，不采集 runtime prefetch checkpoint、per-request admission、storage-control drain checkpoint、
 source actual、oracle state 或 observed gate 作为模型输入。
 
-该基线包含本轮 C++ backend / workflow 收口后的三项前提：
+该基线包含本轮 C++ backend / workflow 收口和 Phase 0/1 后的前提：
 
 - Python workflow 入口统一为 `python3 scripts/internal/entrypoints/modeling_workflow.py`；
 - C++ backend 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace，并在进程内合流，不再写大型
   `merged_trace` 中间产物；
 - HiCache best-effort below-threshold revoke 的 pre-extend / post-extend 分岔由 target-derived prefetch worker
   ready-time 投影决定，具体限制见 `docs/validation/hicache_state_model_limitations.md`。
+- `HiCacheModule` 导出 target-derived effect intent；`HiCacheDagPatchModule` 只应用 `hicache_phase01_empty` 空 plan，
+  用于验证 mutation journal 和 active topology 合同，不执行 effect attribution 或 cost patch。
 
 结果目录：
 
 ```text
-data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75
+data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_full_refactor_validation_20260711
 ```
 
 workflow 摘要：
@@ -143,14 +145,19 @@ workflow 摘要：
 | --- | ---: |
 | workflow entry | `modeling_workflow.py` |
 | profile suite | `20260706_020716_profiling_hicache_dag_analysis_forced_replay` |
-| selected validations | `hicache_final_state,hicache_transition` |
+| selected validations | `base_dag,final_dag,hicache_dag_mapping,hicache_final_state,hicache_transition` |
 | inputs | `3` |
 | configs | `5` |
 | prediction scopes | `self,cross` |
+| model runs usable | `90 / 90` |
+| HiCache DAG mapping ready | `15 / 15` |
 | full final-state exact | `75 / 75` |
 | transition exact | `75 / 75` |
 | transition-count exact | `75 / 75` |
 | page-lifecycle multiset exact | `75 / 75` |
+| effect intents | `10110` |
+| empty patch / zero mutation / topology valid | `75 / 75` |
+| base DAG / final DAG replay gate ready | `1 / 15` |
 
 结论：
 
@@ -158,6 +165,10 @@ workflow 摘要：
 - 当前 75 个 transition prediction 也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
 - 该 run 证明当前 unified workflow、C++ manifest trace input、HiCache state facts 和 best-effort revoke visibility
   投影在这批数据下对齐；
+- 75 个 cache-state run 均完成空 patch，mutation count 为零且 Debug active topology validation 通过，证明 Phase 0/1
+  mutation 管线没有改变原图；这不代表任何 HiCache effect 已经映射到 DAG；
+- `base_dag` / `final_dag` 的其余 `14/15` 均被 `dag_replay_error_too_high` 阻塞，属于现有 faithful replay E2E
+  误差限制，不影响本节 state/transition exactness 结论；
 - 上述通过仍只证明当前 manual matrix 和当前近似边界成立，不等价于完整 SGLang scheduler / backend I/O /
   rank-synced queue exactness，长期近似仍维护在限制文档。
 

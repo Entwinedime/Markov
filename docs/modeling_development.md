@@ -23,11 +23,12 @@ profile manifest
 
 ```json
 {
-  "predicted_e2e_ns": 0
+  "predicted_e2e_us": 0
 }
 ```
 
-`predicted_e2e_ns` 来自 DAG 拓扑仿真。对于 HiCache state-only backend，它不是 cache state 正确性的验收指标。
+`predicted_e2e_us` 来自 active DAG 拓扑仿真，单位与 Chrome trace 一致，为微秒。Phase 0/1 的 HiCache patch 为空，
+因此它仍等于 base DAG 结果，也不是 cache state 正确性的验收指标。
 
 ## 运行入口
 
@@ -72,42 +73,16 @@ validation object 从 profile suite 的 target server metadata 动态生成 Pyth
 `<workflow_output>/model_runs/<model_run_id>/runner_config.json`；每个 model run 输出目录下的 `cpp_model_config.json`
 是 C++ TraceGraph backend narrow config。
 
-faithful replay：
+低层单次 modeling execution 只能消费 workflow 生成的自包含 runner config：
 
 ```bash
 scripts/model.sh \
-  --config <modeling-config.json> \
-  --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <run_dir>/modeling/faithful_replay \
-  --mode faithful_replay \
-  --emit-validation
+  --config <workflow_output>/model_runs/<model_run_id>/runner_config.json
 ```
 
-低层单次 modeling execution 仍可由 workflow 生成 runner config 后调用：
-
-```bash
-scripts/model.sh \
-  --config <workflow_output>/model_runs/<model_run_id>/runner_config.json \
-  --profile-manifest <run_dir>/profile_manifest.json \
-  --output-dir <workflow_output>/model_runs/<model_run_id> \
-  --mode cache_state
-```
-
-该 runner config 必须包含 `cpp_trace_graph.backend_kind="validation"` 和
-`outputs.emit_validation=true`。普通 business cache-state prediction 不生成 `model_summary.json` /
-`validation.json`，也不使用 validation backend。
-
-常用覆盖项：
-
-| CLI | 作用 |
-| --- | --- |
-| `--profile-manifest` | 覆盖 config 中的 manifest。 |
-| `--output-dir` | 覆盖输出目录。 |
-| `--mode` | 覆盖 modeling mode。 |
-| `--emit-dag-chrome-trace` | 输出 DAG Chrome trace。 |
-| `--emit-module-summary` | 输出 `model_summary.json`。 |
-| `--emit-validation` | 输出 `validation.json`。 |
-| `--emit-dag-analysis` | 输出 Debug-only `dag_quality.json`、`dag_analysis.json`、`dag_anchor_coverage.json` 和 `dag_operation_visibility.json`。 |
+`runner_config.json` 自包含 `input.profile_manifest`、`output_dir`、`mode`、`cpp_trace_graph`、`outputs`、oracle path 和
+`cpp_model_config`。`model.py` 只接受 `--config`，不再用 CLI 覆盖同一状态。validation requirement 会自动选择
+`cpp_trace_graph.backend_kind="validation"` 并打开所需 artifact；普通 business prediction 使用 Release backend。
 
 ## 脚本分层
 
@@ -115,11 +90,13 @@ Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
 
 | 层级 | 路径 | 职责 |
 | --- | --- | --- |
-| 低层 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发单次 runner CLI；workflow 用户不以它作为主入口。 |
-| 容器内入口 | `scripts/internal/entrypoints/model.py` | 解析 modeling CLI，调用 `markov_internal.modeling.runner`。 |
-| C++ 输入记录 | `scripts/internal/markov_internal/modeling/trace_inputs.py` | 展开 profile manifest 中的原始 trace 路径，供 validation artifact 记录。 |
+| 低层 wrapper | `scripts/model.sh` | 启动 modeling 容器并转发唯一的 `--config`；workflow 用户不以它作为主入口。 |
+| 容器内入口 | `scripts/internal/entrypoints/model.py` | 只解析自包含 `--config`，调用 `markov_internal.modeling.runner`。 |
+| 单次 run contract | `scripts/internal/markov_internal/modeling/run_config.py` | 校验 runner config、路径、backend 和输出选择。 |
+| C++ command | `scripts/internal/markov_internal/modeling/backend.py` | 把 normalized run config 转成窄 C++ CLI 并执行。 |
+| trace channel | `scripts/internal/markov_internal/modeling/trace_channels.py` / `trace_inputs.py` | 统一 channel 名称；后者只为 validation 记录 C++ 实际消费的原始文件。 |
 | C++ config / binary | `scripts/internal/markov_internal/modeling/cpp_config.py` | 生成窄 C++ model config、解析 target HiCache 参数，并按 backend 定位 Release 或 Debug/validation binary。 |
-| validation payload | `scripts/internal/markov_internal/modeling/hicache_validation_artifacts.py` | 组装 `validation.json`、HiCache state validation、predicted state trace 和 recommended config audit。 |
+| HiCache backend adapter | `scripts/internal/markov_internal/modeling_workflow/validations/hicache/backend/` | 在 workflow composition root 中把 C++ summary 转成 predicted state trace，并组装 faithful replay / HiCache validation 和 recommended config audit。 |
 | workload helper | `scripts/internal/markov_internal/modeling/workload.py` | 读取 workload report / bench JSONL 中的实际运行窗口。 |
 | workflow 入口 | `scripts/internal/entrypoints/modeling_workflow.py` | profiling 后统一 modeling workflow 入口；用户直接运行该 Python entrypoint，选择 validation object，不选择底层 C++ debug flag。 |
 | workflow 包 | `scripts/internal/markov_internal/modeling_workflow/` | preflight、plan、model-runs、validations、artifact layout、runner adapter 和 workflow summary。 |
@@ -127,8 +104,10 @@ Modeling 相关脚本同样按 wrapper、entrypoint 和可复用包分层：
 Unified modeling workflow 是 profiling 后的 validation / analysis 编排，不属于 C++ 后端主体。它的固定阶段是：
 
 ```text
-preflight -> plan -> model-runs -> validations -> workflow-summary
+preflight -> plan artifact -> model-runs -> validations -> workflow-summary
 ```
+
+`plan artifact` 是瞬时内存规划和 `model_run_plan.json` 写出，不单独打印无实际工作的 console stage。
 
 validation object 是 C++ output 的读取视角，不是独立 workflow：
 
@@ -175,7 +154,7 @@ WorkflowContext
   model_runs/
     <model_run_id>/
       runner_config.json
-      command.json
+      execution.json
       prediction.json
       run_summary.json
       cpp_model_config.json
@@ -195,7 +174,10 @@ WorkflowContext
 - `workflow_summary.json`、`preflight_summary.json`、`artifacts/model_runs_summary.json` 和
   `artifacts/validations/<validation_name>/summary.json` 是用户第一入口，只保留阶段级计数和分组摘要，不嵌入 per-run/per-cell rows；
 - `model_runs/<model_run_id>/runner_config.json` 是 Python runner config，供 `scripts/model.sh --config` 使用；
+- `model_runs/<model_run_id>/execution.json` 记录该 cell 的执行、复用、跳过或失败状态；
 - `model_runs/<model_run_id>/cpp_model_config.json` 是 C++ TraceGraph backend narrow config，供 `trace_graph --model-config` 使用；
+- `run_summary.json` 使用 `markov.trace_graph.run_summary.v3`，只保留 graph 业务计数、微秒单位的 E2E、module business result；
+  validation build 额外包含 `stage_timings_ms`。不重复记录 config/path/thread 字段，这些信息已经存在于 runner config；
 - per-run audit、transition catalog、gate、model run cell 产物都是复现/诊断 artifact，不应和用户第一入口混称；
 - 默认 console 输出不逐 run/cell 打印 `result ok ...`；失败时只补充失败数量、少量 sample 和关键 artifact 路径。
 
@@ -218,8 +200,7 @@ HiCache Python helper 的当前职责分组：
 | mode | 语义 |
 | --- | --- |
 | `faithful_replay` | 不加载子模块，不 patch DAG；消费完整真实执行 trace，验证 base DAG。 |
-| `cache_state` | 加载状态子模块，维护内部状态，不修改 DAG。 |
-| `cache_patch` | 子模块维护状态并通过 mutation API 修改 DAG；HiCache 尚未实现。 |
+| `cache_state` | 执行 HiCache state replay，并把 Release effect intent 交给独立 patch module；Phase 0/1 只应用空 plan，因此不修改 DAG。 |
 
 `replay` 只允许指 `mode=faithful_replay`。启用 HiCacheModule 的场景必须称为 `self-config prediction` 或
 `cross-config prediction`。
@@ -232,10 +213,14 @@ C++ TraceGraph 直接读取 profile manifest 中的 trace channel，并在进程
 - LD_PRELOAD trace；
 - Python probe sidecar。
 
-Python modeling runner 不再调用 trace 合并脚本，也不写长期 `merged_trace` 中间产物。C++ manifest input 层按 torch trace
-pid / manifest 顺序选择 LD_PRELOAD trace 和 Python probe sidecar，执行 wrapper args 注入、standalone HiCache/cache_io/python_probe
-事件附加和稳定排序。`faithful_replay`、`cache_state` 和 `cache_patch` 应看到同一份 manifest source 合同；差异只在是否加载子模块、
-是否产生 DAG mutation。
+Python modeling runner 不调用 trace 合并脚本，也不写 `merged_trace` 中间产物。C++ `trace_manifest_input` 只负责 manifest
+选路、logical input 并行读取和 channel 文件配对；`trace_channel_join` 在同一进程内负责 LD/profiler timestamp search、wrapper args
+注入、standalone HiCache/cache_io/python_probe 事件附加和稳定排序。不存在独立 merger 进程或 sequential 兼容路径。
+`faithful_replay` 和 `cache_state` 看到同一份 manifest source 合同；差异只在 channel selector 和启用的模块。
+
+`--threads` 是 logical input 读取与 DAG build 的总预算。多个 logical input 并行构图时，每个 `DagBuilder` 得到
+`max(1, threads / logical_concurrency)` 个内部线程，避免外层并发与单图并发相乘。`--file-threads` 独立控制单文件 scanner；
+workflow 分别通过 `--trace-threads` 和 `--trace-file-threads` 设置这两个值。
 
 Chrome trace reader 只立即解析顶层 event 字段，`args` 保留原始 JSON，并在模型查询具体 key 时懒加载。需要遍历全部
 args 的模块必须显式走 materialized view，不能在 reader 阶段全量展开。
@@ -257,6 +242,7 @@ C++ 后端位于 `src/modeling/trace_graph`：
 | `include/markov/trace_graph/core` / `src/core` | `TraceEvent`、`DagGraph`、`DagBuilder` 和日志等基础结构。 |
 | `include/markov/trace_graph/frontend` / `src/frontend` | 窄 model config 和 trace normalize。 |
 | `include/markov/trace_graph/io` / `src/io` | Chrome trace 读取输出 adapter。 |
+| `src/cli` | 私有 CLI options、module pipeline、workflow、run summary 与 Debug output adapter；`main.cpp` 只做进程 glue。 |
 | `include/markov/trace_graph/simulation` / `src/simulation` | 拓扑仿真。 |
 | `include/markov/trace_graph/modules` / `src/modules` | `SimulationModule`、业务模块、diagnostics 和 validation。 |
 | `modules/hicache/model` | HiCache target-derived 状态机。 |
@@ -286,10 +272,10 @@ active public include 根固定为 `include/markov/trace_graph/...`，命名空�
 | `trace_graph_simulation` | 拓扑仿真。 |
 | `trace_graph_hicache` | HiCache fact、policy、runtime、radix、storage 和 state model。 |
 | `trace_graph_modules` | 业务 `SimulationModule` 包装层。 |
-| `trace_graph_cli_support` | CLI Debug/Release 边界；Release stub 不链接 diagnostics / validation。 |
+| `trace_graph_cli_support` | 文件输出和 CLI Debug/Release 链接边界；Release 不编译 Debug output adapter，也不链接 diagnostics。 |
 | `trace_graph_diagnostics` | Debug-only module summary、HiCache summary JSON、DAG analysis 和调试输出 adapter。 |
-| `trace_graph_validation` | Debug-only C++ 轻量结构 validation；oracle 对比仍由 Python validation pipeline 负责。 |
 
+窄 C++ model config 只用 `node_scale` / `hicache` 对象自身的 `enabled` 字段表达启用状态，不再同时维护 `modules[]` 注册表。
 业务层不得依赖 diagnostics / validation target；diagnostics / validation 可以消费业务层暴露的结构化结果。Release 构建不链接
 diagnostics / validation，`--model-summary` 和 `--dag-analysis-output-dir` 会明确要求 `TRACE_GRAPH_DEBUG=ON`。调试和验证裁剪只使用单一
 `DEBUG` 宏，由 CMake 的 `TRACE_GRAPH_DEBUG` 或 Debug build 控制，宏不应散落在状态机主体中。
@@ -311,13 +297,14 @@ diagnostics / validation，`--model-summary` 和 `--dag-analysis-output-dir` 会
 | 模块 | 状态 |
 | --- | --- |
 | `NodeScaleModule` | smoke / 节点耗时缩放。 |
-| `HiCacheModule` | state-only；维护 cache state，不修改 DAG。 |
+| `HiCacheModule` | 执行 state replay 并导出 effect intent；自身不修改 DAG。 |
+| `HiCacheDagPatchModule` | 只读消费 state result；Phase 0/1 通过统一 mutation API 应用空 plan，并验证 active topology。 |
 
 ## HiCache 状态后端
 
-HiCache backend 当前是 state-only `SimulationModule`：它消费 state-model facts 和显式 target config，维护 target cache state，
-输出 final state、transition trace、policy decision trace 等结构化 summary；oracle validation 由 Python pipeline 消费这些输出完成。
-它暂不修改 DAG。
+`HiCacheModule` 消费 state-model facts 和显式 target config，维护 target cache state，并输出 Release 可用的 effect intent；
+Debug/validation build 额外输出 final state、transition trace、policy decision trace 等结构化 summary，供 Python oracle validation 使用。
+`HiCacheDagPatchModule` 通过只读共享 result 接在 state replay 后；Phase 0/1 只提交空 mutation plan，因此 active DAG 和 E2E 不变。
 
 主链路：
 
@@ -329,9 +316,20 @@ HiCacheFact
   -> scoped canonical HiCacheTokenRadixTree
   -> StorageDirectory / RefLedger / CapacityIndex / AsyncOperationTable / TargetControlClock
   -> HiCachePolicy
-  -> DerivedStateView / structured summary
-  -> diagnostics summary / Python validation
+  -> DerivedStateView / HiCacheEffectIntentCatalog
+  -> HiCacheDagPatchModule / DagMutationPlan
+  -> topological simulation
+  -> Debug diagnostics summary / Python validation
 ```
+
+Phase 0/1 的 Release 业务结果只包含 state replay 完成状态和 effect intent catalog；policy、transition、capacity、ref 等逐行
+history 只存在于 Debug/validation build。effect intent 记录 operation/request/scope、方向、有效 page/byte 数、逻辑边界、resource lane
+和 not-patchable 原因，不包含 source DAG node id，也不读取 target timing。`kv_bytes_per_page` 缺失时明确输出
+`byte_projection_source=missing`。
+
+当前 patch module 不回写 state result，只提交 `hicache_phase01_empty` 空 plan。`DagMutationPlan` 已支持 node/edge tombstone、独立
+synthetic node identity、add/redirect edge、prospective topology validation、mutation journal 和最终 active topology validation；
+simulator、DAG writer、run summary 与 DAG diagnostics 都读取相同 active graph view。
 
 ### 输入边界
 
@@ -389,9 +387,13 @@ cross-config rule diagnosis 必须先通过 hard workload identity contract：�
 | `model/host_storage_model.cpp` | host cleanup、host allocation 和 capacity eviction。 |
 | `model/writeback_model.cpp` | write-through / write-back、backup ACK、dirty clear 和 ref hold/release。 |
 | `model/finalizer.cpp` | finalize 时 pending operation 收束。 |
+| `model/effect_intent.hpp/.cpp` | 从 canonical async operation 导出 Release effect intent、byte projection 和合同缺口。 |
+| `model/result.hpp` | state replay 的 Release result 与 Debug summary 边界。 |
 | `model/summary.hpp` | HiCache state model 的 Debug/validation 结构化执行结果；Release 下为空标记类型，不包含 JSON。 |
 | `diagnostics/summary.hpp/.cpp` | HiCache summary JSON 序列化；不参与状态机决策。 |
-| `hicache_module.hpp/.cpp` | `SimulationModule` registry glue；Debug 才持有结构化 summary，Release 只执行 state replay。 |
+| `hicache_module.hpp/.cpp` | state replay 的 `SimulationModule` glue；Release 暴露 effect intent，Debug 额外持有 summary。 |
+| `dag_patch_module.hpp/.cpp` | 只读消费 state result，并通过统一 mutation API 修改 DAG；Phase 0/1 只应用空 plan。 |
+| `core/dag_mutation.hpp/.cpp` | 通用 mutation plan、journal、tombstone、redirect、去重和 topology validation。 |
 
 ### 目标 Page 投影
 
@@ -591,7 +593,8 @@ model_runs/<model_run_id>/dag_anchor_coverage.json
 model_runs/<model_run_id>/dag_operation_visibility.json
 ```
 
-`dag_quality.json` 记录 faithful replay sanity 和 channel coverage；`dag_analysis.json` 记录 node / edge / lane /
+`dag_quality.json` 记录 faithful replay sanity 与 DAG build 计数；输入 channel coverage 只在 preflight 的
+`profile_artifact_audit.json` 中维护，不再由 Python 回写 C++ artifact。`dag_analysis.json` 记录 node / edge / lane /
 critical path 摘要；`dag_anchor_coverage.json` 只审计当前 workload identity facts 的 DAG anchor；`dag_operation_visibility.json`
 把候选 HiCache operation 标记为 visible / partially visible / invisible。这里的 `patchable_candidate` 只表示阶段二可继续评估，
 不代表当前业务路径已经支持 patch。
@@ -601,8 +604,8 @@ critical path 摘要；`dag_anchor_coverage.json` 只审计当前 workload ident
 
 ## 验证
 
-validation 不是默认输出，只有 `--emit-validation` 或 config 中 `outputs.emit_validation=true` 时生成，并且必须使用
-validation backend。
+validation 不是默认输出。用户只选择 workflow validation object；runner adapter 由 semantic output requirement 自动生成
+`outputs.emit_validation=true` 或 `outputs.emit_dag_analysis=true`，并选择 validation backend。低层 `model.py` 不暴露 emit CLI。
 
 HiCache state validation 必须同时看：
 
@@ -620,7 +623,7 @@ HiCache state validation 必须同时看：
 
 下列内容不应在 development 文档中用实验结论替代设计：
 
-- HiCache state-to-DAG patch；
+- effect attribution、带宽 cost 和非空 HiCache state-to-DAG patch；
 - async prefetch exact progress / partial completion 的完整 target model；
 - SGLang `TreeNode.host_ref_counter`、host protection lifetime 和复杂 radix split/delete victim tie-break 的完整等价；
 - write-back ack、background flush 和 `_evict_backuped()` / `writing_check(write_back=True)` 的真实异步批处理时序；

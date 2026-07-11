@@ -121,7 +121,8 @@
 - 当前 target modeling config 由 workflow 根据 profile suite 动态生成，不作为手工长期配置维护。
 - Unified modeling workflow 维护两层 modeling config：`model_runs/<model_run_id>/runner_config.json` 是 Python runner config，供
   `scripts/model.sh --config` 使用；同一 model run 输出目录下的 `cpp_model_config.json` 是 C++ TraceGraph backend narrow
-  config。两者不能混称为同一种目标建模配置。
+  config。`runner_config.json` 必须自包含 manifest、output、backend、trace channel、oracle 和 narrow model config；
+  `scripts/model.sh` 不再用额外 CLI 参数重复覆盖这些字段。两层 config 不能混称为同一种目标建模配置。
 - Unified modeling workflow 必须使用统一 validation object、artifact policy、runner adapter 和 `WorkflowProgressReporter`；
   preflight、plan、model-runs、validations 业务模块不直接拥有终端进度输出。
 - DAG analysis、HiCache final-state、HiCache transition 和未来 cache patch 都是同一个 modeling workflow 的 validation
@@ -177,16 +178,17 @@ profile suite
        -> workflow_summary.json
        -> preflight_summary.json
        -> artifacts/{model_run_plan.json,preflight,model_runs_summary.json,validations}
-       -> model_runs/<model_run_id>/{runner_config.json,command.json,prediction.json,run_summary.json,...}
+       -> model_runs/<model_run_id>/{runner_config.json,execution.json,prediction.json,run_summary.json,...}
 ```
 
 ## 工程质量
 
 - 主线使用 C++23，CMake 最低版本为 3.20。
 - 所有项目文档必须使用中文维护；只保留必要的英文协议名、类型名、配置字段、路径、命令和原始事件名。
-- 代码和解释性注释以中文为主，保留必要的英文协议名、类型名和配置字段，此外，所有的“输出性内容”，比如 CLI help，需要保持英文。
-- C++ 公共接口、状态机边界和不变量说明使用 Doxygen 风格；Python 使用模块、类和函数 docstring 表达同类信息。
-- 注释应解释设计原因、不变量和边界，避免复述代码。
+- 所有源码注释和 docstring 必须使用英文；CLI help、日志、错误信息、schema 名称和其它程序输出同样保持英文。项目文档仍按本节上一条约束使用中文维护。
+- C++ 公共接口、模块合同、所有权和生命周期、状态机边界及不变量必须使用 Doxygen 风格英文注释。实现内注释只用于解释非显然的算法、顺序约束和失败边界。
+- Python 模块、类、公共函数和复杂私有 helper 必须提供英文 docstring；参数、返回值、副作用、异常和跨层合同在无法从类型签名直接判断时必须明确说明。
+- 注释应解释设计原因、不变量和边界，避免逐句复述代码、保留失效历史或用注释掩盖可以通过结构表达的复杂度。
 - Python 和 C++ 都优先用清晰的对象、接口和小模块表达有生命周期、有共享状态或多阶段的流程；短小纯函数不强行类化。
 - 单文件长度是可维护性信号，不设硬性数字门禁；文件持续膨胀时应优先按职责拆分，而不是用长函数、匿名 helper 或文件名前缀掩盖边界。
 - 源码结构应体现业务层次：入口只做 CLI glue，编排层只做 plan/execute/summary，业务模型、诊断、validation 和 artifact writer

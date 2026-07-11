@@ -200,7 +200,7 @@ final-state `75 / 75` exact 和 transition `75 / 75` exact。这说明当前 5x3
 当前 active 结果目录：
 
 ```text
-data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75
+data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_full_refactor_validation_20260711
 ```
 
 代码锚点：

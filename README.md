@@ -160,25 +160,26 @@ RUN_DIR=<forced_replay_suite_dir>
 
 python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir "$RUN_DIR" \
-  --output-dir "$RUN_DIR/modeling/modeling_workflow_hicache_state_manual_3inputs" \
-  --validations hicache_final_state,hicache_transition \
+  --output-dir "$RUN_DIR/modeling/modeling_workflow_full" \
+  --validations base_dag,final_dag,hicache_dag_mapping,hicache_final_state,hicache_transition \
   --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
   --configs c0_wt_timeout_p128_balanced,c1_wts_wait_p128_low_l1,c2_wb_best_effort_p64_low_l1,c3_wt_best_effort_p32_low_host,c4_wb_timeout_p64_low_capacity \
   --prediction-scope self,cross \
   --page-key-mode strip_scope \
   --trace-threads 4 \
   --trace-file-threads 4 \
-  --model-run-jobs 3 \
+  --model-run-jobs 4 \
   --force \
   --continue-on-error
 ```
 
-HiCacheModule 当前是 state-only backend：它维护 cache state 和 transition trace，不修改 DAG，
-`prediction.json.predicted_e2e_ns` 只来自 base DAG 拓扑仿真，不是 HiCache state 准确性的验收指标。
+`HiCacheModule` 当前执行 state replay 并导出 Release effect intent；`HiCacheDagPatchModule` 在 Phase 0/1 只提交空
+mutation plan，因此仍不改变 DAG。`prediction.json.predicted_e2e_us` 来自当前 active DAG 的拓扑仿真，单位为微秒；
+在空 patch 阶段它等于 base DAG 结果，不是 HiCache state 准确性的验收指标。
 
 ## HiCache 当前进展
 
-截至 2026-07-07，当前主线状态是：
+截至 2026-07-11，当前主线状态是：
 
 - Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `54` 个 target；
 - `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
@@ -193,10 +194,15 @@ HiCacheModule 当前是 state-only backend：它维护 cache state 和 transitio
 - C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
 - forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和
   `modeling_workflow.py` 已落地；
+- C++ Phase 0/1 已建立 state result、effect intent、统一 DAG mutation plan/journal、active topology validation 和空
+  HiCache patch module；真实 effect attribution、带宽 cost 和非空 DAG patch 尚未实现；
 - 当前 active full-matrix baseline 是
-  `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_hicache_release_visibility_worker_query_large_op_guard_75`，
-  HiCache final-state self/cross `75/75` exact，transition exactness、transition-count exactness 和 page-lifecycle multiset
-  exactness 均为 `75/75`；
+  `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_full_refactor_validation_20260711`：
+  `90/90` model runs usable，HiCache DAG mapping `15/15` ready，final-state self/cross、transition exactness、
+  transition-count exactness 和 page-lifecycle multiset exactness 均为 `75/75`；75 个 cache-state run 共导出 `10110`
+  个 effect intent，空 patch、零 mutation 和 Debug active topology validation 均为 `75/75`；
+- 同一基线的 `base_dag` / `final_dag` 只有 `1/15` 通过 faithful replay E2E error gate，其余 `14/15` 为
+  `dag_replay_error_too_high`；这是当前 DAG/E2E 建模限制，不是 state/transition、cycle 或 workflow 执行失败；
 - `scripts/internal/entrypoints/` 只保留 `profile.py`、`model.py` 和 `modeling_workflow.py` 三个主入口，复用逻辑位于
   `scripts/internal/markov_internal/`；旧平铺脚本和人工对照入口已删除，不保留兼容入口。
 
