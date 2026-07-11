@@ -1,25 +1,29 @@
 /**
  * @file
- * @brief HiCache canonical radix tree 实现。
+ * @brief Canonical HiCache radix-tree implementation.
  */
 #include "markov/trace_graph/modules/hicache/radix/token_radix_tree.hpp"
 
+#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/radix/node_split_policy.hpp"
 
 #include <algorithm>
 #include <iterator>
 #include <ranges>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::modules::hicache::radix {
 
 namespace token_radix_tree_detail {
 
-size_t common_prefix_size(const std::vector<std::string> & left, const std::vector<std::string> & right) {
-    const auto [left_it, right_it] = std::ranges::mismatch(left, right);
-    (void)right_it;
-    return static_cast<size_t>(std::ranges::distance(left.begin(), left_it));
+size_t common_prefix_size(const std::vector<std::string> & node_pages, const std::vector<std::string> & path, size_t path_offset = 0) {
+    const auto available = path_offset < path.size() ? path.size() - path_offset : 0;
+    const auto limit = std::min(node_pages.size(), available);
+    size_t matched = 0;
+    while (matched < limit && node_pages[matched] == path[path_offset + matched]) ++matched;
+    return matched;
 }
 
 std::vector<std::string> slice_pages(const std::vector<std::string> & pages, size_t begin, size_t end) {
@@ -39,6 +43,37 @@ void append_all(std::vector<std::string> & target, const std::vector<std::string
 
 bool has_host_backup(const HiCacheCacheNode & node) { return node.residency.host_present; }
 
+struct LookupPrefixState {
+    bool device_open = true;
+    bool host_open = true;
+    bool storage_open = true;
+    bool visible_open = true;
+};
+
+void extend_lookup_prefixes(HiCachePathLookup & result, const HiCacheCacheNode & child, LookupPrefixState & state) {
+    if (state.device_open && child.residency.device_present) {
+        append_all(result.device_pages, child.pages);
+        result.device_chain.push_back(child.id);
+        result.deepest_device_node = child.id;
+    }
+    else state.device_open = false;
+
+    if (state.host_open && child.residency.host_present && child.residency.host_visible) {
+        append_all(result.host_pages, child.pages);
+        result.host_chain.push_back(child.id);
+        result.deepest_host_node = child.id;
+    }
+    else state.host_open = false;
+
+    if (state.storage_open && child.residency.storage_readable) append_all(result.storage_pages, child.pages);
+    else state.storage_open = false;
+
+    const bool visible = child.residency.device_present || (child.residency.host_present && child.residency.host_visible) || child.residency.storage_readable;
+    if (state.visible_open && visible) append_all(result.visible_pages, child.pages);
+    else state.visible_open = false;
+}
+
+#ifdef DEBUG
 std::string page_hash_from_id(const std::string & page_id) {
     const auto delimiter = page_id.find('|');
     if (delimiter == std::string::npos) return page_id;
@@ -50,26 +85,33 @@ std::string page_scope_from_id(const std::string & page_id) {
     if (delimiter == std::string::npos) return "-1";
     return page_id.substr(0, delimiter);
 }
+#endif
 
 } // namespace token_radix_tree_detail
 
 using token_radix_tree_detail::append_all;
 using token_radix_tree_detail::common_prefix_size;
+using token_radix_tree_detail::extend_lookup_prefixes;
 using token_radix_tree_detail::has_host_backup;
+using token_radix_tree_detail::LookupPrefixState;
+#ifdef DEBUG
 using token_radix_tree_detail::page_hash_from_id;
 using token_radix_tree_detail::page_scope_from_id;
+#endif
 using token_radix_tree_detail::slice_pages;
 using token_radix_tree_detail::suffix_pages;
 
 HiCacheTokenRadixTree::HiCacheTokenRadixTree() {
     /**
-     * @brief root 不承载 page residency。
+     * @brief Keeps the topology root free of page residency.
      *
-     * 它仅作为所有 cache_scope/page path 的拓扑根，避免把真实 page 归属混入根节点。
+     * The root exists only to anchor page paths for this cache scope; assigning real
+     * pages to it would mix topology with residency ownership.
      */
     HiCacheCacheNode root;
     root.id = 0;
-    root.last_access_order = ++access_clock_;
+    access_clock_ = core::checked_add_u64(access_clock_, 1, "HiCache radix access clock overflow");
+    root.last_access_order = access_clock_;
     nodes_.push_back(std::move(root));
 }
 
@@ -91,9 +133,10 @@ std::optional<HiCacheNodeId> HiCacheTokenRadixTree::node_for_page(const std::str
     return it->second;
 }
 
-std::vector<std::string> HiCacheTokenRadixTree::node_pages(HiCacheNodeId node_id) const {
+const std::vector<std::string> & HiCacheTokenRadixTree::node_pages(HiCacheNodeId node_id) const {
     const auto * current = node(node_id);
-    return current == nullptr ? std::vector<std::string>{} : current->pages;
+    if (current == nullptr) throw std::out_of_range("HiCache radix node is missing or inactive");
+    return current->pages;
 }
 
 std::vector<HiCacheNodeId> HiCacheTokenRadixTree::ancestor_node_ids(HiCacheNodeId terminal_node) const {
@@ -113,24 +156,27 @@ std::vector<std::string> HiCacheTokenRadixTree::flattened_pages(HiCacheNodeId te
     return pages;
 }
 
+#ifdef DEBUG
 void HiCacheTokenRadixTree::observe_page_path(const HiCachePagePath & path) {
     /**
-     * @brief projection metadata 只服务 split diagnostics 和 storage key 还原。
+     * @brief Retains projection metadata only for split diagnostics.
      *
-     * 真正 residency 状态仍保存在 radix node 上。
+     * Residency remains canonical on radix nodes; this map only reconstructs token
+     * spans and storage keys for Debug evidence.
      */
     std::ranges::for_each(path.pages, [&](const auto & page) { page_projection_[page.id] = page; });
 }
 
 HiCacheNodeSplitProjection HiCacheTokenRadixTree::split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const {
     /**
-     * @brief split 后 prefix/suffix 仍需能解释到原 token/page 区间。
+     * @brief Preserves source token/page explanation across a radix split.
      *
-     * 缺 projection metadata 时继续保留 page hash，但把 token_span_known 标成 false。
+     * Missing projection metadata still yields page hashes, while explicitly marking
+     * the source token span as unknown.
      */
     HiCacheNodeSplitProjection projection{
         .depth_page_begin = depth_page_begin,
-        .depth_page_end = depth_page_begin + static_cast<uint64_t>(pages.size()),
+        .depth_page_end = core::checked_add_u64(depth_page_begin, static_cast<uint64_t>(pages.size()), "HiCache split depth overflow"),
     };
     projection.page_hashes.reserve(pages.size());
     projection.storage_keys.reserve(pages.size());
@@ -161,6 +207,7 @@ HiCacheNodeSplitProjection HiCacheTokenRadixTree::split_projection(const std::ve
     }
     return projection;
 }
+#endif
 
 HiCacheNodeId HiCacheTokenRadixTree::create_child(HiCacheNodeId parent, std::vector<std::string> pages) {
     if (pages.empty()) return parent;
@@ -168,33 +215,52 @@ HiCacheNodeId HiCacheTokenRadixTree::create_child(HiCacheNodeId parent, std::vec
     child.id = nodes_.size();
     child.parent = parent;
     child.pages = std::move(pages);
-    child.last_access_order = ++access_clock_;
+    access_clock_ = core::checked_add_u64(access_clock_, 1, "HiCache radix access clock overflow");
+    child.last_access_order = access_clock_;
     nodes_.push_back(std::move(child));
     nodes_[parent].children[nodes_.back().pages.front()] = nodes_.back().id;
+    for (const auto & page : nodes_.back().pages) page_to_node_[page] = nodes_.back().id;
     return nodes_.back().id;
 }
 
-HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNodeId child_id, size_t split_pages) {
+HiCacheNodeId HiCacheTokenRadixTree::split_child(const ChildSplitRequest & request) {
     /**
-     * @brief radix split 会把原 child 的 residency/ref/hit_count 复制到 prefix node。
+     * @brief Copies child residency, references, and hit count into the split prefix.
      *
-     * suffix node 再承接剩余 pages；这模拟 SGLang radix cache 中共享前缀节点的语义。
+     * The original child retains the suffix pages, preserving SGLang shared-prefix
+     * semantics for both halves of the compressed edge.
      */
+    const auto parent = request.parent;
+    const auto child_id = request.child;
+    const auto split_pages = request.split_pages;
     const auto child_pages = nodes_[child_id].pages;
     if (split_pages == 0 || split_pages >= child_pages.size()) return child_id;
 
     const auto prefix = slice_pages(child_pages, 0, split_pages);
     const auto suffix = suffix_pages(child_pages, split_pages);
+#ifdef DEBUG
     const auto parent_depth_pages = static_cast<uint64_t>(flattened_pages(parent).size());
     const auto context = HiCacheNodeSplitContext{
         .parent_child_key = prefix.front(),
         .suffix_child_key = suffix.front(),
         .prefix_projection = split_projection(prefix, parent_depth_pages),
-        .suffix_projection = split_projection(suffix, parent_depth_pages + static_cast<uint64_t>(prefix.size())),
+        .suffix_projection =
+            split_projection(suffix,
+                             core::checked_add_u64(parent_depth_pages, static_cast<uint64_t>(prefix.size()), "HiCache split projection depth overflow")),
     };
+#endif
 
     const HiCacheNodeSplitPolicy policy;
-    auto plan = policy.plan(parent, nodes_[child_id], nodes_.size(), split_pages, prefix, suffix, context);
+    auto plan = policy.plan(parent,
+                            nodes_[child_id],
+                            nodes_.size(),
+                            HiCacheNodeSplitPages{
+                                .prefix = prefix,
+                                .suffix = suffix,
+                            });
+#ifdef DEBUG
+    policy.attach_debug_record(plan, parent, nodes_[child_id], split_pages, context);
+#endif
     nodes_.push_back(std::move(plan.prefix_node));
 
     const auto split_id = nodes_.back().id;
@@ -202,48 +268,40 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(HiCacheNodeId parent, HiCacheNo
     nodes_[split_id].children[suffix.front()] = child_id;
     nodes_[child_id].parent = split_id;
     policy.apply_suffix(nodes_[child_id], plan);
-    ++split_count_;
 #ifdef DEBUG
+    split_count_ = core::checked_add_u64(split_count_, 1, "HiCache radix split count overflow");
     split_history_.push_back(std::move(plan.record));
 #endif
-    rebuild_page_index();
+    for (const auto & page : prefix) page_to_node_[page] = split_id;
+    for (const auto & page : suffix) page_to_node_[page] = child_id;
     return split_id;
 }
 
-HiCacheNodeId HiCacheTokenRadixTree::insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & suffix) {
+HiCacheNodeId HiCacheTokenRadixTree::insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & pages, size_t offset) {
     /**
-     * @brief 插入只改变拓扑。
+     * @brief Changes topology without assigning residency.
      *
-     * L1/L2/L3 residency 由 insert_device_path/insert_host_path 等 higher-level
-     * 操作在 touched chain 上赋值。
+     * Higher-level device and host insertion operations assign tier residency over
+     * the resulting touched chain.
      */
-    if (suffix.empty()) return parent;
-    const auto child_it = nodes_[parent].children.find(suffix.front());
-    if (child_it == nodes_[parent].children.end()) return create_child(parent, suffix);
+    if (offset >= pages.size()) return parent;
+    const auto child_it = nodes_[parent].children.find(pages[offset]);
+    if (child_it == nodes_[parent].children.end()) return create_child(parent, slice_pages(pages, offset, pages.size()));
 
     const auto child_id = child_it->second;
     auto & child = nodes_[child_id];
-    const auto shared = common_prefix_size(child.pages, suffix);
-    if (shared == child.pages.size()) {
-        const auto remaining = suffix_pages(suffix, shared);
-        return remaining.empty() ? child_id : insert_suffix(child_id, remaining);
-    }
+    const auto shared = common_prefix_size(child.pages, pages, offset);
+    if (shared == child.pages.size()) { return offset + shared == pages.size() ? child_id : insert_suffix(child_id, pages, offset + shared); }
 
-    const auto split_id = split_child(parent, child_id, shared);
-    const auto remaining = suffix_pages(suffix, shared);
-    return remaining.empty() ? split_id : create_child(split_id, remaining);
-}
-
-void HiCacheTokenRadixTree::rebuild_page_index() {
-    page_to_node_.clear();
-    for (const auto & current : nodes_) {
-        if (!current.active || current.id == 0) continue;
-        std::ranges::for_each(current.pages, [&](const auto & page) { page_to_node_[page] = current.id; });
-    }
+    const auto split_id = split_child(ChildSplitRequest{ .parent = parent, .child = child_id, .split_pages = shared });
+    return offset + shared == pages.size() ? split_id : create_child(split_id, slice_pages(pages, offset + shared, pages.size()));
 }
 
 void HiCacheTokenRadixTree::touch_node(HiCacheNodeId node_id) {
-    if (auto * current = mutable_node(node_id); current != nullptr) current->last_access_order = ++access_clock_;
+    if (auto * current = mutable_node(node_id); current != nullptr) {
+        access_clock_ = core::checked_add_u64(access_clock_, 1, "HiCache radix access clock overflow");
+        current->last_access_order = access_clock_;
+    }
 }
 
 bool HiCacheTokenRadixTree::has_backup_child(HiCacheNodeId node_id) const {
@@ -262,6 +320,7 @@ void HiCacheTokenRadixTree::deactivate_subtree(HiCacheNodeId node_id, std::vecto
     std::ranges::copy(nodes_[node_id].children | std::views::values, std::back_inserter(child_ids));
     std::ranges::for_each(child_ids, [&](auto child_id) { deactivate_subtree(child_id, affected_nodes); });
     nodes_[node_id].children.clear();
+    for (const auto & page : nodes_[node_id].pages) page_to_node_.erase(page);
     nodes_[node_id].refs = HiCacheNodeRefState{};
     nodes_[node_id].residency = HiCacheNodeResidency{};
     nodes_[node_id].active = false;
@@ -278,34 +337,29 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup_peek(const std::vector<std::stri
 
 HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::string> & pages, bool refresh_access) {
     /**
-     * @brief lookup 会按需 split 部分命中的 child。
+     * @brief Splits partially matched children while resolving a path.
      *
-     * 这样后续 residency/ref 变更能落在精确 prefix node 上。lookup_peek 关闭
-     * access refresh，但仍可能规范化拓扑。
+     * This gives later residency and reference mutations an exact prefix node.
+     * `lookup_peek` suppresses access refresh but may still canonicalize topology.
      */
     HiCachePathLookup result;
     if (pages.empty()) return result;
 
     HiCacheNodeId current_id = 0;
     size_t matched = 0;
-    bool device_prefix_open = true;
-    bool host_prefix_open = true;
-    bool storage_prefix_open = true;
-    bool visible_prefix_open = true;
+    LookupPrefixState prefix_state;
 
     while (matched < pages.size()) {
         auto & current = nodes_[current_id];
         const auto child_it = current.children.find(pages[matched]);
         if (child_it == current.children.end()) break;
         auto child_id = child_it->second;
-        auto child_pages = nodes_[child_id].pages;
-        auto remaining = suffix_pages(pages, matched);
-        const auto shared = common_prefix_size(child_pages, remaining);
+        const auto shared = common_prefix_size(nodes_[child_id].pages, pages, matched);
         if (shared == 0) break;
-        if (shared < child_pages.size()) {
-            child_id = split_child(current_id, child_id, shared);
-            child_pages = nodes_[child_id].pages;
+        if (shared < nodes_[child_id].pages.size()) {
+            child_id = split_child(ChildSplitRequest{ .parent = current_id, .child = child_id, .split_pages = shared });
         }
+        const auto & child_pages = nodes_[child_id].pages;
 
         if (refresh_access) touch_node(child_id);
         append_all(result.topology_pages, child_pages);
@@ -313,27 +367,7 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::stri
         result.terminal_node = child_id;
 
         const auto & child = nodes_[child_id];
-        if (device_prefix_open && child.residency.device_present) {
-            append_all(result.device_pages, child.pages);
-            result.device_chain.push_back(child_id);
-            result.deepest_device_node = child_id;
-        }
-        else { device_prefix_open = false; }
-
-        if (host_prefix_open && child.residency.host_present && child.residency.host_visible) {
-            append_all(result.host_pages, child.pages);
-            result.host_chain.push_back(child_id);
-            result.deepest_host_node = child_id;
-        }
-        else { host_prefix_open = false; }
-
-        if (storage_prefix_open && child.residency.storage_readable) append_all(result.storage_pages, child.pages);
-        else storage_prefix_open = false;
-
-        const auto visible =
-            child.residency.device_present || (child.residency.host_present && child.residency.host_visible) || child.residency.storage_readable;
-        if (visible_prefix_open && visible) append_all(result.visible_pages, child.pages);
-        else visible_prefix_open = false;
+        extend_lookup_prefixes(result, child, prefix_state);
 
         matched += child_pages.size();
         current_id = child_id;
@@ -344,9 +378,9 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::stri
 std::vector<std::string> HiCacheTokenRadixTree::contiguous_prefix(const std::vector<std::string> & pages, bool include_device, bool include_host,
                                                                   bool include_storage) {
     /**
-     * @brief prefix 查询要求从第一页开始连续可见。
+     * @brief Requires visibility to remain contiguous from the first page.
      *
-     * 任一层级断开后不能跳过缺口继续命中。
+     * A gap at any tier terminates the prefix; later visible pages cannot be skipped to.
      */
     (void)lookup_peek(pages);
     std::vector<std::string> prefix;
@@ -366,9 +400,10 @@ std::vector<std::string> HiCacheTokenRadixTree::contiguous_prefix(const std::vec
 
 HiCacheInsertResult HiCacheTokenRadixTree::insert_device_path(const std::vector<std::string> & pages, int64_t priority, bool dirty) {
     /**
-     * @brief L1 insert 会沿 terminal chain 标记 device_present。
+     * @brief Marks device residency along the complete terminal chain.
      *
-     * 若节点已有 host backup，该 device value 视为从 backup 恢复，不再因为本次 insert 变成 dirty。
+     * A node with a host backup is restored rather than newly produced and therefore
+     * does not become dirty solely because of this insertion.
      */
     HiCacheInsertResult result;
     if (pages.empty()) return result;
@@ -377,20 +412,16 @@ HiCacheInsertResult HiCacheTokenRadixTree::insert_device_path(const std::vector<
     result.existing_topology_prefix_pages = static_cast<uint64_t>(existing.topology_pages.size());
     result.inserted_key_pages = static_cast<uint64_t>(pages.size());
     result.page_aligned_key_pages = static_cast<uint64_t>(pages.size());
-    std::set<HiCacheNodeId> existing_nodes;
-    std::ranges::for_each(nodes_, [&](const auto & current) {
-        if (current.active) existing_nodes.insert(current.id);
-    });
+    const auto existing_node_count = nodes_.size();
 
-    result.terminal_node = insert_suffix(0, pages);
-    rebuild_page_index();
+    result.terminal_node = insert_suffix(0, pages, 0);
     result.touched_nodes = ancestor_node_ids(result.terminal_node);
     for (const auto node_id : result.touched_nodes) {
         auto & current = nodes_[node_id];
         current.priority = std::max(current.priority, priority);
         touch_node(node_id);
         if (current.residency.device_present) continue;
-        const bool existed = existing_nodes.contains(node_id);
+        const bool existed = node_id < existing_node_count;
         const bool had_backup = has_host_backup(current);
         const bool was_dirty = current.residency.device_dirty;
         current.residency.device_present = true;
@@ -409,9 +440,10 @@ HiCacheInsertResult HiCacheTokenRadixTree::insert_host_path(const std::vector<st
 HiCacheInsertResult HiCacheTokenRadixTree::insert_host_path(const std::vector<std::string> & pages, const std::set<std::string> & visible_pages,
                                                             bool storage_readable) {
     /**
-     * @brief Host insertion 可以只 materialize 可见 prefix。
+     * @brief Allows host insertion to materialize only the visible prefix.
      *
-     * visible_pages 之外的 topology node 可能已因 split/insert 创建，但不能被标成 host_visible。
+     * Splits may create topology beyond `visible_pages`; those nodes must not gain
+     * host visibility.
      */
     HiCacheInsertResult result;
     if (pages.empty()) return result;
@@ -420,8 +452,7 @@ HiCacheInsertResult HiCacheTokenRadixTree::insert_host_path(const std::vector<st
     result.existing_topology_prefix_pages = static_cast<uint64_t>(existing.topology_pages.size());
     result.inserted_key_pages = static_cast<uint64_t>(pages.size());
     result.page_aligned_key_pages = static_cast<uint64_t>(pages.size());
-    result.terminal_node = insert_suffix(0, pages);
-    rebuild_page_index();
+    result.terminal_node = insert_suffix(0, pages, 0);
     result.touched_nodes = ancestor_node_ids(result.terminal_node);
     for (const auto node_id : result.touched_nodes) {
         auto & current = nodes_[node_id];
@@ -441,8 +472,12 @@ void HiCacheTokenRadixTree::add_lock_ref(const std::vector<HiCacheNodeId> & chai
     if (owner.empty()) return;
     for (const auto node_id : chain) {
         if (auto * current = mutable_node(node_id); current != nullptr) {
-            current->refs.lock_ref_total++;
-            current->refs.lock_refs_by_owner[owner]++;
+            const auto owner_ref = current->refs.lock_refs_by_owner.find(owner);
+            const auto owner_count = owner_ref == current->refs.lock_refs_by_owner.end() ? uint64_t{ 0 } : owner_ref->second;
+            const auto next_total = core::checked_add_u64(current->refs.lock_ref_total, 1, "HiCache lock-ref total overflow");
+            const auto next_owner = core::checked_add_u64(owner_count, 1, "HiCache lock-ref owner count overflow");
+            current->refs.lock_ref_total = next_total;
+            current->refs.lock_refs_by_owner.insert_or_assign(owner, next_owner);
         }
     }
 }
@@ -451,28 +486,32 @@ void HiCacheTokenRadixTree::add_host_ref(const std::vector<HiCacheNodeId> & chai
     if (owner.empty()) return;
     for (const auto node_id : chain) {
         if (auto * current = mutable_node(node_id); current != nullptr) {
-            current->refs.host_ref_total++;
-            current->refs.host_refs_by_owner[owner]++;
+            const auto owner_ref = current->refs.host_refs_by_owner.find(owner);
+            const auto owner_count = owner_ref == current->refs.host_refs_by_owner.end() ? uint64_t{ 0 } : owner_ref->second;
+            const auto next_total = core::checked_add_u64(current->refs.host_ref_total, 1, "HiCache host-ref total overflow");
+            const auto next_owner = core::checked_add_u64(owner_count, 1, "HiCache host-ref owner count overflow");
+            current->refs.host_ref_total = next_total;
+            current->refs.host_refs_by_owner.insert_or_assign(owner, next_owner);
         }
     }
 }
 
 void HiCacheTokenRadixTree::release_refs_by_owner(const std::string & owner) {
     /**
-     * @brief ref counter 以 owner 为删除单位。
+     * @brief Releases reference counters atomically by owner identity.
      *
-     * 这里和 HiCacheRefLedger::release_owner 保持同一语义；计数用 saturating subtract
-     * 防止诊断路径重复释放造成 underflow。
+     * The tree and ref ledger are one invariant boundary. A repeated release or
+     * mismatched owner count is a model error and must not be hidden by saturation.
      */
     if (owner.empty()) return;
     for (auto & current : nodes_) {
         if (!current.active) continue;
         if (const auto it = current.refs.lock_refs_by_owner.find(owner); it != current.refs.lock_refs_by_owner.end()) {
-            current.refs.lock_ref_total -= std::min(current.refs.lock_ref_total, it->second);
+            current.refs.lock_ref_total = core::checked_subtract_u64(current.refs.lock_ref_total, it->second, "HiCache lock-ref release underflow");
             current.refs.lock_refs_by_owner.erase(it);
         }
         if (const auto it = current.refs.host_refs_by_owner.find(owner); it != current.refs.host_refs_by_owner.end()) {
-            current.refs.host_ref_total -= std::min(current.refs.host_ref_total, it->second);
+            current.refs.host_ref_total = core::checked_subtract_u64(current.refs.host_ref_total, it->second, "HiCache host-ref release underflow");
             current.refs.host_refs_by_owner.erase(it);
         }
     }
@@ -493,9 +532,9 @@ void HiCacheTokenRadixTree::clear_dirty(HiCacheNodeId node_id) {
 
 void HiCacheTokenRadixTree::demote_device_to_host(HiCacheNodeId node_id, bool ensure_host) {
     /**
-     * @brief write-back eviction 可以把 dirty device 同步为 host/storage-readable 后再释放 L1。
+     * @brief Supports write-back demotion before releasing device residency.
      *
-     * 普通 device eviction 不会凭空创建 host backup。
+     * Ordinary device eviction never invents a host backup.
      */
     if (auto * current = mutable_node(node_id); current != nullptr) {
         if (ensure_host) {
@@ -518,12 +557,16 @@ void HiCacheTokenRadixTree::remove_device_regular(HiCacheNodeId node_id) {
 
 HiCacheHostEvictionResult HiCacheTokenRadixTree::evict_host_leaf(HiCacheNodeId node_id) {
     /**
-     * @brief L2 cleanup 删除的是 host-visible leaf/subtree，而不是简单清掉一个 flag。
+     * @brief Removes the host-visible leaf or subtree rather than clearing one flag.
      *
-     * 有 device value、ref 或 backup child 时都不能驱逐，保持 radix topology 可解释。
+     * Device residency, references, or backed-up children prevent eviction so the
+     * remaining radix topology stays explainable.
      */
     auto result = HiCacheHostEvictionResult{
         .node_id = node_id,
+        .pages = {},
+        .affected_nodes = {},
+        .reason = {},
     };
     auto * current = mutable_node(node_id);
     if (current == nullptr || node_id == 0) {
@@ -570,7 +613,6 @@ HiCacheHostEvictionResult HiCacheTokenRadixTree::evict_host_leaf(HiCacheNodeId n
     result.affected_nodes.clear();
     result.affected_nodes.push_back(parent->id);
     deactivate_subtree(node_id, result.affected_nodes);
-    rebuild_page_index();
     result.evicted = true;
     result.reason = "evict_host_leaf";
     return result;

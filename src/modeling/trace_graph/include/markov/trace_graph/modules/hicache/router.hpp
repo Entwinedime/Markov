@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache fact 到 state model role 的硬门禁路由。
+ * @brief Strict gate from HiCache facts to state-model roles.
  */
 #pragma once
 
@@ -13,11 +13,11 @@
 namespace markov::trace_graph::modules::hicache {
 
 /**
- * @brief C++ HiCache state model 当前接受的 fact role。
+ * @brief Fact roles currently accepted by the C++ HiCache state model.
  *
- * Unknown 只用于 summary 诊断，不能承载当前合同外的处理分支。
+ * `Unknown` is diagnostic only and must never become a fallback processing branch.
  */
-enum class HiCacheFactRole {
+enum class HiCacheFactRole : std::uint8_t {
     Unknown,
     PrefetchCandidateAnchor,
     CacheLookupInput,
@@ -26,10 +26,11 @@ enum class HiCacheFactRole {
 };
 
 /**
- * @brief fact 路由结果。
+ * @brief Result of applying the state-model consumer and role gates.
  *
- * `model_fact` 表示 fact 声明给 `hicache_state_model` 消费；`known_role` 表示
- * class/role 在当前 state model 白名单中。二者分开可区分非模型事实和模型事实 schema 漂移。
+ * `model_fact` means the catalog declared `hicache_state_model` as a consumer.
+ * `known_role` means class, role, and phase belong to the active whitelist. Keeping them
+ * separate distinguishes unrelated facts from schema drift in intended model inputs.
  */
 struct HiCacheFactRoute {
     bool model_fact = false;
@@ -37,23 +38,20 @@ struct HiCacheFactRoute {
     HiCacheFactRole role = HiCacheFactRole::Unknown;
 };
 
-/** @brief 将 fact.role 字符串解析成白名单枚举。 */
-[[nodiscard]] HiCacheFactRole parse_hicache_fact_role(const std::string & role);
+/** @brief Parses a role token into the active whitelist enum. */
+[[nodiscard]] HiCacheFactRole parse_hicache_fact_role(std::string_view role);
 
-/** @brief 返回 role 的稳定字符串名。 */
+/** @brief Returns the stable artifact name for a role. */
 [[nodiscard]] std::string hicache_fact_role_name(HiCacheFactRole role);
 
-/** @brief 对 fact 执行输入契约检查和 role 路由。 */
+/** @brief Applies consumer, phase, class, and role gates to one fact. */
 [[nodiscard]] HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact);
 
-/** @brief 判断 role 是否有 active handler。 */
-[[nodiscard]] bool hicache_fact_role_implemented(HiCacheFactRole role);
-
 /**
- * @brief 返回 role 对应的必需 state-model 字段缺口。
+ * @brief Returns missing required fields for one approved role.
  *
- * 缺口进入 summary，不触发 source result 兜底。
+ * Missing fields become explicit contract errors; source outcomes are never used as fallback.
  */
-[[nodiscard]] std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role, uint64_t effective_page_size);
+[[nodiscard]] std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role);
 
 } // namespace markov::trace_graph::modules::hicache

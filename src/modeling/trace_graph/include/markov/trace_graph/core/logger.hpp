@@ -1,43 +1,49 @@
 /**
  * @file
- * @brief C++ trace_graph 后端的轻量日志设施。
+ * @brief Lightweight process-local logging for the C++ TraceGraph backend.
  */
 #pragma once
 
+#include <cstdint>
 #include <mutex>
 #include <sstream>
 
 namespace markov::trace_graph::core {
 
-/** @brief C++ TraceGraph CLI 进程内使用的轻量日志器。 */
+/** @brief Serializes complete log lines without imposing a logging dependency. */
 class Logger {
 public:
-    /** @brief 日志级别；数值越小输出越详细。枚举值避免与全局 DEBUG 宏同名。 */
-    enum Level : int { Debug = 0, Info = 1, Warn = 2, Error = 3, Off = 4 };
+    /** @brief Severity threshold; lower values enable more verbose output. */
+    enum Level : std::uint8_t { Debug = 0, Info = 1, Warn = 2, Error = 3, Off = 4 };
 
     static Logger & instance();
 
-    /** @brief 设置当前进程的最小输出日志级别。 */
+    /** @brief Sets the minimum severity emitted by this process. */
     void set_level(Level lv) { level_ = lv; }
 
-    /** @brief 读取当前进程的最小输出日志级别。 */
+    /** @brief Returns the current process-wide severity threshold. */
     [[nodiscard]] Level level() const { return level_; }
 
+    /** @brief Tests a level before constructing expensive log arguments. */
+    [[nodiscard]] bool enabled(Level lv) const { return level_ <= lv; }
+
     /**
-     * @brief RAII 日志行构造器。
+     * @brief RAII builder that emits one complete line at destruction.
      *
-     * 析构时一次性写出整行，避免多线程下半行日志交错。用户可见日志内容保持英文；
-     * 这里的注释说明实现约束。
+     * The object buffers fragments locally and acquires the logger mutex only for
+     * the final write. Moving a line transfers emission ownership exactly once.
      */
     class Line {
     public:
-        /** @brief 记录一行日志的临时对象；active=false 时只吞掉输出。 */
+        /** @brief Creates an active line or a sink when the level is disabled. */
         Line(Level lv, bool active, std::mutex * mtx);
         ~Line();
-        Line(Line &&) = default;
-        Line & operator=(Line &&) = default;
+        Line(const Line &) = delete;
+        Line & operator=(const Line &) = delete;
+        Line(Line && other) noexcept;
+        Line & operator=(Line &&) = delete;
 
-        /** @brief 追加一个可流式输出的片段；最终在析构时一次性输出。 */
+        /** @brief Appends one streamable fragment to the buffered line. */
         template <typename T> Line & operator<<(const T & v) {
             if (active_) ss_ << v;
             return *this;
@@ -50,16 +56,16 @@ public:
         std::mutex * mtx_;
     };
 
-    /** @brief 构造 debug 级日志行。 */
+    /** @brief Creates a debug-level line. */
     [[nodiscard]] Line debug() { return Line(Debug, level_ <= Debug, &mtx_); }
 
-    /** @brief 构造 info 级日志行。 */
+    /** @brief Creates an info-level line. */
     [[nodiscard]] Line info() { return Line(Info, level_ <= Info, &mtx_); }
 
-    /** @brief 构造 warn 级日志行。 */
+    /** @brief Creates a warning-level line. */
     [[nodiscard]] Line warn() { return Line(Warn, level_ <= Warn, &mtx_); }
 
-    /** @brief 构造 error 级日志行。 */
+    /** @brief Creates an error-level line. */
     [[nodiscard]] Line error() { return Line(Error, level_ <= Error, &mtx_); }
 
 private:

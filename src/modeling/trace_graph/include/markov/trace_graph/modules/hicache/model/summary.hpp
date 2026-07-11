@@ -1,11 +1,11 @@
 /**
  * @file
- * @brief HiCache 状态模型的 Debug/validation 结构化结果。
+ * @brief Structured Debug and validation output from the HiCache state model.
  *
- * 本文件只定义模型执行后供 Debug/validation 消费的结构化数据，不包含 JSON
- * 序列化、文件输出或 validation oracle 对比。Release 业务 backend 执行 state replay
- * 后不暴露也不长期保存这些结构；diagnostics 层可以在 Debug 构建中消费这些结构生成
- * summary/debug 输出，但状态机核心不反向依赖 diagnostics。
+ * This file defines the data boundary consumed after model execution. It does not
+ * own JSON serialization, file output, or oracle comparison. Release execution
+ * neither exposes nor retains these records; Debug diagnostics may serialize them
+ * without introducing a dependency from the state machine back to diagnostics.
  */
 #pragma once
 
@@ -40,11 +40,11 @@ using runtime::HiCacheRefAuditIssue;
 using runtime::HiCacheRefMutation;
 
 /**
- * @brief 单个 target-derived state mutation 的结构化记录。
+ * @brief Structured record of one target-derived state mutation.
  *
- * 记录描述模型内部状态如何随某个 fact 变化，`pages` 使用模型 canonical page id；
- * `source_event_index` 指向输入 trace event 在归一化序列中的位置。digest 字段仅在
- * `HiCacheConfig::emit_state_digests` 打开时填充，不参与状态机决策。
+ * `pages` contains canonical model page IDs, and `source_event_index` identifies
+ * the source event in normalized trace order. Digest fields are populated only
+ * when `HiCacheConfig::emit_state_digests` is enabled and never affect decisions.
  */
 struct HiCacheStateTransition {
     std::string transition_id;
@@ -68,19 +68,18 @@ struct HiCacheTransitionBuffer {};
 #endif
 
 /**
- * @brief HiCache state model 的 Debug/validation 执行结果。
+ * @brief Debug and validation result produced by one HiCache model replay.
  *
- * 该结构是 state replay 与 diagnostics/validation 层之间的唯一汇总边界：Debug 构建
- * 会填充 fact 计数、policy 决策、async lifecycle、capacity/ref 审计和 final
- * derived state；JSON 字段名、pretty print 和 oracle 对比逻辑均在外层完成。Release
- * 构建不把这些字段作为业务输出持有。
+ * This is the sole aggregate boundary between replay and diagnostics. Debug builds
+ * populate fact counts, policy decisions, asynchronous lifecycle evidence,
+ * capacity/reference audits, and final derived state. JSON naming, presentation,
+ * and oracle comparison remain outside the model. Release builds do not retain it.
  *
- * 关键不变量：
- * - `dag_mutations` 目前固定为 0，表示该模型只做 state alignment，不 patch DAG；
- * - `*_trace` 中的 page/node 单位均为模型 canonical page/node，不是原始 token；
- * - `final_state_derivation_mode` 说明 final state 使用的 derived-state 投影模式；
- * - `storage_directory_inclusive_state` 是包含 storage directory 投影的补充视图，
- *   不替代 `final_state` 中的 materialized-only 页面集合。
+ * Invariants:
+ * - page and node values in `*_trace` fields are canonical model identities, not tokens;
+ * - `final_state_derivation_mode` names the projection used for final state;
+ * - `storage_directory_inclusive_state` supplements, but never replaces, the
+ *   materialized-only page sets in `final_state`.
  */
 struct HiCacheSummary {
 #ifdef DEBUG
@@ -90,7 +89,6 @@ struct HiCacheSummary {
     uint64_t input_hicache_events = 0;
     uint64_t processed_hicache_events = 0;
     uint64_t state_transition_count = 0;
-    uint64_t dag_mutations = 0;
     uint64_t dirty_eviction_events = 0;
     uint64_t active_ref_owner_count = 0;
     uint64_t radix_split_count = 0;

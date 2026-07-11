@@ -1,42 +1,51 @@
 /**
  * @file
- * @brief HiCache state model 接入 SimulationModule 的业务包装层。
+ * @brief SimulationModule adapter for the HiCache state model.
  */
 #pragma once
 
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
+#include <memory>
+
 namespace markov::trace_graph::modules::hicache {
 
 /**
- * @brief HiCache 状态模型的 SimulationModule 包装层。
+ * @brief Adapts HiCache state replay to the ordered module pipeline.
  *
- * 包装层只负责接入 module registry 和暴露 summary，具体状态逻辑集中在
- * `HiCacheState` 状态对象。
+ * The adapter owns configuration and result publication only. Canonical state and policy
+ * transitions remain in `HiCacheState` so diagnostics and pipeline plumbing cannot become
+ * additional state sources.
  */
 class HiCacheModule final : public SimulationModule {
 public:
     explicit HiCacheModule(frontend::HiCacheConfig config);
+    HiCacheModule(frontend::HiCacheConfig config, std::shared_ptr<model::HiCacheModelResult> result);
 
-    /** @brief 返回 registry / summary 使用的稳定模块名。 */
-    [[nodiscard]] std::string name() const override;
+    /** @brief Returns the stable registry and diagnostics name. */
+    [[nodiscard]] std::string_view name() const noexcept override;
 
-    /** @brief 从 DAG 中抽取 HiCache fact，并驱动 canonical state model。 */
+    /** @brief Extracts approved HiCache facts and executes canonical target-state replay. */
     void apply(core::DagGraph & graph) override;
 
-    /** @brief Debug/validation 构建在 apply 后暴露结构化 summary；Release 不暴露 diagnostics summary。 */
-    [[nodiscard]] bool has_summary() const override;
-
+    /** @brief Reports whether apply() produced a diagnostics summary. */
 #ifdef DEBUG
-    /** @brief 读取最近一次 apply 后生成的 HiCache summary。 */
-    [[nodiscard]] const model::HiCacheSummary & summary() const { return summary_; }
+    [[nodiscard]] bool has_summary() const override;
+#endif
+
+    /** @brief Returns the effect-intent business contract in Release and Debug builds. */
+    [[nodiscard]] const model::HiCacheEffectIntentCatalog & effect_intents() const { return result_->effect_intents; }
+
+    /** @brief Returns the diagnostics summary produced by the latest successful apply. */
+#ifdef DEBUG
+    [[nodiscard]] const model::HiCacheSummary & summary() const { return result_->summary; }
 #endif
 
 private:
     frontend::HiCacheConfig config_;
+    std::shared_ptr<model::HiCacheModelResult> result_;
 #ifdef DEBUG
-    model::HiCacheSummary summary_;
     bool applied_ = false;
 #endif
 };

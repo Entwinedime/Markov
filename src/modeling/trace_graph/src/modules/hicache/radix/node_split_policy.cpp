@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache radix node split policy 实现。
+ * @brief HiCache radix-node split policy implementation.
  */
 #include "markov/trace_graph/modules/hicache/radix/node_split_policy.hpp"
 
@@ -10,26 +10,24 @@
 
 namespace markov::trace_graph::modules::hicache::radix {
 
+#ifdef DEBUG
 std::vector<std::string> HiCacheNodeSplitPolicy::owner_keys(const std::map<std::string, uint64_t> & owners) {
     std::vector<std::string> keys;
     keys.reserve(owners.size());
     std::ranges::transform(owners, std::back_inserter(keys), [](const auto & item) { return item.first; });
     return keys;
 }
+#endif
 
-HiCacheNodeSplitPlan HiCacheNodeSplitPolicy::plan(HiCacheNodeId parent, const HiCacheCacheNode & child, HiCacheNodeId prefix_node_id, size_t split_pages,
-                                                  const std::vector<std::string> & prefix_pages, const std::vector<std::string> & suffix_pages,
-                                                  const HiCacheNodeSplitContext & context) const {
-    /**
-     * @brief split policy 采用“prefix 继承原 child residency/ref/hit_count”的语义。
-     *
-     * 这是后续 ref ledger sync 和 capacity index 重新判定 leaf eligibility 的前提。
-     */
+HiCacheNodeSplitPlan HiCacheNodeSplitPolicy::plan(HiCacheNodeId parent, const HiCacheCacheNode & child, HiCacheNodeId prefix_node_id,
+                                                  const HiCacheNodeSplitPages & pages) const {
+    // Copying residency, references, and hit count into the prefix is required before the
+    // reference ledger and capacity index can re-evaluate the split topology.
     HiCacheCacheNode prefix_node{
         .id = prefix_node_id,
         .parent = parent,
         .children = {},
-        .pages = prefix_pages,
+        .pages = pages.prefix,
         .priority = child.priority,
         .last_access_order = child.last_access_order,
         .active = child.active,
@@ -38,18 +36,27 @@ HiCacheNodeSplitPlan HiCacheNodeSplitPolicy::plan(HiCacheNodeId parent, const Hi
         .hit_count = child.hit_count,
     };
 
-    HiCacheNodeSplitRecord record{
+    return HiCacheNodeSplitPlan{
+        .prefix_node = std::move(prefix_node),
+        .suffix_pages = pages.suffix,
+    };
+}
+
+#ifdef DEBUG
+void HiCacheNodeSplitPolicy::attach_debug_record(HiCacheNodeSplitPlan & plan, HiCacheNodeId parent, const HiCacheCacheNode & child, size_t split_pages,
+                                                 const HiCacheNodeSplitContext & context) const {
+    plan.record = HiCacheNodeSplitRecord{
         .parent_node = parent,
-        .prefix_node = prefix_node_id,
+        .prefix_node = plan.prefix_node.id,
         .suffix_node = child.id,
         .split_pages = split_pages,
         .parent_child_key = context.parent_child_key,
         .suffix_child_key = context.suffix_child_key,
-        .prefix_pages = prefix_pages,
-        .suffix_pages = suffix_pages,
+        .prefix_pages = plan.prefix_node.pages,
+        .suffix_pages = plan.suffix_pages,
         .prefix_projection = context.prefix_projection,
         .suffix_projection = context.suffix_projection,
-        .prefix_residency = prefix_node.residency,
+        .prefix_residency = plan.prefix_node.residency,
         .suffix_residency = child.residency,
         .copied_lock_ref_total = child.refs.lock_ref_total,
         .copied_host_ref_total = child.refs.host_ref_total,
@@ -57,13 +64,9 @@ HiCacheNodeSplitPlan HiCacheNodeSplitPolicy::plan(HiCacheNodeId parent, const Hi
         .copied_host_ref_owners = owner_keys(child.refs.host_refs_by_owner),
         .inherited_hit_count = child.hit_count,
     };
-
-    return HiCacheNodeSplitPlan{
-        .prefix_node = std::move(prefix_node),
-        .record = std::move(record),
-    };
 }
+#endif
 
-void HiCacheNodeSplitPolicy::apply_suffix(HiCacheCacheNode & child, const HiCacheNodeSplitPlan & plan) const { child.pages = plan.record.suffix_pages; }
+void HiCacheNodeSplitPolicy::apply_suffix(HiCacheCacheNode & child, const HiCacheNodeSplitPlan & plan) const { child.pages = plan.suffix_pages; }
 
 } // namespace markov::trace_graph::modules::hicache::radix

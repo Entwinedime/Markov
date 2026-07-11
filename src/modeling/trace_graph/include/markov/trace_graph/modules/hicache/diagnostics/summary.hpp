@@ -1,12 +1,13 @@
 /**
  * @file
- * @brief HiCache model summary 的 diagnostics JSON writer。
+ * @brief Diagnostics JSON writer for a HiCache model summary.
  *
- * 这里不定义模型状态，只把 `model::HiCacheSummary` 序列化为 workflow 需要的
- * model_summary JSON。状态机核心不得包含本头文件。
+ * This layer defines no model state. It serializes `model::HiCacheSummary` for workflow
+ * validation, and the state-machine core must not depend on this header.
  */
 #pragma once
 
+#include "markov/trace_graph/modules/hicache/model/effect_intent.hpp"
 #include "markov/trace_graph/modules/hicache/model/summary.hpp"
 
 #include <string>
@@ -14,10 +15,10 @@
 namespace markov::trace_graph::modules::hicache::diagnostics {
 
 /**
- * @brief 把 HiCache 结构化模型结果写成 JSON 字符串。
+ * @brief Serializes one structured HiCache model result to JSON text.
  *
- * 本函数只负责 Debug/validation diagnostics 表达，不改变 summary 内容。
+ * The function is diagnostics-only and never mutates or re-derives the summary.
  */
-[[nodiscard]] std::string summary_json(const model::HiCacheSummary & summary);
+[[nodiscard]] std::string summary_json(const model::HiCacheSummary & summary, const model::HiCacheEffectIntentCatalog & effect_intents);
 
 } // namespace markov::trace_graph::modules::hicache::diagnostics

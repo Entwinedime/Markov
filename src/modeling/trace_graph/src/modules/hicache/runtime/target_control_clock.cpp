@@ -1,58 +1,62 @@
 /**
  * @file
- * @brief HiCache target control clock 实现。
+ * @brief Target-derived HiCache control-clock implementation.
  */
 #include "markov/trace_graph/modules/hicache/runtime/target_control_clock.hpp"
 
-#include <sstream>
+#include "markov/trace_graph/core/numeric.hpp"
+
+#include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-/** @brief 为 target-derived async operation 分配当前 scope 内可读的单调 id。 */
+/** @brief Allocates a readable monotonic ID for a target-derived operation. */
 std::string HiCacheTargetControlClock::next_operation_id(std::string_view kind) {
-    std::ostringstream os;
-    os << kind << ":" << ++operation_epoch_;
-    return os.str();
+    if (kind.empty()) throw std::invalid_argument("HiCache operation kind must not be empty");
+    const auto epoch = core::checked_increment_u64(operation_epoch_, "HiCache operation ID epoch exceeds uint64 range");
+    return std::string(kind) + ":" + std::to_string(epoch);
 }
 
 /**
- * @brief enqueue epoch 与 scheduler epoch 同步推进。
+ * @brief Allocates a monotonic enqueue epoch.
  *
- * 这里的时钟只服务 target model 中的因果解释，不代表 source runtime 的真实线程调度时间。
+ * This model-local clock explains causal order and does not represent source scheduling.
  */
 uint64_t HiCacheTargetControlClock::next_enqueue_epoch() {
-    ++scheduler_epoch_;
-    return ++enqueue_epoch_;
+#ifdef DEBUG
+    (void)core::checked_increment_u64(scheduler_epoch_, "HiCache scheduler epoch exceeds uint64 range");
+#endif
+    return core::checked_increment_u64(enqueue_epoch_, "HiCache enqueue epoch exceeds uint64 range");
 }
 
-/** @brief trace finalize 是 target-derived 的 terminal boundary，用于收敛残留 async lifecycle。 */
-HiCacheControlBoundary HiCacheTargetControlClock::record_target_finalize_boundary(const std::string & cache_scope, uint64_t ts) {
-    return record_boundary(cache_scope, "", "finalize", "target_finalize", 0, ts, true);
-}
+/** @brief Records the terminal target boundary used to settle remaining operations. */
+uint64_t HiCacheTargetControlClock::record_target_finalize_boundary(const std::string & cache_scope, uint64_t ts) { return record_boundary(cache_scope, ts); }
 
 /**
- * @brief 统一登记 target control boundary。
+ * @brief Allocates one boundary epoch and, in Debug, records its provenance.
  *
- * scheduler_epoch 和 boundary_epoch 都在这里分配，保证 target boundary/finalize 的
- * 顺序可以在 summary 中复现。
+ * Production callers consume only the epoch. Debug builds retain the descriptive record
+ * needed to reproduce boundary order in summaries.
  */
-HiCacheControlBoundary HiCacheTargetControlClock::record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
-                                                                  const std::string & source, size_t source_event_index, uint64_t ts, bool terminal) {
-    HiCacheControlBoundary boundary{
-        .scheduler_epoch = ++scheduler_epoch_,
-        .boundary_epoch = ++boundary_epoch_,
-        .cache_scope = cache_scope,
-        .request_key = request_key,
-        .kind = kind,
-        .source = source,
-        .source_event_index = source_event_index,
-        .ts = ts,
-        .terminal = terminal,
-    };
+uint64_t HiCacheTargetControlClock::record_boundary(const std::string & cache_scope, uint64_t ts) {
+    const auto boundary_epoch = core::checked_increment_u64(boundary_epoch_, "HiCache boundary epoch exceeds uint64 range");
 #ifdef DEBUG
-    boundaries_.push_back(boundary);
+    boundaries_.push_back(HiCacheControlBoundary{
+        .scheduler_epoch = core::checked_increment_u64(scheduler_epoch_, "HiCache scheduler epoch exceeds uint64 range"),
+        .boundary_epoch = boundary_epoch,
+        .cache_scope = cache_scope,
+        .request_key = "",
+        .kind = "finalize",
+        .source = "target_finalize",
+        .source_event_index = 0,
+        .ts = ts,
+        .terminal = true,
+    });
+#else
+    (void)cache_scope;
+    (void)ts;
 #endif
-    return boundary;
+    return boundary_epoch;
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

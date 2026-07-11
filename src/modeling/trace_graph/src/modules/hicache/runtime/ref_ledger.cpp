@@ -1,12 +1,15 @@
 /**
  * @file
- * @brief HiCache node ref owner ledger 实现。
+ * @brief HiCache node-reference owner ledger implementation.
  */
 #include "markov/trace_graph/modules/hicache/runtime/ref_ledger.hpp"
+
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
 #include <ranges>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
@@ -37,143 +40,157 @@ using ref_ledger_detail::NodeOwnerKey;
 #endif
 using ref_ledger_detail::repeated_nodes;
 
+#ifdef DEBUG
 std::vector<std::string> HiCacheRefLedger::flatten_pages(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & nodes) {
     std::vector<std::string> pages;
     std::ranges::for_each(nodes, [&](auto node_id) {
-        auto node_pages = tree.node_pages(node_id);
+        const auto & node_pages = tree.node_pages(node_id);
         pages.insert(pages.end(), node_pages.begin(), node_pages.end());
     });
     return pages;
 }
+#endif
 
 /**
- * @brief 取得或创建 ref owner 记录。
+ * @brief Returns or creates the reverse-index record for one reference owner.
  *
- * owner 维度保留 request/operation 归属，便于一次释放整条链上的 lock/host ref；
- * radix node 上的 ref counter 才是 capacity/victim 判断会读取的 canonical copy。
+ * The owner dimension permits an atomic lifecycle release across lock and host chains.
+ * Capacity and victim policy continue to read the canonical counters on radix nodes.
  */
-HiCacheRefOwnerRecord & HiCacheRefLedger::ensure_owner(const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
-                                                       const std::string & operation_id) {
+HiCacheRefOwnerRecord & HiCacheRefLedger::ensure_owner(const std::string & owner_id, const OwnerMetadata & metadata) {
     auto & record = owners_[owner_id];
-    if (record.owner_id.empty()) record.owner_id = owner_id;
-    if (!owner_kind.empty()) record.owner_kind = owner_kind;
-    if (!request_key.empty()) record.request_key = request_key;
-    if (!operation_id.empty()) record.operation_id = operation_id;
+#ifdef DEBUG
+    auto assign_identity = [&](std::string & current, const std::string & incoming, std::string_view field) {
+        if (incoming.empty()) return;
+        if (!current.empty() && current != incoming) throw std::logic_error("Conflicting HiCache reference owner " + std::string(field) + ": " + owner_id);
+        current = incoming;
+    };
+    assign_identity(record.owner_kind, metadata.owner_kind, "kind");
+    assign_identity(record.request_key, metadata.request_key, "request key");
+    assign_identity(record.operation_id, metadata.operation_id, "operation ID");
+#else
+    (void)metadata;
+#endif
     return record;
 }
 
-void HiCacheRefLedger::record_mutation(HiCacheRefMutation mutation) {
-    if (!mutation.changed) return;
-    if (mutation.mutation_epoch == 0) mutation.mutation_epoch = ++epoch_;
-#ifdef DEBUG
-    mutation_trace_.push_back(std::move(mutation));
-#else
-    (void)mutation;
-#endif
-}
-
-HiCacheRefMutation HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id) {
-    /**
-     * @brief release_owner 是唯一按 owner 批量回收 ref 的入口。
-     *
-     * 它同时更新 radix node counter 和 ledger owner 状态，避免两份 ref copy 漂移。
-     */
-    HiCacheRefMutation mutation{
-        .action = "release",
-        .owner_id = owner_id,
-    };
+HiCacheRefChange HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id) {
+    // This is the only owner-wide release path. It updates radix counters and the reverse
+    // index together so copied references cannot outlive their lifecycle owner.
+    auto change = HiCacheRefChange{};
     const auto it = owners_.find(owner_id);
-    if (it == owners_.end() || !it->second.active) return mutation;
+    if (it == owners_.end() || !it->second.active) return change;
 
     auto & record = it->second;
-    mutation.owner_kind = record.owner_kind;
-    mutation.request_key = record.request_key;
-    mutation.operation_id = record.operation_id;
-    mutation.lock_nodes = record.lock_nodes;
-    mutation.host_nodes = record.host_nodes;
-    mutation.lock_pages = flatten_pages(tree, record.lock_nodes);
-    mutation.host_pages = flatten_pages(tree, record.host_nodes);
-    mutation.lock_ref_delta = -static_cast<int64_t>(record.lock_nodes.size());
-    mutation.host_ref_delta = -static_cast<int64_t>(record.host_nodes.size());
-    mutation.changed = !record.lock_nodes.empty() || !record.host_nodes.empty();
+#ifdef DEBUG
+    auto mutation = HiCacheRefMutation{
+        .action = "release",
+        .owner_id = owner_id,
+        .owner_kind = record.owner_kind,
+        .request_key = record.request_key,
+        .operation_id = record.operation_id,
+        .lock_nodes = record.lock_nodes,
+        .host_nodes = record.host_nodes,
+        .lock_pages = flatten_pages(tree, record.lock_nodes),
+        .host_pages = flatten_pages(tree, record.host_nodes),
+        .lock_ref_delta = -static_cast<int64_t>(record.lock_nodes.size()),
+        .host_ref_delta = -static_cast<int64_t>(record.host_nodes.size()),
+        .changed = !record.lock_nodes.empty() || !record.host_nodes.empty(),
+    };
+#endif
+    change.affected_nodes.reserve(record.lock_nodes.size() + record.host_nodes.size());
+    change.affected_nodes.insert(change.affected_nodes.end(), record.lock_nodes.begin(), record.lock_nodes.end());
+    change.affected_nodes.insert(change.affected_nodes.end(), record.host_nodes.begin(), record.host_nodes.end());
 
     tree.release_refs_by_owner(owner_id);
     record.lock_nodes.clear();
     record.host_nodes.clear();
-    mutation.mutation_epoch = ++epoch_;
+#ifdef DEBUG
+    mutation.mutation_epoch = core::checked_increment_u64(epoch_, "HiCache reference mutation epoch exceeds uint64 range");
     record.release_epoch = mutation.mutation_epoch;
+#endif
     record.active = false;
-    record_mutation(mutation);
-    return mutation;
+#ifdef DEBUG
+    if (mutation.changed) mutation_trace_.push_back(std::move(mutation));
+#endif
+    return change;
 }
 
-HiCacheRefMutation HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
-                                                  const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
-    /**
-     * @brief lock ref 保护 device/host eviction 路径。
-     *
-     * 常见用途是 request 执行或 backup ACK 尚未完成的窗口。
-     */
-    HiCacheRefMutation mutation{
+HiCacheRefChange HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
+                                                const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
+    // Lock references protect device and host eviction while a request executes or a
+    // backup acknowledgement is outstanding.
+    if (owner_id.empty() || nodes.empty()) return {};
+
+    auto & record = ensure_owner(owner_id,
+                                 OwnerMetadata{
+                                     .owner_kind = owner_kind,
+                                     .request_key = request_key,
+                                     .operation_id = operation_id,
+                                 });
+    tree.add_lock_ref(nodes, owner_id);
+    record.lock_nodes.insert(record.lock_nodes.end(), nodes.begin(), nodes.end());
+#ifdef DEBUG
+    auto mutation = HiCacheRefMutation{
+        .mutation_epoch = core::checked_increment_u64(epoch_, "HiCache reference mutation epoch exceeds uint64 range"),
         .action = "acquire_lock",
         .owner_id = owner_id,
         .owner_kind = owner_kind,
         .request_key = request_key,
         .operation_id = operation_id,
+        .lock_nodes = nodes,
+        .lock_pages = flatten_pages(tree, nodes),
+        .lock_ref_delta = static_cast<int64_t>(nodes.size()),
     };
-    if (owner_id.empty() || nodes.empty()) return mutation;
-
-    auto & record = ensure_owner(owner_id, owner_kind, request_key, operation_id);
-    tree.add_lock_ref(nodes, owner_id);
-    record.lock_nodes.insert(record.lock_nodes.end(), nodes.begin(), nodes.end());
-    mutation.mutation_epoch = ++epoch_;
     record.acquire_epoch = mutation.mutation_epoch;
+#endif
     record.active = true;
-    mutation.lock_nodes = nodes;
-    mutation.lock_pages = flatten_pages(tree, nodes);
-    mutation.lock_ref_delta = static_cast<int64_t>(nodes.size());
+#ifdef DEBUG
     mutation.changed = !mutation.lock_pages.empty();
-    record_mutation(mutation);
-    return mutation;
+    if (mutation.changed) mutation_trace_.push_back(std::move(mutation));
+#endif
+    return HiCacheRefChange{ .affected_nodes = nodes };
 }
 
-HiCacheRefMutation HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
-                                                  const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
-    /**
-     * @brief host ref 保护 L2 value。
-     *
-     * 它覆盖 prefetch materialize 前后的 reservation/use 窗口；capacity cleanup 会跳过仍有 host ref 的 leaf。
-     */
-    HiCacheRefMutation mutation{
+HiCacheRefChange HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
+                                                const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
+    // Host references protect L2 values throughout prefetch reservation and consumption;
+    // capacity cleanup must skip leaves that still carry one.
+    if (owner_id.empty() || nodes.empty()) return {};
+
+    auto & record = ensure_owner(owner_id,
+                                 OwnerMetadata{
+                                     .owner_kind = owner_kind,
+                                     .request_key = request_key,
+                                     .operation_id = operation_id,
+                                 });
+    tree.add_host_ref(nodes, owner_id);
+    record.host_nodes.insert(record.host_nodes.end(), nodes.begin(), nodes.end());
+#ifdef DEBUG
+    auto mutation = HiCacheRefMutation{
+        .mutation_epoch = core::checked_increment_u64(epoch_, "HiCache reference mutation epoch exceeds uint64 range"),
         .action = "acquire_host",
         .owner_id = owner_id,
         .owner_kind = owner_kind,
         .request_key = request_key,
         .operation_id = operation_id,
+        .host_nodes = nodes,
+        .host_pages = flatten_pages(tree, nodes),
+        .host_ref_delta = static_cast<int64_t>(nodes.size()),
     };
-    if (owner_id.empty() || nodes.empty()) return mutation;
-
-    auto & record = ensure_owner(owner_id, owner_kind, request_key, operation_id);
-    tree.add_host_ref(nodes, owner_id);
-    record.host_nodes.insert(record.host_nodes.end(), nodes.begin(), nodes.end());
-    mutation.mutation_epoch = ++epoch_;
     record.acquire_epoch = mutation.mutation_epoch;
+#endif
     record.active = true;
-    mutation.host_nodes = nodes;
-    mutation.host_pages = flatten_pages(tree, nodes);
-    mutation.host_ref_delta = static_cast<int64_t>(nodes.size());
+#ifdef DEBUG
     mutation.changed = !mutation.host_pages.empty();
-    record_mutation(mutation);
-    return mutation;
+    if (mutation.changed) mutation_trace_.push_back(std::move(mutation));
+#endif
+    return HiCacheRefChange{ .affected_nodes = nodes };
 }
 
-void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, const std::string & reason) {
-    /**
-     * @brief radix split 会把 child ref 复制到新 prefix node。
-     *
-     * ledger 需要追平这些复制出来的 owner 计数，否则后续 release_owner 只能释放原 node，
-     * 留下不可释放的 ref。
-     */
+void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, std::string_view reason) {
+    // Radix splits copy child references to a new prefix node. Mirror those copies into
+    // owner chains or release_owner would leave the new counters behind.
     for (const auto & node : tree.nodes()) {
         if (!node.active || node.id == 0) continue;
         for (const auto & [owner_id, tree_count] : node.refs.lock_refs_by_owner) {
@@ -185,20 +202,22 @@ void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, 
             const auto missing = tree_count - ledger_count;
             auto copied_nodes = repeated_nodes(node.id, missing);
             record.lock_nodes.insert(record.lock_nodes.end(), copied_nodes.begin(), copied_nodes.end());
-            record.acquire_epoch = ++epoch_;
-            record_mutation(HiCacheRefMutation{
+#ifdef DEBUG
+            record.acquire_epoch = core::checked_increment_u64(epoch_, "HiCache reference mutation epoch exceeds uint64 range");
+            mutation_trace_.push_back(HiCacheRefMutation{
                 .mutation_epoch = record.acquire_epoch,
                 .action = "sync_lock_ref_copy",
                 .owner_id = owner_id,
                 .owner_kind = record.owner_kind,
                 .request_key = record.request_key,
                 .operation_id = record.operation_id,
-                .reason = reason,
+                .reason = std::string(reason),
                 .lock_nodes = copied_nodes,
                 .lock_pages = flatten_pages(tree, copied_nodes),
                 .lock_ref_delta = static_cast<int64_t>(missing),
                 .changed = true,
             });
+#endif
         }
         for (const auto & [owner_id, tree_count] : node.refs.host_refs_by_owner) {
             auto owner_it = owners_.find(owner_id);
@@ -209,51 +228,48 @@ void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, 
             const auto missing = tree_count - ledger_count;
             auto copied_nodes = repeated_nodes(node.id, missing);
             record.host_nodes.insert(record.host_nodes.end(), copied_nodes.begin(), copied_nodes.end());
-            record.acquire_epoch = ++epoch_;
-            record_mutation(HiCacheRefMutation{
+#ifdef DEBUG
+            record.acquire_epoch = core::checked_increment_u64(epoch_, "HiCache reference mutation epoch exceeds uint64 range");
+            mutation_trace_.push_back(HiCacheRefMutation{
                 .mutation_epoch = record.acquire_epoch,
                 .action = "sync_host_ref_copy",
                 .owner_id = owner_id,
                 .owner_kind = record.owner_kind,
                 .request_key = record.request_key,
                 .operation_id = record.operation_id,
-                .reason = reason,
+                .reason = std::string(reason),
                 .host_nodes = copied_nodes,
                 .host_pages = flatten_pages(tree, copied_nodes),
                 .host_ref_delta = static_cast<int64_t>(missing),
                 .changed = true,
             });
+#endif
         }
     }
-}
-
-const HiCacheRefOwnerRecord * HiCacheRefLedger::owner(const std::string & owner_id) const {
-    const auto it = owners_.find(owner_id);
-    return it == owners_.end() ? nullptr : &it->second;
+#ifndef DEBUG
+    (void)reason;
+#endif
 }
 
 #ifdef DEBUG
 HiCacheRefAudit HiCacheRefLedger::audit(const HiCacheTokenRadixTree & tree) const {
-    /**
-     * @brief audit 比较 owner ledger 与 radix node ref maps。
-     *
-     * 它用于调试和 summary，不是 ref 状态的第三份业务真相源。
-     */
+    // This independent comparison supports Debug summaries only; it is never a third
+    // reference-state source and does not participate in policy decisions.
     HiCacheRefAudit audit;
     std::map<NodeOwnerKey, uint64_t> ledger_lock_refs;
     std::map<NodeOwnerKey, uint64_t> ledger_host_refs;
     std::map<NodeOwnerKey, uint64_t> tree_lock_refs;
     std::map<NodeOwnerKey, uint64_t> tree_host_refs;
 
-    for (const auto & record : owners_ | std::views::values) {
+    for (const auto & [owner_id, record] : owners_) {
         if (!record.active) continue;
         audit.active_owner_count++;
         std::ranges::for_each(record.lock_nodes, [&](auto node_id) {
-            ledger_lock_refs[{ node_id, record.owner_id }]++;
+            ledger_lock_refs[{ node_id, owner_id }]++;
             audit.ledger_lock_ref_count++;
         });
         std::ranges::for_each(record.host_nodes, [&](auto node_id) {
-            ledger_host_refs[{ node_id, record.owner_id }]++;
+            ledger_host_refs[{ node_id, owner_id }]++;
             audit.ledger_host_ref_count++;
         });
     }
@@ -315,10 +331,9 @@ HiCacheRefAudit HiCacheRefLedger::audit(const HiCacheTokenRadixTree & tree) cons
     compare_refs("host", ledger_host_refs, tree_host_refs);
     return audit;
 }
-#endif
-
 uint64_t HiCacheRefLedger::active_owner_count() const {
     return static_cast<uint64_t>(std::ranges::count_if(owners_, [](const auto & item) { return item.second.active; }));
 }
+#endif
 
 } // namespace markov::trace_graph::modules::hicache::runtime

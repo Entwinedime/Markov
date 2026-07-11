@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief NodeScale what-if 模块和结构化执行结果。
+ * @brief NodeScale what-if module and structured Debug result.
  */
 #pragma once
 
@@ -13,43 +13,48 @@
 namespace markov::trace_graph::modules::node_scale {
 
 /**
- * @brief NodeScale 执行后的结构化结果。
+ * @brief Structured result from the latest NodeScale execution.
  *
- * `scaled_nodes` 是被规则命中的 DAG node 数量，规则配置按原始配置保留，供
- * diagnostics writer 输出 summary。模块本体不负责 JSON 序列化。
+ * `scaled_nodes` counts matched DAG nodes. The original rule configuration is retained for
+ * diagnostics, while JSON serialization remains outside the module.
  */
+#ifdef DEBUG
 struct NodeScaleSummary {
     frontend::NodeScaleConfig config;
     uint64_t scaled_nodes = 0;
 };
+#endif
 
 /**
- * @brief 最简单的 what-if 子模块。
+ * @brief Applies the first matching substring rule to each existing DAG node.
  *
- * NodeScaleModule 按节点 name 的 substring match 找到已有 DAG node，并按 factor 修改 duration。
- * 它不新增/删除节点和边，主要用于验证 SimulationModule 管线和简单 latency 变换。
+ * The module scales the complete duration by the configured positive factor. It never adds,
+ * removes, or rewires graph elements, making it a narrow latency-only what-if transform.
  */
 class NodeScaleModule final : public modules::SimulationModule {
 public:
     explicit NodeScaleModule(frontend::NodeScaleConfig config);
 
-    /** @brief 返回 registry / summary 使用的稳定模块名。 */
-    [[nodiscard]] std::string name() const override;
+    /** @brief Returns the stable registry and diagnostics name. */
+    [[nodiscard]] std::string_view name() const noexcept override;
 
-    /** @brief 按配置规则修改 DAG node duration。 */
+    /** @brief Scales matching node durations according to the configured rule order. */
     void apply(core::DagGraph & graph) override;
 
-    /** @brief apply 后提供命中规则的结构化 summary。 */
+#ifdef DEBUG
+    /** @brief Reports whether apply() produced a diagnostics summary. */
     [[nodiscard]] bool has_summary() const override;
 
-    /** @brief 读取 NodeScale 执行结果。 */
+    /** @brief Returns the result of the most recent apply() call. */
     [[nodiscard]] NodeScaleSummary summary() const;
+#endif
 
 private:
     frontend::NodeScaleConfig config_;
-    /** @brief apply 后写入 summary，便于验证规则是否实际命中。 */
+#ifdef DEBUG
     uint64_t scaled_nodes_ = 0;
     bool applied_ = false;
+#endif
 };
 
 } // namespace markov::trace_graph::modules::node_scale

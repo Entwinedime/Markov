@@ -1,10 +1,11 @@
 /**
  * @file
- * @brief trace_graph C++ 后端的进程内日志实现。
+ * @brief Process-local TraceGraph logger implementation.
  */
 #include "markov/trace_graph/core/logger.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #ifdef DEBUG
 #include <chrono>
 #include <ctime>
@@ -21,9 +22,6 @@
 namespace markov::trace_graph::core {
 
 Logger & Logger::instance() {
-    /**
-     * @brief 全局 logger 只用于 C++ CLI 进程内日志；不跨动态库边界暴露。
-     */
     static Logger logger;
     return logger;
 }
@@ -31,9 +29,7 @@ Logger & Logger::instance() {
 namespace logger_detail {
 
 bool use_color() {
-    /**
-     * @brief 默认只有 stderr 是 tty 时才输出颜色；也可以用 TRACE_GRAPH_COLOR 强制开关。
-     */
+    // Resolve the environment once because all logger instances share stderr.
     static bool color = false;
     static std::once_flag init;
     std::call_once(init, [] {
@@ -55,9 +51,6 @@ bool use_color() {
 }
 
 const char * ansi(Logger::Level lv) {
-    /**
-     * @brief 用户可见日志保持英文 label，颜色只影响终端显示，不写入 JSON 输出。
-     */
     if (!use_color()) return "";
     switch (lv) {
     case Logger::Error:
@@ -92,14 +85,17 @@ const char * label(Logger::Level lv) {
 
 #ifdef DEBUG
 std::string timestamp() {
-    /**
-     * @brief 日志时间只用于人工调试，不参与性能预测或 validation。
-     */
     auto now = std::chrono::system_clock::now();
     auto t = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1'000;
+    std::tm local_time{};
+#ifdef _WIN32
+    localtime_s(&local_time, &t);
+#else
+    localtime_r(&t, &local_time);
+#endif
     std::ostringstream ss;
-    ss << std::put_time(std::localtime(&t), "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
+    ss << std::put_time(&local_time, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count();
     return ss.str();
 }
 #endif
@@ -117,17 +113,16 @@ std::string prefix(Logger::Level lv) {
 using logger_detail::prefix;
 
 Logger::Line::Line(Level lv, bool active, std::mutex * mtx) : lv_(lv), active_(active), mtx_(mtx) {
-    /**
-     * @brief active=false 时仍允许调用方继续 << 拼接，但不会产生实际输出。
-     */
     if (active_) ss_ << prefix(lv);
 }
 
+Logger::Line::Line(Line && other) noexcept : ss_(std::move(other.ss_)), lv_(other.lv_), active_(other.active_), mtx_(other.mtx_) {
+    other.active_ = false;
+    other.mtx_ = nullptr;
+}
+
 Logger::Line::~Line() {
-    /**
-     * @brief 析构时一次性加锁输出整行，避免多个日志调用在 stderr 上交错。
-     */
-    if (active_) {
+    if (active_ && mtx_ != nullptr) {
         ss_ << "\n";
         std::lock_guard<std::mutex> lock(*mtx_);
         std::cerr << ss_.str() << std::flush;

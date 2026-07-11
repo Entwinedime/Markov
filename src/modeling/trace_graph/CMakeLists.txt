@@ -12,6 +12,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 option(TRACE_GRAPH_DEBUG "Build trace_graph diagnostics and validation code" ${MARKOV_TRACE_GRAPH_DEBUG_DEFAULT})
+option(TRACE_GRAPH_BUILD_TESTS "Build focused TraceGraph smoke tests" OFF)
 
 add_library(trace_graph_options INTERFACE)
 target_compile_features(trace_graph_options INTERFACE cxx_std_23)
@@ -29,6 +30,7 @@ target_sources(trace_graph_core
     PRIVATE
         src/core/trace_event.cpp
         src/core/dag_graph.cpp
+        src/core/dag_mutation.cpp
         src/core/dag_builder.cpp
         src/core/logger.cpp
 )
@@ -38,6 +40,7 @@ add_library(trace_graph_io STATIC)
 target_sources(trace_graph_io
     PRIVATE
         src/io/chrome_trace_io.cpp
+        src/io/trace_channel_join.cpp
         src/io/trace_manifest_input.cpp
 )
 target_link_libraries(trace_graph_io PUBLIC trace_graph_core)
@@ -71,9 +74,9 @@ target_sources(trace_graph_hicache
         src/modules/hicache/runtime/ref_ledger.cpp
         src/modules/hicache/runtime/target_control_clock.cpp
         src/modules/hicache/runtime/async_state.cpp
-        src/modules/hicache/runtime/state_index.cpp
         src/modules/hicache/storage/storage_directory.cpp
         src/modules/hicache/model/state.cpp
+        src/modules/hicache/model/effect_intent.cpp
         src/modules/hicache/model/request_model.cpp
         src/modules/hicache/model/prefetch_model.cpp
         src/modules/hicache/model/host_storage_model.cpp
@@ -88,6 +91,7 @@ target_sources(trace_graph_modules
     PRIVATE
         src/modules/node_scale/node_scale_module.cpp
         src/modules/hicache/hicache_module.cpp
+        src/modules/hicache/dag_patch_module.cpp
 )
 target_link_libraries(trace_graph_modules
     PUBLIC
@@ -97,7 +101,10 @@ target_link_libraries(trace_graph_modules
 )
 
 add_library(trace_graph_cli_support STATIC)
+target_sources(trace_graph_cli_support PRIVATE src/cli/file_output.cpp)
 if(TRACE_GRAPH_DEBUG)
+    target_sources(trace_graph_hicache PRIVATE src/modules/hicache/runtime/state_index.cpp)
+
     add_library(trace_graph_diagnostics STATIC)
     target_sources(trace_graph_diagnostics
         PRIVATE
@@ -107,23 +114,19 @@ if(TRACE_GRAPH_DEBUG)
     )
     target_link_libraries(trace_graph_diagnostics PUBLIC trace_graph_modules)
 
-    add_library(trace_graph_validation STATIC)
-    target_sources(trace_graph_validation
-        PRIVATE
-            src/modules/validation/validation_runner.cpp
-    )
-    target_link_libraries(trace_graph_validation PUBLIC trace_graph_modules)
-
     target_sources(trace_graph_cli_support PRIVATE src/cli/debug_support_debug.cpp)
-    target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_diagnostics trace_graph_validation)
+    target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_diagnostics)
 else()
-    target_sources(trace_graph_cli_support PRIVATE src/cli/debug_support_release.cpp)
     target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_modules)
 endif()
 
 add_executable(trace_graph)
 target_sources(trace_graph
     PRIVATE
+        src/cli/options.cpp
+        src/cli/module_pipeline.cpp
+        src/cli/run_summary.cpp
+        src/cli/workflow.cpp
         src/cli/main.cpp
 )
 target_link_libraries(trace_graph
@@ -139,3 +142,15 @@ target_link_libraries(trace_graph
 set_target_properties(trace_graph PROPERTIES
     OUTPUT_NAME trace_graph
 )
+
+if(TRACE_GRAPH_BUILD_TESTS)
+    enable_testing()
+    add_executable(trace_graph_dag_mutation_smoke tests/dag_mutation_smoke.cpp)
+    target_link_libraries(trace_graph_dag_mutation_smoke
+        PRIVATE
+            trace_graph_core
+            trace_graph_io
+            trace_graph_simulation
+    )
+    add_test(NAME trace_graph_dag_mutation_smoke COMMAND trace_graph_dag_mutation_smoke)
+endif()

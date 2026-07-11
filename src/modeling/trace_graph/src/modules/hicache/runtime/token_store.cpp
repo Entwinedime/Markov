@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache request token path snapshot directory 实现。
+ * @brief Fact-local HiCache token-path resolver and Debug history implementation.
  */
 #include "markov/trace_graph/modules/hicache/runtime/token_store.hpp"
 
@@ -10,6 +10,7 @@ namespace markov::trace_graph::modules::hicache::runtime {
 
 namespace token_store_detail {
 
+#ifdef DEBUG
 std::string normalized_scope(const HiCacheFact & fact) { return fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope; }
 
 uint8_t rank(HiCacheTokenCompleteness completeness) {
@@ -32,12 +33,14 @@ HiCacheTokenCompleteness completeness_for_snapshot(const HiCacheFact & fact, uin
     if (page_size > 0 && fact.full_path_tokens.size() / page_size * page_size == fact.full_path_tokens.size()) return HiCacheTokenCompleteness::PageAligned;
     return HiCacheTokenCompleteness::Partial;
 }
+#endif
 
 uint64_t aligned_token_count(uint64_t token_count, uint64_t page_size) {
     if (page_size == 0) return 0;
     return token_count / page_size * page_size;
 }
 
+#ifdef DEBUG
 HiCacheTokenSnapshotStage stage_for_fact(const HiCacheFact & fact) {
     if (fact.role == "cache_lookup_input") return HiCacheTokenSnapshotStage::CacheLookup;
     if (fact.role == "cache_extend_input") return HiCacheTokenSnapshotStage::CacheExtend;
@@ -48,13 +51,13 @@ HiCacheTokenSnapshotStage stage_for_fact(const HiCacheFact & fact) {
     }
     return HiCacheTokenSnapshotStage::Unknown;
 }
+#endif
 
 /**
- * @brief 判断 fact 是否允许写入 request token directory。
+ * @brief Returns whether a fact is an allowed state-model path source.
  *
- * directory 是 state model 的输入身份索引，不是诊断缓存。它只接受当前合同指定
- * phase 的 state-model path fact；source_actual/oracle 中的 path 即便更完整，
- * 也不能作为 target page projection 的兜底来源。
+ * Only contract-approved state-model phases may provide target page identity. A more
+ * complete source-actual/oracle path must never become a fallback source.
  */
 bool state_model_path_source_allowed(const HiCacheFact & fact) {
     if (!fact.has_consumer("hicache_state_model")) return false;
@@ -64,6 +67,7 @@ bool state_model_path_source_allowed(const HiCacheFact & fact) {
     return fact.role == "cache_lookup_input" || fact.role == "cache_lifecycle_commit" || fact.role == "prefetch_candidate_anchor";
 }
 
+#ifdef DEBUG
 bool snapshot_before_fact(const HiCacheTokenPathSnapshot & snapshot, const HiCacheFact & fact) {
     if (snapshot.seq_no != 0 && fact.seq_no != 0 && snapshot.seq_no != fact.seq_no) return snapshot.seq_no < fact.seq_no;
     if (snapshot.source_event_index != fact.source_event_index) return snapshot.source_event_index < fact.source_event_index;
@@ -77,31 +81,39 @@ bool committed_stage(HiCacheTokenSnapshotStage stage) {
 }
 
 bool snapshot_stage_observable(HiCacheTokenSnapshotStage stage) { return stage != HiCacheTokenSnapshotStage::Unknown; }
+#endif
 
 HiCacheTokenResolution missing_resolution(const HiCacheFact & fact) {
     return HiCacheTokenResolution{
         .status = HiCacheTokenResolutionStatus::Missing,
+        .tokens = {},
         .token_count = fact.token_count,
+        .page_aligned_token_count = 0,
     };
 }
 
 HiCacheTokenResolution source_rejected_resolution(const HiCacheFact & fact) {
     return HiCacheTokenResolution{
         .status = HiCacheTokenResolutionStatus::SourceClassRejected,
+        .tokens = {},
         .token_count = fact.token_count,
+        .page_aligned_token_count = 0,
     };
 }
 
 HiCacheBatchTokenResolution batch_source_rejected_resolution() {
     return HiCacheBatchTokenResolution{
         .status = HiCacheTokenResolutionStatus::SourceClassRejected,
+        .entries = {},
     };
 }
 
 HiCacheTokenResolution wrong_stage_resolution(const HiCacheFact & fact) {
     return HiCacheTokenResolution{
         .status = HiCacheTokenResolutionStatus::WrongStageRejected,
+        .tokens = {},
         .token_count = fact.full_path_span.valid ? fact.full_path_span.token_count : static_cast<uint64_t>(fact.full_path_tokens.size()),
+        .page_aligned_token_count = 0,
     };
 }
 
@@ -119,19 +131,26 @@ HiCacheTokenResolution direct_fact_resolution(const HiCacheFact & fact, uint64_t
 
 using token_store_detail::aligned_token_count;
 using token_store_detail::batch_source_rejected_resolution;
+#ifdef DEBUG
 using token_store_detail::committed_stage;
 using token_store_detail::completeness_for_snapshot;
+#endif
 using token_store_detail::direct_fact_resolution;
 using token_store_detail::missing_resolution;
+#ifdef DEBUG
 using token_store_detail::normalized_scope;
 using token_store_detail::rank;
 using token_store_detail::snapshot_before_fact;
 using token_store_detail::snapshot_stage_observable;
+#endif
 using token_store_detail::source_rejected_resolution;
+#ifdef DEBUG
 using token_store_detail::stage_for_fact;
+#endif
 using token_store_detail::state_model_path_source_allowed;
 using token_store_detail::wrong_stage_resolution;
 
+#ifdef DEBUG
 std::string hicache_token_resolution_status_name(HiCacheTokenResolutionStatus status) {
     switch (status) {
     case HiCacheTokenResolutionStatus::Direct:
@@ -154,12 +173,8 @@ std::string HiCacheTokenDirectory::scoped_request_key(const HiCacheFact & fact) 
 void HiCacheTokenDirectory::observe_fact_path(const HiCacheFact & fact, uint64_t page_size) {
     if (!state_model_path_source_allowed(fact)) return;
 
-    /**
-     * @brief snapshot 只记录当前 fact 明确携带的 path 语义阶段。
-     *
-     * prefetch candidate 不会覆盖 extend/lifecycle committed path，避免把投机路径当成
-     * request 已提交状态。
-     */
+    // Record only the semantic stage explicitly carried by the fact. Prefetch candidates
+    // remain separate from committed extend/lifecycle history.
     const auto stage = stage_for_fact(fact);
     if (!snapshot_stage_observable(stage)) return;
     if (stage == HiCacheTokenSnapshotStage::CacheExtend) {
@@ -193,33 +208,34 @@ void HiCacheTokenDirectory::append_snapshot(const HiCacheFact & fact, HiCacheTok
     snapshots_.push_back(std::move(snapshot));
     snapshots_by_request_[key].push_back(snapshots_.size() - 1);
 }
+#endif
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_cache_lookup_path(const HiCacheFact & fact, uint64_t page_size) const {
-    /**
-     * @brief lookup/extend/lifecycle/prefetch resolver 都采用 fact-local direct resolution。
-     *
-     * timeline fallback 已被移除，因为它会在合同缺 path 时静默复用其它阶段 path。
-     */
+    // Every resolver is fact-local. Timeline fallback was removed because it silently
+    // reused a path from another semantic stage when the current contract was incomplete.
     if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
-    if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::CacheLookup) return wrong_stage_resolution(fact);
+    if (fact.role != "cache_lookup_input") return wrong_stage_resolution(fact);
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact);
     return direct_fact_resolution(fact, page_size);
 }
 
 HiCacheBatchTokenResolution HiCacheTokenDirectory::resolve_cache_extend_paths(const HiCacheFact & fact, uint64_t page_size) const {
     if (!state_model_path_source_allowed(fact)) return batch_source_rejected_resolution();
-    if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::CacheExtend) {
+    if (fact.role != "cache_extend_input") {
         return HiCacheBatchTokenResolution{
             .status = HiCacheTokenResolutionStatus::WrongStageRejected,
+            .entries = {},
         };
     }
     if (fact.batch_paths.empty()) {
         return HiCacheBatchTokenResolution{
             .status = HiCacheTokenResolutionStatus::Missing,
+            .entries = {},
         };
     }
     HiCacheBatchTokenResolution batch{
         .status = HiCacheTokenResolutionStatus::Direct,
+        .entries = {},
     };
     batch.entries.reserve(fact.batch_paths.size());
     for (const auto & entry : fact.batch_paths) {
@@ -237,8 +253,7 @@ HiCacheBatchTokenResolution HiCacheTokenDirectory::resolve_cache_extend_paths(co
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_cache_lifecycle_commit_path(const HiCacheFact & fact, uint64_t page_size) const {
     if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
-    const auto expected_stage = stage_for_fact(fact);
-    if (expected_stage != HiCacheTokenSnapshotStage::LifecycleFinished && expected_stage != HiCacheTokenSnapshotStage::LifecycleUnfinished) {
+    if (fact.role != "cache_lifecycle_commit" || (fact.lifecycle_kind != "finished" && fact.lifecycle_kind != "unfinished")) {
         return wrong_stage_resolution(fact);
     }
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact);
@@ -247,17 +262,15 @@ HiCacheTokenResolution HiCacheTokenDirectory::resolve_cache_lifecycle_commit_pat
 
 HiCacheTokenResolution HiCacheTokenDirectory::resolve_prefetch_candidate_path(const HiCacheFact & fact, uint64_t page_size) const {
     if (!state_model_path_source_allowed(fact)) return source_rejected_resolution(fact);
-    if (stage_for_fact(fact) != HiCacheTokenSnapshotStage::PrefetchCandidate) return wrong_stage_resolution(fact);
+    if (fact.role != "prefetch_candidate_anchor") return wrong_stage_resolution(fact);
     if (!hicache_fact_has_resolved_full_path(fact)) return missing_resolution(fact);
     return direct_fact_resolution(fact, page_size);
 }
 
+#ifdef DEBUG
 const HiCacheTokenPathSnapshot * HiCacheTokenDirectory::previous_committed_snapshot(const HiCacheFact & fact) const {
-    /**
-     * @brief 仅供诊断和增长检查使用。
-     *
-     * 正常状态推进不应靠这个接口补齐当前 fact 的 path，否则会重新引入跨 role fallback。
-     */
+    // Diagnostics may compare growth against prior committed snapshots. Normal state
+    // transitions never use this interface to fill the current fact's path.
     const auto key = scoped_request_key(fact);
     if (key.empty()) return nullptr;
 
@@ -281,5 +294,6 @@ const HiCacheTokenPathSnapshot * HiCacheTokenDirectory::previous_committed_snaps
     }
     return best;
 }
+#endif
 
 } // namespace markov::trace_graph::modules::hicache::runtime

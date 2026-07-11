@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache probe fact 的解析结果和 token dictionary 水合器。
+ * @brief Parsed HiCache probe facts and token-dictionary hydration.
  */
 #pragma once
 
@@ -9,43 +9,46 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache {
 
 /**
- * @brief HiCache token 的规范化表示。
+ * @brief Canonical representation of one HiCache token.
  *
- * probe 可能把 token 写成数字、字符串数字或复合数组。模型层不保存 Python
- * 对象形态，只保留参与 target page hash 的 32-bit word 序列。
+ * Probes may encode a token as a number, numeric string, or word array. Replay retains only
+ * the unsigned 32-bit words that participate in target-page hashing.
  */
 struct HiCacheToken {
-    std::vector<uint32_t> words;
+    std::vector<uint32_t> words{};
+
+    bool operator==(const HiCacheToken &) const = default;
 };
 
 using HiCacheTokenPath = std::vector<HiCacheToken>;
 
 /**
- * @brief token dictionary 中一段 request path 的不可变引用。
+ * @brief Immutable reference to a half-open interval in a token dictionary path.
  *
- * span 只说明“哪条 token path 的哪个半开区间”，不携带 source page identity，
- * 因而可以安全用于 cross-config target page projection。
+ * A span carries no source page identity, so the same token interval can be projected under
+ * a different target page size without consuming a source residency result.
  */
 struct HiCacheTokenSpan {
-    std::string path_id;
+    std::string path_id{};
     uint64_t begin = 0;
     uint64_t end = 0;
     uint64_t token_count = 0;
-    std::string hash_algo;
+    std::string hash_algo{};
     bool valid = false;
 };
 
 /**
- * @brief `cache_extend_input` batch 中单个 request 的 accepted fill path。
+ * @brief Accepted fill path for one request in a `cache_extend_input` batch.
  *
- * batch entry 独立于 scalar request path，避免把 batch 第一项误写进
- * `HiCacheFact::full_path_tokens` 并退化回 per-request 输入语义。
+ * Batch entries stay independent from the scalar path so the first request cannot
+ * accidentally become a per-request fallback for the rest of the batch.
  */
 struct HiCacheBatchPathEntry {
     std::string request_id;
@@ -56,16 +59,16 @@ struct HiCacheBatchPathEntry {
 };
 
 /**
- * @brief 单条 HiCache trace event 解析后的 atomic fact。
+ * @brief Atomic fact parsed from one HiCache trace event.
  *
- * 该结构只承载 probe catalog 显式声明的字段。是否能进入 target state model，
- * 由 router 基于 `fact.class`、`fact.role` 和 `fact.consumers` 再做硬门禁。
+ * This record carries only catalog-declared fields. The router separately enforces class,
+ * role, phase, and consumer eligibility before target replay.
  */
 struct HiCacheFact {
     size_t source_node_id = 0;
     size_t source_event_index = 0;
-    uint64_t ts = 0;
-    uint64_t dur = 0;
+    uint64_t ts = 0;  ///< Chrome trace timestamp in microseconds.
+    uint64_t dur = 0; ///< Chrome trace duration in microseconds.
 
     std::string event_name;
     std::string target_id;
@@ -78,7 +81,6 @@ struct HiCacheFact {
     std::string operation_id;
     std::string cache_scope;
     std::string lifecycle_kind;
-    std::string storage_source;
     std::string batch_kind;
 
     uint64_t seq_no = 0;
@@ -105,45 +107,42 @@ struct HiCacheFact {
     HiCacheTokenSpan full_path_span;
     HiCacheTokenPath full_path_tokens;
     std::vector<HiCacheBatchPathEntry> batch_paths;
-    std::vector<std::string> storage_page_hashes;
-
-    /** @brief 判断 catalog fact 是否声明给指定 consumer 消费。 */
-    [[nodiscard]] bool has_consumer(const std::string & consumer) const;
+    /** @brief Returns whether catalog metadata declares the requested consumer. */
+    [[nodiscard]] bool has_consumer(std::string_view consumer) const;
 };
 
 /**
- * @brief 判断 fact-local full path 是否已经可被模型消费。
+ * @brief Returns whether the fact-local full path is complete enough for replay.
  *
- * 空 path 是合法输入：当 span 明确指向长度为 0 的 token 区间时，它表示本轮没有
- * 可投影 page，而不是 token dictionary 缺失。非空 path 则必须已经通过
- * token dictionary 水合出完整 token 序列。
+ * An explicit zero-length span is valid and means no complete target page. A non-empty span
+ * must hydrate to exactly its declared token count; no other role or source result fills gaps.
  */
 [[nodiscard]] bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact);
 
 /**
- * @brief HiCache event parser 和 token dictionary 索引。
+ * @brief HiCache event parser and approved token-dictionary index.
  *
- * parser 先从 completed state-model path fact 中观察 dictionary，再解析 span-only
- * fact。source actual / oracle 中的 dictionary 只可用于诊断，不能水合 normal model
- * 的 token path。
+ * Callers first observe dictionaries from approved state-model path facts, then parse
+ * span-only facts. Dictionaries carried by source-actual, oracle, or diagnostics facts are
+ * intentionally excluded from normal replay hydration.
  */
 class HiCacheFactParser {
 public:
-    /** @brief 判断一个 TraceEvent 是否属于 HiCache 域。 */
+    /** @brief Returns whether an event belongs to the HiCache trace domain. */
     [[nodiscard]] bool is_hicache_event(const core::TraceEvent & event) const;
 
-    /** @brief 从 HiCache event 中观察 token dictionary。 */
+    /** @brief Indexes token dictionaries only when the event passes the source contract. */
     void observe_token_dictionaries(const core::TraceEvent & event);
 
-    /** @brief 将 HiCache event 解析成 fact。 */
+    /** @brief Parses and normalizes one HiCache event without routing it. */
     [[nodiscard]] HiCacheFact parse(size_t node_id, const core::TraceEvent & event) const;
 
 private:
     std::unordered_map<std::string, HiCacheTokenPath> token_paths_;
 
-    [[nodiscard]] HiCacheTokenSpan parse_span(const core::TraceEvent & event, const std::string & key) const;
+    [[nodiscard]] HiCacheTokenSpan parse_span(const core::TraceEvent & event, std::string_view key) const;
     [[nodiscard]] HiCacheTokenPath resolve_span(const HiCacheTokenSpan & span) const;
-    [[nodiscard]] std::vector<HiCacheBatchPathEntry> parse_batch_paths(const core::TraceEvent & event) const;
+    void parse_batch_fields(HiCacheFact & fact, const core::TraceEvent & event) const;
     void observe_dictionary_value(const std::string & raw);
 };
 

@@ -1,15 +1,16 @@
 /**
  * @file
- * @brief 阶段一 DAG analysis JSON artifact 构造实现。
+ * @brief First-stage DAG analysis JSON artifact implementation.
  */
 #include "markov/trace_graph/modules/dag_analysis/diagnostics.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <initializer_list>
 #include <limits>
@@ -53,7 +54,7 @@ struct RoleAnchorStats {
 
 struct LaneStats {
     size_t node_count = 0;
-    uint64_t duration_ns = 0;
+    uint64_t duration_us = 0;
 };
 
 struct LaneSummaryStats {
@@ -64,7 +65,7 @@ struct LaneSummaryStats {
 
 struct AnchorFact {
     std::string role;
-    uint64_t timestamp_ns = 0;
+    uint64_t timestamp_us = 0;
 };
 
 struct EvidenceNodes {
@@ -214,7 +215,7 @@ FactInfo parse_fact(const core::TraceEvent & event) {
         info.role = fact.value("role", "");
         info.present = !info.fact_class.empty() && !info.role.empty();
     }
-    catch (...) {
+    catch (const Json::exception &) {
         info.present = false;
     }
     return info;
@@ -224,36 +225,25 @@ Json compact_node_json(const core::DagGraph & graph, size_t node_id) {
     const auto & node = graph.node(node_id);
     const auto & event = graph.event_for_node(node_id);
     return Json{
-        {             "node_id",               node.id },
-        {         "event_index",      node.event_index },
-        {                "name",            event.name },
-        {                 "cat",             event.cat },
-        {              "domain",   event_domain(event) },
-        {                "lane",         node.lane_key },
-        {              "is_cpu",           node.is_cpu },
-        {         "duration_ns",         node.duration },
-        { "simulation_start_ns", node.simulation_start },
-        {       "completion_ns",  node.completion_time },
+        {             "node_id",                                                                 node.id },
+        {         "event_index",                                                        node.event_index },
+        {                "name",                                                              event.name },
+        {                 "cat",                                                               event.cat },
+        {              "domain",                                                     event_domain(event) },
+        {                "lane",                               std::string(graph.node_lane_key(node_id)) },
+        {              "is_cpu",                                                             node.is_cpu },
+        {              "active",                                                             node.active },
+        {           "node_kind", node.kind == core::DagNodeKind::Synthetic ? "synthetic" : "trace_event" },
+        {         "duration_us",                                                           node.duration },
+        { "simulation_start_us",                                                   node.simulation_start },
+        {       "completion_us",                                                    node.completion_time },
     };
 }
 
 Json selected_args_json(const core::TraceEvent & event) {
     constexpr std::string_view keys[] = {
-        "correlation_id",
-        "connection_id",
-        "Raw Stream",
-        "streamId",
-        "stream id",
-        "Physic Stream Id",
-        "Event Id",
-        "event_id",
-        "launchts",
-        "submitts",
-        "submit_anchor_name",
-        "submit_anchor_source",
-        "trace_source",
-        "source",
-        "domain",
+        "correlation_id", "connection_id",      "Raw Stream",           "streamId",     "stream id", "Physic Stream Id", "Event Id", "event_id", "launchts",
+        "submitts",       "submit_anchor_name", "submit_anchor_source", "trace_source", "source",    "domain",
     };
     Json result = Json::object();
     for (auto key : keys) {
@@ -271,43 +261,45 @@ Json cycle_node_json(const core::DagGraph & graph, size_t node_id) {
     item["source"] = event_source(event);
     item["pid"] = event.pid;
     item["tid"] = event.tid;
-    item["ts_ns"] = event.ts;
-    item["event_duration_ns"] = event.dur;
-    item["args"] = selected_args_json(event);
+    item["ts_us"] = event.ts;
+    item["event_duration_us"] = event.dur;
+    auto args = selected_args_json(event);
+    if (node.submit_ts > 0) args["submitts"] = node.submit_ts;
+    item["args"] = std::move(args);
     return item;
 }
 
-uint64_t event_submit_ts(const core::TraceEvent & event) {
-    auto submit_ts = event.arg_u64("submitts", 0);
-    return submit_ts > 0 ? submit_ts : event.ts;
+uint64_t event_submit_ts(const core::DagGraph & graph, size_t node_id) {
+    const auto & node = graph.node(node_id);
+    return node.submit_ts > 0 ? node.submit_ts : graph.event_for_node(node_id).ts;
 }
 
 Json edge_ref_json(const core::DagGraph & graph, const EdgeRef & edge) {
     const auto & src_event = graph.event_for_node(edge.src);
     const auto & dst_event = graph.event_for_node(edge.dst);
-    const auto src_submit_ts = event_submit_ts(src_event);
-    const auto dst_submit_ts = event_submit_ts(dst_event);
+    const auto src_submit_ts = event_submit_ts(graph, edge.src);
+    const auto dst_submit_ts = event_submit_ts(graph, edge.dst);
     Json delta = nullptr;
     if (dst_event.ts >= src_event.ts) delta = dst_event.ts - src_event.ts;
     Json submit_delta = nullptr;
     if (dst_submit_ts >= src_submit_ts) submit_delta = dst_submit_ts - src_submit_ts;
     return Json{
-        {              "edge_index",          edge.edge_index },
-        {                    "kind", edge_kind_name(edge.kind) },
-        {                     "src",                  edge.src },
-        {                     "dst",                  edge.dst },
-        {                "src_name",            src_event.name },
-        {                "dst_name",            dst_event.name },
-        {                "src_lane",    graph.node(edge.src).lane_key },
-        {                "dst_lane",    graph.node(edge.dst).lane_key },
-        {               "src_ts_ns",             src_event.ts },
-        {               "dst_ts_ns",             dst_event.ts },
-        {          "src_submit_ts_ns",           src_submit_ts },
-        {          "dst_submit_ts_ns",           dst_submit_ts },
-        {      "dst_minus_src_ts_ns",                 delta },
-        { "dst_minus_src_submit_ts_ns",          submit_delta },
-        {             "backward_ts",      dst_event.ts < src_event.ts },
-        {    "backward_submit_ts",       dst_submit_ts < src_submit_ts },
+        {                 "edge_index",                            edge.edge_index },
+        {                       "kind",                  edge_kind_name(edge.kind) },
+        {                        "src",                                   edge.src },
+        {                        "dst",                                   edge.dst },
+        {                   "src_name",                             src_event.name },
+        {                   "dst_name",                             dst_event.name },
+        {                   "src_lane", std::string(graph.node_lane_key(edge.src)) },
+        {                   "dst_lane", std::string(graph.node_lane_key(edge.dst)) },
+        {                  "src_ts_us",                               src_event.ts },
+        {                  "dst_ts_us",                               dst_event.ts },
+        {           "src_submit_ts_us",                              src_submit_ts },
+        {           "dst_submit_ts_us",                              dst_submit_ts },
+        {        "dst_minus_src_ts_us",                                      delta },
+        { "dst_minus_src_submit_ts_us",                               submit_delta },
+        {                "backward_ts",                dst_event.ts < src_event.ts },
+        {         "backward_submit_ts",              dst_submit_ts < src_submit_ts },
     };
 }
 
@@ -327,110 +319,164 @@ Json unordered_count_map_json(const std::unordered_map<std::string, size_t> & co
     return result;
 }
 
-CycleWitness find_cycle_witness(const core::DagGraph & graph) {
-    const size_t node_count = graph.node_count();
-    std::vector<std::vector<EdgeRef>> outgoing(node_count);
-    std::vector<int> indegree(node_count, 0);
+struct CycleGraph {
+    std::vector<std::vector<EdgeRef>> outgoing;
+    std::vector<int> indegree;
+};
+
+CycleGraph build_cycle_graph(const core::DagGraph & graph) {
+    CycleGraph cycle_graph{
+        .outgoing = std::vector<std::vector<EdgeRef>>(graph.node_count()),
+        .indegree = std::vector<int>(graph.node_count(), 0),
+    };
     const auto & edges = graph.edges();
     for (size_t edge_index = 0; edge_index < edges.size(); ++edge_index) {
         const auto & edge = edges[edge_index];
-        if (edge.src >= node_count || edge.dst >= node_count) continue;
-        outgoing[edge.src].push_back(EdgeRef{ .edge_index = edge_index, .src = edge.src, .dst = edge.dst, .kind = edge.kind });
-        indegree[edge.dst]++;
+        if (!edge.active || edge.src >= graph.node_count() || edge.dst >= graph.node_count()) continue;
+        if (!graph.node(edge.src).active || !graph.node(edge.dst).active) continue;
+        cycle_graph.outgoing[edge.src].push_back(EdgeRef{ .edge_index = edge_index, .src = edge.src, .dst = edge.dst, .kind = edge.kind });
+        cycle_graph.indegree[edge.dst]++;
     }
+    return cycle_graph;
+}
 
+size_t consume_acyclic_nodes(const core::DagGraph & graph, CycleGraph & cycle_graph) {
     std::queue<size_t> ready;
-    for (size_t node_id = 0; node_id < node_count; ++node_id) {
-        if (indegree[node_id] == 0) ready.push(node_id);
+    for (size_t node_id = 0; node_id < graph.node_count(); ++node_id) {
+        if (graph.node(node_id).active && cycle_graph.indegree[node_id] == 0) ready.push(node_id);
     }
 
-    CycleWitness witness;
+    size_t processed = 0;
     while (!ready.empty()) {
         const auto node_id = ready.front();
         ready.pop();
-        witness.processed_nodes++;
-        for (const auto & edge : outgoing[node_id]) {
-            indegree[edge.dst]--;
-            if (indegree[edge.dst] == 0) ready.push(edge.dst);
+        processed++;
+        for (const auto & edge : cycle_graph.outgoing[node_id]) {
+            cycle_graph.indegree[edge.dst]--;
+            if (cycle_graph.indegree[edge.dst] == 0) ready.push(edge.dst);
         }
     }
+    return processed;
+}
 
-    for (size_t node_id = 0; node_id < node_count; ++node_id) {
-        if (indegree[node_id] <= 0) continue;
+void summarize_remaining_nodes(const core::DagGraph & graph, const std::vector<int> & indegree, CycleWitness & witness) {
+    for (size_t node_id = 0; node_id < graph.node_count(); ++node_id) {
+        if (!graph.node(node_id).active || indegree[node_id] <= 0) continue;
         witness.remaining_node_count++;
         if (witness.remaining_node_sample.size() < kCycleRemainingSampleLimit) witness.remaining_node_sample.push_back(node_id);
     }
-    if (witness.remaining_node_count == 0) return witness;
+}
 
-    std::vector<int> visit_state(node_count, 0);
-    std::vector<size_t> path_nodes;
-    std::vector<EdgeRef> path_in_edges;
-    std::vector<size_t> path_position(node_count, kInvalidNode);
-    std::vector<DfsFrame> dfs_stack;
+class CycleWitnessSearch {
+public:
+    CycleWitnessSearch(const core::DagGraph & graph, const CycleGraph & cycle_graph, CycleWitness & witness)
+        : graph_(graph),
+          cycle_graph_(cycle_graph),
+          witness_(witness),
+          visit_state_(graph.node_count(), 0),
+          path_position_(graph.node_count(), kInvalidNode) {}
 
-    for (size_t start = 0; start < node_count; ++start) {
-        if (indegree[start] <= 0 || visit_state[start] != 0) continue;
-        path_nodes.clear();
-        path_in_edges.clear();
-        dfs_stack.clear();
-        dfs_stack.push_back(DfsFrame{ .node_id = start, .next_edge_index = 0 });
-        visit_state[start] = 1;
-        path_position[start] = path_nodes.size();
-        path_nodes.push_back(start);
-        path_in_edges.push_back(EdgeRef{});
-
-        while (!dfs_stack.empty()) {
-            auto & frame = dfs_stack.back();
-            const auto & edges_for_node = outgoing[frame.node_id];
-            bool descended = false;
-            while (frame.next_edge_index < edges_for_node.size()) {
-                const auto edge = edges_for_node[frame.next_edge_index++];
-                if (edge.dst >= node_count || indegree[edge.dst] <= 0) continue;
-                if (visit_state[edge.dst] == 0) {
-                    visit_state[edge.dst] = 1;
-                    path_position[edge.dst] = path_nodes.size();
-                    path_nodes.push_back(edge.dst);
-                    path_in_edges.push_back(edge);
-                    dfs_stack.push_back(DfsFrame{ .node_id = edge.dst, .next_edge_index = 0 });
-                    descended = true;
-                    break;
-                }
-                if (visit_state[edge.dst] == 1) {
-                    const auto position = path_position[edge.dst];
-                    if (position != kInvalidNode && position < path_nodes.size()) {
-                        witness.cycle_nodes.assign(path_nodes.begin() + static_cast<std::ptrdiff_t>(position), path_nodes.end());
-                        witness.cycle_edges.assign(path_in_edges.begin() + static_cast<std::ptrdiff_t>(position + 1), path_in_edges.end());
-                        witness.cycle_edges.push_back(edge);
-                    }
-                    else {
-                        witness.cycle_nodes = { edge.dst };
-                        witness.cycle_edges = { edge };
-                    }
-                    return witness;
-                }
-            }
-            if (descended) continue;
-
-            const auto done = frame.node_id;
-            dfs_stack.pop_back();
-            visit_state[done] = 2;
-            path_position[done] = kInvalidNode;
-            if (!path_nodes.empty()) path_nodes.pop_back();
-            if (!path_in_edges.empty()) path_in_edges.pop_back();
+    void run() {
+        for (size_t start = 0; start < graph_.node_count(); ++start) {
+            if (!is_unresolved(start) || visit_state_[start] != 0) continue;
+            if (search_from(start)) return;
         }
     }
+
+private:
+    [[nodiscard]] bool is_unresolved(size_t node_id) const {
+        return node_id < graph_.node_count() && graph_.node(node_id).active && cycle_graph_.indegree[node_id] > 0;
+    }
+
+    void push_node(size_t node_id, EdgeRef incoming) {
+        visit_state_[node_id] = 1;
+        path_position_[node_id] = path_nodes_.size();
+        path_nodes_.push_back(node_id);
+        path_in_edges_.push_back(incoming);
+        dfs_stack_.push_back(DfsFrame{ .node_id = node_id, .next_edge_index = 0 });
+    }
+
+    void capture_cycle(const EdgeRef & edge) {
+        const auto position = path_position_[edge.dst];
+        if (position == kInvalidNode || position >= path_nodes_.size()) {
+            witness_.cycle_nodes = { edge.dst };
+            witness_.cycle_edges = { edge };
+            return;
+        }
+        witness_.cycle_nodes.assign(path_nodes_.begin() + static_cast<std::ptrdiff_t>(position), path_nodes_.end());
+        witness_.cycle_edges.assign(path_in_edges_.begin() + static_cast<std::ptrdiff_t>(position + 1), path_in_edges_.end());
+        witness_.cycle_edges.push_back(edge);
+    }
+
+    [[nodiscard]] bool advance(DfsFrame & frame, bool & descended) {
+        const auto & edges = cycle_graph_.outgoing[frame.node_id];
+        while (frame.next_edge_index < edges.size()) {
+            const auto edge = edges[frame.next_edge_index++];
+            if (!is_unresolved(edge.dst)) continue;
+            if (visit_state_[edge.dst] == 0) {
+                push_node(edge.dst, edge);
+                descended = true;
+                return false;
+            }
+            if (visit_state_[edge.dst] == 1) {
+                capture_cycle(edge);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void finish_top_frame() {
+        const auto done = dfs_stack_.back().node_id;
+        dfs_stack_.pop_back();
+        visit_state_[done] = 2;
+        path_position_[done] = kInvalidNode;
+        path_nodes_.pop_back();
+        path_in_edges_.pop_back();
+    }
+
+    [[nodiscard]] bool search_from(size_t start) {
+        path_nodes_.clear();
+        path_in_edges_.clear();
+        dfs_stack_.clear();
+        push_node(start, EdgeRef{});
+        while (!dfs_stack_.empty()) {
+            bool descended = false;
+            if (advance(dfs_stack_.back(), descended)) return true;
+            if (!descended) finish_top_frame();
+        }
+        return false;
+    }
+
+    const core::DagGraph & graph_;
+    const CycleGraph & cycle_graph_;
+    CycleWitness & witness_;
+    std::vector<int> visit_state_;
+    std::vector<size_t> path_nodes_;
+    std::vector<EdgeRef> path_in_edges_;
+    std::vector<size_t> path_position_;
+    std::vector<DfsFrame> dfs_stack_;
+};
+
+CycleWitness find_cycle_witness(const core::DagGraph & graph) {
+    auto cycle_graph = build_cycle_graph(graph);
+    CycleWitness witness;
+    witness.processed_nodes = consume_acyclic_nodes(graph, cycle_graph);
+    summarize_remaining_nodes(graph, cycle_graph.indegree, witness);
+    if (witness.remaining_node_count > 0) CycleWitnessSearch(graph, cycle_graph, witness).run();
     return witness;
 }
 
-void add_lane_summary_node(LaneSummaryStats & summary, const core::DagNode & node, const core::TraceEvent & event) {
+void add_lane_summary_node(const core::DagGraph & graph, LaneSummaryStats & summary, const core::DagNode & node, const core::TraceEvent & event) {
     auto & lanes = node.is_cpu ? summary.cpu : summary.device;
-    auto & item = lanes[node.lane_key];
+    const auto lane = std::string(graph.node_lane_key(node.id));
+    auto & item = lanes[lane];
     item.node_count++;
-    item.duration_ns += node.duration;
+    item.duration_us += node.duration;
     if (!node.is_cpu && (event.name.contains("hcom") || event.name.contains("HCCL") || event.name.contains("hccl"))) {
-        auto & hccl_item = summary.hccl[node.lane_key];
+        auto & hccl_item = summary.hccl[lane];
         hccl_item.node_count++;
-        hccl_item.duration_ns += node.duration;
+        hccl_item.duration_us += node.duration;
     }
 }
 
@@ -438,8 +484,8 @@ Json lane_stats_json(const std::map<std::string, LaneStats> & stats) {
     Json result = Json::object();
     for (const auto & item : stats) {
         result[item.first] = Json{
-            {  "node_count",     item.second.node_count },
-            { "duration_ns", item.second.duration_ns }
+            {  "node_count",  item.second.node_count },
+            { "duration_us", item.second.duration_us }
         };
     }
     return result;
@@ -455,16 +501,17 @@ Json lane_summary_json(const LaneSummaryStats & summary) {
 
 Json critical_path_sample(const core::DagGraph & graph) {
     constexpr size_t invalid = std::numeric_limits<size_t>::max();
-    if (graph.node_count() == 0)
+    if (graph.active_node_count() == 0)
         return Json{
-            { "total_duration_ns", graph.e2e_time() },
+            { "total_duration_us", graph.e2e_time() },
             {      "sample_nodes",    Json::array() }
         };
 
     std::vector<size_t> best_pred_by_node(graph.node_count(), invalid);
     std::vector<core::DagEdgeKind> best_kind_by_node(graph.node_count(), core::DagEdgeKind::Sequential);
     for (const auto & edge : graph.edges()) {
-        if (edge.src >= graph.node_count() || edge.dst >= graph.node_count()) continue;
+        if (!edge.active || edge.src >= graph.node_count() || edge.dst >= graph.node_count() || !graph.node(edge.src).active || !graph.node(edge.dst).active)
+            continue;
         const auto & pred_node = graph.node(edge.src);
         auto current_pred = best_pred_by_node[edge.dst];
         if (current_pred == invalid || pred_node.completion_time > graph.node(current_pred).completion_time) {
@@ -473,9 +520,10 @@ Json critical_path_sample(const core::DagGraph & graph) {
         }
     }
 
-    size_t current = 0;
+    size_t current = invalid;
     for (const auto & node : graph.nodes()) {
-        if (node.completion_time > graph.node(current).completion_time) current = node.id;
+        if (!node.active) continue;
+        if (current == invalid || node.completion_time > graph.node(current).completion_time) current = node.id;
     }
 
     std::vector<Json> reversed;
@@ -493,7 +541,7 @@ Json critical_path_sample(const core::DagGraph & graph) {
     }
     std::ranges::reverse(reversed);
     return Json{
-        { "total_duration_ns", graph.e2e_time() },
+        { "total_duration_us", graph.e2e_time() },
         {      "sample_nodes",         reversed },
     };
 }
@@ -509,29 +557,30 @@ Json build_dag_quality(const core::DagGraph & graph, const std::unordered_map<st
     if (real > 0 && static_cast<double>(abs_error) / static_cast<double>(real) > kFaithfulReplayRelErrorMax) blockers.push_back("dag_replay_error_too_high");
 
     return Json{
-        {                 "schema","markov.trace_graph.dag_quality.v1"                                   },
-        {                    "run",                      Json::object() },
-        { "trace_channel_coverage",                      Json::object() },
-        {              "dag_build",
+        {          "schema","markov.trace_graph.dag_quality.v2" },
+        {       "dag_build",
          Json{
          { "parsed_record_count", graph.parsed_record_count() },
-         { "normalized_event_count", graph.events().size() },
-         { "node_count", graph.node_count() },
-         { "edge_count", graph.edge_count() },
+         { "normalized_event_count", graph.active_trace_node_count() },
+         { "synthetic_node_count", graph.active_synthetic_node_count() },
+         { "node_count", graph.active_node_count() },
+         { "edge_count", graph.active_edge_count() },
+         { "stored_node_count", graph.node_count() },
+         { "stored_edge_count", graph.edge_count() },
          { "edge_counts_by_kind", edge_counts },
          { "cpu_lane_count", scan.cpu_lanes.size() },
          { "device_lane_count", scan.device_lanes.size() },
-         }                                                             },
-        {        "faithful_replay",
+         }                          },
+        { "faithful_replay",
          Json{
-         { "real_e2e_ns", real },
-         { "simulated_e2e_ns", simulated },
-         { "absolute_error_ns", abs_error },
+         { "real_e2e_us", real },
+         { "simulated_e2e_us", simulated },
+         { "absolute_error_us", abs_error },
          { "relative_error", rel_error },
          { "threshold_relative_error", kFaithfulReplayRelErrorMax },
          { "ready", blockers.empty() },
          { "blockers", blockers },
-         }                                                             },
+         }                          },
     };
 }
 
@@ -545,16 +594,16 @@ Json build_dag_analysis(const core::DagGraph & graph, const std::unordered_map<s
     correlation_coverage["correlation_groups"] = scan.correlation_groups.size();
     correlation_coverage["connection_groups"] = scan.connection_groups.size();
     Json blockers = Json::array();
-    if (graph.node_count() == 0) blockers.push_back("empty_dag");
-    if (graph.edge_count() == 0 && graph.node_count() > 1) blockers.push_back("dag_edge_coverage_gap");
+    if (graph.active_node_count() == 0) blockers.push_back("empty_dag");
+    if (graph.active_edge_count() == 0 && graph.active_node_count() > 1) blockers.push_back("dag_edge_coverage_gap");
 
     return Json{
-        {                 "schema", "markov.trace_graph.dag_analysis.v1" },
-        {   "node_count_by_source",          count_map_json(scan.by_source) },
-        {   "node_count_by_domain",          count_map_json(scan.by_domain) },
-        { "node_count_by_category",        count_map_json(scan.by_category) },
+        {                 "schema","markov.trace_graph.dag_analysis.v2"                                   },
+        {   "node_count_by_source",       count_map_json(scan.by_source) },
+        {   "node_count_by_domain",       count_map_json(scan.by_domain) },
+        { "node_count_by_category",     count_map_json(scan.by_category) },
         {     "edge_count_by_kind",                          edge_counts },
-        {           "lane_summary",  lane_summary_json(scan.lane_summary) },
+        {           "lane_summary", lane_summary_json(scan.lane_summary) },
         {          "sync_coverage",
          Json{
          { "event_wait_nodes", scan.sync_coverage.event_wait_nodes },
@@ -563,7 +612,7 @@ Json build_dag_analysis(const core::DagGraph & graph, const std::unordered_map<s
          { "device_sync_nodes", scan.sync_coverage.device_sync_nodes },
          { "notify_wait_nodes", scan.sync_coverage.notify_wait_nodes },
          { "sync_edges", scan.sync_coverage.sync_edges },
-         }                                                            },
+         }                                                              },
         {   "correlation_coverage",                 correlation_coverage },
         {          "critical_path",          critical_path_sample(graph) },
         {               "blockers",                             blockers },
@@ -631,10 +680,11 @@ bool operation_fact_candidate(const core::TraceEvent & event) {
     auto raw = event.args_json_view();
     return raw.find("capacity_result_observed") != std::string_view::npos || raw.find("writeback_io_observed") != std::string_view::npos
            || raw.find("prefetch_io_observed") != std::string_view::npos || raw.find("prefetch_progress") != std::string_view::npos
-           || raw.find("prefetch_intent") != std::string_view::npos || raw.find("insert_result") != std::string_view::npos || raw.find("capacity") != std::string_view::npos
-           || raw.find("lock_scope") != std::string_view::npos || raw.find("request_admission") != std::string_view::npos
-           || raw.find("writeback_enqueue") != std::string_view::npos || raw.find("writeback_io") != std::string_view::npos
-           || raw.find("prefetch_decision") != std::string_view::npos || raw.find("workload_identity") != std::string_view::npos;
+           || raw.find("prefetch_intent") != std::string_view::npos || raw.find("insert_result") != std::string_view::npos
+           || raw.find("capacity") != std::string_view::npos || raw.find("lock_scope") != std::string_view::npos
+           || raw.find("request_admission") != std::string_view::npos || raw.find("writeback_enqueue") != std::string_view::npos
+           || raw.find("writeback_io") != std::string_view::npos || raw.find("prefetch_decision") != std::string_view::npos
+           || raw.find("workload_identity") != std::string_view::npos;
 }
 
 FactInfo parse_operation_fact(const core::TraceEvent & event) {
@@ -648,12 +698,58 @@ bool name_contains_any(const std::string & name, std::initializer_list<std::stri
 
 std::string lower_if_needed(const core::TraceEvent & event) {
     auto raw = event.args_json_view();
-    if (!name_contains_any(event.name, { "alloc", "evict", "revoke", "backup", "host", "storage", "writeback", "write_back", "write", "prefetch", "read",
-                                         "progress", "loadback", "load_back", "device", "cleanup", "release", "drain", "ack", "wait", "timeout",
-                                         "match_prefix", "prepare_for_extend", "_prefetch_kvcache", "radix" })
-        && !name_contains_any(event.cat, { "alloc", "evict", "revoke", "backup", "host", "storage", "writeback", "write_back", "write", "prefetch", "read",
-                                           "progress", "loadback", "load_back", "device", "cleanup", "release", "drain", "ack", "wait", "timeout",
-                                           "match_prefix", "prepare_for_extend", "_prefetch_kvcache", "radix" })
+    if (!name_contains_any(event.name,
+                           { "alloc",
+                             "evict",
+                             "revoke",
+                             "backup",
+                             "host",
+                             "storage",
+                             "writeback",
+                             "write_back",
+                             "write",
+                             "prefetch",
+                             "read",
+                             "progress",
+                             "loadback",
+                             "load_back",
+                             "device",
+                             "cleanup",
+                             "release",
+                             "drain",
+                             "ack",
+                             "wait",
+                             "timeout",
+                             "match_prefix",
+                             "prepare_for_extend",
+                             "_prefetch_kvcache",
+                             "radix" })
+        && !name_contains_any(event.cat,
+                              { "alloc",
+                                "evict",
+                                "revoke",
+                                "backup",
+                                "host",
+                                "storage",
+                                "writeback",
+                                "write_back",
+                                "write",
+                                "prefetch",
+                                "read",
+                                "progress",
+                                "loadback",
+                                "load_back",
+                                "device",
+                                "cleanup",
+                                "release",
+                                "drain",
+                                "ack",
+                                "wait",
+                                "timeout",
+                                "match_prefix",
+                                "prepare_for_extend",
+                                "_prefetch_kvcache",
+                                "radix" })
         && raw.find("fact") == std::string_view::npos && raw.find("event_kind") == std::string_view::npos && raw.find("target") == std::string_view::npos)
         return "";
     return lower(event.name + " " + event.cat + " " + event.arg("event_kind") + " " + event.arg("target"));
@@ -667,7 +763,7 @@ Json build_anchor_coverage(const DagAnalysisScan & scan) {
         auto & row = role_stats(stats, fact.role);
         row.fact_count++;
         row.direct_fact_node_count++;
-        if (has_near_runtime_anchor(scan.runtime_ts, fact.timestamp_ns)) row.near_runtime_anchor_count++;
+        if (has_near_runtime_anchor(scan.runtime_ts, fact.timestamp_us)) row.near_runtime_anchor_count++;
     }
 
     Json roles_json = Json::object();
@@ -688,7 +784,7 @@ Json build_anchor_coverage(const DagAnalysisScan & scan) {
     }
 
     return Json{
-        {         "schema","markov.trace_graph.dag_anchor_coverage.v1"                           },
+        {         "schema","markov.trace_graph.dag_anchor_coverage.v2"                           },
         {     "fact_roles",                                  roles_json },
         { "anchor_methods",
          Json{
@@ -731,7 +827,7 @@ std::vector<OperationEvidence> make_operation_evidence() {
     };
 }
 
-enum OperationIndex : size_t {
+enum OperationIndex : std::uint8_t {
     kDeviceAllocationOrEviction = 0,
     kHostBackup = 1,
     kStorageWrite = 2,
@@ -810,8 +906,7 @@ void add_sync_coverage(SyncCoverageStats & target, const SyncCoverageStats & sou
     target.notify_wait_nodes += source.notify_wait_nodes;
 }
 
-template <typename Map>
-void add_count_map(Map & target, const Map & source) {
+template <typename Map> void add_count_map(Map & target, const Map & source) {
     for (const auto & item : source) target[item.first] += item.second;
 }
 
@@ -819,7 +914,7 @@ void add_lane_stats(std::map<std::string, LaneStats> & target, const std::map<st
     for (const auto & item : source) {
         auto & row = target[item.first];
         row.node_count += item.second.node_count;
-        row.duration_ns += item.second.duration_ns;
+        row.duration_us += item.second.duration_us;
     }
 }
 
@@ -850,7 +945,7 @@ Json operation_json(const core::DagGraph & graph, const OperationEvidence & evid
     if (visibility == "invisible") blockers.push_back("operation_invisible");
     if (duration_source == "none" || duration_source == "state_fact_only" || duration_source == "control_fact") blockers.push_back("duration_source_missing");
     return Json{
-        {          "visibility",                                                                           visibility                                },
+        {          "visibility",                                                                              visibility                                },
         {            "evidence",
          Json{
          { "direct_runtime_node_count", evidence.direct_runtime_nodes.count },
@@ -858,11 +953,11 @@ Json operation_json(const core::DagGraph & graph, const OperationEvidence & evid
          { "state_fact_node_count", evidence.state_fact_nodes.count },
          { "direct_runtime_node_samples", node_samples(graph, evidence.direct_runtime_nodes.samples) },
          { "control_fact_node_samples", node_samples(graph, evidence.control_fact_nodes.samples) },
-         }                                                                                                                                           },
+         }                                                                                                                                              },
         {    "possible_anchors", evidence.direct_runtime_nodes.count == 0 ? Json::array({ "state_fact_or_timestamp" }) : Json::array({ "runtime_node" }) },
-        {     "duration_source",                                                                                                      duration_source },
-        { "patchable_candidate",                                                                                              visibility == "visible" },
-        {            "blockers",                                                                                                             blockers },
+        {     "duration_source",                                                                                                         duration_source },
+        { "patchable_candidate",                                                                                                 visibility == "visible" },
+        {            "blockers",                                                                                                                blockers },
     };
 }
 
@@ -881,10 +976,42 @@ Json build_operation_visibility(const core::DagGraph & graph, const DagAnalysisS
         operations_json[evidence.name] = std::move(row);
     }
     return Json{
-        {     "schema", "markov.trace_graph.dag_operation_visibility.v1" },
+        {     "schema", "markov.trace_graph.dag_operation_visibility.v2" },
         { "operations",                                  operations_json },
         {    "summary",                                          summary },
     };
+}
+
+void observe_node_dimensions(const core::DagGraph & graph, DagAnalysisScan & scan, const core::DagNode & node, const core::TraceEvent & event) {
+    const auto lane = std::string(graph.node_lane_key(node.id));
+    if (node.is_cpu) scan.cpu_lanes.insert(lane);
+    else scan.device_lanes.insert(lane);
+    add_lane_summary_node(graph, scan.lane_summary, node, event);
+    scan.by_source[event_source(event)]++;
+    scan.by_domain[event_domain(event)]++;
+    scan.by_category[event.cat.empty() ? "unknown" : event.cat]++;
+}
+
+void observe_sync_node(SyncCoverageStats & coverage, const core::TraceEvent & event) {
+    if (event.name == "EVENT_WAIT") coverage.event_wait_nodes++;
+    else if (event.name == "AscendCL@aclrtSynchronizeStream" || event.name == "AscendCL@aclrtSynchronizeStreamWithTimeout") coverage.stream_sync_nodes++;
+    else if (event.name == "AscendCL@aclrtSynchronizeEvent" || event.name == "AscendCL@aclrtSynchronizeEventWithTimeout") coverage.event_sync_nodes++;
+    else if (event.name == "AscendCL@aclrtSynchronizeDevice" || event.name == "AscendCL@aclrtSynchronizeDeviceWithTimeout") coverage.device_sync_nodes++;
+    else if (event.name == "NOTIFY_WAIT") coverage.notify_wait_nodes++;
+}
+
+void observe_identity_group(const core::TraceEvent & event, std::string_view key, std::unordered_set<std::string> & groups) {
+    if (!raw_contains_key_hint(event, key)) return;
+    const auto value = event.arg(key);
+    if (!value.empty()) groups.insert(value);
+}
+
+void observe_runtime_anchor(DagAnalysisScan & scan, const core::TraceEvent & event) {
+    if (is_runtime_node(event)) scan.runtime_ts.push_back(event.ts);
+    const auto fact = parse_relevant_fact(event);
+    if (fact.present && fact.fact_class == "workload_identity" && role_tracked(fact.role)) {
+        scan.anchor_facts.push_back(AnchorFact{ .role = fact.role, .timestamp_us = event.ts });
+    }
 }
 
 DagAnalysisScan scan_node_range(const core::DagGraph & graph, size_t begin, size_t end) {
@@ -894,38 +1021,13 @@ DagAnalysisScan scan_node_range(const core::DagGraph & graph, size_t begin, size
 
     for (size_t node_id = begin; node_id < end; ++node_id) {
         const auto & node = graph.node(node_id);
+        if (!node.active) continue;
         const auto & event = graph.event_for_node(node.id);
-        if (node.is_cpu) scan.cpu_lanes.insert(node.lane_key);
-        else scan.device_lanes.insert(node.lane_key);
-
-        add_lane_summary_node(scan.lane_summary, node, event);
-        scan.by_source[event_source(event)]++;
-        scan.by_domain[event_domain(event)]++;
-        scan.by_category[event.cat.empty() ? "unknown" : event.cat]++;
-
-        if (event.name == "EVENT_WAIT") scan.sync_coverage.event_wait_nodes++;
-        else if (event.name == "AscendCL@aclrtSynchronizeStream" || event.name == "AscendCL@aclrtSynchronizeStreamWithTimeout")
-            scan.sync_coverage.stream_sync_nodes++;
-        else if (event.name == "AscendCL@aclrtSynchronizeEvent" || event.name == "AscendCL@aclrtSynchronizeEventWithTimeout")
-            scan.sync_coverage.event_sync_nodes++;
-        else if (event.name == "AscendCL@aclrtSynchronizeDevice" || event.name == "AscendCL@aclrtSynchronizeDeviceWithTimeout")
-            scan.sync_coverage.device_sync_nodes++;
-        else if (event.name == "NOTIFY_WAIT") scan.sync_coverage.notify_wait_nodes++;
-
-        if (raw_contains_key_hint(event, "correlation_id")) {
-            auto value = event.arg("correlation_id");
-            if (!value.empty()) scan.correlation_groups.insert(value);
-        }
-        if (raw_contains_key_hint(event, "connection_id")) {
-            auto value = event.arg("connection_id");
-            if (!value.empty()) scan.connection_groups.insert(value);
-        }
-
-        if (is_runtime_node(event)) scan.runtime_ts.push_back(event.ts);
-        auto anchor_fact = parse_relevant_fact(event);
-        if (anchor_fact.present && anchor_fact.fact_class == "workload_identity" && role_tracked(anchor_fact.role))
-            scan.anchor_facts.push_back(AnchorFact{ .role = anchor_fact.role, .timestamp_ns = event.ts });
-
+        observe_node_dimensions(graph, scan, node, event);
+        observe_sync_node(scan.sync_coverage, event);
+        observe_identity_group(event, "correlation_id", scan.correlation_groups);
+        observe_identity_group(event, "connection_id", scan.connection_groups);
+        observe_runtime_anchor(scan, event);
         observe_operation_event(scan.operations, node, event);
     }
     return scan;
@@ -996,22 +1098,55 @@ Json build_cycle_witness(const core::DagGraph & graph, const std::string & error
     if (witness.cycle_nodes.empty() && witness.remaining_node_count > 0) blockers.push_back("cycle_witness_not_found");
 
     return Json{
-        {                  "schema",       "markov.trace_graph.dag_cycle_witness.v1" },
-        {          "cycle_detected",                witness.remaining_node_count > 0 },
-        {           "error_message",                                  error_message },
-        {              "node_count",                            graph.node_count() },
-        {              "edge_count",                            graph.edge_count() },
-        {        "processed_nodes",                       witness.processed_nodes },
-        {   "remaining_node_count",                   witness.remaining_node_count },
-        {       "cycle_node_count",                       witness.cycle_nodes.size() },
-        {       "cycle_edge_count",                       witness.cycle_edges.size() },
-        {          "cycle_nodes",                                      cycle_nodes },
-        {          "cycle_edges",                                      cycle_edges },
-        { "cycle_nodes_truncated",       witness.cycle_nodes.size() > node_limit },
-        { "cycle_edges_truncated",       witness.cycle_edges.size() > edge_limit },
-        {  "cycle_edge_counts_by_kind",          unordered_count_map_json(cycle_edge_counts) },
-        { "remaining_node_sample",                              remaining_sample },
-        {             "blockers",                                        blockers },
+        {                    "schema",   "markov.trace_graph.dag_cycle_witness.v2" },
+        {            "cycle_detected",            witness.remaining_node_count > 0 },
+        {             "error_message",                               error_message },
+        {                "node_count",                   graph.active_node_count() },
+        {                "edge_count",                   graph.active_edge_count() },
+        {         "stored_node_count",                          graph.node_count() },
+        {         "stored_edge_count",                          graph.edge_count() },
+        {           "processed_nodes",                     witness.processed_nodes },
+        {      "remaining_node_count",                witness.remaining_node_count },
+        {          "cycle_node_count",                  witness.cycle_nodes.size() },
+        {          "cycle_edge_count",                  witness.cycle_edges.size() },
+        {               "cycle_nodes",                                 cycle_nodes },
+        {               "cycle_edges",                                 cycle_edges },
+        {     "cycle_nodes_truncated",     witness.cycle_nodes.size() > node_limit },
+        {     "cycle_edges_truncated",     witness.cycle_edges.size() > edge_limit },
+        { "cycle_edge_counts_by_kind", unordered_count_map_json(cycle_edge_counts) },
+        {     "remaining_node_sample",                            remaining_sample },
+        {                  "blockers",                                    blockers },
+    };
+}
+
+Json build_topology_validation(const core::DagGraph & graph, const core::DagTopologyValidationReport & report, const std::string & error_message) {
+    Json issues = Json::array();
+    for (const auto & issue : report.issues) {
+        Json node_witness = Json::array();
+        for (const auto node_id : issue.node_ids) {
+            if (node_id < graph.node_count()) node_witness.push_back(cycle_node_json(graph, node_id));
+        }
+        issues.push_back({
+            {         "code",              issue.code },
+            {      "message",           issue.message },
+            {     "node_ids",          issue.node_ids },
+            { "edge_indices",      issue.edge_indices },
+            { "node_witness", std::move(node_witness) },
+        });
+    }
+    Json cycle_nodes = Json::array();
+    for (const auto node_id : report.cycle_nodes) {
+        if (node_id < graph.node_count()) cycle_nodes.push_back(cycle_node_json(graph, node_id));
+    }
+    return Json{
+        {            "schema", "markov.trace_graph.dag_topology_validation.v2" },
+        {             "valid",                                     report.ok() },
+        {     "error_message",                                   error_message },
+        { "active_node_count",                        report.active_node_count },
+        { "active_edge_count",                        report.active_edge_count },
+        {            "issues",                               std::move(issues) },
+        {    "cycle_node_ids",                              report.cycle_nodes },
+        {       "cycle_nodes",                          std::move(cycle_nodes) },
     };
 }
 
@@ -1022,6 +1157,7 @@ using dag_analysis_detail::build_cycle_witness;
 using dag_analysis_detail::build_dag_analysis;
 using dag_analysis_detail::build_dag_quality;
 using dag_analysis_detail::build_operation_visibility;
+using dag_analysis_detail::build_topology_validation;
 using dag_analysis_detail::elapsed_ms;
 using dag_analysis_detail::scan_dag_analysis_inputs;
 
@@ -1062,6 +1198,10 @@ DagAnalysisArtifacts build_dag_analysis_artifacts(const core::DagGraph & graph, 
 
 std::string build_cycle_witness_json(const core::DagGraph & graph, const std::string & error_message) {
     return build_cycle_witness(graph, error_message).dump(2);
+}
+
+std::string build_topology_validation_json(const core::DagGraph & graph, const core::DagTopologyValidationReport & report, const std::string & error_message) {
+    return build_topology_validation(graph, report, error_message).dump(2);
 }
 
 } // namespace markov::trace_graph::modules::dag_analysis

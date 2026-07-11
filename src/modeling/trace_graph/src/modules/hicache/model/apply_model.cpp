@@ -1,8 +1,10 @@
 /**
  * @file
- * @brief HiCache state model 的输入扫描、state replay 和 Debug summary 收敛。
+ * @brief HiCache fact scanning, target-state replay, and Debug summary convergence.
  */
-#include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
+#include "markov/trace_graph/modules/hicache/model/state.hpp"
+
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
 #include <ranges>
@@ -13,65 +15,77 @@ using core::DagGraph;
 using frontend::HiCacheConfig;
 
 /**
- * @brief 对 DAG 中的 HiCache fact 执行 target state replay，并在 Debug 下生成 module summary。
+ * @brief Replays approved HiCache facts and emits a Debug module summary.
  *
- * 流程分三步：
- * 1. 先观察 state-model path fact 的 token dictionary，让 span-only fact 能解析成 target page path；
- * 2. 按 DAG node 顺序 dispatch fact；
- * 3. 在 finalize 收敛 pending async lifecycle；
- * 4. 仅 Debug 构建聚合 diagnostics/validation summary。
+ * The pass first indexes approved token dictionaries, then dispatches facts in stable DAG
+ * node order, finalizes target-derived asynchronous lifecycles, and finally aggregates
+ * diagnostics in Debug builds. State replay never consumes source-actual outcomes.
  */
-HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & config) {
+HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & config) {
+    HiCacheModelResult result;
     HiCacheSummary summary;
 #ifdef DEBUG
     summary.target_config = config;
-    summary.resolved_policy = resolve_hicache_policy(config);
 #endif
 
     HiCacheFactParser parser;
+    std::vector<size_t> hicache_node_ids;
     for (const auto & node : graph.nodes()) {
         const auto & event = graph.event_for_node(node.id);
+        if (!parser.is_hicache_event(event)) continue;
+        hicache_node_ids.push_back(node.id);
         parser.observe_token_dictionaries(event);
     }
 
     HiCacheState state(config);
-    for (const auto & node : graph.nodes()) {
-        const auto & event = graph.event_for_node(node.id);
-        if (!parser.is_hicache_event(event)) continue;
 #ifdef DEBUG
-        summary.input_hicache_events++;
+    summary.resolved_policy = state.resolved_policy();
 #endif
-        auto fact = parser.parse(node.id, event);
+    for (const auto node_id : hicache_node_ids) {
+        const auto & event = graph.event_for_node(node_id);
 #ifdef DEBUG
-        summary.events_by_role[fact.role]++;
+        (void)core::checked_increment_u64(summary.input_hicache_events, "HiCache input event count exceeds uint64 range");
+#endif
+        auto fact = parser.parse(node_id, event);
+#ifdef DEBUG
+        (void)core::checked_increment_u64(summary.events_by_role[fact.role], "HiCache input role count exceeds uint64 range");
 #endif
 
         auto route = route_hicache_fact(fact);
         if (!route.model_fact) {
 #ifdef DEBUG
-            summary.skipped_non_state_model_events++;
+            (void)core::checked_increment_u64(summary.skipped_non_state_model_events, "HiCache skipped event count exceeds uint64 range");
 #endif
             continue;
         }
-        if (!route.known_role || !hicache_fact_role_implemented(route.role)) {
+        if (!route.known_role) {
 #ifdef DEBUG
-            summary.missing_state_model_facts["unknown_state_model_fact"]++;
+            (void)core::checked_increment_u64(summary.missing_state_model_facts["unknown_state_model_fact"],
+                                              "HiCache missing state-model fact count exceeds uint64 range");
 #endif
+            (void)core::checked_increment_u64(result.effect_intents.missing_facts["unknown_state_model_fact"],
+                                              "HiCache effect missing-fact count exceeds uint64 range");
             continue;
         }
-        const auto required_errors = hicache_required_fact_errors(fact, route.role, effective_page_size(config, fact));
+        const auto required_errors = hicache_required_fact_errors(fact, route.role);
         if (!required_errors.empty()) {
 #ifdef DEBUG
-            std::ranges::for_each(required_errors, [&](const auto & error) { summary.missing_state_model_facts[error]++; });
+            std::ranges::for_each(required_errors, [&](const auto & error) {
+                (void)core::checked_increment_u64(summary.missing_state_model_facts[error], "HiCache missing state-model fact count exceeds uint64 range");
+            });
 #endif
+            std::ranges::for_each(required_errors, [&](const auto & error) {
+                (void)core::checked_increment_u64(result.effect_intents.missing_facts[error], "HiCache effect missing-fact count exceeds uint64 range");
+            });
             continue;
         }
 
         HiCacheTransitionBuffer transitions;
         state.apply_fact(fact, route.role, summary, transitions);
 #ifdef DEBUG
-        summary.processed_hicache_events++;
-        summary.processed_events_by_role[hicache_fact_role_name(route.role)]++;
+        (void)core::checked_increment_u64(summary.processed_hicache_events, "HiCache processed event count exceeds uint64 range");
+        (void)core::checked_increment_u64(summary.processed_events_by_role[hicache_fact_role_name(route.role)],
+                                          "HiCache processed role count exceeds uint64 range");
         summary.transition_trace.insert(summary.transition_trace.end(), transitions.begin(), transitions.end());
         summary.state_transition_count = summary.transition_trace.size();
 #endif
@@ -129,7 +143,17 @@ HiCacheSummary apply_hicache_model(DagGraph & graph, const HiCacheConfig & confi
         summary.warnings.push_back("HiCache capacity index audit found mismatches between mutation-driven index and canonical tree.");
     if (summary.ref_audit_issue_count > 0) summary.warnings.push_back("HiCache ref ledger audit found mismatches between owner ledger and tree ref counters.");
 #endif
-    return summary;
+    auto effect_intents = state.effect_intent_catalog();
+    for (const auto & [reason, count] : result.effect_intents.missing_facts) {
+        auto & merged_count = effect_intents.missing_facts[reason];
+        merged_count = core::checked_add_u64(merged_count, count, "HiCache merged missing-fact count exceeds uint64 range");
+    }
+    result.effect_intents = std::move(effect_intents);
+    result.replay_complete = true;
+#ifdef DEBUG
+    result.summary = std::move(summary);
+#endif
+    return result;
 }
 
 } // namespace markov::trace_graph::modules::hicache::model

@@ -1,29 +1,21 @@
 /**
  * @file
- * @brief HiCache write-through/write-back backup 和 ACK 近似。
+ * @brief Models HiCache write-through/write-back backup and acknowledgement.
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
 
-#include <algorithm>
-#include <iterator>
-#include <ranges>
-#include <set>
-#include <sstream>
-#include <unordered_map>
-#include <unordered_set>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::model {
 
-using core::DagGraph;
-using frontend::HiCacheConfig;
-
 /**
- * @brief 在 target-control 或 finalize 边界释放 write-through backup 临时 ref。
+ * @brief Releases temporary write-through references at control or finalization.
  *
- * SGLang write-through-selective backup 在 CPU 写入 ACK 前会持有普通 lock ref。
- * 模型把 ACK 时序折叠到下一条 target control fact 开始处 drain；trace 末尾仍
- * pending 的 ACK 在 target finalize 边界收敛，避免 final state 保留临时 lock。
+ * Selective write-through holds an ordinary lock reference until CPU-write
+ * acknowledgement. The model drains it at the next target-control fact, or at final
+ * state when no later fact exists, preventing temporary locks from surviving replay.
  */
 void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
                                                    ScopedState & scope, const std::string & reason) {
@@ -35,93 +27,127 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiC
         const auto ref = scope.refs.release_owner(scope.tree, backup.owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, reason);
         if constexpr (debug_records_enabled())
-            record_transition(fact, summary, transitions, "complete_write_through_backup", "writeback", backup.pages, before);
+            record_transition(fact,
+                              summary,
+                              transitions,
+                              TransitionDescriptor{ .kind = "complete_write_through_backup", .tier = "writeback" },
+                              backup.pages,
+                              before);
     }
 }
 
-/**
- * @brief 将一个 device node 的 value 提交为 host/storage backup。
- *
- * storage_readable=true 表示 backup 同步进入 L3 backend 可读目录；write-back dirty
- * eviction 和 hit-count write-through backup 复用该入口，但 host allocation 必须先通过
- * target capacity cleanup。
- */
-bool HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                      HiCacheNodeId node_id, bool storage_readable) {
-    const auto pages = scope.tree.node_pages(node_id);
-    const auto * node = scope.tree.node(node_id);
-    if (node == nullptr || pages.empty()) return false;
-    const auto host_allocation_pages = !(node->residency.host_present && node->residency.host_visible) ? static_cast<uint64_t>(pages.size()) : uint64_t{ 0 };
-    if (host_allocation_pages > 0) {
-        const auto allocation = request_host_allocation(fact, summary, transitions, scope, host_allocation_pages, host_allocation_pages, false, "write_backup");
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "host_allocation",
-                                       .policy_name = "write_backup",
-                                       .decision = allocation.accepted ? "accept_host_backup_pages" : "skip_host_backup_capacity",
-                                       .reason = allocation.accepted ? "target host pool can fit write_backup allocation after SGLang-style cleanup"
-                                                                     : "target host pool still lacks space after SGLang-style cleanup",
-                                       .accepted = allocation.accepted,
-                                       .requested_pages = host_allocation_pages,
-                                       .candidate_pages = allocation.accepted_pages,
-                                       .capacity_pages = allocation.capacity_pages,
-                                       .occupied_pages = allocation.occupied_pages,
-                                       .reserved_pages = allocation.reserved_pages,
-                                       .pages = pages,
-                                   });
-        if (!allocation.accepted) return false;
+bool HiCacheState::reserve_host_backup_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                                const std::vector<std::string> & pages, uint64_t allocation_pages) {
+    if (allocation_pages == 0) return true;
+    const auto allocation = request_host_allocation(fact,
+                                                    summary,
+                                                    transitions,
+                                                    scope,
+                                                    HostAllocationRequest{
+                                                        .requested_pages = allocation_pages,
+                                                        .minimum_pages = allocation_pages,
+                                                        .allow_truncate = false,
+                                                        .reason = "write_backup",
+                                                    });
+    if constexpr (debug_records_enabled()) {
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "host_allocation",
+                                   .policy_name = "write_backup",
+                                   .decision = allocation.accepted ? "accept_host_backup_pages" : "skip_host_backup_capacity",
+                                   .reason = allocation.accepted ? "target host pool can fit write_backup allocation after SGLang-style cleanup"
+                                                                 : "target host pool still lacks space after SGLang-style cleanup",
+                                   .accepted = allocation.accepted,
+                                   .requested_pages = allocation_pages,
+                                   .candidate_pages = allocation.accepted_pages,
+                                   .capacity_pages = allocation.capacity_pages,
+                                   .occupied_pages = allocation.occupied_pages,
+                                   .reserved_pages = allocation.reserved_pages,
+                                   .pages = pages,
+                               });
     }
+    return allocation.accepted;
+}
 
-    std::string storage_id;
-    if (storage_readable) {
-        storage_id = scope.clock.next_operation_id("storage");
-        const auto storage_owner = scoped_request_key(fact) + ":storage:" + storage_id;
-        const auto before_enqueue = debug_state_digest();
-        scope.async_ops.upsert_storage(HiCacheStorageOperation{
-            .header = make_operation_header(HiCacheOperationKind::Storage,
-                                            storage_id,
-                                            normalized_scope(fact),
-                                            scoped_request_key(fact),
-                                            storage_owner,
-                                            node_id,
-                                            std::vector<HiCacheNodeId>{ node_id },
-                                            pages,
-                                            fact.ts,
-                                            0),
-            .node_id = node_id,
-        });
-        const auto ref =
-            scope.refs.acquire_host(scope.tree, storage_owner, "storage", scoped_request_key(fact), storage_id, std::vector<HiCacheNodeId>{ node_id });
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_acquire");
-        if constexpr (debug_records_enabled()) record_transition(fact, summary, transitions, "enqueue_storage_backup", "storage", pages, before_enqueue);
-    }
+std::string HiCacheState::begin_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                               HiCacheNodeId node_id, const std::vector<std::string> & pages) {
+    const auto storage_id = scope.clock.next_operation_id("storage");
+    const auto request_key = scoped_request_key(fact);
+    const auto storage_owner = request_key + ":storage:" + storage_id;
+    const auto before_enqueue = debug_state_digest();
+    scope.async_ops.insert_storage(HiCacheStorageOperation{
+        .header = make_operation_header(HiCacheOperationKind::Storage, storage_id, normalized_scope(fact), request_key, storage_owner, pages, fact.ts, 0),
+    });
+    const auto ref = scope.refs.acquire_host(scope.tree, storage_owner, "storage", request_key, storage_id, std::vector<HiCacheNodeId>{ node_id });
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_acquire");
+    if constexpr (debug_records_enabled())
+        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "enqueue_storage_backup", .tier = "storage" }, pages, before_enqueue);
+    return storage_id;
+}
+
+void HiCacheState::materialize_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                           HiCacheNodeId node_id, const std::vector<std::string> & pages, bool storage_readable) {
     const auto before = debug_state_digest();
     scope.tree.mark_host_visible(node_id, storage_readable);
     scope.tree.clear_dirty(node_id);
     sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "commit_host_backup");
     if (storage_readable) {
         scope.storage.mark_readable_pages(normalized_scope(fact), pages);
+#ifdef DEBUG
         scope.storage.mark_materialized_pages(pages, node_id);
+#endif
     }
+    if constexpr (debug_records_enabled()) {
+        record_transition(fact,
+                          summary,
+                          transitions,
+                          TransitionDescriptor{
+                              .kind = storage_readable ? "commit_host_storage_backup" : "commit_host_backup",
+                              .tier = "L2",
+                          },
+                          pages,
+                          before);
+    }
+    if (storage_readable && policy_.write_count_enabled()) hold_write_through_backup_ref(fact, summary, transitions, scope, node_id, pages);
+}
+
+void HiCacheState::complete_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                           const std::string & storage_id, const std::vector<std::string> & pages) {
+    if (storage_id.empty()) return;
+    const auto before_complete = debug_state_digest();
+    scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
+    const auto ref = scope.refs.release_owner(scope.tree, scoped_request_key(fact) + ":storage:" + storage_id);
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_release");
     if constexpr (debug_records_enabled())
-        record_transition(fact, summary, transitions, storage_readable ? "commit_host_storage_backup" : "commit_host_backup", "L2", pages, before);
-    if (storage_readable && policy_.write_count_enabled()) { hold_write_through_backup_ref(fact, summary, transitions, scope, node_id, pages); }
-    if (!storage_id.empty()) {
-        const auto before_complete = debug_state_digest();
-        scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
-        const auto ref = scope.refs.release_owner(scope.tree, scoped_request_key(fact) + ":storage:" + storage_id);
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_release");
-        if constexpr (debug_records_enabled()) record_transition(fact, summary, transitions, "complete_storage_backup", "storage", pages, before_complete);
-    }
+        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "complete_storage_backup", .tier = "storage" }, pages, before_complete);
+}
+
+/**
+ * @brief Commits one device node value as a host and optional storage backup.
+ *
+ * `storage_readable` also registers the backup in the readable L3 directory. Dirty
+ * write-back eviction and hit-count write-through share this path, and both must pass
+ * target host-capacity cleanup before materialization.
+ */
+bool HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                      HiCacheNodeId node_id, bool storage_readable) {
+    const auto * node = scope.tree.node(node_id);
+    if (node == nullptr) return false;
+    const auto & pages = scope.tree.node_pages(node_id);
+    if (pages.empty()) return false;
+    const auto host_allocation_pages = !(node->residency.host_present && node->residency.host_visible) ? static_cast<uint64_t>(pages.size()) : uint64_t{ 0 };
+    if (!reserve_host_backup_capacity(fact, summary, transitions, scope, pages, host_allocation_pages)) return false;
+    const auto storage_id = storage_readable ? begin_storage_backup(fact, summary, transitions, scope, node_id, pages) : std::string{};
+    materialize_host_backup(fact, summary, transitions, scope, node_id, pages, storage_readable);
+    complete_storage_backup(fact, summary, transitions, scope, storage_id, pages);
     return true;
 }
 
 /**
- * @brief 为 write-through-selective backup 持有普通 lock ref，等待后续 ACK drain。
+ * @brief Holds an ordinary lock reference until write-through acknowledgement.
  *
- * 该 ref 不代表 request lifecycle，而是近似 SGLang `writing_check()` 之前 backup
- * node 仍被保护的窗口。
+ * This reference does not represent request lifecycle. It approximates the interval
+ * during which a backup node remains protected before SGLang `writing_check()`.
  */
 void HiCacheState::hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                                  HiCacheNodeId node_id, const std::vector<std::string> & pages) {
@@ -149,71 +175,88 @@ void HiCacheState::hold_write_through_backup_ref(const HiCacheFact & fact, HiCac
                                    .candidate_pages = static_cast<uint64_t>(pages.size()),
                                    .pages = pages,
                                });
-    if constexpr (debug_records_enabled()) record_transition(fact, summary, transitions, "enqueue_write_through_backup", "writeback", pages, before);
+    if constexpr (debug_records_enabled())
+        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "enqueue_write_through_backup", .tier = "writeback" }, pages, before);
+}
+
+void HiCacheState::record_write_count_skip(const HiCacheFact & fact, const std::vector<std::string> & pages, const std::string & reason) {
+    if constexpr (debug_records_enabled()) {
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "write_policy",
+                                   .policy_name = policy_.write_policy(),
+                                   .decision = "skip_hit_count_backup",
+                                   .reason = reason,
+                                   .accepted = false,
+                                   .candidate_pages = static_cast<uint64_t>(pages.size()),
+                                   .pages = pages,
+                               });
+    }
+    else {
+        (void)fact;
+        (void)pages;
+        (void)reason;
+    }
+}
+
+void HiCacheState::apply_write_count_to_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
+                                             const WriteCountRequest & request) {
+    const auto node_id = request.node_id;
+    const auto threshold = request.threshold;
+    auto * node = scope.tree.mutable_node(node_id);
+    if (node == nullptr || !node->residency.device_present) return;
+    const auto before = debug_state_digest();
+    (void)core::checked_increment_u64(node->hit_count, "HiCache radix node hit count exceeds uint64 range");
+    if constexpr (debug_records_enabled())
+        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "increment_hit_count", .tier = "hit_count" }, node->pages, before);
+    const auto should_backup = !has_host_backup(*node) && node->hit_count >= threshold;
+    if constexpr (debug_records_enabled()) {
+        record_policy_decision(fact,
+                               HiCachePolicyDecisionRecord{
+                                   .policy_area = "write_policy",
+                                   .policy_name = policy_.write_policy(),
+                                   .decision = should_backup ? "commit_hit_count_backup" : "wait_for_hit_count_backup",
+                                   .reason = has_host_backup(*node) ? "node already has host backup"
+                                             : should_backup        ? "node hit count reached write-through threshold"
+                                                                    : "node hit count is below write-through threshold",
+                                   .accepted = should_backup,
+                                   .candidate_pages = static_cast<uint64_t>(node->pages.size()),
+                                   .hit_count = node->hit_count,
+                                   .threshold_pages = threshold,
+                                   .pages = node->pages,
+                               });
+    }
+    if (should_backup) (void)commit_host_backup(fact, summary, transitions, scope, node_id, true);
 }
 
 /**
- * @brief 按 hit-count write-through policy 检查 request path 上的 node 是否需要 backup。
+ * @brief Applies hit-count write-through policy to nodes on a request path.
  *
- * write-back 不走该路径；write-through-selective 在 node hit_count 达到 threshold 时
- * 立即提交 host/storage backup，并通过 hold_write_through_backup_ref 保留 ACK 前保护。
+ * Write-back bypasses this path. Selective write-through commits host/storage backup
+ * when node hit count reaches the threshold and holds protection until acknowledgement.
  */
 void HiCacheState::apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                             const std::vector<std::string> & pages) {
     if (!policy_.write_count_enabled()) {
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "write_policy",
-                                       .policy_name = policy_.write_policy(),
-                                       .decision = "skip_hit_count_backup",
-                                       .reason = "target write policy does not use hit-count backup",
-                                       .accepted = false,
-                                       .candidate_pages = static_cast<uint64_t>(pages.size()),
-                                       .pages = pages,
-                                   });
+        record_write_count_skip(fact, pages, "target write policy does not use hit-count backup");
         return;
     }
     const auto threshold = policy_.write_through_threshold();
     if (threshold == 0) {
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "write_policy",
-                                       .policy_name = policy_.write_policy(),
-                                       .decision = "skip_hit_count_backup",
-                                       .reason = "resolved write-through threshold is zero",
-                                       .accepted = false,
-                                       .candidate_pages = static_cast<uint64_t>(pages.size()),
-                                       .pages = pages,
-                                   });
+        record_write_count_skip(fact, pages, "resolved write-through threshold is zero");
         return;
     }
 
-    auto lookup = scope.tree.lookup_peek(pages);
+    const auto lookup = scope.tree.lookup_peek(pages);
     for (const auto node_id : lookup.topology_chain) {
-        auto * node = scope.tree.mutable_node(node_id);
-        if (node == nullptr || !node->residency.device_present) continue;
-        const auto before = debug_state_digest();
-        node->hit_count++;
-        if constexpr (debug_records_enabled()) record_transition(fact, summary, transitions, "increment_hit_count", "hit_count", node->pages, before);
-        const auto should_backup = !has_host_backup(*node) && node->hit_count >= threshold;
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "write_policy",
-                                       .policy_name = policy_.write_policy(),
-                                       .decision = should_backup ? "commit_hit_count_backup" : "wait_for_hit_count_backup",
-                                       .reason = has_host_backup(*node) ? "node already has host backup"
-                                                 : should_backup        ? "node hit count reached write-through threshold"
-                                                                        : "node hit count is below write-through threshold",
-                                       .accepted = should_backup,
-                                       .candidate_pages = static_cast<uint64_t>(node->pages.size()),
-                                       .hit_count = node->hit_count,
-                                       .threshold_pages = threshold,
-                                       .pages = node->pages,
-                                   });
-        if (should_backup) (void)commit_host_backup(fact, summary, transitions, scope, node_id, true);
+        apply_write_count_to_node(fact,
+                                  summary,
+                                  transitions,
+                                  scope,
+                                  WriteCountRequest{
+                                      .node_id = node_id,
+                                      .threshold = threshold,
+                                  });
     }
 }
 

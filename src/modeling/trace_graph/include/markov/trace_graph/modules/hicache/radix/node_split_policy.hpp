@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache token radix tree 的节点分裂策略。
+ * @brief Node-split policy for the HiCache token radix tree.
  */
 #pragma once
 
@@ -13,43 +13,60 @@
 
 namespace markov::trace_graph::modules::hicache::radix {
 
-/**
- * @brief split policy 所需的 topology/projection 上下文。
- */
+#ifdef DEBUG
+/** @brief Projection context used only to construct a split diagnostics record. */
 struct HiCacheNodeSplitContext {
     std::string parent_child_key;
     std::string suffix_child_key;
     HiCacheNodeSplitProjection prefix_projection;
     HiCacheNodeSplitProjection suffix_projection;
 };
+#endif
 
 /**
- * @brief radix split 的字段继承计划。
+ * @brief Field-inheritance plan for one radix split.
  */
 struct HiCacheNodeSplitPlan {
     HiCacheCacheNode prefix_node;
+    std::vector<std::string> suffix_pages;
+#ifdef DEBUG
     HiCacheNodeSplitRecord record;
+#endif
+};
+
+/** @brief Non-owning page partition supplied to one radix split plan. */
+struct HiCacheNodeSplitPages {
+    const std::vector<std::string> & prefix;
+    const std::vector<std::string> & suffix;
 };
 
 /**
- * @brief HiCache canonical radix node split 策略。
+ * @brief Canonical HiCache radix-node split policy.
  *
- * SGLang split 会把 child 的 value/host value 按 prefix/suffix 切开；lock_ref
- * 和 hit_count 则保持 node-chain 语义，prefix node 继承一份，suffix child 保留一份。
- * 本策略把这些字段规则从 tree topology 操作中拆出来。
+ * SGLang partitions device and host values into prefix and suffix segments. Reference
+ * counters and hit count retain node-chain semantics, so the new prefix inherits a copy
+ * while the suffix child keeps its original state. This class isolates those rules from
+ * topology mutation.
  */
 class HiCacheNodeSplitPolicy {
 public:
-    /** @brief 构造 prefix node 和审计记录；不修改原 child。 */
-    [[nodiscard]] HiCacheNodeSplitPlan plan(HiCacheNodeId parent, const HiCacheCacheNode & child, HiCacheNodeId prefix_node_id, size_t split_pages,
-                                            const std::vector<std::string> & prefix_pages, const std::vector<std::string> & suffix_pages,
-                                            const HiCacheNodeSplitContext & context) const;
+    /** @brief Builds the business split plan without mutating the suffix child. */
+    [[nodiscard]] HiCacheNodeSplitPlan plan(HiCacheNodeId parent, const HiCacheCacheNode & child, HiCacheNodeId prefix_node_id,
+                                            const HiCacheNodeSplitPages & pages) const;
 
-    /** @brief 将 suffix child 调整为 split 后状态；保留 residency/ref/hit_count。 */
+#ifdef DEBUG
+    /** @brief Attaches validation-only split provenance to an existing business plan. */
+    void attach_debug_record(HiCacheNodeSplitPlan & plan, HiCacheNodeId parent, const HiCacheCacheNode & child, size_t split_pages,
+                             const HiCacheNodeSplitContext & context) const;
+#endif
+
+    /** @brief Replaces suffix pages while preserving residency, references, and hit count. */
     void apply_suffix(HiCacheCacheNode & child, const HiCacheNodeSplitPlan & plan) const;
 
 private:
+#ifdef DEBUG
     [[nodiscard]] static std::vector<std::string> owner_keys(const std::map<std::string, uint64_t> & owners);
+#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache::radix

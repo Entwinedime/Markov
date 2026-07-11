@@ -1,10 +1,10 @@
 /**
  * @file
- * @brief SimulationModule summary 的 diagnostics JSON 入口。
+ * @brief Diagnostics JSON boundary for SimulationModule summaries.
  *
- * 模块本体只暴露结构化 summary；本 writer 在 CLI diagnostics 边界把不同模块的
- * summary 转成 JSON。未知模块会输出模块名和 unsupported 标记，避免业务接口重新
- * 引入 JSON 虚函数。
+ * Modules expose typed summaries. This writer performs dynamic dispatch at the CLI boundary,
+ * keeping JSON virtual functions out of the business interface. Unknown modules receive a
+ * stable unsupported record instead of silently disappearing.
  */
 #pragma once
 
@@ -14,7 +14,7 @@
 
 namespace markov::trace_graph::modules::diagnostics {
 
-/** @brief 生成单个已执行模块的 summary JSON 字符串。 */
+/** @brief Serializes the summary of one executed module to JSON text. */
 [[nodiscard]] std::string module_summary_json(const SimulationModule & module);
 
 } // namespace markov::trace_graph::modules::diagnostics

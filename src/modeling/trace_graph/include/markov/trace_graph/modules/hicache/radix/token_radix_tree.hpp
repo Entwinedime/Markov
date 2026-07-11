@@ -1,10 +1,12 @@
 /**
  * @file
- * @brief HiCache canonical token radix tree 和 page residency 状态源。
+ * @brief Canonical HiCache token radix tree and page-residency source of truth.
  */
 #pragma once
 
+#ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
+#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -17,15 +19,18 @@
 
 namespace markov::trace_graph::modules::hicache::radix {
 
+#ifdef DEBUG
 using runtime::HiCachePagePath;
 using runtime::HiCacheProjectedPage;
+#endif
 
 using HiCacheNodeId = size_t;
 
 /**
- * @brief 单个 radix node 的 device/host/storage residency。
+ * @brief Device, host, and storage residency for one radix node.
  *
- * final-state page set 必须从这些字段派生，不能成为另一个事实源。
+ * Final-state page sets must be derived from these fields rather than maintained
+ * as a second source of cache state.
  */
 struct HiCacheNodeResidency {
     bool device_present = false;
@@ -37,9 +42,10 @@ struct HiCacheNodeResidency {
 };
 
 /**
- * @brief 单个 radix node 的保护引用。
+ * @brief Protection references held on one radix node.
  *
- * request、write、load、storage 和 prefetch 可以同时持有引用，并能按 owner 独立释放。
+ * Request, write, load, storage, and prefetch lifecycles may hold references
+ * concurrently, with independent release by owner identity.
  */
 struct HiCacheNodeRefState {
     uint64_t lock_ref_total = 0;
@@ -49,10 +55,11 @@ struct HiCacheNodeRefState {
 };
 
 /**
- * @brief canonical radix tree 中的状态节点。
+ * @brief Stateful node in the canonical radix tree.
  *
- * pages 是压缩边上的 target page group。一个 node 的 residency/ref 对整段 group
- * 生效，从而保留 SGLang leaf group eviction/writeback 语义。
+ * `pages` is the compressed target-page group on the incoming radix edge. Residency
+ * and references apply to the complete group, preserving SGLang leaf-group eviction
+ * and writeback semantics.
  */
 struct HiCacheCacheNode {
     HiCacheNodeId id = 0;
@@ -68,7 +75,7 @@ struct HiCacheCacheNode {
 };
 
 /**
- * @brief radix lookup 的 node/page 结果。
+ * @brief Node and page-prefix result from one radix lookup.
  */
 struct HiCachePathLookup {
     HiCacheNodeId terminal_node = 0;
@@ -85,7 +92,7 @@ struct HiCachePathLookup {
 };
 
 /**
- * @brief path insertion 的状态变化结果。
+ * @brief Structured state changes produced by one path insertion.
  */
 struct HiCacheInsertResult {
     HiCacheNodeId terminal_node = 0;
@@ -96,16 +103,17 @@ struct HiCacheInsertResult {
     std::vector<HiCacheNodeId> touched_nodes;
     std::vector<HiCacheNodeId> new_device_nodes;
     std::vector<HiCacheNodeId> restored_device_nodes;
-    /** @brief 本次 device insert 中从 clean 变为 dirty 的 node。 */
+    /** @brief Nodes that changed from clean to dirty during this device insertion. */
     std::vector<HiCacheNodeId> dirtied_device_nodes;
     std::vector<HiCacheNodeId> new_host_nodes;
 };
 
 /**
- * @brief SGLang `evict_host()` 删除 host leaf 后的结构化结果。
+ * @brief Structured result of SGLang-compatible host-leaf eviction.
  *
- * SGLang 释放 host leaf 时会从 parent.children 中移除整棵子树，而不是只清
- * host_value。模型必须显式返回被移除的 node，供 capacity/ref 审计同步原 record。
+ * SGLang removes the subtree from `parent.children` rather than clearing only the
+ * host value. The model returns every affected node so capacity and reference
+ * projections can synchronize their records.
  */
 struct HiCacheHostEvictionResult {
     bool evicted = false;
@@ -116,9 +124,8 @@ struct HiCacheHostEvictionResult {
     std::string reason;
 };
 
-/**
- * @brief split record 中单个 node group 的 target projection 摘要。
- */
+#ifdef DEBUG
+/** @brief Target projection details retained for a split diagnostics record. */
 struct HiCacheNodeSplitProjection {
     uint64_t depth_page_begin = 0;
     uint64_t depth_page_end = 0;
@@ -129,12 +136,7 @@ struct HiCacheNodeSplitProjection {
     std::vector<std::string> storage_keys;
 };
 
-/**
- * @brief radix node split 的结构化审计记录。
- *
- * SGLang split 会把一个 child 切成 prefix parent 和 suffix child；value/ref/hit
- * 继承语义必须显式记录，后续 transition exactness 才能解释 split 边界。
- */
+/** @brief Debug record describing residency and ref inheritance across a split. */
 struct HiCacheNodeSplitRecord {
     std::string cache_scope;
     HiCacheNodeId parent_node = 0;
@@ -155,120 +157,131 @@ struct HiCacheNodeSplitRecord {
     std::vector<std::string> copied_host_ref_owners;
     uint64_t inherited_hit_count = 0;
 };
+#endif
 
 /**
- * @brief 每个 cache_scope 的 canonical token/page radix tree。
+ * @brief Canonical token/page radix tree for one cache scope.
  *
- * 当前模型以 target page path 作为 radix key。token path 到 page path 的投影由
- * HiCacheTargetPager 完成；tree 本身维护 SGLang TreeNode 风格的 residency/ref。
+ * Target page paths are radix keys. `HiCacheTargetPager` owns token-to-page
+ * projection; this tree owns SGLang `TreeNode`-style residency and references.
  */
 class HiCacheTokenRadixTree {
 public:
-    /** @brief 创建只含 root 的空 radix tree。 */
+    /** @brief Creates an empty radix tree containing only the topology root. */
     HiCacheTokenRadixTree();
 
-    /** @brief 读取 canonical root node。 */
+    /** @brief Returns the canonical topology root. */
     [[nodiscard]] const HiCacheCacheNode & root() const { return nodes_.front(); }
 
-    /** @brief 读取所有 node 的稳定数组视图。 */
+    /** @brief Returns the stable node-storage view, including inactive nodes. */
     [[nodiscard]] const std::vector<HiCacheCacheNode> & nodes() const { return nodes_; }
 
-#ifdef DEBUG
-    /** @brief 返回 radix split 的结构化历史。 */
-    [[nodiscard]] const std::vector<HiCacheNodeSplitRecord> & split_history() const { return split_history_; }
-#endif
-
-    /** @brief 已发生的 radix split 次数。 */
-    [[nodiscard]] uint64_t split_count() const { return split_count_; }
-
-    /** @brief 按 node id 读取 node；不存在时返回空指针。 */
+    /** @brief Returns `nullptr` for out-of-range or inactive node IDs. */
     [[nodiscard]] const HiCacheCacheNode * node(HiCacheNodeId node_id) const;
 
-    /** @brief 按 node id 获取可变 node；不存在时返回空指针。 */
+    /** @brief Returns `nullptr` for out-of-range or inactive mutable node IDs. */
     [[nodiscard]] HiCacheCacheNode * mutable_node(HiCacheNodeId node_id);
 
-    /** @brief 判断 page 是否已经出现在 active radix tree 中。 */
+#ifdef DEBUG
+    /** @brief Returns structured radix-split history for validation. */
+    [[nodiscard]] const std::vector<HiCacheNodeSplitRecord> & split_history() const { return split_history_; }
+
+    /** @brief Returns the number of radix splits observed by this tree. */
+    [[nodiscard]] uint64_t split_count() const { return split_count_; }
+#endif
+
+    /** @brief Reports whether a page belongs to the active radix topology. */
     [[nodiscard]] bool contains_page(const std::string & page) const;
 
-    /** @brief 查找 page 所在 node；不存在时返回空。 */
+    /** @brief Resolves the active node that owns a page. */
     [[nodiscard]] std::optional<HiCacheNodeId> node_for_page(const std::string & page) const;
 
-    /** @brief 返回 node 压缩边上的 page group。 */
-    [[nodiscard]] std::vector<std::string> node_pages(HiCacheNodeId node_id) const;
+    /** @brief Returns a node's compressed page group; invalid IDs throw. */
+    [[nodiscard]] const std::vector<std::string> & node_pages(HiCacheNodeId node_id) const;
 
-    /** @brief 返回从 root 到 terminal node 的 ancestor chain。 */
+    /** @brief Returns the root-to-terminal ancestor chain, excluding the root. */
     [[nodiscard]] std::vector<HiCacheNodeId> ancestor_node_ids(HiCacheNodeId terminal_node) const;
 
-    /** @brief 将 root 到 terminal node 的 page group 展平成完整 page path。 */
+    /** @brief Flattens compressed groups from root through the terminal node. */
     [[nodiscard]] std::vector<std::string> flattened_pages(HiCacheNodeId terminal_node) const;
 
-    /** @brief 记录 page path 的存在，用于后续 split/projection 审计。 */
+#ifdef DEBUG
+    /** @brief Retains page projection metadata for split diagnostics. */
     void observe_page_path(const HiCachePagePath & path);
+#endif
 
-    /** @brief 查找 page path，并刷新命中节点的 access clock。 */
+    /** @brief Looks up a page path and refreshes access order for matched nodes. */
     [[nodiscard]] HiCachePathLookup lookup(const std::vector<std::string> & pages);
 
-    /** @brief 查找 page path，但不刷新 access clock。 */
+    /** @brief Looks up a path without refreshing access order; topology may still split. */
     [[nodiscard]] HiCachePathLookup lookup_peek(const std::vector<std::string> & pages);
 
-    /** @brief 返回在指定 residency 层连续命中的 page prefix。 */
+    /** @brief Returns the contiguous visible prefix across selected residency tiers. */
     [[nodiscard]] std::vector<std::string> contiguous_prefix(const std::vector<std::string> & pages, bool include_device, bool include_host,
                                                              bool include_storage);
 
-    /** @brief 将 page path 插入 device residency，并按目标优先级/dirty 状态更新 node。 */
+    /** @brief Inserts device residency and applies target priority and dirty state. */
     HiCacheInsertResult insert_device_path(const std::vector<std::string> & pages, int64_t priority, bool dirty);
 
-    /** @brief 将完整 page path 插入 host residency。 */
+    /** @brief Materializes a complete page path into host residency. */
     HiCacheInsertResult insert_host_path(const std::vector<std::string> & pages, bool storage_readable);
 
-    /** @brief 只把 visible pages 对应 prefix materialize 到 host residency。 */
+    /** @brief Materializes only node groups fully covered by `visible_pages`. */
     HiCacheInsertResult insert_host_path(const std::vector<std::string> & pages, const std::set<std::string> & visible_pages, bool storage_readable);
 
-    /** @brief 刷新 node chain 的访问时间，用于 capacity victim 排序。 */
+    /** @brief Refreshes access order for capacity-victim selection. */
     void touch_chain(const std::vector<HiCacheNodeId> & chain);
 
-    /** @brief 给 node chain 添加 ordinary lock ref owner。 */
+    /** @brief Adds one lock-reference count for an owner along a node chain. */
     void add_lock_ref(const std::vector<HiCacheNodeId> & chain, const std::string & owner);
 
-    /** @brief 给 node chain 添加 host ref owner。 */
+    /** @brief Adds one host-reference count for an owner along a node chain. */
     void add_host_ref(const std::vector<HiCacheNodeId> & chain, const std::string & owner);
 
-    /** @brief 释放指定 owner 在 tree 上持有的所有 ref。 */
+    /** @brief Releases every tree reference held by an owner. */
     void release_refs_by_owner(const std::string & owner);
 
-    /** @brief 标记 node 已有 host-visible value，并同步 storage-readable 状态。 */
+    /** @brief Marks host visibility and monotonically updates storage readability. */
     void mark_host_visible(HiCacheNodeId node_id, bool storage_readable);
 
-    /** @brief 清除 node 的 dirty 标记。 */
+    /** @brief Clears device dirty state for an active node. */
     void clear_dirty(HiCacheNodeId node_id);
 
-    /** @brief 将 device value 降级到 host residency，可选择强制补齐 host value。 */
+    /** @brief Removes device residency, optionally materializing a readable host backup. */
     void demote_device_to_host(HiCacheNodeId node_id, bool ensure_host);
 
-    /** @brief 移除 node 的普通 device residency，但不删除 host/storage 状态。 */
+    /** @brief Removes ordinary device residency without changing host or storage state. */
     void remove_device_regular(HiCacheNodeId node_id);
 
-    /** @brief 按 SGLang host leaf eviction 语义删除 host leaf/subtree。 */
+    /** @brief Removes a host leaf or subtree under SGLang eviction semantics. */
     [[nodiscard]] HiCacheHostEvictionResult evict_host_leaf(HiCacheNodeId node_id);
 
 private:
+    /** @brief Topology coordinates for splitting one compressed radix child. */
+    struct ChildSplitRequest {
+        HiCacheNodeId parent = 0;
+        HiCacheNodeId child = 0;
+        size_t split_pages = 0;
+    };
+
     std::vector<HiCacheCacheNode> nodes_;
 #ifdef DEBUG
     std::vector<HiCacheNodeSplitRecord> split_history_;
+    std::unordered_map<std::string, HiCacheProjectedPage> page_projection_;
+    uint64_t split_count_ = 0;
 #endif
     std::unordered_map<std::string, HiCacheNodeId> page_to_node_;
-    std::unordered_map<std::string, HiCacheProjectedPage> page_projection_;
     uint64_t access_clock_ = 0;
-    uint64_t split_count_ = 0;
 
     [[nodiscard]] HiCacheNodeId create_child(HiCacheNodeId parent, std::vector<std::string> pages);
-    [[nodiscard]] HiCacheNodeId insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & suffix);
-    [[nodiscard]] HiCacheNodeId split_child(HiCacheNodeId parent, HiCacheNodeId child, size_t split_pages);
+    [[nodiscard]] HiCacheNodeId insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & pages, size_t offset);
+    [[nodiscard]] HiCacheNodeId split_child(const ChildSplitRequest & request);
+#ifdef DEBUG
     [[nodiscard]] HiCacheNodeSplitProjection split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const;
+#endif
     [[nodiscard]] HiCachePathLookup lookup_impl(const std::vector<std::string> & pages, bool refresh_access);
     [[nodiscard]] bool has_backup_child(HiCacheNodeId node_id) const;
     void deactivate_subtree(HiCacheNodeId node_id, std::vector<HiCacheNodeId> & affected_nodes);
-    void rebuild_page_index();
     void touch_node(HiCacheNodeId node_id);
 };
 

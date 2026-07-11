@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief TraceGraph 的核心 DAG 数据结构和基础 mutation API。
+ * @brief Core DAG storage and mutation primitives for TraceGraph.
  */
 #pragma once
 
@@ -8,181 +8,301 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace markov::trace_graph::core {
 
 /**
- * @brief DAG 边的语义来源。
+ * @brief Semantic source of a hard DAG dependency.
  *
- * 不同来源的边在拓扑仿真中都表示“dst 必须等 src 完成”，但 summary/debug 会按 kind 拆分。
+ * Every kind means that `dst` starts no earlier than `src` completes. The kind
+ * remains explicit so diagnostics can attribute topology to its source rule.
  */
-enum class DagEdgeKind { Sequential, Stream, Correlation, Sync, HCCL, HiCache, Mutation };
+enum class DagEdgeKind : std::uint8_t { Sequential, Stream, Correlation, Sync, HCCL, HiCache, Mutation };
 
-/** @brief DAG 中的一条硬依赖边。 */
-struct DagEdge {
-    /** @brief src/dst 都是 DagGraph::nodes_ 中的 node id，不是 TraceEvent::index。 */
-    size_t src = 0;
-    size_t dst = 0;
-    DagEdgeKind kind = DagEdgeKind::Sequential;
+/** @brief Distinguishes input trace events from model-created nodes. */
+enum class DagNodeKind : std::uint8_t { TraceEvent, Synthetic };
+
+/** @brief Sparse provenance allocated only for model-created dependencies. */
+struct DagEdgeProvenance {
+    std::string effect_id;
+    std::string reason;
 };
 
 /**
- * @brief 一条可执行 duration event 在建模图中的实例。
+ * @brief One hard dependency in stable edge-index order.
  *
- * 当前实现保持“一条 TraceEvent 对应一个 DagNode”的基础关系；后续子模块可以
- * 新增或修改节点，但需要继续维护 event_index / attrs 中的可追溯信息。
+ * Base DAGs contain tens of millions of edges and normally have no mutation
+ * provenance. Keeping optional strings behind one pointer avoids paying for two
+ * `std::string` objects on every base edge.
  */
-struct DagNode {
-    size_t id = 0;
+struct DagEdge {
+    DagEdge() = default;
+    DagEdge(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id = {}, std::string_view reason = {});
+    DagEdge(const DagEdge & other);
+    DagEdge & operator=(const DagEdge & other);
+    DagEdge(DagEdge &&) noexcept = default;
+    DagEdge & operator=(DagEdge &&) noexcept = default;
 
-    /** @brief 指向 events_ 中的原始事件；merge 多 rank 时会随 event_offset 重写。 */
-    size_t event_index = 0;
+    /** @brief Endpoints are node IDs, never `TraceEvent::index` values. */
+    size_t src = 0;
+    size_t dst = 0;
+    DagEdgeKind kind = DagEdgeKind::Sequential;
+    bool active = true;
+    std::unique_ptr<DagEdgeProvenance> provenance;
 
-    /** @brief 单输入 trace 构图时由 CLI 输入序号生成；merge 后主要用于输出和 HCCL 分组。 */
-    int gpu_id = 0;
+    /** @brief Returns an empty view for ordinary base-DAG edges. */
+    [[nodiscard]] std::string_view effect_id() const;
 
-    /** @brief CPU 节点和 device 节点的顺序约束不同：CPU 使用 Sequential，device 使用 Stream。 */
+    /** @brief Returns an empty view when no diagnostic reason was attached. */
+    [[nodiscard]] std::string_view reason() const;
+};
+
+/** @brief Execution identity and optional provenance for a synthetic node. */
+struct DagSyntheticNodeSpec {
+    std::string name;
+    std::string category = "mutation";
     bool is_cpu = true;
-
-    /** @brief 逻辑执行 lane；CPU 当前可以被合并为 CPU_MERGED，device lane 通常来自 tid/stream。 */
-    std::string lane_key;
-
-    /** @brief 当前用于仿真的耗时；子模块修改 duration 时必须同步 attrs["time"]。 */
+    std::string lane_key = "SYNTHETIC";
     uint64_t duration = 0;
-
-    /** @brief 原始耗时，用于 what-if 缩放和 debug 对比。 */
-    uint64_t original_duration = 0;
-
-    /** @brief 拓扑仿真后写入的相对开始/结束时间。 */
-    uint64_t simulation_start = 0;
-    uint64_t completion_time = 0;
-
-    /** @brief 松散元数据区，承载历史字段和后续子模块 mutation metadata。 */
     std::unordered_map<std::string, std::string> attrs;
 };
 
 /**
- * @brief 持有归一化事件、DAG 节点、DAG 边和仿真统计。
+ * @brief Executable instance of one duration event in the model graph.
  *
- * DagGraph 不负责解释 trace 语义；语义边由 DagBuilder 或 SimulationModule 添加。
+ * Trace nodes retain a stable `event_index`. Synthetic nodes receive their own
+ * `TraceEvent`, so every node remains inspectable without an auxiliary fact table.
+ * Lane strings are interned by `DagGraph`; nodes store only the compact lane ID.
+ */
+struct DagNode {
+    static constexpr size_t kNoNode = std::numeric_limits<size_t>::max();
+
+    size_t id = 0;
+    DagNodeKind kind = DagNodeKind::TraceEvent;
+    bool active = true;
+
+    /** @brief Index into the owning graph's event vector. */
+    size_t event_index = 0;
+
+    /** @brief Logical input identity used for output and cross-rank grouping. */
+    int gpu_id = 0;
+
+    /** @brief CPU lanes use sequential edges; device lanes use stream edges. */
+    bool is_cpu = true;
+
+    /** @brief Interned logical lane owned by `DagGraph`. */
+    size_t lane_id = 0;
+
+    /** @brief Current execution duration consumed by topological simulation. */
+    uint64_t duration = 0;
+
+    /** @brief Immutable observed duration used as the baseline for model scaling. */
+    uint64_t original_duration = 0;
+
+    /**
+     * @brief Observed idle gap after this node on the merged CPU lane.
+     *
+     * The gap advances wall time between sequential CPU nodes but is not part of
+     * either node's execution duration. Keeping it typed prevents model modules
+     * from accidentally scaling or double-counting idle time.
+     */
+    uint64_t cpu_gap_after = 0;
+
+    /** @brief Relative start and completion times written by simulation. */
+    uint64_t simulation_start = 0;
+    uint64_t completion_time = 0;
+
+    /**
+     * @brief Earliest proven CPU submit timestamp for a device node.
+     *
+     * Zero means no submit anchor was observed and consumers must fall back to
+     * the event timestamp. This value is execution semantics, not debug metadata.
+     */
+    uint64_t submit_ts = 0;
+
+    /** @brief Same-rank successor used when cross-rank HCCL edges are added. */
+    size_t hccl_successor_node_id = kNoNode;
+};
+
+/** @brief Counts derived from one immutable traversal of the active graph view. */
+struct DagGraphSummaryStats {
+    size_t active_node_count = 0;
+    size_t active_trace_node_count = 0;
+    size_t active_synthetic_node_count = 0;
+    size_t active_edge_count = 0;
+    std::unordered_map<std::string, size_t> edge_counts_by_kind;
+};
+
+/** @brief Storage reservation requested before graph construction or merge. */
+struct DagGraphCapacity {
+    size_t nodes = 0;
+    size_t edges = 0;
+};
+
+/**
+ * @brief Owns normalized events, compact nodes, hard edges, and simulation state.
+ *
+ * `DagGraph` enforces storage and endpoint invariants but does not infer trace
+ * semantics. `DagBuilder` and model modules remain responsible for dependency
+ * meaning. Node and edge indices stay stable; removals use tombstones.
  */
 class DagGraph {
 public:
     explicit DagGraph(std::vector<TraceEvent> events = {}, int gpu_id = 0);
 
-    /** @brief 创建节点时只设置基础属性，不自动加任何依赖边。 */
-    size_t add_node(size_t event_index, bool is_cpu, const std::string & lane_key);
+    /** @brief Creates a node and interns its lane without adding dependencies. */
+    size_t add_node(size_t event_index, bool is_cpu, std::string_view lane_key);
 
-    /** @brief 预留节点和边容量，用于大 trace 构图减少重复扩容。 */
-    void reserve(size_t node_capacity, size_t edge_capacity);
+    /** @brief Creates a model node with an independent synthetic event identity. */
+    size_t add_synthetic_node(const DagSyntheticNodeSpec & spec);
 
-    /** @brief 添加一条硬依赖边；当前不做去重，调用方需要避免重复边导致 indegree 膨胀。 */
-    void add_edge(size_t src, size_t dst, DagEdgeKind kind);
+    /** @brief Reserves compact storage before constructing a large graph. */
+    void reserve(const DagGraphCapacity & capacity);
 
-    /** @brief 原始事件的只读视图。 */
+    /** @brief Adds a hard dependency; callers own duplicate-edge prevention. */
+    size_t add_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id = {}, std::string_view reason = {});
+
+    /** @brief Tombstones an edge without changing stable edge indices. */
+    void disable_edge(size_t edge_index);
+
+    /** @brief Returns a read-only view of normalized and synthetic events. */
     [[nodiscard]] const std::vector<TraceEvent> & events() const { return events_; }
 
-    /** @brief 原始事件的可变视图；只允许 normalizer/模块在明确边界内修改。 */
+    /** @brief Returns mutable events for normalizers and explicit module boundaries. */
     std::vector<TraceEvent> & mutable_events() { return events_; }
 
-    /** @brief DAG 节点只读视图。 */
+    /** @brief Returns the stable node array. */
     [[nodiscard]] const std::vector<DagNode> & nodes() const { return nodes_; }
 
-    /** @brief DAG 边只读视图。 */
+    /** @brief Returns the stable edge array. */
     [[nodiscard]] const std::vector<DagEdge> & edges() const { return edges_; }
 
-    /** @brief 按 trace event index 读取事件。 */
+    /** @brief Returns an event by event-vector index. */
     [[nodiscard]] const TraceEvent & event(size_t event_index) const;
 
-    /** @brief 按 trace event index 获取可变事件。 */
+    /** @brief Returns a mutable event by event-vector index. */
     TraceEvent & mutable_event(size_t event_index);
 
-    /** @brief 读取 node_id 对应的原始事件。 */
+    /** @brief Resolves the event owned by a node. */
     [[nodiscard]] const TraceEvent & event_for_node(size_t node_id) const;
 
-    /** @brief 获取 node_id 对应的可变原始事件。 */
+    /** @brief Resolves the mutable event owned by a node. */
     TraceEvent & mutable_event_for_node(size_t node_id);
 
-    /** @brief 读取 DAG node。 */
+    /** @brief Returns a node by stable node ID. */
     [[nodiscard]] const DagNode & node(size_t node_id) const;
 
-    /** @brief 获取可变 DAG node。 */
+    /** @brief Returns a mutable node by stable node ID. */
     DagNode & mutable_node(size_t node_id);
 
-    /** @brief 写入节点属性；调用方负责保证属性语义一致。 */
-    void set_node_attr(size_t node_id, const std::string & key, const std::string & value);
+    /** @brief Returns an edge by stable edge index. */
+    [[nodiscard]] const DagEdge & edge(size_t edge_index) const;
 
-    /** @brief 修改节点耗时时同时更新 attrs["time"]，保证拓扑仿真和 debug 输出读到一致值。 */
+    /** @brief Returns a mutable edge by stable edge index. */
+    DagEdge & mutable_edge(size_t edge_index);
+
+    /** @brief Updates the sole authoritative execution duration for a node. */
     void set_node_duration(size_t node_id, uint64_t duration);
 
-    /** @brief 读取节点属性，缺失时返回 fallback。 */
-    [[nodiscard]] std::string node_attr(size_t node_id, const std::string & key, const std::string & fallback = "") const;
+    /** @brief Returns the stable interned lane name for a node. */
+    [[nodiscard]] std::string_view node_lane_key(size_t node_id) const;
 
-    /** @brief CPU lane 集合用于决定 lane 顺序边类型，以及输出时是否合并 pid/tid。 */
-    void set_cpu_lane(const std::string & lane_key);
+    /** @brief Resolves a lane ID; throws when graph storage is inconsistent. */
+    [[nodiscard]] std::string_view lane_key(size_t lane_id) const;
 
-    /** @brief 判断 lane 是否被登记为 CPU lane。 */
-    [[nodiscard]] bool is_cpu_lane(const std::string & lane_key) const;
+    /** @brief Looks up an already interned lane without allocating. */
+    [[nodiscard]] std::optional<size_t> find_lane_id(std::string_view lane_key) const;
 
-    /** @brief 所有已登记 CPU lane 的只读集合。 */
-    [[nodiscard]] const std::unordered_set<std::string> & cpu_lanes() const { return cpu_lanes_; }
-
-    /** @brief 当前 DAG node 数。 */
+    /** @brief Returns total node storage, including tombstoned nodes. */
     [[nodiscard]] size_t node_count() const { return nodes_.size(); }
 
-    /** @brief 当前 DAG edge 数。 */
+    /** @brief Returns nodes visible in the active graph view. */
+    [[nodiscard]] size_t active_node_count() const;
+
+    /** @brief Returns active nodes originating from input trace events. */
+    [[nodiscard]] size_t active_trace_node_count() const;
+
+    /** @brief Returns active synthetic nodes created by graph mutations. */
+    [[nodiscard]] size_t active_synthetic_node_count() const;
+
+    /** @brief Returns total edge storage, including tombstoned edges. */
     [[nodiscard]] size_t edge_count() const { return edges_.size(); }
 
-    /** @brief reader 解析到的原始记录数，包含被过滤事件。 */
+    /** @brief Returns edges visible in the active graph view. */
+    [[nodiscard]] size_t active_edge_count() const;
+
+    /** @brief Checks for an active edge with matching endpoints, kind, and effect ID. */
+    [[nodiscard]] bool has_active_edge(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id = {}) const;
+
+    /** @brief Returns reader records before normalization and filtering. */
     [[nodiscard]] size_t parsed_record_count() const { return parsed_record_count_; }
 
-    /** @brief 记录 reader 解析到的原始记录数。 */
+    /** @brief Stores reader records before normalization and filtering. */
     void set_parsed_record_count(size_t value) { parsed_record_count_ = value; }
 
-    /** @brief 原始 trace 的真实端到端时间窗口。 */
+#ifdef DEBUG
+    /** @brief Returns the observed trace timestamp window for diagnostics. */
     [[nodiscard]] uint64_t real_e2e_time() const { return real_e2e_time_; }
 
-    /** @brief 设置原始 trace 的真实端到端时间窗口。 */
+    /** @brief Stores the observed trace timestamp window for diagnostics. */
     void set_real_e2e_time(uint64_t value) { real_e2e_time_ = value; }
+#endif
 
-    /** @brief 按边类型统计 DAG edge 数。 */
+    /** @brief Counts active dependencies by semantic edge kind. */
     [[nodiscard]] std::unordered_map<std::string, size_t> edge_counts_by_kind() const;
 
-    /** @brief trace 中识别出的 device id；未知时为默认值。 */
+    /** @brief Computes all run-summary counts in one node pass and one edge pass. */
+    [[nodiscard]] DagGraphSummaryStats summary_stats() const;
+
+    /** @brief Returns the device ID assigned to this logical input. */
     [[nodiscard]] int gpu_id() const { return gpu_id_; }
 
-    /** @brief 写入拓扑仿真得到的端到端时间。 */
+    /** @brief Stores the critical-path duration produced by simulation. */
     void set_e2e_time(uint64_t value) { e2e_time_ = value; }
 
-    /** @brief 读取拓扑仿真得到的端到端时间。 */
+    /** @brief Returns the critical-path duration produced by simulation. */
     [[nodiscard]] uint64_t e2e_time() const { return e2e_time_; }
 
     /**
-     * @brief 合并多输入 trace 构出的 per-rank graph。
+     * @brief Merges independently built per-rank graphs.
      *
-     * 目前只在 merge 阶段建立 HCCL 跨 rank 约束；其他跨 rank 语义需要后续子模块补充。
+     * Merge establishes only HCCL cross-rank constraints. Additional cross-rank
+     * semantics belong in later modules with their own evidence and ownership.
      */
     static DagGraph merge(std::vector<DagGraph> graphs);
 
 private:
-    /** @brief 保存所有被 parser 接受的 duration event；不包含 metadata / flow event。 */
+    /** @brief File-local implementation of capacity-safe cross-rank graph merging. */
+    class GraphMerger;
+
+    /** @brief Returns a stable lane ID, inserting the name exactly once. */
+    size_t intern_lane(std::string_view lane_key);
+
+    /** @brief Parsed duration events plus synthetic events; excludes metadata and flows. */
     std::vector<TraceEvent> events_;
     std::vector<DagNode> nodes_;
     std::vector<DagEdge> edges_;
 
-    /** @brief CPU lane 被单独记录，是因为 lane_key 本身只是字符串，不能从字符串判断资源类型。 */
-    std::unordered_set<std::string> cpu_lanes_;
+    /** @brief Millions of nodes normally share only a handful of lane names. */
+    std::vector<std::string> lane_keys_;
+    std::unordered_map<std::string, size_t, TraceArgHash, std::equal_to<>> lane_ids_;
     int gpu_id_ = 0;
 
-    /** @brief e2e_time_ 是拓扑仿真结果；real_e2e_time_ 是输入 trace 自身的真实时间窗口。 */
+    /** @brief Critical-path duration produced by topological simulation. */
     uint64_t e2e_time_ = 0;
+#ifdef DEBUG
+    /** @brief Observed input timestamp window, retained only for diagnostics. */
     uint64_t real_e2e_time_ = 0;
+#endif
 
-    /** @brief parser 接受的 duration event 数；命名沿用历史 summary 字段。 */
+    /** @brief Reader record count retained across normalization for run summaries. */
     size_t parsed_record_count_ = 0;
 };
 

@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Chrome trace event 到基础执行 DAG 的构建器。
+ * @brief Constructs the faithful base execution DAG from Chrome trace events.
  */
 #pragma once
 
@@ -18,27 +18,27 @@
 namespace markov::trace_graph::core {
 
 /**
- * @brief 把一组 TraceEvent 转换成可仿真的 base DAG。
+ * @brief Converts normalized trace events into a simulatable base DAG.
  *
- * DagBuilder 只负责 faithful replay 的基础因果边：
- * - 同 CPU lane 的顺序边；
- * - 同 device stream/lane 的顺序边；
- * - runtime launch 到 kernel 的 correlation 边；
- * - event/stream sync 边；
- * - notify/model_execute 这类模型执行同步锚点边。
+ * `DagBuilder` owns only dependencies justified by faithful replay:
+ * - sequential ordering on the merged CPU lane;
+ * - stream ordering on each device lane;
+ * - runtime-launch to kernel correlation;
+ * - event, stream, and device synchronization;
+ * - model-execution synchronization anchors such as notify events.
  *
- * what-if 子模块不应该把额外策略逻辑塞进 DagBuilder，而应该在 SimulationModule 中修改 DAG。
+ * What-if policy belongs in a `SimulationModule` after construction, not in this builder.
  */
 class DagBuilder {
 public:
-    /** @brief threads 控制单 logical input 内部可并行构图阶段的最大并行度。 */
+    /** @brief Sets maximum phase parallelism within one logical input. */
     explicit DagBuilder(size_t threads = 1);
 
-    /** @brief 构建单 rank / 单输入 trace 的 base DAG。 */
+    /** @brief Builds the base DAG for one rank and one logical trace input. */
     [[nodiscard]] DagGraph build(std::vector<TraceEvent> events, int gpu_id) const;
 
 #ifdef DEBUG
-    /** @brief 单个 logical input 的 DAG build 子阶段耗时，单位毫秒；只用于 validation/debug build。 */
+    /** @brief Per-phase milliseconds retained only by Debug validation builds. */
     struct BuildTimings {
         uint64_t normalize_ms = 0;
         uint64_t create_nodes_ms = 0;
@@ -54,41 +54,47 @@ public:
         uint64_t real_e2e_ms = 0;
     };
 
-    /** @brief 构建 DAG 并记录 Debug/validation 使用的阶段耗时。 */
+    /** @brief Builds a DAG while recording Debug-only phase timings. */
     [[nodiscard]] DagGraph build_with_timings(std::vector<TraceEvent> events, int gpu_id, BuildTimings & timings) const;
 #endif
 
 private:
+    /** @brief File-local staged implementation of event normalization. */
+    class EventNormalizer;
+
+    /** @brief File-local node creation and identity indexing implementation. */
+    class NodeIndexer;
+
     /**
-     * @brief 单次构图中的临时索引。
+     * @brief Temporary lookup indices scoped to one build.
      *
-     * 构图过程中反复需要按不同 key 查节点；BuildIndex 只在一次 build 内有效，
-     * 不能跨 graph 或跨输入 trace 复用。
+     * Edge rules repeatedly query nodes by different trace identities. These indices
+     * are invalid outside the graph and input from which they were constructed.
      */
     struct BuildIndex {
-        /** @brief lane -> node ids，用于同 lane 顺序边和 stream sync 查找。 */
-        std::unordered_map<std::string, std::vector<size_t>> lane_to_nodes;
-        /** @brief correlation_id / connection_id 是 runtime 与 device event 的主要关联证据。 */
+        /** @brief Interned lane ID to node IDs for ordering and sync lookup. */
+        std::unordered_map<size_t, std::vector<size_t>> lane_to_nodes;
+        /** @brief Runtime-to-device groups keyed by profiler correlation identities. */
         std::unordered_map<std::string, std::vector<size_t>> correlation_to_nodes;
         std::unordered_map<std::string, std::vector<size_t>> connection_to_nodes;
-        /** @brief 只收集可确认 event id 的 record node，避免缺 id 事件被错误归组。 */
+        /** @brief Record nodes with a confirmed event ID; missing IDs are never grouped. */
         std::unordered_map<std::string, std::vector<size_t>> event_id_to_nodes;
         /**
-         * @brief Raw Stream 到实际 DAG lane 的映射。
+         * @brief Maps wrapper-visible raw stream handles to graph lanes.
          *
-         * Raw Stream 是 LD_PRELOAD / AscendCL wrapper 看到的 stream handle，需要通过 record event
-         * 映射到实际 DAG lane。
+         * LD_PRELOAD and AscendCL wrappers expose raw handles rather than the lane
+         * identity selected by `lane_key`; record events provide the bridge.
          */
-        std::unordered_map<std::string, std::string> raw_stream_to_stream;
+        std::unordered_map<std::string, size_t> raw_stream_to_lane;
         /**
-         * @brief device lane 别名到真实 lane_key 的映射。
+         * @brief Maps device-lane aliases to the interned lane selected by the builder.
          *
-         * streamId / Physic Stream Id / 顶层 tid 都可能是同一条 device lane 的别名；
-         * stream sync 只能看到其中一种时，通过该表回到 DagBuilder::lane_key 选择出的真实 lane。
+         * `streamId`, `Physic Stream Id`, and top-level `tid` can identify the same
+         * device lane. Synchronization wrappers may expose only one of them.
          */
-        std::unordered_map<std::string, std::string> stream_alias_to_lane;
+        std::unordered_map<std::string, size_t> stream_alias_to_lane;
 
-        /** @brief 特殊事件分类缓存，避免后续边构建阶段全图重复扫描。 */
+        /** @brief Event-class caches that avoid rescanning the full graph per rule. */
         std::vector<size_t> event_record_nodes;
         std::vector<size_t> event_wait_nodes;
         std::vector<size_t> stream_sync_nodes;
@@ -96,67 +102,63 @@ private:
         std::vector<size_t> device_sync_nodes;
         std::vector<size_t> notify_record_nodes;
         std::vector<size_t> notify_wait_nodes;
+        size_t notify_wait_candidate_count = 0;
         std::vector<size_t> model_execute_nodes;
-        std::vector<size_t> hccl_nodes;
     };
 
-    /** @brief 归一化阶段合并重复事件、过滤 CPU 嵌套父节点，并保留 HiCache 事实事件。 */
+    /** @brief Deduplicates events and removes nested CPU parents while retaining facts. */
     [[nodiscard]] static std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
 
-    /** @brief 判断一个事件是否应被视作 device 执行节点；该判断会影响 lane 和边类型。 */
-    [[nodiscard]] static bool is_device_event(const TraceEvent & event);
-
-    /** @brief 判断事件是否属于 HiCache 事实事件，确保事实事件不会被 CPU leaf 过滤误删。 */
+    /** @brief Protects routed HiCache fact events from CPU-leaf elimination. */
     [[nodiscard]] static bool is_hicache_event(const TraceEvent & event);
 
-    /** @brief 计算顺序边使用的资源身份；该函数是 faithful replay 精度的关键点。 */
-    [[nodiscard]] static std::string lane_key(const TraceEvent & event);
-    [[nodiscard]] static std::string lane_key(const TraceEvent & event, bool is_device);
+    /** @brief Executes the ordered build pipeline through a direct or Debug timing profiler. */
+    template <typename Profiler> [[nodiscard]] DagGraph build_impl(std::vector<TraceEvent> events, int gpu_id, Profiler & profiler) const;
 
-    /** @brief 从统一 args 表读取事件参数；只在缺失时返回 fallback。 */
-    [[nodiscard]] static std::string event_arg(const TraceEvent & event, const std::string & key, const std::string & fallback = "");
-
-    /** @brief 对已经初始化好的 graph 添加 base DAG 边。 */
-    void add_base_edges(DagGraph & graph) const;
-
-    /** @brief 从 trace timestamp 窗口计算真实 E2E；该值是模型语义，不是性能 profiling timing。 */
+#ifdef DEBUG
+    /** @brief Computes the observed trace timestamp window for diagnostics. */
     static void set_real_e2e_time(DagGraph & graph);
+#endif
 
     /**
-     * @name 构图阶段
+     * @name Ordered build phases
      *
-     * 以下函数按固定顺序执行。顺序本身有语义：create_nodes 先收集 index，
-     * correlation/sequence/sync 再根据这些 index 补边，最后统一收敛 sync 节点耗时。
+     * Node creation first builds all indices. Correlation, sequence, and sync phases
+     * then add dependencies, after which synchronization-node durations are finalized.
+     * The order is semantic and must remain centralized in `build_impl`.
      * @{
      */
-    /** @brief 创建 DAG 节点并收集后续补边所需的事件索引。 */
+    /** @brief Creates nodes and builds all indices required by later edge phases. */
     BuildIndex create_nodes(DagGraph & graph) const;
 
-    /** @brief 根据 correlation_id 建立 CPU runtime 到 device kernel 的提交边。 */
+    /** @brief Computes a checked upper bound for all base-DAG edge rules. */
+    [[nodiscard]] static size_t estimate_edge_capacity(const DagGraph & graph, const BuildIndex & index);
+
+    /** @brief Adds CPU-runtime to device-kernel submission edges by correlation ID. */
     void add_correlation_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 在每条 CPU/device lane 内建立顺序边。 */
+    /** @brief Adds timestamp-ordered dependencies within every CPU and device lane. */
     void add_sequential_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 根据 EVENT_RECORD/EVENT_WAIT 建立 Ascend event wait 依赖。 */
+    /** @brief Adds Ascend event dependencies from `EVENT_RECORD` to `EVENT_WAIT`. */
     void add_event_wait_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 为 NOTIFY_RECORD/NOTIFY_WAIT 这类模型执行同步锚点补边。 */
+    /** @brief Connects model-execution synchronization anchors represented by notify events. */
     void add_notify_wait_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 为 MODEL_EXECUTE 到 device lane 建立保守同步边。 */
+    /** @brief Conservatively anchors device work to `MODEL_EXECUTE`. */
     void add_model_execute_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 为 stream synchronize wrapper 建立 device-to-CPU wait 边。 */
+    /** @brief Adds device-to-CPU wait edges for stream synchronization wrappers. */
     void add_stream_sync_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 为 event synchronize wrapper 建立 record-to-sync wait 边。 */
+    /** @brief Adds record-to-CPU wait edges for event synchronization wrappers. */
     void add_event_sync_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 为 device synchronize wrapper 建立所有 device lane 到 CPU 的 wait 边。 */
+    /** @brief Adds all-device-lane wait edges for device synchronization wrappers. */
     void add_device_sync_edges(DagGraph & graph, BuildIndex & index) const;
 
-    /** @brief 把同步 wait 节点耗时压缩为固定开销，避免重复计入观测阻塞。 */
+    /** @brief Replaces observed wait durations with fixed execution overhead. */
     void finalize_sync_nodes(DagGraph & graph, const BuildIndex & index) const;
     /** @} */
 

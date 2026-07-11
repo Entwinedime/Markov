@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache host/device capacity 投影索引和审计记录。
+ * @brief Incremental HiCache host/device capacity index and Debug diagnostics.
  */
 #pragma once
 
@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -23,28 +24,37 @@ using radix::HiCacheNodeResidency;
 using radix::HiCacheTokenRadixTree;
 
 /**
- * @brief 单个 node 在 capacity index 中的可审计投影。
+ * @brief Minimal projection needed to account and rank one radix node.
  *
- * record 不成为 residency 状态源，只缓存 leaf eligibility 和排序字段，避免 capacity
- * handler 反复扫描 canonical tree。
+ * The canonical radix node remains the residency and reference source of truth. This
+ * record caches only fields needed by capacity accounting and victim selection. Large
+ * page lists and owner maps are retained exclusively in Debug builds for consistency
+ * audits; Release updates therefore do not copy them on every state transition.
  */
 struct HiCacheCapacityNodeRecord {
     HiCacheNodeId node_id = 0;
-    HiCacheNodeId parent = 0;
     bool active = false;
     uint64_t page_count = 0;
-    std::vector<std::string> pages;
     int64_t priority = 0;
     uint64_t last_access_order = 0;
-    HiCacheNodeResidency residency;
-    HiCacheNodeRefState refs;
+    bool device_present = false;
+    bool host_visible = false;
+    bool storage_readable = false;
+    uint64_t host_ref_total = 0;
     bool device_evictable = false;
     bool host_evictable = false;
+#ifdef DEBUG
+    HiCacheNodeId parent = 0;
+    std::vector<std::string> pages;
+    HiCacheNodeResidency residency;
+    HiCacheNodeRefState refs;
     uint64_t observed_epoch = 0;
+#endif
 };
 
+#ifdef DEBUG
 /**
- * @brief 一次 capacity index 同步的审计记录。
+ * @brief Diagnostic record for one incremental capacity-index synchronization.
  */
 struct HiCacheCapacityMutation {
     uint64_t mutation_epoch = 0;
@@ -59,7 +69,7 @@ struct HiCacheCapacityMutation {
 };
 
 /**
- * @brief 一次 capacity victim 选择的解释记录。
+ * @brief Diagnostic explanation of one capacity-victim selection.
  */
 struct HiCacheCapacityVictimChoice {
     uint64_t selection_epoch = 0;
@@ -80,7 +90,7 @@ struct HiCacheCapacityVictimChoice {
 };
 
 /**
- * @brief capacity index 与 canonical tree 的一致性问题。
+ * @brief One consistency discrepancy between the index and canonical radix tree.
  */
 struct HiCacheCapacityAuditIssue {
     std::string cache_scope;
@@ -93,7 +103,7 @@ struct HiCacheCapacityAuditIssue {
 };
 
 /**
- * @brief capacity index 一致性审计结果。
+ * @brief Full Debug audit result for the capacity index.
  */
 struct HiCacheCapacityAudit {
     uint64_t indexed_device_pages = 0;
@@ -106,77 +116,88 @@ struct HiCacheCapacityAudit {
     uint64_t expected_reserved_host_pages = 0;
     std::vector<HiCacheCapacityAuditIssue> issues;
 
-    /** @brief capacity index 与 canonical tree 是否完全一致。 */
+    /** @brief Returns true when the derived index exactly matches the tree. */
     [[nodiscard]] bool ok() const { return issues.empty(); }
 };
+#endif
 
 /**
- * @brief 单个 cache_scope 的容量索引快照。
+ * @brief Constant-size capacity view consumed by allocation policy.
+ *
+ * Victim identities intentionally do not live in this snapshot. They are already held
+ * in ordered sets, and materializing duplicate vectors on each synchronization made a
+ * logically constant-time read path scale with the number of evictable leaves.
  */
 struct HiCacheCapacitySnapshot {
     uint64_t occupied_device_pages = 0;
     uint64_t occupied_host_pages = 0;
     uint64_t readable_storage_pages = 0;
     uint64_t reserved_host_pages = 0;
-    std::vector<HiCacheNodeId> evictable_device_leaves;
-    std::vector<HiCacheNodeId> evictable_host_leaves;
+};
+
+/** @brief Capacity and allocation context attached to one victim selection. */
+struct HiCacheVictimRequest {
+    uint64_t capacity_pages = 0;
+    uint64_t requested_pages = 0;
+    std::string_view reason;
 };
 
 /**
- * @brief HiCache L1/L2 capacity 的显式 leaf index。
+ * @brief Mutation-driven L1/L2 capacity and evictable-leaf index.
  *
- * SGLang 在 insert/split/evict/ref 变化时更新 evictable leaf 集合。该索引同样由
- * tree/ref/reservation mutation 显式同步，不再让 capacity handler 自己扫描 tree。
+ * Insert, split, residency, and reference mutations explicitly synchronize the affected
+ * closure. Allocation policy can then read counts and the first ordered victim without
+ * rescanning the entire canonical tree. Audit methods independently derive the expected
+ * state in Debug builds and never feed decisions back into the model.
  */
 class HiCacheCapacityIndex {
 public:
-    /** @brief 同步一组发生变化的 node、其祖先和必要子节点。 */
-    HiCacheCapacityMutation sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes, uint64_t reserved_host_pages,
-                                       const std::string & reason);
+    /** @brief Synchronizes changed nodes plus ancestors and direct children affecting leaf eligibility. */
+    void sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes, uint64_t reserved_host_pages, std::string_view reason);
 
-    /** @brief 只同步 async reservation，不观察 tree node。 */
-    HiCacheCapacityMutation sync_reservation(uint64_t reserved_host_pages, const std::string & reason);
+    /** @brief Synchronizes only asynchronous host reservation, without observing tree nodes. */
+    void sync_reservation(uint64_t reserved_host_pages, std::string_view reason);
 
-    /** @brief 当前容量快照。 */
+    /** @brief Returns the current constant-size capacity view. */
     [[nodiscard]] const HiCacheCapacitySnapshot & snapshot() const { return snapshot_; }
 
-    /** @brief 当前已缓存的 node record。 */
+#ifdef DEBUG
+    /** @brief Returns cached node projections for Debug audits. */
     [[nodiscard]] const std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> & node_records() const { return records_; }
 
-    /** @brief 已发生的 capacity index mutation 次数。 */
+    /** @brief Returns the number of capacity-index synchronization epochs. */
     [[nodiscard]] uint64_t mutation_epoch() const { return mutation_epoch_; }
 
-#ifdef DEBUG
-    /** @brief capacity leaf mutation 的审计 trace。 */
+    /** @brief Returns the capacity-leaf mutation trace. */
     [[nodiscard]] const std::vector<HiCacheCapacityMutation> & mutation_trace() const { return mutation_trace_; }
 
-    /** @brief victim 选择解释 trace。 */
+    /** @brief Returns the victim-selection explanation trace. */
     [[nodiscard]] const std::vector<HiCacheCapacityVictimChoice> & victim_choices() const { return victim_choices_; }
 
-    /** @brief 审计 index 与 canonical tree 是否一致。 */
+    /** @brief Independently checks the incremental index against the canonical tree. */
     [[nodiscard]] HiCacheCapacityAudit audit(const HiCacheTokenRadixTree & tree, uint64_t expected_reserved_host_pages) const;
+
+    /** @brief Returns the number of recorded victim selections. */
+    [[nodiscard]] uint64_t victim_selection_count() const { return victim_selection_epoch_; }
 #endif
 
-    /** @brief 已发生的 capacity victim 选择次数。 */
-    [[nodiscard]] uint64_t victim_selection_count() const { return victim_selection_epoch_; }
-
-    /** @brief device 层超过 target capacity 的 page 数。 */
+    /** @brief Returns L1 pages beyond configured target capacity. */
     [[nodiscard]] uint64_t device_excess_pages(uint64_t capacity_pages) const;
 
-    /** @brief host 层超过 target capacity 的 page 数，包含 prefetch reservation。 */
+    /** @brief Returns L2 pages beyond capacity, including active prefetch reservations. */
     [[nodiscard]] uint64_t host_excess_pages(uint64_t capacity_pages) const;
 
-    /** @brief 当前 device victim；无可驱逐 leaf 时为空。 */
+    /** @brief Returns the first ordered L1 victim, or no value when none is evictable. */
     [[nodiscard]] std::optional<HiCacheNodeId> first_device_victim() const;
 
-    /** @brief 当前 host victim；无可清理 leaf 时为空。 */
+    /** @brief Returns the first unreferenced L2 victim, or no value when none is evictable. */
     [[nodiscard]] std::optional<HiCacheNodeId> first_host_victim() const;
 
-    /** @brief 记录并返回当前 device victim。 */
-    std::optional<HiCacheNodeId> select_device_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason);
+    /** @brief Selects the current L1 victim and records an explanation in Debug builds. */
+    std::optional<HiCacheNodeId> select_device_victim(const HiCacheVictimRequest & request);
 
-    /** @brief 记录并返回当前 host victim。 */
-    std::optional<HiCacheNodeId> select_host_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason);
+    /** @brief Selects the current L2 victim and records an explanation in Debug builds. */
+    std::optional<HiCacheNodeId> select_host_victim(const HiCacheVictimRequest & request);
 
 private:
     struct VictimKey {
@@ -187,17 +208,17 @@ private:
         [[nodiscard]] bool operator<(const VictimKey & other) const;
     };
 
-    uint64_t mutation_epoch_ = 0;
     uint64_t occupied_device_pages_ = 0;
     uint64_t occupied_host_pages_ = 0;
     uint64_t readable_storage_pages_ = 0;
     uint64_t reserved_host_pages_ = 0;
-    uint64_t victim_selection_epoch_ = 0;
     std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> records_;
     std::set<VictimKey> evictable_device_leaves_;
     std::set<VictimKey> evictable_host_leaves_;
     HiCacheCapacitySnapshot snapshot_;
 #ifdef DEBUG
+    uint64_t mutation_epoch_ = 0;
+    uint64_t victim_selection_epoch_ = 0;
     std::vector<HiCacheCapacityMutation> mutation_trace_;
     std::vector<HiCacheCapacityVictimChoice> victim_choices_;
 #endif
@@ -208,11 +229,10 @@ private:
     [[nodiscard]] bool has_backup_child(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const;
     void remove_record_contribution(const HiCacheCapacityNodeRecord & record);
     void add_record_contribution(const HiCacheCapacityNodeRecord & record);
-    void record_mutation(HiCacheCapacityMutation mutation);
-    [[nodiscard]] std::optional<HiCacheCapacityNodeRecord> indexed_record(HiCacheNodeId node_id) const;
-    [[nodiscard]] HiCacheCapacityVictimChoice make_victim_choice(const std::string & tier, const std::string & reason, uint64_t capacity_pages,
-                                                                 uint64_t requested_pages, std::optional<HiCacheNodeId> node_id) const;
 #ifdef DEBUG
+    [[nodiscard]] const HiCacheCapacityNodeRecord * indexed_record(HiCacheNodeId node_id) const;
+    [[nodiscard]] HiCacheCapacityVictimChoice make_victim_choice(std::string_view tier, const HiCacheVictimRequest & request,
+                                                                 std::optional<HiCacheNodeId> node_id) const;
     [[nodiscard]] std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> derive_tree_records(const HiCacheTokenRadixTree & tree) const;
 #endif
     void update_snapshot();

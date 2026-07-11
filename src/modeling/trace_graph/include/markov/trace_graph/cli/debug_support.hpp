@@ -1,48 +1,41 @@
 /**
  * @file
- * @brief trace_graph CLI 的 Debug/validation 边界。
+ * @brief Debug-only TraceGraph CLI diagnostics boundary.
  */
 #pragma once
 
+#ifdef DEBUG
 #include "markov/trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
-#include <memory>
+#include <exception>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 namespace markov::trace_graph::cli {
 
 /**
- * @brief 对已执行模块做 Debug-only validation。
+ * @brief Writes summaries exposed by modules after they have executed.
  *
- * Release 实现为空操作；Debug 实现调用 validation runner 并写日志。
- */
-void validate_modules(const std::vector<std::unique_ptr<modules::SimulationModule>> & modules, core::Logger & logger);
-
-#ifdef DEBUG
-/**
- * @brief 写出 Debug-only module summary。
- *
- * 该声明只存在于 TRACE_GRAPH_DEBUG=ON 构建，避免 release CLI 暴露 validation artifact writer。
+ * The writer is available only in diagnostics builds. Release builds neither
+ * expose module summaries nor link their JSON serializers.
  */
 void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules);
 
 /**
- * @brief 写出 Debug-only DAG analysis artifacts。
+ * @brief Writes the complete set of DAG analysis artifacts.
  *
- * 该输出只服务阶段一 DAG 理解和验证，不参与业务 prediction。
+ * Artifact generation traverses the graph and can be expensive, so callers
+ * must invoke it only when an explicit output directory was requested.
  */
 std::map<std::string, uint64_t> write_dag_analysis_artifacts(const std::string & output_dir, const core::DagGraph & graph, size_t threads = 1);
 
-/**
- * @brief 写出 Debug-only DAG cycle witness artifact。
- *
- * 该输出只在 validation/debug 路径使用；release 构建不暴露该 writer。
- */
-void write_dag_cycle_witness_artifact(const std::string & output_dir, const core::DagGraph & graph, const std::string & error_message);
-#endif
+/** @brief Writes a topology or cycle witness for a failed workflow. */
+void write_dag_failure_artifact(const std::string & output_dir, const core::DagGraph & graph, const std::exception & error, core::Logger & logger);
 
 } // namespace markov::trace_graph::cli
+#endif

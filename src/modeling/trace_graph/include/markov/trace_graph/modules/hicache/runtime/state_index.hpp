@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief 从 HiCache runtime 结构派生 final state snapshot 的索引。
+ * @brief Debug-only final-state views derived from canonical HiCache runtime structures.
  */
 #pragma once
 
@@ -20,18 +20,18 @@ using radix::HiCacheTokenRadixTree;
 using storage::HiCacheStorageDirectory;
 
 /**
- * @brief final-state 派生口径。
+ * @brief Selects the residency scope of a derived final-state view.
  */
-enum class HiCacheDerivedStateMode { MaterializedOnly, StorageDirectoryInclusive };
+enum class HiCacheDerivedStateMode : std::uint8_t { MaterializedOnly, StorageDirectoryInclusive };
 
-/** @brief 返回派生口径的稳定名称。 */
+/** @brief Returns the stable artifact name for a derivation mode. */
 [[nodiscard]] std::string hicache_derived_state_mode_name(HiCacheDerivedStateMode mode);
 
 /**
- * @brief HiCache final-state 的派生快照。
+ * @brief Immutable derived HiCache final-state snapshot.
  *
- * 这些集合不是状态源；它们由 canonical radix node residency/ref 和 async operation
- * table 收集得到，只用于 summary/validation。
+ * These sets are not state sources. They are collected from canonical radix residency and
+ * references, asynchronous operations, and optionally the storage directory for diagnostics.
  */
 struct HiCacheDerivedStateSnapshot {
     HiCacheDerivedStateMode mode = HiCacheDerivedStateMode::MaterializedOnly;
@@ -49,34 +49,34 @@ struct HiCacheDerivedStateSnapshot {
     std::set<std::string> prefetch_suppressed;
     std::map<std::string, uint64_t> page_hit_counts;
 
-    /** @brief 生成当前派生 state snapshot 的稳定摘要。 */
+    /** @brief Builds a deterministic digest of every field in this snapshot. */
     [[nodiscard]] std::string digest() const;
 };
 
 /**
- * @brief 只读派生视图构建器。
+ * @brief Read-only accumulator for a derived state snapshot.
  */
 class HiCacheDerivedStateView {
 public:
     explicit HiCacheDerivedStateView(HiCacheDerivedStateMode mode = HiCacheDerivedStateMode::MaterializedOnly);
 
-    /** @brief 从 canonical radix tree 汇总 materialized residency/ref 状态。 */
+    /** @brief Includes materialized residency, references, and hit counts from the radix tree. */
     void include_tree(const HiCacheTokenRadixTree & tree);
 
-    /** @brief 从 async operation table 汇总 pending/ready prefetch 和 writeback 状态。 */
+    /** @brief Includes prefetch and writeback lifecycle projections from operation tables. */
     void include_async(const HiCacheAsyncOperationTable & async_ops);
 
-    /** @brief 从 storage directory 汇总 L3 readable/backend 状态。 */
+    /** @brief Includes backend-readable storage identities only in inclusive mode. */
     void include_storage_directory(const HiCacheStorageDirectory & storage);
 
-    /** @brief 返回当前累计出的派生快照。 */
+    /** @brief Returns the accumulated snapshot by value. */
     [[nodiscard]] HiCacheDerivedStateSnapshot snapshot() const { return snapshot_; }
 
 private:
     HiCacheDerivedStateSnapshot snapshot_;
 };
 
-/** @brief 将 set 转成稳定排序 vector。 */
+/** @brief Copies an ordered set into a stable vector for JSON artifacts. */
 [[nodiscard]] std::vector<std::string> hicache_sorted_vector(const std::set<std::string> & values);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

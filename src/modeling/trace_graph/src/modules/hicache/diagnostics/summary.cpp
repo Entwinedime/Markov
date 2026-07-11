@@ -1,9 +1,9 @@
 /**
  * @file
- * @brief HiCache summary JSON 序列化。
+ * @brief HiCache summary JSON serialization.
  *
- * 本文件属于 diagnostics 层：只把 model::HiCacheSummary 转成稳定 JSON，不读取
- * profiling trace、不回写 state，也不参与 validation oracle 判定。
+ * This diagnostics layer converts `model::HiCacheSummary` to stable JSON. It neither reads
+ * profile traces nor mutates state, and it does not implement validation-oracle decisions.
  */
 #include "markov/trace_graph/modules/hicache/diagnostics/summary.hpp"
 
@@ -14,10 +14,16 @@
 
 namespace markov::trace_graph::modules::hicache::diagnostics {
 
+using model::hicache_effect_patch_status_name;
+using model::hicache_effect_type_name;
+using model::hicache_transfer_direction_name;
 using model::HiCacheCapacityAuditIssue;
 using model::HiCacheCapacityMutation;
 using model::HiCacheCapacityVictimChoice;
 using model::HiCacheControlBoundary;
+using model::HiCacheEffectBoundary;
+using model::HiCacheEffectIntent;
+using model::HiCacheEffectIntentCatalog;
 using model::HiCacheNodeSplitRecord;
 using model::HiCacheOperationLifecycleTransition;
 using model::HiCacheRefAuditIssue;
@@ -45,6 +51,7 @@ Json array_from(std::ranges::input_range auto && range, auto projector) {
 Json target_config_json(const frontend::HiCacheConfig & config) {
     return {
         {                         "page_size",                         config.page_size },
+        {                 "kv_bytes_per_page",                 config.kv_bytes_per_page },
         {                 "l1_capacity_pages",                 config.l1_capacity_pages },
         {                 "l2_capacity_pages",                 config.l2_capacity_pages },
         {                      "write_policy",                      config.write_policy },
@@ -58,6 +65,57 @@ Json target_config_json(const frontend::HiCacheConfig & config) {
         {          "prefetch_timeout_max_sec",          config.prefetch_timeout_max_sec },
         {        "device_allocator_need_sort",        config.device_allocator_need_sort },
         {                "emit_state_digests",                config.emit_state_digests },
+        {                 "dag_patch_enabled",                 config.dag_patch_enabled },
+    };
+}
+
+Json effect_boundary_json(const HiCacheEffectBoundary & boundary) {
+    return {
+        {         "kind",         boundary.kind },
+        {        "epoch",        boundary.epoch },
+        { "timestamp_us", boundary.timestamp_us },
+    };
+}
+
+Json effect_intent_json(const HiCacheEffectIntent & intent) {
+    return {
+        {                   "effect_id",                                         intent.effect_id },
+        {                 "effect_type",             hicache_effect_type_name(intent.effect_type) },
+        {                "operation_id",                                      intent.operation_id },
+        {                 "request_key",                                       intent.request_key },
+        {                 "cache_scope",                                       intent.cache_scope },
+        {                   "direction",        hicache_transfer_direction_name(intent.direction) },
+        {                       "pages",                                             intent.pages },
+        {        "candidate_page_count",                              intent.candidate_page_count },
+        {        "effective_page_count",                              intent.effective_page_count },
+        {        "effective_byte_count",                              intent.effective_byte_count },
+        {      "logical_start_boundary",      effect_boundary_json(intent.logical_start_boundary) },
+        { "logical_completion_boundary", effect_boundary_json(intent.logical_completion_boundary) },
+        {           "consumer_boundary",           effect_boundary_json(intent.consumer_boundary) },
+        {               "resource_lane",                                     intent.resource_lane },
+        {                       "state",                                             intent.state },
+        {                "patch_status",    hicache_effect_patch_status_name(intent.patch_status) },
+        {        "not_patchable_reason",                              intent.not_patchable_reason },
+    };
+}
+
+Json effect_intent_catalog_json(const HiCacheEffectIntentCatalog & catalog) {
+    return {
+        { "status", catalog.status },
+        { "intent_count", catalog.intents.size() },
+        { "patchable_count", catalog.patchable_count() },
+        { "not_patchable_count", catalog.not_patchable_count() },
+        { "deferred_count", catalog.deferred_count() },
+        { "counts_by_effect_type", catalog.counts_by_effect_type() },
+        { "missing_facts", catalog.missing_facts },
+        { "not_patchable_reasons", catalog.not_patchable_reasons },
+        { "byte_projection",
+         Json{
+              { "available", catalog.byte_projection_available },
+              { "kv_bytes_per_page", catalog.kv_bytes_per_page },
+              { "source", catalog.byte_projection_source },
+          } },
+        { "intents", array_from(catalog.intents, effect_intent_json) },
     };
 }
 
@@ -429,6 +487,7 @@ using summary_detail::capacity_mutation_json;
 using summary_detail::capacity_victim_choice_json;
 using summary_detail::control_boundary_json;
 using summary_detail::derived_snapshot_json;
+using summary_detail::effect_intent_catalog_json;
 using summary_detail::final_state_json;
 using summary_detail::Json;
 using summary_detail::policy_decision_json;
@@ -440,12 +499,12 @@ using summary_detail::target_config_json;
 using summary_detail::transition_json;
 
 /**
- * @brief 将 HiCacheSummary 投影成稳定 diagnostics JSON。
+ * @brief Projects `HiCacheSummary` into stable diagnostics JSON.
  *
- * 该函数只序列化 state model 已经生成的事实、trace 和派生视图，不重新计算模型状态，
- * 也不把 diagnostics-only inclusive state 写回 final_state。
+ * The serializer emits facts, traces, and derived views already produced by replay. It does
+ * not recompute model state or merge the diagnostics-only inclusive view into final state.
  */
-std::string summary_json(const HiCacheSummary & summary) {
+std::string summary_json(const HiCacheSummary & summary, const HiCacheEffectIntentCatalog & effect_intents) {
     Json root;
     root["status"] = summary.status;
     root["target_config"] = target_config_json(summary.target_config);
@@ -453,7 +512,7 @@ std::string summary_json(const HiCacheSummary & summary) {
     root["input_hicache_events"] = summary.input_hicache_events;
     root["processed_hicache_events"] = summary.processed_hicache_events;
     root["state_transition_count"] = summary.state_transition_count;
-    root["dag_mutations"] = summary.dag_mutations;
+    root["effect_intents"] = effect_intent_catalog_json(effect_intents);
     root["dirty_eviction_events"] = summary.dirty_eviction_events;
     root["active_ref_owner_count"] = summary.active_ref_owner_count;
     root["radix_split_count"] = summary.radix_split_count;

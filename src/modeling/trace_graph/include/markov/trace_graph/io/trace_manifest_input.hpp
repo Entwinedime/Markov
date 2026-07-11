@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief profile_manifest.json 到 C++ TraceGraph 输入事件的内存合流层。
+ * @brief In-memory channel join from `profile_manifest.json` to logical TraceGraph inputs.
  */
 #pragma once
 
@@ -12,50 +12,44 @@
 
 namespace markov::trace_graph::io {
 
-/** @brief C++ manifest reader 的并发和匹配选项。 */
+/** @brief Concurrency, channel selection, and timestamp-association options. */
 struct ManifestTraceInputOptions {
-    /** @brief logical input 之间的读取/构图并发上限。 */
+    /** @brief Total budget shared by logical-input loading and DAG construction. */
     size_t threads = 1;
 
-    /** @brief 单 trace 文件内部 event object 解析线程数。 */
+    /** @brief Parser partitions used within each selected trace file. */
     size_t file_threads = 1;
 
-    /** @brief LD_PRELOAD wrapper 与 torch profiler event 的 timestamp 容忍窗口，单位 us。 */
+    /** @brief Native-wrapper to profiler matching tolerance in microseconds. */
     double tolerance_us = 10'000.0;
 
-    /** @brief search 模式下每侧候选窗口大小。 */
+    /** @brief Candidate count inspected on each side of a timestamp insertion point. */
     size_t search_window = 5;
 
-    /** @brief earliest profiler timestamp 之前仍保留 standalone custom event 的余量，单位 us。 */
+    /** @brief Pre-profiler margin for standalone custom events, in microseconds. */
     double margin_us = 100.0;
 
-    /** @brief 当前支持 search；sequential 保留为后续严格审计扩展点。 */
-    std::string mode = "search";
-
-    /** @brief 是否允许 torch profiler trace 进入 C++ 后端。 */
+    /** @brief Selects torch-profiler traces for this backend invocation. */
     bool include_torch = true;
 
-    /** @brief 是否允许 LD_PRELOAD/native trace 进入 C++ 后端。 */
+    /** @brief Selects LD_PRELOAD/native traces for this backend invocation. */
     bool include_ld_preload = true;
 
-    /** @brief 是否允许 Python probe sidecar trace 进入 C++ 后端。 */
+    /** @brief Selects Python-probe sidecars for this backend invocation. */
     bool include_python_probe = true;
 };
 
-/** @brief 一组 torch / LD_PRELOAD / Python probe 合流后的 logical trace input。 */
+/** @brief One logical input after selected channels have been joined in memory. */
 struct ManifestTraceInput {
     std::vector<core::TraceEvent> events;
-    std::vector<std::string> source_paths;
-    std::string torch_path;
-    std::string ld_preload_path;
-    std::vector<std::string> sidecar_paths;
 };
 
-/** @brief 读取 profile_manifest.json 并在内存中执行 trace merger 语义。 */
-[[nodiscard]] std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::string & manifest_path,
-                                                                              const ManifestTraceInputOptions & options);
-
-/** @brief 仅展开 manifest 中真实存在的 trace 文件，供 Python validation artifact 记录原始输入。 */
-[[nodiscard]] std::vector<std::string> trace_paths_from_manifest(const std::string & manifest_path);
+/**
+ * @brief Loads selected manifest channels and produces independent logical inputs.
+ *
+ * No merged trace file is written. Missing manifest-declared files and malformed path
+ * entries fail the invocation instead of silently reducing the fact set.
+ */
+[[nodiscard]] std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::string & manifest_path, const ManifestTraceInputOptions & options);
 
 } // namespace markov::trace_graph::io

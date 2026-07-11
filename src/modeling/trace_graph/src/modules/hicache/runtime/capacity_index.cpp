@@ -1,8 +1,10 @@
 /**
  * @file
- * @brief HiCache capacity leaf index 实现。
+ * @brief Incremental HiCache capacity and evictable-leaf index implementation.
  */
 #include "markov/trace_graph/modules/hicache/runtime/capacity_index.hpp"
+
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
 #include <iterator>
@@ -56,7 +58,7 @@ HiCacheCapacityIndex::VictimKey HiCacheCapacityIndex::victim_key(const HiCacheCa
     };
 }
 
-/** @brief device victim 必须是没有 device descendant 的 leaf，匹配 SGLang leaf eviction 约束。 */
+/** @brief An L1 victim must have no resident descendant, matching SGLang leaf eviction. */
 bool HiCacheCapacityIndex::has_device_descendant(const HiCacheTokenRadixTree & tree, const HiCacheCacheNode & node) const {
     return std::ranges::any_of(node.children | std::views::values, [&](auto child_id) {
         const auto * child = tree.node(child_id);
@@ -75,10 +77,12 @@ bool HiCacheCapacityIndex::has_backup_child(const HiCacheTokenRadixTree & tree, 
 }
 
 /**
- * @brief 从 canonical radix tree 为单个 node 投影 capacity/index 记录。
+ * @brief Projects one canonical radix node into the incremental capacity index.
  *
- * 记录只服务容量计数和 victim 排序；canonical residency/ref 仍在 radix node 上。
- * host evictable 要求节点本身是 host-visible leaf，并且没有 lock/host ref 保护。
+ * The projection supports accounting and victim ordering only; canonical residency and
+ * references stay on the radix node. An L2 victim must be a host-visible leaf with no
+ * lock protection. Host references are checked again at selection time because they can
+ * protect a candidate independently of leaf eligibility.
  */
 HiCacheCapacityNodeRecord HiCacheCapacityIndex::make_record(const HiCacheTokenRadixTree & tree, HiCacheNodeId node_id) const {
     const auto * node = tree.node(node_id);
@@ -87,28 +91,32 @@ HiCacheCapacityNodeRecord HiCacheCapacityIndex::make_record(const HiCacheTokenRa
     const auto device_leaf = node_id != 0 && node->residency.device_present && node->refs.lock_ref_total == 0 && !has_device_descendant(tree, *node);
     const auto host_leaf = node_id != 0 && !node->residency.device_present && node->residency.host_present && node->residency.host_visible
                            && node->refs.lock_ref_total == 0 && !has_backup_child(tree, *node);
-    return HiCacheCapacityNodeRecord{
+    auto record = HiCacheCapacityNodeRecord{
         .node_id = node_id,
-        .parent = node->parent,
         .active = node->active,
         .page_count = static_cast<uint64_t>(node->pages.size()),
-        .pages = node->pages,
         .priority = node->priority,
         .last_access_order = node->last_access_order,
-        .residency = node->residency,
-        .refs = node->refs,
+        .device_present = node->residency.device_present,
+        .host_visible = node->residency.host_present && node->residency.host_visible,
+        .storage_readable = node->residency.storage_readable,
+        .host_ref_total = node->refs.host_ref_total,
         .device_evictable = device_leaf,
         .host_evictable = host_leaf,
-        .observed_epoch = mutation_epoch_,
     };
+#ifdef DEBUG
+    record.parent = node->parent;
+    record.pages = node->pages;
+    record.residency = node->residency;
+    record.refs = node->refs;
+    record.observed_epoch = mutation_epoch_;
+#endif
+    return record;
 }
 
 std::set<HiCacheNodeId> HiCacheCapacityIndex::observation_closure(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes) const {
-    /**
-     * @brief radix split/insert/ref mutation 会影响祖先和直接孩子的 leaf eligibility。
-     *
-     * 增量同步必须覆盖这个闭包，而不是只刷新 seed node。
-     */
+    // Split, insertion, and reference mutations can change ancestor and direct-child
+    // eligibility, so incremental synchronization must cover this closure.
     std::set<HiCacheNodeId> nodes;
     auto add_with_ancestors = [&](HiCacheNodeId node_id) {
         nodes.insert(node_id);
@@ -132,71 +140,59 @@ std::set<HiCacheNodeId> HiCacheCapacityIndex::observation_closure(const HiCacheT
 
 void HiCacheCapacityIndex::remove_record_contribution(const HiCacheCapacityNodeRecord & record) {
     if (!record.active || record.node_id == 0) return;
-    if (record.residency.device_present) occupied_device_pages_ -= std::min(occupied_device_pages_, record.page_count);
-    if (record.residency.host_present && record.residency.host_visible) occupied_host_pages_ -= std::min(occupied_host_pages_, record.page_count);
-    if (record.residency.storage_readable) readable_storage_pages_ -= std::min(readable_storage_pages_, record.page_count);
+    if (record.device_present)
+        occupied_device_pages_ = core::checked_subtract_u64(occupied_device_pages_, record.page_count, "HiCache L1 capacity index contribution underflow");
+    if (record.host_visible)
+        occupied_host_pages_ = core::checked_subtract_u64(occupied_host_pages_, record.page_count, "HiCache L2 capacity index contribution underflow");
+    if (record.storage_readable)
+        readable_storage_pages_ = core::checked_subtract_u64(readable_storage_pages_, record.page_count, "HiCache L3 capacity index contribution underflow");
     if (record.device_evictable) evictable_device_leaves_.erase(victim_key(record));
     if (record.host_evictable) evictable_host_leaves_.erase(victim_key(record));
 }
 
 void HiCacheCapacityIndex::add_record_contribution(const HiCacheCapacityNodeRecord & record) {
     if (!record.active || record.node_id == 0) return;
-    if (record.residency.device_present) occupied_device_pages_ += record.page_count;
-    if (record.residency.host_present && record.residency.host_visible) occupied_host_pages_ += record.page_count;
-    if (record.residency.storage_readable) readable_storage_pages_ += record.page_count;
+    if (record.device_present)
+        occupied_device_pages_ = core::checked_add_u64(occupied_device_pages_, record.page_count, "HiCache L1 capacity index exceeds uint64 range");
+    if (record.host_visible)
+        occupied_host_pages_ = core::checked_add_u64(occupied_host_pages_, record.page_count, "HiCache L2 capacity index exceeds uint64 range");
+    if (record.storage_readable)
+        readable_storage_pages_ = core::checked_add_u64(readable_storage_pages_, record.page_count, "HiCache L3 capacity index exceeds uint64 range");
     if (record.device_evictable) evictable_device_leaves_.insert(victim_key(record));
     if (record.host_evictable) evictable_host_leaves_.insert(victim_key(record));
 }
 
 void HiCacheCapacityIndex::update_snapshot() {
-    auto device_leaves = std::vector<HiCacheNodeId>{};
-    device_leaves.reserve(evictable_device_leaves_.size());
-    std::ranges::transform(evictable_device_leaves_, std::back_inserter(device_leaves), &VictimKey::node_id);
-
-    auto host_leaves = std::vector<HiCacheNodeId>{};
-    host_leaves.reserve(evictable_host_leaves_.size());
-    std::ranges::transform(evictable_host_leaves_, std::back_inserter(host_leaves), &VictimKey::node_id);
-
     snapshot_ = HiCacheCapacitySnapshot{
         .occupied_device_pages = occupied_device_pages_,
         .occupied_host_pages = occupied_host_pages_,
         .readable_storage_pages = readable_storage_pages_,
         .reserved_host_pages = reserved_host_pages_,
-        .evictable_device_leaves = std::move(device_leaves),
-        .evictable_host_leaves = std::move(host_leaves),
     };
 }
 
-void HiCacheCapacityIndex::record_mutation(HiCacheCapacityMutation mutation) {
 #ifdef DEBUG
-    mutation_trace_.push_back(std::move(mutation));
-#else
-    (void)mutation;
-#endif
-}
-
-std::optional<HiCacheCapacityNodeRecord> HiCacheCapacityIndex::indexed_record(HiCacheNodeId node_id) const {
+const HiCacheCapacityNodeRecord * HiCacheCapacityIndex::indexed_record(HiCacheNodeId node_id) const {
     const auto it = records_.find(node_id);
-    if (it == records_.end()) return std::nullopt;
-    return it->second;
+    return it == records_.end() ? nullptr : &it->second;
 }
 
-HiCacheCapacityVictimChoice HiCacheCapacityIndex::make_victim_choice(const std::string & tier, const std::string & reason, uint64_t capacity_pages,
-                                                                     uint64_t requested_pages, std::optional<HiCacheNodeId> node_id) const {
+HiCacheCapacityVictimChoice HiCacheCapacityIndex::make_victim_choice(std::string_view tier, const HiCacheVictimRequest & request,
+                                                                     std::optional<HiCacheNodeId> node_id) const {
     const auto device_tier = tier == "L1";
     auto choice = HiCacheCapacityVictimChoice{
-        .tier = tier,
-        .reason = reason,
+        .tier = std::string(tier),
+        .reason = std::string(request.reason),
         .selected = node_id.has_value(),
         .node_id = node_id.value_or(0),
         .occupied_pages = device_tier ? snapshot_.occupied_device_pages : snapshot_.occupied_host_pages,
         .reserved_host_pages = device_tier ? 0 : snapshot_.reserved_host_pages,
-        .capacity_pages = capacity_pages,
-        .requested_pages = requested_pages,
-        .excess_pages = device_tier ? device_excess_pages(capacity_pages) : host_excess_pages(capacity_pages),
+        .capacity_pages = request.capacity_pages,
+        .requested_pages = request.requested_pages,
+        .excess_pages = device_tier ? device_excess_pages(request.capacity_pages) : host_excess_pages(request.capacity_pages),
     };
     if (!node_id) return choice;
-    if (const auto record = indexed_record(*node_id)) {
+    if (const auto * record = indexed_record(*node_id); record != nullptr) {
         choice.page_count = record->page_count;
         choice.priority = record->priority;
         choice.last_access_order = record->last_access_order;
@@ -205,7 +201,6 @@ HiCacheCapacityVictimChoice HiCacheCapacityIndex::make_victim_choice(const std::
     return choice;
 }
 
-#ifdef DEBUG
 std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> HiCacheCapacityIndex::derive_tree_records(const HiCacheTokenRadixTree & tree) const {
     std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> records;
     for (const auto & node : tree.nodes()) {
@@ -216,134 +211,132 @@ std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> HiCacheCapacityIndex::derive_
 }
 #endif
 
-HiCacheCapacityMutation HiCacheCapacityIndex::sync_reservation(uint64_t reserved_host_pages, const std::string & reason) {
-    /**
-     * @brief prefetch reservation 不在 radix tree 中，但会占用 L2 budget。
-     *
-     * 单独同步它可以让 host cleanup 的压力计算和 node residency 索引保持同一 snapshot。
-     */
+void HiCacheCapacityIndex::sync_reservation(uint64_t reserved_host_pages, std::string_view reason) {
+    // Prefetch reservations do not live in the radix tree but consume L2 capacity. Keep
+    // the reservation and residency counters in one allocation-policy snapshot.
     reserved_host_pages_ = reserved_host_pages;
-    const auto epoch = ++mutation_epoch_;
     update_snapshot();
-    auto mutation = HiCacheCapacityMutation{
-        .mutation_epoch = epoch,
-        .reason = reason,
+#ifdef DEBUG
+    mutation_trace_.push_back(HiCacheCapacityMutation{
+        .mutation_epoch = core::checked_increment_u64(mutation_epoch_, "HiCache capacity mutation epoch exceeds uint64 range"),
+        .reason = std::string(reason),
         .reserved_host_pages = reserved_host_pages_,
-    };
-    record_mutation(mutation);
-    return mutation;
+    });
+#else
+    (void)reason;
+#endif
 }
 
-HiCacheCapacityMutation HiCacheCapacityIndex::sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes,
-                                                         uint64_t reserved_host_pages, const std::string & reason) {
-    /**
-     * @brief capacity index 是 mutation-driven cache。
-     *
-     * 所有状态推进必须显式给出受影响 node；audit 会把该缓存和 radix tree 全量推导结果对齐。
-     */
+void HiCacheCapacityIndex::sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes, uint64_t reserved_host_pages,
+                                      std::string_view reason) {
+    // Every state transition names its affected nodes. Debug audits independently derive
+    // the complete index from the tree to catch a missing synchronization closure.
     reserved_host_pages_ = reserved_host_pages;
-    const auto epoch = ++mutation_epoch_;
+#ifdef DEBUG
+    const auto epoch = core::checked_increment_u64(mutation_epoch_, "HiCache capacity mutation epoch exceeds uint64 range");
     auto mutation = HiCacheCapacityMutation{
         .mutation_epoch = epoch,
-        .reason = reason,
+        .reason = std::string(reason),
         .reserved_host_pages = reserved_host_pages_,
     };
+#else
+    (void)reason;
+#endif
 
     for (const auto node_id : observation_closure(tree, seed_nodes)) {
         const auto old_it = records_.find(node_id);
+#ifdef DEBUG
         const auto old_device_leaf = old_it != records_.end() && old_it->second.device_evictable;
         const auto old_host_leaf = old_it != records_.end() && old_it->second.host_evictable;
+#endif
         if (old_it != records_.end()) remove_record_contribution(old_it->second);
 
         auto record = make_record(tree, node_id);
+#ifdef DEBUG
         record.observed_epoch = epoch;
+#endif
         if (!record.active) {
             records_.erase(node_id);
+#ifdef DEBUG
             if (old_device_leaf) mutation.device_leaf_left.push_back(node_id);
             if (old_host_leaf) mutation.host_leaf_left.push_back(node_id);
+#endif
             continue;
         }
 
+#ifdef DEBUG
         const auto new_device_leaf = record.device_evictable;
         const auto new_host_leaf = record.host_evictable;
+#endif
         add_record_contribution(record);
-        records_[node_id] = std::move(record);
+        records_[node_id] = record;
+#ifdef DEBUG
         mutation.observed_nodes.push_back(node_id);
         if (!old_device_leaf && new_device_leaf) mutation.device_leaf_entered.push_back(node_id);
         if (old_device_leaf && !new_device_leaf) mutation.device_leaf_left.push_back(node_id);
         if (!old_host_leaf && new_host_leaf) mutation.host_leaf_entered.push_back(node_id);
         if (old_host_leaf && !new_host_leaf) mutation.host_leaf_left.push_back(node_id);
+#endif
     }
 
     update_snapshot();
-    record_mutation(mutation);
-    return mutation;
+#ifdef DEBUG
+    mutation_trace_.push_back(std::move(mutation));
+#endif
 }
 
 uint64_t HiCacheCapacityIndex::device_excess_pages(uint64_t capacity_pages) const { return excess(snapshot_.occupied_device_pages, capacity_pages); }
 
 uint64_t HiCacheCapacityIndex::host_excess_pages(uint64_t capacity_pages) const {
-    return excess(snapshot_.occupied_host_pages + snapshot_.reserved_host_pages, capacity_pages);
+    return excess(core::checked_add_u64(snapshot_.occupied_host_pages, snapshot_.reserved_host_pages, "HiCache committed host capacity exceeds uint64 range"),
+                  capacity_pages);
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_device_victim() const {
-    if (snapshot_.evictable_device_leaves.empty()) return std::nullopt;
-    return snapshot_.evictable_device_leaves.front();
+    if (evictable_device_leaves_.empty()) return std::nullopt;
+    return evictable_device_leaves_.begin()->node_id;
 }
 
 std::optional<HiCacheNodeId> HiCacheCapacityIndex::first_host_victim() const {
-    /**
-     * @brief host victim 还要二次检查 host_ref。
-     *
-     * host_ref 通常表示 request/prefetch 仍可能读取该 host value，不能只靠 leaf set
-     * 排序结果直接驱逐。
-     */
+    // A host reference means a request or prefetch can still read the L2 value, so leaf
+    // ordering alone cannot authorize eviction.
     for (const auto & candidate : evictable_host_leaves_) {
         const auto record_it = records_.find(candidate.node_id);
         if (record_it == records_.end()) continue;
-        if (record_it->second.refs.host_ref_total > 0) continue;
+        if (record_it->second.host_ref_total > 0) continue;
         return candidate.node_id;
     }
     return std::nullopt;
 }
 
-std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_device_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason) {
+std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_device_victim(const HiCacheVictimRequest & request) {
     const auto victim = first_device_victim();
 #ifdef DEBUG
-    auto choice = make_victim_choice("L1", reason, capacity_pages, requested_pages, victim);
-    choice.selection_epoch = ++victim_selection_epoch_;
+    auto choice = make_victim_choice("L1", request, victim);
+    choice.selection_epoch = core::checked_increment_u64(victim_selection_epoch_, "HiCache victim selection epoch exceeds uint64 range");
     victim_choices_.push_back(std::move(choice));
 #else
-    (void)capacity_pages;
-    (void)requested_pages;
-    (void)reason;
-    ++victim_selection_epoch_;
+    (void)request;
 #endif
     return victim;
 }
 
-std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_host_victim(uint64_t capacity_pages, uint64_t requested_pages, const std::string & reason) {
+std::optional<HiCacheNodeId> HiCacheCapacityIndex::select_host_victim(const HiCacheVictimRequest & request) {
     const auto victim = first_host_victim();
 #ifdef DEBUG
-    auto choice = make_victim_choice("L2", reason, capacity_pages, requested_pages, victim);
-    choice.selection_epoch = ++victim_selection_epoch_;
+    auto choice = make_victim_choice("L2", request, victim);
+    choice.selection_epoch = core::checked_increment_u64(victim_selection_epoch_, "HiCache victim selection epoch exceeds uint64 range");
     victim_choices_.push_back(std::move(choice));
 #else
-    (void)capacity_pages;
-    (void)requested_pages;
-    (void)reason;
-    ++victim_selection_epoch_;
+    (void)request;
 #endif
     return victim;
 }
 
 #ifdef DEBUG
 HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & tree, uint64_t expected_reserved_host_pages) const {
-    /**
-     * @brief audit 从 radix tree 重新全量派生期望值。
-     *
-     * 它用于证明增量 index 没有漏同步，不参与业务决策，避免把验证逻辑反向喂给模型。
-     */
+    // The audit derives expectations from the complete radix tree. It proves the
+    // incremental index did not miss a mutation and never feeds model decisions.
     HiCacheCapacityAudit audit{
         .indexed_device_pages = snapshot_.occupied_device_pages,
         .indexed_host_pages = snapshot_.occupied_host_pages,
@@ -356,9 +349,9 @@ HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & t
     std::set<VictimKey> expected_device_leaves;
     std::set<VictimKey> expected_host_leaves;
     for (const auto & record : tree_records | std::views::values) {
-        if (record.residency.device_present) audit.tree_device_pages += record.page_count;
-        if (record.residency.host_present && record.residency.host_visible) audit.tree_host_pages += record.page_count;
-        if (record.residency.storage_readable) audit.tree_storage_pages += record.page_count;
+        if (record.device_present) audit.tree_device_pages += record.page_count;
+        if (record.host_visible) audit.tree_host_pages += record.page_count;
+        if (record.storage_readable) audit.tree_storage_pages += record.page_count;
         if (record.device_evictable) expected_device_leaves.insert(victim_key(record));
         if (record.host_evictable) expected_host_leaves.insert(victim_key(record));
     }
@@ -384,19 +377,25 @@ HiCacheCapacityAudit HiCacheCapacityIndex::audit(const HiCacheTokenRadixTree & t
     auto expected_host_ids = std::vector<HiCacheNodeId>{};
     expected_host_ids.reserve(expected_host_leaves.size());
     std::ranges::transform(expected_host_leaves, std::back_inserter(expected_host_ids), &VictimKey::node_id);
-    if (snapshot_.evictable_device_leaves != expected_device_ids) {
+    auto indexed_device_ids = std::vector<HiCacheNodeId>{};
+    indexed_device_ids.reserve(evictable_device_leaves_.size());
+    std::ranges::transform(evictable_device_leaves_, std::back_inserter(indexed_device_ids), &VictimKey::node_id);
+    auto indexed_host_ids = std::vector<HiCacheNodeId>{};
+    indexed_host_ids.reserve(evictable_host_leaves_.size());
+    std::ranges::transform(evictable_host_leaves_, std::back_inserter(indexed_host_ids), &VictimKey::node_id);
+    if (indexed_device_ids != expected_device_ids) {
         audit.issues.push_back(HiCacheCapacityAuditIssue{
             .issue = "device_leaf_set_mismatch",
             .tier = "L1",
-            .indexed_count = static_cast<uint64_t>(snapshot_.evictable_device_leaves.size()),
+            .indexed_count = static_cast<uint64_t>(indexed_device_ids.size()),
             .tree_count = static_cast<uint64_t>(expected_device_ids.size()),
         });
     }
-    if (snapshot_.evictable_host_leaves != expected_host_ids) {
+    if (indexed_host_ids != expected_host_ids) {
         audit.issues.push_back(HiCacheCapacityAuditIssue{
             .issue = "host_leaf_set_mismatch",
             .tier = "L2",
-            .indexed_count = static_cast<uint64_t>(snapshot_.evictable_host_leaves.size()),
+            .indexed_count = static_cast<uint64_t>(indexed_host_ids.size()),
             .tree_count = static_cast<uint64_t>(expected_host_ids.size()),
         });
     }

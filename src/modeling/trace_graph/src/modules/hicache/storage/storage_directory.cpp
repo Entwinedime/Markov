@@ -1,11 +1,14 @@
 /**
  * @file
- * @brief HiCache target storage directory 实现。
+ * @brief HiCache target storage-readability directory implementation.
  */
 #include "markov/trace_graph/modules/hicache/storage/storage_directory.hpp"
 
+#include "markov/trace_graph/core/numeric.hpp"
+
 #include <algorithm>
 #include <ranges>
+#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::modules::hicache::storage {
@@ -37,137 +40,133 @@ std::string HiCacheStorageDirectory::storage_key(const std::string & cache_scope
 }
 
 /**
- * @brief 确保 backend hash namespace 记录存在。
+ * @brief Returns or creates a backend hash-namespace record.
  *
- * backend record 表示“某 scope/hash 在 L3 backend 可读”，不要求该 page 已经在
- * radix tree 中 materialize。prefetch 可以先通过 hash 命中，再在 target cache extend
- * 边界把可读 prefix 插入 host tree。
+ * A backend record means that one scope/hash can become L3-readable independently of
+ * radix materialization. Prefetch may discover the hash first and insert the readable
+ * prefix into the host tree at a later target cache-extend boundary.
  */
 HiCacheStorageBackendRecord & HiCacheStorageDirectory::ensure_backend_record(const std::string & cache_scope, const std::string & page_hash) {
-    auto & record = records_by_storage_key_[storage_key(cache_scope, page_hash)];
-    if (record.storage_key.empty()) {
-        record.storage_key = storage_key(cache_scope, page_hash);
+    const auto key = storage_key(cache_scope, page_hash);
+    auto [it, inserted] = records_by_storage_key_.try_emplace(key);
+    auto & record = it->second;
+    if (inserted) {
+        record.storage_key = key;
         record.cache_scope = normalized_scope(cache_scope);
         record.page_hash = page_hash;
-        record.known_epoch = ++epoch_;
+#ifdef DEBUG
+        record.known_epoch = core::checked_increment_u64(epoch_, "HiCache storage directory epoch exceeds uint64 range");
+#endif
     }
     return record;
 }
 
 HiCacheStorageRecord & HiCacheStorageDirectory::ensure_record(const std::string & cache_scope, const std::string & page_id) {
-    /**
-     * @brief page record 是 target page id 维度的视图。
-     *
-     * 如果 backend hash 已经可读，新 page record 创建时会继承 readable，
-     * 而不是重新等待一次 source observation。
-     */
-    auto & record = records_by_page_[page_id];
-    if (record.page_id.empty()) {
+    // A page record projects one target page ID. If its backend hash is already readable,
+    // the new page inherits that state instead of waiting for another observation.
+    if (page_id.empty()) throw std::invalid_argument("HiCache storage page ID must not be empty");
+    auto [it, inserted] = records_by_page_.try_emplace(page_id);
+    auto & record = it->second;
+    if (inserted) {
+#ifdef DEBUG
         record.page_id = page_id;
+#endif
         record.cache_scope = cache_scope.empty() ? page_scope_from_id(page_id) : normalized_scope(cache_scope);
         record.page_hash = page_hash_from_id(page_id);
         record.storage_key = storage_key(record.cache_scope, record.page_hash);
-        record.known_epoch = ++epoch_;
+#ifdef DEBUG
+        record.known_epoch = core::checked_increment_u64(epoch_, "HiCache storage directory epoch exceeds uint64 range");
+#endif
+    }
+    else if (!cache_scope.empty() && record.cache_scope != normalized_scope(cache_scope)) {
+        throw std::logic_error("HiCache storage page ID was observed with conflicting cache scopes: " + page_id);
     }
     auto & backend = ensure_backend_record(record.cache_scope, record.page_hash);
     if (backend.readable && !record.readable) {
         record.readable = true;
+#ifdef DEBUG
         record.readable_source = backend.readable_source;
         record.readable_epoch = backend.readable_epoch;
+#endif
     }
     return record;
 }
 
 HiCacheStorageRecord & HiCacheStorageDirectory::ensure_record(const HiCacheProjectedPage & page) {
+    if (page.hash.empty()) throw std::invalid_argument("HiCache projected page hash must not be empty");
+    const auto expected_id = storage_key(page.cache_scope, page.hash);
+    if (page.id != expected_id) throw std::invalid_argument("HiCache projected page ID does not match its scope and hash: " + page.id);
     auto & record = ensure_record(page.cache_scope, page.id);
-    if (!page.hash.empty() && record.page_hash != page.hash) {
-        record.page_hash = page.hash;
-        record.storage_key = storage_key(record.cache_scope, record.page_hash);
-    }
-    auto & backend = ensure_backend_record(record.cache_scope, record.page_hash);
-    if (backend.readable && !record.readable) {
-        record.readable = true;
-        record.readable_source = backend.readable_source;
-        record.readable_epoch = backend.readable_epoch;
-    }
+    if (record.page_hash != page.hash || record.storage_key != expected_id)
+        throw std::logic_error("HiCache storage page identity changed after insertion: " + page.id);
     return record;
 }
 
-void HiCacheStorageDirectory::mark_backend_readable(HiCacheStorageBackendRecord & record, const std::string & source) {
-    if (!record.readable) record.readable_epoch = ++epoch_;
+void HiCacheStorageDirectory::mark_backend_readable(HiCacheStorageBackendRecord & record, std::string_view source) {
+#ifdef DEBUG
+    if (!record.readable) record.readable_epoch = core::checked_increment_u64(epoch_, "HiCache storage directory epoch exceeds uint64 range");
+#endif
     record.readable = true;
-    if (!source.empty()) record.readable_source = source;
+#ifdef DEBUG
+    if (!source.empty()) record.readable_source = std::string(source);
+#else
+    (void)source;
+#endif
 }
 
-void HiCacheStorageDirectory::mark_record_readable(HiCacheStorageRecord & record, const std::string & source) {
-    if (!record.readable) record.readable_epoch = ++epoch_;
+void HiCacheStorageDirectory::mark_record_readable(HiCacheStorageRecord & record, std::string_view source) {
+#ifdef DEBUG
+    if (!record.readable) record.readable_epoch = core::checked_increment_u64(epoch_, "HiCache storage directory epoch exceeds uint64 range");
+#endif
     record.readable = true;
-    if (!source.empty()) record.readable_source = source;
+#ifdef DEBUG
+    if (!source.empty()) record.readable_source = std::string(source);
+#endif
     auto & backend = ensure_backend_record(record.cache_scope, record.page_hash);
+#ifdef DEBUG
     mark_backend_readable(backend, record.readable_source);
+#else
+    mark_backend_readable(backend, source);
+#endif
 }
 
 void HiCacheStorageDirectory::observe_page(const HiCacheProjectedPage & page) {
     auto & record = ensure_record(page);
+#ifdef DEBUG
     record.known = true;
+#else
+    (void)record;
+#endif
 }
 
 void HiCacheStorageDirectory::observe_path(const HiCachePagePath & path) {
     std::ranges::for_each(path.pages, [&](const auto & page) { observe_page(page); });
 }
 
-void HiCacheStorageDirectory::seed_readable_path(const HiCachePagePath & path, const std::string & source) {
-    /**
-     * @brief 记录模型自己已经确认的 target page path。
-     *
-     * 典型来源是 write-back/write-through commit 后的 L3 readable。
-     */
-    std::ranges::for_each(path.pages, [&](const auto & page) {
-        auto & record = ensure_record(page);
-        record.known = true;
-        mark_record_readable(record, source);
-    });
-}
-
-void HiCacheStorageDirectory::seed_readable_hashes(const std::string & cache_scope, const std::vector<std::string> & page_hashes, const std::string & source) {
-    /**
-     * @brief storage hash fact 只给 backend namespace 加可读性。
-     *
-     * 若对应 target page 已经被投影出来，同步更新 page record；尚未投影的 hash
-     * 保留为 backend-only hit。
-     */
-    std::ranges::for_each(page_hashes, [&](const auto & page_hash) {
-        auto & backend = ensure_backend_record(cache_scope, page_hash);
-        mark_backend_readable(backend, source);
-        std::ranges::for_each(records_by_page_ | std::views::values, [&](auto & record) {
-            if (record.storage_key == backend.storage_key) mark_record_readable(record, source);
-        });
-    });
-}
-
 void HiCacheStorageDirectory::mark_readable_pages(const std::string & cache_scope, const std::vector<std::string> & page_ids) {
     std::ranges::for_each(page_ids, [&](const auto & page_id) {
         auto & record = ensure_record(cache_scope, page_id);
+#ifdef DEBUG
         record.known = true;
+#endif
         mark_record_readable(record, "modeled_storage_commit");
     });
 }
 
+#ifdef DEBUG
 void HiCacheStorageDirectory::mark_materialized_pages(const std::vector<std::string> & page_ids, HiCacheNodeId node_id) {
-    /**
-     * @brief materialized 表示 storage/host prefix 已经落到 radix node 上。
-     *
-     * 它不改变 backend readable 语义，只记录 page id 到 canonical tree node 的关联。
-     */
+    // Materialization records page-to-radix ownership for Debug derivation. It does not
+    // alter backend readability.
     std::ranges::for_each(page_ids, [&](const auto & page_id) {
         auto & record = ensure_record("", page_id);
         record.known = true;
-        if (!record.materialized_node) record.materialized_epoch = ++epoch_;
+        if (!record.materialized_node) record.materialized_epoch = core::checked_increment_u64(epoch_, "HiCache storage directory epoch exceeds uint64 range");
         record.materialized_node = node_id;
         auto & backend = ensure_backend_record(record.cache_scope, record.page_hash);
         backend.materialized_pages.insert(page_id);
     });
 }
+#endif
 
 bool HiCacheStorageDirectory::readable(const std::string & page_id) const {
     const auto it = records_by_page_.find(page_id);
@@ -197,11 +196,8 @@ std::vector<std::string> HiCacheStorageDirectory::contiguous_readable_prefix(con
 }
 
 std::vector<std::string> HiCacheStorageDirectory::contiguous_readable_prefix(const std::vector<HiCacheProjectedPage> & pages) const {
-    /**
-     * @brief SGLang storage hit 只接受连续 prefix。
-     *
-     * 中间断点之后的 backend readable page 不能被本次 prefetch 当成可用结果。
-     */
+    // SGLang accepts only a contiguous storage-hit prefix. Readable pages after the first
+    // gap cannot contribute to this prefetch result.
     std::vector<std::string> prefix;
     prefix.reserve(pages.size());
     for (const auto & page : pages) {
@@ -211,6 +207,7 @@ std::vector<std::string> HiCacheStorageDirectory::contiguous_readable_prefix(con
     return prefix;
 }
 
+#ifdef DEBUG
 std::set<std::string> HiCacheStorageDirectory::readable_page_ids(bool include_backend_only) const {
     std::set<std::string> pages;
     std::ranges::for_each(records_by_page_ | std::views::values, [&](const auto & record) {
@@ -243,5 +240,6 @@ uint64_t HiCacheStorageDirectory::backend_readable_count() const {
 uint64_t HiCacheStorageDirectory::materialized_page_count() const {
     return static_cast<uint64_t>(std::ranges::count_if(records_by_page_, [](const auto & item) { return item.second.materialized_node.has_value(); }));
 }
+#endif
 
 } // namespace markov::trace_graph::modules::hicache::storage

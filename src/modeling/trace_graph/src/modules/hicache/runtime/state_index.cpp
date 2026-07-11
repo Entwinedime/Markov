@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache canonical state 的派生 final-state view。
+ * @brief Derived final-state views over canonical HiCache runtime state.
  */
 #include "markov/trace_graph/modules/hicache/runtime/state_index.hpp"
 
@@ -25,9 +25,21 @@ std::string join_set(const std::set<std::string> & values) {
     return os.str();
 }
 
+std::string join_hit_counts(const std::map<std::string, uint64_t> & values) {
+    std::ostringstream os;
+    bool first = true;
+    for (const auto & [page, hit_count] : values) {
+        if (!first) os << ',';
+        first = false;
+        os << page << '=' << hit_count;
+    }
+    return os.str();
+}
+
 } // namespace state_index_detail
 
 using state_index_detail::insert_all;
+using state_index_detail::join_hit_counts;
 using state_index_detail::join_set;
 
 std::string hicache_derived_state_mode_name(HiCacheDerivedStateMode mode) {
@@ -46,18 +58,15 @@ std::string HiCacheDerivedStateSnapshot::digest() const {
        << ";dirty=" << join_set(dirty) << ";backuped=" << join_set(backuped) << ";evicted=" << join_set(evicted) << ";locked=" << join_set(locked)
        << ";pending_writeback=" << join_set(pending_writeback) << ";prefetch_planned=" << join_set(prefetch_planned)
        << ";prefetch_ready=" << join_set(prefetch_ready) << ";prefetch_late=" << join_set(prefetch_late)
-       << ";prefetch_suppressed=" << join_set(prefetch_suppressed);
+       << ";prefetch_suppressed=" << join_set(prefetch_suppressed) << ";page_hit_counts=" << join_hit_counts(page_hit_counts);
     return os.str();
 }
 
 HiCacheDerivedStateView::HiCacheDerivedStateView(HiCacheDerivedStateMode mode) { snapshot_.mode = mode; }
 
 void HiCacheDerivedStateView::include_tree(const HiCacheTokenRadixTree & tree) {
-    /**
-     * @brief final-state 的 materialized 口径只从 canonical radix tree 派生。
-     *
-     * 这里不读取 source oracle，也不把 storage directory 的 backend-only hash 当成 host value。
-     */
+    // Materialized final state comes only from the canonical radix tree, never an oracle or
+    // a backend-only storage hash.
     for (const auto & node : tree.nodes()) {
         if (!node.active || node.id == 0 || node.pages.empty()) continue;
         if (node.residency.device_present) insert_all(snapshot_.l1, node.pages);
@@ -74,11 +83,8 @@ void HiCacheDerivedStateView::include_tree(const HiCacheTokenRadixTree & tree) {
 }
 
 void HiCacheDerivedStateView::include_storage_directory(const HiCacheStorageDirectory & storage) {
-    /**
-     * @brief inclusive 口径只用于诊断 backend 已可读但尚未 materialize 的 page/hash。
-     *
-     * validation 默认不应把它当成最终 residency 事实。
-     */
+    // Inclusive mode explains backend-readable identities that are not yet materialized; it
+    // must not replace the default residency view used by final-state validation.
     if (snapshot_.mode != HiCacheDerivedStateMode::StorageDirectoryInclusive) return;
     for (const auto & page : storage.readable_page_ids(true)) {
         snapshot_.l3.insert(page);
@@ -88,11 +94,7 @@ void HiCacheDerivedStateView::include_storage_directory(const HiCacheStorageDire
 }
 
 void HiCacheDerivedStateView::include_async(const HiCacheAsyncOperationTable & async_ops) {
-    /**
-     * @brief async 派生字段解释 prefetch/writeback 生命周期。
-     *
-     * 这些字段不改变 L1/L2/L3 residency 集合。
-     */
+    // Lifecycle projections explain pending work without changing L1/L2/L3 residency sets.
     for (const auto & op : async_ops.prefetch_ops() | std::views::values) {
         insert_all(snapshot_.prefetch_planned, op.planned_pages);
         if (op.prefetch_state == HiCachePrefetchState::Ready || op.prefetch_state == HiCachePrefetchState::Applied)

@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache token path 到 target page id 的投影器。
+ * @brief Projects HiCache token paths into target page identities.
  */
 #pragma once
 
@@ -14,10 +14,10 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 /**
- * @brief target page 的可追溯投影结果。
+ * @brief Traceable projection of one complete target page.
  *
- * `id` 是模型内部和 summary 使用的稳定 page id；其余字段用于解释该 id 从哪个
- * cache scope 和 token span 推导出来。
+ * `id` is the stable state-model identity. The remaining fields preserve the scope and token
+ * interval from which that identity was derived.
  */
 struct HiCacheProjectedPage {
     std::string id;
@@ -29,40 +29,41 @@ struct HiCacheProjectedPage {
 };
 
 /**
- * @brief 一条 request path 在 target page size 下的 page 投影。
+ * @brief Complete-page projection of one request path under the target page size.
  */
 struct HiCachePagePath {
     std::string cache_scope;
     uint64_t page_size = 0;
     std::vector<HiCacheProjectedPage> pages;
 
-    /** @brief 当前投影是否没有完整 target page。 */
+    /** @brief Returns whether the path contains no complete target page. */
     [[nodiscard]] bool empty() const { return pages.empty(); }
 
-    /** @brief 当前投影包含的完整 target page 数。 */
+    /** @brief Returns the number of complete projected pages. */
     [[nodiscard]] size_t size() const { return pages.size(); }
 
-    /** @brief 提取投影后的 page id 序列。 */
+    /** @brief Copies stable page IDs in request-path order. */
     [[nodiscard]] std::vector<std::string> page_ids() const;
 };
 
 /**
- * @brief 将 token path 纯函数式投影成 target page id。
+ * @brief Pure target-page projector for token paths.
  *
- * 该层是 source page identity 与 target state 的隔离层。page id 由 token、
- * chained hash、cache scope 和 target page size 推导，不读取 source residency。
+ * This is the isolation boundary between source page identity and target state. IDs are
+ * derived from tokens, chained hashes, cache scope, and target page size without consulting
+ * source residency.
  */
 class HiCacheTargetPager {
 public:
     explicit HiCacheTargetPager(frontend::HiCacheConfig config = frontend::HiCacheConfig{});
 
-    /** @brief 返回 fact 应使用的 target page size。 */
+    /** @brief Resolves target page size, using the fact's source size only when config omits it. */
     [[nodiscard]] uint64_t page_size_for_fact(const HiCacheFact & fact) const;
 
-    /** @brief 生成包含 cache_scope 的内部 page id。 */
+    /** @brief Builds a scope-qualified internal page ID. */
     [[nodiscard]] std::string scoped_page_id(const std::string & cache_scope, const std::string & page_hash) const;
 
-    /** @brief 将 token path 投影成 page path，只保留完整 page。 */
+    /** @brief Projects a token path and drops its incomplete trailing page. */
     [[nodiscard]] HiCachePagePath project(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
 
 private:

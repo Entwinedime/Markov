@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief DAG 拓扑仿真入口和汇总结果。
+ * @brief Topological DAG simulation entry point and result.
  */
 #pragma once
 
@@ -8,28 +8,25 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
-#include <vector>
 
 namespace markov::trace_graph::simulation {
 
 /**
- * @brief 拓扑仿真的执行结果。
+ * @brief Successful topological simulation result.
  *
- * e2e_ns 是 DAG critical path 长度，不是原始 trace timestamp 窗口。
+ * `e2e_us` is the simulated DAG critical-path length in Chrome trace microseconds;
+ * it is not the observed input timestamp window.
  */
 struct SimulationResult {
-    uint64_t e2e_ns = 0;
+    uint64_t e2e_us = 0;
     size_t processed_nodes = 0;
-    bool cycle_detected = false;
-    std::vector<size_t> cycle_nodes;
-    std::string error;
 };
 
 /**
- * @brief 对已经构建好的 DAG 做拓扑重放。
+ * @brief Replays an already constructed active DAG in topological order.
  *
- * 所有边都被解释为 hard dependency：dst 的开始时间不早于 src 的完成时间。
+ * Every active edge is a hard dependency: a destination cannot start before its
+ * source completes. Invalid endpoints and cycles throw; no partial result is returned.
  */
 [[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph);
 

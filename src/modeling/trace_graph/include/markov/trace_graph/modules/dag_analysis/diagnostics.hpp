@@ -1,10 +1,11 @@
 /**
  * @file
- * @brief Debug-only DAG analysis artifact 构造器。
+ * @brief Debug-only DAG analysis artifact builders.
  */
 #pragma once
 
 #include "markov/trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/core/dag_mutation.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,7 +14,7 @@
 
 namespace markov::trace_graph::modules::dag_analysis {
 
-/** @brief 阶段一 DAG analysis 输出的四份 JSON artifact。 */
+/** @brief Four JSON artifacts produced by the first-stage DAG analysis pass. */
 struct DagAnalysisArtifacts {
     std::string dag_quality_json;
     std::string dag_analysis_json;
@@ -23,18 +24,23 @@ struct DagAnalysisArtifacts {
 };
 
 /**
- * @brief 从已完成拓扑仿真的 DAG 构造阶段一 analysis artifact。
+ * @brief Builds first-stage analysis artifacts from a successfully simulated DAG.
  *
- * 该函数只读 DAG，不修改 node、edge、duration 或 module state。
+ * This operation is read-only and may be expensive; it never changes nodes, edges,
+ * durations, or module state.
  */
 [[nodiscard]] DagAnalysisArtifacts build_dag_analysis_artifacts(const core::DagGraph & graph, size_t threads = 1);
 
 /**
- * @brief 构造 cycle failure 的结构化 witness artifact。
+ * @brief Builds a structured witness for a cycle failure.
  *
- * 该函数用于 validation/debug 路径：当拓扑仿真发现 cycle 并失败时，输出
- * 可审计的 node/edge 证据，帮助定位是哪类边生成了闭环。
+ * The validation path uses this after simulation fails, preserving auditable node and edge
+ * evidence that identifies which dependency rules closed the cycle.
  */
 [[nodiscard]] std::string build_cycle_witness_json(const core::DagGraph & graph, const std::string & error_message = "");
+
+/** @brief Builds a structured witness for mutation-plan or topology validation failure. */
+[[nodiscard]] std::string build_topology_validation_json(const core::DagGraph & graph, const core::DagTopologyValidationReport & report,
+                                                         const std::string & error_message = "");
 
 } // namespace markov::trace_graph::modules::dag_analysis

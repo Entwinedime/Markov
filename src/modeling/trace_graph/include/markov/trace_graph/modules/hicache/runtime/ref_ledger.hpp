@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache lock/host ref owner ledger 和 tree ref 审计。
+ * @brief HiCache lock/host reference ownership ledger and Debug tree audit.
  */
 #pragma once
 
@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -18,25 +19,40 @@ using radix::HiCacheNodeId;
 using radix::HiCacheTokenRadixTree;
 
 /**
- * @brief 单个 ref owner 当前持有的 node-level 引用。
+ * @brief Node-level references currently held by one lifecycle owner.
  *
- * tree 上的 ref counter 是最终状态源；ledger 保存 owner 到 node chain 的审计账，
- * 用于保证 request、write、load、storage 和 prefetch 可以独立释放。
+ * Radix-node counters are the canonical reference state. The ledger supplies the reverse
+ * owner-to-node mapping required to release request, write, load, storage, and prefetch
+ * lifecycles independently. Descriptive owner metadata is Debug-only because policy reads
+ * only the node chains and active flag.
  */
 struct HiCacheRefOwnerRecord {
-    std::string owner_id;
+    std::vector<HiCacheNodeId> lock_nodes;
+    std::vector<HiCacheNodeId> host_nodes;
+    bool active = false;
+#ifdef DEBUG
     std::string owner_kind;
     std::string request_key;
     std::string operation_id;
-    std::vector<HiCacheNodeId> lock_nodes;
-    std::vector<HiCacheNodeId> host_nodes;
     uint64_t acquire_epoch = 0;
     uint64_t release_epoch = 0;
-    bool active = false;
+#endif
 };
 
 /**
- * @brief 一次 ref acquire/release 的可审计结果。
+ * @brief Minimal production result identifying nodes affected by a reference mutation.
+ *
+ * Capacity synchronization needs only this set. Keeping the diagnostic mutation separate
+ * prevents Release builds from flattening page paths and copying owner metadata for a
+ * value that callers immediately discard.
+ */
+struct HiCacheRefChange {
+    std::vector<HiCacheNodeId> affected_nodes;
+};
+
+#ifdef DEBUG
+/**
+ * @brief Detailed diagnostic record for one reference acquire, release, or split copy.
  */
 struct HiCacheRefMutation {
     uint64_t mutation_epoch = 0;
@@ -57,7 +73,7 @@ struct HiCacheRefMutation {
 };
 
 /**
- * @brief ref ledger 与 canonical tree ref counter 的一致性问题。
+ * @brief One consistency discrepancy between the ledger and radix-node counters.
  */
 struct HiCacheRefAuditIssue {
     std::string cache_scope;
@@ -71,7 +87,7 @@ struct HiCacheRefAuditIssue {
 };
 
 /**
- * @brief ref ledger 的一致性审计结果。
+ * @brief Full Debug audit result for the reference ledger.
  */
 struct HiCacheRefAudit {
     uint64_t active_owner_count = 0;
@@ -81,63 +97,67 @@ struct HiCacheRefAudit {
     uint64_t tree_host_ref_count = 0;
     std::vector<HiCacheRefAuditIssue> issues;
 
-    /** @brief ref ledger 与 canonical tree ref counter 是否完全一致。 */
+    /** @brief Returns true when owner chains exactly match radix-node counters. */
     [[nodiscard]] bool ok() const { return issues.empty(); }
 };
+#endif
 
 /**
- * @brief HiCache node-level ref 的 owner 账本。
+ * @brief Owner ledger for HiCache node-level lock and host references.
  *
- * SGLang 的 lock_ref/host_lock_ref 挂在 radix node 上；本账本只负责把不同
- * lifecycle owner 的 acquire/release 收敛到统一入口，不成为另一个 page set 状态源。
+ * SGLang stores lock and host-reference counters on radix nodes. This ledger centralizes
+ * lifecycle acquire/release operations but does not become another residency or page-set
+ * source of truth. Split synchronization mirrors reference copies made by the radix tree
+ * so a later owner release can still remove every copied counter.
  */
 class HiCacheRefLedger {
 public:
-    /** @brief 释放某个 owner 当前持有的所有 lock/host 引用。 */
-    HiCacheRefMutation release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id);
+    /** @brief Releases every lock and host reference held by an owner. */
+    HiCacheRefChange release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id);
 
-    /** @brief 为 owner 持有一条 ordinary lock ref node chain。 */
-    HiCacheRefMutation acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
-                                    const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes);
+    /** @brief Acquires an ordinary lock-reference node chain for an owner. */
+    HiCacheRefChange acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
+                                  const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes);
 
-    /** @brief 为 owner 持有一条 host ref node chain。 */
-    HiCacheRefMutation acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
-                                    const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes);
+    /** @brief Acquires a host-reference node chain for an owner. */
+    HiCacheRefChange acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
+                                  const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes);
 
-    /** @brief 将 radix split 复制出来的 tree ref 同步回 owner 账本。 */
-    void sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, const std::string & reason);
-
-    /** @brief 查询 owner 记录；不存在时返回空指针。 */
-    [[nodiscard]] const HiCacheRefOwnerRecord * owner(const std::string & owner_id) const;
-
-    /** @brief 所有 owner 记录。 */
-    [[nodiscard]] const std::unordered_map<std::string, HiCacheRefOwnerRecord> & owners() const { return owners_; }
+    /** @brief Mirrors references copied by radix splits into the owner reverse index. */
+    void sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, std::string_view reason);
 
 #ifdef DEBUG
-    /** @brief ref lifecycle mutation 的审计 trace。 */
+    /** @brief Returns the detailed reference lifecycle trace. */
     [[nodiscard]] const std::vector<HiCacheRefMutation> & mutation_trace() const { return mutation_trace_; }
 
-    /** @brief 审计 ledger 与 tree ref counter 是否一致。 */
+    /** @brief Independently checks owner chains against canonical radix-node counters. */
     [[nodiscard]] HiCacheRefAudit audit(const HiCacheTokenRadixTree & tree) const;
-#endif
 
-    /** @brief 当前 active owner 数。 */
+    /** @brief Returns the number of owners currently holding any reference. */
     [[nodiscard]] uint64_t active_owner_count() const;
 
-    /** @brief 已记录的 ref mutation 次数。 */
+    /** @brief Returns the number of recorded reference mutations. */
     [[nodiscard]] uint64_t mutation_count() const { return epoch_; }
+#endif
 
 private:
-    uint64_t epoch_ = 0;
+    /** @brief Non-owning diagnostic identity supplied while acquiring an owner record. */
+    struct OwnerMetadata {
+        const std::string & owner_kind;
+        const std::string & request_key;
+        const std::string & operation_id;
+    };
+
     std::unordered_map<std::string, HiCacheRefOwnerRecord> owners_;
 #ifdef DEBUG
+    uint64_t epoch_ = 0;
     std::vector<HiCacheRefMutation> mutation_trace_;
 #endif
 
-    [[nodiscard]] HiCacheRefOwnerRecord & ensure_owner(const std::string & owner_id, const std::string & owner_kind, const std::string & request_key,
-                                                       const std::string & operation_id);
+    [[nodiscard]] HiCacheRefOwnerRecord & ensure_owner(const std::string & owner_id, const OwnerMetadata & metadata);
+#ifdef DEBUG
     [[nodiscard]] static std::vector<std::string> flatten_pages(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & nodes);
-    void record_mutation(HiCacheRefMutation mutation);
+#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime
