@@ -115,7 +115,11 @@
 - DAG 修改必须通过统一 mutation 接口记录，不能以隐式副作用改变图结构。
 - 非执行类 state snapshot、oracle 和质量事件不得成为默认 DAG 节点。
 - Cache-state prediction 必须同时具有显式 target config 和满足合同的 profile 输入。
-- target config 至少明确 page projection、容量和 policy；不得使用“observed”一类从 source 行为回填 target policy 的配置。
+- target config 至少明确 page size、容量和 policy；byte projection 由 workflow 级模型几何生成，不得使用“observed”一类从 source 行为回填 target policy 的配置。
+- HiCache I/O cost 只允许使用 effective bytes、device-host bandwidth 和 host-storage bandwidth；KV bytes 是模型几何，不能作为第三个 cost 参数。
+- Workflow 只能通过统一的 `--hicache-io-model` 文件提供模型几何与两个 bandwidth，同一 invocation 不允许 target config 或单个 cell 覆盖这些值。
+- HiCache I/O duration 不读取 source/target observed latency、E2E、oracle exactness 或 config/input/cell 专项修正；参数缺失时必须输出明确 blocker。
+- Resource model 必须显式区分 host-storage、device-to-host 和 host-to-device 三条 lane；同 lane 顺序不能隐式依赖 simulator 行为。
 - Target trace 只作为 oracle；cross-config prediction 不得把 target actual 行为作为模型事实源。
 - 状态模型、策略推导、验证摘要和 DAG mutation 应保持清晰组件边界，避免重新形成单体状态机。
 - 当前 target modeling config 由 workflow 根据 profile suite 动态生成，不作为手工长期配置维护。
@@ -125,8 +129,8 @@
   `scripts/model.sh` 不再用额外 CLI 参数重复覆盖这些字段。两层 config 不能混称为同一种目标建模配置。
 - Unified modeling workflow 必须使用统一 validation object、artifact policy、runner adapter 和 `WorkflowProgressReporter`；
   preflight、plan、model-runs、validations 业务模块不直接拥有终端进度输出。
-- DAG analysis、HiCache final-state、HiCache transition 和未来 cache patch 都是同一个 modeling workflow 的 validation
-  object，不再维护独立 DAG workflow 或 HiCache state workflow 主入口。
+- Base-DAG analysis、Final-DAG patch、HiCache final-state 和 HiCache transition 都是同一个 modeling workflow 的 validation
+  object，不再维护独立 DAG workflow、cache patch workflow 或 HiCache state workflow 主入口。
 - workflow 共享进度条、count/value 渲染等公共编排能力维护在
   `scripts/internal/markov_internal/modeling_workflow/progress.py`；具体 validation 只保留自身 stage metrics 和业务 summary。
 - Workflow 用户第一入口是 `workflow_summary.json`、`preflight_summary.json`、`artifacts/model_runs_summary.json` 和

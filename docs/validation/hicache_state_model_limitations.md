@@ -187,8 +187,8 @@ profiling 合同不采集 `drain_storage_control_queues()` runtime checkpoint。
   对本轮 allocation 可见的情况；
 - `cache_extend_input` 被视为同 request active prefetch 的 target-derived terminal boundary，用于结算 ready / revoked / late /
   suppressed；
-- 对 best-effort below-threshold revoke，若模型认为后台 storage query 已经早于本次 `cache_extend_input` 可见，则在 cache
-  extend side effect 前释放 reservation；
+- 对 below-threshold revoke，模型不为 metadata query 虚构时间；在当前 `cache_extend_input` 控制边界撤销 prefetch，并在
+  allocation side effect 前释放 reservation；
 - 其它同 request terminal prefetch 的 pending reservation 在 `cache_extend_input` side effect 后做 post-extend release drain；
 - `finalize()` 只兜底释放没有后续 cache extend 的残留 reservation；
 - 模型不读取 source queue snapshot、source page identity 或 oracle final state 来决定释放哪些 page。
@@ -234,7 +234,7 @@ release drain 过早会让 host budget 太早变空，可能少触发一次 host
 queue、rank-synced FIFO drain count 或 scheduler batch round。不能把 source run 的 `drain_storage_control_queues()`
 重新包装成跨配置 profiling checkpoint。
 
-## HCSV-LIMIT-004: best-effort prefetch revoke 可见性使用 worker-ready 时间投影
+## HCSV-LIMIT-004: best-effort prefetch revoke 竞态折叠到 pre-extend 控制边界
 
 ### 问题
 
@@ -257,8 +257,8 @@ scheduler path
   -> cache_extend_input
 ```
 
-如果后台线程足够早完成 below-threshold 判定，后一次 scheduler drain 可能在 cache extend 前释放 host reservation；
-否则 release 只能在同 request cache extend 后才对模型可见。
+如果后台线程足够早完成 below-threshold 判定，后一次 scheduler drain 会在 cache extend 前释放 host reservation；否则该
+reservation 仍可能短暂进入 cache extend 内部的 host allocation。这个分歧是后台线程与 scheduler 的真实竞态。
 
 ### 当前近似
 
@@ -266,29 +266,28 @@ C++ state model 仍只消费 `cache_lookup_input`、`cache_extend_input`、`cach
 `prefetch_candidate_anchor` 四类 state facts。不新增 source runtime checkpoint，不消费 source actual、oracle state、
 observed gate 或 Python probe 的最终答案。
 
-在 `prefetch_candidate_anchor` 上，模型用 target-derived 信息估计后台 worker 的 storage query 可见时刻：
+模型不再用固定 base、per-page、large-query 或 visibility-guard 常数猜测这个竞态：
 
-- 以 modeled storage readable prefix 计算 below-threshold 首个 miss 之前需要查询的 page 数；
-- query page 数按 SGLang storage batch 粒度折叠，batch size 当前为 `128` pages，并被 planned prefetch pages 截断；
-- 每个 `cache_scope` 维护一个串行 `prefetch_worker_available_ts`；
-- ready time 近似为 `max(candidate_anchor.ts, prefetch_worker_available_ts) + query_duration`；
-- `query_duration = 2000us + 1250us * query_pages`，当 `query_pages > 16` 时再加 `2500us`；
-- 在 `cache_extend_input` 上，如果 `storage_query_ready_ts + 2500us <= cache_extend_input.ts`，则把 below-threshold
-  host release 视为 pre-extend drain 可见；否则走 post-extend drain。
+- modeled storage directory 自主计算 target 连续 hit prefix；
+- hit prefix 低于 target threshold 时，prefetch 在下一次 `cache_extend_input` 控制边界进入 revoked；
+- metadata `batch_exists()` 不搬运 KV payload，没有可用于两带宽模型的 effective bytes，因此不生成 duration；
+- revoked reservation 在该控制边界的 allocation side effect 前释放，对应正常 scheduler path 中
+  `check_hicache_events()` 位于 request admission 和 cache extend allocation 之前；
+- hit prefix 达到 threshold 时，模型按 SGLang `prefetch_buffer.put(operation)` 语义记录
+  `payload_transfer_issued=true`；真正的 storage -> host KV payload 严格按
+  `effective_bytes / host_storage_bandwidth` 调度，不受此控制折叠影响；
+- payload operation 是否存在由 threshold gate 决定，不由带宽配置是否可用或 payload 是否已进入 radix 决定；缺少带宽时
+  operation 仍存在，但 cost/rewrite 必须保持不可用。
 
-非 `best_effort` 的 below-threshold revoke 仍按原语义在 cache extend 前可见；这个 worker-ready 投影只特化
-`best_effort` 的 A/B 分岔。
+这是一种明确的控制边界投影，不是假装复现后台线程时间轴。它不会读取 source actual progress、queue snapshot、oracle state
+或 observed gate，也没有 config/workload 特判。
 
 代码锚点：
 
 - `src/modeling/trace_graph/src/modules/hicache/model/prefetch_model.cpp` 的
-  `prefetch_storage_query_pages()`、`estimate_prefetch_storage_query_duration()`、
-  `prefetch_release_visible_before_cache_extend()`、`apply_prefetch_candidate_anchor()` 和
-  `settle_prefetch_before_cache_extend()`；
-- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/model/state.hpp` 的
-  `ScopedState::prefetch_worker_available_ts`；
-- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/runtime/async_state.hpp` 的
-  `HiCachePrefetchOperation::storage_query_ready_ts` 和 `release_before_cache_extend`；
+  `apply_prefetch_candidate_anchor()` 和 `settle_prefetch_before_cache_extend()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/request_model.cpp` 的
+  `prepare_prefetch_before_cache_extend()`；
 - `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的 `prefetch_thread_func()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的 `prefetch_from_storage()`、
   `check_prefetch_progress()` 和 `drain_storage_control_queues()`。
@@ -301,18 +300,18 @@ state-model 输入。只看 lookup 也不够，因为改变状态的是后续 ca
 
 ### 风险
 
-该近似依赖固定的 storage query latency 常数和每 scope 单 worker 假设。如果 storage backend 延迟、prefetch candidate
-大小分布、scheduler round 间隔、rank 同步或后台线程并发度变化，pre-extend / post-extend drain 判定可能翻转。翻转后会改变
-host budget、cleanup victim order、L2 host-visible page set 和 transition multiset。
+当后台 query 没有赶上本轮 maintenance drain 时，该投影会比真实运行更早释放 reservation，进而少触发一次 host cleanup。
+反方向不再存在由任意常数造成的误判，但真实 scheduler round、rank 同步和 worker backlog 仍可能改变 host budget、victim order、
+L2 host-visible page set 和 transition multiset。
 
 ### 收敛方向
 
-长期应引入 target-independent 的 scheduler round / storage-control drain intent，或把 prefetch worker queue 抽象成
-可校准的 target operation graph。允许记录的应是可复算边界条件，例如 cache scope、request id、enqueue order、query page
-count、scheduler round id 或 drain intent；不应记录 source run 的 actual completion、oracle final state 或 observed gate
-答案。
+长期应引入 target-independent 的 scheduler round / storage-control drain intent。允许记录的应是可复算边界条件，例如 cache
+scope、request id、enqueue order、scheduler round id 或 drain intent；不应记录 source run 的 actual completion、oracle final
+state 或 observed gate 答案。若未来必须预测 metadata latency，也必须增加独立、可校准的 config 合同，不能把固定经验数字重新写回
+state model。
 
-## HCSV-LIMIT-005: prefetch I/O progress 仍是未校准的完成度投影
+## HCSV-LIMIT-005: prefetch readiness 仍是 payload-only boundary 投影
 
 ### 问题
 
@@ -322,20 +321,60 @@ host-visible materialization 和 release queue enqueue。`storage readable prefi
 
 ### 当前近似
 
-模型的 I/O progress 估计当前是 zero-progress placeholder：
+模型只给真实 KV payload transfer 建立 target I/O schedule：
 
 ```text
-estimate_prefetch_io_progress() -> completed_pages = []
+effective_bytes = storage_hit_pages * kv_bytes_per_page
+duration_us     = ceil(effective_bytes * 1_000_000 / host_storage_bandwidth)
+ready_ts        = max(candidate_ts, host_storage_lane_available_ts) + duration_us
 ```
 
-在不同 prefetch policy 下模型再做策略性折叠：
+Prefetch operation 中三个字段表达不同语义，不能互相替代：
 
-- `best_effort`：可以立刻 terminate，但 completed prefix 使用 zero-progress，通常不会 materialize host prefix；
-- `wait_complete`：在需要完整 completion 的 boundary 上把 completed prefix 近似为 storage hit prefix；
-- `timeout`：cache-extend terminal boundary 未超时时把 completed prefix 近似为 storage hit prefix；已超时时只暴露
-  zero-progress 并取消；
-- completed prefetch 的 host insertion 当前只在模型判定可 apply 的 `cache_extend_input` terminal boundary 同步发生；如果 completed prefix
-  不可知，模型会保守保留 pending release / suppressed / late 状态，而不是再用 request reuse 边界补齐 host-visible page。
+```text
+hit_pages                  batch_exists() 得到的 target 连续命中前缀
+payload_transfer_issued    命中前缀通过 threshold 后提交给 payload worker
+completed_pages            当前 canonical boundary 已可进入 host radix 的前缀
+```
+
+`completed_byte_count` 另外记录 boundary 前按 bandwidth 推进的 payload 字节数；只有
+`floor(completed_byte_count / kv_bytes_per_page)` 对应的完整连续页能够进入 `completed_pages`。因此 DAG effect ledger 中
+`PrefetchIo` 只使用 `completed_pages`，不会再把尚未完成的整个 `hit_pages` 前缀算作 target I/O。Best-effort 可以已经提交后台
+payload，但在 source boundary 前只完成一部分 page segment；这种情况在 effect ledger 中明确为 `partial`，且不会自动产生
+visibility gate。
+
+模型预先索引同 request 的下一条 `cache_extend_input`，把它作为 source scheduler 提供的 prefetch control boundary。关联的
+admission lookup 到来时，先按这个 boundary 结算 target prefetch，再执行 host match / loadback。这样表达的是
+`check_prefetch_progress()` 在 admission lookup 之前决定 request 是否继续，而不是把 source event timestamp 本身改写掉。
+
+三种 policy 共用同一条 payload schedule，但 boundary 语义不同：
+
+- `best_effort`：`policy_stop = source_boundary`，`target_boundary = source_boundary`。完成字节按
+  `floor((source_boundary - io_start) * host_storage_bandwidth / 1_000_000)` 计算，只把完整连续页 materialize，boundary 永不移动；
+- `wait_complete`：`policy_stop = io_ready`，`target_boundary = max(source_boundary, io_ready)`。只有 `io_ready > source_boundary`
+  时才生成 visibility dependency；I/O 已在 source eligibility 前完成时，不再强行制造一个 blocking gate；
+- `timeout`：`deadline = enqueue_ts + min(max, base + per_ki_token * hit_tokens / 1024)`，其中 `hit_tokens` 对齐 SGLang
+  `operation.hash_value` 的连续 storage-hit prefix；`policy_stop = min(io_ready, deadline)`，
+  `target_boundary = max(source_boundary, policy_stop)`。`io_ready <= deadline` 表示正常完成，否则在 deadline 终止并只保留当时
+  已完成的完整页；不得借用更晚 source boundary 继续累计进度；
+- 未使用的 host reservation 继续通过 storage-control pending release 路径释放。
+
+这里的 `source_boundary` 是 source scheduler 提供的最早可复用 control skeleton，不是 target actual 结果。模型允许 target I/O 或
+timeout 比它更晚，从而通过 causal gate 推迟 consumer；当 target stop 更早时，state replay不会凭空发明一个更早 scheduler poll，
+而是保留 source eligibility。DAG 中 source-owned I/O duration仍由target cost替换，但不按timestamp窗口删除scheduler polling。
+
+这套逻辑只使用candidate、cache-extend、target page geometry、scope-local lane和校准bandwidth，没有读取
+`prefetch_progress_observed`、target completed token、workload/config ID或transition exactness。Release和Debug summary显式输出：
+
+```text
+prefetch_readiness_status = payload_only_control_pipeline_unmodeled
+```
+
+该字段表示payload部分已经有target-derived cost和boundary规则，但payload开始之前的control pipeline仍是已知限制。
+
+metadata hit query 不在这条 schedule 内，因为它没有 KV payload effective bytes；对应限制见 HCSV-LIMIT-004。
+当 byte geometry 或 bandwidth 缺失时，模型不补默认时延：payload submission 语义仍保留，ready-time projection 和 production
+rewrite 由配置门禁阻断。
 
 跨 rank / cache scope 的真实 backend I/O 仍可能存在更细的阶段边界：例如先整体完成 `storage -> host` materialize，再在后续
 request reuse / lock 边界推进 `host -> L1/GPU` loadback。当前模型只保证在现有 fact 边界上做 target-derived 折叠，不承诺重放
@@ -346,6 +385,9 @@ request reuse / lock 边界推进 `host -> L1/GPU` loadback。当前模型只保
 - `src/modeling/trace_graph/src/modules/hicache/model/prefetch_model.cpp` 的
   `estimate_prefetch_io_progress()`、`estimate_prefetch_progress()`、`apply_prefetch_ready()`、
   `settle_prefetch_before_cache_extend()`；
+- `src/modeling/trace_graph/src/modules/hicache/model/effect_decision.cpp` 的 `operation_evidence()`；
+- `src/modeling/trace_graph/include/markov/trace_graph/modules/hicache/runtime/async_state.hpp` 的
+  `HiCachePrefetchOperation`；
 - `third_party/sglang/python/sglang/srt/managers/cache_controller.py` 的
   `prefetch_thread_func()`、`terminate_prefetch()`、`_page_get_zero_copy()`；
 - `third_party/sglang/python/sglang/srt/mem_cache/hiradix_cache.py` 的
@@ -353,9 +395,26 @@ request reuse / lock 边界推进 `host -> L1/GPU` loadback。当前模型只保
 
 ### 为什么难以精确
 
-真实 completed prefix 取决于后台线程、storage backend latency、rank synchronization 和 terminate 时刻。直接把 source
-`completed_tokens` 当 state-model input 会让 target prediction 依赖 source runtime timing；完全不记录 progress 又只能做保守
-projection。
+真实 completed prefix 还取决于后台线程调度、storage metadata query、`prefetch_queue` backlog、TP MIN all-reduce、payload worker
+取任务和terminate时刻。两带宽schedule只表达KV payload service time，不能为这些control阶段生成唯一duration；直接把source
+`completed_tokens`、`prefetch_progress_observed`或target actual timing当state-model input，又会让target prediction依赖运行答案。
+
+当前真实证据同时验证了规则和信息缺口：
+
+- `c1/deeper` wait-complete 的11页I/O比source boundary早约29 ms完成，因此不需要额外gate；final state保持exact；
+- `c2/deeper` best-effort有两个scope在22页storage hit中只完成2个完整页，`policy_stop == target_boundary == source_boundary`，
+  final state保持exact，但transition仍受control readiness与writeback/eviction交错影响；
+- `c0/deeper` timeout真实格中I/O先于deadline完成，走normal-complete分支；最终75格的15个target-c4 cell共出现30次
+  `timeout_prefetch/timed_out=true`，因此deadline-wins也已有真实artifact覆盖；
+- 另一个best-effort request从candidate到source cache-extend约16.5 ms，两页payload按校准bandwidth只需约13 ms，payload-only
+  模型判定ready而真实运行仍未ready，说明剩余时间消耗在未建模的query/control pipeline；
+- 2026-07-12最终75-cell矩阵中，raw final state为`67/75` exact，另外8格全部由同一readiness证据闭合；raw transition为
+  `30/75` exact，18格归入readiness limitation，27格归入snapshot grouping/observability，unrelated和not-ready均为0；
+- 同一矩阵的Final-DAG schedule-invariant acceptance为`75/75`，invariant mismatch、acceptance mismatch、alternate evidence missing和
+  blocker均为0，说明该limitation没有遮蔽attribution/rewrite/topology错误。
+
+独立4 MiB和8 MiB校准得到的host-storage bandwidth并不更低，因此不能通过调小payload bandwidth修补该差异。Raw exactness继续
+保持原值；closure只把证据充分的差异标记为temporary TODO，不把它们计为exact。
 
 ### 风险
 
@@ -367,11 +426,14 @@ projection。
 - transition exactness 中 `prefetch_ready`、`apply_prefetch_host_visibility`、`add_l2` 等操作数量和顺序；
 - 多 rank/cache scope 的 union transition timeline 中，`storage -> host` 和 `host -> L1/GPU` 的阶段边界如果被折叠到
   不同粒度，仍可能改变 marker 顺序。2026-07-06/07 full matrix 已关闭当前 manual matrix 的该类 mismatch，但不能证明后台 I/O
-  exactness。
+  exactness；
+- closed-loop source/target arrival schedule不同时，cross transition还会混入scheduler boundary漂移，不能把这类差异反向拟合进
+  payload cost。
 
 ### 收敛方向
 
-需要设计 target-independent prefetch progress fact 或校准模型。可选方向：
+若要关闭这个限制，需要增加独立、可测量且不携带target答案的control contract。可选方向是新增target-independent prefetch
+control/progress boundary：
 
 ```text
 fact.role = prefetch_progress_boundary
@@ -383,14 +445,15 @@ fact.role = prefetch_progress_boundary
 cache_scope
 request_id
 progress boundary kind
-elapsed time / enqueue timestamp
-storage hit prefix length
-target-independent completed prefix policy
+scheduler round / queue admission identity
+metadata query workload identity
+target-independent service parameters
 ```
 
-如果要 exact 复现 backend I/O，则需要把 storage backend completion 抽象成独立可重放的 intent，而不是在 state model 中继续猜测。
-同时需要保留跨 scope 的阶段边界：先在 prefetch progress boundary 上整体 materialize host-visible prefix，再在后续 request reuse /
-loadback boundary 上整体推进 L1/GPU materialization，避免 `scope A: mark+clear`、`scope B: mark+clear` 这种伪 transition。
+如果要exact复现backend控制链，至少还需要独立校准metadata query service和TP/control queue，而不是在state model中加入固定base、
+per-page或visibility guard常数。若仍坚持只有两个payload bandwidth参数，则该race只能作为显式limitation保留。同时需要保留跨scope
+阶段边界：先在prefetch control boundary整体materialize host-visible prefix，再在关联lookup/loadback boundary推进L1/GPU
+materialization，不能按target actual结果逐rank补丁。
 
 ## HCSV-LIMIT-006: write-through backup ACK 与普通 lock lifetime 是边界近似
 

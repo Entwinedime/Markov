@@ -17,8 +17,8 @@ base profiling state-model facts + explicit target cache config
 
 | 层级 | 目标 | 当前地位 |
 | --- | --- | --- |
-| final state alignment | L1/L2/L3/dirty/backuped/evicted/locked 等最终集合对齐 | hard gate。 |
-| transition exactness | 中间状态变化、operation lifecycle、policy/ref/capacity 账本可与 target run 证据分层比较 | diagnostic / next gate。 |
+| final state alignment | L1/L2/L3/dirty/backuped/evicted/locked 等最终集合对齐 | raw exactness 保持硬结果；只有证据闭合的 async readiness limitation 可单独分栏，不改写为 exact。 |
+| transition exactness | 中间状态变化、operation lifecycle、policy/ref/capacity 账本可与 target run 证据分层比较 | raw exactness 与 closure classification 同时报告。 |
 
 它不是 DAG patch 验收，也不是 E2E 性能预测验收。`prediction.json.predicted_e2e_us` 只能作为 runner / DAG sanity check，不能证明 HiCache state 正确。
 
@@ -32,7 +32,7 @@ HiCache state prediction 必须同时满足：
 | missing state-model facts | `hicache_state.missing_state_model_facts=[]` 或 `{}`。 |
 | validation | `validation_ready=true` 且 `validation_errors=[]`。 |
 | final state | 有 oracle 时必须 `hicache_state.final_state_match=true` 才能称该场景 state 通过。 |
-| DAG | Phase 0/1 的 `run_summary.json.module_results.hicache_dag_patch.mutation_count=0` 是预期，不代表 effect-specific DAG patch 已实现。 |
+| DAG | 启用 patch validation 时，source attribution、rewrite、boundary、atomic apply、materialization 和 active topology 必须全部 ready；raw E2E 不参与该门槛。 |
 
 只要 `state_model_fact_ready=false`，即使 final state 偶然对齐，也不能宣称 state-model prediction 通过。
 
@@ -105,7 +105,7 @@ Unified modeling workflow 的 HiCache validation preflight 会把该检查压缩
 | capacity index | `HiCacheCapacityIndex` mutation-driven 维护 device/host leaf、occupied pages、reserved host pages、victim choice 和 audit trace。 |
 | ref ledger | request / writeback / loadback / storage / prefetch owner 级 acquire/release，输出 ref mutation 和 tree ref audit。 |
 | storage directory | 区分 materialized page record 与 backend-readable hash record；prefetch storage hit query 只保留连续 readable prefix。 |
-| prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离；best-effort below-threshold revoke 可见性使用 target-derived prefetch worker ready-time 投影。 |
+| prefetch policy | wait-complete / best-effort / timeout 共用 operation lifecycle，planned path、hit prefix、reservation、anchor ref 和 apply/revoke/late/suppressed 分离；同request的source cache-extend被索引为control boundary，payload进度只按scope-local lane、effective bytes和host-storage bandwidth计算。 |
 | host cleanup | host allocation 失败按 SGLang request budget cleanup；victim 是 host-visible、evicted、无 ref 保护且无 backuped child 的 host radix leaf。 |
 | write policy | write-through / selective / write-back 共享 host backup / storage readable / dirty clear / cleanup helper；ACK / ref lifetime 仍按 target control boundary 近似，并在 finalize 收敛尾部 write-through pending ACK，具体风险维护在限制文档。 |
 
@@ -113,24 +113,91 @@ Unified modeling workflow 的 HiCache validation preflight 会把该检查压缩
 
 ## 当前合同状态与保留验证基线
 
-说明：当前 active state/transition 正确性以 2026-07-06 forced replay suite 上的 unified `modeling_workflow`
-full-matrix 结果为准。2026-07-01 旧 workflow 结果只保留为上一版合同证据。
+说明：当前 active state/transition 与 DAG patch 正确性以 2026-07-12 expanded forced replay profiles 的最终 75-cell
+closure 为准。2026-07-06 和 2026-07-01 的结果只保留为旧 state-only 合同证据。
+
+### HCSV-20260712-direct-io-control-v1-current
+
+当前 active 能力已经从 resource-plan smoke 推进到 calibrated production DAG patch。Workflow 使用独立标定文件：
+
+```text
+data/calibration/hicache_io_qwen3_32b_tp2_20260712/hicache_io_model.json
+```
+
+该模型为 `calibration_status=calibrated`，KV geometry 来自 Qwen3-32B/TP2 model config；device-host 与 host-storage bandwidth
+来自独立 benchmark，不读取 target workload trace、target observed duration 或 E2E。Production patch 当前完成：
+
+- stable opportunity 和显式 target decision；
+- source full DAG 一次索引与 effect-local attribution；
+- source present/absent 对 target required/not-required 的 insert/remove/replace/no-op；
+- partial transfer 的完整 source-owned duration replacement；
+- prefetch I/O 与 visibility gate 分离；
+- commit D2H、H2S 与 capacity gate 分离；
+- scope-local host-storage、D2H、H2D lane；
+- cell-level ownership、prospective topology、boundary、journal 和 post-apply materialization gate；
+- schedule-invariant 与 arrival-schedule-sensitive shape row 分流，cross sensitive row 必须具有 target-self alternate evidence；
+- prefill 明确报告为 `deferred`，不宣称完整跨配置 E2E prediction。
+
+最终验证使用 15 个 expanded profile，形成：
+
+```text
+3 inputs x 5 source configs x 5 target configs = 75 HiCache cells
+15 faithful replay runs + 75 cache-state runs = 90 C++ runs
+```
+
+当前报告目录：
+
+```text
+data/profile_runs/sglang/20260712_133108_profiling_hicache_dag_analysis_forced_replay/
+  modeling/hicache_dag_patch_final_75_completion_v3
+```
+
+最终报告 pass 复用已完成的 90 个 C++ artifact，没有重新执行后端。真实结果为：
+
+| 范围 | 结果 |
+| --- | --- |
+| profile preflight | full-DAG `15/15`、HiCache `15/15` ready。 |
+| C++ model runs | `90/90` usable，`0` error，`0` skipped；最终报告 pass 为 `90/90` reused。 |
+| base-DAG / DAG mapping | 均为 `15/15` ready。 |
+| production DAG patch | `75/75` patch applied；source attribution、rewrite、boundary、post-apply、topology、state fact 均为 `75/75` ready。 |
+| target shape | raw exact `37/75`；schedule-invariant acceptance `75/75`；invariant mismatch、acceptance mismatch、alternate evidence missing 和 blocker 均为 `0`。 |
+| final state | raw exact `67/75`；closure 为 `67` exact + `8` payload-only readiness limitation；unrelated/not-ready 均为 `0`。 |
+| transition | raw exact `30/75`；closure 为 `30` exact + `18` payload-only readiness limitation + `27` snapshot grouping/observability；unrelated/not-ready 均为 `0`。 |
+| deferred scope | `75/75` 明确报告 `prefill_effect_status=deferred`。 |
+
+Raw final-state 和 transition status 仍保持 `NOT_READY`，因为 closure 不能改写原始 exactness。顶层 workflow summary 和二级
+validation summary 同时给出 closure classification、review readiness、unrelated count 和 not-ready count；只有
+`closure_review_ready=true` 且 unrelated/not-ready 都为 0，才能说明剩余差异已经被证据闭合，而不是模型错误被隐藏。
+
+异步prefetch readiness仍有显式限制。模型现在统一解析三种policy boundary：best-effort固定使用source cache-extend并按bandwidth
+计算完整连续页；wait-complete只在target I/O晚于source eligibility时把boundary推迟到I/O completion；timeout比较target I/O
+completion与configured deadline，取较早者作为stop，再决定完整完成或timeout partial。Prefetch I/O effect只报告boundary前已完成的
+page segment，不再把整个storage-hit prefix当作已传输。该逻辑只使用两个bandwidth和SGLang timeout config，但无法为metadata query、
+后台queue、TP collective和worker调度生成唯一延迟，因此summary输出
+`prefetch_readiness_status=payload_only_control_pipeline_unmodeled`。Focused c1/deeper已恢复真实loadback与final-state exact；
+c2/deeper展示22页hit在source boundary前只完成2页的best-effort partial，并继续暴露payload-only模型无法区分的query/control race；
+c0/deeper覆盖I/O先于timeout完成；最终75格的15个target-c4 cell共出现30次`timeout_prefetch/timed_out=true`，补齐
+deadline-wins真实覆盖。具体机制和收敛条件见限制文档。
+
+当前可以宣称 direct I/O/control v1 的 final-DAG patch-local acceptance 为 `75/75`，但不能宣称 raw final state、raw transition
+或完整跨配置 E2E 为 `75/75 exact`。Async readiness limitation 和 snapshot observability 必须继续保留独立分类；禁止为了提高 raw
+exact 总数调低 bandwidth、读取 target progress 答案或加入 config/workload 特判。
 
 ### HCSV-20260706-unified-workflow-full-matrix
 
-这是当前 active profiling 合同和 unified workflow 下的 full-matrix 基线。该 run 使用
+这是 direct I/O/control production patch 之前的历史 state/transition full-matrix 基线，不代表当前 patch 实现。该 run 使用
 `cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
 作为 state-model 输入，不采集 runtime prefetch checkpoint、per-request admission、storage-control drain checkpoint、
 source actual、oracle state 或 observed gate 作为模型输入。
 
-该基线包含本轮 C++ backend / workflow 收口和 Phase 0/1 后的前提：
+该历史基线包含当时 C++ backend / workflow 收口和 Phase 0/1 后的前提：
 
 - Python workflow 入口统一为 `python3 scripts/internal/entrypoints/modeling_workflow.py`；
 - C++ backend 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace，并在进程内合流，不再写大型
   `merged_trace` 中间产物；
 - HiCache best-effort below-threshold revoke 的 pre-extend / post-extend 分岔由 target-derived prefetch worker
   ready-time 投影决定，具体限制见 `docs/validation/hicache_state_model_limitations.md`。
-- `HiCacheModule` 导出 target-derived effect intent；`HiCacheDagPatchModule` 只应用 `hicache_phase01_empty` 空 plan，
+- 当时 `HiCacheModule` 导出 target-derived effect intent；`HiCacheDagPatchModule` 只应用 `hicache_phase01_empty` 空 plan，
   用于验证 mutation journal 和 active topology 合同，不执行 effect attribution 或 cost patch。
 
 结果目录：

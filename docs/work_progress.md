@@ -2,6 +2,28 @@
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
 
+## 2026-07-13 10:52:59 +0800
+
+- 完成 HiCache direct I/O/control DAG patch v1 主线实现和最终75格closure：
+  - 15个expanded profile形成15个faithful replay与75个cache-state run，C++ `90/90 usable`，error/skip均为0；
+  - Final-DAG `75/75 ready/applied`，source attribution、rewrite、boundary、post-apply、topology和state-model fact全部`75/75 ready`；
+  - 75格累计55,500个stable effect decision、7,030个source-present carrier、48,470个source-absent opportunity，
+    unresolved、ownership conflict、rejected rewrite和apply blocker均为0；
+  - Rewrite真实覆盖insert/remove/replace/partial-replace/no-op，共6,740个synthetic node、4,550个source duration update和
+    4,236条scope-local lane dependency；plan/journal、family/lane dependency与materialization全部exact。
+- 收口target shape、final-state和transition validation合同：
+  - Raw shape `37/75 exact`，schedule-invariant acceptance `75/75`，invariant/acceptance mismatch和alternate evidence missing均为0；
+  - Raw final state `67/75 exact`，closure为67 exact + 8 payload-only readiness limitation；
+  - Raw transition `30/75 exact`，closure为30 exact + 18 readiness limitation + 27 snapshot grouping/observability；
+  - 两个closure的unrelated semantic mismatch和not-ready均为0，raw exact/status保持原值，不把limitation伪装为exact。
+- HiCache cost与resource模型当前只使用target effective bytes、独立标定的device-host/host-storage bandwidth和KV geometry；
+  不读取target actual progress、observed duration、raw E2E或config/input/cell专项修正。Best-effort、wait-complete和timeout共用
+  payload schedule；最终矩阵的15个target-c4 cell共覆盖30次`timeout_prefetch/timed_out=true`。
+- 当前明确保留的范围是payload前metadata/query/control readiness、snapshot marker可观测性、完整scheduler/rank queue时间轴和
+  prefill计算图；`prefill_effect_status=deferred`，raw cross-config E2E只作diagnostic。
+- 性能与工程门槛完成：同图规模1线程到4线程wall time为68.23秒到41.99秒（1.62x），read/parse约2.14x--2.17x；
+  Validation/Release重新构建通过，CTest `3/3`，全量Python `py_compile`、Ruff、JSON、clang-format和`git diff --check`均通过。
+
 ## 2026-07-07 19:00:41 +0800
 
 - 对齐 README、当前 unified modeling workflow 与 HiCache validation 文档：

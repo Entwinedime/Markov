@@ -157,6 +157,7 @@ model run 输出目录下的 `cpp_model_config.json` 作为 C++ TraceGraph backe
 
 ```bash
 RUN_DIR=<forced_replay_suite_dir>
+IO_MODEL=data/calibration/hicache_io_qwen3_32b_tp2_20260712/hicache_io_model.json
 
 python3 scripts/internal/entrypoints/modeling_workflow.py \
   --profile-run-dir "$RUN_DIR" \
@@ -166,6 +167,7 @@ python3 scripts/internal/entrypoints/modeling_workflow.py \
   --configs c0_wt_timeout_p128_balanced,c1_wts_wait_p128_low_l1,c2_wb_best_effort_p64_low_l1,c3_wt_best_effort_p32_low_host,c4_wb_timeout_p64_low_capacity \
   --prediction-scope self,cross \
   --page-key-mode strip_scope \
+  --hicache-io-model "$IO_MODEL" \
   --trace-threads 4 \
   --trace-file-threads 4 \
   --model-run-jobs 4 \
@@ -173,15 +175,15 @@ python3 scripts/internal/entrypoints/modeling_workflow.py \
   --continue-on-error
 ```
 
-`HiCacheModule` 当前执行 state replay 并导出 Release effect intent；`HiCacheDagPatchModule` 在 Phase 0/1 只提交空
-mutation plan，因此仍不改变 DAG。`prediction.json.predicted_e2e_us` 来自当前 active DAG 的拓扑仿真，单位为微秒；
-在空 patch 阶段它等于 base DAG 结果，不是 HiCache state 准确性的验收指标。
+`HiCacheModule` 执行 state replay 并导出 stable-keyed target effect decision；`HiCacheDagPatchModule` 使用 calibrated I/O model
+完成 source attribution、insert/remove/replace/partial-replace、boundary gate 和一次原子 mutation apply。`prediction.json.predicted_e2e_us`
+来自 materialized active DAG 的拓扑仿真，单位为微秒；由于 prefill 仍为 `deferred`，该值不代表完整跨配置 E2E prediction。
 
 ## HiCache 当前进展
 
-截至 2026-07-11，当前主线状态是：
+截至 2026-07-13，当前主线状态是：
 
-- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `54` 个 target；
+- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `40` 个 target；
 - `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
 - `hicache_state_model` 正常输入只消费 `cache_lookup_input`、`cache_extend_input`、`cache_lifecycle_commit` 和
   `prefetch_candidate_anchor` 四类 state fact；其余 target 只用于输入合同、
@@ -194,15 +196,21 @@ mutation plan，因此仍不改变 DAG。`prediction.json.predicted_e2e_us` 来�
 - C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
 - forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和
   `modeling_workflow.py` 已落地；
-- C++ Phase 0/1 已建立 state result、effect intent、统一 DAG mutation plan/journal、active topology validation 和空
-  HiCache patch module；真实 effect attribution、带宽 cost 和非空 DAG patch 尚未实现；
-- 当前 active full-matrix baseline 是
-  `data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_full_refactor_validation_20260711`：
-  `90/90` model runs usable，HiCache DAG mapping `15/15` ready，final-state self/cross、transition exactness、
-  transition-count exactness 和 page-lifecycle multiset exactness 均为 `75/75`；75 个 cache-state run 共导出 `10110`
-  个 effect intent，空 patch、零 mutation 和 Debug active topology validation 均为 `75/75`；
-- 同一基线的 `base_dag` / `final_dag` 只有 `1/15` 通过 faithful replay E2E error gate，其余 `14/15` 为
-  `dag_replay_error_too_high`；这是当前 DAG/E2E 建模限制，不是 state/transition、cycle 或 workflow 执行失败；
+- C++ direct I/O/control v1 已建立完整 target effect decision、scope-local三lane资源模型、source DAG一次索引、effect-local
+  attribution、insert/remove/replace/partial-replace/no-op、ownership/no-double-count gate、prospective topology、boundary validation、
+  cell-level atomic apply和post-apply materialization validation；
+- I/O cost只使用target effective bytes、device-host bandwidth和host-storage bandwidth；当前production calibration具有独立
+  KV geometry与两类bandwidth provenance，不读取target observed duration、raw E2E或validation答案；
+- 当前active full-matrix报告是
+  `data/profile_runs/sglang/20260712_133108_profiling_hicache_dag_analysis_forced_replay/modeling/hicache_dag_patch_final_75_completion_v3`：
+  profile preflight full-DAG/HiCache均为`15/15`，C++ model run为`90/90 usable`，Final-DAG为`75/75 ready/applied`；
+- Raw target shape为`37/75 exact`，schedule-invariant acceptance为`75/75`，invariant/acceptance mismatch、alternate evidence missing、
+  source unresolved、ownership conflict、apply blocker和topology error均为0；
+- Raw final state为`67/75 exact`，closure为67 exact + 8 payload-only readiness limitation；raw transition为`30/75 exact`，
+  closure为30 exact + 18 readiness limitation + 27 snapshot grouping/observability；两个closure的unrelated/not-ready均为0；
+- Prefetch payload前的metadata query、后台queue、TP collective和worker调度仍是显式limitation；prefill固定报告`deferred`，
+  当前结果不宣称raw state/transition或完整跨配置E2E为`75/75 exact`；
+- 同一大case的1线程到4线程整体wall time从68.23秒降到41.99秒（1.62x），trace read/parse约2.14x--2.17x；
 - `scripts/internal/entrypoints/` 只保留 `profile.py`、`model.py` 和 `modeling_workflow.py` 三个主入口，复用逻辑位于
   `scripts/internal/markov_internal/`；旧平铺脚本和人工对照入口已删除，不保留兼容入口。
 

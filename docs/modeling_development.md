@@ -27,8 +27,9 @@ profile manifest
 }
 ```
 
-`predicted_e2e_us` 来自 active DAG 拓扑仿真，单位与 Chrome trace 一致，为微秒。Phase 0/1 的 HiCache patch 为空，
-因此它仍等于 base DAG 结果，也不是 cache state 正确性的验收指标。
+`predicted_e2e_us` 来自 materialized active DAG 拓扑仿真，单位与 Chrome trace 一致，为微秒。启用 calibrated HiCache DAG patch
+时，该图已经包含 target-derived I/O/control mutation；但 prefill 仍为 `deferred`，raw cross-config real E2E 也不是当前
+direct I/O/control v1 的正确性门禁。
 
 ## 运行入口
 
@@ -115,9 +116,9 @@ validation object 是 C++ output 的读取视角，不是独立 workflow：
 | --- | --- |
 | `validations/base_dag/` | 请求 faithful replay + base DAG diagnostics，解释 `dag_quality.json` / `dag_analysis.json`。 |
 | `validations/hicache/dag_mapping.py` | 复用 base DAG faithful replay run，解释 HiCache anchor coverage / operation visibility。 |
-| `validations/hicache/final_state.py` | 请求或复用 cache-state run，解释 `validation.json` / `model_summary.json` 的 final-state 结果。 |
-| `validations/hicache/transition/` | 复用 cache-state run 和 validation artifact，调用 transition comparator 解释 transition exactness。 |
-| `validations/final_dag/` | 当前读取 faithful replay DAG diagnostics；在 patch artifact 稳定前 `final DAG == base DAG`。 |
+| `validations/hicache/final_state.py` | 请求或复用 cache-state run，保留 raw final-state exactness，并用独立 closure 报告区分 exact、async readiness limitation、schedule sensitivity 和未闭合错误。 |
+| `validations/hicache/transition/` | 复用 cache-state run 和 validation artifact，保留 raw transition exactness，并把 readiness、snapshot observability、cross schedule 和其它错误分栏。 |
+| `validations/final_dag/` | 读取 active patched graph、attribution/rewrite/boundary/post-apply artifact 和 target shape oracle；raw shape 与 patch-local acceptance 分开报告。 |
 | `scripts/internal/markov_internal/modeling_workflow/progress.py` | workflow 共享 TTY progress reporter。 |
 
 transition oracle 只消费 `source_actual` / `timing_observation` evidence 和 `oracle_state` snapshot 来做验证标签；
@@ -200,7 +201,7 @@ HiCache Python helper 的当前职责分组：
 | mode | 语义 |
 | --- | --- |
 | `faithful_replay` | 不加载子模块，不 patch DAG；消费完整真实执行 trace，验证 base DAG。 |
-| `cache_state` | 执行 HiCache state replay，并把 Release effect intent 交给独立 patch module；Phase 0/1 只应用空 plan，因此不修改 DAG。 |
+| `cache_state` | 执行 target-derived HiCache state replay，生成完整 effect decision ledger；请求 final DAG 时继续完成 source attribution、resource planning 和一次原子 DAG patch。 |
 
 `replay` 只允许指 `mode=faithful_replay`。启用 HiCacheModule 的场景必须称为 `self-config prediction` 或
 `cross-config prediction`。
@@ -249,13 +250,14 @@ C++ 后端位于 `src/modeling/trace_graph`：
 | `modules/hicache/runtime` | async operation、capacity、ref ledger、token directory 和 target-control clock。 |
 | `modules/hicache/radix` | canonical token radix tree 和 split policy。 |
 | `modules/hicache/storage` | storage directory 和 backend-readable 投影。 |
+| `modules/hicache/patch` | source DAG index、effect attribution、I/O resource、rewrite transaction、boundary 和 materialization validation。 |
 | `modules/hicache/diagnostics` | HiCache summary JSON 序列化和诊断输出。 |
 | `modules/dag_analysis` | Debug-only DAG faithful replay、结构画像、anchor coverage 和 operation visibility artifact。 |
 
 构建目标：
 
 ```bash
-scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling/trace_graph --target trace_graph -j2'
+scripts/run.sh modeling -- bash -lc 'cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
 ```
 
 旧 C++ TraceGraph 对照目录已移除，不参与 active build，也不提供旧 include path 或 namespace 兼容层。
@@ -297,14 +299,16 @@ diagnostics / validation，`--model-summary` 和 `--dag-analysis-output-dir` 会
 | 模块 | 状态 |
 | --- | --- |
 | `NodeScaleModule` | smoke / 节点耗时缩放。 |
-| `HiCacheModule` | 执行 state replay 并导出 effect intent；自身不修改 DAG。 |
-| `HiCacheDagPatchModule` | 只读消费 state result；Phase 0/1 通过统一 mutation API 应用空 plan，并验证 active topology。 |
+| `HiCacheModule` | 执行 state replay 并导出 stable-keyed effect decision ledger；自身不修改 DAG。 |
+| `HiCacheDagPatchModule` | 只读消费 state result 和 source full DAG，完成 attribution、resource planning、rewrite/boundary gate，并通过统一 mutation API 原子应用完整 cell transaction。 |
 
 ## HiCache 状态后端
 
-`HiCacheModule` 消费 state-model facts 和显式 target config，维护 target cache state，并输出 Release 可用的 effect intent；
+`HiCacheModule` 只消费四类 canonical state-model facts 和显式 target config，维护 target cache state，并输出 Release 可用的 effect decision ledger；
 Debug/validation build 额外输出 final state、transition trace、policy decision trace 等结构化 summary，供 Python oracle validation 使用。
-`HiCacheDagPatchModule` 通过只读共享 result 接在 state replay 后；Phase 0/1 只提交空 mutation plan，因此 active DAG 和 E2E 不变。
+`HiCacheDagPatchModule` 通过只读共享 result 接在 state replay 后。启用 DAG patch 时，它从 source full DAG 建立一次语义索引，
+逐 effect 证明 source carrier、consumer 和 ownership，生成完整 shadow transaction，通过 prospective topology 与 boundary gate 后
+一次 apply。任一 supported effect unresolved、ownership conflict、未校准 non-empty cost 或拓扑失败都会阻止整个 cell 的 production mutation。
 
 主链路：
 
@@ -316,20 +320,71 @@ HiCacheFact
   -> scoped canonical HiCacheTokenRadixTree
   -> StorageDirectory / RefLedger / CapacityIndex / AsyncOperationTable / TargetControlClock
   -> HiCachePolicy
-  -> DerivedStateView / HiCacheEffectIntentCatalog
-  -> HiCacheDagPatchModule / DagMutationPlan
+  -> DerivedStateView / HiCacheEffectDecisionLedger
+  -> SourceDagIndex / SourceAttribution / IoResourcePlan
+  -> ShadowRewriteTransaction / BoundaryValidation
+  -> one atomic DagMutationPlan / AppliedValidation
   -> topological simulation
   -> Debug diagnostics summary / Python validation
 ```
 
-Phase 0/1 的 Release 业务结果只包含 state replay 完成状态和 effect intent catalog；policy、transition、capacity、ref 等逐行
-history 只存在于 Debug/validation build。effect intent 记录 operation/request/scope、方向、有效 page/byte 数、逻辑边界、resource lane
-和 not-patchable 原因，不包含 source DAG node id，也不读取 target timing。`kv_bytes_per_page` 缺失时明确输出
-`byte_projection_source=missing`。
+Release 业务结果包含 replay 完成状态、每个 stable opportunity 的显式 target state、schedule sensitivity、compact attribution/rewrite
+计数、mutation journal 和 active graph 计数；policy、transition、capacity、ref 和 per-effect 证据行只存在于 Debug/validation build。
+effect decision 记录 request/scope、方向、candidate/effective segment、byte 数、target boundary、target effect state 和 patchability，
+不读取 target actual timing、E2E 或 validation answer。`not_required` 必须由 opportunity 上的显式 decision 表达，不能由 operation
+缺席推断。Prefill 不属于 direct I/O/control v1，ledger 与 patch result 固定报告 `prefill_effect_status=deferred`。
 
-当前 patch module 不回写 state result，只提交 `hicache_phase01_empty` 空 plan。`DagMutationPlan` 已支持 node/edge tombstone、独立
-synthetic node identity、add/redirect edge、prospective topology validation、mutation journal 和最终 active topology validation；
-simulator、DAG writer、run summary 与 DAG diagnostics 都读取相同 active graph view。
+Patch 不回写 state result。Source attribution 使用完整 source DAG，但只把具有强 identity、明确 ingress/egress/consumer 且 ownership
+唯一的 atom 交给 rewrite。`DagMutationPlan` 支持 duration replacement、node/edge tombstone、独立 synthetic node、add/redirect edge、
+prospective topology validation 和 mutation journal；post-apply validator核对 plan/journal/materialization、family dependency、resource lane
+和 active topology。Simulator、DAG writer、run summary 与 DAG diagnostics 始终读取同一个 materialized active graph。
+
+### HiCache I/O 资源合同
+
+Workflow 只提供一个可选的业务模型输入：
+
+```text
+--hicache-io-model <explicit_io_model.json>
+```
+
+文件 schema 固定为 `markov.hicache.io_model.v1`，必须显式包含：
+
+```json
+{
+  "schema": "markov.hicache.io_model.v1",
+  "model_id": "model identity",
+  "calibration_status": "calibrated",
+  "kv_bytes_per_token_per_rank": 1024,
+  "device_host_bandwidth_bytes_per_sec": 1000000000,
+  "host_storage_bandwidth_bytes_per_sec": 500000000,
+  "provenance": {
+    "kv_geometry": "explicit model metadata",
+    "device_host_bandwidth": "external measurement",
+    "host_storage_bandwidth": "external measurement"
+  }
+}
+```
+
+示例数值只用于展示 schema 和单位，不是默认值或标定值。其中只有 device-host 与 host-storage bandwidth 是 cost 参数；
+`kv_bytes_per_token_per_rank` 是模型几何。Workflow 使用 target
+`page_size` 计算 `kv_bytes_per_page`，并把 canonical JSON digest、模型身份、provenance、page bytes 与两个 bandwidth 写入每个
+cache-state runner config 和 C++ narrow config。一个 workflow invocation 只能使用同一份 I/O model；target profile config
+不能按 cell 覆盖 `kv_bytes_per_page` 或 `io_cost`。未提供模型时仍可执行 state/transition workflow，但 resource plan 必须输出
+missing byte projection blocker 和两个 bandwidth parameter-presence 字段，不能使用默认值。
+
+`calibration_status=contract_only` 只允许构造 decision、cost、attribution 和 shadow transaction，不允许 non-empty production apply；
+`calibration_status=calibrated` 必须来自独立 measurement provenance，才允许带 synthetic I/O 的 transaction materialize。Target workload
+trace、target observed duration 和 E2E 不得用于反推 bandwidth。
+
+I/O duration 只按下式计算：
+
+```text
+duration_us = ceil(effective_byte_count * 1_000_000 / bandwidth_bytes_per_sec)
+```
+
+resource model 在每个 logical scope 内维护 `host_storage_lane`、`device_to_host_lane` 和 `host_to_device_lane`。同 scope 同 lane 的 operation 按
+target logical enqueue boundary 与稳定 effect id 排序，输出相邻 dependency；不同 lane 不增加依赖。capacity dependency gate
+不占 I/O lane 且 duration 为零。Resource planning 本身只生成 read-only plan；synthetic node 和依赖只由完整 rewrite transaction 创建。
 
 ### 输入边界
 
@@ -387,12 +442,18 @@ cross-config rule diagnosis 必须先通过 hard workload identity contract：�
 | `model/host_storage_model.cpp` | host cleanup、host allocation 和 capacity eviction。 |
 | `model/writeback_model.cpp` | write-through / write-back、backup ACK、dirty clear 和 ref hold/release。 |
 | `model/finalizer.cpp` | finalize 时 pending operation 收束。 |
-| `model/effect_intent.hpp/.cpp` | 从 canonical async operation 导出 Release effect intent、byte projection 和合同缺口。 |
+| `model/effect_decision.hpp/.cpp` | 为每个 stable opportunity 导出显式 target decision、segment、schedule sensitivity、byte projection 和合同缺口。 |
+| `patch/io_resource_model.hpp/.cpp` | 只用 effective bytes 与两个显式 bandwidth 生成 duration、三条 lane 和稳定 lane dependency；不读取 DAG 或 target timing。 |
+| `patch/source_dag_index.hpp/.cpp` | 一次扫描 active source DAG，索引 fact、request、operation、邻接和 input contract。 |
+| `patch/attribution.hpp/.cpp` | 逐 effect 证明 source presence、carrier、owned duration、boundary 和 consumer。 |
+| `patch/rewrite_transaction.hpp/.cpp` | 分类 insert/remove/replace/no-op/partial，解决 ownership，并构造完整 prospective mutation plan。 |
+| `patch/boundary_validator.hpp/.cpp` | apply 前检查 source cost、target cost、ingress/egress 和 consumer dependency。 |
+| `patch/applied_validator.hpp/.cpp` | apply 后核对 journal、materialization、family/lane dependency 和 topology。 |
 | `model/result.hpp` | state replay 的 Release result 与 Debug summary 边界。 |
 | `model/summary.hpp` | HiCache state model 的 Debug/validation 结构化执行结果；Release 下为空标记类型，不包含 JSON。 |
 | `diagnostics/summary.hpp/.cpp` | HiCache summary JSON 序列化；不参与状态机决策。 |
-| `hicache_module.hpp/.cpp` | state replay 的 `SimulationModule` glue；Release 暴露 effect intent，Debug 额外持有 summary。 |
-| `dag_patch_module.hpp/.cpp` | 只读消费 state result，并通过统一 mutation API 修改 DAG；Phase 0/1 只应用空 plan。 |
+| `hicache_module.hpp/.cpp` | state replay 的 `SimulationModule` glue；Release 暴露 effect decisions，Debug 额外持有 summary。 |
+| `dag_patch_module.hpp/.cpp` | 集中编排 resource、index、attribution、rewrite、validation 和一次原子 mutation apply。 |
 | `core/dag_mutation.hpp/.cpp` | 通用 mutation plan、journal、tombstone、redirect、去重和 topology validation。 |
 
 ### 目标 Page 投影
@@ -458,7 +519,8 @@ host / storage / prefetch：
   `evict_host(len(node.value))`；
 - storage hit query 只保留连续命中前缀；storage-readable 不等于 host-visible；
 - prefetch operation 保存 planned path、hit prefix、requested host pages、reserved host pages 和 anchor ref；
-- wait-complete 完成后 apply ready pages，best-effort 在 cache-extend terminal boundary terminate，timeout 在 completed 或 timeout 边界 terminate/late；
+- prefetch policy 共用一个 boundary solver：best-effort固定source cache-extend，wait-complete取I/O completion并仅在更晚时加gate，
+  timeout取I/O completion与configured deadline的较早者；只有boundary前完成的完整页进入host radix和PrefetchIo effect；
 - revoke / timeout incomplete 的 host reservation 进入 pending release 近似，不立即从 host budget 中消失；同 request 的
   `cache_extend_input` side effect 完成后做 request-local release drain。
 
@@ -499,44 +561,54 @@ model_summary.json.modules[0].hicache
 
 ### 状态到 DAG / E2E 路线
 
-HiCache 的最终目标不是只让 final state 对齐，而是预测 target config 下的 E2E、关键路径和主要 cache 开销变化。
-后续链路按以下边界推进：
+当前完成对象是 HiCache direct I/O/control DAG patch v1。它不只检查 final state，还把 source DAG 中已有的 HiCache
+载体与 target decision 做显式 diff，并在同一 active graph 上完成删除、插入、替换、依赖重连和拓扑仿真：
 
 ```text
 target semantic chain:
-  state-model probe facts
+  four canonical workload facts + target config + calibrated I/O model
     -> target state
-    -> state transitions
-    -> target cache operation intents
+    -> stable opportunities
+    -> complete target effect decisions
 
 source physical chain:
   torch / LD_PRELOAD / timing evidence
-    -> source cache physical op groups
-    -> source DAG node / edge attribution
+    -> one-pass source DAG index
+    -> source presence/carrier/boundary/consumer attribution
 
 DAG rewrite chain:
-  source full DAG
-    - source-only cache physical ops
-    + target-only cache intents
-    +/- resize ops that exist in both source and target
-    -> predicted target DAG
-    -> predicted E2E
+  source attribution + target decisions
+    -> no-op / insert / remove / replace / partial-replace decision
+    -> one cell-level mutation transaction
+    -> prospective topology and boundary validation
+    -> one atomic apply
+    -> post-apply materialization validation
+    -> simulated target DAG
 ```
 
-长期阶段：
+职责和验收边界：
 
 | 阶段 | 输入 | 输出 | 通过口径 |
 | --- | --- | --- | --- |
-| target state | state-model facts + target config + oracle label | final state / transition trace | final state 对齐，`state_model_fact_ready=true`。 |
-| target intent | state-model facts + transition / policy / async / ref traces | cache operation intent stream | intent 可追溯到 state transition，source outcome 不混入。 |
-| source physical attribution | torch / LD_PRELOAD / timing evidence + workload anchors | source cache-owned node / edge groups | physical op group 归因稳定且不重复占用 DAG node。 |
-| cache-neutral baseline | source full DAG + source physical groups | cache-neutral DAG | source cache cost 能拆出去并装回去。 |
-| source/target cache diff | source physical groups + target intents | delete / insert / replace / resize decisions | self-config diff 基本 identity，cross diff 可解释。 |
-| DAG patch | cache-neutral DAG + target intents | predicted target DAG | 无 dangling edge、无 cycle，blocking intent 位于正确依赖边界。 |
-| duration / E2E | source calibration + target intents + target oracle label | predicted E2E / critical path audit | E2E 误差、phase 误差和 cache op contribution 可解释。 |
+| target state | 四类 state-model facts + target config | final state、transition、effect decisions | raw exactness不被改写；已知 async readiness limitation必须有final-DAG证据并独立分栏，unrelated/not-ready必须为0。Source actual与target oracle不进入replay。 |
+| target cost | effective bytes + 两个 bandwidth | duration 与 scope-local lane | 公式可追溯；没有经验常数或 target observed duration。 |
+| source attribution | source full DAG + source actual/timing probes | source carrier、owned cost、boundary、consumer | 每个 atom ownership 唯一；unobservable/ambiguous 显式阻断。 |
+| source/target diff | attribution + target decisions | rewrite transaction | supported opportunity 全覆盖；不存在用 operation absence 代替 `not_required`。 |
+| DAG patch | transaction + source graph | materialized active graph | cell-level atomic；boundary、journal、family/lane dependency 与 topology 一致。 |
+| patch-local validation | target actual validation probes + prediction artifact | self/cross shape comparison | schedule-invariant exact；arrival-sensitive row 必须有 target-self alternate evidence。 |
+| simulation | materialized active graph | simulated E2E / critical path | 只作预测输出；raw cross-config real E2E 不参与 v1 pass/fail。 |
 
-`transition` 解释 state 怎么变；`intent` 解释 target 下应该有哪些物理 cache 操作。DAG patch 应消费 intent，
-不能直接消费 raw page-level transition 或 final page set。
+当前 2026-07-12 expanded profile 最终矩阵包含 15 个 profile、90 个 C++ run 和 75 个 source-target cell。Final-DAG
+patch-local acceptance 为 `75/75`，所有 attribution、rewrite、boundary、post-apply、topology 和 materialization gate 通过；raw shape
+exact 为 `37/75`，其余差异全部进入有证据的 arrival sensitivity 或 payload-only readiness limitation。Raw final state 为
+`67/75` exact，closure 为 `67 exact + 8 readiness limitation`；raw transition 为 `30/75` exact，closure 为
+`30 exact + 18 readiness limitation + 27 snapshot grouping/observability`。两个 closure 的 unrelated/not-ready 都为 0。
+Raw validation status继续保持原值，closure只解释差异，不把 limitation伪装成exact。完整结果与复现入口维护在
+`docs/validation/hicache_state_validation.md`。
+
+`transition` 解释 state 怎么变；effect decision 解释 target 下每个稳定 opportunity 应该发生什么。DAG patch 消费 decision ledger，
+不能从 raw page-level transition、final page set 或 target actual operation 反推 rewrite。当前 supported effect 为 loadback、prefetch
+I/O、prefetch visibility、commit D2H、commit H2S 和 commit capacity gate；prefill 明确 deferred。
 
 ## Backend 选择
 
@@ -599,6 +671,12 @@ critical path 摘要；`dag_anchor_coverage.json` 只审计当前 workload ident
 把候选 HiCache operation 标记为 visible / partially visible / invisible。这里的 `patchable_candidate` 只表示阶段二可继续评估，
 不代表当前业务路径已经支持 patch。
 
+`base_dag.ready`只表示full-DAG输入和结构artifact可用于后续建模：C++命令成功、`dag_quality.json` / `dag_analysis.json`
+存在、node/edge非空且DAG analysis没有结构blocker。`faithful_replay.ready`、relative error和
+`dag_replay_error_too_high`继续原样保留在row与summary中，但属于raw E2E diagnostic，不参与`base_dag.ready`。原因是当前
+closed-loop benchmark没有固定跨配置request arrival timeline，scheduler idle/polling差异不能作为HiCache patch或base-DAG结构
+正确性的hard gate。
+
 后续 scheduler、storage、runtime 或 communication 子模块不应新增独立 DAG workflow，而应在 unified modeling workflow
 下新增 validation object，并声明自己需要的 C++ output requirement。
 
@@ -623,12 +701,13 @@ HiCache state validation 必须同时看：
 
 下列内容不应在 development 文档中用实验结论替代设计：
 
-- effect attribution、带宽 cost 和非空 HiCache state-to-DAG patch；
+- HiCache 命中变化造成的 prefill token 数和 LLM 计算图变化；
 - async prefetch exact progress / partial completion 的完整 target model；
 - SGLang `TreeNode.host_ref_counter`、host protection lifetime 和复杂 radix split/delete victim tie-break 的完整等价；
 - write-back ack、background flush 和 `_evict_backuped()` / `writing_check(write_back=True)` 的真实异步批处理时序；
-- transition exact oracle 和逐步 provenance 验收；
 - scope-normalized comparison 之外的多 scope page identity 验证。
+- host-wide/device-wide 多 request 竞争和跨平台 CPU/NPU operation cost；
+- 修复 closed-loop benchmark 后的固定 arrival schedule raw E2E exactness。
 
 这些风险的当前验证状态维护在 `docs/validation/hicache_state_validation.md`；中长期缺口和阶段性妥协维护在
 `docs/validation/hicache_state_model_limitations.md`。本文件不重复实验分析。
