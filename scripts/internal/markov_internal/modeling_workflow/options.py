@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..common.paths import ROOT_DIR, require_repo_path
 from .context import WorkflowOptions
+from .io_model import HiCacheIoModel
 from .validations.registry import validation_names
 
 
@@ -41,6 +42,7 @@ def workflow_options_from_args(args: argparse.Namespace) -> WorkflowOptions:
         trace_threads=args.trace_threads,
         trace_file_threads=args.trace_file_threads,
         model_run_jobs=args.model_run_jobs,
+        hicache_io_model=HiCacheIoModel.load(args.hicache_io_model) if args.hicache_io_model else None,
     )
 
 

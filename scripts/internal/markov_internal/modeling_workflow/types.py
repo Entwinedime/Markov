@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .artifacts import ModelRunArtifacts
+    from .io_model import HiCacheIoModel
 
 
 class ModelOutputRequirement(str, Enum):
@@ -16,6 +17,7 @@ class ModelOutputRequirement(str, Enum):
 
     DAG_ANALYSIS = "dag_analysis"
     HICACHE_VALIDATION = "hicache_validation"
+    HICACHE_DAG_PATCH = "hicache_dag_patch"
 
 
 @dataclass(frozen=True)
@@ -82,6 +84,7 @@ class ModelRunSpec:
     trace_file_threads: int = 1
     trace_channels: tuple[str, ...] = ()
     page_key_mode: str = "strip_scope"
+    hicache_io_model: HiCacheIoModel | None = None
 
     @property
     def label(self) -> str:

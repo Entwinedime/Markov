@@ -38,6 +38,11 @@ def write_model_run_plan(
         ],
         "model_runs": [model_run_spec_payload(spec) for spec in specs],
     }
+    io_models = {spec.hicache_io_model.digest: spec.hicache_io_model for spec in specs if spec.hicache_io_model}
+    if io_models:
+        if len(io_models) != 1:
+            raise ValueError("one workflow plan cannot contain multiple HiCache I/O models")
+        payload["hicache_io_model"] = next(iter(io_models.values())).metadata()
     write_json(artifacts.plan_path, payload)
     return payload
 
@@ -61,6 +66,8 @@ def model_run_spec_payload(spec: ModelRunSpec) -> dict[str, Any]:
         "trace_channels": list(spec.trace_channels),
         "page_key_mode": spec.page_key_mode,
     }
+    if spec.hicache_io_model is not None:
+        payload["hicache_io_model"] = spec.hicache_io_model.metadata()
     if spec.prediction is not None:
         payload["prediction"] = {
             "is_self": spec.prediction.is_self,

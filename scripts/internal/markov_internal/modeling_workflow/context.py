@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .artifacts import WorkflowArtifactLayout
+from .io_model import HiCacheIoModel
 from .progress import WorkflowProgressReporter
 from .types import ProfileRunRef
 
@@ -36,6 +37,7 @@ class WorkflowOptions:
     trace_threads: int = 1
     trace_file_threads: int = 1
     model_run_jobs: int = 1
+    hicache_io_model: HiCacheIoModel | None = None
 
 
 @dataclass

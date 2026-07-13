@@ -9,6 +9,30 @@ from ..context import WorkflowContext
 from ..types import ModelRunCounts, ModelRunResult, ModelRunSpec, ValidationSummary
 
 
+def _validation_payload(summary: ValidationSummary) -> dict[str, Any]:
+    """Project one validation result into the compact workflow contract."""
+
+    payload = {
+        "status": summary.status,
+        "selected_run_count": summary.selected_run_count,
+        "ready_count": summary.ready_count,
+        "exact_count": summary.exact_count,
+        "skipped_count": summary.skipped_count,
+        "blocker_counts": summary.blocker_counts,
+        "artifact_paths": summary.artifact_paths,
+    }
+    closure_fields = (
+        "closure_review_ready",
+        "closure_classification_counts",
+        "closure_unrelated_semantic_mismatch_count",
+        "closure_not_ready_count",
+    )
+    for field in closure_fields:
+        if field in summary.payload:
+            payload[field] = summary.payload[field]
+    return payload
+
+
 def write_workflow_summary(
     context: WorkflowContext,
     *,
@@ -32,18 +56,10 @@ def write_workflow_summary(
         "model_run_skipped_count": counts.skipped,
         "model_run_reused_count": counts.reused,
         "preflight_ready": preflight_report.get("ready"),
-        "validations": {
-            summary.name: {
-                "status": summary.status,
-                "selected_run_count": summary.selected_run_count,
-                "ready_count": summary.ready_count,
-                "exact_count": summary.exact_count,
-                "skipped_count": summary.skipped_count,
-                "blocker_counts": summary.blocker_counts,
-                "artifact_paths": summary.artifact_paths,
-            }
-            for summary in validation_summaries
-        },
+        "hicache_io_model": context.options.hicache_io_model.metadata()
+        if context.options.hicache_io_model is not None
+        else None,
+        "validations": {summary.name: _validation_payload(summary) for summary in validation_summaries},
     }
     write_json(context.artifacts.workflow_summary_path, payload)
     return payload

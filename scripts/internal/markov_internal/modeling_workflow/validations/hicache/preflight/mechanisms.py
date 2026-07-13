@@ -23,6 +23,11 @@ ROLE_TO_MECHANISM = {
     "lock_scope_delta": "lock_ref",
     "lock_scope_result_observed": "lock_ref",
     "prefetch_io_observed": "prefetch_transfer",
+    "loadback_decision_observed": "load_back",
+    "loadback_io_observed": "load_back",
+    "commit_device_to_host_enqueue_observed": "write_backup",
+    "commit_device_to_host_io_observed": "write_backup",
+    "commit_capacity_release_observed": "write_backup",
     "writeback_io_observed": "write_storage",
     "writeback_enqueue_observed": "write_storage",
 }

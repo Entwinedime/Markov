@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ...common.paths import ROOT_DIR, repo_relative_path
+from ..io_model import HiCacheIoModel, merge_hicache_io_model
 from ..types import ModelOutputRequirement, ModelRunSpec, ProfileRunRef
 
 
@@ -74,12 +75,16 @@ class RunnerConfigBuilder:
             },
             "outputs": outputs.as_config(),
         }
+        if self.spec.hicache_io_model is not None:
+            payload["metadata"]["hicache_io_model"] = self.spec.hicache_io_model.metadata()
         if self.spec.mode == "cache_state":
             payload.update(
                 hicache_run_payload(
                     require_target_profile(self.spec),
                     outputs,
+                    dag_patch_enabled=ModelOutputRequirement.HICACHE_DAG_PATCH in self.spec.output_requirements,
                     page_key_mode=self.spec.page_key_mode,
+                    io_model=self.spec.hicache_io_model,
                 )
             )
         return payload
@@ -104,13 +109,15 @@ def hicache_run_payload(
     target: ProfileRunRef,
     outputs: RunnerOutputs,
     *,
+    dag_patch_enabled: bool,
     page_key_mode: str,
+    io_model: HiCacheIoModel | None,
 ) -> dict[str, Any]:
     """Build the narrow C++ HiCache and Python oracle-validation config."""
 
-    hicache_config = {"enabled": True, **(target.hicache_config or {})}
+    hicache_config = merge_hicache_io_model({"enabled": True, **(target.hicache_config or {})}, io_model)
     dag_patch = hicache_config.get("dag_patch") if isinstance(hicache_config.get("dag_patch"), dict) else {}
-    hicache_config["dag_patch"] = {**dag_patch, "enabled": True}
+    hicache_config["dag_patch"] = {**dag_patch, "enabled": dag_patch_enabled}
     return {
         "cpp_model_config": {"hicache": hicache_config},
         "validation": {

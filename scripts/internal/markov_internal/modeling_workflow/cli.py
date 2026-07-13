@@ -40,6 +40,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     inputs.add_argument("--source-configs", default="", help="Comma-separated source config_ids.")
     inputs.add_argument("--target-configs", default="", help="Comma-separated target config_ids.")
 
+    model_inputs = parser.add_argument_group("model inputs")
+    model_inputs.add_argument(
+        "--hicache-io-model",
+        type=Path,
+        help="Explicit model geometry and two-bandwidth HiCache I/O model JSON.",
+    )
+
     validation = parser.add_argument_group("validation")
     validation.add_argument(
         "--validations",

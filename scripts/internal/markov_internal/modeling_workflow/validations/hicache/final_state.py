@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from ....common.io import load_json, write_json
 from ...types import ModelRunResult, ModelOutputRequirement, ValidationSummary
 from ..registry import PredictionValidation, RowValidation, count_blockers
+from .final_state_closure import build_final_state_closure_report
 from .prediction_rows import build_prediction_row, summarize_final_state_rows
 from .preflight.state_input_preflight import HiCacheStateInputPreflightCheck
 
@@ -39,6 +41,10 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
     def build_summary(self, context: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
         """Aggregate final-state readiness and exactness by prediction scope."""
 
+        final_dag_rows = self._final_dag_rows(context, rows)
+        closure = build_final_state_closure_report(rows, final_dag_rows)
+        closure_path = context.artifacts.validations_dir / self.name / "final_state_closure_report.json"
+        write_json(closure_path, closure)
         prediction_count = len(rows)
         validation_ready_count = sum(1 for row in rows if row.get("validation_ready") is True)
         exact_count = sum(1 for row in rows if row.get("final_state_match") is True)
@@ -73,16 +79,41 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
             "skipped_count": skipped_count,
             "error_count": error_count,
             "blocker_counts": count_blockers(rows, "validation_errors"),
+            "closure_report_path": str(closure_path),
+            "closure_review_ready": closure["review_ready"],
+            "closure_classification_counts": closure["classification_counts"],
+            "closure_unrelated_semantic_mismatch_count": closure["unrelated_semantic_mismatch_count"],
+            "closure_not_ready_count": closure["not_ready_count"],
             "by_scope": by_scope,
         }
+
+    @staticmethod
+    def _final_dag_rows(context: Any, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Load final-DAG evidence produced earlier in the same workflow."""
+
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            model_run_id = str(row.get("model_run_id") or "")
+            if not model_run_id:
+                continue
+            path = context.artifacts.validation_row_path("final_dag", model_run_id)
+            if not path.is_file():
+                continue
+            payload = load_json(path)
+            if isinstance(payload, dict):
+                result[model_run_id] = payload
+        return result
 
     def summary_text(self, summary: dict[str, Any]) -> str:
         """Render the final-state validation progress summary."""
 
+        closure_counts = summary.get("closure_classification_counts") or {}
         return (
             f"{summary['prediction_count']} predictions | "
-            f"exact {summary['final_state_match_count']}/{summary['prediction_count']} | "
-            f"ready {summary['validation_ready_count']}/{summary['prediction_count']}"
+            f"raw exact {summary['final_state_match_count']}/{summary['prediction_count']} | "
+            f"readiness-limit "
+            f"{closure_counts.get('payload_only_prefetch_readiness_limitation', 0)} | "
+            f"unresolved {summary.get('closure_unrelated_semantic_mismatch_count', 0)}"
         )
 
     def validation_summary(
@@ -101,6 +132,9 @@ class HiCacheFinalStateValidation(PredictionValidation, RowValidation):
             exact_count=int(summary["final_state_match_count"]),
             skipped_count=int(summary["skipped_count"]),
             blocker_counts=summary["blocker_counts"],
-            artifact_paths={"summary": str(context.artifacts.validation_summary_path(self.name))},
+            artifact_paths={
+                "summary": str(context.artifacts.validation_summary_path(self.name)),
+                "closure": str(summary["closure_report_path"]),
+            },
             payload=summary,
         )

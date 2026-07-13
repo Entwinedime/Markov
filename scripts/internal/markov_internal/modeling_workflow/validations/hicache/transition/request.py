@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from .....common.io import write_json
+from .....common.io import load_json, write_json
 from ....types import ModelRunResult, ModelRunSpec, ModelOutputRequirement, ValidationSummary
 from ...registry import PredictionValidation
 from ..prediction_rows import build_prediction_row
 from ..preflight.state_input_preflight import HiCacheStateInputPreflightCheck
+from .closure import build_transition_closure_report
 from .exactness.prediction_set import compare_transition_prediction_rows
 
 
@@ -80,12 +81,30 @@ class HiCacheTransitionValidation(PredictionValidation):
                 summary_output_path=context.artifacts.validation_summary_path(self.name),
                 on_row=on_row,
             )
+            final_dag_rows = self._final_dag_rows(context, rows)
+            final_state_closure_rows = self._final_state_closure_rows(context)
+            closure = build_transition_closure_report(
+                rows,
+                final_dag_rows,
+                final_state_closure_rows,
+            )
+            closure_path = artifact_root / "transition_closure_report.json"
+            write_json(closure_path, closure)
+            for row in rows:
+                model_run_id = str(row.get("model_run_id") or "")
+                if model_run_id:
+                    write_json(context.artifacts.validation_row_path(self.name, model_run_id), row)
             summary = {
                 **summary,
                 "schema": "trace_sim.modeling_workflow.validation.hicache_transition.v1",
                 "validation": self.name,
                 "status": self._status(summary),
                 "artifact_root": str(artifact_root),
+                "closure_report_path": str(closure_path),
+                "closure_review_ready": closure["review_ready"],
+                "closure_classification_counts": closure["classification_counts"],
+                "closure_unrelated_semantic_mismatch_count": closure["unrelated_semantic_mismatch_count"],
+                "closure_not_ready_count": closure["not_ready_count"],
             }
         write_json(context.artifacts.validation_summary_path(self.name), summary)
         progress.finish(summary["status"], self._summary_text(summary))
@@ -96,7 +115,10 @@ class HiCacheTransitionValidation(PredictionValidation):
             ready_count=int(summary.get("ready_count") or 0),
             exact_count=int(summary.get("exact_count") or 0),
             skipped_count=int(summary.get("skipped_count") or 0),
-            artifact_paths={"summary": str(context.artifacts.validation_summary_path(self.name))},
+            artifact_paths={
+                "summary": str(context.artifacts.validation_summary_path(self.name)),
+                **({"closure": str(summary["closure_report_path"])} if summary.get("closure_report_path") else {}),
+            },
             payload=summary,
         )
 
@@ -118,6 +140,36 @@ class HiCacheTransitionValidation(PredictionValidation):
         }
 
     @staticmethod
+    def _final_dag_rows(context: Any, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Load final-DAG evidence produced earlier in the same workflow."""
+
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            model_run_id = str(row.get("model_run_id") or "")
+            if not model_run_id:
+                continue
+            path = context.artifacts.validation_row_path("final_dag", model_run_id)
+            if not path.is_file():
+                continue
+            payload = load_json(path)
+            if isinstance(payload, dict):
+                result[model_run_id] = payload
+        return result
+
+    @staticmethod
+    def _final_state_closure_rows(context: Any) -> dict[str, dict[str, Any]]:
+        """Load final-state closure evidence produced earlier in the workflow."""
+
+        path = context.artifacts.validations_dir / "hicache_final_state" / "final_state_closure_report.json"
+        if not path.is_file():
+            return {}
+        payload = load_json(path)
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            return {}
+        return {str(row.get("model_run_id")): row for row in rows if isinstance(row, dict) and row.get("model_run_id")}
+
+    @staticmethod
     def _status(summary: dict[str, Any]) -> str:
         prediction_count = int(summary.get("prediction_count") or 0)
         ready_count = int(summary.get("ready_count") or 0)
@@ -133,9 +185,12 @@ class HiCacheTransitionValidation(PredictionValidation):
     @staticmethod
     def _summary_text(summary: dict[str, Any]) -> str:
         prediction_count = int(summary.get("prediction_count") or 0)
+        closure_counts = summary.get("closure_classification_counts") or {}
         return (
             f"{prediction_count} predictions | "
-            f"exact {summary.get('exact_count')}/{prediction_count} | "
-            f"ready {summary.get('ready_count')}/{prediction_count} | "
-            f"count {summary.get('transition_count_exact_count')}/{prediction_count}"
+            f"raw exact {summary.get('exact_count')}/{prediction_count} | "
+            f"readiness-limit "
+            f"{closure_counts.get('payload_only_prefetch_readiness_limitation', 0)} | "
+            f"snapshot {closure_counts.get('snapshot_grouping_or_observability', 0)} | "
+            f"unresolved {summary.get('closure_unrelated_semantic_mismatch_count', 0)}"
         )

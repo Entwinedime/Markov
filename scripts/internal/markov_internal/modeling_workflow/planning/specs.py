@@ -73,7 +73,15 @@ class ModelRunPlanner:
             requirement for request in group_requests for requirement in request.output_requirements
         )
         validations_for_run = tuple(sorted({request.validation_name for request in group_requests}))
-        run_id = model_run_id(first.mode, first.source_profile, first.target_profile, first.prediction, requirements)
+        io_model = self.context.options.hicache_io_model if first.mode == "cache_state" else None
+        run_id = model_run_id(
+            first.mode,
+            first.source_profile,
+            first.target_profile,
+            first.prediction,
+            requirements,
+            io_model.digest if io_model else "",
+        )
         return ModelRunSpec(
             run_id=run_id,
             mode=first.mode,
@@ -83,11 +91,12 @@ class ModelRunPlanner:
             validation_requests=validations_for_run,
             output_dir=self.artifacts.model_run_dir(run_id),
             prediction=first.prediction,
-            skip_reason=skip_policy.reason_for(first),
+            skip_reason=skip_policy.reason_for(first, requirements, io_model_available=io_model is not None),
             trace_threads=self.context.options.trace_threads,
             trace_file_threads=self.context.options.trace_file_threads,
-            trace_channels=model_run_trace_channels(first),
+            trace_channels=model_run_trace_channels(first.mode, requirements),
             page_key_mode=self.context.options.page_key_mode,
+            hicache_io_model=io_model,
         )
 
 
@@ -112,17 +121,34 @@ class PreflightSkipPolicy:
             hicache_by_run=index_rows(hicache.get("runs")),
         )
 
-    def reason_for(self, request: ModelRunRequest) -> str:
+    def reason_for(
+        self,
+        request: ModelRunRequest,
+        requirements: frozenset[ModelOutputRequirement],
+        *,
+        io_model_available: bool,
+    ) -> str:
         """Return an empty string or a stable machine-readable skip reason."""
 
         if request.mode == "faithful_replay":
             return self._faithful_replay_reason(request)
         if request.mode == "cache_state":
+            if ModelOutputRequirement.HICACHE_DAG_PATCH in requirements:
+                full_dag_reason = self._full_dag_reason(request.source_profile)
+                if full_dag_reason:
+                    return full_dag_reason
+                if not io_model_available:
+                    return "missing_hicache_io_model"
             return self._hicache_prediction_reason(request.prediction)
         return ""
 
     def _faithful_replay_reason(self, request: ModelRunRequest) -> str:
-        row = self.full_dag_by_run.get(request.source_profile.run_id)
+        return self._full_dag_reason(request.source_profile)
+
+    def _full_dag_reason(self, profile: ProfileRunRef) -> str:
+        """Return the full-source trace blocker for one profile."""
+
+        row = self.full_dag_by_run.get(profile.run_id)
         if not isinstance(row, dict):
             return "preflight_missing:full_dag_trace_channels"
         if row.get("full_trace_ready") is not True:
@@ -192,10 +218,15 @@ def index_rows(value: object) -> dict[str, dict[str, object]]:
     return {str(row.get("run_id")): row for row in value if isinstance(row, dict) and row.get("run_id") is not None}
 
 
-def model_run_trace_channels(request: ModelRunRequest) -> tuple[str, ...]:
+def model_run_trace_channels(
+    mode: str,
+    requirements: frozenset[ModelOutputRequirement],
+) -> tuple[str, ...]:
     """Select manifest trace channels that the C++ backend may consume."""
 
-    if request.mode == "cache_state":
+    if ModelOutputRequirement.HICACHE_DAG_PATCH in requirements:
+        return ("torch", "ld_preload", "python_probe")
+    if mode == "cache_state":
         return ("python_probe",)
     return ()
 
@@ -242,18 +273,23 @@ def model_run_id(
     target: ProfileRunRef | None,
     prediction: CacheStatePredictionRef | None,
     requirements: frozenset[ModelOutputRequirement],
+    hicache_io_model_digest: str,
 ) -> str:
     """Build a readable model-run identifier from semantic inputs."""
 
     req_text = ",".join(sorted(requirement.value for requirement in requirements))
     req_digest = hashlib.sha1(req_text.encode("utf-8")).hexdigest()[:8]
+    io_digest = hicache_io_model_digest.removeprefix("sha256_json:")[:8]
     if prediction is not None:
-        return "__".join(
-            [safe_slug(mode), safe_slug(prediction.input_id), prediction_config_slug(prediction), req_digest]
-        )
+        components = [safe_slug(mode), safe_slug(prediction.input_id), prediction_config_slug(prediction), req_digest]
+        if io_digest:
+            components.append(f"io_{io_digest}")
+        return "__".join(components)
     parts = [safe_slug(mode), safe_slug(source.input_id), safe_slug(source.config_id), req_digest]
     if target is not None:
         parts.insert(3, f"to_{safe_slug(target.config_id)}")
+    if io_digest:
+        parts.append(f"io_{io_digest}")
     return "__".join(parts)
 
 

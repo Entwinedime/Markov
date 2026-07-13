@@ -11,6 +11,7 @@ prepend_repo_src_to_sys_path()
 
 from profiling.python_probe.trace_sim_probe.schema import (  # noqa: E402
     HICACHE_CONSUMER_INPUT_CONTRACT,
+    HICACHE_CONSUMER_DAG_PATCH,
     HICACHE_CONSUMER_STATE_MODEL,
     validate_hicache_fact,
 )
@@ -18,6 +19,7 @@ from profiling.python_probe.trace_sim_probe.schema import (  # noqa: E402
 
 __all__ = [
     "HICACHE_CONSUMER_INPUT_CONTRACT",
+    "HICACHE_CONSUMER_DAG_PATCH",
     "HICACHE_CONSUMER_STATE_MODEL",
     "HiCacheFact",
     "parse_fact",

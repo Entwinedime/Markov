@@ -91,6 +91,7 @@ def summarize_transition_prediction_row(
     """Project one exactness payload to its workflow prediction row."""
 
     base = {
+        "model_run_id": prediction_row.get("model_run_id"),
         "label": prediction_row.get("label"),
         "input_id": prediction_row.get("input_id"),
         "source_config_id": prediction_row.get("source_config_id"),
