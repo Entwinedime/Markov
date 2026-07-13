@@ -232,7 +232,8 @@
       "class": "source_actual",
       "role": "prefetch_decision_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -315,7 +316,8 @@
       "class": "source_actual",
       "role": "request_admission_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -340,7 +342,8 @@
       "class": "source_actual",
       "role": "request_admission_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -365,7 +368,8 @@
       "class": "source_actual",
       "role": "insert_result_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -386,7 +390,8 @@
       "class": "source_actual",
       "role": "prefetch_intent_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -411,13 +416,18 @@
       "class": "source_actual",
       "role": "prefetch_progress_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
       {
         "name": "request_id",
         "source": "arg:req_id"
+      },
+      {
+        "name": "progress_ready",
+        "source": "return"
       },
       {
         "name": "cache_scope",
@@ -462,7 +472,8 @@
       "class": "source_actual",
       "role": "capacity_result_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -572,7 +583,8 @@
       "class": "timing_observation",
       "role": "prefetch_io_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -584,6 +596,32 @@
       {
         "name": "operation_id",
         "source": "arg:operation.id",
+        "required": false
+      },
+      {
+        "name": "source_page_size",
+        "source": "self.page_size"
+      },
+      {
+        "name": "token_dictionary",
+        "source": "token_path:arg:operation.token_ids"
+      },
+      {
+        "name": "full_path_span",
+        "source": "token_span:arg:operation.token_ids"
+      },
+      {
+        "name": "token_count",
+        "source": "len:arg:operation.token_ids"
+      },
+      {
+        "name": "completed_token_count",
+        "source": "arg:operation.completed_tokens",
+        "required": false
+      },
+      {
+        "name": "page_hashes",
+        "source": "list:arg:operation.hash_value",
         "required": false
       },
       {
@@ -603,13 +641,40 @@
       "class": "timing_observation",
       "role": "writeback_io_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
       {
         "name": "operation_id",
         "source": "arg:operation.id",
+        "required": false
+      },
+      {
+        "name": "source_page_size",
+        "source": "self.page_size"
+      },
+      {
+        "name": "token_dictionary",
+        "source": "token_path:arg:operation.token_ids"
+      },
+      {
+        "name": "full_path_span",
+        "source": "token_span:arg:operation.token_ids"
+      },
+      {
+        "name": "token_count",
+        "source": "len:arg:operation.token_ids"
+      },
+      {
+        "name": "completed_token_count",
+        "source": "arg:operation.completed_tokens",
+        "required": false
+      },
+      {
+        "name": "page_hashes",
+        "source": "list:arg:operation.hash_value",
         "required": false
       },
       {
@@ -629,7 +694,8 @@
       "class": "source_actual",
       "role": "writeback_enqueue_observed",
       "consumers": [
-        "hicache_transition_validator"
+        "hicache_transition_validator",
+        "hicache_dag_patch"
       ]
     },
     "fields": [
@@ -637,6 +703,231 @@
         "name": "operation_id",
         "source": "return",
         "required": false
+      },
+      {
+        "name": "source_page_size",
+        "source": "self.page_size"
+      },
+      {
+        "name": "token_dictionary",
+        "source": "token_path:arg:token_ids"
+      },
+      {
+        "name": "full_path_span",
+        "source": "token_span:arg:token_ids"
+      },
+      {
+        "name": "token_count",
+        "source": "len:arg:token_ids"
+      },
+      {
+        "name": "page_hashes",
+        "source": "list:arg:hash_value",
+        "required": false
+      },
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      }
+    ]
+  },
+  {
+    "id": "hiradix.loadback_decision_observed",
+    "module": "sglang.srt.mem_cache.hiradix_cache",
+    "target": "HiRadixCache.init_load_back",
+    "events": {
+      "end": "hicache_loadback_decision_observed_end"
+    },
+    "fact": {
+      "class": "source_actual",
+      "role": "loadback_decision_observed",
+      "consumers": [
+        "hicache_transition_validator",
+        "hicache_dag_patch"
+      ]
+    },
+    "fields": [
+      {
+        "name": "request_id",
+        "source": "arg:params.req.rid",
+        "required": false
+      },
+      {
+        "name": "node_id",
+        "source": "arg:params.best_match_node.id",
+        "required": false
+      },
+      {
+        "name": "host_hit_token_count",
+        "source": "arg:params.host_hit_length"
+      },
+      {
+        "name": "effective_token_count",
+        "source": "len:return.0",
+        "required": false
+      },
+      {
+        "name": "page_hashes",
+        "source": "list:arg:params.best_match_node.hash_value",
+        "required": false
+      },
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      }
+    ]
+  },
+  {
+    "id": "hicache_controller.loadback_io_observed",
+    "module": "sglang.srt.managers.cache_controller",
+    "target": "HiCacheController.start_loading",
+    "events": {
+      "start": "hicache_loadback_io_observed_start",
+      "end": "hicache_loadback_io_observed_end"
+    },
+    "fact": {
+      "class": "timing_observation",
+      "role": "loadback_io_observed",
+      "consumers": [
+        "hicache_transition_validator",
+        "hicache_dag_patch"
+      ]
+    },
+    "fields": [
+      {
+        "name": "operation_id",
+        "source": "return",
+        "required": false
+      },
+      {
+        "name": "operation_node_ids",
+        "source": "hicache_operation_node_ids:self.load_queue",
+        "required": false
+      },
+      {
+        "name": "token_count",
+        "source": "hicache_operation_token_count:self.load_queue",
+        "required": false
+      },
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      }
+    ]
+  },
+  {
+    "id": "hiradix.commit_device_to_host_enqueue_observed",
+    "module": "sglang.srt.mem_cache.hiradix_cache",
+    "target": "HiRadixCache.write_backup",
+    "events": {
+      "end": "hicache_commit_device_to_host_enqueue_observed_end"
+    },
+    "fact": {
+      "class": "source_actual",
+      "role": "commit_device_to_host_enqueue_observed",
+      "consumers": [
+        "hicache_transition_validator",
+        "hicache_dag_patch"
+      ]
+    },
+    "fields": [
+      {
+        "name": "node_id",
+        "source": "arg:node.id"
+      },
+      {
+        "name": "token_dictionary",
+        "source": "token_path:arg:node.key,self"
+      },
+      {
+        "name": "full_path_span",
+        "source": "token_span:arg:node.key"
+      },
+      {
+        "name": "token_count",
+        "source": "len:arg:node.key"
+      },
+      {
+        "name": "effective_token_count",
+        "source": "return"
+      },
+      {
+        "name": "page_hashes",
+        "source": "list:arg:node.hash_value",
+        "required": false
+      },
+      {
+        "name": "write_back",
+        "source": "arg:write_back"
+      },
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      }
+    ]
+  },
+  {
+    "id": "hicache_controller.commit_device_to_host_io_observed",
+    "module": "sglang.srt.managers.cache_controller",
+    "target": "HiCacheController.start_writing",
+    "events": {
+      "start": "hicache_commit_device_to_host_io_observed_start",
+      "end": "hicache_commit_device_to_host_io_observed_end"
+    },
+    "fact": {
+      "class": "timing_observation",
+      "role": "commit_device_to_host_io_observed",
+      "consumers": [
+        "hicache_transition_validator",
+        "hicache_dag_patch"
+      ]
+    },
+    "fields": [
+      {
+        "name": "operation_node_ids",
+        "source": "hicache_operation_node_ids:self.write_queue",
+        "required": false
+      },
+      {
+        "name": "token_count",
+        "source": "hicache_operation_token_count:self.write_queue",
+        "required": false
+      },
+      {
+        "name": "cache_scope",
+        "source": "hicache_cache_scope:self"
+      }
+    ]
+  },
+  {
+    "id": "hiradix.commit_capacity_release_observed",
+    "module": "sglang.srt.mem_cache.hiradix_cache",
+    "target": "HiRadixCache._finish_write_through_ack",
+    "events": {
+      "start": "hicache_commit_capacity_release_observed_start",
+      "end": "hicache_commit_capacity_release_observed_end"
+    },
+    "fact": {
+      "class": "source_actual",
+      "role": "commit_capacity_release_observed",
+      "consumers": [
+        "hicache_transition_validator",
+        "hicache_dag_patch"
+      ]
+    },
+    "fields": [
+      {
+        "name": "operation_id",
+        "source": "arg:ack_id"
+      },
+      {
+        "name": "operation_node_ids",
+        "source": "hicache_pending_write_node_ids:arg:ack_id,self",
+        "required": false
+      },
+      {
+        "name": "release_lock",
+        "source": "arg:release_lock"
       },
       {
         "name": "cache_scope",

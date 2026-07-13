@@ -488,12 +488,13 @@ def _has_value(value: Any) -> bool:
 
 
 def _bind_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """把位置参数、关键字参数和函数签名绑定结果合并成取值上下文。"""
+    """Resolve positional, keyword, and default arguments into one field context."""
 
     values = {f"arg{index}": value for index, value in enumerate(args)}
     values.update(kwargs)
     try:
         binding = inspect.signature(fn).bind_partial(*args, **kwargs)
+        binding.apply_defaults()
         values.update(binding.arguments)
     except (TypeError, ValueError):
         pass

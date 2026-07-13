@@ -274,6 +274,130 @@ def _hicache_seq_source(
     return (True, True, next_seq)
 
 
+def _operation_batch_values(
+    source: str,
+    prefix: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, list[Any]]:
+    """Read one controller operation queue without retaining operation objects."""
+
+    spec = _source_spec(source, prefix)
+    if spec is None:
+        return (False, [])
+    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
+    if not found or value is None:
+        return (True, [])
+    try:
+        return (True, list(value))
+    except TypeError:
+        return (True, [])
+
+
+def _hicache_operation_node_ids_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    """Extract stable tree-node IDs from a pending controller operation batch."""
+
+    handled, operations = _operation_batch_values(
+        source, "hicache_operation_node_ids:", field_name, bound, args, kwargs, result
+    )
+    if not handled:
+        return (False, False, None)
+    node_ids: list[int] = []
+    seen: set[int] = set()
+    for operation in operations:
+        values = getattr(operation, "node_ids", None)
+        if values is None:
+            value = getattr(operation, "node_id", None)
+            values = [] if value is None else [value]
+        for value in values:
+            try:
+                node_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if node_id < 0 or node_id in seen:
+                continue
+            seen.add(node_id)
+            node_ids.append(node_id)
+    return (True, bool(node_ids), node_ids)
+
+
+def _hicache_operation_token_count_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    """Sum token slots represented by a pending controller operation batch."""
+
+    handled, operations = _operation_batch_values(
+        source, "hicache_operation_token_count:", field_name, bound, args, kwargs, result
+    )
+    if not handled:
+        return (False, False, None)
+    total = 0
+    found = False
+    for operation in operations:
+        values = getattr(operation, "host_indices", None)
+        if values is None:
+            continue
+        try:
+            total += len(values)
+            found = True
+        except TypeError:
+            continue
+    return (True, found, total if found else None)
+
+
+def _hicache_pending_write_node_ids_source(
+    source: str,
+    field_name: str,
+    bound: dict[str, Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    result: Any,
+) -> tuple[bool, bool, Any]:
+    """Resolve one write-through ACK to the tree nodes it is releasing."""
+
+    spec = _source_spec(source, "hicache_pending_write_node_ids:")
+    if spec is None:
+        return (False, False, None)
+    parts = [part.strip() for part in spec.split(",") if part.strip()]
+    if len(parts) != 2:
+        return (True, False, None)
+    ack_found, ack_value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
+    scope_found, scope = _extract_source_value(parts[1], field_name, bound, args, kwargs, result)
+    if not ack_found or not scope_found or scope is None:
+        return (True, False, None)
+    pending = getattr(scope, "ongoing_write_through", None)
+    if not isinstance(pending, dict):
+        return (True, False, None)
+    entry = pending.get(ack_value)
+    if not isinstance(entry, tuple) or len(entry) < 3:
+        return (True, False, None)
+    nodes = entry[2]
+    node_ids: list[int] = []
+    for node in nodes:
+        try:
+            node_id = int(getattr(node, "id"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if node_id not in node_ids:
+            node_ids.append(node_id)
+    return (True, bool(node_ids), node_ids)
+
+
 _HICACHE_SOURCE_EXTRACTORS = (
     _hicache_state_source,
     _token_path_source,
@@ -288,6 +412,9 @@ _HICACHE_SOURCE_EXTRACTORS = (
     _request_token_counts_source,
     _hicache_cache_scope_source,
     _hicache_seq_source,
+    _hicache_operation_node_ids_source,
+    _hicache_operation_token_count_source,
+    _hicache_pending_write_node_ids_source,
 )
 
 
