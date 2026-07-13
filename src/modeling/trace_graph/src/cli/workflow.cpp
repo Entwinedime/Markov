@@ -97,6 +97,57 @@ public:
         timings_["build_inputs"] = std::move(build_inputs_);
     }
 
+    void record_trace_reads(const std::vector<io::ManifestTraceInput> & inputs) {
+        Json files = Json::array();
+        uint64_t file_bytes = 0;
+        uint64_t event_count = 0;
+        uint64_t file_read_ms_sum = 0;
+        uint64_t parse_ms_sum = 0;
+        uint64_t partition_ms_sum = 0;
+        uint64_t finalize_ms_sum = 0;
+        uint64_t file_total_ms_sum = 0;
+        uint64_t file_total_ms_max = 0;
+        for (const auto & input : inputs) {
+            for (const auto & timing : input.trace_read_timings) {
+                file_bytes = core::checked_add_u64(file_bytes, timing.file_bytes, "Trace input byte count exceeds uint64 range");
+                event_count = core::checked_add_u64(event_count, timing.event_count, "Trace input event count exceeds uint64 range");
+                file_read_ms_sum = core::checked_add_u64(file_read_ms_sum, timing.file_read_ms, "Trace read worker time exceeds uint64 range");
+                parse_ms_sum = core::checked_add_u64(parse_ms_sum, timing.parse_ms, "Trace parse worker time exceeds uint64 range");
+                partition_ms_sum = core::checked_add_u64(partition_ms_sum, timing.partition_ms, "Trace partition worker time exceeds uint64 range");
+                finalize_ms_sum = core::checked_add_u64(finalize_ms_sum, timing.finalize_ms, "Trace finalize worker time exceeds uint64 range");
+                file_total_ms_sum = core::checked_add_u64(file_total_ms_sum, timing.total_ms, "Trace file worker time exceeds uint64 range");
+                file_total_ms_max = std::max(file_total_ms_max, timing.total_ms);
+                files.push_back(Json{
+                    {          "filename",          timing.filename },
+                    {           "channel",           timing.channel },
+                    {        "file_bytes",        timing.file_bytes },
+                    {       "event_count",       timing.event_count },
+                    { "requested_threads", timing.requested_threads },
+                    {   "read_partitions",   timing.read_partitions },
+                    {  "parse_partitions",  timing.parse_partitions },
+                    {      "file_read_ms",      timing.file_read_ms },
+                    {         "repair_ms",         timing.repair_ms },
+                    {      "partition_ms",      timing.partition_ms },
+                    {          "parse_ms",          timing.parse_ms },
+                    {       "finalize_ms",       timing.finalize_ms },
+                    {          "total_ms",          timing.total_ms },
+                });
+            }
+        }
+        timings_["trace_io"] = Json{
+            {               "file_count",      files.size() },
+            {               "file_bytes",        file_bytes },
+            {              "event_count",       event_count },
+            {  "file_read_worker_ms_sum",  file_read_ms_sum },
+            {      "parse_worker_ms_sum",      parse_ms_sum },
+            {  "partition_worker_ms_sum",  partition_ms_sum },
+            {   "finalize_worker_ms_sum",   finalize_ms_sum },
+            { "file_total_worker_ms_sum", file_total_ms_sum },
+            { "file_total_worker_ms_max", file_total_ms_max },
+            {                    "files",  std::move(files) },
+        };
+    }
+
     void set(const char * name, Json value) { timings_[name] = std::move(value); }
     [[nodiscard]] const Json & timings() const { return timings_; }
 
@@ -137,6 +188,7 @@ InputBuildResult build_input_graph(InputBuildRequest request) {
     const auto start = std::chrono::steady_clock::now();
     DagBuilder::BuildTimings timings;
     auto graph = builder.build_with_timings(std::move(request.input.events), static_cast<int>(request.index), timings);
+    graph.set_input_contracts(std::move(request.input.input_contracts));
     return InputBuildResult{
         .index = request.index,
         .graph = std::move(graph),
@@ -144,16 +196,20 @@ InputBuildResult build_input_graph(InputBuildRequest request) {
         .timings = timings,
     };
 #else
+    auto graph = builder.build(std::move(request.input.events), static_cast<int>(request.index));
+    graph.set_input_contracts(std::move(request.input.input_contracts));
     return InputBuildResult{
         .index = request.index,
-        .graph = builder.build(std::move(request.input.events), static_cast<int>(request.index)),
+        .graph = std::move(graph),
     };
 #endif
 }
 
 std::vector<io::ManifestTraceInput> load_inputs(const CliOptions & options, WorkflowDiagnostics & diagnostics) {
 #ifdef DEBUG
-    return diagnostics.measure("read_ms", [&] { return io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input); });
+    auto inputs = diagnostics.measure("read_ms", [&] { return io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input); });
+    diagnostics.record_trace_reads(inputs);
+    return inputs;
 #else
     (void)diagnostics;
     return io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);

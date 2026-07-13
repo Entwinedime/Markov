@@ -23,6 +23,7 @@ namespace markov::trace_graph::io {
 namespace {
 
 using core::TraceEvent;
+using core::TraceSourceChannel;
 using Json = nlohmann::json;
 
 constexpr std::string_view kWorkspacePrefix = "/workspace/trace-sim";
@@ -33,6 +34,19 @@ struct ManifestPaths {
     std::vector<std::string> ld_preload;
     std::vector<std::string> python_probe;
 };
+
+std::vector<std::string> manifest_input_contracts(const Json & manifest) {
+    const auto profiling = manifest.contains("profiling") && manifest["profiling"].is_object() ? manifest["profiling"] : Json::object();
+    const auto consumers = profiling.value("python_consumers", Json::array());
+    if (!consumers.is_array()) return {};
+    std::vector<std::string> contracts;
+    for (const auto & consumer : consumers) {
+        if (consumer.is_string() && !consumer.get_ref<const std::string &>().empty()) contracts.push_back(consumer.get<std::string>());
+    }
+    std::ranges::sort(contracts);
+    contracts.erase(std::unique(contracts.begin(), contracts.end()), contracts.end());
+    return contracts;
+}
 
 Json load_manifest(const std::string & path) {
     std::ifstream input(path);
@@ -133,53 +147,122 @@ TraceReadOptions sidecar_read_options(const ManifestTraceInputOptions & options)
     };
 }
 
-void append_trace_files(std::vector<TraceEvent> & events, const std::vector<std::string> & paths, const TraceReadOptions & options) {
+#ifdef DEBUG
+std::string_view trace_channel_name(TraceSourceChannel channel) {
+    switch (channel) {
+    case TraceSourceChannel::Torch:
+        return "torch";
+    case TraceSourceChannel::LdPreload:
+        return "ld_preload";
+    case TraceSourceChannel::PythonProbe:
+        return "python_probe";
+    case TraceSourceChannel::Synthetic:
+        return "synthetic";
+    case TraceSourceChannel::Unknown:
+        return "unknown";
+    }
+    return "unknown";
+}
+#endif
+
+struct ChannelTraceRead {
+    std::vector<TraceEvent> events;
+#ifdef DEBUG
+    TraceReadTimings timings;
+#endif
+};
+
+ChannelTraceRead read_channel_trace(const std::string & path, const TraceReadOptions & options, TraceSourceChannel channel) {
+    ChannelTraceRead result;
+#ifdef DEBUG
+    auto timed = read_chrome_trace_with_timings(path, options);
+    result.events = std::move(timed.events);
+    result.timings = std::move(timed.timings);
+    result.timings.channel = trace_channel_name(channel);
+#else
+    result.events = read_chrome_trace(path, options);
+#endif
+    for (auto & event : result.events) event.source_channel = channel;
+    return result;
+}
+
+void record_trace_read(ManifestTraceInput & input, ChannelTraceRead & read) {
+#ifdef DEBUG
+    input.trace_read_timings.push_back(std::move(read.timings));
+#else
+    (void)input;
+    (void)read;
+#endif
+}
+
+void append_trace_files(ManifestTraceInput & input, const std::vector<std::string> & paths, const TraceReadOptions & options, TraceSourceChannel channel) {
     for (const auto & path : paths) {
-        auto appended = read_chrome_trace(path, options);
-        const auto offset = events.size();
-        for (size_t index = 0; index < appended.size(); ++index) appended[index].index = offset + index;
-        events.insert(events.end(), std::make_move_iterator(appended.begin()), std::make_move_iterator(appended.end()));
+        auto read = read_channel_trace(path, options, channel);
+        record_trace_read(input, read);
+        const auto offset = input.events.size();
+        for (size_t index = 0; index < read.events.size(); ++index) read.events[index].index = offset + index;
+        input.events.insert(input.events.end(), std::make_move_iterator(read.events.begin()), std::make_move_iterator(read.events.end()));
     }
 }
 
 ManifestTraceInput load_torch_group(const std::string & torch_path, const std::string & custom_path, const std::vector<std::string> & sidecar_paths,
-                                    const ManifestTraceInputOptions & options) {
+                                    const std::vector<std::string> & input_contracts, const ManifestTraceInputOptions & options) {
     ManifestTraceInput input;
-    input.events = read_chrome_trace(torch_path, profiler_read_options(options));
-    if (!custom_path.empty()) { detail::join_custom_trace(input.events, read_chrome_trace(custom_path, sidecar_read_options(options)), options); }
-    append_trace_files(input.events, sidecar_paths, sidecar_read_options(options));
+    input.input_contracts = input_contracts;
+    auto torch = read_channel_trace(torch_path, profiler_read_options(options), TraceSourceChannel::Torch);
+    record_trace_read(input, torch);
+    input.events = std::move(torch.events);
+    if (!custom_path.empty()) {
+        auto custom = read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
+        record_trace_read(input, custom);
+        detail::join_custom_trace(input.events, std::move(custom.events), options);
+    }
+    append_trace_files(input, sidecar_paths, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
     return input;
 }
 
-ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const ManifestTraceInputOptions & options) {
+ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std::vector<std::string> & input_contracts,
+                                         const ManifestTraceInputOptions & options) {
     ManifestTraceInput input;
-    for (const auto & path : paths.ld_preload) { detail::append_standalone_events(input.events, read_chrome_trace(path, sidecar_read_options(options))); }
-    append_trace_files(input.events, paths.python_probe, sidecar_read_options(options));
+    input.input_contracts = input_contracts;
+    for (const auto & path : paths.ld_preload) {
+        auto custom = read_channel_trace(path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
+        record_trace_read(input, custom);
+        detail::append_standalone_events(input.events, std::move(custom.events));
+    }
+    append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
     return input;
 }
 
-ManifestTraceInput load_logical_input(const ManifestPaths & paths, size_t index, const ManifestTraceInputOptions & options) {
+ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::vector<std::string> & input_contracts, size_t index,
+                                      const ManifestTraceInputOptions & options) {
     const auto pid = pid_from_path(paths.torch[index]);
-    return load_torch_group(paths.torch[index], select_by_pid_or_index(paths.ld_preload, pid, index), select_sidecars(paths.python_probe, pid, index), options);
+    return load_torch_group(paths.torch[index],
+                            select_by_pid_or_index(paths.ld_preload, pid, index),
+                            select_sidecars(paths.python_probe, pid, index),
+                            input_contracts,
+                            options);
 }
 
 } // namespace
 
 std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::string & manifest_path, const ManifestTraceInputOptions & options) {
-    const auto paths = selected_paths(load_manifest(manifest_path), options);
+    const auto manifest = load_manifest(manifest_path);
+    const auto paths = selected_paths(manifest, options);
+    const auto input_contracts = manifest_input_contracts(manifest);
     if (paths.torch.empty()) {
         if (paths.ld_preload.empty() && paths.python_probe.empty()) {
             throw std::runtime_error("profile manifest has no usable trace inputs: " + manifest_path);
         }
-        return { load_state_only_group(paths, options) };
+        return { load_state_only_group(paths, input_contracts, options) };
     }
 
     std::vector<ManifestTraceInput> inputs(paths.torch.size());
     const size_t concurrency = std::max<size_t>(1, std::min(options.threads, paths.torch.size()));
     if (concurrency == 1) {
-        for (size_t index = 0; index < paths.torch.size(); ++index) { inputs[index] = load_logical_input(paths, index, options); }
+        for (size_t index = 0; index < paths.torch.size(); ++index) { inputs[index] = load_logical_input(paths, input_contracts, index, options); }
         return inputs;
     }
 
@@ -188,8 +271,9 @@ std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::strin
         std::vector<std::future<std::pair<size_t, ManifestTraceInput>>> futures;
         futures.reserve(end - begin);
         for (size_t index = begin; index < end; ++index) {
-            futures.push_back(
-                std::async(std::launch::async, [&paths, &options, index] { return std::make_pair(index, load_logical_input(paths, index, options)); }));
+            futures.push_back(std::async(std::launch::async, [&paths, &input_contracts, &options, index] {
+                return std::make_pair(index, load_logical_input(paths, input_contracts, index, options));
+            }));
         }
         for (auto & future : futures) {
             auto [index, input] = future.get();

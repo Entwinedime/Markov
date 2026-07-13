@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#ifdef DEBUG
+#include <chrono>
+#endif
 #include <fstream>
 #include <future>
 #include <limits>
@@ -20,6 +24,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 namespace markov::trace_graph::io {
 
@@ -397,6 +402,14 @@ private:
     bool malformed_ = false;
 };
 
+constexpr size_t kMinParallelReadBytes = 64ull * 1'024ull * 1'024ull;
+
+size_t file_read_partition_count(size_t file_bytes, size_t threads) {
+    if (threads <= 1 || file_bytes < kMinParallelReadBytes) return 1;
+    const auto useful_partitions = file_bytes / kMinParallelReadBytes + (file_bytes % kMinParallelReadBytes == 0 ? 0 : 1);
+    return std::max<size_t>(1, std::min(threads, useful_partitions));
+}
+
 std::string read_file_buffer(const std::string & filename, size_t threads) {
     std::ifstream ifs(filename, std::ios::binary | std::ios::ate);
     if (!ifs.is_open()) { throw std::runtime_error("Failed to open trace file: " + filename); }
@@ -409,9 +422,7 @@ std::string read_file_buffer(const std::string & filename, size_t threads) {
         throw std::runtime_error("Trace file is too large for std::ifstream: " + filename);
     }
 
-    constexpr size_t kMinParallelReadBytes = 64ull * 1'024ull * 1'024ull;
-    const auto useful_partitions = size / kMinParallelReadBytes + (size % kMinParallelReadBytes == 0 ? 0 : 1);
-    const size_t partition_count = threads > 1 && size >= kMinParallelReadBytes ? std::min<size_t>(threads, useful_partitions) : 1;
+    const size_t partition_count = file_read_partition_count(size, threads);
     if (partition_count <= 1) {
         ifs.seekg(0, std::ios::beg);
         if (!ifs.read(buffer.data(), static_cast<std::streamsize>(size))) { throw std::runtime_error("Failed to read trace file: " + filename); }
@@ -581,6 +592,138 @@ std::string json_scalar_literal(const std::string & value) {
     return Json(value).dump();
 }
 
+std::vector<TraceEvent> parse_trace_buffer(const std::shared_ptr<const std::string> & shared_buffer, const TraceReadOptions & options,
+                                           const std::vector<EventByteRange> & partitions) {
+    if (options.threads <= 1 || partitions.empty()) {
+        TraceScanner scanner(shared_buffer, options);
+        return scanner.parse();
+    }
+    if (partitions.size() == 1) return parse_event_partition(shared_buffer, partitions.front(), options);
+
+    std::vector<std::future<std::vector<TraceEvent>>> futures;
+    futures.reserve(partitions.size());
+    for (const auto partition : partitions) {
+        futures.push_back(
+            std::async(std::launch::async, [shared_buffer, partition, options] { return parse_event_partition(shared_buffer, partition, options); }));
+    }
+
+    std::vector<std::vector<TraceEvent>> parsed_partitions;
+    parsed_partitions.reserve(futures.size());
+    size_t event_count = 0;
+    for (auto & future : futures) {
+        auto part = future.get();
+        if (part.size() > std::numeric_limits<size_t>::max() - event_count) throw std::length_error("Chrome trace event count overflow");
+        event_count += part.size();
+        parsed_partitions.push_back(std::move(part));
+    }
+    std::vector<TraceEvent> events;
+    events.reserve(event_count);
+    for (auto & part : parsed_partitions) events.insert(events.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+    return events;
+}
+
+enum class TraceReadPhase : std::uint8_t { FileRead, Repair, Partition, Parse, Finalize };
+
+class DirectTraceReadProfiler {
+public:
+    template <typename Function> auto measure(TraceReadPhase, Function && function) { return std::forward<Function>(function)(); }
+    template <typename Function> void measure_void(TraceReadPhase, Function && function) { std::forward<Function>(function)(); }
+    void set_file_bytes(size_t) {}
+    void set_event_count(size_t) {}
+    void set_read_partitions(size_t) {}
+    void set_parse_partitions(size_t) {}
+    void finish() {}
+};
+
+#ifdef DEBUG
+class TimedTraceReadProfiler {
+public:
+    explicit TimedTraceReadProfiler(TraceReadTimings & timings, const std::string & filename, size_t requested_threads)
+        : timings_(timings),
+          started_at_(std::chrono::steady_clock::now()) {
+        timings_.filename = filename;
+        timings_.requested_threads = requested_threads;
+    }
+
+    template <typename Function> auto measure(TraceReadPhase phase, Function && function) {
+        const auto start = std::chrono::steady_clock::now();
+        auto value = std::forward<Function>(function)();
+        record(phase, elapsed_ms(start));
+        return value;
+    }
+
+    template <typename Function> void measure_void(TraceReadPhase phase, Function && function) {
+        const auto start = std::chrono::steady_clock::now();
+        std::forward<Function>(function)();
+        record(phase, elapsed_ms(start));
+    }
+
+    void set_file_bytes(size_t value) { timings_.file_bytes = value; }
+    void set_event_count(size_t value) { timings_.event_count = value; }
+    void set_read_partitions(size_t value) { timings_.read_partitions = value; }
+    void set_parse_partitions(size_t value) { timings_.parse_partitions = value; }
+    void finish() { timings_.total_ms = elapsed_ms(started_at_); }
+
+private:
+    static uint64_t elapsed_ms(std::chrono::steady_clock::time_point start) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+
+    void record(TraceReadPhase phase, uint64_t elapsed) {
+        switch (phase) {
+        case TraceReadPhase::FileRead:
+            timings_.file_read_ms = elapsed;
+            break;
+        case TraceReadPhase::Repair:
+            timings_.repair_ms = elapsed;
+            break;
+        case TraceReadPhase::Partition:
+            timings_.partition_ms = elapsed;
+            break;
+        case TraceReadPhase::Parse:
+            timings_.parse_ms = elapsed;
+            break;
+        case TraceReadPhase::Finalize:
+            timings_.finalize_ms = elapsed;
+            break;
+        }
+    }
+
+    TraceReadTimings & timings_;
+    std::chrono::steady_clock::time_point started_at_;
+};
+#endif
+
+template <typename Profiler>
+std::vector<TraceEvent> read_chrome_trace_impl(const std::string & filename, const TraceReadOptions & options, Profiler & profiler) {
+    std::string buffer = profiler.measure(TraceReadPhase::FileRead, [&] { return read_file_buffer(filename, std::max<size_t>(1, options.threads)); });
+    profiler.set_file_bytes(buffer.size());
+    profiler.set_read_partitions(file_read_partition_count(buffer.size(), std::max<size_t>(1, options.threads)));
+    if (options.auto_repair) {
+        buffer = profiler.measure(TraceReadPhase::Repair, [&] { return repair_trace_tail(std::move(buffer)); });
+    }
+    auto shared_buffer = std::make_shared<const std::string>(std::move(buffer));
+
+    std::vector<EventByteRange> partitions;
+    if (options.threads > 1) {
+        constexpr size_t kMinParallelParseBytes = 64ull * 1'024ull * 1'024ull;
+        const auto useful_partitions = shared_buffer->size() / kMinParallelParseBytes + (shared_buffer->size() % kMinParallelParseBytes == 0 ? 0 : 1);
+        partitions =
+            profiler.measure(TraceReadPhase::Partition, [&] { return partition_event_array(*shared_buffer, std::min(options.threads, useful_partitions)); });
+    }
+    profiler.set_parse_partitions(partitions.empty() ? 1 : partitions.size());
+
+    auto events = profiler.measure(TraceReadPhase::Parse, [&] { return parse_trace_buffer(shared_buffer, options, partitions); });
+    profiler.measure_void(TraceReadPhase::Finalize, [&] {
+        for (size_t index = 0; index < events.size(); ++index) events[index].index = index;
+        auto & logger = Logger::instance();
+        if (logger.enabled(Logger::Info)) logger.info() << "Read " << events.size() << " Chrome trace events from " << filename;
+    });
+    profiler.set_event_count(events.size());
+    profiler.finish();
+    return events;
+}
+
 } // namespace chrome_trace_io_detail
 
 using chrome_trace_io_detail::json_scalar_literal;
@@ -589,54 +732,18 @@ using chrome_trace_io_detail::TraceScanner;
 std::vector<TraceEvent> read_chrome_trace(const std::string & filename) { return read_chrome_trace(filename, TraceReadOptions{}); }
 
 std::vector<TraceEvent> read_chrome_trace(const std::string & filename, const TraceReadOptions & options) {
-    // One shared file buffer keeps lazy args alive while avoiding the multi-fold memory
-    // expansion of a whole-file JSON DOM.
-    std::string buffer = chrome_trace_io_detail::read_file_buffer(filename, std::max<size_t>(1, options.threads));
-    if (options.auto_repair) buffer = chrome_trace_io_detail::repair_trace_tail(std::move(buffer));
-    auto shared_buffer = std::make_shared<const std::string>(std::move(buffer));
-
-    std::vector<TraceEvent> events;
-    if (options.threads <= 1) {
-        TraceScanner scanner(shared_buffer, options);
-        events = scanner.parse();
-    }
-    else {
-        constexpr size_t kMinParallelParseBytes = 64ull * 1'024ull * 1'024ull;
-        const auto useful_partitions = shared_buffer->size() / kMinParallelParseBytes + (shared_buffer->size() % kMinParallelParseBytes == 0 ? 0 : 1);
-        auto partitions = chrome_trace_io_detail::partition_event_array(*shared_buffer, std::min(options.threads, useful_partitions));
-        if (partitions.empty()) {
-            TraceScanner scanner(shared_buffer, options);
-            events = scanner.parse();
-        }
-        else if (partitions.size() == 1) { events = chrome_trace_io_detail::parse_event_partition(shared_buffer, partitions.front(), options); }
-        else {
-            std::vector<std::future<std::vector<TraceEvent>>> futures;
-            futures.reserve(partitions.size());
-            for (const auto partition : partitions) {
-                futures.push_back(std::async(std::launch::async, [shared_buffer, partition, options] {
-                    return chrome_trace_io_detail::parse_event_partition(shared_buffer, partition, options);
-                }));
-            }
-
-            std::vector<std::vector<TraceEvent>> parsed_partitions;
-            parsed_partitions.reserve(futures.size());
-            size_t event_count = 0;
-            for (auto & future : futures) {
-                auto part = future.get();
-                if (part.size() > std::numeric_limits<size_t>::max() - event_count) { throw std::length_error("Chrome trace event count overflow"); }
-                event_count += part.size();
-                parsed_partitions.push_back(std::move(part));
-            }
-            events.reserve(event_count);
-            for (auto & part : parsed_partitions) { events.insert(events.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end())); }
-        }
-    }
-
-    for (size_t index = 0; index < events.size(); ++index) events[index].index = index;
-    auto & logger = Logger::instance();
-    if (logger.enabled(Logger::Info)) logger.info() << "Read " << events.size() << " Chrome trace events from " << filename;
-    return events;
+    chrome_trace_io_detail::DirectTraceReadProfiler profiler;
+    return chrome_trace_io_detail::read_chrome_trace_impl(filename, options, profiler);
 }
+
+#ifdef DEBUG
+TimedTraceReadResult read_chrome_trace_with_timings(const std::string & filename, const TraceReadOptions & options) {
+    TimedTraceReadResult result;
+    chrome_trace_io_detail::TimedTraceReadProfiler profiler(result.timings, filename, std::max<size_t>(1, options.threads));
+    result.events = chrome_trace_io_detail::read_chrome_trace_impl(filename, options, profiler);
+    return result;
+}
+#endif
 
 void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph) {
     // Graph output is explicit and may be large; it never participates in the default result.

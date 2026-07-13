@@ -22,6 +22,13 @@ struct SimulationResult {
     size_t processed_nodes = 0;
 };
 
+/** @brief Returns the edge delay used by simulation and critical-path reconstruction. */
+[[nodiscard]] inline uint64_t topological_edge_delay_us(const core::DagNode & source, core::DagEdgeKind kind) noexcept {
+    constexpr uint64_t kMaxPlausibleCpuGapUs = 1'000'000'000;
+    if (kind != core::DagEdgeKind::Sequential || !source.is_cpu) return 0;
+    return source.cpu_gap_after <= kMaxPlausibleCpuGapUs ? source.cpu_gap_after : 0;
+}
+
 /**
  * @brief Replays an already constructed active DAG in topological order.
  *

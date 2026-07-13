@@ -309,6 +309,7 @@ bool lookup_json_arg(std::string_view raw_args, std::string_view key, std::strin
 
 TraceEvent::TraceEvent(const TraceEvent & other)
     : index(other.index),
+      source_channel(other.source_channel),
       event_id(other.event_id),
       name(other.name),
       cat(other.cat),
@@ -330,6 +331,7 @@ TraceEvent::TraceEvent(const TraceEvent & other)
 TraceEvent & TraceEvent::operator=(const TraceEvent & other) {
     if (this == &other) return *this;
     index = other.index;
+    source_channel = other.source_channel;
     event_id = other.event_id;
     name = other.name;
     cat = other.cat;

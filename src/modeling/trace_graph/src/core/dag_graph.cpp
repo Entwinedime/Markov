@@ -120,6 +120,7 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     if (spec.name.empty()) throw std::invalid_argument("synthetic DAG node name must not be empty");
     TraceEvent event;
     event.index = events_.size();
+    event.source_channel = TraceSourceChannel::Synthetic;
     event.event_id = "synthetic_" + std::to_string(nodes_.size());
     event.name = spec.name;
     event.cat = spec.category;
@@ -225,6 +226,14 @@ bool DagGraph::has_active_edge(size_t src, size_t dst, DagEdgeKind kind, std::st
     });
 }
 
+void DagGraph::set_input_contracts(std::vector<std::string> contracts) {
+    std::ranges::sort(contracts);
+    contracts.erase(std::unique(contracts.begin(), contracts.end()), contracts.end());
+    input_contracts_ = std::move(contracts);
+}
+
+bool DagGraph::has_input_contract(std::string_view contract) const { return std::ranges::binary_search(input_contracts_, contract); }
+
 std::unordered_map<std::string, size_t> DagGraph::edge_counts_by_kind() const {
     std::unordered_map<std::string, size_t> counts;
     std::ranges::for_each(edges_, [&](const auto & edge) {
@@ -300,6 +309,7 @@ private:
             auto & graph = graphs_[graph_index];
             node_offsets_[graph_index] = node_offset;
             merge_parsed_record_count(graph);
+            merge_input_contracts(graph);
             remap_nodes(graph,
                         GraphRelocation{
                             .graph_index = graph_index,
@@ -315,6 +325,12 @@ private:
 #ifdef DEBUG
         merged_.real_e2e_time_ = has_real_time_ && real_max_ > real_min_ ? real_max_ - real_min_ : 0;
 #endif
+    }
+
+    void merge_input_contracts(const DagGraph & graph) {
+        merged_.input_contracts_.insert(merged_.input_contracts_.end(), graph.input_contracts_.begin(), graph.input_contracts_.end());
+        std::ranges::sort(merged_.input_contracts_);
+        merged_.input_contracts_.erase(std::unique(merged_.input_contracts_.begin(), merged_.input_contracts_.end()), merged_.input_contracts_.end());
     }
 
     void merge_parsed_record_count(const DagGraph & graph) {

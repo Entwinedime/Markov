@@ -4,6 +4,9 @@
  */
 #include "markov/trace_graph/modules/dag_analysis/diagnostics.hpp"
 
+#include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/simulation/topological_simulator.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -501,10 +504,14 @@ Json lane_summary_json(const LaneSummaryStats & summary) {
 
 Json critical_path_sample(const core::DagGraph & graph) {
     constexpr size_t invalid = std::numeric_limits<size_t>::max();
-    if (graph.active_node_count() == 0)
+    const auto active_node_count = graph.active_node_count();
+    if (active_node_count == 0)
         return Json{
-            { "total_duration_us", graph.e2e_time() },
-            {      "sample_nodes",    Json::array() }
+            {            "total_duration_us", graph.e2e_time() },
+            {                   "node_count",                0 },
+            {       "synthetic_effect_count",                0 },
+            { "synthetic_effect_duration_us",                0 },
+            {                 "sample_nodes",    Json::array() }
         };
 
     std::vector<size_t> best_pred_by_node(graph.node_count(), invalid);
@@ -513,8 +520,12 @@ Json critical_path_sample(const core::DagGraph & graph) {
         if (!edge.active || edge.src >= graph.node_count() || edge.dst >= graph.node_count() || !graph.node(edge.src).active || !graph.node(edge.dst).active)
             continue;
         const auto & pred_node = graph.node(edge.src);
+        const auto arrival = core::checked_add_u64(pred_node.completion_time,
+                                                   simulation::topological_edge_delay_us(pred_node, edge.kind),
+                                                   "Critical-path predecessor arrival exceeds uint64 range");
+        if (arrival != graph.node(edge.dst).simulation_start) continue;
         auto current_pred = best_pred_by_node[edge.dst];
-        if (current_pred == invalid || pred_node.completion_time > graph.node(current_pred).completion_time) {
+        if (current_pred == invalid || edge.src < current_pred) {
             best_pred_by_node[edge.dst] = edge.src;
             best_kind_by_node[edge.dst] = edge.kind;
         }
@@ -527,12 +538,23 @@ Json critical_path_sample(const core::DagGraph & graph) {
     }
 
     std::vector<Json> reversed;
-    std::unordered_set<size_t> seen;
     std::string incoming_edge_kind;
-    while (current != invalid && reversed.size() < kCriticalPathSampleLimit && seen.insert(current).second) {
-        auto item = compact_node_json(graph, current);
-        if (!incoming_edge_kind.empty()) item["incoming_edge_kind"] = incoming_edge_kind;
-        reversed.push_back(std::move(item));
+    size_t path_node_count = 0;
+    size_t synthetic_effect_count = 0;
+    uint64_t synthetic_effect_duration_us = 0;
+    while (current != invalid && path_node_count < active_node_count) {
+        const auto & node = graph.node(current);
+        ++path_node_count;
+        if (node.kind == core::DagNodeKind::Synthetic) {
+            ++synthetic_effect_count;
+            synthetic_effect_duration_us =
+                core::checked_add_u64(synthetic_effect_duration_us, node.duration, "Critical-path synthetic duration exceeds uint64 range");
+        }
+        if (reversed.size() < kCriticalPathSampleLimit) {
+            auto item = compact_node_json(graph, current);
+            if (!incoming_edge_kind.empty()) item["incoming_edge_kind"] = incoming_edge_kind;
+            reversed.push_back(std::move(item));
+        }
 
         size_t best_pred = best_pred_by_node[current];
         if (best_pred == invalid) break;
@@ -541,8 +563,11 @@ Json critical_path_sample(const core::DagGraph & graph) {
     }
     std::ranges::reverse(reversed);
     return Json{
-        { "total_duration_us", graph.e2e_time() },
-        {      "sample_nodes",         reversed },
+        {            "total_duration_us",             graph.e2e_time() },
+        {                   "node_count",              path_node_count },
+        {       "synthetic_effect_count",       synthetic_effect_count },
+        { "synthetic_effect_duration_us", synthetic_effect_duration_us },
+        {                 "sample_nodes",                     reversed },
     };
 }
 

@@ -27,6 +27,7 @@ using markov::trace_graph::core::DagMutationPlan;
 using markov::trace_graph::core::DagNodeKind;
 using markov::trace_graph::core::DagNodeRef;
 using markov::trace_graph::core::DagRedirectEdgeMutation;
+using markov::trace_graph::core::DagSetNodeDurationMutation;
 using markov::trace_graph::core::DagSyntheticNodeMutation;
 using markov::trace_graph::core::DagSyntheticNodeSpec;
 using markov::trace_graph::core::TraceByteRange;
@@ -38,8 +39,13 @@ void expect(bool condition, const std::string & message) {
 
 void expect_plan_rejected_atomically(DagGraph & graph, const DagMutationPlan & plan, const std::string & message) {
     std::vector<bool> node_activity;
+    std::vector<uint64_t> node_durations;
     node_activity.reserve(graph.node_count());
-    for (const auto & node : graph.nodes()) node_activity.push_back(node.active);
+    node_durations.reserve(graph.node_count());
+    for (const auto & node : graph.nodes()) {
+        node_activity.push_back(node.active);
+        node_durations.push_back(node.duration);
+    }
     std::vector<bool> edge_activity;
     edge_activity.reserve(graph.edge_count());
     for (const auto & edge : graph.edges()) edge_activity.push_back(edge.active);
@@ -55,6 +61,8 @@ void expect_plan_rejected_atomically(DagGraph & graph, const DagMutationPlan & p
     expect(graph.node_count() == node_activity.size() && graph.edge_count() == edge_activity.size(), "rejected plan changed graph storage");
     for (size_t index = 0; index < node_activity.size(); ++index)
         expect(graph.node(index).active == node_activity[index], "rejected plan changed node activity");
+    for (size_t index = 0; index < node_durations.size(); ++index)
+        expect(graph.node(index).duration == node_durations[index], "rejected plan changed node duration");
     for (size_t index = 0; index < edge_activity.size(); ++index)
         expect(graph.edge(index).active == edge_activity[index], "rejected plan changed edge activity");
 }
@@ -190,6 +198,37 @@ void check_incident_edge_journal() {
     expect(graph.active_node_count() == 2 && graph.active_edge_count() == 0, "node tombstone left active incident edges");
 }
 
+void check_duration_update_preserves_boundary() {
+    auto graph = make_linear_graph();
+    graph.mutable_node(1).cpu_gap_after = 7;
+    DagMutationPlan plan{
+        .plan_id = "duration_update",
+        .effect_id = "effect:duration_update",
+        .set_node_durations = {
+            DagSetNodeDurationMutation{
+                .node_id = 1,
+                .duration = 0,
+                .reason = "remove_owned_cost",
+            },
+        },
+    };
+    const auto result = markov::trace_graph::core::apply_dag_mutation_plan(graph, plan);
+    expect(result.journal.records.size() == 1, "duration update did not produce one journal record");
+    expect(result.journal.records[0].old_duration == 20 && result.journal.records[0].new_duration == 0, "duration update journal lost old or new cost");
+    expect(graph.node(1).active && graph.node(1).duration == 0, "duration update changed boundary-node activity");
+    expect(graph.node(1).cpu_gap_after == 7, "duration update discarded the retained CPU gap");
+    const auto simulation = markov::trace_graph::simulation::run_topological_simulation(graph);
+    expect(simulation.e2e_us == 47, "duration update did not preserve the boundary CPU gap");
+
+    auto conflict_graph = make_linear_graph();
+    DagMutationPlan conflict{
+        .plan_id = "duration_disable_conflict",
+        .set_node_durations = { DagSetNodeDurationMutation{ .node_id = 1, .duration = 0 } },
+        .disable_nodes = { 1 },
+    };
+    expect_plan_rejected_atomically(conflict_graph, conflict, "duration update and node disable conflict was accepted");
+}
+
 void check_addition_to_disabled_node_is_atomic() {
     auto graph = make_linear_graph();
     DagMutationPlan plan{
@@ -260,6 +299,43 @@ void check_duplicate_addition_is_deduplicated() {
     expect(graph.active_edge_count() == 3, "duplicate planned edge was not deduplicated");
 }
 
+void check_existing_edge_deduplication_paths() {
+    {
+        auto graph = make_linear_graph();
+        graph.add_edge(0, 2, DagEdgeKind::Mutation, "effect:existing");
+        DagMutationPlan plan{
+            .plan_id = "deduplicate_existing_effect_edge",
+            .add_edges = {
+                DagAddEdgeMutation{
+                    .src = DagNodeRef::existing(0),
+                    .dst = DagNodeRef::existing(2),
+                    .kind = DagEdgeKind::Mutation,
+                    .effect_id = "effect:existing",
+                },
+            },
+        };
+        const auto result = markov::trace_graph::core::apply_dag_mutation_plan(graph, plan);
+        expect(result.journal.records.empty(), "existing provenance edge was added twice");
+        expect(graph.active_edge_count() == 3, "existing provenance edge deduplication changed edge count");
+    }
+    {
+        auto graph = make_linear_graph();
+        DagMutationPlan plan{
+            .plan_id = "deduplicate_existing_plain_edge",
+            .add_edges = {
+                DagAddEdgeMutation{
+                    .src = DagNodeRef::existing(0),
+                    .dst = DagNodeRef::existing(1),
+                    .kind = DagEdgeKind::Sequential,
+                },
+            },
+        };
+        const auto result = markov::trace_graph::core::apply_dag_mutation_plan(graph, plan);
+        expect(result.journal.records.empty(), "existing edge without provenance was added twice");
+        expect(graph.active_edge_count() == 2, "plain-edge fallback deduplication changed edge count");
+    }
+}
+
 void check_lazy_argument_merge() {
     auto target_buffer = std::make_shared<const std::string>(R"({"shared":"target","target_only":1})");
     auto source_buffer = std::make_shared<const std::string>(R"({"shared":"source","nested":{"value":7}})");
@@ -300,9 +376,11 @@ int main() {
     check_collapse_and_replace();
     check_invalid_and_cycle_reports();
     check_incident_edge_journal();
+    check_duration_update_preserves_boundary();
     check_addition_to_disabled_node_is_atomic();
     check_conflicting_redirects_are_atomic();
     check_duplicate_addition_is_deduplicated();
+    check_existing_edge_deduplication_paths();
     check_lazy_argument_merge();
     return 0;
 }

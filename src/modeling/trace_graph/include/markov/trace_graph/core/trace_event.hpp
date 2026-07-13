@@ -30,6 +30,9 @@ struct TraceArgHash {
 
 using TraceArgMap = std::unordered_map<std::string, std::string, TraceArgHash, std::equal_to<>>;
 
+/** @brief Physical manifest channel that supplied one trace event. */
+enum class TraceSourceChannel : std::uint8_t { Unknown, Torch, LdPreload, PythonProbe, Synthetic };
+
 /**
  * @brief Unified event representation used throughout the C++ backend.
  *
@@ -46,6 +49,9 @@ struct TraceEvent {
 
     /** @brief Stable input order, retained as the final same-timestamp tie breaker. */
     size_t index = 0;
+
+    /** @brief Typed source provenance retained without allocating an argument per event. */
+    TraceSourceChannel source_channel = TraceSourceChannel::Unknown;
 
     /** @brief Optional external event ID; most duration events do not provide one. */
     std::string event_id;

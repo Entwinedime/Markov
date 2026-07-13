@@ -51,6 +51,14 @@ struct DagRedirectEdgeMutation {
     std::string reason{};
 };
 
+/** @brief Replaces one active node's execution duration while retaining its identity and CPU gap. */
+struct DagSetNodeDurationMutation {
+    size_t node_id = 0;
+    uint64_t duration = 0;
+    std::string effect_id{};
+    std::string reason{};
+};
+
 /**
  * @brief A set of mutations that is validated as one prospective graph before apply.
  *
@@ -62,6 +70,7 @@ struct DagMutationPlan {
     std::string plan_id{};
     std::string effect_id{};
     std::string reason{};
+    std::vector<DagSetNodeDurationMutation> set_node_durations{};
     std::vector<size_t> disable_nodes{};
     std::vector<size_t> disable_edges{};
     std::vector<DagSyntheticNodeMutation> synthetic_nodes{};
@@ -72,7 +81,7 @@ struct DagMutationPlan {
 };
 
 /** @brief Action kinds emitted to the applied-mutation journal. */
-enum class DagMutationAction : std::uint8_t { DisableNode, DisableEdge, AddSyntheticNode, AddEdge, RedirectEdge };
+enum class DagMutationAction : std::uint8_t { SetNodeDuration, DisableNode, DisableEdge, AddSyntheticNode, AddEdge, RedirectEdge };
 
 /** @brief One mutation that materially changed graph storage or activity. */
 struct DagMutationRecord {
@@ -84,6 +93,8 @@ struct DagMutationRecord {
     std::optional<size_t> replaced_edge_index = std::nullopt;
     std::optional<size_t> src = std::nullopt;
     std::optional<size_t> dst = std::nullopt;
+    std::optional<uint64_t> old_duration = std::nullopt;
+    std::optional<uint64_t> new_duration = std::nullopt;
 };
 
 /** @brief Active graph counts and concrete actions before and after plan application. */

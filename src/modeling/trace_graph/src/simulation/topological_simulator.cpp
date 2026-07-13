@@ -18,7 +18,6 @@ namespace markov::trace_graph::simulation {
 namespace topological_simulator_detail {
 
 constexpr size_t kInvalidNode = std::numeric_limits<size_t>::max();
-constexpr uint64_t kMaxPlausibleCpuGapUs = 1'000'000'000;
 
 struct DfsFrame {
     size_t node_id = kInvalidNode;
@@ -28,7 +27,7 @@ struct DfsFrame {
 struct CsrAdjacency {
     std::vector<size_t> offsets;
     std::vector<size_t> destinations;
-    std::vector<uint8_t> applies_cpu_gap;
+    std::vector<core::DagEdgeKind> edge_kinds;
 };
 
 class CycleFinder {
@@ -134,13 +133,13 @@ ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph) {
 
     for (size_t node_id = 0; node_id < node_count; ++node_id) storage.outgoing.offsets[node_id + 1] += storage.outgoing.offsets[node_id];
     storage.outgoing.destinations.resize(storage.active_edge_count);
-    storage.outgoing.applies_cpu_gap.resize(storage.active_edge_count, 0);
+    storage.outgoing.edge_kinds.resize(storage.active_edge_count, core::DagEdgeKind::Sequential);
     auto cursor = storage.outgoing.offsets;
     for (const auto & edge : graph.edges()) {
         if (!edge.active) continue;
         const auto offset = cursor[edge.src]++;
         storage.outgoing.destinations[offset] = edge.dst;
-        storage.outgoing.applies_cpu_gap[offset] = edge.kind == core::DagEdgeKind::Sequential && nodes[edge.src].is_cpu;
+        storage.outgoing.edge_kinds[offset] = edge.kind;
     }
     return storage;
 }
@@ -187,8 +186,7 @@ private:
 
     void propagate_edge(const core::DagNode & source, size_t offset) {
         const auto dst = storage_.outgoing.destinations[offset];
-        const auto raw_delay = storage_.outgoing.applies_cpu_gap[offset] ? source.cpu_gap_after : 0;
-        const auto delay = raw_delay <= kMaxPlausibleCpuGapUs ? raw_delay : 0;
+        const auto delay = topological_edge_delay_us(source, storage_.outgoing.edge_kinds[offset]);
         start_time_[dst] = std::max(start_time_[dst], checked_add(source.completion_time, delay, "DAG simulation edge-delay overflow"));
         storage_.indegree[dst]--;
         if (storage_.indegree[dst] == 0) ready_.push_back(dst);

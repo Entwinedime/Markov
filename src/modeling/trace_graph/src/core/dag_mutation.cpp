@@ -5,6 +5,7 @@
 #include "markov/trace_graph/core/dag_mutation.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <queue>
 #include <ranges>
@@ -12,6 +13,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -42,6 +44,52 @@ struct ProspectiveGraph {
     std::unordered_map<std::string, size_t> synthetic_node_ids;
     std::vector<DagTopologyIssue> plan_issues;
 };
+
+/** @brief Identity of one provenance-bearing edge tracked during a mutation. */
+struct EffectEdgeKey {
+    size_t src = 0;
+    size_t dst = 0;
+    DagEdgeKind kind = DagEdgeKind::Mutation;
+    std::string effect_id;
+
+    bool operator==(const EffectEdgeKey &) const = default;
+};
+
+/** @brief Hashes the narrow edge set that can collide with model-created edges. */
+struct EffectEdgeKeyHash {
+    size_t operator()(const EffectEdgeKey & key) const noexcept {
+        auto combine = [](size_t seed, size_t value) { return seed ^ (value + static_cast<size_t>(0x9e37'79b9'7f4a'7c15ULL) + (seed << 6U) + (seed >> 2U)); };
+        size_t value = std::hash<size_t>{}(key.src);
+        value = combine(value, std::hash<size_t>{}(key.dst));
+        value = combine(value, std::hash<unsigned int>{}(static_cast<unsigned int>(key.kind)));
+        return combine(value, std::hash<std::string>{}(key.effect_id));
+    }
+};
+
+using EffectEdgeCounts = std::unordered_map<EffectEdgeKey, size_t, EffectEdgeKeyHash>;
+
+EffectEdgeKey effect_edge_key(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
+    return EffectEdgeKey{
+        .src = src,
+        .dst = dst,
+        .kind = kind,
+        .effect_id = std::string(effect_id),
+    };
+}
+
+void increment_effect_edge(EffectEdgeCounts & counts, size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
+    if (effect_id.empty()) return;
+    ++counts[effect_edge_key(src, dst, kind, effect_id)];
+}
+
+void decrement_effect_edge(EffectEdgeCounts & counts, size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
+    if (effect_id.empty()) return;
+    const auto key = effect_edge_key(src, dst, kind, effect_id);
+    const auto found = counts.find(key);
+    if (found == counts.end()) return;
+    if (found->second <= 1) counts.erase(found);
+    else --found->second;
+}
 
 void add_issue(std::vector<DagTopologyIssue> & issues, std::string code, std::string message, std::vector<size_t> node_ids = {},
                std::vector<size_t> edge_indices = {}) {
@@ -79,11 +127,6 @@ bool same_edge(const VirtualEdge & lhs, const VirtualEdge & rhs) {
     return lhs.active && rhs.active && lhs.src == rhs.src && lhs.dst == rhs.dst && lhs.kind == rhs.kind && lhs.effect_id == rhs.effect_id;
 }
 
-void append_edge_if_unique(ProspectiveGraph & graph, VirtualEdge edge) {
-    if (std::ranges::any_of(graph.edges, [&](const auto & existing) { return same_edge(existing, edge); })) return;
-    graph.edges.push_back(std::move(edge));
-}
-
 class ProspectiveGraphBuilder {
 public:
     ProspectiveGraphBuilder(const DagGraph & graph, const DagMutationPlan & plan) : graph_(graph), plan_(plan) {
@@ -93,6 +136,7 @@ public:
     [[nodiscard]] ProspectiveGraph run() {
         copy_active_graph();
         register_synthetic_nodes();
+        validate_duration_updates();
         apply_node_disables();
         apply_edge_disables();
         apply_redirects();
@@ -104,6 +148,7 @@ public:
 private:
     void copy_active_graph() {
         if (plan_.plan_id.empty()) add_issue(prospective_.plan_issues, "empty_plan_id", "non-empty DAG mutation plan requires a plan id");
+        active_effect_edges_.reserve(plan_.redirect_edges.size() + plan_.add_edges.size());
         prospective_.active_nodes.reserve(graph_.node_count() + plan_.synthetic_nodes.size());
         for (const auto & node : graph_.nodes()) prospective_.active_nodes.push_back(node.active);
         prospective_.edges.reserve(graph_.edge_count() + plan_.add_edges.size() + plan_.redirect_edges.size());
@@ -117,7 +162,27 @@ private:
                 .effect_id = std::string(edge.effect_id()),
                 .source_edge_index = edge_index,
             });
+            if (edge.active) increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
         }
+    }
+
+    void deactivate_edge(size_t edge_index) {
+        auto & edge = prospective_.edges[edge_index];
+        if (!edge.active) return;
+        decrement_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id);
+        edge.active = false;
+    }
+
+    void append_edge_if_unique(VirtualEdge edge) {
+        if (!edge.effect_id.empty()) {
+            const auto key = effect_edge_key(edge.src, edge.dst, edge.kind, edge.effect_id);
+            if (active_effect_edges_.contains(key)) return;
+            increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id);
+            prospective_.edges.push_back(std::move(edge));
+            return;
+        }
+        if (std::ranges::any_of(prospective_.edges, [&](const auto & existing) { return same_edge(existing, edge); })) return;
+        prospective_.edges.push_back(std::move(edge));
     }
 
     void register_synthetic_nodes() {
@@ -132,6 +197,31 @@ private:
                 add_issue(prospective_.plan_issues, "duplicate_synthetic_id", "synthetic node id is duplicated: " + mutation.synthetic_id);
             }
             prospective_.active_nodes.push_back(true);
+        }
+    }
+
+    void validate_duration_updates() {
+        std::unordered_set<size_t> seen;
+        seen.reserve(plan_.set_node_durations.size());
+        const std::unordered_set<size_t> disabled_nodes(plan_.disable_nodes.begin(), plan_.disable_nodes.end());
+        for (const auto & mutation : plan_.set_node_durations) {
+            if (!seen.insert(mutation.node_id).second) {
+                add_issue(prospective_.plan_issues, "duplicate_node_duration_update", "node duration update is duplicated", { mutation.node_id });
+                continue;
+            }
+            if (mutation.node_id >= graph_.node_count()) {
+                add_issue(prospective_.plan_issues, "invalid_node_duration_update", "node duration update is out of range", { mutation.node_id });
+                continue;
+            }
+            if (!graph_.node(mutation.node_id).active) {
+                add_issue(prospective_.plan_issues, "inactive_node_duration_update", "node duration update targets an inactive node", { mutation.node_id });
+            }
+            if (disabled_nodes.contains(mutation.node_id)) {
+                add_issue(prospective_.plan_issues,
+                          "duration_disable_conflict",
+                          "one node cannot receive a duration update and be disabled by the same plan",
+                          { mutation.node_id });
+            }
         }
     }
 
@@ -161,7 +251,7 @@ private:
                 add_issue(prospective_.plan_issues, "invalid_disable_edge", "disabled edge index is out of range", {}, { edge_index });
                 continue;
             }
-            prospective_.edges[edge_index].active = false;
+            deactivate_edge(edge_index);
         }
     }
 
@@ -200,18 +290,17 @@ private:
                 add_issue(prospective_.plan_issues, "redirect_inactive_edge", "redirected edge is already inactive", {}, { redirect.edge_index });
                 continue;
             }
-            prospective_.edges[redirect.edge_index].active = false;
+            deactivate_edge(redirect.edge_index);
             const auto src = redirect.src ? resolve_node_ref(*redirect.src, prospective_, prospective_.plan_issues) : std::optional<size_t>{ original.src };
             const auto dst = redirect.dst ? resolve_node_ref(*redirect.dst, prospective_, prospective_.plan_issues) : std::optional<size_t>{ original.dst };
             if (!src || !dst) continue;
-            append_edge_if_unique(prospective_,
-                                  VirtualEdge{
-                                      .src = *src,
-                                      .dst = *dst,
-                                      .kind = original.kind,
-                                      .added_after_node_disable = true,
-                                      .effect_id = redirect_effect_id(redirect, original),
-                                  });
+            append_edge_if_unique(VirtualEdge{
+                .src = *src,
+                .dst = *dst,
+                .kind = original.kind,
+                .added_after_node_disable = true,
+                .effect_id = redirect_effect_id(redirect, original),
+            });
         }
     }
 
@@ -220,28 +309,29 @@ private:
             const auto src = resolve_node_ref(addition.src, prospective_, prospective_.plan_issues);
             const auto dst = resolve_node_ref(addition.dst, prospective_, prospective_.plan_issues);
             if (!src || !dst) continue;
-            append_edge_if_unique(prospective_,
-                                  VirtualEdge{
-                                      .src = *src,
-                                      .dst = *dst,
-                                      .kind = addition.kind,
-                                      .added_after_node_disable = true,
-                                      .effect_id = addition.effect_id.empty() ? plan_.effect_id : addition.effect_id,
-                                  });
+            append_edge_if_unique(VirtualEdge{
+                .src = *src,
+                .dst = *dst,
+                .kind = addition.kind,
+                .added_after_node_disable = true,
+                .effect_id = addition.effect_id.empty() ? plan_.effect_id : addition.effect_id,
+            });
         }
     }
 
     void deactivate_original_edges_incident_to_disabled_nodes() {
-        for (auto & edge : prospective_.edges) {
+        for (size_t edge_index = 0; edge_index < prospective_.edges.size(); ++edge_index) {
+            const auto & edge = prospective_.edges[edge_index];
             if (!edge.active || edge.added_after_node_disable) continue;
             if (edge.src >= prospective_.active_nodes.size() || edge.dst >= prospective_.active_nodes.size()) continue;
-            if (!prospective_.active_nodes[edge.src] || !prospective_.active_nodes[edge.dst]) edge.active = false;
+            if (!prospective_.active_nodes[edge.src] || !prospective_.active_nodes[edge.dst]) deactivate_edge(edge_index);
         }
     }
 
     const DagGraph & graph_;
     const DagMutationPlan & plan_;
     ProspectiveGraph prospective_;
+    EffectEdgeCounts active_effect_edges_;
     std::unordered_set<size_t> disabled_edge_indices_;
 };
 
@@ -456,10 +546,15 @@ public:
         result_.journal.plan_id = plan.plan_id;
         result_.journal.active_nodes_before = graph.active_node_count();
         result_.journal.active_edges_before = graph.active_edge_count();
+        active_effect_edges_.reserve(plan.redirect_edges.size() + plan.add_edges.size());
+        for (const auto & edge : graph.edges()) {
+            if (edge.active) increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
+        }
     }
 
     [[nodiscard]] DagMutationResult run() {
         add_synthetic_nodes();
+        set_node_durations();
         disable_explicit_edges();
         redirect_edges();
         disable_nodes_and_incident_edges();
@@ -470,6 +565,25 @@ public:
     }
 
 private:
+    void disable_tracked_edge(size_t edge_index) {
+        const auto & edge = graph_.edge(edge_index);
+        if (!edge.active) return;
+        decrement_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
+        graph_.disable_edge(edge_index);
+    }
+
+    [[nodiscard]] std::optional<size_t> add_tracked_edge(size_t src, size_t dst, DagEdgeKind kind, const std::string & effect_id, const std::string & reason) {
+        if (!effect_id.empty()) {
+            const auto key = effect_edge_key(src, dst, kind, effect_id);
+            if (active_effect_edges_.contains(key)) return std::nullopt;
+        }
+        else if (graph_.has_active_edge(src, dst, kind, effect_id)) return std::nullopt;
+
+        const auto edge_index = graph_.add_edge(src, dst, kind, effect_id, reason);
+        increment_effect_edge(active_effect_edges_, src, dst, kind, effect_id);
+        return edge_index;
+    }
+
     void add_synthetic_nodes() {
         for (const auto & mutation : plan_.synthetic_nodes) {
             auto spec = mutation.node;
@@ -490,10 +604,26 @@ private:
         }
     }
 
+    void set_node_durations() {
+        for (const auto & mutation : plan_.set_node_durations) {
+            const auto old_duration = graph_.node(mutation.node_id).duration;
+            if (old_duration == mutation.duration) continue;
+            graph_.set_node_duration(mutation.node_id, mutation.duration);
+            result_.journal.records.push_back(DagMutationRecord{
+                .action = DagMutationAction::SetNodeDuration,
+                .effect_id = effective_value(mutation.effect_id, plan_.effect_id),
+                .reason = effective_value(mutation.reason, plan_.reason),
+                .node_id = mutation.node_id,
+                .old_duration = old_duration,
+                .new_duration = mutation.duration,
+            });
+        }
+    }
+
     void disable_explicit_edges() {
         for (const auto edge_index : plan_.disable_edges) {
             const auto was_active = graph_.edge(edge_index).active;
-            graph_.disable_edge(edge_index);
+            disable_tracked_edge(edge_index);
             if (!was_active) continue;
             result_.journal.records.push_back(DagMutationRecord{
                 .action = DagMutationAction::DisableEdge,
@@ -508,13 +638,12 @@ private:
     void redirect_edges() {
         for (const auto & redirect : plan_.redirect_edges) {
             const auto original = graph_.edge(redirect.edge_index);
-            graph_.disable_edge(redirect.edge_index);
+            disable_tracked_edge(redirect.edge_index);
             const auto src = redirect.src ? resolve_applied_ref(*redirect.src, result_.synthetic_node_ids) : original.src;
             const auto dst = redirect.dst ? resolve_applied_ref(*redirect.dst, result_.synthetic_node_ids) : original.dst;
             const auto effect_id = effective_value(redirect.effect_id, effective_value(original.effect_id(), plan_.effect_id));
             const auto reason = effective_value(redirect.reason, plan_.reason);
-            std::optional<size_t> new_edge_index;
-            if (!graph_.has_active_edge(src, dst, original.kind, effect_id)) { new_edge_index = graph_.add_edge(src, dst, original.kind, effect_id, reason); }
+            const auto new_edge_index = add_tracked_edge(src, dst, original.kind, effect_id, reason);
             result_.journal.records.push_back(DagMutationRecord{
                 .action = DagMutationAction::RedirectEdge,
                 .effect_id = effect_id,
@@ -551,7 +680,7 @@ private:
     void disable_incident_edge(size_t edge_index) {
         const auto & edge = graph_.edge(edge_index);
         if (!edge.active || (!nodes_disabled_by_plan_[edge.src] && !nodes_disabled_by_plan_[edge.dst])) return;
-        graph_.disable_edge(edge_index);
+        disable_tracked_edge(edge_index);
         result_.journal.records.push_back(DagMutationRecord{
             .action = DagMutationAction::DisableEdge,
             .effect_id = plan_.effect_id,
@@ -567,14 +696,14 @@ private:
             const auto dst = resolve_applied_ref(addition.dst, result_.synthetic_node_ids);
             const auto effect_id = effective_value(addition.effect_id, plan_.effect_id);
             const auto reason = effective_value(addition.reason, plan_.reason);
-            if (graph_.has_active_edge(src, dst, addition.kind, effect_id)) continue;
-            const auto edge_index = graph_.add_edge(src, dst, addition.kind, effect_id, reason);
+            const auto edge_index = add_tracked_edge(src, dst, addition.kind, effect_id, reason);
+            if (!edge_index) continue;
             result_.journal.records.push_back(DagMutationRecord{
                 .action = DagMutationAction::AddEdge,
                 .effect_id = effect_id,
                 .reason = reason,
                 .node_id = std::nullopt,
-                .edge_index = edge_index,
+                .edge_index = *edge_index,
                 .src = src,
                 .dst = dst,
             });
@@ -585,6 +714,7 @@ private:
     const DagMutationPlan & plan_;
     DagMutationResult result_;
     std::vector<bool> nodes_disabled_by_plan_;
+    EffectEdgeCounts active_effect_edges_;
 };
 
 DagMutationResult empty_mutation_result(const DagGraph & graph, const DagMutationPlan & plan) {
@@ -610,7 +740,8 @@ DagNodeRef DagNodeRef::existing(size_t node_id) { return DagNodeRef{ .existing_n
 DagNodeRef DagNodeRef::synthetic(std::string synthetic_id) { return DagNodeRef{ .existing_node_id = std::nullopt, .synthetic_id = std::move(synthetic_id) }; }
 
 bool DagMutationPlan::empty() const {
-    return disable_nodes.empty() && disable_edges.empty() && synthetic_nodes.empty() && add_edges.empty() && redirect_edges.empty();
+    return set_node_durations.empty() && disable_nodes.empty() && disable_edges.empty() && synthetic_nodes.empty() && add_edges.empty()
+           && redirect_edges.empty();
 }
 
 DagMutationValidationError::DagMutationValidationError(const std::string & message, DagTopologyValidationReport report)
@@ -619,6 +750,8 @@ DagMutationValidationError::DagMutationValidationError(const std::string & messa
 
 std::string dag_mutation_action_name(DagMutationAction action) {
     switch (action) {
+    case DagMutationAction::SetNodeDuration:
+        return "set_node_duration";
     case DagMutationAction::DisableNode:
         return "disable_node";
     case DagMutationAction::DisableEdge:

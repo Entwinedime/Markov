@@ -247,6 +247,15 @@ public:
     /** @brief Stores reader records before normalization and filtering. */
     void set_parsed_record_count(size_t value) { parsed_record_count_ = value; }
 
+    /** @brief Replaces the sorted manifest-declared consumer contracts for this graph. */
+    void set_input_contracts(std::vector<std::string> contracts);
+
+    /** @brief Returns whether the profile manifest enabled one named input contract. */
+    [[nodiscard]] bool has_input_contract(std::string_view contract) const;
+
+    /** @brief Returns the compact sorted manifest contract set. */
+    [[nodiscard]] const std::vector<std::string> & input_contracts() const { return input_contracts_; }
+
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
     [[nodiscard]] uint64_t real_e2e_time() const { return real_e2e_time_; }
@@ -304,6 +313,9 @@ private:
 
     /** @brief Reader record count retained across normalization for run summaries. */
     size_t parsed_record_count_ = 0;
+
+    /** @brief Small manifest-level contract set; never stores event or fact rows. */
+    std::vector<std::string> input_contracts_;
 };
 
 } // namespace markov::trace_graph::core

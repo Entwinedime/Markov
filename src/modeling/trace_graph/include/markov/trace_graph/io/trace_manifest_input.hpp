@@ -5,6 +5,9 @@
 #pragma once
 
 #include "markov/trace_graph/core/trace_event.hpp"
+#ifdef DEBUG
+#include "markov/trace_graph/io/chrome_trace_io.hpp"
+#endif
 
 #include <cstddef>
 #include <string>
@@ -42,6 +45,10 @@ struct ManifestTraceInputOptions {
 /** @brief One logical input after selected channels have been joined in memory. */
 struct ManifestTraceInput {
     std::vector<core::TraceEvent> events;
+    std::vector<std::string> input_contracts;
+#ifdef DEBUG
+    std::vector<TraceReadTimings> trace_read_timings;
+#endif
 };
 
 /**

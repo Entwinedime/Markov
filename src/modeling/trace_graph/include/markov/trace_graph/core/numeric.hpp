@@ -39,6 +39,25 @@ namespace markov::trace_graph::core {
     return left * right;
 }
 
+/** @brief Computes `ceil(value * multiplier / divisor)` without intermediate overflow. */
+[[nodiscard]] inline std::optional<uint64_t> ceil_multiply_divide_u64(uint64_t value, uint64_t multiplier, uint64_t divisor) {
+    if (divisor == 0) return std::nullopt;
+    using WideUnsigned = unsigned __int128;
+    const auto numerator = static_cast<WideUnsigned>(value) * static_cast<WideUnsigned>(multiplier);
+    const auto result = (numerator + static_cast<WideUnsigned>(divisor) - 1) / static_cast<WideUnsigned>(divisor);
+    if (result > std::numeric_limits<uint64_t>::max()) return std::nullopt;
+    return static_cast<uint64_t>(result);
+}
+
+/** @brief Computes `floor(value * multiplier / divisor)` without intermediate overflow. */
+[[nodiscard]] inline std::optional<uint64_t> floor_multiply_divide_u64(uint64_t value, uint64_t multiplier, uint64_t divisor) {
+    if (divisor == 0) return std::nullopt;
+    using WideUnsigned = unsigned __int128;
+    const auto result = static_cast<WideUnsigned>(value) * static_cast<WideUnsigned>(multiplier) / static_cast<WideUnsigned>(divisor);
+    if (result > std::numeric_limits<uint64_t>::max()) return std::nullopt;
+    return static_cast<uint64_t>(result);
+}
+
 /** @brief Removes ASCII whitespace without allocating a temporary string. */
 [[nodiscard]] inline std::string_view trim_ascii(std::string_view value) {
     while (!value.empty() && static_cast<unsigned char>(value.front()) <= ' ') value.remove_prefix(1);
