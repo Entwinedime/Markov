@@ -42,11 +42,11 @@ bool HiCacheState::commit_device_eviction_writeback(const HiCacheFact & fact, Hi
     scope.async_ops.insert_writeback(HiCacheWritebackOperation{
         .header = make_operation_header(HiCacheOperationKind::Writeback,
                                         writeback_id,
+                                        fact,
                                         normalized_scope(fact),
                                         scoped_request_key(fact),
                                         writeback_owner,
                                         pages,
-                                        fact.ts,
                                         0),
     });
     auto ref = scope.refs.acquire_lock(scope.tree, writeback_owner, "writeback", scoped_request_key(fact), writeback_id, std::vector<HiCacheNodeId>{ node_id });

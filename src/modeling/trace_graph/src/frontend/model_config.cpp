@@ -45,6 +45,14 @@ std::string lower(std::string s) {
 
 bool is_allowed_policy(const std::string & value, std::initializer_list<const char *> allowed) { return std::ranges::find(allowed, value) != allowed.end(); }
 
+void require_known_fields(const Json & object, const std::string & context, std::initializer_list<const char *> allowed) {
+    for (const auto & [name, value] : object.items()) {
+        (void)value;
+        const bool known = std::ranges::any_of(allowed, [&](const char * field) { return name == field; });
+        if (!known) throw std::runtime_error("Unknown model config field '" + context + "." + name + "'");
+    }
+}
+
 std::string string_value(const Json & object, const std::string & key, const std::string & def) {
     if (!object.is_object()) return def;
     auto it = object.find(key);
@@ -96,6 +104,54 @@ bool bool_value(const Json & object, const std::string & key, bool def) {
         if (text == "false" || text == "0" || text == "no") return false;
     }
     throw std::runtime_error("Model config field '" + key + "' must be a boolean");
+}
+
+std::map<std::string, std::string> string_map_value(const Json & object, const std::string & key) {
+    if (!object.is_object()) return {};
+    const auto it = object.find(key);
+    if (it == object.end() || it->is_null()) return {};
+    if (!it->is_object()) throw std::runtime_error("Model config field '" + key + "' must be an object");
+    std::map<std::string, std::string> values;
+    for (const auto & [name, value] : it->items()) {
+        if (!value.is_string()) throw std::runtime_error("Model config field '" + key + "." + name + "' must be a string");
+        values.emplace(name, value.get<std::string>());
+    }
+    return values;
+}
+
+HiCacheIoCostConfig parse_hicache_io_cost(const Json & object) {
+    HiCacheIoCostConfig config;
+    const auto it = object.find("io_cost");
+    if (it == object.end() || it->is_null()) return config;
+    if (!it->is_object()) throw std::runtime_error("Model config field 'hicache.io_cost' must be an object");
+    require_known_fields(*it,
+                         "hicache.io_cost",
+                         { "model_id",
+                           "model_digest",
+                           "calibration_status",
+                           "resource_model",
+                           "device_host_bandwidth_bytes_per_sec",
+                           "host_storage_bandwidth_bytes_per_sec",
+                           "provenance" });
+    if (const auto provenance = it->find("provenance"); provenance != it->end() && !provenance->is_null()) {
+        if (!provenance->is_object()) throw std::runtime_error("Model config field 'hicache.io_cost.provenance' must be an object");
+        require_known_fields(*provenance, "hicache.io_cost.provenance", { "kv_geometry", "device_host_bandwidth", "host_storage_bandwidth" });
+    }
+
+    config.model_id = string_value(*it, "model_id", "");
+    config.model_digest = string_value(*it, "model_digest", "");
+    config.calibration_status = lower(string_value(*it, "calibration_status", ""));
+    config.resource_model = string_value(*it, "resource_model", "");
+    config.device_host_bandwidth_bytes_per_sec = u64_value(*it, "device_host_bandwidth_bytes_per_sec", 0);
+    config.host_storage_bandwidth_bytes_per_sec = u64_value(*it, "host_storage_bandwidth_bytes_per_sec", 0);
+    config.provenance = string_map_value(*it, "provenance");
+    if (!config.resource_model.empty() && config.resource_model != "scope_local_directional_device_host_shared_host_storage_v1") {
+        throw std::runtime_error("Unsupported hicache.io_cost.resource_model: " + config.resource_model);
+    }
+    if (!config.calibration_status.empty() && !is_allowed_policy(config.calibration_status, { "contract_only", "calibrated" })) {
+        throw std::runtime_error("Invalid hicache.io_cost.calibration_status: " + config.calibration_status);
+    }
+    return config;
 }
 
 NodeScaleConfig parse_node_scale(const Json & root) {
@@ -164,6 +220,7 @@ HiCacheConfig parse_hicache(const Json & root) {
     }
     const auto disaggregation_mode = lower(string_value(object, "disaggregation_mode", ""));
     config.device_allocator_need_sort = bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
+    config.io_cost = parse_hicache_io_cost(object);
 #ifdef DEBUG
     config.emit_state_digests = bool_value(object, "emit_state_digests", false);
 #endif

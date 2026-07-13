@@ -142,11 +142,7 @@ HiCacheTokenSpan token_span_from_json(const Json & value) {
     return span;
 }
 
-struct FactMetadata {
-    std::string fact_class;
-    std::string role;
-    std::vector<std::string> consumers;
-};
+using FactMetadata = HiCacheFactMetadata;
 
 /**
  * @brief Parses the fact metadata written by the probe catalog.
@@ -304,7 +300,17 @@ using fact_detail::token_path_from_json;
 using fact_detail::token_span_from_json;
 using fact_detail::validate_batch_positions;
 
+HiCacheFactMetadata parse_hicache_fact_metadata(const TraceEvent & event) { return fact_metadata_from_event(event); }
+
+uint64_t hicache_fact_boundary_timestamp(const TraceEvent & event) {
+    if (event.arg("phase") != "end") return event.ts;
+    return core::checked_add_u64(event.ts, event.dur, "HiCache end-fact timestamp exceeds uint64 range");
+}
+
+HiCacheTokenSpan parse_hicache_token_span_arg(const TraceEvent & event, std::string_view key) { return token_span_from_json(parse_json_arg(event.arg(key))); }
+
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
+    if (event.source_channel != core::TraceSourceChannel::PythonProbe) return false;
     if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) return true;
 
     const auto raw = event.args_json_view();
@@ -420,7 +426,7 @@ HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) c
     const auto metadata = fact_metadata_from_event(event);
     fact.source_node_id = node_id;
     fact.source_event_index = event.index;
-    fact.ts = event.ts;
+    fact.ts = hicache_fact_boundary_timestamp(event);
     fact.dur = event.dur;
     fact.event_name = event.name;
     fact.target_id = event.arg("target_id");

@@ -4,11 +4,11 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
 #ifdef DEBUG
-#include <cstddef>
 #include <vector>
 #endif
 
@@ -51,6 +51,10 @@ public:
     /** @brief Records a target-finalize boundary and returns its causal epoch. */
     [[nodiscard]] uint64_t record_target_finalize_boundary(const std::string & cache_scope, uint64_t ts);
 
+    /** @brief Records one canonical fact boundary consumed by a target async operation. */
+    [[nodiscard]] uint64_t record_fact_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
+                                                size_t source_event_index, uint64_t ts);
+
 #ifdef DEBUG
     /** @brief Returns all modeled control boundaries. */
     [[nodiscard]] const std::vector<HiCacheControlBoundary> & boundaries() const { return boundaries_; }
@@ -68,7 +72,8 @@ private:
     std::vector<HiCacheControlBoundary> boundaries_;
 #endif
 
-    [[nodiscard]] uint64_t record_boundary(const std::string & cache_scope, uint64_t ts);
+    [[nodiscard]] uint64_t record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
+                                           const std::string & source, size_t source_event_index, uint64_t ts, bool terminal);
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

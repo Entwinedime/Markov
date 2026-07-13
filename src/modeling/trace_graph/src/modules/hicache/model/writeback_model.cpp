@@ -23,6 +23,20 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiC
 
     auto pending = std::exchange(scope.pending_write_through_backups, {});
     for (const auto & backup : pending) {
+        const bool source_available = fact.event_name != "hicache_finalize";
+        const auto consumer_epoch = source_available ? scope.clock.record_fact_boundary(normalized_scope(fact),
+                                                                                        scoped_request_key(fact),
+                                                                                        "write_through_capacity_consumer",
+                                                                                        fact.source_event_index,
+                                                                                        fact.ts)
+                                                     : scope.clock.record_target_finalize_boundary(normalized_scope(fact), fact.ts);
+        scope.async_ops.set_storage_consumer_boundary(backup.storage_operation_id,
+                                                      consumer_epoch,
+                                                      fact.ts,
+                                                      fact.source_node_id,
+                                                      fact.source_event_index,
+                                                      fact.role,
+                                                      source_available);
         const auto before = debug_state_digest();
         const auto ref = scope.refs.release_owner(scope.tree, backup.owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, reason);
@@ -70,13 +84,16 @@ bool HiCacheState::reserve_host_backup_capacity(const HiCacheFact & fact, HiCach
 }
 
 std::string HiCacheState::begin_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                               HiCacheNodeId node_id, const std::vector<std::string> & pages) {
+                                               HiCacheNodeId node_id, const std::vector<std::string> & pages,
+                                               const std::vector<std::string> & device_to_host_pages) {
     const auto storage_id = scope.clock.next_operation_id("storage");
     const auto request_key = scoped_request_key(fact);
     const auto storage_owner = request_key + ":storage:" + storage_id;
     const auto before_enqueue = debug_state_digest();
     scope.async_ops.insert_storage(HiCacheStorageOperation{
-        .header = make_operation_header(HiCacheOperationKind::Storage, storage_id, normalized_scope(fact), request_key, storage_owner, pages, fact.ts, 0),
+        .header = make_operation_header(HiCacheOperationKind::Storage, storage_id, fact, normalized_scope(fact), request_key, storage_owner, pages, 0),
+        .device_to_host_pages = device_to_host_pages,
+        .capacity_gate_pages = {},
     });
     const auto ref = scope.refs.acquire_host(scope.tree, storage_owner, "storage", request_key, storage_id, std::vector<HiCacheNodeId>{ node_id });
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_acquire");
@@ -86,7 +103,8 @@ std::string HiCacheState::begin_storage_backup(const HiCacheFact & fact, HiCache
 }
 
 void HiCacheState::materialize_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                           HiCacheNodeId node_id, const std::vector<std::string> & pages, bool storage_readable) {
+                                           HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_id,
+                                           bool storage_readable) {
     const auto before = debug_state_digest();
     scope.tree.mark_host_visible(node_id, storage_readable);
     scope.tree.clear_dirty(node_id);
@@ -108,7 +126,10 @@ void HiCacheState::materialize_host_backup(const HiCacheFact & fact, HiCacheSumm
                           pages,
                           before);
     }
-    if (storage_readable && policy_.write_count_enabled()) hold_write_through_backup_ref(fact, summary, transitions, scope, node_id, pages);
+    if (storage_readable && policy_.write_count_enabled()) {
+        scope.async_ops.set_storage_capacity_gate_pages(storage_id, pages);
+        hold_write_through_backup_ref(fact, summary, transitions, scope, node_id, pages, storage_id);
+    }
 }
 
 void HiCacheState::complete_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
@@ -137,8 +158,10 @@ bool HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary &
     if (pages.empty()) return false;
     const auto host_allocation_pages = !(node->residency.host_present && node->residency.host_visible) ? static_cast<uint64_t>(pages.size()) : uint64_t{ 0 };
     if (!reserve_host_backup_capacity(fact, summary, transitions, scope, pages, host_allocation_pages)) return false;
-    const auto storage_id = storage_readable ? begin_storage_backup(fact, summary, transitions, scope, node_id, pages) : std::string{};
-    materialize_host_backup(fact, summary, transitions, scope, node_id, pages, storage_readable);
+    const bool device_to_host_required = node->residency.device_present && (node->residency.device_dirty || !node->residency.host_visible);
+    const auto device_to_host_pages = device_to_host_required ? pages : std::vector<std::string>{};
+    const auto storage_id = storage_readable ? begin_storage_backup(fact, summary, transitions, scope, node_id, pages, device_to_host_pages) : std::string{};
+    materialize_host_backup(fact, summary, transitions, scope, node_id, pages, storage_id, storage_readable);
     complete_storage_backup(fact, summary, transitions, scope, storage_id, pages);
     return true;
 }
@@ -150,7 +173,7 @@ bool HiCacheState::commit_host_backup(const HiCacheFact & fact, HiCacheSummary &
  * during which a backup node remains protected before SGLang `writing_check()`.
  */
 void HiCacheState::hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                                 HiCacheNodeId node_id, const std::vector<std::string> & pages) {
+                                                 HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_operation_id) {
     const auto chain = scope.tree.ancestor_node_ids(node_id);
     if (chain.empty()) return;
 
@@ -161,6 +184,7 @@ void HiCacheState::hold_write_through_backup_ref(const HiCacheFact & fact, HiCac
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "write_through_backup_ref_acquire");
     scope.pending_write_through_backups.push_back(PendingWriteThroughBackup{
         .owner = owner,
+        .storage_operation_id = storage_operation_id,
         .pages = pages,
     });
     if constexpr (debug_records_enabled())

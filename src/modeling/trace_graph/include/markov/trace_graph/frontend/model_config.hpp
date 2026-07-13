@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -26,6 +27,17 @@ struct NodeScaleRuleConfig {
 struct NodeScaleConfig {
     bool enabled = false;
     std::vector<NodeScaleRuleConfig> rules{};
+};
+
+/** @brief Explicit model identity and the only two HiCache I/O cost parameters. */
+struct HiCacheIoCostConfig {
+    std::string model_id{};
+    std::string model_digest{};
+    std::string calibration_status{};
+    std::string resource_model{};
+    uint64_t device_host_bandwidth_bytes_per_sec = 0;
+    uint64_t host_storage_bandwidth_bytes_per_sec = 0;
+    std::map<std::string, std::string> provenance{};
 };
 
 /**
@@ -50,6 +62,7 @@ struct HiCacheConfig {
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
     bool device_allocator_need_sort = false;
+    HiCacheIoCostConfig io_cost;
 #ifdef DEBUG
     bool emit_state_digests = false;
 #endif

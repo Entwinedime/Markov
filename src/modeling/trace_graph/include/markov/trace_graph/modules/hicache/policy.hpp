@@ -7,6 +7,7 @@
 #include "markov/trace_graph/frontend/model_config.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -103,13 +104,22 @@ struct HiCachePolicyDecisionRecord {
     uint64_t lifecycle_tail_pages = 0;
     uint64_t threshold_pages = 0;
     uint64_t limit_pages = 0;
+    uint64_t source_boundary_ts = 0;
+    uint64_t policy_stop_ts = 0;
+    uint64_t target_boundary_ts = 0;
+    uint64_t timeout_deadline_ts = 0;
+    uint64_t io_start_ts = 0;
+    uint64_t io_ready_ts = 0;
+    uint64_t completed_byte_count = 0;
+    bool io_completed = false;
+    bool timed_out = false;
+    bool boundary_adjusted = false;
     std::vector<std::string> pages{};
 };
 
-/** @brief Runtime boundary used to evaluate target prefetch timeout. */
-struct HiCachePrefetchTimeoutObservation {
+/** @brief Target-derived inputs used to compute the configured prefetch deadline. */
+struct HiCachePrefetchTimeoutInput {
     uint64_t enqueue_ts = 0;
-    uint64_t boundary_ts = 0;
     uint64_t token_count = 0;
 };
 
@@ -146,8 +156,8 @@ public:
     /** @brief Returns whether active prefetch pages hit the target rate limit. */
     [[nodiscard]] bool prefetch_rate_limited(uint64_t active_requested_pages) const;
 
-    /** @brief Returns whether a target boundary exceeds the configured prefetch timeout. */
-    [[nodiscard]] bool prefetch_timeout_elapsed(const HiCachePrefetchTimeoutObservation & observation) const;
+    /** @brief Returns the target timeout deadline, or no value when timeout is not configured. */
+    [[nodiscard]] std::optional<uint64_t> prefetch_timeout_deadline_ts(const HiCachePrefetchTimeoutInput & input) const;
 
     /** @brief Returns target L1/device capacity in pages. */
     [[nodiscard]] uint64_t l1_capacity_pages() const { return resolved_.l1_capacity_pages; }

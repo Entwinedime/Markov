@@ -34,8 +34,8 @@ public:
     [[nodiscard]] bool has_summary() const override;
 #endif
 
-    /** @brief Returns the effect-intent business contract in Release and Debug builds. */
-    [[nodiscard]] const model::HiCacheEffectIntentCatalog & effect_intents() const { return result_->effect_intents; }
+    /** @brief Returns the complete effect-decision ledger in Release and Debug builds. */
+    [[nodiscard]] const model::HiCacheEffectDecisionLedger & effect_decisions() const { return result_->effect_decisions; }
 
     /** @brief Returns the diagnostics summary produced by the latest successful apply. */
 #ifdef DEBUG

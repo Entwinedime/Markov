@@ -22,6 +22,16 @@ using frontend::HiCacheConfig;
  * diagnostics in Debug builds. State replay never consumes source-actual outcomes.
  */
 HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & config) {
+    struct OrderedHiCacheNode {
+        size_t node_id = 0;
+        uint64_t boundary_ts = 0;
+    };
+    struct RoutedHiCacheFact {
+        HiCacheFact fact;
+        HiCacheFactRoute route;
+        std::vector<std::string> required_errors;
+    };
+
     HiCacheModelResult result;
     HiCacheSummary summary;
 #ifdef DEBUG
@@ -29,19 +39,35 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
 #endif
 
     HiCacheFactParser parser;
-    std::vector<size_t> hicache_node_ids;
+    std::vector<OrderedHiCacheNode> hicache_nodes;
     for (const auto & node : graph.nodes()) {
         const auto & event = graph.event_for_node(node.id);
         if (!parser.is_hicache_event(event)) continue;
-        hicache_node_ids.push_back(node.id);
+        hicache_nodes.push_back(OrderedHiCacheNode{
+            .node_id = node.id,
+            .boundary_ts = hicache_fact_boundary_timestamp(event),
+        });
         parser.observe_token_dictionaries(event);
     }
+    std::ranges::sort(hicache_nodes, [&](const OrderedHiCacheNode & left, const OrderedHiCacheNode & right) {
+        const auto & lhs = graph.event_for_node(left.node_id);
+        const auto & rhs = graph.event_for_node(right.node_id);
+        if (left.boundary_ts != right.boundary_ts) return left.boundary_ts < right.boundary_ts;
+        if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
+        if (lhs.tid != rhs.tid) return lhs.tid < rhs.tid;
+        if (lhs.name != rhs.name) return lhs.name < rhs.name;
+        if (lhs.index != rhs.index) return lhs.index < rhs.index;
+        return left.node_id < right.node_id;
+    });
 
     HiCacheState state(config);
 #ifdef DEBUG
     summary.resolved_policy = state.resolved_policy();
 #endif
-    for (const auto node_id : hicache_node_ids) {
+    std::vector<RoutedHiCacheFact> routed_facts;
+    routed_facts.reserve(hicache_nodes.size());
+    for (const auto & ordered_node : hicache_nodes) {
+        const auto node_id = ordered_node.node_id;
         const auto & event = graph.event_for_node(node_id);
 #ifdef DEBUG
         (void)core::checked_increment_u64(summary.input_hicache_events, "HiCache input event count exceeds uint64 range");
@@ -52,6 +78,22 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
 #endif
 
         auto route = route_hicache_fact(fact);
+        auto required_errors = route.model_fact && route.known_role ? hicache_required_fact_errors(fact, route.role) : std::vector<std::string>{};
+        routed_facts.push_back(RoutedHiCacheFact{
+            .fact = std::move(fact),
+            .route = route,
+            .required_errors = std::move(required_errors),
+        });
+    }
+
+    for (const auto & routed : routed_facts) {
+        if (routed.route.model_fact && routed.route.known_role && routed.required_errors.empty() && routed.route.role == HiCacheFactRole::CacheExtendInput)
+            state.register_prefetch_control_boundary(routed.fact);
+    }
+
+    for (const auto & routed : routed_facts) {
+        const auto & fact = routed.fact;
+        const auto & route = routed.route;
         if (!route.model_fact) {
 #ifdef DEBUG
             (void)core::checked_increment_u64(summary.skipped_non_state_model_events, "HiCache skipped event count exceeds uint64 range");
@@ -63,19 +105,19 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
             (void)core::checked_increment_u64(summary.missing_state_model_facts["unknown_state_model_fact"],
                                               "HiCache missing state-model fact count exceeds uint64 range");
 #endif
-            (void)core::checked_increment_u64(result.effect_intents.missing_facts["unknown_state_model_fact"],
-                                              "HiCache effect missing-fact count exceeds uint64 range");
+            (void)core::checked_increment_u64(result.effect_decisions.missing_facts["unknown_state_model_fact"],
+                                              "HiCache effect-decision missing-fact count exceeds uint64 range");
             continue;
         }
-        const auto required_errors = hicache_required_fact_errors(fact, route.role);
-        if (!required_errors.empty()) {
+        if (!routed.required_errors.empty()) {
 #ifdef DEBUG
-            std::ranges::for_each(required_errors, [&](const auto & error) {
+            std::ranges::for_each(routed.required_errors, [&](const auto & error) {
                 (void)core::checked_increment_u64(summary.missing_state_model_facts[error], "HiCache missing state-model fact count exceeds uint64 range");
             });
 #endif
-            std::ranges::for_each(required_errors, [&](const auto & error) {
-                (void)core::checked_increment_u64(result.effect_intents.missing_facts[error], "HiCache effect missing-fact count exceeds uint64 range");
+            std::ranges::for_each(routed.required_errors, [&](const auto & error) {
+                (void)core::checked_increment_u64(result.effect_decisions.missing_facts[error],
+                                                  "HiCache effect-decision missing-fact count exceeds uint64 range");
             });
             continue;
         }
@@ -143,12 +185,13 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
         summary.warnings.push_back("HiCache capacity index audit found mismatches between mutation-driven index and canonical tree.");
     if (summary.ref_audit_issue_count > 0) summary.warnings.push_back("HiCache ref ledger audit found mismatches between owner ledger and tree ref counters.");
 #endif
-    auto effect_intents = state.effect_intent_catalog();
-    for (const auto & [reason, count] : result.effect_intents.missing_facts) {
-        auto & merged_count = effect_intents.missing_facts[reason];
+    auto effect_decisions = state.effect_decision_ledger();
+    for (const auto & [reason, count] : result.effect_decisions.missing_facts) {
+        auto & merged_count = effect_decisions.missing_facts[reason];
         merged_count = core::checked_add_u64(merged_count, count, "HiCache merged missing-fact count exceeds uint64 range");
     }
-    result.effect_intents = std::move(effect_intents);
+    if (!effect_decisions.missing_facts.empty()) effect_decisions.status = "partial";
+    result.effect_decisions = std::move(effect_decisions);
     result.replay_complete = true;
 #ifdef DEBUG
     result.summary = std::move(summary);

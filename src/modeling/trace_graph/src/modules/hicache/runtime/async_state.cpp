@@ -186,7 +186,23 @@ void HiCacheAsyncOperationTable::insert_loadback(HiCacheLoadbackOperation op) {
     validate_new_operation(op.header, HiCacheOperationKind::Loadback, loadback_by_id_);
     transition_header(op.header, HiCacheOperationState::Queued, "enqueue_loadback", op.header.enqueue_ts);
     const auto operation_id = op.header.operation_id;
+    const auto request_key = op.header.request_key;
     loadback_by_id_.emplace(operation_id, std::move(op));
+    if (!request_key.empty()) latest_loadback_id_by_request_[request_key] = operation_id;
+}
+
+HiCacheLoadbackOperation * HiCacheAsyncOperationTable::loadback_for_request(const std::string & request_key) {
+    const auto id = latest_loadback_id_by_request_.find(request_key);
+    if (id == latest_loadback_id_by_request_.end()) return nullptr;
+    const auto operation = loadback_by_id_.find(id->second);
+    return operation == loadback_by_id_.end() ? nullptr : &operation->second;
+}
+
+const HiCacheLoadbackOperation * HiCacheAsyncOperationTable::loadback_for_request(const std::string & request_key) const {
+    const auto id = latest_loadback_id_by_request_.find(request_key);
+    if (id == latest_loadback_id_by_request_.end()) return nullptr;
+    const auto operation = loadback_by_id_.find(id->second);
+    return operation == loadback_by_id_.end() ? nullptr : &operation->second;
 }
 
 void HiCacheAsyncOperationTable::set_loadback_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason,
@@ -204,6 +220,27 @@ void HiCacheAsyncOperationTable::insert_storage(HiCacheStorageOperation op) {
 void HiCacheAsyncOperationTable::set_storage_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason,
                                                    uint64_t transition_ts) {
     if (const auto it = storage_by_id_.find(operation_id); it != storage_by_id_.end()) transition_header(it->second.header, state, reason, transition_ts);
+}
+
+void HiCacheAsyncOperationTable::set_storage_capacity_gate_pages(const std::string & operation_id, std::vector<std::string> pages) {
+    const auto it = storage_by_id_.find(operation_id);
+    if (it == storage_by_id_.end()) throw std::logic_error("Unknown HiCache storage operation: " + operation_id);
+    it->second.capacity_gate_pages = std::move(pages);
+}
+
+void HiCacheAsyncOperationTable::set_storage_consumer_boundary(const std::string & operation_id, uint64_t consumer_epoch, uint64_t consumer_ts,
+                                                               size_t source_node_id, size_t source_event_index, std::string source_fact_role,
+                                                               bool source_available) {
+    const auto it = storage_by_id_.find(operation_id);
+    if (it == storage_by_id_.end()) throw std::logic_error("Unknown HiCache storage operation: " + operation_id);
+    auto & header = it->second.header;
+    if (header.consumer_epoch != 0) throw std::logic_error("HiCache storage operation already has a consumer boundary: " + operation_id);
+    header.consumer_epoch = consumer_epoch;
+    header.consumer_ts = consumer_ts;
+    header.consumer_source_node_id = source_node_id;
+    header.consumer_source_event_index = source_event_index;
+    header.consumer_source_fact_role = std::move(source_fact_role);
+    header.consumer_source_available = source_available;
 }
 
 std::span<const std::string> HiCacheAsyncOperationTable::operations_for_request(const std::string & request_key) const {

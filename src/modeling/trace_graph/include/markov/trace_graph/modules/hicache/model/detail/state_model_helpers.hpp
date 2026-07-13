@@ -182,19 +182,27 @@ inline uint64_t allocation_cleanup_target(const HostCleanupInput & input) {
 /** @brief Performs saturating subtraction for unsigned counters. */
 inline uint64_t bounded_subtract(uint64_t value, uint64_t decrement) { return decrement >= value ? 0 : value - decrement; }
 
-/** @brief Builds the common header for a target-derived asynchronous operation. */
-inline HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, const std::string & operation_id, const std::string & cache_scope,
-                                                    const std::string & request_key, const std::string & owner, const std::vector<std::string> & pages,
-                                                    uint64_t enqueue_ts, uint64_t enqueue_epoch) {
+/** @brief Builds an operation header with stable source-fact provenance. */
+inline HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, const std::string & operation_id, const HiCacheFact & fact,
+                                                    const std::string & cache_scope, const std::string & request_key, const std::string & owner,
+                                                    const std::vector<std::string> & pages, uint64_t enqueue_epoch) {
     return HiCacheOperationHeader{
         .operation_id = operation_id,
         .kind = kind,
         .cache_scope = cache_scope,
         .request_key = request_key,
+        .request_id = fact.request_id,
         .owner = owner,
         .pages = pages,
         .enqueue_epoch = enqueue_epoch,
-        .enqueue_ts = enqueue_ts,
+        .enqueue_ts = fact.ts,
+        .source_node_id = fact.source_node_id,
+        .source_event_index = fact.source_event_index,
+        .source_fact_seq_no = fact.seq_no,
+        .source_fact_role = fact.role,
+        .source_token_path_id = fact.full_path_span.path_id,
+        .source_token_begin = fact.full_path_span.begin,
+        .source_token_end = fact.full_path_span.end,
     };
 }
 

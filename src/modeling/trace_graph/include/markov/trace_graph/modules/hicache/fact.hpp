@@ -29,6 +29,24 @@ struct HiCacheToken {
 
 using HiCacheTokenPath = std::vector<HiCacheToken>;
 
+/** @brief Catalog metadata shared by state routing and source-DAG attribution. */
+struct HiCacheFactMetadata {
+    std::string fact_class;
+    std::string role;
+    std::vector<std::string> consumers;
+};
+
+/**
+ * @brief Parses the required `args.fact` object without hydrating token paths.
+ *
+ * This is the narrow parser for code that needs catalog identity but must not
+ * construct a second state-model fact table.
+ */
+[[nodiscard]] HiCacheFactMetadata parse_hicache_fact_metadata(const core::TraceEvent & event);
+
+/** @brief Returns the semantic boundary timestamp of a catalog phase event. */
+[[nodiscard]] uint64_t hicache_fact_boundary_timestamp(const core::TraceEvent & event);
+
 /**
  * @brief Immutable reference to a half-open interval in a token dictionary path.
  *
@@ -43,6 +61,9 @@ struct HiCacheTokenSpan {
     std::string hash_algo{};
     bool valid = false;
 };
+
+/** @brief Parses one token-span argument without resolving its token dictionary. */
+[[nodiscard]] HiCacheTokenSpan parse_hicache_token_span_arg(const core::TraceEvent & event, std::string_view key);
 
 /**
  * @brief Accepted fill path for one request in a `cache_extend_input` batch.
@@ -67,7 +88,7 @@ struct HiCacheBatchPathEntry {
 struct HiCacheFact {
     size_t source_node_id = 0;
     size_t source_event_index = 0;
-    uint64_t ts = 0;  ///< Chrome trace timestamp in microseconds.
+    uint64_t ts = 0;  ///< Semantic phase-boundary timestamp in microseconds.
     uint64_t dur = 0; ///< Chrome trace duration in microseconds.
 
     std::string event_name;

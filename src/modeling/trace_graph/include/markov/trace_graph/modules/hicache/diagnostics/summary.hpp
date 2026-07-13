@@ -7,7 +7,7 @@
  */
 #pragma once
 
-#include "markov/trace_graph/modules/hicache/model/effect_intent.hpp"
+#include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
 #include "markov/trace_graph/modules/hicache/model/summary.hpp"
 
 #include <string>
@@ -19,6 +19,6 @@ namespace markov::trace_graph::modules::hicache::diagnostics {
  *
  * The function is diagnostics-only and never mutates or re-derives the summary.
  */
-[[nodiscard]] std::string summary_json(const model::HiCacheSummary & summary, const model::HiCacheEffectIntentCatalog & effect_intents);
+[[nodiscard]] std::string summary_json(const model::HiCacheSummary & summary, const model::HiCacheEffectDecisionLedger & effect_decisions);
 
 } // namespace markov::trace_graph::modules::hicache::diagnostics

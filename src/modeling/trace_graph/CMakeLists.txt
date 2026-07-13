@@ -76,7 +76,13 @@ target_sources(trace_graph_hicache
         src/modules/hicache/runtime/async_state.cpp
         src/modules/hicache/storage/storage_directory.cpp
         src/modules/hicache/model/state.cpp
-        src/modules/hicache/model/effect_intent.cpp
+        src/modules/hicache/model/effect_decision.cpp
+        src/modules/hicache/patch/io_resource_model.cpp
+        src/modules/hicache/patch/source_dag_index.cpp
+        src/modules/hicache/patch/attribution.cpp
+        src/modules/hicache/patch/rewrite_transaction.cpp
+        src/modules/hicache/patch/boundary_validator.cpp
+        src/modules/hicache/patch/applied_validator.cpp
         src/modules/hicache/model/request_model.cpp
         src/modules/hicache/model/prefetch_model.cpp
         src/modules/hicache/model/host_storage_model.cpp
@@ -153,4 +159,12 @@ if(TRACE_GRAPH_BUILD_TESTS)
             trace_graph_simulation
     )
     add_test(NAME trace_graph_dag_mutation_smoke COMMAND trace_graph_dag_mutation_smoke)
+
+    add_executable(trace_graph_hicache_io_resource_smoke tests/hicache_io_resource_smoke.cpp)
+    target_link_libraries(trace_graph_hicache_io_resource_smoke PRIVATE trace_graph_hicache)
+    add_test(NAME trace_graph_hicache_io_resource_smoke COMMAND trace_graph_hicache_io_resource_smoke)
+
+    add_executable(trace_graph_hicache_source_attribution_smoke tests/hicache_source_attribution_smoke.cpp)
+    target_link_libraries(trace_graph_hicache_source_attribution_smoke PRIVATE trace_graph_modules)
+    add_test(NAME trace_graph_hicache_source_attribution_smoke COMMAND trace_graph_hicache_source_attribution_smoke)
 endif()

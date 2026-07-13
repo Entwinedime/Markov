@@ -55,6 +55,7 @@ using radix::HiCacheTokenRadixTree;
 using runtime::HiCacheAsyncOperationTable;
 using runtime::HiCacheBatchTokenResolution;
 using runtime::HiCacheCapacityIndex;
+using runtime::HiCacheIoSchedule;
 using runtime::HiCacheLoadbackOperation;
 using runtime::HiCacheOperationHeader;
 using runtime::HiCacheOperationKind;
@@ -84,6 +85,9 @@ class HiCacheState {
 public:
     /** @brief Initializes the state machine from an explicit target configuration. */
     explicit HiCacheState(frontend::HiCacheConfig config = frontend::HiCacheConfig{});
+
+    /** @brief Registers a future cache-extend fact as the request's prefetch control boundary. */
+    void register_prefetch_control_boundary(const HiCacheFact & fact);
 
     /** @brief Applies one routed fact; only Debug builds populate transition evidence. */
     void apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
@@ -165,8 +169,8 @@ public:
     [[nodiscard]] std::string digest() const;
 #endif
 
-    /** @brief Exports target-derived effect intents without depending on Debug history. */
-    [[nodiscard]] HiCacheEffectIntentCatalog effect_intent_catalog() const;
+    /** @brief Exports one explicit decision for every registered direct-effect opportunity. */
+    [[nodiscard]] HiCacheEffectDecisionLedger effect_decision_ledger() const;
 
 private:
     /** @brief Request-local lifecycle projection that never owns residency state. */
@@ -180,11 +184,13 @@ private:
         std::vector<HiCacheNodeId> device_chain;
         std::vector<HiCacheNodeId> host_chain;
         std::string lifecycle_state;
+        bool prefetch_candidate_seen = false;
     };
 
     /** @brief Write-through backup lock awaiting the next control or finalization drain. */
     struct PendingWriteThroughBackup {
         std::string owner;
+        std::string storage_operation_id;
         std::vector<std::string> pages;
     };
 
@@ -229,6 +235,9 @@ private:
         uint64_t release(uint64_t pages);
     };
 
+    /** @brief Logical target I/O resources whose availability is tracked per scope. */
+    enum class TargetIoLane : std::uint8_t { HostToDevice, DeviceToHost, HostStorage };
+
     /** @brief Complete canonical runtime state for one cache scope. */
     struct ScopedState {
         HiCacheTokenRadixTree tree;
@@ -240,7 +249,9 @@ private:
         DeviceAllocatorLedger device_allocator;
         std::unordered_map<std::string, RequestState> requests;
         std::vector<PendingWriteThroughBackup> pending_write_through_backups;
-        uint64_t prefetch_worker_available_ts = 0;
+        uint64_t host_to_device_lane_available_ts = 0;
+        uint64_t device_to_host_lane_available_ts = 0;
+        uint64_t host_storage_lane_available_ts = 0;
     };
 
     /**
@@ -290,11 +301,12 @@ private:
      * @brief Independent estimate of storage-prefetch I/O progress.
      *
      * This layer only answers how much of the prefix has reached host memory; it
-     * does not decide whether policy may terminate the prefetch. The current
-     * zero-progress approximation is an explicit replacement point for calibration.
+     * does not decide whether policy may terminate the prefetch. Progress uses only
+     * the calibrated host-storage bandwidth and exposes complete contiguous pages.
      */
     struct PrefetchIoProgressEstimate {
         std::vector<std::string> completed_pages;
+        uint64_t completed_byte_count = 0;
 #ifdef DEBUG
         std::string reason;
 #endif
@@ -309,9 +321,16 @@ private:
      */
     struct PrefetchProgressEstimate {
         std::vector<std::string> completed_pages;
+        uint64_t completed_byte_count = 0;
+        uint64_t source_boundary_ts = 0;
+        uint64_t policy_stop_ts = 0;
+        uint64_t target_boundary_ts = 0;
+        uint64_t timeout_deadline_ts = 0;
         bool storage_hit_sufficient = false;
-        bool terminal_boundary = false;
-        bool timeout_elapsed = false;
+        bool boundary_resolved = false;
+        bool io_completed = false;
+        bool timed_out = false;
+        bool visibility_dependency_required = false;
 #ifdef DEBUG
         std::string reason;
 #endif
@@ -347,6 +366,12 @@ private:
     HiCacheTokenDirectory token_directory_;
     HiCachePolicy policy_;
     std::unordered_map<std::string, ScopedState> scopes_;
+    std::unordered_map<std::string, std::vector<HiCacheFact>> prefetch_control_boundaries_;
+    std::vector<HiCacheEffectOpportunity> effect_opportunities_;
+    std::unordered_map<std::string, uint64_t> effect_fact_ordinals_;
+    std::unordered_map<std::string, std::string> effect_scope_identities_;
+    uint64_t effect_opportunity_epoch_ = 0;
+    uint64_t effect_scope_epoch_ = 0;
 #ifdef DEBUG
     uint64_t policy_decision_epoch_ = 0;
     std::vector<HiCachePolicyDecisionRecord> policy_decisions_;
@@ -358,8 +383,17 @@ private:
     /** @brief Builds a scope-qualified request key to prevent cross-scope collisions. */
     [[nodiscard]] std::string scoped_request_key(const HiCacheFact & fact) const;
 
+    /** @brief Finds the first registered cache-extend boundary after this lookup. */
+    [[nodiscard]] const HiCacheFact * prefetch_control_boundary_for_lookup(const HiCacheFact & fact) const;
+
+    /** @brief Finds the first registered cache-extend boundary after an operation was enqueued. */
+    [[nodiscard]] const HiCacheFact * prefetch_control_boundary_for_operation(const HiCachePrefetchOperation & operation) const;
+
     /** @brief Returns or creates canonical runtime state for the fact's cache scope. */
     [[nodiscard]] ScopedState & scope_state(const HiCacheFact & fact);
+
+    /** @brief Registers the fixed direct-effect opportunities owned by one input fact. */
+    void observe_effect_opportunities(const HiCacheFact & fact, HiCacheFactRole role);
 
     /** @brief Records token-resolution evidence for Debug input-contract diagnostics. */
     void record_token_resolution(const HiCacheFact & fact, HiCacheSummary & summary, const HiCacheTokenResolution & resolution) const;
@@ -371,13 +405,16 @@ private:
     void ensure_device_allocator(ScopedState & scope);
     /** @brief Reports whether a new device page has observable dirty state at insertion. */
     [[nodiscard]] bool inserted_device_dirty_visible_at_insert_boundary() const;
+    /** @brief Schedules one target transfer using only projected bytes and its configured bandwidth. */
+    [[nodiscard]] HiCacheIoSchedule schedule_target_io(ScopedState & scope, TargetIoLane lane, uint64_t eligibility_ts, uint64_t page_count) const;
+    /** @brief Materializes every target prefetch completed by the current global boundary. */
+    void advance_ready_prefetches(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    /** @brief Binds a transfer-owned prefetch dependency to its canonical cache consumer. */
+    void bind_prefetch_consumer_boundary(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op, const std::string & request_key);
     /** @brief Estimates the page prefix whose storage I/O completed by this boundary. */
-    [[nodiscard]] PrefetchIoProgressEstimate estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact) const;
-    /** @brief Estimates the completed prefix visible at an SGLang termination boundary. */
-    [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
-                                                                      bool terminal_boundary) const;
-    /** @brief Reports whether revoke release becomes visible before extend side effects. */
-    [[nodiscard]] bool prefetch_release_visible_before_cache_extend(const HiCachePrefetchOperation & op, const HiCacheFact & boundary_fact) const;
+    [[nodiscard]] PrefetchIoProgressEstimate estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, uint64_t boundary_ts) const;
+    /** @brief Resolves target progress and control timing from one source cache-extend boundary. */
+    [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & source_boundary) const;
     void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                          const std::string & reason);
 
@@ -510,18 +547,19 @@ private:
 
     /** @brief Starts storage backup lifecycle and acquires its host reference. */
     [[nodiscard]] std::string begin_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                   ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages);
+                                                   ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
+                                                   const std::vector<std::string> & device_to_host_pages);
 
     /** @brief Commits host/storage residency before asynchronous acknowledgement. */
     void materialize_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                 HiCacheNodeId node_id, const std::vector<std::string> & pages, bool storage_readable);
+                                 HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_id, bool storage_readable);
 
     /** @brief Acknowledges storage backup and releases its temporary host reference. */
     void complete_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                  const std::string & storage_id, const std::vector<std::string> & pages);
     /** @brief Holds a write-through reference until the next target-control drain. */
     void hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                       HiCacheNodeId node_id, const std::vector<std::string> & pages);
+                                       HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_operation_id);
     /** @brief Emits one Debug-only state transition with optional before/after digests. */
     void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, const TransitionDescriptor & descriptor,
                            const std::vector<std::string> & pages, const std::string & before_digest);

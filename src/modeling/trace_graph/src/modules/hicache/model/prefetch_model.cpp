@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <ranges>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -14,73 +15,166 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-namespace {
+HiCacheIoSchedule HiCacheState::schedule_target_io(ScopedState & scope, TargetIoLane lane, uint64_t eligibility_ts, uint64_t page_count) const {
+    HiCacheIoSchedule schedule;
+    uint64_t bandwidth = 0;
+    uint64_t * lane_available_ts = nullptr;
+    switch (lane) {
+    case TargetIoLane::HostToDevice:
+        schedule.resource_lane = "host_to_device_lane";
+        bandwidth = config_.io_cost.device_host_bandwidth_bytes_per_sec;
+        lane_available_ts = &scope.host_to_device_lane_available_ts;
+        break;
+    case TargetIoLane::DeviceToHost:
+        schedule.resource_lane = "device_to_host_lane";
+        bandwidth = config_.io_cost.device_host_bandwidth_bytes_per_sec;
+        lane_available_ts = &scope.device_to_host_lane_available_ts;
+        break;
+    case TargetIoLane::HostStorage:
+        schedule.resource_lane = "host_storage_lane";
+        bandwidth = config_.io_cost.host_storage_bandwidth_bytes_per_sec;
+        lane_available_ts = &scope.host_storage_lane_available_ts;
+        break;
+    }
+    if (page_count == 0 || config_.kv_bytes_per_page == 0 || bandwidth == 0 || lane_available_ts == nullptr) return schedule;
 
-constexpr uint64_t kStorageBatchPages = 128;
-constexpr uint64_t kPrefetchStorageQueryBaseUs = 2'000;
-constexpr uint64_t kPrefetchStorageQueryPerPageUs = 1'250;
-constexpr uint64_t kPrefetchStorageLargeQueryPages = 16;
-constexpr uint64_t kPrefetchStorageLargeQueryExtraUs = 2'500;
-constexpr uint64_t kPrefetchStorageVisibilityGuardUs = 2'500;
-
-uint64_t prefetch_storage_query_pages(uint64_t planned_pages, uint64_t hit_pages) {
-    if (planned_pages == 0) return 0;
-    if (hit_pages >= planned_pages) return planned_pages;
-    const auto pages_until_first_miss = hit_pages + 1;
-    const auto queried_batches = detail::ceil_div(pages_until_first_miss, kStorageBatchPages);
-    return std::min(planned_pages, core::checked_multiply_u64(queried_batches, kStorageBatchPages, "HiCache storage query page count exceeds uint64 range"));
+    schedule.effective_byte_count =
+        core::checked_multiply_u64(page_count, config_.kv_bytes_per_page, "HiCache target I/O byte projection exceeds uint64 range");
+    const auto duration = core::ceil_multiply_divide_u64(schedule.effective_byte_count, 1'000'000, bandwidth);
+    if (!duration) throw std::overflow_error("HiCache target I/O duration exceeds uint64 range");
+    schedule.duration_us = *duration;
+    schedule.start_ts = std::max(eligibility_ts, *lane_available_ts);
+    schedule.ready_ts = core::checked_add_u64(schedule.start_ts, schedule.duration_us, "HiCache target I/O ready timestamp exceeds uint64 range");
+    schedule.available = true;
+    *lane_available_ts = schedule.ready_ts;
+    return schedule;
 }
 
-uint64_t estimate_prefetch_storage_query_duration(uint64_t queried_pages) {
-    if (queried_pages == 0) return 0;
-    auto duration =
-        core::checked_add_u64(kPrefetchStorageQueryBaseUs,
-                              core::checked_multiply_u64(queried_pages, kPrefetchStorageQueryPerPageUs, "HiCache storage query duration exceeds uint64 range"),
-                              "HiCache storage query duration exceeds uint64 range");
-    if (queried_pages > kPrefetchStorageLargeQueryPages)
-        duration = core::checked_add_u64(duration, kPrefetchStorageLargeQueryExtraUs, "HiCache storage query duration exceeds uint64 range");
-    return duration;
+void HiCacheState::advance_ready_prefetches(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions) {
+    struct ReadyPrefetch {
+        const std::string * cache_scope = nullptr;
+        ScopedState * scope = nullptr;
+        HiCachePrefetchOperation * operation = nullptr;
+        const HiCacheFact * source_boundary = nullptr;
+        PrefetchProgressEstimate progress;
+    };
+
+    std::vector<ReadyPrefetch> ready;
+    for (auto & [cache_scope, scope] : scopes_) {
+        for (auto & op : scope.async_ops.prefetch_ops() | std::views::values) {
+            if (op.prefetch_state != HiCachePrefetchState::Pending) continue;
+            const auto * source_boundary = prefetch_control_boundary_for_operation(op);
+            if (source_boundary == nullptr) continue;
+            auto progress = estimate_prefetch_progress(op, *source_boundary);
+            if (!progress.storage_hit_sufficient || !progress.boundary_resolved || progress.target_boundary_ts > fact.ts) continue;
+            ready.push_back(ReadyPrefetch{
+                .cache_scope = &cache_scope,
+                .scope = &scope,
+                .operation = &op,
+                .source_boundary = source_boundary,
+                .progress = std::move(progress),
+            });
+        }
+    }
+    std::ranges::sort(ready, [](const auto & left, const auto & right) {
+        if (left.progress.target_boundary_ts != right.progress.target_boundary_ts) return left.progress.target_boundary_ts < right.progress.target_boundary_ts;
+        if (*left.cache_scope != *right.cache_scope) return *left.cache_scope < *right.cache_scope;
+        return left.operation->header.operation_id < right.operation->header.operation_id;
+    });
+    for (auto & candidate : ready) {
+        auto & op = *candidate.operation;
+        bind_prefetch_consumer_boundary(*candidate.source_boundary, *candidate.scope, op, op.header.request_key);
+        op.header.boundary_ts = candidate.progress.target_boundary_ts;
+        op.header.boundary_epoch = op.header.consumer_epoch;
+        op.completed_pages = std::move(candidate.progress.completed_pages);
+        op.completed_byte_count = candidate.progress.completed_byte_count;
+        op.policy_stop_ts = candidate.progress.policy_stop_ts;
+        op.target_boundary_ts = candidate.progress.target_boundary_ts;
+        op.timeout_deadline_ts = candidate.progress.timeout_deadline_ts;
+        op.timed_out = candidate.progress.timed_out;
+        op.visibility_dependency_required = candidate.progress.visibility_dependency_required;
+        apply_prefetch_ready(*candidate.source_boundary, summary, transitions, *candidate.scope, op);
+    }
 }
 
-} // namespace
+void HiCacheState::bind_prefetch_consumer_boundary(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op,
+                                                   const std::string & request_key) {
+    if (op.header.consumer_epoch != 0) return;
+    const auto consumer_epoch =
+        scope.clock.record_fact_boundary(normalized_scope(fact), request_key, "prefetch_cache_extend_consumer", fact.source_event_index, fact.ts);
+    op.header.consumer_epoch = consumer_epoch;
+    op.header.consumer_ts = fact.ts;
+    op.header.consumer_source_node_id = fact.source_node_id;
+    op.header.consumer_source_event_index = fact.source_event_index;
+    op.header.consumer_source_fact_role = fact.role;
+    op.header.consumer_source_available = true;
+}
 
 /**
  * @brief Estimates host-prefix transfer completed by the current target boundary.
  *
- * The input contract exposes a prefetch candidate and later cache-extend boundary,
- * but no calibratable background-I/O progress. Incomplete best-effort and timeout
- * paths therefore report zero completed pages. Policy owns terminal full completion.
+ * The input contract exposes a prefetch candidate and later cache-extend boundary.
+ * Payload progress is projected from the target lane schedule and calibrated bandwidth;
+ * only complete contiguous pages become host-visible state.
  */
-HiCacheState::PrefetchIoProgressEstimate HiCacheState::estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact) const {
-    (void)op;
-    (void)fact;
-    return PrefetchIoProgressEstimate{
-        .completed_pages = {},
+HiCacheState::PrefetchIoProgressEstimate HiCacheState::estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, uint64_t boundary_ts) const {
+    PrefetchIoProgressEstimate estimate;
+    if (!op.io_schedule.available || boundary_ts <= op.io_schedule.start_ts) {
 #ifdef DEBUG
-        .reason = "zero-progress IO model: state-model input has no calibrated storage transfer progress",
+        estimate.reason =
+            op.io_schedule.available ? "target boundary precedes host-storage payload progress" : "target I/O model is unavailable for this prefetch";
 #endif
-    };
+        return estimate;
+    }
+    if (boundary_ts >= op.io_schedule.ready_ts) {
+        estimate.completed_pages = op.hit_pages;
+        estimate.completed_byte_count = op.io_schedule.effective_byte_count;
+#ifdef DEBUG
+        estimate.reason = "target host-storage transfer is ready at the selected policy boundary";
+#endif
+        return estimate;
+    }
+
+    const auto elapsed_us = core::checked_subtract_u64(boundary_ts, op.io_schedule.start_ts, "HiCache prefetch progress boundary precedes I/O start");
+    const auto completed_bytes = core::floor_multiply_divide_u64(elapsed_us, config_.io_cost.host_storage_bandwidth_bytes_per_sec, 1'000'000);
+    if (!completed_bytes || config_.kv_bytes_per_page == 0) {
+#ifdef DEBUG
+        estimate.reason = "target I/O progress cannot be projected from the configured bandwidth and page geometry";
+#endif
+        return estimate;
+    }
+    estimate.completed_byte_count = std::min(*completed_bytes, op.io_schedule.effective_byte_count);
+    const auto completed_page_count = std::min<uint64_t>(static_cast<uint64_t>(op.hit_pages.size()), estimate.completed_byte_count / config_.kv_bytes_per_page);
+    estimate.completed_pages = prefix_to(op.hit_pages, static_cast<size_t>(completed_page_count));
+#ifdef DEBUG
+    estimate.reason = "target boundary exposes the complete contiguous pages transferred by the calibrated host-storage bandwidth";
+#endif
+    return estimate;
 }
 
 /**
- * @brief Combines stop policy, terminal state, and timeout at one target boundary.
+ * @brief Resolves one target prefetch stop boundary from the source control skeleton.
  *
- * The result describes the completed prefix visible at this boundary and whether
- * application may occur. `apply_prefetch_ready` owns all host-radix materialization.
+ * Best-effort samples progress at the source cache-extend boundary. Wait-complete
+ * stops at target I/O completion. Timeout stops at the earlier of target I/O completion
+ * and the configured deadline. The source boundary remains the earliest scheduler
+ * eligibility point; a later policy stop moves the target consumer through a causal gate.
  */
-HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & fact,
-                                                                                bool terminal_boundary) const {
+HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(const HiCachePrefetchOperation & op,
+                                                                                const HiCacheFact & source_boundary) const {
+    const auto token_count = core::checked_multiply_u64(static_cast<uint64_t>(op.hit_pages.size()),
+                                                        config_.page_size,
+                                                        "HiCache prefetch timeout token projection exceeds uint64 range");
+    const auto timeout_input = HiCachePrefetchTimeoutInput{
+        .enqueue_ts = op.header.enqueue_ts,
+        .token_count = token_count,
+    };
     auto estimate = PrefetchProgressEstimate{
         .completed_pages = {},
+        .source_boundary_ts = source_boundary.ts,
+        .policy_stop_ts = source_boundary.ts,
+        .target_boundary_ts = source_boundary.ts,
         .storage_hit_sufficient = op.hit_pages.size() >= policy_.prefetch_threshold_pages(),
-        .terminal_boundary = terminal_boundary,
-        .timeout_elapsed = policy_.prefetch_timeout_elapsed(HiCachePrefetchTimeoutObservation{
-            .enqueue_ts = op.header.enqueue_ts,
-            .boundary_ts = fact.ts,
-            .token_count = core::checked_multiply_u64(static_cast<uint64_t>(op.planned_pages.size()),
-                                                      config_.page_size,
-                                                      "HiCache prefetch timeout token projection exceeds uint64 range"),
-        }),
     };
     if (!estimate.storage_hit_sufficient) {
 #ifdef DEBUG
@@ -88,59 +182,66 @@ HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(
 #endif
         return estimate;
     }
+    if (!op.io_schedule.available) {
+#ifdef DEBUG
+        estimate.reason = "target host-storage schedule is unavailable at the source cache-extend boundary";
+#endif
+        return estimate;
+    }
 
     const auto policy = policy_.prefetch_policy();
     if (policy == "wait_complete") {
-        estimate.completed_pages = op.hit_pages;
+        estimate.policy_stop_ts = op.io_schedule.ready_ts;
+        estimate.target_boundary_ts = std::max(estimate.source_boundary_ts, estimate.policy_stop_ts);
+        estimate.boundary_resolved = true;
+        estimate.io_completed = true;
+        estimate.visibility_dependency_required = estimate.policy_stop_ts > estimate.source_boundary_ts;
+        auto io_progress = estimate_prefetch_io_progress(op, estimate.policy_stop_ts);
+        estimate.completed_pages = std::move(io_progress.completed_pages);
+        estimate.completed_byte_count = io_progress.completed_byte_count;
 #ifdef DEBUG
-        estimate.reason = "wait_complete policy exposes all completed IO, prefetch is modeled as fully completed";
+        estimate.reason = estimate.visibility_dependency_required
+                              ? "wait_complete moves the target cache-extend boundary to target I/O completion; " + io_progress.reason
+                              : "wait_complete I/O is ready by the source cache-extend eligibility boundary; " + io_progress.reason;
 #endif
         return estimate;
     }
     if (policy == "best_effort") {
-        const auto io_progress = estimate_prefetch_io_progress(op, fact);
-        estimate.completed_pages = io_progress.completed_pages;
+        auto io_progress = estimate_prefetch_io_progress(op, estimate.source_boundary_ts);
+        estimate.completed_pages = std::move(io_progress.completed_pages);
+        estimate.completed_byte_count = io_progress.completed_byte_count;
+        estimate.boundary_resolved = true;
+        estimate.io_completed = estimate.source_boundary_ts >= op.io_schedule.ready_ts;
 #ifdef DEBUG
-        estimate.reason = "best_effort can terminate immediately; " + io_progress.reason;
+        estimate.reason = "best_effort retains the source cache-extend boundary and exposes target payload progress there; " + io_progress.reason;
 #endif
         return estimate;
     }
-    if (policy == "timeout" && estimate.terminal_boundary && !estimate.timeout_elapsed) {
-        estimate.completed_pages = op.hit_pages;
+    if (policy == "timeout") {
+        const auto timeout_deadline = policy_.prefetch_timeout_deadline_ts(timeout_input);
+        if (!timeout_deadline) {
 #ifdef DEBUG
-        estimate.reason = "terminal cache extend boundary is modeled as completed IO until calibrated progress is available";
+            estimate.reason = "timeout policy cannot resolve a target boundary without target timeout configuration";
+#endif
+            return estimate;
+        }
+        estimate.timed_out = *timeout_deadline < op.io_schedule.ready_ts;
+        estimate.io_completed = !estimate.timed_out;
+        estimate.timeout_deadline_ts = *timeout_deadline;
+        estimate.policy_stop_ts = std::min(*timeout_deadline, op.io_schedule.ready_ts);
+        estimate.target_boundary_ts = std::max(estimate.source_boundary_ts, estimate.policy_stop_ts);
+        estimate.visibility_dependency_required = estimate.policy_stop_ts > estimate.source_boundary_ts;
+        estimate.boundary_resolved = true;
+        auto io_progress = estimate_prefetch_io_progress(op, estimate.policy_stop_ts);
+        estimate.completed_pages = std::move(io_progress.completed_pages);
+        estimate.completed_byte_count = io_progress.completed_byte_count;
+#ifdef DEBUG
+        estimate.reason = estimate.timed_out ? "timeout deadline wins over target I/O completion and fixes the completed prefix; " + io_progress.reason
+                                             : "target I/O completion wins before the configured timeout deadline; " + io_progress.reason;
 #endif
         return estimate;
     }
-    if (estimate.timeout_elapsed) {
-        const auto io_progress = estimate_prefetch_io_progress(op, fact);
-        estimate.completed_pages = io_progress.completed_pages;
-#ifdef DEBUG
-        estimate.reason = "timeout stop boundary exposes only calibrated completed IO; " + io_progress.reason;
-#endif
-        return estimate;
-    }
-#ifdef DEBUG
-    estimate.reason = "prefetch has not reached a modeled completion or timeout boundary";
-#endif
-    return estimate;
-}
-
-/**
- * @brief Approximates revoke-release visibility before cache-extend side effects.
- *
- * The C++ model cannot consume observed source/probe outcomes. A below-threshold
- * best-effort revoke originates from the controller prefetch worker, and can be
- * drained by the final progress/extend boundary only after that worker has completed
- * the operation's storage-hit query. Lookup is not a state boundary; the current
- * `cache_extend_input` fact remains the only state-changing decision point.
- */
-bool HiCacheState::prefetch_release_visible_before_cache_extend(const HiCachePrefetchOperation & op, const HiCacheFact & boundary_fact) const {
-    if (op.reserved_host_pages == 0) return false;
-    if (op.hit_pages.size() >= policy_.prefetch_threshold_pages()) return false;
-    if (policy_.prefetch_policy() != "best_effort") return true;
-    if (op.storage_query_ready_ts == 0) return false;
-    return boundary_fact.ts >= op.storage_query_ready_ts && boundary_fact.ts - op.storage_query_ready_ts >= kPrefetchStorageVisibilityGuardUs;
+    throw std::logic_error("Resolved HiCache prefetch policy is not executable: " + policy);
 }
 
 void HiCacheState::suppress_prior_prefetch(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
@@ -188,6 +289,8 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
     const auto pages = page_path.page_ids();
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
+    const auto request_key = scoped_request_key(fact);
+    if (!request_key.empty()) scope.requests[request_key].prefetch_candidate_seen = true;
     scope.storage.observe_path(page_path);
 #ifdef DEBUG
     scope.tree.observe_page_path(page_path);
@@ -256,7 +359,6 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
         return;
     }
 
-    const auto request_key = scoped_request_key(fact);
     if (request_key.empty()) return;
     const auto prefetch_id = scope.clock.next_operation_id("prefetch");
     const auto enqueue_epoch = scope.clock.next_enqueue_epoch();
@@ -332,31 +434,23 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
      * materialization after termination.
      */
     const auto hit_pages = scope.storage.contiguous_readable_prefix(planned_projected_pages);
-    const auto storage_query_pages = prefetch_storage_query_pages(effective_requested_pages, static_cast<uint64_t>(hit_pages.size()));
-    const auto storage_query_start_ts = std::max(fact.ts, scope.prefetch_worker_available_ts);
-    const auto storage_query_ready_ts = core::checked_add_u64(storage_query_start_ts,
-                                                              estimate_prefetch_storage_query_duration(storage_query_pages),
-                                                              "HiCache storage query ready timestamp exceeds uint64 range");
-    scope.prefetch_worker_available_ts = storage_query_ready_ts;
     suppress_prior_prefetch(fact, summary, transitions, scope, request_key);
+    const bool payload_transfer_issued = hit_pages.size() >= policy_.prefetch_threshold_pages();
+    const auto io_schedule =
+        payload_transfer_issued ? schedule_target_io(scope, TargetIoLane::HostStorage, fact.ts, static_cast<uint64_t>(hit_pages.size())) : HiCacheIoSchedule{};
 
     HiCachePrefetchOperation op{
-        .header = make_operation_header(HiCacheOperationKind::Prefetch,
-                                        prefetch_id,
-                                        normalized_scope(fact),
-                                        request_key,
-                                        owner,
-                                        planned_pages,
-                                        fact.ts,
-                                        enqueue_epoch),
+        .header =
+            make_operation_header(HiCacheOperationKind::Prefetch, prefetch_id, fact, normalized_scope(fact), request_key, owner, planned_pages, enqueue_epoch),
         .host_insert_pages = prefix_to(pages, memory_prefix.size() + hit_pages.size()),
         .host_visible_offset_pages = static_cast<uint64_t>(memory_prefix.size()),
         .planned_pages = planned_pages,
         .hit_pages = hit_pages,
         .completed_pages = {},
+        .io_schedule = io_schedule,
+        .payload_transfer_issued = payload_transfer_issued,
         .requested_host_pages = effective_requested_pages,
         .reserved_host_pages = reservable,
-        .storage_query_ready_ts = storage_query_ready_ts,
         .prefetch_state = HiCachePrefetchState::Pending,
     };
     scope.async_ops.insert_prefetch(std::move(op));
@@ -400,13 +494,20 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiC
 void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
                                         HiCachePrefetchOperation & op) {
     const auto before_ready = debug_state_digest();
+    const auto completion_ts = op.target_boundary_ts != 0 ? op.target_boundary_ts : op.io_schedule.available ? op.io_schedule.ready_ts : fact.ts;
+    const bool timeout_incomplete = op.timed_out && op.completed_byte_count < op.io_schedule.effective_byte_count;
     scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
-                                             HiCachePrefetchState::Ready,
-                                             HiCacheOperationState::Ready,
-                                             "completed_prefetch_ready",
-                                             fact.ts);
+                                             timeout_incomplete ? HiCachePrefetchState::Late : HiCachePrefetchState::Ready,
+                                             timeout_incomplete ? HiCacheOperationState::Completed : HiCacheOperationState::Ready,
+                                             timeout_incomplete ? "prefetch_timeout_incomplete" : "completed_prefetch_ready",
+                                             completion_ts);
     if constexpr (debug_records_enabled())
-        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "prefetch_ready", .tier = "prefetch" }, op.completed_pages, before_ready);
+        record_transition(fact,
+                          summary,
+                          transitions,
+                          TransitionDescriptor{ .kind = timeout_incomplete ? "prefetch_timeout_incomplete" : "prefetch_ready", .tier = "prefetch" },
+                          timeout_incomplete ? op.planned_pages : op.completed_pages,
+                          before_ready);
     if constexpr (debug_records_enabled()) {
         if (op.completed_pages.empty())
             record_transition(fact,
@@ -433,10 +534,10 @@ void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary
     for (const auto node_id : insert.touched_nodes) { scope.storage.mark_materialized_pages(scope.tree.node_pages(node_id), node_id); }
 #endif
     scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
-                                             HiCachePrefetchState::Applied,
+                                             timeout_incomplete ? HiCachePrefetchState::Late : HiCachePrefetchState::Applied,
                                              HiCacheOperationState::Committed,
-                                             "apply_host_visibility",
-                                             fact.ts);
+                                             timeout_incomplete ? "apply_timeout_host_visibility" : "apply_host_visibility",
+                                             completion_ts);
     /**
      * @brief Converts the completed prefix immediately into host residency.
      *
@@ -486,7 +587,7 @@ void HiCacheState::cancel_prefetch_pending_release(const HiCacheFact & fact, HiC
 void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
                                                        ScopedState & scope, const std::string & request_key) {
     auto * op = scope.async_ops.prefetch_for_request(request_key);
-    if (op == nullptr || !prefetch_active(*op)) {
+    if (op == nullptr) {
         if constexpr (debug_records_enabled())
             record_policy_decision(fact,
                                    HiCachePolicyDecisionRecord{
@@ -498,112 +599,120 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
                                    });
         return;
     }
-    op->header.boundary_ts = fact.ts;
-    constexpr bool terminal = true;
+    if (!prefetch_active(*op)) {
+        if (op->visibility_dependency_required) bind_prefetch_consumer_boundary(fact, scope, *op, request_key);
+        return;
+    }
+    bind_prefetch_consumer_boundary(fact, scope, *op, request_key);
+    op->visibility_dependency_required = false;
 
     auto suppress = [&](const std::string & kind, HiCachePrefetchState state) {
         cancel_prefetch_pending_release(fact, summary, transitions, scope, *op, kind, state);
     };
 
     if (op->hit_pages.size() < policy_.prefetch_threshold_pages()) {
-        op->release_before_cache_extend = prefetch_release_visible_before_cache_extend(*op, fact);
         if constexpr (debug_records_enabled())
-            record_policy_decision(
-                fact,
-                HiCachePolicyDecisionRecord{
-                    .operation_id = op->header.operation_id,
-                    .policy_area = "prefetch_cache_extend_boundary",
-                    .policy_name = policy_.prefetch_policy(),
-                    .decision = "revoke_prefetch",
-                    .reason = op->release_before_cache_extend
-                                  ? "storage readable prefix is below prefetch threshold; prefetch worker query is ready before cache extend"
-                                  : "storage readable prefix is below prefetch threshold; prefetch worker query is not ready before cache extend",
-                    .accepted = false,
-                    .requested_pages = op->requested_host_pages,
-                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
-                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
-                    .reserved_pages = op->reserved_host_pages,
-                    .threshold_pages = policy_.prefetch_threshold_pages(),
-                    .pages = op->planned_pages,
-                });
+            record_policy_decision(fact,
+                                   HiCachePolicyDecisionRecord{
+                                       .operation_id = op->header.operation_id,
+                                       .policy_area = "prefetch_cache_extend_boundary",
+                                       .policy_name = policy_.prefetch_policy(),
+                                       .decision = "revoke_prefetch",
+                                       .reason = "storage readable prefix is below threshold; metadata-query timing is not modeled and the target control "
+                                                 "boundary drains revoke before allocation",
+                                       .accepted = false,
+                                       .requested_pages = op->requested_host_pages,
+                                       .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                                       .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                                       .reserved_pages = op->reserved_host_pages,
+                                       .threshold_pages = policy_.prefetch_threshold_pages(),
+                                       .pages = op->planned_pages,
+                                   });
+        op->header.boundary_ts = fact.ts;
+        op->header.boundary_epoch = op->header.consumer_epoch;
+        op->policy_stop_ts = fact.ts;
+        op->target_boundary_ts = fact.ts;
+        op->timeout_deadline_ts = 0;
         suppress("prefetch_revoked", HiCachePrefetchState::Revoked);
+        drain_prefetch_pending_release(
+            fact,
+            summary,
+            transitions,
+            scope,
+            request_key,
+            PrefetchReleaseReasons{
+                .capacity = "prefetch_storage_control_pre_cache_extend_host_release",
+                .policy = "Below-threshold target prefetch is revoked and its host reservation is drained before cache extend allocation",
+            });
         return;
     }
 
     const auto policy = policy_.prefetch_policy();
-    if (policy == "wait_complete") {
-        auto progress = estimate_prefetch_progress(*op, fact, terminal);
+    auto progress = estimate_prefetch_progress(*op, fact);
+    if (!progress.boundary_resolved) {
 #ifdef DEBUG
         record_policy_decision(fact,
                                HiCachePolicyDecisionRecord{
                                    .operation_id = op->header.operation_id,
                                    .policy_area = "prefetch_cache_extend_boundary",
                                    .policy_name = policy,
-                                   .decision = "apply_prefetch",
+                                   .decision = "defer_prefetch_boundary",
                                    .reason = progress.reason,
-                                   .accepted = true,
+                                   .accepted = false,
                                    .requested_pages = op->requested_host_pages,
                                    .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
                                    .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
-                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
                                    .reserved_pages = op->reserved_host_pages,
                                    .threshold_pages = policy_.prefetch_threshold_pages(),
+                                   .source_boundary_ts = progress.source_boundary_ts,
+                                   .io_start_ts = op->io_schedule.start_ts,
+                                   .io_ready_ts = op->io_schedule.ready_ts,
                                    .pages = op->planned_pages,
                                });
 #endif
-        op->completed_pages = std::move(progress.completed_pages);
-        apply_prefetch_ready(fact, summary, transitions, scope, *op);
         return;
     }
-    if (policy == "best_effort") {
-        auto progress = estimate_prefetch_progress(*op, fact, terminal);
+
+    op->header.boundary_ts = progress.target_boundary_ts;
+    op->header.boundary_epoch = op->header.consumer_epoch;
+    op->completed_pages = std::move(progress.completed_pages);
+    op->completed_byte_count = progress.completed_byte_count;
+    op->policy_stop_ts = progress.policy_stop_ts;
+    op->target_boundary_ts = progress.target_boundary_ts;
+    op->timeout_deadline_ts = progress.timeout_deadline_ts;
+    op->timed_out = progress.timed_out;
+    op->visibility_dependency_required = progress.visibility_dependency_required;
 #ifdef DEBUG
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .operation_id = op->header.operation_id,
-                                   .policy_area = "prefetch_cache_extend_boundary",
-                                   .policy_name = policy,
-                                   .decision = "terminate_prefetch",
-                                   .reason = progress.reason,
-                                   .accepted = true,
-                                   .requested_pages = op->requested_host_pages,
-                                   .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
-                                   .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
-                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
-                                   .reserved_pages = op->reserved_host_pages,
-                                   .threshold_pages = policy_.prefetch_threshold_pages(),
-                                   .pages = op->planned_pages,
-                               });
+    record_policy_decision(fact,
+                           HiCachePolicyDecisionRecord{
+                               .operation_id = op->header.operation_id,
+                               .policy_area = "prefetch_cache_extend_boundary",
+                               .policy_name = policy,
+                               .decision = progress.timed_out        ? "timeout_prefetch"
+                                           : policy == "best_effort" ? "terminate_prefetch"
+                                                                     : "apply_prefetch",
+                               .reason = progress.reason,
+                               .accepted = true,
+                               .requested_pages = op->requested_host_pages,
+                               .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
+                               .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
+                               .allocated_pages = static_cast<uint64_t>(op->completed_pages.size()),
+                               .reserved_pages = op->reserved_host_pages,
+                               .threshold_pages = policy_.prefetch_threshold_pages(),
+                               .source_boundary_ts = progress.source_boundary_ts,
+                               .policy_stop_ts = progress.policy_stop_ts,
+                               .target_boundary_ts = progress.target_boundary_ts,
+                               .timeout_deadline_ts = progress.timeout_deadline_ts,
+                               .io_start_ts = op->io_schedule.start_ts,
+                               .io_ready_ts = op->io_schedule.ready_ts,
+                               .completed_byte_count = progress.completed_byte_count,
+                               .io_completed = progress.io_completed,
+                               .timed_out = progress.timed_out,
+                               .boundary_adjusted = progress.target_boundary_ts != progress.source_boundary_ts,
+                               .pages = op->planned_pages,
+                           });
 #endif
-        op->completed_pages = std::move(progress.completed_pages);
-        apply_prefetch_ready(fact, summary, transitions, scope, *op);
-        return;
-    }
-    if (policy == "timeout") {
-        auto progress = estimate_prefetch_progress(*op, fact, terminal);
-#ifdef DEBUG
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .operation_id = op->header.operation_id,
-                                   .policy_area = "prefetch_cache_extend_boundary",
-                                   .policy_name = policy,
-                                   .decision = "apply_prefetch",
-                                   .reason = progress.reason,
-                                   .accepted = true,
-                                   .requested_pages = op->requested_host_pages,
-                                   .candidate_pages = static_cast<uint64_t>(op->planned_pages.size()),
-                                   .hit_pages = static_cast<uint64_t>(op->hit_pages.size()),
-                                   .allocated_pages = static_cast<uint64_t>(progress.completed_pages.size()),
-                                   .reserved_pages = op->reserved_host_pages,
-                                   .threshold_pages = policy_.prefetch_threshold_pages(),
-                                   .pages = op->planned_pages,
-                               });
-#endif
-        op->completed_pages = std::move(progress.completed_pages);
-        apply_prefetch_ready(fact, summary, transitions, scope, *op);
-        return;
-    }
-    throw std::logic_error("Resolved HiCache prefetch policy is not executable: " + policy);
+    apply_prefetch_ready(fact, summary, transitions, scope, *op);
 }
 
 /**

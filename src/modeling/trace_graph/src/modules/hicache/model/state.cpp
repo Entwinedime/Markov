@@ -100,6 +100,52 @@ std::string HiCacheState::scoped_request_key(const HiCacheFact & fact) const {
     return normalized_scope(fact) + ":" + fact.request_id;
 }
 
+void HiCacheState::register_prefetch_control_boundary(const HiCacheFact & fact) {
+    auto register_request = [&](const std::string & request_id) {
+        if (request_id.empty()) return;
+        HiCacheFact boundary;
+        boundary.source_node_id = fact.source_node_id;
+        boundary.source_event_index = fact.source_event_index;
+        boundary.ts = fact.ts;
+        boundary.event_name = fact.event_name;
+        boundary.role = fact.role;
+        boundary.phase = fact.phase;
+        boundary.request_id = request_id;
+        boundary.cache_scope = fact.cache_scope;
+        prefetch_control_boundaries_[scoped_request_key(boundary)].push_back(std::move(boundary));
+    };
+    if (fact.batch_paths.empty()) {
+        register_request(fact.request_id);
+        return;
+    }
+    for (const auto & entry : fact.batch_paths) { register_request(entry.request_id); }
+}
+
+const HiCacheFact * HiCacheState::prefetch_control_boundary_for_lookup(const HiCacheFact & fact) const {
+    const auto request_key = scoped_request_key(fact);
+    const auto boundaries = prefetch_control_boundaries_.find(request_key);
+    if (boundaries == prefetch_control_boundaries_.end()) return nullptr;
+    const HiCacheFact * selected = nullptr;
+    for (const auto & candidate : boundaries->second) {
+        if (candidate.ts < fact.ts) continue;
+        if (selected == nullptr || candidate.ts < selected->ts || (candidate.ts == selected->ts && candidate.source_event_index < selected->source_event_index))
+            selected = &candidate;
+    }
+    return selected;
+}
+
+const HiCacheFact * HiCacheState::prefetch_control_boundary_for_operation(const HiCachePrefetchOperation & operation) const {
+    const auto boundaries = prefetch_control_boundaries_.find(operation.header.request_key);
+    if (boundaries == prefetch_control_boundaries_.end()) return nullptr;
+    const HiCacheFact * selected = nullptr;
+    for (const auto & candidate : boundaries->second) {
+        if (candidate.ts < operation.header.enqueue_ts) continue;
+        if (selected == nullptr || candidate.ts < selected->ts || (candidate.ts == selected->ts && candidate.source_event_index < selected->source_event_index))
+            selected = &candidate;
+    }
+    return selected;
+}
+
 HiCacheState::ScopedState & HiCacheState::scope_state(const HiCacheFact & fact) { return scopes_[normalized_scope(fact)]; }
 
 void HiCacheState::ensure_device_allocator(ScopedState & scope) {
@@ -495,7 +541,9 @@ void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, Hi
     if (role != HiCacheFactRole::Unknown) {
         auto & scope = scope_state(fact);
         drain_write_through_backup_refs(fact, summary, transitions, scope, "write_through_backup_ack_boundary");
+        advance_ready_prefetches(fact, summary, transitions);
     }
+    observe_effect_opportunities(fact, role);
 
     switch (role) {
     case HiCacheFactRole::PrefetchCandidateAnchor:

@@ -49,6 +49,7 @@ struct HiCacheOperationHeader {
     HiCacheOperationKind kind = HiCacheOperationKind::Prefetch;
     std::string cache_scope;
     std::string request_key;
+    std::string request_id;
     std::string owner;
     std::vector<std::string> pages;
     HiCacheOperationState state = HiCacheOperationState::Created;
@@ -58,6 +59,29 @@ struct HiCacheOperationHeader {
     uint64_t enqueue_ts = 0;
     uint64_t boundary_ts = 0;
     uint64_t complete_ts = 0;
+    uint64_t consumer_epoch = 0;
+    uint64_t consumer_ts = 0;
+    size_t consumer_source_node_id = 0;
+    size_t consumer_source_event_index = 0;
+    std::string consumer_source_fact_role;
+    bool consumer_source_available = false;
+    size_t source_node_id = 0;
+    size_t source_event_index = 0;
+    uint64_t source_fact_seq_no = 0;
+    std::string source_fact_role;
+    std::string source_token_path_id;
+    uint64_t source_token_begin = 0;
+    uint64_t source_token_end = 0;
+};
+
+/** @brief Target-derived timing for one transfer on a logical I/O resource lane. */
+struct HiCacheIoSchedule {
+    bool available = false;
+    std::string resource_lane;
+    uint64_t effective_byte_count = 0;
+    uint64_t duration_us = 0;
+    uint64_t start_ts = 0;
+    uint64_t ready_ts = 0;
 };
 
 #ifdef DEBUG
@@ -85,8 +109,10 @@ struct HiCacheOperationLifecycleTransition {
  * @brief One storage-to-host prefetch operation.
  *
  * `planned_pages` is the aligned request, `hit_pages` is the contiguous storage-hit
- * prefix, `completed_pages` is the prefix transferred by a termination boundary, and
- * `reserved_host_pages` is the L2 reservation accepted after cleanup.
+ * prefix, `payload_transfer_issued` records the SGLang threshold gate that submits that
+ * prefix to the payload worker, `completed_pages` is the prefix visible at a termination
+ * boundary, and `completed_byte_count` records the target payload service completed by
+ * that boundary. `reserved_host_pages` is the L2 reservation accepted after cleanup.
  */
 struct HiCachePrefetchOperation {
     HiCacheOperationHeader header;
@@ -95,10 +121,16 @@ struct HiCachePrefetchOperation {
     std::vector<std::string> planned_pages;
     std::vector<std::string> hit_pages;
     std::vector<std::string> completed_pages;
+    HiCacheIoSchedule io_schedule;
+    uint64_t completed_byte_count = 0;
+    uint64_t policy_stop_ts = 0;
+    uint64_t target_boundary_ts = 0;
+    uint64_t timeout_deadline_ts = 0;
+    bool payload_transfer_issued = false;
+    bool timed_out = false;
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
-    uint64_t storage_query_ready_ts = 0;
-    bool release_before_cache_extend = false;
+    bool visibility_dependency_required = false;
     HiCachePrefetchState prefetch_state = HiCachePrefetchState::Pending;
 };
 
@@ -110,11 +142,14 @@ struct HiCacheWritebackOperation {
 /** @brief Modeled transfer of a host/storage-visible prefix back to L1. */
 struct HiCacheLoadbackOperation {
     HiCacheOperationHeader header;
+    HiCacheIoSchedule io_schedule;
 };
 
 /** @brief Modeled operation that commits an L2 value to storage. */
 struct HiCacheStorageOperation {
     HiCacheOperationHeader header;
+    std::vector<std::string> device_to_host_pages;
+    std::vector<std::string> capacity_gate_pages;
 };
 
 /**
@@ -174,6 +209,12 @@ public:
     /** @brief Inserts a new modeled loadback operation and rejects duplicate IDs. */
     void insert_loadback(HiCacheLoadbackOperation op);
 
+    /** @brief Returns the latest modeled loadback for a request. */
+    [[nodiscard]] HiCacheLoadbackOperation * loadback_for_request(const std::string & request_key);
+
+    /** @brief Returns the latest modeled loadback for a request. */
+    [[nodiscard]] const HiCacheLoadbackOperation * loadback_for_request(const std::string & request_key) const;
+
     /** @brief Advances common lifecycle state for a loadback operation. */
     void set_loadback_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts = 0);
 
@@ -185,6 +226,13 @@ public:
 
     /** @brief Advances common lifecycle state for a storage operation. */
     void set_storage_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts = 0);
+
+    /** @brief Assigns pages protected by the write-through ACK/release gate. */
+    void set_storage_capacity_gate_pages(const std::string & operation_id, std::vector<std::string> pages);
+
+    /** @brief Records the first canonical consumer released by a storage capacity gate. */
+    void set_storage_consumer_boundary(const std::string & operation_id, uint64_t consumer_epoch, uint64_t consumer_ts, size_t source_node_id,
+                                       size_t source_event_index, std::string source_fact_role, bool source_available);
 
     /** @brief Returns all storage operations. */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() const { return storage_by_id_; }
@@ -206,6 +254,7 @@ private:
     std::unordered_map<std::string, std::string> latest_prefetch_id_by_request_;
     std::unordered_map<std::string, HiCacheWritebackOperation> writeback_by_id_;
     std::unordered_map<std::string, HiCacheLoadbackOperation> loadback_by_id_;
+    std::unordered_map<std::string, std::string> latest_loadback_id_by_request_;
     std::unordered_map<std::string, HiCacheStorageOperation> storage_by_id_;
     std::unordered_map<std::string, std::vector<std::string>> operation_ids_by_request_;
 #ifdef DEBUG

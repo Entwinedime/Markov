@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <initializer_list>
 #include <ranges>
 #include <stdexcept>
@@ -187,13 +188,14 @@ bool HiCachePolicy::prefetch_rate_limited(uint64_t active_requested_pages) const
     return active_requested_pages >= limit;
 }
 
-bool HiCachePolicy::prefetch_timeout_elapsed(const HiCachePrefetchTimeoutObservation & observation) const {
-    if (!resolved_.prefetch_timeout_configured || observation.boundary_ts <= observation.enqueue_ts) return false;
+std::optional<uint64_t> HiCachePolicy::prefetch_timeout_deadline_ts(const HiCachePrefetchTimeoutInput & input) const {
+    if (!resolved_.prefetch_timeout_configured) return std::nullopt;
     const double timeout_sec =
         std::min(resolved_.prefetch_timeout_max_sec,
-                 resolved_.prefetch_timeout_base_sec + resolved_.prefetch_timeout_per_ki_token_sec * static_cast<double>(observation.token_count) / 1024.0);
-    const auto elapsed_sec = static_cast<double>(observation.boundary_ts - observation.enqueue_ts) / 1'000'000.0;
-    return elapsed_sec > timeout_sec;
+                 resolved_.prefetch_timeout_base_sec + resolved_.prefetch_timeout_per_ki_token_sec * static_cast<double>(input.token_count) / 1024.0);
+    const auto timeout_us = core::truncate_to_u64(std::ceil(timeout_sec * 1'000'000.0));
+    if (!timeout_us) throw std::overflow_error("HiCache prefetch timeout exceeds uint64 microsecond range");
+    return core::checked_add_u64(input.enqueue_ts, *timeout_us, "HiCache prefetch timeout deadline exceeds uint64 range");
 }
 
 } // namespace markov::trace_graph::modules::hicache

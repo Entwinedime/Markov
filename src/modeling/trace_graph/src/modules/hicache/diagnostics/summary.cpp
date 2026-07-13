@@ -22,8 +22,9 @@ using model::HiCacheCapacityMutation;
 using model::HiCacheCapacityVictimChoice;
 using model::HiCacheControlBoundary;
 using model::HiCacheEffectBoundary;
-using model::HiCacheEffectIntent;
-using model::HiCacheEffectIntentCatalog;
+using model::HiCacheEffectDecision;
+using model::HiCacheEffectDecisionLedger;
+using model::HiCacheEffectSegment;
 using model::HiCacheNodeSplitRecord;
 using model::HiCacheOperationLifecycleTransition;
 using model::HiCacheRefAuditIssue;
@@ -50,7 +51,7 @@ Json array_from(std::ranges::input_range auto && range, auto projector) {
 
 Json target_config_json(const frontend::HiCacheConfig & config) {
     return {
-        {                         "page_size",                         config.page_size },
+        {                         "page_size",config.page_size                                              },
         {                 "kv_bytes_per_page",                 config.kv_bytes_per_page },
         {                 "l1_capacity_pages",                 config.l1_capacity_pages },
         {                 "l2_capacity_pages",                 config.l2_capacity_pages },
@@ -66,56 +67,114 @@ Json target_config_json(const frontend::HiCacheConfig & config) {
         {        "device_allocator_need_sort",        config.device_allocator_need_sort },
         {                "emit_state_digests",                config.emit_state_digests },
         {                 "dag_patch_enabled",                 config.dag_patch_enabled },
+        {                           "io_cost",
+         Json{
+         { "model_id", config.io_cost.model_id },
+         { "model_digest", config.io_cost.model_digest },
+         { "calibration_status", config.io_cost.calibration_status },
+         { "resource_model", config.io_cost.resource_model },
+         { "device_host_bandwidth_bytes_per_sec", config.io_cost.device_host_bandwidth_bytes_per_sec },
+         { "host_storage_bandwidth_bytes_per_sec", config.io_cost.host_storage_bandwidth_bytes_per_sec },
+         { "provenance", config.io_cost.provenance },
+         }                                                                             },
     };
 }
 
 Json effect_boundary_json(const HiCacheEffectBoundary & boundary) {
     return {
-        {         "kind",         boundary.kind },
-        {        "epoch",        boundary.epoch },
-        { "timestamp_us", boundary.timestamp_us },
+        {               "kind",                                                                    boundary.kind },
+        {              "epoch",                                                                   boundary.epoch },
+        {       "timestamp_us",                                                            boundary.timestamp_us },
+        {     "source_node_id",         boundary.source_node_id ? Json(*boundary.source_node_id) : Json(nullptr) },
+        { "source_event_index", boundary.source_event_index ? Json(*boundary.source_event_index) : Json(nullptr) },
+        {   "source_fact_role",                                                        boundary.source_fact_role },
     };
 }
 
-Json effect_intent_json(const HiCacheEffectIntent & intent) {
+Json effect_segment_json(const HiCacheEffectSegment & segment) {
     return {
-        {                   "effect_id",                                         intent.effect_id },
-        {                 "effect_type",             hicache_effect_type_name(intent.effect_type) },
-        {                "operation_id",                                      intent.operation_id },
-        {                 "request_key",                                       intent.request_key },
-        {                 "cache_scope",                                       intent.cache_scope },
-        {                   "direction",        hicache_transfer_direction_name(intent.direction) },
-        {                       "pages",                                             intent.pages },
-        {        "candidate_page_count",                              intent.candidate_page_count },
-        {        "effective_page_count",                              intent.effective_page_count },
-        {        "effective_byte_count",                              intent.effective_byte_count },
-        {      "logical_start_boundary",      effect_boundary_json(intent.logical_start_boundary) },
-        { "logical_completion_boundary", effect_boundary_json(intent.logical_completion_boundary) },
-        {           "consumer_boundary",           effect_boundary_json(intent.consumer_boundary) },
-        {               "resource_lane",                                     intent.resource_lane },
-        {                       "state",                                             intent.state },
-        {                "patch_status",    hicache_effect_patch_status_name(intent.patch_status) },
-        {        "not_patchable_reason",                              intent.not_patchable_reason },
+        {    "segment_key",    segment.segment_key },
+        {  "token_path_id",  segment.token_path_id },
+        {    "token_begin",    segment.token_begin },
+        {      "token_end",      segment.token_end },
+        { "target_page_id", segment.target_page_id },
     };
 }
 
-Json effect_intent_catalog_json(const HiCacheEffectIntentCatalog & catalog) {
+Json effect_decision_json(const HiCacheEffectDecision & decision) {
     return {
-        { "status", catalog.status },
-        { "intent_count", catalog.intents.size() },
-        { "patchable_count", catalog.patchable_count() },
-        { "not_patchable_count", catalog.not_patchable_count() },
-        { "deferred_count", catalog.deferred_count() },
-        { "counts_by_effect_type", catalog.counts_by_effect_type() },
-        { "missing_facts", catalog.missing_facts },
-        { "not_patchable_reasons", catalog.not_patchable_reasons },
+        { "effect_key", decision.effect_key },
+        { "opportunity_key", decision.opportunity_key },
+        { "effect_family_key", decision.effect_family_key },
+        { "effect_type", hicache_effect_type_name(decision.effect_type) },
+        { "direction", hicache_transfer_direction_name(decision.direction) },
+        { "cache_scope", decision.cache_scope },
+        { "source_cache_scope_provenance", decision.source_cache_scope_provenance },
+        { "request_identity", decision.request_identity },
+        { "request_id_provenance", decision.request_id_provenance },
+        { "source_fact_role", decision.source_fact_role },
+        { "source_fact_ordinal", decision.source_fact_ordinal },
+        { "decision_ordinal", decision.decision_ordinal },
+        { "source_fact_seq_no", decision.source_fact_seq_no },
+        { "source_node_id", decision.source_node_id },
+        { "source_event_index", decision.source_event_index },
+        { "operation_ids", decision.operation_ids },
+        { "candidate_segments", array_from(decision.candidate_segments, effect_segment_json) },
+        { "effective_segments", array_from(decision.effective_segments, effect_segment_json) },
+        { "effective_pages", decision.effective_pages },
+        { "candidate_page_count", decision.candidate_page_count },
+        { "effective_page_count", decision.effective_page_count },
+        { "effective_byte_count", decision.effective_byte_count },
+        { "eligibility_boundary", effect_boundary_json(decision.eligibility_boundary) },
+        { "completion_boundary", effect_boundary_json(decision.completion_boundary) },
+        { "consumer_boundary", effect_boundary_json(decision.consumer_boundary) },
+        { "resource_lane", decision.resource_lane },
+        { "state", decision.state },
+        { "target_effect_state", hicache_target_effect_state_name(decision.target_effect_state) },
+        { "schedule_sensitivity", hicache_schedule_sensitivity_name(decision.schedule_sensitivity) },
+        { "schedule_sensitivity_reason", decision.schedule_sensitivity_reason },
+        { "source_carrier_state", hicache_source_carrier_state_name(decision.source_carrier_state) },
+        { "patch_status", hicache_effect_patch_status_name(decision.patch_status) },
+        { "reason", decision.reason },
+        { "not_patchable_reason", decision.not_patchable_reason },
+    };
+}
+
+Json effect_decision_ledger_json(const HiCacheEffectDecisionLedger & ledger) {
+    return {
+        { "status", ledger.status },
+        { "decision_count", ledger.decisions.size() },
+        { "patchable_count", ledger.patchable_count() },
+        { "not_patchable_count", ledger.not_patchable_count() },
+        { "deferred_count", ledger.deferred_count() },
+        { "unresolved_count", ledger.unresolved_count() },
+        { "schedule_sensitive_count", ledger.schedule_sensitive_count() },
+        { "decision_coverage", ledger.decision_coverage },
+        { "prefill_effect_status", ledger.prefill_effect_status },
+        { "prefetch_readiness_status", ledger.prefetch_readiness_status },
+        { "counts_by_effect_type", ledger.counts_by_effect_type() },
+        { "counts_by_target_effect_state", ledger.counts_by_target_effect_state() },
+        { "counts_by_schedule_sensitivity", ledger.counts_by_schedule_sensitivity() },
+        { "counts_by_source_carrier_state", ledger.counts_by_source_carrier_state() },
+        { "missing_facts", ledger.missing_facts },
+        { "not_patchable_reasons", ledger.not_patchable_reasons },
         { "byte_projection",
          Json{
-              { "available", catalog.byte_projection_available },
-              { "kv_bytes_per_page", catalog.kv_bytes_per_page },
-              { "source", catalog.byte_projection_source },
+              { "available", ledger.byte_projection_available },
+              { "kv_bytes_per_page", ledger.kv_bytes_per_page },
+              { "source", ledger.byte_projection_source },
           } },
-        { "intents", array_from(catalog.intents, effect_intent_json) },
+        { "io_model",
+         Json{
+              { "model_id", ledger.io_model_id },
+              { "model_digest", ledger.io_model_digest },
+              { "calibration_status", ledger.io_model_calibration_status },
+              { "resource_model", ledger.resource_model },
+              { "device_host_bandwidth_bytes_per_sec", ledger.device_host_bandwidth_bytes_per_sec },
+              { "host_storage_bandwidth_bytes_per_sec", ledger.host_storage_bandwidth_bytes_per_sec },
+              { "provenance", ledger.io_model_provenance },
+          } },
+        { "decisions", array_from(ledger.decisions, effect_decision_json) },
     };
 }
 
@@ -279,6 +338,16 @@ Json policy_decision_json(const HiCachePolicyDecisionRecord & decision) {
         {             "lifecycle_tail_pages",             decision.lifecycle_tail_pages },
         {                  "threshold_pages",                  decision.threshold_pages },
         {                      "limit_pages",                      decision.limit_pages },
+        {               "source_boundary_ts",               decision.source_boundary_ts },
+        {                   "policy_stop_ts",                   decision.policy_stop_ts },
+        {               "target_boundary_ts",               decision.target_boundary_ts },
+        {              "timeout_deadline_ts",              decision.timeout_deadline_ts },
+        {                      "io_start_ts",                      decision.io_start_ts },
+        {                      "io_ready_ts",                      decision.io_ready_ts },
+        {             "completed_byte_count",             decision.completed_byte_count },
+        {                     "io_completed",                     decision.io_completed },
+        {                        "timed_out",                        decision.timed_out },
+        {                "boundary_adjusted",                decision.boundary_adjusted },
         {                            "pages",                            decision.pages },
     };
 }
@@ -487,7 +556,7 @@ using summary_detail::capacity_mutation_json;
 using summary_detail::capacity_victim_choice_json;
 using summary_detail::control_boundary_json;
 using summary_detail::derived_snapshot_json;
-using summary_detail::effect_intent_catalog_json;
+using summary_detail::effect_decision_ledger_json;
 using summary_detail::final_state_json;
 using summary_detail::Json;
 using summary_detail::policy_decision_json;
@@ -504,7 +573,7 @@ using summary_detail::transition_json;
  * The serializer emits facts, traces, and derived views already produced by replay. It does
  * not recompute model state or merge the diagnostics-only inclusive view into final state.
  */
-std::string summary_json(const HiCacheSummary & summary, const HiCacheEffectIntentCatalog & effect_intents) {
+std::string summary_json(const HiCacheSummary & summary, const HiCacheEffectDecisionLedger & effect_decisions) {
     Json root;
     root["status"] = summary.status;
     root["target_config"] = target_config_json(summary.target_config);
@@ -512,7 +581,7 @@ std::string summary_json(const HiCacheSummary & summary, const HiCacheEffectInte
     root["input_hicache_events"] = summary.input_hicache_events;
     root["processed_hicache_events"] = summary.processed_hicache_events;
     root["state_transition_count"] = summary.state_transition_count;
-    root["effect_intents"] = effect_intent_catalog_json(effect_intents);
+    root["effect_decisions"] = effect_decision_ledger_json(effect_decisions);
     root["dirty_eviction_events"] = summary.dirty_eviction_events;
     root["active_ref_owner_count"] = summary.active_ref_owner_count;
     root["radix_split_count"] = summary.radix_split_count;
