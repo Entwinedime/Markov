@@ -20,12 +20,19 @@ __pycache__/
 venv/
 
 # Profiling and generated traces
+data
 data/profile_runs/**
 data/modeling_runs/**
 data/tmp/**
 data/traces/raw/**
 data/traces/merged/**
 data/traces/dag/**
+
+# ppts
+ppts
+
+# docs
+docs/tmp
 
 # Local runtime outputs
 kernel_meta/
