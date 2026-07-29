@@ -113,19 +113,64 @@ Unified modeling workflow 的 HiCache validation preflight 会把该检查压缩
 
 ## 当前合同状态与保留验证基线
 
-说明：当前 active state/transition 与 DAG patch 正确性以 2026-07-12 expanded forced replay profiles 的最终 75-cell
-closure 为准。2026-07-06 和 2026-07-01 的结果只保留为旧 state-only 合同证据。
+本节只有能够由当前二进制和当前安全约束支持的结论才称为“当前”。2026-07-12 及更早的 full-matrix 是旧
+source-DAG 语义下的历史证据，仍可用于理解机制和失败形态，但不能替代当前的 DAG patch 或跨配置 prediction
+acceptance。
 
-### HCSV-20260712-direct-io-control-v1-current
+| 证据等级 | artifact | 现在可以得出的结论 |
+| --- | --- | --- |
+| 当前 Base-DAG 基线 | `HCSV-20260729-current-binary-base-dag-replay` | 当前二进制在同一批 15 个 full-DAG profile 上的纯 `faithful_replay` 已全部落在 5% 相对误差内。 |
+| 当前 patch 状态 | `v2_27_predictions` | 27 个 cell 都被 safety gate 阻断，未产生任何 DAG mutation；这证明 gate 生效，不是 prediction 通过。 |
+| 历史 patch/state 证据 | `HCSV-20260712`、`HCSV-20260706` 及更早 run | 记录旧输入合同和旧 source-DAG 语义下的行为，不能作为当前 binary 的 acceptance。 |
 
-当前 active 能力已经从 resource-plan smoke 推进到 calibrated production DAG patch。Workflow 使用独立标定文件：
+### HCSV-20260729-current-binary-base-dag-replay
+
+使用当前 validation binary 重新读取 2026-07-13 的 15 个 full-DAG profile，执行全 channel 的
+`faithful_replay`。运行使用 `threads=4`、`file_threads=4`，未加载 model config、HiCache module 或 DAG patch，未启动
+NPU；历史 workload report 没有 `formal_begin_ms` / `formal_end_ms`，因此本轮也是未加 formal trace window 的 replay。
+
+结果目录：
+
+```text
+data/profile_runs/sglang/20260713_113331_hicache_full_recapture_profiling_hicache_dag_analysis_forced_replay/
+  modeling/replay_current_binary_20260729_103825_base_dag/
+```
+
+| 指标 | 历史 binary | 当前 binary |
+| --- | ---: | ---: |
+| 完成 cell | `15/15` | `15/15`，`0` failure、`0` timeout |
+| Base-DAG MAPE | `7.03%` | `1.77%` |
+| 最大绝对相对误差 | `8.62%` | `2.42%` |
+| 相对误差不超过 5% 的 cell | `1/15` | `15/15` |
+| 输入一致性 | - | `real_e2e_us` 与 parsed record count 均为 `15/15` 一致 |
+
+逐 cell 数值见结果目录中的 `comparison.md` 和 `comparison.json`。该结果只验证当前 Base-DAG replay；它不验证
+formal window、HiCache target state、DAG patch、prefill 或 cross-config E2E prediction。
+
+当前 patch 安全状态也必须单独记录。`2026-07-28` 的 V2 诊断覆盖 `3` 个 workload 和 `3 x 3` source/target config，
+共 `27` 个 model run：全部为 `plan_id=hicache_patch_blocked`，`mutation_count=0`、`synthetic_node_count=0`，
+`applied_validation.status=not_applied`。全部 cell 都因 source attribution、shadow rewrite 和 boundary validation 未 ready
+而停止；典型 blocker 是缺少真实 source execution anchor 或真实 consumer/wait boundary。
+
+```text
+data/profile_runs/sglang/20260727_135047_hicache_state_separation_c123_w123_full_profile/
+  diagnostics/semantic_fact_fix_20260728/v2_27_predictions/
+```
+
+因此这 `27/27 blocked` 只说明 semantic-fact / anchor safety gate 没有把不可观测事实伪装成 executable patch；它绝不是
+`27` 个 applied prediction，也不能用于评价 cross-config 建模误差。
+
+### HCSV-20260712-direct-io-control-v1-historical
+
+这是 semantic-fact side table 和 source execution / consumer anchor safety 收紧之前的历史 direct I/O/control patch 结果。
+当时的 workflow 从 resource-plan smoke 推进到 calibrated production DAG patch，并使用独立标定文件：
 
 ```text
 data/calibration/hicache_io_qwen3_32b_tp2_20260712/hicache_io_model.json
 ```
 
-该模型为 `calibration_status=calibrated`，KV geometry 来自 Qwen3-32B/TP2 model config；device-host 与 host-storage bandwidth
-来自独立 benchmark，不读取 target workload trace、target observed duration 或 E2E。Production patch 当前完成：
+该历史模型为 `calibration_status=calibrated`，KV geometry 来自 Qwen3-32B/TP2 model config；device-host 与 host-storage
+bandwidth 来自独立 benchmark，不读取 target workload trace、target observed duration 或 E2E。当时的 production patch 包含：
 
 - stable opportunity 和显式 target decision；
 - source full DAG 一次索引与 effect-local attribution；
@@ -145,7 +190,7 @@ data/calibration/hicache_io_qwen3_32b_tp2_20260712/hicache_io_model.json
 15 faithful replay runs + 75 cache-state runs = 90 C++ runs
 ```
 
-当前报告目录：
+历史报告目录：
 
 ```text
 data/profile_runs/sglang/20260712_133108_profiling_hicache_dag_analysis_forced_replay/
@@ -179,11 +224,12 @@ c2/deeper展示22页hit在source boundary前只完成2页的best-effort partial�
 c0/deeper覆盖I/O先于timeout完成；最终75格的15个target-c4 cell共出现30次`timeout_prefetch/timed_out=true`，补齐
 deadline-wins真实覆盖。具体机制和收敛条件见限制文档。
 
-当前可以宣称 direct I/O/control v1 的 final-DAG patch-local acceptance 为 `75/75`，但不能宣称 raw final state、raw transition
-或完整跨配置 E2E 为 `75/75 exact`。Async readiness limitation 和 snapshot observability 必须继续保留独立分类；禁止为了提高 raw
-exact 总数调低 bandwidth、读取 target progress 答案或加入 config/workload 特判。
+该历史 run 当时给出了 direct I/O/control v1 的 `75/75` final-DAG patch-local acceptance，但在当前 source-DAG 语义下
+不能将其复用为 patch acceptance。其 raw final state、raw transition 和完整 cross-config E2E 从未被宣称为 `75/75 exact`；
+async readiness limitation 和 snapshot observability 仍必须保留独立分类，且不得通过调低 bandwidth、读取 target progress
+答案或加入 config/workload 特判提高 exact 数。
 
-### HCSV-20260706-unified-workflow-full-matrix
+### HCSV-20260706-unified-workflow-full-matrix（历史 state/transition baseline）
 
 这是 direct I/O/control production patch 之前的历史 state/transition full-matrix 基线，不代表当前 patch 实现。该 run 使用
 `cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
@@ -226,20 +272,20 @@ workflow 摘要：
 | empty patch / zero mutation / topology valid | `75 / 75` |
 | base DAG / final DAG replay gate ready | `1 / 15` |
 
-结论：
+历史结论：
 
-- 当前 5x3 manual matrix 的 self/cross final-state 已全部对齐；
-- 当前 75 个 transition prediction 也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
-- 该 run 证明当前 unified workflow、C++ manifest trace input、HiCache state facts 和 best-effort revoke visibility
+- 该 5x3 manual matrix 的 self/cross final-state 当时已全部对齐；
+- 该 75 个 transition prediction 当时也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
+- 该 run 证明当时的 unified workflow、C++ manifest trace input、HiCache state facts 和 best-effort revoke visibility
   投影在这批数据下对齐；
 - 75 个 cache-state run 均完成空 patch，mutation count 为零且 Debug active topology validation 通过，证明 Phase 0/1
   mutation 管线没有改变原图；这不代表任何 HiCache effect 已经映射到 DAG；
 - `base_dag` / `final_dag` 的其余 `14/15` 均被 `dag_replay_error_too_high` 阻塞，属于现有 faithful replay E2E
   误差限制，不影响本节 state/transition exactness 结论；
-- 上述通过仍只证明当前 manual matrix 和当前近似边界成立，不等价于完整 SGLang scheduler / backend I/O /
+- 上述通过仍只证明当时的 manual matrix 和近似边界成立，不等价于完整 SGLang scheduler / backend I/O /
   rank-synced queue exactness，长期近似仍维护在限制文档。
 
-### HCSV-20260701-forced-bundle-full-matrix
+### HCSV-20260701-forced-bundle-full-matrix（历史 state/transition baseline）
 
 这是旧 workflow 下的 full-matrix 基线。该 run 使用
 `cache_lookup_input` / `cache_extend_input` / `cache_lifecycle_commit` / `prefetch_candidate_anchor`
@@ -284,7 +330,7 @@ input contract 状态：
 - `manual_deeper_pressure_prefetch` 的 raw sequence signature 有 3 种，`sequence_match=false`，但 canonical workload
   signature 仍为 1 种；这说明当前跨配置 hard gate 检查的是规范化 workload multiset，不把 source runtime event 排序误当成
   target-independent workload 差异；
-- 当前 trace / catalog 合同中没有 storage-control drain boundary、runtime prefetch checkpoint 或 `check_kind`；
+- 该轮 trace / catalog 合同中没有 storage-control drain boundary、runtime prefetch checkpoint 或 `check_kind`；
   storage-control release 时机由 target-derived 模型近似负责。
 
 quality 说明：
@@ -294,10 +340,10 @@ quality 说明：
   unknown state-model role；
 - 因此 strict `strict_diagnostic_coverage_ready=12/15` 是 source/timing 诊断覆盖率，不阻塞本次 state-model validation。
 
-结论：
+历史结论：
 
-- 当前 5x3 manual matrix 的 self/cross final-state 已全部对齐；
-- 当前 75 个 transition prediction 也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
+- 该 5x3 manual matrix 的 self/cross final-state 当时已全部对齐；
+- 该 75 个 transition prediction 当时也全部 exact，transition-count 和 page-lifecycle multiset 也全部 exact；
 - 这关闭了 2026-06-26 forced-bundle 产物发现的 Case A oracle final snapshot 误报、Case B host-side release boundary
   mismatch、2026-06-27 self 对角线中残留的 transition marker mismatch，以及 2026-07-01 重构后暴露的
   workload sequence hard-gate、transition kind schema drift 和尾部 write-through ACK lock lifetime 回归；
@@ -320,8 +366,8 @@ ready，final-state self `15 / 15` exact，final-state cross `60 / 60` exact，t
 page-lifecycle multiset exact 均为 `75 / 75`。
 
 该 run 证明上一版不采集、不消费 `storage_control_drain_boundary` 的合同下，5x3 manual matrix 曾经完整对齐。由于当前
-state-model 输入、C++ trace input 和 workflow 质量口径已经收紧，它只保留为历史对照；当前 active exactness 结论以
-`HCSV-20260706-unified-workflow-full-matrix` 为准。
+state-model 输入、C++ trace input 和 workflow 质量口径已经收紧，它只保留为历史对照；当前 binary 的 acceptance 以本节开头的
+`HCSV-20260729-current-binary-base-dag-replay` 和其后的 patch safety 状态为准。
 
 ### HCSV-20260627-forced-bundle-self-regression（历史 self 回归）
 
@@ -427,8 +473,7 @@ failure classification：
 - 当前 profiling 合同不采集 `drain_storage_control_queues()` checkpoint。terminal prefetch 后的 host reservation
   由 request-local pre-existing drain、best-effort worker-ready pre-extend drain 和 post-extend drain 三段近似推进。
 - 2026-06-28 forced replay 全矩阵曾在上一版合同下刷新结论：self/cross final-state `75 / 75` exact，transition
-  `75 / 75` exact。2026-06-30 合同收紧后，该 run 只保留为历史问题发现证据；当前 active exactness 结论以
-  `HCSV-20260706-unified-workflow-full-matrix` 为准。
+  `75 / 75` exact。2026-06-30 合同收紧后，该 run 只保留为历史问题发现证据，不构成当前 binary 的 acceptance。
 
 ### HCSV-20260624-pre-bundle-5x3-baseline
 
@@ -437,7 +482,7 @@ probe matrix，并通过当时的旧 HiCache workflow 执行 quality、final-sta
 
 该 run 使用仓库固定 plan，不携带 bundle provenance。当前代码重新审计时会得到
 `forced_token_bundle_signature_match=false` 和 `input_contract_ready=false`，因此不能作为新 workflow 的 active 输入合同验收。
-下面数值只用于保留旧模型 failure set，不代表当前 active full-matrix 结论。
+下面数值只用于保留旧模型 failure set，不代表当前 binary 的 full-matrix 结论。
 
 结果目录：
 
@@ -757,10 +802,9 @@ oracle snapshot 选择误报。
 
 后续优先级：
 
-1. 审查 strict diagnostic coverage 中 `prefetch_transfer` 期望机制覆盖是否仍应作为 hard diagnostic failure；当前这 3 个 failure
-   不影响 state-model fact coverage。
-2. 把 exact transition 聚合成 stable `CacheIntentLog`，同时保持 patch gate 的 `patch_allowed=false`，直到 source attribution、
-   duration 和 remaining semantic boundary 都具备证据。
-3. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation。
-4. 如果后续要支持更强 workload、TP/rank exactness 或 backend I/O exactness，应新增 target-independent scheduler /
-   queue / async progress intent，而不是恢复 source `drain_storage_control_queues()` checkpoint。
+1. 逐项解释 V2 27-cell 中缺失的 execution anchor 和 consumer/wait anchor；仅在真实 trace 可以严格识别时恢复 attribution。
+2. 选择最小的 self/cross profile 重新验证 transaction、topology 和 materialization；在 applied validation 真正 ready 前，
+   继续保持 `patch_allowed=false`。
+3. 继续保持 `source_actual` / `timing_observation` / `oracle_state` 只做 evidence，不回到 normal state mutation，也不恢复
+   `source drain_storage_control_queues()` 一类 source timing shortcut。
+4. prefill 仍为 deferred；Base-DAG replay 的改善不等价于 target state、patch 或 cross-config E2E prediction 正确。

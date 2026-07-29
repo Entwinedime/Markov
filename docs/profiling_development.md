@@ -99,6 +99,16 @@ full-DAG run 中任一启用 channel 缺失时，`artifact_errors` 包含 `trace
 `sidecar_only_trace`。这两个 blocker 只说明采集产物不能用于 DAG analysis accuracy / operation visibility 结论，不代表
 HiCache state-only workflow 的旧 run 本身非法。
 
+### Formal workload window
+
+`workload_report.json` 可以声明 `formal_begin_ms` 与 `formal_end_ms`，用于把真实 workload 的正式计量区间传给建模端。
+两个字段必须同时存在、为有限 epoch-millisecond 值且满足 `formal_end_ms > formal_begin_ms`；它们不是 target config、oracle
+或时延答案。采集侧必须在开始时刻和结束时刻都可审计时才写入这对字段。
+
+建模 runner 优先使用这对 formal 字段；历史 report 未声明时才退回到请求列表的最小 `start_time_ms` 与最大
+`end_time_ms`。无论来源为何，runner 都必须把成对的微秒边界传给 C++ TraceGraph；不能只传一端、也不能用时间戳邻近匹配
+推断另一端。
+
 ## 运行入口
 
 真实 SGLang / KTransformers profiling 必须使用外层容器入口：

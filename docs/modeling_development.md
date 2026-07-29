@@ -234,6 +234,21 @@ args 的模块必须显式走 materialized view，不能在 reader 阶段全量�
 | `fact.role` | class 内事实角色，供状态子模块二级路由。 |
 | `fact.consumers` | 允许消费该事实的模型、质量审计或 validator 列表。 |
 
+### Formal trace window 与 semantic fact
+
+建模 runner 优先从 workload report 的 `formal_begin_ms` / `formal_end_ms` 构造窗口；旧 report 没有这对字段时才使用请求
+包络。窗口起止必须同时存在，runner 将其换算为 `trace_window_start_us` / `trace_window_end_us` 写入 runner config，backend
+再传给 C++ 的 `--trace-window-start-us` / `--trace-window-end-us`。C++ 只接受成对边界。
+
+正式窗口只决定 active DAG 的可执行事件。窗口前的 token dictionary 定义和窗口后、与窗口内 async operation identity 严格匹配的
+ACK / capacity release 分别保存为只读 context side table：前者只帮助解析窗口内 path，后者只证明 lifecycle closure。两者都
+不创建 DAG node、不贡献 duration/E2E，且不能携带 target state 答案。
+
+`args.fact` 标记的非执行 HiCache 事件同样只进入 `DagGraph::hicache_fact_events`；state replay、source index 和 attribution
+从 fact side table 读取它们，但 active CPU lane 不会为这些事实建立可执行节点或顺序边。patch 只能把 semantic fact 映射到已证明的
+真实 source execution anchor；缺少 anchor 或真实 consumer/wait boundary 时必须归类为 `unobservable` 或 `reject`，不得把
+fact node 当作可执行载体补图。
+
 ## TraceGraph 结构
 
 C++ 后端位于 `src/modeling/trace_graph`：
@@ -598,13 +613,14 @@ DAG rewrite chain:
 | patch-local validation | target actual validation probes + prediction artifact | self/cross shape comparison | schedule-invariant exact；arrival-sensitive row 必须有 target-self alternate evidence。 |
 | simulation | materialized active graph | simulated E2E / critical path | 只作预测输出；raw cross-config real E2E 不参与 v1 pass/fail。 |
 
-当前 2026-07-12 expanded profile 最终矩阵包含 15 个 profile、90 个 C++ run 和 75 个 source-target cell。Final-DAG
-patch-local acceptance 为 `75/75`，所有 attribution、rewrite、boundary、post-apply、topology 和 materialization gate 通过；raw shape
-exact 为 `37/75`，其余差异全部进入有证据的 arrival sensitivity 或 payload-only readiness limitation。Raw final state 为
-`67/75` exact，closure 为 `67 exact + 8 readiness limitation`；raw transition 为 `30/75` exact，closure 为
-`30 exact + 18 readiness limitation + 27 snapshot grouping/observability`。两个 closure 的 unrelated/not-ready 都为 0。
-Raw validation status继续保持原值，closure只解释差异，不把 limitation伪装成exact。完整结果与复现入口维护在
-`docs/validation/hicache_state_validation.md`。
+H2D loadback carrier 必须限制在当前 decision opportunity window 内查找；只按 PID + radix node ID 扫描整条 trace 会在跨请求复用
+node ID 时把历史调用误判为多个当前 carrier。一个 opportunity 内没有 carrier 仍为 `unobservable`，出现多个真实 carrier 仍为
+`ambiguous`，不能通过放宽 safety gate 绕过。
+
+2026-07-13 的 75-cell `75/75 applied` 结果属于旧 source-DAG 语义下的历史 artifact，不能作为当前二进制的 patch acceptance
+声明。当前主线先以 2026-07-29 的同输入 15-cell `faithful_replay` 验证 Base-DAG：全部 cell 的相对误差均不超过 5%。当前
+HiCache patch 仍必须逐 cell 满足真实 execution anchor 与 consumer/wait anchor；最新安全阻断结果不能被表述成已 applied prediction。
+可复现实验路径、数值和适用边界维护在 `docs/validation/hicache_state_validation.md`。
 
 `transition` 解释 state 怎么变；effect decision 解释 target 下每个稳定 opportunity 应该发生什么。DAG patch 消费 decision ledger，
 不能从 raw page-level transition、final page set 或 target actual operation 反推 rewrite。当前 supported effect 为 loadback、prefetch

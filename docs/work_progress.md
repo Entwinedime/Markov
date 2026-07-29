@@ -1,6 +1,23 @@
 # 工作进展
 
 维护方式：本文件只做时间戳增量更新。新进展追加到顶部或底部均可，但每条必须带时间戳。除修正事实错误外，不回写历史条目。
+历史条目中的“当前”或“active”只表示该条写入时的状态；现在的权威验证基线和 acceptance 边界以
+`docs/validation/hicache_state_validation.md` 顶部的最新条目为准。
+其中早期 `tests/`、CTest 或 pytest 命令也只是当时的执行记录；项目当前不维护这些入口。
+
+## 2026-07-29 11:02:05 +0800
+
+- 收紧 C++ TraceGraph 的 source-DAG 语义边界：HiCache `args.fact` 不再作为 executable CPU DAG node，而是进入只读 semantic
+  fact side table；state replay / source index 可读取事实，但 patch 只能从事实定位到真实 execution anchor。缺少 execution 或
+  consumer/wait anchor 时明确归类为 `unobservable` / `reject`，不再通过虚构 CPU carrier、顺序边或 synthetic rewrite 绕过。
+- formal trace window 形成完整的 workload report → Python runner config → C++ CLI 链路。窗口前 token dictionary 与严格匹配的
+  窗口后 async tail 只作为解析/closure context，不加入 active DAG、duration 或 E2E。
+- 使用当前 validation binary 对 2026-07-13 的 15 个 full-DAG profile 运行纯全通道 `faithful_replay`，未启动 NPU、未加载
+  model config、未执行 patch：MAPE 从历史 `7.03%` 降至 `1.77%`，最大误差从 `8.62%` 降至 `2.42%`，`≤5%` 从 `1/15` 提升到
+  `15/15`。输入的真实 E2E 与 parsed record count 均逐格一致，结果见
+  `data/profile_runs/sglang/20260713_113331_hicache_full_recapture_profiling_hicache_dag_analysis_forced_replay/modeling/replay_current_binary_20260729_103825_base_dag/`。
+- 该 replay 只证明当前 Base-DAG 质量改善。旧 `75/75 applied` 结果已降级为历史证据；当前安全 gate 下的 27-cell V2 为
+  `27/27 blocked`，不得表述为 applied cross-config prediction。项目自有 CTest / pytest 目标也已按决定移除。
 
 ## 2026-07-13 10:52:59 +0800
 
@@ -22,7 +39,7 @@
 - 当前明确保留的范围是payload前metadata/query/control readiness、snapshot marker可观测性、完整scheduler/rank queue时间轴和
   prefill计算图；`prefill_effect_status=deferred`，raw cross-config E2E只作diagnostic。
 - 性能与工程门槛完成：同图规模1线程到4线程wall time为68.23秒到41.99秒（1.62x），read/parse约2.14x--2.17x；
-  Validation/Release重新构建通过，CTest `3/3`，全量Python `py_compile`、Ruff、JSON、clang-format和`git diff --check`均通过。
+  当时的 Validation/Release 重建、Python `py_compile`、Ruff、JSON、clang-format 和 `git diff --check` 均通过。
 
 ## 2026-07-07 19:00:41 +0800
 

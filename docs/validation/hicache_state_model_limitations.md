@@ -193,11 +193,11 @@ profiling 合同不采集 `drain_storage_control_queues()` runtime checkpoint。
 - `finalize()` 只兜底释放没有后续 cache extend 的残留 reservation；
 - 模型不读取 source queue snapshot、source page identity 或 oracle final state 来决定释放哪些 page。
 
-2026-07-06 forced replay suite 上的 unified workflow 75 格矩阵已经在当前 profiling 合同下达到 self/cross
+2026-07-06 forced replay suite 上的 unified workflow 75 格矩阵曾在当时 profiling 合同下达到 self/cross
 final-state `75 / 75` exact 和 transition `75 / 75` exact。这说明当前 5x3 manual matrix 覆盖了该边界的已知失败形态，
 但不说明 rank-synced FIFO release queue 已被精确复现。
 
-当前 active 结果目录：
+对应的历史结果目录：
 
 ```text
 data/profile_runs/sglang/20260706_020716_profiling_hicache_dag_analysis_forced_replay/modeling/modeling_workflow_full_refactor_validation_20260711
@@ -408,10 +408,11 @@ request reuse / lock 边界推进 `host -> L1/GPU` loadback。当前模型只保
   `timeout_prefetch/timed_out=true`，因此deadline-wins也已有真实artifact覆盖；
 - 另一个best-effort request从candidate到source cache-extend约16.5 ms，两页payload按校准bandwidth只需约13 ms，payload-only
   模型判定ready而真实运行仍未ready，说明剩余时间消耗在未建模的query/control pipeline；
-- 2026-07-12最终75-cell矩阵中，raw final state为`67/75` exact，另外8格全部由同一readiness证据闭合；raw transition为
+- 2026-07-12 历史 75-cell 矩阵中，raw final state为`67/75` exact，另外8格全部由同一readiness证据闭合；raw transition为
   `30/75` exact，18格归入readiness limitation，27格归入snapshot grouping/observability，unrelated和not-ready均为0；
-- 同一矩阵的Final-DAG schedule-invariant acceptance为`75/75`，invariant mismatch、acceptance mismatch、alternate evidence missing和
-  blocker均为0，说明该limitation没有遮蔽attribution/rewrite/topology错误。
+- 该历史矩阵的Final-DAG schedule-invariant acceptance为`75/75`，invariant mismatch、acceptance mismatch、alternate evidence missing和
+  blocker均为0。它说明当时的实现没有被该 limitation 遮蔽，但在 source-DAG semantic fact / anchor safety 变更后不能替代当前
+  patch acceptance 证据。
 
 独立4 MiB和8 MiB校准得到的host-storage bandwidth并不更低，因此不能通过调小payload bandwidth修补该差异。Raw exactness继续
 保持原值；closure只把证据充分的差异标记为temporary TODO，不把它们计为exact。

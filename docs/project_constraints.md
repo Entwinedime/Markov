@@ -114,6 +114,11 @@
 - 状态子模块不得修改原始 profiling trace。
 - DAG 修改必须通过统一 mutation 接口记录，不能以隐式副作用改变图结构。
 - 非执行类 state snapshot、oracle 和质量事件不得成为默认 DAG 节点。
+- `args.fact` 标记的非执行 HiCache semantic fact 只进入只读 fact side table；state replay 与 attribution 可以读取该表，但不能把
+  fact 当作 CPU lane 上的可执行 node、duration 或依赖边。
+- Formal trace window 只能由 workload report 中成对、有限且有序的 `formal_begin_ms` / `formal_end_ms` 或可审计请求包络生成；
+  runner 与 C++ 必须成对传递边界。窗口前 dictionary 与窗口后严格 identity 匹配的 async tail 只可作为解析/closure context，
+  不得进入 active DAG 或 target state。
 - Cache-state prediction 必须同时具有显式 target config 和满足合同的 profile 输入。
 - target config 至少明确 page size、容量和 policy；byte projection 由 workflow 级模型几何生成，不得使用“observed”一类从 source 行为回填 target policy 的配置。
 - HiCache I/O cost 只允许使用 effective bytes、device-host bandwidth 和 host-storage bandwidth；KV bytes 是模型几何，不能作为第三个 cost 参数。
@@ -121,6 +126,14 @@
 - HiCache I/O duration 不读取 source/target observed latency、E2E、oracle exactness 或 config/input/cell 专项修正；参数缺失时必须输出明确 blocker。
 - Resource model 必须显式区分 host-storage、device-to-host 和 host-to-device 三条 lane；同 lane 顺序不能隐式依赖 simulator 行为。
 - Target trace 只作为 oracle；cross-config prediction 不得把 target actual 行为作为模型事实源。
+- DAG patch的stable opportunity key不能包含raw request/object ID、timestamp、DAG node ID、config ID、input ID或cell ID；
+  这些字段只能作为provenance。
+- Source attribution必须区分`present`、`absent`、`unobservable`和`ambiguous`，并使用request/process、operation、tree node、
+  wrapped call或严格containment等强identity；禁止nearest-timestamp matching或扩大时间窗猜测carrier。
+- 每个cell必须先完成全部decision、attribution、rewrite、ownership、family/lane dependency与prospective topology检查，再原子apply一次；
+  任一blocker存在时不得把部分transaction写入production graph。
+- 禁止使用config/workload/cell白名单、observed duration ratio、target E2E fitting、模糊confidence threshold或调低bandwidth
+  来换取validation exactness。
 - 状态模型、策略推导、验证摘要和 DAG mutation 应保持清晰组件边界，避免重新形成单体状态机。
 - 当前 target modeling config 由 workflow 根据 profile suite 动态生成，不作为手工长期配置维护。
 - Unified modeling workflow 维护两层 modeling config：`model_runs/<model_run_id>/runner_config.json` 是 Python runner config，供
@@ -215,5 +228,7 @@ profile suite
 - `scripts/internal` 不新增旧代码人工对照目录；重构时应直接删除失活入口，并把仍有效的经验迁移到主线文档。
 - 不修改或覆盖用户未授权的运行产物和工作区改动。
 - 不把 pycache、临时诊断或大体积 debug 产物纳入主线。
+- 项目不维护自有 `tests/` 目录、CTest target 或 pytest 配置；提交说明与验证文档不得再宣称这些检查存在。改动验证应使用
+  范围相符的构建、语法/格式检查和可追溯的离线或真实 profile artifact。
 - 提交前至少完成与改动范围相符的 Ruff 格式检查、Python/Shell 语法、JSON 解析、diff whitespace、C++ 格式/构建和 workflow
   合同检查。
