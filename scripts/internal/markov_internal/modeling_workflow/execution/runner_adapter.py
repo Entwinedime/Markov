@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from ...common.paths import ROOT_DIR, repo_relative_path
+from ...modeling.workload import discover_workload_window
 from ..io_model import HiCacheIoModel, merge_hicache_io_model
 from ..types import ModelOutputRequirement, ModelRunSpec, ProfileRunRef
 
@@ -75,6 +76,16 @@ class RunnerConfigBuilder:
             },
             "outputs": outputs.as_config(),
         }
+        window = discover_workload_window({}, self.spec.source_profile.manifest_path)
+        if window is not None:
+            payload["cpp_trace_graph"]["trace_window_start_us"] = window.start_ns // 1000
+            payload["cpp_trace_graph"]["trace_window_end_us"] = window.end_ns // 1000
+            payload["metadata"]["trace_window"] = {
+                "source": window.source,
+                "report_path": path_text(window.report_path),
+                "start_ns": window.start_ns,
+                "end_ns": window.end_ns,
+            }
         if self.spec.hicache_io_model is not None:
             payload["metadata"]["hicache_io_model"] = self.spec.hicache_io_model.metadata()
         if self.spec.mode == "cache_state":

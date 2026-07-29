@@ -41,6 +41,8 @@ def append_trace_options(command: list[str], config: dict[str, Any], cpp_config:
 
     append_option(command, "--threads", cpp_config.get("threads"))
     append_option(command, "--file-threads", cpp_config.get("file_threads"))
+    append_option(command, "--trace-window-start-us", cpp_config.get("trace_window_start_us"))
+    append_option(command, "--trace-window-end-us", cpp_config.get("trace_window_end_us"))
     channels = configured_trace_channels(config)
     if channels is not None:
         append_option(command, "--trace-channels", ",".join(channels))

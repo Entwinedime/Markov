@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,26 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
     if not path.is_file():
         return None
     report = load_json(path)
+    formal_start_ms = optional_float(report.get("formal_begin_ms"))
+    formal_end_ms = optional_float(report.get("formal_end_ms"))
+    if formal_start_ms is not None or formal_end_ms is not None:
+        if (
+            formal_start_ms is None
+            or formal_end_ms is None
+            or not math.isfinite(formal_start_ms)
+            or not math.isfinite(formal_end_ms)
+            or formal_end_ms <= formal_start_ms
+        ):
+            raise ValueError(f"invalid formal workload window in workload report: {path}")
+        start_ns = int(formal_start_ms * 1_000_000)
+        end_ns = int(formal_end_ms * 1_000_000)
+        return WorkloadWindow(
+            path,
+            start_ns,
+            end_ns,
+            end_ns - start_ns,
+            "workload_report.formal_window",
+        )
     requests = report.get("requests")
     if not isinstance(requests, list):
         return None
