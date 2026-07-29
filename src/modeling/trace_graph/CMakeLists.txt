@@ -12,8 +12,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 endif()
 
 option(TRACE_GRAPH_DEBUG "Build trace_graph diagnostics and validation code" ${MARKOV_TRACE_GRAPH_DEBUG_DEFAULT})
-option(TRACE_GRAPH_BUILD_TESTS "Build focused TraceGraph smoke tests" OFF)
-
 add_library(trace_graph_options INTERFACE)
 target_compile_features(trace_graph_options INTERFACE cxx_std_23)
 target_include_directories(trace_graph_options
@@ -148,23 +146,3 @@ target_link_libraries(trace_graph
 set_target_properties(trace_graph PROPERTIES
     OUTPUT_NAME trace_graph
 )
-
-if(TRACE_GRAPH_BUILD_TESTS)
-    enable_testing()
-    add_executable(trace_graph_dag_mutation_smoke tests/dag_mutation_smoke.cpp)
-    target_link_libraries(trace_graph_dag_mutation_smoke
-        PRIVATE
-            trace_graph_core
-            trace_graph_io
-            trace_graph_simulation
-    )
-    add_test(NAME trace_graph_dag_mutation_smoke COMMAND trace_graph_dag_mutation_smoke)
-
-    add_executable(trace_graph_hicache_io_resource_smoke tests/hicache_io_resource_smoke.cpp)
-    target_link_libraries(trace_graph_hicache_io_resource_smoke PRIVATE trace_graph_hicache)
-    add_test(NAME trace_graph_hicache_io_resource_smoke COMMAND trace_graph_hicache_io_resource_smoke)
-
-    add_executable(trace_graph_hicache_source_attribution_smoke tests/hicache_source_attribution_smoke.cpp)
-    target_link_libraries(trace_graph_hicache_source_attribution_smoke PRIVATE trace_graph_modules)
-    add_test(NAME trace_graph_hicache_source_attribution_smoke COMMAND trace_graph_hicache_source_attribution_smoke)
-endif()

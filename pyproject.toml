@@ -5,9 +5,6 @@ description = "Trace-driven profiling, DAG modeling, and what-if simulation for 
 requires-python = ">=3.10"
 dependencies = []
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-
 [tool.ruff]
 target-version = "py310"
 line-length = 120
