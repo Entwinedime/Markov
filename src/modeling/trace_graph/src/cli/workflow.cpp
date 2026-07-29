@@ -189,6 +189,8 @@ InputBuildResult build_input_graph(InputBuildRequest request) {
     DagBuilder::BuildTimings timings;
     auto graph = builder.build_with_timings(std::move(request.input.events), static_cast<int>(request.index), timings);
     graph.set_input_contracts(std::move(request.input.input_contracts));
+    graph.set_context_events(std::move(request.input.context_events));
+    graph.set_tail_context_events(std::move(request.input.tail_context_events));
     return InputBuildResult{
         .index = request.index,
         .graph = std::move(graph),
@@ -198,6 +200,8 @@ InputBuildResult build_input_graph(InputBuildRequest request) {
 #else
     auto graph = builder.build(std::move(request.input.events), static_cast<int>(request.index));
     graph.set_input_contracts(std::move(request.input.input_contracts));
+    graph.set_context_events(std::move(request.input.context_events));
+    graph.set_tail_context_events(std::move(request.input.tail_context_events));
     return InputBuildResult{
         .index = request.index,
         .graph = std::move(graph),

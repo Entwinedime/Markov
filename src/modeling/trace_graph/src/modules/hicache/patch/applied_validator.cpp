@@ -171,7 +171,10 @@ bool ingress_exact(const HiCacheRewriteDecision & decision, const MaterializedPl
     if (!synthetic_rewrite(decision.rewrite_kind)) return true;
     const auto synthetic = materialized.synthetic_nodes.find(decision.synthetic_id);
     if (synthetic == materialized.synthetic_nodes.end()) return false;
-    if (insertion_rewrite(decision.rewrite_kind)) return added_edge_exists(materialized, decision.source_fact_node_id, synthetic->second, decision.effect_id);
+    if (!decision.source_execution_anchor_node_id
+        || !added_edge_exists(materialized, *decision.source_execution_anchor_node_id, synthetic->second, decision.effect_id))
+        return false;
+    if (insertion_rewrite(decision.rewrite_kind)) return true;
     if (!replacement_io(decision.rewrite_kind)) return true;
     if (decision.carrier_entry_edges.empty()) {
         return !decision.carrier_nodes.empty() && added_edge_exists(materialized, synthetic->second, decision.carrier_nodes.front(), decision.effect_id);
@@ -180,9 +183,10 @@ bool ingress_exact(const HiCacheRewriteDecision & decision, const MaterializedPl
 }
 
 bool consumer_exact(const HiCacheRewriteDecision & decision, const MaterializedPlan & materialized) {
-    if (!insertion_rewrite(decision.rewrite_kind)) return true;
+    if (!synthetic_rewrite(decision.rewrite_kind)) return true;
     const auto synthetic = materialized.synthetic_nodes.find(decision.synthetic_id);
-    if (synthetic == materialized.synthetic_nodes.end() || decision.consumer_anchors.empty()) return false;
+    if (synthetic == materialized.synthetic_nodes.end()) return false;
+    if (decision.consumer_anchors.empty()) return false;
     return std::ranges::all_of(decision.consumer_anchors,
                                [&](size_t consumer) { return added_edge_exists(materialized, synthetic->second, consumer, decision.effect_id); });
 }

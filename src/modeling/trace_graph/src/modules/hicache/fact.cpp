@@ -420,11 +420,12 @@ void HiCacheFactParser::parse_batch_fields(HiCacheFact & fact, const TraceEvent 
     fact.batch_positions_match_request_ids = position_validation.matches_request_ids;
 }
 
-HiCacheFact HiCacheFactParser::parse(size_t node_id, const TraceEvent & event) const {
+HiCacheFact HiCacheFactParser::parse(size_t source_fact_id, const TraceEvent & event, std::optional<size_t> execution_anchor_node_id) const {
     // Parsing normalizes fields and hydrates spans only. Routing remains a separate strict gate.
     HiCacheFact fact;
     const auto metadata = fact_metadata_from_event(event);
-    fact.source_node_id = node_id;
+    fact.source_node_id = source_fact_id;
+    fact.execution_anchor_node_id = execution_anchor_node_id;
     fact.source_event_index = event.index;
     fact.ts = hicache_fact_boundary_timestamp(event);
     fact.dur = event.dur;

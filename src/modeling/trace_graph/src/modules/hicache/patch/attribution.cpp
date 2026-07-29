@@ -83,14 +83,29 @@ const HiCacheSourceFactNode * paired_call_end(const HiCacheSourceDagIndex & sour
     return match;
 }
 
+const HiCacheSourceFactNode * next_process_opportunity(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor) {
+    const HiCacheSourceFactNode * next = nullptr;
+    for (size_t node_id : source.nodes_for_fact_role(anchor.fact_role)) {
+        const auto * candidate = source.fact_node(node_id);
+        if (candidate == nullptr || candidate->node_id == anchor.node_id || !same_process(*candidate, anchor) || !fact_precedes(anchor, *candidate))
+            continue;
+        if (next == nullptr || fact_precedes(*candidate, *next)) next = candidate;
+    }
+    return next;
+}
+
 std::vector<size_t> timing_call_ends_for_object_node(const HiCacheSourceDagIndex & source, std::string_view role, uint64_t object_node_id,
-                                                     std::string_view pid) {
+                                                     std::string_view pid, const HiCacheSourceFactNode * lower_bound = nullptr,
+                                                     const HiCacheSourceFactNode * upper_bound = nullptr) {
     std::vector<size_t> matches;
     for (size_t node_id : source.nodes_for_fact_role(role)) {
         const auto * start = source.fact_node(node_id);
         if (start == nullptr || start->phase != "start" || start->pid != pid || !contains_object_node(*start, object_node_id)) continue;
+        if (lower_bound != nullptr && fact_precedes(*start, *lower_bound)) continue;
         const auto * end = paired_call_end(source, *start);
-        if (end != nullptr && end->duration_us > 0) matches.push_back(end->node_id);
+        if (end == nullptr || end->duration_us == 0) continue;
+        if (upper_bound != nullptr && fact_end(*end) > upper_bound->timestamp_us) continue;
+        matches.push_back(end->node_id);
     }
     sort_unique(matches);
     return matches;
@@ -107,14 +122,17 @@ void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size
     output.identity_method = std::move(identity_method);
     output.reason = std::move(reason);
 
-    const HiCacheSourceFactNode * earliest = nullptr;
-    const HiCacheSourceFactNode * latest = nullptr;
+    std::optional<size_t> earliest;
+    std::optional<size_t> latest;
     for (size_t node_id : output.carrier_nodes) {
-        const auto * fact = source.fact_node(node_id);
-        if (fact != nullptr) {
-            if (earliest == nullptr || fact->timestamp_us < earliest->timestamp_us) earliest = fact;
-            if (latest == nullptr || fact_end(*fact) > fact_end(*latest)) latest = fact;
-        }
+        const auto & event = source.graph().event_for_node(node_id);
+        if (!earliest || event.ts < source.graph().event_for_node(*earliest).ts) earliest = node_id;
+        const auto event_end = fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur });
+        const auto latest_end = latest ? fact_end(HiCacheSourceFactNode{
+                                       .timestamp_us = source.graph().event_for_node(*latest).ts,
+                                       .duration_us = source.graph().event_for_node(*latest).dur })
+                                      : 0;
+        if (!latest || event_end > latest_end) latest = node_id;
         for (size_t edge_index : source.incoming_edge_ids(node_id)) {
             const auto & edge = source.graph().edge(edge_index);
             if (carrier_set.contains(edge.src)) output.carrier_internal_edges.push_back(edge_index);
@@ -129,8 +147,22 @@ void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size
     sort_unique(output.carrier_internal_edges);
     sort_unique(output.carrier_entry_edges);
     sort_unique(output.carrier_exit_edges);
-    if (earliest != nullptr) output.start_anchor = earliest->node_id;
-    if (latest != nullptr) output.completion_anchor = latest->node_id;
+    output.start_anchor = earliest;
+    output.completion_anchor = latest;
+}
+
+std::optional<std::vector<size_t>> execution_anchors_for_facts(const HiCacheSourceDagIndex & source, const std::vector<size_t> & fact_nodes) {
+    std::vector<size_t> anchors;
+    anchors.reserve(fact_nodes.size());
+    for (size_t fact_node_id : fact_nodes) {
+        const auto * fact = source.fact_node(fact_node_id);
+        if (fact == nullptr || !fact->execution_anchor_node_id) return std::nullopt;
+        const auto anchor = *fact->execution_anchor_node_id;
+        if (anchor >= source.graph().node_count() || !source.graph().node(anchor).active) return std::nullopt;
+        anchors.push_back(anchor);
+    }
+    sort_unique(anchors);
+    return anchors;
 }
 
 void append_candidate(HiCacheSourceAttribution & output, const HiCacheSourceFactNode & fact) {
@@ -164,14 +196,18 @@ void expand_operation_chains(const HiCacheSourceDagIndex & source, const HiCache
     collect(output.timing_fact_nodes);
     for (const auto & operation_id : operation_ids) {
         for (size_t node_id : source.nodes_for_operation(operation_id)) {
-            const auto & event = source.graph().event_for_node(node_id);
-            if (event.pid == anchor.pid) output.operation_chain_nodes.push_back(node_id);
+            const auto * fact = source.fact_node(node_id);
+            if (fact != nullptr && fact->pid == anchor.pid) output.operation_chain_nodes.push_back(node_id);
         }
     }
     sort_unique(output.operation_chain_nodes);
 }
 
-void assign_single_node_carrier(const HiCacheSourceDagIndex & source, size_t node_id, HiCacheSourceAttribution & output) {
+bool assign_single_node_carrier(const HiCacheSourceDagIndex & source, size_t fact_node_id, HiCacheSourceAttribution & output) {
+    const auto * fact = source.fact_node(fact_node_id);
+    if (fact == nullptr || !fact->execution_anchor_node_id) return false;
+    const auto node_id = *fact->execution_anchor_node_id;
+    if (node_id >= source.graph().node_count() || !source.graph().node(node_id).active) return false;
     output.source_carrier_state = HiCacheSourceCarrierState::Present;
     output.carrier_nodes = { node_id };
     output.owned_duration_nodes = { node_id };
@@ -180,18 +216,28 @@ void assign_single_node_carrier(const HiCacheSourceDagIndex & source, size_t nod
     for (size_t edge_index : source.incoming_edge_ids(node_id)) output.carrier_entry_edges.push_back(edge_index);
     for (size_t edge_index : source.outgoing_edge_ids(node_id)) output.carrier_exit_edges.push_back(edge_index);
     output.reason = "unique exact-request timing observation provides a direct source carrier";
+    return true;
 }
 
 enum class ConsumerAnchorResolution : std::uint8_t { Missing, Ready, Invalid };
 
+bool requires_source_consumer_anchor(HiCacheEffectType effect_type) {
+    return effect_type == HiCacheEffectType::Loadback || effect_type == HiCacheEffectType::PrefetchIo
+           || effect_type == HiCacheEffectType::PrefetchVisibility
+           || effect_type == HiCacheEffectType::CommitCapacityGate;
+}
+
 ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
                                                 HiCacheSourceAttribution & output) {
     if (!decision.consumer_boundary.source_node_id) return ConsumerAnchorResolution::Missing;
-    const auto node_id = *decision.consumer_boundary.source_node_id;
-    if (node_id >= source.graph().node_count() || !source.graph().node(node_id).active) return ConsumerAnchorResolution::Invalid;
-    const auto * fact = source.fact_node(node_id);
+    const auto * fact = source.fact_node(*decision.consumer_boundary.source_node_id);
     if (fact == nullptr || (!decision.consumer_boundary.source_fact_role.empty() && fact->fact_role != decision.consumer_boundary.source_fact_role))
         return ConsumerAnchorResolution::Invalid;
+    const auto anchor = decision.consumer_boundary.execution_anchor_node_id ? decision.consumer_boundary.execution_anchor_node_id
+                                                                             : fact->execution_anchor_node_id;
+    if (!anchor) return ConsumerAnchorResolution::Missing;
+    const auto node_id = *anchor;
+    if (node_id >= source.graph().node_count() || !source.graph().node(node_id).active) return ConsumerAnchorResolution::Invalid;
     output.consumer_anchors.push_back(node_id);
     sort_unique(output.consumer_anchors);
     output.consumer_anchor_method = "target_canonical_consumer";
@@ -199,8 +245,14 @@ ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & so
 }
 
 bool append_unique_sequential_successor(const HiCacheSourceDagIndex & source, size_t source_node_id, HiCacheSourceAttribution & output) {
+    const auto * source_fact = source.fact_node(source_node_id);
+    if (source_fact == nullptr || !source_fact->execution_anchor_node_id) {
+        output.consumer_anchor_method = "source_fact_has_no_executable_anchor";
+        return false;
+    }
+    const auto anchor_node_id = *source_fact->execution_anchor_node_id;
     std::vector<size_t> successors;
-    for (size_t edge_index : source.outgoing_edge_ids(source_node_id)) {
+    for (size_t edge_index : source.outgoing_edge_ids(anchor_node_id)) {
         const auto & edge = source.graph().edge(edge_index);
         if (edge.kind == core::DagEdgeKind::Sequential) successors.push_back(edge.dst);
     }
@@ -217,16 +269,21 @@ bool append_unique_sequential_successor(const HiCacheSourceDagIndex & source, si
 
 void classify_prefetch_io(const HiCacheSourceDagIndex & source, HiCacheSourceAttribution & output) {
     if (output.timing_fact_nodes.size() == 1) {
-        const auto node_id = output.timing_fact_nodes.front();
-        if (source.graph().node(node_id).duration > 0) {
-            assign_single_node_carrier(source, node_id, output);
+        const auto fact_node_id = output.timing_fact_nodes.front();
+        const auto * fact = source.fact_node(fact_node_id);
+        if (fact != nullptr && fact->execution_anchor_node_id && source.graph().node(*fact->execution_anchor_node_id).duration > 0) {
+            if (!assign_single_node_carrier(source, fact_node_id, output)) {
+                output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+                output.reason = "prefetch timing observation has no active executable anchor";
+                return;
+            }
             output.identity_method = "request_id+pid";
             output.evidence.push_back("prefetch_io_observed");
             if (!output.operation_chain_nodes.empty()) output.evidence.push_back("operation_id+pid");
             return;
         }
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
-        output.reason = "prefetch timing observation has zero executable duration";
+        output.reason = "prefetch timing observation has no executable source carrier";
         return;
     }
     if (!output.control_fact_nodes.empty()) {
@@ -321,16 +378,28 @@ void classify_loadback(const HiCacheSourceDagIndex & source, const HiCacheEffect
         output.reason = "source loadback decision lacks a tree-node identity";
         return;
     }
-    auto timing_nodes = timing_call_ends_for_object_node(source, "loadback_io_observed", *source_decision.object_node_id, anchor.pid);
+    const HiCacheSourceFactNode * upper_bound = nullptr;
+    if (decision.consumer_boundary.source_node_id) upper_bound = source.fact_node(*decision.consumer_boundary.source_node_id);
+    if (upper_bound == nullptr) upper_bound = next_process_opportunity(source, anchor);
+    auto timing_nodes =
+        timing_call_ends_for_object_node(source, "loadback_io_observed", *source_decision.object_node_id, anchor.pid, &source_decision, upper_bound);
     if (timing_nodes.size() != 1) {
         output.source_carrier_state = timing_nodes.empty() ? HiCacheSourceCarrierState::Unobservable : HiCacheSourceCarrierState::Ambiguous;
-        output.identity_method = "request_id+pid+tree_node_id";
+        output.identity_method = "request_id+pid+opportunity_window+tree_node_id";
         output.reason = timing_nodes.empty() ? "loadback decision has no matching H2D timing call" : "loadback decision matches multiple H2D timing calls";
         return;
     }
     output.evidence.push_back("loadback_io_observed");
+    output.timing_fact_nodes = timing_nodes;
+    const auto timing_anchors = execution_anchors_for_facts(source, timing_nodes);
+    if (!timing_anchors) {
+        output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+        output.identity_method = "request_id+pid+opportunity_window+tree_node_id";
+        output.reason = "loadback timing observation has no proven executable source anchor";
+        return;
+    }
     assign_carrier_nodes(source,
-                         std::move(timing_nodes),
+                         *timing_anchors,
                          "request_id+pid+opportunity_window+tree_node_id+call_identity",
                          "loadback decision and H2D timing call share one tree-node identity",
                          output);
@@ -392,10 +461,17 @@ void classify_prefetch_visibility(const HiCacheSourceDagIndex & source, const Hi
         output.reason = "blocking source prefetch progress has no canonical consumer in the source DAG";
         return;
     }
+    const auto progress_anchors = execution_anchors_for_facts(source, progress_nodes);
+    if (!progress_anchors) {
+        output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+        output.identity_method = "request_id+pid+blocking_progress+consumer";
+        output.reason = "prefetch progress observation has no proven executable source anchor";
+        return;
+    }
     output.source_carrier_state = HiCacheSourceCarrierState::Present;
     output.identity_method = "request_id+pid+blocking_progress+consumer";
     output.evidence.push_back("prefetch_progress_observed");
-    output.carrier_nodes = std::move(progress_nodes);
+    output.carrier_nodes = *progress_anchors;
     output.start_anchor = output.carrier_nodes.front();
     output.completion_anchor = output.carrier_nodes.back();
     output.reason = "exact request progress checks guard the canonical cache-extend consumer";
@@ -439,8 +515,15 @@ void classify_commit_d2h(const HiCacheSourceDagIndex & source, const HiCacheSour
     output.timing_fact_nodes = timing_nodes;
     output.evidence.push_back("commit_device_to_host_enqueue_observed");
     output.evidence.push_back("commit_device_to_host_io_observed");
+    const auto timing_anchors = execution_anchors_for_facts(source, timing_nodes);
+    if (!timing_anchors) {
+        output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+        output.identity_method = "lifecycle_call_containment+tree_node_id";
+        output.reason = "D2H timing observation has no proven executable source anchor";
+        return;
+    }
     assign_carrier_nodes(source,
-                         std::move(timing_nodes),
+                         *timing_anchors,
                          "lifecycle_call_containment+tree_node_id+call_identity",
                          "nested commit enqueue and D2H timing calls share tree-node identities",
                          output);
@@ -466,6 +549,37 @@ std::vector<const HiCacheSourceFactNode *> capacity_release_calls(const HiCacheS
     return releases;
 }
 
+const HiCacheSourceFactNode * paired_tail_call_end(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & start) {
+    const HiCacheSourceFactNode * match = nullptr;
+    for (const auto & candidate : source.tail_context_facts()) {
+        if (candidate.fact_role != start.fact_role || candidate.phase != "end" || candidate.target_id != start.target_id || candidate.pid != start.pid
+            || candidate.tid != start.tid || candidate.timestamp_us != start.timestamp_us)
+            continue;
+        if (match != nullptr) return nullptr;
+        match = &candidate;
+    }
+    return match;
+}
+
+bool all_capacity_releases_in_tail(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor) {
+    std::set<uint64_t> expected;
+    for (const auto * enqueue : commit_d2h_enqueues(source, anchor)) {
+        if (enqueue->effective_token_count > 0 && enqueue->object_node_id) expected.insert(*enqueue->object_node_id);
+    }
+    if (expected.empty()) return false;
+
+    std::set<uint64_t> closed;
+    for (const auto & start : source.tail_context_facts()) {
+        if (start.fact_role != "commit_capacity_release_observed" || start.phase != "start" || start.pid != anchor.pid) continue;
+        const auto * end = paired_tail_call_end(source, start);
+        if (end == nullptr || end->duration_us == 0) continue;
+        for (uint64_t object_node_id : start.operation_node_ids) {
+            if (expected.contains(object_node_id)) closed.insert(object_node_id);
+        }
+    }
+    return closed == expected;
+}
+
 void classify_commit_h2s(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & anchor, HiCacheSourceAttribution & output) {
     if (!role_contract_available(source, "commit_capacity_release_observed")) {
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
@@ -480,6 +594,13 @@ void classify_commit_h2s(const HiCacheSourceDagIndex & source, const HiCacheSour
     }
     const auto releases = capacity_release_calls(source, anchor);
     if (releases.empty()) {
+        if (all_capacity_releases_in_tail(source, anchor)) {
+            output.source_carrier_state = HiCacheSourceCarrierState::Absent;
+            output.identity_method = "lifecycle_call_containment+tree_node_id+post_window_call_identity";
+            output.reason = "source commit ACK and storage carrier complete after the measured window";
+            output.evidence.push_back("post_window_commit_capacity_release_observed");
+            return;
+        }
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
         output.identity_method = "lifecycle_call_containment+tree_node_id";
         output.reason = "source lifecycle has no matching commit ACK boundary";
@@ -531,8 +652,15 @@ void classify_commit_h2s(const HiCacheSourceDagIndex & source, const HiCacheSour
     output.evidence.push_back("commit_capacity_release_observed");
     output.evidence.push_back("writeback_enqueue_observed");
     output.evidence.push_back("writeback_io_observed");
+    const auto timing_anchors = execution_anchors_for_facts(source, timing_nodes);
+    if (!timing_anchors) {
+        output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+        output.identity_method = "tree_node_id+ack_call_containment+operation_id";
+        output.reason = "H2S timing observation has no proven executable source anchor";
+        return;
+    }
     assign_carrier_nodes(source,
-                         std::move(timing_nodes),
+                         *timing_anchors,
                          "tree_node_id+ack_call_containment+operation_id+pid",
                          "commit ACK contains a storage enqueue joined to one H2S timing operation",
                          output);
@@ -551,6 +679,7 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
         output.reason = "source opportunity anchor is missing from the semantic DAG index";
         return output;
     }
+    output.source_execution_anchor_node_id = anchor->execution_anchor_node_id;
     output.evidence.push_back("source_opportunity_anchor");
     const auto consumer_resolution = append_target_consumer(source, decision, output);
     if (consumer_resolution == ConsumerAnchorResolution::Invalid) {
@@ -559,7 +688,10 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
         output.reason = "target consumer boundary does not resolve to its declared active source fact";
         return output;
     }
-    if (consumer_resolution == ConsumerAnchorResolution::Missing) (void)append_unique_sequential_successor(source, decision.source_node_id, output);
+    if (consumer_resolution == ConsumerAnchorResolution::Missing) {
+        if (requires_source_consumer_anchor(decision.effect_type)) (void)append_unique_sequential_successor(source, decision.source_node_id, output);
+        else output.consumer_anchor_method = "asynchronous_effect_no_source_consumer";
+    }
 
     switch (decision.effect_type) {
     case HiCacheEffectType::PrefetchIo:
@@ -580,7 +712,7 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
     case HiCacheEffectType::CommitHostToStorage:
         classify_commit_h2s(source, *anchor, output);
         break;
-    case HiCacheEffectType::CommitCapacityGate:
+    case HiCacheEffectType::CommitCapacityGate: {
         if (!role_contract_available(source, "commit_capacity_release_observed")) {
             output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
             output.reason = "profiling contract does not expose commit capacity-release calls";
@@ -594,6 +726,13 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
         }
         for (const auto * release : capacity_release_calls(source, *anchor)) output.control_fact_nodes.push_back(release->node_id);
         if (output.control_fact_nodes.empty()) {
+            if (all_capacity_releases_in_tail(source, *anchor)) {
+                output.source_carrier_state = HiCacheSourceCarrierState::Absent;
+                output.identity_method = "lifecycle_call_containment+tree_node_id+post_window_call_identity";
+                output.reason = "source capacity release completes after the measured window";
+                output.evidence.push_back("post_window_commit_capacity_release_observed");
+                break;
+            }
             output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
             output.identity_method = "lifecycle_call_containment+tree_node_id";
             output.reason = "D2H commit has no matching capacity-release call";
@@ -605,11 +744,19 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
             output.reason = "capacity release is observed but the target consumer boundary is unavailable";
             break;
         }
+        const auto release_anchors = execution_anchors_for_facts(source, output.control_fact_nodes);
+        if (!release_anchors) {
+            output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
+            output.identity_method = "lifecycle_call_containment+tree_node_id+call_identity";
+            output.reason = "capacity-release observation has no proven executable source anchor";
+            break;
+        }
         output.source_carrier_state = HiCacheSourceCarrierState::Present;
-        output.carrier_nodes = output.control_fact_nodes;
+        output.carrier_nodes = *release_anchors;
         output.identity_method = "lifecycle_call_containment+tree_node_id+call_identity+target_consumer";
         output.reason = "capacity release call guards the next target-derived canonical consumer";
         break;
+    }
     case HiCacheEffectType::Loadback:
         classify_loadback(source, decision, *anchor, output);
         break;

@@ -14,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <limits>
 #include <ranges>
 #include <regex>
 #include <stdexcept>
@@ -205,6 +206,31 @@ void append_trace_files(ManifestTraceInput & input, const std::vector<std::strin
     }
 }
 
+bool token_dictionary_context_event(const TraceEvent & event) {
+    if (event.source_channel != TraceSourceChannel::PythonProbe) return false;
+    return event.has_arg_key_hint("token_dictionary") || event.has_arg_key_hint("token_dictionaries");
+}
+
+bool semantic_tail_context_event(const TraceEvent & event) {
+    return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact");
+}
+
+void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOptions & options) {
+    if (!options.window_start_us || !options.window_end_us) return;
+    const auto start = *options.window_start_us;
+    const auto end = *options.window_end_us;
+    for (const auto & event : input.events) {
+        const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
+        if (event_end < start && token_dictionary_context_event(event)) input.context_events.push_back(event);
+        if (event.ts > end && semantic_tail_context_event(event)) input.tail_context_events.push_back(event);
+    }
+    std::erase_if(input.events, [&](const TraceEvent & event) {
+        const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
+        return event_end < start || event.ts > end;
+    });
+    for (size_t index = 0; index < input.events.size(); ++index) input.events[index].index = index;
+}
+
 ManifestTraceInput load_torch_group(const std::string & torch_path, const std::string & custom_path, const std::vector<std::string> & sidecar_paths,
                                     const std::vector<std::string> & input_contracts, const ManifestTraceInputOptions & options) {
     ManifestTraceInput input;
@@ -219,6 +245,7 @@ ManifestTraceInput load_torch_group(const std::string & torch_path, const std::s
     }
     append_trace_files(input, sidecar_paths, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
+    retain_trace_window(input, options);
     return input;
 }
 
@@ -233,6 +260,7 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
     }
     append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
+    retain_trace_window(input, options);
     return input;
 }
 

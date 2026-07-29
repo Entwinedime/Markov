@@ -67,6 +67,12 @@ const core::DagRedirectEdgeMutation * redirected_ingress(const core::DagMutation
 }
 
 bool replacement_ingress(const core::DagGraph & graph, const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (!decision.source_execution_anchor_node_id
+        || !has_added_edge(plan,
+                           core::DagNodeRef::existing(*decision.source_execution_anchor_node_id),
+                           core::DagNodeRef::synthetic(decision.synthetic_id),
+                           decision.effect_id))
+        return false;
     if (decision.carrier_entry_edges.empty()) {
         return !decision.carrier_nodes.empty()
                && has_added_edge(plan,
@@ -84,12 +90,21 @@ bool replacement_ingress(const core::DagGraph & graph, const core::DagMutationPl
     return true;
 }
 
-bool insertion_dependencies(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
-    if (!has_added_edge(plan, core::DagNodeRef::existing(decision.source_fact_node_id), core::DagNodeRef::synthetic(decision.synthetic_id), decision.effect_id))
-        return false;
-    return !decision.consumer_anchors.empty() && std::ranges::all_of(decision.consumer_anchors, [&](size_t consumer) {
+bool consumer_dependencies(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (decision.consumer_anchors.empty()) return false;
+    return std::ranges::all_of(decision.consumer_anchors, [&](size_t consumer) {
         return has_added_edge(plan, core::DagNodeRef::synthetic(decision.synthetic_id), core::DagNodeRef::existing(consumer), decision.effect_id);
     });
+}
+
+bool insertion_dependencies(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (!decision.source_execution_anchor_node_id
+        || !has_added_edge(plan,
+                           core::DagNodeRef::existing(*decision.source_execution_anchor_node_id),
+                           core::DagNodeRef::synthetic(decision.synthetic_id),
+                           decision.effect_id))
+        return false;
+    return consumer_dependencies(plan, decision);
 }
 
 HiCacheBoundaryValidation validate_one(const core::DagGraph & graph, const HiCacheShadowRewriteTransaction & shadow, const HiCacheRewriteDecision & decision) {
@@ -126,7 +141,7 @@ HiCacheBoundaryValidation validate_one(const core::DagGraph & graph, const HiCac
         const auto * synthetic = synthetic_node(shadow.plan, decision);
         validation.target_cost_materialized = synthetic != nullptr && synthetic->node.duration == decision.duration_us;
         validation.ingress_preserved = (insertion || gate) ? insertion_dependencies(shadow.plan, decision) : replacement_ingress(graph, shadow.plan, decision);
-        validation.consumer_dependency_ready = insertion ? validation.ingress_preserved : validation.egress_preserved;
+        validation.consumer_dependency_ready = synthetic != nullptr && consumer_dependencies(shadow.plan, decision);
     }
     validation.ready = validation.source_cost_removed && validation.target_cost_materialized && validation.ingress_preserved && validation.egress_preserved
                        && validation.consumer_dependency_ready;

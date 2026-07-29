@@ -250,6 +250,7 @@ HiCacheEffectBoundary consumer_boundary(HiCacheEffectType type, const std::vecto
         boundary.source_fact_role = latest_consumer->consumer_source_fact_role;
         if (latest_consumer->consumer_source_available) {
             boundary.source_node_id = latest_consumer->consumer_source_node_id;
+            boundary.execution_anchor_node_id = latest_consumer->consumer_execution_anchor_node_id;
             boundary.source_event_index = latest_consumer->consumer_source_event_index;
         }
     }
@@ -437,6 +438,7 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
         .decision_ordinal = opportunity.decision_ordinal,
         .source_fact_seq_no = opportunity.source_fact_seq_no,
         .source_node_id = opportunity.source_node_id,
+        .source_execution_anchor_node_id = opportunity.source_execution_anchor_node_id,
         .source_event_index = opportunity.source_event_index,
         .candidate_segments = opportunity.candidate_segments,
         .effective_segments = std::move(segments),
@@ -523,6 +525,7 @@ void HiCacheState::observe_effect_opportunities(const HiCacheFact & fact, HiCach
             .decision_ordinal = decision_ordinal,
             .source_fact_seq_no = fact.seq_no,
             .source_node_id = fact.source_node_id,
+            .source_execution_anchor_node_id = fact.execution_anchor_node_id,
             .source_event_index = fact.source_event_index,
             .input_ready = resolution.ok() && fact.full_path_span.valid,
             .eligibility_boundary =

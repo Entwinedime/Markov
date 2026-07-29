@@ -7,6 +7,7 @@
 #include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <ranges>
 
 namespace markov::trace_graph::modules::hicache::model {
@@ -22,8 +23,10 @@ using frontend::HiCacheConfig;
  * diagnostics in Debug builds. State replay never consumes source-actual outcomes.
  */
 HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & config) {
-    struct OrderedHiCacheNode {
-        size_t node_id = 0;
+    struct OrderedHiCacheFact {
+        const core::TraceEvent * event = nullptr;
+        size_t source_fact_id = 0;
+        std::optional<size_t> execution_anchor_node_id = std::nullopt;
         uint64_t boundary_ts = 0;
     };
     struct RoutedHiCacheFact {
@@ -39,25 +42,43 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
 #endif
 
     HiCacheFactParser parser;
-    std::vector<OrderedHiCacheNode> hicache_nodes;
-    for (const auto & node : graph.nodes()) {
-        const auto & event = graph.event_for_node(node.id);
-        if (!parser.is_hicache_event(event)) continue;
-        hicache_nodes.push_back(OrderedHiCacheNode{
-            .node_id = node.id,
-            .boundary_ts = hicache_fact_boundary_timestamp(event),
-        });
-        parser.observe_token_dictionaries(event);
+    for (const auto & event : graph.context_events()) parser.observe_token_dictionaries(event);
+    std::vector<OrderedHiCacheFact> hicache_facts;
+    if (!graph.hicache_fact_events().empty()) {
+        hicache_facts.reserve(graph.hicache_fact_events().size());
+        for (const auto & event : graph.hicache_fact_events()) {
+            if (!parser.is_hicache_event(event)) continue;
+            hicache_facts.push_back(OrderedHiCacheFact{
+                .event = &event,
+                .source_fact_id = event.index,
+                .boundary_ts = hicache_fact_boundary_timestamp(event),
+            });
+            parser.observe_token_dictionaries(event);
+        }
     }
-    std::ranges::sort(hicache_nodes, [&](const OrderedHiCacheNode & left, const OrderedHiCacheNode & right) {
-        const auto & lhs = graph.event_for_node(left.node_id);
-        const auto & rhs = graph.event_for_node(right.node_id);
+    else {
+        hicache_facts.reserve(graph.node_count());
+        for (const auto & node : graph.nodes()) {
+            const auto & event = graph.event_for_node(node.id);
+            if (!parser.is_hicache_event(event)) continue;
+            hicache_facts.push_back(OrderedHiCacheFact{
+                .event = &event,
+                .source_fact_id = node.id,
+                .execution_anchor_node_id = node.id,
+                .boundary_ts = hicache_fact_boundary_timestamp(event),
+            });
+            parser.observe_token_dictionaries(event);
+        }
+    }
+    std::ranges::sort(hicache_facts, [&](const OrderedHiCacheFact & left, const OrderedHiCacheFact & right) {
+        const auto & lhs = *left.event;
+        const auto & rhs = *right.event;
         if (left.boundary_ts != right.boundary_ts) return left.boundary_ts < right.boundary_ts;
         if (lhs.pid != rhs.pid) return lhs.pid < rhs.pid;
         if (lhs.tid != rhs.tid) return lhs.tid < rhs.tid;
         if (lhs.name != rhs.name) return lhs.name < rhs.name;
         if (lhs.index != rhs.index) return lhs.index < rhs.index;
-        return left.node_id < right.node_id;
+        return left.source_fact_id < right.source_fact_id;
     });
 
     HiCacheState state(config);
@@ -65,14 +86,13 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
     summary.resolved_policy = state.resolved_policy();
 #endif
     std::vector<RoutedHiCacheFact> routed_facts;
-    routed_facts.reserve(hicache_nodes.size());
-    for (const auto & ordered_node : hicache_nodes) {
-        const auto node_id = ordered_node.node_id;
-        const auto & event = graph.event_for_node(node_id);
+    routed_facts.reserve(hicache_facts.size());
+    for (const auto & ordered_fact : hicache_facts) {
+        const auto & event = *ordered_fact.event;
 #ifdef DEBUG
         (void)core::checked_increment_u64(summary.input_hicache_events, "HiCache input event count exceeds uint64 range");
 #endif
-        auto fact = parser.parse(node_id, event);
+        auto fact = parser.parse(ordered_fact.source_fact_id, event, ordered_fact.execution_anchor_node_id);
 #ifdef DEBUG
         (void)core::checked_increment_u64(summary.events_by_role[fact.role], "HiCache input role count exceeds uint64 range");
 #endif

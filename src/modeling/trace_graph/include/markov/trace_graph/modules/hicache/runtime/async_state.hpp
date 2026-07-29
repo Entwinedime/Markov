@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -61,11 +62,17 @@ struct HiCacheOperationHeader {
     uint64_t complete_ts = 0;
     uint64_t consumer_epoch = 0;
     uint64_t consumer_ts = 0;
+    /** @brief Semantic fact identity for the consumer boundary. */
     size_t consumer_source_node_id = 0;
+    /** @brief Executable anchor for the consumer boundary, when trace evidence proves one. */
+    std::optional<size_t> consumer_execution_anchor_node_id = std::nullopt;
     size_t consumer_source_event_index = 0;
     std::string consumer_source_fact_role;
     bool consumer_source_available = false;
+    /** @brief Semantic fact identity for the operation opportunity. */
     size_t source_node_id = 0;
+    /** @brief Executable anchor for the operation opportunity, when trace evidence proves one. */
+    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
     uint64_t source_fact_seq_no = 0;
     std::string source_fact_role;
@@ -232,7 +239,8 @@ public:
 
     /** @brief Records the first canonical consumer released by a storage capacity gate. */
     void set_storage_consumer_boundary(const std::string & operation_id, uint64_t consumer_epoch, uint64_t consumer_ts, size_t source_node_id,
-                                       size_t source_event_index, std::string source_fact_role, bool source_available);
+                                       std::optional<size_t> execution_anchor_node_id, size_t source_event_index, std::string source_fact_role,
+                                       bool source_available);
 
     /** @brief Returns all storage operations. */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() const { return storage_by_id_; }

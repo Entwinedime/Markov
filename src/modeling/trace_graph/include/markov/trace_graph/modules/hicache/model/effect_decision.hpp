@@ -44,7 +44,10 @@ struct HiCacheEffectBoundary {
     uint64_t epoch = 0;
     /** @brief Timestamp in Chrome trace units, which are microseconds in the active contract. */
     uint64_t timestamp_us = 0;
+    /** @brief Semantic fact identity, retained even when no executable anchor exists. */
     std::optional<size_t> source_node_id = std::nullopt;
+    /** @brief Optional executable DAG anchor resolved from the semantic fact. */
+    std::optional<size_t> execution_anchor_node_id = std::nullopt;
     std::optional<size_t> source_event_index = std::nullopt;
     std::string source_fact_role;
 };
@@ -84,7 +87,10 @@ struct HiCacheEffectOpportunity {
     uint64_t source_fact_ordinal = 0;
     uint64_t decision_ordinal = 0;
     uint64_t source_fact_seq_no = 0;
+    /** @brief Semantic fact identity, not necessarily an executable DAG node. */
     size_t source_node_id = 0;
+    /** @brief Optional proven executable anchor for the opportunity fact. */
+    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
     bool input_ready = false;
     HiCacheEffectBoundary eligibility_boundary;
@@ -112,7 +118,10 @@ struct HiCacheEffectDecision {
     uint64_t source_fact_ordinal = 0;
     uint64_t decision_ordinal = 0;
     uint64_t source_fact_seq_no = 0;
+    /** @brief Semantic fact identity, not necessarily an executable DAG node. */
     size_t source_node_id = 0;
+    /** @brief Optional proven executable anchor for the source opportunity. */
+    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
     std::vector<std::string> operation_ids;
     std::vector<HiCacheEffectSegment> candidate_segments;

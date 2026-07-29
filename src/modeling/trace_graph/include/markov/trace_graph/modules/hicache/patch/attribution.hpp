@@ -23,6 +23,7 @@ struct HiCacheSourceAttribution {
     model::HiCacheTargetEffectState target_effect_state = model::HiCacheTargetEffectState::Unresolved;
     model::HiCacheSourceCarrierState source_carrier_state = model::HiCacheSourceCarrierState::NotEvaluated;
     size_t source_fact_node_id = 0;
+    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     std::string identity_method;
     std::vector<std::string> evidence;
     std::vector<size_t> control_fact_nodes;

@@ -256,6 +256,24 @@ public:
     /** @brief Returns the compact sorted manifest contract set. */
     [[nodiscard]] const std::vector<std::string> & input_contracts() const { return input_contracts_; }
 
+    /** @brief Replaces in-window HiCache facts excluded from executable DAG topology. */
+    void set_hicache_fact_events(std::vector<TraceEvent> events) { hicache_fact_events_ = std::move(events); }
+
+    /** @brief Returns in-window HiCache facts retained for semantic modules only. */
+    [[nodiscard]] const std::vector<TraceEvent> & hicache_fact_events() const { return hicache_fact_events_; }
+
+    /** @brief Replaces non-DAG side-table events retained from outside the timing window. */
+    void set_context_events(std::vector<TraceEvent> events) { context_events_ = std::move(events); }
+
+    /** @brief Returns non-DAG side-table events available to semantic modules. */
+    [[nodiscard]] const std::vector<TraceEvent> & context_events() const { return context_events_; }
+
+    /** @brief Replaces post-window facts used only to prove causal-tail closure. */
+    void set_tail_context_events(std::vector<TraceEvent> events) { tail_context_events_ = std::move(events); }
+
+    /** @brief Returns post-window facts excluded from topology and E2E simulation. */
+    [[nodiscard]] const std::vector<TraceEvent> & tail_context_events() const { return tail_context_events_; }
+
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
     [[nodiscard]] uint64_t real_e2e_time() const { return real_e2e_time_; }
@@ -316,6 +334,15 @@ private:
 
     /** @brief Small manifest-level contract set; never stores event or fact rows. */
     std::vector<std::string> input_contracts_;
+
+    /** @brief In-window semantic probe facts excluded from topology and E2E simulation. */
+    std::vector<TraceEvent> hicache_fact_events_;
+
+    /** @brief Side-table definitions excluded from DAG topology and E2E simulation. */
+    std::vector<TraceEvent> context_events_;
+
+    /** @brief Post-window causal closure facts excluded from DAG topology and simulation. */
+    std::vector<TraceEvent> tail_context_events_;
 };
 
 } // namespace markov::trace_graph::core

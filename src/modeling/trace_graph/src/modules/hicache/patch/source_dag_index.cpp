@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <limits>
 #include <ranges>
 #include <stdexcept>
 #include <string_view>
@@ -81,12 +82,10 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
     for (const auto & node : graph.nodes()) {
         if (!node.active) continue;
         ++stats_.active_node_count;
-        const auto & event = graph.event_for_node(node.id);
-        if (event.source_channel != core::TraceSourceChannel::PythonProbe) continue;
-        source_dag_index_detail::append_identity(event, "request_id", node.id, nodes_by_request_);
-        source_dag_index_detail::append_identity(event, "operation_id", node.id, nodes_by_operation_);
+    }
 
-        if (!source_dag_index_detail::fact_candidate(event)) continue;
+    const auto append_fact = [&](const core::TraceEvent & event, size_t fact_id, std::optional<size_t> execution_anchor_node_id) {
+        if (!source_dag_index_detail::fact_candidate(event)) return;
         try {
             auto metadata = parse_hicache_fact_metadata(event);
             auto operation_id = event.arg("operation_id");
@@ -98,10 +97,12 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
             }
             const auto fact_index = fact_nodes_.size();
             fact_nodes_.push_back(HiCacheSourceFactNode{
-                .node_id = node.id,
+                .node_id = fact_id,
+                .execution_anchor_node_id = execution_anchor_node_id,
                 .event_index = event.index,
+                .event_name = event.name,
                 .timestamp_us = event.ts,
-                .duration_us = node.duration,
+                .duration_us = event.dur,
                 .pid = event.pid,
                 .tid = event.tid,
                 .target_id = event.arg("target_id"),
@@ -121,9 +122,11 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
                 .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
                 .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
             });
-            fact_index_by_node_.emplace(node.id, fact_index);
-            nodes_by_fact_role_[fact_nodes_.back().fact_role].push_back(node.id);
-            for (const auto & request_id : fact_nodes_.back().batch_request_ids) nodes_by_request_[request_id].push_back(node.id);
+            fact_index_by_node_.emplace(fact_id, fact_index);
+            source_dag_index_detail::append_identity(event, "request_id", fact_id, nodes_by_request_);
+            source_dag_index_detail::append_identity(event, "operation_id", fact_id, nodes_by_operation_);
+            nodes_by_fact_role_[fact_nodes_.back().fact_role].push_back(fact_id);
+            for (const auto & request_id : fact_nodes_.back().batch_request_ids) nodes_by_request_[request_id].push_back(fact_id);
             ++stats_.counts_by_fact_class[fact_nodes_.back().fact_class];
             ++stats_.counts_by_fact_role[fact_nodes_.back().fact_role];
             if (!fact_nodes_.back().request_id.empty() || !fact_nodes_.back().batch_request_ids.empty())
@@ -135,6 +138,59 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
         }
         catch (const std::exception &) {
             ++stats_.malformed_fact_count;
+        }
+    };
+
+    if (!graph.hicache_fact_events().empty()) {
+        for (const auto & event : graph.hicache_fact_events()) append_fact(event, event.index, std::nullopt);
+    }
+    else {
+        for (const auto & node : graph.nodes()) {
+            if (!node.active) continue;
+            const auto & event = graph.event_for_node(node.id);
+            append_fact(event, node.id, node.id);
+        }
+    }
+
+    for (const auto & event : graph.tail_context_events()) {
+        if (!source_dag_index_detail::fact_candidate(event)) continue;
+        try {
+            auto metadata = parse_hicache_fact_metadata(event);
+            auto operation_id = event.arg("operation_id");
+            if (operation_id.empty() && event.has_arg_key_hint("node_id")) operation_id = event.arg("node_id");
+            std::optional<uint64_t> object_node_id;
+            if (event.has_arg_key_hint("node_id")) {
+                const auto raw_node_id = event.find_arg("node_id");
+                if (raw_node_id) object_node_id = core::parse_u64(*raw_node_id);
+            }
+            tail_context_facts_.push_back(HiCacheSourceFactNode{
+                .node_id = std::numeric_limits<size_t>::max(),
+                .event_index = event.index,
+                .event_name = event.name,
+                .timestamp_us = event.ts,
+                .duration_us = event.dur,
+                .pid = event.pid,
+                .tid = event.tid,
+                .target_id = event.arg("target_id"),
+                .phase = event.arg("phase"),
+                .fact_class = std::move(metadata.fact_class),
+                .fact_role = std::move(metadata.role),
+                .request_id = event.arg("request_id"),
+                .batch_request_ids = source_dag_index_detail::string_array_arg(event, "batch_request_ids"),
+                .operation_id = std::move(operation_id),
+                .cache_scope = event.arg("cache_scope"),
+                .object_node_id = object_node_id,
+                .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
+                .token_count = event.arg_u64("token_count", 0),
+                .effective_token_count = event.arg_u64("effective_token_count", 0),
+                .completed_token_count = event.arg_u64("completed_token_count", 0),
+                .progress_ready = source_dag_index_detail::bool_arg(event, "progress_ready"),
+                .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
+                .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
+            });
+        }
+        catch (const std::exception &) {
+            // Tail context is optional closure evidence; malformed rows cannot prove closure.
         }
     }
 
@@ -170,9 +226,7 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
         if (left->timestamp_us != right->timestamp_us) return left->timestamp_us < right->timestamp_us;
         if (left->pid != right->pid) return left->pid < right->pid;
         if (left->tid != right->tid) return left->tid < right->tid;
-        const auto & left_event = graph.event_for_node(left_node_id);
-        const auto & right_event = graph.event_for_node(right_node_id);
-        if (left_event.name != right_event.name) return left_event.name < right_event.name;
+        if (left->event_name != right->event_name) return left->event_name < right->event_name;
         if (left->event_index != right->event_index) return left->event_index < right->event_index;
         return left_node_id < right_node_id;
     });

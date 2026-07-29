@@ -34,6 +34,7 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, HiC
                                                       consumer_epoch,
                                                       fact.ts,
                                                       fact.source_node_id,
+                                                      fact.execution_anchor_node_id,
                                                       fact.source_event_index,
                                                       fact.role,
                                                       source_available);

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,7 +46,10 @@ struct HiCacheRewriteDecision {
     std::vector<size_t> owned_duration_nodes;
     std::vector<size_t> carrier_entry_edges;
     std::vector<size_t> carrier_exit_edges;
+    /** @brief Semantic source-fact identity retained for diagnostics. */
     size_t source_fact_node_id = 0;
+    /** @brief Proven executable launch anchor required for synthetic insertion. */
+    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     std::vector<size_t> consumer_anchors;
     std::string consumer_anchor_method;
     std::string reason;

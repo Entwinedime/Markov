@@ -299,6 +299,10 @@ private:
         total_nodes_ = checked_total([](const auto & graph) { return graph.nodes_.size(); }, "node");
         total_edges_ = checked_total([](const auto & graph) { return graph.edges_.size(); }, "edge");
         merged_.events_.reserve(total_events_);
+        merged_.hicache_fact_events_.reserve(checked_total([](const auto & graph) { return graph.hicache_fact_events_.size(); }, "HiCache fact"));
+        merged_.context_events_.reserve(checked_total([](const auto & graph) { return graph.context_events_.size(); }, "context event"));
+        merged_.tail_context_events_.reserve(
+            checked_total([](const auto & graph) { return graph.tail_context_events_.size(); }, "tail context event"));
         merged_.reserve(DagGraphCapacity{ .nodes = total_nodes_, .edges = 0 });
     }
 
@@ -310,6 +314,16 @@ private:
             node_offsets_[graph_index] = node_offset;
             merge_parsed_record_count(graph);
             merge_input_contracts(graph);
+            for (auto & fact : graph.hicache_fact_events_) {
+                fact.index = merged_.hicache_fact_events_.size();
+                merged_.hicache_fact_events_.push_back(std::move(fact));
+            }
+            merged_.context_events_.insert(merged_.context_events_.end(),
+                                           std::make_move_iterator(graph.context_events_.begin()),
+                                           std::make_move_iterator(graph.context_events_.end()));
+            merged_.tail_context_events_.insert(merged_.tail_context_events_.end(),
+                                                std::make_move_iterator(graph.tail_context_events_.begin()),
+                                                std::make_move_iterator(graph.tail_context_events_.end()));
             remap_nodes(graph,
                         GraphRelocation{
                             .graph_index = graph_index,

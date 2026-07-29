@@ -25,6 +25,7 @@ std::string request_ref_owner(const std::string & request_key) { return request_
 HiCacheFact batch_request_fact(const HiCacheFact & batch, const std::string & request_id, uint64_t token_count) {
     HiCacheFact fact;
     fact.source_node_id = batch.source_node_id;
+    fact.execution_anchor_node_id = batch.execution_anchor_node_id;
     fact.source_event_index = batch.source_event_index;
     fact.ts = batch.ts;
     fact.dur = batch.dur;
@@ -253,6 +254,7 @@ void HiCacheState::prepare_prefetch_before_cache_extend(const std::vector<HiCach
                 loadback->header.consumer_epoch = consumer_epoch;
                 loadback->header.consumer_ts = entry_fact.ts;
                 loadback->header.consumer_source_node_id = entry_fact.source_node_id;
+                loadback->header.consumer_execution_anchor_node_id = entry_fact.execution_anchor_node_id;
                 loadback->header.consumer_source_event_index = entry_fact.source_event_index;
                 loadback->header.consumer_source_fact_role = entry_fact.role;
                 loadback->header.consumer_source_available = true;

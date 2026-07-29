@@ -20,10 +20,14 @@
 
 namespace markov::trace_graph::modules::hicache::patch {
 
-/** @brief Lightweight catalog fact retained for source-attribution evidence. */
+/** @brief Lightweight semantic fact retained for source-attribution evidence. */
 struct HiCacheSourceFactNode {
+    /** @brief Semantic fact identity; legacy inputs may use an executable node ID. */
     size_t node_id = 0;
+    /** @brief Executable DAG anchor only when separately proven by trace evidence. */
+    std::optional<size_t> execution_anchor_node_id = std::nullopt;
     size_t event_index = 0;
+    std::string event_name;
     uint64_t timestamp_us = 0;
     uint64_t duration_us = 0;
     std::string pid;
@@ -69,9 +73,9 @@ struct HiCacheSourceDagIndexStats {
 /**
  * @brief Active adjacency plus narrow semantic identity indexes for HiCache attribution.
  *
- * Construction performs one node pass and one edge pass. Event arguments stay lazy:
- * only identity keys advertised by a raw-key hint are parsed, and only Python-probe
- * events carrying `args.fact` become semantic fact records.
+ * Construction performs one executable-node pass and one fact-side-table pass. Event
+ * arguments stay lazy: only Python-probe events carrying `args.fact` become semantic
+ * fact records. Legacy graph-embedded facts remain supported for focused tests.
  */
 class HiCacheSourceDagIndex {
 public:
@@ -86,6 +90,7 @@ public:
     [[nodiscard]] std::span<const size_t> outgoing_edge_ids(size_t node_id) const;
 
     [[nodiscard]] const HiCacheSourceFactNode * fact_node(size_t node_id) const;
+    [[nodiscard]] std::span<const HiCacheSourceFactNode> tail_context_facts() const { return tail_context_facts_; }
     [[nodiscard]] std::span<const size_t> nodes_for_fact_role(std::string_view role) const;
     [[nodiscard]] std::span<const size_t> nodes_for_request(std::string_view request_id) const;
     [[nodiscard]] std::span<const size_t> nodes_for_operation(std::string_view operation_id) const;
@@ -100,6 +105,7 @@ private:
     std::vector<size_t> outgoing_offsets_;
     std::vector<size_t> outgoing_edge_ids_;
     std::vector<HiCacheSourceFactNode> fact_nodes_;
+    std::vector<HiCacheSourceFactNode> tail_context_facts_;
     std::vector<size_t> fact_nodes_in_time_order_;
     std::unordered_map<size_t, size_t> fact_index_by_node_;
     NodeMap nodes_by_fact_role_;

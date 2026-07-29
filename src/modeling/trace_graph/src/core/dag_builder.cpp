@@ -87,6 +87,25 @@ bool is_device_sync_event(const std::string & name) {
 
 bool raw_contains_key_hint(const TraceEvent & event, std::string_view key) { return event.args_json_view().find(key) != std::string_view::npos; }
 
+bool is_hicache_fact_event(const TraceEvent & event) {
+    return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact");
+}
+
+struct ExecutionAndFactEvents {
+    std::vector<TraceEvent> executable_events;
+    std::vector<TraceEvent> hicache_fact_events;
+};
+
+ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events) {
+    ExecutionAndFactEvents split;
+    split.executable_events.reserve(events.size());
+    for (auto & event : events) {
+        if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));
+        else split.executable_events.push_back(std::move(event));
+    }
+    return split;
+}
+
 struct EventLaneIdentity {
     bool is_device = false;
     std::string lane = "CPU_MERGED";
@@ -140,6 +159,7 @@ using dag_builder_detail::is_usable_lane_value;
 using dag_builder_detail::node_end_ts;
 using dag_builder_detail::raw_contains_key_hint;
 using dag_builder_detail::resolve_event_lane;
+using dag_builder_detail::split_hicache_fact_events;
 
 namespace {
 
@@ -594,9 +614,11 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
 
 template <typename Profiler> DagGraph DagBuilder::build_impl(std::vector<TraceEvent> events, int gpu_id, Profiler & profiler) const {
     auto parsed_count = events.size();
-    auto normalized = profiler.value(BuildStep::Normalize, [&] { return normalize_events(std::move(events)); });
+    auto split = split_hicache_fact_events(std::move(events));
+    auto normalized = profiler.value(BuildStep::Normalize, [&] { return normalize_events(std::move(split.executable_events)); });
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);
+    graph.set_hicache_fact_events(std::move(split.hicache_fact_events));
     graph.reserve(DagGraphCapacity{ .nodes = graph.events().size(), .edges = 0 });
 
     auto index = profiler.value(BuildStep::CreateNodes, [&] { return create_nodes(graph); });
@@ -744,7 +766,7 @@ private:
         retained.reserve(events_.size());
         for (const auto position : std::views::iota(size_t{ 0 }, events_.size())) {
             const auto event_index = event_index_at(position);
-            if (dropped_[event_index] && !DagBuilder::is_hicache_event(events_[event_index])) continue;
+            if (dropped_[event_index]) continue;
             retained.push_back(std::move(events_[event_index]));
         }
         return retained;
@@ -773,8 +795,8 @@ private:
      * @brief Builds per-lane sequences and retains only leaves from nested CPU call trees.
      *
      * Device events never enter CPU-leaf filtering because kernels and copies are
-     * executable graph nodes rather than nested CPU call frames. HiCache facts bypass
-     * leaf elimination so every approved fact remains available to stage two.
+     * executable graph nodes rather than nested CPU call frames. Semantic HiCache
+     * facts are separated before normalization and do not enter this executable path.
      */
     [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events) {
         auto lanes = build_lane_index(events);
@@ -789,7 +811,7 @@ private:
         std::vector<TraceEvent> result;
         result.reserve(events.size());
         for (const auto index : std::views::iota(size_t{ 0 }, events.size())) {
-            if ((selection.is_leaf[index] && !selection.discarded[index]) || DagBuilder::is_hicache_event(events[index]))
+            if (selection.is_leaf[index] && !selection.discarded[index])
                 result.push_back(std::move(events[index]));
         }
         for (const auto index : std::views::iota(size_t{ 0 }, result.size())) result[index].index = index;
@@ -871,13 +893,6 @@ private:
 };
 
 std::vector<TraceEvent> DagBuilder::normalize_events(std::vector<TraceEvent> events) { return EventNormalizer(std::move(events)).run(); }
-
-bool DagBuilder::is_hicache_event(const TraceEvent & event) {
-    if (event.cat == "hicache" || event.name.starts_with("HiCache::") || event.name.starts_with("hicache_")) return true;
-    if (!raw_contains_key_hint(event, "domain") && !raw_contains_key_hint(event, "python_probe")) return false;
-    auto domain = event.arg("domain");
-    return domain == "hicache" || (domain == "python_probe" && event.name.contains("hicache"));
-}
 
 class DagBuilder::NodeIndexer {
 public:

@@ -10,6 +10,8 @@
 #endif
 
 #include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -40,11 +42,21 @@ struct ManifestTraceInputOptions {
 
     /** @brief Selects Python-probe sidecars for this backend invocation. */
     bool include_python_probe = true;
+
+    /** @brief Optional inclusive lower timestamp bound in trace microseconds. */
+    std::optional<uint64_t> window_start_us;
+
+    /** @brief Optional inclusive upper timestamp bound in trace microseconds. */
+    std::optional<uint64_t> window_end_us;
 };
 
 /** @brief One logical input after selected channels have been joined in memory. */
 struct ManifestTraceInput {
     std::vector<core::TraceEvent> events;
+    /** @brief Pre-window side-table records needed to decode in-window event arguments. */
+    std::vector<core::TraceEvent> context_events;
+    /** @brief Post-window semantic facts retained only to prove causal-tail closure. */
+    std::vector<core::TraceEvent> tail_context_events;
     std::vector<std::string> input_contracts;
 #ifdef DEBUG
     std::vector<TraceReadTimings> trace_read_timings;

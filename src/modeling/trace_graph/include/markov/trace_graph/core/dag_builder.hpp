@@ -106,11 +106,8 @@ private:
         std::vector<size_t> model_execute_nodes;
     };
 
-    /** @brief Deduplicates events and removes nested CPU parents while retaining facts. */
+    /** @brief Deduplicates executable events and removes nested CPU parents. */
     [[nodiscard]] static std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
-
-    /** @brief Protects routed HiCache fact events from CPU-leaf elimination. */
-    [[nodiscard]] static bool is_hicache_event(const TraceEvent & event);
 
     /** @brief Executes the ordered build pipeline through a direct or Debug timing profiler. */
     template <typename Profiler> [[nodiscard]] DagGraph build_impl(std::vector<TraceEvent> events, int gpu_id, Profiler & profiler) const;

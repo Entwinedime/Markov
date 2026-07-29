@@ -197,6 +197,7 @@ inline HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, c
         .enqueue_epoch = enqueue_epoch,
         .enqueue_ts = fact.ts,
         .source_node_id = fact.source_node_id,
+        .source_execution_anchor_node_id = fact.execution_anchor_node_id,
         .source_event_index = fact.source_event_index,
         .source_fact_seq_no = fact.seq_no,
         .source_fact_role = fact.role,

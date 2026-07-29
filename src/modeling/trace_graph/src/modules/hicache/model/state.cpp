@@ -105,6 +105,7 @@ void HiCacheState::register_prefetch_control_boundary(const HiCacheFact & fact) 
         if (request_id.empty()) return;
         HiCacheFact boundary;
         boundary.source_node_id = fact.source_node_id;
+        boundary.execution_anchor_node_id = fact.execution_anchor_node_id;
         boundary.source_event_index = fact.source_event_index;
         boundary.ts = fact.ts;
         boundary.event_name = fact.event_name;

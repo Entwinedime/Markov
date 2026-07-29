@@ -229,8 +229,8 @@ void HiCacheAsyncOperationTable::set_storage_capacity_gate_pages(const std::stri
 }
 
 void HiCacheAsyncOperationTable::set_storage_consumer_boundary(const std::string & operation_id, uint64_t consumer_epoch, uint64_t consumer_ts,
-                                                               size_t source_node_id, size_t source_event_index, std::string source_fact_role,
-                                                               bool source_available) {
+                                                               size_t source_node_id, std::optional<size_t> execution_anchor_node_id,
+                                                               size_t source_event_index, std::string source_fact_role, bool source_available) {
     const auto it = storage_by_id_.find(operation_id);
     if (it == storage_by_id_.end()) throw std::logic_error("Unknown HiCache storage operation: " + operation_id);
     auto & header = it->second.header;
@@ -238,6 +238,7 @@ void HiCacheAsyncOperationTable::set_storage_consumer_boundary(const std::string
     header.consumer_epoch = consumer_epoch;
     header.consumer_ts = consumer_ts;
     header.consumer_source_node_id = source_node_id;
+    header.consumer_execution_anchor_node_id = execution_anchor_node_id;
     header.consumer_source_event_index = source_event_index;
     header.consumer_source_fact_role = std::move(source_fact_role);
     header.consumer_source_available = source_available;

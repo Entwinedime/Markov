@@ -30,6 +30,10 @@ template <typename Value> std::unordered_map<std::string, const Value *> index_b
 
 bool dependency_effect(const HiCacheEffectDecision & effect) { return effect.direction == HiCacheTransferDirection::None; }
 
+bool requires_consumer_anchor(const HiCacheEffectDecision & effect) {
+    return dependency_effect(effect) || effect.effect_type == HiCacheEffectType::Loadback || effect.effect_type == HiCacheEffectType::PrefetchIo;
+}
+
 HiCacheRewriteDecision reject_decision(const HiCacheEffectDecision & effect, const HiCacheSourceAttribution * attribution, std::string blocker) {
     return HiCacheRewriteDecision{
         .effect_id = effect.effect_key,
@@ -39,6 +43,7 @@ HiCacheRewriteDecision reject_decision(const HiCacheEffectDecision & effect, con
         .source_carrier_state = attribution == nullptr ? HiCacheSourceCarrierState::NotEvaluated : attribution->source_carrier_state,
         .rewrite_kind = HiCacheRewriteKind::Reject,
         .source_fact_node_id = effect.source_node_id,
+        .source_execution_anchor_node_id = effect.source_execution_anchor_node_id,
         .reason = "rewrite is not safe under the current source/target evidence",
         .blocker = std::move(blocker),
     };
@@ -55,6 +60,8 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
     if (attribution->source_carrier_state == HiCacheSourceCarrierState::Ambiguous)
         return reject_decision(effect, attribution, "source_carrier_ambiguous:" + attribution->reason);
 
+    const auto source_execution_anchor = effect.source_execution_anchor_node_id ? effect.source_execution_anchor_node_id
+                                                                                  : attribution->source_execution_anchor_node_id;
     HiCacheRewriteDecision decision{
         .effect_id = effect.effect_key,
         .effect_family_id = effect.effect_family_key,
@@ -69,6 +76,7 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .carrier_entry_edges = attribution->carrier_entry_edges,
         .carrier_exit_edges = attribution->carrier_exit_edges,
         .source_fact_node_id = effect.source_node_id,
+        .source_execution_anchor_node_id = source_execution_anchor,
         .consumer_anchors = attribution->consumer_anchors,
         .consumer_anchor_method = attribution->consumer_anchor_method,
     };
@@ -81,6 +89,7 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
             return decision;
         }
         if (cost == nullptr || cost->status != HiCacheIoCostStatus::Ready) return reject_decision(effect, attribution, "target_effect_cost_not_ready");
+        if (!decision.source_execution_anchor_node_id) return reject_decision(effect, attribution, "missing_source_execution_anchor");
         if (attribution->consumer_anchors.empty()) return reject_decision(effect, attribution, "missing_insertion_consumer_anchor");
         decision.rewrite_kind = dependency_effect(effect) ? HiCacheRewriteKind::InsertGate : HiCacheRewriteKind::InsertIo;
         decision.shadow_plan_ready = true;
@@ -105,17 +114,22 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
     if (effect.target_effect_state == HiCacheTargetEffectState::Partial) {
         if (dependency_effect(effect)) return reject_decision(effect, attribution, "partial_dependency_effect_is_invalid");
         if (attribution->owned_duration_nodes.empty()) return reject_decision(effect, attribution, "present_source_carrier_has_no_owned_duration");
+        if (!decision.source_execution_anchor_node_id) return reject_decision(effect, attribution, "missing_source_execution_anchor");
+        if (attribution->consumer_anchors.empty()) return reject_decision(effect, attribution, "missing_replacement_consumer_anchor");
         decision.rewrite_kind = HiCacheRewriteKind::PartialReplace;
         decision.shadow_plan_ready = true;
         decision.reason = "source timing is effect-local and can be replaced completely by the target-derived partial transfer cost";
         return decision;
     }
     if (dependency_effect(effect)) {
+        if (!decision.source_execution_anchor_node_id) return reject_decision(effect, attribution, "missing_source_execution_anchor");
         if (attribution->consumer_anchors.empty()) return reject_decision(effect, attribution, "missing_dependency_consumer_anchor");
         decision.rewrite_kind = HiCacheRewriteKind::ReplaceWithGate;
     }
     else {
         if (attribution->owned_duration_nodes.empty()) return reject_decision(effect, attribution, "present_source_carrier_has_no_owned_duration");
+        if (!decision.source_execution_anchor_node_id) return reject_decision(effect, attribution, "missing_source_execution_anchor");
+        if (attribution->consumer_anchors.empty()) return reject_decision(effect, attribution, "missing_replacement_consumer_anchor");
         decision.rewrite_kind = HiCacheRewriteKind::ReplaceWithIo;
     }
     decision.shadow_plan_ready = true;
@@ -167,6 +181,14 @@ void append_synthetic_node(core::DagMutationPlan & plan, const HiCacheRewriteDec
 }
 
 void append_replacement_edges(const core::DagGraph & graph, core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (!decision.source_execution_anchor_node_id) throw std::logic_error("HiCache replacement requires a proven executable source anchor");
+    plan.add_edges.push_back(core::DagAddEdgeMutation{
+        .src = core::DagNodeRef::existing(*decision.source_execution_anchor_node_id),
+        .dst = core::DagNodeRef::synthetic(decision.synthetic_id),
+        .kind = core::DagEdgeKind::Mutation,
+        .effect_id = decision.effect_id,
+        .reason = "target effect becomes eligible after its proven source opportunity anchor",
+    });
     std::set<size_t> boundary_nodes;
     for (size_t edge_index : decision.carrier_entry_edges) {
         const auto & edge = graph.edge(edge_index);
@@ -188,11 +210,21 @@ void append_replacement_edges(const core::DagGraph & graph, core::DagMutationPla
             .reason = "target effect completes before the retained zero-cost source boundary",
         });
     }
+    for (size_t consumer : decision.consumer_anchors) {
+        plan.add_edges.push_back(core::DagAddEdgeMutation{
+            .src = core::DagNodeRef::synthetic(decision.synthetic_id),
+            .dst = core::DagNodeRef::existing(consumer),
+            .kind = core::DagEdgeKind::Mutation,
+            .effect_id = decision.effect_id,
+            .reason = "target effect completes before its proven consumer boundary",
+        });
+    }
 }
 
 void append_insertion_edges(core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (!decision.source_execution_anchor_node_id) throw std::logic_error("HiCache insertion requires a proven executable source anchor");
     plan.add_edges.push_back(core::DagAddEdgeMutation{
-        .src = core::DagNodeRef::existing(decision.source_fact_node_id),
+        .src = core::DagNodeRef::existing(*decision.source_execution_anchor_node_id),
         .dst = core::DagNodeRef::synthetic(decision.synthetic_id),
         .kind = core::DagEdgeKind::Mutation,
         .effect_id = decision.effect_id,

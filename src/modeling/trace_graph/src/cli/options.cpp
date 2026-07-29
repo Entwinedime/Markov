@@ -33,6 +33,12 @@ double nonnegative_double(std::string_view raw, std::string_view option) {
     throw CliUsageError(std::string(option) + " expects a non-negative number");
 }
 
+uint64_t nonnegative_u64(std::string_view raw, std::string_view option) {
+    const auto value = core::parse_exact_u64(raw);
+    if (value) return *value;
+    throw CliUsageError(std::string(option) + " expects a non-negative integer");
+}
+
 std::string normalized_token(std::string_view raw) {
     size_t begin = 0;
     size_t end = raw.size();
@@ -77,6 +83,12 @@ void select_trace_channels(io::ManifestTraceInputOptions & options, const std::s
 void validate_options(const CliOptions & options) {
     if (options.profile_manifest.empty()) throw CliUsageError("--profile-manifest is required");
     if (options.outputs.run_summary.empty()) throw CliUsageError("--run-summary is required");
+    if (options.trace_input.window_start_us.has_value() != options.trace_input.window_end_us.has_value()) {
+        throw CliUsageError("--trace-window-start-us and --trace-window-end-us must be provided together");
+    }
+    if (options.trace_input.window_start_us && *options.trace_input.window_end_us <= *options.trace_input.window_start_us) {
+        throw CliUsageError("trace window end must be greater than start");
+    }
 }
 
 } // namespace
@@ -95,6 +107,12 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--trace-merge-window") { options.trace_input.search_window = positive_size(next_value(index, argc, argv, argument), argument); }
         else if (argument == "--trace-merge-margin-us") {
             options.trace_input.margin_us = nonnegative_double(next_value(index, argc, argv, argument), argument);
+        }
+        else if (argument == "--trace-window-start-us") {
+            options.trace_input.window_start_us = nonnegative_u64(next_value(index, argc, argv, argument), argument);
+        }
+        else if (argument == "--trace-window-end-us") {
+            options.trace_input.window_end_us = nonnegative_u64(next_value(index, argc, argv, argument), argument);
         }
         else if (argument == "--trace-channels") select_trace_channels(options.trace_input, next_value(index, argc, argv, argument));
         else if (argument == "--graph-output") options.outputs.graph = next_value(index, argc, argv, argument);
@@ -123,6 +141,8 @@ void print_usage(const char * program) {
               << "  --trace-merge-tolerance-us N    LD/profiler timestamp tolerance\n"
               << "  --trace-merge-window N          Search candidates on each timestamp side\n"
               << "  --trace-merge-margin-us N       Standalone custom-event timestamp margin\n\n"
+              << "  --trace-window-start-us N       Inclusive workload-window start timestamp\n"
+              << "  --trace-window-end-us N         Inclusive workload-window end timestamp\n\n"
               << "Model and output:\n"
               << "  --model-config FILE             Optional SimulationModule config\n"
               << "  --graph-output FILE             Optional full DAG Chrome trace\n"

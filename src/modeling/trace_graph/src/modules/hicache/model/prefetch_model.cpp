@@ -105,6 +105,7 @@ void HiCacheState::bind_prefetch_consumer_boundary(const HiCacheFact & fact, Sco
     op.header.consumer_epoch = consumer_epoch;
     op.header.consumer_ts = fact.ts;
     op.header.consumer_source_node_id = fact.source_node_id;
+    op.header.consumer_execution_anchor_node_id = fact.execution_anchor_node_id;
     op.header.consumer_source_event_index = fact.source_event_index;
     op.header.consumer_source_fact_role = fact.role;
     op.header.consumer_source_available = true;
