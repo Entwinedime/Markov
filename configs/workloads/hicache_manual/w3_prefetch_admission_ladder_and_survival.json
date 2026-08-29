@@ -1,0 +1,121 @@
+{
+  "id": "w3_prefetch_admission_ladder_and_survival",
+  "description": "Coldify twelve qualified E/U/T tails to storage-only, force a host-backed shared anchor, then measure one interleaved pass of twelve admission and stop-policy witnesses with no formal pressure.",
+  "defaults": {
+    "sampling": {"max_new_tokens": 1, "temperature": 0, "top_p": 1.0, "top_k": 1, "ignore_eos": true},
+    "request_timeout_sec": 600
+  },
+  "fragments": {
+    "L_prefix": {"text": "L", "repeat": 1},
+    "X_prefix": {"text": "X", "repeat": 1},
+    "Y_prefix": {"text": "Y", "repeat": 1},
+    "N_prefix": {"text": "N", "repeat": 1},
+    "common_prefix": {"text": " anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "E_tail": {"text": "{branch} D-tail cascade payload remains deterministic across every revisit. ", "repeat": 20},
+    "E_pad": {"text": " q", "repeat": 6},
+    "U_tail": {"text": "{branch} D-tail cascade payload remains deterministic across every revisit. ", "repeat": 45},
+    "U_pad": {"text": " q", "repeat": 91},
+    "T_tail": {"text": "{branch} D-tail cascade payload remains deterministic across every revisit. ", "repeat": 88},
+    "T_pad": {"text": " q", "repeat": 87},
+    "S_pad": {"text": " q", "repeat": 855}
+  },
+  "request_defs": {
+    "LE{i}": {
+      "family": "L", "branch_markers": {"0": "a", "1": "b", "2": "j", "3": "k"},
+      "prompt_parts": [{"ref": "L_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "E_tail"}, {"text": "a b c d e f g h i"}, {"ref": "E_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 255, "tail_symbol": "E"}
+    },
+    "LU{i}": {
+      "family": "L", "branch_markers": {"0": "c", "1": "d", "2": "l", "3": "m"},
+      "prompt_parts": [{"ref": "L_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "U_tail"}, {"text": "a b c d e f g h i"}, {"ref": "U_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 640, "tail_symbol": "U"}
+    },
+    "LT{i}": {
+      "family": "L", "branch_markers": {"0": "e", "1": "f", "2": "g", "3": "h"},
+      "prompt_parts": [{"ref": "L_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "T_tail"}, {"text": "a b c d e f g h i"}, {"ref": "T_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "LK": {
+      "family": "L", "branch_marker": "i",
+      "prompt_parts": [{"ref": "L_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "T_tail"}, {"text": "a b c d e f g h i"}, {"ref": "T_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "X{i}": {
+      "family": "X", "branch_markers": {"0": "a", "1": "b", "2": "c", "3": "d", "4": "e", "5": "f", "6": "g", "7": "h", "8": "i", "9": "j"},
+      "prompt_parts": [{"ref": "X_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "T_tail"}, {"text": "a b c d e f g h i"}, {"ref": "S_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1920, "tail_symbol": "S"}
+    },
+    "Y0": {
+      "family": "Y", "branch_marker": "n",
+      "prompt_parts": [{"ref": "Y_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "T_tail"}, {"text": "a b c d e f g h i"}, {"ref": "T_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "Y1": {
+      "family": "N", "branch_marker": "n",
+      "prompt_parts": [{"ref": "N_prefix"}, {"ref": "common_prefix"}, {"text": "x y z q "}, {"ref": "T_tail"}, {"text": "a b c d e f g h i"}, {"ref": "T_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    }
+  },
+  "steps": [
+    {"id": "prepare_le0", "kind": "repeat_request", "request": "LE0", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lu0", "kind": "repeat_request", "request": "LU0", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lt0", "kind": "repeat_request", "request": "LT0", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_le1", "kind": "repeat_request", "request": "LE1", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lu1", "kind": "repeat_request", "request": "LU1", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lt1", "kind": "repeat_request", "request": "LT1", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_le2", "kind": "repeat_request", "request": "LE2", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lu2", "kind": "repeat_request", "request": "LU2", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lt2", "kind": "repeat_request", "request": "LT2", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_le3", "kind": "repeat_request", "request": "LE3", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lu3", "kind": "repeat_request", "request": "LU3", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lt3", "kind": "repeat_request", "request": "LT3", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_lk_source", "kind": "repeat_request", "request": "LK", "count": 3, "phase": "prepare_admission_sources", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+
+    {"id": "prepare_x0", "kind": "repeat_request", "request": "X0", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x1", "kind": "repeat_request", "request": "X1", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x2", "kind": "repeat_request", "request": "X2", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x3", "kind": "repeat_request", "request": "X3", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x4", "kind": "repeat_request", "request": "X4", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x5", "kind": "repeat_request", "request": "X5", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x6", "kind": "repeat_request", "request": "X6", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x7", "kind": "repeat_request", "request": "X7", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x8", "kind": "repeat_request", "request": "X8", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+    {"id": "prepare_x9", "kind": "repeat_request", "request": "X9", "count": 3, "phase": "prepare_coldification", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "evict", "host_cleanup", "storage_backup"]},
+
+    {"id": "prepare_materialize_lk", "kind": "request", "request": "LK", "phase": "prepare_anchor_conversion", "measure": false, "expected_mechanisms": ["lookup", "load_back_or_storage_or_recompute", "anchor_materialization"]},
+    {"id": "prepare_conversion_y0", "kind": "request", "request": "Y0", "phase": "prepare_anchor_conversion", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "anchor_demotion"]},
+    {"id": "prepare_conversion_y1", "kind": "request", "request": "Y1", "phase": "prepare_anchor_conversion", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "anchor_demotion"]},
+    {"id": "prepare_reanchor_lk", "kind": "repeat_request", "request": "LK", "count": 3, "phase": "prepare_anchor_restore", "measure": false, "expected_mechanisms": ["lookup", "load_back_or_storage_or_recompute", "qualification", "anchor_device_and_host_stabilization"]},
+
+    {"id": "prepare_to_formal", "kind": "barrier", "scope": "hicache_idle", "timeout_sec": 300, "phase": "boundary", "measure": false},
+    {"id": "pre_formal_state", "kind": "checkpoint", "phase": "boundary", "measure": false, "assertions": [
+      {"id": "l_anchor_recoverable_and_resident", "request": "LK", "range": "anchor", "expect": {"storage": "all", "device": "all", "host": "all"}},
+      {"id": "le0_tail_s_only", "request": "LE0", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lu0_tail_s_only", "request": "LU0", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lt0_tail_s_only", "request": "LT0", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "le1_tail_s_only", "request": "LE1", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lu1_tail_s_only", "request": "LU1", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lt1_tail_s_only", "request": "LT1", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "le2_tail_s_only", "request": "LE2", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lu2_tail_s_only", "request": "LU2", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lt2_tail_s_only", "request": "LT2", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "le3_tail_s_only", "request": "LE3", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lu3_tail_s_only", "request": "LU3", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}},
+      {"id": "lt3_tail_s_only", "request": "LT3", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "none"}}
+    ]},
+
+    {"id": "formal_probe_e0", "kind": "request", "request": "LE0", "phase": "formal_e_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_or_reject", "residual_prefill"]},
+    {"id": "formal_probe_u0", "kind": "request", "request": "LU0", "phase": "formal_u_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_t0", "kind": "request", "request": "LT0", "phase": "formal_t_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_e1", "kind": "request", "request": "LE1", "phase": "formal_e_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_or_reject", "residual_prefill"]},
+    {"id": "formal_probe_u1", "kind": "request", "request": "LU1", "phase": "formal_u_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_t1", "kind": "request", "request": "LT1", "phase": "formal_t_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_e2", "kind": "request", "request": "LE2", "phase": "formal_e_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_or_reject", "residual_prefill"]},
+    {"id": "formal_probe_u2", "kind": "request", "request": "LU2", "phase": "formal_u_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_t2", "kind": "request", "request": "LT2", "phase": "formal_t_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_e3", "kind": "request", "request": "LE3", "phase": "formal_e_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_or_reject", "residual_prefill"]},
+    {"id": "formal_probe_u3", "kind": "request", "request": "LU3", "phase": "formal_u_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]},
+    {"id": "formal_probe_t3", "kind": "request", "request": "LT3", "phase": "formal_t_admission", "measure": true, "expected_mechanisms": ["page_projection", "threshold_decision", "prefetch_stop", "residual_prefill"]}
+  ],
+  "formal_window": {"start_step": "formal_probe_e0", "end_step": "formal_probe_t3"}
+}

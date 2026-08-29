@@ -15,6 +15,57 @@ PROFILE_EXPERIMENTS_ENV = "TRACE_SIM_PROFILE_EXPERIMENTS"
 PROFILE_INPUTS_ENV = "TRACE_SIM_PROFILE_INPUTS"
 PROFILE_SERVERS_ENV = "TRACE_SIM_PROFILE_SERVERS"
 PROFILE_FORCED_TOKEN_BUNDLE_ENV = "TRACE_SIM_FORCED_TOKEN_BUNDLE"
+PROFILE_CHANNELS_ENV = "TRACE_SIM_PROFILE_CHANNELS"
+
+
+def narrow_profile_channels(cfg: dict[str, Any], requested: set[str]) -> dict[str, Any]:
+    """Return an auditable diagnostic config using a subset of suite channels.
+
+    This override can only remove configured channels.  It changes the suite
+    name and metadata so a Python-probe-only diagnostic can never be mistaken
+    for the source suite's full-DAG profiling contract.
+    """
+
+    if not requested:
+        return copy.deepcopy(cfg)
+    canonical_requested = {value.strip().replace("-", "_").lower() for value in requested if value.strip()}
+    if not canonical_requested:
+        raise ValueError("diagnostic profiling channel override must not be empty")
+    profiling = cfg.get("profiling")
+    if not isinstance(profiling, dict):
+        raise ValueError("diagnostic profiling channel override requires a profiling object")
+    configured_raw = profiling.get("channels")
+    if not isinstance(configured_raw, list) or not all(isinstance(value, str) for value in configured_raw):
+        raise ValueError("diagnostic profiling channel override requires explicit configured channels")
+    configured = [value.replace("-", "_").lower() for value in configured_raw]
+    unknown = canonical_requested - set(configured)
+    if unknown:
+        raise ValueError(
+            "diagnostic profiling channel override can only narrow configured channels; "
+            f"unknown={sorted(unknown)} configured={configured}"
+        )
+    effective = [value for value in configured if value in canonical_requested]
+    result = copy.deepcopy(cfg)
+    result["name"] = f"{str(cfg.get('name') or 'profile_suite')}_diagnostic_{'_'.join(effective)}"
+    result["profiling"]["channels"] = effective
+    metadata = dict(result.get("metadata") or {})
+    metadata["source_suite_name"] = cfg.get("name")
+    metadata["source_suite_purpose"] = metadata.get("purpose")
+    metadata["purpose"] = "Targeted low-overhead diagnostic capture; not a full-DAG modeling profile."
+    metadata["profile_mode"] = "targeted_diagnostic_channel_subset"
+    metadata["profiling_channel_override"] = {
+        "configured": configured,
+        "effective": effective,
+        "narrowing_only": True,
+    }
+    metadata["full_dag_contract"] = (
+        "NOT_APPLICABLE: this diagnostic deliberately omits channels and cannot be used as a DAG source."
+    )
+    metadata["execution_contract"] = (
+        "Only explicitly selected cells run; planned=attempted=completed and zero failures remain required."
+    )
+    result["metadata"] = metadata
+    return result
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -90,21 +141,6 @@ def experiment_selectors(cfg: dict[str, Any], index: int) -> set[str]:
             selectors.add(value.strip())
             selectors.add(sanitize(value))
     return selectors
-
-
-def describe_suite_experiment(index: int, cfg: dict[str, Any]) -> dict[str, Any]:
-    """Build the experiment descriptor used by listing and selection artifacts."""
-
-    metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
-    return {
-        "index": index,
-        "id": cfg.get("id", experiment_identity(cfg, index)),
-        "name": cfg.get("name", experiment_identity(cfg, index)),
-        "server_id": metadata.get("suite_server_id"),
-        "input_id": metadata.get("suite_input_id"),
-        "profile_mode": metadata.get("profile_mode"),
-        "selectors": sorted(experiment_selectors(cfg, index)),
-    }
 
 
 def reject_profiling_override(value: dict[str, Any], context: str) -> None:
@@ -360,34 +396,10 @@ def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
 
 
 def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize forced-token preflight identities across a suite."""
+    """Summarize forced-token modes and business readiness across a suite."""
 
     modes = sorted({str(contract.get("mode") or "none") for contract in contracts})
     errors = sorted({str(error) for contract in contracts for error in contract.get("errors", [])})
-    plan_hashes = sorted(
-        {
-            str(plan.get("sha256"))
-            for contract in contracts
-            for plan in [contract.get("plan")]
-            if isinstance(plan, dict) and plan.get("sha256")
-        }
-    )
-    bundle_hashes = sorted(
-        {
-            str(bundle.get("sha256"))
-            for contract in contracts
-            for bundle in [contract.get("bundle")]
-            if isinstance(bundle, dict) and bundle.get("sha256")
-        }
-    )
-    bundle_ids = sorted(
-        {
-            str(bundle.get("bundle_id"))
-            for contract in contracts
-            for bundle in [contract.get("bundle")]
-            if isinstance(bundle, dict) and bundle.get("bundle_id")
-        }
-    )
     workloads = sorted({str(contract.get("workload_id")) for contract in contracts if contract.get("workload_id")})
     return {
         "mode_count": {
@@ -396,9 +408,4 @@ def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> d
         "errors": errors,
         "ready": not errors,
         "workload_ids": workloads,
-        "plan_sha256_count": len(plan_hashes),
-        "plan_sha256_values": plan_hashes,
-        "bundle_sha256_count": len(bundle_hashes),
-        "bundle_sha256_values": bundle_hashes,
-        "bundle_ids": bundle_ids,
     }

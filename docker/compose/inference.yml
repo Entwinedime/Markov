@@ -27,6 +27,7 @@ services:
     environment:
       <<: *common-env
       ASCEND_CUSTOM_OPP_PATH: /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/batch_invariant
+      PYTHONPATH: /workspace/trace-sim/third_party/sglang/python
     command: bash
 
   ktransformers-profile:

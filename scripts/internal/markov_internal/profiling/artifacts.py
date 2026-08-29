@@ -9,6 +9,8 @@ from typing import Any
 from ..common.commands import command_to_text
 from ..common.io import write_json
 from ..common.paths import prepend_repo_src_to_sys_path
+from .drain import capture_tail_policy
+from .probe_targets import select_python_probe_targets
 
 prepend_repo_src_to_sys_path()
 
@@ -44,6 +46,7 @@ def write_profile_manifest(
     status: str,
     dry_run: bool,
     error: str | None = None,
+    storage_cleanup: dict[str, Any] | None = None,
 ) -> None:
     """Write the profile manifest consumed by downstream C++ modeling."""
 
@@ -57,4 +60,28 @@ def write_profile_manifest(
         dry_run=dry_run,
         error=error,
     )
+    manifest["profiling"]["python_target_contract"] = _python_target_contract(runtime)
+    consumers = {str(consumer) for consumer in runtime.python_consumers}
+    manifest["profiling"]["capture_tail_contract"] = {
+        **capture_tail_policy(cfg),
+        "semantic_lifecycle_closure_required_downstream": "hicache_input_contract" in consumers,
+    }
+    if storage_cleanup is not None:
+        manifest["profiling"]["hicache_storage_cleanup"] = storage_cleanup
     write_json(run_dir / "profile_manifest.json", manifest)
+
+
+def _python_target_contract(runtime: Any) -> dict[str, Any] | None:
+    """Persist the exact catalog subset installed into the profiled server."""
+
+    if "python_probe" not in runtime.channels:
+        return None
+    targets = select_python_probe_targets(
+        tuple(runtime.python_consumers),
+        diagnostics=runtime.python_diagnostics,
+    )
+    return {
+        "selected_target_count": len(targets),
+        "selected_target_ids": [str(target["id"]) for target in targets],
+        "diagnostics": runtime.python_diagnostics,
+    }

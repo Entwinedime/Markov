@@ -19,11 +19,12 @@ usage:
       [--experiment ID]... [--experiments ID[,ID...]]
       [--input ID]... [--inputs ID[,ID...]]
       [--server ID]... [--servers ID[,ID...]]
+      [--channels CHANNEL[,CHANNEL...]]
       [--forced-token-bundle PATH]
 
 Runs a JSON-configured profiling experiment inside the framework container.
 The config chooses the framework, server command, workload, hook settings, and
-SGLang /start_profile body.
+framework-specific profiling controls.
 
 For suite configs, --list-experiments prints expanded experiment ids. Use
 --experiment repeatedly or --experiments with a comma-separated list to run a
@@ -50,6 +51,7 @@ selected_experiments=()
 selected_inputs=()
 selected_servers=()
 forced_token_bundle=""
+profile_channels=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run)
@@ -121,6 +123,15 @@ while [ $# -gt 0 ]; do
                 exit 2
             fi
             forced_token_bundle="$2"
+            shift 2
+            ;;
+        --channels)
+            if [ $# -lt 2 ]; then
+                echo "--channels requires a comma-separated channel list" >&2
+                usage
+                exit 2
+            fi
+            profile_channels="$2"
             shift 2
             ;;
         *)
@@ -248,6 +259,9 @@ fi
 if [ -n "${TRACE_SIM_FORCED_TOKEN_BUNDLE:-}" ]; then
     runner_args+=(--forced-token-bundle "$TRACE_SIM_FORCED_TOKEN_BUNDLE")
 fi
+if [ -n "${TRACE_SIM_PROFILE_CHANNELS:-}" ]; then
+    runner_args+=(--channels "$TRACE_SIM_PROFILE_CHANNELS")
+fi
 python3 scripts/internal/entrypoints/profile.py "${runner_args[@]}"
 '
 
@@ -272,6 +286,9 @@ if [ -n "$selected_servers_csv" ]; then
 fi
 if [ -n "$container_forced_token_bundle" ]; then
     env_args+=(-e "TRACE_SIM_FORCED_TOKEN_BUNDLE=${container_forced_token_bundle}")
+fi
+if [ -n "$profile_channels" ]; then
+    env_args+=(-e "TRACE_SIM_PROFILE_CHANNELS=${profile_channels}")
 fi
 
 docker compose -f "$(compose_file)" run --rm "${env_args[@]}" "$service" \

@@ -1,0 +1,85 @@
+{
+  "id": "w2_writeback_dual_tier_cascade",
+  "description": "Separate large-host survival with six old qualified D tails, then use eight alternating single-seed 2944-token requests to force write-through, selective-delete, and synchronous write-back eviction paths.",
+  "defaults": {
+    "sampling": {"max_new_tokens": 1, "temperature": 0, "top_p": 1.0, "top_k": 1, "ignore_eos": true},
+    "request_timeout_sec": 600
+  },
+  "fragments": {
+    "D_prefix": {"text": "D-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "D_tail": {"text": "{branch} D-tail cascade payload remains deterministic across every revisit. ", "repeat": 88},
+    "D_pad": {"text": " q", "repeat": 87},
+    "E_prefix": {"text": "E-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "E_tail": {"text": "{branch} E-tail cascade payload remains deterministic across every revisit. ", "repeat": 88},
+    "E_pad": {"text": " q", "repeat": 87},
+    "F_prefix": {"text": "F-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "F_tail": {"text": "{branch} F-tail cascade payload remains deterministic across every revisit. ", "repeat": 88},
+    "F_pad": {"text": " q", "repeat": 855},
+    "G_prefix": {"text": "G-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "G_tail": {"text": "{branch} G-tail cascade payload remains deterministic across every revisit. ", "repeat": 88},
+    "G_pad": {"text": " q", "repeat": 855}
+  },
+  "request_defs": {
+    "D{i}": {
+      "family": "D", "branch_markers": {"0": "a", "1": "b", "2": "c", "3": "d", "4": "e", "5": "f", "6": "g"},
+      "prompt_parts": [{"ref": "D_prefix"}, {"text": "x y z q "}, {"ref": "D_tail"}, {"text": "a b c d e f g h i"}, {"ref": "D_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "E{i}": {
+      "family": "E", "branch_markers": {"0": "h", "1": "i", "2": "j", "3": "k"},
+      "prompt_parts": [{"ref": "E_prefix"}, {"text": "x y z q "}, {"ref": "E_tail"}, {"text": "a b c d e f g h i"}, {"ref": "E_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "F{i}": {
+      "family": "F", "branch_markers": {"0": "a", "1": "b", "2": "c", "3": "d"},
+      "prompt_parts": [{"ref": "F_prefix"}, {"text": "x y z q "}, {"ref": "F_tail"}, {"text": "a b c d e f g h i"}, {"ref": "F_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1920, "tail_symbol": "S"}
+    },
+    "G{i}": {
+      "family": "G", "branch_markers": {"0": "e", "1": "f", "2": "g", "3": "h"},
+      "prompt_parts": [{"ref": "G_prefix"}, {"text": "x y z q "}, {"ref": "G_tail"}, {"text": "a b c d e f g h i"}, {"ref": "G_pad"}],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1920, "tail_symbol": "S"}
+    }
+  },
+  "steps": [
+    {"id": "prepare_d0", "kind": "repeat_request", "request": "D0", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_d1", "kind": "repeat_request", "request": "D1", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_d2", "kind": "repeat_request", "request": "D2", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_d3", "kind": "repeat_request", "request": "D3", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_d4", "kind": "repeat_request", "request": "D4", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_d5", "kind": "repeat_request", "request": "D5", "count": 3, "phase": "prepare_survival_targets", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_e0", "kind": "request", "request": "E0", "phase": "prepare_host_pressure", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "host_cleanup"]},
+    {"id": "prepare_e1", "kind": "request", "request": "E1", "phase": "prepare_host_pressure", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "host_cleanup"]},
+    {"id": "prepare_e2", "kind": "request", "request": "E2", "phase": "prepare_host_pressure", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "host_cleanup"]},
+    {"id": "prepare_e3", "kind": "request", "request": "E3", "phase": "prepare_host_pressure", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "host_cleanup"]},
+    {"id": "prepare_d6_anchor_keeper", "kind": "repeat_request", "request": "D6", "count": 3, "phase": "prepare_anchor_restore", "measure": false, "expected_mechanisms": ["lookup", "load_back_or_storage_or_recompute", "qualification", "anchor_device_and_host_stabilization"]},
+
+    {"id": "prepare_to_formal", "kind": "barrier", "scope": "hicache_idle", "timeout_sec": 240, "phase": "boundary", "measure": false},
+    {"id": "pre_formal_state", "kind": "checkpoint", "phase": "boundary", "measure": false, "assertions": [
+      {"id": "d_anchor_recoverable_and_resident", "request": "D6", "range": "anchor", "expect": {"storage": "all", "device": "all", "host": "all"}},
+      {"id": "d0_old_source", "request": "D0", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "d1_old_source", "request": "D1", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "d2_old_source", "request": "D2", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "d3_old_source", "request": "D3", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "d4_old_source", "request": "D4", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "d5_old_source", "request": "D5", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}}
+    ]},
+
+    {"id": "formal_survival_d0", "kind": "request", "request": "D0", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+    {"id": "formal_survival_d1", "kind": "request", "request": "D1", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+    {"id": "formal_survival_d2", "kind": "request", "request": "D2", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+    {"id": "formal_survival_d3", "kind": "request", "request": "D3", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+    {"id": "formal_survival_d4", "kind": "request", "request": "D4", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+    {"id": "formal_survival_d5", "kind": "request", "request": "D5", "phase": "formal_host_survival", "measure": true, "expected_mechanisms": ["lookup", "host_hit_or_storage_or_recompute", "load_back"]},
+
+    {"id": "formal_chain_f0", "kind": "request", "request": "F0", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_g0", "kind": "request", "request": "G0", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_f1", "kind": "request", "request": "F1", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_g1", "kind": "request", "request": "G1", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_f2", "kind": "request", "request": "F2", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_g2", "kind": "request", "request": "G2", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_f3", "kind": "request", "request": "F3", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]},
+    {"id": "formal_chain_g3", "kind": "request", "request": "G3", "phase": "formal_eviction_chain", "measure": true, "expected_mechanisms": ["lookup", "insert", "single_seed", "device_crossing", "through_or_delete_or_writeback"]}
+  ],
+  "formal_window": {"start_step": "formal_survival_d0", "end_step": "formal_chain_g3"}
+}

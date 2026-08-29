@@ -8,7 +8,6 @@ import os
 import sys
 import threading
 from types import ModuleType
-from typing import Iterable
 
 from trace_sim_probe.writer import probe_debug_enabled
 
@@ -17,6 +16,7 @@ _INSTALLED = False
 _LOCK = threading.Lock()
 _ORIGINAL_IMPORT = builtins.__import__
 _IMPORT_GUARD = threading.local()
+_PROBE: ModuleType | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -25,40 +25,24 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _selected_probe_names() -> list[str]:
-    """读取 TRACE_SIM_PYTHON_PROBES 中选择的 probe 名称。"""
+def _probe() -> ModuleType:
+    """Load the single active HiCache probe once."""
 
-    raw = os.environ.get("TRACE_SIM_PYTHON_PROBES", "generic_callable")
-    return [part.strip() for part in raw.split(",") if part.strip()]
-
-
-def _load_probe(name: str):
-    """按短名称或完整模块名加载 probe。"""
-
-    module_name = {
-        "generic_callable": "trace_sim_probe.probes.generic_callable",
-        "sglang.hicache": "trace_sim_probe.probes.hicache.callable",
-        "sglang.kvcacheio": "trace_sim_probe.probes.sglang_kvcacheio",
-    }.get(name, name)
-    return importlib.import_module(module_name)
-
-
-def _iter_selected_probes():
-    """迭代已选择的 probe；profiling 开启后加载失败必须中止进程。"""
-
-    for name in _selected_probe_names():
+    global _PROBE
+    if _PROBE is None:
         try:
-            yield _load_probe(name)
+            _PROBE = importlib.import_module("trace_sim_probe.probes.hicache.callable")
         except Exception as exc:
             if probe_debug_enabled():
-                print(f"[trace_sim_probe] failed to load probe {name}: {exc}", file=sys.stderr)
+                print(f"[trace_sim_probe] failed to load HiCache probe: {exc}", file=sys.stderr)
             raise
+    return _PROBE
 
 
 def _apply_probe_to_loaded_modules(probe) -> None:
     """对当前已加载的目标模块立即安装 probe。"""
 
-    targets: Iterable[str] = getattr(probe, "TARGET_MODULES", ())
+    targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
     for target in targets:
         module = sys.modules.get(target)
         if module is not None:
@@ -79,13 +63,9 @@ def _safe_install(probe, module: ModuleType) -> None:
 def _post_import_apply(module_name: str) -> None:
     """一次 import 完成后，对相关目标模块补装 probe。"""
 
-    for probe in _iter_selected_probes():
-        targets: Iterable[str] = getattr(probe, "TARGET_MODULES", ())
-        for target in targets:
-            if module_name == target or module_name.startswith(target + "."):
-                module = sys.modules.get(target)
-                if module is not None:
-                    _safe_install(probe, module)
+    probe = _probe()
+    targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
+    if any(module_name == target or module_name.startswith(target + ".") for target in targets):
         _apply_probe_to_loaded_modules(probe)
 
 
@@ -119,8 +99,8 @@ def bootstrap() -> None:
     with _LOCK:
         if _INSTALLED:
             return
+        probe = _probe()
         _INSTALLED = True
         builtins.__import__ = _import_hook
 
-    for probe in _iter_selected_probes():
-        _apply_probe_to_loaded_modules(probe)
+    _apply_probe_to_loaded_modules(probe)

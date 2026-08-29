@@ -1,0 +1,57 @@
+{
+  "description": "Calibration-only HiCache policy/page control endpoints. These IDs are excluded from the five-config score panel; they keep device/host capacity constant in tokens while varying only page geometry and write policy.",
+  "configs": [
+    {
+      "id": "CAL_load_control_page32_write_through",
+      "panel_role": "Target-independent control calibration endpoint; 4 MiB page bytes, write-through family.",
+      "resolved": {"page_size": 32, "device_pages": 112, "host_pages": 504},
+      "policy": {
+        "write_policy": "write_through",
+        "prefetch_threshold": 128,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.495}
+    },
+    {
+      "id": "CAL_load_control_page32_write_back",
+      "panel_role": "Target-independent control calibration endpoint; 4 MiB page bytes, write-back family.",
+      "resolved": {"page_size": 32, "device_pages": 112, "host_pages": 504},
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 128,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.495}
+    },
+    {
+      "id": "CAL_load_control_page128_write_through",
+      "panel_role": "Target-independent control calibration endpoint; 16 MiB page bytes, write-through family.",
+      "resolved": {"page_size": 128, "device_pages": 28, "host_pages": 126},
+      "policy": {
+        "write_policy": "write_through",
+        "prefetch_threshold": 128,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.49}
+    },
+    {
+      "id": "CAL_load_control_page128_write_back",
+      "panel_role": "Target-independent control calibration endpoint; 16 MiB page bytes, write-back family.",
+      "resolved": {"page_size": 128, "device_pages": 28, "host_pages": 126},
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 128,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.49}
+    }
+  ]
+}

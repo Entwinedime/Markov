@@ -1,0 +1,31 @@
+{
+  "description": "Calibration-only endpoint configs that expose multi-page existing-key H2S operations under the existing W3 real workload. IDs are outside the five-config score panel.",
+  "configs": [
+    {
+      "id": "CAL_h2s_operation_page32",
+      "panel_role": "Target-independent real-server H2S operation-shape calibration; 4 MiB page bytes.",
+      "resolved": {"page_size": 32, "device_pages": 112, "host_pages": 504},
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 512,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.495}
+    },
+    {
+      "id": "CAL_h2s_operation_page128",
+      "panel_role": "Target-independent real-server H2S operation-shape calibration; 16 MiB page bytes.",
+      "resolved": {"page_size": 128, "device_pages": 28, "host_pages": 126},
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 1024,
+        "prefetch_stop_policy": "timeout",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {"base_sec": 2.0, "per_ki_token_sec": 0.0, "max_sec": 2.0}
+      },
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.49}
+    }
+  ]
+}

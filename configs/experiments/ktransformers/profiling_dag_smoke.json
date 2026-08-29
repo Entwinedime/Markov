@@ -1,0 +1,73 @@
+{
+  "name": "ktransformers_dag_smoke",
+  "framework": "ktransformers",
+  "run_root": "data/profile_runs/ktransformers",
+  "metadata": {
+    "purpose": "Profile one KTransformers request and build a framework-neutral source DAG.",
+    "model_path": "/models/DeepSeek-R1-w8a8-q4km",
+    "gguf_path": "/models/DeepSeek-R1-Q4_K_M-GGUF",
+    "required_devices": "two Ascend NPUs"
+  },
+  "profiling": {
+    "enabled": true,
+    "channels": [
+      "ld_preload"
+    ],
+    "ld_preload": {
+      "enabled": true,
+      "trace_output": "trace/ld_preload/cpu_trace.json"
+    }
+  },
+  "server": {
+    "model_path": "{metadata.model_path}",
+    "command": [
+      "torchrun",
+      "--nproc-per-node=2",
+      "--master-port=29501",
+      "-m",
+      "ktransformers.server.main",
+      "--model_path",
+      "{metadata.model_path}",
+      "--gguf_path",
+      "{metadata.gguf_path}",
+      "--optimize_config_path",
+      "third_party/ktransformers/archive/ktransformers/optimize/optimize_rules/npu/DeepSeek-V3-Chat-300IA2-npu-serve.yaml",
+      "--backend_type",
+      "balance_serve",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "10002",
+      "--tp",
+      "2",
+      "--batch_size",
+      "1",
+      "--max_batch_size",
+      "1",
+      "--max_new_tokens",
+      "16",
+      "--device",
+      "npu:0"
+    ],
+    "ready_url": "http://127.0.0.1:10002/v1/models",
+    "ready_timeout_sec": 1800,
+    "shutdown_cooldown_sec": 5
+  },
+  "bench": {
+    "command": [
+      "curl",
+      "--fail",
+      "--show-error",
+      "--silent",
+      "--max-time",
+      "600",
+      "--header",
+      "Content-Type: application/json",
+      "--data",
+      "{\"model\":\"DeepseekV3ForCausalLM\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with one word: ready\"}],\"temperature\":0,\"max_tokens\":8}",
+      "--output",
+      "{bench_dir}/response.json",
+      "http://127.0.0.1:10002/v1/chat/completions"
+    ]
+  }
+}

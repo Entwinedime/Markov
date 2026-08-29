@@ -42,6 +42,7 @@ def start_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_
         profiler_api_base(server_cfg, profile_cfg).rstrip("/") + "/start_profile",
         body,
         timeout=int(profile_cfg.get("start_timeout_sec", 120)),
+        api_key=profile_cfg.get("api_key"),
     )
     write_json(layout.run_dir / "profile_start_response.json", response)
 
@@ -55,6 +56,7 @@ def stop_torch_profiler(layout: RunLayout, server_cfg: dict[str, Any], profile_c
             profiler_api_base(server_cfg, profile_cfg).rstrip("/") + "/stop_profile",
             None,
             timeout=int(profile_cfg.get("stop_timeout_sec", 1800)),
+            api_key=profile_cfg.get("api_key"),
         )
     except Exception as exc:
         if profile_cfg.get("strict_stop", False):

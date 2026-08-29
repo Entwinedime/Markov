@@ -51,12 +51,26 @@ class ChromeTraceWriter:
         root.mkdir(parents=True, exist_ok=True)
         self.path = root / f"python_probe_trace.rank{self.rank}.pid{self.pid}.json"
         self._flush_every = max(1, _env_u64("TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY", 256))
+        self._flush_interval_sec = _env_nonnegative_float(
+            "TRACE_SIM_PYTHON_PROBE_FLUSH_INTERVAL_SEC",
+            0.0,
+        )
         self._file: TextIO = self.path.open("w", encoding="utf-8")
         self._file.write('{"traceEvents":[')
         self._first_event = True
         self._event_count = 0
+        self._flushed_event_count = 0
         self._closed = False
         self._lock = threading.Lock()
+        self._flush_stop = threading.Event()
+        self._flush_thread: threading.Thread | None = None
+        if self._flush_interval_sec > 0:
+            self._flush_thread = threading.Thread(
+                target=self._periodic_flush,
+                name="trace-sim-python-probe-flush",
+                daemon=True,
+            )
+            self._flush_thread.start()
         atexit.register(self.close)
 
     @staticmethod
@@ -92,6 +106,10 @@ class ChromeTraceWriter:
     def close(self) -> None:
         """进程退出时补齐 Chrome trace JSON 结尾并关闭文件。"""
 
+        self._flush_stop.set()
+        flush_thread = self._flush_thread
+        if flush_thread is not None and flush_thread is not threading.current_thread():
+            flush_thread.join(timeout=max(1.0, self._flush_interval_sec * 2.0))
         with self._lock:
             if self._closed:
                 return
@@ -112,7 +130,24 @@ class ChromeTraceWriter:
         self._file.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")))
         self._event_count += 1
         if self._event_count % self._flush_every == 0:
-            self._file.flush()
+            self._flush_locked()
+
+    def _periodic_flush(self) -> None:
+        """Flush a partial event batch at low frequency outside the hot path."""
+
+        while not self._flush_stop.wait(self._flush_interval_sec):
+            with self._lock:
+                if self._closed:
+                    return
+                self._flush_locked()
+
+    def _flush_locked(self) -> None:
+        """Flush only when at least one event was written since the last flush."""
+
+        if self._flushed_event_count == self._event_count:
+            return
+        self._file.flush()
+        self._flushed_event_count = self._event_count
 
 
 _writer: ChromeTraceWriter | None = None
@@ -146,3 +181,16 @@ def _env_u64(name: str, fallback: int) -> int:
     except ValueError:
         return fallback
     return value if value >= 0 else fallback
+
+
+def _env_nonnegative_float(name: str, fallback: float) -> float:
+    """Read a non-negative finite float environment variable."""
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    return value if value >= 0 and value != float("inf") else fallback

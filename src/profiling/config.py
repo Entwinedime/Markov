@@ -8,8 +8,8 @@ from typing import Any
 from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS
 
 
-DEFAULT_PYTHON_PROBES = ("generic_callable",)
 KNOWN_CHANNELS = {"torch", "python_probe", "ld_preload"}
+PYTHON_PROBE_DIAGNOSTICS = frozenset({"off", "full"})
 
 
 @dataclass(frozen=True)
@@ -18,9 +18,8 @@ class ProfilingRuntimeConfig:
 
     enabled: bool
     channels: tuple[str, ...]
-    python_probes: tuple[str, ...]
     python_consumers: tuple[str, ...]
-    python_target_catalog: str | None
+    python_diagnostics: str
     debug: bool
 
     def to_manifest_fragment(self) -> dict[str, Any]:
@@ -29,9 +28,8 @@ class ProfilingRuntimeConfig:
         return {
             "enabled": self.enabled,
             "channels_enabled": list(self.channels),
-            "python_probes_enabled": list(self.python_probes),
             "python_consumers": list(self.python_consumers),
-            "python_target_catalog": self.python_target_catalog,
+            "python_diagnostics": self.python_diagnostics,
             "debug": self.debug,
         }
 
@@ -55,26 +53,16 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
         raise TypeError("profiling.python_probe must be an object")
 
     if "python_probe" in channels:
-        python_probes = _as_str_tuple(
-            python_probe_cfg.get("probes", python_probe_cfg.get("name", profiling.get("probes"))),
-            default=DEFAULT_PYTHON_PROBES,
-            field_name="profiling.python_probe.probes",
-        )
         python_consumers = _parse_python_consumers(python_probe_cfg.get("consumers"))
-        catalog = python_probe_cfg.get("target_catalog")
-        if catalog is not None and not isinstance(catalog, str):
-            raise TypeError("profiling.python_probe.target_catalog must be a string")
-        python_target_catalog = catalog
+        python_diagnostics = _parse_python_diagnostics(python_probe_cfg.get("diagnostics"))
     else:
-        python_probes = ()
         python_consumers = ()
-        python_target_catalog = None
+        python_diagnostics = "off"
     return ProfilingRuntimeConfig(
         enabled=enabled,
         channels=channels,
-        python_probes=python_probes,
         python_consumers=python_consumers,
-        python_target_catalog=python_target_catalog,
+        python_diagnostics=python_diagnostics,
         debug=_as_bool(profiling.get("debug", cfg.get("debug")), default=False),
     )
 
@@ -132,6 +120,20 @@ def _parse_python_consumers(raw: Any) -> tuple[str, ...]:
     if unknown:
         raise ValueError(f"unknown profiling.python_probe.consumers: {unknown}")
     return _unique(consumers)
+
+
+def _parse_python_diagnostics(raw: Any) -> str:
+    """Parse the single Python-probe diagnostics policy."""
+
+    if raw is None:
+        return "off"
+    if not isinstance(raw, str):
+        raise TypeError("profiling.python_probe.diagnostics must be a string")
+    value = raw.strip().lower()
+    if value not in PYTHON_PROBE_DIAGNOSTICS:
+        allowed = ", ".join(sorted(PYTHON_PROBE_DIAGNOSTICS))
+        raise ValueError(f"profiling.python_probe.diagnostics must be one of: {allowed}")
+    return value
 
 
 def _as_str_tuple(value: Any, *, default: tuple[str, ...], field_name: str) -> tuple[str, ...]:

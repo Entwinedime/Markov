@@ -1,0 +1,104 @@
+{
+  "id": "w1_device_spill_qualification_ring",
+  "description": "Construct six qualified and six single-seed A tails, force and restore a backed shared anchor, then measure twelve interleaved one-shot recovery witnesses without common formal pressure.",
+  "defaults": {
+    "sampling": {"max_new_tokens": 1, "temperature": 0, "top_p": 1.0, "top_k": 1, "ignore_eos": true},
+    "request_timeout_sec": 600
+  },
+  "fragments": {
+    "A_prefix": {"text": "A-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "P_prefix": {"text": "P-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "N_prefix": {"text": "N-anchor cache-state geometry keeps this exact shared prefix stable. ", "repeat": 85},
+    "A_tail": {"text": "{branch} A-tail pressure payload remains deterministic across every revisit. ", "repeat": 95}
+  },
+  "request_defs": {
+    "A{i}": {
+      "family": "A",
+      "branch_markers": {
+        "0": "a", "1": "b", "2": "c", "3": "d", "4": "e", "5": "f",
+        "6": "g", "7": "h", "8": "i", "9": "j", "10": "k", "11": "l",
+        "12": "m", "13": "n", "14": "o", "15": "p", "16": "q", "17": "r"
+      },
+      "prompt_parts": [
+        {"ref": "A_prefix"}, {"text": "x y z q "}, {"ref": "A_tail"},
+        {"text": "a b c d e f g h i j k l"}
+      ],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "P0": {
+      "family": "P",
+      "branch_marker": "s",
+      "prompt_parts": [
+        {"ref": "P_prefix"}, {"text": "x y z q "}, {"ref": "A_tail"},
+        {"text": "a b c d e f g h i j k l"}
+      ],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    },
+    "N0": {
+      "family": "N",
+      "branch_marker": "t",
+      "prompt_parts": [
+        {"ref": "N_prefix"}, {"text": "x y z q "}, {"ref": "A_tail"},
+        {"text": "a b c d e f g h i j k l"}
+      ],
+      "token_contract": {"anchor_tokens": 1024, "tail_tokens": 1152, "tail_symbol": "T"}
+    }
+  },
+  "steps": [
+    {"id": "prepare_selected_a0", "kind": "repeat_request", "request": "A0", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_selected_a1", "kind": "repeat_request", "request": "A1", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_selected_a2", "kind": "repeat_request", "request": "A2", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_selected_a3", "kind": "repeat_request", "request": "A3", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_selected_a4", "kind": "repeat_request", "request": "A4", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+    {"id": "prepare_selected_a5", "kind": "repeat_request", "request": "A5", "count": 3, "phase": "prepare_qualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "qualification", "write_backup_or_hot_guard"]},
+
+    {"id": "prepare_unselected_a6", "kind": "request", "request": "A6", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+    {"id": "prepare_unselected_a7", "kind": "request", "request": "A7", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+    {"id": "prepare_unselected_a8", "kind": "request", "request": "A8", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+    {"id": "prepare_unselected_a9", "kind": "request", "request": "A9", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+    {"id": "prepare_unselected_a10", "kind": "request", "request": "A10", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+    {"id": "prepare_unselected_a11", "kind": "request", "request": "A11", "phase": "prepare_unqualified", "measure": false, "expected_mechanisms": ["lookup", "insert", "single_seed"]},
+
+    {"id": "prepare_spill_a12", "kind": "request", "request": "A12", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+    {"id": "prepare_spill_a13", "kind": "request", "request": "A13", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+    {"id": "prepare_spill_a14", "kind": "request", "request": "A14", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+    {"id": "prepare_spill_a15", "kind": "request", "request": "A15", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+    {"id": "prepare_spill_a16", "kind": "request", "request": "A16", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+    {"id": "prepare_spill_a17", "kind": "request", "request": "A17", "phase": "prepare_device_spill", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict"]},
+
+    {"id": "prepare_anchor_conversion_p0", "kind": "request", "request": "P0", "phase": "prepare_anchor_conversion", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "anchor_demotion"]},
+    {"id": "prepare_anchor_conversion_n0", "kind": "request", "request": "N0", "phase": "prepare_anchor_conversion", "measure": false, "expected_mechanisms": ["lookup", "insert", "evict", "anchor_demotion"]},
+    {"id": "prepare_reanchor_a17", "kind": "repeat_request", "request": "A17", "count": 3, "phase": "prepare_anchor_restore", "measure": false, "expected_mechanisms": ["lookup", "load_back_or_storage_or_recompute", "qualification", "anchor_device_and_host_stabilization"]},
+
+    {"id": "prepare_to_formal", "kind": "barrier", "scope": "hicache_idle", "timeout_sec": 180, "phase": "boundary", "measure": false},
+    {"id": "pre_formal_state", "kind": "checkpoint", "phase": "boundary", "measure": false, "assertions": [
+      {"id": "a_anchor_recoverable_and_resident", "request": "A17", "range": "anchor", "expect": {"storage": "all", "device": "all", "host": "all"}},
+      {"id": "a0_qualified_source", "request": "A0", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a1_qualified_source", "request": "A1", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a2_qualified_source", "request": "A2", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a3_qualified_source", "request": "A3", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a4_qualified_source", "request": "A4", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a5_qualified_source", "request": "A5", "range": "admission_tail", "expect": {"storage": "all", "device": "none", "host": "ignore"}},
+      {"id": "a6_unqualified_off_device", "request": "A6", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}},
+      {"id": "a7_unqualified_off_device", "request": "A7", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}},
+      {"id": "a8_unqualified_off_device", "request": "A8", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}},
+      {"id": "a9_unqualified_off_device", "request": "A9", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}},
+      {"id": "a10_unqualified_off_device", "request": "A10", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}},
+      {"id": "a11_unqualified_off_device", "request": "A11", "range": "admission_tail", "expect": {"storage": "ignore", "device": "none_or_absent", "host": "ignore"}}
+    ]},
+
+    {"id": "formal_probe_selected_a0", "kind": "request", "request": "A0", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a6", "kind": "request", "request": "A6", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]},
+    {"id": "formal_probe_selected_a1", "kind": "request", "request": "A1", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a7", "kind": "request", "request": "A7", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]},
+    {"id": "formal_probe_selected_a2", "kind": "request", "request": "A2", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a8", "kind": "request", "request": "A8", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]},
+    {"id": "formal_probe_selected_a3", "kind": "request", "request": "A3", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a9", "kind": "request", "request": "A9", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]},
+    {"id": "formal_probe_selected_a4", "kind": "request", "request": "A4", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a10", "kind": "request", "request": "A10", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]},
+    {"id": "formal_probe_selected_a5", "kind": "request", "request": "A5", "phase": "formal_qualified_probe", "measure": true, "expected_mechanisms": ["lookup", "prefetch_or_load_back", "residual_prefill"]},
+    {"id": "formal_probe_unselected_a11", "kind": "request", "request": "A11", "phase": "formal_unqualified_probe", "measure": true, "expected_mechanisms": ["lookup", "source_or_regular_delete", "recompute_or_recovery"]}
+  ],
+  "formal_window": {"start_step": "formal_probe_selected_a0", "end_step": "formal_probe_unselected_a11"}
+}

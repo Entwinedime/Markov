@@ -32,6 +32,7 @@ def build_profile_manifest(
     collection_errors = [error] if error else []
     return {
         "experiment_id": cfg.get("run_id") or cfg.get("name"),
+        "framework": str(cfg.get("framework") or "sglang"),
         "name": cfg.get("name"),
         "run_id": cfg.get("run_id"),
         "run_dir": str(run_dir),
@@ -59,7 +60,6 @@ def build_profile_manifest(
         "sidecar": {
             "python_probe_dir": str(python_probe_dir),
             "python_probe_files": python_probe_files,
-            "python_probe_debug_files": _glob_files(python_probe_dir, "*debug*"),
         },
     }
 

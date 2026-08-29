@@ -28,7 +28,7 @@ def prepend_repo_src_to_sys_path() -> None:
     """Expose repository-owned ``src`` Python packages for internal scripts.
 
     Internal entrypoints install only ``scripts/internal`` on ``sys.path``.
-    Profiling schema and manifest modules intentionally remain under ``src``,
+    Profiling fact-contract and manifest modules intentionally remain under ``src``,
     so callers invoke this boundary immediately before importing those modules.
     The operation is idempotent and never reorders an existing path entry.
     """

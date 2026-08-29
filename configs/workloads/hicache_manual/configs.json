@@ -1,0 +1,133 @@
+{
+  "description": "Resolved-target contracts for the strictly serial three-workload HiCache panel. The joint panel must cover all ten config pairs; 10% relative E2E L1 is the hard gate and 20% is the design target. C4 differs from C2 only in stop policy and remains the best_effort approximately-no-prefetch control.",
+  "panel_contract": {
+    "config_count": 5,
+    "workload_count": 3,
+    "pair_count": 10,
+    "pair_score": "max_workload_symmetric_relative_e2e_l1",
+    "hard_gate": 0.10,
+    "design_target": 0.20
+  },
+  "configs": [
+    {
+      "id": "C1_l1_cliff_wait",
+      "panel_role": "Low-threshold write-through wait-complete baseline: all E/U/T classes are admitted and every first-hit branch can become a source.",
+      "resolved": {
+        "page_size": 128,
+        "device_pages": 32,
+        "host_pages": 63
+      },
+      "policy": {
+        "write_policy": "write_through",
+        "prefetch_threshold": 128,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 3174,
+        "timeout": {
+          "base_sec": null,
+          "per_ki_token_sec": null,
+          "max_sec": null
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 4096,
+        "hicache_ratio": 1.95
+      }
+    },
+    {
+      "id": "C2_host_cliff_selective_wait",
+      "panel_role": "Small-D/small-H selective wait-complete case: qualified branches survive, single-seed branches delete, and the W3 ladder is E-reject/U-T-accept.",
+      "resolved": {
+        "page_size": 64,
+        "device_pages": 48,
+        "host_pages": 64
+      },
+      "policy": {
+        "write_policy": "write_through_selective",
+        "prefetch_threshold": 256,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 819,
+        "timeout": {
+          "base_sec": null,
+          "per_ki_token_sec": null,
+          "max_sec": null
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 3072,
+        "hicache_ratio": 1.32
+      }
+    },
+    {
+      "id": "C3_writeback_wait",
+      "panel_role": "Small-page, large-staging-host write-back wait-complete case: eviction performs synchronous D-to-H backup and W3 exposes 32-token page projection.",
+      "resolved": {
+        "page_size": 32,
+        "device_pages": 112,
+        "host_pages": 504
+      },
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 512,
+        "prefetch_stop_policy": "wait_complete",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {
+          "base_sec": null,
+          "per_ki_token_sec": null,
+          "max_sec": null
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 3584,
+        "hicache_ratio": 4.495
+      }
+    },
+    {
+      "id": "C4_selective_best_effort_proxy",
+      "panel_role": "C2-matched stop-policy control: best_effort registers accepted prefetches but, under strict serial requests, usually behaves like recomputation.",
+      "resolved": {
+        "page_size": 64,
+        "device_pages": 48,
+        "host_pages": 64
+      },
+      "policy": {
+        "write_policy": "write_through_selective",
+        "prefetch_threshold": 256,
+        "prefetch_stop_policy": "best_effort",
+        "prefetch_capacity_limit_tokens": 819,
+        "timeout": {
+          "base_sec": null,
+          "per_ki_token_sec": null,
+          "max_sec": null
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 3072,
+        "hicache_ratio": 1.32
+      }
+    },
+    {
+      "id": "C5_writeback_long_gate_timeout",
+      "panel_role": "Large-H write-back, high-threshold timeout case: W2 targets host survival while W3 produces E/U reject and T accept with bounded waiting.",
+      "resolved": {
+        "page_size": 128,
+        "device_pages": 28,
+        "host_pages": 126
+      },
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 1024,
+        "prefetch_stop_policy": "timeout",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {
+          "base_sec": 2.0,
+          "per_ki_token_sec": 0.0,
+          "max_sec": 2.0
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 3584,
+        "hicache_ratio": 4.49
+      }
+    }
+  ]
+}

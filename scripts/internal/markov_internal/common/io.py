@@ -18,13 +18,3 @@ def write_json(path: Path, value: Any) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
-def output_is_current(output_path: Path, input_paths: list[Path]) -> bool:
-    """Return whether an output exists and is no older than every input."""
-
-    try:
-        output_mtime = output_path.stat().st_mtime_ns
-        return all(path.is_file() and output_mtime >= path.stat().st_mtime_ns for path in input_paths)
-    except OSError:
-        return False

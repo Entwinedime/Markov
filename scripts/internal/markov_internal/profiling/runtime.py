@@ -168,7 +168,9 @@ def append_cli_arg(command: list[str], key: str, value: Any) -> None:
         command.extend([option, str(value)])
 
 
-def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str, Any]) -> list[str] | str | None:
+def build_bench_command(
+    bench: dict[str, Any], layout: RunLayout, cfg: dict[str, Any], *, framework: str
+) -> list[str] | str | None:
     """Build an explicit or standard SGLang workload-driver command."""
 
     if not bench:
@@ -176,6 +178,8 @@ def build_bench_command(bench: dict[str, Any], layout: RunLayout, cfg: dict[str,
     if "command" in bench:
         return expand_command_placeholders(command_from_config(bench["command"]), layout, cfg)
 
+    if framework != "sglang":
+        raise ValueError(f"{framework} workloads require bench.command")
     kind = bench.get("kind", "sglang.bench_serving")
     if kind != "sglang.bench_serving":
         raise ValueError(f"unknown bench kind: {kind}")

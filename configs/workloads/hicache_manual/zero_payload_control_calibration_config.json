@@ -1,0 +1,29 @@
+{
+  "description": "Target-independent control calibration contract. It reuses the selected C5 geometry and write-back policy, and changes only the Prefetch stop policy so the otherwise-unseen accepted-but-zero-payload terminal branch executes.",
+  "configs": [
+    {
+      "id": "CAL_C5_geometry_best_effort_zero_payload_control",
+      "panel_role": "Calibration-only C5 geometry; excluded from the five-config scoring panel.",
+      "resolved": {
+        "page_size": 128,
+        "device_pages": 28,
+        "host_pages": 126
+      },
+      "policy": {
+        "write_policy": "write_back",
+        "prefetch_threshold": 1024,
+        "prefetch_stop_policy": "best_effort",
+        "prefetch_capacity_limit_tokens": 10035,
+        "timeout": {
+          "base_sec": null,
+          "per_ki_token_sec": null,
+          "max_sec": null
+        }
+      },
+      "launcher": {
+        "max_total_tokens": 3584,
+        "hicache_ratio": 4.49
+      }
+    }
+  ]
+}

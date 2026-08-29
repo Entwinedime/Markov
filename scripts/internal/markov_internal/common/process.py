@@ -25,7 +25,12 @@ def api_base_from_ready_url(ready_url: str) -> str:
     return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
 
 
-def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
+def post_json(
+    url: str,
+    body: dict[str, Any] | None,
+    timeout: int = 60,
+    api_key: str | None = None,
+) -> Any:
     """Send a JSON POST request and decode JSON or text responses."""
 
     data = None
@@ -33,6 +38,8 @@ def post_json(url: str, body: dict[str, Any] | None, timeout: int = 60) -> Any:
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(request, timeout=timeout) as response:
         payload = response.read()

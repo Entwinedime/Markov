@@ -4,16 +4,12 @@ from __future__ import annotations
 
 HICACHE_CONSUMER_STATE_MODEL = "hicache_state_model"
 HICACHE_CONSUMER_INPUT_CONTRACT = "hicache_input_contract"
-HICACHE_CONSUMER_FINAL_STATE_VALIDATOR = "hicache_final_state_validator"
-HICACHE_CONSUMER_TRANSITION_VALIDATOR = "hicache_transition_validator"
 HICACHE_CONSUMER_DAG_PATCH = "hicache_dag_patch"
 
 HICACHE_FACT_CONSUMERS = frozenset(
     {
         HICACHE_CONSUMER_STATE_MODEL,
         HICACHE_CONSUMER_INPUT_CONTRACT,
-        HICACHE_CONSUMER_FINAL_STATE_VALIDATOR,
-        HICACHE_CONSUMER_TRANSITION_VALIDATOR,
         HICACHE_CONSUMER_DAG_PATCH,
     }
 )
@@ -23,7 +19,6 @@ HICACHE_FACT_CLASSES = frozenset(
         "workload_identity",
         "source_actual",
         "timing_observation",
-        "oracle_state",
     }
 )
 
@@ -59,9 +54,10 @@ HICACHE_FACT_ROLES_BY_CLASS = {
             "writeback_io_observed",
             "loadback_io_observed",
             "commit_device_to_host_io_observed",
+            "storage_read_service_observed",
+            "storage_write_service_observed",
         }
     ),
-    "oracle_state": frozenset({"state_snapshot"}),
 }
 
 HICACHE_CONSUMERS_BY_CLASS = {
@@ -73,20 +69,12 @@ HICACHE_CONSUMERS_BY_CLASS = {
     ),
     "source_actual": frozenset(
         {
-            HICACHE_CONSUMER_TRANSITION_VALIDATOR,
             HICACHE_CONSUMER_DAG_PATCH,
         }
     ),
     "timing_observation": frozenset(
         {
-            HICACHE_CONSUMER_TRANSITION_VALIDATOR,
             HICACHE_CONSUMER_DAG_PATCH,
-        }
-    ),
-    "oracle_state": frozenset(
-        {
-            HICACHE_CONSUMER_FINAL_STATE_VALIDATOR,
-            HICACHE_CONSUMER_TRANSITION_VALIDATOR,
         }
     ),
 }

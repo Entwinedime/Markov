@@ -10,7 +10,10 @@ import functools
 import inspect
 import json
 import os
+import resource
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Callable
@@ -43,8 +46,6 @@ class EmitCondition:
     """控制某个 target 是否在当前调用阶段发事件的条件。"""
 
     source: str
-    op: str = "present"
-    value: Any = None
 
 
 @dataclass(frozen=True)
@@ -59,14 +60,11 @@ class TargetSpec:
     fields: tuple[FieldSpec, ...]
     fact: FactSpec
     emit_when: tuple[EmitCondition, ...] = ()
+    capture_thread_timing: bool = False
 
 
 _TARGETS = None
 _PATCHED: set[str] = set()
-_FULL_LIST_KEYS = {
-    "token_ids",
-    "hash_value",
-}
 SourceExtractor = Callable[
     [str, str, dict[str, Any], tuple[Any, ...], dict[str, Any], Any],
     tuple[bool, bool, Any],
@@ -105,12 +103,6 @@ def _load_targets() -> list[TargetSpec]:
         targets.append(target)
     _TARGETS = targets
     return targets
-
-
-def configured_consumers() -> set[str]:
-    """返回当前 target 配置实际声明的 consumer 集合。"""
-
-    return {consumer for target in _load_targets() for consumer in target.fact.consumers}
 
 
 def install(module: ModuleType) -> None:
@@ -160,6 +152,9 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
     events = _parse_events(raw.get("events"), target_id)
     emit_when = _parse_emit_conditions(raw.get("emit_when"), target_id)
     fact = _parse_fact(raw.get("fact"), target_id)
+    capture_thread_timing = raw.get("capture_thread_timing", False)
+    if not isinstance(capture_thread_timing, bool):
+        raise ValueError(f"python_probe target {target_id!r} capture_thread_timing must be a boolean")
     return TargetSpec(
         id=target_id,
         module_name=module_name,
@@ -169,6 +164,7 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
         fields=tuple(fields),
         fact=fact,
         emit_when=emit_when,
+        capture_thread_timing=capture_thread_timing,
     )
 
 
@@ -230,7 +226,7 @@ def _parse_fact(raw: Any, target_id: str) -> FactSpec:
 def _parse_events(raw: Any, target_id: str) -> dict[str, str]:
     """解析 phase 到 trace event name 的显式映射。"""
 
-    allowed = {"start", "end", "exception", "instant"}
+    allowed = {"start", "end"}
     if not isinstance(raw, dict):
         raise ValueError(f"python_probe target {target_id!r} events must be a phase-to-event-name object")
     events: dict[str, str] = {}
@@ -265,66 +261,199 @@ def _parse_emit_condition(raw: Any, target_id: str, index: int) -> EmitCondition
     source = raw.get("source")
     if not isinstance(source, str) or not source:
         raise ValueError(f"python_probe target {target_id!r} emit_when[{index}].source must be a non-empty string")
-    op = str(raw.get("op") or "present")
-    allowed = {"present", "exists", "has", "absent", "missing", "truthy", "falsey", "equals", "eq", "not_equals", "ne"}
-    if op not in allowed:
-        raise ValueError(f"python_probe target {target_id!r} emit_when[{index}].op is unsupported: {op!r}")
-    return EmitCondition(source=source, op=op, value=raw.get("value"))
+    op = raw.get("op", "present")
+    if op != "present":
+        raise ValueError(f"python_probe target {target_id!r} emit_when[{index}].op must be 'present'")
+    return EmitCondition(source=source)
+
+
+_THREAD_SCHEDSTAT_STATE = threading.local()
+
+
+def _thread_schedstat_snapshot() -> dict[str, int] | None:
+    """Read Linux per-thread runtime/run-queue counters when available.
+
+    ``/proc/thread-self/schedstat`` is a constant-size, current-thread file.  It
+    does not enumerate process state or capture a Python snapshot.  The second
+    field is cumulative time spent runnable on a CPU run queue, which lets a
+    later diagnostic distinguish scheduled-out time from blocking/sleeping.
+    """
+
+    identity = (os.getpid(), threading.get_native_id())
+    descriptor = getattr(_THREAD_SCHEDSTAT_STATE, "descriptor", None)
+    cached_identity = getattr(_THREAD_SCHEDSTAT_STATE, "identity", None)
+    try:
+        if descriptor is None or cached_identity != identity:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            descriptor = os.open(
+                f"/proc/self/task/{identity[1]}/schedstat",
+                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+            )
+            _THREAD_SCHEDSTAT_STATE.descriptor = descriptor
+            _THREAD_SCHEDSTAT_STATE.identity = identity
+        fields = os.pread(descriptor, 256, 0).decode("ascii").split()
+        if len(fields) < 3:
+            return None
+        values = [int(fields[index]) for index in range(3)]
+        if any(value < 0 for value in values):
+            return None
+        return {
+            "schedstat_runtime_ns": values[0],
+            "schedstat_runqueue_delay_ns": values[1],
+            "schedstat_timeslices": values[2],
+        }
+    except (OSError, UnicodeError, ValueError):
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        _THREAD_SCHEDSTAT_STATE.descriptor = None
+        _THREAD_SCHEDSTAT_STATE.identity = None
+        return None
+
+
+def _thread_timing_snapshot(*, boundary: str = "start") -> dict[str, int]:
+    """Capture bounded per-thread clocks close to a measured call boundary.
+
+    The CPU clock is sampled last at the start boundary and first at the end
+    boundary.  This keeps the bounded ``getrusage``/``schedstat`` diagnostic
+    work outside the CPU interval used for the wrapped call.
+    """
+
+    if boundary not in {"start", "end"}:
+        raise ValueError(f"unsupported thread-timing boundary: {boundary!r}")
+    if boundary == "end":
+        thread_cpu_ns = time.thread_time_ns()
+        usage = resource.getrusage(resource.RUSAGE_THREAD)
+        schedstat = _thread_schedstat_snapshot()
+    else:
+        usage = resource.getrusage(resource.RUSAGE_THREAD)
+        schedstat = _thread_schedstat_snapshot()
+        thread_cpu_ns = time.thread_time_ns()
+    return {
+        "thread_cpu_ns": thread_cpu_ns,
+        "voluntary_context_switches": int(usage.ru_nvcsw),
+        "involuntary_context_switches": int(usage.ru_nivcsw),
+        **(schedstat or {}),
+    }
+
+
+def _thread_timing_delta(
+    started: dict[str, int] | None,
+    ended: dict[str, int] | None,
+    wall_start_us: int,
+    wall_end_us: int,
+) -> dict[str, Any] | None:
+    """Project active CPU and wait/scheduling evidence into one event payload."""
+
+    if started is None or ended is None:
+        return None
+    wall_us = max(0, wall_end_us - wall_start_us)
+    raw_thread_cpu_us = max(0, (ended["thread_cpu_ns"] - started["thread_cpu_ns"]) // 1000)
+    thread_cpu_us = min(wall_us, raw_thread_cpu_us)
+    wait_or_scheduled_out_us = max(0, wall_us - thread_cpu_us)
+    schedstat_available = all(
+        field in started and field in ended
+        for field in (
+            "schedstat_runtime_ns",
+            "schedstat_runqueue_delay_ns",
+            "schedstat_timeslices",
+        )
+    )
+    schedstat_fields: dict[str, Any]
+    if schedstat_available:
+        raw_runqueue_us = max(
+            0,
+            (ended["schedstat_runqueue_delay_ns"] - started["schedstat_runqueue_delay_ns"]) // 1000,
+        )
+        runnable_scheduled_out_us = min(wait_or_scheduled_out_us, raw_runqueue_us)
+        schedstat_fields = {
+            "thread_schedstat_status": "available",
+            "thread_schedstat_runtime_us": max(
+                0,
+                (ended["schedstat_runtime_ns"] - started["schedstat_runtime_ns"]) // 1000,
+            ),
+            "thread_schedstat_raw_runqueue_delay_us": raw_runqueue_us,
+            "thread_runnable_scheduled_out_us": runnable_scheduled_out_us,
+            "thread_blocked_or_sleep_us": wait_or_scheduled_out_us - runnable_scheduled_out_us,
+            "thread_schedstat_timeslices": max(
+                0,
+                ended["schedstat_timeslices"] - started["schedstat_timeslices"],
+            ),
+            "thread_schedstat_runqueue_clipped_to_wall_residual": (raw_runqueue_us > wait_or_scheduled_out_us),
+        }
+    else:
+        schedstat_fields = {
+            "thread_schedstat_status": "unavailable",
+            "thread_runnable_scheduled_out_us": None,
+            "thread_blocked_or_sleep_us": None,
+        }
+    return {
+        "thread_timing_clock": "CLOCK_THREAD_CPUTIME_ID_plus_getrusage_RUSAGE_THREAD",
+        "thread_cpu_duration_us": thread_cpu_us,
+        "thread_cpu_raw_duration_us": raw_thread_cpu_us,
+        "thread_cpu_clipped_to_wall": raw_thread_cpu_us > wall_us,
+        "thread_wait_or_scheduled_out_us": wait_or_scheduled_out_us,
+        "thread_voluntary_context_switches": max(
+            0,
+            ended["voluntary_context_switches"] - started["voluntary_context_switches"],
+        ),
+        "thread_involuntary_context_switches": max(
+            0,
+            ended["involuntary_context_switches"] - started["involuntary_context_switches"],
+        ),
+        "thread_timing_semantics": (
+            "diagnostic_only; wait_or_scheduled_out includes blocking I/O and off-CPU time "
+            "and is never direct service/control fit input"
+        ),
+        "thread_schedstat_semantics": (
+            "diagnostic_only; runnable_scheduled_out is Linux schedstat runqueue delay; "
+            "blocked_or_sleep is the conserved wall-minus-CPU-minus-runqueue residual; "
+            "neither is a direct fit input without an explicit attribution contract"
+        ),
+        **schedstat_fields,
+    }
 
 
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
     """包装同步或异步 callable，并按 target phase 配置发事件。"""
 
+    capture_thread_timing = any(target.capture_thread_timing for target in targets)
+
     if inspect.iscoroutinefunction(fn):
 
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+            timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
             started = get_writer().now_us()
-            _emit_call_phase(targets, fn, args, kwargs, None, "start", started, started)
-            try:
-                result = await fn(*args, **kwargs)
-            except BaseException:
-                ended = get_writer().now_us()
-                _emit_call_phase(targets, fn, args, kwargs, None, "exception", started, ended)
-                raise
+            _emit_targets(targets, fn, args, kwargs, None, "start", started, started, None)
+            result = await fn(*args, **kwargs)
             ended = get_writer().now_us()
-            _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
-            _emit_call_phase(targets, fn, args, kwargs, result, "instant", ended, ended)
+            timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
+            timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
+            _emit_targets(targets, fn, args, kwargs, result, "end", started, ended, timing)
             return result
 
         return async_wrapped
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
+        timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
         started = get_writer().now_us()
-        _emit_call_phase(targets, fn, args, kwargs, None, "start", started, started)
-        try:
-            result = fn(*args, **kwargs)
-        except BaseException:
-            ended = get_writer().now_us()
-            _emit_call_phase(targets, fn, args, kwargs, None, "exception", started, ended)
-            raise
+        _emit_targets(targets, fn, args, kwargs, None, "start", started, started, None)
+        result = fn(*args, **kwargs)
         ended = get_writer().now_us()
-        _emit_call_phase(targets, fn, args, kwargs, result, "end", started, ended)
-        _emit_call_phase(targets, fn, args, kwargs, result, "instant", ended, ended)
+        timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
+        timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
+        _emit_targets(targets, fn, args, kwargs, result, "end", started, ended, timing)
         return result
 
     return wrapped
-
-
-def _emit_call_phase(
-    targets: tuple[TargetSpec, ...],
-    fn: Callable[..., Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-    phase: str,
-    start_us: int,
-    end_us: int,
-) -> None:
-    """发射某次 callable 调用的一个阶段事件。"""
-
-    _emit_targets(targets, fn, args, kwargs, result, phase, start_us, end_us)
 
 
 def _emit_targets(
@@ -336,13 +465,14 @@ def _emit_targets(
     phase: str,
     start_us: int,
     end_us: int,
+    thread_timing: dict[str, Any] | None,
 ) -> None:
     """对同一个 callable 上绑定的多个 target 逐一发事件。"""
 
     for target in targets:
         if phase not in target.events:
             continue
-        _emit(target, fn, args, kwargs, result, phase, start_us, end_us)
+        _emit(target, fn, args, kwargs, result, phase, start_us, end_us, thread_timing)
 
 
 def _emit(
@@ -354,6 +484,7 @@ def _emit(
     phase: str,
     start_us: int,
     end_us: int,
+    thread_timing: dict[str, Any] | None,
 ) -> None:
     """构造 Chrome trace event。"""
 
@@ -362,16 +493,17 @@ def _emit(
     if not _should_emit_target(target, bound, args, kwargs, result):
         return
     fields, missing = _collect_fields(target, bound, args, kwargs, result)
-    event_name = _event_name(target, phase)
+    event_name = target.events[phase]
     base_args = {
-        "schema_version": 1,
         "domain": "python_probe",
         "target_id": target.id,
         "target": target.target,
         "phase": phase,
-        "status": "completed" if phase in {"end", "instant"} else phase,
+        "status": "completed" if phase == "end" else phase,
         "missing_required_fields": missing,
     }
+    if target.capture_thread_timing and thread_timing is not None:
+        base_args.update(thread_timing)
     get_writer().duration_event(
         event_name,
         start_us,
@@ -381,7 +513,11 @@ def _emit(
             **base_args,
             "event_kind": event_name,
             **fields,
-            **_fact_args(target),
+            "fact": {
+                "class": target.fact.fact_class,
+                "role": target.fact.role,
+                "consumers": list(target.fact.consumers),
+            },
         },
     )
 
@@ -393,12 +529,6 @@ def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -
     bound["__trace_sim_fact_class"] = target.fact.fact_class
     bound["__trace_sim_fact_role"] = target.fact.role
     bound["__trace_sim_fact_consumers"] = target.fact.consumers
-
-
-def _event_name(target: TargetSpec, phase: str) -> str:
-    """按 target 配置和 phase 生成事件名。"""
-
-    return target.events[phase]
 
 
 def _collect_fields(
@@ -419,19 +549,6 @@ def _collect_fields(
         elif field.required:
             missing.append(field.name)
     return fields, missing
-
-
-def _fact_args(target: TargetSpec) -> dict[str, Any]:
-    """生成写入事件 args 的 fact 元数据。"""
-
-    fact = target.fact
-    return {
-        "fact": {
-            "class": fact.fact_class,
-            "role": fact.role,
-            "consumers": list(fact.consumers),
-        }
-    }
 
 
 def _should_emit_target(
@@ -459,20 +576,7 @@ def _condition_matches(
     """执行单个 emit_when 条件判断。"""
 
     found, value = _extract_raw_value(condition.source, "_emit_when", bound, args, kwargs, result)
-    op = condition.op
-    if op in ("present", "exists", "has"):
-        return found and _has_value(value)
-    if op in ("absent", "missing"):
-        return not found or not _has_value(value)
-    if op == "truthy":
-        return found and bool(value)
-    if op == "falsey":
-        return (not found) or not bool(value)
-    if op in ("equals", "eq"):
-        return found and value == condition.value
-    if op in ("not_equals", "ne"):
-        return (not found) or value != condition.value
-    return False
+    return found and _has_value(value)
 
 
 def _has_value(value: Any) -> bool:
@@ -508,15 +612,14 @@ def _extract_field(
     kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
-    """提取单个字段，并把普通对象收敛成 JSON 可写形态。"""
+    """提取单个字段；writer 统一负责最终 JSON 收敛。"""
 
     source = field.source.strip()
     try:
         found, value = _extract_raw_value(source, field.name, bound, args, kwargs, result)
-        return (found, _jsonable(value, key=field.name) if found else None)
+        return (found, value if found else None)
     except Exception as exc:
         return (False, {"extract_error": type(exc).__name__})
-    return (False, None)
 
 
 def _extract_raw_value(
@@ -529,8 +632,8 @@ def _extract_raw_value(
 ) -> tuple[bool, Any]:
     """按 source 表达式读取原始值。
 
-    这里返回原始对象，外层再做 JSON 摘要。这样 `len:<source>` 可以先拿到
-    tensor/list/tuple 等对象，再记录长度，避免把大对象字符串化后才取长度。
+    这里返回原始对象，由writer统一做JSON摘要。这样`len:<source>`可以先拿到
+    tensor/list/tuple等对象，再记录长度，避免把大对象字符串化后才取长度。
     """
 
     handled, found, value = _extract_transform_source(source, field_name, bound, args, kwargs, result)
@@ -541,7 +644,7 @@ def _extract_raw_value(
     if handled:
         return (found, value)
 
-    return _extract_builtin_source(source, field_name, bound, args, kwargs, result)
+    return _extract_builtin_source(source, field_name, bound, args, result)
 
 
 def _extract_transform_source(
@@ -589,7 +692,6 @@ def _extract_builtin_source(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """解析 generic callable probe 内置的 source 语法。"""
@@ -598,10 +700,6 @@ def _extract_builtin_source(
         return (field_name in bound, bound.get(field_name))
     if source.startswith("arg:"):
         return _extract_arg_source(source.split(":", 1)[1], bound, args)
-    if source.startswith("args."):
-        return _extract_args_source(source.split(".", 1)[1], args)
-    if source.startswith("kwarg:"):
-        return _extract_kwarg_source(source.split(":", 1)[1], kwargs)
     if source == "self":
         return (bool(args), args[0] if args else None)
     if source.startswith("self."):
@@ -632,29 +730,6 @@ def _extract_arg_source(key: str, bound: dict[str, Any], args: tuple[Any, ...]) 
         if head not in bound:
             return (False, None)
         value = bound[head]
-    return _read_path(value, path) if path else (True, value)
-
-
-def _extract_args_source(key: str, args: tuple[Any, ...]) -> tuple[bool, Any]:
-    """读取 `args.<index>[.<path>]`。"""
-
-    head, path = _split_head_path(key)
-    if not head.isdigit():
-        return (False, None)
-    index = int(head)
-    if index >= len(args):
-        return (False, None)
-    value = args[index]
-    return _read_path(value, path) if path else (True, value)
-
-
-def _extract_kwarg_source(key: str, kwargs: dict[str, Any]) -> tuple[bool, Any]:
-    """读取 `kwarg:<name>[.<path>]`。"""
-
-    head, path = _split_head_path(key)
-    if head not in kwargs:
-        return (False, None)
-    value = kwargs[head]
     return _read_path(value, path) if path else (True, value)
 
 
@@ -719,19 +794,6 @@ def _safe_list(value: Any) -> list[Any] | None:
         return list(value)[:64]
     except TypeError:
         return None
-
-
-def _jsonable(value: Any, *, key: str | None = None) -> Any:
-    """把任意 Python 对象收敛成 JSON 值，保留建模所需 token/path 列表。"""
-
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, (list, tuple)):
-        items = value if key in _FULL_LIST_KEYS else value[:32]
-        return [_jsonable(item) for item in items]
-    if isinstance(value, dict):
-        return {str(child_key): _jsonable(item, key=str(child_key)) for child_key, item in list(value.items())[:64]}
-    return str(value)
 
 
 TARGET_MODULES = tuple(sorted({target.module_name for target in _load_targets()}))

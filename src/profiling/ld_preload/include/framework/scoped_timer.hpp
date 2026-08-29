@@ -49,7 +49,6 @@ public:
         const pid_t tid{ static_cast<pid_t>(syscall(SYS_gettid)) };
         const uint64_t dur_us{ GetRealtimeUs() - start_us_ };
         const std::string args_str{ "\"args\": {"
-                                    "\"schema_version\": 1, "
                                     "\"domain\": \"ld_preload\", "
                                     "\"event_kind\": \"runtime_op\", "
                                     "\"hook_profile\": \""

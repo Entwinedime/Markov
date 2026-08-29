@@ -8,7 +8,6 @@ from trace_sim_probe.probes import generic_callable as _base
 
 from .common import _cache_scope_key, _extract_source_value
 from .context import _HICACHE_SEQUENCE_BY_SCOPE
-from .snapshots import _snapshot_hicache_object
 from .tokens import (
     _extract_request_list,
     _extract_request_token_count_records,
@@ -29,24 +28,6 @@ def _source_spec(source: str, prefix: str) -> str | None:
     if not source.startswith(prefix):
         return None
     return source.split(":", 1)[1]
-
-
-def _hicache_state_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 `hicache_state:self`，生成 state snapshot 字段。"""
-
-    if source != "hicache_state:self":
-        return (False, False, None)
-    if not args:
-        return (True, False, None)
-    snapshot = _snapshot_hicache_object(args[0])
-    return (True, True, snapshot)
 
 
 def _token_path_source(
@@ -399,7 +380,6 @@ def _hicache_pending_write_node_ids_source(
 
 
 _HICACHE_SOURCE_EXTRACTORS = (
-    _hicache_state_source,
     _token_path_source,
     _token_span_source,
     _request_token_path_source,

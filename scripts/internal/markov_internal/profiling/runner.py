@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SGLang profiling runner.
+"""Shared profiling runner for SGLang and KTransformers.
 
 This module starts the profiled process, injects capture state, runs the
 workload, and writes profile manifests. Modeling decisions are intentionally
@@ -29,14 +29,15 @@ from .forced_workflow import (
 )
 from .suite import (
     PROFILE_EXPERIMENTS_ENV,
+    PROFILE_CHANNELS_ENV,
     PROFILE_FORCED_TOKEN_BUNDLE_ENV,
     PROFILE_INPUTS_ENV,
     PROFILE_SERVERS_ENV,
-    describe_suite_experiment,
     experiment_identity,
     expand_suite,
     filter_suite_experiments,
     parse_experiment_selection,
+    narrow_profile_channels,
     suite_profile_mode,
     summarize_suite_forced_token_contracts,
 )
@@ -71,9 +72,8 @@ def run_profile_suite(
     selected_servers: set[str] | None = None,
     *,
     forced_token_bundle: Path | None = None,
-    config_path: Path | None = None,
 ) -> list[Path]:
-    """Execute one run or suite and persist suite selection/result artifacts."""
+    """Execute one run or suite and persist one concise result artifact."""
 
     is_suite = "experiments" in cfg or "matrix" in cfg
     all_experiments = list(enumerate(expand_suite(cfg), start=1))
@@ -97,34 +97,7 @@ def run_profile_suite(
     prepared_experiments = _prepare_suite_experiments(experiments, suite_dir, forced_token_bundle)
 
     suite_dir.mkdir(parents=True, exist_ok=True)
-    dump_json(suite_dir / "suite_config.json", cfg)
     log(f"Suite dir: {suite_dir}")
-    dump_json(
-        suite_dir / "suite_selection.json",
-        {
-            "schema": "trace_sim.profile.suite_selection.v1",
-            "suite_name": suite_name,
-            "framework": framework,
-            "profile_mode": suite_profile_mode(cfg),
-            "metadata": cfg.get("metadata", {}) if isinstance(cfg.get("metadata"), dict) else {},
-            "selected_selectors": sorted(selected_experiments or []),
-            "selected_inputs": sorted(selected_inputs or []),
-            "selected_servers": sorted(selected_servers or []),
-            "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
-            if forced_token_bundle is not None
-            else None,
-            "available_experiments": [
-                describe_suite_experiment(index, experiment) for index, experiment in all_experiments
-            ],
-            "planned_experiments": [
-                {
-                    **describe_suite_experiment(experiment.index, experiment.config),
-                    "forced_token_contract": experiment.forced_token_contract,
-                }
-                for experiment in prepared_experiments
-            ],
-        },
-    )
 
     execution = _execute_suite_experiments(
         prepared_experiments,
@@ -137,7 +110,6 @@ def run_profile_suite(
         suite_dir=suite_dir,
         run_dirs=execution.run_dirs,
         failures=execution.failures,
-        config_path=config_path,
     )
     if bundle_error:
         execution.failures.append({"name": "forced_token_bundle", "error": bundle_error})
@@ -145,16 +117,11 @@ def run_profile_suite(
     dump_json(
         suite_dir / "suite_result.json",
         {
-            "schema": "trace_sim.profile.suite_result.v1",
             "suite_dir": str(suite_dir),
             "suite_name": suite_name,
             "framework": framework,
             "profile_mode": suite_profile_mode(cfg),
-            "metadata": cfg.get("metadata", {}) if isinstance(cfg.get("metadata"), dict) else {},
             "dry_run": bool(dry_run),
-            "selected_selectors": sorted(selected_experiments or []),
-            "selected_inputs": sorted(selected_inputs or []),
-            "selected_servers": sorted(selected_servers or []),
             "planned_count": len(prepared_experiments),
             "attempted_count": execution.attempted_count,
             "completed_count": len(execution.run_dirs),
@@ -170,13 +137,6 @@ def run_profile_suite(
             if forced_token_bundle is not None
             else None,
             "generated_forced_token_bundle": generated_bundle,
-            "selected_experiments": [
-                {
-                    **describe_suite_experiment(experiment.index, experiment.config),
-                    "forced_token_contract": experiment.forced_token_contract,
-                }
-                for experiment in prepared_experiments
-            ],
         },
     )
     if bundle_error:
@@ -235,7 +195,6 @@ def _execute_suite_experiments(
                 {
                     "name": experiment.name,
                     "error": str(error),
-                    "forced_token_contract": experiment.forced_token_contract,
                 }
             )
             if not continue_on_error:
@@ -251,20 +210,13 @@ def _build_capture_bundle_if_requested(
     suite_dir: Path,
     run_dirs: list[Path],
     failures: list[dict[str, Any]],
-    config_path: Path | None,
 ) -> tuple[dict[str, Any] | None, str | None]:
     """Build a capture bundle only after every selected experiment succeeds."""
 
     if suite_profile_mode(cfg) != "forced_token_capture" or dry_run or failures:
         return None, None
     try:
-        if config_path is None:
-            raise ValueError("capture suite requires its source config path")
-        bundle = build_forced_token_bundle(
-            suite_dir,
-            run_dirs,
-            capture_config_path=config_path,
-        )
+        bundle = build_forced_token_bundle(suite_dir, run_dirs)
         log(f"Forced token bundle: {bundle.get('path')}")
         return bundle, None
     except Exception as error:
@@ -274,7 +226,7 @@ def _build_capture_bundle_if_requested(
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the container-side profiling runner CLI."""
 
-    parser = argparse.ArgumentParser(description="Run SGLang profiling experiments.")
+    parser = argparse.ArgumentParser(description="Run profiling experiments.")
     parser.add_argument("--config", required=True, help="JSON profile config path")
     parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
     parser.add_argument("--experiment", action="append", default=[], help="run one experiment id/name; may be repeated")
@@ -290,6 +242,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Explicit forced_token_bundle.json required by forced-token replay suites.",
     )
     parser.add_argument(
+        "--channels",
+        action="append",
+        default=[],
+        help="Narrow a suite to a configured channel subset for a clearly labeled diagnostic run.",
+    )
+    parser.add_argument(
         "--list-experiments", action="store_true", help="print expanded experiment ids without running them"
     )
     return parser.parse_args(argv)
@@ -303,6 +261,12 @@ def main(argv: list[str] | None = None) -> int:
     if config_path is None or not config_path.is_file():
         raise FileNotFoundError(f"missing config: {args.config}")
     cfg = load_json(config_path)
+    selected_channels = parse_experiment_selection(
+        args.channels,
+        os.environ.get(PROFILE_CHANNELS_ENV),
+    )
+    if selected_channels:
+        cfg = narrow_profile_channels(cfg, selected_channels)
     selected_experiments = parse_experiment_selection(
         [*args.experiment, *args.experiments],
         os.environ.get(PROFILE_EXPERIMENTS_ENV),
@@ -340,7 +304,6 @@ def main(argv: list[str] | None = None) -> int:
         selected_inputs,
         selected_servers,
         forced_token_bundle=forced_token_bundle,
-        config_path=config_path,
     )
     for run_dir in run_dirs:
         print(run_dir)
