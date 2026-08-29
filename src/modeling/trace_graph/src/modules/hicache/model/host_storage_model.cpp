@@ -9,36 +9,10 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-void HiCacheState::record_device_eviction_policy(const HiCacheFact & fact, const radix::HiCacheCacheNode & node, bool needs_writeback) {
-    if constexpr (debug_records_enabled()) {
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .policy_area = "write_policy",
-                                   .policy_name = policy_.write_policy(),
-                                   .decision = needs_writeback ? "enqueue_dirty_eviction_writeback" : "evict_without_writeback",
-                                   .reason = needs_writeback               ? "write_back dirty device node must refresh host backup before eviction"
-                                             : node.residency.device_dirty ? "target write policy does not require dirty eviction writeback"
-                                                                           : "device node is clean at eviction boundary",
-                                   .accepted = needs_writeback,
-                                   .candidate_pages = static_cast<uint64_t>(node.pages.size()),
-                                   .pages = node.pages,
-                               });
-    }
-    else {
-        (void)fact;
-        (void)node;
-        (void)needs_writeback;
-    }
-}
-
-bool HiCacheState::commit_device_eviction_writeback(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                    ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages) {
-#ifdef DEBUG
-    (void)core::checked_increment_u64(summary.dirty_eviction_events, "HiCache dirty eviction count exceeds uint64 range");
-#endif
+bool HiCacheState::commit_device_eviction_writeback(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id,
+                                                    const std::vector<std::string> & pages) {
     const auto writeback_id = scope.clock.next_operation_id("writeback");
     const auto writeback_owner = scoped_request_key(fact) + ":writeback:" + writeback_id;
-    const auto before_enqueue = debug_state_digest();
     scope.async_ops.insert_writeback(HiCacheWritebackOperation{
         .header = make_operation_header(HiCacheOperationKind::Writeback,
                                         writeback_id,
@@ -51,60 +25,33 @@ bool HiCacheState::commit_device_eviction_writeback(const HiCacheFact & fact, Hi
     });
     auto ref = scope.refs.acquire_lock(scope.tree, writeback_owner, "writeback", scoped_request_key(fact), writeback_id, std::vector<HiCacheNodeId>{ node_id });
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "writeback_ref_acquire");
-    if constexpr (debug_records_enabled())
-        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "enqueue_writeback", .tier = "writeback" }, pages, before_enqueue);
 
-    const auto committed = commit_host_backup(fact, summary, transitions, scope, node_id, true);
-    const auto before_complete = debug_state_digest();
+    const auto committed = commit_host_backup(fact, scope, node_id, true);
     scope.async_ops.set_writeback_state(writeback_id,
                                         committed ? HiCacheOperationState::Committed : HiCacheOperationState::Cancelled,
                                         committed ? "sync_commit" : "host_backup_capacity_rejected",
                                         fact.ts);
     ref = scope.refs.release_owner(scope.tree, writeback_owner);
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "writeback_ref_release");
-    if constexpr (debug_records_enabled()) {
-        record_transition(fact,
-                          summary,
-                          transitions,
-                          TransitionDescriptor{
-                              .kind = committed ? "complete_writeback" : "cancel_writeback",
-                              .tier = "writeback",
-                          },
-                          pages,
-                          before_complete);
-    }
     return committed;
 }
 
-uint64_t HiCacheState::release_device_residency(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                                HiCacheNodeId node_id, const std::vector<std::string> & pages) {
+uint64_t HiCacheState::release_device_residency(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages) {
     const auto released_pages = static_cast<uint64_t>(pages.size());
-    const auto before = debug_state_digest();
     const auto * node = scope.tree.node(node_id);
-    if (node != nullptr && has_host_backup(*node)) scope.tree.demote_device_to_host(node_id, false);
-    else scope.tree.remove_device_regular(node_id);
-    const auto allocator_released_pages = scope.device_allocator.release(released_pages);
-    sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "evict_device_node");
-    if constexpr (debug_records_enabled())
-        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "evict_l1_node", .tier = "L1" }, pages, before);
-    if constexpr (debug_records_enabled()) {
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .policy_area = "device_allocator",
-                                   .policy_name = "device_eviction_free",
-                                   .decision = "release_device_pages_to_allocator",
-                                   .reason = "sglang device eviction frees the victim node value back to token_to_kv_pool_allocator",
-                                   .accepted = allocator_released_pages > 0,
-                                   .candidate_pages = released_pages,
-                                   .capacity_pages = scope.device_allocator.capacity_pages,
-                                   .allocator_free_pages = scope.device_allocator.free_pages,
-                                   .allocator_release_pages = scope.device_allocator.release_pages,
-                                   .allocator_available_pages = scope.device_allocator.available_pages(),
-                                   .allocator_released_pages = allocator_released_pages,
-                                   .pages = pages,
-                               });
+    const bool has_backup = node != nullptr && has_host_backup(*node);
+    std::vector<HiCacheNodeId> affected_nodes{ node_id };
+    if (has_backup) { scope.tree.demote_device_to_host(node_id, false); }
+    else {
+        const auto removal = scope.tree.evict_unbacked_device_leaf(node_id);
+        if (!removal.evicted) {
+            return 0;
+        }
+        affected_nodes = removal.affected_nodes;
     }
-    else { (void)allocator_released_pages; }
+    const auto allocator_released_pages = scope.device_allocator.release(released_pages);
+    sync_capacity(scope, normalized_scope(fact), affected_nodes, "evict_device_node");
+    (void)allocator_released_pages;
     return released_pages;
 }
 
@@ -115,16 +62,14 @@ uint64_t HiCacheState::release_device_residency(const HiCacheFact & fact, HiCach
  * index. Dirty write-back acknowledgement is currently synchronous, while operation
  * and reference lifecycles remain explicit in Debug transition evidence.
  */
-uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                         HiCacheNodeId node_id) {
+uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id) {
     auto * node = scope.tree.mutable_node(node_id);
     if (node == nullptr || !node->residency.device_present) return 0;
 
     const auto pages = node->pages;
     const bool needs_writeback = policy_.write_back_enabled() && node->residency.device_dirty;
-    record_device_eviction_policy(fact, *node, needs_writeback);
-    if (needs_writeback && !commit_device_eviction_writeback(fact, summary, transitions, scope, node_id, pages)) return 0;
-    return release_device_residency(fact, summary, transitions, scope, node_id, pages);
+    if (needs_writeback && !commit_device_eviction_writeback(fact, scope, node_id, pages)) return 0;
+    return release_device_residency(fact, scope, node_id, pages);
 }
 
 /**
@@ -133,46 +78,20 @@ uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, HiCacheSummar
  * Host cleanup skips leaves with a positive host-reference count. Successful eviction
  * removes the host leaf or subtree rather than merely clearing `node.host_value`.
  */
-uint64_t HiCacheState::evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                       HiCacheNodeId node_id) {
+uint64_t HiCacheState::evict_host_node(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id) {
     const auto * node = scope.tree.node(node_id);
     const auto pages = node == nullptr ? std::vector<std::string>{} : node->pages;
     if (node != nullptr && node->refs.host_ref_total > 0) {
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "host_cleanup",
-                                       .policy_name = "evict_host",
-                                       .decision = "skip_host_ref_protected_leaf",
-                                       .reason = "SGLang evict_host skips a popped host leaf while host_ref_counter is positive",
-                                       .accepted = false,
-                                       .candidate_pages = static_cast<uint64_t>(pages.size()),
-                                       .pages = pages,
-                                   });
         sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "evict_host_ref_protected");
         return 0;
     }
 
-    const auto before = debug_state_digest();
     const auto result = scope.tree.evict_host_leaf(node_id);
     sync_capacity(scope,
                   normalized_scope(fact),
                   result.affected_nodes.empty() ? std::vector<HiCacheNodeId>{ node_id } : result.affected_nodes,
                   result.evicted ? "evict_host_leaf" : "evict_host_leaf_skipped");
-    if constexpr (debug_records_enabled())
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .policy_area = "host_cleanup",
-                                   .policy_name = "evict_host",
-                                   .decision = result.evicted ? "evict_host_leaf" : "skip_host_leaf",
-                                   .reason = result.reason,
-                                   .accepted = result.evicted,
-                                   .candidate_pages = static_cast<uint64_t>(result.pages.size()),
-                                   .pages = result.pages,
-                               });
     if (!result.evicted) return 0;
-    if constexpr (debug_records_enabled())
-        record_transition(fact, summary, transitions, TransitionDescriptor{ .kind = "evict_host_node", .tier = "L2" }, pages, before);
     return static_cast<uint64_t>(pages.size());
 }
 
@@ -183,44 +102,16 @@ uint64_t HiCacheState::evict_host_node(const HiCacheFact & fact, HiCacheSummary 
  * `available_size` before allocation and passes the full request budget to radix
  * eviction only when availability is insufficient.
  */
-void HiCacheState::enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                           uint64_t requested_pages) {
+DeviceCapacityEnforcementResult HiCacheState::enforce_device_capacity(const HiCacheFact & fact, ScopedState & scope, uint64_t requested_pages) {
+    DeviceCapacityEnforcementResult result;
     ensure_device_allocator(scope);
     const auto capacity = scope.device_allocator.capacity_pages;
-    if (capacity == 0 || requested_pages == 0) return;
+    if (capacity == 0 || requested_pages == 0) return result;
     sync_capacity(scope, normalized_scope(fact), {}, "device_allocator_budget");
     if (!scope.device_allocator.should_evict(requested_pages)) {
-        if constexpr (debug_records_enabled())
-            record_policy_decision(fact,
-                                   HiCachePolicyDecisionRecord{
-                                       .policy_area = "device_allocator",
-                                       .policy_name = "available_size_gate",
-                                       .decision = "skip_device_eviction",
-                                       .reason = "sglang standard allocator evicts only when available_size is below request budget",
-                                       .accepted = false,
-                                       .requested_pages = requested_pages,
-                                       .capacity_pages = capacity,
-                                       .allocator_free_pages = scope.device_allocator.free_pages,
-                                       .allocator_release_pages = scope.device_allocator.release_pages,
-                                       .allocator_available_pages = scope.device_allocator.available_pages(),
-                                   });
-        return;
+        return result;
     }
     auto target = requested_pages;
-    if constexpr (debug_records_enabled())
-        record_policy_decision(fact,
-                               HiCachePolicyDecisionRecord{
-                                   .policy_area = "device_allocator",
-                                   .policy_name = "available_size_gate",
-                                   .decision = "evict_for_device_allocation",
-                                   .reason = "sglang standard allocator passes the full request budget to tree_cache.evict once available_size is insufficient",
-                                   .accepted = true,
-                                   .requested_pages = requested_pages,
-                                   .capacity_pages = capacity,
-                                   .allocator_free_pages = scope.device_allocator.free_pages,
-                                   .allocator_release_pages = scope.device_allocator.release_pages,
-                                   .allocator_available_pages = scope.device_allocator.available_pages(),
-                               });
     while (target > 0) {
         sync_capacity(scope, normalized_scope(fact), {}, "device_allocator_loop");
         const auto victim = scope.capacity.select_device_victim(runtime::HiCacheVictimRequest{
@@ -229,10 +120,24 @@ void HiCacheState::enforce_device_capacity(const HiCacheFact & fact, HiCacheSumm
             .reason = "device_allocator_loop",
         });
         if (!victim) break;
-        const auto released_pages = evict_device_node(fact, summary, transitions, scope, *victim);
+        const auto * victim_node = scope.tree.node(*victim);
+        const bool dirty_writeback = victim_node != nullptr && policy_.write_back_enabled() && victim_node->residency.device_dirty;
+        const auto released_pages = evict_device_node(fact, scope, *victim);
+        if (released_pages > 0) {
+            result.evicted_node_count = core::checked_add_u64(result.evicted_node_count, 1, "device cleanup evicted-node count exceeds uint64 range");
+            result.evicted_page_count =
+                core::checked_add_u64(result.evicted_page_count, released_pages, "device cleanup evicted-page count exceeds uint64 range");
+            if (dirty_writeback) {
+                result.dirty_evicted_node_count =
+                    core::checked_add_u64(result.dirty_evicted_node_count, 1, "device cleanup dirty-node count exceeds uint64 range");
+                result.dirty_evicted_page_count =
+                    core::checked_add_u64(result.dirty_evicted_page_count, released_pages, "device cleanup dirty-page count exceeds uint64 range");
+            }
+        }
         if (released_pages == 0 || released_pages >= target) break;
         target -= released_pages;
     }
+    return result;
 }
 
 /**
@@ -242,8 +147,7 @@ void HiCacheState::enforce_device_capacity(const HiCacheFact & fact, HiCacheSumm
  * only existing excess. Reserved host pages contribute pressure so active and pending
  * prefetches cannot be ignored.
  */
-void HiCacheState::enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                         uint64_t requested_pages) {
+void HiCacheState::enforce_host_capacity(const HiCacheFact & fact, ScopedState & scope, uint64_t requested_pages) {
     const auto capacity = policy_.l2_capacity_pages();
     if (capacity == 0) return;
     const auto budget_reason = requested_pages > 0 ? "host_allocation_request_budget" : "host_capacity_budget";
@@ -264,7 +168,7 @@ void HiCacheState::enforce_host_capacity(const HiCacheFact & fact, HiCacheSummar
             .reason = loop_reason,
         });
         if (!victim) break;
-        const auto victim_pages = evict_host_node(fact, summary, transitions, scope, *victim);
+        const auto victim_pages = evict_host_node(fact, scope, *victim);
         if (victim_pages == 0) break;
         if (victim_pages >= target) break;
         target -= victim_pages;
@@ -277,9 +181,7 @@ void HiCacheState::enforce_host_capacity(const HiCacheFact & fact, HiCacheSummar
  * Prefetch permits truncation for best-effort threshold-sized prefixes. Write backup
  * rejects truncation because partial backup would violate node-level residency semantics.
  */
-HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary,
-                                                                         HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                                                         const HostAllocationRequest & request) {
+HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const HiCacheFact & fact, ScopedState & scope, const HostAllocationRequest & request) {
     auto result = HostAllocationResult{
         .requested_pages = request.requested_pages,
         .capacity_pages = policy_.l2_capacity_pages(),
@@ -294,7 +196,7 @@ HiCacheState::HostAllocationResult HiCacheState::request_host_allocation(const H
         return result;
     }
 
-    enforce_host_capacity(fact, summary, transitions, scope, request.requested_pages);
+    enforce_host_capacity(fact, scope, request.requested_pages);
     sync_capacity(scope, normalized_scope(fact), {}, std::string(request.reason) + "_host_allocation_post_cleanup");
     const auto snapshot = scope.capacity.snapshot();
     result.occupied_pages = snapshot.occupied_host_pages;

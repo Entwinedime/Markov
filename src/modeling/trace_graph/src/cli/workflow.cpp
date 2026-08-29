@@ -20,13 +20,10 @@
 #include "markov/trace_graph/frontend/trace_normalizer.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
+#include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <algorithm>
-#ifdef DEBUG
-#include <chrono>
-#include <nlohmann/json.hpp>
-#endif
 #include <future>
 #include <limits>
 #include <stdexcept>
@@ -42,135 +39,24 @@ using core::DagGraph;
 
 #ifdef DEBUG
 
-using Json = nlohmann::json;
-
-uint64_t elapsed_ms(std::chrono::steady_clock::time_point start, std::chrono::steady_clock::time_point end) {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+void set_observed_e2e_time(DagGraph & graph) {
+    uint64_t real_min = 0;
+    uint64_t real_max = 0;
+    bool has_real_time = false;
+    for (const auto & node : graph.nodes()) {
+        const auto & event = graph.event_for_node(node.id);
+        if (!has_real_time || event.ts < real_min) real_min = event.ts;
+        real_max = std::max(real_max, core::checked_add_u64(event.ts, event.dur, "trace timestamp overflow while measuring observed E2E"));
+        has_real_time = true;
+    }
+    graph.set_real_e2e_time(has_real_time && real_max > real_min ? real_max - real_min : 0);
 }
-
-Json build_timings_json(const DagBuilder::BuildTimings & timings) {
-    return Json{
-        {     "normalize_ms",     timings.normalize_ms },
-        {  "create_nodes_ms",  timings.create_nodes_ms },
-        {   "correlation_ms",   timings.correlation_ms },
-        {    "sequential_ms",    timings.sequential_ms },
-        {    "event_wait_ms",    timings.event_wait_ms },
-        {   "notify_wait_ms",   timings.notify_wait_ms },
-        { "model_execute_ms", timings.model_execute_ms },
-        {   "stream_sync_ms",   timings.stream_sync_ms },
-        {    "event_sync_ms",    timings.event_sync_ms },
-        {   "device_sync_ms",   timings.device_sync_ms },
-        {      "finalize_ms",      timings.finalize_ms },
-        {      "real_e2e_ms",      timings.real_e2e_ms },
-    };
-}
-
-class WorkflowDiagnostics {
-public:
-    template <typename Function> auto measure(const char * name, Function && function) {
-        const auto start = std::chrono::steady_clock::now();
-        auto value = std::forward<Function>(function)();
-        timings_[name] = elapsed_ms(start, std::chrono::steady_clock::now());
-        return value;
-    }
-
-    template <typename Function> void measure_void(const char * name, Function && function) {
-        const auto start = std::chrono::steady_clock::now();
-        std::forward<Function>(function)();
-        timings_[name] = elapsed_ms(start, std::chrono::steady_clock::now());
-    }
-
-    void begin_graph_build(size_t input_count) {
-        build_started_at_ = std::chrono::steady_clock::now();
-        build_inputs_ = Json::array();
-        for (size_t index = 0; index < input_count; ++index) build_inputs_.push_back(Json::object());
-    }
-
-    void record_graph_build(size_t index, uint64_t worker_ms, const DagBuilder::BuildTimings & timings) {
-        build_worker_ms_sum_ = core::checked_add_u64(build_worker_ms_sum_, worker_ms, "DAG build worker time exceeds uint64 range");
-        build_inputs_[index] = build_timings_json(timings);
-    }
-
-    void finish_graph_build() {
-        timings_["build_ms"] = elapsed_ms(build_started_at_, std::chrono::steady_clock::now());
-        timings_["build_worker_ms_sum"] = build_worker_ms_sum_;
-        timings_["build_inputs"] = std::move(build_inputs_);
-    }
-
-    void record_trace_reads(const std::vector<io::ManifestTraceInput> & inputs) {
-        Json files = Json::array();
-        uint64_t file_bytes = 0;
-        uint64_t event_count = 0;
-        uint64_t file_read_ms_sum = 0;
-        uint64_t parse_ms_sum = 0;
-        uint64_t partition_ms_sum = 0;
-        uint64_t finalize_ms_sum = 0;
-        uint64_t file_total_ms_sum = 0;
-        uint64_t file_total_ms_max = 0;
-        for (const auto & input : inputs) {
-            for (const auto & timing : input.trace_read_timings) {
-                file_bytes = core::checked_add_u64(file_bytes, timing.file_bytes, "Trace input byte count exceeds uint64 range");
-                event_count = core::checked_add_u64(event_count, timing.event_count, "Trace input event count exceeds uint64 range");
-                file_read_ms_sum = core::checked_add_u64(file_read_ms_sum, timing.file_read_ms, "Trace read worker time exceeds uint64 range");
-                parse_ms_sum = core::checked_add_u64(parse_ms_sum, timing.parse_ms, "Trace parse worker time exceeds uint64 range");
-                partition_ms_sum = core::checked_add_u64(partition_ms_sum, timing.partition_ms, "Trace partition worker time exceeds uint64 range");
-                finalize_ms_sum = core::checked_add_u64(finalize_ms_sum, timing.finalize_ms, "Trace finalize worker time exceeds uint64 range");
-                file_total_ms_sum = core::checked_add_u64(file_total_ms_sum, timing.total_ms, "Trace file worker time exceeds uint64 range");
-                file_total_ms_max = std::max(file_total_ms_max, timing.total_ms);
-                files.push_back(Json{
-                    {          "filename",          timing.filename },
-                    {           "channel",           timing.channel },
-                    {        "file_bytes",        timing.file_bytes },
-                    {       "event_count",       timing.event_count },
-                    { "requested_threads", timing.requested_threads },
-                    {   "read_partitions",   timing.read_partitions },
-                    {  "parse_partitions",  timing.parse_partitions },
-                    {      "file_read_ms",      timing.file_read_ms },
-                    {         "repair_ms",         timing.repair_ms },
-                    {      "partition_ms",      timing.partition_ms },
-                    {          "parse_ms",          timing.parse_ms },
-                    {       "finalize_ms",       timing.finalize_ms },
-                    {          "total_ms",          timing.total_ms },
-                });
-            }
-        }
-        timings_["trace_io"] = Json{
-            {               "file_count",      files.size() },
-            {               "file_bytes",        file_bytes },
-            {              "event_count",       event_count },
-            {  "file_read_worker_ms_sum",  file_read_ms_sum },
-            {      "parse_worker_ms_sum",      parse_ms_sum },
-            {  "partition_worker_ms_sum",  partition_ms_sum },
-            {   "finalize_worker_ms_sum",   finalize_ms_sum },
-            { "file_total_worker_ms_sum", file_total_ms_sum },
-            { "file_total_worker_ms_max", file_total_ms_max },
-            {                    "files",  std::move(files) },
-        };
-    }
-
-    void set(const char * name, Json value) { timings_[name] = std::move(value); }
-    [[nodiscard]] const Json & timings() const { return timings_; }
-
-private:
-    Json timings_ = Json::object();
-    Json build_inputs_ = Json::array();
-    std::chrono::steady_clock::time_point build_started_at_{};
-    uint64_t build_worker_ms_sum_ = 0;
-};
-
-#else
-
-class WorkflowDiagnostics {};
 
 #endif
 
 struct InputBuildResult {
     size_t index = 0;
     DagGraph graph;
-#ifdef DEBUG
-    uint64_t worker_ms = 0;
-    DagBuilder::BuildTimings timings;
-#endif
 };
 
 /** @brief One independently buildable logical trace and its worker allocation. */
@@ -184,58 +70,25 @@ InputBuildResult build_input_graph(InputBuildRequest request) {
     if (request.index > static_cast<size_t>(std::numeric_limits<int>::max())) throw std::overflow_error("Logical trace input index exceeds GPU ID range");
     frontend::normalize_trace_events(request.input.events);
     DagBuilder builder(request.thread_count);
-#ifdef DEBUG
-    const auto start = std::chrono::steady_clock::now();
-    DagBuilder::BuildTimings timings;
-    auto graph = builder.build_with_timings(std::move(request.input.events), static_cast<int>(request.index), timings);
-    graph.set_input_contracts(std::move(request.input.input_contracts));
-    graph.set_context_events(std::move(request.input.context_events));
-    graph.set_tail_context_events(std::move(request.input.tail_context_events));
-    return InputBuildResult{
-        .index = request.index,
-        .graph = std::move(graph),
-        .worker_ms = elapsed_ms(start, std::chrono::steady_clock::now()),
-        .timings = timings,
-    };
-#else
     auto graph = builder.build(std::move(request.input.events), static_cast<int>(request.index));
+#ifdef DEBUG
+    set_observed_e2e_time(graph);
+#endif
     graph.set_input_contracts(std::move(request.input.input_contracts));
     graph.set_context_events(std::move(request.input.context_events));
+    graph.set_prelude_context_events(std::move(request.input.prelude_context_events));
     graph.set_tail_context_events(std::move(request.input.tail_context_events));
     return InputBuildResult{
         .index = request.index,
         .graph = std::move(graph),
     };
-#endif
 }
 
-std::vector<io::ManifestTraceInput> load_inputs(const CliOptions & options, WorkflowDiagnostics & diagnostics) {
-#ifdef DEBUG
-    auto inputs = diagnostics.measure("read_ms", [&] { return io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input); });
-    diagnostics.record_trace_reads(inputs);
-    return inputs;
-#else
-    (void)diagnostics;
-    return io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
-#endif
-}
-
-std::vector<DagGraph> build_graphs(std::vector<io::ManifestTraceInput> inputs, size_t thread_budget, WorkflowDiagnostics & diagnostics) {
+std::vector<DagGraph> build_graphs(std::vector<io::ManifestTraceInput> inputs, size_t thread_budget) {
     const size_t concurrency = std::max<size_t>(1, std::min(thread_budget, inputs.size()));
     const size_t build_threads = std::max<size_t>(1, thread_budget / concurrency);
     std::vector<DagGraph> graphs(inputs.size());
-#ifdef DEBUG
-    diagnostics.begin_graph_build(inputs.size());
-#else
-    (void)diagnostics;
-#endif
-
-    auto accept_result = [&](InputBuildResult result) {
-        graphs[result.index] = std::move(result.graph);
-#ifdef DEBUG
-        diagnostics.record_graph_build(result.index, result.worker_ms, result.timings);
-#endif
-    };
+    auto accept_result = [&](InputBuildResult result) { graphs[result.index] = std::move(result.graph); };
 
     if (concurrency == 1) {
         for (size_t index = 0; index < inputs.size(); ++index) {
@@ -263,83 +116,52 @@ std::vector<DagGraph> build_graphs(std::vector<io::ManifestTraceInput> inputs, s
             for (auto & future : futures) accept_result(future.get());
         }
     }
-
-#ifdef DEBUG
-    diagnostics.finish_graph_build();
-#endif
     return graphs;
 }
 
-DagGraph merge_graphs(std::vector<DagGraph> graphs, WorkflowDiagnostics & diagnostics) {
-#ifdef DEBUG
-    return diagnostics.measure("merge_ms", [&] { return DagGraph::merge(std::move(graphs)); });
-#else
-    (void)diagnostics;
-    return DagGraph::merge(std::move(graphs));
-#endif
-}
-
-void apply_modules(DagGraph & graph, const ModulePipeline & pipeline, core::Logger & logger, WorkflowDiagnostics & diagnostics) {
-#ifdef DEBUG
-    diagnostics.measure_void("module_ms", [&] { pipeline.apply(graph, logger); });
-#else
-    (void)diagnostics;
-    pipeline.apply(graph, logger);
-#endif
-}
-
-void simulate(DagGraph & graph, WorkflowDiagnostics & diagnostics) {
-#ifdef DEBUG
-    diagnostics.measure_void("simulation_ms", [&] { (void)simulation::run_topological_simulation(graph); });
-#else
-    (void)diagnostics;
+void simulate(DagGraph & graph) {
     (void)simulation::run_topological_simulation(graph);
-#endif
+    (void)simulation::run_control_topological_simulation(graph);
 }
+
+#ifdef DEBUG
+void run_post_simulation_diagnostics(DagGraph & graph, const ModulePipeline & pipeline) {
+    for (const auto & module : pipeline.modules()) {
+        if (auto * patch = dynamic_cast<modules::hicache::HiCacheDagPatchModule *>(module.get())) patch->run_causal_timing_audit(graph);
+    }
+}
+#endif
 
 void write_graph_output(const CliOptions & options, const DagGraph & graph) {
     if (!options.outputs.graph.empty()) io::write_chrome_trace_dag(options.outputs.graph, graph);
 }
 
-#ifdef DEBUG
-void write_debug_outputs(const CliOptions & options, const DagGraph & graph, const ModulePipeline & pipeline, WorkflowDiagnostics & diagnostics) {
-    if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, pipeline.modules());
-    if (options.outputs.dag_analysis_directory.empty()) return;
-
-    const auto artifact_timings = write_dag_analysis_artifacts(options.outputs.dag_analysis_directory, graph, options.trace_input.threads);
-    Json timing_json = Json::object();
-    for (const auto & [name, value] : artifact_timings) timing_json[name] = value;
-    diagnostics.set("dag_analysis_artifacts", std::move(timing_json));
-}
-#endif
-
 } // namespace
 
 int run_workflow(const CliOptions & options, core::Logger & logger) {
-    WorkflowDiagnostics diagnostics;
-    auto modules = ModulePipeline::from_config(options.model_config);
-    auto inputs = load_inputs(options, diagnostics);
-    auto graphs = build_graphs(std::move(inputs), options.trace_input.threads, diagnostics);
-    auto graph = merge_graphs(std::move(graphs), diagnostics);
-
-    try {
-        apply_modules(graph, modules, logger, diagnostics);
-        simulate(graph, diagnostics);
-    }
-    catch (const std::exception & error) {
 #ifdef DEBUG
-        if (!options.outputs.dag_analysis_directory.empty()) { write_dag_failure_artifact(options.outputs.dag_analysis_directory, graph, error, logger); }
+    auto modules = ModulePipeline::from_config(options.model_config, options.hicache_oracle_cost_replay);
+#else
+    auto modules = ModulePipeline::from_config(options.model_config);
 #endif
-        throw;
-    }
+    auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
+    auto graphs = build_graphs(std::move(inputs), options.trace_input.threads);
+    auto graph = DagGraph::merge(std::move(graphs));
+#ifdef DEBUG
+    if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
+#endif
+
+    modules.apply(graph, logger);
+    simulate(graph);
+#ifdef DEBUG
+    run_post_simulation_diagnostics(graph, modules);
+#endif
 
     write_graph_output(options, graph);
 #ifdef DEBUG
-    write_debug_outputs(options, graph, modules, diagnostics);
-    write_run_summary(options.outputs.run_summary, graph, modules.modules(), diagnostics.timings());
-#else
-    write_run_summary(options.outputs.run_summary, graph, modules.modules());
+    if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
+    write_run_summary(options.outputs.run_summary, graph, modules.modules());
     return 0;
 }
 

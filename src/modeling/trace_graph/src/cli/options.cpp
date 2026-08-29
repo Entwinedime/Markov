@@ -27,12 +27,6 @@ size_t positive_size(std::string_view raw, std::string_view option) {
     return static_cast<size_t>(*value);
 }
 
-double nonnegative_double(std::string_view raw, std::string_view option) {
-    const auto value = core::parse_nonnegative_double(raw);
-    if (value) return *value;
-    throw CliUsageError(std::string(option) + " expects a non-negative number");
-}
-
 uint64_t nonnegative_u64(std::string_view raw, std::string_view option) {
     const auto value = core::parse_exact_u64(raw);
     if (value) return *value;
@@ -101,13 +95,6 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         if (argument == "--profile-manifest") options.profile_manifest = next_value(index, argc, argv, argument);
         else if (argument == "--threads") options.trace_input.threads = positive_size(next_value(index, argc, argv, argument), argument);
         else if (argument == "--file-threads") options.trace_input.file_threads = positive_size(next_value(index, argc, argv, argument), argument);
-        else if (argument == "--trace-merge-tolerance-us") {
-            options.trace_input.tolerance_us = nonnegative_double(next_value(index, argc, argv, argument), argument);
-        }
-        else if (argument == "--trace-merge-window") { options.trace_input.search_window = positive_size(next_value(index, argc, argv, argument), argument); }
-        else if (argument == "--trace-merge-margin-us") {
-            options.trace_input.margin_us = nonnegative_double(next_value(index, argc, argv, argument), argument);
-        }
         else if (argument == "--trace-window-start-us") {
             options.trace_input.window_start_us = nonnegative_u64(next_value(index, argc, argv, argument), argument);
         }
@@ -118,12 +105,12 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--graph-output") options.outputs.graph = next_value(index, argc, argv, argument);
         else if (argument == "--model-config") options.model_config = next_value(index, argc, argv, argument);
 #ifdef DEBUG
+        else if (argument == "--actual-e2e-us") { options.actual_e2e_us = nonnegative_u64(next_value(index, argc, argv, argument), argument); }
+        else if (argument == "--hicache-oracle-cost-replay") options.hicache_oracle_cost_replay = next_value(index, argc, argv, argument);
         else if (argument == "--model-summary") options.outputs.model_summary = next_value(index, argc, argv, argument);
-        else if (argument == "--dag-analysis-output-dir") { options.outputs.dag_analysis_directory = next_value(index, argc, argv, argument); }
 #endif
         else if (argument == "--run-summary") options.outputs.run_summary = next_value(index, argc, argv, argument);
         else if (argument == "-d" || argument == "--debug") options.debug_logging = true;
-        else if (argument == "-v" || argument == "--verbose") options.verbose_logging = true;
         else throw CliUsageError("unknown option: " + std::string(argument));
     }
     validate_options(options);
@@ -138,21 +125,19 @@ void print_usage(const char * program) {
               << "  --trace-channels LIST           torch,ld_preload,python_probe; default all\n"
               << "  --threads N                     Total logical input read/build thread budget\n"
               << "  --file-threads N                Per-file JSON parse threads\n"
-              << "  --trace-merge-tolerance-us N    LD/profiler timestamp tolerance\n"
-              << "  --trace-merge-window N          Search candidates on each timestamp side\n"
-              << "  --trace-merge-margin-us N       Standalone custom-event timestamp margin\n\n"
+              << "\n"
               << "  --trace-window-start-us N       Inclusive workload-window start timestamp\n"
               << "  --trace-window-end-us N         Inclusive workload-window end timestamp\n\n"
               << "Model and output:\n"
               << "  --model-config FILE             Optional SimulationModule config\n"
               << "  --graph-output FILE             Optional full DAG Chrome trace\n"
 #ifdef DEBUG
+              << "  --actual-e2e-us N               Explicit workload E2E used by validation\n"
+              << "  --hicache-oracle-cost-replay FILE  Diagnostic target-observed effect costs\n"
               << "  --model-summary FILE            Optional module validation summary\n"
-              << "  --dag-analysis-output-dir DIR   Optional DAG validation artifacts\n"
 #endif
               << "  --run-summary FILE              Required compact run summary\n"
               << "  -d, --debug                     Debug logging\n"
-              << "  -v, --verbose                   Info logging\n"
               << "  -h, --help                      Show this help\n";
 }
 

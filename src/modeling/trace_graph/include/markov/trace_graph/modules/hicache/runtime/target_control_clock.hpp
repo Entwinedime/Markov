@@ -8,9 +8,6 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
-#ifdef DEBUG
-#include <vector>
-#endif
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -20,19 +17,6 @@ namespace markov::trace_graph::modules::hicache::runtime {
  * The target model generates these records to explain state-machine ordering. They never
  * represent source-observed completion.
  */
-#ifdef DEBUG
-struct HiCacheControlBoundary {
-    uint64_t scheduler_epoch = 0;
-    uint64_t boundary_epoch = 0;
-    std::string cache_scope;
-    std::string request_key;
-    std::string kind;
-    std::string source;
-    size_t source_event_index = 0;
-    uint64_t ts = 0;
-    bool terminal = false;
-};
-#endif
 
 /**
  * @brief Central monotonic clock for target-derived HiCache control flow.
@@ -55,22 +39,11 @@ public:
     [[nodiscard]] uint64_t record_fact_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
                                                 size_t source_event_index, uint64_t ts);
 
-#ifdef DEBUG
-    /** @brief Returns all modeled control boundaries. */
-    [[nodiscard]] const std::vector<HiCacheControlBoundary> & boundaries() const { return boundaries_; }
-
-    /** @brief Returns the number of modeled boundaries. */
-    [[nodiscard]] uint64_t boundary_count() const { return boundary_epoch_; }
-#endif
 
 private:
     uint64_t enqueue_epoch_ = 0;
     uint64_t boundary_epoch_ = 0;
     uint64_t operation_epoch_ = 0;
-#ifdef DEBUG
-    uint64_t scheduler_epoch_ = 0;
-    std::vector<HiCacheControlBoundary> boundaries_;
-#endif
 
     [[nodiscard]] uint64_t record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
                                            const std::string & source, size_t source_event_index, uint64_t ts, bool terminal);

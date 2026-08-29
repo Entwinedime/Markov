@@ -169,13 +169,6 @@ void join_custom_trace(std::vector<TraceEvent> & profiler_events, std::vector<Tr
     profiler_events.insert(profiler_events.end(), std::make_move_iterator(custom_events.begin()), std::make_move_iterator(custom_events.end()));
 }
 
-void append_standalone_events(std::vector<TraceEvent> & target, std::vector<TraceEvent> source) {
-    std::erase_if(source, [](const TraceEvent & event) { return !is_standalone_event(event); });
-    const auto offset = target.size();
-    for (size_t index = 0; index < source.size(); ++index) source[index].index = offset + index;
-    target.insert(target.end(), std::make_move_iterator(source.begin()), std::make_move_iterator(source.end()));
-}
-
 void retain_duration_events(std::vector<TraceEvent> & events) {
     std::erase_if(events, [](const TraceEvent & event) { return event.ph != 'X'; });
 }

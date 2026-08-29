@@ -65,21 +65,7 @@ void HiCacheAsyncOperationTable::transition_header(HiCacheOperationHeader & head
     // The lifecycle epoch is a model-local monotonic clock used by effect intents and
     // Debug ordering. It does not represent a source-runtime scheduling tick.
     const auto epoch = core::checked_increment_u64(lifecycle_epoch_, "HiCache operation lifecycle epoch exceeds uint64 range");
-#ifdef DEBUG
-    lifecycle_transitions_.push_back(HiCacheOperationLifecycleTransition{
-        .operation_id = header.operation_id,
-        .kind = header.kind,
-        .from_state = header.state,
-        .to_state = state,
-        .transition_epoch = epoch,
-        .transition_ts = transition_ts,
-        .cache_scope = header.cache_scope,
-        .request_key = header.request_key,
-        .reason = std::string(reason),
-    });
-#else
     (void)reason;
-#endif
     if (state == HiCacheOperationState::Queued && header.enqueue_epoch == 0) header.enqueue_epoch = epoch;
     if (state == HiCacheOperationState::Completed && header.complete_epoch == 0) {
         header.complete_epoch = epoch;
@@ -229,8 +215,8 @@ void HiCacheAsyncOperationTable::set_storage_capacity_gate_pages(const std::stri
 }
 
 void HiCacheAsyncOperationTable::set_storage_consumer_boundary(const std::string & operation_id, uint64_t consumer_epoch, uint64_t consumer_ts,
-                                                               size_t source_node_id, std::optional<size_t> execution_anchor_node_id,
-                                                               size_t source_event_index, std::string source_fact_role, bool source_available) {
+                                                               size_t source_node_id, std::optional<size_t> execution_anchor_node_id, size_t source_event_index,
+                                                               std::string source_fact_role, bool source_available) {
     const auto it = storage_by_id_.find(operation_id);
     if (it == storage_by_id_.end()) throw std::logic_error("Unknown HiCache storage operation: " + operation_id);
     auto & header = it->second.header;
@@ -244,9 +230,29 @@ void HiCacheAsyncOperationTable::set_storage_consumer_boundary(const std::string
     header.consumer_source_available = source_available;
 }
 
+HiCacheStorageOperation * HiCacheAsyncOperationTable::storage_operation(const std::string & operation_id) {
+    const auto it = storage_by_id_.find(operation_id);
+    return it == storage_by_id_.end() ? nullptr : &it->second;
+}
+
+const HiCacheStorageOperation * HiCacheAsyncOperationTable::storage_operation(const std::string & operation_id) const {
+    const auto it = storage_by_id_.find(operation_id);
+    return it == storage_by_id_.end() ? nullptr : &it->second;
+}
+
 std::span<const std::string> HiCacheAsyncOperationTable::operations_for_request(const std::string & request_key) const {
     const auto it = operation_ids_by_request_.find(request_key);
     return it == operation_ids_by_request_.end() ? std::span<const std::string>{} : std::span<const std::string>{ it->second };
+}
+
+void HiCacheAsyncOperationTable::clear_operations_for_window_boundary() {
+    prefetch_by_id_.clear();
+    latest_prefetch_id_by_request_.clear();
+    writeback_by_id_.clear();
+    loadback_by_id_.clear();
+    latest_loadback_id_by_request_.clear();
+    storage_by_id_.clear();
+    operation_ids_by_request_.clear();
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

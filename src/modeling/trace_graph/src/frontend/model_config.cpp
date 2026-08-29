@@ -4,6 +4,8 @@
  */
 #include "markov/trace_graph/frontend/model_config.hpp"
 
+#include "model_config_parse_detail.hpp"
+
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -15,15 +17,16 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <ranges>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace markov::trace_graph::frontend {
 
 namespace model_config_detail {
-
-using Json = nlohmann::json;
 
 Json read_json_file(const std::string & filename) {
     // Model configurations are small; a DOM keeps this boundary strict and readable without
@@ -53,18 +56,21 @@ void require_known_fields(const Json & object, const std::string & context, std:
     }
 }
 
+void require_exact_fields(const Json & object, const std::string & context, std::initializer_list<const char *> required) {
+    require_known_fields(object, context, required);
+    if (object.size() != required.size()) throw std::runtime_error("Model config field '" + context + "' requires every canonical field");
+}
+
 std::string string_value(const Json & object, const std::string & key, const std::string & def) {
-    if (!object.is_object()) return def;
     auto it = object.find(key);
-    if (it == object.end() || it->is_null()) return def;
+    if (it == object.end()) return def;
     if (!it->is_string()) throw std::runtime_error("Model config field '" + key + "' must be a string");
     return it->get<std::string>();
 }
 
 double number_value(const Json & object, const std::string & key, double def) {
-    if (!object.is_object()) return def;
     auto it = object.find(key);
-    if (it == object.end() || it->is_null()) return def;
+    if (it == object.end()) return def;
     std::optional<double> value;
     if (it->is_number()) {
         const auto numeric = it->get<double>();
@@ -76,9 +82,8 @@ double number_value(const Json & object, const std::string & key, double def) {
 }
 
 uint64_t u64_value(const Json & object, const std::string & key, uint64_t def) {
-    if (!object.is_object()) return def;
     auto it = object.find(key);
-    if (it == object.end() || it->is_null()) return def;
+    if (it == object.end()) return def;
     if (it->is_number_unsigned()) return it->get<uint64_t>();
     if (it->is_number_integer()) {
         const auto value = it->get<int64_t>();
@@ -94,9 +99,8 @@ uint64_t u64_value(const Json & object, const std::string & key, uint64_t def) {
 }
 
 bool bool_value(const Json & object, const std::string & key, bool def) {
-    if (!object.is_object()) return def;
     auto it = object.find(key);
-    if (it == object.end() || it->is_null()) return def;
+    if (it == object.end()) return def;
     if (it->is_boolean()) return it->get<bool>();
     if (it->is_string()) {
         auto text = lower(it->get<std::string>());
@@ -107,9 +111,8 @@ bool bool_value(const Json & object, const std::string & key, bool def) {
 }
 
 std::map<std::string, std::string> string_map_value(const Json & object, const std::string & key) {
-    if (!object.is_object()) return {};
     const auto it = object.find(key);
-    if (it == object.end() || it->is_null()) return {};
+    if (it == object.end()) return {};
     if (!it->is_object()) throw std::runtime_error("Model config field '" + key + "' must be an object");
     std::map<std::string, std::string> values;
     for (const auto & [name, value] : it->items()) {
@@ -119,64 +122,27 @@ std::map<std::string, std::string> string_map_value(const Json & object, const s
     return values;
 }
 
-HiCacheIoCostConfig parse_hicache_io_cost(const Json & object) {
-    HiCacheIoCostConfig config;
-    const auto it = object.find("io_cost");
-    if (it == object.end() || it->is_null()) return config;
-    if (!it->is_object()) throw std::runtime_error("Model config field 'hicache.io_cost' must be an object");
-    require_known_fields(*it,
-                         "hicache.io_cost",
-                         { "model_id",
-                           "model_digest",
-                           "calibration_status",
-                           "resource_model",
-                           "device_host_bandwidth_bytes_per_sec",
-                           "host_storage_bandwidth_bytes_per_sec",
-                           "provenance" });
-    if (const auto provenance = it->find("provenance"); provenance != it->end() && !provenance->is_null()) {
-        if (!provenance->is_object()) throw std::runtime_error("Model config field 'hicache.io_cost.provenance' must be an object");
-        require_known_fields(*provenance, "hicache.io_cost.provenance", { "kv_geometry", "device_host_bandwidth", "host_storage_bandwidth" });
-    }
-
-    config.model_id = string_value(*it, "model_id", "");
-    config.model_digest = string_value(*it, "model_digest", "");
-    config.calibration_status = lower(string_value(*it, "calibration_status", ""));
-    config.resource_model = string_value(*it, "resource_model", "");
-    config.device_host_bandwidth_bytes_per_sec = u64_value(*it, "device_host_bandwidth_bytes_per_sec", 0);
-    config.host_storage_bandwidth_bytes_per_sec = u64_value(*it, "host_storage_bandwidth_bytes_per_sec", 0);
-    config.provenance = string_map_value(*it, "provenance");
-    if (!config.resource_model.empty() && config.resource_model != "scope_local_directional_device_host_shared_host_storage_v1") {
-        throw std::runtime_error("Unsupported hicache.io_cost.resource_model: " + config.resource_model);
-    }
-    if (!config.calibration_status.empty() && !is_allowed_policy(config.calibration_status, { "contract_only", "calibrated" })) {
-        throw std::runtime_error("Invalid hicache.io_cost.calibration_status: " + config.calibration_status);
-    }
-    return config;
-}
-
 NodeScaleConfig parse_node_scale(const Json & root) {
-    // Activation is owned by this object; there is no second module registry to reconcile.
     NodeScaleConfig config;
-    auto it = root.find("node_scale");
+    const auto it = root.find("node_scale");
     if (it == root.end() || it->is_null()) return config;
     if (!it->is_object()) throw std::runtime_error("Model config field 'node_scale' must be an object");
 
-    const auto & object = *it;
-    config.enabled = bool_value(object, "enabled", true);
-    auto rules_it = object.find("rules");
-    if (rules_it != object.end() && !rules_it->is_null()) {
-        if (!rules_it->is_array()) throw std::runtime_error("Model config field 'node_scale.rules' must be an array");
-        config.rules.reserve(rules_it->size());
-        for (const auto & item : *rules_it) {
-            if (!item.is_object()) throw std::runtime_error("Each node_scale rule must be an object");
-            NodeScaleRuleConfig rule;
-            rule.id = string_value(item, "id", "");
-            rule.name = string_value(item, "name", "");
-            rule.factor = number_value(item, "factor", 1.0);
-            if (rule.name.empty()) throw std::runtime_error("Each node_scale rule requires a non-empty name");
-            if (rule.factor <= 0.0) throw std::runtime_error("Each node_scale rule requires factor > 0");
-            config.rules.push_back(std::move(rule));
-        }
+    config.enabled = bool_value(*it, "enabled", true);
+    const auto rules = it->find("rules");
+    if (rules == it->end() || rules->is_null()) return config;
+    if (!rules->is_array()) throw std::runtime_error("Model config field 'node_scale.rules' must be an array");
+
+    config.rules.reserve(rules->size());
+    for (const auto & item : *rules) {
+        if (!item.is_object()) throw std::runtime_error("Each node_scale rule must be an object");
+        NodeScaleRuleConfig rule{
+            .name = string_value(item, "name", ""),
+            .factor = number_value(item, "factor", 1.0),
+        };
+        if (rule.name.empty()) throw std::runtime_error("Each node_scale rule requires a non-empty name");
+        if (rule.factor <= 0.0) throw std::runtime_error("Each node_scale rule requires factor > 0");
+        config.rules.push_back(std::move(rule));
     }
     return config;
 }
@@ -220,13 +186,12 @@ HiCacheConfig parse_hicache(const Json & root) {
     }
     const auto disaggregation_mode = lower(string_value(object, "disaggregation_mode", ""));
     config.device_allocator_need_sort = bool_value(object, "device_allocator_need_sort", disaggregation_mode == "decode" || disaggregation_mode == "prefill");
+    config.io_planning = parse_hicache_io_planning(object);
     config.io_cost = parse_hicache_io_cost(object);
-#ifdef DEBUG
-    config.emit_state_digests = bool_value(object, "emit_state_digests", false);
-#endif
     if (const auto dag_patch = object.find("dag_patch"); dag_patch != object.end() && !dag_patch->is_null()) {
         if (!dag_patch->is_object()) throw std::runtime_error("Model config field 'hicache.dag_patch' must be an object");
         config.dag_patch_enabled = bool_value(*dag_patch, "enabled", false);
+        config.dag_patch_source_target_same_config = bool_value(*dag_patch, "source_target_same_config", false);
     }
     return config;
 }
@@ -238,7 +203,7 @@ using model_config_detail::parse_node_scale;
 using model_config_detail::read_json_file;
 
 ModelConfig ModelConfig::from_file(const std::string & filename) {
-    // The backend accepts only this narrow schema, not the complete experiment document.
+    // The backend accepts only this narrow input contract, not the complete experiment document.
     auto root = read_json_file(filename);
     if (!root.is_object()) { throw std::runtime_error("Model config root must be a JSON object: " + filename); }
 

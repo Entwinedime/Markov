@@ -12,7 +12,11 @@
 
 namespace markov::trace_graph::cli {
 
+#ifdef DEBUG
+ModulePipeline ModulePipeline::from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay) {
+#else
 ModulePipeline ModulePipeline::from_config(const std::string & filename) {
+#endif
     ModulePipeline pipeline;
     if (filename.empty()) return pipeline;
 
@@ -22,7 +26,16 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
     if (config.hicache.enabled) {
         auto result = std::make_shared<modules::hicache::model::HiCacheModelResult>();
         pipeline.modules_.push_back(std::make_unique<modules::hicache::HiCacheModule>(config.hicache, result));
-        if (config.hicache.dag_patch_enabled) { pipeline.modules_.push_back(std::make_unique<modules::hicache::HiCacheDagPatchModule>(std::move(result))); }
+        if (config.hicache.dag_patch_enabled) {
+#ifdef DEBUG
+            auto patch = std::make_unique<modules::hicache::HiCacheDagPatchModule>(std::move(result),
+                                                                                   config.hicache.dag_patch_source_target_same_config,
+                                                                                   hicache_oracle_cost_replay);
+#else
+            auto patch = std::make_unique<modules::hicache::HiCacheDagPatchModule>(std::move(result), config.hicache.dag_patch_source_target_same_config);
+#endif
+            pipeline.modules_.push_back(std::move(patch));
+        }
     }
     return pipeline;
 }

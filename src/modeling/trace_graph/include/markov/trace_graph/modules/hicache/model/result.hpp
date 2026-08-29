@@ -5,16 +5,14 @@
 #pragma once
 
 #include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
-#include "markov/trace_graph/modules/hicache/model/summary.hpp"
 
 namespace markov::trace_graph::modules::hicache::model {
 
 struct HiCacheModelResult {
     bool replay_complete = false;
     HiCacheEffectDecisionLedger effect_decisions;
-#ifdef DEBUG
-    HiCacheSummary summary;
-#endif
+    /** Numerical cost fields remain separate from target-derived effects. */
+    frontend::HiCacheIoCostConfig io_cost_model;
 };
 
 } // namespace markov::trace_graph::modules::hicache::model

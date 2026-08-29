@@ -59,6 +59,22 @@ struct DagSetNodeDurationMutation {
     std::string reason{};
 };
 
+/** @brief Changes whether one existing node may independently define business E2E. */
+struct DagSetNodeE2eEligibilityMutation {
+    size_t node_id = 0;
+    bool counts_toward_e2e = true;
+    std::string effect_id{};
+    std::string reason{};
+};
+
+/** @brief Replaces one CPU node's residual sequential gap. */
+struct DagSetCpuGapMutation {
+    size_t node_id = 0;
+    uint64_t duration = 0;
+    std::string effect_id{};
+    std::string reason{};
+};
+
 /**
  * @brief A set of mutations that is validated as one prospective graph before apply.
  *
@@ -67,10 +83,12 @@ struct DagSetNodeDurationMutation {
  * partially modified graph and must abort the enclosing workflow.
  */
 struct DagMutationPlan {
-    std::string plan_id{};
-    std::string effect_id{};
+    /** Semantic model component that owns every mutation in this atomic plan. */
+    std::string component{};
     std::string reason{};
     std::vector<DagSetNodeDurationMutation> set_node_durations{};
+    std::vector<DagSetNodeE2eEligibilityMutation> set_node_e2e_eligibility{};
+    std::vector<DagSetCpuGapMutation> set_cpu_gaps{};
     std::vector<size_t> disable_nodes{};
     std::vector<size_t> disable_edges{};
     std::vector<DagSyntheticNodeMutation> synthetic_nodes{};
@@ -81,25 +99,34 @@ struct DagMutationPlan {
 };
 
 /** @brief Action kinds emitted to the applied-mutation journal. */
-enum class DagMutationAction : std::uint8_t { SetNodeDuration, DisableNode, DisableEdge, AddSyntheticNode, AddEdge, RedirectEdge };
+enum class DagMutationAction : std::uint8_t {
+    SetNodeDuration,
+    SetNodeE2eEligibility,
+    SetCpuGap,
+    DisableNode,
+    DisableEdge,
+    AddSyntheticNode,
+    AddEdge,
+    RedirectEdge,
+};
 
 /** @brief One mutation that materially changed graph storage or activity. */
 struct DagMutationRecord {
     DagMutationAction action = DagMutationAction::DisableNode;
     std::string effect_id{};
-    std::string reason{};
     std::optional<size_t> node_id = std::nullopt;
     std::optional<size_t> edge_index = std::nullopt;
     std::optional<size_t> replaced_edge_index = std::nullopt;
     std::optional<size_t> src = std::nullopt;
     std::optional<size_t> dst = std::nullopt;
-    std::optional<uint64_t> old_duration = std::nullopt;
     std::optional<uint64_t> new_duration = std::nullopt;
+    std::optional<bool> new_counts_toward_e2e = std::nullopt;
+    std::optional<uint64_t> new_cpu_gap = std::nullopt;
 };
 
 /** @brief Active graph counts and concrete actions before and after plan application. */
 struct DagMutationJournal {
-    std::string plan_id{};
+    std::string component{};
     size_t active_nodes_before = 0;
     size_t active_nodes_after = 0;
     size_t active_edges_before = 0;
@@ -144,9 +171,6 @@ public:
 private:
     DagTopologyValidationReport report_;
 };
-
-/** @brief Returns the stable artifact name for a mutation action. */
-[[nodiscard]] std::string dag_mutation_action_name(DagMutationAction action);
 
 /** @brief Validates the current active graph without modifying it. */
 [[nodiscard]] DagTopologyValidationReport validate_active_dag(const DagGraph & graph);

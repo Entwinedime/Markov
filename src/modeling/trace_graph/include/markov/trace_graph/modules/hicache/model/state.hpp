@@ -8,16 +8,12 @@
 #include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
-#include "markov/trace_graph/modules/hicache/model/summary.hpp"
 #include "markov/trace_graph/modules/hicache/policy.hpp"
 #include "markov/trace_graph/modules/hicache/radix/token_radix_tree.hpp"
 #include "markov/trace_graph/modules/hicache/router.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/async_state.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/capacity_index.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/ref_ledger.hpp"
-#ifdef DEBUG
-#include "markov/trace_graph/modules/hicache/runtime/state_index.hpp"
-#endif
 #include "markov/trace_graph/modules/hicache/runtime/target_control_clock.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/token_store.hpp"
@@ -35,22 +31,6 @@ namespace markov::trace_graph::modules::hicache::model {
 using radix::HiCacheHostEvictionResult;
 using radix::HiCacheInsertResult;
 using radix::HiCacheNodeId;
-#ifdef DEBUG
-using radix::HiCacheNodeSplitRecord;
-using runtime::hicache_derived_state_mode_name;
-using runtime::hicache_sorted_vector;
-using runtime::hicache_token_resolution_status_name;
-using runtime::HiCacheCapacityAuditIssue;
-using runtime::HiCacheCapacityMutation;
-using runtime::HiCacheCapacityVictimChoice;
-using runtime::HiCacheControlBoundary;
-using runtime::HiCacheDerivedStateMode;
-using runtime::HiCacheDerivedStateSnapshot;
-using runtime::HiCacheDerivedStateView;
-using runtime::HiCacheOperationLifecycleTransition;
-using runtime::HiCacheRefAuditIssue;
-using runtime::HiCacheRefMutation;
-#endif
 using radix::HiCacheTokenRadixTree;
 using runtime::HiCacheAsyncOperationTable;
 using runtime::HiCacheBatchTokenResolution;
@@ -74,6 +54,14 @@ using runtime::HiCacheTokenResolutionStatus;
 using runtime::HiCacheWritebackOperation;
 using storage::HiCacheStorageDirectory;
 
+/** @brief Structural work performed by one allocator-driven device cleanup pass. */
+struct DeviceCapacityEnforcementResult {
+    uint64_t evicted_node_count = 0;
+    uint64_t evicted_page_count = 0;
+    uint64_t dirty_evicted_node_count = 0;
+    uint64_t dirty_evicted_page_count = 0;
+};
+
 /**
  * @brief Models target HiCache state over one canonical radix tree per scope.
  *
@@ -89,85 +77,15 @@ public:
     /** @brief Registers a future cache-extend fact as the request's prefetch control boundary. */
     void register_prefetch_control_boundary(const HiCacheFact & fact);
 
-    /** @brief Applies one routed fact; only Debug builds populate transition evidence. */
-    void apply_fact(const HiCacheFact & fact, HiCacheFactRole role, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    /** @brief Retains cache residency while resetting request-local provenance at the formal boundary. */
+    void begin_formal_window();
+
+    /** @brief Applies one routed fact; only Debug builds populate internal transition evidence. */
+    void apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bool observe_effects = true);
 
     /** @brief Finalizes pending lifecycles after the last fact in the trace. */
-    void finalize(HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void finalize();
 
-#ifdef DEBUG
-    /** @brief Returns the resolved target policy used by this state machine. */
-    [[nodiscard]] const HiCacheResolvedPolicyState & resolved_policy() const { return policy_.resolved(); }
-
-    /** @brief Derives a final-state snapshot from canonical runtime structures. */
-    [[nodiscard]] HiCacheDerivedStateSnapshot derived_state(HiCacheDerivedStateMode mode = HiCacheDerivedStateMode::MaterializedOnly) const;
-
-    /** @brief Returns the number of owners that still hold lock or host references. */
-    [[nodiscard]] uint64_t active_ref_owner_count() const;
-
-    /** @brief Returns the number of radix-node splits. */
-    [[nodiscard]] uint64_t radix_split_count() const;
-
-    /** @brief Returns structured radix-split audit records across all scopes. */
-    [[nodiscard]] std::vector<HiCacheNodeSplitRecord> radix_split_trace() const;
-
-    /** @brief Returns the number of target-control boundaries observed. */
-    [[nodiscard]] uint64_t control_boundary_count() const;
-
-    /** @brief Returns structured target-control boundary records. */
-    [[nodiscard]] std::vector<HiCacheControlBoundary> control_boundary_trace() const;
-
-    /** @brief Returns the number of asynchronous operation lifecycle transitions. */
-    [[nodiscard]] uint64_t async_lifecycle_transition_count() const;
-
-    /** @brief Returns structured asynchronous lifecycle audit records. */
-    [[nodiscard]] std::vector<HiCacheOperationLifecycleTransition> async_lifecycle_trace() const;
-
-    /** @brief Returns the number of target-policy decisions. */
-    [[nodiscard]] uint64_t policy_decision_count() const;
-
-    /** @brief Returns decisions that explain acceptance, waiting, truncation, and fallback. */
-    [[nodiscard]] const std::vector<HiCachePolicyDecisionRecord> & policy_decision_trace() const { return policy_decisions_; }
-
-    /** @brief Returns the number of pages known to the target storage directory. */
-    [[nodiscard]] uint64_t storage_known_page_count() const;
-
-    /** @brief Returns pages readable by host or device through the storage directory. */
-    [[nodiscard]] uint64_t storage_readable_page_count() const;
-
-    /** @brief Returns readable pages registered in the target backend hash directory. */
-    [[nodiscard]] uint64_t storage_backend_readable_count() const;
-
-    /** @brief Returns storage pages materialized into the host/device radix tree. */
-    [[nodiscard]] uint64_t storage_materialized_page_count() const;
-
-    /** @brief Returns the number of capacity-index mutations. */
-    [[nodiscard]] uint64_t capacity_mutation_count() const;
-
-    /** @brief Returns the number of recorded capacity-victim selections. */
-    [[nodiscard]] uint64_t capacity_victim_choice_count() const;
-
-    /** @brief Returns capacity-index mutation audit records. */
-    [[nodiscard]] std::vector<HiCacheCapacityMutation> capacity_mutation_trace() const;
-
-    /** @brief Returns records explaining each capacity-victim selection. */
-    [[nodiscard]] std::vector<HiCacheCapacityVictimChoice> capacity_victim_choices() const;
-
-    /** @brief Audits consistency between the capacity index and canonical tree. */
-    [[nodiscard]] std::vector<HiCacheCapacityAuditIssue> capacity_audit_issues() const;
-
-    /** @brief Returns the number of reference-ledger mutations. */
-    [[nodiscard]] uint64_t ref_mutation_count() const;
-
-    /** @brief Returns reference-lifecycle mutation audit records. */
-    [[nodiscard]] std::vector<HiCacheRefMutation> ref_mutation_trace() const;
-
-    /** @brief Audits consistency between the reference ledger and canonical tree. */
-    [[nodiscard]] std::vector<HiCacheRefAuditIssue> ref_audit_issues() const;
-
-    /** @brief Produces a stable digest for validation and failure localization. */
-    [[nodiscard]] std::string digest() const;
-#endif
 
     /** @brief Exports one explicit decision for every registered direct-effect opportunity. */
     [[nodiscard]] HiCacheEffectDecisionLedger effect_decision_ledger() const;
@@ -176,6 +94,7 @@ private:
     /** @brief Request-local lifecycle projection that never owns residency state. */
     struct RequestState {
         uint64_t committed_tokens = 0;
+        uint64_t extended_tokens = 0;
         uint64_t kv_allocated_pages = 0;
         uint64_t cache_protected_pages = 0;
         std::vector<std::string> full_pages;
@@ -233,6 +152,9 @@ private:
 
         /** @brief Adds released pages to the projected release queue. */
         uint64_t release(uint64_t pages);
+
+        /** @brief Reconciles allocator availability with committed radix and request ownership. */
+        void reconcile_occupied_pages(uint64_t committed_pages, uint64_t request_owned_pages);
     };
 
     /** @brief Logical target I/O resources whose availability is tracked per scope. */
@@ -252,6 +174,10 @@ private:
         uint64_t host_to_device_lane_available_ts = 0;
         uint64_t device_to_host_lane_available_ts = 0;
         uint64_t host_storage_lane_available_ts = 0;
+        /** Cumulative target-predicted storage reads/writes used for key reuse distance. */
+        uint64_t storage_access_bytes_completed = 0;
+        /** Byte position immediately after the most recent read or write of each page. */
+        std::unordered_map<std::string, uint64_t> storage_page_last_access_end_byte;
     };
 
     /**
@@ -285,11 +211,6 @@ private:
         std::string_view policy;
     };
 
-    /** @brief Semantic identity of one Debug state-transition record. */
-    struct TransitionDescriptor {
-        std::string_view kind;
-        std::string_view tier;
-    };
 
     /** @brief Node and threshold consumed by one hit-count policy update. */
     struct WriteCountRequest {
@@ -307,9 +228,6 @@ private:
     struct PrefetchIoProgressEstimate {
         std::vector<std::string> completed_pages;
         uint64_t completed_byte_count = 0;
-#ifdef DEBUG
-        std::string reason;
-#endif
     };
 
     /**
@@ -331,9 +249,6 @@ private:
         bool io_completed = false;
         bool timed_out = false;
         bool visibility_dependency_required = false;
-#ifdef DEBUG
-        std::string reason;
-#endif
     };
 
     /** @brief Allocation intent for one request in a batch-level cache extend. */
@@ -372,10 +287,8 @@ private:
     std::unordered_map<std::string, std::string> effect_scope_identities_;
     uint64_t effect_opportunity_epoch_ = 0;
     uint64_t effect_scope_epoch_ = 0;
-#ifdef DEBUG
-    uint64_t policy_decision_epoch_ = 0;
-    std::vector<HiCachePolicyDecisionRecord> policy_decisions_;
-#endif
+    bool formal_window_active_ = false;
+    bool formal_boundary_seen_ = false;
 
     /** @brief Normalizes a fact's cache scope, falling back to the configured default. */
     [[nodiscard]] std::string normalized_scope(const HiCacheFact & fact) const;
@@ -395,8 +308,6 @@ private:
     /** @brief Registers the fixed direct-effect opportunities owned by one input fact. */
     void observe_effect_opportunities(const HiCacheFact & fact, HiCacheFactRole role);
 
-    /** @brief Records token-resolution evidence for Debug input-contract diagnostics. */
-    void record_token_resolution(const HiCacheFact & fact, HiCacheSummary & summary, const HiCacheTokenResolution & resolution) const;
 
     /** @brief Projects a resolved token path into target-sized pages. */
     [[nodiscard]] HiCachePagePath page_path_from_resolution(const HiCacheFact & fact, const HiCacheTokenResolution & resolution) const;
@@ -408,15 +319,14 @@ private:
     /** @brief Schedules one target transfer using only projected bytes and its configured bandwidth. */
     [[nodiscard]] HiCacheIoSchedule schedule_target_io(ScopedState & scope, TargetIoLane lane, uint64_t eligibility_ts, uint64_t page_count) const;
     /** @brief Materializes every target prefetch completed by the current global boundary. */
-    void advance_ready_prefetches(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void advance_ready_prefetches(const HiCacheFact & fact);
     /** @brief Binds a transfer-owned prefetch dependency to its canonical cache consumer. */
     void bind_prefetch_consumer_boundary(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op, const std::string & request_key);
     /** @brief Estimates the page prefix whose storage I/O completed by this boundary. */
     [[nodiscard]] PrefetchIoProgressEstimate estimate_prefetch_io_progress(const HiCachePrefetchOperation & op, uint64_t boundary_ts) const;
     /** @brief Resolves target progress and control timing from one source cache-extend boundary. */
     [[nodiscard]] PrefetchProgressEstimate estimate_prefetch_progress(const HiCachePrefetchOperation & op, const HiCacheFact & source_boundary) const;
-    void drain_write_through_backup_refs(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                         const std::string & reason);
+    void drain_write_through_backup_refs(const HiCacheFact & fact, ScopedState & scope, const std::string & reason);
 
     /** @brief Synchronizes tree, reference, and reservation changes into capacity. */
     void sync_capacity(ScopedState & scope, const std::string & cache_scope, const std::vector<HiCacheNodeId> & node_ids, const std::string & reason);
@@ -427,142 +337,99 @@ private:
     /** @brief Synchronizes capacity eligibility after a reference mutation. */
     void sync_capacity_for_ref(ScopedState & scope, const std::string & cache_scope, const HiCacheRefChange & change, const std::string & reason);
 
-    /** @brief Records a target-policy decision under a stable global epoch. */
-    void record_policy_decision(const HiCacheFact & fact, HiCachePolicyDecisionRecord && decision);
-
-    /** @brief Reports at compile time whether row-level Debug evidence is enabled. */
-    [[nodiscard]] static constexpr bool debug_records_enabled() {
-#ifdef DEBUG
-        return true;
-#else
-        return false;
-#endif
-    }
-
-    /** @brief Avoids deriving validation-only state digests in Release builds. */
-    [[nodiscard]] std::string debug_state_digest() const {
-#ifdef DEBUG
-        return digest();
-#else
-        return {};
-#endif
-    }
 
     /** @brief Protects the reusable request prefix described by a cache lookup. */
-    void apply_cache_lookup_input(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void apply_cache_lookup_input(const HiCacheFact & fact);
 
     /** @brief Allocates batch KV pages and updates request ownership at cache extend. */
-    void apply_cache_extend_input(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void apply_cache_extend_input(const HiCacheFact & fact);
 
     /** @brief Resolves every fact-local batch path without request-history fallback. */
-    [[nodiscard]] std::optional<std::vector<HiCacheFact>> resolve_cache_extend_entry_facts(const HiCacheFact & fact, HiCacheSummary & summary,
-                                                                                           const HiCacheBatchTokenResolution & batch_resolution) const;
+    [[nodiscard]] std::optional<std::vector<HiCacheFact>> resolve_cache_extend_entry_facts(const HiCacheFact & fact,
+                                                                                           const HiCacheBatchTokenResolution & batch_resolution);
 
     /** @brief Settles prefetch release ordering before cache-extend side effects. */
-    void prepare_prefetch_before_cache_extend(const std::vector<HiCacheFact> & entry_facts, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                              ScopedState & scope);
+    void prepare_prefetch_before_cache_extend(const std::vector<HiCacheFact> & entry_facts, ScopedState & scope);
 
     /** @brief Drains current-round prefetch release after cache-extend side effects. */
-    void drain_prefetch_after_cache_extend(const std::vector<HiCacheFact> & entry_facts, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                           ScopedState & scope);
+    void drain_prefetch_after_cache_extend(const std::vector<HiCacheFact> & entry_facts, ScopedState & scope);
 
     /** @brief Releases request-local protection at a lifecycle commit boundary. */
-    void apply_cache_lifecycle_commit(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void apply_cache_lifecycle_commit(const HiCacheFact & fact);
 
     /** @brief Starts or advances prefetch state from a candidate anchor. */
-    void apply_prefetch_candidate_anchor(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions);
+    void apply_prefetch_candidate_anchor(const HiCacheFact & fact);
 
     /** @brief Cancels and releases an older active prefetch for the same request. */
-    void suppress_prior_prefetch(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                 const std::string & request_key);
+    void suppress_prior_prefetch(const HiCacheFact & fact, ScopedState & scope, const std::string & request_key);
 
     /** @brief Materializes a completed target prefetch into host radix and storage. */
-    void apply_prefetch_ready(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                              HiCachePrefetchOperation & op);
+    void apply_prefetch_ready(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op);
     /** @brief Cancels a prefetch while retaining its not-yet-drained host reservation. */
-    void cancel_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                         HiCachePrefetchOperation & op, const std::string & transition_kind, HiCachePrefetchState prefetch_state);
+    void cancel_prefetch_pending_release(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op, const std::string & transition_kind,
+                                         HiCachePrefetchState prefetch_state);
     /** @brief Settles the request's active prefetch before cache-extend side effects. */
-    void settle_prefetch_before_cache_extend(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                             const std::string & request_key);
+    void settle_prefetch_before_cache_extend(const HiCacheFact & fact, ScopedState & scope, const std::string & request_key);
     /** @brief Releases terminal-prefetch reservation at an explicit scheduler boundary. */
-    void drain_prefetch_pending_release(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                        const std::string & request_key, const PrefetchReleaseReasons & reasons);
+    void drain_prefetch_pending_release(const HiCacheFact & fact, ScopedState & scope, const std::string & request_key, const PrefetchReleaseReasons & reasons);
 
     /** @brief Updates the request-local committed path and protected-page count. */
     void update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);
 
     /** @brief Inserts a request path into device radix and returns mutation evidence. */
-    [[nodiscard]] HiCacheInsertResult insert_request_path(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                          ScopedState & scope, const std::vector<std::string> & pages);
+    [[nodiscard]] HiCacheInsertResult insert_request_path(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);
+
 
     /** @brief Applies the configured host/storage backup policy to a request path. */
-    void apply_write_count_policy(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                  const std::vector<std::string> & pages);
+    void apply_write_count_policy(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages);
 
-    /** @brief Records why hit-count backup is disabled for the current policy. */
-    void record_write_count_skip(const HiCacheFact & fact, const std::vector<std::string> & pages, const std::string & reason);
 
     /** @brief Increments one device node's hit count and applies threshold backup. */
-    void apply_write_count_to_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                   const WriteCountRequest & request);
+    void apply_write_count_to_node(const HiCacheFact & fact, ScopedState & scope, const WriteCountRequest & request);
 
     /** @brief Enforces target-derived device capacity before allocation. */
-    void enforce_device_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                 uint64_t requested_pages);
+    DeviceCapacityEnforcementResult enforce_device_capacity(const HiCacheFact & fact, ScopedState & scope, uint64_t requested_pages);
 
     /** @brief Enforces target-derived host capacity before insertion or reservation. */
-    void enforce_host_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                               uint64_t requested_pages);
+    void enforce_host_capacity(const HiCacheFact & fact, ScopedState & scope, uint64_t requested_pages);
 
     /** @brief Requests host capacity with caller-selected truncation or rejection. */
-    [[nodiscard]] HostAllocationResult request_host_allocation(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                               ScopedState & scope, const HostAllocationRequest & request);
+    [[nodiscard]] HostAllocationResult request_host_allocation(const HiCacheFact & fact, ScopedState & scope, const HostAllocationRequest & request);
 
     /** @brief Evicts one device node and synchronizes all derived projections. */
-    [[nodiscard]] uint64_t evict_device_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                             HiCacheNodeId node_id);
+    [[nodiscard]] uint64_t evict_device_node(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id);
 
-    /** @brief Records why device eviction does or does not require dirty write-back. */
-    void record_device_eviction_policy(const HiCacheFact & fact, const radix::HiCacheCacheNode & node, bool needs_writeback);
 
     /** @brief Commits and acknowledges one dirty write-back before device eviction. */
-    [[nodiscard]] bool commit_device_eviction_writeback(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                        ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages);
+    [[nodiscard]] bool commit_device_eviction_writeback(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id,
+                                                        const std::vector<std::string> & pages);
 
     /** @brief Removes device residency and releases its allocator pages. */
-    [[nodiscard]] uint64_t release_device_residency(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                    ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages);
+    [[nodiscard]] uint64_t release_device_residency(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id,
+                                                    const std::vector<std::string> & pages);
 
     /** @brief Evicts one host leaf and synchronizes capacity and transition evidence. */
-    [[nodiscard]] uint64_t evict_host_node(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                           HiCacheNodeId node_id);
+    [[nodiscard]] uint64_t evict_host_node(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id);
     /** @brief Marks one host node as backed up and records storage readability. */
-    [[nodiscard]] bool commit_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                          HiCacheNodeId node_id, bool storage_readable);
+    [[nodiscard]] bool commit_host_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, bool storage_readable);
 
     /** @brief Reserves host pages required before a backup can materialize. */
-    [[nodiscard]] bool reserve_host_backup_capacity(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                    ScopedState & scope, const std::vector<std::string> & pages, uint64_t allocation_pages);
+    [[nodiscard]] bool reserve_host_backup_capacity(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages,
+                                                    uint64_t allocation_pages);
 
     /** @brief Starts storage backup lifecycle and acquires its host reference. */
-    [[nodiscard]] std::string begin_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions,
-                                                   ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
+    [[nodiscard]] std::string begin_storage_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
                                                    const std::vector<std::string> & device_to_host_pages);
 
     /** @brief Commits host/storage residency before asynchronous acknowledgement. */
-    void materialize_host_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                 HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_id, bool storage_readable);
+    void materialize_host_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
+                                 const std::string & storage_id, bool storage_readable);
 
     /** @brief Acknowledges storage backup and releases its temporary host reference. */
-    void complete_storage_backup(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                 const std::string & storage_id, const std::vector<std::string> & pages);
+    void complete_storage_backup(const HiCacheFact & fact, ScopedState & scope, const std::string & storage_id, const std::vector<std::string> & pages);
     /** @brief Holds a write-through reference until the next target-control drain. */
-    void hold_write_through_backup_ref(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, ScopedState & scope,
-                                       HiCacheNodeId node_id, const std::vector<std::string> & pages, const std::string & storage_operation_id);
-    /** @brief Emits one Debug-only state transition with optional before/after digests. */
-    void record_transition(const HiCacheFact & fact, HiCacheSummary & summary, HiCacheTransitionBuffer & transitions, const TransitionDescriptor & descriptor,
-                           const std::vector<std::string> & pages, const std::string & before_digest);
+    void hold_write_through_backup_ref(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
+                                       const std::string & storage_operation_id);
 };
 
 /** @brief Runs the HiCache state model and returns effect intents without mutating the DAG. */

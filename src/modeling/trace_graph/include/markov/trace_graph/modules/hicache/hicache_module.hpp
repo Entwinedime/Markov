@@ -37,11 +37,6 @@ public:
     /** @brief Returns the complete effect-decision ledger in Release and Debug builds. */
     [[nodiscard]] const model::HiCacheEffectDecisionLedger & effect_decisions() const { return result_->effect_decisions; }
 
-    /** @brief Returns the diagnostics summary produced by the latest successful apply. */
-#ifdef DEBUG
-    [[nodiscard]] const model::HiCacheSummary & summary() const { return result_->summary; }
-#endif
-
 private:
     frontend::HiCacheConfig config_;
     std::shared_ptr<model::HiCacheModelResult> result_;

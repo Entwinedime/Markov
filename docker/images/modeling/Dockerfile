@@ -28,6 +28,7 @@ RUN apt-get update \
         lld \
         make \
         ninja-build \
+        nlohmann-json3-dev \
         pkg-config \
         python3 \
         python3-pip \

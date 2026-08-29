@@ -91,26 +91,6 @@ struct HiCacheIoSchedule {
     uint64_t ready_ts = 0;
 };
 
-#ifdef DEBUG
-/**
- * @brief Debug record for one operation lifecycle transition.
- *
- * This is the async table's own audit trail. It differs from a HiCache state transition:
- * the latter describes residency/reference mutations, while this record explains how an
- * operation advanced.
- */
-struct HiCacheOperationLifecycleTransition {
-    std::string operation_id;
-    HiCacheOperationKind kind = HiCacheOperationKind::Prefetch;
-    HiCacheOperationState from_state = HiCacheOperationState::Created;
-    HiCacheOperationState to_state = HiCacheOperationState::Created;
-    uint64_t transition_epoch = 0;
-    uint64_t transition_ts = 0;
-    std::string cache_scope;
-    std::string request_key;
-    std::string reason;
-};
-#endif
 
 /**
  * @brief One storage-to-host prefetch operation.
@@ -137,6 +117,23 @@ struct HiCachePrefetchOperation {
     bool timed_out = false;
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
+    /** Target-derived host-pool state immediately before this reservation. */
+    uint64_t host_capacity_pages_at_enqueue = 0;
+    uint64_t host_occupied_pages_at_enqueue = 0;
+    uint64_t host_reserved_pages_at_enqueue = 0;
+    uint64_t active_requested_pages_at_enqueue = 0;
+    /**
+     * Target-derived storage-key recency immediately before the read.
+     *
+     * The distance is measured in bytes read or written after the last modeled
+     * access to each hit page.  Unlike a config/workload label, it can be replayed for
+     * any target geometry and is the relevant state for selecting between the
+     * calibrated warm and cold storage-read curves.
+     */
+    uint64_t storage_reuse_distance_sum_bytes_at_enqueue = 0;
+    uint64_t storage_reuse_distance_max_bytes_at_enqueue = 0;
+    uint64_t storage_reuse_distance_known_pages_at_enqueue = 0;
+    uint64_t storage_reuse_distance_unknown_pages_at_enqueue = 0;
     bool visibility_dependency_required = false;
     HiCachePrefetchState prefetch_state = HiCachePrefetchState::Pending;
 };
@@ -150,13 +147,28 @@ struct HiCacheWritebackOperation {
 struct HiCacheLoadbackOperation {
     HiCacheOperationHeader header;
     HiCacheIoSchedule io_schedule;
+    /** @brief Host-only radix nodes walked and promoted by SGLang load_back(). */
+    uint64_t promoted_node_count = 0;
+    /** @brief Number of allocator-failure eviction/retry cycles predicted before enqueue. */
+    uint64_t allocation_retry_count = 0;
+    uint64_t allocation_retry_evicted_node_count = 0;
+    uint64_t allocation_retry_evicted_page_count = 0;
+    uint64_t allocation_retry_dirty_evicted_node_count = 0;
+    uint64_t allocation_retry_dirty_evicted_page_count = 0;
 };
 
 /** @brief Modeled operation that commits an L2 value to storage. */
 struct HiCacheStorageOperation {
     HiCacheOperationHeader header;
     std::vector<std::string> device_to_host_pages;
+    /** @brief Pages whose host-to-storage submission became visible after D2H ACK. */
+    std::vector<std::string> host_to_storage_pages;
+    /** @brief Submitted pages whose backend keys were already readable at enqueue time. */
+    std::vector<std::string> host_to_storage_existing_pages;
+    /** @brief Submitted pages whose backend keys still required materialization on storage. */
+    std::vector<std::string> host_to_storage_new_pages;
     std::vector<std::string> capacity_gate_pages;
+    HiCacheIoSchedule device_to_host_schedule;
 };
 
 /**
@@ -245,16 +257,18 @@ public:
     /** @brief Returns all storage operations. */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() const { return storage_by_id_; }
 
-#ifdef DEBUG
-    /** @brief Returns the structured lifecycle transition trace. */
-    [[nodiscard]] const std::vector<HiCacheOperationLifecycleTransition> & lifecycle_transitions() const { return lifecycle_transitions_; }
+    /** @brief Returns one mutable storage operation by stable target-derived ID. */
+    [[nodiscard]] HiCacheStorageOperation * storage_operation(const std::string & operation_id);
 
-    /** @brief Returns the lifecycle transition count. */
-    [[nodiscard]] uint64_t lifecycle_transition_count() const { return lifecycle_epoch_; }
-#endif
+    /** @brief Returns one storage operation by stable target-derived ID. */
+    [[nodiscard]] const HiCacheStorageOperation * storage_operation(const std::string & operation_id) const;
+
 
     /** @brief Returns a stable read-only view of prefetch IDs associated with a request. */
     [[nodiscard]] std::span<const std::string> operations_for_request(const std::string & request_key) const;
+
+    /** @brief Drops terminal operation provenance when a new measured window begins. */
+    void clear_operations_for_window_boundary();
 
 private:
     uint64_t lifecycle_epoch_ = 0;
@@ -265,9 +279,6 @@ private:
     std::unordered_map<std::string, std::string> latest_loadback_id_by_request_;
     std::unordered_map<std::string, HiCacheStorageOperation> storage_by_id_;
     std::unordered_map<std::string, std::vector<std::string>> operation_ids_by_request_;
-#ifdef DEBUG
-    std::vector<HiCacheOperationLifecycleTransition> lifecycle_transitions_;
-#endif
 
     /** @brief Adds a prefetch ID to the request reservation-drain index. */
     void index_prefetch(const HiCacheOperationHeader & header);

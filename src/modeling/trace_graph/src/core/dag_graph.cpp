@@ -19,7 +19,7 @@ namespace dag_graph_detail {
 /**
  * @brief Returns the stable user-visible name for an edge kind.
  *
- * Names are lowercase schema values consumed by run summaries and diagnostics.
+ * Names are lowercase output values consumed by run summaries and diagnostics.
  */
 std::string edge_kind_name(DagEdgeKind kind) {
     switch (kind) {
@@ -112,6 +112,7 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
     node.lane_id = intern_lane(lane_key_value);
     node.duration = event.dur;
     node.original_duration = event.dur;
+    node.counts_toward_e2e = event.arg("counts_toward_e2e") != "false";
     nodes_.push_back(node);
     return node_id;
 }
@@ -129,12 +130,14 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     event.pid = std::to_string(gpu_id_);
     event.tid = spec.lane_key;
     event.set_arg("node_kind", "synthetic");
+    event.set_arg("counts_toward_e2e", spec.counts_toward_e2e ? "true" : "false");
     for (const auto & [key, value] : spec.attrs) event.set_arg(key, value);
     events_.push_back(std::move(event));
 
     const auto node_id = add_node(events_.size() - 1, spec.is_cpu, spec.lane_key);
     auto & node = nodes_[node_id];
     node.kind = DagNodeKind::Synthetic;
+    node.counts_toward_e2e = spec.counts_toward_e2e;
     return node_id;
 }
 
@@ -188,6 +191,14 @@ DagNode & DagGraph::mutable_node(size_t node_id) {
 }
 
 void DagGraph::set_node_duration(size_t node_id, uint64_t duration) { mutable_node(node_id).duration = duration; }
+
+void DagGraph::set_node_counts_toward_e2e(size_t node_id, bool value) { mutable_node(node_id).counts_toward_e2e = value; }
+
+void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration) {
+    auto & target = mutable_node(node_id);
+    if (!target.is_cpu) throw std::invalid_argument("CPU gap update requires a CPU node");
+    target.cpu_gap_after = duration;
+}
 
 std::string_view DagGraph::node_lane_key(size_t node_id) const { return lane_key(node(node_id).lane_id); }
 
@@ -301,8 +312,11 @@ private:
         merged_.events_.reserve(total_events_);
         merged_.hicache_fact_events_.reserve(checked_total([](const auto & graph) { return graph.hicache_fact_events_.size(); }, "HiCache fact"));
         merged_.context_events_.reserve(checked_total([](const auto & graph) { return graph.context_events_.size(); }, "context event"));
-        merged_.tail_context_events_.reserve(
-            checked_total([](const auto & graph) { return graph.tail_context_events_.size(); }, "tail context event"));
+        merged_.prelude_context_events_.reserve(
+            checked_total([](const auto & graph) { return graph.prelude_context_events_.size(); }, "prelude context event"));
+        merged_.tail_context_events_.reserve(checked_total([](const auto & graph) { return graph.tail_context_events_.size(); }, "tail context event"));
+        merged_.control_exclusion_intervals_.reserve(
+            checked_total([](const auto & graph) { return graph.control_exclusion_intervals_.size(); }, "control exclusion interval"));
         merged_.reserve(DagGraphCapacity{ .nodes = total_nodes_, .edges = 0 });
     }
 
@@ -321,9 +335,17 @@ private:
             merged_.context_events_.insert(merged_.context_events_.end(),
                                            std::make_move_iterator(graph.context_events_.begin()),
                                            std::make_move_iterator(graph.context_events_.end()));
-            merged_.tail_context_events_.insert(merged_.tail_context_events_.end(),
-                                                std::make_move_iterator(graph.tail_context_events_.begin()),
-                                                std::make_move_iterator(graph.tail_context_events_.end()));
+            for (auto & event : graph.prelude_context_events_) {
+                event.index = merged_.prelude_context_events_.size();
+                merged_.prelude_context_events_.push_back(std::move(event));
+            }
+            for (auto & event : graph.tail_context_events_) {
+                event.index = merged_.tail_context_events_.size();
+                merged_.tail_context_events_.push_back(std::move(event));
+            }
+            merged_.control_exclusion_intervals_.insert(merged_.control_exclusion_intervals_.end(),
+                                                        std::make_move_iterator(graph.control_exclusion_intervals_.begin()),
+                                                        std::make_move_iterator(graph.control_exclusion_intervals_.end()));
             remap_nodes(graph,
                         GraphRelocation{
                             .graph_index = graph_index,

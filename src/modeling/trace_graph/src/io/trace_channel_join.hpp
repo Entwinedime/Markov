@@ -19,9 +19,6 @@ namespace markov::trace_graph::io::detail {
  */
 void join_custom_trace(std::vector<core::TraceEvent> & profiler_events, std::vector<core::TraceEvent> custom_events, const ManifestTraceInputOptions & options);
 
-/** @brief Moves duration events that have no profiler alignment anchor into `target`. */
-void append_standalone_events(std::vector<core::TraceEvent> & target, std::vector<core::TraceEvent> source);
-
 /** @brief Removes metadata after channel joining; `DagBuilder` owns ordering. */
 void retain_duration_events(std::vector<core::TraceEvent> & events);
 

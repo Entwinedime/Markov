@@ -15,7 +15,6 @@ namespace {
 void configure_logging(const markov::trace_graph::cli::CliOptions & options, markov::trace_graph::core::Logger & logger) {
     using markov::trace_graph::core::Logger;
     if (options.debug_logging) logger.set_level(Logger::Debug);
-    else if (options.verbose_logging) logger.set_level(Logger::Info);
     else logger.set_level(Logger::Warn);
 }
 

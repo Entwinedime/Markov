@@ -23,9 +23,6 @@ std::string HiCacheTargetControlClock::next_operation_id(std::string_view kind) 
  * This model-local clock explains causal order and does not represent source scheduling.
  */
 uint64_t HiCacheTargetControlClock::next_enqueue_epoch() {
-#ifdef DEBUG
-    (void)core::checked_increment_u64(scheduler_epoch_, "HiCache scheduler epoch exceeds uint64 range");
-#endif
     return core::checked_increment_u64(enqueue_epoch_, "HiCache enqueue epoch exceeds uint64 range");
 }
 
@@ -48,19 +45,6 @@ uint64_t HiCacheTargetControlClock::record_fact_boundary(const std::string & cac
 uint64_t HiCacheTargetControlClock::record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
                                                     const std::string & source, size_t source_event_index, uint64_t ts, bool terminal) {
     const auto boundary_epoch = core::checked_increment_u64(boundary_epoch_, "HiCache boundary epoch exceeds uint64 range");
-#ifdef DEBUG
-    boundaries_.push_back(HiCacheControlBoundary{
-        .scheduler_epoch = core::checked_increment_u64(scheduler_epoch_, "HiCache scheduler epoch exceeds uint64 range"),
-        .boundary_epoch = boundary_epoch,
-        .cache_scope = cache_scope,
-        .request_key = request_key,
-        .kind = kind,
-        .source = source,
-        .source_event_index = source_event_index,
-        .ts = ts,
-        .terminal = terminal,
-    });
-#else
     (void)cache_scope;
     (void)request_key;
     (void)kind;
@@ -68,7 +52,6 @@ uint64_t HiCacheTargetControlClock::record_boundary(const std::string & cache_sc
     (void)source_event_index;
     (void)ts;
     (void)terminal;
-#endif
     return boundary_epoch;
 }
 

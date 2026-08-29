@@ -87,7 +87,7 @@ struct HiCacheBatchPathEntry {
  * role, phase, and consumer eligibility before target replay.
  */
 struct HiCacheFact {
-    /** @brief Stable semantic-fact identity; legacy inputs may use a graph-node ID. */
+    /** @brief Stable semantic-fact identity from the canonical fact side-table. */
     size_t source_node_id = 0;
     /** @brief Optional executable graph anchor proven for this semantic fact. */
     std::optional<size_t> execution_anchor_node_id = std::nullopt;
@@ -160,8 +160,7 @@ public:
     void observe_token_dictionaries(const core::TraceEvent & event);
 
     /** @brief Parses and normalizes one HiCache event without routing it. */
-    [[nodiscard]] HiCacheFact parse(size_t source_fact_id, const core::TraceEvent & event,
-                                    std::optional<size_t> execution_anchor_node_id = std::nullopt) const;
+    [[nodiscard]] HiCacheFact parse(size_t source_fact_id, const core::TraceEvent & event, std::optional<size_t> execution_anchor_node_id = std::nullopt) const;
 
 private:
     std::unordered_map<std::string, HiCacheTokenPath> token_paths_;

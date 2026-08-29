@@ -30,13 +30,6 @@ struct HiCacheRefOwnerRecord {
     std::vector<HiCacheNodeId> lock_nodes;
     std::vector<HiCacheNodeId> host_nodes;
     bool active = false;
-#ifdef DEBUG
-    std::string owner_kind;
-    std::string request_key;
-    std::string operation_id;
-    uint64_t acquire_epoch = 0;
-    uint64_t release_epoch = 0;
-#endif
 };
 
 /**
@@ -50,57 +43,6 @@ struct HiCacheRefChange {
     std::vector<HiCacheNodeId> affected_nodes;
 };
 
-#ifdef DEBUG
-/**
- * @brief Detailed diagnostic record for one reference acquire, release, or split copy.
- */
-struct HiCacheRefMutation {
-    uint64_t mutation_epoch = 0;
-    std::string cache_scope;
-    std::string action;
-    std::string owner_id;
-    std::string owner_kind;
-    std::string request_key;
-    std::string operation_id;
-    std::string reason;
-    std::vector<HiCacheNodeId> lock_nodes;
-    std::vector<HiCacheNodeId> host_nodes;
-    std::vector<std::string> lock_pages;
-    std::vector<std::string> host_pages;
-    int64_t lock_ref_delta = 0;
-    int64_t host_ref_delta = 0;
-    bool changed = false;
-};
-
-/**
- * @brief One consistency discrepancy between the ledger and radix-node counters.
- */
-struct HiCacheRefAuditIssue {
-    std::string cache_scope;
-    std::string issue;
-    std::string ref_kind;
-    std::string owner_id;
-    HiCacheNodeId node_id = 0;
-    uint64_t ledger_count = 0;
-    uint64_t tree_count = 0;
-    std::vector<std::string> pages;
-};
-
-/**
- * @brief Full Debug audit result for the reference ledger.
- */
-struct HiCacheRefAudit {
-    uint64_t active_owner_count = 0;
-    uint64_t ledger_lock_ref_count = 0;
-    uint64_t ledger_host_ref_count = 0;
-    uint64_t tree_lock_ref_count = 0;
-    uint64_t tree_host_ref_count = 0;
-    std::vector<HiCacheRefAuditIssue> issues;
-
-    /** @brief Returns true when owner chains exactly match radix-node counters. */
-    [[nodiscard]] bool ok() const { return issues.empty(); }
-};
-#endif
 
 /**
  * @brief Owner ledger for HiCache node-level lock and host references.
@@ -126,19 +68,6 @@ public:
     /** @brief Mirrors references copied by radix splits into the owner reverse index. */
     void sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, std::string_view reason);
 
-#ifdef DEBUG
-    /** @brief Returns the detailed reference lifecycle trace. */
-    [[nodiscard]] const std::vector<HiCacheRefMutation> & mutation_trace() const { return mutation_trace_; }
-
-    /** @brief Independently checks owner chains against canonical radix-node counters. */
-    [[nodiscard]] HiCacheRefAudit audit(const HiCacheTokenRadixTree & tree) const;
-
-    /** @brief Returns the number of owners currently holding any reference. */
-    [[nodiscard]] uint64_t active_owner_count() const;
-
-    /** @brief Returns the number of recorded reference mutations. */
-    [[nodiscard]] uint64_t mutation_count() const { return epoch_; }
-#endif
 
 private:
     /** @brief Non-owning diagnostic identity supplied while acquiring an owner record. */
@@ -149,15 +78,8 @@ private:
     };
 
     std::unordered_map<std::string, HiCacheRefOwnerRecord> owners_;
-#ifdef DEBUG
-    uint64_t epoch_ = 0;
-    std::vector<HiCacheRefMutation> mutation_trace_;
-#endif
 
     [[nodiscard]] HiCacheRefOwnerRecord & ensure_owner(const std::string & owner_id, const OwnerMetadata & metadata);
-#ifdef DEBUG
-    [[nodiscard]] static std::vector<std::string> flatten_pages(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & nodes);
-#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

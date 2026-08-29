@@ -10,6 +10,7 @@
 #include <limits>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string_view>
 #include <utility>
 
@@ -26,6 +27,8 @@ struct EffectDescriptor {
 struct OperationEvidence {
     const HiCacheOperationHeader * header = nullptr;
     const std::vector<std::string> * effective_pages = nullptr;
+    const std::vector<std::string> * storage_existing_pages = nullptr;
+    const std::vector<std::string> * storage_new_pages = nullptr;
     std::string state;
     bool dependency_required = false;
 };
@@ -38,7 +41,22 @@ std::vector<EffectDescriptor> descriptors_for_role(HiCacheFactRole role) {
                              .type = HiCacheEffectType::Loadback,
                              .direction = HiCacheTransferDirection::HostToDevice,
                              .resource_lane = "host_to_device_lane",
-                             }
+                             },
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitDeviceToHost,
+                             .direction = HiCacheTransferDirection::DeviceToHost,
+                             .resource_lane = "device_to_host_lane",
+                             },
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitHostToStorage,
+                             .direction = HiCacheTransferDirection::HostToStorage,
+                             .resource_lane = "host_storage_lane",
+                             },
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitCapacityGate,
+                             .direction = HiCacheTransferDirection::None,
+                             .resource_lane = {},
+                             },
         };
     case HiCacheFactRole::PrefetchCandidateAnchor:
         return {
@@ -72,6 +90,23 @@ std::vector<EffectDescriptor> descriptors_for_role(HiCacheFactRole role) {
                              },
         };
     case HiCacheFactRole::CacheExtendInput:
+        return {
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitDeviceToHost,
+                             .direction = HiCacheTransferDirection::DeviceToHost,
+                             .resource_lane = "device_to_host_lane",
+                             },
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitHostToStorage,
+                             .direction = HiCacheTransferDirection::HostToStorage,
+                             .resource_lane = "host_storage_lane",
+                             },
+            EffectDescriptor{
+                             .type = HiCacheEffectType::CommitCapacityGate,
+                             .direction = HiCacheTransferDirection::None,
+                             .resource_lane = {},
+                             },
+        };
     case HiCacheFactRole::Unknown:
         return {};
     }
@@ -164,6 +199,35 @@ std::vector<HiCacheEffectSegment> effective_segments(const HiCacheEffectOpportun
     return segments;
 }
 
+std::string page_identity(std::string_view page_id) {
+    const auto separator = page_id.rfind('|');
+    return separator == std::string_view::npos ? std::string(page_id) : std::string(page_id.substr(separator + 1));
+}
+
+uint64_t opportunity_page_size(const HiCacheEffectOpportunity & opportunity) {
+    if (opportunity.candidate_segments.empty()) return 0;
+    const auto & first = opportunity.candidate_segments.front();
+    return first.token_end >= first.token_begin ? first.token_end - first.token_begin : 0;
+}
+
+std::vector<HiCacheEffectSegment> operation_page_segments(const HiCacheEffectOpportunity & opportunity, const std::vector<std::string> & pages) {
+    const auto page_size = opportunity_page_size(opportunity);
+    if (page_size == 0) return {};
+    std::vector<HiCacheEffectSegment> segments;
+    segments.reserve(pages.size());
+    for (const auto & page : pages) {
+        const auto identity = page_identity(page);
+        segments.push_back(HiCacheEffectSegment{
+            .segment_key = "operation_page:" + identity + ":" + hicache_transfer_direction_name(opportunity.direction),
+            .token_path_id = identity,
+            .token_begin = 0,
+            .token_end = page_size,
+            .target_page_id = page,
+        });
+    }
+    return segments;
+}
+
 std::vector<std::string> unique_pages(const std::vector<OperationEvidence> & evidence) {
     std::vector<std::string> pages;
     std::set<std::string> seen;
@@ -181,7 +245,7 @@ bool operation_is_pending(const HiCacheOperationHeader & header) {
 }
 
 HiCacheTargetEffectState target_state(const HiCacheEffectOpportunity & opportunity, const std::vector<OperationEvidence> & evidence,
-                                      uint64_t effective_page_count) {
+                                      uint64_t effective_page_count, uint64_t candidate_page_count) {
     if (!opportunity.input_ready) return HiCacheTargetEffectState::Unresolved;
     if (evidence.empty()) return HiCacheTargetEffectState::NotRequired;
     if (opportunity.effect_type == HiCacheEffectType::PrefetchVisibility || opportunity.effect_type == HiCacheEffectType::CommitCapacityGate) {
@@ -197,7 +261,7 @@ HiCacheTargetEffectState target_state(const HiCacheEffectOpportunity & opportuni
             return HiCacheTargetEffectState::Deferred;
         return HiCacheTargetEffectState::NotRequired;
     }
-    if (effective_page_count < opportunity.candidate_segments.size()) return HiCacheTargetEffectState::Partial;
+    if (effective_page_count < candidate_page_count) return HiCacheTargetEffectState::Partial;
     return HiCacheTargetEffectState::Required;
 }
 
@@ -307,22 +371,6 @@ HiCacheScheduleSensitivity schedule_sensitivity(HiCacheEffectType type) {
     return HiCacheScheduleSensitivity::ScheduleInvariant;
 }
 
-std::string schedule_sensitivity_reason(HiCacheEffectType type) {
-    switch (type) {
-    case HiCacheEffectType::Loadback:
-        return "loadback presence can change when background prefetch becomes host-visible before a later lookup";
-    case HiCacheEffectType::PrefetchVisibility:
-        return "prefetch blocking depends on whether target I/O is ready at its canonical consumer boundary";
-    case HiCacheEffectType::PrefetchIo:
-        return "payload submission is determined at the candidate boundary by target storage state and policy";
-    case HiCacheEffectType::CommitDeviceToHost:
-    case HiCacheEffectType::CommitHostToStorage:
-    case HiCacheEffectType::CommitCapacityGate:
-        return "commit shape is determined by target write policy and canonical lifecycle state";
-    }
-    return "effect schedule sensitivity is unresolved";
-}
-
 void classify_patch_status(HiCacheEffectDecision & decision, const HiCacheEffectDecisionLedger & ledger) {
     if (decision.target_effect_state == HiCacheTargetEffectState::Deferred || decision.target_effect_state == HiCacheTargetEffectState::Unresolved) {
         decision.patch_status = HiCacheEffectPatchStatus::Deferred;
@@ -338,20 +386,55 @@ void classify_patch_status(HiCacheEffectDecision & decision, const HiCacheEffect
     else decision.not_patchable_reason = "source_attribution_not_evaluated";
 }
 
-template <typename OperationMap, typename Projector>
+template <typename OperationMap, typename Matcher, typename Projector>
 void append_operation_evidence(std::vector<OperationEvidence> & evidence, const OperationMap & operations, const HiCacheEffectOpportunity & opportunity,
-                               Projector projector) {
+                               Matcher matcher, Projector projector) {
     for (const auto & operation : operations | std::views::values) {
-        if (operation.header.source_event_index != opportunity.source_event_index) continue;
+        if (!matcher(operation.header, opportunity)) continue;
         evidence.push_back(projector(operation));
     }
 }
 
-std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity & opportunity, const HiCacheAsyncOperationTable & operations) {
+bool exact_source_fact_match(const HiCacheOperationHeader & header, const HiCacheEffectOpportunity & opportunity) {
+    if (header.source_event_index != opportunity.source_event_index) return false;
+    if (!header.request_id.empty() && !opportunity.request_id_provenance.empty()) return header.request_id == opportunity.request_id_provenance;
+    return true;
+}
+
+bool commit_operation_match(const HiCacheOperationHeader & header, const HiCacheEffectOpportunity & opportunity,
+                            std::span<const HiCacheEffectOpportunity> opportunities) {
+    if (header.cache_scope != opportunity.state_scope_key) return false;
+    const bool has_exact_opportunity = std::ranges::any_of(opportunities, [&](const auto & candidate) {
+        return candidate.effect_type == opportunity.effect_type && candidate.state_scope_key == header.cache_scope
+               && exact_source_fact_match(header, candidate);
+    });
+    if (has_exact_opportunity) return exact_source_fact_match(header, opportunity);
+    if (!header.request_id.empty() && !opportunity.request_id_provenance.empty()) return header.request_id == opportunity.request_id_provenance;
+    if (header.enqueue_ts > opportunity.eligibility_boundary.timestamp_us) return false;
+
+    uint64_t earliest_lifecycle_ts = std::numeric_limits<uint64_t>::max();
+    std::set<std::string_view> earliest_families;
+    for (const auto & candidate : opportunities) {
+        if (candidate.effect_type != HiCacheEffectType::CommitDeviceToHost || candidate.state_scope_key != header.cache_scope
+            || candidate.eligibility_boundary.timestamp_us < header.enqueue_ts)
+            continue;
+        const auto timestamp = candidate.eligibility_boundary.timestamp_us;
+        if (timestamp < earliest_lifecycle_ts) {
+            earliest_lifecycle_ts = timestamp;
+            earliest_families.clear();
+        }
+        if (timestamp == earliest_lifecycle_ts) earliest_families.insert(candidate.effect_family_key);
+    }
+    return earliest_lifecycle_ts == opportunity.eligibility_boundary.timestamp_us && earliest_families.size() == 1
+           && earliest_families.contains(opportunity.effect_family_key);
+}
+
+std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity & opportunity, const HiCacheAsyncOperationTable & operations,
+                                                  std::span<const HiCacheEffectOpportunity> opportunities) {
     std::vector<OperationEvidence> evidence;
     switch (opportunity.effect_type) {
     case HiCacheEffectType::Loadback:
-        append_operation_evidence(evidence, operations.loadback_ops(), opportunity, [](const auto & operation) {
+        append_operation_evidence(evidence, operations.loadback_ops(), opportunity, exact_source_fact_match, [](const auto & operation) {
             return OperationEvidence{
                 .header = &operation.header,
                 .effective_pages = &operation.header.pages,
@@ -360,7 +443,7 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
         });
         break;
     case HiCacheEffectType::PrefetchIo:
-        append_operation_evidence(evidence, operations.prefetch_ops(), opportunity, [](const auto & operation) {
+        append_operation_evidence(evidence, operations.prefetch_ops(), opportunity, exact_source_fact_match, [](const auto & operation) {
             return OperationEvidence{
                 .header = &operation.header,
                 .effective_pages = operation.payload_transfer_issued ? &operation.hit_pages : nullptr,
@@ -369,7 +452,7 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
         });
         break;
     case HiCacheEffectType::PrefetchVisibility:
-        append_operation_evidence(evidence, operations.prefetch_ops(), opportunity, [](const auto & operation) {
+        append_operation_evidence(evidence, operations.prefetch_ops(), opportunity, exact_source_fact_match, [](const auto & operation) {
             return OperationEvidence{
                 .header = &operation.header,
                 .effective_pages = &operation.completed_pages,
@@ -379,35 +462,49 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
         });
         break;
     case HiCacheEffectType::CommitDeviceToHost:
-        append_operation_evidence(evidence, operations.storage_ops(), opportunity, [](const auto & operation) {
-            return OperationEvidence{
-                .header = &operation.header,
-                .effective_pages = &operation.device_to_host_pages,
-                .state = operation_state_name(operation.header.state),
-            };
-        });
+        append_operation_evidence(
+            evidence,
+            operations.storage_ops(),
+            opportunity,
+            [&](const auto & header, const auto & candidate) { return commit_operation_match(header, candidate, opportunities); },
+            [](const auto & operation) {
+                return OperationEvidence{
+                    .header = &operation.header,
+                    .effective_pages = &operation.device_to_host_pages,
+                    .state = operation_state_name(operation.header.state),
+                };
+            });
         break;
     case HiCacheEffectType::CommitHostToStorage:
-        append_operation_evidence(evidence, operations.storage_ops(), opportunity, [](const auto & operation) {
-            return OperationEvidence{
-                .header = &operation.header,
-                .effective_pages = &operation.header.pages,
-                .state = operation_state_name(operation.header.state),
-            };
-        });
+        append_operation_evidence(
+            evidence,
+            operations.storage_ops(),
+            opportunity,
+            [&](const auto & header, const auto & candidate) { return commit_operation_match(header, candidate, opportunities); },
+            [](const auto & operation) {
+                return OperationEvidence{
+                    .header = &operation.header,
+                    .effective_pages = &operation.host_to_storage_pages,
+                    .storage_existing_pages = &operation.host_to_storage_existing_pages,
+                    .storage_new_pages = &operation.host_to_storage_new_pages,
+                    .state = operation_state_name(operation.header.state),
+                };
+            });
         break;
     case HiCacheEffectType::CommitCapacityGate:
-        append_operation_evidence(evidence, operations.storage_ops(), opportunity, [](const auto & operation) {
-            // A released reservation is a DAG gate only when a later in-horizon fact
-            // consumes that capacity. Finalization without a source consumer closes the
-            // temporary runtime reference but creates no causal edge to materialize.
-            return OperationEvidence{
-                .header = &operation.header,
-                .effective_pages = &operation.capacity_gate_pages,
-                .state = operation_state_name(operation.header.state),
-                .dependency_required = !operation.capacity_gate_pages.empty() && operation.header.consumer_source_available,
-            };
-        });
+        append_operation_evidence(
+            evidence,
+            operations.storage_ops(),
+            opportunity,
+            [&](const auto & header, const auto & candidate) { return commit_operation_match(header, candidate, opportunities); },
+            [](const auto & operation) {
+                return OperationEvidence{
+                    .header = &operation.header,
+                    .effective_pages = &operation.capacity_gate_pages,
+                    .state = operation_state_name(operation.header.state),
+                    .dependency_required = false,
+                };
+            });
         break;
     }
     std::ranges::sort(evidence, [](const auto & left, const auto & right) {
@@ -417,11 +514,15 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
 }
 
 HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunity, const HiCacheAsyncOperationTable * operations,
-                                     const HiCacheEffectDecisionLedger & ledger) {
-    const auto evidence = operations == nullptr ? std::vector<OperationEvidence>{} : operation_evidence(opportunity, *operations);
+                                     std::span<const HiCacheEffectOpportunity> opportunities, const HiCacheEffectDecisionLedger & ledger) {
+    const auto evidence = operations == nullptr ? std::vector<OperationEvidence>{} : operation_evidence(opportunity, *operations, opportunities);
     auto pages = unique_pages(evidence);
-    auto segments = effective_segments(opportunity, pages);
-    auto state = target_state(opportunity, evidence, static_cast<uint64_t>(segments.size()));
+    const bool operation_shaped = opportunity.effect_type == HiCacheEffectType::CommitDeviceToHost
+                                  || opportunity.effect_type == HiCacheEffectType::CommitHostToStorage
+                                  || opportunity.effect_type == HiCacheEffectType::CommitCapacityGate;
+    auto segments = operation_shaped ? operation_page_segments(opportunity, pages) : effective_segments(opportunity, pages);
+    auto candidate_segments = operation_shaped ? segments : opportunity.candidate_segments;
+    auto state = target_state(opportunity, evidence, static_cast<uint64_t>(segments.size()), static_cast<uint64_t>(candidate_segments.size()));
     auto completion = completion_boundary(opportunity, evidence);
     HiCacheEffectDecision decision{
         .effect_key = opportunity.opportunity_key,
@@ -430,27 +531,19 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
         .effect_type = opportunity.effect_type,
         .direction = opportunity.direction,
         .cache_scope = opportunity.cache_scope,
-        .source_cache_scope_provenance = opportunity.state_scope_key,
-        .request_identity = opportunity.request_identity,
         .request_id_provenance = opportunity.request_id_provenance,
         .source_fact_role = opportunity.source_fact_role,
         .source_fact_ordinal = opportunity.source_fact_ordinal,
-        .decision_ordinal = opportunity.decision_ordinal,
-        .source_fact_seq_no = opportunity.source_fact_seq_no,
         .source_node_id = opportunity.source_node_id,
         .source_execution_anchor_node_id = opportunity.source_execution_anchor_node_id,
-        .source_event_index = opportunity.source_event_index,
-        .candidate_segments = opportunity.candidate_segments,
+        .candidate_segments = std::move(candidate_segments),
         .effective_segments = std::move(segments),
         .effective_pages = std::move(pages),
-        .candidate_page_count = static_cast<uint64_t>(opportunity.candidate_segments.size()),
         .eligibility_boundary = opportunity.eligibility_boundary,
-        .completion_boundary = completion,
         .consumer_boundary = consumer_boundary(opportunity.effect_type, evidence, completion),
         .resource_lane = opportunity.resource_lane,
         .target_effect_state = state,
         .schedule_sensitivity = schedule_sensitivity(opportunity.effect_type),
-        .schedule_sensitivity_reason = schedule_sensitivity_reason(opportunity.effect_type),
         .reason = decision_reason(state),
     };
     for (const auto & operation : evidence) {
@@ -462,6 +555,42 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
     decision.effective_page_count = static_cast<uint64_t>(decision.effective_segments.size());
     if (decision.direction != HiCacheTransferDirection::None)
         decision.effective_byte_count = projected_bytes(decision.effective_page_count, ledger.kv_bytes_per_page);
+    if (decision.effect_type == HiCacheEffectType::CommitHostToStorage && !decision.effective_pages.empty()) {
+        const std::set<std::string> effective_page_set(decision.effective_pages.begin(), decision.effective_pages.end());
+        std::set<std::string> existing_pages;
+        std::set<std::string> new_pages;
+        for (const auto & operation : evidence) {
+            if (operation.storage_existing_pages != nullptr) {
+                for (const auto & page : *operation.storage_existing_pages)
+                    if (effective_page_set.contains(page)) existing_pages.insert(page);
+            }
+            if (operation.storage_new_pages != nullptr) {
+                for (const auto & page : *operation.storage_new_pages)
+                    if (effective_page_set.contains(page)) new_pages.insert(page);
+            }
+        }
+        decision.storage_existing_page_count = static_cast<uint64_t>(existing_pages.size());
+        decision.storage_new_page_count = static_cast<uint64_t>(new_pages.size());
+        const auto retained_existing_operation_counts = [&] {
+            std::vector<uint64_t> counts;
+            counts.reserve(evidence.size());
+            uint64_t total = 0;
+            for (const auto & operation : evidence) {
+                if (operation.header == nullptr) return std::vector<uint64_t>{};
+                std::set<std::string> operation_pages;
+                if (operation.storage_existing_pages != nullptr) {
+                    for (const auto & page : *operation.storage_existing_pages)
+                        if (effective_page_set.contains(page)) operation_pages.insert(page);
+                }
+                const auto count = static_cast<uint64_t>(operation_pages.size());
+                total = core::checked_add_u64(total, count, "H2S per-operation page count exceeds uint64 range");
+                counts.push_back(count);
+            }
+            if (counts.size() != decision.operation_ids.size() || total != decision.storage_existing_page_count) return std::vector<uint64_t>{};
+            return counts;
+        };
+        decision.storage_existing_operation_page_counts = retained_existing_operation_counts();
+    }
     classify_patch_status(decision, ledger);
     return decision;
 }
@@ -480,235 +609,101 @@ void HiCacheState::observe_effect_opportunities(const HiCacheFact & fact, HiCach
     if (descriptors.empty()) return;
 
     const auto page_size = pager_.page_size_for_fact(fact);
-    HiCacheTokenResolution resolution;
+    auto append_opportunities = [&](const HiCacheFact & opportunity_fact, const HiCacheTokenResolution & resolution) {
+        const auto page_path = page_path_from_resolution(opportunity_fact, resolution);
+        const auto state_scope_key = normalized_scope(opportunity_fact);
+        auto scope_identity = effect_scope_identities_.find(state_scope_key);
+        if (scope_identity == effect_scope_identities_.end()) {
+            const auto scope_ordinal = core::checked_increment_u64(effect_scope_epoch_, "HiCache effect scope ordinal exceeds uint64 range");
+            scope_identity = effect_scope_identities_.emplace(state_scope_key, "scope:" + std::to_string(scope_ordinal)).first;
+        }
+        const auto & scope = scope_identity->second;
+        auto & role_ordinal_counter = effect_fact_ordinals_[scope + "|" + opportunity_fact.role];
+        const auto role_ordinal = core::checked_increment_u64(role_ordinal_counter, "HiCache effect fact ordinal exceeds uint64 range");
+        const auto opportunity_epoch = core::checked_increment_u64(effect_opportunity_epoch_, "HiCache effect opportunity epoch exceeds uint64 range");
+        const auto identity = request_identity(opportunity_fact, role_ordinal);
+
+        uint64_t decision_ordinal = 0;
+        for (const auto & descriptor : descriptors) {
+            effect_opportunities_.push_back(HiCacheEffectOpportunity{
+                .opportunity_key = opportunity_key(descriptor, scope, identity, opportunity_fact.role, role_ordinal, decision_ordinal),
+                .effect_family_key = effect_family_key(scope, identity, opportunity_fact.role, role_ordinal),
+                .effect_type = descriptor.type,
+                .direction = descriptor.direction,
+                .cache_scope = scope,
+                .state_scope_key = state_scope_key,
+                .request_identity = identity,
+                .request_id_provenance = opportunity_fact.request_id,
+                .source_fact_role = opportunity_fact.role,
+                .source_fact_ordinal = role_ordinal,
+                .decision_ordinal = decision_ordinal,
+                .source_fact_seq_no = opportunity_fact.seq_no,
+                .source_node_id = opportunity_fact.source_node_id,
+                .source_execution_anchor_node_id = opportunity_fact.execution_anchor_node_id,
+                .source_event_index = opportunity_fact.source_event_index,
+                .input_ready = resolution.ok() && opportunity_fact.full_path_span.valid,
+                .eligibility_boundary =
+                    HiCacheEffectBoundary{
+                                          .kind = "source_fact_eligibility",
+                                          .epoch = opportunity_epoch,
+                                          .timestamp_us = opportunity_fact.ts,
+                                          },
+                .resource_lane = std::string(descriptor.resource_lane),
+                .candidate_segments = effect_segments(opportunity_fact, page_path, descriptor.direction),
+            });
+            decision_ordinal = core::checked_add_u64(decision_ordinal, 1, "HiCache decision ordinal exceeds uint64 range");
+        }
+    };
+
     switch (role) {
-    case HiCacheFactRole::CacheLookupInput:
-        resolution = token_directory_.resolve_cache_lookup_path(fact, page_size);
+    case HiCacheFactRole::CacheLookupInput: {
+        const auto resolution = token_directory_.resolve_cache_lookup_path(fact, page_size);
+        append_opportunities(fact, resolution);
         break;
-    case HiCacheFactRole::PrefetchCandidateAnchor:
-        resolution = token_directory_.resolve_prefetch_candidate_path(fact, page_size);
+    }
+    case HiCacheFactRole::PrefetchCandidateAnchor: {
+        const auto resolution = token_directory_.resolve_prefetch_candidate_path(fact, page_size);
+        append_opportunities(fact, resolution);
         break;
-    case HiCacheFactRole::CacheLifecycleCommit:
-        resolution = token_directory_.resolve_cache_lifecycle_commit_path(fact, page_size);
+    }
+    case HiCacheFactRole::CacheLifecycleCommit: {
+        const auto resolution = token_directory_.resolve_cache_lifecycle_commit_path(fact, page_size);
+        append_opportunities(fact, resolution);
         break;
-    case HiCacheFactRole::CacheExtendInput:
+    }
+    case HiCacheFactRole::CacheExtendInput: {
+        const auto batch_resolution = token_directory_.resolve_cache_extend_paths(fact, page_size);
+        for (size_t index = 0; index < fact.batch_paths.size(); ++index) {
+            HiCacheFact entry_fact = fact;
+            const auto & entry = fact.batch_paths[index];
+            entry_fact.request_id = entry.request_id;
+            entry_fact.full_path_span = entry.full_path_span;
+            entry_fact.full_path_tokens = entry.full_path_tokens;
+            entry_fact.token_count = entry.token_count;
+            const auto resolution = index < batch_resolution.entries.size() ? batch_resolution.entries[index] : HiCacheTokenResolution{};
+            append_opportunities(entry_fact, resolution);
+        }
+        break;
+    }
     case HiCacheFactRole::Unknown:
         return;
     }
-
-    const auto page_path = page_path_from_resolution(fact, resolution);
-    const auto state_scope_key = normalized_scope(fact);
-    auto scope_identity = effect_scope_identities_.find(state_scope_key);
-    if (scope_identity == effect_scope_identities_.end()) {
-        const auto scope_ordinal = core::checked_increment_u64(effect_scope_epoch_, "HiCache effect scope ordinal exceeds uint64 range");
-        scope_identity = effect_scope_identities_.emplace(state_scope_key, "scope:" + std::to_string(scope_ordinal)).first;
-    }
-    const auto & scope = scope_identity->second;
-    auto & role_ordinal_counter = effect_fact_ordinals_[scope + "|" + fact.role];
-    const auto role_ordinal = core::checked_increment_u64(role_ordinal_counter, "HiCache effect fact ordinal exceeds uint64 range");
-    const auto opportunity_epoch = core::checked_increment_u64(effect_opportunity_epoch_, "HiCache effect opportunity epoch exceeds uint64 range");
-    const auto identity = request_identity(fact, role_ordinal);
-
-    uint64_t decision_ordinal = 0;
-    for (const auto & descriptor : descriptors) {
-        effect_opportunities_.push_back(HiCacheEffectOpportunity{
-            .opportunity_key = opportunity_key(descriptor, scope, identity, fact.role, role_ordinal, decision_ordinal),
-            .effect_family_key = effect_family_key(scope, identity, fact.role, role_ordinal),
-            .effect_type = descriptor.type,
-            .direction = descriptor.direction,
-            .cache_scope = scope,
-            .state_scope_key = state_scope_key,
-            .request_identity = identity,
-            .request_id_provenance = fact.request_id,
-            .source_fact_role = fact.role,
-            .source_fact_ordinal = role_ordinal,
-            .decision_ordinal = decision_ordinal,
-            .source_fact_seq_no = fact.seq_no,
-            .source_node_id = fact.source_node_id,
-            .source_execution_anchor_node_id = fact.execution_anchor_node_id,
-            .source_event_index = fact.source_event_index,
-            .input_ready = resolution.ok() && fact.full_path_span.valid,
-            .eligibility_boundary =
-                HiCacheEffectBoundary{
-                                      .kind = "source_fact_eligibility",
-                                      .epoch = opportunity_epoch,
-                                      .timestamp_us = fact.ts,
-                                      },
-            .resource_lane = std::string(descriptor.resource_lane),
-            .candidate_segments = effect_segments(fact, page_path, descriptor.direction),
-        });
-        decision_ordinal = core::checked_add_u64(decision_ordinal, 1, "HiCache decision ordinal exceeds uint64 range");
-    }
-}
-
-uint64_t HiCacheEffectDecisionLedger::patchable_count() const {
-    return static_cast<uint64_t>(
-        std::ranges::count_if(decisions, [](const auto & decision) { return decision.patch_status == HiCacheEffectPatchStatus::Patchable; }));
-}
-
-uint64_t HiCacheEffectDecisionLedger::not_patchable_count() const {
-    return static_cast<uint64_t>(
-        std::ranges::count_if(decisions, [](const auto & decision) { return decision.patch_status == HiCacheEffectPatchStatus::NotPatchable; }));
-}
-
-uint64_t HiCacheEffectDecisionLedger::deferred_count() const {
-    return static_cast<uint64_t>(
-        std::ranges::count_if(decisions, [](const auto & decision) { return decision.patch_status == HiCacheEffectPatchStatus::Deferred; }));
-}
-
-uint64_t HiCacheEffectDecisionLedger::unresolved_count() const {
-    return static_cast<uint64_t>(
-        std::ranges::count_if(decisions, [](const auto & decision) { return decision.target_effect_state == HiCacheTargetEffectState::Unresolved; }));
-}
-
-uint64_t HiCacheEffectDecisionLedger::schedule_sensitive_count() const {
-    return static_cast<uint64_t>(std::ranges::count_if(decisions, [](const auto & decision) {
-        return decision.schedule_sensitivity == HiCacheScheduleSensitivity::ArrivalScheduleSensitive;
-    }));
-}
-
-std::map<std::string, uint64_t> HiCacheEffectDecisionLedger::counts_by_effect_type() const {
-    std::map<std::string, uint64_t> counts;
-    for (const auto & decision : decisions) {
-        auto & count = counts[hicache_effect_type_name(decision.effect_type)];
-        (void)core::checked_increment_u64(count, "HiCache effect type count exceeds uint64 range");
-    }
-    return counts;
-}
-
-std::map<std::string, uint64_t> HiCacheEffectDecisionLedger::counts_by_target_effect_state() const {
-    std::map<std::string, uint64_t> counts;
-    for (const auto & decision : decisions) {
-        auto & count = counts[hicache_target_effect_state_name(decision.target_effect_state)];
-        (void)core::checked_increment_u64(count, "HiCache target effect-state count exceeds uint64 range");
-    }
-    return counts;
-}
-
-std::map<std::string, uint64_t> HiCacheEffectDecisionLedger::counts_by_schedule_sensitivity() const {
-    std::map<std::string, uint64_t> counts;
-    for (const auto & decision : decisions) {
-        auto & count = counts[hicache_schedule_sensitivity_name(decision.schedule_sensitivity)];
-        (void)core::checked_increment_u64(count, "HiCache schedule-sensitivity count exceeds uint64 range");
-    }
-    return counts;
-}
-
-std::map<std::string, uint64_t> HiCacheEffectDecisionLedger::counts_by_source_carrier_state() const {
-    std::map<std::string, uint64_t> counts;
-    for (const auto & decision : decisions) {
-        auto & count = counts[hicache_source_carrier_state_name(decision.source_carrier_state)];
-        (void)core::checked_increment_u64(count, "HiCache source carrier-state count exceeds uint64 range");
-    }
-    return counts;
-}
-
-std::string hicache_effect_type_name(HiCacheEffectType type) {
-    switch (type) {
-    case HiCacheEffectType::Loadback:
-        return "loadback";
-    case HiCacheEffectType::PrefetchIo:
-        return "prefetch_io_operation";
-    case HiCacheEffectType::PrefetchVisibility:
-        return "prefetch_visibility_dependency";
-    case HiCacheEffectType::CommitDeviceToHost:
-        return "commit_device_to_host";
-    case HiCacheEffectType::CommitHostToStorage:
-        return "commit_host_to_storage";
-    case HiCacheEffectType::CommitCapacityGate:
-        return "commit_capacity_gate";
-    }
-    return "unknown";
-}
-
-std::string hicache_transfer_direction_name(HiCacheTransferDirection direction) {
-    switch (direction) {
-    case HiCacheTransferDirection::None:
-        return "none";
-    case HiCacheTransferDirection::StorageToHost:
-        return "storage_to_host";
-    case HiCacheTransferDirection::HostToDevice:
-        return "host_to_device";
-    case HiCacheTransferDirection::DeviceToHost:
-        return "device_to_host";
-    case HiCacheTransferDirection::HostToStorage:
-        return "host_to_storage";
-    }
-    return "unknown";
-}
-
-std::string hicache_effect_patch_status_name(HiCacheEffectPatchStatus status) {
-    switch (status) {
-    case HiCacheEffectPatchStatus::Patchable:
-        return "patchable";
-    case HiCacheEffectPatchStatus::NotPatchable:
-        return "not_patchable";
-    case HiCacheEffectPatchStatus::Deferred:
-        return "deferred";
-    }
-    return "unknown";
-}
-
-std::string hicache_target_effect_state_name(HiCacheTargetEffectState state) {
-    switch (state) {
-    case HiCacheTargetEffectState::Required:
-        return "required";
-    case HiCacheTargetEffectState::NotRequired:
-        return "not_required";
-    case HiCacheTargetEffectState::Partial:
-        return "partial";
-    case HiCacheTargetEffectState::Deferred:
-        return "deferred";
-    case HiCacheTargetEffectState::Unresolved:
-        return "unresolved";
-    }
-    return "unknown";
-}
-
-std::string hicache_schedule_sensitivity_name(HiCacheScheduleSensitivity sensitivity) {
-    switch (sensitivity) {
-    case HiCacheScheduleSensitivity::ScheduleInvariant:
-        return "schedule_invariant";
-    case HiCacheScheduleSensitivity::ArrivalScheduleSensitive:
-        return "arrival_schedule_sensitive";
-    }
-    return "unknown";
-}
-
-std::string hicache_source_carrier_state_name(HiCacheSourceCarrierState state) {
-    switch (state) {
-    case HiCacheSourceCarrierState::NotEvaluated:
-        return "not_evaluated";
-    case HiCacheSourceCarrierState::Present:
-        return "present";
-    case HiCacheSourceCarrierState::Absent:
-        return "absent";
-    case HiCacheSourceCarrierState::Unobservable:
-        return "unobservable";
-    case HiCacheSourceCarrierState::Ambiguous:
-        return "ambiguous";
-    }
-    return "unknown";
 }
 
 HiCacheEffectDecisionLedger HiCacheState::effect_decision_ledger() const {
     HiCacheEffectDecisionLedger ledger;
     ledger.kv_bytes_per_page = config_.kv_bytes_per_page;
+    ledger.l2_capacity_pages = config_.l2_capacity_pages;
+    ledger.l2_capacity_bytes =
+        core::checked_multiply_u64(config_.l2_capacity_pages, config_.kv_bytes_per_page, "HiCache target L2 capacity bytes exceed uint64 range");
     ledger.byte_projection_available = config_.kv_bytes_per_page > 0;
     ledger.byte_projection_source = ledger.byte_projection_available ? "target_config.kv_bytes_per_page" : "missing";
-    ledger.io_model_id = config_.io_cost.model_id;
-    ledger.io_model_digest = config_.io_cost.model_digest;
-    ledger.io_model_calibration_status = config_.io_cost.calibration_status;
-    ledger.resource_model = config_.io_cost.resource_model;
-    ledger.device_host_bandwidth_bytes_per_sec = config_.io_cost.device_host_bandwidth_bytes_per_sec;
-    ledger.host_storage_bandwidth_bytes_per_sec = config_.io_cost.host_storage_bandwidth_bytes_per_sec;
-    ledger.io_model_provenance = config_.io_cost.provenance;
     ledger.decisions.reserve(effect_opportunities_.size());
 
     for (const auto & opportunity : effect_opportunities_) {
         const auto scope = scopes_.find(opportunity.state_scope_key);
         const auto * operations = scope == scopes_.end() ? nullptr : &scope->second.async_ops;
-        ledger.decisions.push_back(build_decision(opportunity, operations, ledger));
+        ledger.decisions.push_back(build_decision(opportunity, operations, effect_opportunities_, ledger));
     }
     std::ranges::sort(ledger.decisions, [](const auto & left, const auto & right) {
         if (left.eligibility_boundary.epoch != right.eligibility_boundary.epoch) return left.eligibility_boundary.epoch < right.eligibility_boundary.epoch;

@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief HiCache state-model fact routing and schema gates.
+ * @brief HiCache state-model fact routing and input gates.
  */
 #include "markov/trace_graph/modules/hicache/router.hpp"
 

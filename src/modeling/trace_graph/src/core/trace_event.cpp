@@ -316,6 +316,8 @@ TraceEvent::TraceEvent(const TraceEvent & other)
       ph(other.ph),
       ts(other.ts),
       dur(other.dur),
+      ts_submicro_ns(other.ts_submicro_ns),
+      dur_submicro_ns(other.dur_submicro_ns),
       pid(other.pid),
       tid(other.tid),
       args_materialized_(other.args_materialized_),
@@ -338,6 +340,8 @@ TraceEvent & TraceEvent::operator=(const TraceEvent & other) {
     ph = other.ph;
     ts = other.ts;
     dur = other.dur;
+    ts_submicro_ns = other.ts_submicro_ns;
+    dur_submicro_ns = other.dur_submicro_ns;
     pid = other.pid;
     tid = other.tid;
     args_materialized_ = other.args_materialized_;
@@ -435,7 +439,7 @@ void TraceEvent::set_arg(std::string_view key, std::string_view value) {
     }
 }
 
-void TraceEvent::freeze_arg_overrides() {
+void TraceEvent::commit_arg_overrides() {
     if (!arg_overrides_ || arg_overrides_->empty()) {
         arg_overrides_.reset();
         return;
@@ -474,7 +478,7 @@ void TraceEvent::append_arg_layers_from(const TraceEvent & other) {
 
 void TraceEvent::merge_args_from(const TraceEvent & other) {
     if (!args_materialized_) {
-        freeze_arg_overrides();
+        commit_arg_overrides();
         append_arg_layers_from(other);
         return;
     }

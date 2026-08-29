@@ -30,7 +30,7 @@ enum class HiCacheFactRole : std::uint8_t {
  *
  * `model_fact` means the catalog declared `hicache_state_model` as a consumer.
  * `known_role` means class, role, and phase belong to the active whitelist. Keeping them
- * separate distinguishes unrelated facts from schema drift in intended model inputs.
+ * separate distinguishes unrelated facts from malformed intended model inputs.
  */
 struct HiCacheFactRoute {
     bool model_fact = false;

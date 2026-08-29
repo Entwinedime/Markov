@@ -73,19 +73,6 @@ void extend_lookup_prefixes(HiCachePathLookup & result, const HiCacheCacheNode &
     else state.visible_open = false;
 }
 
-#ifdef DEBUG
-std::string page_hash_from_id(const std::string & page_id) {
-    const auto delimiter = page_id.find('|');
-    if (delimiter == std::string::npos) return page_id;
-    return page_id.substr(delimiter + 1);
-}
-
-std::string page_scope_from_id(const std::string & page_id) {
-    const auto delimiter = page_id.find('|');
-    if (delimiter == std::string::npos) return "-1";
-    return page_id.substr(0, delimiter);
-}
-#endif
 
 } // namespace token_radix_tree_detail
 
@@ -94,10 +81,6 @@ using token_radix_tree_detail::common_prefix_size;
 using token_radix_tree_detail::extend_lookup_prefixes;
 using token_radix_tree_detail::has_host_backup;
 using token_radix_tree_detail::LookupPrefixState;
-#ifdef DEBUG
-using token_radix_tree_detail::page_hash_from_id;
-using token_radix_tree_detail::page_scope_from_id;
-#endif
 using token_radix_tree_detail::slice_pages;
 using token_radix_tree_detail::suffix_pages;
 
@@ -135,7 +118,7 @@ std::optional<HiCacheNodeId> HiCacheTokenRadixTree::node_for_page(const std::str
 
 const std::vector<std::string> & HiCacheTokenRadixTree::node_pages(HiCacheNodeId node_id) const {
     const auto * current = node(node_id);
-    if (current == nullptr) throw std::out_of_range("HiCache radix node is missing or inactive");
+    if (current == nullptr) throw std::out_of_range("HiCache radix node is missing or inactive: node_id=" + std::to_string(node_id));
     return current->pages;
 }
 
@@ -156,58 +139,6 @@ std::vector<std::string> HiCacheTokenRadixTree::flattened_pages(HiCacheNodeId te
     return pages;
 }
 
-#ifdef DEBUG
-void HiCacheTokenRadixTree::observe_page_path(const HiCachePagePath & path) {
-    /**
-     * @brief Retains projection metadata only for split diagnostics.
-     *
-     * Residency remains canonical on radix nodes; this map only reconstructs token
-     * spans and storage keys for Debug evidence.
-     */
-    std::ranges::for_each(path.pages, [&](const auto & page) { page_projection_[page.id] = page; });
-}
-
-HiCacheNodeSplitProjection HiCacheTokenRadixTree::split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const {
-    /**
-     * @brief Preserves source token/page explanation across a radix split.
-     *
-     * Missing projection metadata still yields page hashes, while explicitly marking
-     * the source token span as unknown.
-     */
-    HiCacheNodeSplitProjection projection{
-        .depth_page_begin = depth_page_begin,
-        .depth_page_end = core::checked_add_u64(depth_page_begin, static_cast<uint64_t>(pages.size()), "HiCache split depth overflow"),
-    };
-    projection.page_hashes.reserve(pages.size());
-    projection.storage_keys.reserve(pages.size());
-
-    std::optional<uint64_t> token_begin;
-    std::optional<uint64_t> token_end;
-    bool all_token_spans_known = !pages.empty();
-    for (const auto & page : pages) {
-        if (const auto it = page_projection_.find(page); it != page_projection_.end()) {
-            projection.page_hashes.push_back(it->second.hash.empty() ? page_hash_from_id(page) : it->second.hash);
-            projection.storage_keys.push_back(it->second.cache_scope + "|" + (it->second.hash.empty() ? page_hash_from_id(page) : it->second.hash));
-            token_begin =
-                token_begin ? std::optional<uint64_t>{ std::min(*token_begin, it->second.token_begin) } : std::optional<uint64_t>{ it->second.token_begin };
-            token_end = token_end ? std::optional<uint64_t>{ std::max(*token_end, it->second.token_end) } : std::optional<uint64_t>{ it->second.token_end };
-            all_token_spans_known = all_token_spans_known && it->second.token_end > it->second.token_begin;
-            continue;
-        }
-        const auto scope = page_scope_from_id(page);
-        const auto hash = page_hash_from_id(page);
-        projection.page_hashes.push_back(hash);
-        projection.storage_keys.push_back(scope + "|" + hash);
-        all_token_spans_known = false;
-    }
-    projection.token_span_known = all_token_spans_known && token_begin.has_value() && token_end.has_value();
-    if (projection.token_span_known) {
-        projection.token_begin = *token_begin;
-        projection.token_end = *token_end;
-    }
-    return projection;
-}
-#endif
 
 HiCacheNodeId HiCacheTokenRadixTree::create_child(HiCacheNodeId parent, std::vector<std::string> pages) {
     if (pages.empty()) return parent;
@@ -238,17 +169,6 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(const ChildSplitRequest & reque
 
     const auto prefix = slice_pages(child_pages, 0, split_pages);
     const auto suffix = suffix_pages(child_pages, split_pages);
-#ifdef DEBUG
-    const auto parent_depth_pages = static_cast<uint64_t>(flattened_pages(parent).size());
-    const auto context = HiCacheNodeSplitContext{
-        .parent_child_key = prefix.front(),
-        .suffix_child_key = suffix.front(),
-        .prefix_projection = split_projection(prefix, parent_depth_pages),
-        .suffix_projection =
-            split_projection(suffix,
-                             core::checked_add_u64(parent_depth_pages, static_cast<uint64_t>(prefix.size()), "HiCache split projection depth overflow")),
-    };
-#endif
 
     const HiCacheNodeSplitPolicy policy;
     auto plan = policy.plan(parent,
@@ -258,9 +178,8 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(const ChildSplitRequest & reque
                                 .prefix = prefix,
                                 .suffix = suffix,
                             });
-#ifdef DEBUG
-    policy.attach_debug_record(plan, parent, nodes_[child_id], split_pages, context);
-#endif
+    access_clock_ = core::checked_add_u64(access_clock_, 1, "HiCache radix access clock overflow");
+    plan.prefix_node.last_access_order = access_clock_;
     nodes_.push_back(std::move(plan.prefix_node));
 
     const auto split_id = nodes_.back().id;
@@ -268,10 +187,6 @@ HiCacheNodeId HiCacheTokenRadixTree::split_child(const ChildSplitRequest & reque
     nodes_[split_id].children[suffix.front()] = child_id;
     nodes_[child_id].parent = split_id;
     policy.apply_suffix(nodes_[child_id], plan);
-#ifdef DEBUG
-    split_count_ = core::checked_add_u64(split_count_, 1, "HiCache radix split count overflow");
-    split_history_.push_back(std::move(plan.record));
-#endif
     for (const auto & page : prefix) page_to_node_[page] = split_id;
     for (const auto & page : suffix) page_to_node_[page] = child_id;
     return split_id;
@@ -356,12 +271,14 @@ HiCachePathLookup HiCacheTokenRadixTree::lookup_impl(const std::vector<std::stri
         auto child_id = child_it->second;
         const auto shared = common_prefix_size(nodes_[child_id].pages, pages, matched);
         if (shared == 0) break;
-        if (shared < nodes_[child_id].pages.size()) {
+        const bool split = shared < nodes_[child_id].pages.size();
+        if (split) {
+            if (refresh_access) touch_node(child_id);
             child_id = split_child(ChildSplitRequest{ .parent = current_id, .child = child_id, .split_pages = shared });
         }
         const auto & child_pages = nodes_[child_id].pages;
 
-        if (refresh_access) touch_node(child_id);
+        if (refresh_access && !split) touch_node(child_id);
         append_all(result.topology_pages, child_pages);
         result.topology_chain.push_back(child_id);
         result.terminal_node = child_id;
@@ -553,6 +470,55 @@ void HiCacheTokenRadixTree::remove_device_regular(HiCacheNodeId node_id) {
         current->residency.device_present = false;
         current->residency.device_dirty = false;
     }
+}
+
+HiCacheDeviceEvictionResult HiCacheTokenRadixTree::evict_unbacked_device_leaf(HiCacheNodeId node_id) {
+    auto result = HiCacheDeviceEvictionResult{
+        .node_id = node_id,
+        .pages = {},
+        .affected_nodes = {},
+        .reason = {},
+    };
+    auto * current = mutable_node(node_id);
+    if (current == nullptr || node_id == 0) {
+        result.reason = "missing_or_root_node";
+        result.affected_nodes.push_back(node_id);
+        return result;
+    }
+    result.parent_node = current->parent;
+    result.pages = current->pages;
+    result.affected_nodes = { current->parent };
+    if (!current->residency.device_present) {
+        result.reason = "device_leaf_has_no_device_value";
+        return result;
+    }
+    if (current->residency.host_present) {
+        result.reason = "device_leaf_has_host_backup";
+        return result;
+    }
+    if (current->refs.lock_ref_total > 0 || current->refs.host_ref_total > 0) {
+        result.reason = "device_leaf_reference_protected";
+        return result;
+    }
+    if (!current->children.empty()) {
+        result.reason = "device_leaf_has_active_child";
+        return result;
+    }
+
+    auto * parent = mutable_node(current->parent);
+    if (parent == nullptr || current->pages.empty()) {
+        result.reason = "device_leaf_missing_parent_or_key";
+        return result;
+    }
+    const auto erased = parent->children.erase(current->pages.front());
+    if (erased == 0) {
+        result.reason = "device_leaf_parent_child_missing";
+        return result;
+    }
+    deactivate_subtree(node_id, result.affected_nodes);
+    result.evicted = true;
+    result.reason = "evict_unbacked_device_leaf";
+    return result;
 }
 
 HiCacheHostEvictionResult HiCacheTokenRadixTree::evict_host_leaf(HiCacheNodeId node_id) {

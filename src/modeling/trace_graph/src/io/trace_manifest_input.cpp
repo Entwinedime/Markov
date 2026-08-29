@@ -18,6 +18,8 @@
 #include <ranges>
 #include <regex>
 #include <stdexcept>
+#include <unordered_set>
+#include <utility>
 
 namespace markov::trace_graph::io {
 
@@ -76,17 +78,19 @@ std::string map_repo_path(std::string path) {
 }
 
 std::vector<std::string> existing_paths(const Json & value, std::string_view channel) {
-    if (!value.is_array()) return {};
+    if (!value.is_array()) throw std::runtime_error("profile manifest contains an invalid " + std::string(channel) + " trace file list");
     std::vector<std::string> paths;
     for (const auto & item : value) {
-        std::string raw;
-        if (item.is_object()) {
-            if (item.contains("exists") && item["exists"].is_boolean() && !item["exists"].get<bool>()) continue;
-            if (item.contains("path") && item["path"].is_string()) raw = item["path"].get<std::string>();
+        if (!item.is_object()) throw std::runtime_error("profile manifest contains a non-object " + std::string(channel) + " trace entry");
+        if (item.contains("exists") && (!item["exists"].is_boolean() || !item["exists"].get<bool>())) {
+            throw std::runtime_error("profile manifest declares an unavailable " + std::string(channel) + " trace entry");
         }
-        else if (item.is_string()) raw = item.get<std::string>();
+        if (!item.contains("path") || !item["path"].is_string()) {
+            throw std::runtime_error("profile manifest contains an invalid " + std::string(channel) + " trace path entry");
+        }
+        const auto raw = item["path"].get<std::string>();
         if (raw.empty()) throw std::runtime_error("profile manifest contains an invalid " + std::string(channel) + " trace path entry");
-        auto path = map_repo_path(std::move(raw));
+        auto path = map_repo_path(raw);
         if (!std::filesystem::is_regular_file(path)) {
             throw std::runtime_error("profile manifest declares a missing " + std::string(channel) + " trace file: " + path);
         }
@@ -117,21 +121,21 @@ std::string pid_from_path(const std::string & path) {
     return {};
 }
 
-std::string select_by_pid_or_index(const std::vector<std::string> & paths, const std::string & pid, size_t index) {
-    if (!pid.empty()) {
-        const auto matching = std::ranges::find_if(paths, [&](const auto & path) { return pid_from_path(path) == pid; });
-        if (matching != paths.end()) return *matching;
-    }
-    return index < paths.size() ? paths[index] : std::string{};
+std::string select_by_pid(const std::vector<std::string> & paths, const std::string & pid, std::string_view channel) {
+    if (paths.empty()) return {};
+    if (pid.empty()) throw std::runtime_error("cannot associate " + std::string(channel) + " trace: torch path has no process id");
+    const auto matching = std::ranges::find_if(paths, [&](const auto & path) { return pid_from_path(path) == pid; });
+    if (matching == paths.end()) throw std::runtime_error("profile manifest has no " + std::string(channel) + " trace for torch process " + pid);
+    return *matching;
 }
 
-std::vector<std::string> select_sidecars(const std::vector<std::string> & paths, const std::string & pid, size_t index) {
-    if (!pid.empty()) {
-        auto matching = paths | std::views::filter([&](const auto & path) { return pid_from_path(path) == pid; });
-        std::vector<std::string> selected(matching.begin(), matching.end());
-        if (!selected.empty()) return selected;
-    }
-    return index < paths.size() ? std::vector<std::string>{ paths[index] } : std::vector<std::string>{};
+std::vector<std::string> select_sidecars(const std::vector<std::string> & paths, const std::string & pid) {
+    if (paths.empty()) return {};
+    if (pid.empty()) throw std::runtime_error("cannot associate Python probe trace: torch path has no process id");
+    auto matching = paths | std::views::filter([&](const auto & path) { return pid_from_path(path) == pid; });
+    std::vector<std::string> selected(matching.begin(), matching.end());
+    if (selected.empty()) throw std::runtime_error("profile manifest has no Python probe trace for torch process " + pid);
+    return selected;
 }
 
 TraceReadOptions profiler_read_options(const ManifestTraceInputOptions & options) {
@@ -148,58 +152,20 @@ TraceReadOptions sidecar_read_options(const ManifestTraceInputOptions & options)
     };
 }
 
-#ifdef DEBUG
-std::string_view trace_channel_name(TraceSourceChannel channel) {
-    switch (channel) {
-    case TraceSourceChannel::Torch:
-        return "torch";
-    case TraceSourceChannel::LdPreload:
-        return "ld_preload";
-    case TraceSourceChannel::PythonProbe:
-        return "python_probe";
-    case TraceSourceChannel::Synthetic:
-        return "synthetic";
-    case TraceSourceChannel::Unknown:
-        return "unknown";
-    }
-    return "unknown";
-}
-#endif
-
 struct ChannelTraceRead {
     std::vector<TraceEvent> events;
-#ifdef DEBUG
-    TraceReadTimings timings;
-#endif
 };
 
 ChannelTraceRead read_channel_trace(const std::string & path, const TraceReadOptions & options, TraceSourceChannel channel) {
     ChannelTraceRead result;
-#ifdef DEBUG
-    auto timed = read_chrome_trace_with_timings(path, options);
-    result.events = std::move(timed.events);
-    result.timings = std::move(timed.timings);
-    result.timings.channel = trace_channel_name(channel);
-#else
     result.events = read_chrome_trace(path, options);
-#endif
     for (auto & event : result.events) event.source_channel = channel;
     return result;
-}
-
-void record_trace_read(ManifestTraceInput & input, ChannelTraceRead & read) {
-#ifdef DEBUG
-    input.trace_read_timings.push_back(std::move(read.timings));
-#else
-    (void)input;
-    (void)read;
-#endif
 }
 
 void append_trace_files(ManifestTraceInput & input, const std::vector<std::string> & paths, const TraceReadOptions & options, TraceSourceChannel channel) {
     for (const auto & path : paths) {
         auto read = read_channel_trace(path, options, channel);
-        record_trace_read(input, read);
         const auto offset = input.events.size();
         for (size_t index = 0; index < read.events.size(); ++index) read.events[index].index = offset + index;
         input.events.insert(input.events.end(), std::make_move_iterator(read.events.begin()), std::make_move_iterator(read.events.end()));
@@ -211,22 +177,97 @@ bool token_dictionary_context_event(const TraceEvent & event) {
     return event.has_arg_key_hint("token_dictionary") || event.has_arg_key_hint("token_dictionaries");
 }
 
-bool semantic_tail_context_event(const TraceEvent & event) {
+bool semantic_tail_context_event(const TraceEvent & event) { return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
+
+bool semantic_prelude_context_event(const TraceEvent & event) {
     return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact");
+}
+
+void append_causality_identity(const TraceEvent & event, std::string_view key, std::unordered_set<std::string> & identities) {
+    if (!event.has_arg_key_hint(key)) return;
+    const auto value = event.find_arg(key);
+    if (value && !value->empty()) identities.insert(*value);
+}
+
+bool shares_causality_identity(const TraceEvent & event, std::string_view key, const std::unordered_set<std::string> & identities) {
+    if (!event.has_arg_key_hint(key)) return false;
+    const auto value = event.find_arg(key);
+    return value && identities.contains(*value);
+}
+
+using TimeInterval = std::pair<uint64_t, uint64_t>;
+
+struct ThreadCallInterval {
+    uint64_t start_us = 0;
+    uint64_t end_us = 0;
+    std::string tid;
+};
+
+bool overlaps_tail_context(const TraceEvent & event, const std::vector<TimeInterval> & intervals) {
+    const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
+    return std::ranges::any_of(intervals, [&](const auto & interval) { return event.ts <= interval.second && event_end >= interval.first; });
+}
+
+bool strictly_nested_in_cross_boundary_call(const TraceEvent & event, const std::vector<ThreadCallInterval> & intervals) {
+    if (event.tid.empty() || event.tid == "-1") return false;
+    const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
+    return std::ranges::any_of(intervals, [&](const auto & interval) {
+        return event.tid == interval.tid && event.ts >= interval.start_us && event_end <= interval.end_us;
+    });
+}
+
+void mark_causal_tail(TraceEvent & event, std::unordered_set<std::string> & connection_ids, std::unordered_set<std::string> & correlation_ids) {
+    event.set_arg("formal_window_context", "causal_tail");
+    event.set_arg("counts_toward_e2e", "false");
+    append_causality_identity(event, "connection_id", connection_ids);
+    append_causality_identity(event, "correlation_id", correlation_ids);
 }
 
 void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOptions & options) {
     if (!options.window_start_us || !options.window_end_us) return;
     const auto start = *options.window_start_us;
     const auto end = *options.window_end_us;
+    std::unordered_set<std::string> in_window_connection_ids;
+    std::unordered_set<std::string> in_window_correlation_ids;
+    std::vector<TimeInterval> semantic_tail_intervals;
+    std::vector<ThreadCallInterval> cross_boundary_semantic_calls;
     for (const auto & event : input.events) {
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
         if (event_end < start && token_dictionary_context_event(event)) input.context_events.push_back(event);
-        if (event.ts > end && semantic_tail_context_event(event)) input.tail_context_events.push_back(event);
+        if (event_end < start && semantic_prelude_context_event(event)) input.prelude_context_events.push_back(event);
+        if (event.source_channel == TraceSourceChannel::PythonProbe && semantic_tail_context_event(event) && event.dur > 0 && event.ts <= end && event_end > end
+            && !event.tid.empty() && event.tid != "-1") {
+            cross_boundary_semantic_calls.push_back(ThreadCallInterval{
+                .start_us = event.ts,
+                .end_us = event_end,
+                .tid = event.tid,
+            });
+        }
+        if (event.ts > end && semantic_tail_context_event(event)) {
+            input.tail_context_events.push_back(event);
+            if (event.dur > 0) semantic_tail_intervals.emplace_back(event.ts, event_end);
+        }
+        if (event_end < start || event.ts > end) continue;
+        append_causality_identity(event, "connection_id", in_window_connection_ids);
+        append_causality_identity(event, "correlation_id", in_window_correlation_ids);
+    }
+    for (auto & event : input.events) {
+        if (event.ts <= end) continue;
+        if (event.source_channel != TraceSourceChannel::PythonProbe
+            && (overlaps_tail_context(event, semantic_tail_intervals) || strictly_nested_in_cross_boundary_call(event, cross_boundary_semantic_calls)))
+            mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+    }
+    for (auto & event : input.events) {
+        if (event.ts <= end || event.arg("formal_window_context") == "causal_tail") continue;
+        const bool causal_tail = shares_causality_identity(event, "connection_id", in_window_connection_ids)
+                                 || shares_causality_identity(event, "correlation_id", in_window_correlation_ids);
+        if (!causal_tail) continue;
+        mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
     }
     std::erase_if(input.events, [&](const TraceEvent & event) {
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
-        return event_end < start || event.ts > end;
+        const bool retained_causal_tail = event.arg("formal_window_context") == "causal_tail";
+        return event_end < start || (event.ts > end && !retained_causal_tail);
     });
     for (size_t index = 0; index < input.events.size(); ++index) input.events[index].index = index;
 }
@@ -236,11 +277,9 @@ ManifestTraceInput load_torch_group(const std::string & torch_path, const std::s
     ManifestTraceInput input;
     input.input_contracts = input_contracts;
     auto torch = read_channel_trace(torch_path, profiler_read_options(options), TraceSourceChannel::Torch);
-    record_trace_read(input, torch);
     input.events = std::move(torch.events);
     if (!custom_path.empty()) {
         auto custom = read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
-        record_trace_read(input, custom);
         detail::join_custom_trace(input.events, std::move(custom.events), options);
     }
     append_trace_files(input, sidecar_paths, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
@@ -255,8 +294,9 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
     input.input_contracts = input_contracts;
     for (const auto & path : paths.ld_preload) {
         auto custom = read_channel_trace(path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
-        record_trace_read(input, custom);
-        detail::append_standalone_events(input.events, std::move(custom.events));
+        const auto offset = input.events.size();
+        for (size_t index = 0; index < custom.events.size(); ++index) custom.events[index].index = offset + index;
+        input.events.insert(input.events.end(), std::make_move_iterator(custom.events.begin()), std::make_move_iterator(custom.events.end()));
     }
     append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
@@ -268,8 +308,8 @@ ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::ve
                                       const ManifestTraceInputOptions & options) {
     const auto pid = pid_from_path(paths.torch[index]);
     return load_torch_group(paths.torch[index],
-                            select_by_pid_or_index(paths.ld_preload, pid, index),
-                            select_sidecars(paths.python_probe, pid, index),
+                            select_by_pid(paths.ld_preload, pid, "LD_PRELOAD"),
+                            select_sidecars(paths.python_probe, pid),
                             input_contracts,
                             options);
 }

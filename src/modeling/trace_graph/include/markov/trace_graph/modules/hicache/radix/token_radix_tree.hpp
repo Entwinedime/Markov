@@ -4,9 +4,6 @@
  */
 #pragma once
 
-#ifdef DEBUG
-#include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
-#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -19,10 +16,6 @@
 
 namespace markov::trace_graph::modules::hicache::radix {
 
-#ifdef DEBUG
-using runtime::HiCachePagePath;
-using runtime::HiCacheProjectedPage;
-#endif
 
 using HiCacheNodeId = size_t;
 
@@ -124,40 +117,21 @@ struct HiCacheHostEvictionResult {
     std::string reason;
 };
 
-#ifdef DEBUG
-/** @brief Target projection details retained for a split diagnostics record. */
-struct HiCacheNodeSplitProjection {
-    uint64_t depth_page_begin = 0;
-    uint64_t depth_page_end = 0;
-    bool token_span_known = false;
-    uint64_t token_begin = 0;
-    uint64_t token_end = 0;
-    std::vector<std::string> page_hashes;
-    std::vector<std::string> storage_keys;
+/**
+ * @brief Result of deleting an unbacked device leaf under write-through rules.
+ *
+ * SGLang removes an unbacked device leaf from the active radix topology instead
+ * of leaving a residency-less node (and its hit count) behind for a later request.
+ */
+struct HiCacheDeviceEvictionResult {
+    bool evicted = false;
+    HiCacheNodeId node_id = 0;
+    HiCacheNodeId parent_node = 0;
+    std::vector<std::string> pages;
+    std::vector<HiCacheNodeId> affected_nodes;
+    std::string reason;
 };
 
-/** @brief Debug record describing residency and ref inheritance across a split. */
-struct HiCacheNodeSplitRecord {
-    std::string cache_scope;
-    HiCacheNodeId parent_node = 0;
-    HiCacheNodeId prefix_node = 0;
-    HiCacheNodeId suffix_node = 0;
-    size_t split_pages = 0;
-    std::string parent_child_key;
-    std::string suffix_child_key;
-    std::vector<std::string> prefix_pages;
-    std::vector<std::string> suffix_pages;
-    HiCacheNodeSplitProjection prefix_projection;
-    HiCacheNodeSplitProjection suffix_projection;
-    HiCacheNodeResidency prefix_residency;
-    HiCacheNodeResidency suffix_residency;
-    uint64_t copied_lock_ref_total = 0;
-    uint64_t copied_host_ref_total = 0;
-    std::vector<std::string> copied_lock_ref_owners;
-    std::vector<std::string> copied_host_ref_owners;
-    uint64_t inherited_hit_count = 0;
-};
-#endif
 
 /**
  * @brief Canonical token/page radix tree for one cache scope.
@@ -182,13 +156,6 @@ public:
     /** @brief Returns `nullptr` for out-of-range or inactive mutable node IDs. */
     [[nodiscard]] HiCacheCacheNode * mutable_node(HiCacheNodeId node_id);
 
-#ifdef DEBUG
-    /** @brief Returns structured radix-split history for validation. */
-    [[nodiscard]] const std::vector<HiCacheNodeSplitRecord> & split_history() const { return split_history_; }
-
-    /** @brief Returns the number of radix splits observed by this tree. */
-    [[nodiscard]] uint64_t split_count() const { return split_count_; }
-#endif
 
     /** @brief Reports whether a page belongs to the active radix topology. */
     [[nodiscard]] bool contains_page(const std::string & page) const;
@@ -205,10 +172,6 @@ public:
     /** @brief Flattens compressed groups from root through the terminal node. */
     [[nodiscard]] std::vector<std::string> flattened_pages(HiCacheNodeId terminal_node) const;
 
-#ifdef DEBUG
-    /** @brief Retains page projection metadata for split diagnostics. */
-    void observe_page_path(const HiCachePagePath & path);
-#endif
 
     /** @brief Looks up a page path and refreshes access order for matched nodes. */
     [[nodiscard]] HiCachePathLookup lookup(const std::vector<std::string> & pages);
@@ -256,6 +219,9 @@ public:
     /** @brief Removes a host leaf or subtree under SGLang eviction semantics. */
     [[nodiscard]] HiCacheHostEvictionResult evict_host_leaf(HiCacheNodeId node_id);
 
+    /** @brief Removes an unbacked device leaf rather than preserving a ghost node. */
+    [[nodiscard]] HiCacheDeviceEvictionResult evict_unbacked_device_leaf(HiCacheNodeId node_id);
+
 private:
     /** @brief Topology coordinates for splitting one compressed radix child. */
     struct ChildSplitRequest {
@@ -265,20 +231,12 @@ private:
     };
 
     std::vector<HiCacheCacheNode> nodes_;
-#ifdef DEBUG
-    std::vector<HiCacheNodeSplitRecord> split_history_;
-    std::unordered_map<std::string, HiCacheProjectedPage> page_projection_;
-    uint64_t split_count_ = 0;
-#endif
     std::unordered_map<std::string, HiCacheNodeId> page_to_node_;
     uint64_t access_clock_ = 0;
 
     [[nodiscard]] HiCacheNodeId create_child(HiCacheNodeId parent, std::vector<std::string> pages);
     [[nodiscard]] HiCacheNodeId insert_suffix(HiCacheNodeId parent, const std::vector<std::string> & pages, size_t offset);
     [[nodiscard]] HiCacheNodeId split_child(const ChildSplitRequest & request);
-#ifdef DEBUG
-    [[nodiscard]] HiCacheNodeSplitProjection split_projection(const std::vector<std::string> & pages, uint64_t depth_page_begin) const;
-#endif
     [[nodiscard]] HiCachePathLookup lookup_impl(const std::vector<std::string> & pages, bool refresh_access);
     [[nodiscard]] bool has_backup_child(HiCacheNodeId node_id) const;
     void deactivate_subtree(HiCacheNodeId node_id, std::vector<HiCacheNodeId> & affected_nodes);

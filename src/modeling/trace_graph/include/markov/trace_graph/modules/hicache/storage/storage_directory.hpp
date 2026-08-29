@@ -33,15 +33,6 @@ struct HiCacheStorageRecord {
     std::string page_hash;
     std::string storage_key;
     bool readable = false;
-#ifdef DEBUG
-    std::string page_id;
-    bool known = false;
-    std::string readable_source;
-    uint64_t known_epoch = 0;
-    uint64_t readable_epoch = 0;
-    uint64_t materialized_epoch = 0;
-    std::optional<HiCacheNodeId> materialized_node;
-#endif
 };
 
 /**
@@ -55,12 +46,6 @@ struct HiCacheStorageBackendRecord {
     std::string cache_scope;
     std::string page_hash;
     bool readable = false;
-#ifdef DEBUG
-    std::string readable_source;
-    uint64_t known_epoch = 0;
-    uint64_t readable_epoch = 0;
-    std::set<std::string> materialized_pages;
-#endif
 };
 
 /**
@@ -81,10 +66,6 @@ public:
     /** @brief Marks modeled storage-commit pages as readable. */
     void mark_readable_pages(const std::string & cache_scope, const std::vector<std::string> & page_ids);
 
-#ifdef DEBUG
-    /** @brief Records Debug ownership for pages materialized into a radix node. */
-    void mark_materialized_pages(const std::vector<std::string> & page_ids, HiCacheNodeId node_id);
-#endif
 
     /** @brief Returns whether a page ID resolves to a readable storage key. */
     [[nodiscard]] bool readable(const std::string & page_id) const;
@@ -98,35 +79,10 @@ public:
     /** @brief Returns the contiguous readable prefix of projected pages. */
     [[nodiscard]] std::vector<std::string> contiguous_readable_prefix(const std::vector<HiCacheProjectedPage> & pages) const;
 
-#ifdef DEBUG
-    /** @brief Returns readable page IDs, optionally including backend-only keys. */
-    [[nodiscard]] std::set<std::string> readable_page_ids(bool include_backend_only) const;
-
-    /** @brief Returns page records for derived Debug state. */
-    [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageRecord> & records() const { return records_by_page_; }
-
-    /** @brief Returns backend hash records for derived Debug state. */
-    [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageBackendRecord> & backend_records() const { return records_by_storage_key_; }
-
-    /** @brief Counts observed target page identities. */
-    [[nodiscard]] uint64_t known_page_count() const;
-
-    /** @brief Counts page identities resolving to readable storage keys. */
-    [[nodiscard]] uint64_t readable_page_count() const;
-
-    /** @brief Counts readable backend hash keys. */
-    [[nodiscard]] uint64_t backend_readable_count() const;
-
-    /** @brief Counts pages materialized into radix nodes. */
-    [[nodiscard]] uint64_t materialized_page_count() const;
-#endif
 
 private:
     std::unordered_map<std::string, HiCacheStorageRecord> records_by_page_;
     std::unordered_map<std::string, HiCacheStorageBackendRecord> records_by_storage_key_;
-#ifdef DEBUG
-    uint64_t epoch_ = 0;
-#endif
 
     [[nodiscard]] HiCacheStorageRecord & ensure_record(const std::string & cache_scope, const std::string & page_id);
     [[nodiscard]] HiCacheStorageRecord & ensure_record(const HiCacheProjectedPage & page);

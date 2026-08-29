@@ -22,6 +22,7 @@ struct HiCacheAppliedEffectValidation {
     bool ready = false;
     bool source_duration_exact = false;
     bool synthetic_cost_exact = false;
+    bool observable_endpoint_exact = false;
     bool ingress_exact = false;
     bool consumer_dependency_exact = false;
     std::string reason;

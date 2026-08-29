@@ -100,23 +100,110 @@ namespace markov::trace_graph::core {
     return static_cast<uint64_t>(value);
 }
 
+/** @brief Exact truncated value plus the first nine decimal digits after the point. */
+struct ParsedU64Decimal {
+    static constexpr uint32_t kFractionalScale = 1'000'000'000;
+
+    uint64_t integral = 0;
+    uint32_t fractional_billionths = 0;
+};
+
 /**
- * @brief Parses an unsigned integer or a non-negative finite decimal representation.
+ * @brief Parses a non-negative decimal without routing a large integer part through `double`.
  *
- * Exact integer text is parsed first so `UINT64_MAX` remains representable. Decimal
- * input keeps the prior trace behavior of truncating the fractional component while
- * rejecting malformed, non-finite, negative, and overflowing values.
+ * `integral` is the value truncated toward zero. `fractional_billionths` preserves up to
+ * nine digits after the effective decimal point so callers that need sub-unit ordering can
+ * avoid independently truncating a start and duration. Scientific notation is supported.
  */
-[[nodiscard]] inline std::optional<uint64_t> parse_u64(std::string_view text) {
+[[nodiscard]] inline std::optional<ParsedU64Decimal> parse_u64_decimal(std::string_view text) {
     text = trim_ascii(text);
     if (text.empty()) return std::nullopt;
 
     uint64_t exact = 0;
     const auto [integer_end, integer_error] = std::from_chars(text.data(), text.data() + text.size(), exact);
-    if (integer_error == std::errc{} && integer_end == text.data() + text.size()) return exact;
+    if (integer_error == std::errc{} && integer_end == text.data() + text.size()) return ParsedU64Decimal{ .integral = exact };
 
-    const auto decimal = parse_finite_double(text);
-    return decimal ? truncate_to_u64(*decimal) : std::nullopt;
+    const auto exponent_offset = text.find_first_of("eE");
+    if (exponent_offset != std::string_view::npos && text.find_first_of("eE", exponent_offset + 1) != std::string_view::npos) return std::nullopt;
+
+    const auto mantissa = text.substr(0, exponent_offset);
+    if (mantissa.empty() || mantissa.front() == '-' || mantissa.front() == '+') return std::nullopt;
+    const auto decimal_offset = mantissa.find('.');
+    if (decimal_offset != std::string_view::npos && mantissa.find('.', decimal_offset + 1) != std::string_view::npos) return std::nullopt;
+
+    const auto integer_part = decimal_offset == std::string_view::npos ? mantissa : mantissa.substr(0, decimal_offset);
+    const auto fractional_part = decimal_offset == std::string_view::npos ? std::string_view{} : mantissa.substr(decimal_offset + 1);
+    if (integer_part.empty() && fractional_part.empty()) return std::nullopt;
+
+    std::string digits;
+    digits.reserve(integer_part.size() + fractional_part.size());
+    const auto append_digits = [&](std::string_view part) {
+        for (const unsigned char value : part) {
+            if (value < '0' || value > '9') return false;
+            digits.push_back(static_cast<char>(value));
+        }
+        return true;
+    };
+    if (!append_digits(integer_part) || !append_digits(fractional_part)) return std::nullopt;
+
+    int64_t exponent = 0;
+    if (exponent_offset != std::string_view::npos) {
+        auto exponent_text = text.substr(exponent_offset + 1);
+        if (exponent_text.empty()) return std::nullopt;
+        bool negative = false;
+        if (exponent_text.front() == '+' || exponent_text.front() == '-') {
+            negative = exponent_text.front() == '-';
+            exponent_text.remove_prefix(1);
+        }
+        if (exponent_text.empty()) return std::nullopt;
+        uint64_t magnitude = 0;
+        const auto [end, error] = std::from_chars(exponent_text.data(), exponent_text.data() + exponent_text.size(), magnitude);
+        if (error != std::errc{} || end != exponent_text.data() + exponent_text.size()
+            || magnitude > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            return std::nullopt;
+        exponent = negative ? -static_cast<int64_t>(magnitude) : static_cast<int64_t>(magnitude);
+    }
+
+    using WideSigned = __int128;
+    const auto integer_digit_count = static_cast<WideSigned>(integer_part.size()) + static_cast<WideSigned>(exponent);
+    const auto source_digit_count = integer_digit_count <= 0                                       ? size_t{ 0 }
+                                    : integer_digit_count < static_cast<WideSigned>(digits.size()) ? static_cast<size_t>(integer_digit_count)
+                                                                                                   : digits.size();
+    uint64_t value = 0;
+    for (size_t index = 0; index < source_digit_count; ++index) {
+        const auto digit = static_cast<uint64_t>(digits[index] - '0');
+        if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10) return std::nullopt;
+        value = value * 10 + digit;
+    }
+    const auto appended_zero_count = integer_digit_count - static_cast<WideSigned>(source_digit_count);
+    if (value != 0) {
+        if (appended_zero_count > 19) return std::nullopt;
+        for (WideSigned index = 0; index < appended_zero_count; ++index) {
+            if (value > std::numeric_limits<uint64_t>::max() / 10) return std::nullopt;
+            value *= 10;
+        }
+    }
+
+    uint32_t fractional_billionths = 0;
+    for (WideSigned offset = 0; offset < 9; ++offset) {
+        fractional_billionths *= 10;
+        const auto digit_index = integer_digit_count + offset;
+        if (digit_index >= 0 && digit_index < static_cast<WideSigned>(digits.size())) {
+            fractional_billionths += static_cast<uint32_t>(digits[static_cast<size_t>(digit_index)] - '0');
+        }
+    }
+    return ParsedU64Decimal{ .integral = value, .fractional_billionths = fractional_billionths };
+}
+
+/**
+ * @brief Parses an unsigned integer or non-negative decimal and truncates its fraction.
+ *
+ * Exact text parsing keeps `UINT64_MAX` representable and prevents trace timestamps near
+ * 1e15 from rounding into the next integer before truncation.
+ */
+[[nodiscard]] inline std::optional<uint64_t> parse_u64(std::string_view text) {
+    const auto value = parse_u64_decimal(text);
+    return value ? std::optional<uint64_t>{ value->integral } : std::nullopt;
 }
 
 /** @brief Parses only canonical unsigned integer text with no fractional form. */

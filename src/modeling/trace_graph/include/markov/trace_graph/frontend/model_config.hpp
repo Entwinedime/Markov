@@ -7,37 +7,81 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace markov::trace_graph::frontend {
 
-/**
- * @brief One duration-scaling rule for `NodeScaleModule`.
- *
- * `name` is a literal substring, not a regular expression. Rules are ordered and the first
- * match scales the complete node duration by the positive finite `factor`.
- */
+/** @brief One ordered substring rule for the optional duration-scaling transform. */
 struct NodeScaleRuleConfig {
-    std::string id{};
     std::string name{};
     double factor = 1.0;
 };
 
-/** @brief Narrow NodeScale configuration containing activation and ordered rules only. */
+/** @brief Configuration for the framework-neutral NodeScale DAG transform. */
 struct NodeScaleConfig {
     bool enabled = false;
     std::vector<NodeScaleRuleConfig> rules{};
 };
 
-/** @brief Explicit model identity and the only two HiCache I/O cost parameters. */
+/** @brief One page-byte anchor in a runtime DMA calibration curve. */
+struct HiCacheIoPageBandwidthPoint {
+    uint64_t page_bytes = 0;
+    double bandwidth_bytes_per_sec = 0.0;
+};
+
+/** @brief One existing-key page-size and operation-depth throughput anchor. */
+struct HiCacheIoExistingKeyBandwidthPoint {
+    uint64_t page_bytes = 0;
+    uint64_t operation_pages = 0;
+    double bandwidth_bytes_per_sec = 0.0;
+};
+
+/** @brief Runtime-batch new-write cost at one page size. */
+struct HiCacheIoNewOperationPoint {
+    uint64_t page_bytes = 0;
+    double setup_us_per_operation = 0.0;
+    double bandwidth_bytes_per_sec = 0.0;
+};
+
+/** @brief One direction-specific physical service curve in the unified I/O model. */
+struct HiCacheIoServiceModelConfig {
+    std::string direction{};
+    double setup_us_per_operation = 0.0;
+    double setup_us_per_page = 0.0;
+    double bandwidth_bytes_per_sec = 0.0;
+    double runtime_scale = 1.0;
+    std::vector<HiCacheIoPageBandwidthPoint> page_bandwidth_points{};
+    std::vector<HiCacheIoNewOperationPoint> new_operation_points{};
+    std::vector<HiCacheIoExistingKeyBandwidthPoint> existing_key_bandwidth_points{};
+    double existing_runtime_scale = 1.0;
+    double new_runtime_scale = 1.0;
+};
+
+/** @brief Explicit per-operation and per-page host control primitive. */
+struct HiCacheIoControlModelConfig {
+    double fixed_us_per_operation = 0.0;
+    double zero_payload_fixed_us_per_operation = 0.0;
+    double per_page_us = 0.0;
+};
+
+/** @brief Whether storage directions share one server lane or remain scope-local. */
+struct HiCacheIoResourceLanesConfig {
+    bool shared_storage_read = false;
+    bool shared_storage_write = false;
+};
+
+/** @brief Numerical fields consumed by the HiCache direct I/O cost model. */
 struct HiCacheIoCostConfig {
-    std::string model_id{};
-    std::string model_digest{};
-    std::string calibration_status{};
-    std::string resource_model{};
+    std::map<std::string, HiCacheIoServiceModelConfig> service_models{};
+    std::map<std::string, HiCacheIoControlModelConfig> control_models{};
+    HiCacheIoResourceLanesConfig resource_lanes{};
+};
+
+/** @brief Calibration-only rates used to resolve target I/O readiness during effect replay. */
+struct HiCacheIoPlanningConfig {
     uint64_t device_host_bandwidth_bytes_per_sec = 0;
     uint64_t host_storage_bandwidth_bytes_per_sec = 0;
-    std::map<std::string, std::string> provenance{};
 };
 
 /**
@@ -62,11 +106,10 @@ struct HiCacheConfig {
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
     bool device_allocator_need_sort = false;
+    HiCacheIoPlanningConfig io_planning;
     HiCacheIoCostConfig io_cost;
-#ifdef DEBUG
-    bool emit_state_digests = false;
-#endif
     bool dag_patch_enabled = false;
+    bool dag_patch_source_target_same_config = false;
 };
 
 /**

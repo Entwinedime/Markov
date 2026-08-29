@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "markov/trace_graph/frontend/model_config.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -56,7 +58,7 @@ struct HiCacheEffectBoundary {
  * @brief One target-page segment under a config-independent token-range identity.
  *
  * The parent opportunity remains stable when page size changes. Segment identities use
- * the canonical token-path digest and absolute token interval, while `target_page_id`
+ * the canonical token-path identity and absolute token interval, while `target_page_id`
  * records the target-specific projection needed by state replay and mutation planning.
  */
 struct HiCacheEffectSegment {
@@ -111,55 +113,51 @@ struct HiCacheEffectDecision {
     HiCacheEffectType effect_type = HiCacheEffectType::Loadback;
     HiCacheTransferDirection direction = HiCacheTransferDirection::None;
     std::string cache_scope;
-    std::string source_cache_scope_provenance;
-    std::string request_identity;
     std::string request_id_provenance;
     std::string source_fact_role;
     uint64_t source_fact_ordinal = 0;
-    uint64_t decision_ordinal = 0;
-    uint64_t source_fact_seq_no = 0;
     /** @brief Semantic fact identity, not necessarily an executable DAG node. */
     size_t source_node_id = 0;
     /** @brief Optional proven executable anchor for the source opportunity. */
     std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
-    size_t source_event_index = 0;
     std::vector<std::string> operation_ids;
+    /**
+     * Per-operation H2S shape retained from predicted target state replay.
+     * Vectors are emitted only when they conserve the corresponding aggregate
+     * page count and their indices align with `operation_ids`.
+     */
+    std::vector<uint64_t> storage_existing_operation_page_counts;
     std::vector<HiCacheEffectSegment> candidate_segments;
     std::vector<HiCacheEffectSegment> effective_segments;
     std::vector<std::string> effective_pages;
-    uint64_t candidate_page_count = 0;
     uint64_t effective_page_count = 0;
     uint64_t effective_byte_count = 0;
+    /** @brief H2S pages already readable in the predicted target storage directory. */
+    uint64_t storage_existing_page_count = 0;
+    /** @brief H2S pages requiring a new backend file write in the predicted target state. */
+    uint64_t storage_new_page_count = 0;
     HiCacheEffectBoundary eligibility_boundary;
-    HiCacheEffectBoundary completion_boundary;
     HiCacheEffectBoundary consumer_boundary;
     std::string resource_lane;
     std::string state;
     HiCacheTargetEffectState target_effect_state = HiCacheTargetEffectState::Unresolved;
     HiCacheScheduleSensitivity schedule_sensitivity = HiCacheScheduleSensitivity::ScheduleInvariant;
-    std::string schedule_sensitivity_reason;
     HiCacheSourceCarrierState source_carrier_state = HiCacheSourceCarrierState::NotEvaluated;
     HiCacheEffectPatchStatus patch_status = HiCacheEffectPatchStatus::NotPatchable;
     std::string reason;
     std::string not_patchable_reason;
 };
 
-/** @brief Complete target decision ledger and workflow-wide I/O model provenance. */
+/** @brief Complete target-derived effect plan, independent of cost coefficients. */
 struct HiCacheEffectDecisionLedger {
     std::string status = "ready";
     std::string decision_coverage = "complete_target_opportunities";
     std::string prefill_effect_status = "deferred";
-    std::string prefetch_readiness_status = "payload_only_control_pipeline_unmodeled";
     uint64_t kv_bytes_per_page = 0;
+    uint64_t l2_capacity_pages = 0;
+    uint64_t l2_capacity_bytes = 0;
     bool byte_projection_available = false;
     std::string byte_projection_source;
-    std::string io_model_id;
-    std::string io_model_digest;
-    std::string io_model_calibration_status;
-    std::string resource_model;
-    uint64_t device_host_bandwidth_bytes_per_sec = 0;
-    uint64_t host_storage_bandwidth_bytes_per_sec = 0;
-    std::map<std::string, std::string> io_model_provenance;
     std::vector<HiCacheEffectDecision> decisions;
     std::map<std::string, uint64_t> missing_facts;
     std::map<std::string, uint64_t> not_patchable_reasons;

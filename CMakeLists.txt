@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ktransformers_sglang_trace_sim VERSION 0.1.0 LANGUAGES CXX)
+project(ktransformers_sglang_trace_sim LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

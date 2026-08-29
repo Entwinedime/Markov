@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 
+#include <cstdint>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -18,7 +19,6 @@ struct OutputPaths {
     std::string graph;
 #ifdef DEBUG
     std::string model_summary;
-    std::string dag_analysis_directory;
 #endif
 };
 
@@ -26,10 +26,15 @@ struct OutputPaths {
 struct CliOptions {
     std::string profile_manifest;
     std::string model_config;
+#ifdef DEBUG
+    std::string hicache_oracle_cost_replay;
+#endif
     io::ManifestTraceInputOptions trace_input;
+#ifdef DEBUG
+    std::optional<uint64_t> actual_e2e_us;
+#endif
     OutputPaths outputs;
     bool debug_logging = false;
-    bool verbose_logging = false;
 };
 
 /** @brief Distinguishes invalid user syntax from backend execution failures. */

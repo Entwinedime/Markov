@@ -62,6 +62,9 @@ struct TraceEvent {
     char ph = 'X';
     uint64_t ts = 0;
     uint64_t dur = 0;
+    /** Sub-microsecond timing is retained only for exact nested CPU-leaf classification. */
+    uint16_t ts_submicro_ns = 0;
+    uint16_t dur_submicro_ns = 0;
     std::string pid = "-1";
     std::string tid = "-1";
 
@@ -108,7 +111,7 @@ private:
     };
 
     void ensure_args_materialized() const;
-    void freeze_arg_overrides();
+    void commit_arg_overrides();
     void append_arg_layers_from(const TraceEvent & other);
     [[nodiscard]] bool lookup_arg_layers(std::string_view key, std::string * value) const;
     [[nodiscard]] bool lookup_raw_arg(std::string_view key, std::string * value) const;

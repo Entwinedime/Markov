@@ -37,4 +37,12 @@ struct SimulationResult {
  */
 [[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph);
 
+/**
+ * @brief Replays the active DAG while contracting source snapshot and model blackbox spans.
+ *
+ * This pass never overwrites full-replay node timestamps. It is an independent
+ * metric used only for snapshot/PREFILL/DECODE-stripped control deltas.
+ */
+[[nodiscard]] SimulationResult run_control_topological_simulation(core::DagGraph & graph);
+
 } // namespace markov::trace_graph::simulation

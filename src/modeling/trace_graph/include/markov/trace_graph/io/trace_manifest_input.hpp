@@ -5,9 +5,6 @@
 #pragma once
 
 #include "markov/trace_graph/core/trace_event.hpp"
-#ifdef DEBUG
-#include "markov/trace_graph/io/chrome_trace_io.hpp"
-#endif
 
 #include <cstddef>
 #include <cstdint>
@@ -55,12 +52,11 @@ struct ManifestTraceInput {
     std::vector<core::TraceEvent> events;
     /** @brief Pre-window side-table records needed to decode in-window event arguments. */
     std::vector<core::TraceEvent> context_events;
+    /** @brief Pre-window semantic facts replayed only to reconstruct initial model state. */
+    std::vector<core::TraceEvent> prelude_context_events;
     /** @brief Post-window semantic facts retained only to prove causal-tail closure. */
     std::vector<core::TraceEvent> tail_context_events;
     std::vector<std::string> input_contracts;
-#ifdef DEBUG
-    std::vector<TraceReadTimings> trace_read_timings;
-#endif
 };
 
 /**

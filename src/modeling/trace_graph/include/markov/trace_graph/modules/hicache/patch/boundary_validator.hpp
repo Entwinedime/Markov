@@ -21,6 +21,7 @@ struct HiCacheBoundaryValidation {
     bool ready = false;
     bool source_cost_removed = false;
     bool target_cost_materialized = false;
+    bool observable_endpoint_ready = false;
     bool ingress_preserved = false;
     bool egress_preserved = false;
     bool consumer_dependency_ready = false;

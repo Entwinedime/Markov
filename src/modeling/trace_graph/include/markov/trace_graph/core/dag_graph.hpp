@@ -29,6 +29,17 @@ enum class DagEdgeKind : std::uint8_t { Sequential, Stream, Correlation, Sync, H
 /** @brief Distinguishes input trace events from model-created nodes. */
 enum class DagNodeKind : std::uint8_t { TraceEvent, Synthetic };
 
+/** @brief Source-observed wallclock spans excluded from control-only replay. */
+enum class DagControlExclusionKind : std::uint8_t { PrefillDecode, ProfilingSnapshot };
+
+/** @brief One absolute source-trace interval removed only by control-only replay. */
+struct DagControlExclusionInterval {
+    int gpu_id = 0;
+    uint64_t start_us = 0;
+    uint64_t end_us = 0;
+    DagControlExclusionKind kind = DagControlExclusionKind::PrefillDecode;
+};
+
 /** @brief Sparse provenance allocated only for model-created dependencies. */
 struct DagEdgeProvenance {
     std::string effect_id;
@@ -71,6 +82,7 @@ struct DagSyntheticNodeSpec {
     bool is_cpu = true;
     std::string lane_key = "SYNTHETIC";
     uint64_t duration = 0;
+    bool counts_toward_e2e = false;
     std::unordered_map<std::string, std::string> attrs;
 };
 
@@ -87,6 +99,9 @@ struct DagNode {
     size_t id = 0;
     DagNodeKind kind = DagNodeKind::TraceEvent;
     bool active = true;
+
+    /** @brief Whether this node may independently define the business E2E endpoint. */
+    bool counts_toward_e2e = true;
 
     /** @brief Index into the owning graph's event vector. */
     size_t event_index = 0;
@@ -114,6 +129,9 @@ struct DagNode {
      * from accidentally scaling or double-counting idle time.
      */
     uint64_t cpu_gap_after = 0;
+
+    /** @brief Immutable observed CPU gap before any model mutation. */
+    uint64_t original_cpu_gap_after = 0;
 
     /** @brief Relative start and completion times written by simulation. */
     uint64_t simulation_start = 0;
@@ -211,6 +229,12 @@ public:
     /** @brief Updates the sole authoritative execution duration for a node. */
     void set_node_duration(size_t node_id, uint64_t duration);
 
+    /** @brief Updates whether one node may independently define business E2E. */
+    void set_node_counts_toward_e2e(size_t node_id, bool value);
+
+    /** @brief Updates the residual delay carried by one CPU node's sequential edge. */
+    void set_cpu_gap_after(size_t node_id, uint64_t duration);
+
     /** @brief Returns the stable interned lane name for a node. */
     [[nodiscard]] std::string_view node_lane_key(size_t node_id) const;
 
@@ -268,11 +292,23 @@ public:
     /** @brief Returns non-DAG side-table events available to semantic modules. */
     [[nodiscard]] const std::vector<TraceEvent> & context_events() const { return context_events_; }
 
+    /** @brief Replaces pre-window semantic facts used only to reconstruct model state. */
+    void set_prelude_context_events(std::vector<TraceEvent> events) { prelude_context_events_ = std::move(events); }
+
+    /** @brief Returns pre-window semantic facts excluded from topology and simulation. */
+    [[nodiscard]] const std::vector<TraceEvent> & prelude_context_events() const { return prelude_context_events_; }
+
     /** @brief Replaces post-window facts used only to prove causal-tail closure. */
     void set_tail_context_events(std::vector<TraceEvent> events) { tail_context_events_ = std::move(events); }
 
     /** @brief Returns post-window facts excluded from topology and E2E simulation. */
     [[nodiscard]] const std::vector<TraceEvent> & tail_context_events() const { return tail_context_events_; }
+
+    /** @brief Replaces source-derived intervals contracted by control-only replay. */
+    void set_control_exclusion_intervals(std::vector<DagControlExclusionInterval> intervals) { control_exclusion_intervals_ = std::move(intervals); }
+
+    /** @brief Returns source-only timing intervals excluded from the control metric. */
+    [[nodiscard]] const std::vector<DagControlExclusionInterval> & control_exclusion_intervals() const { return control_exclusion_intervals_; }
 
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
@@ -296,6 +332,12 @@ public:
 
     /** @brief Returns the critical-path duration produced by simulation. */
     [[nodiscard]] uint64_t e2e_time() const { return e2e_time_; }
+
+    /** @brief Stores the critical path after contracting snapshot and PREFILL/DECODE. */
+    void set_control_e2e_time(uint64_t value) { control_e2e_time_ = value; }
+
+    /** @brief Returns the control-only critical-path duration. */
+    [[nodiscard]] uint64_t control_e2e_time() const { return control_e2e_time_; }
 
     /**
      * @brief Merges independently built per-rank graphs.
@@ -324,6 +366,9 @@ private:
 
     /** @brief Critical-path duration produced by topological simulation. */
     uint64_t e2e_time_ = 0;
+
+    /** @brief Critical path from the independent control-only replay. */
+    uint64_t control_e2e_time_ = 0;
 #ifdef DEBUG
     /** @brief Observed input timestamp window, retained only for diagnostics. */
     uint64_t real_e2e_time_ = 0;
@@ -341,8 +386,14 @@ private:
     /** @brief Side-table definitions excluded from DAG topology and E2E simulation. */
     std::vector<TraceEvent> context_events_;
 
+    /** @brief Pre-window semantic facts excluded from DAG topology and patch opportunities. */
+    std::vector<TraceEvent> prelude_context_events_;
+
     /** @brief Post-window causal closure facts excluded from DAG topology and simulation. */
     std::vector<TraceEvent> tail_context_events_;
+
+    /** @brief Absolute source intervals contracted only by control-only replay. */
+    std::vector<DagControlExclusionInterval> control_exclusion_intervals_;
 };
 
 } // namespace markov::trace_graph::core

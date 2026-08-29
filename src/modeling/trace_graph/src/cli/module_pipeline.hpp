@@ -25,7 +25,11 @@ namespace markov::trace_graph::cli {
 class ModulePipeline {
 public:
     /** @brief Parses one C++ model config; an empty path creates an empty pipeline. */
+#ifdef DEBUG
+    [[nodiscard]] static ModulePipeline from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay = {});
+#else
     [[nodiscard]] static ModulePipeline from_config(const std::string & filename);
+#endif
 
     /** @brief Applies every owned module exactly once in configuration order. */
     void apply(core::DagGraph & graph, core::Logger & logger) const;
