@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -11,6 +13,44 @@ from ..common.io import load_json
 if TYPE_CHECKING:
     from .types import ModelRunSpec
 
+
+class DiagnosticLevel(str, Enum):
+    """User-facing amount of optional diagnostic computation and retention."""
+
+    OFF = "off"
+    FULL = "full"
+
+
+@dataclass(frozen=True)
+class ArtifactPolicy:
+    """One typed policy shared by planning, execution, and validation.
+
+    Explicitly selected validations may still require Debug-backend evidence
+    when optional diagnostics are off.  That evidence is a validation input,
+    not permission to run unrelated diagnostics.
+    """
+
+    diagnostics: DiagnosticLevel = DiagnosticLevel.OFF
+
+    @classmethod
+    def from_value(cls, value: str | DiagnosticLevel) -> ArtifactPolicy:
+        """Build the policy once from a validated CLI value."""
+
+        return cls(diagnostics=DiagnosticLevel(value))
+
+    @property
+    def keep_debug_artifacts(self) -> bool:
+        """Return whether detailed rows, successful logs, and C++ details remain."""
+
+        return self.diagnostics is DiagnosticLevel.FULL
+
+    @property
+    def failure_log_max_bytes(self) -> int:
+        """Return the maximum retained bytes for one failed model command."""
+
+        if self.diagnostics is DiagnosticLevel.FULL:
+            return 16 * 1024 * 1024
+        return 64 * 1024
 
 @dataclass(frozen=True)
 class WorkflowArtifactLayout:
@@ -37,10 +77,10 @@ class WorkflowArtifactLayout:
         return self.output_dir / "model_runs"
 
     @property
-    def validations_dir(self) -> Path:
-        """Return the root containing validation summaries and row artifacts."""
+    def debug_rows_dir(self) -> Path:
+        """Return the optional per-cell Debug row directory."""
 
-        return self.artifacts_dir / "validations"
+        return self.artifacts_dir / "debug_rows"
 
     @property
     def plan_path(self) -> Path:
@@ -55,26 +95,15 @@ class WorkflowArtifactLayout:
         return self.output_dir / "preflight_summary.json"
 
     @property
-    def model_runs_summary_path(self) -> Path:
-        """Return the aggregate model-run execution summary path."""
-
-        return self.artifacts_dir / "model_runs_summary.json"
-
-    @property
     def workflow_summary_path(self) -> Path:
         """Return the top-level workflow summary path."""
 
         return self.output_dir / "workflow_summary.json"
 
-    def validation_summary_path(self, validation_name: str) -> Path:
-        """Return the summary path owned by one registered validation."""
+    def debug_row_path(self, model_run_id: str) -> Path:
+        """Return one optional per-cell Debug row path."""
 
-        return self.validations_dir / validation_name / "summary.json"
-
-    def validation_row_path(self, validation_name: str, model_run_id: str) -> Path:
-        """Return one validation's per-model-run diagnostic row path."""
-
-        return self.validations_dir / validation_name / f"{model_run_id}.json"
+        return self.debug_rows_dir / f"{model_run_id}.json"
 
     def model_run_dir(self, model_run_id: str) -> Path:
         """Return the isolated output directory for one normalized model run."""
@@ -82,16 +111,9 @@ class WorkflowArtifactLayout:
         return self.model_runs_dir / model_run_id
 
     def ensure_base_dirs(self) -> None:
-        """Create the stable top-level directory structure idempotently."""
+        """Create only the workflow root; artifact writers own subdirectories."""
 
-        for path in (
-            self.artifacts_dir,
-            self.preflight_dir,
-            self.model_runs_dir,
-            self.validations_dir,
-        ):
-            path.mkdir(parents=True, exist_ok=True)
-
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
 @dataclass(frozen=True)
 class ModelRunArtifacts:
@@ -112,16 +134,10 @@ class ModelRunArtifacts:
         return self.output_dir / "runner_config.json"
 
     @property
-    def execution_json(self) -> Path:
-        """Return the durable execution-status record path."""
+    def cpp_model_config_json(self) -> Path:
+        """Return the C++ business-config path referenced by the runner config."""
 
-        return self.output_dir / "execution.json"
-
-    @property
-    def prediction_json(self) -> Path:
-        """Return the workflow-facing prediction path."""
-
-        return self.output_dir / "prediction.json"
+        return self.output_dir / "cpp_model_config.json"
 
     @property
     def run_summary_json(self) -> Path:
@@ -130,46 +146,16 @@ class ModelRunArtifacts:
         return self.output_dir / "run_summary.json"
 
     @property
-    def validation_json(self) -> Path:
-        """Return the container-runner validation summary path."""
-
-        return self.output_dir / "validation.json"
-
-    @property
     def model_summary_json(self) -> Path:
         """Return the Debug C++ module-summary path."""
 
         return self.output_dir / "model_summary.json"
 
     @property
-    def dag_quality_json(self) -> Path:
-        """Return the compact base-DAG quality artifact path."""
+    def debug_details(self) -> tuple[Path, ...]:
+        """Return large C++ details pruned after the prediction summary."""
 
-        return self.output_dir / "dag_quality.json"
-
-    @property
-    def dag_analysis_json(self) -> Path:
-        """Return the detailed Debug DAG-analysis artifact path."""
-
-        return self.output_dir / "dag_analysis.json"
-
-    @property
-    def dag_anchor_coverage_json(self) -> Path:
-        """Return the DAG synchronization-anchor coverage path."""
-
-        return self.output_dir / "dag_anchor_coverage.json"
-
-    @property
-    def dag_operation_visibility_json(self) -> Path:
-        """Return the DAG operation-visibility diagnostic path."""
-
-        return self.output_dir / "dag_operation_visibility.json"
-
-    @property
-    def predicted_state_trace_json(self) -> Path:
-        """Return the predicted target cache-state transition trace path."""
-
-        return self.output_dir / "predicted_target_cache_state_trace.json"
+        return (self.model_summary_json,)
 
     def load_if_present(self, path: Path) -> dict[str, Any]:
         """Load an optional JSON object, returning an empty mapping otherwise."""
@@ -184,3 +170,17 @@ class ModelRunArtifacts:
         """Bind artifact paths to the output directory owned by a model spec."""
 
         return cls(spec.output_dir)
+
+
+def prune_debug_details(
+    model_runs: Iterable[ModelRunArtifacts],
+    policy: ArtifactPolicy,
+) -> None:
+    """Remove C++ details after the prediction summary unless Debug retention is enabled."""
+
+    if policy.keep_debug_artifacts:
+        return
+
+    for artifacts in model_runs:
+        for path in artifacts.debug_details:
+            path.unlink(missing_ok=True)

@@ -37,7 +37,7 @@ def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | No
     candidates = sorted(run_dir.glob("bench/**/workload_report.json"))
     if candidates:
         return load_workload_window(candidates[-1])
-    bench_candidates = sorted(path for path in run_dir.glob("bench/**/*.jsonl") if path.name != "workload_report.jsonl")
+    bench_candidates = sorted(run_dir.glob("bench/**/*.jsonl"))
     for path in reversed(bench_candidates):
         window = load_bench_serving_window(path)
         if window is not None:
@@ -51,8 +51,12 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
     if not path.is_file():
         return None
     report = load_json(path)
-    formal_start_ms = optional_float(report.get("formal_begin_ms"))
-    formal_end_ms = optional_float(report.get("formal_end_ms"))
+    formal_window = report.get("formal_window")
+    if formal_window is not None and not isinstance(formal_window, dict):
+        raise ValueError(f"invalid formal workload window in workload report: {path}")
+    formal_source = formal_window if isinstance(formal_window, dict) else report
+    formal_start_ms = optional_float(formal_source.get("formal_begin_ms"))
+    formal_end_ms = optional_float(formal_source.get("formal_end_ms"))
     if formal_start_ms is not None or formal_end_ms is not None:
         if (
             formal_start_ms is None
@@ -64,11 +68,20 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
             raise ValueError(f"invalid formal workload window in workload report: {path}")
         start_ns = int(formal_start_ms * 1_000_000)
         end_ns = int(formal_end_ms * 1_000_000)
+        actual_e2e_ns = end_ns - start_ns
+        formal_e2e_raw = formal_source.get("e2e_ms")
+        if formal_e2e_raw is not None:
+            formal_e2e_ms = optional_float(formal_e2e_raw)
+            if formal_e2e_ms is None or not math.isfinite(formal_e2e_ms) or formal_e2e_ms <= 0:
+                raise ValueError(f"invalid formal workload E2E in workload report: {path}")
+            actual_e2e_ns = int(formal_e2e_ms * 1_000_000)
+            if abs(actual_e2e_ns - (end_ns - start_ns)) > 1_000_000:
+                raise ValueError(f"formal workload E2E does not match its window: {path}")
         return WorkloadWindow(
             path,
             start_ns,
             end_ns,
-            end_ns - start_ns,
+            actual_e2e_ns,
             "workload_report.formal_window",
         )
     requests = report.get("requests")

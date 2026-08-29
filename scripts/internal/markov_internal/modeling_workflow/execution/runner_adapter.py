@@ -6,45 +6,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...common.paths import ROOT_DIR, repo_relative_path
+from ...common.paths import ROOT_DIR, repo_relative_path, running_in_modeling_container
 from ...modeling.workload import discover_workload_window
-from ..io_model import HiCacheIoModel, merge_hicache_io_model
-from ..types import ModelOutputRequirement, ModelRunSpec, ProfileRunRef
-
-
-@dataclass(frozen=True)
-class RunnerOutputs:
-    """Runner output capabilities derived once from semantic requirements."""
-
-    validation: bool
-    dag_analysis: bool
-
-    @classmethod
-    def from_spec(cls, spec: ModelRunSpec) -> RunnerOutputs:
-        """Map semantic artifact requirements to runner output capabilities."""
-
-        requirements = spec.output_requirements
-        return cls(
-            validation=ModelOutputRequirement.HICACHE_VALIDATION in requirements,
-            dag_analysis=ModelOutputRequirement.DAG_ANALYSIS in requirements,
-        )
-
-    @property
-    def validation_backend(self) -> bool:
-        """Return whether the C++ invocation must use its Debug backend."""
-
-        return self.validation or self.dag_analysis
-
-    def as_config(self) -> dict[str, bool]:
-        """Serialize only explicitly enabled output switches for the runner."""
-
-        output: dict[str, bool] = {}
-        if self.validation:
-            output["emit_validation"] = True
-            output["emit_module_summary"] = True
-        if self.dag_analysis:
-            output["emit_dag_analysis"] = True
-        return output
+from ..io_model import HiCacheIoModel
+from ..io_model_projection import merge_hicache_io_model
+from ..types import ModelRunSpec, TargetHiCacheConfig
 
 
 @dataclass(frozen=True)
@@ -56,90 +22,73 @@ class RunnerConfigBuilder:
     def payload(self) -> dict[str, Any]:
         """Build the self-contained config consumed by the container runner."""
 
-        outputs = RunnerOutputs.from_spec(self.spec)
         payload: dict[str, Any] = {
-            "schema": "trace_sim.modeling.runner_config.v1",
             "metadata": {
                 "model_run_id": self.spec.run_id,
-                "validation_requests": list(self.spec.validation_requests),
             },
             "input": {
                 "profile_manifest": path_text(self.spec.source_profile.manifest_path),
             },
             "output_dir": path_text(self.spec.output_dir),
-            "mode": self.spec.mode,
+            "mode": "cache_state",
             "cpp_trace_graph": {
-                "backend_kind": "validation" if outputs.validation_backend else "release",
+                "backend_kind": "validation",
                 "threads": self.spec.trace_threads,
                 "file_threads": self.spec.trace_file_threads,
                 "trace_channels": list(self.spec.trace_channels),
             },
-            "outputs": outputs.as_config(),
+            "outputs": {"emit_module_summary": True},
         }
         window = discover_workload_window({}, self.spec.source_profile.manifest_path)
         if window is not None:
             payload["cpp_trace_graph"]["trace_window_start_us"] = window.start_ns // 1000
             payload["cpp_trace_graph"]["trace_window_end_us"] = window.end_ns // 1000
+            payload["cpp_trace_graph"]["actual_e2e_us"] = window.actual_e2e_ns // 1000
             payload["metadata"]["trace_window"] = {
                 "source": window.source,
                 "report_path": path_text(window.report_path),
                 "start_ns": window.start_ns,
                 "end_ns": window.end_ns,
+                "actual_e2e_ns": window.actual_e2e_ns,
             }
-        if self.spec.hicache_io_model is not None:
-            payload["metadata"]["hicache_io_model"] = self.spec.hicache_io_model.metadata()
-        if self.spec.mode == "cache_state":
-            payload.update(
-                hicache_run_payload(
-                    require_target_profile(self.spec),
-                    outputs,
-                    dag_patch_enabled=ModelOutputRequirement.HICACHE_DAG_PATCH in self.spec.output_requirements,
-                    page_key_mode=self.spec.page_key_mode,
-                    io_model=self.spec.hicache_io_model,
-                )
+        payload.update(
+            hicache_run_payload(
+                self.spec.target_config,
+                source_target_same_config=self.spec.target_config.matches_source(self.spec.source_profile),
+                io_model=self.spec.hicache_io_model,
             )
+        )
         return payload
 
     def command(self, runner_config_path: Path) -> list[str]:
-        """Return the single supported internal container-runner invocation."""
+        """Run a cell directly in-container or enter the container once."""
 
-        return [str(ROOT_DIR / "scripts/model.sh"), "--config", str(runner_config_path)]
-
-
-def require_target_profile(spec: ModelRunSpec) -> ProfileRunRef:
-    """Return the target profile required by a cache-state run."""
-
-    if spec.target_profile is None:
-        raise ValueError(f"cache_state model run requires target profile: {spec.run_id}")
-    if spec.target_profile.hicache_config is None:
-        raise ValueError(f"target profile has no HiCache config: {spec.target_profile.label}")
-    return spec.target_profile
+        if running_in_modeling_container():
+            return [
+                "python3",
+                "scripts/internal/entrypoints/model.py",
+                "--config",
+                str(runner_config_path),
+            ]
+        return [str(ROOT_DIR / "scripts/model.sh"), "build-dag", "--config", str(runner_config_path)]
 
 
 def hicache_run_payload(
-    target: ProfileRunRef,
-    outputs: RunnerOutputs,
+    target: TargetHiCacheConfig,
     *,
-    dag_patch_enabled: bool,
-    page_key_mode: str,
+    source_target_same_config: bool,
     io_model: HiCacheIoModel | None,
 ) -> dict[str, Any]:
-    """Build the narrow C++ HiCache and Python oracle-validation config."""
+    """Build the narrow C++ HiCache config."""
 
-    hicache_config = merge_hicache_io_model({"enabled": True, **(target.hicache_config or {})}, io_model)
+    hicache_config = merge_hicache_io_model({"enabled": True, **target.fields}, io_model)
     dag_patch = hicache_config.get("dag_patch") if isinstance(hicache_config.get("dag_patch"), dict) else {}
-    hicache_config["dag_patch"] = {**dag_patch, "enabled": dag_patch_enabled}
-    return {
-        "cpp_model_config": {"hicache": hicache_config},
-        "validation": {
-            "hicache_state": {
-                "enabled": outputs.validation,
-                "require_oracle_state_trace": outputs.validation,
-                "oracle_page_key_mode": page_key_mode,
-                "oracle_trace_paths": [path_text(path) for path in target.python_probe_files],
-            }
-        },
+    hicache_config["dag_patch"] = {
+        **dag_patch,
+        "enabled": True,
+        "source_target_same_config": source_target_same_config,
     }
+    return {"cpp_model_config": {"hicache": hicache_config}}
 
 
 def path_text(path: Path) -> str:

@@ -1,353 +1,55 @@
-"""Builder for the complete HiCache state-input preflight report."""
+"""Compact source-fact preflight for HiCache prediction."""
 
 from __future__ import annotations
 
-import collections
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable
 
 from markov_internal.common.io import write_json
 from markov_internal.common.naming import safe_slug
+
 from ....types import ProfileRunRef
-from .profile import HiCacheProfileAuditOptions, audit_hicache_profile
-from .readiness import (
-    normalize_forced_token_preflight,
-    public_preflight_row,
-    state_model_input_ready,
-    summarize_forced_token_input_group,
-    workflow_input_ready,
-)
-from ..input_contract.signature.primitives import trace_events
-from .workload_signature import WorkloadSignatureBuilder, summarize_workload_sequence_input_group
-
-
-@dataclass(frozen=True)
-class StateInputPreflightOptions:
-    """Internal evidence options derived from selected validations."""
-
-    require_validation_evidence: bool = False
-    validate_diagnostic_coverage: bool = False
-    require_cross_config_contract: bool = False
-    include_sequence_diagnostics: bool = False
-
-
-@dataclass
-class StateInputPreflightReportBuilder:
-    """Build per-run audits, per-input contracts, and aggregate readiness."""
-
-    runs: list[ProfileRunRef]
-    output_dir: Path
-    options: StateInputPreflightOptions
-    audit_dir: Path | None = None
-    summary_path: Path | None = None
-    on_row: Callable[[dict[str, Any]], None] | None = None
-
-    def build(self) -> dict[str, Any]:
-        """Build the complete report and persist its compact stage summary."""
-
-        rows = self._run_rows()
-        signature_by_input = self._input_groups(rows)
-        all_ready = all(row["workflow_input_ready"] for row in rows) and all(
-            row["input_contract_ready"] for row in signature_by_input.values()
-        )
-        report = self._report(rows, signature_by_input, all_ready)
-        write_json(self.summary_path or self._default_summary_path(), compact_preflight_report(report))
-        return report
-
-    def _run_rows(self) -> list[dict[str, Any]]:
-        rows: list[dict[str, Any]] = []
-        preflight_dir = self.audit_dir or self.output_dir / "artifacts" / "preflight"
-        audit_options = HiCacheProfileAuditOptions(
-            validate_forced_token=self.options.require_cross_config_contract,
-            validate_oracle_evidence=self.options.require_validation_evidence,
-            validate_diagnostic_coverage=self.options.validate_diagnostic_coverage,
-        )
-        for run in self.runs:
-            row = self._run_row(run, preflight_dir, audit_options)
-            rows.append(row)
-            if self.on_row is not None:
-                self.on_row(row)
-        return rows
-
-    def _run_row(
-        self,
-        run: ProfileRunRef,
-        preflight_dir: Path,
-        audit_options: HiCacheProfileAuditOptions,
-    ) -> dict[str, Any]:
-        profile_audit_path = preflight_dir / f"{safe_slug(run.run_id)}.hicache_profile_audit.json"
-        event_rows = trace_events(list(run.python_probe_files))
-        profile_audit = audit_hicache_profile(
-            run.manifest_path,
-            options=audit_options,
-            event_rows=event_rows,
-        )
-        write_json(profile_audit_path, profile_audit)
-        workload_signature = WorkloadSignatureBuilder(
-            run,
-            include_sequence_diagnostics=self.options.include_sequence_diagnostics,
-            event_rows=event_rows,
-        ).build()
-        forced_token_preflight = (
-            normalize_forced_token_preflight(profile_audit) if self.options.require_cross_config_contract else None
-        )
-        state_ready = state_model_input_ready(profile_audit, workload_signature)
-        workflow_ready = workflow_input_ready(
-            profile_audit,
-            state_ready,
-            require_validation_evidence=self.options.require_validation_evidence,
-        )
-        row = self._base_row(run, profile_audit_path, profile_audit, workload_signature, state_ready, workflow_ready)
-        self._add_optional_row_fields(row, profile_audit, forced_token_preflight)
-        return row
-
-    def _base_row(
-        self,
-        run: ProfileRunRef,
-        profile_audit_path: Path,
-        profile_audit: dict[str, Any],
-        workload_signature: dict[str, Any],
-        state_ready: bool,
-        workflow_ready: bool,
-    ) -> dict[str, Any]:
-        row = {
-            "run_id": run.run_id,
-            "config_id": run.config_id,
-            "input_id": run.input_id,
-            "input_class": run.input_class,
-            "manifest_path": str(run.manifest_path),
-            "run_dir": str(run.run_dir),
-            "hicache_profile_audit_path": str(profile_audit_path),
-            "python_probe_file_count": len(run.python_probe_files),
-            "requested_consumers": profile_audit.get("requested_consumers", []),
-            "canonical_request_count": workload_signature["request_event_count"],
-            "canonical_workload_signature": workload_signature["signature"],
-            "canonical_workload_ready": workload_signature["ready"],
-            "workload_sequence_diagnostic_signature": workload_signature["sequence_diagnostic_signature"],
-            "workload_sequence_diagnostic_ready": workload_signature["sequence_diagnostic_ready"],
-            "artifact_ready": bool(profile_audit.get("artifact_ready")),
-            "artifact_errors": profile_audit.get("artifact_errors", []),
-            "state_model_input_ready": state_ready,
-            "state_model_input_errors": profile_audit.get("state_model_input_errors", []),
-            "workflow_input_ready": workflow_ready,
-            "workflow_input_errors": profile_audit.get("workflow_input_errors", []),
-        }
-        if self.options.include_sequence_diagnostics:
-            row["_workload_sequence_diagnostic_events"] = workload_signature.get("sequence_diagnostic_events", [])
-        return row
-
-    def _add_optional_row_fields(
-        self,
-        row: dict[str, Any],
-        profile_audit: dict[str, Any],
-        forced_token_preflight: dict[str, Any] | None,
-    ) -> None:
-        if self.options.validate_diagnostic_coverage:
-            row.update(
-                {
-                    "strict_diagnostic_coverage_ready": profile_audit.get("strict_diagnostic_coverage_ready"),
-                    "diagnostic_coverage_errors": profile_audit.get("diagnostic_coverage_errors", []),
-                }
-            )
-        if self.options.require_validation_evidence:
-            row.update(
-                {
-                    "validator_evidence_ready": profile_audit.get("validator_evidence_ready"),
-                    "validator_evidence_errors": profile_audit.get("validator_evidence_errors", []),
-                }
-            )
-        if forced_token_preflight is not None:
-            row.update(
-                {
-                    "forced_token_enabled": bool(forced_token_preflight.get("enabled")),
-                    "forced_token_ready": bool(forced_token_preflight.get("ready")),
-                    "forced_token_plan_ready": bool(forced_token_preflight.get("plan_ready")),
-                    "forced_token_bundle_ready": bool(forced_token_preflight.get("bundle_ready")),
-                    "forced_token_mode": forced_token_preflight.get("mode"),
-                    "forced_token_plan_sha256": forced_token_preflight.get("plan_sha256"),
-                    "forced_token_bundle_sha256": forced_token_preflight.get("bundle_sha256"),
-                    "forced_token_bundle_id": forced_token_preflight.get("bundle_id"),
-                    "forced_token_bundle_path": forced_token_preflight.get("bundle_path"),
-                }
-            )
-
-    def _input_groups(self, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-        by_input: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
-        for row in rows:
-            by_input[str(row["input_id"])].append(row)
-        return {input_id: self._input_group(input_id, input_rows) for input_id, input_rows in sorted(by_input.items())}
-
-    def _input_group(self, input_id: str, input_rows: list[dict[str, Any]]) -> dict[str, Any]:
-        signatures = sorted(
-            {str(row["canonical_workload_signature"]) for row in input_rows if row["canonical_workload_signature"]}
-        )
-        forced_token_summary = (
-            summarize_forced_token_input_group(input_rows) if self.options.require_cross_config_contract else {}
-        )
-        sequence_summary = summarize_workload_sequence_input_group(
-            input_rows,
-            include_details=self.options.include_sequence_diagnostics,
-        )
-        signature_match = len(signatures) == 1 if self.options.require_cross_config_contract else None
-        row = {
-            "input_id": input_id,
-            "run_count": len(input_rows),
-            "config_ids": sorted(str(item["config_id"]) for item in input_rows),
-            "signature_count": len(signatures),
-            "signature_match": signature_match,
-            "signatures": signatures,
-            "canonical_workload_ready": all(item.get("canonical_workload_ready") for item in input_rows),
-            **sequence_summary,
-            **forced_token_summary,
-        }
-        row["input_contract_ready"] = self._input_group_ready(row)
-        return row
-
-    def _input_group_ready(self, row: dict[str, Any]) -> bool:
-        input_ready = bool(row["canonical_workload_ready"])
-        if not self.options.require_cross_config_contract:
-            return input_ready
-        return input_ready and (
-            row["signature_match"] is True
-            and row["forced_token_enabled_count"] == row["run_count"]
-            and row["forced_token_plan_signature_match"]
-            and row["forced_token_bundle_signature_match"]
-        )
-
-    def _report(
-        self,
-        rows: list[dict[str, Any]],
-        signature_by_input: dict[str, dict[str, Any]],
-        all_workflow_inputs_ready: bool,
-    ) -> dict[str, Any]:
-        report = {
-            "schema": "trace_sim.hicache.state_model.preflight.v1",
-            "stage": "preflight",
-            "preflight_options": {
-                "require_validation_evidence": self.options.require_validation_evidence,
-                "validate_diagnostic_coverage": self.options.validate_diagnostic_coverage,
-                "require_cross_config_contract": self.options.require_cross_config_contract,
-                "sequence_diagnostics_enabled": self.options.include_sequence_diagnostics,
-            },
-            "run_count": len(rows),
-            "config_ids": sorted({run.config_id for run in self.runs}),
-            "input_ids": sorted({run.input_id for run in self.runs}),
-            "workflow_input_ready": all_workflow_inputs_ready,
-            "workflow_input_ready_count": sum(1 for row in rows if row["workflow_input_ready"]),
-            "state_model_input_ready_count": sum(1 for row in rows if row["state_model_input_ready"]),
-            "artifact_ready_count": sum(1 for row in rows if row["artifact_ready"]),
-            "sequence_diagnostic_enabled": self.options.include_sequence_diagnostics,
-            "input_sequence_diagnostic_match_count": sum(
-                1 for item in signature_by_input.values() if item.get("sequence_diagnostic_match") is True
-            ),
-            "input_workload_signatures": signature_by_input,
-            "runs": [public_preflight_row(row) for row in rows],
-            "note": (
-                "workflow_input_ready gates modeling workflow execution. "
-                "state_model_input_ready covers workload identity state facts, token dictionary/span, "
-                "and workload identity signatures. Sequence diagnostics explain cross-config ordering "
-                "differences only and never gate workflow readiness. Validation-only fields are omitted when disabled."
-            ),
-        }
-        if self.options.validate_diagnostic_coverage:
-            report["strict_diagnostic_coverage_ready_count"] = sum(
-                1 for row in rows if row.get("strict_diagnostic_coverage_ready") is True
-            )
-        return report
-
-    def _default_summary_path(self) -> Path:
-        return self.output_dir / "artifacts" / "preflight" / "hicache_state_inputs" / "summary.json"
+from .profile import audit_hicache_profile
 
 
 def build_state_input_preflight_report(
     runs: list[ProfileRunRef],
-    output_dir: Path,
     *,
-    audit_dir: Path | None = None,
-    summary_path: Path | None = None,
-    on_row: Callable[[dict[str, Any]], None] | None = None,
-    require_validation_evidence: bool = False,
-    validate_diagnostic_coverage: bool = False,
-    require_cross_config_contract: bool = False,
-    include_sequence_diagnostics: bool = False,
+    audit_dir: Path,
+    retain_details: bool = False,
 ) -> dict[str, Any]:
-    """Build the HiCache state-input gate and persist per-run audits."""
+    """Audit each selected source exactly once and return the planning gate."""
 
-    options = StateInputPreflightOptions(
-        require_validation_evidence=require_validation_evidence,
-        validate_diagnostic_coverage=validate_diagnostic_coverage,
-        require_cross_config_contract=require_cross_config_contract,
-        include_sequence_diagnostics=include_sequence_diagnostics,
-    )
-    return StateInputPreflightReportBuilder(
-        runs=runs,
-        output_dir=output_dir,
-        options=options,
-        audit_dir=audit_dir,
-        summary_path=summary_path,
-        on_row=on_row,
-    ).build()
-
-
-def compact_preflight_report(report: dict[str, Any]) -> dict[str, Any]:
-    """Project the full report to its compact stage-summary payload."""
-
-    compact = {
-        "schema": report.get("schema"),
-        "stage": report.get("stage"),
-        "preflight_options": report.get("preflight_options", {}),
-        "run_count": report.get("run_count"),
-        "config_ids": report.get("config_ids", []),
-        "input_ids": report.get("input_ids", []),
-        "workflow_input_ready": report.get("workflow_input_ready"),
-        "workflow_input_ready_count": report.get("workflow_input_ready_count"),
-        "state_model_input_ready_count": report.get("state_model_input_ready_count"),
-        "artifact_ready_count": report.get("artifact_ready_count"),
-        "sequence_diagnostic_enabled": report.get("sequence_diagnostic_enabled"),
-        "input_sequence_diagnostic_match_count": report.get("input_sequence_diagnostic_match_count"),
-        "input_workload_signatures": compact_input_workload_signatures(report.get("input_workload_signatures")),
-        "note": (
-            "This summary keeps only stage-level workflow gate fields. Sequence diagnostics explain ordering only "
-            "and never gate readiness. Full audits live under artifacts/preflight."
-        ),
+    rows = [_audit_run(run, audit_dir, retain_details=retain_details) for run in runs]
+    ready_count = sum(row["workflow_input_ready"] is True for row in rows)
+    return {
+        "stage": "preflight",
+        "run_count": len(rows),
+        "workflow_input_ready": bool(rows) and ready_count == len(rows),
+        "workflow_input_ready_count": ready_count,
+        "state_model_input_ready_count": sum(row["state_model_input_ready"] is True for row in rows),
+        "artifact_ready_count": sum(row["artifact_ready"] is True for row in rows),
+        "runs": rows,
     }
-    if "strict_diagnostic_coverage_ready_count" in report:
-        compact["strict_diagnostic_coverage_ready_count"] = report.get("strict_diagnostic_coverage_ready_count")
-    return compact
 
 
-def compact_input_workload_signatures(value: Any) -> dict[str, dict[str, Any]]:
-    """Project per-input workload contracts to stable summary fields."""
-
-    inputs = value if isinstance(value, dict) else {}
-    result: dict[str, dict[str, Any]] = {}
-    for input_id, item in sorted(inputs.items()):
-        if not isinstance(item, dict):
-            continue
-        row = {
-            "input_id": str(input_id),
-            "run_count": item.get("run_count"),
-            "config_ids": item.get("config_ids", []),
-            "signature_count": item.get("signature_count"),
-            "signature_match": item.get("signature_match"),
-            "sequence_diagnostic_signature_count": item.get("sequence_diagnostic_signature_count"),
-            "sequence_diagnostic_match": item.get("sequence_diagnostic_match"),
-            "canonical_workload_ready": item.get("canonical_workload_ready"),
-            "input_contract_ready": item.get("input_contract_ready"),
-        }
-        if "sequence_diagnostic" in item:
-            row["sequence_diagnostic"] = item.get("sequence_diagnostic")
-        for key in (
-            "forced_token_enabled_count",
-            "forced_token_plan_signature_count",
-            "forced_token_plan_signature_match",
-            "forced_token_bundle_signature_count",
-            "forced_token_bundle_signature_match",
-            "forced_token_bundle_ids",
-        ):
-            if key in item:
-                row[key] = item.get(key)
-        result[str(input_id)] = row
-    return result
+def _audit_run(run: ProfileRunRef, audit_dir: Path, *, retain_details: bool) -> dict[str, Any]:
+    audit = audit_hicache_profile(run.manifest_path)
+    audit_path = audit_dir / f"{safe_slug(run.run_id)}.hicache_profile_audit.json"
+    if retain_details:
+        write_json(audit_path, audit)
+    return {
+        "run_id": run.run_id,
+        "config_id": run.config_id,
+        "input_id": run.input_id,
+        "manifest_path": str(run.manifest_path),
+        "hicache_profile_audit_path": str(audit_path) if retain_details else None,
+        "python_probe_file_count": len(run.python_probe_files),
+        "requested_consumers": audit.get("requested_consumers", []),
+        "artifact_ready": bool(audit.get("artifact_ready")),
+        "artifact_errors": audit.get("artifact_errors", []),
+        "state_model_input_ready": bool(audit.get("state_model_input_ready")),
+        "state_model_input_errors": audit.get("state_model_input_errors", []),
+        "workflow_input_ready": bool(audit.get("workflow_input_ready")),
+        "workflow_input_errors": audit.get("workflow_input_errors", []),
+    }

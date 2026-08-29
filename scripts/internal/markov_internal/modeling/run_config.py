@@ -16,8 +16,6 @@ class ModelingOutputs:
 
     dag_chrome_trace: bool = False
     module_summary: bool = False
-    validation: bool = False
-    dag_analysis: bool = False
     debug_logging: bool = False
 
     @classmethod
@@ -25,15 +23,10 @@ class ModelingOutputs:
         """Derive output capabilities and implicit validation dependencies."""
 
         raw = config.get("outputs") if isinstance(config.get("outputs"), dict) else {}
-        validation = bool(raw.get("emit_validation", False))
         module_summary = bool(raw.get("emit_module_summary", False))
-        if validation and hicache_state_validation_enabled(config):
-            module_summary = True
         return cls(
             dag_chrome_trace=bool(raw.get("emit_dag_chrome_trace", False)),
             module_summary=module_summary,
-            validation=validation,
-            dag_analysis=bool(raw.get("emit_dag_analysis", False)),
             debug_logging=bool(raw.get("debug", False)),
         )
 
@@ -41,7 +34,7 @@ class ModelingOutputs:
     def requires_validation_backend(self) -> bool:
         """Return whether any requested artifact requires the Debug backend."""
 
-        return self.module_summary or self.dag_analysis
+        return self.module_summary
 
 
 @dataclass(frozen=True)
@@ -56,7 +49,6 @@ class ModelingRunConfig:
     input_config: dict[str, Any]
     cpp_config: dict[str, Any]
     outputs: ModelingOutputs
-    hicache_oracle_traces: tuple[Path, ...]
 
     @classmethod
     def load(cls, path: Path) -> ModelingRunConfig:
@@ -93,7 +85,6 @@ class ModelingRunConfig:
             input_config=input_config,
             cpp_config=cpp_config,
             outputs=outputs,
-            hicache_oracle_traces=tuple(resolve_hicache_oracle_traces(raw)),
         )
 
 
@@ -103,23 +94,4 @@ def require_validation_backend(cpp_config: dict[str, Any]) -> None:
     backend_kind = str(cpp_config.get("backend_kind") or "").strip().lower()
     if backend_kind == "validation":
         return
-    raise ValueError("validation/debug modeling outputs require cpp_trace_graph.backend_kind='validation'")
-
-
-def resolve_hicache_oracle_traces(config: dict[str, Any]) -> list[Path]:
-    """Resolve explicitly configured HiCache oracle traces to repository paths."""
-
-    validation = config.get("validation") if isinstance(config.get("validation"), dict) else {}
-    hicache = validation.get("hicache_state") if isinstance(validation.get("hicache_state"), dict) else {}
-    raw_paths = hicache.get("oracle_trace_paths")
-    if not isinstance(raw_paths, list):
-        return []
-    return [require_repo_path(value) for value in raw_paths if isinstance(value, str) and value]
-
-
-def hicache_state_validation_enabled(config: dict[str, Any]) -> bool:
-    """Return whether the runner config requests HiCache oracle validation."""
-
-    validation = config.get("validation") if isinstance(config.get("validation"), dict) else {}
-    hicache = validation.get("hicache_state") if isinstance(validation.get("hicache_state"), dict) else {}
-    return bool(hicache.get("enabled", False))
+    raise ValueError("Debug modeling outputs require cpp_trace_graph.backend_kind='validation'")

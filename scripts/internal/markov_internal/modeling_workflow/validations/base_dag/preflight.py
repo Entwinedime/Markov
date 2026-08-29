@@ -29,7 +29,8 @@ class DagTracePreflightCheck(PreflightCheck):
         for run in context.runs:
             audit_path = root / safe_slug(run.input_id) / safe_slug(run.config_id) / "profile_artifact_audit.json"
             audit = audit_profile_artifacts(run.manifest_path)
-            write_json(audit_path, audit)
+            if context.options.artifact_policy.keep_debug_artifacts:
+                write_json(audit_path, audit)
             coverage = (
                 audit.get("trace_channel_coverage") if isinstance(audit.get("trace_channel_coverage"), dict) else {}
             )
@@ -48,7 +49,7 @@ class DagTracePreflightCheck(PreflightCheck):
                     "config_id": run.config_id,
                     "input_id": run.input_id,
                     "manifest_path": str(run.manifest_path),
-                    "audit_path": str(audit_path),
+                    "audit_path": str(audit_path) if context.options.artifact_policy.keep_debug_artifacts else None,
                     "artifact_ready": audit.get("artifact_ready"),
                     "full_trace_ready": full_trace_ready,
                     "trace_channel_coverage": coverage,
@@ -75,7 +76,6 @@ def summarize_dag_trace_preflight(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for error in row.get("artifact_errors") or []:
             blocker_counts[str(error)] = blocker_counts.get(str(error), 0) + 1
     return {
-        "schema": "trace_sim.modeling_workflow.preflight.full_dag_trace_channels.v1",
         "check": DagTracePreflightCheck.name,
         "run_count": run_count,
         "artifact_ready_count": artifact_ready_count,

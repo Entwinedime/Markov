@@ -2,22 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .artifacts import ModelRunArtifacts
     from .io_model import HiCacheIoModel
-
-
-class ModelOutputRequirement(str, Enum):
-    """Semantic artifact families required from one C++ invocation."""
-
-    DAG_ANALYSIS = "dag_analysis"
-    HICACHE_VALIDATION = "hicache_validation"
-    HICACHE_DAG_PATCH = "hicache_dag_patch"
 
 
 @dataclass(frozen=True)
@@ -42,11 +33,35 @@ class ProfileRunRef:
 
 
 @dataclass(frozen=True)
+class TargetHiCacheConfig:
+    """Explicit target policy/capacity input for one prediction."""
+
+    label: str
+    fields: dict[str, Any]
+    source_path: Path | None = None
+
+    @classmethod
+    def from_profile(cls, profile: ProfileRunRef) -> TargetHiCacheConfig:
+        """Project an observed profile config into the prediction contract for scoring."""
+
+        if profile.hicache_config is None:
+            raise ValueError(f"profile has no HiCache config: {profile.label}")
+        return cls(label=profile.config_id, fields=dict(profile.hicache_config), source_path=profile.config_path)
+
+    def matches_source(self, source: ProfileRunRef) -> bool:
+        """Compare policy/capacity values without relying on experiment identifiers."""
+
+        if source.hicache_config is None:
+            return False
+        return {"enabled": True, **source.hicache_config} == {"enabled": True, **self.fields}
+
+
+@dataclass(frozen=True)
 class CacheStatePredictionRef:
-    """Replay a source profile under a target configuration and oracle."""
+    """Replay one source profile under an explicit target configuration."""
 
     source: ProfileRunRef
-    target: ProfileRunRef
+    target: TargetHiCacheConfig
 
     @property
     def input_id(self) -> str:
@@ -58,52 +73,40 @@ class CacheStatePredictionRef:
     def is_self(self) -> bool:
         """Return whether source and target configurations are identical."""
 
-        return self.source.config_id == self.target.config_id
+        return self.target.matches_source(self.source)
 
     @property
     def label(self) -> str:
         """Return the compact source-to-target prediction label."""
 
-        return f"{self.input_id}/{self.source.config_id}->{self.target.config_id}"
+        return f"{self.input_id}/{self.source.config_id}->{self.target.label}"
 
 
 @dataclass(frozen=True)
 class ModelRunSpec:
-    """One normalized C++ execution after validation-request merging."""
+    """One Direct HiCache prediction executed by the C++ DAG model."""
 
     run_id: str
-    mode: str
     source_profile: ProfileRunRef
-    target_profile: ProfileRunRef | None
-    output_requirements: frozenset[ModelOutputRequirement]
-    validation_requests: tuple[str, ...]
+    target_config: TargetHiCacheConfig
     output_dir: Path
-    prediction: CacheStatePredictionRef | None = None
+    prediction: CacheStatePredictionRef
     skip_reason: str = ""
     trace_threads: int = 1
     trace_file_threads: int = 1
     trace_channels: tuple[str, ...] = ()
-    page_key_mode: str = "strip_scope"
     hicache_io_model: HiCacheIoModel | None = None
 
     @property
     def label(self) -> str:
-        """Return the prediction label or faithful source-profile label."""
+        """Return the source-to-target prediction label."""
 
-        if self.prediction is not None:
-            return self.prediction.label
-        return self.source_profile.label
-
-    @property
-    def output_requirement_names(self) -> tuple[str, ...]:
-        """Return deterministic schema names for requested artifact families."""
-
-        return tuple(sorted(requirement.value for requirement in self.output_requirements))
+        return self.prediction.label
 
 
 @dataclass(frozen=True)
 class ModelRunResult:
-    """Outcome of executing, reusing, skipping, or dry-running one spec."""
+    """Outcome of executing, skipping, or dry-running one spec."""
 
     spec: ModelRunSpec
     return_code: int
@@ -111,30 +114,14 @@ class ModelRunResult:
     artifacts: ModelRunArtifacts
     skipped: bool = False
     dry_run: bool = False
-    reused: bool = False
     skip_reason: str = ""
     execution_error_tail: str = ""
 
     @property
     def ok(self) -> bool:
-        """Return whether the spec actually ran or was reused successfully."""
+        """Return whether the spec ran successfully."""
 
         return not self.skipped and self.return_code == 0
-
-
-@dataclass
-class ValidationSummary:
-    """Compact workflow-facing result from one validation object."""
-
-    name: str
-    status: str
-    selected_run_count: int
-    ready_count: int = 0
-    exact_count: int | None = None
-    skipped_count: int = 0
-    blocker_counts: dict[str, int] = field(default_factory=dict)
-    artifact_paths: dict[str, str] = field(default_factory=dict)
-    payload: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -147,7 +134,6 @@ class ModelRunCounts:
     errors: int
     skipped: int
     dry_run: int
-    reused: int
 
     @classmethod
     def from_results(cls, results: list[ModelRunResult] | tuple[ModelRunResult, ...]) -> ModelRunCounts:
@@ -161,18 +147,4 @@ class ModelRunCounts:
             errors=sum(result.return_code != 0 for result in runnable),
             skipped=sum(result.skipped for result in results),
             dry_run=sum(result.dry_run for result in results),
-            reused=sum(result.reused for result in results),
         )
-
-    def as_payload(self) -> dict[str, int]:
-        """Serialize counters under stable workflow-summary field names."""
-
-        return {
-            "handled_count": self.handled,
-            "runnable_count": self.runnable,
-            "usable_count": self.usable,
-            "error_count": self.errors,
-            "skipped_count": self.skipped,
-            "dry_run_count": self.dry_run,
-            "reused_count": self.reused,
-        }

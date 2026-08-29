@@ -23,27 +23,17 @@ class HiCacheStateInputPreflightCheck(PreflightCheck):
     def run(self, context: Any) -> dict[str, Any]:
         """Execute the HiCache input audit in the shared artifact layout."""
 
-        selected = set(context.options.validations)
-        state_validation_selected = bool({"hicache_final_state", "hicache_transition"} & selected)
         report = build_state_input_preflight_report(
             context.runs,
-            context.options.output_dir,
             audit_dir=context.artifacts.preflight_dir / self.name,
-            summary_path=context.artifacts.preflight_dir / self.name / "summary.json",
-            require_validation_evidence=state_validation_selected,
-            validate_diagnostic_coverage="hicache_transition" in selected,
-            require_cross_config_contract=(state_validation_selected and "cross" in context.options.prediction_scope),
-            include_sequence_diagnostics=state_validation_selected,
+            retain_details=context.options.artifact_policy.keep_debug_artifacts,
         )
         return {
-            "schema": "trace_sim.modeling_workflow.preflight.hicache_state_inputs.v1",
             "check": self.name,
             "ready": report.get("workflow_input_ready"),
             "run_count": report.get("run_count"),
             "workflow_input_ready_count": report.get("workflow_input_ready_count"),
             "state_model_input_ready_count": report.get("state_model_input_ready_count"),
             "artifact_ready_count": report.get("artifact_ready_count"),
-            "input_workload_signatures": report.get("input_workload_signatures", {}),
             "runs": report.get("runs", []),
-            "source_summary_path": str(context.artifacts.preflight_dir / self.name / "summary.json"),
         }

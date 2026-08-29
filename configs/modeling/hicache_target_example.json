@@ -1,0 +1,16 @@
+{
+  "name": "selective_wait_example",
+  "hicache": {
+    "enabled": true,
+    "page_size": 64,
+    "write_policy": "write_through_selective",
+    "prefetch_policy": "wait_complete",
+    "prefetch_threshold_pages": 4,
+    "prefetch_timeout_base_sec": 2.0,
+    "prefetch_timeout_per_ki_token_sec": 0.0,
+    "prefetch_timeout_max_sec": 2.0,
+    "l1_capacity_pages": 48,
+    "l2_capacity_pages": 64,
+    "prefetch_capacity_limit_pages": 12
+  }
+}

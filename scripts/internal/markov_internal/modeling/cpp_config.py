@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ..common.io import write_json
 from ..common.paths import ROOT_DIR, require_repo_path
 
 TRACE_GRAPH_RELEASE_EXECUTABLE = ROOT_DIR / "build/modeling/trace_graph-release/trace_graph"
@@ -23,20 +22,16 @@ TRACE_GRAPH_VALIDATION_BUILD_COMMAND = (
 )
 
 
-def write_cpp_model_config(config: dict[str, Any], output_dir: Path, mode: str) -> Path | None:
-    """Materialize only the model config consumed by C++ TraceGraph."""
+def cpp_model_config_path(config: dict[str, Any], mode: str) -> Path | None:
+    """Resolve the model config materialized by the workflow executor."""
 
     if mode == "faithful_replay":
         return None
 
     cpp_cfg = config.get("cpp_model_config")
-    if isinstance(cpp_cfg, str):
-        return require_repo_path(cpp_cfg)
-    if isinstance(cpp_cfg, dict):
-        path = output_dir / "cpp_model_config.json"
-        write_json(path, cpp_cfg)
-        return path
-    raise ValueError(f"mode={mode} requires an explicit cpp_model_config object or path")
+    if not isinstance(cpp_cfg, str) or not cpp_cfg:
+        raise ValueError(f"mode={mode} requires a cpp_model_config path")
+    return require_repo_path(cpp_cfg)
 
 
 def trace_graph_executable(config: dict[str, Any]) -> Path:

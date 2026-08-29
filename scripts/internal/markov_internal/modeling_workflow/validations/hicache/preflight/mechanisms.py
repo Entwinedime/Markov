@@ -1,69 +1,35 @@
-"""Mapping from HiCache fact roles to diagnostic mechanism coverage."""
+"""Identify the HiCache fact roles consumed by the profile audit."""
 
 from __future__ import annotations
 
-from collections import Counter
 from typing import Any
 
 from ..core.facts import parse_fact_or_none
 
 
-ROLE_TO_MECHANISM = {
-    "cache_lookup_input": "lookup",
-    "cache_lifecycle_commit": "insert",
-    "cache_extend_input": "cache_extend",
-    "request_admission_observed": "admission",
-    "insert_result_observed": "insert",
-    "prefetch_candidate_anchor": "prefetch_schedule",
-    "prefetch_decision_observed": "prefetch_schedule",
-    "prefetch_intent_observed": "prefetch_schedule",
-    "prefetch_progress_observed": "prefetch_progress",
-    "capacity_request": "evict",
-    "capacity_result_observed": "evict",
-    "lock_scope_delta": "lock_ref",
-    "lock_scope_result_observed": "lock_ref",
-    "prefetch_io_observed": "prefetch_transfer",
-    "loadback_decision_observed": "load_back",
-    "loadback_io_observed": "load_back",
-    "commit_device_to_host_enqueue_observed": "write_backup",
-    "commit_device_to_host_io_observed": "write_backup",
-    "commit_capacity_release_observed": "write_backup",
-    "writeback_io_observed": "write_storage",
-    "writeback_enqueue_observed": "write_storage",
+HICACHE_PROFILE_ROLES = {
+    "cache_lookup_input",
+    "cache_lifecycle_commit",
+    "cache_extend_input",
+    "request_admission_observed",
+    "insert_result_observed",
+    "prefetch_candidate_anchor",
+    "prefetch_decision_observed",
+    "prefetch_intent_observed",
+    "prefetch_progress_observed",
+    "capacity_request",
+    "capacity_result_observed",
+    "lock_scope_delta",
+    "lock_scope_result_observed",
+    "prefetch_io_observed",
+    "loadback_decision_observed",
+    "loadback_io_observed",
+    "commit_device_to_host_enqueue_observed",
+    "commit_device_to_host_io_observed",
+    "commit_capacity_release_observed",
+    "writeback_io_observed",
+    "writeback_enqueue_observed",
 }
-
-
-def observe_mechanism(counter: Counter[str], args: dict[str, Any]) -> None:
-    """Count the mechanism represented by one completed fact."""
-
-    fact = parse_fact_or_none(args)
-    if fact is None or not completed_fact_role(args, fact.role):
-        return
-    mechanism = ROLE_TO_MECHANISM.get(fact.role)
-    if mechanism:
-        counter[mechanism] += 1
-
-
-def configured_mechanisms(configured_targets: dict[str, dict[str, Any]]) -> list[str]:
-    """Derive theoretically observable mechanisms from configured targets."""
-
-    mechanisms: set[str] = set()
-    for target in configured_targets.values():
-        mechanism = ROLE_TO_MECHANISM.get(configured_fact_role(target))
-        if mechanism:
-            mechanisms.add(mechanism)
-    return sorted(mechanisms)
-
-
-def configured_fact_role(target: dict[str, Any]) -> str:
-    """Read the declared fact role from one configured probe target."""
-
-    fact = target.get("fact")
-    if isinstance(fact, dict):
-        role = fact.get("role")
-        if isinstance(role, str):
-            return role
-    return ""
 
 
 def completed_fact_role(args: dict[str, Any], role: str) -> bool:
@@ -82,4 +48,4 @@ def is_hicache_profile_event(args: dict[str, Any], state_roles: set[str]) -> boo
     if target_id.startswith(("hiradix.", "hicache.", "hicache_controller.")):
         return True
     fact = parse_fact_or_none(args)
-    return fact is not None and (fact.role in ROLE_TO_MECHANISM or fact.role in state_roles)
+    return fact is not None and (fact.role in HICACHE_PROFILE_ROLES or fact.role in state_roles)

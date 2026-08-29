@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .artifacts import WorkflowArtifactLayout
+from .artifacts import ArtifactPolicy, WorkflowArtifactLayout
 from .io_model import HiCacheIoModel
 from .progress import WorkflowProgressReporter
-from .types import ProfileRunRef
+from .types import ProfileRunRef, TargetHiCacheConfig
 
 
 @dataclass(frozen=True)
@@ -20,24 +20,24 @@ class WorkflowOptions:
     """
 
     profile_run_dirs: tuple[Path, ...]
-    manifests: tuple[Path, ...]
+    source_manifests: tuple[Path, ...]
+    target_configs: tuple[TargetHiCacheConfig, ...]
     output_dir: Path
-    validations: tuple[str, ...]
     input_ids: frozenset[str]
     config_ids: frozenset[str]
     source_config_ids: frozenset[str]
     target_config_ids: frozenset[str]
-    prediction_scope: frozenset[str]
+    artifact_policy: ArtifactPolicy
     dry_run: bool = False
-    force: bool = False
     continue_on_error: bool = False
     max_predictions: int = 0
-    page_key_mode: str = "strip_scope"
-    sample_limit: int = 20
     trace_threads: int = 1
     trace_file_threads: int = 1
     model_run_jobs: int = 1
     hicache_io_model: HiCacheIoModel | None = None
+    base_io_models: tuple[tuple[str, HiCacheIoModel], ...] = ()
+    oracle_scores: tuple[tuple[str, Path, Path], ...] = ()
+    evaluation: bool = False
 
 
 @dataclass

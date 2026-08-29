@@ -29,28 +29,22 @@ def build_trace_graph_command(run: ModelingRunConfig, model_config_path: Path | 
         command.extend(["--graph-output", str(run.output_dir / "dag_chrome_trace.json")])
     if run.outputs.module_summary:
         command.extend(["--model-summary", str(run.output_dir / "model_summary.json")])
-    if run.outputs.dag_analysis:
-        command.extend(["--dag-analysis-output-dir", str(run.output_dir)])
     if model_config_path is not None:
         command.extend(["--model-config", str(model_config_path)])
     return command
 
 
 def append_trace_options(command: list[str], config: dict[str, Any], cpp_config: dict[str, Any]) -> None:
-    """Append trace concurrency, channel selection, and join parameters."""
+    """Append trace concurrency, window, and channel selection."""
 
     append_option(command, "--threads", cpp_config.get("threads"))
     append_option(command, "--file-threads", cpp_config.get("file_threads"))
     append_option(command, "--trace-window-start-us", cpp_config.get("trace_window_start_us"))
     append_option(command, "--trace-window-end-us", cpp_config.get("trace_window_end_us"))
+    append_option(command, "--actual-e2e-us", cpp_config.get("actual_e2e_us"))
     channels = configured_trace_channels(config)
     if channels is not None:
         append_option(command, "--trace-channels", ",".join(channels))
-
-    merge = config.get("trace_merge") if isinstance(config.get("trace_merge"), dict) else {}
-    append_option(command, "--trace-merge-tolerance-us", merge.get("tolerance_us"))
-    append_option(command, "--trace-merge-window", merge.get("search_window"))
-    append_option(command, "--trace-merge-margin-us", merge.get("margin_us"))
 
 
 def append_option(command: list[str], name: str, value: Any) -> None:

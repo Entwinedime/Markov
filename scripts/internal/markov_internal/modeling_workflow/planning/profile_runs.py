@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 from ...common.io import load_json
 from ...common.manifest import existing_manifest_files
 from ...common.paths import map_repo_path
-from ..types import CacheStatePredictionRef, ProfileRunRef
+from ..types import ProfileRunRef
 
 
 @dataclass(frozen=True)
@@ -41,37 +42,23 @@ class ProfileRunParser:
     def from_manifest(self, manifest_path: Path) -> ProfileRunRef:
         """Parse a manifest and its referenced profiling configuration."""
 
-        manifest = require_json_object(load_json(manifest_path), manifest_path)
-        run_dir = map_repo_path(Path(str(manifest.get("run_dir") or manifest_path.parent)))
-        config_path = map_repo_path(Path(str(manifest.get("config_path") or run_dir / "config.json")))
-        config = require_json_object(load_json(config_path), config_path)
-        metadata = config.get("metadata") if isinstance(config.get("metadata"), dict) else {}
+        manifest = load_json(manifest_path)
+        run_dir = map_repo_path(Path(str(manifest["run_dir"])))
+        config_path = map_repo_path(Path(str(manifest["config_path"])))
+        config = load_json(config_path)
+        framework = str(manifest.get("framework") or config.get("framework") or "sglang")
+        if framework != "sglang":
+            raise ValueError(f"{framework} supports framework-neutral build-dag, not HiCache prediction")
+        metadata = config["metadata"]
         sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
         return ProfileRunRef(
             manifest_path=manifest_path,
             run_dir=run_dir,
             config_path=config_path,
-            run_id=first_non_empty(
-                manifest.get("run_id"),
-                manifest.get("experiment_id"),
-                config.get("run_id"),
-                config.get("name"),
-                manifest_path.parent.name,
-            ),
-            config_id=first_non_empty(
-                metadata.get("suite_server_id"),
-                metadata.get("config_id"),
-                config.get("id"),
-                config.get("name"),
-                manifest_path.parent.name,
-            ),
-            input_id=first_non_empty(
-                metadata.get("suite_input_id"),
-                metadata.get("input_id"),
-                metadata.get("workload_id"),
-                "default_input",
-            ),
-            input_class=first_non_empty(metadata.get("input_class"), "unknown"),
+            run_id=str(manifest["run_id"]),
+            config_id=str(metadata["suite_server_id"]),
+            input_id=str(metadata["suite_input_id"]),
+            input_class=str(metadata.get("input_class") or "manual"),
             python_probe_files=tuple(existing_manifest_files(sidecar.get("python_probe_files", []))),
             hicache_config=extract_hicache_modeling_config(config, run_dir),
         )
@@ -79,71 +66,20 @@ class ProfileRunParser:
 
 @dataclass(frozen=True)
 class RunSelector:
-    """Filter discovered runs using independent CLI membership selectors."""
+    """Filter the discovered profile universe before role selection."""
 
     input_ids: frozenset[str]
     config_ids: frozenset[str]
-    source_config_ids: frozenset[str]
-    target_config_ids: frozenset[str]
 
     def filter(self, runs: list[ProfileRunRef]) -> list[ProfileRunRef]:
         """Return runs admitted by the requested input and config selectors."""
 
-        config_filter = self.config_ids | self.source_config_ids | self.target_config_ids
         return [
             run
             for run in runs
             if (not self.input_ids or run.input_id in self.input_ids)
-            and (not config_filter or run.config_id in config_filter)
+            and (not self.config_ids or run.config_id in self.config_ids)
         ]
-
-
-@dataclass(frozen=True)
-class PredictionMatrixBuilder:
-    """Build source-to-target predictions within each workload input."""
-
-    runs: list[ProfileRunRef]
-    source_config_ids: frozenset[str]
-    target_config_ids: frozenset[str]
-    prediction_scope: frozenset[str]
-    max_predictions: int = 0
-
-    def build(self) -> list[CacheStatePredictionRef]:
-        """Return a deterministic, optionally bounded prediction matrix."""
-
-        selected: dict[tuple[str, str, str], CacheStatePredictionRef] = {}
-        for by_config in group_runs_by_input(self.runs).values():
-            sources = [
-                run
-                for run in by_config.values()
-                if not self.source_config_ids or run.config_id in self.source_config_ids
-            ]
-            targets = [
-                run
-                for run in by_config.values()
-                if not self.target_config_ids or run.config_id in self.target_config_ids
-            ]
-            for source in sources:
-                for target in targets:
-                    prediction = CacheStatePredictionRef(source=source, target=target)
-                    if prediction.is_self and "self" not in self.prediction_scope:
-                        continue
-                    if not prediction.is_self and "cross" not in self.prediction_scope:
-                        continue
-                    selected[(prediction.input_id, source.config_id, target.config_id)] = prediction
-        predictions = [selected[key] for key in sorted(selected)]
-        if self.max_predictions > 0:
-            return predictions[: self.max_predictions]
-        return predictions
-
-
-def first_non_empty(*values: Any) -> str:
-    """Return the first non-empty string candidate or ``unknown``."""
-
-    for value in values:
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return "unknown"
 
 
 def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
@@ -151,9 +87,54 @@ def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> di
 
     modeling = config.get("modeling") if isinstance(config.get("modeling"), dict) else {}
     hicache = modeling.get("hicache") if isinstance(modeling.get("hicache"), dict) else {}
-    if not hicache:
+    if hicache:
+        return apply_sglang_capacity_from_server_cmd(run_dir, {"enabled": True, **hicache})
+    return extract_hicache_from_server_cmd(run_dir)
+
+
+def extract_hicache_from_server_cmd(run_dir: Path) -> dict[str, Any] | None:
+    """Reconstruct the narrow target contract from the exact profiled server command."""
+
+    flags = parse_server_command_flags(run_dir / "server_cmd.txt")
+    if flags.get("enable_hierarchical_cache") != "true":
         return None
-    return apply_sglang_capacity_from_server_cmd(run_dir, {"enabled": True, **hicache})
+    page_size = parse_nonnegative_int_or_none(flags.get("page_size"))
+    if not page_size:
+        return None
+
+    result: dict[str, Any] = {
+        "enabled": True,
+        "page_size": page_size,
+        "write_policy": flags.get("hicache_write_policy", "write_through"),
+        "prefetch_policy": flags.get("hicache_storage_prefetch_policy", "timeout"),
+    }
+    extra = parse_json_object_or_empty(flags.get("hicache_storage_backend_extra_config"))
+    threshold_tokens = parse_nonnegative_int_or_none(extra.get("prefetch_threshold"))
+    if threshold_tokens:
+        result["prefetch_threshold_pages"] = (threshold_tokens + page_size - 1) // page_size
+
+    timeout_fields = (
+        ("prefetch_timeout_base", "prefetch_timeout_base_sec"),
+        ("prefetch_timeout_per_ki_token", "prefetch_timeout_per_ki_token_sec"),
+        ("prefetch_timeout_max", "prefetch_timeout_max_sec"),
+    )
+    timeout_values = [parse_nonnegative_float_or_none(extra.get(source)) for source, _ in timeout_fields]
+    if all(value is not None for value in timeout_values):
+        for (_, target), value in zip(timeout_fields, timeout_values):
+            result[target] = value
+    return apply_sglang_capacity_from_server_cmd(run_dir, result)
+
+
+def parse_json_object_or_empty(value: Any) -> dict[str, Any]:
+    """Parse one command-line JSON object without accepting non-object values."""
+
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 
 
 def apply_sglang_capacity_from_server_cmd(run_dir: Path, hicache_config: dict[str, Any]) -> dict[str, Any]:
@@ -262,11 +243,3 @@ def group_runs_by_input(runs: list[ProfileRunRef]) -> dict[str, dict[str, Profil
             )
         by_config[run.config_id] = run
     return {input_id: dict(sorted(by_config.items())) for input_id, by_config in sorted(grouped.items())}
-
-
-def require_json_object(value: Any, path: Path) -> dict[str, Any]:
-    """Require a top-level JSON object at a workflow contract boundary."""
-
-    if not isinstance(value, dict):
-        raise ValueError(f"Expected a JSON object in {path}")
-    return value

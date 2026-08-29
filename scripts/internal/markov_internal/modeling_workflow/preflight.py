@@ -52,7 +52,7 @@ class PreflightRunner:
         progress = self.context.reporter.start_stage(
             "preflight",
             len(ordered_checks),
-            f"validations {','.join(self.context.options.validations)}",
+            "Direct I/O/control prediction",
             unit="check",
         )
         for check in ordered_checks:
@@ -83,8 +83,6 @@ class PreflightRunner:
 
     def _report(self, ordered_checks: list[PreflightCheck]) -> dict[str, Any]:
         return {
-            "schema": "trace_sim.modeling_workflow.preflight.v1",
-            "selected_validations": list(self.context.options.validations),
             "selected_checks": [check.name for check in ordered_checks],
             "run_count": len(self.context.runs),
             "ready": all(bool(summary.get("ready")) for summary in self.summaries.values()) if self.summaries else True,

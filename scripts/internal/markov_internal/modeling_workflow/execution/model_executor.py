@@ -1,20 +1,20 @@
-"""Execution, reuse, and persistence of normalized model-run cells."""
+"""Execution and compact persistence of normalized model-run cells."""
 
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ...common.io import load_json, write_json
+from ...common.io import write_json
+from ...common.paths import repo_relative_path
 from ...common.process import run_command
 from ..artifacts import ModelRunArtifacts
 from ..progress import StageProgress, count_text
-from ..types import ModelOutputRequirement, ModelRunCounts, ModelRunResult, ModelRunSpec
+from ..types import ModelRunCounts, ModelRunResult, ModelRunSpec
 from .runner_adapter import RunnerConfigBuilder
 
 if TYPE_CHECKING:
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class ModelRunExecutor:
-    """Execute, reuse, dry-run, or skip every cell in a model-run plan."""
+    """Execute, dry-run, or skip every cell in a model-run plan."""
 
     context: WorkflowContext
     specs: list[ModelRunSpec]
@@ -47,8 +47,7 @@ class ModelRunExecutor:
             if result.return_code != 0 and first_failure is None:
                 first_failure = result
 
-        summary = self._write_summary()
-        progress.finish(model_run_status(summary), self._done_text())
+        progress.finish(model_run_status(self._counts()), self._done_text())
         if first_failure is not None and not self.context.options.continue_on_error:
             raise SystemExit(f"Model run failed: {first_failure.spec.label}; see {first_failure.artifacts.model_log}")
         return self.results
@@ -100,7 +99,6 @@ class ModelRunExecutor:
         self.results[result.spec.run_id] = result
         row = model_run_row(result)
         self.rows.append(row)
-        write_json(result.artifacts.execution_json, row)
         progress.advance(self._running_metrics(inflight=inflight))
 
     def _run_one(self, spec: ModelRunSpec) -> ModelRunResult:
@@ -111,18 +109,24 @@ class ModelRunExecutor:
         try:
             spec.output_dir.mkdir(parents=True, exist_ok=True)
             builder = RunnerConfigBuilder(spec)
-            runner_config = builder.payload()
+            runner_config = materialize_runner_config(builder.payload(), artifacts)
             if self.context.options.dry_run:
                 write_json(artifacts.runner_config_json, runner_config)
                 return skipped_result(spec, artifacts, "dry_run", dry_run=True)
-            if not self.context.options.force and reusable_artifacts_ready(spec, artifacts, runner_config):
-                return ModelRunResult(spec=spec, return_code=0, elapsed_sec=0.0, artifacts=artifacts, reused=True)
-
             write_json(artifacts.runner_config_json, runner_config)
             return_code, elapsed_sec = execute_command(
                 builder.command(artifacts.runner_config_json), artifacts.model_log
             )
-            error_tail = read_log_tail(artifacts.model_log) if return_code != 0 else ""
+            if return_code == 0:
+                if not self.context.options.artifact_policy.keep_debug_artifacts:
+                    artifacts.model_log.unlink(missing_ok=True)
+                error_tail = ""
+            else:
+                truncate_log_tail(
+                    artifacts.model_log,
+                    self.context.options.artifact_policy.failure_log_max_bytes,
+                )
+                error_tail = read_log_tail(artifacts.model_log)
             return ModelRunResult(
                 spec=spec,
                 return_code=return_code,
@@ -132,6 +136,10 @@ class ModelRunExecutor:
             )
         except Exception as error:
             write_internal_error(artifacts.model_log, error)
+            truncate_log_tail(
+                artifacts.model_log,
+                self.context.options.artifact_policy.failure_log_max_bytes,
+            )
             return ModelRunResult(
                 spec=spec,
                 return_code=1,
@@ -147,21 +155,9 @@ class ModelRunExecutor:
             metrics["inflight"] = str(inflight)
         if counts.skipped:
             metrics["skipped"] = str(counts.skipped)
-        if counts.reused:
-            metrics["reused"] = str(counts.reused)
         if counts.errors:
             metrics["errors"] = str(counts.errors)
         return metrics
-
-    def _write_summary(self) -> dict[str, Any]:
-        summary = {
-            "schema": "trace_sim.modeling_workflow.model_runs.v1",
-            "run_count": len(self.rows),
-            **self._counts().as_payload(),
-            "total_elapsed_sec": sum(float(row.get("elapsed_sec") or 0.0) for row in self.rows),
-        }
-        write_json(self.context.artifacts.model_runs_summary_path, summary)
-        return summary
 
     def _done_text(self) -> str:
         counts = self._counts()
@@ -170,8 +166,6 @@ class ModelRunExecutor:
             parts.append(f"skipped {counts.skipped}")
         if counts.dry_run:
             parts.append(f"dry-run {counts.dry_run}")
-        if counts.reused:
-            parts.append(f"reused {counts.reused}")
         if counts.errors:
             parts.append(f"errors {counts.errors}")
         return " | ".join(parts)
@@ -200,6 +194,17 @@ def skipped_result(
     )
 
 
+def materialize_runner_config(config: dict[str, Any], artifacts: ModelRunArtifacts) -> dict[str, Any]:
+    """Write the C++ config once and replace its large runner-config copy with a path."""
+
+    cpp_config = config.get("cpp_model_config")
+    if not isinstance(cpp_config, dict):
+        raise ValueError("cache-state workflow requires an in-memory C++ model config")
+    write_json(artifacts.cpp_model_config_json, cpp_config)
+    config["cpp_model_config"] = str(repo_relative_path(artifacts.cpp_model_config_json))
+    return config
+
+
 def model_run_row(result: ModelRunResult) -> dict[str, Any]:
     """Serialize one model-run result without embedding large backend artifacts."""
 
@@ -207,73 +212,23 @@ def model_run_row(result: ModelRunResult) -> dict[str, Any]:
     row = {
         "model_run_id": spec.run_id,
         "label": spec.label,
-        "mode": spec.mode,
         "source_run_id": spec.source_profile.run_id,
         "source_config_id": spec.source_profile.config_id,
         "input_id": spec.source_profile.input_id,
-        "target_run_id": spec.target_profile.run_id if spec.target_profile is not None else None,
-        "target_config_id": spec.target_profile.config_id if spec.target_profile is not None else None,
-        "validation_requests": list(spec.validation_requests),
-        "output_requirements": list(spec.output_requirement_names),
+        "target_config": spec.target_config.label,
+        "target_config_path": str(spec.target_config.source_path) if spec.target_config.source_path else None,
         "output_dir": str(spec.output_dir),
-        "log_path": str(result.artifacts.model_log),
+        "log_path": str(result.artifacts.model_log) if result.artifacts.model_log.is_file() else None,
+        "log_retained": result.artifacts.model_log.is_file(),
         "return_code": result.return_code,
         "elapsed_sec": result.elapsed_sec,
         "skipped": result.skipped,
         "dry_run": result.dry_run,
-        "reused": result.reused,
         "skip_reason": result.skip_reason or None,
     }
     if result.execution_error_tail:
         row["execution_error_tail"] = result.execution_error_tail
     return row
-
-
-def reusable_artifacts_ready(
-    spec: ModelRunSpec,
-    artifacts: ModelRunArtifacts,
-    expected_runner_config: dict[str, Any],
-) -> bool:
-    """Return whether existing outputs exactly match the requested runner input.
-
-    File existence alone is insufficient: changing threads, trace channels,
-    target config, oracle paths, or page-key semantics must invalidate the old
-    model cell. The previous execution record must also describe a successful,
-    non-skipped invocation.
-    """
-
-    required = [artifacts.run_summary_json, artifacts.prediction_json]
-    if ModelOutputRequirement.HICACHE_VALIDATION in spec.output_requirements:
-        required.extend(
-            [
-                artifacts.validation_json,
-                artifacts.model_summary_json,
-                artifacts.predicted_state_trace_json,
-            ]
-        )
-    if ModelOutputRequirement.DAG_ANALYSIS in spec.output_requirements:
-        required.extend(
-            [
-                artifacts.dag_quality_json,
-                artifacts.dag_analysis_json,
-                artifacts.dag_anchor_coverage_json,
-                artifacts.dag_operation_visibility_json,
-            ]
-        )
-    if not all(path.is_file() for path in required):
-        return False
-    try:
-        existing_config = load_json(artifacts.runner_config_json)
-        execution = load_json(artifacts.execution_json)
-    except (OSError, json.JSONDecodeError):
-        return False
-    return (
-        existing_config == expected_runner_config
-        and isinstance(execution, dict)
-        and execution.get("return_code") == 0
-        and execution.get("skipped") is not True
-        and execution.get("dry_run") is not True
-    )
 
 
 def execute_command(command: list[str], log_path: Path) -> tuple[int, float]:
@@ -296,16 +251,32 @@ def read_log_tail(path: Path, limit: int = 8_000) -> str:
 
     if not path.is_file():
         return ""
-    return path.read_text(encoding="utf-8", errors="replace")[-limit:]
+    with path.open("rb") as log_file:
+        log_file.seek(0, 2)
+        log_file.seek(max(0, log_file.tell() - limit))
+        return log_file.read().decode("utf-8", errors="replace")
 
 
-def model_run_status(summary: dict[str, Any]) -> str:
+def truncate_log_tail(path: Path, limit: int) -> None:
+    """Retain at most ``limit`` trailing bytes from one failed command log."""
+
+    if not path.is_file() or path.stat().st_size <= limit:
+        return
+    marker = f"[model log truncated to final {limit} bytes]\n".encode()
+    tail_bytes = max(0, limit - len(marker))
+    with path.open("rb") as log_file:
+        log_file.seek(-tail_bytes, 2)
+        tail = log_file.read()
+    path.write_bytes(marker + tail)
+
+
+def model_run_status(counts: ModelRunCounts) -> str:
     """Map aggregate execution counts to the workflow progress status vocabulary."""
 
-    if summary.get("run_count") == 0:
+    if counts.handled == 0:
         return "EMPTY"
-    if summary.get("error_count"):
+    if counts.errors:
         return "ERROR"
-    if summary.get("skipped_count"):
+    if counts.skipped:
         return "CHECK"
     return "OK"

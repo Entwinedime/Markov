@@ -12,15 +12,12 @@ if str(INTERNAL_ROOT) not in sys.path:
     sys.path.insert(0, str(INTERNAL_ROOT))
 
 from markov_internal.modeling.runner import main as run_modeling  # noqa: E402
-from markov_internal.modeling_workflow.validations.hicache.backend.runner import (  # noqa: E402
-    write_validation_artifacts,
-)
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Compose the generic C++ runner with workflow-owned HiCache validation."""
+    """Run one generated C++ modeling config."""
 
-    return run_modeling(argv, validation_artifact_writer=write_validation_artifacts)
+    return run_modeling(argv)
 
 
 if __name__ == "__main__":
