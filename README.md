@@ -1,223 +1,156 @@
-# Trace Simulation
+# Markov Trace Simulation
 
-本仓库维护一条 trace-driven 建模链路：先从真实 SGLang / KTransformers 运行中采集事实，再由 C++ TraceGraph
-构建 DAG 或领域状态模型，最后用于 faithful replay、state prediction 和后续 what-if 性能预测。
+本项目从真实推理运行中采集 trace，构建可仿真的 DAG，并对配置变化进行图变换和性能预测。
 
-当前 active 工作重点是 SGLang HiCache state model。旧的 page-identity/observed 行为答案口径已经停止作为主线；
-当前采集和后端都按 token/range fact contract 推进。
-
-## 当前结构
+当前建模主线是 SGLang HiCache 的直接 I/O 与 control 变化：
 
 ```text
-.
-├── src/profiling/python_probe/          # sitecustomize + import hook + Python callable probes
-│   └── trace_sim_probe/probes/
-│       ├── generic_callable.py          # 通用 callable 插桩
-│       └── hicache/                     # HiCache source、token、snapshot、internal wrapper package
-├── src/profiling/ld_preload/            # C++ LD_PRELOAD hook 框架和硬编码 wrapper
-├── src/modeling/trace_graph/            # C++ TraceGraph、DAG 仿真和 SimulationModule 后端
-│   ├── include/markov/trace_graph/modules/hicache/
-│   └── src/modules/hicache/             # HiCache fact parser、radix tree、state model、summary
-├── scripts/profile.sh                   # 宿主机 profiling 入口，进入框架容器运行
-├── scripts/model.sh                     # 低层单次 modeling runner wrapper，进入干净 modeling 容器运行
-├── scripts/run.sh                       # 打开 framework runtime 或 modeling 容器
-├── scripts/build.sh                     # 构建 framework runtime/hook 或 modeling image
-├── scripts/internal/entrypoints/        # active CLI：profile/model/modeling_workflow
-├── scripts/internal/markov_internal/    # 内部 Python 包：profiling、audit、contracts、modeling、HiCache validation
-├── scripts/bench/hicache_phased_workload.py
-├── configs/experiments/hicache_state/   # common / forced capture / forced replay
-├── docs/                                # 主线文档和专项验证记录
-├── third_party/sglang/                  # SGLang fork submodule
-├── third_party/ktransformers/           # KTransformers fork submodule
-└── data/                                # 可再生 profiling/modeling 产物，不纳入长期证据
+profile manifest
+  -> source DAG
+  -> target HiCache effect plan
+  -> I/O cost plan
+  -> DAG patch
+  -> topological simulation
 ```
 
-## 文档入口
+`gap`、`prefill` 和 `decode` 不属于当前 HiCache direct 模型，结果和评分必须单独列出这些 component。
 
-| 文档 | 内容 |
-| --- | --- |
-| `docs/profiling_development.md` | profiling 架构、runner、suite、Python probe 和 HiCache 采集契约。 |
-| `docs/modeling_development.md` | C++ TraceGraph、model runner、mode、HiCache state backend 和输出格式。 |
-| `docs/validation/hicache_state_validation.md` | 当前 HiCache state validation 口径、forced-token bundle workflow、保留基线和复现命令。 |
-| `docs/validation/hicache_state_model_limitations.md` | 当前仍存在的中长期模型限制和收敛方向。 |
-| `docs/project_constraints.md` | 项目长期约束。 |
-| `docs/work_progress.md` | 时间戳流水记录；旧条目只代表当时状态。 |
+## 公开入口
 
-## 子模块
+- `scripts/profile.sh`：在目标框架容器中采集 profile；
+- `scripts/model.sh`：在 modeling 容器中构建 DAG、校准、建模和预测；
+- `scripts/run.sh`：进入 SGLang、KTransformers 或 modeling 容器排查环境；
+- `scripts/build.sh`：构建对应 image 和 hook。
 
-```bash
-git submodule update --init --recursive
-```
-
-框架源码作为可编辑 submodule 保留：
-
-- `third_party/sglang/`
-- `third_party/ktransformers/`
-
-容器 runtime image 会把 submodule 源码复制进镜像并安装。框架源码变更后需要重建对应 runtime layer。
+内部 Python module 和 C++ binary 不是需要用户串联的第二套公开流程。
 
 ## Docker 环境
 
-项目维护三个 Docker 环境：
+项目保留三个环境：
 
-- `sglang-profile`：SGLang 真实 profiling / runtime 环境，包含 Ascend/CANN 和 hook build 上下文；
-- `ktransformers-profile`：KTransformers 真实 profiling / runtime 环境，包含 Ascend/CANN 和 hook build 上下文；
-- `modeling`：干净 Ubuntu 24.04 C++23 环境，只用于 C++ TraceGraph 构建、clang-format/clang-tidy 和 modeling run/check。
+| 环境 | 用途 |
+| --- | --- |
+| `sglang` | SGLang 运行、profiling 和 framework hook |
+| `ktransformers` | KTransformers 运行、profiling 和 framework hook |
+| `modeling` | C++ TraceGraph、Python modeling workflow 和验证 |
 
-构建 modeling 环境并检查 TraceGraph：
+构建或进入环境：
 
 ```bash
 scripts/build.sh modeling
-scripts/run.sh modeling -- bash -lc \
-  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
-scripts/run.sh modeling -- bash -lc \
-  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=ON && cmake --build build/modeling/trace_graph-validation --target trace_graph -j2'
-```
-
-构建 framework runtime 和对应 hook：
-
-```bash
 scripts/build.sh sglang
 scripts/build.sh ktransformers
+
+scripts/run.sh modeling
+scripts/run.sh sglang
+scripts/run.sh ktransformers
 ```
 
-真实 profiling 不应直接使用 host build 的 hook so。LD_PRELOAD hook 需要在对应框架容器内构建，保证 ABI、工具链和运行依赖匹配。
+## Profiling
+
+配置决定 framework、server、workload 和采集 channel：
+
+```bash
+scripts/profile.sh <experiment.json> --dry-run
+scripts/profile.sh <experiment.json>
+```
+
+KTransformers 的共享 DAG smoke 配置位于：
+
+```text
+configs/experiments/ktransformers/profiling_dag_smoke.json
+```
+
+profiling 与 modeling 的唯一正式交接面是每个 run 的 `profile_manifest.json`。
+
+## Modeling
+
+查看当前正式动作：
+
+```bash
+scripts/model.sh --help
+```
+
+主要动作是：
+
+```text
+build-dag
+calibrate-hicache physical
+calibrate-hicache runtime-dma
+build-hicache-model
+predict-hicache
+evaluate-hicache
+```
+
+所有 modeling 动作都在同一个 modeling 容器中完成；批量预测不会为每个 cell 再启动一个嵌套容器。
+
+SGLang 与 KTransformers 共用 framework-neutral DAG 入口：
+
+```bash
+scripts/model.sh build-dag \
+  --profile-manifest <profile_manifest.json> \
+  --output-dir <dag-output>
+```
+
+它只构图和仿真，不要求 HiCache。KTransformers manifest 显式记录 framework，当前提供 LD_PRELOAD CPU trace；
+HiCache prediction 只接受 SGLang source，并会对其他 framework 给出 capability 错误。
+
+正式预测只需要 source manifest、显式 target HiCache 配置和 one-base I/O model：
+
+```bash
+scripts/model.sh predict-hicache \
+  --source-manifest <source/profile_manifest.json> \
+  --target-config configs/modeling/hicache_target_example.json \
+  --hicache-io-model <one-base-model.json> \
+  --output-dir <prediction-output>
+```
+
+真实 target profile 不属于该命令。5×3/12/60-cell 和 target oracle 只通过 `evaluate-hicache` 进入评分流程。
+oracle-cost 诊断在 `evaluate-hicache --diagnostics full` 后显式增加
+`--oracle-scores <manifest.json>`。manifest 按 base 列出 base observation 和 target score-only 输入，
+同一次 matrix 评分可覆盖多个 base；这些输入不会参与参数估计。
+
+## 可选 DAG 变换
+
+NodeScale 是框架无关的可选 DAG 变换。它按顺序匹配节点名称子串，并缩放节点耗时；没有配置时默认关闭：
+
+```json
+{
+  "node_scale": {
+    "enabled": true,
+    "rules": [
+      {
+        "name": "AscendCL@aclrtSynchronizeStream",
+        "factor": 1.1
+      }
+    ]
+  }
+}
+```
+
+HiCache 是 SGLang 专属扩展；KTransformers 共享 profile manifest、source DAG 和 simulation，但不会被伪造为支持 HiCache。
 
 ## 常用检查
 
 ```bash
-python3 -m ruff format --check .
+python3 -m ruff check scripts src/profiling
 find configs -name '*.json' -print0 | xargs -0 -n1 jq empty
 git diff --check
 ```
 
-C/C++ 或 modeling runner 改动还需要：
+C++ TraceGraph 使用 modeling 容器构建：
 
 ```bash
 scripts/run.sh modeling -- bash -lc \
-  'python3 -m py_compile $(find scripts/internal/entrypoints scripts/internal/markov_internal -name "*.py" -print)'
-scripts/run.sh modeling -- bash -lc \
-  "find src/modeling/trace_graph src/profiling/ld_preload -type f \\( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \\) -print0 | xargs -0 clang-format --dry-run --Werror"
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
 ```
 
-## 采集
+## 文档
 
-真实 SGLang / KTransformers profiling 通过宿主机入口启动：
+- `docs/project_constraints.md`：不可违反的项目边界；
+- `docs/profiling_development.md`：profiling 结构和采集合同；
+- `docs/modeling_development.md`：DAG、HiCache 模型与 workflow；
+- `docs/hicache_io_cost_model.md`：I/O cost 的变量、参数和预测方式；
+- `docs/validation/`：当前验证结果和已知限制。
 
-```bash
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_common.json --list-experiments
-scripts/profile.sh configs/experiments/hicache_state/profiling_hicache_state_common.json \
-  --inputs manual_phased_fast
-```
-
-`scripts/profile.sh` 负责选择 docker compose service、挂载仓库、设置 Ascend 环境，并在容器内调用
-`scripts/internal/entrypoints/profile.py`。宿主机上不要直接调用容器内 entrypoint 启动真实 server profiling。
-
-当前 HiCache state validation suite 只启用 `python_probe`。它采集：
-
-- 声明给 `hicache_state_model` 的 `workload_identity` 状态输入事实，包括 cache lookup、cache extend、cache lifecycle commit
-  和 prefetch candidate；
-- `timing_observation` / `source_actual` 的异步 IO 或 source 行为观测；
-- `oracle_state` 的 validation-only state snapshot。
-
-需要 base DAG faithful replay 或 cache patch 时，应另建完整执行 trace suite，同时启用 torch / LD_PRELOAD / Python
-真实执行事件。HiCache state-only suite 不能替代性能 DAG 采集。
-
-profiling 后的通用 artifact audit 和 HiCache workflow readiness 不再维护单独 host CLI。`modeling_workflow.py`
-preflight 每次基于当前代码重新审计 manifest，并把结果写入：
-
-```text
-<workflow_output>/preflight_summary.json
-<workflow_output>/artifacts/preflight/
-```
-
-跨配置验证使用 forced-token capture/replay suite，保证同一 input 的 generated token timeline 一致：
-
-```bash
-scripts/profile.sh \
-  configs/experiments/hicache_state/profiling_hicache_state_forced_capture.json \
-  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch
-
-CAPTURE_BUNDLE=data/profile_runs/sglang/<capture_suite>/forced_token_bundle.json
-
-scripts/profile.sh \
-  configs/experiments/hicache_state/profiling_hicache_state_forced_replay.json \
-  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
-  --forced-token-bundle "$CAPTURE_BUNDLE"
-```
-
-capture suite 在自身目录生成 `forced_token_bundle.json` 和 `forced_token_plans/`。forced replay 必须显式传 bundle；
-runner 不读取仓库固定 plan，也不自动选择最近一次 capture。
-
-## 建模
-
-当前不维护静态 modeling config。post-profile modeling 主流程直接运行 unified workflow。它根据 replay suite 中的
-target server config 动态生成 `<workflow_output>/model_runs/<model_run_id>/runner_config.json`，低层 runner 再生成每个
-model run 输出目录下的 `cpp_model_config.json` 作为 C++ TraceGraph backend narrow config：
-
-```bash
-RUN_DIR=<forced_replay_suite_dir>
-IO_MODEL=data/calibration/hicache_io_qwen3_32b_tp2_20260712/hicache_io_model.json
-
-python3 scripts/internal/entrypoints/modeling_workflow.py \
-  --profile-run-dir "$RUN_DIR" \
-  --output-dir "$RUN_DIR/modeling/modeling_workflow_full" \
-  --validations base_dag,final_dag,hicache_dag_mapping,hicache_final_state,hicache_transition \
-  --inputs manual_phased_fast,manual_pressure_prefetch,manual_deeper_pressure_prefetch \
-  --configs c0_wt_timeout_p128_balanced,c1_wts_wait_p128_low_l1,c2_wb_best_effort_p64_low_l1,c3_wt_best_effort_p32_low_host,c4_wb_timeout_p64_low_capacity \
-  --prediction-scope self,cross \
-  --page-key-mode strip_scope \
-  --hicache-io-model "$IO_MODEL" \
-  --trace-threads 4 \
-  --trace-file-threads 4 \
-  --model-run-jobs 4 \
-  --force \
-  --continue-on-error
-```
-
-`HiCacheModule` 执行 state replay 并导出 stable-keyed target effect decision；`HiCacheDagPatchModule` 使用 calibrated I/O model
-完成 source attribution、insert/remove/replace/partial-replace、boundary gate 和一次原子 mutation apply。`prediction.json.predicted_e2e_us`
-来自 materialized active DAG 的拓扑仿真，单位为微秒；由于 prefill 仍为 `deferred`，该值不代表完整跨配置 E2E prediction。
-
-## HiCache 当前进展
-
-截至 2026-07-13，当前主线状态是：
-
-- Python probe target catalog 统一维护在 `configs/profiling/hicache_probe_targets.json`，当前共 `40` 个 target；
-- `fact` 只保留 `class`、`role`、`consumers` 三类语义字段；采集入口按 consumer 选择 target，不维护旧 registry / envelope；
-- `hicache_state_model` 正常输入只消费 `cache_lookup_input`、`cache_extend_input`、`cache_lifecycle_commit` 和
-  `prefetch_candidate_anchor` 四类 state fact；其余 target 只用于输入合同、
-  transition validation 或 final-state oracle；
-- C++ TraceGraph 直接读取 profile manifest 中的 torch / LD_PRELOAD / Python probe trace，并在进程内合流，不再写大型
-  `merged_trace` 中间产物；
-- `hicache_profile_quality` 不再作为采集 consumer；quality 审计按当前 run 实际请求的 input/final/transition consumer 判断 readiness；
-- `oracle_state/state_snapshot` 只保留 `23` 个 `HiRadixCache.*` target，不再让 `HiCacheController.*`、`PrefillAdder.*`
-  或 `Scheduler.*` snapshot 定义 HiCache cache-tree final state；
-- C++ 使用 `HiCacheTokenDirectory` 和 role-specific resolver，不再用 `request_id -> longest path` 或 admission path 回退；
-- forced-token capture bundle、显式 replay bundle 依赖、preflight、workflow input quality gate 和
-  `modeling_workflow.py` 已落地；
-- C++ direct I/O/control v1 已建立完整 target effect decision、scope-local三lane资源模型、source DAG一次索引、effect-local
-  attribution、insert/remove/replace/partial-replace/no-op、ownership/no-double-count gate、prospective topology、boundary validation、
-  cell-level atomic apply和post-apply materialization validation；
-- I/O cost只使用target effective bytes、device-host bandwidth和host-storage bandwidth；当前production calibration具有独立
-  KV geometry与两类bandwidth provenance，不读取target observed duration、raw E2E或validation答案；
-- 当前active full-matrix报告是
-  `data/profile_runs/sglang/20260712_133108_profiling_hicache_dag_analysis_forced_replay/modeling/hicache_dag_patch_final_75_completion_v3`：
-  profile preflight full-DAG/HiCache均为`15/15`，C++ model run为`90/90 usable`，Final-DAG为`75/75 ready/applied`；
-- Raw target shape为`37/75 exact`，schedule-invariant acceptance为`75/75`，invariant/acceptance mismatch、alternate evidence missing、
-  source unresolved、ownership conflict、apply blocker和topology error均为0；
-- Raw final state为`67/75 exact`，closure为67 exact + 8 payload-only readiness limitation；raw transition为`30/75 exact`，
-  closure为30 exact + 18 readiness limitation + 27 snapshot grouping/observability；两个closure的unrelated/not-ready均为0；
-- Prefetch payload前的metadata query、后台queue、TP collective和worker调度仍是显式limitation；prefill固定报告`deferred`，
-  当前结果不宣称raw state/transition或完整跨配置E2E为`75/75 exact`；
-- 同一大case的1线程到4线程整体wall time从68.23秒降到41.99秒（1.62x），trace read/parse约2.14x--2.17x；
-- `scripts/internal/entrypoints/` 只保留 `profile.py`、`model.py` 和 `modeling_workflow.py` 三个主入口，复用逻辑位于
-  `scripts/internal/markov_internal/`；旧平铺脚本和人工对照入口已删除，不保留兼容入口。
-
-当前详细结果、已关闭诊断问题、已知限制和复现命令以 `docs/validation/hicache_state_validation.md` 与
-`docs/validation/hicache_state_model_limitations.md` 为准。
-
-## 数据约束
-
-`data/profile_runs/**`、`data/modeling_runs/**`、`data/traces/**` 都是可再生运行产物，不作为长期事实来源。
-需要保留的结论必须抽取到 `docs/validation/` 或主线文档中。
+`data/` 中的大部分内容是可再生运行资产。删除前必须核对 retention manifest，不能清理最终回归仍需使用的数据。
