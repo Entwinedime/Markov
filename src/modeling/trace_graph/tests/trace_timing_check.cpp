@@ -1,5 +1,6 @@
 /** @file Small trace timing checks, enabled only in explicit validation builds. */
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/io/trace_channel_join.hpp"
 
@@ -92,10 +93,62 @@ void runtime_diagnostics_do_not_add_or_remove_work() {
     auto after = event("after prepare", "1", "1", 200, 10);
     auto observation = event("runtime.triton.prepare", "1", "1", 50, 200, "runtime_diagnostic");
     observation.source_channel = core::TraceSourceChannel::PythonProbe;
-    auto graph = core::DagBuilder(1).build({before, observation, after}, 0);
-    require(graph.node_count() == 2 && graph.edge_count() == 1, "diagnostic envelope is not executable work");
+    auto response = event("runtime.response.scheduler_send", "1", "1", 150, 10, "runtime_diagnostic");
+    response.source_channel = core::TraceSourceChannel::PythonProbe;
+    auto graph = core::DagBuilder(1).build({before, observation, response, after}, 0);
+    require(graph.node_count() == 4 && graph.active_edge_count() == 3, "response boundaries partition the gap without materializing diagnostic work");
     require(graph.hicache_fact_events().empty(), "runtime diagnostic is not a HiCache fact");
     require(simulation::run_topological_simulation(graph).e2e_us == 110, "retain the full 90 us CPU gap");
+    graph.set_scope_node_owned(0);
+    graph.set_scope_node_owned(1);
+    require(simulation::run_gap_excluded_topological_simulation(graph).e2e_us == 20, "response boundaries do not turn gap into execution cost");
+}
+
+void observed_cpu_gap_split_preserves_consumers() {
+    const auto source = event("source", "1", "1", 100, 10);
+    const auto target = event("target", "1", "1", 200, 10);
+    auto observation = event("send", "1", "1", 140, 20);
+    auto graph = core::DagBuilder(1).build({source, target}, 0);
+    const auto consumer = graph.add_synthetic_node({.name = "other consumer", .duration = 7});
+    graph.add_edge(0, consumer, core::DagEdgeKind::Correlation);
+    const auto split = core::insert_cpu_gap_observation(graph, observation);
+    require(split.has_value(), "an interval wholly inside a unique CPU gap can be connected");
+    require(graph.node(0).cpu_gap_after == 30 && graph.node(split->begin).cpu_gap_after == 20
+                && graph.node(split->end).cpu_gap_after == 40,
+            "three gaps partition the original observed interval");
+    require(simulation::run_topological_simulation(graph).e2e_us == 110
+                && graph.node(consumer).completion_time == 17 && graph.node(1).completion_time == 110,
+            "all original sequential and non-sequential consumers retain their completion times");
+    observation.ts = 170;
+    require(core::insert_cpu_gap_observation(graph, observation).has_value(), "later disjoint observations share the remaining gap");
+    require(simulation::run_topological_simulation(graph).e2e_us == 110, "multiple observations do not duplicate time");
+    graph.set_control_exclusion_intervals({{.gpu_id = 0, .start_us = 170, .end_us = 190,
+                                            .kind = core::DagControlExclusionKind::PrefillDecode}});
+    require(simulation::run_control_topological_simulation(graph).e2e_us == 90,
+            "control exclusions use each split interval, not a fraction of the former whole gap");
+
+    const auto rejected = [&](core::DagGraph candidate, const core::TraceEvent & interval) {
+        const auto nodes = candidate.node_count(), edges = candidate.edge_count();
+        require(!core::insert_cpu_gap_observation(candidate, interval), "unsupported placement must not guess an owner");
+        require(candidate.node_count() == nodes && candidate.edge_count() == edges, "rejected placement does not partially edit the graph");
+    };
+    observation.ts = 155; observation.dur = 20;
+    rejected(graph, observation);
+    observation.ts = 145; observation.dur = 5; rejected(graph, observation);
+    observation.ts = 140; observation.dur = 20; rejected(graph, observation);
+    auto raw = core::DagBuilder(1).build({source, target}, 0);
+    observation.ts = 105; rejected(raw, observation);
+    observation.ts = 190; rejected(raw, observation);
+    observation.ts = 140; observation.tid = "unknown"; rejected(raw, observation);
+    observation.tid = "1";
+    auto changed = raw; changed.mutable_node(0).cpu_gap_after = 80; rejected(changed, observation);
+    auto owned = raw; owned.add_scope_gap_duration(0, 10); rejected(owned, observation);
+    auto branched = raw;
+    const auto branch = branched.add_synthetic_node({.name = "second sequential consumer"});
+    branched.add_edge(0, branch, core::DagEdgeKind::Sequential); rejected(branched, observation);
+    observation.ts = 110; observation.dur = 90;
+    require(core::insert_cpu_gap_observation(raw, observation).has_value(), "intervals may exactly meet both CPU boundaries");
+    require(simulation::run_topological_simulation(raw).e2e_us == 110, "zero length surrounding gaps conserve time");
 }
 
 void queue_wait_follows_task_arrival() {
@@ -144,6 +197,29 @@ void queue_wait_follows_task_arrival() {
     require(unknown.node(node_id(unknown, worker.name)).cpu_gap_after == 96,
             "unmatched queue events keep their observed gap");
 }
+
+void response_endpoint_preserves_background_resource_dependencies() {
+    core::DagGraph graph;
+    const auto background = graph.add_synthetic_node({.name = "earlier background work", .duration = 40});
+    const auto work = graph.add_synthetic_node({.name = "business work", .duration = 10});
+    const auto response = graph.add_synthetic_node({.name = "client response", .duration = 5, .counts_toward_e2e = true});
+    const auto poll = graph.add_synthetic_node({.name = "later background poll", .duration = 100});
+    graph.add_edge(background, work, core::DagEdgeKind::Sequential);
+    graph.add_edge(work, response, core::DagEdgeKind::Sequential);
+    graph.add_edge(work, poll, core::DagEdgeKind::Sequential);
+    const auto replay = simulation::run_topological_simulation(graph);
+    require(replay.e2e_us == 55 && replay.processed_nodes == 4 && graph.node(poll).completion_time == 150,
+            "response completion retains earlier resource contention but not unrelated later work");
+    graph.mutable_node(background).duration = 80;
+    require(simulation::run_topological_simulation(graph).e2e_us == 95,
+            "a non-endpoint background task still delays its business consumer");
+    graph.mutable_node(work).cpu_gap_after = 7;
+    require(simulation::run_topological_simulation(graph).e2e_us == 102,
+            "selecting a response endpoint must not erase the observed gap on its incoming path");
+    graph.add_edge(poll, response, core::DagEdgeKind::Mutation);
+    require(simulation::run_topological_simulation(graph).e2e_us == 202,
+            "background completion must be included when the response actually depends on it");
+}
 }
 
 int main() {
@@ -151,5 +227,7 @@ int main() {
     worker_runtime_keeps_submission_and_device_dependencies();
     queue_wait_follows_task_arrival();
     runtime_diagnostics_do_not_add_or_remove_work();
+    observed_cpu_gap_split_preserves_consumers();
+    response_endpoint_preserves_background_resource_dependencies();
     std::cout << "Trace timing checks passed\n";
 }
