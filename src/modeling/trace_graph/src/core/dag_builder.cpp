@@ -180,7 +180,6 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     graph.reserve(DagGraphCapacity{ .nodes = graph.node_count(), .edges = estimate_edge_capacity(graph, index) });
     add_correlation_edges(graph, index, threads_);
     add_sequential_edges(graph, index);
-    add_request_boundary_edges(graph, index);
     add_event_wait_edges(graph, index);
     add_notify_wait_edges(graph, index);
     add_model_execute_edges(graph, index);

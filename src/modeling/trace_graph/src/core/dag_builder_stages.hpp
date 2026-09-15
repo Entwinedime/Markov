@@ -54,7 +54,6 @@ void sort_nodes_by_event_ts_if_needed(const DagGraph & graph, std::vector<size_t
 [[nodiscard]] size_t estimate_edge_capacity(const DagGraph & graph, const DagBuildIndex & index);
 void add_correlation_edges(DagGraph & graph, DagBuildIndex & index, size_t threads);
 void add_sequential_edges(DagGraph & graph, DagBuildIndex & index);
-void add_request_boundary_edges(DagGraph & graph, DagBuildIndex & index);
 void add_event_wait_edges(DagGraph & graph, DagBuildIndex & index);
 void add_notify_wait_edges(DagGraph & graph, DagBuildIndex & index);
 void add_model_execute_edges(DagGraph & graph, DagBuildIndex & index);

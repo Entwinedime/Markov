@@ -1,16 +1,13 @@
 /**
  * @file
- * @brief Orders execution lanes and proven request lifecycle boundaries.
+ * @brief Orders execution lanes and separates CPU queue service from arrival waits.
  */
 #include "dag_builder_stages.hpp"
 
 #include <algorithm>
-#include <optional>
 #include <ranges>
 #include <string>
 #include <tuple>
-#include <unordered_map>
-#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::core {
@@ -33,15 +30,7 @@ namespace {
 
 using dag_builder_detail::node_end_ts;
 
-using LaneNodes = std::unordered_map<size_t, std::vector<size_t>>;
-
 bool contains_any_hccl_name(const std::string & name) { return name.contains("hcom") || name.contains("HCCL") || name.contains("hccl"); }
-
-struct RequestLifecycleBoundary {
-    std::string request_id;
-    uint64_t lookup_ts = 0;
-    uint64_t commit_end_ts = 0;
-};
 
 struct LaneOrderBuffers {
     std::vector<size_t> & nodes;
@@ -74,87 +63,6 @@ void add_lane_order_edges(DagGraph & graph, const LaneOrderBuffers & buffers) {
     }
 }
 
-std::vector<RequestLifecycleBoundary> request_lifecycle_boundaries(const DagGraph & graph) {
-    std::unordered_map<std::string, RequestLifecycleBoundary> by_request;
-    for (const auto & event : graph.hicache_fact_events()) {
-        if (event.arg("fact.class") != "workload_identity") continue;
-        const auto request_id = event.arg("request_id");
-        if (request_id.empty()) continue;
-        const auto role = event.arg("fact.role");
-        auto & boundary = by_request[request_id];
-        boundary.request_id = request_id;
-        if (role == "cache_lookup_input" && (boundary.lookup_ts == 0 || event.ts < boundary.lookup_ts)) boundary.lookup_ts = event.ts;
-        if (role == "cache_lifecycle_commit" && event.arg("lifecycle_kind") == "finished") {
-            boundary.commit_end_ts = std::max(boundary.commit_end_ts, node_end_ts(event));
-        }
-    }
-
-    std::vector<RequestLifecycleBoundary> boundaries;
-    boundaries.reserve(by_request.size());
-    for (auto & [request_id, boundary] : by_request) {
-        (void)request_id;
-        if (boundary.lookup_ts > 0) boundaries.push_back(std::move(boundary));
-    }
-    std::ranges::sort(boundaries, [](const auto & left, const auto & right) {
-        if (left.lookup_ts != right.lookup_ts) return left.lookup_ts < right.lookup_ts;
-        return left.request_id < right.request_id;
-    });
-    return boundaries;
-}
-
-std::optional<size_t> first_cpu_node_at_or_after(const DagGraph & graph, const LaneNodes & lane_to_nodes, uint64_t timestamp) {
-    std::optional<size_t> selected;
-    for (const auto & [lane_id, nodes] : lane_to_nodes) {
-        (void)lane_id;
-        if (nodes.empty() || !graph.node(nodes.front()).is_cpu) continue;
-        auto node =
-            std::lower_bound(nodes.begin(), nodes.end(), timestamp, [&](size_t node_id, uint64_t value) { return graph.event_for_node(node_id).ts < value; });
-        while (node != nodes.end() && graph.event_for_node(*node).name.ends_with(".self")) ++node;
-        if (node == nodes.end()) continue;
-        if (!selected || graph.event_for_node(*node).ts < graph.event_for_node(*selected).ts) selected = *node;
-    }
-    return selected;
-}
-
-std::optional<size_t> device_frontier_before(const DagGraph & graph, const std::vector<size_t> & nodes, uint64_t timestamp) {
-    if (nodes.empty() || graph.node(nodes.front()).is_cpu) return std::nullopt;
-    auto node =
-        std::lower_bound(nodes.begin(), nodes.end(), timestamp, [&](size_t node_id, uint64_t value) { return graph.event_for_node(node_id).ts < value; });
-    if (node == nodes.begin()) return std::nullopt;
-    --node;
-    return *node;
-}
-
-std::optional<size_t> first_device_node_at_or_after(const DagGraph & graph, const std::vector<size_t> & nodes, uint64_t timestamp) {
-    if (nodes.empty() || graph.node(nodes.front()).is_cpu) return std::nullopt;
-    const auto node =
-        std::lower_bound(nodes.begin(), nodes.end(), timestamp, [&](size_t node_id, uint64_t value) { return graph.event_for_node(node_id).ts < value; });
-    if (node == nodes.end()) return std::nullopt;
-    return *node;
-}
-
-void add_request_boundary_dependencies(DagGraph & graph, const LaneNodes & lane_to_nodes) {
-    const auto boundaries = request_lifecycle_boundaries(graph);
-    for (size_t index = 1; index < boundaries.size(); ++index) {
-        const auto & previous = boundaries[index - 1];
-        const auto & current = boundaries[index];
-        if (previous.commit_end_ts == 0 || previous.commit_end_ts >= current.lookup_ts) continue;
-        const auto cpu_anchor = first_cpu_node_at_or_after(graph, lane_to_nodes, current.lookup_ts);
-        if (!cpu_anchor) continue;
-        for (const auto & [lane_id, nodes] : lane_to_nodes) {
-            (void)lane_id;
-            const auto frontier = device_frontier_before(graph, nodes, current.lookup_ts);
-            if (frontier) graph.add_edge(*frontier, *cpu_anchor, DagEdgeKind::Sync);
-        }
-        for (const auto & [lane_id, nodes] : lane_to_nodes) {
-            (void)lane_id;
-            const auto first = first_device_node_at_or_after(graph, nodes, current.lookup_ts);
-            if (first) graph.add_edge(*cpu_anchor, *first, DagEdgeKind::Sync);
-        }
-    }
-}
-
-
 } // namespace
 
 void add_sequential_edges(DagGraph & graph, DagBuildIndex & index) {
@@ -169,8 +77,6 @@ void add_sequential_edges(DagGraph & graph, DagBuildIndex & index) {
         add_lane_order_edges(graph, LaneOrderBuffers{ .nodes = nodes, .notify_wait_nodes = index.notify_wait_nodes });
     }
 }
-
-void add_request_boundary_edges(DagGraph & graph, DagBuildIndex & index) { add_request_boundary_dependencies(graph, index.lane_to_nodes); }
 
 void normalize_cpu_queue_waits(DagGraph & graph) {
     struct QueuePredecessors {
@@ -205,6 +111,5 @@ void normalize_cpu_queue_waits(DagGraph & graph) {
         graph.mutable_node(id).cpu_ready_delay_before = start - ready;
     }
 }
-
 
 } // namespace markov::trace_graph::core
