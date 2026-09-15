@@ -311,7 +311,8 @@ def _compare_phase_cost(
                     {"effect_id": prefill_effect + "common_kernel", "duration_us": target["prefill_common_kernel"]},
                     {"effect_id": prefill_effect + "prefix_attention", "duration_us": target["prefill_prefix_attention"]},
                     {"effect_id": prefill_effect + "collective", "duration_us": target_prefill_collective},
-                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel},
+                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel,
+                     "paged_attention_duration_us": target["decode_paged_attention"]},
                     {"effect_id": decode_effect + "collective", "duration_us": target_decode_collective},
                 )
             )
@@ -323,7 +324,8 @@ def _compare_phase_cost(
                         "effect_id": prefill_effect + "collective",
                         "duration_us": rank_collective[("prefill", rank, request)],
                     },
-                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel},
+                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel,
+                     "paged_attention_duration_us": target["decode_paged_attention"]},
                     {
                         "effect_id": decode_effect + "collective",
                         "duration_us": rank_collective[("decode", rank, request)],
