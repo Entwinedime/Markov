@@ -5,9 +5,11 @@
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 #include "markov/trace_graph/modules/hicache/service_model.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/device_allocator.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
+#include "../src/modules/hicache/patch/rewrite_mutation.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -59,6 +61,95 @@ void allocator_slice_follows_physical_operations() {
     require(allocator.free_index_offset == 1, "empty sorted merge preserves the offset");
     allocator.allocate(100);
     require(!allocator.free_index_offset, "partial count consumption does not prove a successful physical allocation");
+}
+
+void source_prefetch_wait_is_removed_without_a_target_join() {
+    core::DagGraph graph;
+    const auto before = graph.add_synthetic_node({.name = "source polling", .duration = 1});
+    const auto after = graph.add_synthetic_node({.name = "consumer", .duration = 1});
+    graph.add_edge(before, after, core::DagEdgeKind::Sequential);
+    graph.mutable_node(before).cpu_gap_after = graph.mutable_node(before).original_cpu_gap_after = 100;
+    patch::HiCacheRewriteDecision decision;
+    decision.effect_id = "prefetch";
+    decision.effect_type = model::HiCacheEffectType::PrefetchIo;
+    decision.rewrite_kind = patch::HiCacheRewriteKind::RemoveOwnedCost;
+    decision.shadow_plan_ready = true;
+    decision.completion_join_contract_ready = true;
+    decision.source_completion_wait_blocking = true;
+    decision.completion_wait_slices = {{.owner_node_id = before, .successor_node_id = after,
+        .gap_start_us = 1, .gap_end_us = 101, .owned_start_us = 21, .owned_end_us = 81}};
+    const auto plan = patch::rewrite_transaction_detail::build_plan(graph, {decision}, {});
+    require(plan.set_cpu_gaps.size() == 1 && plan.set_cpu_gaps.front().duration == 40,
+            "target without a completion join still removes proven source polling wait, retaining unrelated time");
+    decision.source_completion_wait_blocking = false;
+    require(patch::rewrite_transaction_detail::build_plan(graph, {decision}, {}).set_cpu_gaps.empty(),
+            "no proven source wait means no invented removal");
+    decision.source_completion_wait_blocking = true;
+    decision.rewrite_kind = patch::HiCacheRewriteKind::NoOp;
+    require(patch::rewrite_transaction_detail::build_plan(graph, {decision}, {}).empty(), "self no-op preserves source waiting");
+}
+
+void allocator_preparation_uses_source_coverage_and_target_history() {
+    core::TraceEvent before;
+    before.name = "before allocation"; before.pid = before.tid = "1"; before.dur = 10;
+    auto after = before; after.name = "Enqueue@alloc_extend_kernel"; after.ts = 100;
+    auto observation = before;
+    observation.name = "runtime.triton.prepare"; observation.cat = "runtime_diagnostic";
+    observation.source_channel = core::TraceSourceChannel::PythonProbe;
+    observation.ts = 20; observation.dur = 40;
+    observation.set_arg("kernel", "alloc_extend_kernel");
+    observation.set_arg("status", "returned");
+    observation.set_arg("constants", R"({"page_size":64,"bs_upper":1,"max_num_extend_tokens":64,"BLOCK_SIZE":2048})");
+    observation.set_arg("signature", R"({"pre_lens_ptr":"*i64","seq_lens_ptr":"*i64","last_loc_ptr":"*i64","free_page_ptr":"*i64","out_indices":"*i64"})");
+    observation.set_arg("argument_properties", R"({"tt.divisibility":[0,1,2,3,4]})");
+    auto load = observation; load.name = "runtime.triton.load"; load.ts = 55; load.dur = 20;
+    load.set_arg("kernel", "alloc_extend_kernel_aiv");
+    auto graph = core::DagBuilder(1).build({before, after, observation, load}, 0);
+    auto fact = before; fact.name = "cache_extend_input"; fact.ts = 10; fact.dur = 0;
+    graph.set_hicache_fact_events({fact});
+    model::HiCacheAllocatorWorkItem prelude{.pid = "1", .formal = false, .page_size = 64,
+        .batch_size = 1, .extend_tokens = 64, .allocated_pages = 1, .free_index_offset = 0};
+    auto formal = prelude; formal.formal = true;
+    auto plan = runtime::plan_allocator_preparations(graph, {prelude, formal});
+    require(plan.status == "ready" && plan.calls[1].status == "already_prepared", "target prelude prepares the formal variant");
+    require(plan.observed_formal_calls == 1 && plan.removed_coverage_us == 55
+            && plan.mutation.set_cpu_gaps.size() == 1 && plan.mutation.set_cpu_gaps[0].duration == 35,
+            "prepare/load overlap is counted once; uncovered CPU time remains");
+    require(graph.node(0).cpu_gap_after == 90, "planning must not edit the source graph");
+    const auto self = runtime::plan_allocator_preparations(graph, {formal});
+    require(self.status == "ready" && self.calls[0].status == "required" && self.mutation.empty(),
+            "same required variant retains its measured preparation cost");
+    auto before2 = before, after2 = after, observation2 = observation, load2 = load, fact2 = fact;
+    for (auto* value : {&before2, &after2, &observation2, &load2, &fact2}) value->pid = value->tid = "2";
+    auto other_rank = core::DagBuilder(1).build({before2, after2, observation2, load2}, 1);
+    other_rank.set_hicache_fact_events({fact2});
+    auto merged = core::DagGraph::merge({graph, other_rank});
+    auto prelude2 = prelude, formal2 = formal;
+    prelude2.pid = formal2.pid = "2"; formal2.source_fact_id = 1;
+    const auto two_ranks = runtime::plan_allocator_preparations(merged, {prelude, prelude2, formal, formal2});
+    require(merged.runtime_observations().size() == 4 && two_ranks.status == "ready" && two_ranks.mutation.set_cpu_gaps.size() == 2
+            && two_ranks.removed_coverage_us == 110, "rank-local preparation identities and coverage survive graph merge");
+    formal.free_index_offset = 1;
+    const auto alignment = runtime::plan_allocator_preparations(graph, {prelude, formal});
+    require(alignment.status == "partial" && alignment.calls[1].status == "required" && alignment.mutation.empty(),
+            "pointer alignment creates a distinct variant; a different source cost is not silently reused");
+    formal.free_index_offset.reset();
+    require(runtime::plan_allocator_preparations(graph, {prelude, formal}).status == "partial", "unknown physical slice is not a cache hit");
+    formal.allocated_pages = 200;
+    require(runtime::plan_allocator_preparations(graph, {formal}).removed_coverage_us == 55, "naive path requires no Triton preparation");
+    formal = prelude; formal.formal = true;
+    prelude.free_index_offset.reset();
+    require(runtime::plan_allocator_preparations(graph, {prelude, formal}).calls[1].status == "possibly_required",
+            "unknown prelude propagates uncertainty to first use of a variant");
+    prelude = formal; prelude.formal = false;
+    graph.mutable_node(0).cpu_gap_after = 80;
+    require(runtime::plan_allocator_preparations(graph, {prelude, formal}).mutation.empty(), "never overwrite a previously transformed gap");
+    graph.mutable_node(0).cpu_gap_after = 90;
+    observation.ts = 5;
+    graph.set_runtime_observations({observation, load});
+    require(runtime::plan_allocator_preparations(graph, {formal}).status == "partial", "load alone cannot prove preparation cost coverage");
+    graph.set_runtime_observations({});
+    require(runtime::plan_allocator_preparations(graph, {prelude, formal}).status == "unavailable", "missing probe is not a zero-cost prediction");
 }
 
 void prefill_batch_records_one_preallocation_slice() {
@@ -454,7 +545,9 @@ void oracle_preserves_terminal_control() {
 } // namespace
 
 int main() {
+    source_prefetch_wait_is_removed_without_a_target_join();
     allocator_slice_follows_physical_operations();
+    allocator_preparation_uses_source_coverage_and_target_history();
     prefill_batch_records_one_preallocation_slice();
     extend_respects_lookup_input_limit();
     resource_validation_distinguishes_preservation_from_rewrite();

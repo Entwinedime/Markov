@@ -147,6 +147,8 @@ void runtime_diagnostics_do_not_add_or_remove_work() {
     auto graph = core::DagBuilder(1).build({before, observation, response, after}, 0);
     require(graph.node_count() == 4 && graph.active_edge_count() == 3, "response boundaries partition the gap without materializing diagnostic work");
     require(graph.hicache_fact_events().empty(), "runtime diagnostic is not a HiCache fact");
+    require(graph.runtime_observations().size() == 1 && graph.runtime_observations().front().dur == 200,
+            "preparation envelope remains available as metadata without becoming execution");
     require(simulation::run_topological_simulation(graph).e2e_us == 110, "retain the full 90 us CPU gap");
     graph.set_scope_node_owned(0);
     graph.set_scope_node_owned(1);
@@ -407,6 +409,21 @@ void client_input_reads_only_declared_source_observations() {
     const auto input = io::load_client_requests_from_manifest(manifest_path);
     require(input.status == "ready" && input.requests.size() == 2 && input.requests.back().frontend_end_us == 130,
             "source report and submission observations are joined by request identity");
+    const auto client_events = events;
+    events = Json::array();
+    for (const auto ts : {10, 100, 300}) events.push_back({{"name", "runtime.triton.prepare"}, {"cat", "runtime_diagnostic"},
+        {"ph", "X"}, {"ts", ts}, {"dur", 5}, {"pid", 1}, {"tid", 1}});
+    for (const auto ts : {10, 100, 300}) events.push_back({{"name", "CPU work"}, {"cat", "cpu_op"},
+        {"ph", "X"}, {"ts", ts}, {"dur", 5}, {"pid", 1}, {"tid", 1}});
+    std::ofstream(probe_path) << events;
+    io::ManifestTraceInputOptions window;
+    window.window_start_us = 90; window.window_end_us = 200;
+    auto traces = io::load_trace_inputs_from_manifest(manifest_path, window);
+    auto graph = core::DagBuilder(1).build(std::move(traces.front().events), 0);
+    require(graph.runtime_observations().size() == 2 && graph.node_count() == 1,
+            "retain prelude and formal preparation metadata, but neither prelude work nor post-window preparation");
+    require(graph.event_for_node(0).ts == 100, "preparation context cannot move the execution window origin");
+    std::ofstream(probe_path) << client_events;
     const Json barrier = {{"kind", "barrier"}, {"status", "ok"}, {"start_time_ms", 0.117}, {"end_time_ms", 0.119}};
     report["requests"].insert(report["requests"].begin() + 1, barrier);
     std::ofstream(report_path) << report;
