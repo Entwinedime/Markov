@@ -8,6 +8,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
 #include "../src/modules/hicache/patch/rewrite_mutation.hpp"
 #include "../src/modules/hicache/patch/io_operation_ledger_detail.hpp"
@@ -290,7 +291,7 @@ void extend_respects_lookup_input_limit() {
             for (const bool unfinished : {false, true}) check(page_size, limit, unfinished);
 }
 
-void foreground_projection_does_not_remove_queue_wait_twice() {
+void foreground_wait_does_not_own_unrelated_threads() {
     const auto event = [](std::string name, std::string tid, uint64_t ts, uint64_t dur, std::string cat = "cpu_op") {
         core::TraceEvent e;
         e.name = std::move(name); e.pid = "1"; e.tid = std::move(tid);
@@ -309,10 +310,27 @@ void foreground_projection_does_not_remove_queue_wait_twice() {
     };
     const std::vector<patch::HiCacheCpuGapSlice> foreground{{id("foreground begin"), id("foreground end"), 0, 10, 106, 20, 80}};
     const patch::HiCacheSourceDagIndex index(graph);
-    const auto projected = index.project_foreground_gap_across_logical_input_lanes(foreground);
-    require(projected.size() == 1 && projected.front().owner_node_id == id("unknown begin")
-                && projected.front().owned_duration_us() == 60,
-            "only the still-fixed unknown gap can be projected; task-arrival wait already follows its dependency");
+    patch::HiCacheSourceAttribution attribution;
+    attribution.source_control_gap_slices = foreground;
+    patch::attribution_detail::finalize_source_control_ownership(index, attribution);
+    require(attribution.source_control_gap_slices.size() == 1
+                && attribution.source_control_gap_slices.front().owner_node_id == id("foreground begin")
+                && attribution.source_control_gap_duration_us == 60,
+            "overlapping time cannot assign unrelated threads to a HiCache control call");
+    patch::HiCacheRewriteDecision decision;
+    decision.effect_id = "control";
+    decision.rewrite_kind = patch::HiCacheRewriteKind::RemoveOwnedCost;
+    decision.shadow_plan_ready = decision.source_control_removal_required = true;
+    decision.source_control_gap_slices = attribution.source_control_gap_slices;
+    const auto plan = patch::rewrite_transaction_detail::build_plan(graph, {decision}, {});
+    require(plan.set_cpu_gaps.size() == 1 && plan.set_cpu_gaps.front().node_id == id("foreground begin"),
+            "only the proven foreground gap is rewritten");
+    const auto mutation = core::apply_dag_mutation_plan(graph, plan);
+    (void)simulation::run_topological_simulation(graph);
+    require(graph.node(id("foreground end")).completion_time == 47
+                && graph.node(id("unknown end")).completion_time == 107
+                && graph.node(id("next task")).completion_time == 111,
+            "the changed control wait must not shorten an independent timer or duplicate a queue wait");
 }
 
 void first_allocation_owns_inherited_writeback() {
@@ -621,7 +639,7 @@ int main() {
     prefill_batch_records_one_preallocation_slice();
     extend_respects_lookup_input_limit();
     resource_validation_distinguishes_preservation_from_rewrite();
-    foreground_projection_does_not_remove_queue_wait_twice();
+    foreground_wait_does_not_own_unrelated_threads();
     first_allocation_owns_inherited_writeback();
     service_and_dag_share_batch_cost();
     fixed_cost_and_resource_scope();
