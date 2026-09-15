@@ -191,7 +191,7 @@ void append_gap_updates(const core::DagGraph & graph, core::DagMutationPlan & pl
         const auto append = [&](const HiCacheCpuGapSlice & gap) {
             if (gap.owned_end_us > gap.owned_start_us) slices_by_node[gap.owner_node_id].emplace_back(gap.owned_start_us, gap.owned_end_us);
         };
-        if (decision.completion_join_required) {
+        if (decision.replaces_source_completion_wait()) {
             for (const auto & gap : decision.completion_wait_slices) append(gap);
             for (const auto & gap : decision.logical_input_completion_wait_slices) append(gap);
         }

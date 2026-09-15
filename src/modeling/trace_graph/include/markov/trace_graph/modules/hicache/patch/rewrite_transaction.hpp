@@ -110,6 +110,12 @@ struct HiCacheRewriteDecision {
     std::string family_consumer_synthetic_id;
     std::string reason;
     std::string blocker;
+
+    /** Source waiting must be replaced even when the target needs no I/O join. */
+    [[nodiscard]] bool replaces_source_completion_wait() const {
+        return completion_join_required || (effect_type == model::HiCacheEffectType::PrefetchIo
+            && completion_join_contract_ready && source_completion_wait_blocking);
+    }
 };
 
 /** @brief Complete read-only transaction candidate for one prediction cell. */
