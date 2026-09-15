@@ -1,5 +1,6 @@
 /** @file Small trace timing checks, enabled only in explicit validation builds. */
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/client_requests.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
@@ -536,6 +537,40 @@ void cpu_queue_order_follows_target_arrivals() {
     require(simulation::run_topological_simulation(partial).cpu_queue_count == 0, "a partially identified worker is not silently reordered");
 }
 
+void removed_cpu_tasks_do_not_become_residual_waits() {
+    std::vector<core::TraceEvent> events;
+    for (size_t i = 0; i < 3; ++i) {
+        const auto identity = std::to_string(i);
+        auto submit = event("submit " + identity, "1", std::to_string(i + 1), 0, i + 1, "enqueue");
+        auto task = event("task " + identity, "1", "4", 2 + 11 * i, 10);
+        submit.set_arg("correlation_id", identity); task.set_arg("correlation_id", identity);
+        events.push_back(submit); events.push_back(task);
+    }
+    for (const auto [removed, expected] : {std::pair{0, 24}, {1, 23}, {2, 23}}) {
+        auto graph = core::DagBuilder(1).build(events, 0);
+        const auto find = [&](const std::string& name) {
+            return std::ranges::find_if(graph.nodes(), [&](const auto& node) { return graph.event_for_node(node.id).name == name; })->id;
+        };
+        require(simulation::run_topological_simulation(graph).e2e_us == 34, "source queue includes three tasks and measured ready delays");
+        core::DagMutationPlan plan{.component = "task_removal"};
+        plan.disable_nodes = {find("submit " + std::to_string(removed)), find("task " + std::to_string(removed))};
+        if (removed == 1) plan.add_edges.push_back({.src = core::DagNodeRef::existing(find("task 0")),
+            .dst = core::DagNodeRef::existing(find("task 2")), .kind = core::DagEdgeKind::Sequential});
+        (void)core::apply_dag_mutation_plan(graph, plan);
+        for (int replay = 0; replay < 2; ++replay) {
+            const auto result = simulation::run_topological_simulation(graph);
+            require(result.cpu_task_count == 2 && result.e2e_us == static_cast<uint64_t>(expected),
+                    "removing a task cannot reclassify its service as the next task's residual delay");
+        }
+        if (removed != 2) {
+            require(graph.node(find("task 2")).cpu_ready_delay_before == 1, "source ready delay survives task removal");
+            graph.set_node_duration(find("submit 2"), 40);
+            require(simulation::run_topological_simulation(graph).e2e_us == 51,
+                    "retained task still follows its target arrival plus measured delay and work");
+        }
+    }
+}
+
 void response_endpoint_preserves_background_resource_dependencies() {
     core::DagGraph graph;
     const auto background = graph.add_synthetic_node({.name = "earlier background work", .duration = 40});
@@ -574,6 +609,7 @@ int main() {
     serial_http_clients_follow_responses_not_background_work();
     client_input_reads_only_declared_source_observations();
     cpu_queue_order_follows_target_arrivals();
+    removed_cpu_tasks_do_not_become_residual_waits();
     response_endpoint_preserves_background_resource_dependencies();
     std::cout << "Trace timing checks passed\n";
 }

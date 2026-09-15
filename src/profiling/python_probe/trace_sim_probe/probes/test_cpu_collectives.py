@@ -90,3 +90,33 @@ class CollectiveCheck(unittest.TestCase):
         self.module.broadcast(self.tensor, src=2)
         record = _jsonable(self.records()[0])
         self.assertEqual(record["members"], list(range(64)))
+
+    def test_nested_compatibility_wrapper_records_one_native_call(self):
+        inner = self.module.broadcast
+
+        def compatibility(tensor, src=None, group=None, async_op=False, group_src=None):
+            return inner(tensor, src, group, async_op, group_src)
+
+        outer = probe._wrap(compatibility, "broadcast", self.module)
+        self.assertIs(outer(self.tensor, src=2, async_op=True), self.work)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual((self.records()[0]["sequence_before"], self.records()[0]["sequence_after"]), (7, 8))
+        with self.assertRaisesRegex(ValueError, "invalid root"):
+            outer(self.tensor, src=-1)
+        self.assertEqual(len(self.records()), 2)
+        self.assertEqual(self.records()[-1]["status"], "raised")
+        self.assertFalse(probe._CALLS.get())
+        self.work.wait.assert_not_called()
+
+    def test_nested_different_operation_is_not_silenced(self):
+        inner = self.module.broadcast
+
+        def combined(tensor, src=None, group=None, async_op=False, group_src=None):
+            self.module.all_reduce(tensor, group=group)
+            return inner(tensor, src, group, async_op, group_src)
+
+        probe._wrap(combined, "broadcast", self.module)(self.tensor, src=2)
+        first, second = self.records()
+        self.assertEqual(first["operation"], "all_reduce")
+        self.assertEqual(second["sequence_after"] - second["sequence_before"], 2)
+        self.assertFalse(probe._CALLS.get())
