@@ -25,6 +25,11 @@ source facts + target config
 KTransformers 是同级目标框架，继续使用 manifest、DAG build 和 simulation，但没有 HiCache module。NodeScale 是默认关闭的框架无关
 duration-only 变换，也不属于 HiCache。
 
+基础 CPU 时序先统一有明确线程归属的 CANN 显示进程，避免嵌套同步被拆成两份成本。
+对能够关联的任务提交和消费，任务开始取“线程空闲、任务已提交”两者的较晚时刻，再加 base 中实测的剩余间隔；
+整段等待不再固定重放。没有关联证据的 gap 保留，剩余间隔不参与 HiCache 或 Prefill/Decode 成本拟合。
+这只修复已确认的任务等待，尚未完成所有 CPU 等待、业务响应出口和完整 E2E 建模，当前验证见进展文档。
+
 ## 2. 职责边界
 
 | 阶段 | 输入 | 输出 | 不负责 |
