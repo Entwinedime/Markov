@@ -638,13 +638,14 @@ std::vector<HiCacheCpuGapSlice>
 
     std::vector<std::pair<uint64_t, uint64_t>> intervals;
     intervals.reserve(source_slices.size());
-    std::vector<std::string_view> source_lane_keys;
+    std::vector<std::string> source_lane_keys;
     for (const auto & slice : source_slices) {
         if (slice.owner_node_id >= graph_.node_count() || slice.successor_node_id >= graph_.node_count()) return {};
         const auto & owner = graph_.node(slice.owner_node_id);
         const auto & successor = graph_.node(slice.successor_node_id);
         if (owner.gpu_id != logical_input_id || successor.gpu_id != logical_input_id) return {};
-        source_lane_keys.push_back(graph_.node_lane_key(slice.owner_node_id));
+        const auto & event = graph_.event_for_node(slice.owner_node_id);
+        source_lane_keys.push_back(cpu_lane_key(event.pid, event.tid));
         if (slice.owned_end_us > slice.owned_start_us) intervals.emplace_back(slice.owned_start_us, slice.owned_end_us);
     }
     std::ranges::sort(source_lane_keys);
@@ -660,7 +661,7 @@ std::vector<HiCacheCpuGapSlice>
     const auto logical_input_lanes = cpu_lane_keys_by_logical_input_.find(logical_input_id);
     if (logical_input_lanes == cpu_lane_keys_by_logical_input_.end()) return {};
     for (const auto & lane_key : logical_input_lanes->second) {
-        if (std::ranges::find(source_lane_keys, std::string_view(lane_key)) != source_lane_keys.end()) continue;
+        if (std::ranges::find(source_lane_keys, lane_key) != source_lane_keys.end()) continue;
         const auto lane = cpu_nodes_by_lane_.find(lane_key);
         if (lane == cpu_nodes_by_lane_.end() || lane->second.size() < 2) continue;
         const auto & nodes = lane->second;
@@ -678,6 +679,9 @@ std::vector<HiCacheCpuGapSlice>
                 const auto gap_start = source_dag_index_detail::saturated_add(previous.ts, previous.dur);
                 const auto gap_end = successor.ts;
                 if (gap_start >= interval_end && successor.ts >= interval_end) break;
+                // Queue arrival waits already follow a dependency, not a fixed
+                // interval that HiCache can remove from this worker a second time.
+                if (graph_.node(previous_node_id).cpu_gap_after == 0) continue;
                 if (gap_end <= gap_start) continue;
                 const auto owned_start = std::max(interval_start, gap_start);
                 const auto owned_end = std::min(interval_end, gap_end);

@@ -4,6 +4,7 @@
 #include "markov/trace_graph/modules/hicache/patch/boundary_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 #include "markov/trace_graph/modules/hicache/service_model.hpp"
+#include "markov/trace_graph/core/dag_builder.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
 
 #include <algorithm>
@@ -20,6 +21,31 @@ namespace {
 
 void require(bool value, const std::string & message) {
     if (!value) throw std::runtime_error(message);
+}
+
+void foreground_projection_does_not_remove_queue_wait_twice() {
+    const auto event = [](std::string name, std::string tid, uint64_t ts, uint64_t dur, std::string cat = "cpu_op") {
+        core::TraceEvent e;
+        e.name = std::move(name); e.pid = "1"; e.tid = std::move(tid);
+        e.ts = ts; e.dur = dur; e.cat = std::move(cat);
+        return e;
+    };
+    auto submit = event("submit", "producer", 0, 100, "enqueue");
+    auto next = event("next task", "worker", 106, 5, "dequeue");
+    submit.set_arg("correlation_id", "task"); next.set_arg("correlation_id", "task");
+    auto graph = core::DagBuilder(1).build({
+        submit, next, event("previous task", "worker", 0, 10),
+        event("foreground begin", "foreground", 0, 10), event("foreground end", "foreground", 106, 1),
+        event("unknown begin", "unknown", 0, 10), event("unknown end", "unknown", 106, 1)}, 0);
+    const auto id = [&](std::string_view name) {
+        return std::ranges::find_if(graph.nodes(), [&](const auto& n) { return graph.event_for_node(n.id).name == name; })->id;
+    };
+    const std::vector<patch::HiCacheCpuGapSlice> foreground{{id("foreground begin"), id("foreground end"), 0, 10, 106, 20, 80}};
+    const patch::HiCacheSourceDagIndex index(graph);
+    const auto projected = index.project_foreground_gap_across_logical_input_lanes(foreground);
+    require(projected.size() == 1 && projected.front().owner_node_id == id("unknown begin")
+                && projected.front().owned_duration_us() == 60,
+            "only the still-fixed unknown gap can be projected; task-arrival wait already follows its dependency");
 }
 
 void first_allocation_owns_inherited_writeback() {
@@ -247,6 +273,7 @@ void oracle_preserves_terminal_control() {
 } // namespace
 
 int main() {
+    foreground_projection_does_not_remove_queue_wait_twice();
     first_allocation_owns_inherited_writeback();
     service_and_dag_share_batch_cost();
     fixed_cost_and_resource_scope();
