@@ -105,6 +105,11 @@ class WorkflowArtifactLayout:
 
         return self.debug_rows_dir / f"{model_run_id}.json"
 
+    def target_phase_score_dir(self, target_run_id: str) -> Path:
+        """Return the score-only C++ extraction directory for one target profile."""
+
+        return self.artifacts_dir / "target_phase_scores" / target_run_id
+
     def model_run_dir(self, model_run_id: str) -> Path:
         """Return the isolated output directory for one normalized model run."""
 

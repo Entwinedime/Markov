@@ -76,7 +76,6 @@ def build_final_capture_service_models(report: dict[str, Any]) -> dict[str, dict
     scope_count = int(parameters.get("tensor_parallel_size") or 0)
     services = _storage_service_models(list(storage.get("selected_points") or []))
     dma = load_runtime_anchor_projection(
-        Path(str(runtime.get("isolated_report") or runtime.get("report") or "")),
         Path(str(runtime.get("concurrent_report") or "")),
         expected_kv_bytes_per_token_per_rank=int(
             (report.get("kv_geometry") or {}).get("kv_bytes_per_token_per_rank") or 0
@@ -108,7 +107,7 @@ def _storage_service_models(points: list[dict[str, Any]]) -> dict[str, dict[str,
     ]
     if not warm_reads or not existing_writes or not new_writes:
         raise ValueError("storage calibration requires warm-read, existing-key, and runtime new-write points")
-    page_setup, bandwidth = _fit_pages_bytes(warm_reads, clock="resource_wall")
+    page_setup, bandwidth = _fit_pages_bytes(warm_reads)
     return {
         "prefetch": {
             "direction": "storage_to_host",
@@ -146,8 +145,6 @@ def _new_operation_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     by_page: dict[int, list[dict[str, Any]]] = {}
     for point in points:
         by_page.setdefault(int(point["page_bytes"]), []).append(point)
-    if len(by_page) < 2:
-        raise ValueError("new-write calibration requires at least two page sizes")
     output: list[dict[str, Any]] = []
     for page_bytes, page_points in sorted(by_page.items()):
         if len({int(row["operation_bytes_per_scope"]) for row in page_points}) < 2:
@@ -172,10 +169,15 @@ def _new_operation_points(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return output
 
 
-def _fit_pages_bytes(points: list[dict[str, Any]], *, clock: str) -> tuple[float, float]:
+def _fit_pages_bytes(points: list[dict[str, Any]]) -> tuple[float, float]:
+    if len({row["page_bytes"] for row in points}) == 1:
+        # Bytes = pages * page_bytes: only the combined response is identifiable.
+        # Represent it as an effective rate on this page domain, not two fitted costs.
+        (us_per_byte,) = _nonnegative_lstsq([(float(row["bytes"]), _selected_us(row)) for row in points])
+        return 0.0, _rate(us_per_byte)
     setup, us_per_byte = _nonnegative_lstsq(
         [
-            (float(row["page_count"]), float(row["bytes"]), _selected_us(row, clock=clock))
+            (float(row["page_count"]), float(row["bytes"]), _selected_us(row))
             for row in points
         ]
     )
@@ -184,32 +186,59 @@ def _fit_pages_bytes(points: list[dict[str, Any]], *, clock: str) -> tuple[float
     return setup, _rate(us_per_byte)
 
 
-def _selected_us(point: dict[str, Any], *, clock: str = "service_sum") -> float:
-    field = "selected_service_duration_ns" if clock == "service_sum" else "selected_duration_ns"
-    return float(int(point[field])) / 1000.0
+def _selected_us(point: dict[str, Any]) -> float:
+    """Total rank work pairs with summed rank service, not concurrent wall time."""
+    return float(int(point["selected_service_duration_ns"])) / 1000.0
 
 
 def _nonnegative_lstsq(rows: list[tuple[float, ...]]) -> list[float]:
-    import numpy as np
-
     if not rows:
         raise ValueError("calibration fit requires samples")
     feature_count = len(rows[0]) - 1
-    x = np.asarray([row[:feature_count] for row in rows], dtype=np.float64)
-    y = np.asarray([row[-1] for row in rows], dtype=np.float64)
-    active = list(range(feature_count))
-    coefficients = np.zeros(feature_count, dtype=np.float64)
-    while active:
-        fitted, *_ = np.linalg.lstsq(x[:, active], y, rcond=None)
-        negative = [index for index, value in zip(active, fitted) if value < 0.0]
-        if not negative:
-            for index, value in zip(active, fitted):
-                coefficients[index] = value
-            break
-        active.remove(min(negative, key=lambda index: fitted[active.index(index)]))
-    if not np.all(np.isfinite(coefficients)):
-        raise ValueError("calibration fit produced a non-finite coefficient")
-    return [float(value) for value in coefficients]
+    if feature_count not in (1, 2) or any(len(row) != feature_count + 1 for row in rows):
+        raise ValueError("calibration fit supports one or two coefficients")
+    if any(not all(math.isfinite(float(value)) for value in row) for row in rows):
+        raise ValueError("calibration fit requires finite samples")
+
+    # The physical model has at most two non-negative coefficients.  Enumerate
+    # the zero, one-column and two-column fits instead of adding a numerical
+    # package to the runtime image for this tiny problem.
+    candidates = [[0.0] * feature_count]
+    for index in range(feature_count):
+        denominator = math.fsum(float(row[index]) ** 2 for row in rows)
+        if denominator > 0.0:
+            value = math.fsum(float(row[index]) * float(row[-1]) for row in rows) / denominator
+            if value >= 0.0 and math.isfinite(value):
+                candidate = [0.0] * feature_count
+                candidate[index] = value
+                candidates.append(candidate)
+    if feature_count == 2:
+        scales = [max(abs(float(row[index])) for row in rows) for index in range(2)]
+        if all(scale > 0.0 for scale in scales):
+            z0 = [float(row[0]) / scales[0] for row in rows]
+            z1 = [float(row[1]) / scales[1] for row in rows]
+            y = [float(row[-1]) for row in rows]
+            a00 = math.fsum(value * value for value in z0)
+            a01 = math.fsum(left * right for left, right in zip(z0, z1))
+            a11 = math.fsum(value * value for value in z1)
+            b0 = math.fsum(value * target for value, target in zip(z0, y))
+            b1 = math.fsum(value * target for value, target in zip(z1, y))
+            determinant = a00 * a11 - a01 * a01
+            if determinant > 1e-12 * max(a00 * a11, 1.0):
+                scaled = [(b0 * a11 - b1 * a01) / determinant,
+                          (a00 * b1 - a01 * b0) / determinant]
+                candidate = [scaled[index] / scales[index] for index in range(2)]
+                if all(value >= 0.0 and math.isfinite(value) for value in candidate):
+                    candidates.append(candidate)
+
+    def residual(coefficients: list[float]) -> float:
+        return math.fsum(
+            (math.fsum(float(row[index]) * coefficients[index] for index in range(feature_count))
+             - float(row[-1])) ** 2
+            for row in rows
+        )
+
+    return min(candidates, key=residual)
 
 
 def _rate(us_per_byte: float) -> float:

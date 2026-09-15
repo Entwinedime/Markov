@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class ModelRunRequest:
-    """One source-to-target Direct HiCache prediction request."""
+    """One source-to-target HiCache I/O/control prediction request."""
 
     source_profile: ProfileRunRef
     target_config: TargetHiCacheConfig
@@ -31,7 +31,7 @@ class ModelRunRequest:
 
 @dataclass(frozen=True)
 class ModelRunPlanner:
-    """Translate Direct prediction requests into C++ execution specs."""
+    """Translate HiCache prediction requests into C++ execution specs."""
 
     context: WorkflowContext
     artifacts: WorkflowArtifactLayout
@@ -44,7 +44,7 @@ class ModelRunPlanner:
         specs = [self._spec(request, skip_policy) for request in requests]
         run_ids = [spec.run_id for spec in specs]
         if len(run_ids) != len(set(run_ids)):
-            raise ValueError("Direct prediction plan produced duplicate source/target/workload cells")
+            raise ValueError("HiCache prediction plan produced duplicate source/target/workload cells")
         return sorted(specs, key=lambda spec: spec.run_id)
 
     def _spec(self, request: ModelRunRequest, skip_policy: PreflightSkipPolicy) -> ModelRunSpec:
@@ -140,7 +140,7 @@ def index_rows(value: object) -> dict[str, dict[str, object]]:
 
 
 def model_run_id(prediction: CacheStatePredictionRef) -> str:
-    """Build a readable Direct HiCache prediction identifier."""
+    """Build a readable HiCache prediction identifier."""
 
     return "__".join(("hicache", safe_slug(prediction.input_id), prediction_config_slug(prediction)))
 

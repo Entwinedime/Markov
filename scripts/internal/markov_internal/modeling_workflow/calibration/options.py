@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -62,6 +64,28 @@ def format_cpu_set(value: set[int]) -> str:
     return ",".join(str(cpu) for cpu in sorted(value))
 
 
+def apply_numa_preference(node: int | None) -> int | None:
+    """Set/read the worker's preferred node, not the residency of pinned pages."""
+    if node is None:
+        return None  # Inherited policy is not observed or changed.
+    if node < 0 or not Path(f"/sys/devices/system/node/node{node}").is_dir():
+        raise ValueError(f"NUMA node {node} is unavailable")
+    lib = ctypes.CDLL("libnuma.so.1", use_errno=True)
+    lib.numa_set_preferred.argtypes = [ctypes.c_int]
+    lib.numa_set_preferred.restype = None
+    if lib.numa_available() < 0:
+        raise RuntimeError("NUMA policy is unavailable")
+    ctypes.set_errno(0)
+    lib.numa_set_preferred(node)
+    actual = lib.numa_preferred()
+    error = ctypes.get_errno()
+    if error:
+        raise OSError(error, os.strerror(error))
+    if actual != node:
+        raise RuntimeError(f"NUMA preference mismatch: requested={node}, actual={actual}")
+    return actual
+
+
 @dataclass(frozen=True)
 class CalibrationOptions:
     output_dir: Path
@@ -69,8 +93,6 @@ class CalibrationOptions:
     tensor_parallel_size: int
     storage_dir: Path
     runtime_dma_report: Path
-    concurrent_runtime_dma_report: Path
-    control_primitives: Path
     page_token_sizes: str
     burst_bytes_per_scope: int
     warmup: int
@@ -90,14 +112,7 @@ def parse_args(argv: list[str] | None = None) -> CalibrationOptions:
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--tensor-parallel-size", type=positive_int, required=True)
     parser.add_argument("--storage-dir", type=Path, required=True)
-    parser.add_argument("--runtime-dma-report", type=Path, required=True)
-    parser.add_argument("--concurrent-runtime-dma-report", type=Path, required=True)
-    parser.add_argument(
-        "--control-primitives",
-        type=Path,
-        required=True,
-        help="Snapshot-free control calibration containing zero-payload prefetch and load per-page scalars.",
-    )
+    parser.add_argument("--runtime-dma-report", type=Path, required=True, help="DMA measured at the deployment TP scope count")
     parser.add_argument("--page-token-sizes", default=DEFAULT_PAGE_TOKEN_SIZES)
     parser.add_argument("--burst-bytes-per-scope", type=positive_int, default=DEFAULT_BURST_BYTES_PER_SCOPE)
     parser.add_argument("--warmup", type=nonnegative_int, default=1)

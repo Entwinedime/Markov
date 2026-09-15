@@ -1,4 +1,4 @@
-"""Profile discovery, selection, parsing, and prediction-matrix construction."""
+"""Profile discovery and parsing for prediction inputs or independent target scoring."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import Any
 from ...common.io import load_json
 from ...common.manifest import existing_manifest_files
 from ...common.paths import map_repo_path
+from ...common.commands import command_tokens
 from ..types import ProfileRunRef
 
 
@@ -64,24 +65,6 @@ class ProfileRunParser:
         )
 
 
-@dataclass(frozen=True)
-class RunSelector:
-    """Filter the discovered profile universe before role selection."""
-
-    input_ids: frozenset[str]
-    config_ids: frozenset[str]
-
-    def filter(self, runs: list[ProfileRunRef]) -> list[ProfileRunRef]:
-        """Return runs admitted by the requested input and config selectors."""
-
-        return [
-            run
-            for run in runs
-            if (not self.input_ids or run.input_id in self.input_ids)
-            and (not self.config_ids or run.config_id in self.config_ids)
-        ]
-
-
 def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
     """Extract the target HiCache model configuration from a profile config."""
 
@@ -95,7 +78,14 @@ def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> di
 def extract_hicache_from_server_cmd(run_dir: Path) -> dict[str, Any] | None:
     """Reconstruct the narrow target contract from the exact profiled server command."""
 
-    flags = parse_server_command_flags(run_dir / "server_cmd.txt")
+    path = run_dir / "server_cmd.txt"
+    return extract_hicache_from_server_command(path.read_text(encoding="utf-8")) if path.is_file() else None
+
+
+def extract_hicache_from_server_command(command: list[str] | str) -> dict[str, Any] | None:
+    """Reconstruct a target contract directly from a declared server command."""
+
+    flags = parse_server_command_tokens(command_tokens(command))
     if flags.get("enable_hierarchical_cache") != "true":
         return None
     page_size = parse_nonnegative_int_or_none(flags.get("page_size"))
@@ -122,7 +112,7 @@ def extract_hicache_from_server_cmd(run_dir: Path) -> dict[str, Any] | None:
     if all(value is not None for value in timeout_values):
         for (_, target), value in zip(timeout_fields, timeout_values):
             result[target] = value
-    return apply_sglang_capacity_from_server_cmd(run_dir, result)
+    return apply_sglang_capacity_from_flags(flags, result)
 
 
 def parse_json_object_or_empty(value: Any) -> dict[str, Any]:
@@ -141,6 +131,12 @@ def apply_sglang_capacity_from_server_cmd(run_dir: Path, hicache_config: dict[st
     """Resolve model capacities from the exact SGLang server command."""
 
     flags = parse_server_command_flags(run_dir / "server_cmd.txt")
+    return apply_sglang_capacity_from_flags(flags, hicache_config)
+
+
+def apply_sglang_capacity_from_flags(flags: dict[str, str], hicache_config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve cache capacities from already parsed server flags."""
+
     if not flags:
         return hicache_config
 
@@ -168,7 +164,7 @@ def apply_sglang_capacity_from_server_cmd(run_dir: Path, hicache_config: dict[st
 
 
 def parse_server_command_flags(path: Path) -> dict[str, str]:
-    """Parse ``--key value`` and ``--key=value`` server arguments."""
+    """Parse server arguments, retaining complete multi-value options."""
 
     if not path.is_file():
         return {}
@@ -177,6 +173,12 @@ def parse_server_command_flags(path: Path) -> dict[str, str]:
     except ValueError:
         return {}
 
+    return parse_server_command_tokens(tokens)
+
+
+def parse_server_command_tokens(tokens: list[str]) -> dict[str, str]:
+    """Parse an argv-style server command into normalized option values."""
+
     flags: dict[str, str] = {}
     index = 0
     while index < len(tokens):
@@ -184,19 +186,13 @@ def parse_server_command_flags(path: Path) -> dict[str, str]:
         if not token.startswith("--"):
             index += 1
             continue
-        key_value = token[2:]
-        if "=" in key_value:
-            key, value = key_value.split("=", 1)
-            flags[key.replace("-", "_")] = value
+        key, separator, first = token[2:].partition("=")
+        values = [first] if separator else []
+        index += 1
+        while index < len(tokens) and not tokens[index].startswith("--"):
+            values.append(tokens[index])
             index += 1
-            continue
-        key = key_value.replace("-", "_")
-        if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
-            flags[key] = tokens[index + 1]
-            index += 2
-        else:
-            flags[key] = "true"
-            index += 1
+        flags[key.replace("-", "_")] = " ".join(values) if values else "true"
     return flags
 
 
@@ -222,24 +218,3 @@ def parse_nonnegative_float_or_none(value: Any) -> float | None:
         return parsed if parsed >= 0.0 else None
     except (TypeError, ValueError):
         return None
-
-
-def group_runs_by_input(runs: list[ProfileRunRef]) -> dict[str, dict[str, ProfileRunRef]]:
-    """Index one unambiguous profile run per input/config cell.
-
-    A prediction matrix has no run-generation dimension. Silently choosing one
-    of two manifests for the same input/config pair would make every downstream
-    source/target cell depend on path ordering, so duplicate cells fail here.
-    """
-
-    grouped: dict[str, dict[str, ProfileRunRef]] = {}
-    for run in runs:
-        by_config = grouped.setdefault(run.input_id, {})
-        existing = by_config.get(run.config_id)
-        if existing is not None and existing.manifest_path != run.manifest_path:
-            raise ValueError(
-                f"Duplicate profile cell for input={run.input_id!r}, config={run.config_id!r}: "
-                f"{existing.manifest_path} and {run.manifest_path}"
-            )
-        by_config[run.config_id] = run
-    return {input_id: dict(sorted(by_config.items())) for input_id, by_config in sorted(grouped.items())}

@@ -8,9 +8,11 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from .options import STORAGE_PAGE_MATERIALIZATION_RUNTIME, parse_positive_csv
+from ...common.io import write_json
+from .options import STORAGE_PAGE_MATERIALIZATION_RUNTIME, apply_numa_preference, parse_positive_csv
 from ..physical_calibration import sample_row
 
 
@@ -23,8 +25,10 @@ class HostStorageCapturePlan:
 
     storage_dir: Path
     page_sizes: tuple[int, ...]
-    scope_count: int
+    devices: tuple[int, ...]
+    numa_nodes: tuple[int | None, ...]
     model_name: str
+    kv_geometry: dict[str, Any]
     warmup: int
     repeats: int
     isolated_repeats: int
@@ -42,28 +46,35 @@ class HostStorageCapture:
     new_write_samples: tuple[dict[str, Any], ...]
 
 
-def capture_host_storage(plan: HostStorageCapturePlan) -> HostStorageCapture:
+def capture_host_storage(plan: HostStorageCapturePlan, *, observations_path: Path) -> HostStorageCapture:
     """Execute the complete process-only host-storage sampling grid."""
 
     scope_cpu_sets = [set(value) if value is not None else None for value in plan.scope_cpu_sets]
     storage_samples = calibrate_storage_curves(
         storage_dir=plan.storage_dir,
         page_sizes=list(plan.page_sizes),
-        scope_count=plan.scope_count,
+        devices=list(plan.devices),
+        numa_nodes=list(plan.numa_nodes),
         model_name=plan.model_name,
+        kv_geometry=plan.kv_geometry,
         warmup=plan.warmup,
         repeats=plan.repeats,
         isolated_repeats=plan.isolated_repeats,
         scope_cpu_sets=scope_cpu_sets,
         existing_operation_pages=list(plan.existing_operation_pages),
     )
+    # Preserve completed families if a later sampling family fails. The final
+    # bundle replaces this partial record with the complete capture metadata.
+    write_json(observations_path, {"status": "partial", "host_storage": {"samples": storage_samples}})
     new_write_samples = calibrate_new_write_only(
         storage_dir=plan.storage_dir,
         page_sizes=list(plan.page_sizes),
         queue_bytes_per_scope=list(plan.new_write_queues),
         operation_bytes_per_scope=list(plan.new_write_operations),
-        scope_count=plan.scope_count,
+        devices=list(plan.devices),
+        numa_nodes=list(plan.numa_nodes),
         model_name=plan.model_name,
+        kv_geometry=plan.kv_geometry,
         warmup=plan.warmup,
         repeats=plan.repeats,
         scope_cpu_sets=scope_cpu_sets,
@@ -88,20 +99,29 @@ class StorageScopeProcesses:
         self,
         *,
         storage_dir: Path,
-        scope_count: int,
+        devices: list[int],
         model_name: str,
+        kv_geometry: dict[str, Any],
         scope_cpu_sets: list[set[int] | None] | None = None,
+        numa_nodes: list[int | None] | None = None,
     ) -> None:
-        if scope_count <= 0:
-            raise ValueError("storage scope process count must be positive")
+        scope_count = len(devices)
+        if not devices or len(set(devices)) != scope_count or any(device < 0 for device in devices):
+            raise ValueError("storage calibration requires distinct nonnegative deployment devices")
         if scope_cpu_sets is None:
             scope_cpu_sets = [None] * scope_count
         if len(scope_cpu_sets) != scope_count:
             raise ValueError("storage scope CPU set count must match scope count")
+        numa_nodes = numa_nodes if numa_nodes is not None else [None] * scope_count
+        if len(numa_nodes) != scope_count:
+            raise ValueError("storage NUMA node count must match scope count")
         context = multiprocessing.get_context("spawn")
         self._processes: list[multiprocessing.Process] = []
         self._commands: list[Any] = []
         self._results: list[Any] = []
+        self.worker_threads: list[int] = []
+        self.worker_devices: list[int] = []
+        self.worker_numa_nodes: list[int | None] = []
         self._next_task_id = 1
         for scope in range(scope_count):
             command = context.Queue()
@@ -112,10 +132,13 @@ class StorageScopeProcesses:
                     str(storage_dir),
                     scope,
                     scope_count,
+                    devices[scope],
                     model_name,
+                    kv_geometry,
                     tuple(sorted(scope_cpu_sets[scope])) if scope_cpu_sets[scope] else (),
                     command,
                     result,
+                    numa_nodes[scope],
                 ),
                 name=f"hicache-calibration-scope-{scope}",
             )
@@ -128,6 +151,11 @@ class StorageScopeProcesses:
                 ready = self._results[scope].get(timeout=self._RESULT_TIMEOUT_SEC)
                 if not isinstance(ready, dict) or ready.get("status") != "ready":
                     raise RuntimeError(f"storage calibration scope {scope} failed to start: {ready}")
+                self.worker_threads.append(int(ready["torch_num_threads"]))
+                self.worker_devices.append(int(ready["device"]))
+                self.worker_numa_nodes.append(ready["numa_preferred_node"])
+                if self.worker_devices[-1] != devices[scope]:
+                    raise RuntimeError(f"storage calibration scope {scope} selected a different device")
                 actual = {int(cpu) for cpu in ready.get("cpu_affinity") or []}
                 if scope_cpu_sets[scope] is not None and actual != scope_cpu_sets[scope]:
                     raise RuntimeError(f"storage calibration scope {scope} CPU affinity mismatch")
@@ -158,7 +186,16 @@ class StorageScopeProcesses:
                     "operation_bytes_per_scope": operation_bytes_per_scope,
                 }
             )
-        rows = [self._receive(scope, task_id) for scope in range(len(self._processes))]
+        rows, errors = [], []
+        for scope in range(len(self._processes)):
+            try:
+                rows.append(self._receive(scope, task_id))
+            except RuntimeError as error:
+                errors.append(str(error))
+        if errors:
+            # Drain all ranks before clear/reset so cleanup cannot consume an
+            # outstanding operation response and hide the original failure.
+            raise RuntimeError("; ".join(errors))
         wall_duration_ns = time.perf_counter_ns() - start
         return [int(row["duration_ns"]) for row in rows], wall_duration_ns
 
@@ -212,21 +249,32 @@ def _storage_scope_process_main(
     storage_dir: str,
     scope: int,
     scope_count: int,
+    device: int,
     model_name: str,
+    kv_geometry: dict[str, Any],
     cpu_set: tuple[int, ...],
     command_queue: Any,
     result_queue: Any,
+    numa_node: int | None = None,
 ) -> None:
     try:
         if cpu_set:
             os.sched_setaffinity(0, set(cpu_set))
+        actual_numa_node = apply_numa_preference(numa_node)
+        import torch
+        import torch_npu  # noqa: F401
+
+        # Pinned host allocations initialize accelerator context too. Select
+        # the same device as this deployment rank before creating any buffers.
+        torch.npu.set_device(device)
         backend = build_hicache_file_backends(
             storage_dir=Path(storage_dir),
             scope_count=scope_count,
             model_name=model_name,
         )[scope]
-        import torch
-
+        # SGLang ModelRunner uses one intra-op CPU thread on accelerator deployments.
+        # Affinity alone leaves PyTorch's machine-wide thread default unchanged.
+        torch.set_num_threads(1)
         page_state_cache: dict[str, Any] | None = None
         page_state_geometry: tuple[Any, ...] | None = None
         result_queue.put(
@@ -234,6 +282,9 @@ def _storage_scope_process_main(
                 "status": "ready",
                 "scope": scope,
                 "cpu_affinity": sorted(os.sched_getaffinity(0)),
+                "torch_num_threads": torch.get_num_threads(),
+                "device": torch.npu.current_device(),
+                "numa_preferred_node": actual_numa_node,
             }
         )
         while True:
@@ -254,8 +305,10 @@ def _storage_scope_process_main(
                     page_bytes = int(request["page_bytes"])
                     operation_bytes_per_scope = int(request.get("operation_bytes_per_scope") or 0)
                     required_source_pages = (
-                        operation_bytes_per_scope // page_bytes if operation_bytes_per_scope > 0 else 2
+                        max(2, operation_bytes_per_scope // page_bytes) if operation_bytes_per_scope > 0 else 2
                     )
+                    # A one-page operation still reads a strided view of the
+                    # multi-page runtime pool; the padding page is not transferred.
                     requested_geometry = (page_bytes, required_source_pages)
                     if page_state_cache is None or page_state_geometry != requested_geometry:
                         page_state = create_storage_page_state(
@@ -263,6 +316,7 @@ def _storage_scope_process_main(
                             page_bytes,
                             pin_memory=True,
                             working_set_page_count=required_source_pages,
+                            kv_geometry=kv_geometry,
                         )
                         page_state_cache = page_state
                         page_state_geometry = requested_geometry
@@ -309,19 +363,24 @@ def calibrate_storage_curves(
     *,
     storage_dir: Path,
     page_sizes: list[int],
-    scope_count: int,
+    devices: list[int],
     model_name: str,
+    kv_geometry: dict[str, Any],
     warmup: int,
     repeats: int,
     isolated_repeats: int,
     scope_cpu_sets: list[set[int] | None] | None = None,
     existing_operation_pages: list[int] | None = None,
+    numa_nodes: list[int | None] | None = None,
 ) -> list[dict[str, Any]]:
+    scope_count = len(devices)
     process_scopes = StorageScopeProcesses(
         storage_dir=storage_dir,
-        scope_count=scope_count,
+        devices=devices,
         model_name=model_name,
+        kv_geometry=kv_geometry,
         scope_cpu_sets=scope_cpu_sets,
+        numa_nodes=numa_nodes,
     )
     samples: list[dict[str, Any]] = []
     try:
@@ -360,19 +419,24 @@ def calibrate_new_write_only(
     page_sizes: list[int],
     queue_bytes_per_scope: list[int],
     operation_bytes_per_scope: list[int],
-    scope_count: int,
+    devices: list[int],
     model_name: str,
+    kv_geometry: dict[str, Any],
     warmup: int,
     repeats: int,
     scope_cpu_sets: list[set[int] | None],
+    numa_nodes: list[int | None] | None = None,
 ) -> list[dict[str, Any]]:
     """Measure only new-key sustained writes over a repeated physical grid."""
 
+    scope_count = len(devices)
     process_scopes = StorageScopeProcesses(
         storage_dir=storage_dir,
-        scope_count=scope_count,
+        devices=devices,
         model_name=model_name,
+        kv_geometry=kv_geometry,
         scope_cpu_sets=scope_cpu_sets,
+        numa_nodes=numa_nodes,
     )
     samples: list[dict[str, Any]] = []
     try:
@@ -437,7 +501,7 @@ def calibrate_existing_key_curves(
     repeats: int,
     process_scopes: StorageScopeProcesses,
 ) -> list[dict[str, Any]]:
-    """Measure flatten + existing-key check after one untimed population per grid point."""
+    """Measure runtime batch materialization + existing-key checks after population."""
 
     samples: list[dict[str, Any]] = []
     for page_bytes in page_sizes:
@@ -448,7 +512,10 @@ def calibrate_existing_key_curves(
             ]
 
             def execute() -> tuple[list[int], int]:
-                return process_scopes.run("write", keys_by_scope, page_bytes)
+                # Existing keys skip file writes, not the controller's whole-batch
+                # materialization. Use distinct source slots and keep all pages
+                # alive until batch_set returns, just as for new-key operations.
+                return process_scopes.run("write", keys_by_scope, page_bytes, pages_per_scope * page_bytes)
 
             try:
                 # This is the only physical file-write population for the grid
@@ -474,7 +541,14 @@ def calibrate_existing_key_curves(
                             "page_count": total_pages,
                             "scope_count": scope_count,
                             "operation_pages_per_scope": pages_per_scope,
+                            "operation_bytes_per_scope": pages_per_scope * page_bytes,
+                            "operation_count": scope_count,
+                            "batch_semantics": "runtime_materialize_then_batch_set",
+                            "source_working_set_semantics": STORAGE_SOURCE_WORKING_SET_RUNTIME,
                             "service_duration_ns": sum(per_scope_ns),
+                            "scope_cpu_threads": list(process_scopes.worker_threads),
+                            "scope_devices": list(process_scopes.worker_devices),
+                            "scope_numa_nodes": list(process_scopes.worker_numa_nodes),
                             "page_materialization": STORAGE_PAGE_MATERIALIZATION_RUNTIME,
                         }
                     )
@@ -550,6 +624,9 @@ def timed_storage_batch(
                 else None
             ),
             "service_duration_ns": sum(scope_durations_ns),
+            "scope_cpu_threads": list(process_scopes.worker_threads),
+            "scope_devices": list(process_scopes.worker_devices),
+            "scope_numa_nodes": list(process_scopes.worker_numa_nodes),
             "page_materialization": STORAGE_PAGE_MATERIALIZATION_RUNTIME,
         }
     )
@@ -562,8 +639,9 @@ def create_storage_page_state(
     *,
     pin_memory: bool = True,
     working_set_page_count: int = 2,
+    kv_geometry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Create a byte-equivalent non-contiguous page-first host buffer."""
+    """Create the model's page-first pool; byte-only state is for diagnostics."""
 
     if page_bytes <= 0:
         raise ValueError("storage page bytes must be positive")
@@ -578,7 +656,7 @@ def create_storage_page_state(
         pin_memory=pin_memory,
     )
     page_buffer.fill_(0x5A)
-    return {
+    state = {
         "mode": STORAGE_PAGE_MATERIALIZATION_RUNTIME,
         "page_bytes": page_bytes,
         "page_slot_count": working_set_page_count,
@@ -588,10 +666,36 @@ def create_storage_page_state(
         "page_dtype": torch_module.uint8,
         "page_element_count": page_bytes,
     }
+    if kv_geometry is not None:
+        from sglang.srt.managers.cache_controller import HiCacheController
+        from sglang.srt.mem_cache.memory_pool_host import MHATokenToKVPoolHost
+
+        class PageView(SimpleNamespace):
+            get_data_page = MHATokenToKVPoolHost.get_data_page
+
+        dtype = getattr(torch_module, kv_geometry["kv_torch_dtype"])
+        element_bytes = torch_module.empty(0, dtype=dtype).element_size()
+        token_bytes = kv_geometry["kv_bytes_per_token_per_rank"]
+        if element_bytes != kv_geometry["kv_element_bytes"] or page_bytes % token_bytes:
+            raise ValueError("storage page geometry must match the declared runtime KV dtype and token width")
+        page_size = page_bytes // token_bytes
+        page_buffer = page_buffer.view(dtype).reshape(2, working_set_page_count,
+            kv_geometry["num_hidden_layers"], page_size,
+            kv_geometry["num_key_value_heads_per_rank"], kv_geometry["head_dim"])
+        state.update(page_buffer=page_buffer, page_dtype=dtype, page_element_count=page_bytes // element_bytes,
+            runtime_pool=PageView(kv_buffer=page_buffer, page_size=page_size, layout="page_first_direct"),
+            # Repeated indices allow an operation to wrap through the declared
+            # source slots without allocating index tensors in the timed call.
+            token_indices=torch_module.arange(working_set_page_count * page_size, dtype=torch_module.int64).repeat(2),
+            runtime_batch_set=HiCacheController._generic_page_set)
+    return state
 
 
 def materialize_storage_write_page(page_state: dict[str, Any], page_ordinal: int) -> Any:
     slot = int(page_ordinal) % int(page_state["page_slot_count"])
+    if "runtime_pool" in page_state:
+        pool = page_state["runtime_pool"]
+        return pool.get_data_page(page_state["token_indices"][slot * pool.page_size])
     page_view = page_state["page_buffer"][:, slot : slot + 1, :]
     if page_view.is_contiguous():
         raise RuntimeError("page_first_direct write emulation unexpectedly became contiguous")
@@ -629,11 +733,17 @@ def write_storage_runtime_batches(
     operation_count = 0
     for start in range(0, len(keys), pages_per_operation):
         batch_keys = keys[start : start + pages_per_operation]
-        batch_values = [
-            materialize_storage_write_page(page_state, page_ordinal)
-            for page_ordinal in range(start, start + len(batch_keys))
-        ]
-        if not backend.batch_set(batch_keys, batch_values):
+        if "runtime_pool" in page_state:
+            pool = page_state["runtime_pool"]
+            offset = (start % page_state["page_slot_count"]) * pool.page_size
+            indices = page_state["token_indices"][offset:offset + len(batch_keys) * pool.page_size]
+            controller = SimpleNamespace(mem_pool_host=pool, page_size=pool.page_size, storage_backend=backend)
+            succeeded = page_state["runtime_batch_set"](controller, batch_keys, indices)
+        else:
+            batch_values = [materialize_storage_write_page(page_state, ordinal)
+                            for ordinal in range(start, start + len(batch_keys))]
+            succeeded = backend.batch_set(batch_keys, batch_values)
+        if not succeeded:
             raise IOError(f"HiCacheFile.batch_set failed for {len(batch_keys)} calibration keys")
         operation_count += 1
     return operation_count

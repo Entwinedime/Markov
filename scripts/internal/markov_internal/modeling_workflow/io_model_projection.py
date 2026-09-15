@@ -1,4 +1,4 @@
-"""Projection of one compact I/O model into a target C++ request."""
+"""Projection of one compact HiCache model into a target C++ request."""
 
 from __future__ import annotations
 
@@ -16,13 +16,14 @@ def merge_hicache_io_model(config: dict[str, Any], model: HiCacheIoModel | None)
     if model is None:
         return merged
     page_size = positive_u64(merged.get("page_size"), "target hicache.page_size")
-    merged.update(model.narrow_config(page_size))
+    # Match the C++ target configuration default, not the runtime CLI default.
+    merged.update(model.narrow_config(page_size, merged.get("prefetch_policy", "timeout")))
     return merged
 
 
 def _reject_target_local_io_model(config: dict[str, Any]) -> None:
     if any(
         not is_missing_contract_value(config.get(field))
-        for field in ("kv_bytes_per_page", "io_planning", "io_cost")
+        for field in ("kv_bytes_per_page", "io_cost")
     ):
         raise ValueError("target config cannot carry per-cell I/O cost fields; use --hicache-io-model")

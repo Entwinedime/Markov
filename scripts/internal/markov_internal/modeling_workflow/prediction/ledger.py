@@ -1,4 +1,4 @@
-"""Compact Direct I/O/control ledger projected from one C++ result."""
+"""Compact HiCache I/O/control ledger projected from one C++ result."""
 
 from __future__ import annotations
 
@@ -37,6 +37,13 @@ def predicted_aggregates(result: ModelRunResult) -> tuple[dict[str, Any], list[s
     errors: list[str] = []
     by_kind = _empty_kind_aggregates()
     model_summary = result.artifacts.load_if_present(result.artifacts.model_summary_json)
+    state = _module_payload(model_summary, "HiCacheModule", "hicache")
+    decisions = (state.get("effect_decisions") or {}).get("decisions") or []
+    decision_by_effect = {
+        str(row.get("effect_key") or ""): row
+        for row in decisions
+        if isinstance(row, dict) and row.get("effect_key")
+    }
     patch = _module_payload(model_summary, "HiCacheDagPatchModule", "hicache_dag_patch")
     attribution = patch.get("source_attribution")
     attribution_by_effect = {
@@ -80,6 +87,14 @@ def predicted_aggregates(result: ModelRunResult) -> tuple[dict[str, Any], list[s
 
         service_us = int(raw.get("duration_us") or 0)
         control_us = int(raw.get("host_control_duration_us") or 0)
+        decision = decision_by_effect.get(str(raw.get("effect_id") or ""), {})
+        blocking_us = 0
+        if kind == "prefetch":
+            blocking_us = (
+                service_us
+                if bool(decision.get("consumer_dependency_required"))
+                else int(decision.get("policy_wait_duration_us") or 0)
+            )
         aggregate = by_kind[kind]
         aggregate["operation_count"] += operation_count
         aggregate["zero_payload_control_operation_count"] += operation_count if zero_payload else 0
@@ -88,7 +103,7 @@ def predicted_aggregates(result: ModelRunResult) -> tuple[dict[str, Any], list[s
         aggregate["byte_count"] += byte_count
         aggregate["service_us"] += service_us
         aggregate["control_us"] += control_us
-        aggregate["blocking_us"] += service_us if kind == "prefetch" else 0
+        aggregate["blocking_us"] += blocking_us
         aggregate["storage_existing_page_count"] += existing_pages
         aggregate["storage_new_page_count"] += new_pages
         aggregate["storage_existing_byte_count"] += existing_bytes
@@ -110,16 +125,16 @@ def predicted_aggregates(result: ModelRunResult) -> tuple[dict[str, Any], list[s
                 "storage_new_page_count": new_pages,
                 "storage_existing_byte_count": existing_bytes,
                 "storage_new_byte_count": new_bytes,
+                "storage_service_batches": list(raw.get("storage_service_batches") or []),
                 "service_us": service_us,
                 "control_us": control_us,
-                "blocking_us": service_us if kind == "prefetch" else 0,
+                "blocking_us": blocking_us,
                 "calibration_setup_us": int(raw.get("calibration_setup_us") or 0),
                 "calibration_transfer_us": int(raw.get("calibration_transfer_us") or 0),
                 "runtime_scale": float(raw.get("runtime_scale") or 0.0),
                 "storage_existing_service_us": int(raw.get("storage_existing_service_us") or 0),
                 "storage_new_service_us": int(raw.get("storage_new_service_us") or 0),
                 "host_control_fixed_us": int(raw.get("host_control_fixed_us") or 0),
-                "host_control_page_us": int(raw.get("host_control_page_us") or 0),
                 **_source_carrier_fields(attribution_by_effect.get(str(raw.get("effect_id") or ""))),
             }
         )

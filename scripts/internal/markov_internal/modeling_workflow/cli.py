@@ -13,54 +13,33 @@ from .workflow import WorkflowRunner
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse workflow arguments without reading them at module import time."""
 
-    parser = argparse.ArgumentParser(description="Predict Direct HiCache I/O/control changes from one profiled base.")
+    parser = argparse.ArgumentParser(description="Predict HiCache I/O/control and Prefill/Decode changes from one profiled base.")
     inputs = parser.add_argument_group("prediction inputs")
     inputs.add_argument(
         "--source-manifest",
         type=Path,
         action="append",
-        default=[],
+        required=True,
         help="Source profile_manifest.json. Can be repeated for multiple workloads.",
     )
     inputs.add_argument(
         "--target-config",
         type=Path,
         action="append",
-        default=[],
+        required=True,
         help="Explicit {name?, hicache} target config. Can be repeated.",
-    )
-    evaluation = parser.add_argument_group("optional matrix evaluation")
-    evaluation.add_argument("--evaluation", action="store_true", help="Score an observed profile matrix.")
-    evaluation.add_argument(
-        "--profile-run-dir",
-        type=Path,
-        action="append",
-        default=[],
-        help="Evaluation-only directory containing */profile_manifest.json.",
     )
     inputs.add_argument(
         "--output-dir",
         type=Path,
-        help="Output directory. Defaults beside the first source or evaluation suite.",
+        help="Output directory. Defaults beside the first source profile.",
     )
-    evaluation.add_argument("--inputs", default="", help="Evaluation-only comma-separated input_ids.")
-    evaluation.add_argument("--configs", default="", help="Evaluation-only comma-separated config_ids.")
-    evaluation.add_argument("--source-configs", default="", help="Evaluation-only selected base config.")
-    evaluation.add_argument("--target-configs", default="", help="Evaluation-only target config subset.")
-    evaluation.add_argument(
-        "--base-io-model",
-        action="append",
-        default=[],
-        metavar="CONFIG=PATH",
-        help="Evaluation-only base config to one-base I/O model mapping. Repeat for a multi-base matrix.",
-    )
-    evaluation.add_argument("--oracle-scores", type=Path, help="Optional data-driven oracle score manifest.")
 
     model_inputs = parser.add_argument_group("model inputs")
     model_inputs.add_argument(
         "--hicache-io-model",
         type=Path,
-        help="Explicit compact one-base HiCache I/O model JSON.",
+        help="Explicit compact one-base HiCache model JSON.",
     )
 
     prediction = parser.add_argument_group("prediction")

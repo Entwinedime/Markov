@@ -1,14 +1,15 @@
-"""Load runtime DMA measurements and expose only the sustained page curves."""
+"""Identify DMA call setup and byte cost from independent device-clock samples."""
 
 from __future__ import annotations
 
 import math
+from statistics import median
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ...common.io import load_json
-from ...common.paths import repo_relative_path, require_repo_path
+from ...common.paths import require_repo_path
 
 
 RUNTIME_DMA_OPERATOR_NAME = "npu::transfer_kv_dim_exchange"
@@ -18,28 +19,23 @@ RUNTIME_DMA_INDEX_RESIDENCY = {"host_indices": "cpu", "device_indices": "cpu"}
 @dataclass(frozen=True)
 class RuntimeAnchorProjection:
     service_models: dict[str, dict[str, Any]]
-    report_metadata: dict[str, Any]
     environment: dict[str, Any]
-    input_sample_count: int
 
 
 def load_runtime_anchor_projection(
-    isolated_report_path: Path,
     concurrent_report_path: Path,
     *,
     expected_kv_bytes_per_token_per_rank: int,
     expected_page_bytes: list[int],
     expected_concurrent_scope_count: int,
 ) -> RuntimeAnchorProjection:
-    """Validate the deployed path and select one sustained rate per page size."""
+    """Validate the deployed path and retain small/large operation response."""
 
-    isolated_path = require_repo_path(isolated_report_path).resolve()
     concurrent_path = require_repo_path(concurrent_report_path).resolve()
-    isolated = _load_report(isolated_path, "isolated")
-    concurrent = _load_report(concurrent_path, "concurrent")
-    _validate_runtime(isolated, expected_scope_count=1)
+    concurrent = _load_report(concurrent_path)
     _validate_runtime(concurrent, expected_scope_count=expected_concurrent_scope_count)
-    _validate_geometry(isolated, concurrent, expected_kv_bytes_per_token_per_rank)
+    if int((concurrent.get("geometry") or {}).get("kv_bytes_per_token_per_rank") or 0) != expected_kv_bytes_per_token_per_rank:
+        raise ValueError("runtime DMA KV geometry does not match storage calibration")
 
     services = {
         "load": _service_model(concurrent, "host_to_device"),
@@ -51,21 +47,16 @@ def load_runtime_anchor_projection(
         if domain != expected_domain:
             raise ValueError(f"{kind} page-byte domain {domain} does not match storage {expected_domain}")
 
-    report_metadata = {
-        "isolated_report": str(repo_relative_path(isolated_path)),
-        "concurrent_report": str(repo_relative_path(concurrent_path)),
-    }
     return RuntimeAnchorProjection(
         service_models=services,
-        report_metadata=report_metadata,
         environment={
             "operator": RUNTIME_DMA_OPERATOR_NAME,
             "service_clock": "operator_device_total_duration",
-            "runtime_semantics": "kernel_ascend/page_first_direct/NUMA-local-pinned",
-            "isolated_devices": list((isolated.get("parameters") or {}).get("devices") or []),
+            "runtime_semantics": "kernel_ascend/page_first_direct/pinned",
             "concurrent_devices": list((concurrent.get("parameters") or {}).get("devices") or []),
+            "numa_nodes": [row.get("numa_preferred_node") for row in sorted(
+                concurrent["environment"]["ranks"], key=lambda row: row["rank"])],
         },
-        input_sample_count=len(isolated.get("samples") or []) + len(concurrent.get("samples") or []),
     )
 
 
@@ -75,37 +66,42 @@ def _service_model(report: dict[str, Any], direction: str) -> dict[str, Any]:
         for row in report.get("samples") or []
         if isinstance(row, dict)
         and row.get("direction") == direction
-        and int(row.get("operation_pages") or 0) > 1
+        and int(row.get("operation_pages") or 0) > 0
     ]
-    by_page: dict[int, list[float]] = {}
+    by_page: dict[int, dict[int, list[float]]] = {}
     for row in samples:
-        by_page.setdefault(int(row["page_bytes"]), []).append(float(row["bandwidth_bytes_per_sec"]))
-    if len(by_page) < 2:
-        raise ValueError(f"concurrent runtime DMA has fewer than two sustained page points for {direction}")
+        by_page.setdefault(int(row["page_bytes"]), {}).setdefault(int(row["bytes"]), []).append(float(row["device_duration_us"]))
+    if not by_page:
+        raise ValueError(f"concurrent runtime DMA has no service points for {direction}")
+    points = []
+    for page_bytes, sizes in sorted(by_page.items()):
+        if len(sizes) < 2:
+            raise ValueError(f"DMA {direction} requires two operation sizes per page size")
+        anchors = [(size, median(times)) for size, times in sorted(sizes.items())]
+        small, large = anchors[0], anchors[-1]
+        slope = (large[1] - small[1]) / (large[0] - small[0])
+        setup = small[1] - slope * small[0]
+        if setup < 0:
+            # A negative fixed cost is unphysical: the constrained line passes
+            # through the origin. This is not selected using target accuracy.
+            setup = 0.
+            slope = math.fsum(size * duration for size, duration in anchors) / math.fsum(size * size for size, _ in anchors)
+        if slope <= 0 or not math.isfinite(slope):
+            raise ValueError(f"DMA {direction} samples do not identify positive byte cost")
+        points.append({"page_bytes": page_bytes, "setup_us_per_operation": setup,
+                       "bandwidth_bytes_per_sec": 1_000_000. / slope})
     return {
         "direction": direction,
-        "page_bandwidth_points": [
-            {"page_bytes": page_bytes, "bandwidth_bytes_per_sec": _percentile(rates, 0.25)}
-            for page_bytes, rates in sorted(by_page.items())
-        ],
+        "page_bandwidth_points": points,
     }
 
 
-def _percentile(values: list[float], fraction: float) -> float:
-    ordered = sorted(values)
-    if not ordered or not 0.0 <= fraction <= 1.0:
-        raise ValueError("invalid percentile input")
-    position = fraction * (len(ordered) - 1)
-    lower, upper = math.floor(position), math.ceil(position)
-    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
-
-
-def _load_report(path: Path, role: str) -> dict[str, Any]:
+def _load_report(path: Path) -> dict[str, Any]:
     report = load_json(path)
     if not isinstance(report, dict):
-        raise ValueError(f"{role} runtime DMA report must be an object")
+        raise ValueError("runtime DMA report must be an object")
     if report.get("target_workload_trace_used") is not False or report.get("target_e2e_used") is not False:
-        raise ValueError(f"{role} runtime DMA report is not target-independent")
+        raise ValueError("runtime DMA report is not target-independent")
     return report
 
 
@@ -121,10 +117,15 @@ def _validate_runtime(report: dict[str, Any], *, expected_scope_count: int) -> N
         raise ValueError("runtime DMA calibration must not load model weights")
     if int((report.get("parameters") or {}).get("scope_count") or 0) != expected_scope_count:
         raise ValueError(f"runtime DMA report requires scope_count={expected_scope_count}")
-
-
-def _validate_geometry(isolated: dict[str, Any], concurrent: dict[str, Any], expected: int) -> None:
-    isolated_bytes = int((isolated.get("geometry") or {}).get("kv_bytes_per_token_per_rank") or 0)
-    concurrent_bytes = int((concurrent.get("geometry") or {}).get("kv_bytes_per_token_per_rank") or 0)
-    if isolated_bytes != expected or concurrent_bytes != expected:
-        raise ValueError("runtime DMA KV geometry does not match storage calibration")
+    devices = report.get("parameters", {}).get("devices", [])
+    ranks = sorted(report.get("environment", {}).get("ranks", []), key=lambda row: row["rank"])
+    if (len(devices) != expected_scope_count or len(set(devices)) != expected_scope_count
+            or any(device < 0 for device in devices)
+            or [row["rank"] for row in ranks] != list(range(expected_scope_count))
+            or [row["device"] for row in ranks] != devices):
+        raise ValueError("runtime DMA deployment devices must match its actual rank records")
+    nodes = report.get("parameters", {}).get("numa_nodes")
+    if nodes is not None and (len(nodes) != expected_scope_count
+            or any(node is not None and node < 0 for node in nodes)
+            or [row.get("numa_preferred_node") for row in ranks] != nodes):
+        raise ValueError("runtime DMA NUMA preference must match its actual rank records")

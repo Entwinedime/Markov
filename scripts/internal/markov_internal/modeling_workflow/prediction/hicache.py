@@ -6,11 +6,12 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from ...common.io import write_json
+from ...common.io import load_json, write_json
 from ..planning.specs import ModelRunRequest
 from ..types import CacheStatePredictionRef, ModelRunResult, ModelRunSpec
 from ..validations.base_dag.preflight import DagTracePreflightCheck
 from ..validations.hicache.preflight.state_input_preflight import HiCacheStateInputPreflightCheck
+from ..validations.final_dag.shape_compare import predicted_shape
 from .ledger import predicted_aggregates
 
 
@@ -56,12 +57,17 @@ class HiCachePredictionRequest:
         progress = context.reporter.start_stage(
             self.name,
             len(specs),
-            "source-only Direct I/O/control",
+            "source-only HiCache I/O/control + Prefill/Decode",
             unit="prediction",
         )
         for spec in specs:
-            row = self.build_row(results[spec.run_id])
+            result = results[spec.run_id]
+            row = self.build_row(result)
             rows.append(row)
+            if result.ok and not result.dry_run:
+                run = load_json(result.artifacts.run_summary_json)
+                run["prediction"] = prediction_evidence(result, row)
+                write_json(result.artifacts.run_summary_json, run)
             if context.options.artifact_policy.keep_debug_artifacts:
                 write_json(context.artifacts.debug_row_path(spec.run_id), row)
             progress.advance(self.progress_metrics(rows))
@@ -90,8 +96,8 @@ class HiCachePredictionRequest:
             structure_blockers.append("io_resources_not_ready")
         if patch.get("topology_valid") is not True:
             structure_blockers.append("topology_invalid")
-        if patch.get("prefill_effect_status") != "deferred":
-            structure_blockers.append("phase_effect_not_deferred")
+        if patch.get("phase_patch_status") != "ready":
+            structure_blockers.append("phase_patch_not_ready")
 
         cost_blockers: list[str] = []
         if patch.get("status") not in {"applied", "no_mutation_required"}:
@@ -115,6 +121,14 @@ class HiCachePredictionRequest:
         structure_blockers = sorted(set(structure_blockers))
         cost_blockers = sorted(set(cost_blockers))
         structure_ready = not structure_blockers
+        io_domain = (
+            spec.hicache_io_model.domain_status(
+                int(spec.target_config.fields.get("page_size") or 0),
+                predicted.get("by_kind") or {},
+            )
+            if spec.hicache_io_model is not None
+            else {"status": "unverified", "reason": "missing_hicache_io_model"}
+        )
         return {
             "model_run_id": spec.run_id,
             "pair_id": spec.prediction.label,
@@ -130,7 +144,8 @@ class HiCachePredictionRequest:
             "structure_ready": structure_ready,
             "structure_blockers": structure_blockers,
             "cost_blockers": cost_blockers,
-            "prefill_decode_excluded": patch.get("prefill_effect_status") == "deferred",
+            "phase_modeled": patch.get("phase_patch_status") == "ready",
+            "io_domain": io_domain,
             "target_predicted": predicted,
             "source_record_mapping": {
                 "predicted_record_count": len(records),
@@ -171,7 +186,12 @@ class HiCachePredictionRequest:
             "blocker_counts": dict(sorted(blockers.items())),
             "source_profile_count": len({row.get("source_run_id") for row in rows}),
             "target_score_cell_count": 0,
-            "prefill_decode_excluded": all(row.get("prefill_decode_excluded") is True for row in rows),
+            "phase_modeled_cell_count": sum(row.get("phase_modeled") is True for row in rows),
+            "phase_limitation_cell_count": sum(row.get("phase_modeled") is not True for row in rows),
+            "residual_gap_modeled": False,
+            "io_domain_counts": dict(sorted(Counter(
+                str(row.get("io_domain", {}).get("status") or "unverified") for row in rows
+            ).items())),
             "bounded_by_max_predictions": context.options.max_predictions > 0,
         }
 
@@ -187,3 +207,22 @@ class HiCachePredictionRequest:
 def _dict_field(payload: dict[str, Any], name: str) -> dict[str, Any]:
     value = payload.get(name)
     return value if isinstance(value, dict) else {}
+
+
+def prediction_evidence(result: ModelRunResult, row: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Project completed output, never rerun a model to recover missing evidence."""
+
+    if not result.artifacts.model_summary_json.is_file():
+        raise ValueError(f"prediction has neither retained scoring evidence nor full details: {result.spec.label}")
+    row = dict(row if row is not None else HiCachePredictionRequest.build_row(result))
+    aggregate = row["target_predicted"]
+    if aggregate["resource_status"] != "ready":
+        raise ValueError(f"prediction cost summary is incomplete: {result.spec.label}")
+    row["target_predicted"] = {
+        "totals": aggregate["totals"],
+        "by_kind": {kind: {key: value for key, value in values.items() if key != "records"}
+                    for kind, values in aggregate["by_kind"].items()},
+    }
+    row["shape"] = predicted_shape(load_json(result.artifacts.model_summary_json))
+    row["target_hicache"] = dict(result.spec.target_config.fields)
+    return row

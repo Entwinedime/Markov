@@ -2,21 +2,66 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from typing import Any
+
+from ....evaluation.scoring import observed_direct_cost
+from ....io_model_contract import io_observation_ready
 
 
 SHAPE_FIELDS = ("operation_count", "page_count", "byte_count")
-PRIMITIVE_CONTROL_EFFECTS = frozenset({"loadback", "commit_device_to_host"})
 
 
 class OracleCostMatchError(ValueError):
-    """Raised when target observations cannot be mapped without ambiguity."""
+    """Raised when exact shapes or a unique trace-local lane binding are unavailable."""
+
+
+def _logical_inputs(run: dict[str, Any]) -> dict[str, int]:
+    """Resolve process IDs within one trace, never compare PIDs across runs."""
+
+    inputs: dict[str, int] = {}
+    for row in run["source_phase_observations"]["observations"]:
+        if inputs.setdefault(row["pid"], row["logical_input"]) != row["logical_input"]:
+            raise OracleCostMatchError("one process belongs to multiple logical inputs")
+    return inputs
+
+
+def target_operation_cell(ledger: dict, run: dict, kv_bytes_per_token: int) -> dict:
+    """Project actual operation shapes and current control clocks; no predicted costs."""
+
+    inputs = _logical_inputs(run)
+    by_kind: dict[str, dict] = {}
+    for row in run["source_io_observations"]["observations"]:
+        tokens, direction = row["completed_tokens"], row["direction"]
+        pages = row["service_page_count"]
+        if pages == 0 and tokens == 0 and direction != "storage_to_host":
+            continue  # Inferred zero Load and other no-ops have no owned cost.
+        observed = io_observation_ready(row) and (pages == 0 or row["service_observed"])
+        if direction == "storage_to_host":
+            observed = observed and row["terminal_control_observed"]
+        elif direction == "host_to_device":
+            observed = observed and row["admission_control_observed"]
+        if not observed or row["page_size"] <= 0 or tokens % row["page_size"]:
+            raise OracleCostMatchError(f"target operation shape/cost not observed: {row['record_id']}")
+        if "source_start_us" not in row or "timing_fact_node_id" not in row:
+            raise OracleCostMatchError("target observation lacks operation order; re-extract into a fresh score output")
+        service, control = observed_direct_cost(row)
+        record = {"record_id": row["record_id"], "resource_lane": f"{row['resource_scope']}/{direction}",
+                  "logical_input": inputs[row["pid"]], "source_start_us": row["source_start_us"],
+                  "timing_fact_node_id": row["timing_fact_node_id"],
+                  "operation_count": row["operation_count"], "page_count": pages,
+                  "byte_count": pages * row["page_size"] * kv_bytes_per_token,
+                  "completed_page_count": tokens // row["page_size"],
+                  "service_us": service, "control_us": control}
+        by_kind.setdefault(row["kind"], {"records": []})["records"].append(record)
+    return {"status": "READY", "config_id": ledger["target_config_id"], "run_id": ledger["target_run_id"],
+            "workload_id": ledger["workload_id"], "by_kind": by_kind}
 
 
 def build_score_only_target_oracle_catalog(
     pair_ledger: dict[str, Any],
     observed_cell: dict[str, Any],
+    source_run: dict[str, Any],
 ) -> dict[str, Any]:
     """Bind one predicted structure to a score-only operation ledger.
 
@@ -51,6 +96,8 @@ def build_score_only_target_oracle_catalog(
     return _build_target_oracle_catalog(
         actual,
         predicted,
+        source_run=source_run,
+        source_scope_records=pair_ledger["source_scope_records"],
         workload_id=pair_ledger.get("workload_id"),
         target_run_id=pair_ledger.get("target_run_id"),
     )
@@ -60,10 +107,12 @@ def _build_target_oracle_catalog(
     actual: list[dict[str, Any]],
     predicted: list[dict[str, Any]],
     *,
+    source_run: dict[str, Any],
+    source_scope_records: list[dict],
     workload_id: Any,
     target_run_id: Any,
 ) -> dict[str, Any]:
-    scope_to_lane = _map_scopes_to_observed_lanes(actual, predicted)
+    scope_to_lane = _map_scopes_to_observed_lanes(actual, predicted, source_run, source_scope_records)
 
     matched: list[dict[str, Any]] = []
     consumed_record_ids: set[str] = set()
@@ -148,8 +197,6 @@ def build_pair_oracle_override(pair_ledger: dict[str, Any], target_catalog: dict
                 "byte_count": int(structure["byte_count"]),
                 "service_us": int(oracle["service_us"]),
                 "control_us": int(oracle["control_us"]),
-                "observed_blocking_us": int(oracle["observed_blocking_us"]),
-                "control_semantics": oracle["control_semantics"],
             }
         )
     return {"costs": sorted(costs, key=lambda row: (int(row["logical_order_epoch"]), str(row["effect_id"])))}
@@ -184,49 +231,29 @@ def _flatten_records(ledger: dict[str, Any], side: str) -> list[dict[str, Any]]:
 
 
 def _map_scopes_to_observed_lanes(
-    actual: list[dict[str, Any]], predicted: list[dict[str, Any]]
+    actual: list[dict[str, Any]], predicted: list[dict[str, Any]], source_run: dict[str, Any], source_scope_records: list[dict]
 ) -> dict[str, str]:
-    actual_by_timing = {
-        int(row["timing_fact_node_id"]): row for row in actual if row.get("timing_fact_node_id") is not None
-    }
-    votes: dict[str, Counter[str]] = defaultdict(Counter)
-    for model_record in predicted:
-        scope = str(model_record.get("resource_scope") or "")
-        if not scope:
-            raise OracleCostMatchError("predicted effect is missing resource_scope")
-        for raw_node_id in model_record.get("source_timing_fact_node_ids", []):
-            node_id = int(raw_node_id)
-            observed = actual_by_timing.get(node_id)
-            if observed is None or observed["kind"] != model_record["kind"]:
-                continue
-            lane = str(observed["lane_base"])
-            votes[scope][lane] += 1
-
-    mapping: dict[str, str] = {}
-    for scope, counter in votes.items():
-        ranked = counter.most_common()
-        if len(ranked) > 1 and ranked[0][1] == ranked[1][1]:
-            raise OracleCostMatchError(f"ambiguous timing-evidence lane mapping for scope {scope!r}: {dict(counter)}")
-        mapping[scope] = ranked[0][0]
-    if len(set(mapping.values())) != len(mapping):
-        raise OracleCostMatchError(f"multiple scopes map to the same observed lane: {mapping}")
-
-    scopes = sorted(
-        {str(row["resource_scope"]) for row in predicted},
-        key=lambda scope: min(_predicted_order(row) for row in predicted if row["resource_scope"] == scope),
-    )
-    lanes = sorted(
-        {str(row["lane_base"]) for row in actual},
-        key=lambda lane: min(_actual_order(row) for row in actual if row["lane_base"] == lane),
-    )
-    unmatched_scopes = [scope for scope in scopes if scope not in mapping]
-    unmatched_lanes = [lane for lane in lanes if lane not in mapping.values()]
-    if len(unmatched_scopes) != len(unmatched_lanes):
-        raise OracleCostMatchError(
-            f"scope/lane cardinality mismatch after timing evidence: scopes={unmatched_scopes}, lanes={unmatched_lanes}"
-        )
-    for scope, lane in zip(unmatched_scopes, unmatched_lanes):
-        mapping[scope] = lane
+    # Source operation IDs bind the predicted scope to its own trace's rank.
+    # Target node IDs, process IDs and arrival order are not cross-trace identities.
+    inputs = _logical_inputs(source_run)
+    source = {row["record_id"]: row for row in source_run["source_io_observations"]["observations"]}
+    scopes: dict[str, set[int]] = {row["resource_scope"]: set() for row in predicted}
+    lanes: dict[int, set[str]] = defaultdict(set)
+    for row in actual:
+        lanes[row["logical_input"]].add(row["lane_base"])
+    for row in source_scope_records:
+        if row["resource_scope"] not in scopes:
+            continue
+        ranks = scopes[row["resource_scope"]]
+        for record_id in row["source_io_operation_record_ids"]:
+            ranks.add(inputs[source[record_id]["pid"]])
+    mapping = {}
+    for scope, ranks in scopes.items():
+        if len(ranks) != 1 or len(lanes[next(iter(ranks))]) != 1:
+            raise OracleCostMatchError(f"no unique logical-input lane for predicted scope {scope}: {sorted(ranks)}")
+        mapping[scope] = next(iter(lanes[next(iter(ranks))]))
+    if len(set(mapping.values())) != len(mapping) or set(mapping.values()) != {row["lane_base"] for row in actual}:
+        raise OracleCostMatchError("predicted scopes and observed logical-input lanes are not one-to-one")
     return mapping
 
 
@@ -309,12 +336,6 @@ def _oracle_cost_record(model_record: dict[str, Any], observed: list[dict[str, A
         **{field: int(model_record[field]) for field in SHAPE_FIELDS},
         "service_us": sum(int(row.get("service_us") or 0) for row in observed),
         "control_us": sum(int(row.get("control_us") or 0) for row in observed),
-        "observed_blocking_us": sum(int(row.get("blocking_us") or 0) for row in observed),
-        "control_semantics": (
-            "host_control_primitive"
-            if bool(model_record.get("zero_payload_control")) or effect_type in PRIMITIVE_CONTROL_EFFECTS
-            else "outcome_only_terminal_control"
-        ),
     }
 
 

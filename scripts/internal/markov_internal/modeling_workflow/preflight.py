@@ -52,7 +52,7 @@ class PreflightRunner:
         progress = self.context.reporter.start_stage(
             "preflight",
             len(ordered_checks),
-            "Direct I/O/control prediction",
+            "HiCache I/O/control + Prefill/Decode prediction",
             unit="check",
         )
         for check in ordered_checks:

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import asdict
+import time
 from typing import Any
 
-from ..common.io import load_json
 from ..common.paths import repo_relative_path, require_repo_path
 from .calibration.aggregation import _is_sustained_new_write_point, select_point_durations
 from .calibration.bundle import write_final_capture_bundle
@@ -35,7 +36,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str, Any]:
-    """Measure service primitives and persist one coefficient-only report."""
+    """Measure physical services, preserving observations independently of control."""
+
+    started = time.monotonic()
+    from sglang.srt.mem_cache.hicache_storage import STORAGE_BATCH_SIZE
 
     output_path = output_dir / "calibration_report.json"
     if output_path.exists() and not args.force:
@@ -54,7 +58,6 @@ def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str
     page_bytes = sorted({geometry["kv_bytes_per_token_per_rank"] * value for value in page_tokens})
     runtime = load_runtime_anchor_projection(
         args.runtime_dma_report,
-        args.concurrent_runtime_dma_report,
         expected_kv_bytes_per_token_per_rank=geometry["kv_bytes_per_token_per_rank"],
         expected_page_bytes=page_bytes,
         expected_concurrent_scope_count=args.tensor_parallel_size,
@@ -85,8 +88,10 @@ def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str
         HostStorageCapturePlan(
             storage_dir=storage_dir,
             page_sizes=tuple(page_bytes),
-            scope_count=args.tensor_parallel_size,
+            devices=tuple(runtime.environment["concurrent_devices"]),
+            numa_nodes=tuple(runtime.environment["numa_nodes"]),
             model_name=geometry["model_name"],
+            kv_geometry=geometry,
             warmup=args.warmup,
             repeats=args.repeats,
             isolated_repeats=args.isolated_repeats,
@@ -94,7 +99,8 @@ def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str
             existing_operation_pages=tuple(existing_pages),
             new_write_queues=tuple(new_queues),
             new_write_operations=tuple(new_operations),
-        )
+        ),
+        observations_path=output_dir / "physical_observations.json",
     )
     storage_samples = [row for row in captured.storage_samples if not _is_sustained_new_write_point(row)]
     storage_samples.extend(captured.new_write_samples)
@@ -103,35 +109,34 @@ def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str
     if sum(_is_sustained_new_write_point(row) for row in selected) != expected_new:
         raise ValueError("new-write calibration grid is incomplete")
 
-    control = _load_control_primitives(args.control_primitives)
     capture = {
-        "parameters": {
+        "storage_batch_pages": STORAGE_BATCH_SIZE,
+        "parameters": {**{key: str(value) if isinstance(value, Path) else value for key, value in asdict(args).items()},
             "page_bytes": page_bytes,
             "tensor_parallel_size": args.tensor_parallel_size,
         },
         "kv_geometry": geometry,
         "runtime_dma": {
-            "isolated_report": str(repo_relative_path(require_repo_path(args.runtime_dma_report).resolve())),
             "concurrent_report": str(
-                repo_relative_path(require_repo_path(args.concurrent_runtime_dma_report).resolve())
+                repo_relative_path(require_repo_path(args.runtime_dma_report).resolve())
             ),
         },
-        "host_storage": {"selected_points": selected},
-        "control_primitives": {
-            "prefetch_zero_payload_us_per_operation": control[
-                "prefetch_zero_payload_us_per_operation"
-            ],
-            "load_us_per_page": control["load_us_per_page"],
-        },
+        "host_storage": {"samples": storage_samples, "selected_points": selected},
         "measurement_scope": {
             "runtime_dma": runtime.environment["runtime_semantics"],
             "storage": f"HiCacheFile on {filesystem_type(storage_dir)}",
             "storage_path": str(repo_relative_path(storage_dir)),
+            "storage_scope_cpu_threads": captured.storage_samples[0]["scope_cpu_threads"],
+            "storage_scope_devices": captured.storage_samples[0]["scope_devices"],
+            "storage_scope_numa_nodes": captured.storage_samples[0]["scope_numa_nodes"],
+            "storage_page_representation": "model_kv_dtype_page_first_direct",
+            "storage_write_path": "HiCacheController._generic_page_set + MHATokenToKVPoolHost.get_data_page; CPU Tensor indices",
             "storage_scope_cpu_sets": [
                 format_cpu_set(value) if value is not None else None for value in cpu_sets
             ],
         },
-        "calibration_workload_trace_used": control["calibration_workload_trace_used"],
+        "capture_wall_seconds": time.monotonic() - started,
+        "calibration_workload_trace_used": False,
         "target_workload_trace_used": False,
         "target_e2e_used": False,
     }
@@ -141,18 +146,6 @@ def capture_final_bundle(args: CalibrationOptions, output_dir: Path) -> dict[str
         "host_storage": len(storage_samples),
     }
     return result
-
-
-def _load_control_primitives(path: Path) -> dict[str, Any]:
-    payload = load_json(require_repo_path(path))
-    if not isinstance(payload, dict):
-        raise ValueError("control primitive report must be an object")
-    if payload.get("target_workload_trace_used") is not False or payload.get("target_e2e_used") is not False:
-        raise ValueError("control primitive report must not use target labels")
-    for field in ("prefetch_zero_payload_us_per_operation", "load_us_per_page"):
-        if not isinstance(payload.get(field), (int, float)) or float(payload[field]) < 0.0:
-            raise ValueError(f"control primitive report requires non-negative {field}")
-    return payload
 
 
 if __name__ == "__main__":

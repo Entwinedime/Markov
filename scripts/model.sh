@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 从宿主机进入 modeling 容器，执行唯一的建模业务入口。
+# 宿主机上的建模入口；设备校准使用框架容器，其余计算使用 modeling。
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,12 +14,23 @@ usage() {
 usage:
   scripts/model.sh build-dag (--profile-manifest <manifest> --output-dir <dir> | --config <runner_config.json>)
   scripts/model.sh calibrate-hicache <physical|runtime-dma> [options]
-  scripts/model.sh build-hicache-model --calibration-report <report> --base-observations <observations> --output-dir <dir>
+  scripts/model.sh build-hicache-model --group <group_request.json> [--output-dir <dir>]
+  scripts/model.sh prepare-hicache --group <group_request.json> [--dry-run] [--calibration-only] [--refresh-observations] [--model-run-jobs <n>] [--diagnostics off|full]
   scripts/model.sh predict-hicache [workflow options]
-  scripts/model.sh evaluate-hicache [matrix options]
+  scripts/model.sh evaluate-hicache --prediction-dir <completed-output> --profile-run-dir <target-suite> --output-dir <score-output> [--oracle-cost-replay]
 
-All modeling actions run inside one modeling container. predict-hicache selects
-the Direct I/O/control prediction and executes its model cells in that same
+prepare-hicache coordinates containers from the host. Its dry-run writes fixed-input
+and readiness plans without starting an inference server. With sufficient admitted
+group observations it builds one model and predicts the group. --calibration-only
+stops before model build/prediction. Missing base runs require a separate
+base_capture_budget; without it only a plan is returned.
+Missing physical data requires a separately budgeted physical_capture request;
+without it only a measurement plan is returned. That request must explicitly
+declare target-independent physical_capture.page_token_sizes.
+
+Physical/runtime-DMA calibration runs in the SGLang device environment.
+Other modeling actions run inside one modeling container. predict-hicache selects
+the HiCache I/O/control prediction and executes its model cells in that same
 container; it does not start one nested container per cell.
 
 examples:
@@ -28,7 +39,7 @@ examples:
   scripts/model.sh calibrate-hicache runtime-dma --help
   scripts/model.sh build-hicache-model --help
   scripts/model.sh predict-hicache --source-manifest <manifest> --target-config <config> --hicache-io-model <model>
-  scripts/model.sh evaluate-hicache --profile-run-dir <suite> --base-io-model <base>=<model>
+  scripts/model.sh evaluate-hicache --prediction-dir <predictions> --profile-run-dir <suite> --output-dir <scores>
 EOF
 }
 
@@ -46,8 +57,12 @@ action=$1
 shift
 container_command=()
 action_args=()
+model_environment=modeling
 
 case "$action" in
+    prepare-hicache)
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.prepare "$@"
+        ;;
     build-dag)
         container_command=(python3 scripts/internal/entrypoints/model.py)
         action_args=("$@")
@@ -61,10 +76,12 @@ case "$action" in
         shift
         case "$calibration_kind" in
             physical)
+                model_environment=sglang
                 container_command=(python3 -m markov_internal.modeling_workflow.io_calibration)
                 action_args=("$@")
                 ;;
             runtime-dma)
+                model_environment=sglang
                 container_command=(python3 -m markov_internal.modeling_workflow.runtime_dma_calibration)
                 action_args=("$@")
                 ;;
@@ -84,8 +101,8 @@ case "$action" in
         action_args=("$@")
         ;;
     evaluate-hicache)
-        container_command=(python3 scripts/internal/entrypoints/modeling_workflow.py)
-        action_args=(--evaluation "$@")
+        container_command=(python3 -m markov_internal.modeling_workflow.evaluation.existing)
+        action_args=("$@")
         ;;
     *)
         echo "unknown modeling action: $action" >&2
@@ -129,8 +146,10 @@ for arg in "${action_args[@]}"; do
     container_args+=("$(container_arg "$arg")")
 done
 
-docker compose -f "$(compose_file)" run --rm \
-    -e TRACE_SIM_MODELING_CONTAINER=1 \
-    modeling \
-    env PYTHONPATH=scripts/internal \
+model_python_path=scripts/internal
+if [ "$model_environment" = sglang ]; then
+    model_python_path+=:third_party/sglang/python
+fi
+exec "$SCRIPT_DIR/run.sh" "$model_environment" -- \
+    env PYTHONPATH="$model_python_path" \
     "${container_command[@]}" "${container_args[@]}"

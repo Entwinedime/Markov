@@ -13,6 +13,7 @@ from ..common.paths import require_repo_path, running_in_modeling_container
 from .backend import append_option, build_trace_graph_command, execute_trace_graph
 from .cpp_config import cpp_model_config_path, trace_graph_executable
 from .run_config import ModelingRunConfig
+from .workload import discover_workload_window
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -56,6 +57,10 @@ def run_from_manifest(args: argparse.Namespace) -> dict[str, Any]:
     ]
     append_option(command, "--threads", args.threads)
     append_option(command, "--file-threads", args.file_threads)
+    window = discover_workload_window({}, manifest)
+    if window is not None:
+        append_option(command, "--trace-window-start-us", window.start_ns // 1000)
+        append_option(command, "--trace-window-end-us", window.end_ns // 1000)
     if args.emit_dag:
         command.extend(("--graph-output", str(output / "dag_chrome_trace.json")))
     execute_trace_graph(command)

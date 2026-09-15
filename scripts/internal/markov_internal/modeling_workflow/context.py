@@ -19,14 +19,9 @@ class WorkflowOptions:
     loads arguments or observes process-global command-line state.
     """
 
-    profile_run_dirs: tuple[Path, ...]
     source_manifests: tuple[Path, ...]
     target_configs: tuple[TargetHiCacheConfig, ...]
     output_dir: Path
-    input_ids: frozenset[str]
-    config_ids: frozenset[str]
-    source_config_ids: frozenset[str]
-    target_config_ids: frozenset[str]
     artifact_policy: ArtifactPolicy
     dry_run: bool = False
     continue_on_error: bool = False
@@ -35,9 +30,6 @@ class WorkflowOptions:
     trace_file_threads: int = 1
     model_run_jobs: int = 1
     hicache_io_model: HiCacheIoModel | None = None
-    base_io_models: tuple[tuple[str, HiCacheIoModel], ...] = ()
-    oracle_scores: tuple[tuple[str, Path, Path], ...] = ()
-    evaluation: bool = False
 
 
 @dataclass

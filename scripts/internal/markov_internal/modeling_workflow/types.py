@@ -84,7 +84,7 @@ class CacheStatePredictionRef:
 
 @dataclass(frozen=True)
 class ModelRunSpec:
-    """One Direct HiCache prediction executed by the C++ DAG model."""
+    """One HiCache I/O/control prediction executed by the C++ DAG model."""
 
     run_id: str
     source_profile: ProfileRunRef

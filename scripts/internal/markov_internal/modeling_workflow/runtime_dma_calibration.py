@@ -16,7 +16,7 @@ import csv
 import math
 import multiprocessing
 import os
-import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ from .calibration.runtime_anchors import (
     RUNTIME_DMA_INDEX_RESIDENCY,
     RUNTIME_DMA_OPERATOR_NAME,
 )
-from .calibration.options import format_cpu_set, parse_cpu_sets, parse_integer_csv, parse_positive_csv
+from .calibration.options import apply_numa_preference, format_cpu_set, parse_cpu_sets, parse_integer_csv, parse_positive_csv
 from .physical_calibration import nonnegative_int, positive_int
 
 DEFAULT_PAGE_TOKEN_SIZES = "32,64,128"
@@ -120,6 +120,8 @@ def parse_operator_table(
         samples.append(
             {
                 "rank": rank,
+                "sample_index": operation.sample_index,
+                "ordinal": operation.ordinal,
                 "direction": operation.direction,
                 "page_bytes": operation.page_bytes,
                 "operation_pages": operation.operation_pages,
@@ -168,6 +170,7 @@ def _profile_rank(
     output_dir: Path,
     barrier: Any,
     result_queue: Any,
+    numa_node: int | None = None,
 ) -> None:
     try:
         os.sched_setaffinity(0, cpu_set)
@@ -176,6 +179,7 @@ def _profile_rank(
             raise RuntimeError(
                 f"rank {rank} CPU affinity mismatch: requested={sorted(cpu_set)}, actual={actual_affinity}"
             )
+        actual_numa_node = apply_numa_preference(numa_node)
         import torch
         import torch_npu
         from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
@@ -287,6 +291,7 @@ def _profile_rank(
                 "rank": rank,
                 "device": device,
                 "cpu_affinity": actual_affinity,
+                "numa_preferred_node": actual_numa_node,
                 "device_name": str(torch.npu.get_device_name(device)),
                 "index_residency": dict(RUNTIME_DMA_INDEX_RESIDENCY),
             }
@@ -313,7 +318,12 @@ def capture_runtime_dma(
     kv_heads_per_rank: int,
     head_dim: int,
     element_bytes: int,
+    numa_nodes: list[int | None] | None = None,
 ) -> dict[str, Any]:
+    started = time.monotonic()
+    numa_nodes = numa_nodes if numa_nodes is not None else [None] * len(devices)
+    if len(numa_nodes) != len(devices) or any(node is not None and node < 0 for node in numa_nodes):
+        raise ValueError("NUMA nodes require one nonnegative node per deployment device")
     output_dir = require_repo_path(output_dir).resolve()
     report_path = output_dir / "runtime_dma_calibration.json"
     if output_dir.exists():
@@ -337,6 +347,7 @@ def capture_runtime_dma(
                 "rank": rank,
                 "device": device,
                 "cpu_set": cpu_set,
+                "numa_node": numa_nodes[rank],
                 "operations": operations,
                 "warmup": warmup,
                 "layer_count": layer_count,
@@ -368,10 +379,12 @@ def capture_runtime_dma(
     worker_by_rank = {int(row["rank"]): row for row in worker_rows}
 
     samples: list[dict[str, Any]] = []
+    operator_tables: list[str] = []
     for rank, _device in enumerate(devices):
         candidates = list((output_dir / "profile_work" / f"rank{rank}").glob("**/operator_details.csv"))
         if len(candidates) != 1:
             raise RuntimeError(f"rank {rank} must emit exactly one operator_details.csv; found {len(candidates)}")
+        operator_tables.append(str(candidates[0].relative_to(output_dir)))
         samples.extend(
             parse_operator_table(
                 candidates[0],
@@ -379,9 +392,9 @@ def capture_runtime_dma(
                 rank=rank,
             )
         )
-    shutil.rmtree(output_dir / "profile_work")
-
     report = {
+        "capture_wall_seconds": time.monotonic() - started,
+        "operator_tables": operator_tables,
         "environment": {
             "ranks": [worker_by_rank[rank] for rank in sorted(worker_by_rank)],
         },
@@ -389,6 +402,7 @@ def capture_runtime_dma(
             "devices": devices,
             "scope_count": len(devices),
             "cpu_sets": [format_cpu_set(value) for value in cpu_sets],
+            "numa_nodes": numa_nodes,
             "page_token_sizes": sorted(page_token_sizes),
             "payload_bytes": sorted(payload_bytes),
             "repeats": repeats,
@@ -415,7 +429,7 @@ def capture_runtime_dma(
                 "Host Self Duration(us) from operator_details.csv",
                 "Host Total Duration(us) from operator_details.csv",
             ],
-            "host_memory": "NUMA-local pinned CPU",
+            "host_memory": "pinned CPU; worker NUMA preference does not establish page residency",
             "index_residency": dict(RUNTIME_DMA_INDEX_RESIDENCY),
             "index_semantics_source": (
                 "HiCacheController.move_indices(kernel_ascend): return host_indices, device_indices.cpu()"
@@ -436,6 +450,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     capture.add_argument("--output-dir", required=True, type=Path)
     capture.add_argument("--devices", default="0,1")
     capture.add_argument("--cpu-sets", required=True)
+    capture.add_argument("--numa-nodes", help="Comma-separated preferred nodes, one per device; otherwise inherit policy")
     capture.add_argument("--page-token-sizes", default=DEFAULT_PAGE_TOKEN_SIZES)
     capture.add_argument("--payload-bytes", default=DEFAULT_PAYLOAD_BYTES)
     capture.add_argument("--repeats", type=positive_int, default=3)
@@ -456,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         devices=devices,
         cpu_sets=[value for value in cpu_sets if value is not None],
+        numa_nodes=[int(value) for value in args.numa_nodes.split(",")] if args.numa_nodes is not None else None,
         page_token_sizes=parse_positive_csv(args.page_token_sizes, "page-token-sizes"),
         payload_bytes=parse_positive_csv(args.payload_bytes, "payload-bytes"),
         repeats=args.repeats,

@@ -18,8 +18,22 @@ def compare_predicted_shape(
 ) -> dict[str, Any]:
     """Compare stable effect shape; target observations never change prediction."""
 
-    decisions = _effect_decisions(model_summary)
-    predicted_rows, predicted_lane_orders = _predicted_shape(decisions)
+    return compare_shape(predicted_shape(model_summary), oracle)
+
+
+def predicted_shape(model_summary: dict[str, Any]) -> dict[str, Any]:
+    """Retain only the semantic projection required for later target scoring."""
+
+    rows, lanes = _predicted_shape(_effect_decisions(model_summary))
+    effects = [{key: value for key, value in row.items() if key not in {"effect_family_key", "resource_lane", "eligibility_epoch"}}
+               for row in rows]
+    return {"effects": effects, "lane_orders": lanes}
+
+
+def compare_shape(shape: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
+    """Score the same projection whether detailed diagnostics were retained or not."""
+
+    predicted_rows, predicted_lane_orders = shape["effects"], shape["lane_orders"]
     predicted = {str(row["effect_key"]): row for row in predicted_rows}
     actual = {
         str(row.get("effect_key")): row
@@ -29,7 +43,7 @@ def compare_predicted_shape(
     blockers = []
     if oracle.get("ready") is not True:
         blockers.append("target_shape_oracle_not_ready")
-    if not decisions:
+    if not predicted_rows:
         blockers.append("predicted_effect_decisions_missing")
     if blockers:
         return _comparison_result(
@@ -50,12 +64,23 @@ def compare_predicted_shape(
         ("consumer_role", "consumer_role", "consumer_role"),
         ("blocking_relation", "blocking_relation", "blocking_relation"),
         ("schedule_sensitivity", "schedule_sensitivity", "schedule_sensitivity"),
+        ("operation_count", "operation_count", "operation_count"),
+        ("effective_page_count", "effective_page_count", "effective_page_count"),
+        ("completed_page_count", "completed_page_count", "completed_page_count"),
+        ("storage_existing_page_count", "storage_existing_page_count", "storage_existing_page_count"),
+        ("storage_new_page_count", "storage_new_page_count", "storage_new_page_count"),
+        ("storage_batches", "storage_batches", "storage_batches"),
     )
     for effect_key in sorted(predicted_keys & actual_keys):
         predicted_row = predicted[effect_key]
         actual_row = actual[effect_key]
         for predicted_field, actual_field, label in compared_fields:
-            if predicted_row.get(predicted_field) == actual_row.get(actual_field):
+            predicted_value = predicted_row.get(predicted_field)
+            actual_value = actual_row.get(actual_field)
+            if label == "storage_batches":
+                predicted_value = [tuple(batch) for batch in predicted_value or []]
+                actual_value = [tuple(batch) for batch in actual_value or []]
+            if predicted_value == actual_value:
                 continue
             sensitivity = _field_schedule_sensitivity(predicted_row, label)
             if label != "transfer_direction" and sensitivity == "arrival_schedule_sensitive":
@@ -105,6 +130,7 @@ def actual_row(
     blocker: str = "",
     operation_sort_key: tuple[Any, ...] | None = None,
     actual_consumer_role: str = "",
+    work: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build one target-observed effect row from trace evidence."""
 
@@ -119,6 +145,13 @@ def actual_row(
         "blocker": blocker,
         "operation_sort_key": operation_sort_key,
         "actual_consumer_role": actual_consumer_role,
+        "operation_count": 0,
+        "effective_page_count": 0,
+        "completed_page_count": 0,
+        "storage_existing_page_count": 0,
+        "storage_new_page_count": 0,
+        "storage_batches": [],
+        **(work or {}),
     }
 
 
@@ -154,6 +187,21 @@ def _predicted_shape(decisions: list[dict[str, Any]]) -> tuple[list[dict[str, An
                 str(decision.get("cache_scope") or ""), str(decision.get("resource_lane") or "")
             ),
             "eligibility_epoch": u64(decision.get("eligibility_epoch")),
+            "operation_count": u64(decision.get("operation_count")),
+            "effective_page_count": u64(decision.get("effective_page_count")),
+            "completed_page_count": u64(decision.get("completed_page_count")),
+            "storage_existing_page_count": u64(decision.get("storage_existing_page_count")),
+            "storage_new_page_count": u64(decision.get("storage_new_page_count")),
+            "storage_batches": [
+                (
+                    u64(batch.get("operation_index")),
+                    u64(batch.get("page_count")),
+                    u64(batch.get("existing_page_count")),
+                    u64(batch.get("new_page_count")),
+                )
+                for batch in decision.get("storage_service_batches", [])
+                if isinstance(batch, dict)
+            ],
         }
         rows.append(row)
         if state in ACTIVE_STATES and row["resource_lane"]:
@@ -201,7 +249,8 @@ def _comparison_result(
     schedule_count = sum(row.get("schedule_sensitivity") == "arrival_schedule_sensitive" for row in predicted_rows)
     mismatch_count = invariant_mismatches + schedule_mismatches
     return {
-        "acceptance_ready": ready and invariant_mismatches == 0,
+        "acceptance_ready": ready and mismatch_count == 0,
+        "schedule_conditioned_ready": ready and invariant_mismatches == 0,
         "mismatch_count": mismatch_count,
         "acceptance_mismatch_count": invariant_mismatches,
         "schedule_sensitive_count": schedule_count,

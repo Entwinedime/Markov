@@ -170,9 +170,12 @@ def _build_opportunities(
     role_ordinals: Counter[tuple[str, str]] = Counter()
     for event in events:
         window_position = str(event.get("window_position") or "")
-        if window_position != "formal":
-            continue
         role = str(event["role"])
+        # C++ apply_model retains lifecycle facts from causal-tail context.
+        # Mirror that semantic evidence without extending the timing window or
+        # admitting new lookup/prefetch opportunities after the formal interval.
+        if window_position != "formal" and not (window_position == "post" and role == "cache_lifecycle_commit"):
+            continue
         descriptors = _EFFECT_DESCRIPTORS.get(role)
         if not descriptors or event["fact_class"] != "workload_identity" or not _completed_state_fact_phase(event):
             continue
@@ -268,10 +271,13 @@ def _classify_loadback(
         state = "ambiguous" if len(timings) > 1 else "unobservable"
         return _actual_row(opportunity, state, blocker="loadback_timing_identity_incomplete")
     state = _transfer_state(effective, _candidate_transfer_token_count(opportunity))
+    page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
+    pages = effective // page_size if page_size else 0
     return _actual_row(
         opportunity,
         state,
         operation_sort_key=_event_sort_key(timings[0]),
+        work={"operation_count": 1, "effective_page_count": pages, "completed_page_count": pages},
     )
 
 
@@ -286,12 +292,27 @@ def _classify_prefetch_io(
     if not timings:
         return _actual_row(opportunity, "not_required")
     timing = timings[0]
+    services = _nested_events(timing, role_events.get("storage_read_service_observed", []))
+    batch_pages = [_u64(event["args"].get("service_item_count")) for event in services]
+    if any(pages == 0 for pages in batch_pages):
+        return _actual_row(opportunity, "unobservable", blocker="prefetch_service_batch_work_incomplete")
+    executed_pages = sum(batch_pages)
+    page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
     completed = _completed_transfer_tokens(timing["args"])
-    state = _transfer_state(completed, _candidate_transfer_token_count(opportunity))
+    completed_pages = completed // page_size if page_size else 0
+    candidate_tokens = _candidate_transfer_token_count(opportunity)
+    candidate_pages = candidate_tokens // page_size if page_size else 0
+    state = _transfer_state(executed_pages, candidate_pages)
     return _actual_row(
         opportunity,
         state,
         operation_sort_key=_event_sort_key(timing),
+        work={
+            "operation_count": 1,
+            "effective_page_count": executed_pages,
+            "completed_page_count": completed_pages,
+            "storage_batches": [(0, pages, 0, 0) for pages in batch_pages],
+        },
     )
 
 
@@ -345,10 +366,13 @@ def _classify_commit_d2h(opportunity: dict[str, Any], role_events: dict[str, lis
     if not timings:
         return _actual_row(opportunity, "unobservable", blocker="commit_d2h_timing_identity_incomplete")
     state = _transfer_state(effective, effective)
+    page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
+    pages = effective // page_size if page_size else 0
     return _actual_row(
         opportunity,
         state,
         operation_sort_key=min((_event_sort_key(event) for event in timings)),
+        work={"operation_count": len(timings), "effective_page_count": pages, "completed_page_count": pages},
     )
 
 
@@ -383,11 +407,36 @@ def _classify_commit_h2s(opportunity: dict[str, Any], role_events: dict[str, lis
             )
         timings.extend(matches)
     completed = sum(_completed_transfer_tokens(event["args"]) for event in timings)
-    state = _transfer_state(completed, candidate)
+    page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
+    batches: list[tuple[int, int, int, int]] = []
+    for operation_index, timing in enumerate(sorted(timings, key=_event_sort_key)):
+        services = _nested_events(timing, role_events.get("storage_write_service_observed", []))
+        for service in services:
+            args = service["args"]
+            pages = _u64(args.get("service_item_count"))
+            existing = _optional_u64(args.get("storage_existing_page_count"))
+            new = _optional_u64(args.get("storage_new_page_count"))
+            if pages == 0 or existing is None or new is None or existing + new != pages:
+                return _actual_row(opportunity, "unobservable", blocker="commit_h2s_service_batch_work_incomplete")
+            batches.append((operation_index, pages, existing, new))
+    if not batches:
+        return _actual_row(opportunity, "unobservable", blocker="commit_h2s_service_batch_work_incomplete")
+    executed_pages = sum(batch[1] for batch in batches)
+    candidate_pages = candidate // page_size if page_size else 0
+    completed_pages = completed // page_size if page_size else 0
+    state = _transfer_state(executed_pages, candidate_pages)
     return _actual_row(
         opportunity,
         state,
         operation_sort_key=min((_event_sort_key(event) for event in timings)),
+        work={
+            "operation_count": len(timings),
+            "effective_page_count": executed_pages,
+            "completed_page_count": completed_pages,
+            "storage_existing_page_count": sum(batch[2] for batch in batches),
+            "storage_new_page_count": sum(batch[3] for batch in batches),
+            "storage_batches": batches,
+        },
     )
 
 
@@ -413,6 +462,13 @@ def _annotate_family_relations(rows: list[dict[str, Any]]) -> None:
     for row in rows:
         families[str(row["effect_family_key"])][str(row["effect_type"])] = row
     for family in families.values():
+        visibility = family.get("prefetch_visibility_dependency")
+        transfer = family.get("prefetch_io_operation")
+        if visibility is not None and transfer is not None:
+            # Visibility describes the same completed payload, not a second I/O.
+            # Completed pages can be nonzero even when no foreground wait is needed.
+            visibility["effective_page_count"] = transfer["completed_page_count"]
+            visibility["completed_page_count"] = transfer["completed_page_count"]
         for effect_type, row in family.items():
             active = row["actual_state"] in _ACTIVE_STATES
             if not active:
