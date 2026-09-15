@@ -32,11 +32,18 @@ def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | No
     if manifest_path is None or not manifest_path.is_file():
         return None
     manifest = load_json(manifest_path)
+    reports = manifest.get("bench", {}).get("workload_report_files", [])
+    if len(reports) > 1:
+        raise ValueError("multiple workload reports; select input.workload_report explicitly")
+    if reports:
+        return load_workload_window(require_repo_path(reports[0]["path"]))
     run_dir_raw = manifest.get("run_dir")
     run_dir = map_repo_path(Path(str(run_dir_raw))) if isinstance(run_dir_raw, str) else manifest_path.parent
     candidates = sorted(run_dir.glob("bench/**/workload_report.json"))
+    if len(candidates) > 1:
+        raise ValueError("multiple workload reports; select input.workload_report explicitly")
     if candidates:
-        return load_workload_window(candidates[-1])
+        return load_workload_window(candidates[0])
     bench_candidates = sorted(run_dir.glob("bench/**/*.jsonl"))
     for path in reversed(bench_candidates):
         window = load_bench_serving_window(path)

@@ -57,6 +57,9 @@ def build_profile_manifest(
             "ld_preload_trace_dir": str(trace_dir / "ld_preload"),
             "ld_preload_trace_files": ld_preload_trace_files,
         },
+        "bench": {
+            "workload_report_files": _glob_files(run_dir / "bench", "**/workload_report.json"),
+        },
         "sidecar": {
             "python_probe_dir": str(python_probe_dir),
             "python_probe_files": python_probe_files,

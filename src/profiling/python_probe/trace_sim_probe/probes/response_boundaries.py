@@ -1,7 +1,8 @@
-"""Optional response observations, not execution costs or client completion.
+"""Optional request/response observations, not execution costs or client completion.
 
-Record terminal request IDs only. Never inspect serialized bodies, tokens, or
-cache state. ASGI send completion is distinct from the bench client's receipt.
+Record request IDs at ingress and terminal response boundaries only. Never
+inspect serialized bodies, tokens, or cache state. ASGI send completion is
+distinct from the bench client's receipt.
 """
 
 import functools
@@ -29,6 +30,27 @@ def _sender(original):
         _record("scheduler_send", ids, start, get_writer().now_us())
         return result
     return send
+
+
+def _receiver(stage):
+    def wrap(original):
+        def receive(instance, *args, **kwargs):
+            requests = original(instance, *args, **kwargs)
+            if requests:
+                ids = []
+                for request in requests:
+                    # Batch containers hold requests; never inspect their tokens.
+                    for item in getattr(request, "batch", (request,)):
+                        rid = getattr(item, "rid", None)
+                        if isinstance(rid, str):
+                            ids.append(rid)
+                if ids:
+                    writer = get_writer()
+                    now = writer.now_us()
+                    writer.duration_event("runtime.request." + stage, now, now, "runtime_diagnostic", {"request_ids": ids})
+            return requests
+        return receive
+    return wrap
 
 
 def _tokenizer(original):
@@ -82,6 +104,10 @@ _TARGETS = {
     "sglang.srt.utils.json_response": (
         ("SGLangORJSONResponse", "__init__", _response_init),
         ("SGLangORJSONResponse", "__call__", _response_send),
+    ),
+    "sglang.srt.managers.scheduler_components.request_receiver": (
+        ("SchedulerRequestReceiver", "_pull_raw_reqs", _receiver("socket_received")),
+        ("SchedulerRequestReceiver", "recv_requests", _receiver("dispatch_ready")),
     ),
 }
 TARGET_MODULES = tuple(_TARGETS)
