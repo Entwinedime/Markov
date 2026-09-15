@@ -63,9 +63,13 @@ false 检查的函数 fact 可能比 scheduler 的控制标记短：probe 字段
 
 阶段不再把设备成本搬到五个聚合节点上。Prefill/Decode 的 family 总成本仍由原模型计算，
 按 base 中各算子的实测成本份额分配，并保留其提交、stream、HCCL 和 CPU 同步关系。
+Decode 的注意力与非注意力算子分组分配：普通预测只改变注意力分量，其他 kernel 保持原成本，
+不能把注意力变化均摊到全部 Decode 算子。两组共用原 kernel effect，总量口径不变。
+score-only phase oracle 的 Decode kernel 记录同时提供 `duration_us` 和 `paged_attention_duration_us`，
+通过相同分配逻辑替换两组成本；仅有总量的旧诊断清单需重新生成，不能保留预测的注意力分量冒充真实成本。
 累计分配后再取整数差，保证总成本精确；HCCL 权重使用归一化后的 source 服务时间，而非含等待的原 duration。
 `start` / `complete` 是零成本连接点，不承担计算；原依赖允许时，Decode 的 CPU 准备可以与 Prefill 执行重叠。
-现有两个真实输入的同成本变换没有改变任何原节点完成时刻，但这不证明所有配置的算子形状都相同。
+已有 W2/W3/W4 输入的同成本验证见工作进展，但这不证明所有配置的算子形状都相同。
 source 中没有对应 family 而 target 需要非零成本时，报告 `phase_operator_template_missing`；
 后续需从 base/固定校准及执行机制补结构模板，不能任意插入一个聚合成本，也不能把这一覆盖缺口当成已经完成。
 现阶段沿用 source 算子份额仍是形状变化近似，不能冒充逐 kernel 的独立成本模型。
