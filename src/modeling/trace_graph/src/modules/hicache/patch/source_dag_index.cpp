@@ -105,7 +105,6 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
             auto lane_key = cpu_lane_key(event.pid, event.tid);
             auto [lane, inserted] = cpu_nodes_by_lane_.try_emplace(lane_key);
             (void)inserted;
-            cpu_lane_keys_by_logical_input_[node.gpu_id].push_back(lane_key);
             lane->second.push_back(node.id);
             if (event.name.starts_with("hicache.control.") && event.name.ends_with(".self") && event.has_arg_key_hint("hicache_control_parent")
                 && event.has_arg_key_hint("hicache_control_parent_index")) {
@@ -330,11 +329,6 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
             prefix_ends.push_back(frontier_end);
         }
     }
-    for (auto & lane_keys : cpu_lane_keys_by_logical_input_ | std::views::values) {
-        std::ranges::sort(lane_keys);
-        lane_keys.erase(std::unique(lane_keys.begin(), lane_keys.end()), lane_keys.end());
-    }
-
     stats_.fact_node_count = fact_nodes_.size();
     stats_.request_identity_count = nodes_by_request_.size();
     stats_.operation_identity_count = nodes_by_operation_.size();
@@ -626,100 +620,6 @@ HiCacheDeviceTransferClosure HiCacheSourceDagIndex::device_transfer_closure(cons
     output.status = output.readiness_join_node_ids.empty() ? "transfer_only" : "ready";
     output.reason = output.readiness_join_node_ids.empty() ? "device transfer is observed but no cross-lane event readiness join is proven"
                                                            : "direction-matched device transfers retain cross-lane event record/wait readiness joins";
-    return output;
-}
-
-std::vector<HiCacheCpuGapSlice>
-    HiCacheSourceDagIndex::project_foreground_gap_across_logical_input_lanes(std::span<const HiCacheCpuGapSlice> source_slices) const {
-    if (source_slices.empty()) return {};
-    const auto first_owner = source_slices.front().owner_node_id;
-    if (first_owner >= graph_.node_count()) return {};
-    const auto logical_input_id = graph_.node(first_owner).gpu_id;
-
-    std::vector<std::pair<uint64_t, uint64_t>> intervals;
-    intervals.reserve(source_slices.size());
-    std::vector<std::string> source_lane_keys;
-    for (const auto & slice : source_slices) {
-        if (slice.owner_node_id >= graph_.node_count() || slice.successor_node_id >= graph_.node_count()) return {};
-        const auto & owner = graph_.node(slice.owner_node_id);
-        const auto & successor = graph_.node(slice.successor_node_id);
-        if (owner.gpu_id != logical_input_id || successor.gpu_id != logical_input_id) return {};
-        const auto & event = graph_.event_for_node(slice.owner_node_id);
-        source_lane_keys.push_back(cpu_lane_key(event.pid, event.tid));
-        if (slice.owned_end_us > slice.owned_start_us) intervals.emplace_back(slice.owned_start_us, slice.owned_end_us);
-    }
-    std::ranges::sort(source_lane_keys);
-    source_lane_keys.erase(std::unique(source_lane_keys.begin(), source_lane_keys.end()), source_lane_keys.end());
-    std::ranges::sort(intervals);
-    std::vector<std::pair<uint64_t, uint64_t>> merged;
-    for (const auto & interval : intervals) {
-        if (!merged.empty() && interval.first <= merged.back().second) merged.back().second = std::max(merged.back().second, interval.second);
-        else merged.push_back(interval);
-    }
-
-    std::map<std::pair<size_t, size_t>, std::vector<std::pair<uint64_t, uint64_t>>> projected;
-    const auto logical_input_lanes = cpu_lane_keys_by_logical_input_.find(logical_input_id);
-    if (logical_input_lanes == cpu_lane_keys_by_logical_input_.end()) return {};
-    for (const auto & lane_key : logical_input_lanes->second) {
-        if (std::ranges::find(source_lane_keys, lane_key) != source_lane_keys.end()) continue;
-        const auto lane = cpu_nodes_by_lane_.find(lane_key);
-        if (lane == cpu_nodes_by_lane_.end() || lane->second.size() < 2) continue;
-        const auto & nodes = lane->second;
-        for (const auto & [interval_start, interval_end] : merged) {
-            auto bound = std::lower_bound(nodes.begin(), nodes.end(), interval_start, [&](size_t node_id, uint64_t timestamp) {
-                return graph_.event_for_node(node_id).ts < timestamp;
-            });
-            size_t index = static_cast<size_t>(std::distance(nodes.begin(), bound));
-            if (index > 0) --index;
-            for (; index + 1 < nodes.size(); ++index) {
-                const auto previous_node_id = nodes[index];
-                const auto successor_node_id = nodes[index + 1];
-                const auto & previous = graph_.event_for_node(previous_node_id);
-                const auto & successor = graph_.event_for_node(successor_node_id);
-                const auto gap_start = source_dag_index_detail::saturated_add(previous.ts, previous.dur);
-                const auto gap_end = successor.ts;
-                if (gap_start >= interval_end && successor.ts >= interval_end) break;
-                // Queue arrival waits already follow a dependency, not a fixed
-                // interval that HiCache can remove from this worker a second time.
-                if (graph_.node(previous_node_id).cpu_gap_after == 0) continue;
-                if (gap_end <= gap_start) continue;
-                const auto owned_start = std::max(interval_start, gap_start);
-                const auto owned_end = std::min(interval_end, gap_end);
-                if (owned_end <= owned_start) continue;
-                projected[{ previous_node_id, successor_node_id }].emplace_back(owned_start, owned_end);
-            }
-        }
-    }
-
-    std::vector<HiCacheCpuGapSlice> output;
-    for (auto & [edge, slices] : projected) {
-        std::ranges::sort(slices);
-        std::vector<std::pair<uint64_t, uint64_t>> merged_slices;
-        for (const auto & slice : slices) {
-            if (!merged_slices.empty() && slice.first <= merged_slices.back().second)
-                merged_slices.back().second = std::max(merged_slices.back().second, slice.second);
-            else merged_slices.push_back(slice);
-        }
-        const auto & previous = graph_.event_for_node(edge.first);
-        const auto & successor = graph_.event_for_node(edge.second);
-        const auto gap_start = source_dag_index_detail::saturated_add(previous.ts, previous.dur);
-        for (const auto & [owned_start, owned_end] : merged_slices) {
-            output.push_back(HiCacheCpuGapSlice{
-                .owner_node_id = edge.first,
-                .successor_node_id = edge.second,
-                .logical_input_id = logical_input_id,
-                .gap_start_us = gap_start,
-                .gap_end_us = successor.ts,
-                .owned_start_us = owned_start,
-                .owned_end_us = owned_end,
-            });
-        }
-    }
-    std::ranges::sort(output, [](const auto & left, const auto & right) {
-        if (left.owned_start_us != right.owned_start_us) return left.owned_start_us < right.owned_start_us;
-        if (left.owner_node_id != right.owner_node_id) return left.owner_node_id < right.owner_node_id;
-        return left.successor_node_id < right.successor_node_id;
-    });
     return output;
 }
 

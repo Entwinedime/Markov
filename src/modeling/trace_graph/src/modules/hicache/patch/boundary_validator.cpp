@@ -39,11 +39,9 @@ bool duration_removed(const core::DagGraph & graph, const core::DagMutationPlan 
     const auto append_gap = [&](const HiCacheCpuGapSlice & gap) { owned_gap_nodes.insert(gap.owner_node_id); };
     if (decision.replaces_source_completion_wait()) {
         for (const auto & gap : decision.completion_wait_slices) append_gap(gap);
-        for (const auto & gap : decision.logical_input_completion_wait_slices) append_gap(gap);
     }
     else {
         for (const auto & gap : decision.owned_gap_slices) append_gap(gap);
-        for (const auto & gap : decision.logical_input_causal_gap_slices) append_gap(gap);
     }
     const bool gaps_removed = std::ranges::all_of(owned_gap_nodes, [&](size_t node_id) {
         if (node_id >= graph.node_count()) return false;

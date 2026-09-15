@@ -154,10 +154,8 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
         output.owned_duration_nodes = operation.completion_wait_owned_node_ids;
         output.owned_gap_slices.clear();
         output.source_gap_removal_slices.clear();
-        output.logical_input_causal_gap_slices.clear();
         output.owned_gap_duration_us = 0;
         output.source_gap_removal_duration_us = 0;
-        output.logical_input_causal_gap_duration_us = 0;
         output.evidence.push_back("completion_join_replaces_payload_ratio_gap_timing");
     }
     else if (operation.kind == HiCacheIoOperationKind::Load && operation.source_readiness_topology_ready) {
@@ -203,16 +201,6 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
             output.source_gap_removal_duration_us = core::checked_add_u64(output.source_gap_removal_duration_us,
                                                                           slice.owned_duration_us(),
                                                                           "HiCache source CPU gap removal duration exceeds uint64 range");
-        }
-        output.logical_input_causal_gap_slices = source.project_foreground_gap_across_logical_input_lanes(output.source_gap_removal_slices);
-        for (const auto & slice : output.logical_input_causal_gap_slices) {
-            output.logical_input_causal_gap_duration_us = core::checked_add_u64(output.logical_input_causal_gap_duration_us,
-                                                                                slice.owned_duration_us(),
-                                                                                "HiCache logical-input-causal CPU gap duration exceeds uint64 range");
-        }
-        if (!output.logical_input_causal_gap_slices.empty()) {
-            output.evidence.push_back(output.target_effective_token_count == 0 ? "target_omits_foreground_wait_logical_input_gap_projection"
-                                                                               : "target_reduces_foreground_wait_by_payload_ratio");
         }
     }
     const auto owned_duration =

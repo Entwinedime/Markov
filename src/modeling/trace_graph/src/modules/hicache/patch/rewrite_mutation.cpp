@@ -193,11 +193,9 @@ void append_gap_updates(const core::DagGraph & graph, core::DagMutationPlan & pl
         };
         if (decision.replaces_source_completion_wait()) {
             for (const auto & gap : decision.completion_wait_slices) append(gap);
-            for (const auto & gap : decision.logical_input_completion_wait_slices) append(gap);
         }
         else {
             for (const auto & gap : decision.owned_gap_slices) append(gap);
-            for (const auto & gap : decision.logical_input_causal_gap_slices) append(gap);
         }
         if (decision.source_control_removal_required) {
             for (const auto & gap : decision.source_control_gap_slices) append(gap);
@@ -225,8 +223,8 @@ void append_gap_updates(const core::DagGraph & graph, core::DagMutationPlan & pl
         plan.set_cpu_gaps.push_back(core::DagSetCpuGapMutation{
             .node_id = node_id,
             .duration = graph.node(node_id).cpu_gap_after - owned,
-            .effect_id = "hicache_foreground_wait_projection",
-            .reason = "remove the union of source-owned foreground HiCache wait from every idle CPU lane in the same logical input",
+            .effect_id = "hicache_owned_wait",
+            .reason = "remove the union of waits owned by the source HiCache calls; retain other threads' gaps",
         });
     }
 }

@@ -247,10 +247,8 @@ bool duration_exact(const HiCacheRewriteDecision & decision, const core::DagGrap
                && std::ranges::any_of(materialized.cpu_gap_updates, [&](const auto & update) { return update.first == gap.owner_node_id; });
     };
     const auto & owned_gaps = decision.replaces_source_completion_wait() ? decision.completion_wait_slices : decision.owned_gap_slices;
-    const auto & causal_gaps = decision.replaces_source_completion_wait() ? decision.logical_input_completion_wait_slices : decision.logical_input_causal_gap_slices;
     const bool gaps_exact = std::ranges::all_of(owned_gaps, gap_exact);
-    const bool causal_gaps_exact = std::ranges::all_of(causal_gaps, gap_exact);
-    return nodes_exact && gaps_exact && causal_gaps_exact && source_control_exact(decision, graph, materialized);
+    return nodes_exact && gaps_exact && source_control_exact(decision, graph, materialized);
 }
 
 bool added_edge_exists(const MaterializedPlan & materialized, size_t src, size_t dst, std::string_view effect_id) {

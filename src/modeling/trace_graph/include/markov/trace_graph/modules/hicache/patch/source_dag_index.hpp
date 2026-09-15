@@ -174,7 +174,6 @@ public:
     [[nodiscard]] std::optional<HiCacheTimingIntervalOwnership> enclosing_control_interval_ownership(const HiCacheSourceFactNode & fact,
                                                                                                      std::string_view control_event_name) const;
     [[nodiscard]] HiCacheDeviceTransferClosure device_transfer_closure(const HiCacheSourceFactNode & submission, std::string_view direction) const;
-    [[nodiscard]] std::vector<HiCacheCpuGapSlice> project_foreground_gap_across_logical_input_lanes(std::span<const HiCacheCpuGapSlice> source_slices) const;
 
 private:
     using NodeMap = std::unordered_map<std::string, std::vector<size_t>, core::TraceArgHash, std::equal_to<>>;
@@ -206,7 +205,6 @@ private:
     /** @brief Prefix maxima of immutable observed event ends, aligned with sorted lane nodes. */
     std::unordered_map<std::string, std::vector<uint64_t>, core::TraceArgHash, std::equal_to<>> cpu_prefix_end_us_by_lane_;
     ControlIntervalMap control_intervals_by_name_;
-    std::unordered_map<int, std::vector<std::string>> cpu_lane_keys_by_logical_input_;
 
     [[nodiscard]] static std::span<const size_t> find_nodes(const NodeMap & index, std::string_view key);
     [[nodiscard]] static std::string cpu_lane_key(std::string_view pid, std::string_view tid);

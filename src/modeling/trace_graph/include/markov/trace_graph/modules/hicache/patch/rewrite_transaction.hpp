@@ -54,7 +54,6 @@ struct HiCacheRewriteDecision {
     std::vector<size_t> source_control_duration_nodes;
     std::vector<HiCacheCpuGapSlice> source_control_gap_slices;
     std::vector<HiCacheCpuGapSlice> source_gap_removal_slices;
-    std::vector<HiCacheCpuGapSlice> logical_input_causal_gap_slices;
     uint64_t observed_io_duration_us = 0;
     uint64_t owned_gap_duration_us = 0;
     uint64_t target_host_control_duration_us = 0;
@@ -68,7 +67,6 @@ struct HiCacheRewriteDecision {
     std::optional<size_t> target_host_control_ingress_edge_id = std::nullopt;
     std::vector<size_t> target_host_control_ingress_edge_ids;
     uint64_t source_gap_removal_duration_us = 0;
-    uint64_t logical_input_causal_gap_duration_us = 0;
     uint64_t residual_unknown_duration_us = 0;
     std::string observed_span_semantics = "unknown";
     std::string completion_wait_status = "not_applicable";
@@ -87,7 +85,6 @@ struct HiCacheRewriteDecision {
     uint64_t wait_exit_end_us = 0;
     uint64_t completion_wait_duration_us = 0;
     uint64_t completion_wait_gap_duration_us = 0;
-    uint64_t logical_input_completion_wait_duration_us = 0;
     uint64_t polling_lag_us = 0;
     uint64_t retained_terminal_control_us = 0;
     std::optional<size_t> control_ready_anchor_node_id = std::nullopt;
@@ -98,7 +95,6 @@ struct HiCacheRewriteDecision {
     std::vector<size_t> source_completion_node_ids;
     std::vector<size_t> readiness_join_node_ids;
     std::vector<HiCacheCpuGapSlice> completion_wait_slices;
-    std::vector<HiCacheCpuGapSlice> logical_input_completion_wait_slices;
     std::vector<size_t> carrier_entry_edges;
     std::vector<size_t> carrier_exit_edges;
     /** @brief Semantic source-fact identity retained for diagnostics. */

@@ -129,9 +129,6 @@ void finalize_source_control_ownership(const HiCacheSourceDagIndex & source, HiC
         return merged;
     };
     output.source_control_gap_slices = merge_gaps(std::move(output.source_control_gap_slices));
-    const auto projected = source.project_foreground_gap_across_logical_input_lanes(output.source_control_gap_slices);
-    output.source_control_gap_slices.insert(output.source_control_gap_slices.end(), projected.begin(), projected.end());
-    output.source_control_gap_slices = merge_gaps(std::move(output.source_control_gap_slices));
     std::ranges::sort(output.source_control_gap_slices, [](const auto & left, const auto & right) {
         if (left.owner_node_id != right.owner_node_id) return left.owner_node_id < right.owner_node_id;
         if (left.owned_start_us != right.owned_start_us) return left.owned_start_us < right.owned_start_us;
@@ -191,7 +188,6 @@ void copy_completion_wait_contract(const HiCacheIoOperationRecord & operation, H
     output.wait_exit_end_us = operation.wait_exit_end_us;
     output.completion_wait_duration_us = operation.completion_wait_duration_us;
     output.completion_wait_gap_duration_us = operation.completion_wait_gap_duration_us;
-    output.logical_input_completion_wait_duration_us = operation.logical_input_completion_wait_duration_us;
     output.polling_lag_us = operation.polling_lag_us;
     output.retained_terminal_control_us = operation.retained_terminal_control_us;
     output.control_ready_anchor_node_id = operation.control_ready_anchor_node_id;
@@ -201,9 +197,6 @@ void copy_completion_wait_contract(const HiCacheIoOperationRecord & operation, H
     output.source_completion_node_ids = operation.device_completion_node_ids;
     output.readiness_join_node_ids = operation.readiness_join_node_ids;
     output.completion_wait_slices = operation.completion_wait_slices;
-    output.logical_input_completion_wait_slices = operation.logical_input_completion_wait_slices;
-    output.logical_input_completion_wait_duration_us = operation.logical_input_completion_wait_duration_us;
-    if (!operation.logical_input_completion_wait_slices.empty()) output.evidence.push_back("logical_input_completion_wait_projection");
 }
 
 } // namespace markov::trace_graph::modules::hicache::patch::attribution_detail

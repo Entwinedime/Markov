@@ -350,8 +350,6 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     const auto wait_ownership = source.timing_interval_ownership(first_false->pid, first_false->tid, first_false->timestamp_us, wait_window_duration);
     record.completion_wait_slices = wait_ownership.owned_gap_slices;
     record.completion_wait_gap_duration_us = gap_duration(record.completion_wait_slices);
-    record.logical_input_completion_wait_slices = source.project_foreground_gap_across_logical_input_lanes(record.completion_wait_slices);
-    record.logical_input_completion_wait_duration_us = gap_duration(record.logical_input_completion_wait_slices);
     record.completion_wait_duration_us = record.source_completion_us > record.control_ready_us ? record.source_completion_us - record.control_ready_us : 0;
     const auto completion_or_control = std::max(record.control_ready_us, record.source_completion_us);
     record.polling_lag_us = record.wait_exit_start_us > completion_or_control ? record.wait_exit_start_us - completion_or_control : 0;
