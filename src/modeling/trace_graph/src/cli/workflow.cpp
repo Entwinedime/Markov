@@ -134,7 +134,7 @@ nlohmann::json replay_client_requests(DagGraph & graph, const io::ManifestClient
     const auto server_e2e = graph.e2e_time();
     const auto chain = core::connect_client_requests(graph, input.requests);
     if (chain.status != "connected") return {{"status", chain.status}};
-    (void)simulation::run_topological_simulation(graph);
+    const auto replay = simulation::run_topological_simulation(graph);
     uint64_t completion = 0;
     Json requests = Json::array();
     for (const auto & request : chain.requests) {
@@ -144,6 +144,10 @@ nlohmann::json replay_client_requests(DagGraph & graph, const io::ManifestClient
     }
     return {{"status", "connected"}, {"e2e_us", completion}, {"server_graph_e2e_us", server_e2e},
             {"peripheral_cost_source", "base_frontend_response_and_client_intervals"}, {"source_residual_waits_retained", true},
+            {"cpu_task_queues", {{"queue_count", replay.cpu_queue_count}, {"task_count", replay.cpu_task_count},
+                {"max_depth", replay.max_cpu_queue_depth},
+                {"arrival_basis", "submission_return_upper_bound"}, {"submission_overlap_count", replay.submission_overlap_count},
+                {"submission_overlap_total_us", replay.submission_overlap_total_us}, {"submission_overlap_max_us", replay.submission_overlap_max_us}}},
             {"component_metrics_before_client_chain", true}, {"requests", requests}};
 }
 

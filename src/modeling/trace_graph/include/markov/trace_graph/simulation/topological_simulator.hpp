@@ -20,6 +20,12 @@ namespace markov::trace_graph::simulation {
 struct SimulationResult {
     uint64_t e2e_us = 0;
     size_t processed_nodes = 0;
+    size_t cpu_queue_count = 0;
+    size_t cpu_task_count = 0;
+    size_t max_cpu_queue_depth = 0;
+    size_t submission_overlap_count = 0;
+    uint64_t submission_overlap_total_us = 0;
+    uint64_t submission_overlap_max_us = 0;
 };
 
 /** @brief Returns the edge delay used by simulation and critical-path reconstruction. */
@@ -30,10 +36,12 @@ struct SimulationResult {
 }
 
 /**
- * @brief Replays an already constructed active DAG in topological order.
+ * @brief Resolves correlated CPU task queues and replays the active DAG.
  *
- * Every active edge is a hard dependency: a destination cannot start before its
- * source completes. Invalid endpoints and cycles throw; no partial result is returned.
+ * Proven inter-task CPU lane order is a resource schedule, not a fixed causal
+ * dependency. Full replay replaces it by arrival-order FIFO and writes the chosen
+ * order back to the graph. All other active edges remain hard dependencies.
+ * Invalid endpoints, cycles and stalled queues throw; no partial result is returned.
  */
 [[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph);
 

@@ -3,6 +3,7 @@
  * @brief Compact-CSR topological simulator implementation.
  */
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "cpu_task_queues.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -10,8 +11,10 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <queue>
 #include <ranges>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -169,7 +172,7 @@ private:
 
 enum class ReplayMode : std::uint8_t { Full, ControlOnly, GapExcluded };
 
-ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph) {
+ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph, const detail::CpuTaskQueues& queues) {
     ActiveDagStorage storage;
     const auto node_count = graph.node_count();
     const auto & nodes = graph.nodes();
@@ -179,6 +182,7 @@ ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph) {
         if (!edge.active) continue;
         if (edge.src >= node_count || edge.dst >= node_count) throw std::runtime_error("Invalid active DAG: active edge endpoint is out of range");
         if (!nodes[edge.src].active || !nodes[edge.dst].active) throw std::runtime_error("Invalid active DAG: active edge references a disabled node");
+        if (queues.replaces(edge)) continue;
         storage.outgoing.offsets[edge.src + 1]++;
         storage.indegree[edge.dst]++;
         storage.active_edge_count++;
@@ -189,7 +193,7 @@ ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph) {
     storage.outgoing.edge_kinds.resize(storage.active_edge_count, core::DagEdgeKind::Sequential);
     auto cursor = storage.outgoing.offsets;
     for (const auto & edge : graph.edges()) {
-        if (!edge.active) continue;
+        if (!edge.active || queues.replaces(edge)) continue;
         const auto offset = cursor[edge.src]++;
         storage.outgoing.destinations[offset] = edge.dst;
         storage.outgoing.edge_kinds[offset] = edge.kind;
@@ -203,14 +207,18 @@ public:
         : graph_(graph),
           nodes_(graph.nodes()),
           active_node_count_(graph.active_node_count()),
-          storage_(build_active_dag_storage(graph)),
+          queues_(mode == ReplayMode::Full ? detail::discover_cpu_task_queues(graph) : detail::CpuTaskQueues{}),
+          storage_(build_active_dag_storage(graph, queues_)),
           start_time_(graph.node_count(), 0),
           completion_time_(graph.node_count(), 0),
+          workers_(queues_.queue_count),
+          task_ready_(queues_.tasks.size(), false),
+          task_order_(queues_.queue_count),
           mode_(mode),
           control_exclusions_(graph) {
         ready_.reserve(active_node_count_);
         for (const auto & node : nodes_) {
-            if (node.active && storage_.indegree[node.id] == 0) ready_.push_back(node.id);
+            if (node.active && storage_.indegree[node.id] == 0) make_ready(node.id);
         }
 #ifdef DEBUG
         if (mode_ == ReplayMode::GapExcluded) {
@@ -222,12 +230,24 @@ public:
     }
 
     [[nodiscard]] SimulationResult run() {
-        size_t ready_index = 0;
-        while (ready_index < ready_.size()) execute_node(ready_[ready_index++]);
+        if (queues_.tasks.empty()) {
+            size_t ready_index = 0;
+            while (ready_index < ready_.size()) execute_node(ready_[ready_index++]);
+        } else run_task_queues();
         if (result_.processed_nodes < active_node_count_) throw_cycle_error();
         if (e2e_endpoint_count_ == 0) throw std::runtime_error("Active DAG has no observable business E2E endpoint.");
         result_.e2e_us = e2e_;
-        if (mode_ == ReplayMode::Full) graph_.set_e2e_time(e2e_);
+        if (mode_ == ReplayMode::Full) {
+            graph_.set_e2e_time(e2e_);
+            queues_.materialize(graph_, task_order_);
+            result_.cpu_queue_count = queues_.queue_count;
+            result_.cpu_task_count = queues_.tasks.size();
+            for (const auto& task : queues_.tasks) {
+                result_.submission_overlap_count += task.submission_overlap_us != 0;
+                result_.submission_overlap_total_us = checked_add(result_.submission_overlap_total_us, task.submission_overlap_us, "queue overlap total overflow");
+                result_.submission_overlap_max_us = std::max(result_.submission_overlap_max_us, task.submission_overlap_us);
+            }
+        }
         else if (mode_ == ReplayMode::ControlOnly) graph_.set_control_e2e_time(e2e_);
         else {
             graph_.set_gap_excluded_e2e_time(e2e_);
@@ -240,6 +260,74 @@ public:
     }
 
 private:
+    enum class QueueEventKind { Finish, Arrival, Start };
+    using QueueEvent = std::tuple<uint64_t, QueueEventKind, size_t>;
+    struct Worker {
+        size_t active = kInvalidNode;
+        uint64_t free_us = 0;
+        std::queue<size_t> pending;
+    };
+
+    void launch_task(size_t task_id) {
+        const auto& task = queues_.tasks[task_id];
+        const auto ready = std::max(start_time_[task.first], workers_[task.queue].free_us);
+        events_.emplace(checked_add(ready, task.ready_delay_us, "queue ready delay overflow"), QueueEventKind::Start, task.first);
+    }
+
+    void admit_task(size_t queue) {
+        auto& worker = workers_[queue];
+        if (worker.active != kInvalidNode || worker.pending.empty()) return;
+        worker.active = worker.pending.front();
+        worker.pending.pop();
+        task_order_[queue].push_back(worker.active);
+        if (task_ready_[worker.active]) launch_task(worker.active);
+    }
+
+    void make_ready(size_t id) {
+        if (queues_.tasks.empty()) { ready_.push_back(id); return; }
+        const auto task = queues_.node_task[id];
+        if (task != kInvalidNode && queues_.tasks[task].first == id) {
+            task_ready_[task] = true;
+            if (workers_[queues_.tasks[task].queue].active == task) launch_task(task);
+        } else {
+            events_.emplace(checked_add(start_time_[id], effective_ready_delay(nodes_[id]), "CPU ready delay overflow"), QueueEventKind::Start, id);
+        }
+    }
+
+    void finish_node(size_t id) {
+        for (size_t offset = storage_.outgoing.offsets[id]; offset < storage_.outgoing.offsets[id + 1]; ++offset)
+            propagate_edge(nodes_[id], offset);
+    }
+
+    void run_task_queues() {
+        while (!events_.empty()) {
+            const auto [time, kind, id] = events_.top();
+            events_.pop();
+            if (kind == QueueEventKind::Start) {
+                start_time_[id] = time;
+                execute_node(id);
+            } else if (kind == QueueEventKind::Arrival) {
+                auto& worker = workers_[queues_.tasks[id].queue];
+                worker.pending.push(id);
+                result_.max_cpu_queue_depth = std::max(result_.max_cpu_queue_depth,
+                    worker.pending.size() + static_cast<size_t>(worker.active != kInvalidNode));
+                worker.free_us = std::max(worker.free_us, time);
+                admit_task(queues_.tasks[id].queue);
+            } else {
+                finish_node(id);
+                const auto submitted = queues_.submitted_task[id];
+                if (submitted != kInvalidNode) events_.emplace(time, QueueEventKind::Arrival, submitted);
+                const auto task_id = queues_.node_task[id];
+                if (task_id != kInvalidNode && queues_.tasks[task_id].last == id) {
+                    auto& worker = workers_[queues_.tasks[task_id].queue];
+                    worker.active = kInvalidNode;
+                    worker.free_us = time;
+                    admit_task(queues_.tasks[task_id].queue);
+                }
+            }
+        }
+    }
+
     [[nodiscard]] static uint64_t checked_add(uint64_t left, uint64_t right, const char * message) {
         if (left > std::numeric_limits<uint64_t>::max() - right) throw std::overflow_error(message);
         return left + right;
@@ -248,7 +336,7 @@ private:
     void execute_node(size_t node_id) {
         result_.processed_nodes++;
         auto & node = graph_.mutable_node(node_id);
-        start_time_[node_id] = checked_add(start_time_[node_id], effective_ready_delay(node), "DAG CPU ready-delay overflow");
+        if (queues_.tasks.empty()) start_time_[node_id] = checked_add(start_time_[node_id], effective_ready_delay(node), "DAG CPU ready-delay overflow");
         const auto completion_time = checked_add(start_time_[node_id], effective_node_duration(node), "DAG simulation timestamp overflow");
         completion_time_[node_id] = completion_time;
         if (mode_ == ReplayMode::Full) {
@@ -264,7 +352,8 @@ private:
             }
             e2e_endpoint_count_++;
         }
-        for (size_t offset = storage_.outgoing.offsets[node_id]; offset < storage_.outgoing.offsets[node_id + 1]; ++offset) { propagate_edge(node, offset); }
+        if (queues_.tasks.empty()) finish_node(node_id);
+        else events_.emplace(completion_time, QueueEventKind::Finish, node_id);
     }
 
     void propagate_edge(const core::DagNode & source, size_t offset) {
@@ -282,7 +371,7 @@ private:
 #endif
         }
         storage_.indegree[dst]--;
-        if (storage_.indegree[dst] == 0) ready_.push_back(dst);
+        if (storage_.indegree[dst] == 0) make_ready(dst);
     }
 
 #ifdef DEBUG
@@ -338,7 +427,8 @@ private:
     }
 
     [[noreturn]] void throw_cycle_error() const {
-        constexpr auto error = "Cycle detected in DAG. Simulation aborted.";
+        const auto error = queues_.tasks.empty() ? "Cycle detected in DAG. Simulation aborted."
+                                               : "DAG or CPU task queue stalled: dependencies conflict with execution order.";
         const auto cycle_nodes = find_cycle_nodes(storage_.outgoing, storage_.indegree);
         auto log = core::Logger::instance().error();
         log << error << " Processed " << result_.processed_nodes << " out of " << active_node_count_ << " active nodes.";
@@ -360,9 +450,14 @@ private:
     core::DagGraph & graph_;
     const std::vector<core::DagNode> & nodes_;
     size_t active_node_count_ = 0;
+    detail::CpuTaskQueues queues_;
     ActiveDagStorage storage_;
     std::vector<uint64_t> start_time_;
     std::vector<uint64_t> completion_time_;
+    std::vector<Worker> workers_;
+    std::vector<bool> task_ready_;
+    std::vector<std::vector<size_t>> task_order_;
+    std::priority_queue<QueueEvent, std::vector<QueueEvent>, std::greater<QueueEvent>> events_;
     std::vector<size_t> ready_;
     SimulationResult result_;
     uint64_t e2e_ = 0;

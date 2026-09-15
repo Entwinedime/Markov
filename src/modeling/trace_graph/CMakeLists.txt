@@ -67,6 +67,7 @@ add_library(trace_graph_simulation STATIC)
 target_sources(trace_graph_simulation
     PRIVATE
         src/simulation/topological_simulator.cpp
+        src/simulation/cpu_task_queues.cpp
 )
 target_link_libraries(trace_graph_simulation PUBLIC trace_graph_core)
 
