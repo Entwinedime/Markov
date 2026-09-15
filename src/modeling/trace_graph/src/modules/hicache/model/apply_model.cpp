@@ -293,6 +293,7 @@ HiCacheModelResult apply_hicache_model(DagGraph & graph, const HiCacheConfig & c
     if (!effect_decisions.missing_facts.empty()) effect_decisions.status = "partial";
     result.effect_decisions = std::move(effect_decisions);
     result.phase_work.prefills = state.prefill_work_items();
+    result.phase_work.allocator_calls = state.allocator_work_items();
     const auto source_phases = observe_hicache_phases(graph);
     std::map<std::pair<std::string, std::string>, const HiCachePhaseObservation *> source_by_request;
     for (const auto & observation : source_phases.observations) {

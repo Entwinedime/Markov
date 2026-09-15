@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -42,6 +43,20 @@ struct HiCachePrefillWorkItem {
     bool feature_covered = false;
 };
 
+/** @brief One target allocator call, including prelude calls that prepare runtime code. */
+struct HiCacheAllocatorWorkItem {
+    size_t source_fact_id = 0;
+    size_t source_event_index = 0;
+    std::string pid;
+    std::vector<std::string> request_ids;
+    bool formal = false;
+    uint64_t page_size = 0;
+    uint64_t batch_size = 0;
+    uint64_t extend_tokens = 0;
+    uint64_t allocated_pages = 0;
+    std::optional<uint64_t> free_index_offset;
+};
+
 /** @brief Decode work inherited from the fixed source request contract. */
 struct HiCacheDecodeWorkItem {
     int logical_input = -1;
@@ -66,6 +81,7 @@ struct HiCachePhaseWorkLedger {
     std::string decode_status = "not_ready";
     std::string cost_status = "disabled";
     std::vector<HiCachePrefillWorkItem> prefills;
+    std::vector<HiCacheAllocatorWorkItem> allocator_calls;
     std::vector<HiCacheDecodeWorkItem> decodes;
     std::map<std::string, uint64_t> blockers;
 };

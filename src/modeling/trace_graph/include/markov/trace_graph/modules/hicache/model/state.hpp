@@ -13,6 +13,7 @@
 #include "markov/trace_graph/modules/hicache/router.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/async_state.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/capacity_index.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/device_allocator.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/ref_ledger.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/target_control_clock.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
@@ -33,6 +34,7 @@ using radix::HiCacheHostEvictionResult;
 using radix::HiCacheInsertResult;
 using radix::HiCacheNodeId;
 using radix::HiCacheTokenRadixTree;
+using runtime::DeviceAllocatorLedger;
 using runtime::HiCacheAsyncOperationTable;
 using runtime::HiCacheBatchTokenResolution;
 using runtime::HiCacheCapacityIndex;
@@ -93,6 +95,7 @@ public:
 
     /** @brief Returns target prefill work accumulated at formal cache-extend boundaries. */
     [[nodiscard]] const std::vector<HiCachePrefillWorkItem> & prefill_work_items() const { return prefill_work_items_; }
+    [[nodiscard]] const std::vector<HiCacheAllocatorWorkItem> & allocator_work_items() const { return allocator_work_items_; }
 
 private:
     /** @brief Request-local lifecycle projection that never owns residency state. */
@@ -115,50 +118,6 @@ private:
         std::string owner;
         std::string storage_operation_id;
         std::vector<std::string> pages;
-    };
-
-    /**
-     * @brief Count-level projection of the SGLang device KV allocator.
-     *
-     * This ledger only reconstructs the `allocator.available_size()` gate from
-     * `free_pages` and `release_pages`. The radix tree still owns logical residency.
-     */
-    struct DeviceAllocatorLedger {
-        bool initialized = false;
-        bool need_sort = false;
-        uint64_t capacity_pages = 0;
-        uint64_t free_pages = 0;
-        uint64_t release_pages = 0;
-
-        /** @brief Initializes the allocator projection from target capacity. */
-        void configure(uint64_t pages, bool sort_required);
-
-        /** @brief Returns the page count visible to the SGLang allocation gate. */
-        [[nodiscard]] uint64_t available_pages() const;
-
-        /** @brief Reports whether an allocation requires device eviction first. */
-        [[nodiscard]] bool should_evict(uint64_t requested_pages) const;
-
-        /** @brief Merges pending releases back into the free-page count. */
-        void merge_release_pages();
-
-        /** @brief Reconstructs release-queue visibility before an extend boundary. */
-        void merge_before_extend(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size);
-
-        /** @brief Reconstructs release-queue visibility before page allocation. */
-        void merge_before_page_allocation(uint64_t requested_pages);
-
-        /** @brief Reports whether the current free count satisfies an allocation. */
-        [[nodiscard]] bool can_allocate(uint64_t pages) const;
-
-        /** @brief Consumes free pages and returns the number actually allocated. */
-        uint64_t allocate(uint64_t pages);
-
-        /** @brief Adds released pages to the projected release queue. */
-        uint64_t release(uint64_t pages);
-
-        /** @brief Reconciles allocator availability with committed radix and request ownership. */
-        void reconcile_occupied_pages(uint64_t committed_pages, uint64_t request_owned_pages);
     };
 
     /** @brief Complete canonical runtime state for one cache scope. */
@@ -285,6 +244,7 @@ private:
     std::unordered_map<std::string, std::vector<HiCacheFact>> prefetch_control_boundaries_;
     std::vector<HiCacheEffectOpportunity> effect_opportunities_;
     std::vector<HiCachePrefillWorkItem> prefill_work_items_;
+    std::vector<HiCacheAllocatorWorkItem> allocator_work_items_;
     std::unordered_map<std::string, uint64_t> effect_fact_ordinals_;
     std::unordered_map<std::string, std::string> effect_scope_identities_;
     uint64_t effect_opportunity_epoch_ = 0;

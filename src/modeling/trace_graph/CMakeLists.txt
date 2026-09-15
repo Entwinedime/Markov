@@ -80,6 +80,7 @@ target_sources(trace_graph_hicache
         src/modules/hicache/runtime/token_store.cpp
         src/modules/hicache/runtime/target_pager.cpp
         src/modules/hicache/runtime/capacity_index.cpp
+        src/modules/hicache/runtime/device_allocator.cpp
         src/modules/hicache/runtime/ref_ledger.cpp
         src/modules/hicache/runtime/target_control_clock.cpp
         src/modules/hicache/runtime/async_state.cpp

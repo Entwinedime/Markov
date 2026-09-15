@@ -394,6 +394,16 @@ Json phase_work_result(const modules::hicache::HiCacheModule & module) {
             { "submit_cost", cost(item.submit_cost) },
         });
     }
+    Json allocator_calls = Json::array();
+    for (const auto & call : plan.allocator_calls) {
+        allocator_calls.push_back({
+            {"source_fact_id", call.source_fact_id}, {"source_event_index", call.source_event_index},
+            {"pid", call.pid}, {"request_ids", call.request_ids}, {"formal", call.formal},
+            {"page_size", call.page_size}, {"batch_size", call.batch_size},
+            {"extend_tokens", call.extend_tokens}, {"allocated_pages", call.allocated_pages},
+            {"free_index_offset", call.free_index_offset ? Json(*call.free_index_offset) : Json(nullptr)},
+        });
+    }
     return Json{
         { "status", plan.status },
         { "prefill_status", plan.prefill_status },
@@ -406,6 +416,7 @@ Json phase_work_result(const modules::hicache::HiCacheModule & module) {
         { "blockers", plan.blockers },
         { "prefills", std::move(prefills) },
         { "decodes", std::move(decodes) },
+        { "allocator_calls", std::move(allocator_calls) },
     };
 }
 

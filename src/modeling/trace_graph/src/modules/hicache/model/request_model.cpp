@@ -344,24 +344,6 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
                                             }),
                                             page_size);
 
-    if (formal_window_active_) {
-        for (size_t index = 0; index < batch_intent.requests.size(); ++index) {
-            const auto & intent = batch_intent.requests[index];
-            prefill_work_items_.push_back(HiCachePrefillWorkItem{
-                .source_fact_id = fact.source_node_id,
-                .source_event_index = fact.source_event_index,
-                .pid = fact.pid,
-                .request_id = intent.request_id,
-                .batch_position = static_cast<uint64_t>(index),
-                .batch_size = batch_intent.batch_size,
-                .target_page_size = page_size,
-                .prompt_token_count = intent.accepted_tokens,
-                .reusable_prefix_token_count = intent.allocation_prefix_tokens,
-                .prefill_token_count = intent.extend_tokens,
-            });
-        }
-    }
-
     // The scheduler owns each accepted prefix before it asks the allocator to
     // make room for extension.  Refresh the canonical node chain after prefetch
     // and host cleanup, then hold that chain across the device-eviction pass.
@@ -381,6 +363,38 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
 
     enforce_device_capacity(fact, scope, batch_intent.requested_pages);
     scope.device_allocator.merge_before_extend(batch_intent.total_extend_tokens, batch_intent.batch_size, page_size);
+
+    HiCacheAllocatorWorkItem allocation{
+        .source_fact_id = fact.source_node_id,
+        .source_event_index = fact.source_event_index,
+        .pid = fact.pid,
+        .formal = formal_window_active_,
+        .page_size = page_size,
+        .batch_size = batch_intent.batch_size,
+        .extend_tokens = batch_intent.total_extend_tokens,
+        .allocated_pages = batch_intent.allocated_pages,
+        .free_index_offset = scope.device_allocator.free_index_offset,
+    };
+    for (const auto & intent : batch_intent.requests) allocation.request_ids.push_back(intent.request_id);
+    allocator_work_items_.push_back(std::move(allocation));
+
+    if (formal_window_active_) {
+        for (size_t index = 0; index < batch_intent.requests.size(); ++index) {
+            const auto & intent = batch_intent.requests[index];
+            prefill_work_items_.push_back(HiCachePrefillWorkItem{
+                .source_fact_id = fact.source_node_id,
+                .source_event_index = fact.source_event_index,
+                .pid = fact.pid,
+                .request_id = intent.request_id,
+                .batch_position = static_cast<uint64_t>(index),
+                .batch_size = batch_intent.batch_size,
+                .target_page_size = page_size,
+                .prompt_token_count = intent.accepted_tokens,
+                .reusable_prefix_token_count = intent.allocation_prefix_tokens,
+                .prefill_token_count = intent.extend_tokens,
+            });
+        }
+    }
 
     for (const auto & intent : batch_intent.requests) {
         auto it = scope.requests.find(intent.request_key);
