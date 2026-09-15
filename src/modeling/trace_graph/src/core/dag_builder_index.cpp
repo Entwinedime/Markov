@@ -67,19 +67,10 @@ private:
         if (value && !value->empty()) groups[std::move(*value)].push_back(node_id);
     }
 
-    /**
-     * @brief Classifies synchronization anchors once while nodes are created.
-     *
-     * `EVENT_WAIT` moves one microsecond later while preserving its original end time,
-     * removing an ambiguous equal-timestamp record/wait boundary.
-     */
+    /** @brief Classifies synchronization anchors without changing observed time. */
     void classify_special_event(TraceEvent & event, size_t node_id) {
         if (event.name == "EVENT_RECORD") index_.event_record_nodes.push_back(node_id);
-        else if (event.name == "EVENT_WAIT") {
-            event.ts += 1;
-            if (event.dur > 0) event.dur -= 1;
-            index_.event_wait_nodes.push_back(node_id);
-        }
+        else if (event.name == "EVENT_WAIT") index_.event_wait_nodes.push_back(node_id);
         else if (is_stream_sync_event(event.name)) index_.stream_sync_nodes.push_back(node_id);
         else if (is_event_sync_event(event.name)) index_.event_sync_nodes.push_back(node_id);
         else if (is_device_sync_event(event.name)) index_.device_sync_nodes.push_back(node_id);

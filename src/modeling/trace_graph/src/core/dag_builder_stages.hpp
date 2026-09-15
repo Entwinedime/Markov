@@ -24,11 +24,18 @@ namespace dag_builder_detail {
 
 } // namespace dag_builder_detail
 
+struct DagEventRecord {
+    size_t node_id = 0;
+    uint64_t host_start_ns = 0;
+    uint64_t host_end_ns = 0;
+    bool ordered_after_prior_calls = true;
+};
+
 struct DagBuildIndex {
     std::unordered_map<size_t, std::vector<size_t>> lane_to_nodes;
     std::unordered_map<std::string, std::vector<size_t>> correlation_to_nodes;
     std::unordered_map<std::string, std::vector<size_t>> connection_to_nodes;
-    std::unordered_map<std::string, std::vector<size_t>> event_id_to_nodes;
+    std::unordered_map<std::string, std::vector<DagEventRecord>> event_id_to_records;
     std::unordered_map<std::string, size_t> raw_stream_to_lane;
     std::unordered_map<std::string, size_t> stream_alias_to_lane;
     std::vector<size_t> event_record_nodes;

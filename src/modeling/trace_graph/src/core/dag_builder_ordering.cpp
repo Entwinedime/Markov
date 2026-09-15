@@ -8,6 +8,7 @@
 #include <optional>
 #include <ranges>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -15,15 +16,17 @@
 namespace markov::trace_graph::core {
 
 void sort_nodes_by_event_ts_if_needed(const DagGraph & graph, std::vector<size_t> & nodes) {
-    if (nodes.size() <= 1 || std::ranges::is_sorted(nodes, [&](size_t a, size_t b) {
-            if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
-            return a < b;
-        }))
-        return;
-    std::ranges::sort(nodes, [&](size_t a, size_t b) {
-        if (graph.event_for_node(a).ts != graph.event_for_node(b).ts) return graph.event_for_node(a).ts < graph.event_for_node(b).ts;
-        return a < b;
-    });
+    const auto earlier = [&](size_t a, size_t b) {
+        const auto & left = graph.event_for_node(a);
+        const auto & right = graph.event_for_node(b);
+        // CPU self-time fragments are partitioned in whole microseconds and
+        // share that stable order with scope indexing. Only device observations
+        // retain fractional boundaries throughout normalization.
+        const auto left_fraction = graph.node(a).is_cpu ? 0 : left.ts_submicro_ns;
+        const auto right_fraction = graph.node(b).is_cpu ? 0 : right.ts_submicro_ns;
+        return std::tie(left.ts, left_fraction, a) < std::tie(right.ts, right_fraction, b);
+    };
+    if (!std::ranges::is_sorted(nodes, earlier)) std::ranges::sort(nodes, earlier);
 }
 
 namespace {

@@ -85,18 +85,21 @@ using NodeGroups = std::unordered_map<std::string, std::vector<size_t>>;
 using LaneNodes = std::unordered_map<size_t, std::vector<size_t>>;
 using StreamLaneMap = std::unordered_map<std::string, size_t>;
 using SubmitFrontiers = std::unordered_map<size_t, std::vector<SubmitFrontierNode>>;
+using EventRecords = std::unordered_map<std::string, std::vector<DagEventRecord>>;
+
+uint64_t host_start_ns(const TraceEvent & event) { return event.ts * 1000 + event.ts_submicro_ns; }
 
 struct EventRecordBindings {
     const NodeGroups & connection_to_nodes;
     StreamLaneMap & raw_stream_to_lane;
     StreamLaneMap & stream_alias_to_lane;
-    NodeGroups & event_id_to_nodes;
+    EventRecords & event_id_to_records;
 };
 
 /** @brief Read-only identity indices used to resolve one event wait. */
 struct EventWaitBindings {
     const NodeGroups & connection_to_nodes;
-    const NodeGroups & event_id_to_nodes;
+    const EventRecords & event_id_to_records;
 };
 
 const TraceEvent * unique_cpu_connection_event(const DagGraph & graph, const std::vector<size_t> & nodes) {
@@ -122,53 +125,47 @@ void bind_event_record(DagGraph & graph, size_t record_node, const EventRecordBi
         bindings.stream_alias_to_lane[raw_stream] = lane;
     }
     const auto event_id = event_id_from_cpu_record(*cpu_event);
-    if (event_id) bindings.event_id_to_nodes[*event_id].push_back(record_node);
+    if (event_id) {
+        const auto start = host_start_ns(*cpu_event);
+        bindings.event_id_to_records[*event_id].push_back({record_node, start, start + cpu_event->dur * 1000 + cpu_event->dur_submicro_ns});
+    }
 }
 
-void sort_event_records(const DagGraph & graph, NodeGroups & event_id_to_nodes) {
-    for (auto & [event_id, nodes] : event_id_to_nodes) {
+void sort_event_records(EventRecords & event_id_to_records) {
+    for (auto & [event_id, records] : event_id_to_records) {
         (void)event_id;
-        std::ranges::sort(nodes, [&](size_t left, size_t right) { return graph.event_for_node(left).ts < graph.event_for_node(right).ts; });
+        std::ranges::sort(records, {}, &DagEventRecord::host_start_ns);
+        uint64_t prior_end = 0;
+        for (auto & record : records) {
+            record.ordered_after_prior_calls = prior_end <= record.host_start_ns;
+            prior_end = std::max(prior_end, record.host_end_ns);
+        }
     }
 }
 
-std::optional<size_t> latest_cross_lane_record(const DagGraph & graph, size_t wait_node, const std::vector<size_t> & records) {
-    const auto & wait_event = graph.event_for_node(wait_node);
-    auto bound = records.end();
-    if (wait_event.dur == 0) {
-        const auto bound_value = wait_event.ts > 0 ? wait_event.ts - 1 : 0;
-        bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) {
-            return value < graph.event_for_node(node_id).ts;
-        });
-    }
-    else {
-        const auto bound_value = static_cast<double>(wait_event.ts) + static_cast<double>(wait_event.dur) - 0.1;
-        bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](double value, size_t node_id) {
-            return value < static_cast<double>(graph.event_for_node(node_id).ts);
-        });
-    }
+std::optional<size_t> captured_event_record(const std::vector<DagEventRecord> & records, const TraceEvent & host_wait) {
+    // Event reuse changes future waits, not a wait already submitted. Device
+    // completion timestamps cannot identify which record the host captured.
+    const auto start = host_start_ns(host_wait);
+    auto bound = std::ranges::upper_bound(records, start, {}, &DagEventRecord::host_start_ns);
     if (bound == records.begin()) return std::nullopt;
     --bound;
-    const auto wait_lane = graph.node(wait_node).lane_id;
-    while (bound != records.begin() && wait_lane == graph.node(*bound).lane_id) --bound;
-    if (wait_lane == graph.node(*bound).lane_id) return std::nullopt;
-    return *bound;
-}
-
-std::optional<std::string> wait_event_id(const DagGraph & graph, size_t wait_node, const NodeGroups & connection_to_nodes) {
-    const auto & wait_event = graph.event_for_node(wait_node);
-    const auto connection = connection_to_nodes.find(wait_event.arg("connection_id"));
-    if (connection == connection_to_nodes.end() || connection->second.empty()) return std::nullopt;
-    const auto * cpu = unique_cpu_connection_event(graph, connection->second);
-    return cpu ? event_id_from_cpu_record(*cpu) : std::nullopt;
+    if (!bound->ordered_after_prior_calls || bound->host_end_ns > start || bound->host_start_ns == start) return std::nullopt;
+    if (bound != records.begin() && std::prev(bound)->host_start_ns == bound->host_start_ns) return std::nullopt;
+    return bound->node_id;
 }
 
 void add_event_wait_dependency(DagGraph & graph, size_t wait_node, const EventWaitBindings & bindings) {
-    const auto event_id = wait_event_id(graph, wait_node, bindings.connection_to_nodes);
+    const auto & wait = graph.event_for_node(wait_node);
+    const auto connection = bindings.connection_to_nodes.find(wait.arg("connection_id"));
+    if (connection == bindings.connection_to_nodes.end()) return;
+    const auto * cpu = unique_cpu_connection_event(graph, connection->second);
+    if (!cpu) return;
+    const auto event_id = event_id_from_cpu_record(*cpu);
     if (!event_id) return;
-    const auto records = bindings.event_id_to_nodes.find(*event_id);
-    if (records == bindings.event_id_to_nodes.end()) return;
-    const auto record = latest_cross_lane_record(graph, wait_node, records->second);
+    const auto records = bindings.event_id_to_records.find(*event_id);
+    if (records == bindings.event_id_to_records.end()) return;
+    const auto record = captured_event_record(records->second, *cpu);
     if (record) graph.add_edge(*record, wait_node, DagEdgeKind::Sync);
 }
 
@@ -246,17 +243,17 @@ void add_event_wait_edges(DagGraph & graph, DagBuildIndex & index) {
                               .connection_to_nodes = index.connection_to_nodes,
                               .raw_stream_to_lane = index.raw_stream_to_lane,
                               .stream_alias_to_lane = index.stream_alias_to_lane,
-                              .event_id_to_nodes = index.event_id_to_nodes,
+                              .event_id_to_records = index.event_id_to_records,
                           });
     }
-    sort_event_records(graph, index.event_id_to_nodes);
+    sort_event_records(index.event_id_to_records);
 
     for (const auto wait_node : index.event_wait_nodes) {
         add_event_wait_dependency(graph,
                                   wait_node,
                                   EventWaitBindings{
                                       .connection_to_nodes = index.connection_to_nodes,
-                                      .event_id_to_nodes = index.event_id_to_nodes,
+                                      .event_id_to_records = index.event_id_to_records,
                                   });
     }
 }
@@ -308,17 +305,10 @@ void add_event_sync_edges(DagGraph & graph, DagBuildIndex & index) {
             }
         }
         if (!event_id) continue;
-        auto records_it = index.event_id_to_nodes.find(*event_id);
-        if (records_it == index.event_id_to_nodes.end()) continue;
-
-        auto & records = records_it->second;
-        auto bound_value = node_end_ts(sync_event);
-        auto bound = std::upper_bound(records.begin(), records.end(), bound_value, [&](uint64_t value, size_t node_id) {
-            return value < graph.event_for_node(node_id).ts;
-        });
-        if (bound == records.begin()) continue;
-        --bound;
-        graph.add_edge(*bound, sync_node, DagEdgeKind::Sync);
+        auto records_it = index.event_id_to_records.find(*event_id);
+        if (records_it == index.event_id_to_records.end()) continue;
+        const auto record = captured_event_record(records_it->second, sync_event);
+        if (record) graph.add_edge(*record, sync_node, DagEdgeKind::Sync);
     }
 }
 
@@ -338,8 +328,16 @@ void add_device_sync_edges(DagGraph & graph, DagBuildIndex & index) {
 }
 
 void finalize_sync_nodes(DagGraph & graph, const DagBuildIndex & index) {
+    std::vector<bool> has_wait_dependency(graph.node_count(), false);
+    for (const auto & edge : graph.edges()) {
+        if (edge.active && edge.kind == DagEdgeKind::Sync) has_wait_dependency[edge.dst] = true;
+    }
     auto set_fixed_sync_duration = [&](const std::vector<size_t> & nodes) {
-        std::ranges::for_each(nodes, [&](size_t node_id) { graph.set_node_duration(node_id, 10); });
+        for (const auto node_id : nodes) {
+            // A submission or stream-order edge alone does not replace a wait.
+            // Keep the observed blocking interval when its object is unknown.
+            if (has_wait_dependency[node_id]) graph.set_node_duration(node_id, 10);
+        }
     };
     set_fixed_sync_duration(index.stream_sync_nodes);
     set_fixed_sync_duration(index.event_sync_nodes);
