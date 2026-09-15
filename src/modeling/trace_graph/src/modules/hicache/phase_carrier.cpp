@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Canonical request/rank Prefill and Decode carrier construction.
+ * @brief Source-supported phase operators with zero-cost request boundaries.
  */
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 
@@ -59,120 +59,69 @@ std::optional<size_t> ordered_node(const core::DagGraph & graph, const std::vect
     return result;
 }
 
-bool validate_source_family(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan & cost, std::set<size_t> & owned_nodes,
-                            HiCachePhaseCarrierAudit & audit) {
+bool project_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan & cost, std::string_view effect_id, bool cpu,
+                  core::DagMutationPlan & plan, std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
+    if (cost.source_duration_us == 0 && cost.predicted_duration_us != 0) {
+        add_blocker(audit, "phase_operator_template_missing");
+        return false;
+    }
     uint64_t actual = 0;
     for (const auto node_id : cost.source_node_ids) {
-        if (node_id >= graph.node_count() || !graph.node(node_id).active) {
-            add_blocker(audit, "source_device_node_invalid");
-            return false;
-        }
-        if (!owned_nodes.insert(node_id).second) {
+        if (node_id >= graph.node_count() || !graph.node(node_id).active || graph.node(node_id).is_cpu != cpu
+            || !owned_nodes.insert(node_id).second) {
             ++audit.owner_conflict_count;
-            add_blocker(audit, "source_device_owner_conflict");
+            add_blocker(audit, "phase_source_owner_invalid");
             return false;
         }
         actual = core::checked_add_u64(actual, graph.node(node_id).duration, "HiCache phase source duration exceeds uint64 range");
     }
     if (actual != cost.source_duration_us) {
-        add_blocker(audit, "source_device_duration_mismatch");
+        add_blocker(audit, "phase_source_duration_mismatch");
         return false;
     }
-    return true;
-}
-
-void zero_source_family(const HiCachePhaseNodeCostPlan & cost, std::string_view effect_id, core::DagMutationPlan & plan,
-                        HiCachePhaseCarrierAudit & audit) {
+    uint64_t cumulative = 0, assigned = 0;
     for (const auto node_id : cost.source_node_ids) {
-        plan.set_node_durations.push_back(core::DagSetNodeDurationMutation{
-            .node_id = node_id,
-            .duration = 0,
-            .effect_id = std::string(effect_id),
-            .reason = "move phase cost from source-specific device topology to one semantic carrier",
-        });
-        plan.set_node_e2e_eligibility.push_back(core::DagSetNodeE2eEligibilityMutation{
-            .node_id = node_id,
-            .counts_toward_e2e = false,
-            .effect_id = std::string(effect_id),
-            .reason = "zero-cost source phase skeleton is not a standalone business endpoint",
-        });
-        ++audit.source_device_node_count;
-    }
-}
-
-bool project_submit_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan & cost, std::string_view effect_id,
-                         core::DagMutationPlan & plan, std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
-    if (cost.source_node_ids.empty() || cost.source_duration_us == 0) {
-        add_blocker(audit, "phase_submit_carrier_missing");
-        return false;
-    }
-    uint64_t actual = 0;
-    for (const auto node_id : cost.source_node_ids) {
-        if (node_id >= graph.node_count() || !graph.node(node_id).active || !graph.node(node_id).is_cpu
-            || !owned_nodes.insert(node_id).second) {
-            ++audit.owner_conflict_count;
-            add_blocker(audit, "phase_submit_owner_invalid");
+        cumulative += graph.node(node_id).duration; // Bounded by the checked total.
+        const auto projected = cost.source_duration_us
+            ? core::floor_multiply_divide_u64(cumulative, cost.predicted_duration_us, cost.source_duration_us)
+            : std::optional<uint64_t>{0};
+        if (!projected) {
+            add_blocker(audit, "phase_projection_overflow");
             return false;
         }
-        actual = core::checked_add_u64(actual, graph.node(node_id).duration, "HiCache phase submit duration exceeds uint64 range");
-    }
-    if (actual != cost.source_duration_us) {
-        add_blocker(audit, "phase_submit_duration_mismatch");
-        return false;
-    }
-    uint64_t assigned = 0;
-    for (size_t index = 0; index < cost.source_node_ids.size(); ++index) {
-        const auto node_id = cost.source_node_ids[index];
-        uint64_t duration = 0;
-        if (index + 1 == cost.source_node_ids.size()) duration = cost.predicted_duration_us - assigned;
-        else {
-            const auto projected = core::floor_multiply_divide_u64(graph.node(node_id).duration,
-                                                                   cost.predicted_duration_us,
-                                                                   cost.source_duration_us);
-            if (!projected) {
-                add_blocker(audit, "phase_submit_projection_overflow");
-                return false;
-            }
-            duration = *projected;
-            assigned = core::checked_add_u64(assigned, duration, "HiCache projected phase submit duration exceeds uint64 range");
-        }
         plan.set_node_durations.push_back(core::DagSetNodeDurationMutation{
             .node_id = node_id,
-            .duration = duration,
+            .duration = *projected - assigned,
             .effect_id = std::string(effect_id),
-            .reason = "project active phase submit cost on its correlated source CPU carriers",
+            .reason = "allocate target family cost by measured source operator shares; preserve dependencies",
         });
-        ++audit.source_submit_node_count;
+        assigned = *projected;
+        if (cpu) ++audit.source_submit_node_count;
+        else ++audit.source_device_node_count;
     }
     return true;
 }
 
 struct CarrierRecord {
     const HiCachePrefillWorkItem * prefill = nullptr;
-    const HiCacheDecodeWorkItem * decode = nullptr;
-    size_t first_prefill_submit = 0;
-    size_t last_prefill_submit = 0;
-    size_t first_decode_submit = 0;
-    size_t last_decode_submit = 0;
     uint64_t order_ts = 0;
-    std::string prefill_common;
-    std::string prefill_prefix;
-    std::string prefill_collective;
-    std::string decode_kernel;
-    std::string decode_collective;
+    std::string prefill_start;
+    std::string prefill_complete;
+    std::string decode_start;
+    std::string decode_complete;
 };
 
-void append_carrier_node(core::DagMutationPlan & plan, std::string_view synthetic_id, std::string_view effect_id,
+void append_boundary_node(core::DagMutationPlan & plan, std::string_view synthetic_id, std::string_view effect_id,
                          std::string_view request_id, int logical_input, std::string_view phase, std::string_view family,
-                         uint64_t duration_us, bool endpoint, HiCachePhaseCarrierAudit & audit) {
+                         bool endpoint, HiCachePhaseCarrierAudit & audit) {
     plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
         .synthetic_id = std::string(synthetic_id),
         .node = core::DagSyntheticNodeSpec{
             .name = "hicache_phase_" + std::string(phase) + "_" + std::string(family),
             .category = "hicache_phase",
             .is_cpu = false,
-            .lane_key = "scope:" + std::to_string(logical_input + 1) + "/phase_device_lane",
-            .duration = duration_us,
+            .lane_key = "scope:" + std::to_string(logical_input + 1) + "/phase_boundary",
+            .duration = 0,
             .counts_toward_e2e = endpoint,
             .attrs = {
                 { "request_id", std::string(request_id) },
@@ -182,7 +131,7 @@ void append_carrier_node(core::DagMutationPlan & plan, std::string_view syntheti
             },
         },
         .effect_id = std::string(effect_id),
-        .reason = "materialize source-independent request/rank phase work",
+        .reason = "zero-cost phase boundary; operators retain submission and synchronization",
     });
     ++audit.synthetic_carrier_count;
 }
@@ -210,143 +159,51 @@ bool append_record(const core::DagGraph & graph, const HiCachePrefillWorkItem & 
         add_blocker(audit, "phase_submit_boundary_missing");
         return false;
     }
-    const auto common_effect = phase_effect(prefill.request_id, prefill.logical_input, "prefill", "common_kernel");
-    const auto prefix_effect = phase_effect(prefill.request_id, prefill.logical_input, "prefill", "prefix_attention");
-    const auto prefill_collective_effect = phase_effect(prefill.request_id, prefill.logical_input, "prefill", "collective");
-    const auto prefill_submit_effect = phase_effect(prefill.request_id, prefill.logical_input, "prefill", "submit");
-    const auto decode_kernel_effect = phase_effect(decode.request_id, decode.logical_input, "decode", "kernel");
-    const auto decode_collective_effect = phase_effect(decode.request_id, decode.logical_input, "decode", "collective");
-    const auto decode_submit_effect = phase_effect(decode.request_id, decode.logical_input, "decode", "submit");
-
-    bool ready = true;
-    for (const auto * cost : { &prefill.common_kernel_cost, &prefill.prefix_attention_cost, &prefill.collective_cost,
-                              &decode.kernel_cost, &decode.collective_cost }) {
-        ready = validate_source_family(graph, *cost, owned_nodes, audit) && ready;
-    }
-    ready = project_submit_cost(graph, prefill.submit_cost, prefill_submit_effect, plan, owned_nodes, audit) && ready;
-    ready = project_submit_cost(graph, decode.submit_cost, decode_submit_effect, plan, owned_nodes, audit) && ready;
+    const auto project = [&](const HiCachePhaseNodeCostPlan& cost, std::string_view phase, std::string_view family, bool cpu = false) {
+        return project_cost(graph, cost, phase_effect(prefill.request_id, prefill.logical_input, phase, family),
+                            cpu, plan, owned_nodes, audit);
+    };
+    bool ready = project(prefill.submit_cost, "prefill", "submit", true);
+    ready = project(decode.submit_cost, "decode", "submit", true) && ready;
+    ready = project(prefill.common_kernel_cost, "prefill", "common_kernel") && ready;
+    ready = project(prefill.prefix_attention_cost, "prefill", "prefix_attention") && ready;
+    ready = project(prefill.collective_cost, "prefill", "collective") && ready;
+    ready = project(decode.kernel_cost, "decode", "kernel") && ready;
+    ready = project(decode.collective_cost, "decode", "collective") && ready;
     if (!ready) return false;
-
-    zero_source_family(prefill.common_kernel_cost, common_effect, plan, audit);
-    zero_source_family(prefill.prefix_attention_cost, prefix_effect, plan, audit);
-    zero_source_family(prefill.collective_cost, prefill_collective_effect, plan, audit);
-    zero_source_family(decode.kernel_cost, decode_kernel_effect, plan, audit);
-    zero_source_family(decode.collective_cost, decode_collective_effect, plan, audit);
 
     record = CarrierRecord{
         .prefill = &prefill,
-        .decode = &decode,
-        .first_prefill_submit = *first_prefill,
-        .last_prefill_submit = *last_prefill,
-        .first_decode_submit = *first_decode,
-        .last_decode_submit = *last_decode,
         .order_ts = graph.event_for_node(*first_prefill).ts,
-        .prefill_common = carrier_id(common_effect),
-        .prefill_prefix = carrier_id(prefix_effect),
-        .prefill_collective = carrier_id(prefill_collective_effect),
-        .decode_kernel = carrier_id(decode_kernel_effect),
-        .decode_collective = carrier_id(decode_collective_effect),
+        .prefill_start = carrier_id(phase_effect(prefill.request_id, prefill.logical_input, "prefill", "start")),
+        .prefill_complete = carrier_id(phase_effect(prefill.request_id, prefill.logical_input, "prefill", "complete")),
+        .decode_start = carrier_id(phase_effect(decode.request_id, decode.logical_input, "decode", "start")),
+        .decode_complete = carrier_id(phase_effect(decode.request_id, decode.logical_input, "decode", "complete")),
     };
-    append_carrier_node(plan,
-                        record.prefill_common,
-                        common_effect,
-                        prefill.request_id,
-                        prefill.logical_input,
-                        "prefill",
-                        "common_kernel",
-                        prefill.common_kernel_cost.predicted_duration_us,
-                        false,
-                        audit);
-    append_carrier_node(plan,
-                        record.prefill_prefix,
-                        prefix_effect,
-                        prefill.request_id,
-                        prefill.logical_input,
-                        "prefill",
-                        "prefix_attention",
-                        prefill.prefix_attention_cost.predicted_duration_us,
-                        false,
-                        audit);
-    append_carrier_node(plan,
-                        record.prefill_collective,
-                        prefill_collective_effect,
-                        prefill.request_id,
-                        prefill.logical_input,
-                        "prefill",
-                        "collective",
-                        prefill.collective_cost.predicted_duration_us,
-                        false,
-                        audit);
-    append_carrier_node(plan,
-                        record.decode_kernel,
-                        decode_kernel_effect,
-                        decode.request_id,
-                        decode.logical_input,
-                        "decode",
-                        "kernel",
-                        decode.kernel_cost.predicted_duration_us,
-                        false,
-                        audit);
-    append_carrier_node(plan,
-                        record.decode_collective,
-                        decode_collective_effect,
-                        decode.request_id,
-                        decode.logical_input,
-                        "decode",
-                        "collective",
-                        decode.collective_cost.predicted_duration_us,
-                        true,
-                        audit);
-
-    const auto topology_effect = "hicache_phase_topology:" + prefill.request_id + ":" + std::to_string(prefill.logical_input);
-    append_edge(plan,
-                core::DagNodeRef::existing(record.first_prefill_submit),
-                core::DagNodeRef::synthetic(record.prefill_common),
-                topology_effect + ":prefill_ingress",
-                "active Prefill submission makes common device work eligible",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::synthetic(record.prefill_common),
-                core::DagNodeRef::synthetic(record.prefill_prefix),
-                topology_effect + ":prefill_common_prefix",
-                "Prefill prefix work follows common-kernel work",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::synthetic(record.prefill_prefix),
-                core::DagNodeRef::synthetic(record.prefill_collective),
-                topology_effect + ":prefill_prefix_collective",
-                "Prefill collective follows the optional prefix family",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::existing(record.last_prefill_submit),
-                core::DagNodeRef::synthetic(record.prefill_collective),
-                topology_effect + ":prefill_submit_join",
-                "Prefill completion waits for active submission control",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::synthetic(record.prefill_collective),
-                core::DagNodeRef::existing(record.first_decode_submit),
-                topology_effect + ":prefill_decode",
-                "Decode submission follows Prefill completion",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::existing(record.first_decode_submit),
-                core::DagNodeRef::synthetic(record.decode_kernel),
-                topology_effect + ":decode_ingress",
-                "active Decode submission makes device work eligible",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::synthetic(record.decode_kernel),
-                core::DagNodeRef::synthetic(record.decode_collective),
-                topology_effect + ":decode_collective",
-                "Decode collective follows Decode kernel work",
-                audit);
-    append_edge(plan,
-                core::DagNodeRef::existing(record.last_decode_submit),
-                core::DagNodeRef::synthetic(record.decode_collective),
-                topology_effect + ":decode_submit_join",
-                "Decode completion waits for active submission control",
-                audit);
+    const auto boundaries = [&](std::string_view phase, const std::string& start, const std::string& complete,
+                                size_t first, size_t last,
+                                std::initializer_list<const HiCachePhaseNodeCostPlan*> families) {
+        const auto boundary_effect = phase_effect(prefill.request_id, prefill.logical_input, phase, "boundary");
+        append_boundary_node(plan, start, boundary_effect, prefill.request_id, prefill.logical_input, phase, "start", false, audit);
+        append_boundary_node(plan, complete, boundary_effect, prefill.request_id, prefill.logical_input, phase, "complete", true, audit);
+        const auto connect = [&](core::DagNodeRef from, core::DagNodeRef to) {
+            append_edge(plan, std::move(from), std::move(to), boundary_effect,
+                        "phase boundary connects work without relocating its execution cost", audit);
+        };
+        connect(core::DagNodeRef::existing(first), core::DagNodeRef::synthetic(start));
+        connect(core::DagNodeRef::synthetic(start), core::DagNodeRef::synthetic(complete));
+        connect(core::DagNodeRef::existing(last), core::DagNodeRef::synthetic(complete));
+        for (const auto* cost : families) for (const auto id : cost->source_node_ids) {
+            connect(core::DagNodeRef::synthetic(start), core::DagNodeRef::existing(id));
+            connect(core::DagNodeRef::existing(id), core::DagNodeRef::synthetic(complete));
+        }
+    };
+    boundaries("prefill", record.prefill_start, record.prefill_complete, *first_prefill, *last_prefill,
+               {&prefill.common_kernel_cost, &prefill.prefix_attention_cost, &prefill.collective_cost});
+    boundaries("decode", record.decode_start, record.decode_complete, *first_decode, *last_decode,
+               {&decode.kernel_cost, &decode.collective_cost});
+    // CPU preparation may overlap prior device work. Original stream and sync
+    // edges, not a whole-Prefill-to-first-Decode-submit edge, constrain execution.
     return true;
 }
 
@@ -411,8 +268,8 @@ HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph 
         for (const auto * before : previous) {
             for (const auto * after : current) {
                 append_edge(plan,
-                            core::DagNodeRef::synthetic(before->decode_collective),
-                            core::DagNodeRef::existing(after->first_prefill_submit),
+                            core::DagNodeRef::synthetic(before->decode_complete),
+                            core::DagNodeRef::synthetic(after->prefill_start),
                             "hicache_phase_request_boundary:" + before->prefill->request_id + "->" + after->prefill->request_id + ":"
                                 + std::to_string(before->prefill->logical_input) + ":" + std::to_string(after->prefill->logical_input),
                             "the next formal request starts after every prior rank completes Decode",

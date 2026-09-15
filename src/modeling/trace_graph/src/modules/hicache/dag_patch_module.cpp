@@ -136,7 +136,7 @@ bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph,
                 .src = core::DagNodeRef::synthetic(hicache_phase_carrier_synthetic_id(previous->second->request_id,
                                                                                       previous->second->logical_input,
                                                                                       "decode",
-                                                                                      "collective")),
+                                                                                      "complete")),
                 .dst = core::DagNodeRef::synthetic(current.prefetch_synthetic_id),
                 .kind = core::DagEdgeKind::Mutation,
                 .effect_id = "hicache_request_phase_direct_boundary",
@@ -180,7 +180,7 @@ bool append_reused_loadback_phase_boundaries(const model::HiCachePhaseWorkLedger
         const auto phase_carrier = hicache_phase_carrier_synthetic_id(prefill->second->request_id,
                                                                       prefill->second->logical_input,
                                                                       "prefill",
-                                                                      "common_kernel");
+                                                                      "start");
         for (const auto transfer_node_id : decision.owned_duration_nodes) {
             if (prefetch != prefetch_by_request_rank.end()) {
                 plan.add_edges.push_back(core::DagAddEdgeMutation{

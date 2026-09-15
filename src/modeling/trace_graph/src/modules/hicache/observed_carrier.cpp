@@ -277,7 +277,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
             append_edge(plan,
                         core::DagNodeRef::existing(transfer_node_id),
                         core::DagNodeRef::synthetic(
-                            hicache_phase_carrier_synthetic_id(prefill->second->request_id, prefill->second->logical_input, "prefill", "common_kernel")),
+                            hicache_phase_carrier_synthetic_id(prefill->second->request_id, prefill->second->logical_input, "prefill", "start")),
                         operation.record_id,
                         "request Prefill cannot begin before every target-observed Load/H2D transfer completes",
                         audit);
@@ -319,7 +319,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
         if (previous != previous_by_input.end() && current.prefetch != nullptr) {
             append_edge(plan,
                         core::DagNodeRef::synthetic(
-                            hicache_phase_carrier_synthetic_id(previous->second->request_id, previous->second->logical_input, "decode", "collective")),
+                            hicache_phase_carrier_synthetic_id(previous->second->request_id, previous->second->logical_input, "decode", "complete")),
                         core::DagNodeRef::synthetic(current.prefetch->service_id),
                         "hicache_observed_request_prefetch_boundary:" + previous->second->request_id + "->" + current.request_id + ":"
                             + std::to_string(current.logical_input),

@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Source-independent semantic carriers for Prefill/Decode work.
+ * @brief Source-supported operators and semantic boundaries for Prefill/Decode work.
  */
 #pragma once
 
@@ -41,9 +41,9 @@ struct HiCachePhaseCarrierAudit {
 /**
  * @brief Appends one request/rank semantic phase graph to an existing atomic plan.
  *
- * Source device nodes retain their dependency identity at zero cost. Predicted work is
- * carried by synthetic common/prefix/collective and decode nodes whose topology depends
- * on request semantics, not on whether the source happened to expose a target I/O carrier.
+ * Predicted family costs stay on observed operators, preserving submission, stream
+ * and synchronization dependencies. Zero-cost start/complete nodes connect phases
+ * to I/O and requests. Unobserved operator families require a separate template.
  */
 [[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph,
                                                                           const model::HiCachePhaseWorkLedger & phase_work,
