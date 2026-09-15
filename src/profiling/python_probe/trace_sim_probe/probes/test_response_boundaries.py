@@ -116,6 +116,40 @@ class ResponseBoundaryCheck(unittest.IsolatedAsyncioTestCase):
         for name in probe.TARGET_MODULES:
             probe.install(types.ModuleType(name))
 
+    def test_receiver_observes_only_nonempty_results_without_changing_them(self):
+        class SchedulerRequestReceiver:
+            def _pull_raw_reqs(self):
+                if self.fail:
+                    raise ValueError("receive failed")
+                return self.requests
+
+            def recv_requests(self):
+                return self._pull_raw_reqs()
+
+        module = install(3, "SchedulerRequestReceiver", SchedulerRequestReceiver)
+        wrapped = SchedulerRequestReceiver.recv_requests
+        probe.install(module)
+        self.assertIs(wrapped, SchedulerRequestReceiver.recv_requests)
+        receiver = SchedulerRequestReceiver()
+        receiver.fail = False
+        receiver.requests = [types.SimpleNamespace(rid="one"), types.SimpleNamespace(batch=[types.SimpleNamespace(rid="two")])]
+        writer = Mock()
+        with patch.object(probe, "get_writer", return_value=writer):
+            self.assertIs(receiver.recv_requests(), receiver.requests)
+        self.assertEqual([call.args[0] for call in writer.duration_event.call_args_list],
+                         ["runtime.request.socket_received", "runtime.request.dispatch_ready"])
+        for call in writer.duration_event.call_args_list:
+            self.assertEqual(call.args[1], call.args[2])
+            self.assertEqual(call.args[4], {"request_ids": ["one", "two"]})
+        with patch.object(probe, "get_writer") as get_writer:
+            for empty in (None, [], [types.SimpleNamespace(control="flush")]):
+                receiver.requests = empty
+                self.assertIs(receiver.recv_requests(), empty)
+            receiver.fail = True
+            with self.assertRaisesRegex(ValueError, "receive failed"):
+                receiver.recv_requests()
+            get_writer.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
