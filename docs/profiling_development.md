@@ -135,6 +135,11 @@ http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回
 对唯一落在原始 CPU gap 内的 scheduler_send，建图会增加 begin/end 两个零耗时连接点，将原 gap 分段保留。
 重叠、越界、分支或已有时间改写导致无法绑定时不猜测；这些点不能独立决定 E2E，HTTP/客户端完成仍需另行连接和验证。
 
+同一诊断档位还记录 `runtime.request.socket_received` 和 `runtime.request.dispatch_ready` 两个请求入口时刻。
+前者是 socket 轮询及反序列化函数返回后的时刻，不是网络包到达时间；后者是跨 rank 广播、输入处理结束并返回请求后的时刻。
+只对带请求 ID 的非空结果记录，不读取 token 或 snapshot，空轮询不写事件。它们目前只供诊断，尚未接入请求 DAG 依赖；
+真实请求链和探针开销仍需成功补采后验证，不能把两个时刻之差直接当成纯 CPU 成本。
+
 probe target 声明位于：
 
 ```text
@@ -146,7 +151,9 @@ configs/profiling/hicache_probe_targets.json
 
 ## 7. Formal window
 
-每个 workload report 提供语义开始和结束；manifest 将其传给 DAG builder。
+每个 workload report 提供语义开始和结束。manifest 的 `bench.workload_report_files` 声明报告路径，
+建模入口读取报告并向 DAG builder 传递窗口；这不等于已把报告中的逐请求链接入 DAG。
+显式 `input.workload_report` 优先；旧 manifest 仍可从运行目录发现报告，存在多份时需显式选择，不能按文件名猜测。
 
 - 窗口内执行事件进入 DAG；
 - 窗口前的 token dictionary 只解释窗口内路径；
