@@ -30,6 +30,14 @@ target 计算变化对后续请求和缓存判断的反馈还需核对。以上�
 `data/modeling_runs/hicache_full_e2e_root_cause_20260915/summary.json`；详细计划保留在本地
 `docs/tmp/hicache_full_e2e_root_cause_and_plan_20260915.md`。这些目录按仓库现有规则不入 Git，关键结论在本节保留。
 
+09-15 随后的实施已修复一个具体原因：CANN 显示进程与框架实际进程不同，使同一线程的长 CPU 调用和内部同步被分到不同 lane。
+现在只按明确元数据和唯一线程归属统一运行时 CPU 身份，不合并设备/未知线程，也不调整成本公式。
+C4/W2 同成本回放从 14.480 秒降到 10.995 秒，C2/W2 从 17.320 秒降到 14.238 秒；分别仍高于实测约 4.90% 和 3.23%。
+一格 C2/W2→C4 正式预测在原参数下从 17.545 秒降到 14.469 秒，完整误差仍为 38.04%，不代表全矩阵通过。
+Release/诊断构建、小型 trace 时序检查、既有 I/O 检查和 15 项 Python 测试通过；后续继续查任务线程间隔和阶段提交依赖。
+主计划为本地 `docs/tmp/hicache_full_e2e_master_plan_20260915.md`，每轮记录在 `docs/tmp/hicache_full_e2e_development_log_20260915.md`。
+新结果在 `data/modeling_runs/hicache_full_e2e_development_20260915/r1_summary.json`。完整 E2E 尚未完成，原历史 60/12 格成绩不追溯修改。
+
 ## 09-14 泛化结果
 
 新 workload / 新 HiCache 配置 / TP=4 初步泛化实验已完成：C5 base × W4/W5 × G1/G2/G3，
