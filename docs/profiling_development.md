@@ -125,7 +125,11 @@ Python probe 默认不采集 cache snapshot。早期 snapshot 会遍历并序列
 
 这两个诊断档位还记录 Triton 的编译准备（`runtime.triton.prepare`）和首次句柄装载（`runtime.triton.load`），默认 off 不安装这些包装。
 准备区间包括磁盘缓存查找，异步模式下可能只测到编译提交；装载区间包括 launcher 创建和 binary 装载，均不能当成设备执行时间。
-记录保存在 Python probe trace 的 `runtime_diagnostic` 类别中，只供空白归因，不作为 HiCache fact 或额外 DAG 成本重复加入。
+prepare 的 `execution_mode` 区分同步、异步与未知；`path` 仅在实际进入 IR 生成时标为 `compiled`，
+同步返回对应内核且确认 IR 入口已观测、没有生成 IR 时标为 `disk_cache`。异步提交标为 `async_submit`，
+其他情况为 `unknown`；不按耗时阈值分类，旧记录缺少字段也不能反推成编译样本。
+记录保存在 Python probe trace 的 `runtime_diagnostic` 类别中，供准备成本归因与建模使用，不作为 HiCache fact。
+source 已有准备时间仍由原 CPU gap 承载，消费这些观测时不能再重复加入一份成本。
 不采 tensor 内容、snapshot 或缓存摘要；重复的已装载内核不发事件。不改缓存与预热策略，冷启动和已有缓存的结果必须分开解释。
 
 `timing/full` 还记录终止请求的 `runtime.response.*` 边界：scheduler_send、tokenizer_dispatch、serialize、http_body_sent。

@@ -92,10 +92,20 @@ Prefill 的可复用范围还受请求的前缀查询上限约束：缓存中存
 正式模型保留 source 的 prepare/load 包围区间作为非执行元数据。观测签名符合当前 NPU allocator 时，
 按目标页数、batch/extend 上界和 free-page 指针对齐判断是否走 Triton、是否已准备；不按配置名分类。
 目标已准备或转为 naive 分配时，只移除对应 source 调用中已观测、且承载于未改写 CPU gap 的准备覆盖；
-prepare/load 取并集，未覆盖的时间、原始观测及依赖保持不变。目标仍需相同变体时保留实测准备成本。
-新变体成本未覆盖、来源不足或承载冲突时不修改准备成本，在 patch 摘要 `runtime_preparation` 中报告限制。
-其 `call_counts` 包含预热，`removed_coverage_us` 是跨 rank 覆盖总量，不是 E2E 收益；`ready` 也只表示这部分已覆盖。
-未测量变体的冷编译/磁盘加载成本及其目标位置仍待实现，不能把当前准备处理称为完整运行时成本模型。
+prepare/load 取并集，未覆盖的时间、原始观测及依赖保持不变。目标仍需相同变体、缓存路径及首次装载状态一致时，保留实测准备成本。
+
+新增准备先使用一个明确的常数近似：所选 base、同一 rank、同 allocator 内核的同步编译耗时中位数，加后续装载耗时中位数。
+页大小、batch/extend 上界和对齐决定变体身份及出现次数，不再各拟合一条编译时间曲线。首次装载单独报告，不能把它平均进后续成本。
+样本必须有实际编译路径标签；旧 prepare 观测不能仅按耗时推断成编译样本。`cost_samples` 给出各项的数量、最小值、中位数和最大值。
+
+当前新增成本近似的条件是新容器的共享磁盘缓存、同 batch 各 rank 并行首用；source 的同签名编译区间相交才允许使用，
+这不是任意 target 时序下的严格证明。内存缓存逐 rank 推进，共享变体在整批完成后发布：同批不能只给第一个 rank 收编译成本，
+后续批次跨 rank 复用则需要磁盘命中样本。异步/未知路径、正式窗口首次使用 allocator 而运行时状态未定、样本不足等仍报告未覆盖。
+
+新增成本沿真实的 device → worker launch → 主线程 enqueue 关联找到提交前的顺序 gap，要求在对应 batch 内唯一匹配。
+一次原子变换计算 `新 gap = 原 gap − source 准备覆盖 + target 准备成本`；找不到提交模板或存在 owner 冲突时，删除和新增都撤回。
+`runtime_preparation.call_counts` 包含预热，`removed_coverage_us` / `added_cost_us` 是跨 rank 总量，不是 E2E 收益；
+`ready` 只表示这部分在所报告的近似条件下已覆盖，不能把它称为完整运行时成本模型或全矩阵精度通过。
 
 `source_io_observations` 与 `source_phase_observations` 均在任何模型 mutation 之前记录。
 后者不能从已经清零原设备节点的 target 图重新采样，否则会把 source 成本误报为 0；
