@@ -184,6 +184,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #endif
 
     const auto source_io = hicache_io_observations(graph, modules::hicache::mark_observed_hicache_scope(graph));
+    const auto source_phase = modules::hicache::observe_hicache_phases(graph);
     modules.apply(graph, logger);
     simulate(graph);
 #ifdef DEBUG
@@ -195,7 +196,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #ifdef DEBUG
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
-    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, client_result);
+    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, source_phase, client_result);
     return 0;
 }
 

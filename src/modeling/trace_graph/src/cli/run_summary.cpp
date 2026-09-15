@@ -476,6 +476,9 @@ Json phase_carrier_audit(const modules::hicache::HiCachePhaseCarrierAudit & carr
 
 Json dag_patch_result(const modules::hicache::HiCacheDagPatchModule & module) {
     const auto & result = module.result();
+    const auto& preparation = result.runtime_preparation;
+    std::map<std::string, size_t> preparation_counts;
+    for (const auto& call : preparation.calls) ++preparation_counts[call.status];
     const auto duration_update_count = static_cast<size_t>(
         std::ranges::count_if(result.journal.records, [](const auto & record) { return record.action == core::DagMutationAction::SetNodeDuration; }));
     const auto e2e_eligibility_update_count = static_cast<size_t>(
@@ -486,6 +489,10 @@ Json dag_patch_result(const modules::hicache::HiCacheDagPatchModule & module) {
     Json summary{
         {                       "status",result.status                                         },
         {             "phase_patch_status",                      result.phase_patch_status },
+        { "runtime_preparation", {{"status", preparation.status}, {"call_counts", preparation_counts},
+            {"observed_formal_calls", preparation.observed_formal_calls}, {"blockers", preparation.blockers},
+            {"changed_gap_count", preparation.mutation.set_cpu_gaps.size()}, {"removed_coverage_us", preparation.removed_coverage_us},
+            {"cost_source", "source_prepare_load_interval_union"}, {"coverage_is_e2e_saving", false}} },
         {   "phase_duration_update_count",            result.phase_duration_update_count },
         {       "phase_owner_conflict_count",                result.phase_owner_conflict_count },
         {                    "component",                     result.journal.component },
@@ -620,22 +627,9 @@ Json module_results(const std::vector<std::unique_ptr<modules::SimulationModule>
     return results;
 }
 
-modules::hicache::HiCachePhaseObservationAudit phase_observation_for_summary(
-    const core::DagGraph & graph,
-    const std::vector<std::unique_ptr<modules::SimulationModule>> & modules) {
-#ifdef DEBUG
-    for (const auto & module : modules) {
-        if (const auto * observed = dynamic_cast<const modules::hicache::HiCacheObservedPhaseCarrierModule *>(module.get())) {
-            return observed->result().observed;
-        }
-    }
-#endif
-    return modules::hicache::observe_hicache_phases(graph);
-}
-
-Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules) {
+Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
+                 const modules::hicache::HiCachePhaseObservationAudit & phase) {
     const auto stats = graph.summary_stats();
-    const auto phase = phase_observation_for_summary(graph, modules);
     Json root;
     root["parsed_record_count"] = graph.parsed_record_count();
     root["simulated_e2e_us"] = graph.e2e_time();
@@ -747,8 +741,10 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
 
 void write_run_summary(const std::string & filename, const core::DagGraph & graph,
                        const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
-                       const nlohmann::json & source_io_observations, const nlohmann::json & client_result) {
-    auto summary = run_summary(graph, modules);
+                       const nlohmann::json & source_io_observations,
+                       const modules::hicache::HiCachePhaseObservationAudit & source_phase_observations,
+                       const nlohmann::json & client_result) {
+    auto summary = run_summary(graph, modules, source_phase_observations);
     summary["source_io_observations"] = source_io_observations;
     summary["http_client"] = client_result;
     write_json_file(filename, summary);
