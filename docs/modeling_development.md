@@ -56,6 +56,23 @@ source 中已证明的预取轮询等待是否需要移除，与 target 是否�
 即使 target 是立即返回或零 payload，也要按 source 的等待合同处理旧 false→true 轮询覆盖；
 不能因关闭 target join 就保留旧等待。未知 gap、终止检查之外的工作和 self NoOp 仍保留，
 mutation 与前后验证共用 `replaces_source_completion_wait()` 的语义判断，不改变 target 策略。
+false 检查的函数 fact 可能比 scheduler 的控制标记短：probe 字段提取和输出发生在 fact 计时结束之后。
+若同线程的外层控制标记能完整界定该调用，移除整次已取消检查的 CPU 叶子，而不留下跨越 fact 边界的 `.self`；
+没有完整标记时只使用原有较窄归属。显式 CPU 校准样本仍来自函数内部，true 终止检查和调用外工作不因此删除。
+这也会修正 self 回放中的 HiCache 范围归属，但不改变其完整 HTTP 耗时；范围指标不能与完整指标混用。
+
+阶段不再把设备成本搬到五个聚合节点上。Prefill/Decode 的 family 总成本仍由原模型计算，
+按 base 中各算子的实测成本份额分配，并保留其提交、stream、HCCL 和 CPU 同步关系。
+累计分配后再取整数差，保证总成本精确；HCCL 权重使用归一化后的 source 服务时间，而非含等待的原 duration。
+`start` / `complete` 是零成本连接点，不承担计算；原依赖允许时，Decode 的 CPU 准备可以与 Prefill 执行重叠。
+现有两个真实输入的同成本变换没有改变任何原节点完成时刻，但这不证明所有配置的算子形状都相同。
+source 中没有对应 family 而 target 需要非零成本时，报告 `phase_operator_template_missing`；
+后续需从 base/固定校准及执行机制补结构模板，不能任意插入一个聚合成本，也不能把这一覆盖缺口当成已经完成。
+现阶段沿用 source 算子份额仍是形状变化近似，不能冒充逐 kernel 的独立成本模型。
+
+control-only 是按 source 区间消融的诊断，不是完整 HTTP 指标。旧实现对 synthetic 节点不做区间排除，
+因此旧聚合计算成本会残留在 control 指标中；成本回到真实算子后，该数值会大幅变化。
+不要将其变化解释为完整 E2E 节省，也不要把新旧 control 数值当作同一纯 CPU 成本对照。
 
 完整回放现在会重新安排已可靠识别的 CPU 任务队列：只有整条 worker lane 的连续叶子都能通过 correlation
 唯一对应提交事件时，才将跨任务的 source 顺序换成预测到达顺序。任务内部执行、生产者顺序及真实同步依赖保留，
