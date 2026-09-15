@@ -3,6 +3,7 @@
  * @brief Source-supported phase operators with zero-cost request boundaries.
  */
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
+#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -102,6 +103,32 @@ bool project_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan &
     return true;
 }
 
+bool project_decode_kernels(const core::DagGraph& graph, const HiCacheDecodeWorkItem& decode,
+                            core::DagMutationPlan& plan, std::set<size_t>& owned_nodes, HiCachePhaseCarrierAudit& audit) {
+    const auto& total = decode.kernel_cost;
+    if (decode.source_paged_attention_duration_us > total.source_duration_us
+        || decode.predicted_paged_attention_duration_us > total.predicted_duration_us) {
+        add_blocker(audit, "decode_attention_exceeds_kernel_cost");
+        return false;
+    }
+    HiCachePhaseNodeCostPlan attention{decode.source_paged_attention_duration_us, decode.predicted_paged_attention_duration_us, {}};
+    HiCachePhaseNodeCostPlan common{total.source_duration_us - attention.source_duration_us,
+                                   total.predicted_duration_us - attention.predicted_duration_us, {}};
+    for (const auto id : total.source_node_ids) {
+        if (id >= graph.node_count()) {
+            add_blocker(audit, "phase_source_owner_invalid");
+            return false;
+        }
+        auto& family = is_hicache_paged_attention(graph.event_for_node(id).name) ? attention : common;
+        family.source_node_ids.push_back(id);
+    }
+    // Keep the existing aggregate effect identity, but never spread attention
+    // changes onto unrelated kernels. Oracle costs supply both components too.
+    const auto effect = phase_effect(decode.request_id, decode.logical_input, "decode", "kernel");
+    const bool common_ready = project_cost(graph, common, effect, false, plan, owned_nodes, audit);
+    return project_cost(graph, attention, effect, false, plan, owned_nodes, audit) && common_ready;
+}
+
 struct CarrierRecord {
     const HiCachePrefillWorkItem * prefill = nullptr;
     uint64_t order_ts = 0;
@@ -168,7 +195,7 @@ bool append_record(const core::DagGraph & graph, const HiCachePrefillWorkItem & 
     ready = project(prefill.common_kernel_cost, "prefill", "common_kernel") && ready;
     ready = project(prefill.prefix_attention_cost, "prefill", "prefix_attention") && ready;
     ready = project(prefill.collective_cost, "prefill", "collective") && ready;
-    ready = project(decode.kernel_cost, "decode", "kernel") && ready;
+    ready = project_decode_kernels(graph, decode, plan, owned_nodes, audit) && ready;
     ready = project(decode.collective_cost, "decode", "collective") && ready;
     if (!ready) return false;
 

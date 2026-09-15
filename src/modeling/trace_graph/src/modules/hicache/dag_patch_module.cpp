@@ -227,6 +227,7 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
             throw std::invalid_argument("HiCache phase oracle-cost replay must not consume target E2E fields");
     }
     std::unordered_map<std::string, uint64_t> supplied;
+    std::unordered_map<std::string, uint64_t> supplied_attention;
     const auto load_costs = [&](std::string_view field) {
         if (!root.contains(std::string(field))) return false;
         const auto & rows = root.at(std::string(field));
@@ -238,6 +239,12 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
             const auto effect = row.at("effect_id").get<std::string>();
             if (effect.empty() || !supplied.emplace(effect, row.at("duration_us").get<uint64_t>()).second)
                 throw std::invalid_argument("duplicate or empty HiCache phase oracle-cost effect");
+            if (row.contains("paged_attention_duration_us")) {
+                if (!effect.ends_with(":kernel") || !row.at("paged_attention_duration_us").is_number_unsigned()
+                    || row.at("paged_attention_duration_us").get<uint64_t>() > supplied.at(effect))
+                    throw std::invalid_argument("invalid Decode attention oracle-cost component");
+                supplied_attention.emplace(effect, row.at("paged_attention_duration_us").get<uint64_t>());
+            }
         }
         return true;
     };
@@ -267,7 +274,12 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
         if (include_control) apply(item.submit_cost, prefill_phase_effect(item, "submit"));
     }
     for (auto & item : phase_work.decodes) {
-        apply(item.kernel_cost, decode_phase_effect(item, "kernel"));
+        const auto kernel_effect = decode_phase_effect(item, "kernel");
+        apply(item.kernel_cost, kernel_effect);
+        const auto attention = supplied_attention.find(kernel_effect);
+        if (attention == supplied_attention.end())
+            throw std::invalid_argument("missing Decode attention oracle cost for effect: " + kernel_effect);
+        item.predicted_paged_attention_duration_us = attention->second;
         apply(item.collective_cost, decode_phase_effect(item, "collective"));
         if (include_control) apply(item.submit_cost, decode_phase_effect(item, "submit"));
     }

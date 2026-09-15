@@ -137,16 +137,20 @@ std::string phase_family_name(std::string_view name) {
 
 } // namespace
 
+bool is_hicache_paged_attention(std::string_view name) {
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (const auto character : name) {
+        if (character >= 'A' && character <= 'Z') normalized.push_back(static_cast<char>(character - 'A' + 'a'));
+        else if ((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')) normalized.push_back(character);
+    }
+    return normalized.contains("attention");
+}
+
 uint64_t hicache_paged_attention_duration(const std::map<std::string, HiCachePhaseCostFamily> & families) {
     uint64_t duration = 0;
     for (const auto & [name, family] : families) {
-        std::string normalized;
-        normalized.reserve(name.size());
-        for (const auto character : name) {
-            if (character >= 'A' && character <= 'Z') normalized.push_back(static_cast<char>(character - 'A' + 'a'));
-            else if ((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9')) normalized.push_back(character);
-        }
-        if (!normalized.contains("attention")) continue;
+        if (!is_hicache_paged_attention(name)) continue;
         duration = core::checked_add_u64(duration, family.duration_us, "HiCache paged-attention duration exceeds uint64 range");
     }
     return duration;

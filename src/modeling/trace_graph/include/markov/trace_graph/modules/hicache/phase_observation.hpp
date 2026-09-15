@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace markov::trace_graph::core {
@@ -95,6 +96,9 @@ struct HiCachePhaseObservationAudit {
 
     [[nodiscard]] bool ready() const { return status == "ready"; }
 };
+
+/** @brief Share Decode attention classification between observation and patch. */
+[[nodiscard]] bool is_hicache_paged_attention(std::string_view name);
 
 /** @brief Sum the semantic paged-attention family in one Decode observation. */
 [[nodiscard]] uint64_t hicache_paged_attention_duration(
