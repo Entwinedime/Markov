@@ -143,7 +143,8 @@ if(TRACE_GRAPH_DEBUG)
         PRIVATE
             src/modules/hicache/patch/oracle_cost_replay.cpp
     )
-    add_executable(hicache_io_logic_check EXCLUDE_FROM_ALL tests/hicache_io_logic_check.cpp tests/hicache_phase_checks.cpp)
+    add_executable(hicache_io_logic_check EXCLUDE_FROM_ALL
+        tests/hicache_io_logic_check.cpp tests/hicache_phase_checks.cpp tests/hicache_preparation_checks.cpp)
     target_link_libraries(hicache_io_logic_check PRIVATE trace_graph_modules trace_graph_simulation)
     add_executable(trace_timing_check EXCLUDE_FROM_ALL tests/trace_timing_check.cpp)
     target_link_libraries(trace_timing_check PRIVATE trace_graph_io trace_graph_simulation)
