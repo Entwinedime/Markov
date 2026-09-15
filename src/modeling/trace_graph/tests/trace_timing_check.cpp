@@ -1,11 +1,17 @@
 /** @file Small trace timing checks, enabled only in explicit validation builds. */
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
+#include "markov/trace_graph/core/client_requests.hpp"
+#include "markov/trace_graph/io/trace_manifest_input.hpp"
+#include <nlohmann/json.hpp>
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/io/trace_channel_join.hpp"
 #include "../src/core/dag_builder_stages.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <tuple>
@@ -270,6 +276,110 @@ void observed_cpu_gap_split_preserves_consumers() {
     require(simulation::run_topological_simulation(raw).e2e_us == 110, "zero length surrounding gaps conserve time");
 }
 
+void instantaneous_cpu_observation_preserves_time() {
+    auto graph = core::DagBuilder(1).build({event("before", "1", "1", 100, 10), event("after", "1", "1", 200, 10)}, 0);
+    const auto before = simulation::run_topological_simulation(graph).e2e_us;
+    auto point = event("runtime.request.dispatch_ready", "1", "1", 150, 0, "runtime_diagnostic");
+    point.source_channel = core::TraceSourceChannel::PythonProbe;
+    const auto boundary = core::insert_cpu_gap_observation(graph, point);
+    require(boundary.has_value(), "a measured instant inside a unique CPU gap must be connectable");
+    require(boundary->begin == boundary->end && graph.node_count() == 3, "an instant is one point, not a synthetic interval");
+    require(graph.node(boundary->begin).duration == 0 && !graph.node(boundary->begin).counts_toward_e2e,
+            "observing a point neither adds cost nor selects the business endpoint");
+    require(simulation::run_topological_simulation(graph).e2e_us == before, "point insertion preserves full replay");
+    require(graph.node(0).cpu_gap_after == 40 && graph.node(boundary->begin).cpu_gap_after == 50, "the old gap is only partitioned");
+    require(!core::insert_cpu_gap_observation(graph, point), "ambiguous repeated boundaries do not guess an owner");
+    for (size_t id = 0; id < 2; ++id) graph.set_scope_node_owned(id);
+    require(simulation::run_gap_excluded_topological_simulation(graph).e2e_us == 20, "point insertion does not turn gap into scoped cost");
+
+    auto envelope = point; envelope.name = "runtime.request.receive"; envelope.ts = 140; envelope.dur = 10;
+    auto with_receive = core::DagBuilder(1).build({event("before", "1", "1", 100, 10), event("after", "1", "1", 200, 10), envelope, point}, 0);
+    require(with_receive.node_count() == 4, "receive envelope adds a start point, not a second execution interval");
+    require(simulation::run_topological_simulation(with_receive).e2e_us == before, "receive start and dispatch points preserve the original timeline");
+}
+
+void serial_http_clients_follow_responses_not_background_work() {
+    core::DagGraph graph;
+    const auto boundary = [&](const char* stage, const char* role, const char* id, uint64_t ts) {
+        auto node = graph.add_synthetic_node({.name = stage, .category = "observed_boundary",
+            .attrs = {{"observed_interval", stage}, {"interval_boundary", role}, {"request_ids", std::string("[\"") + id + "\"]"}}});
+        graph.mutable_event_for_node(node).ts = ts;
+        return node;
+    };
+    const auto receive1 = boundary("runtime.request.socket_received", "point", "one", 10);
+    const auto compute1 = graph.add_synthetic_node({.name = "first compute", .duration = 100, .counts_toward_e2e = true});
+    const auto send1 = boundary("runtime.response.scheduler_send", "end", "one", 110);
+    const auto receive2 = boundary("runtime.request.socket_received", "point", "two", 130);
+    const auto compute2 = graph.add_synthetic_node({.name = "second compute", .duration = 50, .counts_toward_e2e = true});
+    const auto send2 = boundary("runtime.response.scheduler_send", "end", "two", 180);
+    const auto background = graph.add_synthetic_node({.name = "background work", .duration = 500, .counts_toward_e2e = true});
+    graph.add_edge(receive1, compute1, core::DagEdgeKind::Sync);
+    graph.add_edge(compute1, send1, core::DagEdgeKind::Sync);
+    graph.add_edge(send1, receive2, core::DagEdgeKind::Sequential);
+    graph.mutable_node(send1).cpu_gap_after = 20;
+    graph.add_edge(receive2, compute2, core::DagEdgeKind::Sync);
+    graph.add_edge(compute2, send2, core::DagEdgeKind::Sync);
+    const std::vector<core::ClientRequestTiming> requests{{"one", 0, 115, 10}, {"two", 120, 185, 130}};
+    auto incomplete = graph;
+    auto invalid = requests; invalid.back().request_id = "missing";
+    require(core::connect_client_requests(incomplete, invalid).status != "connected" && incomplete.node_count() == graph.node_count(),
+            "missing source observations leave the graph unchanged");
+    const auto chain = core::connect_client_requests(graph, requests);
+    require(chain.status == "connected" && chain.requests.size() == 2, "complete source requests form a client chain");
+    for (const auto [compute, expected] : {std::pair{100, 185}, {50, 135}, {150, 235}}) {
+        graph.set_node_duration(compute1, compute);
+        require(simulation::run_topological_simulation(graph).e2e_us == 500, "background work remains in the graph metric");
+        require(graph.node(chain.requests.back().completion).completion_time == static_cast<uint64_t>(expected),
+                "HTTP completion follows changed compute without double-counting the existing server gap");
+    }
+    graph.set_node_duration(background, 1000);
+    graph.mutable_node(send1).cpu_gap_after = 60;
+    (void)simulation::run_topological_simulation(graph);
+    require(graph.node(chain.requests.back().completion).completion_time == 275, "server availability can dominate client availability");
+}
+
+void client_input_reads_only_declared_source_observations() {
+    using Json = nlohmann::json;
+    char pattern[] = "/tmp/markov-client-XXXXXX";
+    const auto * directory = mkdtemp(pattern);
+    require(directory != nullptr, "create isolated client input fixture");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto manifest_path = (cleanup.path / "manifest.json").string();
+    const auto report_path = (cleanup.path / "report.json").string();
+    const auto probe_path = (cleanup.path / "probe.json").string();
+    const auto row = [](const char* id, double start, double end) {
+        return Json{{"kind", "request"}, {"status", "ok"}, {"logical_request_id", id}, {"start_time_ms", start}, {"end_time_ms", end}};
+    };
+    Json report = {{"status", "completed"}, {"formal_window", {{"formal_begin_ms", 0}, {"formal_end_ms", 0.185}}},
+                   {"requests", Json::array({row("one", 0, 0.115), row("two", 0.120, 0.185)})}};
+    Json events = Json::array();
+    for (const auto& [id, start] : {std::pair{"one", 5}, {"two", 125}})
+        events.push_back({{"name", "runtime.request.tokenizer_submit"}, {"ph", "X"}, {"ts", start}, {"dur", 5},
+                          {"pid", 1}, {"tid", 1}, {"args", {{"request_ids", Json::array({id})}}}});
+    Json manifest;
+    manifest["bench"]["workload_report_files"] = Json::array({{{"path", report_path}, {"exists", true}}});
+    manifest["sidecar"]["python_probe_files"] = Json::array({{{"path", probe_path}, {"exists", true}}});
+    std::ofstream(report_path) << report;
+    std::ofstream(probe_path) << events;
+    std::ofstream(manifest_path) << manifest;
+    const auto input = io::load_client_requests_from_manifest(manifest_path);
+    require(input.status == "ready" && input.requests.size() == 2 && input.requests.back().frontend_end_us == 130,
+            "source report and submission observations are joined by request identity");
+    const Json barrier = {{"kind", "barrier"}, {"status", "ok"}, {"start_time_ms", 0.117}, {"end_time_ms", 0.119}};
+    report["requests"].insert(report["requests"].begin() + 1, barrier);
+    std::ofstream(report_path) << report;
+    require(io::load_client_requests_from_manifest(manifest_path).status == "formal_control_step_not_modeled",
+            "a control step inside the HTTP window is not silently converted into client think time");
+    report["requests"][1].erase("start_time_ms");
+    std::ofstream(report_path) << report;
+    require(io::load_client_requests_from_manifest(manifest_path).status == "formal_step_without_timing", "untimed steps cannot disappear");
+    std::ofstream(manifest_path) << Json::object();
+    require(io::load_client_requests_from_manifest(manifest_path).requests.empty(), "old manifests do not invent client observations");
+}
+
 void queue_wait_follows_task_arrival() {
     auto worker = event("previous task", "1", "2", 0, 10);
     auto submit = event("task submission", "1", "1", 0, 100, "enqueue");
@@ -350,6 +460,9 @@ int main() {
     queue_wait_follows_task_arrival();
     runtime_diagnostics_do_not_add_or_remove_work();
     observed_cpu_gap_split_preserves_consumers();
+    instantaneous_cpu_observation_preserves_time();
+    serial_http_clients_follow_responses_not_background_work();
+    client_input_reads_only_declared_source_observations();
     response_endpoint_preserves_background_resource_dependencies();
     std::cout << "Trace timing checks passed\n";
 }
