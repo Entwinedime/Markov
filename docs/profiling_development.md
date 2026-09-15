@@ -154,6 +154,8 @@ http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回
 `async_op=true` 时区间仅到提交返回，不能当作通信完成；合并提交或失败时序号可能没有推进，不能强行一一配对。
 默认 off 不安装，设备通信及其他 backend 原样调用。建图仅保留观测，不新增执行节点或重复收费；
 通用 CPU 通信依赖与真实模型采集开销尚未完成验证，不能用这些字段声称完整通信建模已完成。
+NPU 兼容层可能再次包装 distributed 函数；同一调用栈内、同组同操作的探针只记录外层一次，
+避免一条真实通信产生两条相同序号的观测。不同操作或进程组不因此跳过，异常后恢复调用上下文。
 
 `timing/full` 还记录 `runtime.hicache.layer_waits`：每个 forward batch 的请求、阶段、consumer index、层数，
 以及实际 HiCache 逐层等待调用的起止时间。调用区间先缓存在内存，batch 结束时统一写出，完整保留列表；
