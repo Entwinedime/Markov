@@ -15,6 +15,7 @@ from ...io_model_builder import _io_coverage, _new_write_curve, _physical_servic
 from ...io_model_contract import io_observation_ready
 from .oracle_cost_replay.matching import _oracle_cost_record, target_operation_cell
 from .oracle_cost_replay.runner import _identity_mismatches, _select_replay_scores
+from .phase.score import _compare_phase_cost
 from ..final_dag.shape_compare import compare_shape
 from ..final_dag.shape_oracle import _annotate_family_relations
 
@@ -47,6 +48,26 @@ def new_write_rows(batches: tuple[int, ...]) -> list[dict]:
 
 
 class IoWorkContract(unittest.TestCase):
+    def test_phase_oracle_keeps_decode_attention_component(self):
+        costs = {name: {"source_duration_us": 10, "predicted_duration_us": 12}
+                 for name in ("kernel_cost", "collective_cost", "submit_cost")}
+        phase = {"logical_input": 0, "request_id": "request", **costs}
+        work = {"cost_status": "ready", "prefills": [phase],
+                "decodes": [{**phase, "predicted_paged_attention_duration_us": 3}]}
+        observed = {"logical_input": 0, "request_ids": ["request"],
+                    "prefill_common_kernel_duration_us": 7, "prefill_prefix_attention_duration_us": 4,
+                    "decode_kernel_families": {"FusedInferAttentionScore": {"duration_us": 5},
+                                               "MatMul": {"duration_us": 6}}}
+        for name in ("prefill", "decode"):
+            observed.update({f"{name}_kernel_duration_us": 11, f"{name}_collective_duration_us": 2,
+                             f"{name}_submit_cpu_duration_us": 1})
+        result = _compare_phase_cost(work, [observed], include_oracle_costs=True)
+        for collection in ("device_oracle_costs", "all_owner_device_oracle_costs"):
+            kernel = next(row for row in result[collection] if row["effect_id"].endswith(":decode:0:kernel"))
+            self.assertEqual(kernel["duration_us"], 11)
+            self.assertEqual(kernel["paged_attention_duration_us"], 5)
+        self.assertNotIn("device_oracle_costs", _compare_phase_cost(work, [observed], include_oracle_costs=False))
+
     def test_background_service_status_is_model_input_ready(self):
         self.assertTrue(io_observation_ready({"status": "ready_background_unmaterialized"}))
         self.assertTrue(io_observation_ready({"status": "ready_background_transfer_only"}))

@@ -8,8 +8,6 @@
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
-#include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
-#include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
 #include "../src/modules/hicache/patch/rewrite_mutation.hpp"
 #include "../src/modules/hicache/patch/io_operation_ledger_detail.hpp"
@@ -24,88 +22,14 @@
 using namespace markov::trace_graph;
 using namespace markov::trace_graph::modules::hicache;
 
+void check_hicache_phase_timing();
+
 namespace {
 
 void require(bool value, const std::string & message) {
     if (!value) throw std::runtime_error(message);
 }
 
-void phase_operators_preserve_interleaving() {
-    core::DagGraph graph;
-    auto add = [&](const char* name, bool cpu, uint64_t duration) {
-        return graph.add_synthetic_node({.name=name, .is_cpu=cpu, .duration=duration, .counts_toward_e2e=true});
-    };
-    const auto first = add("first submit", true, 1);
-    const auto middle = add("second compute submit", true, 1);
-    const auto last = add("last collective submit", true, 1);
-    const auto decode = add("decode submit", true, 1);
-    const auto common1 = add("layer 1 compute", false, 10);
-    const auto comm1 = add("layer 1 collective", false, 5);
-    const auto common2 = add("layer 2 compute", false, 10);
-    const auto comm2 = add("layer 2 collective", false, 5);
-    const auto decode_kernel = add("decode compute", false, 1);
-    const auto decode_comm = add("decode collective", false, 1);
-    graph.mutable_node(first).cpu_gap_after = 19;
-    graph.mutable_node(middle).cpu_gap_after = 9;
-    graph.add_edge(first, middle, core::DagEdgeKind::Sequential);
-    graph.add_edge(middle, last, core::DagEdgeKind::Sequential);
-    graph.add_edge(last, decode, core::DagEdgeKind::Sequential);
-    graph.add_edge(first, common1, core::DagEdgeKind::Correlation);
-    graph.add_edge(common1, comm1, core::DagEdgeKind::Stream);
-    graph.add_edge(comm1, common2, core::DagEdgeKind::Stream);
-    graph.add_edge(middle, common2, core::DagEdgeKind::Correlation);
-    graph.add_edge(common2, comm2, core::DagEdgeKind::Stream);
-    graph.add_edge(last, comm2, core::DagEdgeKind::Correlation);
-    graph.add_edge(comm2, decode, core::DagEdgeKind::Sync);
-    graph.add_edge(decode, decode_kernel, core::DagEdgeKind::Correlation);
-    graph.add_edge(decode_kernel, decode_comm, core::DagEdgeKind::Stream);
-    const auto original = simulation::run_topological_simulation(graph).e2e_us;
-    require(original == 39, "fixture has 36 us Prefill followed by 3 us Decode");
-    model::HiCachePhaseWorkLedger work;
-    work.status = work.cost_status = "ready";
-    model::HiCachePrefillWorkItem prefill;
-    prefill.pid = "1"; prefill.request_id = "request"; prefill.logical_input = 0;
-    prefill.common_kernel_cost = {20,20,{common1,common2}};
-    prefill.collective_cost = {10,10,{comm1,comm2}};
-    prefill.submit_cost = {3,3,{first,middle,last}};
-    model::HiCacheDecodeWorkItem dec;
-    dec.pid = "1"; dec.request_id = "request"; dec.logical_input = 0;
-    dec.kernel_cost = {1,1,{decode_kernel}};
-    dec.collective_cost = {1,1,{decode_comm}};
-    dec.submit_cost = {1,1,{decode}};
-    work.prefills.push_back(prefill); work.decodes.push_back(dec);
-    const auto replay = [&](const core::DagGraph& source, const model::HiCachePhaseWorkLedger& costs) {
-        auto target = source;
-        core::DagMutationPlan plan{.component="phase_test"};
-        const auto audit = append_hicache_phase_carrier_plan(target,costs,plan);
-        require(audit.status == "ready", "observed operators supply the phase structure");
-        const auto mutation = core::apply_dag_mutation_plan(target,plan);
-        return simulation::run_topological_simulation(target).e2e_us;
-    };
-    require(replay(graph,work) == original, "same costs retain interleaved submission, compute and communication");
-    auto larger = work;
-    larger.prefills[0].common_kernel_cost.predicted_duration_us = 40;
-    require(replay(graph,larger) == 54, "longer device work propagates to the true CPU synchronization");
-    auto smaller = work;
-    smaller.prefills[0].common_kernel_cost.predicted_duration_us = 10;
-    require(replay(graph,smaller) == 39, "faster compute still waits for the last collective submission");
-    auto late = graph;
-    late.mutable_node(middle).cpu_gap_after = 29;
-    require(replay(late,work) == 59, "a late final submission delays only its dependent work");
-
-    auto overlap = graph;
-    for (size_t i=0; i<overlap.edge_count(); ++i)
-        if (overlap.edge(i).src == comm2 && overlap.edge(i).dst == decode) overlap.mutable_edge(i).active = false;
-    overlap.add_edge(comm2,decode_kernel,core::DagEdgeKind::Stream);
-    require(simulation::run_topological_simulation(overlap).e2e_us == 38 && replay(overlap,work) == 38,
-            "Decode CPU preparation may precede Prefill completion when the actual dependency is on device execution");
-    auto missing = work;
-    missing.prefills[0].prefix_attention_cost.predicted_duration_us = 1;
-    core::DagMutationPlan unsupported;
-    const auto audit = append_hicache_phase_carrier_plan(graph,missing,unsupported);
-    require(audit.status == "blocked" && audit.blockers.contains("phase_operator_template_missing"),
-            "a nonzero cost cannot invent the location of an unobserved operator family");
-}
 
 void allocator_slice_follows_physical_operations() {
     runtime::DeviceAllocatorLedger allocator;
@@ -687,7 +611,7 @@ void oracle_preserves_terminal_control() {
 } // namespace
 
 int main() {
-    phase_operators_preserve_interleaving();
+    check_hicache_phase_timing();
     source_prefetch_wait_is_removed_without_a_target_join();
     false_progress_owns_its_enclosing_call();
     allocator_slice_follows_physical_operations();
