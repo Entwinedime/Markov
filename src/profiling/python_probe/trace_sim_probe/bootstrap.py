@@ -34,6 +34,7 @@ def _probes() -> tuple[ModuleType, ...]:
             probes = [importlib.import_module("trace_sim_probe.probes.hicache.callable")]
             if os.environ.get("TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS", "off") in {"timing", "full"}:
                 probes.append(importlib.import_module("trace_sim_probe.probes.runtime_preparation"))
+                probes.append(importlib.import_module("trace_sim_probe.probes.response_boundaries"))
             _PROBES = tuple(probes)
         except Exception as exc:
             if probe_debug_enabled():
