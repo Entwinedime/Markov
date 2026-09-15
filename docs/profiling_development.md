@@ -149,7 +149,18 @@ http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回
 `runtime.request.receive` 记录带请求 ID 的整次 scheduler 接收调用区间，其中包含广播和等待。建图只将其开始转为零耗时点，
 结束复用 dispatch_ready，不重复加入区间耗时。空轮询只读取一个开始时间，不写事件；请求 ID 列表作为语义身份完整保留，不按 32 项截断。
 
-probe target 声明位于：
+`timing/full` 另外记录 CPU Gloo 的 `runtime.cpu_collective`：broadcast/all_reduce 的进程组名、成员、全局 rank、
+调用前后组内序号、tensor 元素数/类型，以及 root 或规约操作。只读元信息，不读取 tensor 内容、不增加同步。
+`async_op=true` 时区间仅到提交返回，不能当作通信完成；合并提交或失败时序号可能没有推进，不能强行一一配对。
+默认 off 不安装，设备通信及其他 backend 原样调用。建图仅保留观测，不新增执行节点或重复收费；
+通用 CPU 通信依赖与真实模型采集开销尚未完成验证，不能用这些字段声称完整通信建模已完成。
+
+`timing/full` 还记录 `runtime.hicache.layer_waits`：每个 forward batch 的请求、阶段、consumer index、层数，
+以及实际 HiCache 逐层等待调用的起止时间。调用区间先缓存在内存，batch 结束时统一写出，完整保留列表；
+不逐次写 JSON、不增加设备同步、不采集 snapshot。没有启用 consumer 的 batch 保留空列表，失败调用标记为 raised。
+默认 off 不安装；建图只保存观测，尚不据此删除等待成本。该探针的真实模型采集开销仍需测量。
+
+HiCache probe target 声明位于：
 
 ```text
 configs/profiling/hicache_probe_targets.json
