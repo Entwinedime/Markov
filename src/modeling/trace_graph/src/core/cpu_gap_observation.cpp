@@ -8,7 +8,7 @@ namespace markov::trace_graph::core {
 
 std::optional<CpuGapBoundaryNodes> insert_cpu_gap_observation(DagGraph & graph, TraceEvent observation) {
     const auto finish = checked_add_u64(observation.ts, observation.dur, "observed interval end overflow");
-    if (observation.pid.empty() || observation.tid.empty() || observation.pid == "-1" || observation.tid == "-1" || observation.dur == 0) return std::nullopt;
+    if (observation.pid.empty() || observation.tid.empty() || observation.pid == "-1" || observation.tid == "-1") return std::nullopt;
     std::optional<size_t> selected;
     for (size_t index = 0; index < graph.edges().size(); ++index) {
         const auto & edge = graph.edge(index);
@@ -54,15 +54,16 @@ std::optional<CpuGapBoundaryNodes> insert_cpu_gap_observation(DagGraph & graph, 
         graph.mutable_node(id).original_cpu_gap_after = gap;
         return id;
     };
-    const auto begin = boundary("begin", observation.ts, observation.dur);
-    const auto end = boundary("end", finish, gap_end - finish);
+    const bool instant = observation.dur == 0;
+    const auto begin = boundary(instant ? "point" : "begin", observation.ts, instant ? gap_end - finish : observation.dur);
+    const auto end = instant ? begin : boundary("end", finish, gap_end - finish);
     graph.mutable_node(edge.src).cpu_gap_after = observation.ts - gap_start;
     // This is a partition of observed time, not a predicted duration change.
     // Exclusion overlaps must use the new subinterval rather than the old whole.
     graph.mutable_node(edge.src).original_cpu_gap_after = observation.ts - gap_start;
     graph.disable_edge(*selected);
     graph.add_edge(edge.src, begin, DagEdgeKind::Sequential);
-    graph.add_edge(begin, end, DagEdgeKind::Sequential);
+    if (!instant) graph.add_edge(begin, end, DagEdgeKind::Sequential);
     graph.add_edge(end, edge.dst, DagEdgeKind::Sequential);
     return CpuGapBoundaryNodes{begin, end};
 }

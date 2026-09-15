@@ -13,6 +13,7 @@ struct CpuGapBoundaryNodes {
 
 /**
  * Split a unique, unchanged CPU sequential gap at an observed interval's ends.
+ * A zero-duration observation produces one point (begin == end), not an interval.
  * All time remains gap, not new execution cost; other dependencies are retained.
  * Unsupported or ambiguous placement returns nullopt without changing the graph.
  */

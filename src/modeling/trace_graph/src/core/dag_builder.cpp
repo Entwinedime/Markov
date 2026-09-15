@@ -41,7 +41,7 @@ bool is_hicache_control_event(const TraceEvent & event) {
 struct ExecutionAndFactEvents {
     std::vector<TraceEvent> executable_events;
     std::vector<TraceEvent> hicache_fact_events;
-    std::vector<TraceEvent> response_observations;
+    std::vector<TraceEvent> request_observations;
 };
 
 std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, int gpu_id) {
@@ -106,7 +106,16 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     for (auto & event : events) {
         // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
-            if (event.name == "runtime.response.scheduler_send") split.response_observations.push_back(std::move(event));
+            if (event.name == "runtime.request.receive") {
+                // The envelope contains existing work and waits. Only expose
+                // its start; dispatch_ready already supplies the end point.
+                event.name += ".begin";
+                event.dur = 0;
+                event.dur_submicro_ns = 0;
+                split.request_observations.push_back(std::move(event));
+            }
+            else if (event.name == "runtime.response.scheduler_send" || event.name == "runtime.request.socket_received"
+                || event.name == "runtime.request.dispatch_ready") split.request_observations.push_back(std::move(event));
             continue;
         }
         if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));
@@ -180,8 +189,8 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     add_device_sync_edges(graph, index);
     finalize_sync_nodes(graph, index);
     normalize_cpu_queue_waits(graph);
-    std::ranges::sort(split.response_observations, {}, &TraceEvent::ts);
-    for (const auto & observation : split.response_observations) {
+    std::ranges::sort(split.request_observations, {}, &TraceEvent::ts);
+    for (const auto & observation : split.request_observations) {
         // These points carry no extra cost or E2E eligibility. A future response
         // path must separately prove complete request binding before using them.
         (void)insert_cpu_gap_observation(graph, observation);
