@@ -123,6 +123,11 @@ Python probe 默认不采集 cache snapshot。早期 snapshot 会遍历并序列
 可选 `profiling.python_probe.diagnostics: "timing"` 记录 I/O thread CPU/wait 和缺页计数；`full` 再增加有限函数计时。二者只用于诊断，
 不能与默认轻量 profile 混作同条件成本样本，也不能把未覆盖时间自动归为可建模 CPU gap。
 
+这两个诊断档位还记录 Triton 的编译准备（`runtime.triton.prepare`）和首次句柄装载（`runtime.triton.load`），默认 off 不安装这些包装。
+准备区间包括磁盘缓存查找，异步模式下可能只测到编译提交；装载区间包括 launcher 创建和 binary 装载，均不能当成设备执行时间。
+记录保存在 Python probe trace 的 `runtime_diagnostic` 类别中，只供空白归因，不作为 HiCache fact 或额外 DAG 成本重复加入。
+不采 tensor 内容、snapshot 或缓存摘要；重复的已装载内核不发事件。不改缓存与预热策略，冷启动和已有缓存的结果必须分开解释。
+
 probe target 声明位于：
 
 ```text
