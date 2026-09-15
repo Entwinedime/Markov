@@ -42,6 +42,7 @@ struct ExecutionAndFactEvents {
     std::vector<TraceEvent> executable_events;
     std::vector<TraceEvent> hicache_fact_events;
     std::vector<TraceEvent> request_observations;
+    std::vector<TraceEvent> runtime_observations;
 };
 
 std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, int gpu_id) {
@@ -106,6 +107,10 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     for (auto & event : events) {
         // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
+            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load") {
+                split.runtime_observations.push_back(std::move(event));
+                continue;
+            }
             if (event.name == "runtime.request.receive") {
                 // The envelope contains existing work and waits. Only expose
                 // its start; dispatch_ready already supplies the end point.
@@ -172,6 +177,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);
     graph.set_hicache_fact_events(std::move(split.hicache_fact_events));
+    graph.set_runtime_observations(std::move(split.runtime_observations));
     graph.set_control_exclusion_intervals(std::move(exclusions));
     graph.set_phase_marker_events(std::move(phase_markers));
     graph.reserve(DagGraphCapacity{ .nodes = graph.events().size(), .edges = 0 });

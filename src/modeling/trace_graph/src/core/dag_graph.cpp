@@ -344,6 +344,7 @@ private:
         total_edges_ = checked_total([](const auto & graph) { return graph.edges_.size(); }, "edge");
         merged_.events_.reserve(total_events_);
         merged_.hicache_fact_events_.reserve(checked_total([](const auto & graph) { return graph.hicache_fact_events_.size(); }, "HiCache fact"));
+        merged_.runtime_observations_.reserve(checked_total([](const auto & graph) { return graph.runtime_observations_.size(); }, "runtime observation"));
         merged_.context_events_.reserve(checked_total([](const auto & graph) { return graph.context_events_.size(); }, "context event"));
         merged_.prelude_context_events_.reserve(
             checked_total([](const auto & graph) { return graph.prelude_context_events_.size(); }, "prelude context event"));
@@ -362,6 +363,8 @@ private:
             node_offsets_[graph_index] = node_offset;
             merge_parsed_record_count(graph);
             merge_input_contracts(graph);
+            merged_.runtime_observations_.insert(merged_.runtime_observations_.end(),
+                std::make_move_iterator(graph.runtime_observations_.begin()), std::make_move_iterator(graph.runtime_observations_.end()));
             for (auto & fact : graph.hicache_fact_events_) {
                 fact.index = merged_.hicache_fact_events_.size();
                 merged_.hicache_fact_events_.push_back(std::move(fact));

@@ -327,6 +327,10 @@ public:
     /** @brief Returns in-window HiCache facts retained for semantic modules only. */
     [[nodiscard]] const std::vector<TraceEvent> & hicache_fact_events() const { return hicache_fact_events_; }
 
+    /** Runtime preparation envelopes explain existing costs; never execution nodes. */
+    void set_runtime_observations(std::vector<TraceEvent> events) { runtime_observations_ = std::move(events); }
+    [[nodiscard]] const std::vector<TraceEvent> & runtime_observations() const { return runtime_observations_; }
+
     /** @brief Replaces non-DAG side-table events retained from outside the timing window. */
     void set_context_events(std::vector<TraceEvent> events) { context_events_ = std::move(events); }
 
@@ -453,6 +457,7 @@ private:
 
     /** @brief In-window semantic probe facts excluded from topology and E2E simulation. */
     std::vector<TraceEvent> hicache_fact_events_;
+    std::vector<TraceEvent> runtime_observations_;
 
     /** @brief Side-table definitions excluded from DAG topology and E2E simulation. */
     std::vector<TraceEvent> context_events_;

@@ -267,6 +267,10 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
     }
     std::erase_if(input.events, [&](const TraceEvent & event) {
+        // Pre-window preparation is model context, not pre-window execution.
+        // DagBuilder retains these envelopes only as non-executable metadata.
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
+            && (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load") && event.ts <= end) return false;
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
         const bool retained_causal_tail = event.arg("formal_window_context") == "causal_tail";
         return event_end < start || (event.ts > end && !retained_causal_tail);
