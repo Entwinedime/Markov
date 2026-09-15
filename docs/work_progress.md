@@ -1,151 +1,173 @@
 # 当前工作进展
 
-更新时间：2026-08-29。
+更新时间：2026-09-15
 
-详细执行记录维护在：
+## 最新重点：完整 E2E 尚未达到要求
 
-- `docs/tmp/final_project_semantic_slimming_plan_20260828.md`
-- `docs/tmp/final_project_semantic_slimming_log_20260828.md`
+保留 residual gap 和未归属成本后，将已有预测的 `simulated_e2e_us` 与对应 target 的 HTTP 正式窗口实测比较：
 
-本文件只保留当前状态，不保存迭代时间线。
+| 已有预测面板 | 完整 E2E WAPE | P90 误差 | 最大误差 |
+| --- | ---: | ---: | ---: |
+| 09-12 旧 60 格 | 21.98% | 46.46% | 67.39% |
+| 09-14 新 workload 12 格 | 5.50% | 14.62% | 15.19% |
 
-## 目标
+这不是当前代码重新预测全部 72 格的成绩。直接使用 source 实测耗时作为 target 预测时，两组 WAPE 分别为
+19.75% 和 5.07%；当前完整预测的整体误差尚未优于这个简单参照。对照仍在开启采集的环境下，不代表关闭 profiler 后的部署性能。
 
-项目收敛为：
+09-15 使用当前 C++ 库，对五份已有 profile 做了原始 DAG、同成本阶段变换和诊断性消融。确认两个问题：
+
+- C4/W2 使用同一份实测成本，原始 DAG 为 10.482 秒，仅做 Prefill/Decode 图变换后变成 14.480 秒；
+  C2/W2 同样增加约 3.528 秒。保留的 CPU 耗时/等待与新计算节点的衔接需要修复，不能只靠调整成本参数。
+- C4/W2 原始 DAG 将已识别的 Prefill/Decode 设备成本全部清零后，总时间仍不变：CPU lane 的实测间隔仍撑起原耗时。
+  长 scalar CPU 调用与设备执行高度重叠，但其真实 CPU 工作和阻塞等待尚未完成拆分；不能按事件名直接清零。
+
+此外，HiCache 状态处理使用扣除 residual gap 后的 source 事件时间，完整回放却保留尚未改写的 CPU 时间；
+target 计算变化对后续请求和缓存判断的反馈还需核对。以上是问题定位，不是已经完成的模型修复。
+
+下一步先用 C4/W2 等少量样本修复同成本图变换与等待依赖，再统一请求和缓存的时间推进，最后处理剩余成本误差并回归。
+不以删除所有 gap、未归属成本或使用 target 成本作为正式预测修复。
+数值依据分别在 `data/modeling_runs/hicache_full_e2e_audit_20260914/summary.json` 和
+`data/modeling_runs/hicache_full_e2e_root_cause_20260915/summary.json`；详细计划保留在本地
+`docs/tmp/hicache_full_e2e_root_cause_and_plan_20260915.md`。这些目录按仓库现有规则不入 Git，关键结论在本节保留。
+
+## 09-14 泛化结果
+
+新 workload / 新 HiCache 配置 / TP=4 初步泛化实验已完成：C5 base × W4/W5 × G1/G2/G3，
+TP=2→TP=2 与 TP=4→TP=4 各 6 格，合计 12/12 预测、target 采集和独立评分齐全。
+不是跨 TP 扩图；新 workload 的 base profile 提供 source DAG/工作量，但不参与参数拟合。
+
+| 当前新面板 | TP=2 六格 | TP=4 六格 | 总体十二格 |
+| --- | ---: | ---: | ---: |
+| 组合 scope WAPE | 0.276% | 0.389% | 0.317% |
+| Scope p90 / 最大 APE | 0.935% / 0.935% | 1.453% / 1.453% | 0.935% / 1.453% |
+| HiCache I/O/控制 WAPE | 12.950% | 16.209% | 14.772% |
+| 不抵消 I/O 分项 WAPE | 17.463% | 20.486% | 19.153% |
+| HiCache / phase 结构严格一致 | 4/6；5/6 | 4/6；5/6 | 8/12；10/12 |
+
+组合 scope 主目标通过，但排除了 residual gap 和未归属成本，不是完整墙钟 E2E；最终仍为 `MODEL_LIMITATION`。
+Prefill compute 总体 WAPE/p90 为 1.662%/8.634%，Decode 为 0.151%/0.476%；Prefill 与 I/O 分项仍未达标。
+G2/W4 在两种 TP 均暴露完整前缀匹配边界缺陷（预测 Prefill 0，实际每 rank 128 tokens）；
+G3 四格的等待/可见性投影尚未对齐，不能把严格结构失败直接说成预测 DAG 漏了等待。
+这两项新问题尚未修复；未因新 target 成绩调参或追加校准，保留原始外推成绩。
+
+本轮完成首次正式分配写回的归属修复、可选 NPU profiler 串行导出、TP4/W5 source 原始数据重导出恢复，
+并通过机制测试、代表格与十二格正式原生回归。全部十九份普通 profile 请求成功，最终十二份 target 的
+独立 phase/I/O 观测 ready，无无效事实、归属冲突或 token 范围错误。早期失败记录仍保留。
+正式结果：`data/modeling_runs/hicache_generalization_20260914/generalization_summary.json`。
+详细配置、逐 workload/单格结果、参数边界及后续问题见 [主验证文档第 10 节](validation/hicache_validation.md#10-09-14-新-workload--新配置--tp4-泛化结果)，
+过程见 [泛化计划](tmp/hicache_generalization_plan_20260914.md) 与 [泛化日志](tmp/hicache_generalization_log_20260914.md)。
+
+以下为 09-12 历史对照结果；没有在本轮首次分配归属修复后重跑旧 60-cross，不与新面板混算。
+
+本阶段完成验证合同与控制边界修复、新 60-cross、独立评分与五格真实成本回放。
+普通预测没有调参、补采或缩小评分范围；主要变化是消除旧验证工具造成的错误归因。
+见 [本轮计划](tmp/hicache_gap_excluded_causal_plan_20260912.md) 与 [执行日志](tmp/hicache_gap_excluded_causal_log_20260912.md)。
+
+## 1. 09-12 对照状态
+
+“一个固定小型校准 + 一个 base 的 profiles，预测全部 HiCache target”主流程已经完成逻辑修复并执行新的
+5-base/60-cross 验证。软件流程和信息边界可用，但严格模型验收没有全部通过：
+
+- 60/60 预测 READY，60/60 位于当前固定校准记录的 I/O 域；
+- 60/60 effect shape 与 phase 结构严格一致；原 40 格差异是 target 漏字段造成；
+- 排除 residual CPU gap 的组合 scope：WAPE 0.921%、p90 1.981%，总体及五个 base 均通过；最大单格 APE 2.712%；
+- Prefill+Decode combined：WAPE 0.694%、p90 2.316%，通过；phase delta 1.383%，54 个大变化方向全对；
+- Prefill 单项 p90 3.436%，略高于 3% 门槛；
+- HiCache I/O/控制：WAPE 5.186%、p90 32.518%、delta 8.121%；不抵消分项 WAPE 5.995%，失败；
+- 最终状态为 `MODEL_LIMITATION`，不是工作流错误，也不是全 gate PASS。
+
+09-12 对照正式结果：
 
 ```text
-profile -> source DAG -> HiCache effect -> I/O cost -> DAG patch -> simulation
+data/modeling_runs/hicache_gap_excluded_causal_20260912/final_60_evaluation/gate_summary.json
 ```
 
-同时保留 KTransformers 的 `profile -> source DAG -> simulation` 路径。当前阶段只评分 `hicache_direct`，不把 gap、prefill、
-decode 或 probe snapshot overhead 混入 Direct 误差。
+## 2. 本轮逻辑修复
 
-## 已完成
+### 本次修复
 
-- 公共 shell 入口收敛为 `scripts/profile.sh` 和 `scripts/model.sh`；
-- Python workflow 收敛为一次 plan、execute、summary；
-- target I/O structure 与 cost model 分离；
-- gap/prefill/decode 建立独立 ownership；
-- C++ Release/validation 链接边界明确；
-- workload 收敛到三个 JSON template，Python probe 默认 snapshot-free；
-- KTransformers image、installer、compose、hook、profile dispatch 与 framework-neutral DAG smoke 保留并适配；
-- oracle-cost replay 收敛为一个 compact summary；
-- calibration reader 不再依赖内部身份、文件摘要或冻结证明；
-- compact one-base I/O cost 模型已经替换旧 correction/pressure/contention surface；
-- effect planning 只读 calibration-only `io_planning`，duration 只读 `io_cost`；
-- P0–P11 已全部执行，包括三组开发 base 回归、五 base 最终 60 cross、source-invariance、
-  oracle replay、clean build 和保护资产审计。
+- 成本回放不再清零正载荷 Prefetch 的 terminal control；删除过时的 outcome-only 分类，保留真实 CPU 工作。
+- 控制节点由操作是否存在决定，不因 duration 为零而消失；避免后台 service 意外成为前台前驱。
+- target shape 从同一 target trace 的 Prefetch I/O 完成记录传播 visibility 页数，不用默认 0 冒充观测。
+- oracle 先检查相同成本回放恒等性，再比较 target 成本；异常保留具体失败字段，不仅输出 READY。
 
-## 当前代码量
+### 保持的模型边界
 
-本轮基线 active product surface 为 76,947 行、359 个 active 文件。P11 最终为：
+- 已执行 I/O 与缓存可见收益分开；状态推进与 DAG 共用 service cost，timeout 等待与后台传输分开。
+- DMA 使用设备时钟，存储使用函数墙钟代理，后者可能含内部调度等待。
+- 三组件组合 scope 保留必要资源/消费者依赖，排除 residual gap 和未归入组件的 wrapper/probe 成本；不是完整墙钟只减 CPU 空白。
+- 分项总量、非抵消误差、适用域和环境信息完整保留，不能通过跨组件抵消或隐式倍率过关。
 
-- 46,422 行；
-- 300 个 active 文件；
-- 正式流程规范化完成后的基线为 295 个 active 文件 / 43,993 行；
-- 最终语义瘦身完成后为 295 个 active 文件 / 43,511 行，净减 482 行；
-- Python modeling workflow：7,555 行；Python validation：2,504 行；C++ TraceGraph：22,806 行；
-- 不再以文件是否超过某个行数作为验收标准。
-
-## 稳定数据
-
-受保护的主 profile：
+## 3. 当前正式流程
 
 ```text
-data/profile_runs/sglang/20260824_222856_hicache_manual_template_lightweight_dag_replay
+一个 base 的 3 个 profiles
+        +
+共享平台物理校准
+        +
+共享固定小型校准（page 32/128，各 2 次）
+        ↓
+观测提取 → 简洁成本模型 → source DAG 状态/工作量变换
+        ↓
+Prefill/Decode 变换 → 原子 DAG patch → 模拟
+        ↓
+全部预测完成后，独立打开 target profiles 评分
 ```
 
-它包含五配置、三 workload，共 15 个真实 profile cell。当前开发不重新采集 5×3，除非证明现有资产无法被当前代码读取。
+target config 在预测时决定预取、写回、容量等行为；target trace 和 target cost 只在最后评分/显式 oracle 中使用，
+不会回写模型。当前五个 model build summary 的 `target_inputs`、`target_score_inputs` 都为空。
 
-当前 compact 输入和五个 one-base model：
+## 4. 验证证据
+
+- Release 和 validation 全量 C++ 构建通过；`hicache_io_logic_check` 覆盖零/正控制耗时、best-effort/timeout 与 oracle 控制保留。
+- 15 项 Python 语义回归和 ruff 通过。
+- 固定校准两端点各 2 次成功重复，四类 service 的相对范围均小于 4.3%。
+- 5 个 base 各 12 个 cross 全部 READY；60 个 cell 都在固定校准记录的域内。
+- 每个 base 选择 1 个 cell，执行 1 次相同成本与 5 次真实成本组合；30 次全部通过，五格恒等性全部成立。
+- evaluator 新提取 15 个 target DAG，只在全部预测完成后打开，`parameters_or_capture_plan_changed=false`。
+- `current_result_audit.json` 逐值核对 60 格 source manifest 和完整 C++ 模型输入不变；36 格只增加零成本控制边界，耗时不变。
+
+旧 Oracle 的 READY 不能证明成本替换有效：它没有检查相同成本回放恒等性，且会清零 Prefetch 控制成本并改变依赖。
+旧约 13% 偏差因此撤回为真实调度误差证据。修复后 C5/W1→C4 完整成本回放误差为 0.0059%；
+五格中四格低于 0.01%，C4/W2→C3 仍为 1.272%，保留为尚未单独归因的时序投影残差。
+effect shape 与工作量比较正确，仍不等于完整 target 时序同构。
+
+当前 5×3 矩阵没有触发 required/partial capacity gate；这一路径只有机制级证据，尚无本矩阵数据级覆盖。
+
+## 5. 数据资产
+
+当前修复运行根目录：
 
 ```text
-data/calibration/hicache_io_qwen3_32b_tp2/calibration_report.json
-data/calibration/hicache_io_qwen3_32b_tp2/control_primitives.json
-data/modeling_inputs/hicache/C5_observations.json
-data/modeling_inputs/hicache/models/C5_writeback_long_gate_timeout/hicache_io_model.json
-data/modeling_inputs/hicache/formal_oracle_scores.json
+data/modeling_runs/hicache_gap_excluded_causal_20260912/
 ```
 
-其他 base 的 observation/model 位于同一 `data/modeling_inputs/hicache/` 树。旧开发轮次、gate、版本目录和
-retention/SHA manifest 不再属于正式输入；当前代码验证必须重新运行关键 cell，不能通过复用旧 row/run summary 宣称通过。
+其中包含：
 
-## 稳定数值基线
+- 五个 `C*/predictions/`：当前 60 个预测及复现输入；
+- `representative/`、`representative_oracle/`：机制代表格和显式成本回放；
+- `final_60_evaluation/`：15 个新 target DAG 观测、60 个评分 cell 与正式汇总；
+- `identity*/`、`shape*/`、`current_result_audit.json`：根因反例与修复对照。
 
-重构前 one-base 12-cross：
+模型没有重拟合：`data/modeling_runs/hicache_io_logic_repair_20260911/` 中的物理校准、五个 base 的模型、
+model build summary、base observations、targets 及其引用的原始 5×3 profiles/固定校准仍是当前必需输入，不能删除。
+09-11 预测和更早结果保留为对照，不代替当前验收。
 
-| Base | Direct WAPE | Direct P90 | 同骨架 oracle WAPE | 同骨架 oracle P90 |
-| --- | ---: | ---: | ---: | ---: |
-| C5 | 1.564% | 4.387% | 0.518% | 2.185% |
-| C1 | 1.605% | 4.305% | 0.560% | 2.661% |
-| C3 | 0.854% | 4.305% | 0.587% | 1.922% |
+## 6. 结果应如何理解
 
-这些是回归参考，不要求 P9 简化后逐数值一致。
+现在可以正式陈述：
 
-P9 cost 简化前的 9-cell 基线是 Direct WAPE 1.1735%、p90 APE 3.2016%；同骨架 oracle WAPE 0.3473%。
+1. 一个固定小型校准加一个 base 的 profiles 能构建并运行所有当前 target 预测；
+2. 实际执行 I/O、缓存可见收益、前台等待和后台资源占用已经从概念与实现上分开；
+3. 配置决定的 HiCache 工作量/关系在当前矩阵没有不变量差异；
+4. 排除 residual gap 的组合 scope 达到本阶段精度要求，但 HiCache I/O/控制分项未达到旧严格门槛；旧调度差异归因已撤回；
+5. 当前数字不能称为完整请求 E2E，也不能声称“DAG 完全正确”。
 
-P9-D 最终重新运行的 C5 -> C3 / W1：
+## 7. 09-12 停止边界与当时的后续方向
 
-- 384 个 predicted effect，112 个 required cost；
-- structure exact、topology valid、cost ready，0 blocker；
-- operation/page/byte 与 planning/cost 分离前精确一致；
-- Direct predicted service+control：3,311,756 µs；
-- target Direct service+control：3,169,507 µs，APE 4.488048%；
-- prefill/decode 显式 deferred，target cost/E2E 不参与参数估计。
+本轮在看过最终 60-cell 结果后没有修改公式、系数或采集计划，也没有恢复逐 target 补采和 residual correction。
+总体及逐 base 组合 scope 目标已通过；HiCache I/O/控制及部分 phase 分项限制保留，不因分项偏差追加经验修正。
 
-这是边界回归证据，不能替代 P10 的 12-cell 或 P11 的 60-cell gate。
-
-P10-A 简化后 9-cell 回归：
-
-- 9/9 structure acceptance ready、9/9 cost ready、8/9 diagnostic exact；唯一非 exact cell 的 32 项均为
-  gap/prefill/decode 尚未建模时的 arrival-sensitive prefetch consumer relation，invariant mismatch 为 0；
-- Direct WAPE 2.1252%、p90 4.3048%、max 4.4880%，通过总体 3%/5% 门禁；
-- 同骨架 oracle normalized WAPE 0.6140%、p90 2.3108%、max 4.0222%，488/488 cost effect 有执行响应；
-- load、D2H 和 H2S 局部 tail 仍失败，作为 12/60-cell 限制继续观察，不恢复旧 correction。
-
-P10-B 三个 selected-base 的 12-cross 外推已经完成：
-
-| Base | Structure acceptance | Direct WAPE / P90 | Delta weighted L1 | 大变化方向 | 同骨架 WAPE / P90 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| C5 | 12/12 | 2.239% / 4.488% | 3.123% | 100% | 0.803% / 3.862% |
-| C1 | 12/12 | 1.829% / 4.305% | 2.094% | 100% | 0.783% / 2.936% |
-| C3 | 12/12 | 2.002% / 4.305% | 2.200% | 100% | 1.667% / 4.308% |
-
-三组合计 36 个 cross，不含 self：Direct WAPE/P90 为 2.029%/4.488%，delta weighted L1 为 2.444%，33 个大变化
-方向 100%；同骨架 normalized WAPE/P90 为 1.075%/4.017%。C3 有六格 arrival-schedule-sensitive 诊断差异，但 Direct
-invariant mismatch 为 0，不能在 HiCache direct 阶段通过硬编码 consumer relation 修补。
-
-## 当前最终结果
-
-60 个 cross prediction 全部完成，不含 self。结构结论为 PASS：60/60 usable/shape/oracle binding，
-15/15 个 target/workload 组在四个 source 间保持相同语义 I/O 结构。
-
-| Base | Direct WAPE / P90 | Delta weighted L1 | 大变化方向 | 同骨架 WAPE / P90 | 结果 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| C1 | 1.829% / 4.305% | 2.094% | 100% | 0.783% / 2.936% | PASS |
-| C2 | 6.474% / 9.208% | 8.508% | 100% | 0.729% / 3.033% | cost limitation |
-| C3 | 2.002% / 4.305% | 2.200% | 100% | 1.667% / 4.308% | PASS |
-| C4 | 23.944% / 39.320% | 24.000% | 100% | 9.665% / 21.870% | cost limitation |
-| C5 | 2.239% / 4.488% | 3.123% | 100% | 0.803% / 3.862% | PASS |
-
-60-cell 合计 Direct WAPE/P90 为 8.487%/36.857%，delta weighted L1 为 9.906%，同骨架 WAPE/P90
-为 3.145%/18.762%。数值结论为 `MODEL_LIMITATION`：C2 没有 D2H/H2S positive service observation，C4 没有
-任何 positive-payload service observation，所以单一 base 无法辨识缺失 family 的 runtime scale。这不通过读取
-target score 回拟。
-
-## 当前阶段
-
-最终语义瘦身已执行完成。工程门禁全部通过，结构模型通过，数值模型以明确可辨识性限制收束。
-当前 60-cell 汇总位于 `data/modeling_runs/formal_workflow_final_60cell_20260829/workflow_summary.json`，与瘦身前汇总逐字节一致。
-数据资产从约 223GB 收敛到约 70GB，只保留当前 5×3、forced-token、compact calibration、模型输入、score-only、
-KTransformers smoke 和当前正式结果。
-后续应先设计一个信息完备的 single-base 观测/独立 runtime calibration，再分别建立 gap、prefill 和 decode
-组件；不应回到多 target residual 拟合。
-
-## 最终报告口径
-
-- 60 cross = `5 base × 4 non-self target × 3 workload`；
-- 15 self 不是预测矩阵；
-- target observation 只用于 structure/cost/oracle score；
-- 分别报告 structure、Direct cost 和 isolated E2E；
-- 完整 source-to-target E2E 的 phase/gap 残差另行报告，不能归入 Direct cost 失败。
+当时提出单独研究 target-independent、可复现的调度/资源机制，重点是 best-effort 后台 I/O 如何影响 source
+骨架中的资源时序，以及存储函数墙钟能否取得更明确的分解；当时 residual CPU gap 仍 deferred。09-15 的进一步诊断和当前优先级见文首。KTransformers 和 NodeScale
+均保留：KTransformers 作为另一目标推理框架，NodeScale 作为默认关闭的可选 what-if，不进入默认 SGLang HiCache 流程。

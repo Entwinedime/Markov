@@ -1,132 +1,71 @@
 # Modeling 开发与使用
 
-本文件只描述当前可执行的建模流程。开发阶段的取舍、删除记录和数值回归见
-`docs/tmp/hicache_modeling_further_slimming_plan_20260827.md` 与配套日志。
+本文描述当前唯一可执行流程。模型公式见 `docs/hicache_io_cost_model.md`，结果见
+`docs/validation/hicache_validation.md`，不可违反的边界见 `docs/project_constraints.md`。
 
-## 1. 范围
+## 1. 总体结构
 
-项目有一条框架无关的 DAG 主链：
+所有框架共享基础链路：
 
 ```text
-profile manifest -> source DAG -> simulation
+profile_manifest.json -> normalized source DAG -> topological simulation
 ```
 
-SGLang 在这条主链上增加 HiCache Direct 预测：
+SGLang 在此基础上增加 HiCache：
 
 ```text
-profile manifest
-  -> source DAG
-  -> target HiCache effect plan
-  -> Direct I/O/control cost plan
-  -> atomic DAG patch
+source facts + target config
+  -> target cache-state/effect plan
+  -> Prefill/Decode work plan
+  -> HiCache I/O/control + phase cost plan
+  -> one atomic DAG patch
   -> simulation
 ```
 
-KTransformers 是同级目标框架，但没有 HiCache 模块，因此只执行第一条主链。不能为它伪造 HiCache effect、cost 或评分。
+KTransformers 是同级目标框架，继续使用 manifest、DAG build 和 simulation，但没有 HiCache module。NodeScale 是默认关闭的框架无关
+duration-only 变换，也不属于 HiCache。
 
-当前正式预测组件是 `hicache_direct`。`gap`、`prefill` 和 `decode` 有独立 ownership，但仍是 deferred；它们不进入
-Direct 误差，也不能用来修正 Direct cost。
+## 2. 职责边界
 
-## 2. 六个阶段
-
-| 阶段 | 输入 | 输出 | 唯一职责 |
+| 阶段 | 输入 | 输出 | 不负责 |
 | --- | --- | --- | --- |
-| profile | framework、server、workload、channel | manifest + traces + formal window | 记录一次真实执行 |
-| DAG build | manifest | normalized source DAG | 合并 trace 并构图 |
-| effect planning | source facts + target config + calibration planning rates | target effect plan | 推导 I/O/control 结构 |
-| cost | effect bytes/pages + calibration/base | operation cost plan | 估计 Direct duration |
-| patch | source DAG + effect/cost plan | target DAG | 一次原子结构和 duration 变换 |
-| simulation | materialized DAG | component timing | 计算预测时间 |
+| Profiling | framework/config/workload | manifest、trace、formal window | 预测 target |
+| DAG build | 一个 source manifest | normalized source DAG | 猜 target DAG |
+| Effect/work planning | source facts、target HiCache config、统一 service model | target I/O 执行/可见结构、phase 工作量 | 用 target 标签选结构 |
+| Cost model | effect demand、固定校准、base phase 参数 | duration；供完成/timeout 与 DAG 共用 | 用 target 残差选结构 |
+| DAG patch | source DAG、effect/work/cost plan | target DAG | 拟合系数 |
+| Simulation | target DAG | component timing | 回填模型 |
+| Evaluation | 已完成预测、target profile | score | 补采、构模、重预测 |
 
-依赖始终单向。effect planner 不读 target duration；cost model 不决定 carrier；patcher 不估计系数；simulator 不回填模型。
+预测只接收 source manifest、target config 和已建模型。target profile、target structure oracle、target cost 与 E2E 只属于 evaluator。
 
-## 3. 核心概念
+已实际验证 TP=2→TP=2 和 TP=4→TP=4 的新 workload/HiCache 配置预测与独立评分，未实现 TP=2→TP=4 的跨 rank 扩图。
+更换 TP 属于更换参数环境，需要该环境的 base profiles 和物理/固定校准；不能直接把 TP2 成本参数用于 TP4。
+运行成功不等于全部精度门槛通过，具体覆盖与限制见 [泛化结果](validation/hicache_validation.md#10-09-14-新-workload--新配置--tp4-泛化结果)。
 
-### 3.1 Source DAG
-
-Source DAG 来自一个真实 profile cell。它保留 source 的 CPU/GPU/NPU 执行、依赖关系和当前尚未建模的 phase context。
-cross prediction 不是复制 target DAG，而是在 source DAG 上应用 target effect/cost plan。
-
-### 3.2 Target effect plan
-
-effect plan 由 source 中与目标配置无关的事实和 target HiCache 配置共同推导。它描述：
-
-- effect 类型：prefetch、loadback、device-to-host commit、host-to-storage commit、capacity/control；
-- operation/page/byte 数量；
-- resource scope/lane；
-- consumer 与 logical order。
-
-target profile 中观测到的 I/O 结构只用于 score-only 比较，不参与预测结构生成。
-异步 I/O readiness 只读取共享 calibration 派生的 `io_planning` 速率；这些速率不乘 selected-base cost scale。
-
-### 3.3 Direct cost plan
-
-cost plan 为 effect plan 中需要落地的 I/O/control operation 提供微秒 duration。当前输入边界是：
-
-- 共享 physical/runtime calibration；
-- 选定 base 的三个 workload observation；
-- effect 的 direction、bytes、pages、operation count 和资源语义。
-
-禁止输入 target E2E、target score duration、config/workload/cell ID。当前实现的公式、计时边界、参数估计表和可辨识性决定见
-`docs/hicache_io_cost_model.md`。
-
-### 3.4 Oracle-cost replay
-
-oracle-cost replay 是 Debug 诊断，不是预测模型。它保持 source DAG 和预测 target I/O 结构不变，只把同一 effect 的 cost
-替换为 target-observed Direct cost，用于回答两个问题：
-
-1. 结构、operation shape 和 patch 是否正确；
-2. model-cost 与 oracle-cost 的差异经过同一 DAG 后造成多少隔离 E2E 误差。
-
-它不使用 target E2E，也不获得泛化成绩。
-
-## 4. 容器和构建
-
-所有建模动作通过 modeling image 执行：
-
-```bash
-docker compose -f docker/compose/inference.yml build modeling
-```
-
-构建 TraceGraph：
-
-```bash
-scripts/run.sh modeling -- bash -lc '
-  cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF &&
-  cmake --build build/modeling/trace_graph-release --target trace_graph -j2
-'
-```
-
-需要 structure/oracle 诊断时构建 validation binary：
-
-```bash
-scripts/run.sh modeling -- bash -lc '
-  cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=ON &&
-  cmake --build build/modeling/trace_graph-validation --target trace_graph -j2
-'
-```
-
-Release 只链接 DAG、HiCache business module、patch 和 simulator。validation 额外链接 compact model summary 与 oracle replay。
-
-## 5. 公共入口
-
-建模只有一个公共 shell 入口：
+## 3. 唯一公开入口
 
 ```bash
 scripts/model.sh --help
 ```
 
-它包含五个动作：
+正式用户流程由三个动作组成：
 
-- `build-dag`：从任意受支持 framework 的 profile manifest 构图并仿真；
-- `calibrate-hicache`：采集 physical 或 runtime DMA calibration；
-- `build-hicache-model`：用共享 calibration 和一个 base 的三个 workload 估计 compact cost 系数；
-- `predict-hicache`：只用 source manifest、显式 target 配置和 I/O model 执行正式预测；
-- `evaluate-hicache`：可选地读取 target profile，对正式 predictor 的结果评分。
+```text
+build-dag -> prepare-hicache -> evaluate-hicache
+```
 
-### 5.1 Framework-neutral DAG
+以下动作是同一流程的可独立排查阶段，不构成另一套产品路径：
+
+- `calibrate-hicache physical|runtime-dma`
+- `build-hicache-model`
+- `predict-hicache`
+
+不存在单独的 phase calibration 命令、旧模型版本转换、target-gap candidate loop 或“评分时重新预测”入口。
+
+## 4. 构建普通 DAG
+
+SGLang 和 KTransformers 都使用：
 
 ```bash
 scripts/model.sh build-dag \
@@ -134,214 +73,217 @@ scripts/model.sh build-dag \
   --output-dir <dag-output>
 ```
 
-该入口使用 Release backend，只构图和 simulation。`--config <runner_config.json>` 仅用于精确重放 workflow 已生成的 cell。
+该动作不需要 HiCache model。对 KTransformers 调用 HiCache prediction 会返回 capability 错误，而不是伪造空 HiCache 结果。
 
-### 5.2 构建 one-base model
+## 5. 一个 base 组
 
-physical calibration 只保存四类 service 曲线、两个 control 标量和 resource lane，不再生成可直接预测的“无 base model”。
-已有 compact calibration 与 C5 base observation 可直接构建一套不携带 config identity 的系数：
+一个组描述：一个 base config、该 base 的 workload profiles、一份平台物理校准、一份固定校准以及要预测的 target config。最小形态：
 
-```bash
-scripts/model.sh build-hicache-model \
-  --calibration-report data/calibration/hicache_io_qwen3_32b_tp2/calibration_report.json \
-  --base-observations data/modeling_inputs/hicache/C5_observations.json \
-  --output-dir <c5-model-output>
+```json
+{
+  "profile_suite": "configs/experiments/hicache_manual_workload/profiling_full_dag_replay.json",
+  "base_config": "<base-id>",
+  "workload_ids": ["<w1>", "<w2>", "<w3>"],
+  "base_manifests": ["<base-w1-manifest>", "<base-w2-manifest>", "<base-w3-manifest>"],
+  "target_configs": ["<target-a>", "<target-b>"],
+  "physical_calibration": {
+    "report": "<physical-report>",
+    "measurement_sources": ["<original-measurement>"],
+    "measurement_description": "Target-independent platform primitives."
+  },
+  "fixed_calibration_manifests": ["<page-low-repeat-1>", "<page-high-repeat-1>"],
+  "budget": {
+    "wall_seconds": 0,
+    "server_starts": 0,
+    "requests": 0,
+    "tokens": 0,
+    "repeats": 1
+  },
+  "output_dir": "data/modeling_runs/<group>"
+}
 ```
 
-fresh physical capture 使用：
+`repeats` 是每个物理 page 端点所需的成功 profile 数。显式 manifests 可以满足它；不足时只有在剩余总预算内才原样补采。失败和无效
+trace 同样计入 wall/start/request/token 预算。
 
-```bash
-scripts/model.sh calibrate-hicache physical \
-  --output-dir <calibration-output> \
-  --model-config <model-config.json> \
-  --tensor-parallel-size 2 \
-  --storage-dir <temporary-storage-dir> \
-  --runtime-dma-report <isolated-runtime-dma-report.json> \
-  --concurrent-runtime-dma-report <tp-runtime-dma-report.json> \
-  --control-primitives <snapshot-free-control-primitives.json>
+缺 base profile 时可另外声明 `base_capture_budget` 和 `forced_token_bundle`。缺物理数据时可声明：
+
+```json
+{
+  "physical_capture": {
+    "page_token_sizes": [32, 64, 128],
+    "devices": [2, 3],
+    "cpu_sets": "<rank-0-cpus>|<rank-1-cpus>",
+    "budget": {
+      "wall_seconds": 900,
+      "container_starts": 2,
+      "logical_io_bytes": 100000000000
+    }
+  }
+}
 ```
 
-`control-primitives` 只有 `prefetch_zero_payload_us_per_operation` 和 `load_us_per_page` 两个业务标量；raw profile 的身份元数据、
-pressure/completion surface 都不进入最终 calibration report。
+`page_token_sizes` 是部署平台的采样域，必须显式给出，不能从 `target_configs` 推导。设备与 CPU 集合应匹配该 base 的 TP/资源环境。
 
-### 5.3 正式 Direct prediction
+## 6. 准备、构模和预测
+
+```bash
+scripts/model.sh prepare-hicache --group <group_request.json>
+```
+
+它严格单向执行：
+
+1. 准入或在独立预算内采集缺失 base profiles；
+2. 准入或采集 target-independent physical calibration；
+3. 生成一个固定 workload，在物理域最小/最大 page 端点原样采集到声明重复数；
+4. 提取 base 和固定校准 observations；
+5. 构建一个 HiCache I/O/control + phase model；
+6. 用该模型和每个显式 target config 预测全部 source workload。
+
+不会执行 `target requirements -> gap -> candidate -> refit` 循环。target 不受支持或结果不够准时，输出 limitation；它不会回到采集器改变
+固定 workload。
+
+只检查输入和 readiness：
+
+```bash
+scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
+```
+
+只准备数据、不构模和预测：
+
+```bash
+scripts/model.sh prepare-hicache --group <group_request.json> --calibration-only
+```
+
+源码或原 trace 有实质变化时可用 `--refresh-observations`。项目不通过 schema version、文件摘要、runner hash 或冻结副本自动判断代码是否变化。
+
+独立重建模型：
+
+```bash
+scripts/model.sh build-hicache-model --group <group_request.json>
+```
+
+输出：
+
+```text
+<group>/
+  observations.json
+  calibration_plan.json
+  hicache_io_model.json
+  phase_calibration.json
+  model_build_summary.json
+```
+
+`ready` 只表示参数可辨识且合同完整，不表示 target 精度通过。summary 中的 `target_inputs` 和 `target_score_inputs` 必须为空。summary 还应
+保留物理测量环境和 I/O 观测域；预测超出固定校准调用大小时标记为超域，而不是隐式改变公式。
+
+## 7. 独立预测
 
 ```bash
 scripts/model.sh predict-hicache \
-  --source-manifest <source/profile_manifest.json> \
-  --target-config configs/modeling/hicache_target_example.json \
-  --hicache-io-model <one-base-model.json> \
-  --output-dir <output-dir> \
-  --trace-threads 4 \
-  --trace-file-threads 4
+  --source-manifest <base/profile_manifest.json> \
+  --target-config <target.json> \
+  --hicache-io-model <hicache_io_model.json> \
+  --output-dir <prediction-output>
 ```
 
-`target-config` 是 `{name?, hicache}` 对象，只描述 policy/capacity；它不能携带 I/O cost、target operation observation
-或 target E2E。正式 prediction 不读取 target profile。多个 source workload 或 target config 可以重复传参。
+`target.json` 只含 `{name?, hicache}` 配置。多个 source 或 target 可重复传参。`--max-predictions` 只用于开发期挑少量语义关键 cell，
+不能改变模型。
 
-### 5.4 可选 observed-matrix evaluation
+默认 `--diagnostics off` 保留评分必需的 compact summary；`--diagnostics full` 才保留逐操作 row、C++ model summary 和成功日志。
+diagnostics 不改变预测语义。
 
-以 C5 为 base 时，target 是另外四个配置，workload 是 W1/W2/W3：
-
-```bash
-scripts/model.sh evaluate-hicache \
-  --profile-run-dir <5x3-profile-suite> \
-  --source-configs C5_writeback_long_gate_timeout \
-  --hicache-io-model <c5-one-base-model.json> \
-  --output-dir <output-dir> \
-  --model-run-jobs 4 \
-  --trace-threads 4 \
-  --trace-file-threads 4
-```
-
-matrix 的维度来自输入数据，不由 predictor 固定。当前 5×3 资产下，一个 base 对其他配置形成 12 个 cross，最终五个 base
-形成 60 个 cross；这些数字只属于当前评分实验。开发时用 `--target-configs`、`--inputs` 或 `--max-predictions` 选择关键 cell。
-evaluation 在相同 predictor 完成后才读取 target shape，不能回写 I/O model。
-多 base 最终评分重复 `--base-io-model <base>=<model.json>`；需要 oracle-cost 时另外提供一个
-score-only manifest：
-
-```bash
-scripts/model.sh evaluate-hicache \
-  --profile-run-dir <5x3-profile-suite> \
-  --base-io-model <base-1>=<model-1.json> \
-  --base-io-model <base-2>=<model-2.json> \
-  --oracle-scores <score-only-manifest.json> \
-  --diagnostics full \
-  --output-dir <output-dir>
-```
-
-manifest 按 base 列出 `base_observations` 和 `target_costs`。它是 evaluator 的数据驱动输入，不是
-predictor 合同。
-
-### 5.5 Dry-run 和 diagnostics
-
-```bash
-scripts/model.sh predict-hicache <options> --dry-run
-scripts/model.sh predict-hicache <options> --diagnostics full
-scripts/model.sh evaluate-hicache <options> --diagnostics full
-```
-
-默认 diagnostics 为 off。`full` 才保留每 cell Direct ledger、C++ model summary 和成功日志；它不改变 prediction 语义。
-
-## 6. 产物
-
-默认输出：
+主要产物：
 
 ```text
-<output>/
-  preflight_summary.json
+<prediction-output>/
   workflow_summary.json
-  model_runs/<id>/
+  preflight_summary.json
+  artifacts/model_run_plan.json
+  model_runs/<cell>/
     runner_config.json
     cpp_model_config.json
     run_summary.json
-  artifacts/model_run_plan.json
 ```
 
-`workflow_summary.json` 是第一阅读入口。默认不保留逐阶段 wall-clock、逐文件 trace timing、完整 proof row 或 model summary。
+## 8. 独立评分
 
-`--diagnostics full` 额外保留：
-
-```text
-artifacts/debug_rows/<model-run-id>.json
-model_runs/<id>/model_summary.json
-model_runs/<id>/model.log
-```
-
-### 6.1 Oracle replay
-
-oracle-cost 不再有独立 runner CLI。它由统一 evaluator 在普通 prediction 和 structure score 完成后执行：
+只有所有选中的预测完成后，才允许打开 target profiles：
 
 ```bash
 scripts/model.sh evaluate-hicache \
-  <matrix-and-base-model-options> \
-  --oracle-scores <score-only-manifest.json> \
-  --diagnostics full
+  --prediction-dir <base-a-predictions> \
+  --prediction-dir <base-b-predictions> \
+  --profile-run-dir <target-profile-suite> \
+  --output-dir <separate-score-output>
 ```
 
-ledger 数量由 score bundle 决定。base observations 提供当前 selected base 的 source-self Direct 总量，用于计算 target delta；
-target bundle 只在 prediction 完成后参与评分。`--max-predictions 1` 可用于开发烟测；不设限时每个
-base 必须与自身 score bundle 的全部 cross cell 一一对应。最终紧凑摘要为：
+evaluator 不接收模型或采集预算，不执行普通 prediction，也不回写任何参数。多 base 结果同时给出总面板和 `by_source`，不能用总均值隐藏
+失败 base。
 
-```text
-artifacts/oracle_cost_replay/<base>/summary.json
-```
-
-catalog、override 和 C++ replay output 都是 worker 临时文件。
-
-## 7. 结果判读
-
-Direct workflow 先看：
-
-- preflight ready；
-- model run usable；
-- predicted effect/patch structure ready；
-- topology valid；
-- required cost ready；
-- `component=hicache_direct`，其他 component deferred。
-
-oracle summary 再看：
-
-- Direct total WAPE/P90、delta weighted L1 和大变化方向；
-- structure binding ready 与 effect/cost-response 数量；
-- model replay 与 oracle replay 的隔离误差。
-
-隔离误差的分母是 target Direct `service + control`，不是完整 target E2E。当前 gate 是 WAPE ≤3%、P90 ≤5%。单 cell
-只能提供局部证据，不能宣布完整 gate PASS。
-
-## 8. Component ownership
-
-| Component | 当前状态 | 本轮评分 |
-| --- | --- | --- |
-| `hicache_direct` | implemented | 是 |
-| `gap` | deferred | 否 |
-| `prefill` | deferred | 否 |
-| `decode` | deferred | 否 |
-| probe snapshot overhead | 已从默认采集移除 | 否 |
-
-同骨架 replay 的 model/oracle 差分天然排除了 source 固定的 phase/gap；完整 source-to-target E2E 则仍包含这些未建模项，不能与
-Direct score 混报。
-
-## 9. KTransformers
-
-KTransformers 的 profile manifest 只启用实际存在的 channel 和 hook，并显式记录 framework。它直接使用共享 `build-dag`：
+显式结构/cost sensitivity 诊断：
 
 ```bash
-scripts/model.sh build-dag \
-  --profile-manifest <ktransformers-run>/profile_manifest.json \
-  --output-dir <dag-output>
+scripts/model.sh evaluate-hicache \
+  --prediction-dir <predictions-made-with-full-diagnostics> \
+  --profile-run-dir <target-profile-suite> \
+  --output-dir <oracle-score-output> \
+  --oracle-cost-replay \
+  --oracle-max-runs 1
 ```
 
-预期 `module_results` 不含 HiCache module；source DAG 和 simulation 仍须成功。对 KTransformers 调用 HiCache prediction 会返回明确
-capability 错误。其 image、installer、submodule、compose service 和专用 LD_PRELOAD hook 都属于保留能力。
+oracle replay 保持已经预测出的 operation/effect plan，只替换 target-observed cost。默认评分不生成或保存 oracle cost 数组；它验证
+操作级绑定与 cost sensitivity，不证明 source 骨架和 target 到达时序完全相同，诊断结果不计作泛化精度。
+每个选中 cell 先执行一次相同预测成本回放，计时、ownership、关键路径及节点/边计数不一致就停止该 cell 诊断。
+通过后才执行五种 target 成本变体；`--oracle-max-runs 1` 是每 base 一个 cell、六次回放，不是只运行一次 C++。
 
-## 10. 代码所有权
+## 9. Component 与结果解释
+
+| Component | 当前状态 | 正式评分 |
+| --- | --- | --- |
+| HiCache I/O/control（内部 `hicache_direct`） | implemented | service/control、delta、按 kind、不抵消分项 |
+| `prefill` | implemented | compute、delta |
+| `decode` | implemented | compute、delta |
+| residual CPU gap | deferred | 排除 |
+| Python snapshot overhead | 默认采集已移除 | 排除 |
+
+gap-excluded scope 是 HiCache I/O/control + Prefill + Decode 在 target DAG 上的组合关键路径，不是完整应用 E2E。formal window 是 workload 语义边界，
+不按 config/cell 写死。
+它保留这些组件的 service、compute/collective、submit/显式 control CPU 与必要资源依赖，
+排除 residual gap 和未归入组件的 wrapper/probe 成本；存储 service 仍含函数内部可能的等待。
+因此不要把该指标描述为“完整墙钟仅减去所有 CPU 空白”。
+
+逻辑命中、容量策略和 operation 身份先由 source facts 与 target config 决定；但 timeout 前完成了多少 batch 是时间因果问题，因此状态推进和
+最终 DAG 必须使用同一个 service cost。这里不是用 cost 反向拟合结构，而是避免用两套互相矛盾的时钟判断同一个 deadline。
+
+## 10. 容器与构建
+
+- SGLang 推理、profiling、physical/runtime-DMA：`sglang` image；
+- KTransformers 推理/profiling：`ktransformers` image；
+- observation、DAG、构模、预测、评分：`modeling` image。
+
+Release 构建：
+
+```bash
+scripts/run.sh modeling -- bash -lc \
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
+```
+
+需要 oracle/详细诊断时另建 `TRACE_GRAPH_DEBUG=ON` 的 validation binary。Debug 只增加证据，不改变 business model。
+
+## 11. 代码所有权
 
 | 路径 | 职责 |
 | --- | --- |
-| `scripts/model.sh` | 唯一 modeling shell 入口 |
-| `scripts/internal/markov_internal/modeling_workflow/` | profile selection、plan、execution、summary |
-| `modeling_workflow/calibration/` | 物理 service/control calibration 的采集与紧凑投影 |
-| `modeling_workflow/io_model_builder.py` | 共享 calibration + 一个 base 的 observation 参数估计 |
-| `modeling_workflow/prediction/` | source-only HiCache request 与 compact ledger |
-| `modeling_workflow/evaluation/` | observed-target score-only orchestration |
-| `modeling_workflow/validations/final_dag/` | score-only target shape comparison |
-| `modeling_workflow/validations/hicache/oracle_cost_replay/` | Debug oracle replay |
-| `src/modeling/trace_graph/src/core/` | source DAG build |
-| `src/modeling/trace_graph/src/modules/hicache/model/` | effect planning |
+| `scripts/internal/markov_internal/modeling_workflow/group.py` | one-base 输入与预算合同 |
+| `base_capture.py`、`physical_capture.py`、`capture.py` | 三类独立、串行、有限预算采集 |
+| `fixed_calibration.py` | 唯一固定 workload 生成与重复计划 |
+| `observations.py`、`coverage.py`、`stability.py` | source-only 提取和 readiness |
+| `io_model_builder.py`、`control_cost.py`、`phase_calibration.py` | 唯一数值模型 |
+| `prediction/`、`execution/` | source-to-target DAG prediction |
+| `evaluation/`、`validations/` | score-only 与显式 oracle 诊断 |
+| `src/modeling/trace_graph/src/modules/hicache/model/` | target effect/phase work planning |
 | `src/modeling/trace_graph/src/modules/hicache/patch/` | cost materialization 与 atomic patch |
 | `src/modeling/trace_graph/src/simulation/` | topological simulation |
 
-## 11. 当前结论与后续顺序
-
-工作流瘦身、I/O cost 简化、C1/C3/C5 换 base 外推和五 base 60 cross 已完成。结构 60/60 通过，
-source-invariance 15/15 通过；
-数值结论为 `MODEL_LIMITATION`，因为 C2/C4 自身三个 workload 没有覆盖之后预测所需的所有
-positive-payload service family。
-
-后续顺序是：
-
-1. 定义一个信息完备的 single-base 观测合同，或用新的独立 runtime calibration 覆盖缺失 family；
-2. 不改 target-independent 结构 planner，只重新验证 cost identifiability 和 60-cell 数值；
-3. 固定 Direct effect/cost 后，分别实现 `GapModel`、`PrefillModel` 和 `DecodeModel`；
-4. 最后组合完整 E2E，继续保留 component attribution。
+当前实现和数据资产见 `docs/work_progress.md`。

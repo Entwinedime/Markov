@@ -2,18 +2,20 @@
 
 本项目从真实推理运行中采集 trace，构建可仿真的 DAG，并对配置变化进行图变换和性能预测。
 
-当前建模主线是 SGLang HiCache 的直接 I/O 与 control 变化：
+当前建模主线是 SGLang HiCache 的 I/O/control 与 Prefill/Decode 变化：
 
 ```text
 profile manifest
   -> source DAG
   -> target HiCache effect plan
-  -> I/O cost plan
+  -> target phase work plan
+  -> HiCache I/O/control + phase cost plan
   -> DAG patch
   -> topological simulation
 ```
 
-`gap`、`prefill` 和 `decode` 不属于当前 HiCache direct 模型，结果和评分必须单独列出这些 component。
+HiCache I/O/control（内部 scope ID 为 `hicache_direct`）、`prefill` 和 `decode` 分别拥有自己的工作量与 cost；`gap` 仍未建模。结果同时报告独立 component 和排除
+residual gap 的组合 scope，不能让一个 component 的系数吸收另一个 component 的误差。
 
 ## 公开入口
 
@@ -71,18 +73,20 @@ profiling 与 modeling 的唯一正式交接面是每个 run 的 `profile_manife
 scripts/model.sh --help
 ```
 
-主要动作是：
+正式 HiCache 动作是：
 
 ```text
 build-dag
-calibrate-hicache physical
-calibrate-hicache runtime-dma
-build-hicache-model
-predict-hicache
+prepare-hicache
 evaluate-hicache
 ```
 
-所有 modeling 动作都在同一个 modeling 容器中完成；批量预测不会为每个 cell 再启动一个嵌套容器。
+`prepare-hicache` 按 `base profiles → target-independent physical calibration → 固定小型 calibration →
+唯一 cost model → 全部 target prediction` 单向执行。固定 calibration 是同一 workload 在平台 page 域两端的采集，允许原样重复；
+它不查看 target 列表、target trace 或评分。`build-hicache-model`、`predict-hicache` 和
+`calibrate-hicache physical/runtime-dma` 是该流程的可独立排查阶段，不是另一套产品流程。
+
+除实际 SGLang/物理采集外，modeling 动作都在同一个 modeling 容器中完成；批量预测不会为每个 cell 再启动一个嵌套容器。
 
 SGLang 与 KTransformers 共用 framework-neutral DAG 入口：
 
@@ -95,7 +99,14 @@ scripts/model.sh build-dag \
 它只构图和仿真，不要求 HiCache。KTransformers manifest 显式记录 framework，当前提供 LD_PRELOAD CPU trace；
 HiCache prediction 只接受 SGLang source，并会对其他 framework 给出 capability 错误。
 
-正式预测只需要 source manifest、显式 target HiCache 配置和 one-base I/O model：
+一个 base 组的正式入口是：
+
+```bash
+scripts/model.sh prepare-hicache --group <group_request.json>
+```
+
+它需要该 base 的三个 profile、固定校准 profile 和平台物理校准；缺失且声明了预算时会采集，否则只报告缺项。单独重放已建模型时只需要
+source manifest、显式 target HiCache 配置和 one-base HiCache model：
 
 ```bash
 scripts/model.sh predict-hicache \
@@ -106,9 +117,20 @@ scripts/model.sh predict-hicache \
 ```
 
 真实 target profile 不属于该命令。5×3/12/60-cell 和 target oracle 只通过 `evaluate-hicache` 进入评分流程。
-oracle-cost 诊断在 `evaluate-hicache --diagnostics full` 后显式增加
-`--oracle-scores <manifest.json>`。manifest 按 base 列出 base observation 和 target score-only 输入，
-同一次 matrix 评分可覆盖多个 base；这些输入不会参与参数估计。
+已有预测使用只评分模式，不再执行模型：
+
+```bash
+scripts/model.sh evaluate-hicache \
+  --prediction-dir <prediction-output> \
+  --profile-run-dir <target-profile-suite> \
+  --output-dir <separate-score-output>
+```
+
+可重复传入 `--prediction-dir` 评分多个 base；所有选中预测完成后才读取 target，分组报告误差。此模式不接受模型/补采输入。
+旧的“评分时重新预测”矩阵路径已删除。需要 oracle-cost 诊断时，预测阶段使用 `--diagnostics full` 保留操作详情，
+再给上述评分命令显式增加 `--oracle-cost-replay`；可用 `--oracle-max-runs 1` 限制每组诊断一个格。
+回放直接使用本次评分提取的 target 操作成本和原预测中的 base 观测，不再手工提供另一份成本文件。
+回放另记费用与状态，不参与模型估计或覆盖正式预测结果。
 
 ## 可选 DAG 变换
 
@@ -150,7 +172,9 @@ scripts/run.sh modeling -- bash -lc \
 - `docs/project_constraints.md`：不可违反的项目边界；
 - `docs/profiling_development.md`：profiling 结构和采集合同；
 - `docs/modeling_development.md`：DAG、HiCache 模型与 workflow；
-- `docs/hicache_io_cost_model.md`：I/O cost 的变量、参数和预测方式；
-- `docs/validation/`：当前验证结果和已知限制。
+- `docs/hicache_io_cost_model.md`：HiCache I/O/control 与 phase cost 的变量、参数和预测方式；
+- `docs/validation/hicache_validation.md`：结构、HiCache I/O/control、phase cost、oracle 结果和已知限制；
+- `docs/work_progress.md`：重构状态、当前数据资产和下一阶段。
 
-`data/` 中的大部分内容是可再生运行资产。删除前必须核对 retention manifest，不能清理最终回归仍需使用的数据。
+`data/` 中的大部分内容是可再生运行资产。清理前按 `docs/work_progress.md` 的资产表确认正式 base、固定校准、物理校准、
+prediction 与 score 资产；项目不使用内部版本号、文件摘要或冻结副本管理当前实现。
