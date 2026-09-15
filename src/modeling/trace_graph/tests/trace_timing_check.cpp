@@ -147,6 +147,82 @@ void runtime_diagnostics_do_not_add_or_remove_work() {
     require(simulation::run_gap_excluded_topological_simulation(graph).e2e_us == 20, "response boundaries do not turn gap into execution cost");
 }
 
+void event_wait_follows_record_at_host_submission() {
+    auto record = event("EVENT_RECORD", "900", "7", 1000, 0, "Kernel");
+    record.ts_submicro_ns = 900;
+    record.set_arg("Physic Stream Id", "7"); record.set_arg("connection_id", "first");
+    auto host_record = event("AscendCL@aclrtRecordEvent", "20", "21", 10, 1);
+    host_record.set_arg("connection_id", "first"); host_record.set_arg("Event Id", "handle");
+    auto later_record = record; later_record.ts = 900; later_record.tid = "9";
+    later_record.set_arg("Physic Stream Id", "9"); later_record.set_arg("connection_id", "later");
+    auto later_host = host_record; later_host.ts = 30; later_host.set_arg("connection_id", "later");
+    auto wait = event("EVENT_WAIT", "900", "8", 100, 900, "Kernel");
+    wait.ts_submicro_ns = 100; wait.dur_submicro_ns = 900;
+    wait.set_arg("Physic Stream Id", "8"); wait.set_arg("connection_id", "wait");
+    auto host_wait = event("AscendCL@aclrtStreamWaitEvent", "20", "21", 20, 1);
+    host_wait.set_arg("connection_id", "wait"); host_wait.set_arg("Event Id", "handle");
+    core::DagGraph graph({record, host_record, later_record, later_host, wait, host_wait}, 0);
+    auto index = core::create_node_index(graph);
+    core::add_event_wait_edges(graph, index);
+    require(std::ranges::any_of(graph.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 4 && edge.kind == core::DagEdgeKind::Sync; }),
+            "wait captures the record submitted before it, even at a fractional device completion boundary");
+    require(std::ranges::none_of(graph.edges(), [](const auto& edge) { return edge.src == 2 && edge.dst == 4; }),
+            "a later host record cannot replace the event already captured by a wait");
+    require(graph.event_for_node(4).ts == wait.ts && graph.event_for_node(4).dur == wait.dur,
+            "binding must not shift observed wait timestamps to resolve ordering");
+    core::finalize_sync_nodes(graph, index);
+    require(graph.node(4).duration == 10, "a proven wait retains the existing bound-sync cost rule");
+    core::DagGraph unresolved({wait, host_wait}, 0);
+    auto missing = core::create_node_index(unresolved);
+    core::add_event_wait_edges(unresolved, missing);
+    core::finalize_sync_nodes(unresolved, missing);
+    require(unresolved.node(0).duration == wait.dur, "without a wait dependency the observed blocking cost must not disappear");
+
+    auto overlapping_host = host_record; overlapping_host.dur = 15;
+    core::DagGraph overlapping({record, overlapping_host, wait, host_wait}, 0);
+    auto ambiguous = core::create_node_index(overlapping);
+    core::add_event_wait_edges(overlapping, ambiguous);
+    core::finalize_sync_nodes(overlapping, ambiguous);
+    require(overlapping.active_edge_count() == 0 && overlapping.node(2).duration == wait.dur,
+            "overlapping host calls do not establish which event record was captured");
+
+    auto concurrent_record = host_record; concurrent_record.dur = 25;
+    auto later_wait = host_wait; later_wait.ts = 40;
+    core::DagGraph concurrent({record, concurrent_record, later_record, later_host, wait, later_wait}, 0);
+    auto concurrent_index = core::create_node_index(concurrent);
+    core::add_event_wait_edges(concurrent, concurrent_index);
+    require(concurrent.active_edge_count() == 0, "overlapping record calls do not prove their capture order even after both return");
+
+    auto same_stream_wait = wait; same_stream_wait.tid = "7"; same_stream_wait.ts = 1001;
+    same_stream_wait.set_arg("Physic Stream Id", "7");
+    core::DagGraph same_stream({record, host_record, same_stream_wait, host_wait}, 0);
+    auto same_index = core::create_node_index(same_stream);
+    core::add_event_wait_edges(same_stream, same_index);
+    require(std::ranges::any_of(same_stream.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 2; }),
+            "same-stream capture must not fall back to an older record from another stream");
+
+    auto host_sync = host_wait; host_sync.name = "AscendCL@aclrtSynchronizeEvent";
+    core::DagGraph cpu_sync({record, host_record, later_record, later_host, host_sync}, 0);
+    auto sync_index = core::create_node_index(cpu_sync);
+    core::add_event_wait_edges(cpu_sync, sync_index);
+    core::add_event_sync_edges(cpu_sync, sync_index);
+    require(std::ranges::any_of(cpu_sync.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 4; }),
+            "host event synchronization also waits for the record captured at its own call");
+
+    same_stream_wait.ts = 1000; same_stream_wait.ts_submicro_ns = 950; same_stream_wait.dur = 10;
+    auto fractional = core::DagBuilder(1).build({same_stream_wait, record, host_record, host_wait}, 0);
+    require(simulation::run_topological_simulation(fractional).processed_nodes == fractional.node_count(),
+            "same-microsecond device order must retain the measured fractional timestamps");
+
+    auto child = event("short CPU child", "20", "21", 100, 0); child.ts_submicro_ns = 800;
+    auto fragment = event("CPU self-time fragment", "20", "21", 100, 599);
+    core::DagGraph coarse_cpu({child, fragment}, 0);
+    auto coarse_index = core::create_node_index(coarse_cpu);
+    core::add_sequential_edges(coarse_cpu, coarse_index);
+    require(coarse_cpu.edges().size() == 1 && coarse_cpu.edges().front().src == 0 && coarse_cpu.edges().front().dst == 1,
+            "integer-partitioned CPU fragments retain their established child/self ordering");
+}
+
 void observed_cpu_gap_split_preserves_consumers() {
     const auto source = event("source", "1", "1", 100, 10);
     const auto target = event("target", "1", "1", 200, 10);
@@ -270,6 +346,7 @@ int main() {
     worker_runtime_keeps_submission_and_device_dependencies();
     device_clock_overlap_does_not_reverse_submission();
     event_binding_selects_cpu_role_not_first_timestamp();
+    event_wait_follows_record_at_host_submission();
     queue_wait_follows_task_arrival();
     runtime_diagnostics_do_not_add_or_remove_work();
     observed_cpu_gap_split_preserves_consumers();
