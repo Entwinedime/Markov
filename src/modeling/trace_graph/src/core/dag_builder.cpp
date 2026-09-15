@@ -107,7 +107,8 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     for (auto & event : events) {
         // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
-            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load") {
+            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.cpu_collective"
+                || event.name == "runtime.hicache.layer_waits") {
                 split.runtime_observations.push_back(std::move(event));
                 continue;
             }
