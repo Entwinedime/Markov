@@ -298,6 +298,45 @@ void instantaneous_cpu_observation_preserves_time() {
     require(simulation::run_topological_simulation(with_receive).e2e_us == before, "receive start and dispatch points preserve the original timeline");
 }
 
+void cache_facts_do_not_create_device_barriers() {
+    auto first = event("first host work", "1", "1", 0, 5);
+    auto submit = event("next submission", "1", "1", 110, 1, "enqueue");
+    submit.set_arg("correlation_id", "next");
+    auto query = event("unrelated background query", "1", "2", 105, 1);
+    auto background = event("background kernel", "1", "10", 10, 50, "Kernel");
+    background.set_arg("Physic Stream Id", "10");
+    auto compute = event("request kernel", "1", "11", 120, 10, "Kernel");
+    compute.set_arg("Physic Stream Id", "11");
+    compute.set_arg("correlation_id", "next");
+    const auto fact = [](const char* role, const char* request, uint64_t ts) {
+        auto value = event("cache fact", "1", "1", ts, 0);
+        value.source_channel = core::TraceSourceChannel::PythonProbe;
+        value.set_arg("fact", "{}");
+        value.set_arg("fact.class", "workload_identity");
+        value.set_arg("fact.role", role);
+        value.set_arg("request_id", request);
+        value.set_arg("lifecycle_kind", "finished");
+        return value;
+    };
+    auto graph = core::DagBuilder(1).build({first, submit, query, background, compute,
+        fact("cache_lookup_input", "one", 5), fact("cache_lifecycle_commit", "one", 80),
+        fact("cache_lookup_input", "two", 100)}, 0);
+    require(graph.hicache_fact_events().size() == 3 && graph.node_count() == 5, "cache facts remain metadata, not execution nodes");
+    const auto find = [&](const char* name) {
+        return std::ranges::find_if(graph.nodes(), [&](const auto& node) { return graph.event_for_node(node.id).name == name; })->id;
+    };
+    const auto request = find("request kernel"), unrelated = find("background kernel");
+    (void)simulation::run_topological_simulation(graph);
+    const auto before = graph.node(request).completion_time;
+    graph.set_node_duration(unrelated, 1000);
+    (void)simulation::run_topological_simulation(graph);
+    require(graph.node(request).completion_time == before,
+            "cache lookup facts cannot turn unrelated streams and background threads into a request barrier");
+    graph.set_node_duration(find("next submission"), 11);
+    (void)simulation::run_topological_simulation(graph);
+    require(graph.node(request).completion_time == before + 10, "real submission dependencies remain active");
+}
+
 void serial_http_clients_follow_responses_not_background_work() {
     core::DagGraph graph;
     const auto boundary = [&](const char* stage, const char* role, const char* id, uint64_t ts) {
@@ -427,6 +466,51 @@ void queue_wait_follows_task_arrival() {
             "unmatched queue events keep their observed gap");
 }
 
+void cpu_queue_order_follows_target_arrivals() {
+    auto a = event("submit A", "1", "1", 0, 20, "enqueue"); a.set_arg("correlation_id", "A");
+    auto b = event("submit B", "1", "2", 0, 60, "enqueue"); b.set_arg("correlation_id", "B");
+    auto first = event("task A first", "1", "3", 25, 4); first.set_arg("correlation_id", "A");
+    auto last = event("task A last", "1", "3", 31, 4); last.set_arg("correlation_id", "A");
+    auto other = event("task B", "1", "3", 65, 15); other.set_arg("correlation_id", "B");
+    auto graph = core::DagBuilder(1).build({a, b, first, last, other}, 0);
+    const auto find = [&](const char* name) {
+        return std::ranges::find_if(graph.nodes(), [&](const auto& node) { return graph.event_for_node(node.id).name == name; })->id;
+    };
+    const auto submit_a = find("submit A"), submit_b = find("submit B");
+    const auto task_a = find("task A last"), task_b = find("task B");
+    // Reuse the graph: each full replay must replace the previous resource order.
+    for (const auto [a_cost, b_cost, a_end, b_end] : {
+            std::tuple{20, 60, 35, 80}, {20, 10, 45, 30}, {100, 10, 115, 30},
+            {20, 20, 35, 55}, {20, 25, 35, 55}, {20, 60, 35, 80}}) {
+        graph.set_node_duration(submit_a, a_cost);
+        graph.set_node_duration(submit_b, b_cost);
+        const auto full = simulation::run_topological_simulation(graph);
+        require(full.cpu_queue_count == 1 && full.cpu_task_count == 2, "continuous worker leaves form two tasks sharing one queue");
+        require(graph.node(task_a).completion_time == static_cast<uint64_t>(a_end)
+                && graph.node(task_b).completion_time == static_cast<uint64_t>(b_end),
+                "FIFO follows target arrivals, preserves internal work, and charges readiness after the worker is free");
+        require(simulation::run_control_topological_simulation(graph).e2e_us == full.e2e_us,
+                "resolved queue order must be represented in the output DAG, not hidden inside simulation");
+    }
+    a.dur = 30;
+    auto overlap = core::DagBuilder(1).build({a, b, first, last, other}, 0);
+    const auto conservative = simulation::run_topological_simulation(overlap);
+    require(conservative.submission_overlap_count == 1 && conservative.submission_overlap_total_us == 5
+            && conservative.submission_overlap_max_us == 5, "return-time approximation must disclose source publication overlap");
+    auto blocked = core::DagBuilder(1).build({a, b, first, last, other}, 0);
+    const auto locate = [&](const char* name) {
+        return std::ranges::find_if(blocked.nodes(), [&](const auto& node) { return blocked.event_for_node(node.id).name == name; })->id;
+    };
+    blocked.add_edge(locate("task B"), locate("task A first"), core::DagEdgeKind::Sync);
+    bool rejected = false;
+    try { (void)simulation::run_topological_simulation(blocked); }
+    catch (const std::runtime_error&) { rejected = true; }
+    require(rejected, "a task blocked on a later task in the same FIFO must not return partial timing");
+    other.set_arg("correlation_id", "missing");
+    auto partial = core::DagBuilder(1).build({a, b, first, last, other}, 0);
+    require(simulation::run_topological_simulation(partial).cpu_queue_count == 0, "a partially identified worker is not silently reordered");
+}
+
 void response_endpoint_preserves_background_resource_dependencies() {
     core::DagGraph graph;
     const auto background = graph.add_synthetic_node({.name = "earlier background work", .duration = 40});
@@ -461,8 +545,10 @@ int main() {
     runtime_diagnostics_do_not_add_or_remove_work();
     observed_cpu_gap_split_preserves_consumers();
     instantaneous_cpu_observation_preserves_time();
+    cache_facts_do_not_create_device_barriers();
     serial_http_clients_follow_responses_not_background_work();
     client_input_reads_only_declared_source_observations();
+    cpu_queue_order_follows_target_arrivals();
     response_endpoint_preserves_background_resource_dependencies();
     std::cout << "Trace timing checks passed\n";
 }
