@@ -26,13 +26,28 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
         return core::checked_add_u64(event.ts, event.dur, "CPU task observation end overflow");
     };
     for (const auto& node : graph.nodes()) {
-        if (!node.active || !node.is_cpu) continue;
+        if (!node.is_cpu) continue;
         lanes[node.lane_id].push_back(node.id);
+        if (!node.active) continue;
         const auto& event = graph.event_for_node(node.id);
         if (event.cat == "enqueue" && !event.arg("correlation_id").empty()) submissions[identity(node.id)].push_back(node.id);
     }
     for (auto& [lane, ids] : lanes) {
         std::ranges::sort(ids, {}, [&](size_t id) { return std::pair{graph.event_for_node(id).ts, id}; });
+        // Task removal changes the queue, not the source-measured ready delay.
+        // Otherwise a removed task's service is charged again as its successor's gap.
+        std::vector<size_t> active_ids;
+        std::vector<uint64_t> observed_previous_ends;
+        uint64_t previous_end = 0;
+        for (const auto id : ids) {
+            if (graph.node(id).active) {
+                active_ids.push_back(id);
+                observed_previous_ends.push_back(previous_end);
+            }
+            previous_end = end(id);
+        }
+        ids = std::move(active_ids);
+        if (ids.empty()) continue;
         std::vector<size_t> producers;
         for (const auto id : ids) {
             const auto found = submissions.find(identity(id));
@@ -48,8 +63,8 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
             const auto submit = producers[begin], first = ids[begin], last = ids[stop - 1];
             const auto start = graph.event_for_node(first).ts;
             if (!seen.insert(submit).second || result.submitted_task[submit] != none
-                || graph.event_for_node(submit).ts > start || (begin && end(ids[begin - 1]) > start)) break;
-            const auto ready = std::max(end(submit), begin ? end(ids[begin - 1]) : uint64_t{0});
+                || graph.event_for_node(submit).ts > start || observed_previous_ends[begin] > start) break;
+            const auto ready = std::max(end(submit), observed_previous_ends[begin]);
             tasks.push_back({first, last, submit, result.queue_count, start > ready ? start - ready : 0, ready > start ? ready - start : 0});
             begin = stop;
         }
