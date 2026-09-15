@@ -335,6 +335,11 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
         auto ownership = source.timing_interval_ownership(*check);
         const auto nodes = explicit_control_nodes(source, ownership);
         if (!nodes.empty()) record.progress_check_cpu_samples_us.push_back(explicit_control_duration(source, nodes));
+        // The fact ends before probe serialization; the scheduler marker encloses
+        // the whole call. Retire that obsolete false check, not just its interior.
+        // Keep calibration samples above restricted to explicit function work.
+        const auto call = source.enclosing_control_interval_ownership(*check, "hicache.control.prefetch_progress");
+        if (call && call->status == "ready") ownership = *call;
         record.completion_wait_owned_node_ids.insert(record.completion_wait_owned_node_ids.end(),
                                                      ownership.owned_node_ids.begin(),
                                                      ownership.owned_node_ids.end());
