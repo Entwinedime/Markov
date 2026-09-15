@@ -132,6 +132,8 @@ Python probe 默认不采集 cache snapshot。早期 snapshot 会遍历并序列
 只记录请求 ID 和区间，不读取 token 数组或序列化正文；无 socket 的非发送 rank 不记录发送成功。
 http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回，不等于客户端已经收到；
 最终 E2E 真值仍来自 bench。它们同属 runtime_diagnostic，不作为额外 DAG 工作重复计时，默认 off 不安装。
+对唯一落在原始 CPU gap 内的 scheduler_send，建图会增加 begin/end 两个零耗时连接点，将原 gap 分段保留。
+重叠、越界、分支或已有时间改写导致无法绑定时不猜测；这些点不能独立决定 E2E，HTTP/客户端完成仍需另行连接和验证。
 
 probe target 声明位于：
 
