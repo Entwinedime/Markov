@@ -27,10 +27,14 @@ struct EffectDescriptor {
 struct OperationEvidence {
     const HiCacheOperationHeader * header = nullptr;
     const std::vector<std::string> * effective_pages = nullptr;
+    const std::vector<std::string> * completed_pages = nullptr;
     const std::vector<std::string> * storage_existing_pages = nullptr;
     const std::vector<std::string> * storage_new_pages = nullptr;
     std::string state;
     bool dependency_required = false;
+    uint64_t policy_wait_duration_us = 0;
+    std::optional<uint64_t> control_host_available_pages;
+    std::optional<uint64_t> service_completion_ts;
 };
 
 std::vector<EffectDescriptor> descriptors_for_role(HiCacheFactRole role) {
@@ -266,6 +270,19 @@ HiCacheTargetEffectState target_state(const HiCacheEffectOpportunity & opportuni
 }
 
 HiCacheEffectBoundary completion_boundary(const HiCacheEffectOpportunity & opportunity, const std::vector<OperationEvidence> & evidence) {
+    const OperationEvidence * latest_service = nullptr;
+    for (const auto & operation : evidence) {
+        if (!operation.service_completion_ts) continue;
+        if (latest_service == nullptr || *operation.service_completion_ts > *latest_service->service_completion_ts)
+            latest_service = &operation;
+    }
+    if (latest_service != nullptr) {
+        return HiCacheEffectBoundary{
+            .kind = "target_service_completion",
+            .epoch = latest_service->header == nullptr ? opportunity.eligibility_boundary.epoch : latest_service->header->complete_epoch,
+            .timestamp_us = *latest_service->service_completion_ts,
+        };
+    }
     const HiCacheOperationHeader * latest = nullptr;
     for (const auto & operation : evidence) {
         if (operation.header == nullptr) continue;
@@ -308,7 +325,7 @@ HiCacheEffectBoundary consumer_boundary(HiCacheEffectType type, const std::vecto
         if (operation.header == nullptr || operation.header->consumer_epoch == 0) continue;
         if (latest_consumer == nullptr || operation.header->consumer_epoch > latest_consumer->consumer_epoch) latest_consumer = operation.header;
     }
-    if (latest_consumer != nullptr) {
+    if (latest_consumer != nullptr && type != HiCacheEffectType::CommitHostToStorage) {
         boundary.epoch = latest_consumer->consumer_epoch;
         boundary.timestamp_us = latest_consumer->consumer_ts;
         boundary.source_fact_role = latest_consumer->consumer_source_fact_role;
@@ -438,7 +455,9 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
             return OperationEvidence{
                 .header = &operation.header,
                 .effective_pages = &operation.header.pages,
+                .completed_pages = &operation.header.pages,
                 .state = operation_state_name(operation.header.state),
+                .dependency_required = true,
             };
         });
         break;
@@ -446,8 +465,12 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
         append_operation_evidence(evidence, operations.prefetch_ops(), opportunity, exact_source_fact_match, [](const auto & operation) {
             return OperationEvidence{
                 .header = &operation.header,
-                .effective_pages = operation.payload_transfer_issued ? &operation.hit_pages : nullptr,
+                .effective_pages = operation.payload_transfer_issued ? &operation.service_pages : nullptr,
+                .completed_pages = &operation.completed_pages,
                 .state = prefetch_state_name(operation.prefetch_state),
+                .dependency_required = operation.service_consumer_dependency_required,
+                .policy_wait_duration_us = operation.policy_wait_duration_us,
+                .control_host_available_pages = operation.host_available_pages_at_control,
             };
         });
         break;
@@ -456,6 +479,7 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
             return OperationEvidence{
                 .header = &operation.header,
                 .effective_pages = &operation.completed_pages,
+                .completed_pages = &operation.completed_pages,
                 .state = prefetch_state_name(operation.prefetch_state),
                 .dependency_required = operation.visibility_dependency_required,
             };
@@ -471,7 +495,11 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
                 return OperationEvidence{
                     .header = &operation.header,
                     .effective_pages = &operation.device_to_host_pages,
+                    .completed_pages = operation.host_materialized ? &operation.device_to_host_pages : nullptr,
                     .state = operation_state_name(operation.header.state),
+                    .service_completion_ts = operation.device_to_host_schedule.available
+                                                 ? std::optional<uint64_t>{operation.device_to_host_schedule.ready_ts}
+                                                 : std::nullopt,
                 };
             });
         break;
@@ -485,9 +513,13 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
                 return OperationEvidence{
                     .header = &operation.header,
                     .effective_pages = &operation.host_to_storage_pages,
+                    .completed_pages = operation.storage_committed ? &operation.host_to_storage_pages : nullptr,
                     .storage_existing_pages = &operation.host_to_storage_existing_pages,
                     .storage_new_pages = &operation.host_to_storage_new_pages,
                     .state = operation_state_name(operation.header.state),
+                    .service_completion_ts = operation.host_to_storage_schedule.available
+                                                 ? std::optional<uint64_t>{operation.host_to_storage_schedule.ready_ts}
+                                                 : std::nullopt,
                 };
             });
         break;
@@ -502,13 +534,16 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
                     .header = &operation.header,
                     .effective_pages = &operation.capacity_gate_pages,
                     .state = operation_state_name(operation.header.state),
-                    .dependency_required = false,
+                    .dependency_required = !operation.capacity_gate_pages.empty(),
                 };
             });
         break;
     }
     std::ranges::sort(evidence, [](const auto & left, const auto & right) {
-        return left.header != nullptr && right.header != nullptr && left.header->operation_id < right.header->operation_id;
+        if (left.header == nullptr || right.header == nullptr) return left.header != nullptr;
+        // A readable operation ID is an identity, not FIFO order ("storage:10" precedes "storage:2" lexically).
+        if (left.header->enqueue_epoch != right.header->enqueue_epoch) return left.header->enqueue_epoch < right.header->enqueue_epoch;
+        return left.header->operation_id < right.header->operation_id;
     });
     return evidence;
 }
@@ -517,6 +552,10 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
                                      std::span<const HiCacheEffectOpportunity> opportunities, const HiCacheEffectDecisionLedger & ledger) {
     const auto evidence = operations == nullptr ? std::vector<OperationEvidence>{} : operation_evidence(opportunity, *operations, opportunities);
     auto pages = unique_pages(evidence);
+    std::set<std::string> completed_pages;
+    for (const auto & operation : evidence)
+        if (operation.completed_pages != nullptr)
+            completed_pages.insert(operation.completed_pages->begin(), operation.completed_pages->end());
     const bool operation_shaped = opportunity.effect_type == HiCacheEffectType::CommitDeviceToHost
                                   || opportunity.effect_type == HiCacheEffectType::CommitHostToStorage
                                   || opportunity.effect_type == HiCacheEffectType::CommitCapacityGate;
@@ -532,6 +571,7 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
         .direction = opportunity.direction,
         .cache_scope = opportunity.cache_scope,
         .request_id_provenance = opportunity.request_id_provenance,
+        .source_pid = opportunity.source_pid,
         .source_fact_role = opportunity.source_fact_role,
         .source_fact_ordinal = opportunity.source_fact_ordinal,
         .source_node_id = opportunity.source_node_id,
@@ -541,6 +581,12 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
         .effective_pages = std::move(pages),
         .eligibility_boundary = opportunity.eligibility_boundary,
         .consumer_boundary = consumer_boundary(opportunity.effect_type, evidence, completion),
+        .consumer_dependency_required = std::ranges::any_of(evidence, [](const auto & operation) { return operation.dependency_required; }),
+        .policy_wait_duration_us = [&] {
+            uint64_t duration = 0;
+            for (const auto & operation : evidence) duration = std::max(duration, operation.policy_wait_duration_us);
+            return duration;
+        }(),
         .resource_lane = opportunity.resource_lane,
         .target_effect_state = state,
         .schedule_sensitivity = schedule_sensitivity(opportunity.effect_type),
@@ -548,11 +594,14 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
     };
     for (const auto & operation : evidence) {
         if (operation.header != nullptr) decision.operation_ids.push_back(operation.header->operation_id);
+        if (operation.header != nullptr && decision.effect_type == HiCacheEffectType::PrefetchIo)
+            decision.control_host_available_pages.push_back(operation.control_host_available_pages);
         if (decision.state.empty()) decision.state = operation.state;
         else if (decision.state != operation.state) decision.state = "mixed";
     }
     if (decision.state.empty()) decision.state = hicache_target_effect_state_name(state);
     decision.effective_page_count = static_cast<uint64_t>(decision.effective_segments.size());
+    decision.completed_page_count = static_cast<uint64_t>(completed_pages.size());
     if (decision.direction != HiCacheTransferDirection::None)
         decision.effective_byte_count = projected_bytes(decision.effective_page_count, ledger.kv_bytes_per_page);
     if (decision.effect_type == HiCacheEffectType::CommitHostToStorage && !decision.effective_pages.empty()) {
@@ -571,25 +620,30 @@ HiCacheEffectDecision build_decision(const HiCacheEffectOpportunity & opportunit
         }
         decision.storage_existing_page_count = static_cast<uint64_t>(existing_pages.size());
         decision.storage_new_page_count = static_cast<uint64_t>(new_pages.size());
-        const auto retained_existing_operation_counts = [&] {
-            std::vector<uint64_t> counts;
-            counts.reserve(evidence.size());
-            uint64_t total = 0;
-            for (const auto & operation : evidence) {
-                if (operation.header == nullptr) return std::vector<uint64_t>{};
-                std::set<std::string> operation_pages;
-                if (operation.storage_existing_pages != nullptr) {
-                    for (const auto & page : *operation.storage_existing_pages)
-                        if (effective_page_set.contains(page)) operation_pages.insert(page);
+    }
+    if (ledger.storage_batch_pages > 0
+        && (decision.effect_type == HiCacheEffectType::CommitHostToStorage || decision.effect_type == HiCacheEffectType::PrefetchIo)) {
+        // Preserve each runtime operation's page order before splitting calls.
+        // Sorting/merging the aggregate page set would change branch mixtures.
+        for (size_t index = 0; index < evidence.size(); ++index) {
+            const auto & operation = evidence[index];
+            if (operation.effective_pages == nullptr) continue;
+            const auto & pages = *operation.effective_pages;
+            const std::set<std::string> existing(operation.storage_existing_pages ? operation.storage_existing_pages->begin() : pages.end(),
+                                                 operation.storage_existing_pages ? operation.storage_existing_pages->end() : pages.end());
+            const std::set<std::string> fresh(operation.storage_new_pages ? operation.storage_new_pages->begin() : pages.end(),
+                                              operation.storage_new_pages ? operation.storage_new_pages->end() : pages.end());
+            for (size_t start = 0; start < pages.size();) {
+                const auto count = std::min<uint64_t>(ledger.storage_batch_pages, pages.size() - start);
+                HiCacheStorageBatchWork batch{ .operation_index = index, .page_count = count };
+                for (size_t page = start; page < start + count; ++page) {
+                    batch.existing_page_count += existing.contains(pages[page]);
+                    batch.new_page_count += fresh.contains(pages[page]);
                 }
-                const auto count = static_cast<uint64_t>(operation_pages.size());
-                total = core::checked_add_u64(total, count, "H2S per-operation page count exceeds uint64 range");
-                counts.push_back(count);
+                decision.storage_service_batches.push_back(batch);
+                start += count;
             }
-            if (counts.size() != decision.operation_ids.size() || total != decision.storage_existing_page_count) return std::vector<uint64_t>{};
-            return counts;
-        };
-        decision.storage_existing_operation_page_counts = retained_existing_operation_counts();
+        }
     }
     classify_patch_status(decision, ledger);
     return decision;
@@ -641,6 +695,7 @@ void HiCacheState::observe_effect_opportunities(const HiCacheFact & fact, HiCach
                 .source_node_id = opportunity_fact.source_node_id,
                 .source_execution_anchor_node_id = opportunity_fact.execution_anchor_node_id,
                 .source_event_index = opportunity_fact.source_event_index,
+                .source_pid = opportunity_fact.pid,
                 .input_ready = resolution.ok() && opportunity_fact.full_path_span.valid,
                 .eligibility_boundary =
                     HiCacheEffectBoundary{
@@ -693,6 +748,7 @@ void HiCacheState::observe_effect_opportunities(const HiCacheFact & fact, HiCach
 HiCacheEffectDecisionLedger HiCacheState::effect_decision_ledger() const {
     HiCacheEffectDecisionLedger ledger;
     ledger.kv_bytes_per_page = config_.kv_bytes_per_page;
+    ledger.storage_batch_pages = config_.io_cost.storage_batch_pages;
     ledger.l2_capacity_pages = config_.l2_capacity_pages;
     ledger.l2_capacity_bytes =
         core::checked_multiply_u64(config_.l2_capacity_pages, config_.kv_bytes_per_page, "HiCache target L2 capacity bytes exceed uint64 range");

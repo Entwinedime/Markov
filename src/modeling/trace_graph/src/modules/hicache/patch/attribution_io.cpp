@@ -131,6 +131,10 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
     output.observed_io_duration_us = operation.observed_duration_us;
     output.residual_unknown_duration_us = operation.observed_duration_us;
     output.evidence.insert(output.evidence.end(), operation.evidence.begin(), operation.evidence.end());
+    if (operation.kind == HiCacheIoOperationKind::Prefetch) {
+        output.source_control_duration_nodes = operation.terminal_control_node_ids;
+        output.source_control_removal_required = !output.source_control_duration_nodes.empty();
+    }
     if (operation.completed_token_count == 0) {
         output.source_carrier_state = HiCacheSourceCarrierState::Absent;
         output.reason = "source operation ledger proves an explicit zero-payload I/O boundary";

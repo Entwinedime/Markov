@@ -25,8 +25,8 @@ enum class HiCacheOperationKind : std::uint8_t { Prefetch, Writeback, Loadback, 
 /**
  * @brief Common operation lifecycle state.
  *
- * The current model folds acknowledgements synchronously, but explicit states preserve
- * physical intent rather than reducing each operation to an anonymous page mutation.
+ * Explicit states preserve acknowledgement order rather than reducing each operation
+ * to an anonymous page mutation.
  */
 enum class HiCacheOperationState : std::uint8_t { Created, Queued, Ready, Completed, Committed, Cancelled };
 
@@ -81,7 +81,13 @@ struct HiCacheOperationHeader {
     uint64_t source_token_end = 0;
 };
 
-/** @brief Target-derived timing for one transfer on a logical I/O resource lane. */
+struct HiCacheIoBatchSchedule {
+    uint64_t page_count = 0;
+    uint64_t start_ts = 0;
+    uint64_t ready_ts = 0;
+};
+
+/** @brief Executed service batches, separate from any early consumer/stop boundary. */
 struct HiCacheIoSchedule {
     bool available = false;
     std::string resource_lane;
@@ -89,6 +95,7 @@ struct HiCacheIoSchedule {
     uint64_t duration_us = 0;
     uint64_t start_ts = 0;
     uint64_t ready_ts = 0;
+    std::vector<HiCacheIoBatchSchedule> batches;
 };
 
 
@@ -107,12 +114,15 @@ struct HiCachePrefetchOperation {
     uint64_t host_visible_offset_pages = 0;
     std::vector<std::string> planned_pages;
     std::vector<std::string> hit_pages;
+    std::vector<std::string> service_pages;
     std::vector<std::string> completed_pages;
     HiCacheIoSchedule io_schedule;
     uint64_t completed_byte_count = 0;
     uint64_t policy_stop_ts = 0;
     uint64_t target_boundary_ts = 0;
     uint64_t timeout_deadline_ts = 0;
+    /** Foreground policy wait measured from enqueue; zero for non-timeout or completed I/O. */
+    uint64_t policy_wait_duration_us = 0;
     bool payload_transfer_issued = false;
     bool timed_out = false;
     uint64_t requested_host_pages = 0;
@@ -122,6 +132,8 @@ struct HiCachePrefetchOperation {
     uint64_t host_occupied_pages_at_enqueue = 0;
     uint64_t host_reserved_pages_at_enqueue = 0;
     uint64_t active_requested_pages_at_enqueue = 0;
+    /** Logical capacity minus residency/reservations before terminal mutation; not an observed free-list size. */
+    std::optional<uint64_t> host_available_pages_at_control;
     /**
      * Target-derived storage-key recency immediately before the read.
      *
@@ -134,6 +146,9 @@ struct HiCachePrefetchOperation {
     uint64_t storage_reuse_distance_max_bytes_at_enqueue = 0;
     uint64_t storage_reuse_distance_known_pages_at_enqueue = 0;
     uint64_t storage_reuse_distance_unknown_pages_at_enqueue = 0;
+    /** The terminal consumer waits for the full service completion. */
+    bool service_consumer_dependency_required = false;
+    /** Published pages require a causal terminal boundary, possibly a timeout gate. */
     bool visibility_dependency_required = false;
     HiCachePrefetchState prefetch_state = HiCachePrefetchState::Pending;
 };
@@ -147,19 +162,12 @@ struct HiCacheWritebackOperation {
 struct HiCacheLoadbackOperation {
     HiCacheOperationHeader header;
     HiCacheIoSchedule io_schedule;
-    /** @brief Host-only radix nodes walked and promoted by SGLang load_back(). */
-    uint64_t promoted_node_count = 0;
-    /** @brief Number of allocator-failure eviction/retry cycles predicted before enqueue. */
-    uint64_t allocation_retry_count = 0;
-    uint64_t allocation_retry_evicted_node_count = 0;
-    uint64_t allocation_retry_evicted_page_count = 0;
-    uint64_t allocation_retry_dirty_evicted_node_count = 0;
-    uint64_t allocation_retry_dirty_evicted_page_count = 0;
 };
 
 /** @brief Modeled operation that commits an L2 value to storage. */
 struct HiCacheStorageOperation {
     HiCacheOperationHeader header;
+    size_t node_id = 0;
     std::vector<std::string> device_to_host_pages;
     /** @brief Pages whose host-to-storage submission became visible after D2H ACK. */
     std::vector<std::string> host_to_storage_pages;
@@ -169,6 +177,9 @@ struct HiCacheStorageOperation {
     std::vector<std::string> host_to_storage_new_pages;
     std::vector<std::string> capacity_gate_pages;
     HiCacheIoSchedule device_to_host_schedule;
+    HiCacheIoSchedule host_to_storage_schedule;
+    bool host_materialized = false;
+    bool storage_committed = false;
 };
 
 /**
@@ -255,6 +266,7 @@ public:
                                        bool source_available);
 
     /** @brief Returns all storage operations. */
+    [[nodiscard]] std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() { return storage_by_id_; }
     [[nodiscard]] const std::unordered_map<std::string, HiCacheStorageOperation> & storage_ops() const { return storage_by_id_; }
 
     /** @brief Returns one mutable storage operation by stable target-derived ID. */

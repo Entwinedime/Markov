@@ -4,6 +4,8 @@
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
 
+#include <algorithm>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,22 +30,8 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, Sco
             scope.pending_write_through_backups.push_back(backup);
             continue;
         }
-        if (operation != nullptr && force_finalize) {
-            // The write-through policy already made this storage write mandatory when the
-            // backup was enqueued.  A trace-window boundary can precede the asynchronous
-            // acknowledgement, but it must not erase the target-derived payload shape.
-            // Settle the required pages without claiming a source-observed completion or
-            // extending the executable E2E window; the finalize consumer below remains a
-            // target-only boundary with no source anchor.
-            operation->host_to_storage_pages = backup.pages;
-            scope.async_ops.set_storage_state(backup.storage_operation_id, HiCacheOperationState::Committed, "target_finalize_required_write_through", fact.ts);
-            const auto storage_ref = scope.refs.release_owner(scope.tree, operation->header.owner);
-            sync_capacity_for_ref(scope, normalized_scope(fact), storage_ref, "storage_ref_release_at_window_end");
-        }
-        else if (operation != nullptr) {
-            operation->host_to_storage_pages = backup.pages;
-            complete_storage_backup(fact, scope, backup.storage_operation_id, backup.pages);
-        }
+        if (operation != nullptr && !operation->host_materialized)
+            materialize_host_backup(fact, scope, operation->node_id, backup.pages, backup.storage_operation_id);
         const bool source_available = fact.event_name != "hicache_finalize";
         const auto consumer_epoch = source_available ? scope.clock.record_fact_boundary(normalized_scope(fact),
                                                                                         scoped_request_key(fact),
@@ -51,17 +39,31 @@ void HiCacheState::drain_write_through_backup_refs(const HiCacheFact & fact, Sco
                                                                                         fact.source_event_index,
                                                                                         fact.ts)
                                                      : scope.clock.record_target_finalize_boundary(normalized_scope(fact), fact.ts);
-        scope.async_ops.set_storage_consumer_boundary(backup.storage_operation_id,
-                                                      consumer_epoch,
-                                                      fact.ts,
-                                                      fact.source_node_id,
-                                                      fact.execution_anchor_node_id,
-                                                      fact.source_event_index,
-                                                      fact.role,
-                                                      source_available);
+        if (operation != nullptr && operation->header.consumer_epoch == 0)
+            scope.async_ops.set_storage_consumer_boundary(backup.storage_operation_id,
+                                                          consumer_epoch,
+                                                          force_finalize ? operation->device_to_host_schedule.ready_ts : fact.ts,
+                                                          fact.source_node_id,
+                                                          fact.execution_anchor_node_id,
+                                                          fact.source_event_index,
+                                                          fact.role,
+                                                          source_available);
         const auto ref = scope.refs.release_owner(scope.tree, backup.owner);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, reason);
     }
+}
+
+void HiCacheState::advance_storage_backups(const HiCacheFact & fact, ScopedState & scope, bool force) {
+    std::vector<std::string> completed;
+    for (auto & [operation_id, operation] : scope.async_ops.storage_ops()) {
+        if (!operation.host_materialized && operation.device_to_host_schedule.available
+            && (force || operation.device_to_host_schedule.ready_ts <= fact.ts))
+            materialize_host_backup(fact, scope, operation.node_id, operation.header.pages, operation_id);
+        if (!operation.storage_committed && operation.host_to_storage_schedule.available
+            && (force || operation.host_to_storage_schedule.ready_ts <= fact.ts))
+            completed.push_back(operation_id);
+    }
+    for (const auto & operation_id : completed) complete_storage_backup(fact, scope, operation_id);
 }
 
 bool HiCacheState::reserve_host_backup_capacity(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages,
@@ -84,7 +86,7 @@ std::string HiCacheState::begin_storage_backup(const HiCacheFact & fact, ScopedS
     const auto storage_id = scope.clock.next_operation_id("storage");
     const auto request_key = scoped_request_key(fact);
     const auto storage_owner = request_key + ":storage:" + storage_id;
-    const auto device_to_host_schedule = schedule_target_io(scope, TargetIoLane::DeviceToHost, fact.ts, static_cast<uint64_t>(device_to_host_pages.size()));
+    const auto device_to_host_schedule = schedule_target_io(normalized_scope(fact), "write_device_to_host", fact.ts, device_to_host_pages.size());
     std::vector<std::string> existing_storage_pages;
     std::vector<std::string> new_storage_pages;
     existing_storage_pages.reserve(pages.size());
@@ -93,45 +95,70 @@ std::string HiCacheState::begin_storage_backup(const HiCacheFact & fact, ScopedS
         auto & destination = scope.storage.readable(page) ? existing_storage_pages : new_storage_pages;
         destination.push_back(page);
     }
+    const auto batch_limit = config_.io_cost.storage_batch_pages;
+    std::vector<uint64_t> existing_batch_pages(pages.size() / batch_limit + static_cast<size_t>(pages.size() % batch_limit != 0), 0);
+    const std::set<std::string> existing_set(existing_storage_pages.begin(), existing_storage_pages.end());
+    for (size_t index = 0; index < pages.size(); ++index)
+        if (existing_set.contains(pages[index])) ++existing_batch_pages[index / batch_limit];
+    const auto storage_eligibility = device_to_host_schedule.available ? device_to_host_schedule.ready_ts : fact.ts;
+    const auto host_to_storage_schedule = schedule_target_io(normalized_scope(fact),
+                                                             "write_host_to_storage",
+                                                             storage_eligibility,
+                                                             pages.size(),
+                                                             existing_batch_pages);
     scope.async_ops.insert_storage(HiCacheStorageOperation{
-        .header = make_operation_header(HiCacheOperationKind::Storage, storage_id, fact, normalized_scope(fact), request_key, storage_owner, pages, 0),
+        .header = make_operation_header(HiCacheOperationKind::Storage,
+                                        storage_id,
+                                        fact,
+                                        normalized_scope(fact),
+                                        request_key,
+                                        storage_owner,
+                                        pages,
+                                        scope.clock.next_enqueue_epoch()),
+        .node_id = node_id,
         .device_to_host_pages = device_to_host_pages,
-        .host_to_storage_pages = policy_.write_count_enabled() ? std::vector<std::string>{} : pages,
+        .host_to_storage_pages = pages,
         .host_to_storage_existing_pages = std::move(existing_storage_pages),
         .host_to_storage_new_pages = std::move(new_storage_pages),
         .capacity_gate_pages = {},
         .device_to_host_schedule = device_to_host_schedule,
+        .host_to_storage_schedule = host_to_storage_schedule,
     });
-    if (!policy_.write_count_enabled()) {
-        const auto ref = scope.refs.acquire_host(scope.tree, storage_owner, "storage", request_key, storage_id, std::vector<HiCacheNodeId>{ node_id });
-        sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_acquire");
-    }
+    const auto ref = scope.refs.acquire_host(scope.tree, storage_owner, "storage", request_key, storage_id, std::vector<HiCacheNodeId>{ node_id });
+    sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_acquire");
     return storage_id;
 }
 
 void HiCacheState::materialize_host_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
-                                           const std::string & storage_id, bool storage_readable) {
-    scope.tree.mark_host_visible(node_id, storage_readable);
+                                           const std::string & storage_id) {
+    auto * operation = scope.async_ops.storage_operation(storage_id);
+    if (operation == nullptr || operation->host_materialized) return;
+    scope.tree.mark_host_visible(node_id, false);
     scope.tree.clear_dirty(node_id);
     sync_capacity(scope, normalized_scope(fact), std::vector<HiCacheNodeId>{ node_id }, "commit_host_backup");
-    if (storage_readable) {
-        for (const auto & page : pages) {
-            scope.storage_access_bytes_completed = core::checked_add_u64(scope.storage_access_bytes_completed,
-                                                                         config_.kv_bytes_per_page,
-                                                                         "HiCache cumulative storage-access bytes exceed uint64 range");
-            scope.storage_page_last_access_end_byte[page] = scope.storage_access_bytes_completed;
-        }
-        scope.storage.mark_readable_pages(normalized_scope(fact), pages);
-    }
+    operation->host_materialized = true;
+    scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Ready, "device_to_host_ack", operation->device_to_host_schedule.ready_ts);
+    (void)pages;
 }
 
-void HiCacheState::complete_storage_backup(const HiCacheFact & fact, ScopedState & scope, const std::string & storage_id,
-                                           const std::vector<std::string> & pages) {
+void HiCacheState::complete_storage_backup(const HiCacheFact & fact, ScopedState & scope, const std::string & storage_id) {
     if (storage_id.empty()) return;
-    scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Committed, "sync_commit", fact.ts);
-    const auto ref = scope.refs.release_owner(scope.tree, scoped_request_key(fact) + ":storage:" + storage_id);
+    auto * operation = scope.async_ops.storage_operation(storage_id);
+    if (operation == nullptr || operation->storage_committed) return;
+    if (!operation->host_materialized)
+        materialize_host_backup(fact, scope, operation->node_id, operation->header.pages, storage_id);
+    scope.tree.mark_host_visible(operation->node_id, true);
+    for (const auto & page : operation->header.pages) {
+        scope.storage_access_bytes_completed = core::checked_add_u64(scope.storage_access_bytes_completed,
+                                                                     config_.kv_bytes_per_page,
+                                                                     "HiCache cumulative storage-access bytes exceed uint64 range");
+        scope.storage_page_last_access_end_byte[page] = scope.storage_access_bytes_completed;
+    }
+    scope.storage.mark_readable_pages(normalized_scope(fact), operation->header.pages);
+    operation->storage_committed = true;
+    scope.async_ops.set_storage_state(storage_id, HiCacheOperationState::Committed, "host_to_storage_ack", operation->host_to_storage_schedule.ready_ts);
+    const auto ref = scope.refs.release_owner(scope.tree, operation->header.owner);
     sync_capacity_for_ref(scope, normalized_scope(fact), ref, "storage_ref_release");
-    (void)pages;
 }
 
 /**
@@ -151,9 +178,12 @@ bool HiCacheState::commit_host_backup(const HiCacheFact & fact, ScopedState & sc
     const bool device_to_host_required = node->residency.device_present && (node->residency.device_dirty || !node->residency.host_visible);
     const auto device_to_host_pages = device_to_host_required ? pages : std::vector<std::string>{};
     const auto storage_id = storage_readable ? begin_storage_backup(fact, scope, node_id, pages, device_to_host_pages) : std::string{};
-    materialize_host_backup(fact, scope, node_id, pages, storage_id, storage_readable);
-    if (storage_readable && policy_.write_count_enabled()) hold_write_through_backup_ref(fact, scope, node_id, pages, storage_id);
-    else complete_storage_backup(fact, scope, storage_id, pages);
+    if (storage_readable && policy_.write_count_enabled()) {
+        hold_write_through_backup_ref(fact, scope, node_id, pages, storage_id);
+    }
+    else if (storage_readable) {
+        materialize_host_backup(fact, scope, node_id, pages, storage_id);
+    }
     return true;
 }
 
@@ -196,13 +226,9 @@ void HiCacheState::apply_write_count_to_node(const HiCacheFact & fact, ScopedSta
  * when node hit count reaches the threshold and holds protection until acknowledgement.
  */
 void HiCacheState::apply_write_count_policy(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages) {
-    if (!policy_.write_count_enabled()) {
-        return;
-    }
+    if (!policy_.write_count_enabled()) { return; }
     const auto threshold = policy_.write_through_threshold();
-    if (threshold == 0) {
-        return;
-    }
+    if (threshold == 0) { return; }
 
     const auto lookup = scope.tree.lookup_peek(pages);
     for (const auto node_id : lookup.topology_chain) {

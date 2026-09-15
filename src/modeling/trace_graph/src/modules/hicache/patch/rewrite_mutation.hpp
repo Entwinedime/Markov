@@ -6,7 +6,8 @@
 
 namespace markov::trace_graph::modules::hicache::patch::rewrite_transaction_detail {
 
-void append_resource_lane_dependencies(core::DagMutationPlan & plan, const HiCacheIoResourcePlan & resources,
+void append_resource_lane_dependencies(const core::DagGraph & graph, core::DagMutationPlan & plan, const HiCacheIoResourcePlan & resources,
+                                       const std::vector<HiCacheRewriteDecision> & decisions,
                                        const std::unordered_map<std::string, std::string> & synthetic_by_effect);
 void append_family_dependencies(core::DagMutationPlan & plan, const std::vector<HiCacheRewriteDecision> & decisions,
                                 const std::unordered_map<std::string, std::string> & synthetic_by_effect);

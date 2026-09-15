@@ -35,6 +35,10 @@ void resolve_target_host_control_boundaries(const core::DagGraph & graph, std::v
         if (!decision.target_host_control_required || !decision.shadow_plan_ready) continue;
         if (decision.target_host_control_terminal) {
             decision.target_host_control_exit_node_ids.clear();
+            if (decision.completion_join_required) {
+                decision.target_host_control_exit_node_ids.push_back(*decision.wait_exit_anchor_node_id);
+                continue;
+            }
             if (decision.consumer_anchors.size() == 1) decision.target_host_control_exit_node_ids.push_back(decision.consumer_anchors.front());
             else if (decision.terminal_control_anchor_node_id) decision.target_host_control_exit_node_ids.push_back(*decision.terminal_control_anchor_node_id);
             else if (decision.wait_exit_anchor_node_id) decision.target_host_control_exit_node_ids.push_back(*decision.wait_exit_anchor_node_id);
@@ -138,12 +142,14 @@ void fold_shared_immediate_ready_completion_joins(std::vector<HiCacheRewriteDeci
             else if (decision->effect_type == HiCacheEffectType::Loadback) loadback = decision;
         }
         if (prefetch == nullptr || loadback == nullptr || prefetch->request_id.empty() || prefetch->request_id != loadback->request_id) continue;
-        prefetch->completion_join_required = false;
-        prefetch->completion_control_ingress_edge_id = std::nullopt;
-        prefetch->consumer_anchors.clear();
-        prefetch->consumer_anchor_method = "request_loadback_completion_join";
-        prefetch->request_consumer_synthetic_id = loadback->synthetic_id;
-        prefetch->reason = "prefetch completion feeds the request loadback; one shared immediate-ready completion join guards the final consumer";
+        // CPU readiness gates the terminal Prefetch check, not just the final
+        // Load completion. Join first, then control -> Load -> native consumer;
+        // otherwise control/Load can incorrectly overlap the readiness branch.
+        loadback->completion_join_required = false;
+        loadback->completion_control_ingress_edge_id = std::nullopt;
+        loadback->consumer_anchors = { *loadback->wait_exit_anchor_node_id };
+        loadback->consumer_anchor_method = "shared_prefetch_ready_consumer";
+        loadback->reason = "request Load follows ready Prefetch control before releasing the shared native consumer";
     }
 }
 

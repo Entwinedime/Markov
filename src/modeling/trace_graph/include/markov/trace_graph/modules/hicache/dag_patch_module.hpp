@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
+#include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 #include "markov/trace_graph/modules/hicache/patch/applied_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
 #include "markov/trace_graph/modules/hicache/patch/boundary_validator.hpp"
@@ -63,13 +64,28 @@ struct HiCacheCausalTimingAudit {
     std::vector<HiCacheEffectCausalTimingAudit> effects;
     bool restored_exact = false;
 };
+
+/** @brief Debug-only exact binding of target-observed costs to predicted phase carriers. */
+struct HiCachePhaseOracleCostReplayAudit {
+    std::string status = "disabled";
+    uint64_t required_cost_count = 0;
+    uint64_t supplied_cost_count = 0;
+    uint64_t applied_cost_count = 0;
+    uint64_t oracle_duration_us = 0;
+    uint64_t applied_duration_us = 0;
+    bool effect_identity_exact = false;
+    bool target_e2e_consumed = false;
+};
 #endif
 
 /** @brief Business result for the HiCache patch plan and applied mutation journal. */
 struct HiCacheDagPatchResult {
     std::string status = "not_applied";
     bool source_target_same_config = false;
-    std::string prefill_effect_status = "deferred";
+    std::string phase_patch_status = "disabled";
+    size_t phase_duration_update_count = 0;
+    size_t phase_owner_conflict_count = 0;
+    HiCachePhaseCarrierAudit phase_carrier;
     core::DagMutationPlan plan;
     core::DagMutationJournal journal;
     patch::HiCacheIoResourcePlan io_resources;
@@ -82,6 +98,7 @@ struct HiCacheDagPatchResult {
     std::map<std::string, uint64_t> apply_blockers;
 #ifdef DEBUG
     HiCacheCausalTimingAudit causal_timing_audit;
+    HiCachePhaseOracleCostReplayAudit phase_oracle_cost_replay;
     core::DagTopologyValidationReport topology;
 #endif
 };
@@ -97,7 +114,10 @@ class HiCacheDagPatchModule final : public SimulationModule {
 public:
     explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false);
 #ifdef DEBUG
-    HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config, std::string oracle_cost_replay_path);
+    HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result,
+                          bool source_target_same_config,
+                          std::string oracle_cost_replay_path,
+                          std::string phase_oracle_cost_replay_path);
 #endif
 
     [[nodiscard]] std::string_view name() const noexcept override;
@@ -114,6 +134,7 @@ private:
     bool source_target_same_config_ = false;
 #ifdef DEBUG
     std::string oracle_cost_replay_path_;
+    std::string phase_oracle_cost_replay_path_;
 #endif
     HiCacheDagPatchResult result_;
 #ifdef DEBUG

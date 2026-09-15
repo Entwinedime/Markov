@@ -72,6 +72,7 @@ add_library(trace_graph_hicache STATIC)
 target_sources(trace_graph_hicache
     PRIVATE
         src/modules/hicache/fact.cpp
+        src/modules/hicache/phase_observation.cpp
         src/modules/hicache/router.cpp
         src/modules/hicache/policy.cpp
         src/modules/hicache/radix/token_radix_tree.cpp
@@ -87,7 +88,7 @@ target_sources(trace_graph_hicache
         src/modules/hicache/model/effect_decision.cpp
         src/modules/hicache/model/effect_ledger.cpp
         src/modules/hicache/patch/io_resource_demand.cpp
-        src/modules/hicache/patch/io_resource_service.cpp
+        src/modules/hicache/service_model.cpp
         src/modules/hicache/patch/io_resource_cost.cpp
         src/modules/hicache/patch/io_resource_model.cpp
         src/modules/hicache/patch/io_operation_ledger.cpp
@@ -120,6 +121,8 @@ target_sources(trace_graph_modules
         src/modules/node_scale/node_scale_module.cpp
         src/modules/hicache/hicache_module.cpp
         src/modules/hicache/dag_patch_module.cpp
+        src/modules/hicache/phase_carrier.cpp
+        src/modules/hicache/observed_carrier.cpp
 )
 target_link_libraries(trace_graph_modules
     PUBLIC
@@ -135,6 +138,8 @@ if(TRACE_GRAPH_DEBUG)
         PRIVATE
             src/modules/hicache/patch/oracle_cost_replay.cpp
     )
+    add_executable(hicache_io_logic_check EXCLUDE_FROM_ALL tests/hicache_io_logic_check.cpp)
+    target_link_libraries(hicache_io_logic_check PRIVATE trace_graph_hicache)
 
     add_library(trace_graph_diagnostics STATIC)
     target_sources(trace_graph_diagnostics
@@ -155,6 +160,7 @@ target_sources(trace_graph
     PRIVATE
         src/cli/options.cpp
         src/cli/module_pipeline.cpp
+        src/cli/hicache_observations.cpp
         src/cli/run_summary.cpp
         src/cli/workflow.cpp
         src/cli/main.cpp

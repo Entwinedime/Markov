@@ -22,18 +22,14 @@ std::map<std::string, HiCacheIoControlModelConfig> control_models(const Json & i
         const std::string kind(kind_view);
         const auto raw = models->find(kind);
         if (raw == models->end() || !raw->is_object()) throw std::runtime_error("Missing control model for " + kind);
-        require_exact_fields(*raw,
-                             "hicache.io_cost.control_models." + kind,
-                             { "fixed_us_per_operation", "zero_payload_fixed_us_per_operation", "per_page_us" });
-        HiCacheIoControlModelConfig model{
-            .fixed_us_per_operation = number_value(*raw, "fixed_us_per_operation", 0.0),
-            .zero_payload_fixed_us_per_operation = number_value(*raw, "zero_payload_fixed_us_per_operation", 0.0),
-            .per_page_us = number_value(*raw, "per_page_us", 0.0),
+        const auto coefficient = [&](const std::string & field) {
+            const auto value = number_value(*raw, field, 0.0);
+            if (!std::isfinite(value) || value < 0.0) throw std::runtime_error("Invalid control coefficient " + kind + "." + field);
+            return value;
         };
-        if (!std::isfinite(model.fixed_us_per_operation) || model.fixed_us_per_operation < 0.0
-            || !std::isfinite(model.zero_payload_fixed_us_per_operation) || model.zero_payload_fixed_us_per_operation < 0.0
-            || !std::isfinite(model.per_page_us) || model.per_page_us < 0.0)
-            throw std::runtime_error("Control coefficients must be finite and non-negative for " + kind);
+        HiCacheIoControlModelConfig model{ .fixed_us_per_operation = coefficient("fixed_us_per_operation") };
+        const auto path = "hicache.io_cost.control_models." + kind;
+        require_exact_fields(*raw, path, { "fixed_us_per_operation" });
         output.emplace(kind, model);
     }
     return output;
@@ -55,30 +51,14 @@ HiCacheIoResourceLanesConfig resource_lanes(const Json & io_cost) {
 
 } // namespace
 
-HiCacheIoPlanningConfig parse_hicache_io_planning(const Json & object) {
-    const auto raw = object.find("io_planning");
-    if (raw == object.end()) return {};
-    if (!raw->is_object()) throw std::runtime_error("hicache.io_planning must be an object");
-    require_exact_fields(*raw,
-                         "hicache.io_planning",
-                         { "device_host_bandwidth_bytes_per_sec", "host_storage_bandwidth_bytes_per_sec" });
-    HiCacheIoPlanningConfig config{
-        .device_host_bandwidth_bytes_per_sec = u64_value(*raw, "device_host_bandwidth_bytes_per_sec", 0),
-        .host_storage_bandwidth_bytes_per_sec = u64_value(*raw, "host_storage_bandwidth_bytes_per_sec", 0),
-    };
-    if (config.device_host_bandwidth_bytes_per_sec == 0 || config.host_storage_bandwidth_bytes_per_sec == 0)
-        throw std::runtime_error("HiCache effect planning bandwidths must be positive");
-    return config;
-}
-
 HiCacheIoCostConfig parse_hicache_io_cost(const Json & object) {
     HiCacheIoCostConfig config;
     const auto raw = object.find("io_cost");
     if (raw == object.end()) return config;
     if (!raw->is_object()) throw std::runtime_error("hicache.io_cost must be an object");
-    require_exact_fields(*raw,
-                         "hicache.io_cost",
-                         { "service_models", "control_models", "resource_lanes" });
+    require_exact_fields(*raw, "hicache.io_cost", { "storage_batch_pages", "service_models", "control_models", "resource_lanes" });
+    config.storage_batch_pages = u64_value(*raw, "storage_batch_pages", 0);
+    if (config.storage_batch_pages == 0) throw std::runtime_error("HiCache storage batch pages must be positive");
     config.service_models = parse_hicache_service_models(*raw);
     config.control_models = control_models(*raw);
     config.resource_lanes = resource_lanes(*raw);

@@ -11,6 +11,7 @@
 #include <optional>
 #include <ranges>
 #include <set>
+#include <span>
 #include <tuple>
 #include <unordered_map>
 
@@ -60,12 +61,36 @@ struct MaterializedPlan {
     std::set<std::pair<size_t, std::string>> cpu_gap_updates;
 };
 
-const core::DagMutationRecord * unique_record(const core::DagMutationJournal & journal, core::DagMutationAction action, const auto & predicate) {
+/** @brief Index the journal once; preserve the original matching and duplicate rules. */
+struct JournalIndex {
+    using Records = std::vector<const core::DagMutationRecord *>;
+    std::map<core::DagMutationAction, Records> by_action;
+    std::unordered_map<size_t, Records> by_node;
+
+    explicit JournalIndex(const core::DagMutationJournal & journal) {
+        for (const auto & record : journal.records) {
+            by_action[record.action].push_back(&record);
+            if (record.node_id) by_node[*record.node_id].push_back(&record);
+        }
+    }
+
+    [[nodiscard]] std::span<const core::DagMutationRecord * const> action_records(core::DagMutationAction action) const {
+        const auto found = by_action.find(action);
+        return found == by_action.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
+    }
+
+    [[nodiscard]] std::span<const core::DagMutationRecord * const> node_records(size_t node_id) const {
+        const auto found = by_node.find(node_id);
+        return found == by_node.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
+    }
+};
+
+const core::DagMutationRecord * unique_record(std::span<const core::DagMutationRecord * const> records, const auto & predicate) {
     const core::DagMutationRecord * match = nullptr;
-    for (const auto & record : journal.records) {
-        if (record.action != action || !predicate(record)) continue;
+    for (const auto * record : records) {
+        if (!predicate(*record)) continue;
         if (match != nullptr) return nullptr;
-        match = &record;
+        match = record;
     }
     return match;
 }
@@ -73,8 +98,9 @@ const core::DagMutationRecord * unique_record(const core::DagMutationJournal & j
 MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core::DagMutationPlan & plan, const core::DagMutationJournal & journal,
                                         HiCacheAppliedPatchValidation & validation) {
     MaterializedPlan output;
+    const JournalIndex journal_index(journal);
     for (const auto & synthetic : plan.synthetic_nodes) {
-        const auto * record = unique_record(journal, core::DagMutationAction::AddSyntheticNode, [&](const auto & candidate) {
+        const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::AddSyntheticNode), [&](const auto & candidate) {
             if (candidate.effect_id != synthetic.effect_id || !candidate.node_id || *candidate.node_id >= graph.node_count()) return false;
             return graph.event_for_node(*candidate.node_id).arg("synthetic_id") == synthetic.synthetic_id;
         });
@@ -95,7 +121,8 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
     }
 
     for (const auto & update : plan.set_node_durations) {
-        const auto record_count = std::ranges::count_if(journal.records, [&](const auto & candidate) {
+        const auto record_count = std::ranges::count_if(journal_index.node_records(update.node_id), [&](const auto * record) {
+            const auto & candidate = *record;
             return candidate.action == core::DagMutationAction::SetNodeDuration && candidate.node_id == update.node_id
                    && candidate.effect_id == update.effect_id && candidate.new_duration == update.duration;
         });
@@ -108,7 +135,8 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
     }
 
     for (const auto & update : plan.set_node_e2e_eligibility) {
-        const auto record_count = std::ranges::count_if(journal.records, [&](const auto & candidate) {
+        const auto record_count = std::ranges::count_if(journal_index.node_records(update.node_id), [&](const auto * record) {
+            const auto & candidate = *record;
             return candidate.action == core::DagMutationAction::SetNodeE2eEligibility && candidate.node_id == update.node_id
                    && candidate.effect_id == update.effect_id && candidate.new_counts_toward_e2e == update.counts_toward_e2e;
         });
@@ -121,7 +149,8 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
     }
 
     for (const auto & update : plan.set_cpu_gaps) {
-        const auto record_count = std::ranges::count_if(journal.records, [&](const auto & candidate) {
+        const auto record_count = std::ranges::count_if(journal_index.node_records(update.node_id), [&](const auto * record) {
+            const auto & candidate = *record;
             return candidate.action == core::DagMutationAction::SetCpuGap && candidate.node_id == update.node_id && candidate.effect_id == update.effect_id
                    && candidate.new_cpu_gap == update.duration;
         });
@@ -134,7 +163,7 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
     }
 
     for (const auto & redirect : plan.redirect_edges) {
-        const auto * record = unique_record(journal, core::DagMutationAction::RedirectEdge, [&](const auto & candidate) {
+        const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::RedirectEdge), [&](const auto & candidate) {
             return candidate.replaced_edge_index == redirect.edge_index && candidate.effect_id == redirect.effect_id;
         });
         const auto src = record == nullptr ? std::nullopt : record->src;
@@ -165,7 +194,7 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
             continue;
         }
         const EdgeKey expected{ *src, *dst, addition.kind, addition.effect_id };
-        const auto * record = unique_record(journal, core::DagMutationAction::AddEdge, [&](const auto & candidate) {
+        const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::AddEdge), [&](const auto & candidate) {
             return candidate.src == src && candidate.dst == dst && candidate.effect_id == addition.effect_id;
         });
         if (record == nullptr || !record->edge_index || !edge_matches(graph, *record->edge_index, expected)) {
@@ -221,9 +250,7 @@ bool added_edge_exists(const MaterializedPlan & materialized, size_t src, size_t
 bool target_host_control_exact(const HiCacheRewriteDecision & decision, const core::DagGraph & graph, const MaterializedPlan & materialized) {
     const auto found = materialized.synthetic_nodes.find(decision.target_host_control_synthetic_id);
     if (!decision.target_host_control_required) return found == materialized.synthetic_nodes.end();
-    if (found == materialized.synthetic_nodes.end()
-        || (decision.target_host_control_exit_node_ids.empty() && decision.effect_type != HiCacheEffectType::CommitDeviceToHost))
-        return false;
+    if (found == materialized.synthetic_nodes.end()) return false;
     const auto node_id = found->second;
     const auto expected_lane = decision.cache_scope.empty() ? std::string{ "hicache_host_control_lane" } : decision.cache_scope + "/host_control_lane";
     if (!graph.node(node_id).active || !graph.node(node_id).is_cpu || graph.node(node_id).counts_toward_e2e
@@ -232,7 +259,12 @@ bool target_host_control_exact(const HiCacheRewriteDecision & decision, const co
                                 [&](size_t exit_node_id) { return added_edge_exists(materialized, node_id, exit_node_id, decision.effect_id); }))
         return false;
     if (decision.target_host_control_terminal) {
-        if (decision.completion_join_required || decision.target_host_control_exit_node_ids.size() != 1
+        if (decision.completion_join_required) {
+            const auto join = materialized.synthetic_nodes.find(decision.completion_join_synthetic_id);
+            return join != materialized.synthetic_nodes.end() && decision.target_host_control_exit_node_ids.size() == 1
+                   && added_edge_exists(materialized, join->second, node_id, decision.effect_id);
+        }
+        if (decision.target_host_control_exit_node_ids.size() != 1
             || decision.target_host_control_ingress_edge_ids.empty())
             return false;
         const auto join = materialized.synthetic_nodes.find(decision.target_host_control_terminal_join_synthetic_id);
@@ -242,7 +274,8 @@ bool target_host_control_exact(const HiCacheRewriteDecision & decision, const co
                && std::ranges::all_of(decision.target_host_control_ingress_edge_ids,
                                       [&](size_t edge_id) { return materialized.redirected_edges.contains(edge_id); });
     }
-    if (!decision.target_host_control_anchor_node_id
+    if ((decision.target_host_control_exit_node_ids.empty() && decision.effect_type != HiCacheEffectType::CommitDeviceToHost)
+        || !decision.target_host_control_anchor_node_id
         || !added_edge_exists(materialized, *decision.target_host_control_anchor_node_id, node_id, decision.effect_id))
         return false;
     if (!decision.source_readiness_topology_reused) {
@@ -264,7 +297,15 @@ bool synthetic_exact(const HiCacheRewriteDecision & decision, const core::DagGra
     const bool effect_ready = graph.node(node_id).active && !graph.node(node_id).counts_toward_e2e && graph.node(node_id).duration == decision.duration_us
                               && graph.node_lane_key(node_id) == expected_lane;
     const bool host_control_ready = target_host_control_exact(decision, graph, materialized);
-    if (!effect_ready || !host_control_ready || !decision.completion_join_required) return effect_ready && host_control_ready;
+    const auto policy_wait = materialized.synthetic_nodes.find(decision.policy_wait_synthetic_id);
+    const bool policy_wait_ready = decision.policy_wait_duration_us == 0
+                                       ? policy_wait == materialized.synthetic_nodes.end()
+                                       : policy_wait != materialized.synthetic_nodes.end() && graph.node(policy_wait->second).active
+                                             && !graph.node(policy_wait->second).is_cpu && !graph.node(policy_wait->second).counts_toward_e2e
+                                             && graph.node(policy_wait->second).duration == decision.policy_wait_duration_us
+                                             && graph.node_lane_key(policy_wait->second) == "hicache_policy_wait";
+    if (!effect_ready || !host_control_ready || !policy_wait_ready || !decision.completion_join_required)
+        return effect_ready && host_control_ready && policy_wait_ready;
     const auto join = materialized.synthetic_nodes.find(decision.completion_join_synthetic_id);
     return join != materialized.synthetic_nodes.end() && graph.node(join->second).active && !graph.node(join->second).counts_toward_e2e
            && graph.node(join->second).duration == 0 && graph.node_lane_key(join->second) == "hicache_completion_join";
@@ -318,6 +359,32 @@ bool ingress_exact(const HiCacheRewriteDecision & decision, const MaterializedPl
 }
 
 bool consumer_exact(const HiCacheRewriteDecision & decision, const MaterializedPlan & materialized) {
+    if (synthetic_rewrite(decision.rewrite_kind) && !decision.consumer_dependency_required && decision.policy_wait_duration_us == 0) {
+        if (decision.completion_join_required) return false;
+        std::vector<size_t> service_endpoints;
+        if (decision.source_readiness_topology_reused) {
+            const auto & nodes = decision.source_completion_node_ids.empty() ? decision.owned_duration_nodes
+                                                                             : decision.source_completion_node_ids;
+            service_endpoints.assign(nodes.begin(), nodes.end());
+        }
+        else {
+            const auto synthetic = materialized.synthetic_nodes.find(decision.synthetic_id);
+            if (synthetic == materialized.synthetic_nodes.end()) return false;
+            service_endpoints.push_back(synthetic->second);
+        }
+        const auto has_causal_edge = [&](size_t source, size_t target) {
+            return added_edge_exists(materialized, source, target, decision.effect_id);
+        };
+        if (std::ranges::any_of(service_endpoints, [&](size_t source) {
+                return std::ranges::any_of(decision.consumer_anchors,
+                                           [&](size_t target) { return has_causal_edge(source, target); });
+            }))
+            return false;
+        const auto terminal_join = materialized.synthetic_nodes.find(decision.target_host_control_terminal_join_synthetic_id);
+        return terminal_join == materialized.synthetic_nodes.end()
+               || std::ranges::none_of(service_endpoints,
+                                       [&](size_t source) { return has_causal_edge(source, terminal_join->second); });
+    }
     if (decision.source_readiness_topology_reused) {
         if (!decision.completion_join_contract_ready) return false;
         if (!decision.consumer_anchors.empty()) return true;
@@ -334,7 +401,16 @@ bool consumer_exact(const HiCacheRewriteDecision & decision, const MaterializedP
     if (decision.completion_join_required) {
         if (!decision.control_ready_anchor_node_id || !decision.wait_exit_anchor_node_id) return false;
         const auto join = materialized.synthetic_nodes.find(decision.completion_join_synthetic_id);
-        if (join == materialized.synthetic_nodes.end() || !added_edge_exists(materialized, synthetic->second, join->second, decision.effect_id)) return false;
+        if (join == materialized.synthetic_nodes.end()) return false;
+        const bool service_branch = added_edge_exists(materialized, synthetic->second, join->second, decision.effect_id);
+        if (service_branch != decision.completion_join_uses_service) return false;
+        if (decision.policy_wait_duration_us > 0) {
+            const auto policy_wait = materialized.synthetic_nodes.find(decision.policy_wait_synthetic_id);
+            if (policy_wait == materialized.synthetic_nodes.end() || !decision.source_execution_anchor_node_id
+                || !added_edge_exists(materialized, *decision.source_execution_anchor_node_id, policy_wait->second, decision.effect_id)
+                || !added_edge_exists(materialized, policy_wait->second, join->second, decision.effect_id))
+                return false;
+        }
         if (decision.target_host_control_terminal) {
             const auto control = materialized.synthetic_nodes.find(decision.target_host_control_synthetic_id);
             if (control == materialized.synthetic_nodes.end() || !added_edge_exists(materialized, join->second, control->second, decision.effect_id)
@@ -353,11 +429,6 @@ bool consumer_exact(const HiCacheRewriteDecision & decision, const MaterializedP
                && added_edge_exists(materialized, synthetic->second, terminal_join->second, decision.effect_id);
     }
     if (decision.consumer_anchors.empty()) {
-        if (!decision.request_consumer_synthetic_id.empty()) {
-            const auto request_consumer = materialized.synthetic_nodes.find(decision.request_consumer_synthetic_id);
-            return request_consumer != materialized.synthetic_nodes.end()
-                   && added_edge_exists(materialized, synthetic->second, request_consumer->second, "hicache_request_io_dependency");
-        }
         const auto family_consumer = materialized.synthetic_nodes.find(decision.family_consumer_synthetic_id);
         return !decision.family_consumer_synthetic_id.empty() && family_consumer != materialized.synthetic_nodes.end()
                    && added_edge_exists(materialized, synthetic->second, family_consumer->second, "hicache_family_dependency")
@@ -449,15 +520,46 @@ std::set<EdgeKey> expected_family_edges(const HiCacheShadowRewriteTransaction & 
     return output;
 }
 
-std::set<EdgeKey> expected_lane_edges(const HiCacheIoResourcePlan & resources, const std::unordered_map<std::string, size_t> & nodes_by_effect) {
-    std::set<EdgeKey> output;
+std::vector<size_t> lane_endpoints(const HiCacheRewriteDecision & decision, const MaterializedPlan & materialized, bool completion) {
+    const auto synthetic = materialized.synthetic_nodes.find(decision.synthetic_id);
+    if (synthetic != materialized.synthetic_nodes.end()) return { synthetic->second };
+    if (!decision.source_readiness_topology_reused) return {};
+    const auto & nodes = completion && !decision.source_completion_node_ids.empty()
+                            ? decision.source_completion_node_ids
+                            : decision.owned_duration_nodes;
+    return { nodes.begin(), nodes.end() };
+}
+
+bool any_active_edge(const core::DagGraph & graph, size_t source, size_t target) {
+    return std::ranges::any_of(graph.edges(), [&](const auto & edge) {
+        return edge.active && edge.src == source && edge.dst == target;
+    });
+}
+
+bool lane_dependencies_satisfied(const core::DagGraph & graph, const HiCacheShadowRewriteTransaction & shadow,
+                                 const HiCacheIoResourcePlan & resources, const MaterializedPlan & materialized,
+                                 const std::set<EdgeKey> & planned) {
+    std::unordered_map<std::string, const HiCacheRewriteDecision *> decisions;
+    for (const auto & decision : shadow.decisions) decisions.emplace(decision.effect_id, &decision);
+    std::set<EdgeKey> allowed;
     for (const auto & dependency : resources.lane_dependencies) {
-        const auto before = nodes_by_effect.find(dependency.predecessor_effect_id);
-        const auto after = nodes_by_effect.find(dependency.successor_effect_id);
-        if (before == nodes_by_effect.end() || after == nodes_by_effect.end()) continue;
-        output.emplace(before->second, after->second, core::DagEdgeKind::Mutation, dependency.resource_lane);
+        const auto before = decisions.find(dependency.predecessor_effect_id);
+        const auto after = decisions.find(dependency.successor_effect_id);
+        if (before == decisions.end() || after == decisions.end()) return false;
+        const auto sources = lane_endpoints(*before->second, materialized, true);
+        const auto targets = lane_endpoints(*after->second, materialized, false);
+        if (sources.empty() || targets.empty()) return false;
+        for (const auto source : sources) {
+            for (const auto target : targets) {
+                if (source == target) continue;
+                allowed.emplace(source, target, core::DagEdgeKind::Mutation, dependency.resource_lane);
+                if (!any_active_edge(graph, source, target)) return false;
+            }
+        }
     }
-    return output;
+    return std::ranges::all_of(planned, [&](const auto & edge) {
+        return allowed.contains(edge) && materialized.added_edges.contains(edge);
+    });
 }
 
 } // namespace applied_validator_detail
@@ -467,14 +569,15 @@ uint64_t HiCacheAppliedPatchValidation::ready_count() const {
 }
 
 HiCacheAppliedPatchValidation validate_hicache_applied_patch(const core::DagGraph & graph, const HiCacheShadowRewriteTransaction & shadow,
-                                                             const HiCacheIoResourcePlan & resources, const core::DagMutationJournal & journal,
+                                                             const HiCacheIoResourcePlan & resources, const core::DagMutationPlan & complete_plan,
+                                                             const core::DagMutationResult & mutation,
                                                              bool materialized_topology_valid) {
     HiCacheAppliedPatchValidation validation;
-    auto materialized = applied_validator_detail::materialize_plan_index(graph, shadow.plan, journal, validation);
+    auto materialized = applied_validator_detail::materialize_plan_index(graph, complete_plan, mutation.journal, validation);
     validation.plan_journal_exact = materialized.ready;
     validation.prospective_materialization_exact =
-        graph.active_node_count() == shadow.prospective_active_node_count && graph.active_edge_count() == shadow.prospective_active_edge_count
-        && journal.active_nodes_after == graph.active_node_count() && journal.active_edges_after == graph.active_edge_count();
+        graph.active_node_count() == mutation.prospective_active_node_count && graph.active_edge_count() == mutation.prospective_active_edge_count
+        && mutation.journal.active_nodes_after == graph.active_node_count() && mutation.journal.active_edges_after == graph.active_edge_count();
     if (!validation.prospective_materialization_exact) applied_validator_detail::add_blocker(validation, "prospective_materialized_count_mismatch");
     validation.topology_exact = shadow.topology_valid && materialized_topology_valid;
     if (!validation.topology_exact) applied_validator_detail::add_blocker(validation, "materialized_topology_invalid");
@@ -488,17 +591,16 @@ HiCacheAppliedPatchValidation validate_hicache_applied_patch(const core::DagGrap
 
     const auto nodes_by_effect = applied_validator_detail::synthetic_by_effect(shadow, materialized);
     const auto expected_family = applied_validator_detail::expected_family_edges(shadow, materialized, nodes_by_effect);
-    const auto planned_family = applied_validator_detail::planned_edges_by_effect(shadow.plan, materialized.synthetic_nodes, { "hicache_family_dependency" });
+    const auto planned_family = applied_validator_detail::planned_edges_by_effect(complete_plan, materialized.synthetic_nodes, { "hicache_family_dependency" });
     validation.family_dependencies_exact =
         expected_family == planned_family && std::ranges::all_of(expected_family, [&](const auto & edge) { return materialized.added_edges.contains(edge); });
     if (!validation.family_dependencies_exact) applied_validator_detail::add_blocker(validation, "family_dependency_materialization_mismatch");
 
     std::set<std::string> lane_ids;
     for (const auto & dependency : resources.lane_dependencies) lane_ids.insert(dependency.resource_lane);
-    const auto expected_lanes = applied_validator_detail::expected_lane_edges(resources, nodes_by_effect);
-    const auto planned_lanes = applied_validator_detail::planned_edges_by_effect(shadow.plan, materialized.synthetic_nodes, lane_ids);
-    validation.lane_dependencies_exact =
-        expected_lanes == planned_lanes && std::ranges::all_of(expected_lanes, [&](const auto & edge) { return materialized.added_edges.contains(edge); });
+    const auto planned_lanes = applied_validator_detail::planned_edges_by_effect(complete_plan, materialized.synthetic_nodes, lane_ids);
+    validation.lane_dependencies_exact = applied_validator_detail::lane_dependencies_satisfied(
+        graph, shadow, resources, materialized, planned_lanes);
     if (!validation.lane_dependencies_exact) applied_validator_detail::add_blocker(validation, "lane_dependency_materialization_mismatch");
 
     if (!validation.plan_journal_exact) applied_validator_detail::add_blocker(validation, "plan_journal_mismatch");

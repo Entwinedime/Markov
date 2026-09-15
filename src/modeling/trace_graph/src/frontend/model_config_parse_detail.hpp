@@ -38,7 +38,6 @@ void require_exact_fields(const Json & object, const std::string & context, std:
 [[nodiscard]] std::map<std::string, std::string> string_map_value(const Json & object, const std::string & key);
 
 [[nodiscard]] std::map<std::string, HiCacheIoServiceModelConfig> parse_hicache_service_models(const Json & io_cost);
-[[nodiscard]] HiCacheIoPlanningConfig parse_hicache_io_planning(const Json & hicache);
 [[nodiscard]] HiCacheIoCostConfig parse_hicache_io_cost(const Json & hicache);
 
 } // namespace markov::trace_graph::frontend::model_config_detail

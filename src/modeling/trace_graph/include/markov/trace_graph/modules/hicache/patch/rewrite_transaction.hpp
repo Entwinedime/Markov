@@ -43,8 +43,11 @@ struct HiCacheRewriteDecision {
     HiCacheRewriteKind rewrite_kind = HiCacheRewriteKind::Reject;
     bool shadow_plan_ready = false;
     uint64_t duration_us = 0;
+    bool consumer_dependency_required = false;
+    uint64_t policy_wait_duration_us = 0;
     std::string resource_lane;
     std::string synthetic_id;
+    std::string policy_wait_synthetic_id;
     std::vector<size_t> carrier_nodes;
     std::vector<size_t> owned_duration_nodes;
     std::vector<HiCacheCpuGapSlice> owned_gap_slices;
@@ -72,6 +75,7 @@ struct HiCacheRewriteDecision {
     std::string completion_wait_reason;
     bool completion_join_contract_ready = false;
     bool completion_join_required = false;
+    bool completion_join_uses_service = false;
     bool source_effect_schedule_aligned = true;
     bool source_readiness_topology_reused = false;
     bool source_completion_wait_blocking = false;
@@ -103,7 +107,6 @@ struct HiCacheRewriteDecision {
     std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     std::vector<size_t> consumer_anchors;
     std::string consumer_anchor_method;
-    std::string request_consumer_synthetic_id;
     std::string family_consumer_synthetic_id;
     std::string reason;
     std::string blocker;

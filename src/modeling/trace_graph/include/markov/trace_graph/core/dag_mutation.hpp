@@ -155,6 +155,8 @@ struct DagTopologyValidationReport {
 /** @brief Applied journal and synthetic-ID mapping, plus Debug post-apply validation. */
 struct DagMutationResult {
     DagMutationJournal journal;
+    size_t prospective_active_node_count = 0;
+    size_t prospective_active_edge_count = 0;
 #ifdef DEBUG
     DagTopologyValidationReport topology;
 #endif

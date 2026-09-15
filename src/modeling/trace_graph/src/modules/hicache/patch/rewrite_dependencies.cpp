@@ -9,19 +9,57 @@ namespace markov::trace_graph::modules::hicache::patch::rewrite_transaction_deta
 
 using model::HiCacheEffectType;
 
-void append_resource_lane_dependencies(core::DagMutationPlan & plan, const HiCacheIoResourcePlan & resources,
+std::vector<core::DagNodeRef> resource_endpoints(const HiCacheRewriteDecision & decision,
+                                                const std::unordered_map<std::string, std::string> & synthetic_by_effect,
+                                                bool completion) {
+    if (const auto synthetic = synthetic_by_effect.find(decision.effect_id); synthetic != synthetic_by_effect.end())
+        return {core::DagNodeRef::synthetic(synthetic->second)};
+    if (!decision.source_readiness_topology_reused) return {};
+    const auto & nodes = completion && !decision.source_completion_node_ids.empty()
+                            ? decision.source_completion_node_ids
+                            : decision.owned_duration_nodes;
+    std::vector<core::DagNodeRef> endpoints;
+    endpoints.reserve(nodes.size());
+    for (const auto node_id : nodes) endpoints.push_back(core::DagNodeRef::existing(node_id));
+    return endpoints;
+}
+
+bool same_endpoint(const core::DagNodeRef & left, const core::DagNodeRef & right) {
+    return left.existing_node_id == right.existing_node_id && left.synthetic_id == right.synthetic_id;
+}
+
+bool existing_edge(const core::DagGraph & graph, const core::DagNodeRef & source, const core::DagNodeRef & target) {
+    if (!source.existing_node_id || !target.existing_node_id) return false;
+    return std::ranges::any_of(graph.edges(), [&](const auto & edge) {
+        return edge.active && edge.src == *source.existing_node_id && edge.dst == *target.existing_node_id;
+    });
+}
+
+void append_resource_lane_dependencies(const core::DagGraph & graph, core::DagMutationPlan & plan, const HiCacheIoResourcePlan & resources,
+                                       const std::vector<HiCacheRewriteDecision> & decisions,
                                        const std::unordered_map<std::string, std::string> & synthetic_by_effect) {
+    std::map<std::string, const HiCacheRewriteDecision *> by_effect;
+    for (const auto & decision : decisions)
+        if (decision.shadow_plan_ready && decision.rewrite_kind != HiCacheRewriteKind::NoOp && decision.rewrite_kind != HiCacheRewriteKind::Reject)
+            by_effect.emplace(decision.effect_id, &decision);
     for (const auto & dependency : resources.lane_dependencies) {
-        const auto predecessor = synthetic_by_effect.find(dependency.predecessor_effect_id);
-        const auto successor = synthetic_by_effect.find(dependency.successor_effect_id);
-        if (predecessor == synthetic_by_effect.end() || successor == synthetic_by_effect.end()) continue;
-        plan.add_edges.push_back(core::DagAddEdgeMutation{
-            .src = core::DagNodeRef::synthetic(predecessor->second),
-            .dst = core::DagNodeRef::synthetic(successor->second),
-            .kind = core::DagEdgeKind::Mutation,
-            .effect_id = dependency.resource_lane,
-            .reason = "serialize adjacent target effects on one HiCache resource lane",
-        });
+        const auto predecessor = by_effect.find(dependency.predecessor_effect_id);
+        const auto successor = by_effect.find(dependency.successor_effect_id);
+        if (predecessor == by_effect.end() || successor == by_effect.end()) continue;
+        const auto sources = resource_endpoints(*predecessor->second, synthetic_by_effect, true);
+        const auto targets = resource_endpoints(*successor->second, synthetic_by_effect, false);
+        for (const auto & source : sources) {
+            for (const auto & target : targets) {
+                if (same_endpoint(source, target) || existing_edge(graph, source, target)) continue;
+                plan.add_edges.push_back(core::DagAddEdgeMutation{
+                    .src = source,
+                    .dst = target,
+                    .kind = core::DagEdgeKind::Mutation,
+                    .effect_id = dependency.resource_lane,
+                    .reason = "serialize adjacent target effects on one HiCache resource lane",
+                });
+            }
+        }
     }
 }
 
@@ -96,8 +134,14 @@ void append_request_io_dependencies(core::DagMutationPlan & plan, const std::vec
             }
             if (latest_prefetch == nullptr) continue;
             plan.add_edges.push_back(core::DagAddEdgeMutation{
-                .src = core::DagNodeRef::synthetic(synthetic_by_effect.at(latest_prefetch->effect_id)),
-                .dst = core::DagNodeRef::synthetic(synthetic_by_effect.at(decision->effect_id)),
+                .src = core::DagNodeRef::synthetic(latest_prefetch->target_host_control_required
+                                                      ? latest_prefetch->target_host_control_synthetic_id
+                                                      : latest_prefetch->completion_join_required
+                                                            ? latest_prefetch->completion_join_synthetic_id
+                                                            : synthetic_by_effect.at(latest_prefetch->effect_id)),
+                .dst = core::DagNodeRef::synthetic(decision->target_host_control_required
+                                                      ? decision->target_host_control_synthetic_id
+                                                      : synthetic_by_effect.at(decision->effect_id)),
                 .kind = core::DagEdgeKind::Mutation,
                 .effect_id = "hicache_request_io_dependency",
                 .reason = "request load cannot precede its latest target prefetch boundary",

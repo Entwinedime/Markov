@@ -1,8 +1,5 @@
 #include "rewrite_normalization.hpp"
 
-#include "markov/trace_graph/core/numeric.hpp"
-
-#include <algorithm>
 #include <map>
 #include <ranges>
 #include <set>
@@ -10,38 +7,6 @@
 namespace markov::trace_graph::modules::hicache::patch::rewrite_transaction_detail {
 
 using model::HiCacheEffectType;
-using model::HiCacheSourceCarrierState;
-using model::HiCacheTargetEffectState;
-
-uint64_t absolute_difference(uint64_t left, uint64_t right) { return left >= right ? left - right : right - left; }
-
-void fold_prefetch_shift_below_polling_resolution(std::vector<HiCacheRewriteDecision> & decisions) {
-    std::vector<HiCacheRewriteDecision *> candidates;
-    uint64_t target_duration_us = 0;
-    uint64_t source_observed_duration_us = 0;
-    uint64_t source_polling_resolution_us = 0;
-    for (auto & decision : decisions) {
-        if (decision.effect_type != HiCacheEffectType::PrefetchIo || !decision.shadow_plan_ready
-            || decision.source_carrier_state != HiCacheSourceCarrierState::Present || decision.target_effect_state == HiCacheTargetEffectState::NotRequired
-            || !decision.completion_join_contract_ready || decision.observed_io_duration_us == 0 || decision.polling_lag_us == 0)
-            continue;
-        candidates.push_back(&decision);
-        target_duration_us = core::checked_add_u64(target_duration_us, decision.duration_us, "Target prefetch duration exceeds uint64 range");
-        source_observed_duration_us =
-            core::checked_add_u64(source_observed_duration_us, decision.observed_io_duration_us, "Source prefetch duration exceeds uint64 range");
-        source_polling_resolution_us =
-            core::checked_add_u64(source_polling_resolution_us, decision.polling_lag_us, "Source prefetch polling resolution exceeds uint64 range");
-    }
-    if (candidates.empty() || absolute_difference(target_duration_us, source_observed_duration_us) > source_polling_resolution_us) return;
-    for (auto * decision : candidates) {
-        decision->completion_join_required = false;
-        decision->rewrite_kind = HiCacheRewriteKind::NoOp;
-        decision->shadow_plan_ready = true;
-        decision->blocker.clear();
-        decision->reason = "aggregate target prefetch completion shift is below the source polling resolution; preserve the faithful source topology";
-    }
-}
-
 void fold_prefetch_visibility_into_completion_join(std::vector<HiCacheRewriteDecision> & decisions) {
     std::set<std::string> folded_families;
     for (const auto & decision : decisions) {

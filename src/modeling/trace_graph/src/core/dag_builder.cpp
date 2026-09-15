@@ -23,6 +23,12 @@ namespace dag_builder_detail {
 
 uint64_t node_end_ts(const TraceEvent & event) { return checked_add_u64(event.ts, event.dur, "trace event end timestamp overflow"); }
 
+bool is_submit_anchor_event(const TraceEvent & event) {
+    if (event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue") return true;
+    if (event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync")) return true;
+    return event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
+}
+
 bool is_usable_lane_value(const std::string & value) { return !value.empty() && value != "-1"; }
 
 bool raw_contains_key_hint(const TraceEvent & event, std::string_view key) { return event.args_json_view().find(key) != std::string_view::npos; }
@@ -80,6 +86,20 @@ std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::
     return intervals;
 }
 
+std::vector<DagPhaseMarkerEvent> phase_marker_events(const std::vector<TraceEvent> & events, int gpu_id) {
+    std::vector<DagPhaseMarkerEvent> markers;
+    for (const auto & event : events) {
+        if (event.source_channel != TraceSourceChannel::Torch || event.ph != 'X' || event.pid != event.tid) continue;
+        if (!event.name.starts_with("step[EXTEND") && !event.name.starts_with("step[DECODE")) continue;
+        markers.push_back(DagPhaseMarkerEvent{ .gpu_id = gpu_id, .event = event });
+    }
+    std::ranges::sort(markers, [](const auto & left, const auto & right) {
+        if (left.event.ts != right.event.ts) return left.event.ts < right.event.ts;
+        return left.event.index < right.event.index;
+    });
+    return markers;
+}
+
 ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events) {
     ExecutionAndFactEvents split;
     split.executable_events.reserve(events.size());
@@ -132,12 +152,14 @@ DagBuilder::DagBuilder(size_t threads) : threads_(std::max<size_t>(1, threads)) 
 DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto parsed_count = events.size();
     auto exclusions = dag_builder_detail::control_exclusion_intervals(events, gpu_id);
+    auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
     auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
     auto normalized = normalize_events(std::move(split.executable_events));
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);
     graph.set_hicache_fact_events(std::move(split.hicache_fact_events));
     graph.set_control_exclusion_intervals(std::move(exclusions));
+    graph.set_phase_marker_events(std::move(phase_markers));
     graph.reserve(DagGraphCapacity{ .nodes = graph.events().size(), .edges = 0 });
 
     auto index = create_node_index(graph);

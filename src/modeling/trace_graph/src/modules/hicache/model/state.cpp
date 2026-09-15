@@ -125,6 +125,7 @@ void HiCacheState::register_prefetch_control_boundary(const HiCacheFact & fact) 
         boundary.source_node_id = fact.source_node_id;
         boundary.execution_anchor_node_id = fact.execution_anchor_node_id;
         boundary.source_event_index = fact.source_event_index;
+        boundary.source_ts = fact.source_ts;
         boundary.ts = fact.ts;
         boundary.event_name = fact.event_name;
         boundary.role = fact.role;
@@ -259,7 +260,9 @@ void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bo
     if (observe_effects) formal_window_active_ = true;
     if (role != HiCacheFactRole::Unknown) {
         auto & scope = scope_state(fact);
+        advance_storage_backups(fact, scope);
         drain_write_through_backup_refs(fact, scope, "write_through_backup_ack_boundary");
+        advance_storage_backups(fact, scope);
         advance_ready_prefetches(fact);
     }
     if (observe_effects) observe_effect_opportunities(fact, role);
@@ -281,7 +284,6 @@ void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bo
         break;
     }
 }
-
 
 
 } // namespace markov::trace_graph::modules::hicache::model

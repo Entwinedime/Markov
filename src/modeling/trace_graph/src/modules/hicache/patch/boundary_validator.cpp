@@ -99,6 +99,16 @@ const core::DagSyntheticNodeMutation * completion_join_node(const core::DagMutat
     return match;
 }
 
+const core::DagSyntheticNodeMutation * policy_wait_node(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    const core::DagSyntheticNodeMutation * match = nullptr;
+    for (const auto & node : plan.synthetic_nodes) {
+        if (node.synthetic_id != decision.policy_wait_synthetic_id || node.effect_id != decision.effect_id) continue;
+        if (match != nullptr) return nullptr;
+        match = &node;
+    }
+    return match;
+}
+
 const core::DagSyntheticNodeMutation * synthetic_node(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
     const core::DagSyntheticNodeMutation * match = nullptr;
     for (const auto & node : plan.synthetic_nodes) {
@@ -133,12 +143,15 @@ bool target_host_control_materialized(const core::DagMutationPlan & plan, const 
         || (decision.target_host_control_exit_node_ids.empty() && decision.effect_type != model::HiCacheEffectType::CommitDeviceToHost))
         return false;
     if (decision.target_host_control_terminal) {
-        if (decision.completion_join_required || decision.target_host_control_exit_node_ids.size() != 1
-            || decision.target_host_control_ingress_edge_ids.empty())
-            return false;
         const auto control_ref = core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id);
-        const auto join_ref = core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id);
+        if (decision.target_host_control_exit_node_ids.size() != 1) return false;
         const auto exit_ref = core::DagNodeRef::existing(decision.target_host_control_exit_node_ids.front());
+        if (decision.completion_join_required)
+            return completion_join_node(plan, decision) != nullptr
+                   && has_added_edge(plan, core::DagNodeRef::synthetic(decision.completion_join_synthetic_id), control_ref, decision.effect_id)
+                   && has_added_edge(plan, control_ref, exit_ref, decision.effect_id);
+        if (decision.target_host_control_ingress_edge_ids.empty()) return false;
+        const auto join_ref = core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id);
         const auto join_count = std::ranges::count_if(plan.synthetic_nodes, [&](const auto & node) {
             return node.synthetic_id == decision.target_host_control_terminal_join_synthetic_id && node.effect_id == decision.effect_id
                    && node.node.duration == 0 && !node.node.counts_toward_e2e;
@@ -200,7 +213,8 @@ bool observable_endpoint_contract(const core::DagMutationPlan & plan, const HiCa
     const auto * host_control = target_host_control_node(plan, decision);
     if (host_control != nullptr && host_control->node.counts_toward_e2e) return false;
     const auto * join = completion_join_node(plan, decision);
-    return join == nullptr || !join->node.counts_toward_e2e;
+    const auto * policy_wait = policy_wait_node(plan, decision);
+    return (join == nullptr || !join->node.counts_toward_e2e) && (policy_wait == nullptr || !policy_wait->node.counts_toward_e2e);
 }
 
 bool source_boundary_untouched(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
@@ -253,17 +267,14 @@ bool replacement_ingress(const core::DagGraph & graph, const core::DagMutationPl
 
 bool consumer_dependencies(const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
     if (decision.target_host_control_terminal) {
-        return has_added_edge(plan,
-                              core::DagNodeRef::synthetic(decision.synthetic_id),
-                              core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id),
-                              decision.effect_id);
+        return !decision.consumer_dependency_required
+               || has_added_edge(plan,
+                                 core::DagNodeRef::synthetic(decision.synthetic_id),
+                                 core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id),
+                                 decision.effect_id);
     }
+    if (!decision.consumer_dependency_required) return true;
     if (decision.consumer_anchors.empty()) {
-        if (!decision.request_consumer_synthetic_id.empty())
-            return has_added_edge(plan,
-                                  core::DagNodeRef::synthetic(decision.synthetic_id),
-                                  core::DagNodeRef::synthetic(decision.request_consumer_synthetic_id),
-                                  "hicache_request_io_dependency");
         return !decision.family_consumer_synthetic_id.empty()
                    && has_added_edge(plan,
                                      core::DagNodeRef::synthetic(decision.synthetic_id),
@@ -297,12 +308,24 @@ bool insertion_dependencies(const core::DagMutationPlan & plan, const HiCacheRew
 bool completion_join_dependencies(const core::DagGraph & graph, const core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
     if (!decision.completion_join_required || !decision.control_ready_anchor_node_id || !decision.wait_exit_anchor_node_id) return false;
     const auto ingress = target_effect_ingress(decision);
+    const bool has_service_branch = has_added_edge(plan,
+                                                   core::DagNodeRef::synthetic(decision.synthetic_id),
+                                                   core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
+                                                   decision.effect_id);
+    const bool service_branch = has_service_branch == decision.completion_join_uses_service;
+    const bool policy_branch = decision.policy_wait_duration_us == 0
+                               || (policy_wait_node(plan, decision) != nullptr
+                                   && has_added_edge(plan,
+                                                     ingress,
+                                                     core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
+                                                     decision.effect_id)
+                                   && has_added_edge(plan,
+                                                     core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
+                                                     core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
+                                                     decision.effect_id));
     if ((!ingress.existing_node_id && ingress.synthetic_id.empty())
         || !has_added_edge(plan, ingress, core::DagNodeRef::synthetic(decision.synthetic_id), decision.effect_id)
-        || !has_added_edge(plan,
-                           core::DagNodeRef::synthetic(decision.synthetic_id),
-                           core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
-                           decision.effect_id)
+        || !service_branch || !policy_branch
         || (decision.target_host_control_terminal ? (!has_added_edge(plan,
                                                                      core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
                                                                      core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
@@ -387,9 +410,15 @@ HiCacheBoundaryValidation validate_one(const core::DagGraph & graph, const HiCac
         const auto * synthetic = synthetic_node(shadow.plan, decision);
         if (decision.completion_join_required) {
             const auto * join = completion_join_node(shadow.plan, decision);
+            const auto * policy_wait = policy_wait_node(shadow.plan, decision);
+            const bool policy_wait_ready = decision.policy_wait_duration_us == 0
+                                           ? policy_wait == nullptr
+                                           : policy_wait != nullptr && policy_wait->node.duration == decision.policy_wait_duration_us
+                                                 && !policy_wait->node.is_cpu && !policy_wait->node.counts_toward_e2e;
             const bool dependencies = completion_join_dependencies(graph, shadow.plan, decision);
             validation.target_cost_materialized = synthetic != nullptr && synthetic->node.duration == decision.duration_us && join != nullptr
-                                                  && join->node.duration == 0 && target_host_control_materialized(shadow.plan, decision);
+                                                  && join->node.duration == 0 && policy_wait_ready
+                                                  && target_host_control_materialized(shadow.plan, decision);
             validation.ingress_preserved = dependencies;
             validation.consumer_dependency_ready = dependencies;
         }

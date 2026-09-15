@@ -228,6 +228,8 @@ DagMutationResult empty_mutation_result(const DagGraph & graph, const DagMutatio
     result.journal.active_edges_before = graph.active_edge_count();
     result.journal.active_nodes_after = result.journal.active_nodes_before;
     result.journal.active_edges_after = result.journal.active_edges_before;
+    result.prospective_active_node_count = result.journal.active_nodes_after;
+    result.prospective_active_edge_count = result.journal.active_edges_after;
     return result;
 }
 
@@ -265,6 +267,8 @@ DagMutationResult apply_dag_mutation_plan(DagGraph & graph, const DagMutationPla
     if (!prospective.ok()) throw DagMutationValidationError("invalid DAG mutation plan: " + failure_message(prospective), prospective);
 
     auto result = DagMutationApplier(graph, plan).run();
+    result.prospective_active_node_count = prospective.active_node_count;
+    result.prospective_active_edge_count = prospective.active_edge_count;
 #ifdef DEBUG
     result.topology = validate_active_dag(graph);
     if (!result.topology.ok())

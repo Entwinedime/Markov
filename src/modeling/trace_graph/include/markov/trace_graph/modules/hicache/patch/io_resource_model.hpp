@@ -45,7 +45,7 @@ struct HiCacheIoCostRecord {
     uint64_t storage_existing_page_count = 0;
     uint64_t storage_new_page_count = 0;
     /** Predicted per-operation existing-key H2S shape used by canonical storage cost. */
-    std::vector<uint64_t> storage_existing_operation_page_counts;
+    std::vector<model::HiCacheStorageBatchWork> storage_service_batches;
     uint64_t storage_existing_byte_count = 0;
     uint64_t storage_new_byte_count = 0;
     std::string operation_kind;
@@ -59,7 +59,6 @@ struct HiCacheIoCostRecord {
     uint64_t host_control_page_count = 0;
     uint64_t host_control_operation_count = 0;
     double host_control_fixed_us = 0.0;
-    double host_control_page_us = 0.0;
     uint64_t host_control_duration_us = 0;
     std::string resource_scope;
     std::string resource_lane;
@@ -81,8 +80,8 @@ struct HiCacheIoLaneDependency {
  *
  * Oracle costs are applied after target effect decisions have fixed the operation
  * structure.  They must never feed state replay, calibration, or a production
- * prediction.  Blocking and terminal polling are recorded as outcomes rather than
- * force-filled inputs so the replay still tests the predicted dependencies.
+ * prediction. Control inputs are intrinsic CPU work, including terminal control;
+ * blocking and polling waits remain outcomes of the predicted dependencies.
  */
 struct HiCacheOracleCostReplayAudit {
     std::string status = "disabled";
@@ -92,9 +91,7 @@ struct HiCacheOracleCostReplayAudit {
     uint64_t oracle_service_us = 0;
     uint64_t applied_service_us = 0;
     uint64_t oracle_control_us = 0;
-    uint64_t applied_primitive_control_us = 0;
-    uint64_t outcome_only_control_us = 0;
-    uint64_t observed_blocking_us = 0;
+    uint64_t applied_control_us = 0;
     bool effect_identity_exact = false;
     bool operation_shape_exact = false;
     bool target_e2e_consumed = false;

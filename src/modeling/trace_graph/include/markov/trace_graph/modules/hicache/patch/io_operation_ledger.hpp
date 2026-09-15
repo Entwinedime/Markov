@@ -17,6 +17,16 @@ namespace markov::trace_graph::modules::hicache::patch {
 
 enum class HiCacheIoOperationKind : std::uint8_t { Prefetch, Load, WriteDeviceToHost, WriteHostToStorage };
 
+/** One measured storage call; a logical I/O operation may contain several batches. */
+struct HiCacheStorageServiceBatch {
+    size_t fact_node_id = 0;
+    uint64_t start_us = 0;
+    uint64_t duration_us = 0;
+    uint64_t item_count = 0;
+    std::optional<uint64_t> existing_page_count;
+    std::optional<uint64_t> new_page_count;
+};
+
 struct HiCacheIoOperationRecord {
     std::string record_id;
     HiCacheIoOperationKind kind = HiCacheIoOperationKind::Prefetch;
@@ -37,6 +47,13 @@ struct HiCacheIoOperationRecord {
     uint64_t source_end_us = 0;
     uint64_t observed_duration_us = 0;
     std::string observed_span_semantics = "unknown";
+    /** Ordered, non-overlapping calls; gaps between calls are not service time. */
+    std::vector<HiCacheStorageServiceBatch> storage_service_batches;
+    uint64_t observed_service_start_us = 0;
+    uint64_t observed_service_duration_us = 0;
+    bool storage_residency_observed = false;
+    uint64_t storage_existing_page_count = 0;
+    uint64_t storage_new_page_count = 0;
     uint64_t owned_node_duration_us = 0;
     uint64_t owned_gap_duration_us = 0;
     uint64_t overlapping_node_duration_us = 0;
@@ -71,6 +88,13 @@ struct HiCacheIoOperationRecord {
     uint64_t logical_input_completion_wait_duration_us = 0;
     uint64_t polling_lag_us = 0;
     uint64_t retained_terminal_control_us = 0;
+    /** Retained explicit CPU work, excluding wrapper self, gaps and wait nodes. */
+    uint64_t terminal_control_us = 0;
+    /** Observed return-state, not target state or a positive-payload entry-state estimate. */
+    std::optional<uint64_t> host_available_tokens_at_return;
+    std::vector<size_t> terminal_control_node_ids;
+    /** False checks observe the state-check primitive without terminal commit. */
+    std::vector<uint64_t> progress_check_cpu_samples_us;
     std::optional<size_t> control_ready_anchor_node_id = std::nullopt;
     std::optional<size_t> wait_exit_anchor_node_id = std::nullopt;
     std::optional<size_t> terminal_control_anchor_node_id = std::nullopt;

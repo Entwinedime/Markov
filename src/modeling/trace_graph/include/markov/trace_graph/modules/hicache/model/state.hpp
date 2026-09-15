@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -90,6 +91,9 @@ public:
     /** @brief Exports one explicit decision for every registered direct-effect opportunity. */
     [[nodiscard]] HiCacheEffectDecisionLedger effect_decision_ledger() const;
 
+    /** @brief Returns target prefill work accumulated at formal cache-extend boundaries. */
+    [[nodiscard]] const std::vector<HiCachePrefillWorkItem> & prefill_work_items() const { return prefill_work_items_; }
+
 private:
     /** @brief Request-local lifecycle projection that never owns residency state. */
     struct RequestState {
@@ -157,9 +161,6 @@ private:
         void reconcile_occupied_pages(uint64_t committed_pages, uint64_t request_owned_pages);
     };
 
-    /** @brief Logical target I/O resources whose availability is tracked per scope. */
-    enum class TargetIoLane : std::uint8_t { HostToDevice, DeviceToHost, HostStorage };
-
     /** @brief Complete canonical runtime state for one cache scope. */
     struct ScopedState {
         HiCacheTokenRadixTree tree;
@@ -171,9 +172,6 @@ private:
         DeviceAllocatorLedger device_allocator;
         std::unordered_map<std::string, RequestState> requests;
         std::vector<PendingWriteThroughBackup> pending_write_through_backups;
-        uint64_t host_to_device_lane_available_ts = 0;
-        uint64_t device_to_host_lane_available_ts = 0;
-        uint64_t host_storage_lane_available_ts = 0;
         /** Cumulative target-predicted storage reads/writes used for key reuse distance. */
         uint64_t storage_access_bytes_completed = 0;
         /** Byte position immediately after the most recent read or write of each page. */
@@ -244,10 +242,12 @@ private:
         uint64_t policy_stop_ts = 0;
         uint64_t target_boundary_ts = 0;
         uint64_t timeout_deadline_ts = 0;
+        uint64_t policy_wait_duration_us = 0;
         bool storage_hit_sufficient = false;
         bool boundary_resolved = false;
         bool io_completed = false;
         bool timed_out = false;
+        bool service_consumer_dependency_required = false;
         bool visibility_dependency_required = false;
     };
 
@@ -281,8 +281,10 @@ private:
     HiCacheTokenDirectory token_directory_;
     HiCachePolicy policy_;
     std::unordered_map<std::string, ScopedState> scopes_;
+    std::unordered_map<std::string, uint64_t> io_lane_available_ts_;
     std::unordered_map<std::string, std::vector<HiCacheFact>> prefetch_control_boundaries_;
     std::vector<HiCacheEffectOpportunity> effect_opportunities_;
+    std::vector<HiCachePrefillWorkItem> prefill_work_items_;
     std::unordered_map<std::string, uint64_t> effect_fact_ordinals_;
     std::unordered_map<std::string, std::string> effect_scope_identities_;
     uint64_t effect_opportunity_epoch_ = 0;
@@ -316,8 +318,13 @@ private:
     void ensure_device_allocator(ScopedState & scope);
     /** @brief Reports whether a new device page has observable dirty state at insertion. */
     [[nodiscard]] bool inserted_device_dirty_visible_at_insert_boundary() const;
-    /** @brief Schedules one target transfer using only projected bytes and its configured bandwidth. */
-    [[nodiscard]] HiCacheIoSchedule schedule_target_io(ScopedState & scope, TargetIoLane lane, uint64_t eligibility_ts, uint64_t page_count) const;
+    /** @brief Use the same service batches, costs and resource scopes as the DAG. */
+    [[nodiscard]] HiCacheIoSchedule schedule_target_io(const std::string & scope, const std::string & kind,
+                                                       uint64_t eligibility_ts, uint64_t page_count,
+                                                       std::span<const uint64_t> existing_batch_pages = {},
+                                                       std::optional<uint64_t> stop_ts = std::nullopt);
+    /** @brief Publishes D2H/H2S state whose shared service clock reached this boundary. */
+    void advance_storage_backups(const HiCacheFact & fact, ScopedState & scope, bool force = false);
     /** @brief Materializes every target prefetch completed by the current global boundary. */
     void advance_ready_prefetches(const HiCacheFact & fact);
     /** @brief Binds a transfer-owned prefetch dependency to its canonical cache consumer. */
@@ -421,12 +428,12 @@ private:
     [[nodiscard]] std::string begin_storage_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
                                                    const std::vector<std::string> & device_to_host_pages);
 
-    /** @brief Commits host/storage residency before asynchronous acknowledgement. */
+    /** @brief Publishes the host copy after D2H acknowledgement. */
     void materialize_host_backup(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
-                                 const std::string & storage_id, bool storage_readable);
+                                 const std::string & storage_id);
 
-    /** @brief Acknowledges storage backup and releases its temporary host reference. */
-    void complete_storage_backup(const HiCacheFact & fact, ScopedState & scope, const std::string & storage_id, const std::vector<std::string> & pages);
+    /** @brief Publishes storage readability after H2S acknowledgement. */
+    void complete_storage_backup(const HiCacheFact & fact, ScopedState & scope, const std::string & storage_id);
     /** @brief Holds a write-through reference until the next target-control drain. */
     void hold_write_through_backup_ref(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id, const std::vector<std::string> & pages,
                                        const std::string & storage_operation_id);

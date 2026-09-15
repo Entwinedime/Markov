@@ -3,6 +3,7 @@
  * @brief Materializes one source-observed HiCache I/O operation record.
  */
 #include "io_operation_ledger_detail.hpp"
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
 #include <ranges>
@@ -19,6 +20,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
     }
     const auto scope_page_size = page_size_for_scope(source, timing_view.cache_scope);
     const auto trace_page_size = scope_page_size > 0 ? scope_page_size : unique_source_page_size(source);
+    const auto services = nested_storage_services(source, timing_view, kind);
     auto ownership = source.timing_interval_ownership(timing_view);
     HiCacheIoOperationRecord record{
         .record_id = timing.fact_role + ":" + timing.pid + ":" + std::to_string(timing.event_index),
@@ -39,6 +41,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         .source_end_us = fact_end(timing),
         .observed_duration_us = timing.duration_us,
         .observed_span_semantics = observed_span_semantics(kind),
+        .observed_service_start_us = services.empty() ? 0 : services.front()->timestamp_us,
         .owned_node_duration_us = ownership.owned_node_duration_us,
         .owned_gap_duration_us = ownership.owned_gap_duration_us,
         .overlapping_node_duration_us = ownership.overlapping_node_duration_us,
@@ -54,8 +57,41 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         .foreground_consumer_required = kind == HiCacheIoOperationKind::Prefetch || kind == HiCacheIoOperationKind::Load,
         .evidence = { timing.fact_role, "same_pid_tid_call_containment" },
     };
-    if (timing_view.source_page_size == 0 && scope_page_size == 0 && trace_page_size > 0)
-        record.evidence.push_back("unique_source_trace_page_size_fallback");
+    uint64_t items = 0, existing = 0, fresh = 0;
+    bool complete_branches = !services.empty();
+    for (const auto * service : services) {
+        record.storage_service_batches.push_back({ service->node_id,
+                                                   service->timestamp_us,
+                                                   service->duration_us,
+                                                   service->service_item_count,
+                                                   service->storage_existing_page_count,
+                                                   service->storage_new_page_count });
+        record.observed_service_duration_us =
+            core::checked_add_u64(record.observed_service_duration_us, service->duration_us, "Storage service duration exceeds uint64 range");
+        items = core::checked_add_u64(items, service->service_item_count, "Storage service item count exceeds uint64 range");
+        if (!service->storage_existing_page_count || !service->storage_new_page_count || *service->storage_existing_page_count > service->service_item_count
+            || *service->storage_new_page_count != service->service_item_count - *service->storage_existing_page_count
+            || (service->source_page_size > 0 && service->source_page_size != record.source_page_size)) {
+            complete_branches = false;
+            continue;
+        }
+        existing = core::checked_add_u64(existing, *service->storage_existing_page_count, "Storage existing page count exceeds uint64 range");
+        fresh = core::checked_add_u64(fresh, *service->storage_new_page_count, "Storage new page count exceeds uint64 range");
+    }
+    if (!services.empty()) record.evidence.push_back("nested_storage_service_observation");
+    if (kind == HiCacheIoOperationKind::WriteHostToStorage && complete_branches && record.source_page_size > 0) {
+        const auto completed_pages = record.completed_token_count / record.source_page_size;
+        // Completed payload and the nested batches must agree. Missing or partial
+        // branch evidence stays unknown; no residency is inferred from timing.
+        if (record.completed_token_count % record.source_page_size == 0 && existing <= completed_pages && fresh == completed_pages - existing
+            && items == completed_pages) {
+            record.storage_residency_observed = true;
+            record.storage_existing_page_count = existing;
+            record.storage_new_page_count = fresh;
+            record.evidence.push_back("actual_storage_write_branch_counts");
+        }
+    }
+    if (timing_view.source_page_size == 0 && scope_page_size == 0 && trace_page_size > 0) record.evidence.push_back("unique_source_trace_page_size_fallback");
     if (call_start != nullptr) record.control_fact_node_ids.push_back(call_start->node_id);
     const auto * load_decision = kind == HiCacheIoOperationKind::Load ? load_decision_for_timing(source, timing_view) : nullptr;
     if (kind == HiCacheIoOperationKind::Load && record.request_id.empty() && load_decision != nullptr) {
@@ -92,8 +128,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
 
     const HiCacheSourceFactNode * consumer = nullptr;
     if (!record.request_id.empty()) consumer = request_consumer(source, record.request_id, record.pid, record.source_end_us);
-    else if (kind == HiCacheIoOperationKind::WriteDeviceToHost || kind == HiCacheIoOperationKind::WriteHostToStorage)
-        consumer = write_consumer(source, timing);
+    else if (kind == HiCacheIoOperationKind::WriteDeviceToHost || kind == HiCacheIoOperationKind::WriteHostToStorage) consumer = write_consumer(source, timing);
     if (consumer != nullptr) {
         record.consumer_anchor_node_id = source.cpu_boundary_at_or_after(consumer->pid, consumer->tid, fact_boundary(*consumer));
         record.control_fact_node_ids.push_back(consumer->node_id);

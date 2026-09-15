@@ -94,10 +94,19 @@ struct HiCacheEffectOpportunity {
     /** @brief Optional proven executable anchor for the opportunity fact. */
     std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
+    std::string source_pid;
     bool input_ready = false;
     HiCacheEffectBoundary eligibility_boundary;
     std::string resource_lane;
     std::vector<HiCacheEffectSegment> candidate_segments;
+};
+
+/** One predicted physical storage call; residency counts apply only to H2S. */
+struct HiCacheStorageBatchWork {
+    uint64_t operation_index = 0;
+    uint64_t page_count = 0;
+    uint64_t existing_page_count = 0;
+    uint64_t new_page_count = 0;
 };
 
 /**
@@ -114,6 +123,8 @@ struct HiCacheEffectDecision {
     HiCacheTransferDirection direction = HiCacheTransferDirection::None;
     std::string cache_scope;
     std::string request_id_provenance;
+    /** Source-process identity for checking scope correspondence, not a target runtime PID. */
+    std::string source_pid;
     std::string source_fact_role;
     uint64_t source_fact_ordinal = 0;
     /** @brief Semantic fact identity, not necessarily an executable DAG node. */
@@ -121,16 +132,15 @@ struct HiCacheEffectDecision {
     /** @brief Optional proven executable anchor for the source opportunity. */
     std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     std::vector<std::string> operation_ids;
-    /**
-     * Per-operation H2S shape retained from predicted target state replay.
-     * Vectors are emitted only when they conserve the corresponding aggregate
-     * page count and their indices align with `operation_ids`.
-     */
-    std::vector<uint64_t> storage_existing_operation_page_counts;
+    /** Per-operation logical availability at terminal; missing does not mean an empty physical free list. */
+    std::vector<std::optional<uint64_t>> control_host_available_pages;
+    /** Physical calls derived from ordered target pages, not target timings. */
+    std::vector<HiCacheStorageBatchWork> storage_service_batches;
     std::vector<HiCacheEffectSegment> candidate_segments;
     std::vector<HiCacheEffectSegment> effective_segments;
     std::vector<std::string> effective_pages;
     uint64_t effective_page_count = 0;
+    uint64_t completed_page_count = 0;
     uint64_t effective_byte_count = 0;
     /** @brief H2S pages already readable in the predicted target storage directory. */
     uint64_t storage_existing_page_count = 0;
@@ -138,6 +148,10 @@ struct HiCacheEffectDecision {
     uint64_t storage_new_page_count = 0;
     HiCacheEffectBoundary eligibility_boundary;
     HiCacheEffectBoundary consumer_boundary;
+    /** True only when the foreground consumer causally depends on this service. */
+    bool consumer_dependency_required = false;
+    /** Target policy delay before the terminal consumer may proceed; not an I/O cost. */
+    uint64_t policy_wait_duration_us = 0;
     std::string resource_lane;
     std::string state;
     HiCacheTargetEffectState target_effect_state = HiCacheTargetEffectState::Unresolved;
@@ -146,14 +160,20 @@ struct HiCacheEffectDecision {
     HiCacheEffectPatchStatus patch_status = HiCacheEffectPatchStatus::NotPatchable;
     std::string reason;
     std::string not_patchable_reason;
+
+    /** @brief Executed terminal control remains work even when no bytes transfer. */
+    [[nodiscard]] bool zero_payload_prefetch() const {
+        return effect_type == HiCacheEffectType::PrefetchIo && target_effect_state == HiCacheTargetEffectState::NotRequired && state == "applied"
+               && !operation_ids.empty() && effective_page_count == 0 && effective_byte_count == 0;
+    }
 };
 
 /** @brief Complete target-derived effect plan, independent of cost coefficients. */
 struct HiCacheEffectDecisionLedger {
     std::string status = "ready";
     std::string decision_coverage = "complete_target_opportunities";
-    std::string prefill_effect_status = "deferred";
     uint64_t kv_bytes_per_page = 0;
+    uint64_t storage_batch_pages = 0;
     uint64_t l2_capacity_pages = 0;
     uint64_t l2_capacity_bytes = 0;
     bool byte_projection_available = false;

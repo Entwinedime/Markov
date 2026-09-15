@@ -40,6 +40,12 @@ struct DagControlExclusionInterval {
     DagControlExclusionKind kind = DagControlExclusionKind::PrefillDecode;
 };
 
+/** @brief One runtime phase marker retained outside executable leaf topology. */
+struct DagPhaseMarkerEvent {
+    int gpu_id = 0;
+    TraceEvent event;
+};
+
 /** @brief Sparse provenance allocated only for model-created dependencies. */
 struct DagEdgeProvenance {
     std::string effect_id;
@@ -164,6 +170,17 @@ struct DagGraphCapacity {
     size_t edges = 0;
 };
 
+#ifdef DEBUG
+/** @brief One compact step in a diagnostic critical path. */
+struct DagCriticalPathStep {
+    size_t node_id = 0;
+    size_t predecessor_node_id = std::numeric_limits<size_t>::max();
+    DagEdgeKind incoming_edge_kind = DagEdgeKind::Sequential;
+    uint64_t incoming_delay_us = 0;
+    uint64_t effective_duration_us = 0;
+};
+#endif
+
 /**
  * @brief Owns normalized events, compact nodes, hard edges, and simulation state.
  *
@@ -234,6 +251,21 @@ public:
 
     /** @brief Updates the residual delay carried by one CPU node's sequential edge. */
     void set_cpu_gap_after(size_t node_id, uint64_t duration);
+
+    /** @brief Clears the Direct/Prefill/Decode owner mask used by scope replay. */
+    void clear_scope_ownership();
+
+    /** @brief Clears only observed Direct gap costs after a cross-config patch materializes target nodes. */
+    void clear_scope_gap_ownership();
+
+    /** @brief Marks one node duration as owned by a modeled component. */
+    void set_scope_node_owned(size_t node_id);
+
+    /** @brief Adds an exactly attributed Direct slice of one CPU gap. */
+    void add_scope_gap_duration(size_t node_id, uint64_t duration);
+
+    [[nodiscard]] bool scope_node_owned(size_t node_id) const;
+    [[nodiscard]] uint64_t scope_gap_duration(size_t node_id) const;
 
     /** @brief Returns the stable interned lane name for a node. */
     [[nodiscard]] std::string_view node_lane_key(size_t node_id) const;
@@ -310,12 +342,28 @@ public:
     /** @brief Returns source-only timing intervals excluded from the control metric. */
     [[nodiscard]] const std::vector<DagControlExclusionInterval> & control_exclusion_intervals() const { return control_exclusion_intervals_; }
 
+    /** @brief Replaces source Torch phase markers removed by CPU-leaf normalization. */
+    void set_phase_marker_events(std::vector<DagPhaseMarkerEvent> events) { phase_marker_events_ = std::move(events); }
+
+    /** @brief Returns semantic phase markers retained independently of executable leaves. */
+    [[nodiscard]] const std::vector<DagPhaseMarkerEvent> & phase_marker_events() const { return phase_marker_events_; }
+
 #ifdef DEBUG
     /** @brief Returns the observed trace timestamp window for diagnostics. */
     [[nodiscard]] uint64_t real_e2e_time() const { return real_e2e_time_; }
 
     /** @brief Stores the observed trace timestamp window for diagnostics. */
     void set_real_e2e_time(uint64_t value) { real_e2e_time_ = value; }
+
+    /** @brief Stores the reconstructed owner-only critical path for diagnostics. */
+    void set_gap_excluded_critical_path(std::vector<DagCriticalPathStep> path) {
+        gap_excluded_critical_path_ = std::move(path);
+    }
+
+    /** @brief Returns the owner-only critical path reconstructed by simulation. */
+    [[nodiscard]] const std::vector<DagCriticalPathStep> & gap_excluded_critical_path() const {
+        return gap_excluded_critical_path_;
+    }
 #endif
 
     /** @brief Counts active dependencies by semantic edge kind. */
@@ -339,6 +387,12 @@ public:
     /** @brief Returns the control-only critical-path duration. */
     [[nodiscard]] uint64_t control_e2e_time() const { return control_e2e_time_; }
 
+    /** @brief Stores the critical path with observed CPU idle gaps removed. */
+    void set_gap_excluded_e2e_time(uint64_t value) { gap_excluded_e2e_time_ = value; }
+
+    /** @brief Returns the Direct+phase critical path without the deferred gap component. */
+    [[nodiscard]] uint64_t gap_excluded_e2e_time() const { return gap_excluded_e2e_time_; }
+
     /**
      * @brief Merges independently built per-rank graphs.
      *
@@ -358,6 +412,8 @@ private:
     std::vector<TraceEvent> events_;
     std::vector<DagNode> nodes_;
     std::vector<DagEdge> edges_;
+    std::vector<std::uint8_t> scope_node_owned_;
+    std::vector<uint64_t> scope_gap_durations_;
 
     /** @brief Millions of nodes normally share only a handful of lane names. */
     std::vector<std::string> lane_keys_;
@@ -369,9 +425,15 @@ private:
 
     /** @brief Critical path from the independent control-only replay. */
     uint64_t control_e2e_time_ = 0;
+
+    /** @brief Critical path retaining executable work while removing source-observed CPU idle gaps. */
+    uint64_t gap_excluded_e2e_time_ = 0;
 #ifdef DEBUG
     /** @brief Observed input timestamp window, retained only for diagnostics. */
     uint64_t real_e2e_time_ = 0;
+
+    /** @brief Compact owner-only path retained only by validation builds. */
+    std::vector<DagCriticalPathStep> gap_excluded_critical_path_;
 #endif
 
     /** @brief Reader record count retained across normalization for run summaries. */
@@ -394,6 +456,9 @@ private:
 
     /** @brief Absolute source intervals contracted only by control-only replay. */
     std::vector<DagControlExclusionInterval> control_exclusion_intervals_;
+
+    /** @brief Small source phase side table retained after nested CPU parents are removed. */
+    std::vector<DagPhaseMarkerEvent> phase_marker_events_;
 };
 
 } // namespace markov::trace_graph::core

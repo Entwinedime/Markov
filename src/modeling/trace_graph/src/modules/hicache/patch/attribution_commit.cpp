@@ -112,7 +112,24 @@ const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagInd
             || (fact_boundary(*owner) == fact_boundary(candidate) && fact_precedes(*owner, candidate)))
             owner = &candidate;
     });
-    return owner;
+    if (owner != nullptr) return owner;
+
+    // The first formal allocation can evict dirty pages inherited from prelude.
+    // There is then no measured lifecycle to own the delayed write-back. Bind
+    // it to the current allocation opportunity, without importing prelude cost.
+    // A later canonical input closes that opportunity; proximity alone is not
+    // enough to attach arbitrary asynchronous writes to an earlier extension.
+    const HiCacheSourceFactNode * latest_input = nullptr;
+    for (const auto & candidate : source.fact_nodes()) {
+        if (candidate.fact_class != "workload_identity" || candidate.pid != enqueue.pid || candidate.tid != enqueue.tid
+            || candidate.cache_scope != enqueue.cache_scope || fact_boundary(candidate) > capacity_result->timestamp_us)
+            continue;
+        if (latest_input == nullptr || fact_boundary(*latest_input) < fact_boundary(candidate)
+            || (fact_boundary(*latest_input) == fact_boundary(candidate) && fact_precedes(*latest_input, candidate)))
+            latest_input = &candidate;
+    }
+    return latest_input != nullptr && latest_input->fact_role == "cache_extend_input" && latest_input->phase == "start"
+               ? latest_input : nullptr;
 }
 
 const HiCacheSourceFactNode * paired_tail_call_end(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & start) {

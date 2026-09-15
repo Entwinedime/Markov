@@ -8,6 +8,7 @@
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -70,9 +71,10 @@ private:
     /**
      * @brief Coalesces torch and wrapper events that describe one runtime boundary.
      *
-     * @warning The key intentionally contains only timestamp and duration for large-trace
-     * performance. Distinct events with identical values can be merged; tightening the
-     * key requires evidence from production trace collision rates.
+     * Match precise starts and compatible operation identities. Duration
+     * differences are allowed only for explicitly identified views of the same
+     * operation: HCCL views can round a hardware duration to a different precision.
+     * Submission anchors are causal work, not duplicate device execution records.
      */
     void coalesce_runtime_boundaries() {
         for (size_t timestamp_begin = 0; timestamp_begin < events_.size();) {
@@ -85,42 +87,64 @@ private:
     }
 
     void coalesce_timestamp_group(size_t begin, size_t end) {
-        duration_order_.clear();
-        duration_order_.reserve(end - begin);
-        for (size_t position = begin; position < end; ++position) duration_order_.push_back(event_index_at(position));
-        std::ranges::sort(duration_order_, [this](size_t left, size_t right) {
-            if (events_[left].dur != events_[right].dur) return events_[left].dur < events_[right].dur;
+        boundary_order_.clear();
+        boundary_order_.reserve(end - begin);
+        for (size_t position = begin; position < end; ++position) boundary_order_.push_back(event_index_at(position));
+        std::ranges::sort(boundary_order_, [this](size_t left, size_t right) {
+            const auto & lhs = events_[left];
+            const auto & rhs = events_[right];
+            if (lhs.ts_submicro_ns != rhs.ts_submicro_ns) return lhs.ts_submicro_ns < rhs.ts_submicro_ns;
             return logical_index_less(left, right);
         });
 
-        for (size_t duration_begin = 0; duration_begin < duration_order_.size();) {
-            size_t duration_end = duration_begin + 1;
-            while (duration_end < duration_order_.size() && events_[duration_order_[duration_end]].dur == events_[duration_order_[duration_begin]].dur)
-                ++duration_end;
-            if (duration_end - duration_begin > 1) coalesce_duration_group(duration_begin, duration_end);
-            duration_begin = duration_end;
+        for (size_t boundary_begin = 0; boundary_begin < boundary_order_.size();) {
+            size_t boundary_end = boundary_begin + 1;
+            const auto & first = events_[boundary_order_[boundary_begin]];
+            while (boundary_end < boundary_order_.size()) {
+                const auto & next = events_[boundary_order_[boundary_end]];
+                if (first.ts_submicro_ns != next.ts_submicro_ns) break;
+                ++boundary_end;
+            }
+            if (boundary_end - boundary_begin > 1) coalesce_boundary_group(boundary_begin, boundary_end);
+            boundary_begin = boundary_end;
         }
     }
 
-    void coalesce_duration_group(size_t begin, size_t end) {
-        size_t device_index = static_cast<size_t>(-1);
-        for (size_t position = begin; position < end; ++position) {
-            const auto index = duration_order_[position];
-            if (is_hicache_control_event(events_[index])) continue;
-            if (events_[index].has_arg("Physic Stream Id")) {
-                device_index = index;
-                break;
-            }
+    static bool compatible_operation(const TraceEvent & left, const TraceEvent & right) {
+        for (const auto key : { "connection_id", "Physic Stream Id", "Task Id", "Batch Id", "Subtask Id" }) {
+            const auto lhs = left.find_arg(key);
+            const auto rhs = right.find_arg(key);
+            if (lhs && rhs && *lhs != *rhs) return false;
         }
-        if (device_index == static_cast<size_t>(-1)) return;
+        return true;
+    }
 
-        for (size_t position = begin; position < end; ++position) {
-            const auto index = duration_order_[position];
-            if (index == device_index) continue;
-            if (is_hicache_control_event(events_[index])) continue;
-            events_[device_index].merge_args_from(events_[index]);
-            if (events_[index].tid == "0") events_[device_index].name = events_[index].name;
-            dropped_[index] = true;
+    static bool shared_operation_identity(const TraceEvent & left, const TraceEvent & right) {
+        const auto connection = left.arg("connection_id");
+        if (!connection.empty() && connection == right.arg("connection_id")) return true;
+        const auto stream = left.arg("Physic Stream Id", left.arg("stream id"));
+        const auto task = left.arg("Task Id", left.arg("task id"));
+        return !stream.empty() && !task.empty() && stream == right.arg("Physic Stream Id", right.arg("stream id"))
+               && task == right.arg("Task Id", right.arg("task id"));
+    }
+
+    void coalesce_boundary_group(size_t begin, size_t end) {
+        for (size_t device_position = begin; device_position < end; ++device_position) {
+            const auto device_index = boundary_order_[device_position];
+            if (dropped_[device_index] || is_hicache_control_event(events_[device_index]) || !events_[device_index].has_arg("Physic Stream Id")) continue;
+            for (size_t position = begin; position < end; ++position) {
+                const auto index = boundary_order_[position];
+                if (index == device_index || dropped_[index] || is_hicache_control_event(events_[index])
+                    || dag_builder_detail::is_submit_anchor_event(events_[index]))
+                    continue;
+                if (!compatible_operation(events_[device_index], events_[index])) continue;
+                if (std::tie(events_[device_index].dur, events_[device_index].dur_submicro_ns) != std::tie(events_[index].dur, events_[index].dur_submicro_ns)
+                    && !shared_operation_identity(events_[device_index], events_[index]))
+                    continue;
+                events_[device_index].merge_args_from(events_[index]);
+                if (events_[index].tid == "0") events_[device_index].name = events_[index].name;
+                dropped_[index] = true;
+            }
         }
     }
 
@@ -350,7 +374,7 @@ private:
     std::vector<TraceEvent> events_;
     std::vector<bool> dropped_;
     std::vector<size_t> event_order_;
-    std::vector<size_t> duration_order_;
+    std::vector<size_t> boundary_order_;
     bool sorted_by_timestamp_ = true;
 };
 

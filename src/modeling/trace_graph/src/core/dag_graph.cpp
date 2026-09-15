@@ -83,6 +83,8 @@ DagGraph::DagGraph(std::vector<TraceEvent> events, int gpu_id) : events_(std::mo
 void DagGraph::reserve(const DagGraphCapacity & capacity) {
     nodes_.reserve(capacity.nodes);
     edges_.reserve(capacity.edges);
+    scope_node_owned_.reserve(capacity.nodes);
+    scope_gap_durations_.reserve(capacity.nodes);
 }
 
 size_t DagGraph::intern_lane(std::string_view lane_key_value) {
@@ -114,6 +116,8 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
     node.original_duration = event.dur;
     node.counts_toward_e2e = event.arg("counts_toward_e2e") != "false";
     nodes_.push_back(node);
+    scope_node_owned_.push_back(0);
+    scope_gap_durations_.push_back(0);
     return node_id;
 }
 
@@ -198,6 +202,35 @@ void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration) {
     auto & target = mutable_node(node_id);
     if (!target.is_cpu) throw std::invalid_argument("CPU gap update requires a CPU node");
     target.cpu_gap_after = duration;
+}
+
+void DagGraph::clear_scope_ownership() {
+    scope_node_owned_.assign(nodes_.size(), 0);
+    scope_gap_durations_.assign(nodes_.size(), 0);
+}
+
+void DagGraph::clear_scope_gap_ownership() { scope_gap_durations_.assign(nodes_.size(), 0); }
+
+void DagGraph::set_scope_node_owned(size_t node_id) {
+    if (node_id >= nodes_.size()) throw std::out_of_range("scope owner node ID out of range");
+    scope_node_owned_[node_id] = 1;
+}
+
+void DagGraph::add_scope_gap_duration(size_t node_id, uint64_t duration) {
+    if (node_id >= nodes_.size()) throw std::out_of_range("scope gap owner node ID out of range");
+    scope_gap_durations_[node_id] = checked_add_u64(scope_gap_durations_[node_id], duration, "scope-owned CPU gap exceeds uint64 range");
+    if (scope_gap_durations_[node_id] > nodes_[node_id].cpu_gap_after)
+        throw std::logic_error("scope-owned CPU gap exceeds materialized CPU gap");
+}
+
+bool DagGraph::scope_node_owned(size_t node_id) const {
+    if (node_id >= nodes_.size()) throw std::out_of_range("scope owner node ID out of range");
+    return scope_node_owned_[node_id] != 0;
+}
+
+uint64_t DagGraph::scope_gap_duration(size_t node_id) const {
+    if (node_id >= nodes_.size()) throw std::out_of_range("scope gap owner node ID out of range");
+    return scope_gap_durations_[node_id];
 }
 
 std::string_view DagGraph::node_lane_key(size_t node_id) const { return lane_key(node(node_id).lane_id); }
@@ -317,6 +350,7 @@ private:
         merged_.tail_context_events_.reserve(checked_total([](const auto & graph) { return graph.tail_context_events_.size(); }, "tail context event"));
         merged_.control_exclusion_intervals_.reserve(
             checked_total([](const auto & graph) { return graph.control_exclusion_intervals_.size(); }, "control exclusion interval"));
+        merged_.phase_marker_events_.reserve(checked_total([](const auto & graph) { return graph.phase_marker_events_.size(); }, "phase marker event"));
         merged_.reserve(DagGraphCapacity{ .nodes = total_nodes_, .edges = 0 });
     }
 
@@ -346,6 +380,9 @@ private:
             merged_.control_exclusion_intervals_.insert(merged_.control_exclusion_intervals_.end(),
                                                         std::make_move_iterator(graph.control_exclusion_intervals_.begin()),
                                                         std::make_move_iterator(graph.control_exclusion_intervals_.end()));
+            merged_.phase_marker_events_.insert(merged_.phase_marker_events_.end(),
+                                                std::make_move_iterator(graph.phase_marker_events_.begin()),
+                                                std::make_move_iterator(graph.phase_marker_events_.end()));
             remap_nodes(graph,
                         GraphRelocation{
                             .graph_index = graph_index,
@@ -407,6 +444,8 @@ private:
 
     void append_nodes_and_events(DagGraph & graph) {
         merged_.nodes_.insert(merged_.nodes_.end(), std::make_move_iterator(graph.nodes_.begin()), std::make_move_iterator(graph.nodes_.end()));
+        merged_.scope_node_owned_.resize(merged_.nodes_.size(), 0);
+        merged_.scope_gap_durations_.resize(merged_.nodes_.size(), 0);
         for (auto & event : graph.events_) {
             event.index = merged_.events_.size();
             merged_.events_.push_back(std::move(event));

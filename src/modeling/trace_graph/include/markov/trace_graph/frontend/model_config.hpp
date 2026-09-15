@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,6 +29,7 @@ struct NodeScaleConfig {
 struct HiCacheIoPageBandwidthPoint {
     uint64_t page_bytes = 0;
     double bandwidth_bytes_per_sec = 0.0;
+    double setup_us_per_operation = 0.0;
 };
 
 /** @brief One existing-key page-size and operation-depth throughput anchor. */
@@ -51,18 +53,15 @@ struct HiCacheIoServiceModelConfig {
     double setup_us_per_page = 0.0;
     double bandwidth_bytes_per_sec = 0.0;
     double runtime_scale = 1.0;
+    double existing_runtime_scale = 1.0;
     std::vector<HiCacheIoPageBandwidthPoint> page_bandwidth_points{};
     std::vector<HiCacheIoNewOperationPoint> new_operation_points{};
     std::vector<HiCacheIoExistingKeyBandwidthPoint> existing_key_bandwidth_points{};
-    double existing_runtime_scale = 1.0;
-    double new_runtime_scale = 1.0;
 };
 
-/** @brief Explicit per-operation and per-page host control primitive. */
+/** @brief One measured fixed host-control cost per I/O operation. */
 struct HiCacheIoControlModelConfig {
     double fixed_us_per_operation = 0.0;
-    double zero_payload_fixed_us_per_operation = 0.0;
-    double per_page_us = 0.0;
 };
 
 /** @brief Whether storage directions share one server lane or remain scope-local. */
@@ -73,15 +72,56 @@ struct HiCacheIoResourceLanesConfig {
 
 /** @brief Numerical fields consumed by the HiCache direct I/O cost model. */
 struct HiCacheIoCostConfig {
+    uint64_t storage_batch_pages = 0;
     std::map<std::string, HiCacheIoServiceModelConfig> service_models{};
     std::map<std::string, HiCacheIoControlModelConfig> control_models{};
     HiCacheIoResourceLanesConfig resource_lanes{};
 };
 
-/** @brief Calibration-only rates used to resolve target I/O readiness during effect replay. */
-struct HiCacheIoPlanningConfig {
-    uint64_t device_host_bandwidth_bytes_per_sec = 0;
-    uint64_t host_storage_bandwidth_bytes_per_sec = 0;
+/** @brief Monotone cost response for one source-owned phase node family. */
+struct HiCachePhaseLinearCostConfig {
+    double fixed_us = 0.0;
+    double per_new_token_us = 0.0;
+    double per_attention_token_pair_us = 0.0;
+    double per_context_token_us = 0.0;
+};
+
+/** @brief One measured point in a phase cost curve indexed by newly computed tokens. */
+struct HiCachePhaseTokenCostPoint {
+    uint64_t new_tokens = 0;
+    double duration_us = 0.0;
+};
+
+/** @brief Piecewise-linear phase cost derived directly from measured token-work anchors. */
+struct HiCachePhaseTokenCostConfig {
+    std::vector<HiCachePhaseTokenCostPoint> points{};
+};
+
+/** @brief Machine-level paged-attention work/cost primitive. */
+struct HiCacheDecodePagedAttentionCostConfig {
+    uint64_t kernel_page_tokens = 0;
+    double fixed_us_per_iteration = 0.0;
+    double per_context_token_us = 0.0;
+    double per_effective_page_us = 0.0;
+};
+
+/** @brief Shared machine primitives plus the selected-base-only templates. */
+struct HiCachePhaseCostConfig {
+    bool enabled = false;
+    HiCachePhaseTokenCostConfig prefill_common_kernel;
+    HiCachePhaseTokenCostConfig prefill_collective;
+    HiCachePhaseLinearCostConfig prefill_prefix_attention;
+    HiCacheDecodePagedAttentionCostConfig decode_paged_attention;
+    HiCachePhaseLinearCostConfig decode_collective;
+    uint64_t min_new_tokens = 0;
+    uint64_t max_new_tokens = 0;
+    uint64_t min_context_tokens = 0;
+    uint64_t max_context_tokens = 0;
+    double min_attention_token_pairs = 0.0;
+    double max_attention_token_pairs = 0.0;
+    uint64_t min_decode_context_tokens = 0;
+    uint64_t max_decode_context_tokens = 0;
+    uint64_t base_page_size = 0;
 };
 
 /**
@@ -106,8 +146,8 @@ struct HiCacheConfig {
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
     bool device_allocator_need_sort = false;
-    HiCacheIoPlanningConfig io_planning;
     HiCacheIoCostConfig io_cost;
+    HiCachePhaseCostConfig phase_cost;
     bool dag_patch_enabled = false;
     bool dag_patch_source_target_same_config = false;
 };

@@ -190,11 +190,14 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
                 .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
                 .source_page_size = event.arg_u64("source_page_size", 0),
                 .service_item_count = event.arg_u64("service_item_count", 0),
+                .storage_existing_page_count = core::parse_u64(event.arg("storage_existing_page_count")),
+                .storage_new_page_count = core::parse_u64(event.arg("storage_new_page_count")),
                 .token_count = event.arg_u64("token_count", 0),
                 .effective_token_count = event.arg_u64("effective_token_count", 0),
                 .completed_token_count = event.arg_u64("completed_token_count", 0),
                 .completed_token_count_present = event.has_arg_key_hint("completed_token_count"),
                 .progress_ready = source_dag_index_detail::bool_arg(event, "progress_ready"),
+                .host_available_tokens_at_return = core::parse_exact_u64(event.arg("host_available_tokens_at_return")),
                 .write_back = source_dag_index_detail::bool_arg(event, "write_back"),
                 .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
                 .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
@@ -256,11 +259,14 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
                 .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
                 .source_page_size = event.arg_u64("source_page_size", 0),
                 .service_item_count = event.arg_u64("service_item_count", 0),
+                .storage_existing_page_count = core::parse_u64(event.arg("storage_existing_page_count")),
+                .storage_new_page_count = core::parse_u64(event.arg("storage_new_page_count")),
                 .token_count = event.arg_u64("token_count", 0),
                 .effective_token_count = event.arg_u64("effective_token_count", 0),
                 .completed_token_count = event.arg_u64("completed_token_count", 0),
                 .completed_token_count_present = event.has_arg_key_hint("completed_token_count"),
                 .progress_ready = source_dag_index_detail::bool_arg(event, "progress_ready"),
+                .host_available_tokens_at_return = core::parse_exact_u64(event.arg("host_available_tokens_at_return")),
                 .write_back = source_dag_index_detail::bool_arg(event, "write_back"),
                 .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
                 .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
@@ -308,13 +314,21 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
         if (left->event_index != right->event_index) return left->event_index < right->event_index;
         return left_node_id < right_node_id;
     });
-    for (auto & nodes : cpu_nodes_by_lane_ | std::views::values) {
+    for (auto & [lane_key, nodes] : cpu_nodes_by_lane_) {
         std::ranges::sort(nodes, [&](size_t left_node_id, size_t right_node_id) {
             const auto & left = graph_.event_for_node(left_node_id);
             const auto & right = graph_.event_for_node(right_node_id);
             if (left.ts != right.ts) return left.ts < right.ts;
             return left_node_id < right_node_id;
         });
+        auto & prefix_ends = cpu_prefix_end_us_by_lane_[lane_key];
+        prefix_ends.reserve(nodes.size());
+        uint64_t frontier_end = 0;
+        for (size_t node_id : nodes) {
+            const auto & event = graph_.event_for_node(node_id);
+            frontier_end = std::max(frontier_end, source_dag_index_detail::saturated_add(event.ts, event.dur));
+            prefix_ends.push_back(frontier_end);
+        }
     }
     for (auto & lane_keys : cpu_lane_keys_by_logical_input_ | std::views::values) {
         std::ranges::sort(lane_keys);
@@ -394,7 +408,8 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
         output.reason = "timing observation has zero duration";
         return output;
     }
-    const auto nodes = find_nodes(cpu_nodes_by_lane_, cpu_lane_key(pid, tid));
+    const auto lane_key = cpu_lane_key(pid, tid);
+    const auto nodes = find_nodes(cpu_nodes_by_lane_, lane_key);
     if (nodes.empty()) {
         output.reason = "timing observation has no executable nodes on the same pid/tid lane";
         return output;
@@ -402,8 +417,17 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
     output.start_anchor_node_id = cpu_boundary_at_or_before(pid, tid, output.interval_start_us);
     output.completion_anchor_node_id = cpu_boundary_at_or_after(pid, tid, output.interval_end_us);
 
-    bool partial_node_overlap = false;
-    for (size_t node_id : nodes) {
+    const auto first = std::lower_bound(nodes.begin(), nodes.end(), start_us, [&](size_t node_id, uint64_t timestamp) {
+        return graph_.event_for_node(node_id).ts < timestamp;
+    });
+    const auto last = std::lower_bound(first, nodes.end(), output.interval_end_us, [&](size_t node_id, uint64_t timestamp) {
+        return graph_.event_for_node(node_id).ts < timestamp;
+    });
+    const auto first_index = static_cast<size_t>(first - nodes.begin());
+    // Earlier nodes cannot be owned; a prefix maximum still detects any long enclosing leaf.
+    bool partial_node_overlap = first_index > 0 && output.interval_end_us > start_us
+                                && cpu_prefix_end_us_by_lane_.at(lane_key)[first_index - 1] > start_us;
+    for (size_t node_id : std::span<const size_t>{ first, last }) {
         const auto & event = graph_.event_for_node(node_id);
         const auto event_end = source_dag_index_detail::saturated_add(event.ts, event.dur);
         const auto overlap_start = std::max(output.interval_start_us, event.ts);
@@ -449,7 +473,9 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
         }
     }
 
-    for (size_t index = 1; index < nodes.size(); ++index) {
+    // Include the gap crossing either boundary; only its successor may start after the interval.
+    const auto gap_limit = std::min(nodes.size(), static_cast<size_t>(last - nodes.begin()) + 1);
+    for (size_t index = std::max(size_t{ 1 }, first_index); index < gap_limit; ++index) {
         const auto previous_node_id = nodes[index - 1];
         const auto successor_node_id = nodes[index];
         const auto & previous = graph_.event_for_node(previous_node_id);

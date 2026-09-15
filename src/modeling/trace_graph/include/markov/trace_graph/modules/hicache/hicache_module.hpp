@@ -37,6 +37,9 @@ public:
     /** @brief Returns the complete effect-decision ledger in Release and Debug builds. */
     [[nodiscard]] const model::HiCacheEffectDecisionLedger & effect_decisions() const { return result_->effect_decisions; }
 
+    /** @brief Returns the source-only target Prefill/Decode work plan. */
+    [[nodiscard]] const model::HiCachePhaseWorkLedger & phase_work() const { return result_->phase_work; }
+
 private:
     frontend::HiCacheConfig config_;
     std::shared_ptr<model::HiCacheModelResult> result_;

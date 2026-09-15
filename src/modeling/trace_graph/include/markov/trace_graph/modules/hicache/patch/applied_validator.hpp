@@ -50,7 +50,9 @@ struct HiCacheAppliedPatchValidation {
  * family and resource-lane dependencies from the rewrite and resource contracts.
  */
 [[nodiscard]] HiCacheAppliedPatchValidation validate_hicache_applied_patch(const core::DagGraph & graph, const HiCacheShadowRewriteTransaction & shadow,
-                                                                           const HiCacheIoResourcePlan & resources, const core::DagMutationJournal & journal,
+                                                                           const HiCacheIoResourcePlan & resources,
+                                                                           const core::DagMutationPlan & complete_plan,
+                                                                           const core::DagMutationResult & mutation,
                                                                            bool materialized_topology_valid);
 
 } // namespace markov::trace_graph::modules::hicache::patch

@@ -17,15 +17,7 @@ namespace markov::trace_graph::core {
 
 namespace {
 
-bool is_submit_anchor_event(const TraceEvent & event) {
-    if (event.name.starts_with("Enqueue@")) return true;
-    if (event.name == "Node@launch") return true;
-    if (event.cat == "enqueue") return true;
-    if (event.name.starts_with("AscendCL@aclrtLaunch")) return true;
-    if (event.name.starts_with("AscendCL@aclrtMemcpyAsync")) return true;
-    if (event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent") return true;
-    return false;
-}
+using dag_builder_detail::is_submit_anchor_event;
 
 struct PendingEdge {
     size_t src = 0;

@@ -167,7 +167,7 @@ private:
     std::unordered_map<int, std::vector<ReplayInterval>> by_logical_input_;
 };
 
-enum class ReplayMode : std::uint8_t { Full, ControlOnly };
+enum class ReplayMode : std::uint8_t { Full, ControlOnly, GapExcluded };
 
 ActiveDagStorage build_active_dag_storage(const core::DagGraph & graph) {
     ActiveDagStorage storage;
@@ -212,6 +212,13 @@ public:
         for (const auto & node : nodes_) {
             if (node.active && storage_.indegree[node.id] == 0) ready_.push_back(node.id);
         }
+#ifdef DEBUG
+        if (mode_ == ReplayMode::GapExcluded) {
+            predecessor_.assign(graph.node_count(), kInvalidNode);
+            predecessor_edge_kind_.assign(graph.node_count(), core::DagEdgeKind::Sequential);
+            predecessor_delay_us_.assign(graph.node_count(), 0);
+        }
+#endif
     }
 
     [[nodiscard]] SimulationResult run() {
@@ -221,7 +228,13 @@ public:
         if (e2e_endpoint_count_ == 0) throw std::runtime_error("Active DAG has no observable business E2E endpoint.");
         result_.e2e_us = e2e_;
         if (mode_ == ReplayMode::Full) graph_.set_e2e_time(e2e_);
-        else graph_.set_control_e2e_time(e2e_);
+        else if (mode_ == ReplayMode::ControlOnly) graph_.set_control_e2e_time(e2e_);
+        else {
+            graph_.set_gap_excluded_e2e_time(e2e_);
+#ifdef DEBUG
+            graph_.set_gap_excluded_critical_path(build_gap_excluded_critical_path());
+#endif
+        }
         log_success();
         return result_;
     }
@@ -242,7 +255,12 @@ private:
             node.completion_time = completion_time;
         }
         if (node.counts_toward_e2e) {
-            e2e_ = std::max(e2e_, completion_time);
+            if (completion_time > e2e_) {
+                e2e_ = completion_time;
+#ifdef DEBUG
+                if (mode_ == ReplayMode::GapExcluded) e2e_endpoint_node_id_ = node_id;
+#endif
+            }
             e2e_endpoint_count_++;
         }
         for (size_t offset = storage_.outgoing.offsets[node_id]; offset < storage_.outgoing.offsets[node_id + 1]; ++offset) { propagate_edge(node, offset); }
@@ -251,10 +269,37 @@ private:
     void propagate_edge(const core::DagNode & source, size_t offset) {
         const auto dst = storage_.outgoing.destinations[offset];
         const auto delay = effective_edge_delay(source, storage_.outgoing.edge_kinds[offset]);
-        start_time_[dst] = std::max(start_time_[dst], checked_add(completion_time_[source.id], delay, "DAG simulation edge-delay overflow"));
+        const auto candidate = checked_add(completion_time_[source.id], delay, "DAG simulation edge-delay overflow");
+        if (candidate > start_time_[dst]) {
+            start_time_[dst] = candidate;
+#ifdef DEBUG
+            if (mode_ == ReplayMode::GapExcluded) {
+                predecessor_[dst] = source.id;
+                predecessor_edge_kind_[dst] = storage_.outgoing.edge_kinds[offset];
+                predecessor_delay_us_[dst] = delay;
+            }
+#endif
+        }
         storage_.indegree[dst]--;
         if (storage_.indegree[dst] == 0) ready_.push_back(dst);
     }
+
+#ifdef DEBUG
+    [[nodiscard]] std::vector<core::DagCriticalPathStep> build_gap_excluded_critical_path() const {
+        std::vector<core::DagCriticalPathStep> path;
+        for (auto node_id = e2e_endpoint_node_id_; node_id != kInvalidNode; node_id = predecessor_[node_id]) {
+            path.push_back(core::DagCriticalPathStep{
+                .node_id = node_id,
+                .predecessor_node_id = predecessor_[node_id],
+                .incoming_edge_kind = predecessor_edge_kind_[node_id],
+                .incoming_delay_us = predecessor_delay_us_[node_id],
+                .effective_duration_us = effective_node_duration(nodes_[node_id]),
+            });
+        }
+        std::ranges::reverse(path);
+        return path;
+    }
+#endif
 
     [[nodiscard]] uint64_t scaled_outside_duration(uint64_t current_duration, uint64_t observed_duration, uint64_t overlap) const {
         if (current_duration == 0 || observed_duration == 0 || overlap >= observed_duration) return 0;
@@ -264,7 +309,8 @@ private:
     }
 
     [[nodiscard]] uint64_t effective_node_duration(const core::DagNode & node) const {
-        if (mode_ == ReplayMode::Full || node.kind == core::DagNodeKind::Synthetic || node.duration == 0) return node.duration;
+        if (mode_ == ReplayMode::GapExcluded) return graph_.scope_node_owned(node.id) ? node.duration : 0;
+        if (mode_ != ReplayMode::ControlOnly || node.kind == core::DagNodeKind::Synthetic || node.duration == 0) return node.duration;
         const auto & event = graph_.event_for_node(node.id);
         const auto event_end = checked_add(event.ts, event.dur, "trace event end exceeds uint64 range");
         const auto overlap = control_exclusions_.overlap_us(node.gpu_id, event.ts, event_end);
@@ -274,6 +320,7 @@ private:
     [[nodiscard]] uint64_t effective_edge_delay(const core::DagNode & source, core::DagEdgeKind kind) const {
         const auto current_delay = topological_edge_delay_us(source, kind);
         if (mode_ == ReplayMode::Full || current_delay == 0 || source.original_cpu_gap_after == 0) return current_delay;
+        if (mode_ == ReplayMode::GapExcluded) return graph_.scope_gap_duration(source.id);
         const auto & event = graph_.event_for_node(source.id);
         const auto gap_start = checked_add(event.ts, event.dur, "CPU gap start exceeds uint64 range");
         const auto gap_end = checked_add(gap_start, source.original_cpu_gap_after, "CPU gap end exceeds uint64 range");
@@ -296,7 +343,8 @@ private:
     void log_success() const {
         auto & logger = core::Logger::instance();
         if (!logger.enabled(core::Logger::Info)) return;
-        logger.info() << (mode_ == ReplayMode::Full ? "Simulation" : "Control-only simulation") << " completed. End-to-End time: " << e2e_
+        const auto label = mode_ == ReplayMode::Full ? "Simulation" : mode_ == ReplayMode::ControlOnly ? "Control-only simulation" : "Gap-excluded simulation";
+        logger.info() << label << " completed. End-to-End time: " << e2e_
                       << " us | nodes: " << result_.processed_nodes << " edges: " << storage_.active_edge_count;
     }
 
@@ -312,6 +360,12 @@ private:
     size_t e2e_endpoint_count_ = 0;
     ReplayMode mode_ = ReplayMode::Full;
     ControlExclusionIndex control_exclusions_;
+#ifdef DEBUG
+    size_t e2e_endpoint_node_id_ = kInvalidNode;
+    std::vector<size_t> predecessor_;
+    std::vector<core::DagEdgeKind> predecessor_edge_kind_;
+    std::vector<uint64_t> predecessor_delay_us_;
+#endif
 };
 
 } // namespace topological_simulator_detail
@@ -322,6 +376,10 @@ SimulationResult run_topological_simulation(core::DagGraph & graph) {
 
 SimulationResult run_control_topological_simulation(core::DagGraph & graph) {
     return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::ControlOnly).run();
+}
+
+SimulationResult run_gap_excluded_topological_simulation(core::DagGraph & graph) {
+    return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::GapExcluded).run();
 }
 
 } // namespace markov::trace_graph::simulation

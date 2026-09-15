@@ -95,7 +95,6 @@ HiCacheShadowRewriteTransaction build_hicache_shadow_rewrite_transaction(const c
                                                              source_target_same_config);
         transaction.decisions.push_back(std::move(decision));
     }
-    rewrite_transaction_detail::fold_prefetch_shift_below_polling_resolution(transaction.decisions);
     rewrite_transaction_detail::validate_completion_join_boundaries(graph, transaction.decisions);
     rewrite_transaction_detail::fold_shared_immediate_ready_completion_joins(transaction.decisions);
     rewrite_transaction_detail::resolve_target_host_control_boundaries(graph, transaction.decisions);

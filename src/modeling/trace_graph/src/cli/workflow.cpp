@@ -11,6 +11,8 @@
 #include "module_pipeline.hpp"
 #include "options.hpp"
 #include "run_summary.hpp"
+#include "hicache_observations.hpp"
+#include <nlohmann/json.hpp>
 
 #include "markov/trace_graph/cli/debug_support.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
@@ -21,6 +23,7 @@
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
+#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <algorithm>
@@ -122,6 +125,7 @@ std::vector<DagGraph> build_graphs(std::vector<io::ManifestTraceInput> inputs, s
 void simulate(DagGraph & graph) {
     (void)simulation::run_topological_simulation(graph);
     (void)simulation::run_control_topological_simulation(graph);
+    (void)simulation::run_gap_excluded_topological_simulation(graph);
 }
 
 #ifdef DEBUG
@@ -140,7 +144,10 @@ void write_graph_output(const CliOptions & options, const DagGraph & graph) {
 
 int run_workflow(const CliOptions & options, core::Logger & logger) {
 #ifdef DEBUG
-    auto modules = ModulePipeline::from_config(options.model_config, options.hicache_oracle_cost_replay);
+    auto modules = ModulePipeline::from_config(options.model_config,
+                                               options.hicache_oracle_cost_replay,
+                                               options.hicache_phase_oracle_cost_replay,
+                                               options.hicache_canonical_observed_phase_scope);
 #else
     auto modules = ModulePipeline::from_config(options.model_config);
 #endif
@@ -151,6 +158,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
 #endif
 
+    const auto source_io = hicache_io_observations(graph, modules::hicache::mark_observed_hicache_scope(graph));
     modules.apply(graph, logger);
     simulate(graph);
 #ifdef DEBUG
@@ -161,7 +169,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #ifdef DEBUG
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
-    write_run_summary(options.outputs.run_summary, graph, modules.modules());
+    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io);
     return 0;
 }
 

@@ -62,7 +62,7 @@ struct TraceEvent {
     char ph = 'X';
     uint64_t ts = 0;
     uint64_t dur = 0;
-    /** Sub-microsecond timing is retained only for exact nested CPU-leaf classification. */
+    /** Sub-microsecond timing preserves exact span matching and nested CPU-leaf classification. */
     uint16_t ts_submicro_ns = 0;
     uint16_t dur_submicro_ns = 0;
     std::string pid = "-1";

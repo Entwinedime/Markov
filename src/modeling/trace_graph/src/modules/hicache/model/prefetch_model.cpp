@@ -3,6 +3,7 @@
  * @brief Models the target-derived HiCache storage-prefetch lifecycle.
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
+#include "markov/trace_graph/modules/hicache/service_model.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -15,38 +16,42 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-HiCacheIoSchedule HiCacheState::schedule_target_io(ScopedState & scope, TargetIoLane lane, uint64_t eligibility_ts, uint64_t page_count) const {
+HiCacheIoSchedule HiCacheState::schedule_target_io(const std::string & scope, const std::string & kind,
+                                                  uint64_t eligibility_ts, uint64_t page_count,
+                                                  std::span<const uint64_t> existing_batch_pages,
+                                                  std::optional<uint64_t> stop_ts) {
     HiCacheIoSchedule schedule;
-    uint64_t bandwidth = 0;
-    uint64_t * lane_available_ts = nullptr;
-    switch (lane) {
-    case TargetIoLane::HostToDevice:
-        schedule.resource_lane = "host_to_device_lane";
-        bandwidth = config_.io_planning.device_host_bandwidth_bytes_per_sec;
-        lane_available_ts = &scope.host_to_device_lane_available_ts;
-        break;
-    case TargetIoLane::DeviceToHost:
-        schedule.resource_lane = "device_to_host_lane";
-        bandwidth = config_.io_planning.device_host_bandwidth_bytes_per_sec;
-        lane_available_ts = &scope.device_to_host_lane_available_ts;
-        break;
-    case TargetIoLane::HostStorage:
-        schedule.resource_lane = "host_storage_lane";
-        bandwidth = config_.io_planning.host_storage_bandwidth_bytes_per_sec;
-        lane_available_ts = &scope.host_storage_lane_available_ts;
-        break;
+    if (page_count == 0) return schedule;
+    const auto & service = config_.io_cost.service_models.at(kind);
+    const bool storage = kind == "prefetch" || kind == "write_host_to_storage";
+    const auto batch_limit = storage ? config_.io_cost.storage_batch_pages : page_count;
+    if (batch_limit == 0) throw std::logic_error("Storage service requires a positive batch limit");
+    const auto batch_count = page_count / batch_limit + static_cast<uint64_t>(page_count % batch_limit != 0);
+    if (!existing_batch_pages.empty() && (kind != "write_host_to_storage" || existing_batch_pages.size() != batch_count))
+        throw std::logic_error("H2S existing-page work must describe every executed service batch");
+    schedule.resource_lane = hicache_resource_lane(config_.io_cost, kind, scope);
+    auto & lane_available = io_lane_available_ts_[schedule.resource_lane];
+    schedule.start_ts = std::max(eligibility_ts, lane_available);
+    schedule.ready_ts = schedule.start_ts;
+    uint64_t executed_pages = 0;
+    for (uint64_t start = 0; start < page_count;) {
+        // The SGLang payload worker enters its first batch even if already
+        // terminated; subsequent batches stop after the cancelled call returns.
+        if (start > 0 && stop_ts && schedule.ready_ts >= *stop_ts) break;
+        const auto count = std::min(batch_limit, page_count - start);
+        const auto existing = existing_batch_pages.empty() ? 0 : existing_batch_pages[schedule.batches.size()];
+        const auto cost = hicache_service_cost(service, config_.kv_bytes_per_page, count, 1, existing);
+        if (!cost) throw std::logic_error("Target I/O service projection is invalid");
+        const auto ready = core::checked_add_u64(schedule.ready_ts, cost->duration_us, "Target I/O completion overflow");
+        schedule.batches.push_back({count, schedule.ready_ts, ready});
+        schedule.ready_ts = ready;
+        executed_pages += count;
+        start += count;
     }
-    if (page_count == 0 || config_.kv_bytes_per_page == 0 || bandwidth == 0 || lane_available_ts == nullptr) return schedule;
-
-    schedule.effective_byte_count =
-        core::checked_multiply_u64(page_count, config_.kv_bytes_per_page, "HiCache target I/O byte projection exceeds uint64 range");
-    const auto duration = core::ceil_multiply_divide_u64(schedule.effective_byte_count, 1'000'000, bandwidth);
-    if (!duration) throw std::overflow_error("HiCache target I/O duration exceeds uint64 range");
-    schedule.duration_us = *duration;
-    schedule.start_ts = std::max(eligibility_ts, *lane_available_ts);
-    schedule.ready_ts = core::checked_add_u64(schedule.start_ts, schedule.duration_us, "HiCache target I/O ready timestamp exceeds uint64 range");
+    schedule.effective_byte_count = core::checked_multiply_u64(executed_pages, config_.kv_bytes_per_page, "Target I/O byte count overflow");
+    schedule.duration_us = schedule.ready_ts - schedule.start_ts;
     schedule.available = true;
-    *lane_available_ts = schedule.ready_ts;
+    lane_available = schedule.ready_ts;
     return schedule;
 }
 
@@ -92,6 +97,8 @@ void HiCacheState::advance_ready_prefetches(const HiCacheFact & fact) {
         op.target_boundary_ts = candidate.progress.target_boundary_ts;
         op.timeout_deadline_ts = candidate.progress.timeout_deadline_ts;
         op.timed_out = candidate.progress.timed_out;
+        op.policy_wait_duration_us = candidate.progress.policy_wait_duration_us;
+        op.service_consumer_dependency_required = candidate.progress.service_consumer_dependency_required;
         op.visibility_dependency_required = candidate.progress.visibility_dependency_required;
         apply_prefetch_ready(*candidate.source_boundary, *candidate.scope, op);
     }
@@ -123,28 +130,23 @@ HiCacheState::PrefetchIoProgressEstimate HiCacheState::estimate_prefetch_io_prog
     if (!op.io_schedule.available || boundary_ts <= op.io_schedule.start_ts) {
         return estimate;
     }
-    if (boundary_ts >= op.io_schedule.ready_ts) {
-        estimate.completed_pages = op.hit_pages;
-        estimate.completed_byte_count = op.io_schedule.effective_byte_count;
-        return estimate;
+    uint64_t completed_pages = 0;
+    for (const auto & batch : op.io_schedule.batches) {
+        if (batch.ready_ts > boundary_ts) break;
+        completed_pages += batch.page_count;
     }
-
-    const auto elapsed_us = core::checked_subtract_u64(boundary_ts, op.io_schedule.start_ts, "HiCache prefetch progress boundary precedes I/O start");
-    const auto completed_bytes =
-        core::floor_multiply_divide_u64(elapsed_us, config_.io_planning.host_storage_bandwidth_bytes_per_sec, 1'000'000);
-    if (!completed_bytes || config_.kv_bytes_per_page == 0) {
-        return estimate;
-    }
-    estimate.completed_byte_count = std::min(*completed_bytes, op.io_schedule.effective_byte_count);
-    const auto completed_page_count = std::min<uint64_t>(static_cast<uint64_t>(op.hit_pages.size()), estimate.completed_byte_count / config_.kv_bytes_per_page);
-    estimate.completed_pages = prefix_to(op.hit_pages, static_cast<size_t>(completed_page_count));
+    estimate.completed_pages = prefix_to(op.service_pages, static_cast<size_t>(completed_pages));
+    estimate.completed_byte_count = core::checked_multiply_u64(completed_pages, config_.kv_bytes_per_page, "Prefetch completed bytes overflow");
     return estimate;
 }
 
 /**
  * @brief Resolves one target prefetch stop boundary from the source control skeleton.
  *
- * Best-effort samples progress at the source cache-extend boundary. Wait-complete
+ * Best-effort samples progress immediately after target enqueue. The later source
+ * cache-extend fact is only the reusable DAG/control anchor; carrying its source
+ * wait into this check would turn a source wait-complete policy into a target wait.
+ * Wait-complete
  * stops at target I/O completion. Timeout stops at the earlier of target I/O completion
  * and the configured deadline. The source boundary remains the earliest scheduler
  * eligibility point; a later policy stop moves the target consumer through a causal gate.
@@ -170,7 +172,14 @@ HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(
     }
     const auto policy = policy_.prefetch_policy();
     if (policy == "best_effort") {
+        estimate.policy_stop_ts = op.header.enqueue_ts;
+        estimate.target_boundary_ts = op.header.enqueue_ts;
         estimate.boundary_resolved = true;
+        auto progress = estimate_prefetch_io_progress(op, estimate.policy_stop_ts);
+        estimate.completed_pages = std::move(progress.completed_pages);
+        estimate.completed_byte_count = progress.completed_byte_count;
+        estimate.io_completed = estimate.completed_pages.size() == op.hit_pages.size();
+        estimate.visibility_dependency_required = !estimate.completed_pages.empty();
         return estimate;
     }
     if (!op.io_schedule.available) {
@@ -182,7 +191,8 @@ HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(
         estimate.target_boundary_ts = std::max(estimate.source_boundary_ts, estimate.policy_stop_ts);
         estimate.boundary_resolved = true;
         estimate.io_completed = true;
-        estimate.visibility_dependency_required = estimate.policy_stop_ts > estimate.source_boundary_ts;
+        estimate.service_consumer_dependency_required = true;
+        estimate.visibility_dependency_required = estimate.io_completed || !estimate.completed_pages.empty();
         auto io_progress = estimate_prefetch_io_progress(op, estimate.policy_stop_ts);
         estimate.completed_pages = std::move(io_progress.completed_pages);
         estimate.completed_byte_count = io_progress.completed_byte_count;
@@ -193,16 +203,22 @@ HiCacheState::PrefetchProgressEstimate HiCacheState::estimate_prefetch_progress(
         if (!timeout_deadline) {
             return estimate;
         }
-        estimate.timed_out = *timeout_deadline < op.io_schedule.ready_ts;
-        estimate.io_completed = !estimate.timed_out;
+        estimate.io_completed = op.service_pages.size() == op.hit_pages.size() && op.io_schedule.ready_ts <= *timeout_deadline;
+        estimate.timed_out = !estimate.io_completed;
         estimate.timeout_deadline_ts = *timeout_deadline;
-        estimate.policy_stop_ts = std::min(*timeout_deadline, op.io_schedule.ready_ts);
+        estimate.policy_stop_ts = estimate.io_completed ? op.io_schedule.ready_ts : *timeout_deadline;
+        estimate.service_consumer_dependency_required = estimate.io_completed;
+        estimate.policy_wait_duration_us = estimate.timed_out
+                                               ? core::checked_subtract_u64(*timeout_deadline,
+                                                                            op.header.enqueue_ts,
+                                                                            "HiCache prefetch timeout precedes enqueue")
+                                               : 0;
         estimate.target_boundary_ts = std::max(estimate.source_boundary_ts, estimate.policy_stop_ts);
-        estimate.visibility_dependency_required = estimate.policy_stop_ts > estimate.source_boundary_ts;
         estimate.boundary_resolved = true;
         auto io_progress = estimate_prefetch_io_progress(op, estimate.policy_stop_ts);
         estimate.completed_pages = std::move(io_progress.completed_pages);
         estimate.completed_byte_count = io_progress.completed_byte_count;
+        estimate.visibility_dependency_required = estimate.io_completed || !estimate.completed_pages.empty();
         return estimate;
     }
     throw std::logic_error("Resolved HiCache prefetch policy is not executable: " + policy);
@@ -298,9 +314,17 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact) {
      */
     const auto hit_pages = scope.storage.contiguous_readable_prefix(planned_projected_pages);
     suppress_prior_prefetch(fact, scope, request_key);
-    const bool payload_transfer_issued = policy_.prefetch_policy() != "best_effort" && hit_pages.size() >= policy_.prefetch_threshold_pages();
+    const bool payload_transfer_issued = hit_pages.size() >= policy_.prefetch_threshold_pages();
+    std::optional<uint64_t> stop;
+    if (policy_.prefetch_policy() == "best_effort") {
+        if (const auto * boundary = prefetch_control_boundary_for_lookup(fact)) stop = boundary->ts;
+    }
+    else if (policy_.prefetch_policy() == "timeout") {
+        stop = policy_.prefetch_timeout_deadline_ts({ .enqueue_ts = fact.ts,
+            .token_count = core::checked_multiply_u64(hit_pages.size(), config_.page_size, "Prefetch timeout tokens overflow") });
+    }
     const auto io_schedule =
-        payload_transfer_issued ? schedule_target_io(scope, TargetIoLane::HostStorage, fact.ts, static_cast<uint64_t>(hit_pages.size())) : HiCacheIoSchedule{};
+        payload_transfer_issued ? schedule_target_io(normalized_scope(fact), "prefetch", fact.ts, hit_pages.size(), {}, stop) : HiCacheIoSchedule{};
 
     uint64_t storage_reuse_distance_sum_bytes = 0;
     uint64_t storage_reuse_distance_max_bytes = 0;
@@ -330,6 +354,7 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact) {
         .host_visible_offset_pages = static_cast<uint64_t>(memory_prefix.size()),
         .planned_pages = planned_pages,
         .hit_pages = hit_pages,
+        .service_pages = prefix_to(hit_pages, io_schedule.available ? io_schedule.effective_byte_count / config_.kv_bytes_per_page : 0),
         .completed_pages = {},
         .io_schedule = io_schedule,
         .payload_transfer_issued = payload_transfer_issued,
@@ -357,8 +382,14 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact) {
  * reservation remains pending for a later drain.
  */
 void HiCacheState::apply_prefetch_ready(const HiCacheFact & fact, ScopedState & scope, HiCachePrefetchOperation & op) {
+    // Both asynchronous-ready advancement and the request boundary converge here.
+    const auto & capacity = scope.capacity.snapshot();
+    const auto used = core::checked_add_u64(capacity.occupied_host_pages, capacity.reserved_host_pages,
+                                           "HiCache terminal host capacity exceeds uint64 range");
+    if (config_.l2_capacity_pages > 0 && used <= config_.l2_capacity_pages)
+        op.host_available_pages_at_control = config_.l2_capacity_pages - used;
     const auto completion_ts = op.target_boundary_ts != 0 ? op.target_boundary_ts : op.io_schedule.available ? op.io_schedule.ready_ts : fact.ts;
-    const bool timeout_incomplete = op.timed_out && op.completed_byte_count < op.io_schedule.effective_byte_count;
+    const bool timeout_incomplete = op.timed_out && op.completed_pages.size() < op.hit_pages.size();
     scope.async_ops.set_prefetch_state_by_id(op.header.operation_id,
                                              timeout_incomplete ? HiCachePrefetchState::Late : HiCachePrefetchState::Ready,
                                              timeout_incomplete ? HiCacheOperationState::Completed : HiCacheOperationState::Ready,
@@ -442,6 +473,8 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
         op->policy_stop_ts = fact.ts;
         op->target_boundary_ts = fact.ts;
         op->timeout_deadline_ts = 0;
+        op->policy_wait_duration_us = 0;
+        op->service_consumer_dependency_required = false;
         suppress("prefetch_revoked", HiCachePrefetchState::Revoked);
         drain_prefetch_pending_release(
             fact,
@@ -468,6 +501,8 @@ void HiCacheState::settle_prefetch_before_cache_extend(const HiCacheFact & fact,
     op->target_boundary_ts = progress.target_boundary_ts;
     op->timeout_deadline_ts = progress.timeout_deadline_ts;
     op->timed_out = progress.timed_out;
+    op->policy_wait_duration_us = progress.policy_wait_duration_us;
+    op->service_consumer_dependency_required = progress.service_consumer_dependency_required;
     op->visibility_dependency_required = progress.visibility_dependency_required;
     apply_prefetch_ready(fact, scope, *op);
 }

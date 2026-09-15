@@ -21,8 +21,8 @@ namespace markov::trace_graph::modules::hicache::runtime {
 /**
  * @brief Central monotonic clock for target-derived HiCache control flow.
  *
- * The clock owns operation IDs, enqueue epochs, and boundary epochs. Acknowledgements are
- * still folded synchronously, but control ordering no longer leaks across operation tables.
+ * The clock owns operation IDs, enqueue epochs, and boundary epochs. Service schedules
+ * own physical completion time; this clock only gives lifecycle records stable order.
  */
 class HiCacheTargetControlClock {
 public:

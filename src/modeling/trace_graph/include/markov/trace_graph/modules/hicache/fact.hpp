@@ -92,8 +92,12 @@ struct HiCacheFact {
     /** @brief Optional executable graph anchor proven for this semantic fact. */
     std::optional<size_t> execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
-    uint64_t ts = 0;  ///< Semantic phase-boundary timestamp in microseconds.
+    uint64_t source_ts = 0; ///< Original semantic boundary on the source wall clock.
+    uint64_t ts = 0;  ///< Residual-gap-excluded boundary used by target state replay.
     uint64_t dur = 0; ///< Chrome trace duration in microseconds.
+
+    std::string pid;
+    std::string tid;
 
     std::string event_name;
     std::string target_id;

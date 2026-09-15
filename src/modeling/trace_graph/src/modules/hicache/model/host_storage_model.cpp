@@ -59,8 +59,8 @@ uint64_t HiCacheState::release_device_residency(const HiCacheFact & fact, Scoped
  * @brief Evicts one device node, committing dirty write-back data first.
  *
  * Device eviction updates radix residency, allocator release state, and the capacity
- * index. Dirty write-back acknowledgement is currently synchronous, while operation
- * and reference lifecycles remain explicit in Debug transition evidence.
+ * index. Dirty write-back waits for the modeled D2H acknowledgement; its H2S storage
+ * backup remains an independent background lifecycle.
  */
 uint64_t HiCacheState::evict_device_node(const HiCacheFact & fact, ScopedState & scope, HiCacheNodeId node_id) {
     auto * node = scope.tree.mutable_node(node_id);

@@ -28,6 +28,8 @@ struct CliOptions {
     std::string model_config;
 #ifdef DEBUG
     std::string hicache_oracle_cost_replay;
+    std::string hicache_phase_oracle_cost_replay;
+    bool hicache_canonical_observed_phase_scope = false;
 #endif
     io::ManifestTraceInputOptions trace_input;
 #ifdef DEBUG

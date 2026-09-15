@@ -44,11 +44,14 @@ struct HiCacheSourceFactNode {
     HiCacheTokenSpan full_path_span;
     uint64_t source_page_size = 0;
     uint64_t service_item_count = 0;
+    std::optional<uint64_t> storage_existing_page_count;
+    std::optional<uint64_t> storage_new_page_count;
     uint64_t token_count = 0;
     uint64_t effective_token_count = 0;
     uint64_t completed_token_count = 0;
     bool completed_token_count_present = false;
     std::optional<bool> progress_ready = std::nullopt;
+    std::optional<uint64_t> host_available_tokens_at_return;
     std::optional<bool> write_back = std::nullopt;
     std::vector<uint64_t> operation_node_ids;
     std::vector<std::string> page_hashes;
@@ -200,6 +203,8 @@ private:
     NodeMap nodes_by_request_;
     NodeMap nodes_by_operation_;
     NodeMap cpu_nodes_by_lane_;
+    /** @brief Prefix maxima of immutable observed event ends, aligned with sorted lane nodes. */
+    std::unordered_map<std::string, std::vector<uint64_t>, core::TraceArgHash, std::equal_to<>> cpu_prefix_end_us_by_lane_;
     ControlIntervalMap control_intervals_by_name_;
     std::unordered_map<int, std::vector<std::string>> cpu_lane_keys_by_logical_input_;
 

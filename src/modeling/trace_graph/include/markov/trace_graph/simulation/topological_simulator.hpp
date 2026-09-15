@@ -45,4 +45,7 @@ struct SimulationResult {
  */
 [[nodiscard]] SimulationResult run_control_topological_simulation(core::DagGraph & graph);
 
+/** @brief Replays Direct and phase work while removing the separately deferred CPU-gap component. */
+[[nodiscard]] SimulationResult run_gap_excluded_topological_simulation(core::DagGraph & graph);
+
 } // namespace markov::trace_graph::simulation

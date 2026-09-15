@@ -427,8 +427,11 @@ HiCacheFact HiCacheFactParser::parse(size_t source_fact_id, const TraceEvent & e
     fact.source_node_id = source_fact_id;
     fact.execution_anchor_node_id = execution_anchor_node_id;
     fact.source_event_index = event.index;
-    fact.ts = hicache_fact_boundary_timestamp(event);
+    fact.source_ts = hicache_fact_boundary_timestamp(event);
+    fact.ts = fact.source_ts;
     fact.dur = event.dur;
+    fact.pid = event.pid;
+    fact.tid = event.tid;
     fact.event_name = event.name;
     fact.target_id = event.arg("target_id");
     fact.fact_class = metadata.fact_class;

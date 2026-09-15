@@ -27,8 +27,11 @@ HiCacheFact batch_request_fact(const HiCacheFact & batch, const std::string & re
     fact.source_node_id = batch.source_node_id;
     fact.execution_anchor_node_id = batch.execution_anchor_node_id;
     fact.source_event_index = batch.source_event_index;
+    fact.source_ts = batch.source_ts;
     fact.ts = batch.ts;
     fact.dur = batch.dur;
+    fact.pid = batch.pid;
+    fact.tid = batch.tid;
     fact.event_name = batch.event_name;
     fact.target_id = batch.target_id;
     fact.fact_class = batch.fact_class;
@@ -138,10 +141,8 @@ void HiCacheState::apply_cache_lookup_input(const HiCacheFact & fact) {
         ref = scope.refs.acquire_host(scope.tree, allocation_owner, "loadback_allocation", request_key, "", promoted_nodes);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "loadback_allocation_host_acquire");
         scope.device_allocator.merge_before_page_allocation(loadback_pages);
-        const bool allocation_retry_required = !scope.device_allocator.can_allocate(loadback_pages);
-        DeviceCapacityEnforcementResult allocation_retry_work;
-        if (allocation_retry_required) {
-            allocation_retry_work = enforce_device_capacity(fact, scope, loadback_pages);
+        if (!scope.device_allocator.can_allocate(loadback_pages)) {
+            (void)enforce_device_capacity(fact, scope, loadback_pages);
             scope.device_allocator.merge_before_page_allocation(loadback_pages);
         }
         if (!scope.device_allocator.can_allocate(loadback_pages)) {
@@ -163,16 +164,10 @@ void HiCacheState::apply_cache_lookup_input(const HiCacheFact & fact) {
         const auto transferred_pages = suffix_from(promotable_pages, lookup.device_pages.size());
         auto loadback_header =
             make_operation_header(HiCacheOperationKind::Loadback, loadback_id, fact, normalized_scope(fact), request_key, loadback_owner, transferred_pages, 0);
-        const auto io_schedule = schedule_target_io(scope, TargetIoLane::HostToDevice, fact.ts, static_cast<uint64_t>(transferred_pages.size()));
+        const auto io_schedule = schedule_target_io(normalized_scope(fact), "load", fact.ts, transferred_pages.size());
         scope.async_ops.insert_loadback(HiCacheLoadbackOperation{
             .header = std::move(loadback_header),
             .io_schedule = io_schedule,
-            .promoted_node_count = static_cast<uint64_t>(promoted_nodes.size()),
-            .allocation_retry_count = static_cast<uint64_t>(allocation_retry_required),
-            .allocation_retry_evicted_node_count = allocation_retry_work.evicted_node_count,
-            .allocation_retry_evicted_page_count = allocation_retry_work.evicted_page_count,
-            .allocation_retry_dirty_evicted_node_count = allocation_retry_work.dirty_evicted_node_count,
-            .allocation_retry_dirty_evicted_page_count = allocation_retry_work.dirty_evicted_page_count,
         });
         ref = scope.refs.acquire_lock(scope.tree, loadback_owner, "loadback", request_key, loadback_id, lookup.topology_chain);
         sync_capacity_for_ref(scope, normalized_scope(fact), ref, "loadback_ref_acquire");
@@ -348,6 +343,24 @@ void HiCacheState::apply_cache_extend_input(const HiCacheFact & fact) {
                                                 .page_size = page_size,
                                             }),
                                             page_size);
+
+    if (formal_window_active_) {
+        for (size_t index = 0; index < batch_intent.requests.size(); ++index) {
+            const auto & intent = batch_intent.requests[index];
+            prefill_work_items_.push_back(HiCachePrefillWorkItem{
+                .source_fact_id = fact.source_node_id,
+                .source_event_index = fact.source_event_index,
+                .pid = fact.pid,
+                .request_id = intent.request_id,
+                .batch_position = static_cast<uint64_t>(index),
+                .batch_size = batch_intent.batch_size,
+                .target_page_size = page_size,
+                .prompt_token_count = intent.accepted_tokens,
+                .reusable_prefix_token_count = intent.allocation_prefix_tokens,
+                .prefill_token_count = intent.extend_tokens,
+            });
+        }
+    }
 
     // The scheduler owns each accepted prefix before it asks the allocator to
     // make room for extension.  Refresh the canonical node chain after prefetch

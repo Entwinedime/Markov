@@ -83,6 +83,11 @@ void validate_options(const CliOptions & options) {
     if (options.trace_input.window_start_us && *options.trace_input.window_end_us <= *options.trace_input.window_start_us) {
         throw CliUsageError("trace window end must be greater than start");
     }
+#ifdef DEBUG
+    if (options.hicache_canonical_observed_phase_scope && !options.model_config.empty()) {
+        throw CliUsageError("--hicache-canonical-observed-phase-scope is score-only and cannot be combined with --model-config");
+    }
+#endif
 }
 
 } // namespace
@@ -107,6 +112,8 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
 #ifdef DEBUG
         else if (argument == "--actual-e2e-us") { options.actual_e2e_us = nonnegative_u64(next_value(index, argc, argv, argument), argument); }
         else if (argument == "--hicache-oracle-cost-replay") options.hicache_oracle_cost_replay = next_value(index, argc, argv, argument);
+        else if (argument == "--hicache-phase-oracle-cost-replay") options.hicache_phase_oracle_cost_replay = next_value(index, argc, argv, argument);
+        else if (argument == "--hicache-canonical-observed-phase-scope") options.hicache_canonical_observed_phase_scope = true;
         else if (argument == "--model-summary") options.outputs.model_summary = next_value(index, argc, argv, argument);
 #endif
         else if (argument == "--run-summary") options.outputs.run_summary = next_value(index, argc, argv, argument);
@@ -134,6 +141,8 @@ void print_usage(const char * program) {
 #ifdef DEBUG
               << "  --actual-e2e-us N               Explicit workload E2E used by validation\n"
               << "  --hicache-oracle-cost-replay FILE  Diagnostic target-observed effect costs\n"
+              << "  --hicache-phase-oracle-cost-replay FILE  Diagnostic target-observed phase costs\n"
+              << "  --hicache-canonical-observed-phase-scope  Canonical target phase carriers for score-only replay\n"
               << "  --model-summary FILE            Optional module validation summary\n"
 #endif
               << "  --run-summary FILE              Required compact run summary\n"

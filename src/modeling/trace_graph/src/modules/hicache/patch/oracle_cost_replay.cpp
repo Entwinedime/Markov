@@ -21,23 +21,18 @@ namespace oracle_cost_replay_detail {
 
 using Json = nlohmann::json;
 
-constexpr std::string_view kPrimitiveControl = "host_control_primitive";
-constexpr std::string_view kOutcomeOnlyControl = "outcome_only_terminal_control";
-
 struct OracleCost {
     std::string effect_id;
     std::string effect_type;
     std::string direction;
     std::string resource_scope;
     std::string resource_lane;
-    std::string control_semantics;
     uint64_t logical_order_epoch = 0;
     uint64_t operation_count = 0;
     uint64_t page_count = 0;
     uint64_t byte_count = 0;
     uint64_t service_us = 0;
     uint64_t control_us = 0;
-    uint64_t observed_blocking_us = 0;
 };
 
 uint64_t exact_u64(const Json & object, std::string_view field) {
@@ -62,19 +57,14 @@ OracleCost parse_cost(const Json & raw) {
         .direction = exact_string(raw, "direction"),
         .resource_scope = exact_string(raw, "resource_scope"),
         .resource_lane = exact_string(raw, "resource_lane"),
-        .control_semantics = exact_string(raw, "control_semantics"),
         .logical_order_epoch = exact_u64(raw, "logical_order_epoch"),
         .operation_count = exact_u64(raw, "operation_count"),
         .page_count = exact_u64(raw, "page_count"),
         .byte_count = exact_u64(raw, "byte_count"),
         .service_us = exact_u64(raw, "service_us"),
         .control_us = exact_u64(raw, "control_us"),
-        .observed_blocking_us = exact_u64(raw, "observed_blocking_us"),
     };
     if (cost.effect_id.empty()) throw std::invalid_argument("oracle-cost replay effect_id must not be empty");
-    if (cost.control_semantics != kPrimitiveControl && cost.control_semantics != kOutcomeOnlyControl) {
-        throw std::invalid_argument("oracle-cost replay contains an unknown control_semantics for effect: " + cost.effect_id);
-    }
     return cost;
 }
 
@@ -115,13 +105,6 @@ void validate_shape(const HiCacheIoCostRecord & model_cost, const OracleCost & o
         || oracle.resource_lane != model_cost.resource_lane || oracle.logical_order_epoch != model_cost.logical_order_epoch) {
         throw std::invalid_argument("oracle-cost replay operation shape mismatch for effect: " + model_cost.effect_id);
     }
-    const bool primitive_control_supported =
-        model_cost.zero_payload_control || model_cost.effect_type == model::HiCacheEffectType::Loadback
-        || model_cost.effect_type == model::HiCacheEffectType::CommitDeviceToHost;
-    const auto expected_semantics = primitive_control_supported ? kPrimitiveControl : kOutcomeOnlyControl;
-    if (oracle.control_semantics != expected_semantics) {
-        throw std::invalid_argument("oracle-cost replay control semantics mismatch for effect: " + model_cost.effect_id);
-    }
 }
 
 } // namespace oracle_cost_replay_detail
@@ -156,17 +139,12 @@ void apply_hicache_oracle_cost_replay(HiCacheIoResourcePlan & plan, const std::s
 
         checked_accumulate(audit.oracle_service_us, oracle.service_us, "oracle service total exceeds uint64 range");
         checked_accumulate(audit.oracle_control_us, oracle.control_us, "oracle control total exceeds uint64 range");
-        checked_accumulate(audit.observed_blocking_us, oracle.observed_blocking_us, "oracle blocking total exceeds uint64 range");
         model_cost.duration_us = oracle.service_us;
         checked_accumulate(audit.applied_service_us, model_cost.duration_us, "applied oracle service total exceeds uint64 range");
-        if (oracle.control_semantics == kPrimitiveControl) {
-            model_cost.host_control_duration_us = oracle.control_us;
-            checked_accumulate(audit.applied_primitive_control_us, model_cost.host_control_duration_us, "applied oracle control total exceeds uint64 range");
-        }
-        else {
-            model_cost.host_control_duration_us = 0;
-            checked_accumulate(audit.outcome_only_control_us, oracle.control_us, "outcome-only control total exceeds uint64 range");
-        }
+        // Input control is intrinsic CPU work, not polling or a wall-clock wait.
+        // Dropping terminal control would also change the consumer's predecessor.
+        model_cost.host_control_duration_us = oracle.control_us;
+        checked_accumulate(audit.applied_control_us, model_cost.host_control_duration_us, "applied oracle control total exceeds uint64 range");
         audit.applied_cost_count++;
     }
     if (consumed.size() != oracle_by_effect.size()) {

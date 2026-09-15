@@ -87,8 +87,11 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .target_effect_state = effect.target_effect_state,
         .source_carrier_state = attribution->source_carrier_state,
         .duration_us = cost == nullptr ? 0 : cost->duration_us,
+        .consumer_dependency_required = effect.consumer_dependency_required,
+        .policy_wait_duration_us = effect.policy_wait_duration_us,
         .resource_lane = cost == nullptr ? std::string{} : cost->resource_lane,
         .synthetic_id = "hicache_effect:" + effect.effect_key,
+        .policy_wait_synthetic_id = "hicache_policy_wait:" + effect.effect_key,
         .carrier_nodes = attribution->carrier_nodes,
         .owned_duration_nodes = attribution->owned_duration_nodes,
         .owned_gap_slices = attribution->owned_gap_slices,
@@ -100,11 +103,12 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .owned_gap_duration_us = attribution->owned_gap_duration_us,
         .target_host_control_duration_us = cost == nullptr ? 0 : cost->host_control_duration_us,
         .target_host_control_required =
-            cost != nullptr && cost->host_control_duration_us > 0
+            cost != nullptr && cost->host_control_operation_count > 0
             && (cost->zero_payload_control
-                || ((effect.effect_type == HiCacheEffectType::Loadback || effect.effect_type == HiCacheEffectType::CommitDeviceToHost)
+                || ((effect.effect_type == HiCacheEffectType::PrefetchIo || effect.effect_type == HiCacheEffectType::Loadback
+                     || effect.effect_type == HiCacheEffectType::CommitDeviceToHost)
                     && effect.target_effect_state != HiCacheTargetEffectState::NotRequired)),
-        .target_host_control_terminal = cost != nullptr && cost->zero_payload_control,
+        .target_host_control_terminal = cost != nullptr && cost->host_control_operation_count > 0 && effect.effect_type == HiCacheEffectType::PrefetchIo,
         .target_host_control_synthetic_id = "hicache_host_control:" + effect.effect_key,
         .target_host_control_terminal_join_synthetic_id = "hicache_terminal_control_join:" + effect.effect_key,
         .target_host_control_anchor_node_id = effect.effect_type == HiCacheEffectType::CommitDeviceToHost
@@ -130,9 +134,12 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .completion_wait_reason = attribution->completion_wait_reason,
         .completion_join_contract_ready = attribution->completion_join_contract_ready,
         .completion_join_required =
-            (effect.effect_type == HiCacheEffectType::PrefetchIo || (effect.effect_type == HiCacheEffectType::Loadback && !reuse_source_readiness_topology))
+            ((effect.effect_type == HiCacheEffectType::PrefetchIo
+              && (effect.consumer_dependency_required || effect.policy_wait_duration_us > 0))
+             || (effect.effect_type == HiCacheEffectType::Loadback && !reuse_source_readiness_topology))
             && attribution->completion_join_contract_ready
             && (attribution->source_carrier_state == HiCacheSourceCarrierState::Present || effect.target_effect_state != HiCacheTargetEffectState::NotRequired),
+        .completion_join_uses_service = effect.effect_type != HiCacheEffectType::PrefetchIo || effect.consumer_dependency_required,
         .source_effect_schedule_aligned = attribution->source_effect_schedule_aligned,
         .source_readiness_topology_reused = reuse_source_readiness_topology,
         .source_completion_wait_blocking = attribution->source_completion_wait_blocking,
@@ -163,24 +170,12 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .consumer_anchor_method = attribution->consumer_anchor_method,
     };
 
-    if (decision.target_host_control_terminal) {
+    if (cost != nullptr && cost->zero_payload_control && decision.policy_wait_duration_us == 0) {
         // A zero-payload target has no storage completion to join against.  Its
         // only target-side cost is the terminal progress/control operation at
         // the real consumer boundary; retaining the source completion join
         // would preserve source-only wait topology and mask that control cost.
         decision.completion_join_required = false;
-    }
-
-    const bool equivalent_prefetch_completion = effect.effect_type == HiCacheEffectType::PrefetchIo
-                                                && attribution->source_carrier_state == HiCacheSourceCarrierState::Present
-                                                && effect.target_effect_state != HiCacheTargetEffectState::NotRequired
-                                                && attribution->source_completed_token_count == attribution->target_effective_token_count;
-    if (equivalent_prefetch_completion) {
-        decision.completion_join_required = false;
-        decision.rewrite_kind = HiCacheRewriteKind::NoOp;
-        decision.shadow_plan_ready = true;
-        decision.reason = "source and target prefetch completion semantics are identical; preserve the faithful source wait topology";
-        return decision;
     }
 
     if (attribution->source_carrier_state == HiCacheSourceCarrierState::Absent) {
@@ -205,10 +200,10 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
             return decision;
         }
         if (cost == nullptr || cost->status != HiCacheIoCostStatus::Ready) return reject_decision(effect, attribution, "target_effect_cost_not_ready");
-        if (foreground_io_effect(effect) && !decision.completion_join_contract_ready)
+        if (effect.consumer_dependency_required && foreground_io_effect(effect) && !decision.completion_join_contract_ready)
             return reject_decision(effect, attribution, "foreground_io_completion_contract_not_ready:" + attribution->completion_wait_reason);
         if (!decision.source_execution_anchor_node_id) return reject_decision(effect, attribution, "missing_source_execution_anchor");
-        if (attribution->consumer_anchors.empty() && !background_write_effect(effect))
+        if (effect.consumer_dependency_required && attribution->consumer_anchors.empty() && !background_write_effect(effect))
             return reject_decision(effect, attribution, "missing_insertion_consumer_anchor");
         decision.rewrite_kind = dependency_effect(effect) ? HiCacheRewriteKind::InsertGate : HiCacheRewriteKind::InsertIo;
         decision.shadow_plan_ready = true;

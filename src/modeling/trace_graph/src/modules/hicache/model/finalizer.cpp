@@ -4,14 +4,7 @@
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
 
-#include <algorithm>
-#include <iterator>
 #include <ranges>
-#include <set>
-#include <sstream>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
 
 namespace markov::trace_graph::modules::hicache::model {
 
@@ -34,6 +27,10 @@ void HiCacheState::finalize() {
         const auto boundary_epoch = scope.clock.record_target_finalize_boundary(scope_name, fact.ts);
         fact.role = "write_through_backup_finalize";
         drain_write_through_backup_refs(fact, scope, "write_through_backup_finalize_boundary");
+        // Background H2S work remains part of the predicted resource graph even when
+        // its acknowledgement falls outside the measured business window.  Force only
+        // lifecycle convergence here; no source consumer or E2E endpoint is invented.
+        advance_storage_backups(fact, scope, true);
         fact.role = "prefetch_finalize";
         for (auto & op : scope.async_ops.prefetch_ops() | std::views::values) {
             if (op.prefetch_state != HiCachePrefetchState::Pending && op.prefetch_state != HiCachePrefetchState::Ready) continue;
@@ -56,6 +53,4 @@ void HiCacheState::finalize() {
         }
     }
 }
-
-
 } // namespace markov::trace_graph::modules::hicache::model

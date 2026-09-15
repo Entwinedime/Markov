@@ -97,6 +97,39 @@ const HiCacheSourceFactNode * paired_call_start(const HiCacheSourceDagIndex & so
     return match;
 }
 
+std::vector<const HiCacheSourceFactNode *> nested_storage_services(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & timing,
+                                                                   HiCacheIoOperationKind kind) {
+    std::string_view role;
+    if (kind == HiCacheIoOperationKind::Prefetch) role = "storage_read_service_observed";
+    else if (kind == HiCacheIoOperationKind::WriteHostToStorage) role = "storage_write_service_observed";
+    else return {};
+
+    const auto timing_end = fact_end(timing);
+    std::vector<const HiCacheSourceFactNode *> matches;
+    const auto consider = [&](const HiCacheSourceFactNode & candidate) {
+        if (candidate.fact_role != role || candidate.pid != timing.pid || candidate.tid != timing.tid || candidate.timestamp_us < timing.timestamp_us
+            || fact_end(candidate) > timing_end)
+            return;
+        if (!timing.cache_scope.empty() && !candidate.cache_scope.empty() && candidate.cache_scope != timing.cache_scope) return;
+        matches.push_back(&candidate);
+    };
+    for (const auto node_id : source.nodes_for_fact_role(role)) {
+        const auto * candidate = source.fact_node(node_id);
+        if (candidate != nullptr) consider(*candidate);
+    }
+    for (const auto & candidate : source.tail_context_facts()) { consider(candidate); }
+    std::ranges::sort(matches, {}, &HiCacheSourceFactNode::timestamp_us);
+    for (size_t i = 1; i < matches.size(); ++i) {
+        const auto & previous = *matches[i - 1];
+        const auto & current = *matches[i];
+        // Same-thread sequential batching is supported, not recursive,
+        // duplicated or ambiguously scoped service observations.
+        if (current.timestamp_us <= previous.timestamp_us || current.timestamp_us < fact_end(previous) || current.cache_scope != previous.cache_scope)
+            return {};
+    }
+    return matches;
+}
+
 uint64_t page_size_for_scope(const HiCacheSourceDagIndex & source, std::string_view cache_scope) {
     uint64_t page_size = 0;
     for (const auto & fact : source.fact_nodes()) {
@@ -218,6 +251,27 @@ uint64_t gap_duration(std::span<const HiCacheCpuGapSlice> slices) {
     return total;
 }
 
+std::vector<size_t> explicit_control_nodes(const HiCacheSourceDagIndex & source, const HiCacheTimingIntervalOwnership & ownership) {
+    std::vector<size_t> nodes;
+    for (const auto node_id : ownership.owned_node_ids) {
+        const auto & node = source.graph().node(node_id);
+        const auto & event = source.graph().event_for_node(node_id);
+        const bool wait = std::ranges::any_of(source.incoming_edge_ids(node_id), [&](size_t edge_id) {
+            const auto kind = source.graph().edge(edge_id).kind;
+            return kind == core::DagEdgeKind::Sync || kind == core::DagEdgeKind::HCCL;
+        });
+        if (node.is_cpu && !event.name.ends_with(".self") && !wait) nodes.push_back(node_id);
+    }
+    return nodes;
+}
+
+uint64_t explicit_control_duration(const HiCacheSourceDagIndex & source, const std::vector<size_t> & nodes) {
+    uint64_t duration = 0;
+    for (const auto node_id : nodes)
+        duration = core::checked_add_u64(duration, source.graph().node(node_id).duration, "HiCache explicit control duration overflow");
+    return duration;
+}
+
 void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record) {
     record.completion_wait_status = "unresolved";
     record.source_completion_us = record.source_end_us;
@@ -255,6 +309,9 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     record.wait_exit_start_us = first_true->timestamp_us;
     record.wait_exit_end_us = fact_end(*first_true);
     record.retained_terminal_control_us = first_true->duration_us;
+    record.terminal_control_node_ids = explicit_control_nodes(source, source.timing_interval_ownership(*first_true));
+    record.terminal_control_us = explicit_control_duration(source, record.terminal_control_node_ids);
+    record.host_available_tokens_at_return = first_true->host_available_tokens_at_return;
     const auto & control_fact = first_false == nullptr ? *first_true : *first_false;
     record.control_ready_anchor_node_id = source.cpu_boundary_at_or_after(control_fact.pid, control_fact.tid, control_fact.timestamp_us);
     record.wait_exit_anchor_node_id = source.cpu_boundary_at_or_after(first_true->pid, first_true->tid, first_true->timestamp_us);
@@ -276,6 +333,8 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     for (const auto * check : false_checks) {
         if (check->timestamp_us > first_true->timestamp_us) break;
         auto ownership = source.timing_interval_ownership(*check);
+        const auto nodes = explicit_control_nodes(source, ownership);
+        if (!nodes.empty()) record.progress_check_cpu_samples_us.push_back(explicit_control_duration(source, nodes));
         record.completion_wait_owned_node_ids.insert(record.completion_wait_owned_node_ids.end(),
                                                      ownership.owned_node_ids.begin(),
                                                      ownership.owned_node_ids.end());
@@ -307,8 +366,7 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     record.evidence.push_back("prefetch_false_to_completion_to_true_contract");
 }
 
-void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record,
-                                       const HiCacheDeviceTransferClosure & closure) {
+void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record, const HiCacheDeviceTransferClosure & closure) {
     record.completion_wait_status = "unresolved";
     record.device_transfer_node_ids = closure.transfer_node_ids;
     record.device_completion_node_ids = closure.completion_node_ids;
@@ -334,7 +392,8 @@ void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiC
     for (size_t node_id : record.device_transfer_node_ids) {
         if (node_id >= source.graph().node_count()) continue;
         const auto & event = source.graph().event_for_node(node_id);
-        record.source_completion_us = std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
+        record.source_completion_us =
+            std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
     }
     record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
     record.completion_wait_duration_us = record.device_transfer_duration_us;
@@ -359,16 +418,15 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
     for (size_t node_id : record.device_transfer_node_ids) {
         if (node_id >= source.graph().node_count()) continue;
         const auto & event = source.graph().event_for_node(node_id);
-        record.source_completion_us = std::max(
-            record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
+        record.source_completion_us =
+            std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
     }
     if (closure.status == "transfer_only") {
         record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
         record.completion_wait_duration_us = record.device_transfer_duration_us;
         record.source_completion_wait_blocking = false;
         record.completion_wait_status = "ready_background_transfer_only";
-        record.completion_wait_reason =
-            "background device-to-host transfer is exact, but no retained completion/readiness topology is available for reuse";
+        record.completion_wait_reason = "background device-to-host transfer is exact, but no retained completion/readiness topology is available for reuse";
         record.evidence.push_back("device_to_host_transfer_submit_closure");
         record.evidence.push_back("device_to_host_background_transfer_only");
         record.evidence.push_back("device_to_host_readiness_topology_not_reusable");
@@ -385,15 +443,13 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
     record.completion_join_contract_ready = true;
     record.source_readiness_topology_ready = true;
     record.completion_wait_status = "ready_existing_device_event_join";
-    record.completion_wait_reason =
-        "host submission is preserved while direction-matched device-to-host transfers retain their existing completion topology";
+    record.completion_wait_reason = "host submission is preserved while direction-matched device-to-host transfers retain their existing completion topology";
     record.evidence.push_back("device_to_host_transfer_submit_closure");
     record.evidence.push_back("device_to_host_existing_event_readiness_join");
     record.evidence.push_back("device_to_host_host_submission_not_completion");
 }
 
-void build_load_admission_control(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & decision,
-                                  HiCacheIoOperationRecord & record) {
+void build_load_admission_control(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & decision, HiCacheIoOperationRecord & record) {
     constexpr std::string_view control_event_name = "hicache.control.load_back_admission";
     const auto resolved = source.enclosing_control_interval_ownership(decision, control_event_name);
     if (!resolved) return;
@@ -417,13 +473,10 @@ void build_load_admission_control(const HiCacheSourceDagIndex & source, const Hi
 } // namespace io_operation_ledger_detail
 
 bool hicache_io_operation_record_ready(const HiCacheIoOperationRecord & record) {
-    return record.status == "ready" || record.status == "ready_background_unmaterialized"
-           || record.status == "ready_background_transfer_only";
+    return record.status == "ready" || record.status == "ready_background_unmaterialized" || record.status == "ready_background_transfer_only";
 }
 
-uint64_t HiCacheIoOperationLedger::ready_count() const {
-    return static_cast<uint64_t>(std::ranges::count_if(records, hicache_io_operation_record_ready));
-}
+uint64_t HiCacheIoOperationLedger::ready_count() const { return static_cast<uint64_t>(std::ranges::count_if(records, hicache_io_operation_record_ready)); }
 
 uint64_t HiCacheIoOperationLedger::unresolved_count() const { return static_cast<uint64_t>(records.size()) - ready_count(); }
 

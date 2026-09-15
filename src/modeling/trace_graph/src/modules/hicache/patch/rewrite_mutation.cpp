@@ -23,7 +23,7 @@ void append_source_control_updates(const core::DagGraph & graph, core::DagMutati
             .node_id = node_id,
             .duration = 0,
             .effect_id = decision.effect_id,
-            .reason = "remove exact snapshot-exclusive source load-back host-control before target control materialization",
+            .reason = "remove source-owned HiCache control before target control materialization",
         });
     }
     (void)graph;
@@ -44,22 +44,24 @@ void append_target_host_control_node(core::DagMutationPlan & plan, const HiCache
             .counts_toward_e2e = false,
             .attrs = {
                 { "effect_id", decision.effect_id },
-                { "cost_model", decision.target_host_control_terminal ? "zero_payload_terminal_control" : "fixed_plus_per_target_page" },
+                { "request_id", decision.request_id },
+                { "cost_model", decision.target_host_control_terminal ? "explicit_terminal_control" : "fixed_plus_per_target_page" },
             },
         },
         .effect_id = decision.effect_id,
         .reason = decision.target_host_control_terminal
-                      ? "materialize target zero-payload HiCache terminal progress control"
+                      ? "materialize target HiCache terminal progress control"
                       : "materialize target HiCache CPU submission from the workflow-wide host-control calibration",
     });
     if (decision.target_host_control_terminal) {
-        if (decision.completion_join_required || decision.target_host_control_ingress_edge_ids.empty()
+        if (decision.completion_join_required) return; // Wired after max(control-ready, I/O completion).
+        if (decision.target_host_control_ingress_edge_ids.empty()
             || decision.target_host_control_exit_node_ids.size() != 1)
             throw std::logic_error("HiCache zero-payload terminal control requires consumer readiness ingresses and one exit");
         plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
             .synthetic_id = decision.target_host_control_terminal_join_synthetic_id,
             .node = core::DagSyntheticNodeSpec{
-                .name = "hicache_zero_payload_terminal_control_join",
+            .name = "hicache_prefetch_terminal_control_join",
                 .category = "hicache_patch",
                 .is_cpu = false,
                 .lane_key = "hicache_terminal_control_join",
@@ -67,18 +69,19 @@ void append_target_host_control_node(core::DagMutationPlan & plan, const HiCache
                 .counts_toward_e2e = false,
                 .attrs = {
                     { "effect_id", decision.effect_id },
-                    { "join_semantics", "max_consumer_readiness_before_terminal_control" },
+                    { "request_id", decision.request_id },
+                { "join_semantics", "consumer_readiness_before_nonblocking_terminal_control" },
                 },
             },
             .effect_id = decision.effect_id,
-            .reason = "derive the terminal-control opportunity from all real consumer prerequisites",
+            .reason = "derive a nonblocking prefetch terminal-control opportunity from real consumer prerequisites",
         });
         for (size_t ingress_edge_id : decision.target_host_control_ingress_edge_ids) {
             plan.redirect_edges.push_back(core::DagRedirectEdgeMutation{
                 .edge_index = ingress_edge_id,
                 .dst = core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id),
                 .effect_id = decision.effect_id,
-                .reason = "collect one real consumer prerequisite before target zero-payload terminal control",
+                .reason = "collect one real consumer prerequisite before target nonblocking terminal control",
             });
         }
         plan.add_edges.push_back(core::DagAddEdgeMutation{
@@ -86,14 +89,14 @@ void append_target_host_control_node(core::DagMutationPlan & plan, const HiCache
             .dst = core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
             .kind = core::DagEdgeKind::Mutation,
             .effect_id = decision.effect_id,
-            .reason = "zero-payload terminal control begins after every real consumer prerequisite is ready",
+            .reason = "nonblocking terminal control begins after every real consumer prerequisite is ready",
         });
         plan.add_edges.push_back(core::DagAddEdgeMutation{
             .src = core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
             .dst = core::DagNodeRef::existing(decision.target_host_control_exit_node_ids.front()),
             .kind = core::DagEdgeKind::Mutation,
             .effect_id = decision.effect_id,
-            .reason = "target consumer begins after zero-payload terminal progress control completes",
+            .reason = "target consumer begins after nonblocking terminal progress control completes",
         });
         return;
     }
@@ -229,6 +232,26 @@ void append_gap_updates(const core::DagGraph & graph, core::DagMutationPlan & pl
 }
 
 void append_completion_join_node(core::DagMutationPlan & plan, const HiCacheRewriteDecision & decision) {
+    if (decision.policy_wait_duration_us > 0) {
+        plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
+            .synthetic_id = decision.policy_wait_synthetic_id,
+            .node = core::DagSyntheticNodeSpec{
+                .name = "hicache_prefetch_policy_wait",
+                .category = "hicache_patch",
+                .is_cpu = false,
+                .lane_key = "hicache_policy_wait",
+                .duration = decision.policy_wait_duration_us,
+                .counts_toward_e2e = false,
+                .attrs = {
+                    { "effect_id", decision.effect_id },
+                    { "request_id", decision.request_id },
+                    { "wait_semantics", "target_timeout_from_enqueue" },
+                },
+            },
+            .effect_id = decision.effect_id,
+            .reason = "materialize the target timeout deadline independently of background I/O completion",
+        });
+    }
     plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
         .synthetic_id = decision.completion_join_synthetic_id,
         .node = core::DagSyntheticNodeSpec{
@@ -240,11 +263,14 @@ void append_completion_join_node(core::DagMutationPlan & plan, const HiCacheRewr
             .counts_toward_e2e = false,
             .attrs = {
                 { "effect_id", decision.effect_id },
-                { "join_semantics", "max_control_ready_io_complete" },
+                { "request_id", decision.request_id },
+                { "join_semantics", decision.policy_wait_duration_us > 0 ? "max_control_ready_policy_deadline" : "max_control_ready_io_complete" },
             },
         },
         .effect_id = decision.effect_id,
-        .reason = "zero-duration max-plus join between control readiness and target I/O completion",
+        .reason = decision.policy_wait_duration_us > 0
+                      ? "zero-duration max-plus join between control readiness and the target policy deadline"
+                      : "zero-duration max-plus join between control readiness and target I/O completion",
     });
 }
 
@@ -258,13 +284,31 @@ void append_completion_join_edges(const core::DagGraph & graph, core::DagMutatio
         .effect_id = decision.effect_id,
         .reason = "target prefetch becomes eligible after its source opportunity anchor",
     });
-    plan.add_edges.push_back(core::DagAddEdgeMutation{
-        .src = core::DagNodeRef::synthetic(decision.synthetic_id),
-        .dst = core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
-        .kind = core::DagEdgeKind::Mutation,
-        .effect_id = decision.effect_id,
-        .reason = "target storage completion supplies the I/O branch of the completion join",
-    });
+    if (decision.completion_join_uses_service) {
+        plan.add_edges.push_back(core::DagAddEdgeMutation{
+            .src = core::DagNodeRef::synthetic(decision.synthetic_id),
+            .dst = core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
+            .kind = core::DagEdgeKind::Mutation,
+            .effect_id = decision.effect_id,
+            .reason = "target storage completion supplies the I/O branch of the completion join",
+        });
+    }
+    if (decision.policy_wait_duration_us > 0) {
+        plan.add_edges.push_back(core::DagAddEdgeMutation{
+            .src = target_effect_ingress(decision),
+            .dst = core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
+            .kind = core::DagEdgeKind::Mutation,
+            .effect_id = decision.effect_id,
+            .reason = "target timeout starts at the same prefetch enqueue opportunity as background I/O",
+        });
+        plan.add_edges.push_back(core::DagAddEdgeMutation{
+            .src = core::DagNodeRef::synthetic(decision.policy_wait_synthetic_id),
+            .dst = core::DagNodeRef::synthetic(decision.completion_join_synthetic_id),
+            .kind = core::DagEdgeKind::Mutation,
+            .effect_id = decision.effect_id,
+            .reason = "the target policy deadline releases the terminal prefetch boundary",
+        });
+    }
     if (*decision.control_ready_anchor_node_id == *decision.wait_exit_anchor_node_id) {
         if (!decision.completion_control_ingress_edge_id)
             throw std::logic_error("Immediate-ready HiCache completion join requires one sequential control ingress");
@@ -290,14 +334,14 @@ void append_completion_join_edges(const core::DagGraph & graph, core::DagMutatio
             .dst = core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
             .kind = core::DagEdgeKind::Mutation,
             .effect_id = decision.effect_id,
-            .reason = "zero-payload terminal progress control begins after both completion-join branches are ready",
+            .reason = "terminal progress control begins after both completion-join branches are ready",
         });
         plan.add_edges.push_back(core::DagAddEdgeMutation{
             .src = core::DagNodeRef::synthetic(decision.target_host_control_synthetic_id),
             .dst = core::DagNodeRef::existing(*decision.wait_exit_anchor_node_id),
             .kind = core::DagEdgeKind::Mutation,
             .effect_id = decision.effect_id,
-            .reason = "completion wait exits after target zero-payload terminal control completes",
+            .reason = "completion wait exits after target terminal control completes",
         });
     }
     else {
@@ -323,6 +367,7 @@ void append_synthetic_node(core::DagMutationPlan & plan, const HiCacheRewriteDec
             .counts_toward_e2e = false,
             .attrs = {
                 { "effect_id", decision.effect_id },
+                { "request_id", decision.request_id },
                 { "rewrite_kind", hicache_rewrite_kind_name(decision.rewrite_kind) },
             },
         },
@@ -341,15 +386,17 @@ void append_insertion_edges(core::DagMutationPlan & plan, const HiCacheRewriteDe
         .reason = "target effect becomes eligible after its source opportunity anchor",
     });
     if (decision.target_host_control_terminal) {
-        plan.add_edges.push_back(core::DagAddEdgeMutation{
-            .src = core::DagNodeRef::synthetic(decision.synthetic_id),
-            .dst = core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id),
-            .kind = core::DagEdgeKind::Mutation,
-            .effect_id = decision.effect_id,
-            .reason = "zero-payload target I/O boundary joins the real consumer prerequisites before terminal control",
-        });
+        if (decision.consumer_dependency_required)
+            plan.add_edges.push_back(core::DagAddEdgeMutation{
+                .src = core::DagNodeRef::synthetic(decision.synthetic_id),
+                .dst = core::DagNodeRef::synthetic(decision.target_host_control_terminal_join_synthetic_id),
+                .kind = core::DagEdgeKind::Mutation,
+                .effect_id = decision.effect_id,
+                .reason = "visible target I/O joins the real consumer prerequisites before terminal control",
+            });
         return;
     }
+    if (!decision.consumer_dependency_required) return;
     for (size_t consumer : decision.consumer_anchors) {
         plan.add_edges.push_back(core::DagAddEdgeMutation{
             .src = core::DagNodeRef::synthetic(decision.synthetic_id),
@@ -422,7 +469,7 @@ core::DagMutationPlan build_plan(const core::DagGraph & graph, const std::vector
     for (const auto & decision : decisions) append_source_control_updates(graph, plan, decision);
     append_e2e_eligibility_updates(plan, decisions);
     append_gap_updates(graph, plan, decisions);
-    append_resource_lane_dependencies(plan, resources, synthetic_by_effect);
+    append_resource_lane_dependencies(graph, plan, resources, decisions, synthetic_by_effect);
     append_family_dependencies(plan, decisions, synthetic_by_effect);
     append_reused_readiness_family_dependencies(plan, decisions);
     append_request_io_dependencies(plan, decisions, synthetic_by_effect);
