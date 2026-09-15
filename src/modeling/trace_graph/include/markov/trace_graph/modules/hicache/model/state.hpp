@@ -104,6 +104,8 @@ private:
         uint64_t extended_tokens = 0;
         uint64_t kv_allocated_pages = 0;
         uint64_t cache_protected_pages = 0;
+        // Workload lookup boundary, not the source configuration's cache hit count.
+        std::optional<uint64_t> lookup_token_limit;
         std::vector<std::string> full_pages;
         std::vector<std::string> device_pages;
         std::vector<std::string> host_pages;

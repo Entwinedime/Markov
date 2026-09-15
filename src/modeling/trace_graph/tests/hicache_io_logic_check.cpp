@@ -96,6 +96,57 @@ void prefill_batch_records_one_preallocation_slice() {
     }
 }
 
+void extend_respects_lookup_input_limit() {
+    const auto check = [](uint64_t page_size, uint64_t limit, bool unfinished) {
+        frontend::HiCacheConfig config;
+        config.write_policy = "write_back";
+        config.page_size = page_size;
+        config.l1_capacity_pages = 48;
+        config.l2_capacity_pages = 64;
+        model::HiCacheState state(config);
+        const auto fact = [](std::string role, std::string request, uint64_t count) {
+            HiCacheFact f;
+            f.pid = f.tid = "worker";
+            f.cache_scope = "cache";
+            f.fact_class = "workload_identity";
+            f.consumers = {"hicache_state_model"};
+            f.role = std::move(role);
+            f.request_id = std::move(request);
+            f.is_end = true;
+            f.token_count = count;
+            f.full_path_span = {.path_id = "path", .begin = 0, .end = count, .token_count = count, .valid = true};
+            for (uint32_t token = 0; token < count; ++token) f.full_path_tokens.push_back({{token}});
+            return f;
+        };
+        auto seed = fact("cache_lifecycle_commit", "seed", 128);
+        seed.lifecycle_kind = unfinished ? "unfinished" : "finished";
+        state.apply_fact(seed, HiCacheFactRole::CacheLifecycleCommit, false);
+        const auto request = unfinished ? "seed" : "repeat";
+        const uint64_t input_tokens = unfinished ? 192 : 128;
+        const uint64_t prefix_tokens = unfinished ? 128 : limit / page_size * page_size;
+        auto lookup = fact("cache_lookup_input", request, limit);
+        state.apply_fact(lookup, HiCacheFactRole::CacheLookupInput, false);
+        auto extend = fact("cache_extend_input", request, input_tokens);
+        extend.is_end = false;
+        extend.is_start = true;
+        HiCacheBatchPathEntry entry;
+        entry.request_id = request;
+        entry.token_count = input_tokens;
+        entry.full_path_span = extend.full_path_span;
+        entry.full_path_tokens = extend.full_path_tokens;
+        extend.batch_paths = {entry};
+        state.apply_fact(extend, HiCacheFactRole::CacheExtendInput, true);
+        const auto & work = state.prefill_work_items().back();
+        require(work.prompt_token_count == input_tokens && work.reusable_prefix_token_count == prefix_tokens,
+                "extend must not rediscover cached pages beyond the request's lookup input");
+        require(work.prefill_token_count == input_tokens - prefix_tokens,
+                "full cache residency does not remove required final-token or logprob computation");
+    };
+    for (const uint64_t page_size : {32, 64})
+        for (const uint64_t limit : {127, 63, 0})
+            for (const bool unfinished : {false, true}) check(page_size, limit, unfinished);
+}
+
 void foreground_projection_does_not_remove_queue_wait_twice() {
     const auto event = [](std::string name, std::string tid, uint64_t ts, uint64_t dur, std::string cat = "cpu_op") {
         core::TraceEvent e;
@@ -314,6 +365,63 @@ std::pair<size_t, size_t> policy_wait_does_not_foreground_background_service(uin
     return {graph.node_count(), graph.edge_count()};
 }
 
+void resource_validation_distinguishes_preservation_from_rewrite() {
+    core::DagGraph graph;
+    const auto first = graph.add_synthetic_node({.name = "first I/O", .duration = 10});
+    const auto second = graph.add_synthetic_node({.name = "second I/O", .duration = 20});
+    const auto phase = graph.add_synthetic_node({.name = "compute", .duration = 30});
+    const auto edge = graph.add_edge(first, second, core::DagEdgeKind::Sequential);
+    patch::HiCacheShadowRewriteTransaction shadow;
+    shadow.topology_valid = true;
+    for (const auto id : {"first", "second"}) {
+        patch::HiCacheRewriteDecision decision;
+        decision.effect_id = id;
+        decision.rewrite_kind = patch::HiCacheRewriteKind::NoOp;
+        decision.shadow_plan_ready = true;
+        shadow.decisions.push_back(decision);
+    }
+    patch::HiCacheIoResourcePlan resources;
+    resources.lane_dependencies = {{"io_lane", "first", "second"}};
+    core::DagMutationPlan plan;
+    plan.component = "hicache";
+    plan.set_node_durations = {{.node_id = phase, .duration = 25, .effect_id = "prefill"}};
+    const auto validate = [&](core::DagGraph candidate, const auto & transaction, const auto & lanes, const auto & changes) {
+        const auto mutation = core::apply_dag_mutation_plan(candidate, changes);
+        return patch::validate_hicache_applied_patch(candidate, transaction, lanes, changes, mutation, true);
+    };
+    require(validate(graph, shadow, resources, plan).status == "ready",
+            "an empty I/O transaction preserves source resources while an independent phase may change");
+    auto unknown = resources;
+    unknown.lane_dependencies.front().successor_effect_id = "missing";
+    require(!validate(graph, shadow, unknown, plan).lane_dependencies_exact, "preservation cannot hide an unknown effect");
+
+    auto changed_noop = plan;
+    changed_noop.set_node_durations.push_back({.node_id = first, .duration = 1, .effect_id = "first"});
+    require(validate(graph, shadow, resources, changed_noop).status == "failed", "NoOp must reject actual effect mutations");
+    auto extra_lane = plan;
+    extra_lane.add_edges.push_back({.src = core::DagNodeRef::existing(first), .dst = core::DagNodeRef::existing(second),
+                                   .kind = core::DagEdgeKind::Mutation, .effect_id = "io_lane"});
+    require(!validate(graph, shadow, resources, extra_lane).lane_dependencies_exact, "preservation cannot silently add target resource edges");
+
+    auto rewritten = shadow;
+    for (size_t index = 0; index < rewritten.decisions.size(); ++index) {
+        auto & decision = rewritten.decisions[index];
+        decision.rewrite_kind = patch::HiCacheRewriteKind::ReplaceWithIo;
+        decision.source_readiness_topology_reused = true;
+        decision.owned_duration_nodes = {index == 0 ? first : second};
+    }
+    // These minimal decisions test resource validation only, not the other effect contracts.
+    require(validate(graph, rewritten, resources, plan).lane_dependencies_exact, "a retained source edge can satisfy an actual rewrite");
+    auto missing_edge = plan;
+    missing_edge.disable_edges = {edge};
+    require(!validate(graph, rewritten, resources, missing_edge).lane_dependencies_exact, "a removed required resource edge is still rejected");
+    rewritten.decisions.front() = shadow.decisions.front();
+    require(!validate(graph, rewritten, resources, plan).lane_dependencies_exact, "mixed preservation requires explicit source endpoints");
+    auto nonempty_shadow = shadow;
+    nonempty_shadow.plan = plan;
+    require(!validate(graph, nonempty_shadow, resources, plan).lane_dependencies_exact, "a nonempty I/O transaction cannot claim full preservation");
+}
+
 void oracle_preserves_terminal_control() {
     // Anonymous fixture, removed automatically when closed; no repository artifact.
     const std::unique_ptr<FILE, decltype(&std::fclose)> fixture(std::tmpfile(), std::fclose);
@@ -348,6 +456,8 @@ void oracle_preserves_terminal_control() {
 int main() {
     allocator_slice_follows_physical_operations();
     prefill_batch_records_one_preallocation_slice();
+    extend_respects_lookup_input_limit();
+    resource_validation_distinguishes_preservation_from_rewrite();
     foreground_projection_does_not_remove_queue_wait_twice();
     first_allocation_owns_inherited_writeback();
     service_and_dag_share_batch_cost();

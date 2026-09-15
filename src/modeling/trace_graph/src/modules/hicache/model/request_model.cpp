@@ -85,8 +85,13 @@ std::vector<HiCacheNodeId> loadback_promoted_nodes(const HiCacheTokenRadixTree &
 void HiCacheState::update_request_state(const HiCacheFact & fact, ScopedState & scope, const std::vector<std::string> & pages) {
     const auto key = scoped_request_key(fact);
     if (key.empty()) return;
-    auto lookup = scope.tree.lookup_peek(pages);
     auto & request = scope.requests[key];
+    auto lookup_pages = pages;
+    if (fact.role == "cache_extend_input" && request.lookup_token_limit) {
+        const auto limit_pages = *request.lookup_token_limit / pager_.page_size_for_fact(fact);
+        lookup_pages.resize(std::min<uint64_t>(lookup_pages.size(), limit_pages));
+    }
+    auto lookup = scope.tree.lookup_peek(lookup_pages);
     request.full_pages = pages;
     request.device_pages = lookup.device_pages;
     request.host_pages = lookup.host_pages;
@@ -113,6 +118,7 @@ void HiCacheState::apply_cache_lookup_input(const HiCacheFact & fact) {
     const auto resolution = token_directory_.resolve_cache_lookup_path(fact, pager_.page_size_for_fact(fact));
     const auto page_path = page_path_from_resolution(fact, resolution);
     const auto pages = page_path.page_ids();
+    if (!request_key.empty() && resolution.ok()) scope.requests[request_key].lookup_token_limit = resolution.token_count;
     if (pages.empty()) return;
 
     ensure_device_allocator(scope);

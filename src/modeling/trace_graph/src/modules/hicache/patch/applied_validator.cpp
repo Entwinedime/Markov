@@ -53,6 +53,7 @@ bool edge_matches(const core::DagGraph & graph, size_t edge_index, const EdgeKey
 
 struct MaterializedPlan {
     bool ready = true;
+    std::set<std::string> changed_effects;
     std::unordered_map<std::string, size_t> synthetic_nodes;
     std::set<EdgeKey> added_edges;
     std::set<size_t> redirected_edges;
@@ -99,6 +100,7 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
                                         HiCacheAppliedPatchValidation & validation) {
     MaterializedPlan output;
     const JournalIndex journal_index(journal);
+    for (const auto & record : journal.records) output.changed_effects.insert(record.effect_id);
     for (const auto & synthetic : plan.synthetic_nodes) {
         const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::AddSyntheticNode), [&](const auto & candidate) {
             if (candidate.effect_id != synthetic.effect_id || !candidate.node_id || *candidate.node_id >= graph.node_count()) return false;
@@ -448,6 +450,10 @@ HiCacheAppliedEffectValidation validate_effect(const HiCacheRewriteDecision & de
         return validation;
     }
     if (decision.rewrite_kind == HiCacheRewriteKind::NoOp) {
+        if (materialized.changed_effects.contains(decision.effect_id)) {
+            validation.reason = "no-op effect unexpectedly owns a materialized mutation";
+            return validation;
+        }
         validation.source_duration_exact = true;
         validation.synthetic_cost_exact = true;
         validation.observable_endpoint_exact = true;
@@ -541,11 +547,15 @@ bool lane_dependencies_satisfied(const core::DagGraph & graph, const HiCacheShad
                                  const std::set<EdgeKey> & planned) {
     std::unordered_map<std::string, const HiCacheRewriteDecision *> decisions;
     for (const auto & decision : shadow.decisions) decisions.emplace(decision.effect_id, &decision);
+    // A self I/O transaction keeps source resources; phase mutations are validated separately.
+    const bool preserves_source_io = !shadow.decisions.empty() && shadow.plan.empty() && planned.empty()
+        && std::ranges::all_of(shadow.decisions, [](const auto & decision) { return decision.rewrite_kind == HiCacheRewriteKind::NoOp; });
     std::set<EdgeKey> allowed;
     for (const auto & dependency : resources.lane_dependencies) {
         const auto before = decisions.find(dependency.predecessor_effect_id);
         const auto after = decisions.find(dependency.successor_effect_id);
         if (before == decisions.end() || after == decisions.end()) return false;
+        if (preserves_source_io) continue;
         const auto sources = lane_endpoints(*before->second, materialized, true);
         const auto targets = lane_endpoints(*after->second, materialized, false);
         if (sources.empty() || targets.empty()) return false;
