@@ -55,5 +55,6 @@ void add_stream_sync_edges(DagGraph & graph, DagBuildIndex & index);
 void add_event_sync_edges(DagGraph & graph, DagBuildIndex & index);
 void add_device_sync_edges(DagGraph & graph, DagBuildIndex & index);
 void finalize_sync_nodes(DagGraph & graph, const DagBuildIndex & index);
+void normalize_cpu_queue_waits(DagGraph & graph);
 
 } // namespace markov::trace_graph::core

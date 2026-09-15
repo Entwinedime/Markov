@@ -169,5 +169,39 @@ void add_sequential_edges(DagGraph & graph, DagBuildIndex & index) {
 
 void add_request_boundary_edges(DagGraph & graph, DagBuildIndex & index) { add_request_boundary_dependencies(graph, index.lane_to_nodes); }
 
+void normalize_cpu_queue_waits(DagGraph & graph) {
+    struct QueuePredecessors {
+        size_t worker = DagNode::kNoNode;
+        size_t submission = DagNode::kNoNode;
+        size_t count = 0;
+    };
+    std::vector<QueuePredecessors> predecessors(graph.node_count());
+    for (const auto & edge : graph.edges()) {
+        if (!edge.active) continue;
+        auto & before = predecessors[edge.dst];
+        ++before.count;
+        const auto & next = graph.event_for_node(edge.dst);
+        if (!graph.node(edge.dst).is_cpu || next.cat != "dequeue") continue;
+        const auto & source = graph.node(edge.src);
+        if (edge.kind == DagEdgeKind::Sequential && source.lane_id == graph.node(edge.dst).lane_id)
+            before.worker = edge.src;
+        if (edge.kind != DagEdgeKind::Correlation || !source.is_cpu || source.lane_id == graph.node(edge.dst).lane_id) continue;
+        const auto & submit = graph.event_for_node(edge.src);
+        if (submit.cat == "enqueue" && submit.pid == next.pid && !submit.arg("correlation_id").empty()
+            && submit.arg("correlation_id") == next.arg("correlation_id")) before.submission = edge.src;
+    }
+    for (size_t id = 0; id < predecessors.size(); ++id) {
+        const auto & before = predecessors[id];
+        // Only a proven two-input queue join: ambiguous or additional dependencies
+        // need their own explanation, and keep their original timing here.
+        if (before.count != 2 || before.worker == DagNode::kNoNode || before.submission == DagNode::kNoNode) continue;
+        const auto ready = std::max(node_end_ts(graph.event_for_node(before.worker)), node_end_ts(graph.event_for_node(before.submission)));
+        const auto start = graph.event_for_node(id).ts;
+        if (ready > start) continue;
+        graph.mutable_node(before.worker).cpu_gap_after = 0;
+        graph.mutable_node(id).cpu_ready_delay_before = start - ready;
+    }
+}
+
 
 } // namespace markov::trace_graph::core

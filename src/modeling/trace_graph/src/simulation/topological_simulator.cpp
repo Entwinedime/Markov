@@ -248,6 +248,7 @@ private:
     void execute_node(size_t node_id) {
         result_.processed_nodes++;
         auto & node = graph_.mutable_node(node_id);
+        start_time_[node_id] = checked_add(start_time_[node_id], effective_ready_delay(node), "DAG CPU ready-delay overflow");
         const auto completion_time = checked_add(start_time_[node_id], effective_node_duration(node), "DAG simulation timestamp overflow");
         completion_time_[node_id] = completion_time;
         if (mode_ == ReplayMode::Full) {
@@ -306,6 +307,14 @@ private:
         const auto scaled = core::floor_multiply_divide_u64(current_duration, observed_duration - overlap, observed_duration);
         if (!scaled) throw std::overflow_error("control-only duration scaling exceeds uint64 range");
         return *scaled;
+    }
+
+    [[nodiscard]] uint64_t effective_ready_delay(const core::DagNode & node) const {
+        if (mode_ == ReplayMode::GapExcluded) return 0;
+        const auto delay = node.cpu_ready_delay_before;
+        if (mode_ != ReplayMode::ControlOnly || delay == 0) return delay;
+        const auto start = graph_.event_for_node(node.id).ts;
+        return delay - control_exclusions_.overlap_us(node.gpu_id, start - delay, start);
     }
 
     [[nodiscard]] uint64_t effective_node_duration(const core::DagNode & node) const {

@@ -174,6 +174,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     add_event_sync_edges(graph, index);
     add_device_sync_edges(graph, index);
     finalize_sync_nodes(graph, index);
+    normalize_cpu_queue_waits(graph);
     return graph;
 }
 

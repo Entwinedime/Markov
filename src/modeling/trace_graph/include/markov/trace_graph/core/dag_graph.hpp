@@ -128,16 +128,25 @@ struct DagNode {
     uint64_t original_duration = 0;
 
     /**
-     * @brief Observed idle gap after this node on the merged CPU lane.
+     * @brief Remaining fixed gap after this node on the merged CPU lane.
      *
      * The gap advances wall time between sequential CPU nodes but is not part of
-     * either node's execution duration. Keeping it typed prevents model modules
-     * from accidentally scaling or double-counting idle time.
+     * either node's execution duration. Proven queue waits instead follow their
+     * submission dependency and the destination's ready delay.
      */
     uint64_t cpu_gap_after = 0;
 
     /** @brief Immutable observed CPU gap before any model mutation. */
     uint64_t original_cpu_gap_after = 0;
+
+    /**
+     * @brief Source-observed remainder after both worker and queued task are ready.
+     *
+     * Charged after all predecessors finish, before CPU execution. Unlike an
+     * entire inter-task gap, this does not freeze the wait for task submission.
+     * It remains unowned residual time, not part of the task's measured cost.
+     */
+    uint64_t cpu_ready_delay_before = 0;
 
     /** @brief Relative start and completion times written by simulation. */
     uint64_t simulation_start = 0;
