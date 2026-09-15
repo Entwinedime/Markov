@@ -59,6 +59,36 @@ std::string cann_pid(const std::vector<TraceEvent> & events) {
 
 std::string custom_key(const TraceEvent & event) { return event.tid + "\n" + event.name; }
 
+// CANN uses a display process separate from Torch's process for the same CPU
+// thread. Rejoin only unambiguous host threads before selecting nested leaves;
+// otherwise an outer blocking call and its inner sync become independent costs.
+void normalize_runtime_cpu_lanes(std::vector<TraceEvent> & events) {
+    std::string runtime_pid;
+    for (const auto & event : events) {
+        if (event.ph == 'M' && event.name == "process_name" && event.arg("name") == "CANN") {
+            runtime_pid = event.pid;
+            break;
+        }
+    }
+    if (runtime_pid.empty()) return;
+
+    std::unordered_map<std::string, std::string> host_process_by_thread;
+    for (const auto & event : events) {
+        if (event.ph != 'X' || event.pid == runtime_pid || event.source_channel != core::TraceSourceChannel::Torch
+            || (event.cat != "cpu_op" && event.cat != "enqueue") || event.has_arg("Physic Stream Id") || event.has_arg("streamId")
+            || event.tid.empty() || event.tid == "-1") continue;
+        const auto [found, inserted] = host_process_by_thread.emplace(event.tid, event.pid);
+        if (!inserted && found->second != event.pid) found->second.clear();
+    }
+    for (auto & event : events) {
+        if (event.ph != 'X' || event.pid != runtime_pid || event.has_arg("Physic Stream Id") || event.has_arg("streamId")) continue;
+        const auto host = host_process_by_thread.find(event.tid);
+        if (host == host_process_by_thread.end() || host->second.empty()) continue;
+        event.set_arg("profiler_display_pid", event.pid);
+        event.pid = host->second;
+    }
+}
+
 std::unordered_map<std::string, CustomEventGroup> group_custom_events(const std::vector<TraceEvent> & events) {
     using TimestampedEvent = std::pair<uint64_t, const TraceEvent *>;
     std::unordered_map<std::string, std::vector<TimestampedEvent>> grouped;
@@ -170,6 +200,7 @@ void join_custom_trace(std::vector<TraceEvent> & profiler_events, std::vector<Tr
 }
 
 void retain_duration_events(std::vector<TraceEvent> & events) {
+    normalize_runtime_cpu_lanes(events);
     std::erase_if(events, [](const TraceEvent & event) { return event.ph != 'X'; });
 }
 
