@@ -43,6 +43,13 @@ struct CorrelationGroupResult {
 using NodeGroups = std::unordered_map<std::string, std::vector<size_t>>;
 using CausalityEntry = std::pair<std::string, std::vector<size_t> *>;
 
+void order_submission_roles(const DagGraph & graph, std::vector<size_t> & nodes) {
+    sort_nodes_by_event_ts_if_needed(graph, nodes);
+    // Host submission causes device execution even when independently observed
+    // intervals overlap. Device timestamps must not reverse that dependency.
+    std::stable_partition(nodes.begin(), nodes.end(), [&](size_t id) { return graph.node(id).is_cpu; });
+}
+
 template <typename Result, typename Entry, typename Fn> std::vector<Result> map_entries_parallel(const std::vector<Entry> & entries, size_t threads, Fn fn) {
     std::vector<Result> results;
     results.reserve(entries.size());
@@ -122,7 +129,7 @@ void append_causality_chain(const std::vector<size_t> & nodes, CorrelationGroupR
 
 CorrelationGroupResult build_correlation_group(const DagGraph & graph, const CausalityEntry & entry) {
     auto & nodes = *entry.second;
-    sort_nodes_by_event_ts_if_needed(graph, nodes);
+    order_submission_roles(graph, nodes);
     CorrelationGroupResult result{ .key = entry.first, .edges = {}, .submits = {} };
     result.submits.reserve(nodes.size() - 1);
     add_submit_metadata_for_device_suffix(graph, nodes, result);
@@ -132,7 +139,7 @@ CorrelationGroupResult build_correlation_group(const DagGraph & graph, const Cau
 
 CorrelationGroupResult build_connection_group(const DagGraph & graph, const CausalityEntry & entry) {
     auto & nodes = *entry.second;
-    sort_nodes_by_event_ts_if_needed(graph, nodes);
+    order_submission_roles(graph, nodes);
     CorrelationGroupResult result{ .key = entry.first, .edges = {}, .submits = {} };
     if (nodes.size() >= 3 && graph.event_for_node(nodes.front()).name != "Node@launch") return result;
     result.submits.reserve(nodes.size());
@@ -165,7 +172,7 @@ void add_correlation_edges(DagGraph & graph, DagBuildIndex & index, size_t threa
      * @brief Builds CPU-runtime to device-kernel submission chains by correlation ID.
      *
      * Torch profiler commonly shares this identity across launch, runtime, and kernel
-     * events. Timestamp order within one identity defines the submission chain.
+     * events. Host/device roles define direction; timestamps order each role.
      */
     auto correlation_entries = multi_node_entries(index.correlation_to_nodes);
     auto correlation_results =

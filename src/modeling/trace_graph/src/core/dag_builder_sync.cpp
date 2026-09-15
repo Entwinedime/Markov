@@ -99,18 +99,29 @@ struct EventWaitBindings {
     const NodeGroups & event_id_to_nodes;
 };
 
+const TraceEvent * unique_cpu_connection_event(const DagGraph & graph, const std::vector<size_t> & nodes) {
+    const TraceEvent * cpu = nullptr;
+    for (const auto id : nodes) {
+        if (!graph.node(id).is_cpu) continue;
+        if (cpu) return nullptr;
+        cpu = &graph.event_for_node(id);
+    }
+    return cpu;
+}
+
 void bind_event_record(DagGraph & graph, size_t record_node, const EventRecordBindings & bindings) {
     const auto & record_event = graph.event_for_node(record_node);
     const auto connection = bindings.connection_to_nodes.find(record_event.arg("connection_id"));
     if (connection == bindings.connection_to_nodes.end() || connection->second.empty()) return;
-    const auto & cpu_event = graph.event_for_node(connection->second.front());
-    const auto raw_stream = cpu_event.arg("Raw Stream");
+    const auto * cpu_event = unique_cpu_connection_event(graph, connection->second);
+    if (!cpu_event) return;
+    const auto raw_stream = cpu_event->arg("Raw Stream");
     if (!raw_stream.empty()) {
         const auto lane = graph.node(record_node).lane_id;
         bindings.raw_stream_to_lane[raw_stream] = lane;
         bindings.stream_alias_to_lane[raw_stream] = lane;
     }
-    const auto event_id = event_id_from_cpu_record(cpu_event);
+    const auto event_id = event_id_from_cpu_record(*cpu_event);
     if (event_id) bindings.event_id_to_nodes[*event_id].push_back(record_node);
 }
 
@@ -148,7 +159,8 @@ std::optional<std::string> wait_event_id(const DagGraph & graph, size_t wait_nod
     const auto & wait_event = graph.event_for_node(wait_node);
     const auto connection = connection_to_nodes.find(wait_event.arg("connection_id"));
     if (connection == connection_to_nodes.end() || connection->second.empty()) return std::nullopt;
-    return event_id_from_cpu_record(graph.event_for_node(connection->second.front()));
+    const auto * cpu = unique_cpu_connection_event(graph, connection->second);
+    return cpu ? event_id_from_cpu_record(*cpu) : std::nullopt;
 }
 
 void add_event_wait_dependency(DagGraph & graph, size_t wait_node, const EventWaitBindings & bindings) {
@@ -291,8 +303,9 @@ void add_event_sync_edges(DagGraph & graph, DagBuildIndex & index) {
         if (!event_id) {
             const auto connection_id = sync_event.arg("connection_id");
             auto conn_it = index.connection_to_nodes.find(connection_id);
-            if (conn_it != index.connection_to_nodes.end() && !conn_it->second.empty())
-                event_id = event_id_from_cpu_record(graph.event_for_node(conn_it->second.front()));
+            if (conn_it != index.connection_to_nodes.end()) {
+                if (const auto * cpu = unique_cpu_connection_event(graph, conn_it->second)) event_id = event_id_from_cpu_record(*cpu);
+            }
         }
         if (!event_id) continue;
         auto records_it = index.event_id_to_nodes.find(*event_id);

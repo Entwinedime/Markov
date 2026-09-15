@@ -32,8 +32,6 @@ bool is_submit_anchor_event(const TraceEvent & event) {
 
 bool is_usable_lane_value(const std::string & value) { return !value.empty() && value != "-1"; }
 
-bool raw_contains_key_hint(const TraceEvent & event, std::string_view key) { return event.args_json_view().find(key) != std::string_view::npos; }
-
 bool is_hicache_fact_event(const TraceEvent & event) { return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
 
 bool is_hicache_control_event(const TraceEvent & event) {
@@ -117,8 +115,8 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     return split;
 }
 
-std::optional<std::string> raw_hinted_arg(const TraceEvent & event, std::string_view key) {
-    if (!raw_contains_key_hint(event, key)) return std::nullopt;
+std::optional<std::string> hinted_arg(const TraceEvent & event, std::string_view key) {
+    if (!event.has_arg_key_hint(key)) return std::nullopt;
     return event.find_arg(key);
 }
 
@@ -131,9 +129,9 @@ std::optional<std::string> raw_hinted_arg(const TraceEvent & event, std::string_
  */
 EventLaneIdentity resolve_event_lane(const TraceEvent & event, bool collect_aliases) {
     EventLaneIdentity identity;
-    identity.physical_stream_id = raw_hinted_arg(event, "Physic Stream Id");
+    identity.physical_stream_id = hinted_arg(event, "Physic Stream Id");
     const bool stream_identifies_device = event.cat == "Kernel" || event.cat == "cpu_op";
-    if (stream_identifies_device) identity.stream_id = raw_hinted_arg(event, "streamId");
+    if (stream_identifies_device) identity.stream_id = hinted_arg(event, "streamId");
     identity.is_device = identity.physical_stream_id.has_value() || (stream_identifies_device && identity.stream_id.has_value());
     if (!identity.is_device) {
         identity.lane = "CPU:" + event.pid + ":" + event.tid;
@@ -141,8 +139,8 @@ EventLaneIdentity resolve_event_lane(const TraceEvent & event, bool collect_alia
     }
 
     if (collect_aliases || !is_usable_lane_value(event.tid)) {
-        if (!identity.stream_id) identity.stream_id = raw_hinted_arg(event, "streamId");
-        identity.alternate_stream_id = raw_hinted_arg(event, "stream id");
+        if (!identity.stream_id) identity.stream_id = hinted_arg(event, "streamId");
+        identity.alternate_stream_id = hinted_arg(event, "stream id");
     }
     if (is_usable_lane_value(event.tid)) identity.lane = event.tid;
     else if (identity.stream_id && is_usable_lane_value(*identity.stream_id)) identity.lane = *identity.stream_id;
