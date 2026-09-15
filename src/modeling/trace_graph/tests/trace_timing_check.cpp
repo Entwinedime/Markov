@@ -144,11 +144,19 @@ void runtime_diagnostics_do_not_add_or_remove_work() {
     observation.source_channel = core::TraceSourceChannel::PythonProbe;
     auto response = event("runtime.response.scheduler_send", "1", "1", 150, 10, "runtime_diagnostic");
     response.source_channel = core::TraceSourceChannel::PythonProbe;
-    auto graph = core::DagBuilder(1).build({before, observation, response, after}, 0);
+    auto collective = observation;
+    collective.name = "runtime.cpu_collective";
+    collective.set_arg("sequence_before", "7");
+    auto layer_waits = observation;
+    layer_waits.name = "runtime.hicache.layer_waits";
+    layer_waits.set_arg("consumer_index", "0");
+    auto graph = core::DagBuilder(1).build({before, observation, collective, layer_waits, response, after}, 0);
     require(graph.node_count() == 4 && graph.active_edge_count() == 3, "response boundaries partition the gap without materializing diagnostic work");
     require(graph.hicache_fact_events().empty(), "runtime diagnostic is not a HiCache fact");
-    require(graph.runtime_observations().size() == 1 && graph.runtime_observations().front().dur == 200,
-            "preparation envelope remains available as metadata without becoming execution");
+    require(graph.runtime_observations().size() == 3 && graph.runtime_observations().front().dur == 200
+                && graph.runtime_observations()[1].arg("sequence_before") == "7"
+                && graph.runtime_observations().back().arg("consumer_index") == "0",
+            "preparation, collective and layer-wait envelopes retain metadata without becoming execution");
     require(simulation::run_topological_simulation(graph).e2e_us == 110, "retain the full 90 us CPU gap");
     graph.set_scope_node_owned(0);
     graph.set_scope_node_owned(1);

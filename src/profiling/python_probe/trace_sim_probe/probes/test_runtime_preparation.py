@@ -10,7 +10,7 @@ from trace_sim_probe.probes import runtime_preparation as probe
 
 class RuntimePreparationCheck(unittest.TestCase):
     def test_default_off_and_explicit_diagnostics(self):
-        for level, count in (("off", 1), ("timing", 3), ("full", 3)):
+        for level, count in (("off", 1), ("timing", 5), ("full", 5)):
             with self.subTest(level=level), patch.object(bootstrap, "_PROBES", None), \
                     patch.dict("os.environ", {"TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS": level}), \
                     patch.object(bootstrap.importlib, "import_module") as load:
