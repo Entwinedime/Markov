@@ -350,6 +350,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
             preparation.status = preparation.status == "unavailable" ? "unavailable" : "partial";
             preparation.mutation.set_cpu_gaps.clear();
             preparation.removed_coverage_us = 0;
+            preparation.added_cost_us = 0;
         }
     }
     if (!result_.apply_blockers.empty()) result_.plan = blocked_plan();

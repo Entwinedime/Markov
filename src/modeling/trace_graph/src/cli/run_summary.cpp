@@ -479,6 +479,12 @@ Json dag_patch_result(const modules::hicache::HiCacheDagPatchModule & module) {
     const auto& preparation = result.runtime_preparation;
     std::map<std::string, size_t> preparation_counts;
     for (const auto& call : preparation.calls) ++preparation_counts[call.status];
+    std::map<std::string, size_t> required_paths;
+    for (const auto& call : preparation.calls) if (call.status == "required") ++required_paths[call.path];
+    Json preparation_costs = Json::object();
+    for (const auto& [pid, paths] : preparation.cost_samples) for (const auto& [path, samples] : paths)
+        preparation_costs[pid][path] = {{"count", samples.count}, {"minimum_us", samples.minimum_us},
+            {"median_us", samples.median_us}, {"maximum_us", samples.maximum_us}};
     const auto duration_update_count = static_cast<size_t>(
         std::ranges::count_if(result.journal.records, [](const auto & record) { return record.action == core::DagMutationAction::SetNodeDuration; }));
     const auto e2e_eligibility_update_count = static_cast<size_t>(
@@ -492,7 +498,11 @@ Json dag_patch_result(const modules::hicache::HiCacheDagPatchModule & module) {
         { "runtime_preparation", {{"status", preparation.status}, {"call_counts", preparation_counts},
             {"observed_formal_calls", preparation.observed_formal_calls}, {"blockers", preparation.blockers},
             {"changed_gap_count", preparation.mutation.set_cpu_gaps.size()}, {"removed_coverage_us", preparation.removed_coverage_us},
-            {"cost_source", "source_prepare_load_interval_union"}, {"coverage_is_e2e_saving", false}} },
+            {"added_cost_us", preparation.added_cost_us}, {"required_path_counts", required_paths},
+            {"source_parallel_compilation", preparation.source_parallel_compilation}, {"cost_samples", preparation_costs},
+            {"estimate_assumption", "fresh shared disk cache; parallel first use within each batch"},
+            {"cost_source", preparation.added_cost_us ? "selected_base_path_medians" : "source_prepare_load_interval_union"},
+            {"coverage_is_e2e_saving", false}} },
         {   "phase_duration_update_count",            result.phase_duration_update_count },
         {       "phase_owner_conflict_count",                result.phase_owner_conflict_count },
         {                    "component",                     result.journal.component },
