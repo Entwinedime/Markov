@@ -67,11 +67,14 @@ struct JournalIndex {
     using Records = std::vector<const core::DagMutationRecord *>;
     std::map<core::DagMutationAction, Records> by_action;
     std::unordered_map<size_t, Records> by_node;
+    std::map<std::pair<size_t, size_t>, Records> by_added_edge;
 
     explicit JournalIndex(const core::DagMutationJournal & journal) {
         for (const auto & record : journal.records) {
             by_action[record.action].push_back(&record);
             if (record.node_id) by_node[*record.node_id].push_back(&record);
+            if (record.action == core::DagMutationAction::AddEdge && record.src && record.dst)
+                by_added_edge[{*record.src, *record.dst}].push_back(&record);
         }
     }
 
@@ -83,6 +86,11 @@ struct JournalIndex {
     [[nodiscard]] std::span<const core::DagMutationRecord * const> node_records(size_t node_id) const {
         const auto found = by_node.find(node_id);
         return found == by_node.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
+    }
+
+    [[nodiscard]] std::span<const core::DagMutationRecord * const> added_edge_records(size_t src, size_t dst) const {
+        const auto found = by_added_edge.find({src, dst});
+        return found == by_added_edge.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
     }
 };
 
@@ -196,7 +204,7 @@ MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core
             continue;
         }
         const EdgeKey expected{ *src, *dst, addition.kind, addition.effect_id };
-        const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::AddEdge), [&](const auto & candidate) {
+        const auto * record = unique_record(journal_index.added_edge_records(*src, *dst), [&](const auto & candidate) {
             return candidate.src == src && candidate.dst == dst && candidate.effect_id == addition.effect_id;
         });
         if (record == nullptr || !record->edge_index || !edge_matches(graph, *record->edge_index, expected)) {
