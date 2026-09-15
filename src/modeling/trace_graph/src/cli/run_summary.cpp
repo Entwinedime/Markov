@@ -747,9 +747,10 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
 
 void write_run_summary(const std::string & filename, const core::DagGraph & graph,
                        const std::vector<std::unique_ptr<modules::SimulationModule>> & modules,
-                       const nlohmann::json & source_io_observations) {
+                       const nlohmann::json & source_io_observations, const nlohmann::json & client_result) {
     auto summary = run_summary(graph, modules);
     summary["source_io_observations"] = source_io_observations;
+    summary["http_client"] = client_result;
     write_json_file(filename, summary);
 }
 

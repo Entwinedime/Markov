@@ -5,6 +5,7 @@
 #pragma once
 
 #include "markov/trace_graph/core/trace_event.hpp"
+#include "markov/trace_graph/core/client_requests.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +59,14 @@ struct ManifestTraceInput {
     std::vector<core::TraceEvent> tail_context_events;
     std::vector<std::string> input_contracts;
 };
+
+struct ManifestClientInput {
+    std::string status;
+    std::vector<core::ClientRequestTiming> requests;
+};
+
+/** Source manifest only; absent or unsupported client observations stay explicit. */
+[[nodiscard]] ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path);
 
 /**
  * @brief Loads selected manifest channels and produces independent logical inputs.

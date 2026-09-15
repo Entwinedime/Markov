@@ -7,10 +7,12 @@
 #include "trace_channel_join.hpp"
 
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
+#include "markov/trace_graph/core/numeric.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -349,6 +351,61 @@ std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::strin
         }
     }
     return inputs;
+}
+
+ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path) {
+    const auto manifest = load_manifest(manifest_path);
+    const auto reports = manifest.value("bench", Json::object()).value("workload_report_files", Json::array());
+    if (reports.size() != 1) return {"missing_or_multiple_workload_reports", {}};
+    const auto paths = existing_paths(reports, "workload report");
+    Json report;
+    std::ifstream(paths.front()) >> report;
+    const auto window = report.value("formal_window", Json::object());
+    if (report.value("status", "") != "completed" || !window.is_object() || !window.contains("formal_begin_ms")
+        || !window.contains("formal_end_ms") || !report.contains("requests")) return {"missing_completed_formal_window", {}};
+    const auto timestamp = [](const Json & row, const char * key) {
+        const auto value = row.at(key).get<double>() * 1000.0;
+        if (!std::isfinite(value) || value < 0 || value >= static_cast<double>(std::numeric_limits<uint64_t>::max()))
+            throw std::runtime_error("invalid client timestamp");
+        return static_cast<uint64_t>(value);
+    };
+    const auto begin = timestamp(window, "formal_begin_ms");
+    const auto end = timestamp(window, "formal_end_ms");
+    ManifestClientInput result{"ready", {}};
+    bool inside = false;
+    for (const auto & row : report.at("requests")) {
+        if (!row.contains("start_time_ms") || !row.contains("end_time_ms")) {
+            if (inside) return {"formal_step_without_timing", {}};
+            continue;
+        }
+        const auto start = timestamp(row, "start_time_ms"), finish = timestamp(row, "end_time_ms");
+        if (finish <= begin || start >= end) continue;
+        if (row.value("kind", "") != "request") return {"formal_control_step_not_modeled", {}};
+        if (row.value("status", "") != "ok") return {"failed_formal_request", {}};
+        result.requests.push_back({row.at("logical_request_id").get<std::string>(), start, finish, 0});
+        inside = finish < end;
+    }
+    std::ranges::sort(result.requests, {}, &core::ClientRequestTiming::start_us);
+    if (result.requests.empty() || result.requests.front().start_us != begin || result.requests.back().end_us != end)
+        return {"formal_request_envelope_mismatch", {}};
+
+    std::unordered_map<std::string, std::vector<uint64_t>> submits;
+    TraceReadOptions options;
+    options.auto_repair = true;
+    const auto sidecars = existing_paths(manifest.value("sidecar", Json::object()).value("python_probe_files", Json::array()), "Python probe");
+    for (const auto & path : sidecars) {
+        for (const auto & event : read_chrome_trace(path, options)) {
+            if (event.name != "runtime.request.tokenizer_submit") continue;
+            for (const auto & id : Json::parse(event.arg("request_ids")))
+                submits[id.get<std::string>()].push_back(core::checked_add_u64(event.ts, event.dur, "client submission end overflow"));
+        }
+    }
+    for (auto & request : result.requests) {
+        const auto & found = submits[request.request_id];
+        if (found.size() != 1) return {"missing_or_ambiguous_tokenizer_submit", {}};
+        request.frontend_end_us = found.front();
+    }
+    return result;
 }
 
 } // namespace markov::trace_graph::io

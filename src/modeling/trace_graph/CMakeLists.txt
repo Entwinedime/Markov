@@ -31,6 +31,7 @@ target_sources(trace_graph_core
         src/core/trace_event.cpp
         src/core/dag_graph.cpp
         src/core/cpu_gap_observation.cpp
+        src/core/client_requests.cpp
         src/core/dag_mutation.cpp
         src/core/dag_mutation_validation.cpp
         src/core/dag_builder.cpp

@@ -128,6 +128,25 @@ void simulate(DagGraph & graph) {
     (void)simulation::run_gap_excluded_topological_simulation(graph);
 }
 
+nlohmann::json replay_client_requests(DagGraph & graph, const io::ManifestClientInput & input) {
+    using Json = nlohmann::json;
+    if (input.status != "ready") return {{"status", input.status}};
+    const auto server_e2e = graph.e2e_time();
+    const auto chain = core::connect_client_requests(graph, input.requests);
+    if (chain.status != "connected") return {{"status", chain.status}};
+    (void)simulation::run_topological_simulation(graph);
+    uint64_t completion = 0;
+    Json requests = Json::array();
+    for (const auto & request : chain.requests) {
+        const auto end = graph.node(request.completion).completion_time;
+        completion = std::max(completion, end);
+        requests.push_back({{"request_id", request.request_id}, {"start_us", graph.node(request.start).completion_time}, {"completion_us", end}});
+    }
+    return {{"status", "connected"}, {"e2e_us", completion}, {"server_graph_e2e_us", server_e2e},
+            {"peripheral_cost_source", "base_frontend_response_and_client_intervals"}, {"source_residual_waits_retained", true},
+            {"component_metrics_before_client_chain", true}, {"requests", requests}};
+}
+
 #ifdef DEBUG
 void run_post_simulation_diagnostics(DagGraph & graph, const ModulePipeline & pipeline) {
     for (const auto & module : pipeline.modules()) {
@@ -152,6 +171,8 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     auto modules = ModulePipeline::from_config(options.model_config);
 #endif
     auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
+    const auto client_input = options.trace_input.include_python_probe ? io::load_client_requests_from_manifest(options.profile_manifest)
+                                                                    : io::ManifestClientInput{"python_probe_channel_disabled", {}};
     auto graphs = build_graphs(std::move(inputs), options.trace_input.threads);
     auto graph = DagGraph::merge(std::move(graphs));
 #ifdef DEBUG
@@ -164,12 +185,13 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #ifdef DEBUG
     run_post_simulation_diagnostics(graph, modules);
 #endif
+    const auto client_result = replay_client_requests(graph, client_input);
 
     write_graph_output(options, graph);
 #ifdef DEBUG
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
-    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io);
+    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, client_result);
     return 0;
 }
 
