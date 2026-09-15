@@ -7,11 +7,13 @@ An async return is submission, and a coalesced call may not issue work at all.
 import functools
 import inspect
 import sys
+from contextvars import ContextVar
 
 from trace_sim_probe.patching import PATCH_MARKER
 from trace_sim_probe.writer import get_writer
 
 TARGET_MODULES = ("torch.distributed.distributed_c10d", "torch.distributed")
+_CALLS = ContextVar("cpu_collective_calls", default=frozenset())
 
 
 def _wrap(original, operation, c10d):
@@ -29,6 +31,10 @@ def _wrap(original, operation, c10d):
         if c10d._rank_not_in_group(group) or c10d.get_backend(group) != "gloo":
             return original(tensor, *args, **kwargs)
         group = c10d._get_default_group() if group is None else group
+        identity = (group, operation)
+        active = _CALLS.get()
+        if identity in active:
+            return original(tensor, *args, **kwargs)
         if group not in groups:
             groups[group] = {"group": c10d._get_process_group_name(group),
                              "members": c10d.get_process_group_ranks(group), "rank": c10d.get_rank()}
@@ -41,11 +47,13 @@ def _wrap(original, operation, c10d):
             record["reduce_op"] = str(fields["op"])
         writer = get_writer()
         start = writer.now_us()
+        token = _CALLS.set(active | {identity})
         try:
             result = original(tensor, *args, **kwargs)
             record["status"] = "returned"
             return result
         finally:
+            _CALLS.reset(token)
             end = writer.now_us()
             record["sequence_after"] = group._get_sequence_number_for_group()
             writer.duration_event("runtime.cpu_collective", start, end, "runtime_diagnostic", record)
