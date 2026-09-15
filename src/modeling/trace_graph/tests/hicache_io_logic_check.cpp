@@ -8,8 +8,11 @@
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
+#include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
 #include "../src/modules/hicache/patch/rewrite_mutation.hpp"
+#include "../src/modules/hicache/patch/io_operation_ledger_detail.hpp"
 
 #include <algorithm>
 #include <cstdio>
@@ -25,6 +28,83 @@ namespace {
 
 void require(bool value, const std::string & message) {
     if (!value) throw std::runtime_error(message);
+}
+
+void phase_operators_preserve_interleaving() {
+    core::DagGraph graph;
+    auto add = [&](const char* name, bool cpu, uint64_t duration) {
+        return graph.add_synthetic_node({.name=name, .is_cpu=cpu, .duration=duration, .counts_toward_e2e=true});
+    };
+    const auto first = add("first submit", true, 1);
+    const auto middle = add("second compute submit", true, 1);
+    const auto last = add("last collective submit", true, 1);
+    const auto decode = add("decode submit", true, 1);
+    const auto common1 = add("layer 1 compute", false, 10);
+    const auto comm1 = add("layer 1 collective", false, 5);
+    const auto common2 = add("layer 2 compute", false, 10);
+    const auto comm2 = add("layer 2 collective", false, 5);
+    const auto decode_kernel = add("decode compute", false, 1);
+    const auto decode_comm = add("decode collective", false, 1);
+    graph.mutable_node(first).cpu_gap_after = 19;
+    graph.mutable_node(middle).cpu_gap_after = 9;
+    graph.add_edge(first, middle, core::DagEdgeKind::Sequential);
+    graph.add_edge(middle, last, core::DagEdgeKind::Sequential);
+    graph.add_edge(last, decode, core::DagEdgeKind::Sequential);
+    graph.add_edge(first, common1, core::DagEdgeKind::Correlation);
+    graph.add_edge(common1, comm1, core::DagEdgeKind::Stream);
+    graph.add_edge(comm1, common2, core::DagEdgeKind::Stream);
+    graph.add_edge(middle, common2, core::DagEdgeKind::Correlation);
+    graph.add_edge(common2, comm2, core::DagEdgeKind::Stream);
+    graph.add_edge(last, comm2, core::DagEdgeKind::Correlation);
+    graph.add_edge(comm2, decode, core::DagEdgeKind::Sync);
+    graph.add_edge(decode, decode_kernel, core::DagEdgeKind::Correlation);
+    graph.add_edge(decode_kernel, decode_comm, core::DagEdgeKind::Stream);
+    const auto original = simulation::run_topological_simulation(graph).e2e_us;
+    require(original == 39, "fixture has 36 us Prefill followed by 3 us Decode");
+    model::HiCachePhaseWorkLedger work;
+    work.status = work.cost_status = "ready";
+    model::HiCachePrefillWorkItem prefill;
+    prefill.pid = "1"; prefill.request_id = "request"; prefill.logical_input = 0;
+    prefill.common_kernel_cost = {20,20,{common1,common2}};
+    prefill.collective_cost = {10,10,{comm1,comm2}};
+    prefill.submit_cost = {3,3,{first,middle,last}};
+    model::HiCacheDecodeWorkItem dec;
+    dec.pid = "1"; dec.request_id = "request"; dec.logical_input = 0;
+    dec.kernel_cost = {1,1,{decode_kernel}};
+    dec.collective_cost = {1,1,{decode_comm}};
+    dec.submit_cost = {1,1,{decode}};
+    work.prefills.push_back(prefill); work.decodes.push_back(dec);
+    const auto replay = [&](const core::DagGraph& source, const model::HiCachePhaseWorkLedger& costs) {
+        auto target = source;
+        core::DagMutationPlan plan{.component="phase_test"};
+        const auto audit = append_hicache_phase_carrier_plan(target,costs,plan);
+        require(audit.status == "ready", "observed operators supply the phase structure");
+        const auto mutation = core::apply_dag_mutation_plan(target,plan);
+        return simulation::run_topological_simulation(target).e2e_us;
+    };
+    require(replay(graph,work) == original, "same costs retain interleaved submission, compute and communication");
+    auto larger = work;
+    larger.prefills[0].common_kernel_cost.predicted_duration_us = 40;
+    require(replay(graph,larger) == 54, "longer device work propagates to the true CPU synchronization");
+    auto smaller = work;
+    smaller.prefills[0].common_kernel_cost.predicted_duration_us = 10;
+    require(replay(graph,smaller) == 39, "faster compute still waits for the last collective submission");
+    auto late = graph;
+    late.mutable_node(middle).cpu_gap_after = 29;
+    require(replay(late,work) == 59, "a late final submission delays only its dependent work");
+
+    auto overlap = graph;
+    for (size_t i=0; i<overlap.edge_count(); ++i)
+        if (overlap.edge(i).src == comm2 && overlap.edge(i).dst == decode) overlap.mutable_edge(i).active = false;
+    overlap.add_edge(comm2,decode_kernel,core::DagEdgeKind::Stream);
+    require(simulation::run_topological_simulation(overlap).e2e_us == 38 && replay(overlap,work) == 38,
+            "Decode CPU preparation may precede Prefill completion when the actual dependency is on device execution");
+    auto missing = work;
+    missing.prefills[0].prefix_attention_cost.predicted_duration_us = 1;
+    core::DagMutationPlan unsupported;
+    const auto audit = append_hicache_phase_carrier_plan(graph,missing,unsupported);
+    require(audit.status == "blocked" && audit.blockers.contains("phase_operator_template_missing"),
+            "a nonzero cost cannot invent the location of an unobserved operator family");
 }
 
 void allocator_slice_follows_physical_operations() {
@@ -87,6 +167,53 @@ void source_prefetch_wait_is_removed_without_a_target_join() {
     decision.source_completion_wait_blocking = true;
     decision.rewrite_kind = patch::HiCacheRewriteKind::NoOp;
     require(patch::rewrite_transaction_detail::build_plan(graph, {decision}, {}).empty(), "self no-op preserves source waiting");
+}
+
+void false_progress_owns_its_enclosing_call() {
+    const auto event = [](std::string name, uint64_t ts, uint64_t dur) {
+        core::TraceEvent e;
+        e.name = std::move(name); e.index = ts; e.ts = ts; e.dur = dur;
+        e.pid = e.tid = "1"; e.cat = "cpu_op";
+        return e;
+    };
+    auto graph = core::DagBuilder(1).build({event("before", 0, 5),
+        event("hicache.control.prefetch_progress", 10, 30), event("false child", 22, 1),
+        event("unrelated scheduler work", 50, 5),
+        event("hicache.control.prefetch_progress", 65, 25), event("terminal child", 73, 1),
+        event("after", 100, 5)}, 0);
+    const auto check = [&](size_t id, uint64_t ts, bool ready) {
+        auto e = event("progress fact", ts, 5);
+        e.index = id; e.source_channel = core::TraceSourceChannel::PythonProbe;
+        e.set_arg("fact", R"({"class":"source_actual","role":"prefetch_progress_observed","consumers":["hicache_dag_patch"]})");
+        e.set_arg("phase", "end"); e.set_arg("request_id", "request");
+        e.set_arg("progress_ready", ready ? "true" : "false");
+        return e;
+    };
+    graph.set_hicache_fact_events({check(0,20,false), check(1,70,true)});
+    const patch::HiCacheSourceDagIndex index(graph);
+    patch::HiCacheIoOperationRecord record;
+    record.request_id = "request"; record.pid = "1"; record.source_end_us = 60;
+    patch::io_operation_ledger_detail::build_prefetch_completion_wait_contract(index,record);
+    require(record.completion_join_contract_ready, "fixture proves false-to-completion-to-true order");
+    uint64_t removed = 0;
+    for (const auto id : record.completion_wait_owned_node_ids) {
+        const auto& e = graph.event_for_node(id);
+        require(e.ts >= 10 && e.ts + e.dur <= 40, "only the false call is owned, not terminal or intervening scheduler work");
+        removed += graph.node(id).duration;
+    }
+    require(removed == 30, "the false call owns its wrapper self pieces even when the fact cuts through them");
+    require(record.progress_check_cpu_samples_us == std::vector<uint64_t>{1},
+            "calibration keeps only explicit function work, not wrapper/probe overhead");
+    auto bare = core::DagBuilder(1).build({event("before",0,5), event("false child",22,1),
+        event("unrelated scheduler work",50,5), event("terminal child",73,1), event("after",100,5)},0);
+    bare.set_hicache_fact_events(graph.hicache_fact_events());
+    const patch::HiCacheSourceDagIndex bare_index(bare);
+    patch::HiCacheIoOperationRecord bare_record;
+    bare_record.request_id = "request"; bare_record.pid = "1"; bare_record.source_end_us = 60;
+    patch::io_operation_ledger_detail::build_prefetch_completion_wait_contract(bare_index,bare_record);
+    require(bare_record.completion_join_contract_ready && bare_record.completion_wait_owned_node_ids.size() == 1
+            && bare.event_for_node(bare_record.completion_wait_owned_node_ids.front()).name == "false child",
+            "without an enclosing marker, retain the narrower proven ownership");
 }
 
 void allocator_preparation_uses_source_coverage_and_target_history() {
@@ -482,6 +609,21 @@ void resource_validation_distinguishes_preservation_from_rewrite() {
     };
     require(validate(graph, shadow, resources, plan).status == "ready",
             "an empty I/O transaction preserves source resources while an independent phase may change");
+    auto with_phase_edge = plan;
+    with_phase_edge.add_edges.push_back({.src=core::DagNodeRef::existing(phase), .dst=core::DagNodeRef::existing(second),
+        .kind=core::DagEdgeKind::Mutation, .effect_id="prefill_boundary"});
+    auto candidate = graph;
+    auto mutation = core::apply_dag_mutation_plan(candidate, with_phase_edge);
+    require(patch::validate_hicache_applied_patch(candidate,shadow,resources,with_phase_edge,mutation,true).plan_journal_exact,
+            "an indexed phase edge must match its actual materialized edge");
+    const auto added = std::ranges::find_if(mutation.journal.records, [](const auto& record) {
+        return record.action == core::DagMutationAction::AddEdge;
+    });
+    require(added != mutation.journal.records.end(), "fixture must contain an added-edge journal record");
+    const auto duplicate = *added;
+    mutation.journal.records.push_back(duplicate);
+    require(!patch::validate_hicache_applied_patch(candidate,shadow,resources,with_phase_edge,mutation,true).plan_journal_exact,
+            "indexing must still reject duplicate edge journal records");
     auto unknown = resources;
     unknown.lane_dependencies.front().successor_effect_id = "missing";
     require(!validate(graph, shadow, unknown, plan).lane_dependencies_exact, "preservation cannot hide an unknown effect");
@@ -545,7 +687,9 @@ void oracle_preserves_terminal_control() {
 } // namespace
 
 int main() {
+    phase_operators_preserve_interleaving();
     source_prefetch_wait_is_removed_without_a_target_join();
+    false_progress_owns_its_enclosing_call();
     allocator_slice_follows_physical_operations();
     allocator_preparation_uses_source_coverage_and_target_history();
     prefill_batch_records_one_preallocation_slice();
