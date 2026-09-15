@@ -4,6 +4,8 @@
 #include "markov/trace_graph/modules/hicache/patch/boundary_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 #include "markov/trace_graph/modules/hicache/service_model.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/device_allocator.hpp"
+#include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "../src/modules/hicache/patch/attribution_common.hpp"
 
@@ -21,6 +23,77 @@ namespace {
 
 void require(bool value, const std::string & message) {
     if (!value) throw std::runtime_error(message);
+}
+
+void allocator_slice_follows_physical_operations() {
+    runtime::DeviceAllocatorLedger allocator;
+    allocator.configure(48, false);
+    require(allocator.allocate(17) == 17 && allocator.free_index_offset == 17, "loadback consumes a free-index prefix");
+    allocator.configure(48, false);
+    require(allocator.free_index_offset == 17, "reusing configuration must not imply a fresh tensor");
+    allocator.allocate(1);
+    require(allocator.free_index_offset == 18, "extend advances the same tensor slice");
+    allocator.release(1);
+    require(allocator.free_index_offset == 0, "immediate release concatenates a fresh tensor");
+    allocator.allocate(3);
+    allocator.release(0);
+    allocator.merge_release_pages();
+    require(allocator.free_index_offset == 3, "empty release and merge do not rebuild the free tensor");
+    allocator.reconcile_occupied_pages(20, 0);
+    require(allocator.available_pages() == 28 && allocator.free_index_offset == 3, "consistent count audit preserves slice identity");
+    allocator.reconcile_occupied_pages(19, 0);
+    require(!allocator.free_index_offset, "unexplained count correction cannot imply physical alignment");
+    allocator.allocate(1);
+    require(!allocator.free_index_offset, "consumption cannot repair an unknown slice origin");
+    allocator.release(1);
+    require(allocator.free_index_offset == 0, "a later real concatenation restores a known origin");
+
+    allocator.configure(48, true);
+    allocator.allocate(17);
+    allocator.release(4);
+    require(allocator.free_index_offset == 17 && allocator.release_pages == 4, "deferred release does not rebuild free_pages");
+    allocator.merge_release_pages();
+    require(allocator.free_index_offset == 0 && allocator.free_pages == 35, "nonempty merge creates a fresh tensor");
+    allocator.allocate(1);
+    allocator.merge_release_pages();
+    require(allocator.free_index_offset == 1, "empty sorted merge preserves the offset");
+    allocator.allocate(100);
+    require(!allocator.free_index_offset, "partial count consumption does not prove a successful physical allocation");
+}
+
+void prefill_batch_records_one_preallocation_slice() {
+    frontend::HiCacheConfig config;
+    config.page_size = 64;
+    config.l1_capacity_pages = 48;
+    config.l2_capacity_pages = 64;
+    model::HiCacheState state(config);
+    for (uint32_t batch = 0; batch < 2; ++batch) {
+        HiCacheFact fact;
+        fact.pid = fact.tid = "worker";
+        fact.cache_scope = "cache";
+        fact.fact_class = "workload_identity";
+        fact.role = "cache_extend_input";
+        fact.consumers = {"hicache_state_model"};
+        fact.is_start = true;
+        fact.ts = batch + 1;
+        for (uint32_t index = 0; index < 2; ++index) {
+            HiCacheBatchPathEntry entry;
+            entry.request_id = "request-" + std::to_string(batch * 2 + index);
+            entry.position = index;
+            entry.token_count = 64;
+            entry.full_path_span = {.path_id = entry.request_id, .begin = 0, .end = 64, .token_count = 64, .valid = true};
+            for (uint32_t token = 0; token < 64; ++token) entry.full_path_tokens.push_back({{batch * 128 + index * 64 + token}});
+            fact.batch_paths.push_back(std::move(entry));
+        }
+        state.apply_fact(fact, HiCacheFactRole::CacheExtendInput, batch > 0);
+    }
+    const auto & work = state.allocator_work_items();
+    require(state.prefill_work_items().size() == 2 && work.size() == 2, "prelude allocator calls are retained without adding formal compute requests");
+    for (size_t index = 0; index < work.size(); ++index) {
+        require(work[index].batch_size == 2 && work[index].request_ids.size() == 2 && work[index].free_index_offset == index * 2,
+                "batch members share the slice before the joint allocation, not per-request offsets");
+        require(work[index].formal == (index > 0), "formal boundary must not reset preparation history");
+    }
 }
 
 void foreground_projection_does_not_remove_queue_wait_twice() {
@@ -273,6 +346,8 @@ void oracle_preserves_terminal_control() {
 } // namespace
 
 int main() {
+    allocator_slice_follows_physical_operations();
+    prefill_batch_records_one_preallocation_slice();
     foreground_projection_does_not_remove_queue_wait_twice();
     first_allocation_owns_inherited_writeback();
     service_and_dag_share_batch_cost();

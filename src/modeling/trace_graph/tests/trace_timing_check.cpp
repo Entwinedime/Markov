@@ -87,6 +87,17 @@ void worker_runtime_keeps_submission_and_device_dependencies() {
     }
 }
 
+void runtime_diagnostics_do_not_add_or_remove_work() {
+    auto before = event("before prepare", "1", "1", 100, 10);
+    auto after = event("after prepare", "1", "1", 200, 10);
+    auto observation = event("runtime.triton.prepare", "1", "1", 50, 200, "runtime_diagnostic");
+    observation.source_channel = core::TraceSourceChannel::PythonProbe;
+    auto graph = core::DagBuilder(1).build({before, observation, after}, 0);
+    require(graph.node_count() == 2 && graph.edge_count() == 1, "diagnostic envelope is not executable work");
+    require(graph.hicache_fact_events().empty(), "runtime diagnostic is not a HiCache fact");
+    require(simulation::run_topological_simulation(graph).e2e_us == 110, "retain the full 90 us CPU gap");
+}
+
 void queue_wait_follows_task_arrival() {
     auto worker = event("previous task", "1", "2", 0, 10);
     auto submit = event("task submission", "1", "1", 0, 100, "enqueue");
@@ -139,5 +150,6 @@ int main() {
     cann_display_process_is_not_a_second_cpu_thread();
     worker_runtime_keeps_submission_and_device_dependencies();
     queue_wait_follows_task_arrival();
+    runtime_diagnostics_do_not_add_or_remove_work();
     std::cout << "Trace timing checks passed\n";
 }
