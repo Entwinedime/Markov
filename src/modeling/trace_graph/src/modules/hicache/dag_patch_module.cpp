@@ -325,6 +325,21 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
             add_apply_blocker(result_, result_.phase_owner_conflict_count ? "phase_owner_conflict" : "phase_carrier_or_request_boundary_not_ready");
         }
     }
+    if (result_.apply_blockers.empty() && model_result_->phase_cost_model.enabled) {
+        auto& preparation = result_.runtime_preparation;
+        preparation = runtime::plan_allocator_preparations(graph, phase_work.allocator_calls);
+        for (const auto& change : preparation.mutation.set_cpu_gaps) {
+            if (std::ranges::any_of(result_.plan.set_cpu_gaps, [&](const auto& existing) { return existing.node_id == change.node_id; }))
+                ++preparation.blockers["preparation_conflicts_with_hicache_patch"];
+        }
+        if (preparation.blockers.empty()) result_.plan.set_cpu_gaps.insert(result_.plan.set_cpu_gaps.end(),
+            preparation.mutation.set_cpu_gaps.begin(), preparation.mutation.set_cpu_gaps.end());
+        else {
+            preparation.status = preparation.status == "unavailable" ? "unavailable" : "partial";
+            preparation.mutation.set_cpu_gaps.clear();
+            preparation.removed_coverage_us = 0;
+        }
+    }
     if (!result_.apply_blockers.empty()) result_.plan = blocked_plan();
     auto mutation = core::apply_dag_mutation_plan(graph, result_.plan);
     if (result_.apply_blockers.empty()) {

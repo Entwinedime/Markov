@@ -116,6 +116,7 @@ target_sources(trace_graph_hicache
         src/modules/hicache/model/writeback_model.cpp
         src/modules/hicache/model/finalizer.cpp
         src/modules/hicache/model/apply_model.cpp
+        src/modules/hicache/runtime/preparation.cpp
 )
 target_link_libraries(trace_graph_hicache PUBLIC trace_graph_core trace_graph_frontend crypto)
 

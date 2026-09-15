@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 #include "markov/trace_graph/modules/hicache/patch/applied_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
@@ -86,6 +87,7 @@ struct HiCacheDagPatchResult {
     size_t phase_duration_update_count = 0;
     size_t phase_owner_conflict_count = 0;
     HiCachePhaseCarrierAudit phase_carrier;
+    runtime::AllocatorPreparationPlan runtime_preparation;
     core::DagMutationPlan plan;
     core::DagMutationJournal journal;
     patch::HiCacheIoResourcePlan io_resources;
