@@ -3,6 +3,7 @@
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/io/trace_channel_join.hpp"
+#include "../src/core/dag_builder_stages.hpp"
 
 #include <algorithm>
 #include <iostream>
@@ -86,6 +87,48 @@ void worker_runtime_keeps_submission_and_device_dependencies() {
         require(graph.node(node_id(kernel.name)).completion_time == static_cast<uint64_t>(arrival + 33),
                 "device completion must follow changed task submission through the runtime leaf");
     }
+}
+
+void device_clock_overlap_does_not_reverse_submission() {
+    for (const auto key : {"connection_id", "correlation_id"}) {
+        auto launch = event("Node@launch", "20", "21", 105, 5);
+        auto kernel = event("kernel", "900", "7", 100, 20, "Kernel");
+        launch.set_arg(key, "operation"); kernel.set_arg(key, "operation");
+        kernel.set_arg("Physic Stream Id", "7");
+        auto graph = core::DagBuilder(1).build({kernel, launch}, 0);
+        const auto cpu_node = std::ranges::find_if(graph.nodes(), [](const auto& node) { return node.is_cpu; });
+        const auto device_node = std::ranges::find_if(graph.nodes(), [](const auto& node) { return !node.is_cpu; });
+        require(cpu_node != graph.nodes().end() && device_node != graph.nodes().end(), "explicit physical stream arguments identify a device node");
+        const auto cpu = cpu_node->id, device = device_node->id;
+        require(std::ranges::any_of(graph.edges(), [&](const auto& edge) { return edge.active && edge.src == cpu && edge.dst == device; }),
+                "submission role, not cross-clock timestamp order, determines causality");
+        require(std::ranges::none_of(graph.edges(), [&](const auto& edge) { return edge.active && edge.src == device && edge.dst == cpu; }),
+                "device execution cannot become the producer of its own host submission");
+        require(graph.node(device).submit_ts == 105, "overlapping device observation retains actual host submission metadata");
+        require(simulation::run_topological_simulation(graph).processed_nodes == 2, "role-ordered correlation is acyclic");
+    }
+}
+
+void event_binding_selects_cpu_role_not_first_timestamp() {
+    auto record = event("EVENT_RECORD", "900", "7", 100, 1, "Kernel");
+    record.set_arg("Physic Stream Id", "7"); record.set_arg("connection_id", "record");
+    auto host_record = event("AscendCL@aclrtRecordEvent", "20", "21", 110, 5);
+    host_record.set_arg("connection_id", "record"); host_record.set_arg("Event Id", "event"); host_record.set_arg("Raw Stream", "raw7");
+    auto wait = event("EVENT_WAIT", "900", "8", 125, 1, "Kernel");
+    wait.set_arg("Physic Stream Id", "8"); wait.set_arg("connection_id", "wait");
+    auto host_wait = event("AscendCL@aclrtStreamWaitEvent", "20", "22", 130, 5);
+    host_wait.set_arg("connection_id", "wait"); host_wait.set_arg("Event Id", "event");
+    core::DagGraph graph({record, host_record, wait, host_wait}, 0);
+    auto index = core::create_node_index(graph);
+    core::add_event_wait_edges(graph, index);
+    require(std::ranges::any_of(graph.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 2 && edge.kind == core::DagEdgeKind::Sync; }),
+            "event identity comes from the unique CPU view even when device is first");
+    require(index.raw_stream_to_lane.at("raw7") == graph.node(0).lane_id, "stream alias comes from that same CPU record");
+    auto extra_host = host_record; extra_host.tid = "23";
+    core::DagGraph ambiguous({record, host_record, wait, host_wait, extra_host}, 0);
+    auto ambiguous_index = core::create_node_index(ambiguous);
+    core::add_event_wait_edges(ambiguous, ambiguous_index);
+    require(ambiguous.active_edge_count() == 0 && ambiguous_index.raw_stream_to_lane.empty(), "ambiguous CPU views must not guess an event binding");
 }
 
 void runtime_diagnostics_do_not_add_or_remove_work() {
@@ -225,6 +268,8 @@ void response_endpoint_preserves_background_resource_dependencies() {
 int main() {
     cann_display_process_is_not_a_second_cpu_thread();
     worker_runtime_keeps_submission_and_device_dependencies();
+    device_clock_overlap_does_not_reverse_submission();
+    event_binding_selects_cpu_role_not_first_timestamp();
     queue_wait_follows_task_arrival();
     runtime_diagnostics_do_not_add_or_remove_work();
     observed_cpu_gap_split_preserves_consumers();
