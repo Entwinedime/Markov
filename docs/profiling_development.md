@@ -128,6 +128,11 @@ Python probe 默认不采集 cache snapshot。早期 snapshot 会遍历并序列
 记录保存在 Python probe trace 的 `runtime_diagnostic` 类别中，只供空白归因，不作为 HiCache fact 或额外 DAG 成本重复加入。
 不采 tensor 内容、snapshot 或缓存摘要；重复的已装载内核不发事件。不改缓存与预热策略，冷启动和已有缓存的结果必须分开解释。
 
+`timing/full` 还记录终止请求的 `runtime.response.*` 边界：scheduler_send、tokenizer_dispatch、serialize、http_body_sent。
+只记录请求 ID 和区间，不读取 token 数组或序列化正文；无 socket 的非发送 rank 不记录发送成功。
+http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回，不等于客户端已经收到；
+最终 E2E 真值仍来自 bench。它们同属 runtime_diagnostic，不作为额外 DAG 工作重复计时，默认 off 不安装。
+
 probe target 声明位于：
 
 ```text
