@@ -53,6 +53,40 @@ void cann_display_process_is_not_a_second_cpu_thread() {
     require(unknown[0].pid == "900", "unknown runtime threads must retain their identity");
 }
 
+void worker_runtime_keeps_submission_and_device_dependencies() {
+    auto metadata = event("process_name", "900", "0", 0, 0, "");
+    metadata.ph = 'M'; metadata.set_arg("name", "CANN");
+    auto previous = event("previous task", "20", "22", 0, 10, "dequeue");
+    auto submit = event("task submission", "20", "21", 0, 100, "enqueue");
+    auto wrapper = event("task consumption", "20", "22", 106, 20, "dequeue");
+    submit.set_arg("correlation_id", "task"); wrapper.set_arg("correlation_id", "task");
+    auto launch = event("Node@launch", "900", "22", 108, 5, "");
+    auto kernel = event("kernel", "901", "3", 113, 20, "Kernel");
+    launch.set_arg("connection_id", "device"); kernel.set_arg("connection_id", "device");
+    kernel.set_arg("Physic Stream Id", "3");
+    std::vector<core::TraceEvent> events{metadata, previous, submit, wrapper, launch, kernel};
+    io::detail::retain_duration_events(events);
+    require(events[3].pid == "20", "dequeue-only threads must identify their nested runtime calls");
+    auto graph = core::DagBuilder(1).build(std::move(events), 0);
+    require(std::ranges::none_of(graph.events(), [](const auto& e) { return e.name == "task consumption"; }),
+            "the dequeue wrapper must not replace its nested device submission");
+    const auto node_id = [&](const std::string& name) {
+        const auto found = std::ranges::find_if(graph.nodes(), [&](const auto& n) { return graph.event_for_node(n.id).name == name; });
+        require(found != graph.nodes().end(), "retained task and device nodes must exist");
+        return found->id;
+    };
+    const auto launch_id = node_id(launch.name);
+    require(graph.event_for_node(launch_id).arg("correlation_id") == "task", "runtime leaf inherits its task identity");
+    require(graph.node(launch_id).cpu_ready_delay_before == 8, "first runtime leaf follows task readiness");
+    for (const auto arrival : {50, 100, 150}) {
+        graph.mutable_node(node_id(submit.name)).duration = arrival;
+        const auto result = simulation::run_topological_simulation(graph);
+        require(result.processed_nodes == graph.node_count(), "runtime dependency graph must remain acyclic");
+        require(graph.node(node_id(kernel.name)).completion_time == static_cast<uint64_t>(arrival + 33),
+                "device completion must follow changed task submission through the runtime leaf");
+    }
+}
+
 void queue_wait_follows_task_arrival() {
     auto worker = event("previous task", "1", "2", 0, 10);
     auto submit = event("task submission", "1", "1", 0, 100, "enqueue");
@@ -103,6 +137,7 @@ void queue_wait_follows_task_arrival() {
 
 int main() {
     cann_display_process_is_not_a_second_cpu_thread();
+    worker_runtime_keeps_submission_and_device_dependencies();
     queue_wait_follows_task_arrival();
     std::cout << "Trace timing checks passed\n";
 }
