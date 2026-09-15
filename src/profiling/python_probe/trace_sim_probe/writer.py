@@ -21,6 +21,8 @@ _FULL_LIST_KEYS = {
     "token_ids",
     "hash_value",
     "request_ids",
+    "members",
+    "wait_intervals",
 }
 
 
