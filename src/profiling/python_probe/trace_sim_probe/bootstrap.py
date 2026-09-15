@@ -16,7 +16,7 @@ _INSTALLED = False
 _LOCK = threading.Lock()
 _ORIGINAL_IMPORT = builtins.__import__
 _IMPORT_GUARD = threading.local()
-_PROBE: ModuleType | None = None
+_PROBES: tuple[ModuleType, ...] | None = None
 
 
 def _truthy(value: str | None) -> bool:
@@ -25,18 +25,21 @@ def _truthy(value: str | None) -> bool:
     return value is not None and value.lower() not in ("", "0", "false", "no", "off")
 
 
-def _probe() -> ModuleType:
-    """Load the single active HiCache probe once."""
+def _probes() -> tuple[ModuleType, ...]:
+    """Load semantic probes and explicitly enabled runtime diagnostics once."""
 
-    global _PROBE
-    if _PROBE is None:
+    global _PROBES
+    if _PROBES is None:
         try:
-            _PROBE = importlib.import_module("trace_sim_probe.probes.hicache.callable")
+            probes = [importlib.import_module("trace_sim_probe.probes.hicache.callable")]
+            if os.environ.get("TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS", "off") in {"timing", "full"}:
+                probes.append(importlib.import_module("trace_sim_probe.probes.runtime_preparation"))
+            _PROBES = tuple(probes)
         except Exception as exc:
             if probe_debug_enabled():
-                print(f"[trace_sim_probe] failed to load HiCache probe: {exc}", file=sys.stderr)
+                print(f"[trace_sim_probe] failed to load probes: {exc}", file=sys.stderr)
             raise
-    return _PROBE
+    return _PROBES
 
 
 def _apply_probe_to_loaded_modules(probe) -> None:
@@ -63,10 +66,13 @@ def _safe_install(probe, module: ModuleType) -> None:
 def _post_import_apply(module_name: str) -> None:
     """一次 import 完成后，对相关目标模块补装 probe。"""
 
-    probe = _probe()
-    targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
-    if any(module_name == target or module_name.startswith(target + ".") for target in targets):
-        _apply_probe_to_loaded_modules(probe)
+    for probe in _probes():
+        targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
+        if any(
+            module_name == target or module_name.startswith(target + ".") or target.startswith(module_name + ".")
+            for target in targets
+        ):
+            _apply_probe_to_loaded_modules(probe)
 
 
 def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
@@ -99,8 +105,9 @@ def bootstrap() -> None:
     with _LOCK:
         if _INSTALLED:
             return
-        probe = _probe()
+        probes = _probes()
         _INSTALLED = True
         builtins.__import__ = _import_hook
 
-    _apply_probe_to_loaded_modules(probe)
+    for probe in probes:
+        _apply_probe_to_loaded_modules(probe)

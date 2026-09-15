@@ -28,6 +28,7 @@ BENCH_ENV_REMOVE_KEYS = (
     "TRACE_SIM_PYTHON_PROBE_TARGETS",
     "TRACE_SIM_PYTHON_PROBE_OUTPUT",
     "TRACE_SIM_PYTHON_PROBE_DEBUG",
+    "TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS",
     "TRACE_SIM_PYTHON_PROBE_FLUSH_EVERY",
     "TRACE_SIM_PYTHON_PROBE_FLUSH_INTERVAL_SEC",
 )
@@ -76,6 +77,7 @@ def apply_python_probe_env(env: dict[str, str], cfg: dict[str, Any], runtime: An
     )
     prepend_pythonpath(env, PYTHON_PROBE_ROOT)
     env["TRACE_SIM_PYTHON_PROBE"] = "1"
+    env["TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS"] = runtime.python_diagnostics
     env["TRACE_SIM_PYTHON_PROBE_TARGETS"] = json.dumps(selected_targets, ensure_ascii=False)
     env["TRACE_SIM_PYTHON_PROBE_OUTPUT"] = str(layout.trace_dir / "python_probe")
     flush_every = python_probe.get("flush_every")

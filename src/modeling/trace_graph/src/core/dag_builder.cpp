@@ -104,6 +104,8 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     ExecutionAndFactEvents split;
     split.executable_events.reserve(events.size());
     for (auto & event : events) {
+        // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") continue;
         if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));
         else split.executable_events.push_back(std::move(event));
     }
