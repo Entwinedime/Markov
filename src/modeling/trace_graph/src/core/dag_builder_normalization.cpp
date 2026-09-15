@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 
 namespace markov::trace_graph::core {
@@ -40,11 +39,10 @@ private:
     };
 
     struct LeafSelection {
-        explicit LeafSelection(size_t event_count) : is_leaf(event_count, true), discarded(event_count, false), is_enqueue_node(event_count, false) {}
+        explicit LeafSelection(size_t event_count) : is_leaf(event_count, true), discarded(event_count, false) {}
 
         std::vector<bool> is_leaf;
         std::vector<bool> discarded;
-        std::vector<bool> is_enqueue_node;
     };
 
     [[nodiscard]] bool logical_index_less(size_t left, size_t right) const {
@@ -188,11 +186,10 @@ private:
     [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events) {
         auto lanes = build_lane_index(events);
         LeafSelection selection(events.size());
-        std::unordered_set<std::string> seen_correlation_ids;
         for (auto & [lane, lane_events] : lanes) {
             (void)lane;
             if (!lane_events.has_cpu) continue;
-            mark_lane_leaves(events, lane_events.indices, selection, seen_correlation_ids);
+            mark_lane_leaves(events, lane_events.indices, selection);
         }
 
         std::vector<TraceEvent> result;
@@ -330,7 +327,7 @@ private:
                 stack.pop_back();
                 continue;
             }
-            if (parent.name == "Node@launch" || selection.is_enqueue_node[parent_index] || current.name.starts_with("Runtime@")) {
+            if (parent.name == "Node@launch" || parent.cat == "enqueue" || current.name.starts_with("Runtime@")) {
                 selection.discarded[current_index] = true;
                 return;
             }
@@ -346,11 +343,10 @@ private:
     /**
      * @brief Applies the nested CPU-frame heuristic to one timestamp-ordered lane.
      *
-     * `Node@launch`, first-correlation enqueue nodes, runtime implementation details,
+     * `Node@launch`, explicit enqueue nodes, runtime implementation details,
      * and `AscendCL@aclrtRecordEvent` retain the historical faithful-replay exceptions.
      */
-    static void mark_lane_leaves(std::vector<TraceEvent> & events, const std::vector<size_t> & indices, LeafSelection & selection,
-                                 std::unordered_set<std::string> & seen_correlation_ids) {
+    static void mark_lane_leaves(std::vector<TraceEvent> & events, const std::vector<size_t> & indices, LeafSelection & selection) {
 #ifdef DEBUG
         if (!std::ranges::is_sorted(indices, [&](size_t left, size_t right) {
                 if (events[left].ts != events[right].ts) return events[left].ts < events[right].ts;
@@ -365,7 +361,6 @@ private:
             auto & current = events[current_index];
             if (is_hicache_control_event(current)) continue;
             const auto current_correlation_id = correlation_id(current);
-            if (!current_correlation_id.empty() && seen_correlation_ids.insert(current_correlation_id).second) selection.is_enqueue_node[current_index] = true;
             resolve_nested_parent(events, current_index, stack, selection, current_correlation_id);
             if (!selection.discarded[current_index]) stack.push_back(current_index);
         }

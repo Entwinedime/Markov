@@ -75,7 +75,7 @@ void normalize_runtime_cpu_lanes(std::vector<TraceEvent> & events) {
     std::unordered_map<std::string, std::string> host_process_by_thread;
     for (const auto & event : events) {
         if (event.ph != 'X' || event.pid == runtime_pid || event.source_channel != core::TraceSourceChannel::Torch
-            || (event.cat != "cpu_op" && event.cat != "enqueue") || event.has_arg("Physic Stream Id") || event.has_arg("streamId")
+            || (event.cat != "cpu_op" && event.cat != "enqueue" && event.cat != "dequeue") || event.has_arg("Physic Stream Id") || event.has_arg("streamId")
             || event.tid.empty() || event.tid == "-1") continue;
         const auto [found, inserted] = host_process_by_thread.emplace(event.tid, event.pid);
         if (!inserted && found->second != event.pid) found->second.clear();

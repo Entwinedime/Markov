@@ -181,7 +181,7 @@ void normalize_cpu_queue_waits(DagGraph & graph) {
         auto & before = predecessors[edge.dst];
         ++before.count;
         const auto & next = graph.event_for_node(edge.dst);
-        if (!graph.node(edge.dst).is_cpu || next.cat != "dequeue") continue;
+        if (!graph.node(edge.dst).is_cpu) continue;
         const auto & source = graph.node(edge.src);
         if (edge.kind == DagEdgeKind::Sequential && source.lane_id == graph.node(edge.dst).lane_id)
             before.worker = edge.src;
