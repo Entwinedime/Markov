@@ -137,8 +137,13 @@ http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回
 
 同一诊断档位还记录 `runtime.request.socket_received` 和 `runtime.request.dispatch_ready` 两个请求入口时刻。
 前者是 socket 轮询及反序列化函数返回后的时刻，不是网络包到达时间；后者是跨 rank 广播、输入处理结束并返回请求后的时刻。
-只对带请求 ID 的非空结果记录，不读取 token 或 snapshot，空轮询不写事件。它们目前只供诊断，尚未接入请求 DAG 依赖；
-真实请求链和探针开销仍需成功补采后验证，不能把两个时刻之差直接当成纯 CPU 成本。
+只对带请求 ID 的非空结果记录，不读取 token 或 snapshot，空轮询不写事件。对唯一落在未改写 CPU gap 内的时刻，
+建图插入一个零耗时连接点，原 gap 只分段、不增加成本。当前 C2/W2 补采已验证收发观测完整及插点时间守恒，
+串行正式请求已接入客户端依赖链；跨 rank 等待、探针开销及完整预测精度仍需验证，不能把两个时刻之差直接当成纯 CPU 成本。
+
+`runtime.request.tokenizer_submit` 记录 tokenizer 的单个/批请求提交函数区间；异步 ZMQ 的提交函数返回不等于接收端已收到。
+`runtime.request.receive` 记录带请求 ID 的整次 scheduler 接收调用区间，其中包含广播和等待。建图只将其开始转为零耗时点，
+结束复用 dispatch_ready，不重复加入区间耗时。空轮询只读取一个开始时间，不写事件；请求 ID 列表作为语义身份完整保留，不按 32 项截断。
 
 probe target 声明位于：
 
