@@ -20,6 +20,7 @@ def _truthy(value: str | None) -> bool:
 _FULL_LIST_KEYS = {
     "token_ids",
     "hash_value",
+    "request_ids",
 }
 
 

@@ -6,6 +6,7 @@ distinct from the bench client's receipt.
 """
 
 import functools
+import time
 
 from trace_sim_probe.patching import PATCH_MARKER
 from trace_sim_probe.writer import get_writer
@@ -35,6 +36,7 @@ def _sender(original):
 def _receiver(stage):
     def wrap(original):
         def receive(instance, *args, **kwargs):
+            start = time.time_ns() // 1000 if stage == "dispatch_ready" else None
             requests = original(instance, *args, **kwargs)
             if requests:
                 ids = []
@@ -48,8 +50,27 @@ def _receiver(stage):
                     writer = get_writer()
                     now = writer.now_us()
                     writer.duration_event("runtime.request." + stage, now, now, "runtime_diagnostic", {"request_ids": ids})
+                    if start is not None:
+                        writer.duration_event("runtime.request.receive", start, now, "runtime_diagnostic", {"request_ids": ids})
             return requests
         return receive
+    return wrap
+
+
+def _submit(batch):
+    def wrap(original):
+        def submit(instance, request, *args, **kwargs):
+            requests = request if batch else (request,)
+            ids = [item.rid for item in requests if isinstance(getattr(item, "rid", None), str)]
+            if not ids:
+                return original(instance, request, *args, **kwargs)
+            writer = get_writer()
+            start = writer.now_us()
+            result = original(instance, request, *args, **kwargs)
+            # Returning from the submission method is not a socket delivery ACK.
+            writer.duration_event("runtime.request.tokenizer_submit", start, writer.now_us(), "runtime_diagnostic", {"request_ids": ids})
+            return result
+        return submit
     return wrap
 
 
@@ -100,7 +121,11 @@ def _response_send(original):
 
 _TARGETS = {
     "sglang.srt.managers.scheduler_components.output_sender": (("SenderWrapper", "send_output", _sender),),
-    "sglang.srt.managers.tokenizer_manager": (("TokenizerManager", "_handle_batch_output", _tokenizer),),
+    "sglang.srt.managers.tokenizer_manager": (
+        ("TokenizerManager", "_handle_batch_output", _tokenizer),
+        ("TokenizerManager", "_send_one_request", _submit(False)),
+        ("TokenizerManager", "_send_batch_request", _submit(True)),
+    ),
     "sglang.srt.utils.json_response": (
         ("SGLangORJSONResponse", "__init__", _response_init),
         ("SGLangORJSONResponse", "__call__", _response_send),
