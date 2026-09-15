@@ -151,9 +151,17 @@ def _validate_template_shape(data: Mapping[str, Any], path: Path) -> None:
             raise TemplateValidationError(f"request definition {request_name} may contain at most one {{i}}")
         if not isinstance(request_def, dict):
             raise TemplateValidationError(f"request definition {request_name} must be an object")
-        parts = request_def.get("prompt_parts")
-        if not isinstance(parts, list) or not parts:
-            raise TemplateValidationError(f"request definition {request_name} must contain prompt_parts")
+        # Generated calibration requests may reuse admitted input tokens without
+        # a decode/encode round trip changing their length or shared prefix.
+        tokens = request_def.get("prompt_token_ids")
+        parts = request_def.get("prompt_parts", [])
+        if tokens is not None:
+            if "prompt_parts" in request_def or not isinstance(tokens, list) or not tokens or any(
+                not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in tokens
+            ):
+                raise TemplateValidationError(f"request definition {request_name} needs nonnegative token ids, without prompt_parts")
+        elif not isinstance(parts, list) or not parts:
+            raise TemplateValidationError(f"request definition {request_name} must contain prompt_parts or prompt_token_ids")
         for part_index, part in enumerate(parts):
             if not isinstance(part, dict) or set(part) - {"ref", "text"}:
                 raise TemplateValidationError(
@@ -224,23 +232,25 @@ def _validate_two_stage_layout(
 
     barrier_positions = [index for index, step in enumerate(steps) if step.get("kind") == "barrier"]
     checkpoint_positions = [index for index, step in enumerate(steps) if step.get("kind") == "checkpoint"]
-    if len(barrier_positions) != 1:
-        raise TemplateValidationError("two-stage workload must contain exactly one barrier")
+    if not barrier_positions:
+        raise TemplateValidationError("two-stage workload requires a settling barrier before its checkpoint")
     if len(checkpoint_positions) != 1:
         raise TemplateValidationError("two-stage workload must contain exactly one checkpoint")
 
-    barrier_position = barrier_positions[0]
+    barrier_position = barrier_positions[-1]
     checkpoint_position = checkpoint_positions[0]
     if checkpoint_position != barrier_position + 1:
-        raise TemplateValidationError("the sole checkpoint must immediately follow the sole barrier")
+        raise TemplateValidationError("the checkpoint must immediately follow the final preparation barrier")
 
     prepare_steps = steps[:barrier_position]
     formal_steps = steps[checkpoint_position + 1 :]
     if not prepare_steps or not formal_steps:
         raise TemplateValidationError("two-stage workload needs requests on both sides of the boundary")
     request_kinds = {"request", "repeat_request"}
-    if any(step.get("kind") not in request_kinds for step in prepare_steps + formal_steps):
-        raise TemplateValidationError("only request steps may appear outside the barrier/checkpoint boundary")
+    if (not any(step.get("kind") in request_kinds for step in prepare_steps)
+            or any(step.get("kind") not in request_kinds | {"barrier"} for step in prepare_steps)
+            or any(step.get("kind") not in request_kinds for step in formal_steps)):
+        raise TemplateValidationError("preparation allows requests/settling barriers; the formal stage allows only requests")
     if any(step.get("measure") is not False for step in prepare_steps):
         raise TemplateValidationError("all preparation requests must set measure=false")
     if steps[barrier_position].get("measure") is not False or steps[checkpoint_position].get("measure") is not False:

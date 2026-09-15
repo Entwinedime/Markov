@@ -52,6 +52,7 @@
     }
   },
   "env": {
+    "ASCEND_USE_FIA": "1",
     "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": "{run_dir}/hicache_storage",
     "TRACE_SIM_HICACHE_DIAGNOSTIC_API_KEY": "hicache-manual-diagnostic-20260729",
     "SGLANG_SET_CPU_AFFINITY": "0",

@@ -47,6 +47,7 @@ def write_profile_manifest(
     dry_run: bool,
     error: str | None = None,
     storage_cleanup: dict[str, Any] | None = None,
+    workload_started: bool | None = None,
 ) -> None:
     """Write the profile manifest consumed by downstream C++ modeling."""
 
@@ -61,6 +62,8 @@ def write_profile_manifest(
         error=error,
     )
     manifest["profiling"]["python_target_contract"] = _python_target_contract(runtime)
+    if workload_started is not None:
+        manifest["workload_started"] = workload_started
     consumers = {str(consumer) for consumer in runtime.python_consumers}
     manifest["profiling"]["capture_tail_contract"] = {
         **capture_tail_policy(cfg),

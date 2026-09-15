@@ -51,7 +51,7 @@ def execute_workload(
     if mode == "capture" and forced_token_plan_path is not None and forced_token_plan_path.exists():
         raise TemplateValidationError(f"capture plan is immutable and already exists: {forced_token_plan_path}")
     if require_diagnostic and config is None:
-        raise TemplateValidationError("no-profile HiCache replay requires a resolved config contract")
+        raise TemplateValidationError("HiCache state checks require a resolved config contract")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     replay_requests: dict[str, Mapping[str, Any]] = {}
@@ -103,7 +103,7 @@ def execute_workload(
                     break
                 continue
 
-            if mode == "capture" and step.kind in {"barrier", "checkpoint"}:
+            if mode == "capture" and not require_diagnostic and step.kind in {"barrier", "checkpoint"}:
                 rows.append(
                     {
                         "kind": step.kind,
@@ -227,6 +227,8 @@ def _validate_replay_plan(plan: CanonicalPlan, plan_path: Path) -> dict[str, Map
         captured_input_ids = int_list(captured.get("origin_input_ids"))
         if captured_input_ids is None or tuple(captured_input_ids) != request.prompt_token_ids:
             raise TemplateValidationError(f"forced plan origin input mismatch: {request.logical_request_id}")
+        if len(captured["forced_output_ids"]) != request.max_new_tokens:
+            raise TemplateValidationError(f"forced plan output length mismatch: {request.logical_request_id}")
     return indexed
 
 
@@ -266,6 +268,9 @@ def _execute_request(
         if captured is None:
             row["status"] = "error"
             row["failure_reason"] = "capture_response_missing_token_ids"
+        elif len(captured["forced_output_ids"]) != request.max_new_tokens:
+            row.update(status="error", failure_reason="capture_output_length_mismatch")
+            captured = None
     if mode == "replay":
         _apply_replay_checks(row, replay_request)
     row.pop("_response_json", None)
@@ -278,9 +283,10 @@ def _normal_body(request: RequestPlan, *, capture: bool) -> dict[str, Any]:
     """Build deterministic capture/normal body without config-dependent branches."""
 
     body = {
-        "text": request.prompt,
+        "input_ids": list(request.prompt_token_ids),
+        "rid": request.logical_request_id,
         "sampling_params": {
-            "max_new_tokens": 1,
+            "max_new_tokens": request.max_new_tokens,
             "temperature": 0,
             "top_p": 1.0,
             "top_k": 1,

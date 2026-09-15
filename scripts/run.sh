@@ -48,10 +48,11 @@ if [ $# -eq 0 ]; then
     set -- bash
 fi
 
-if [ "$service" = "modeling" ]; then
-    docker compose -f "$(compose_file)" run --rm \
-        -e TRACE_SIM_MODELING_CONTAINER=1 \
-        "$service" "$@"
-else
-    docker compose -f "$(compose_file)" run --rm "$service" "$@"
+container_args=(--rm)
+if [ -n "${TRACE_SIM_RUN_CONTAINER_NAME:-}" ]; then
+    container_args+=(--name "$TRACE_SIM_RUN_CONTAINER_NAME")
 fi
+if [ "$service" = "modeling" ]; then
+    container_args+=(-e TRACE_SIM_MODELING_CONTAINER=1)
+fi
+docker compose -f "$(compose_file)" run "${container_args[@]}" "$service" "$@"

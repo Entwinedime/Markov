@@ -1,6 +1,9 @@
 {
   "name": "hicache_manual_template_capture_no_profile",
   "framework": "sglang",
+  "env": {
+    "ASCEND_USE_FIA": "1"
+  },
   "continue_on_error": false,
   "run_root": "data/no_profile_runs/sglang",
   "metadata": {

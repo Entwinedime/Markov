@@ -45,7 +45,8 @@ def select_python_probe_targets(
     selected: list[dict[str, Any]] = []
     for index, raw_target in enumerate(raw_targets):
         target = validated_catalog_target(raw_target, index, catalog_path)
-        _resolve_thread_timing_policy(target, diagnostics)
+        for key in ("capture_thread_timing", "capture_function_profile"):
+            _resolve_capture_policy(target, key, diagnostics)
         if target.get("diagnostics", "off") == "full" and diagnostics != "full":
             continue
         fact = target["fact"]
@@ -122,18 +123,18 @@ def _validate_target_diagnostics(value: Any, prefix: str) -> None:
         raise ValueError(f"{prefix}.diagnostics must be one of: {allowed}")
 
 
-def _resolve_thread_timing_policy(target: dict[str, Any], diagnostics: str) -> None:
-    """Materialize a catalog-declared thread-timing policy for the probe parser."""
+def _resolve_capture_policy(target: dict[str, Any], key: str, diagnostics: str) -> None:
+    """Resolve optional thread clocks/function profiling from the catalog."""
 
-    value = target.get("capture_thread_timing")
+    value = target.get(key)
     if value is None or isinstance(value, bool):
         return
     if not isinstance(value, dict) or set(value) != {"diagnostics"}:
-        raise ValueError(f"python probe target {target['id']!r} capture_thread_timing policy is invalid")
+        raise ValueError(f"python probe target {target['id']!r} {key} policy is invalid")
     required = value["diagnostics"]
     if required not in PYTHON_PROBE_DIAGNOSTICS or required == "off":
-        raise ValueError(f"python probe target {target['id']!r} thread timing requires a diagnostic mode")
-    if diagnostics == required:
-        target["capture_thread_timing"] = True
+        raise ValueError(f"python probe target {target['id']!r} {key} requires a diagnostic mode")
+    if diagnostics == required or diagnostics == "full":
+        target[key] = True
     else:
-        target.pop("capture_thread_timing")
+        target.pop(key)

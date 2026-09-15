@@ -9,7 +9,7 @@ from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS
 
 
 KNOWN_CHANNELS = {"torch", "python_probe", "ld_preload"}
-PYTHON_PROBE_DIAGNOSTICS = frozenset({"off", "full"})
+PYTHON_PROBE_DIAGNOSTICS = frozenset({"off", "timing", "full"})
 
 
 @dataclass(frozen=True)

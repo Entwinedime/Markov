@@ -52,6 +52,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-sec", type=float, default=600.0)
     parser.add_argument("--forced-token-mode", choices=("none", "capture", "replay"), default="none")
     parser.add_argument("--forced-token-plan")
+    parser.add_argument("--require-hicache-state", action="store_true",
+                        help="Enforce startup, barrier and checkpoint gates while recording real output tokens.")
     parser.add_argument("--diagnostic-api-key", default=os.environ.get("TRACE_SIM_HICACHE_DIAGNOSTIC_API_KEY"))
     parser.add_argument(
         "--dry-run",
@@ -72,7 +74,8 @@ def main() -> int:
     try:
         template = load_template(template_path)
         configs = load_config_specs(config_specs_path)
-        tokenizer = load_tokenizer(str(args.tokenizer_path))
+        tokenizer = (load_tokenizer(str(args.tokenizer_path))
+                     if any("prompt_token_ids" not in request for request in template.data["request_defs"].values()) else None)
         plan = expand_template(template, tokenizer)
     except (OSError, RuntimeError, TemplateValidationError) as error:
         parser.error(str(error))
@@ -97,8 +100,9 @@ def main() -> int:
         config = configs.get(str(args.config_id))
         if config is None:
             parser.error(f"unknown config id: {args.config_id}")
-    if args.forced_token_mode == "replay" and config is None:
-        parser.error("replay requires --config-id")
+    require_diagnostic = args.forced_token_mode == "replay" or args.require_hicache_state
+    if require_diagnostic and config is None:
+        parser.error("HiCache state checks require --config-id")
     forced_plan_path = Path(args.forced_token_plan) if args.forced_token_plan else None
     try:
         execute_workload(
@@ -110,7 +114,7 @@ def main() -> int:
             config=config,
             timeout_sec=float(args.timeout_sec),
             diagnostic_api_key=args.diagnostic_api_key,
-            require_diagnostic=args.forced_token_mode == "replay",
+            require_diagnostic=require_diagnostic,
         )
     except (OSError, TemplateValidationError, WorkloadExecutionError) as error:
         print(f"workload_failed:{error}", file=sys.stderr, flush=True)

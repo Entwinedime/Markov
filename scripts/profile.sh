@@ -291,5 +291,11 @@ if [ -n "$profile_channels" ]; then
     env_args+=(-e "TRACE_SIM_PROFILE_CHANNELS=${profile_channels}")
 fi
 
-docker compose -f "$(compose_file)" run --rm "${env_args[@]}" "$service" \
+container_args=()
+# A host workflow may name its own capture so a budget timeout can stop that
+# exact container, rather than merely killing the Docker client and orphaning NPU work.
+if [ -n "${TRACE_SIM_PROFILE_CONTAINER_NAME:-}" ]; then
+    container_args+=(--name "$TRACE_SIM_PROFILE_CONTAINER_NAME")
+fi
+docker compose -f "$(compose_file)" run --rm "${container_args[@]}" "${env_args[@]}" "$service" \
     bash -lc "$container_cmd"

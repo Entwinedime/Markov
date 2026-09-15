@@ -103,6 +103,7 @@ class ProfileRun:
                 started_at=started_at,
                 status="dry_run",
                 dry_run=True,
+                workload_started=False,
                 storage_cleanup=storage_cleanup,
             )
             return self.layout.run_dir
@@ -112,6 +113,7 @@ class ProfileRun:
         backup: ModelConfigBackup | None = None
         server_process: subprocess.Popen[Any] | None = None
         server_env: dict[str, str] = {}
+        workload_started = False
         storage_cleanup: dict[str, Any] | None = None
         if self.adapter.hicache:
             storage_cleanup = {"status": "not_requested", "removed": False}
@@ -128,6 +130,7 @@ class ProfileRun:
                 start_torch_profiler(self.layout, self.server_cfg, profile_cfg)
 
             if self.bench_command is not None:
+                workload_started = True
                 self._run_bench(server_env)
 
             drain_sec = self.post_workload_drain_sec
@@ -170,6 +173,7 @@ class ProfileRun:
                 started_at=started_at,
                 status=status,
                 dry_run=False,
+                workload_started=workload_started,
                 error=error,
                 storage_cleanup=storage_cleanup,
             )

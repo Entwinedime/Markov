@@ -362,6 +362,11 @@
         "source": "return"
       },
       {
+        "name": "host_available_tokens_at_return",
+        "source": "len:self.cache_controller.mem_pool_host.free_slots",
+        "required": false
+      },
+      {
         "name": "cache_scope",
         "source": "hicache_cache_scope:self"
       }
@@ -492,6 +497,9 @@
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController._generic_page_set",
     "capture_thread_timing": {
+      "diagnostics": "timing"
+    },
+    "capture_function_profile": {
       "diagnostics": "full"
     },
     "events": {"end": "hicache_storage_write_service_observed_end"},
@@ -503,6 +511,16 @@
       {
         "name": "service_item_count",
         "source": "len:arg:hash_values"
+      },
+      {
+        "name": "storage_existing_page_count",
+        "source": "self.storage_backend.last_write_page_counts.0",
+        "required": false
+      },
+      {
+        "name": "storage_new_page_count",
+        "source": "self.storage_backend.last_write_page_counts.1",
+        "required": false
       },
       {
         "name": "source_page_size",
@@ -635,6 +653,9 @@
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController._generic_page_get",
     "capture_thread_timing": {
+      "diagnostics": "timing"
+    },
+    "capture_function_profile": {
       "diagnostics": "full"
     },
     "events": {"end": "hicache_storage_read_service_observed_end"},

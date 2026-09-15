@@ -26,10 +26,10 @@ class RequestPlan:
     request_name: str
     phase: str
     measure: bool
-    prompt: str
     prompt_token_ids: tuple[int, ...]
     anchor_tokens: int
     tail_tokens: int
+    max_new_tokens: int
 
 @dataclass(frozen=True)
 class StaticPlanStep:
@@ -87,7 +87,7 @@ def load_tokenizer(model_path: str) -> Tokenizer:
 
 def expand_template(
     template: Template,
-    tokenizer: Tokenizer,
+    tokenizer: Tokenizer | None,
 ) -> CanonicalPlan:
     """Expand a template and enforce request token contracts."""
 
@@ -128,6 +128,23 @@ def expand_template(
         formal_start_step=formal_start,
         formal_end_step=formal_end,
     )
+
+
+def request_token_budget(template: Template) -> dict[str, int]:
+    """Reserve token-contract bounds without loading a tokenizer on the host.
+
+    Actual execution still validates text/token equality before sending requests.
+    This estimate includes preparation requests, not only the formal window.
+    """
+    counts = []
+    output = int(template.data["defaults"]["sampling"]["max_new_tokens"])
+    for raw in template.data["steps"]:
+        for step in _expand_step(template, raw):
+            if step["kind"] == "request":
+                definition, _ = _resolve_request_definition(template, step["request"])
+                contract = definition["token_contract"]
+                counts.append(int(contract["anchor_tokens"]) + int(contract["tail_tokens"]) + output)
+    return {"requests": len(counts), "tokens": sum(counts), "output_tokens_per_request": output}
 
 
 def prefix_token_digest(token_ids: Iterable[int]) -> str:
@@ -181,14 +198,19 @@ def _build_request_plan(
     template: Template,
     raw_step: Mapping[str, Any],
     sequence_id: int,
-    tokenizer: Tokenizer,
+    tokenizer: Tokenizer | None,
 ) -> RequestPlan:
     """Render one request and verify its local text/token contract."""
 
     request_name = str(raw_step["request"])
     request_definition, request_index = _resolve_request_definition(template, request_name)
-    prompt = _render_prompt(template, request_definition, request_index)
-    token_ids = tuple(int(token_id) for token_id in tokenizer.encode(prompt, add_special_tokens=False))
+    if "prompt_token_ids" in request_definition:
+        token_ids = tuple(request_definition["prompt_token_ids"])
+    else:
+        if tokenizer is None:
+            raise TemplateValidationError("text prompts require a tokenizer")
+        prompt = _render_prompt(template, request_definition, request_index)
+        token_ids = tuple(int(token_id) for token_id in tokenizer.encode(prompt, add_special_tokens=False))
     if not token_ids:
         raise TemplateValidationError(f"request {request_name} rendered an empty token sequence")
     token_contract = request_definition["token_contract"]
@@ -206,10 +228,10 @@ def _build_request_plan(
         request_name=request_name,
         phase=str(raw_step["phase"]),
         measure=bool(raw_step["measure"]),
-        prompt=prompt,
         prompt_token_ids=token_ids,
         anchor_tokens=anchor_tokens,
         tail_tokens=actual_tail_tokens,
+        max_new_tokens=int(template.data["defaults"]["sampling"]["max_new_tokens"]),
     )
 
 
