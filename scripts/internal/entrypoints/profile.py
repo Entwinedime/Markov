@@ -7,7 +7,10 @@ import sys
 from pathlib import Path
 
 
-INTERNAL_ROOT = Path(__file__).resolve().parents[1]
+ENTRY_DIR = Path(__file__).resolve().parent
+# This script is not the stdlib profile module imported by cProfile/Torch.
+sys.path[:] = [path for path in sys.path if Path(path).resolve() != ENTRY_DIR]
+INTERNAL_ROOT = ENTRY_DIR.parent
 if str(INTERNAL_ROOT) not in sys.path:
     sys.path.insert(0, str(INTERNAL_ROOT))
 

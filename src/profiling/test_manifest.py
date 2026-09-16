@@ -1,10 +1,13 @@
 """Small checks for the profiling-to-modeling workload report handoff."""
 
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from profiling.manifest import build_profile_manifest
 from markov_internal.modeling.workload import discover_workload_window
@@ -54,6 +57,27 @@ class WorkloadManifestCheck(unittest.TestCase):
         self.assertEqual(manifest["bench"]["workload_report_files"], [])
         self.manifest.write_text(json.dumps(manifest))
         self.assertIsNone(discover_workload_window({}, self.manifest))
+
+    def test_each_torch_trace_carries_its_own_clock(self):
+        for rank in (1, 2):
+            trace = self.root / "trace" / "torch" / str(rank) / "trace_view.json"
+            trace.parent.mkdir(parents=True)
+            trace.write_text("[]")
+        clocks = [{"origin_tick": 10}, {"origin_tick": 20}]
+        with patch("profiling.manifest.read_host_clock", side_effect=clocks) as read:
+            manifest = self.build_manifest()
+        entries = manifest["trace"]["torch_trace_files"]
+        self.assertEqual([e["host_clock"] for e in entries], clocks)
+        self.assertEqual([call.args[0] for call in read.call_args_list], [Path(e["path"]) for e in entries])
+
+    def test_profile_entrypoint_does_not_shadow_standard_library(self):
+        entry = Path(__file__).resolve().parents[2] / "scripts/internal/entrypoints/profile.py"
+        code = ("import runpy, sys; from pathlib import Path; "
+                "entry = Path(sys.argv[1]); sys.path.insert(0, str(entry.parent)); "
+                "runpy.run_path(str(entry), run_name='entrypoint_check'); "
+                "import cProfile, profile; assert callable(cProfile.run); "
+                "assert Path(profile.__file__).resolve() != entry")
+        subprocess.run([sys.executable, "-c", code, str(entry)], check=True)
 
 
 if __name__ == "__main__":

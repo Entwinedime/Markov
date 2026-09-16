@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ProfilingRuntimeConfig
+from .profiler_clock import read_host_clock
 
 
 def build_profile_manifest(
@@ -27,6 +28,10 @@ def build_profile_manifest(
     trace_dir = run_dir / "trace"
     python_probe_dir = trace_dir / "python_probe"
     torch_trace_files = _glob_files(trace_dir / "torch", "**/trace_view.json")
+    for entry in torch_trace_files:
+        clock = read_host_clock(Path(entry["path"]))
+        if clock is not None:
+            entry["host_clock"] = clock
     ld_preload_trace_files = _glob_files(trace_dir / "ld_preload", "*")
     python_probe_files = _glob_files(python_probe_dir, "*.json")
     collection_errors = [error] if error else []

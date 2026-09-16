@@ -1,6 +1,7 @@
 """Device-free checks for batch-buffered HiCache wait observations."""
 
 import types
+import sys
 import unittest
 from unittest.mock import Mock, patch
 
@@ -71,6 +72,21 @@ class LayerWaitCheck(unittest.TestCase):
         self.batch.hicache_consumer_index = -1
         self.worker.forward_batch_generation(self.batch)
         self.assertEqual(self.writer.duration_event.call_args.args[4]["wait_intervals"], [])
+
+    def test_npu_counter_is_buffered_without_wall_clock_conversion(self):
+        counter = Mock(side_effect=range(1000, 2000))
+        module = types.SimpleNamespace(_get_syscnt=counter)
+        with patch.dict(sys.modules, {"torch_npu._C._profiler": module}):
+            self.worker.forward_batch_generation(self.batch)
+        record = self.writer.duration_event.call_args.args[4]
+        self.assertEqual(record["wait_clock"], "npu_syscnt")
+        self.assertEqual(record["wait_intervals"][0], (0, 1000, 1001))
+        self.assertEqual(counter.call_count, 256)
+
+    def test_non_npu_clock_is_explicit(self):
+        with patch.dict(sys.modules, {"torch_npu._C._profiler": None}):
+            self.worker.forward_batch_generation(self.batch)
+        self.assertEqual(self.writer.duration_event.call_args.args[4]["wait_clock"], "unix_ns")
 
     def test_exception_propagates_and_clears_batch_context(self):
         with self.assertRaisesRegex(ValueError, "invalid layer"):

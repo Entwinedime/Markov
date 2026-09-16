@@ -1,6 +1,7 @@
 """Batch-buffered HiCache layer-wait boundaries, without per-wait serialization."""
 
 import functools
+import sys
 import time
 from contextvars import ContextVar
 
@@ -17,9 +18,10 @@ def _wait(original):
         current = _BATCH.get()
         if current is None or current[0] is not counter or counter.consumer_index < 0:
             return original(counter, threshold)
-        start = time.time_ns() // 1000
+        clock = current[2]
+        start = clock()
         result = original(counter, threshold)
-        end = time.time_ns() // 1000
+        end = clock()
         current[1].append((threshold, start, end))
         return result
     return observed
@@ -32,11 +34,15 @@ def _forward(original):
         if batch is None or counter is None:
             return original(worker, batch, *args, **kwargs)
         intervals = []
+        # Use the same counter as Torch NPU; its wall-clock conversion is only
+        # available after export. Do not import or initialize a device here.
+        profiler = sys.modules.get("torch_npu._C._profiler")
+        clock = getattr(profiler, "_get_syscnt", None)
         fields = {"request_ids": [req.rid for req in batch.reqs], "phase": batch.forward_mode.name,
                   "consumer_index": batch.hicache_consumer_index, "layer_count": counter.num_layers,
-                  "wait_intervals": intervals, "status": "raised"}
+                  "wait_intervals": intervals, "wait_clock": "npu_syscnt" if clock else "unix_ns", "status": "raised"}
         writer = get_writer()
-        token = _BATCH.set((counter, intervals))
+        token = _BATCH.set((counter, intervals, clock or time.time_ns))
         start = writer.now_us()
         try:
             result = original(worker, batch, *args, **kwargs)
