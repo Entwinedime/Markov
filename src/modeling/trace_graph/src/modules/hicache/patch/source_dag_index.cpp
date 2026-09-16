@@ -363,6 +363,10 @@ std::span<const size_t> HiCacheSourceDagIndex::nodes_for_request(std::string_vie
 
 std::span<const size_t> HiCacheSourceDagIndex::nodes_for_operation(std::string_view operation_id) const { return find_nodes(nodes_by_operation_, operation_id); }
 
+std::span<const size_t> HiCacheSourceDagIndex::cpu_nodes_on_lane(std::string_view pid, std::string_view tid) const {
+    return find_nodes(cpu_nodes_by_lane_, cpu_lane_key(pid, tid));
+}
+
 std::string HiCacheSourceDagIndex::cpu_lane_key(std::string_view pid, std::string_view tid) { return std::string(pid) + "\x1f" + std::string(tid); }
 
 std::optional<size_t> HiCacheSourceDagIndex::cpu_boundary_at_or_before(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const {

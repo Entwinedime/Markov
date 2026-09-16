@@ -3,6 +3,7 @@
  * @brief Request-bound source observations for SGLang prefill and decode phases.
  */
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -156,8 +157,16 @@ uint64_t hicache_paged_attention_duration(const std::map<std::string, HiCachePha
     return duration;
 }
 
-HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph) {
+HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits) {
     HiCachePhaseObservationAudit audit;
+    HiCacheLayerWaitObservation local_waits;
+    if (!layer_waits) {
+        if (std::ranges::any_of(graph.runtime_observations(), [](const auto & event) { return event.name == "runtime.hicache.layer_waits"; }))
+            local_waits = observe_hicache_layer_waits(patch::HiCacheSourceDagIndex(graph));
+        layer_waits = &local_waits;
+    }
+    audit.layer_wait_status = layer_waits->status;
+    audit.layer_wait_issues = layer_waits->issues;
     std::vector<PhaseInterval> phase_intervals;
     std::unordered_map<std::string, std::vector<ExtendFact>> facts_by_pid;
     for (const auto & event : graph.hicache_fact_events()) {
@@ -459,6 +468,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     std::map<size_t, const PhaseInterval *> cpu_owners;
     for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || node.kind != core::DagNodeKind::TraceEvent) continue;
+        if (layer_waits->cpu_node_ids.contains(node.id)) continue;
         const auto & event = graph.event_for_node(node.id);
         if (event.source_channel != core::TraceSourceChannel::Torch || !is_phase_cpu_control(event)) continue;
         const auto * owner = find_owner(node, event.ts);
@@ -485,7 +495,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 }
                 const auto & event = graph.event_for_node(predecessor_id);
                 if (event.source_channel != core::TraceSourceChannel::Torch || predecessor.gpu_id != owner->logical_input
-                    || event.pid != owner->pid)
+                    || event.pid != owner->pid || layer_waits->cpu_node_ids.contains(predecessor_id))
                     continue;
                 // A delayed worker anchor follows its producer, not whichever
                 // marker happens to overlap its launch. Conflicting device
@@ -535,7 +545,9 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
 
 patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & graph) {
     graph.clear_scope_ownership();
-    const auto phases = observe_hicache_phases(graph);
+    const auto source = patch::HiCacheSourceDagIndex(graph);
+    const auto layer_waits = observe_hicache_layer_waits(source);
+    const auto phases = observe_hicache_phases(graph, &layer_waits);
     const auto own_nodes = [&](const std::vector<size_t> & nodes) {
         for (const auto node_id : nodes) graph.set_scope_node_owned(node_id);
     };
@@ -549,7 +561,6 @@ patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & gra
         own_nodes(phase.decode_submit_cpu_node_ids);
     }
 
-    const auto source = patch::HiCacheSourceDagIndex(graph);
     auto operations = patch::build_hicache_io_operation_ledger(source);
     std::map<size_t, std::vector<std::pair<uint64_t, uint64_t>>> gap_intervals;
     const auto own_gaps = [&](const std::vector<patch::HiCacheCpuGapSlice> & slices) {
@@ -558,6 +569,9 @@ patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & gra
                 gap_intervals[slice.owner_node_id].emplace_back(slice.owned_start_us, slice.owned_end_us);
         }
     };
+    for (const auto node_id : layer_waits.cpu_node_ids) graph.set_scope_node_owned(node_id);
+    for (const auto node_id : layer_waits.device_wait_node_ids) graph.set_scope_node_owned(node_id);
+    for (const auto & call : layer_waits.calls) if (call.issue.empty()) own_gaps(call.cpu.owned_gap_slices);
     for (const auto & operation : operations.records) {
         own_nodes(operation.runtime_node_ids);
         own_nodes(operation.admission_explicit_node_ids);

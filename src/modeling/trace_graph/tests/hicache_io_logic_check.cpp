@@ -25,6 +25,7 @@ using namespace markov::trace_graph::modules::hicache;
 
 void check_hicache_phase_timing();
 void check_hicache_preparation_costs();
+void check_hicache_layer_waits();
 
 namespace {
 
@@ -632,6 +633,7 @@ void oracle_preserves_terminal_control() {
 int main() {
     check_hicache_phase_timing();
     check_hicache_preparation_costs();
+    check_hicache_layer_waits();
     source_prefetch_wait_is_removed_without_a_target_join();
     false_progress_owns_its_enclosing_call();
     allocator_slice_follows_physical_operations();

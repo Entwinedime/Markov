@@ -17,6 +17,8 @@ class DagGraph;
 
 namespace markov::trace_graph::modules::hicache {
 
+struct HiCacheLayerWaitObservation;
+
 namespace patch {
 struct HiCacheIoOperationLedger;
 }
@@ -78,6 +80,8 @@ struct HiCachePhaseObservation {
 /** @brief Compact completeness audit and request-level phase observations. */
 struct HiCachePhaseObservationAudit {
     std::string status = "not_ready";
+    std::string layer_wait_status = "unavailable";
+    std::map<std::string, size_t> layer_wait_issues;
     size_t cache_extend_fact_count = 0;
     size_t request_bound_fact_count = 0;
     size_t paired_prefill_count = 0;
@@ -111,7 +115,8 @@ struct HiCachePhaseObservationAudit {
  * does not use a fixed time tolerance. Marker intervals remain observations, not
  * ownership windows for Direct I/O or residual CPU gaps.
  */
-[[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph);
+[[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph,
+                                                                  const HiCacheLayerWaitObservation * layer_waits = nullptr);
 
 /** @brief Marks source ownership and returns the same observed I/O ledger for calibration. */
 patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & graph);

@@ -737,6 +737,8 @@ Json run_summary(const core::DagGraph & graph, const std::vector<std::unique_ptr
         { "token_range_error_count", phase.token_range_error_count },
         { "phase_owned_device_node_count", phase.phase_owned_device_node_count },
         { "phase_owned_submit_cpu_node_count", phase.phase_owned_submit_cpu_node_count },
+        { "layer_wait_status", phase.layer_wait_status },
+        { "layer_wait_issues", phase.layer_wait_issues },
         { "phase_owner_conflict_count", phase.phase_owner_conflict_count },
         { "prefill_device_families", phase_cost_families(phase.prefill_device_families) },
         { "decode_device_families", phase_cost_families(phase.decode_device_families) },

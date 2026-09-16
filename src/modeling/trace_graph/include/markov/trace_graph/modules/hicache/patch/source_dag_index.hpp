@@ -156,6 +156,7 @@ public:
     [[nodiscard]] std::span<const size_t> nodes_for_fact_role(std::string_view role) const;
     [[nodiscard]] std::span<const size_t> nodes_for_request(std::string_view request_id) const;
     [[nodiscard]] std::span<const size_t> nodes_for_operation(std::string_view operation_id) const;
+    [[nodiscard]] std::span<const size_t> cpu_nodes_on_lane(std::string_view pid, std::string_view tid) const;
     [[nodiscard]] std::optional<size_t> cpu_boundary_at_or_before(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const;
     [[nodiscard]] std::optional<size_t> cpu_boundary_at_or_after(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const;
     [[nodiscard]] HiCacheTimingIntervalOwnership timing_interval_ownership(const HiCacheSourceFactNode & fact) const;
