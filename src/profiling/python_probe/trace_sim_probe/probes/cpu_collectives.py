@@ -14,11 +14,12 @@ from trace_sim_probe.writer import get_writer
 
 TARGET_MODULES = ("torch.distributed.distributed_c10d", "torch.distributed")
 _CALLS = ContextVar("cpu_collective_calls", default=frozenset())
+# Both public namespaces and compatibility wrappers share each group's order.
+_GROUPS = {}
 
 
 def _wrap(original, operation, c10d):
     signature = inspect.signature(original)
-    groups = {}
 
     @functools.wraps(original)
     def observed(tensor, *args, **kwargs):
@@ -35,12 +36,17 @@ def _wrap(original, operation, c10d):
         active = _CALLS.get()
         if identity in active:
             return original(tensor, *args, **kwargs)
-        if group not in groups:
-            groups[group] = {"group": c10d._get_process_group_name(group),
-                             "members": c10d.get_process_group_ranks(group), "rank": c10d.get_rank()}
-        record = dict(groups[group], operation=operation, numel=tensor.numel(), dtype=str(tensor.dtype),
+        sequence = group._get_sequence_number_for_group()
+        if group not in _GROUPS:
+            _GROUPS[group] = {"group": c10d._get_process_group_name(group),
+                              "members": c10d.get_process_group_ranks(group), "rank": c10d.get_rank(),
+                              "observation_start_sequence": sequence, "collective_index": 0}
+        record = dict(_GROUPS[group], operation=operation, numel=tensor.numel(), dtype=str(tensor.dtype),
                       async_op=bool(fields["async_op"]), status="raised",
-                      sequence_before=group._get_sequence_number_for_group())
+                      sequence_before=sequence)
+        # This counts observed calls, including failed/coalesced ones. Gloo's
+        # native sequence also counts asymmetric P2P work such as monitored_barrier.
+        _GROUPS[group]["collective_index"] += 1
         if operation == "broadcast":
             record.update(src=fields.get("src"), group_src=fields.get("group_src"))
         else:

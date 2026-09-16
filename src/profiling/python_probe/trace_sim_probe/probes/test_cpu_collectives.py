@@ -9,6 +9,9 @@ from trace_sim_probe.writer import _jsonable
 
 class CollectiveCheck(unittest.TestCase):
     def setUp(self):
+        groups_patch = patch.dict(probe._GROUPS, clear=True)
+        groups_patch.start()
+        self.addCleanup(groups_patch.stop)
         self.sequence = 7
         self.group = Mock()
         self.group._get_sequence_number_for_group.side_effect = lambda: self.sequence
@@ -53,6 +56,8 @@ class CollectiveCheck(unittest.TestCase):
         self.assertIs(self.module.all_reduce(self.tensor, async_op=True), self.work)
         self.work.wait.assert_not_called()
         first, second = self.records()
+        self.assertEqual([r["collective_index"] for r in self.records()], [0, 1])
+        self.assertEqual(first["observation_start_sequence"], 7)
         self.assertEqual((first["sequence_before"], first["sequence_after"]), (7, 8))
         self.assertEqual((second["sequence_before"], second["sequence_after"]), (8, 9))
         self.assertEqual(first["members"], [2, 5])
@@ -69,6 +74,33 @@ class CollectiveCheck(unittest.TestCase):
         self.assertEqual(first["status"], "raised")
         self.assertEqual((first["sequence_before"], first["sequence_after"]), (7, 7))
         self.assertEqual((second["sequence_before"], second["sequence_after"]), (7, 7))
+        self.module.broadcast(self.tensor, src=2)
+        self.assertEqual([r["collective_index"] for r in self.records()], [0, 1, 2])
+
+    def test_call_order_is_shared_across_entrypoints_and_ignores_native_jumps(self):
+        alias = types.ModuleType("torch.distributed")
+        alias.broadcast = self.module.broadcast
+        alias.all_reduce = self.module.all_reduce
+        with patch.dict("sys.modules", {self.module.__name__: self.module}):
+            probe.install(alias)
+        self.module.broadcast(self.tensor, src=2)
+        self.sequence += 6  # Unobserved P2P/barrier steps are not tensor collectives.
+        alias.all_reduce(self.tensor)
+        alias.broadcast(self.tensor, src=2)
+        self.assertEqual([r["collective_index"] for r in self.records()], [0, 1, 2])
+        self.assertEqual([r["sequence_before"] for r in self.records()], [7, 14, 15])
+        self.assertTrue(all(r["observation_start_sequence"] == 7 for r in self.records()))
+
+    def test_groups_have_independent_call_order(self):
+        other = Mock()
+        other._get_sequence_number_for_group.side_effect = lambda: self.sequence
+        self.module._get_process_group_name = lambda group: "default" if group is self.group else "other"
+        self.module.broadcast(self.tensor, src=2)
+        self.module.all_reduce(self.tensor, group=other)
+        self.module.all_reduce(self.tensor)
+        self.module.broadcast(self.tensor, src=2, group=other)
+        self.assertEqual([(r["group"], r["collective_index"]) for r in self.records()],
+                         [("default", 0), ("other", 0), ("default", 1), ("other", 1)])
 
     def test_device_and_other_backend_are_unwrapped(self):
         self.tensor.device.type = "npu"
@@ -100,11 +132,13 @@ class CollectiveCheck(unittest.TestCase):
         outer = probe._wrap(compatibility, "broadcast", self.module)
         self.assertIs(outer(self.tensor, src=2, async_op=True), self.work)
         self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["collective_index"], 0)
         self.assertEqual((self.records()[0]["sequence_before"], self.records()[0]["sequence_after"]), (7, 8))
         with self.assertRaisesRegex(ValueError, "invalid root"):
             outer(self.tensor, src=-1)
         self.assertEqual(len(self.records()), 2)
         self.assertEqual(self.records()[-1]["status"], "raised")
+        self.assertEqual(self.records()[-1]["collective_index"], 1)
         self.assertFalse(probe._CALLS.get())
         self.work.wait.assert_not_called()
 

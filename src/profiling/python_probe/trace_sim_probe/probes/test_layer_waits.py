@@ -15,10 +15,15 @@ class LayerWaitCheck(unittest.TestCase):
             consumer_index = -1
             num_layers = 64
 
+            def __init__(self):
+                self.event_wait = Mock(side_effect=lambda threshold: threshold)
+
             def wait_until(self, threshold):
+                if self.consumer_index < 0:
+                    return
                 if threshold < 0:
                     raise ValueError("invalid layer")
-                return threshold
+                return self.event_wait(threshold)
 
         class TpModelWorker:
             def forward_batch_generation(self, batch, fail=False):
@@ -66,12 +71,22 @@ class LayerWaitCheck(unittest.TestCase):
         self.assertEqual([row[0] for row in record["wait_intervals"]],
                          [layer for layer in range(64) for _ in range(2)])
         self.assertTrue(all(end >= start for _, start, end in record["wait_intervals"]))
+        self.assertEqual(self.counter.event_wait.call_count, 128)
         self.assertIsNone(probe._BATCH.get())
 
-    def test_no_consumer_records_an_empty_batch(self):
+    def test_no_consumer_records_call_sites_without_device_work(self):
         self.batch.hicache_consumer_index = -1
-        self.worker.forward_batch_generation(self.batch)
-        self.assertEqual(self.writer.duration_event.call_args.args[4]["wait_intervals"], [])
+        ticks = Mock(side_effect=range(1000, 2000))
+        with patch.dict(sys.modules, {"torch_npu._C._profiler": types.SimpleNamespace(_get_syscnt=ticks)}):
+            self.assertEqual(self.worker.forward_batch_generation(self.batch), "result")
+        self.writer.duration_event.assert_called_once()
+        record = self.writer.duration_event.call_args.args[4]
+        self.assertEqual(record["consumer_index"], -1)
+        self.assertEqual(record["wait_clock"], "npu_syscnt")
+        self.assertEqual(record["wait_intervals"], [(i // 2, 1000 + 2*i, 1001 + 2*i) for i in range(128)])
+        self.counter.event_wait.assert_not_called()
+        self.assertEqual(ticks.call_count, 256)
+        self.assertIsNone(probe._BATCH.get())
 
     def test_npu_counter_is_buffered_without_wall_clock_conversion(self):
         counter = Mock(side_effect=range(1000, 2000))

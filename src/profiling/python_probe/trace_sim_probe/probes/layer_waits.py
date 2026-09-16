@@ -16,7 +16,7 @@ def _wait(original):
     @functools.wraps(original)
     def observed(counter, threshold):
         current = _BATCH.get()
-        if current is None or current[0] is not counter or counter.consumer_index < 0:
+        if current is None or current[0] is not counter:
             return original(counter, threshold)
         clock = current[2]
         start = clock()
