@@ -20,6 +20,7 @@
 #include <ranges>
 #include <regex>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -38,6 +39,7 @@ struct ManifestPaths {
     std::vector<std::string> torch;
     std::vector<std::string> ld_preload;
     std::vector<std::string> python_probe;
+    std::unordered_map<std::string, Json> host_clocks;
 };
 
 std::vector<std::string> manifest_input_contracts(const Json & manifest) {
@@ -105,13 +107,17 @@ std::vector<std::string> existing_paths(const Json & value, std::string_view cha
 ManifestPaths selected_paths(const Json & manifest, const ManifestTraceInputOptions & options) {
     const auto trace = manifest.contains("trace") && manifest["trace"].is_object() ? manifest["trace"] : Json::object();
     const auto sidecar = manifest.contains("sidecar") && manifest["sidecar"].is_object() ? manifest["sidecar"] : Json::object();
-    return ManifestPaths{
+    ManifestPaths paths{
         .torch = options.include_torch ? existing_paths(trace.value("torch_trace_files", Json::array()), "torch") : std::vector<std::string>{},
         .ld_preload =
             options.include_ld_preload ? existing_paths(trace.value("ld_preload_trace_files", Json::array()), "LD_PRELOAD") : std::vector<std::string>{},
         .python_probe =
             options.include_python_probe ? existing_paths(sidecar.value("python_probe_files", Json::array()), "Python probe") : std::vector<std::string>{},
     };
+    for (const auto & entry : trace.value("torch_trace_files", Json::array())) {
+        if (entry.contains("host_clock")) paths.host_clocks.emplace(map_repo_path(entry.at("path").get<std::string>()), entry.at("host_clock"));
+    }
+    return paths;
 }
 
 std::string pid_from_path(const std::string & path) {
@@ -310,14 +316,41 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
     return input;
 }
 
+void normalize_wait_clock(std::vector<TraceEvent> & events, const Json & clock) {
+    for (auto & event : events) {
+        if (event.source_channel != TraceSourceChannel::PythonProbe || event.name != "runtime.hicache.layer_waits"
+            || event.arg("wait_clock") != "npu_syscnt") continue;
+        if (clock.value("clock", "") != "npu_syscnt")
+            throw std::runtime_error("NPU layer-wait counters require the matching Torch trace host_clock");
+        const auto origin_tick = clock.at("origin_tick").get<int64_t>();
+        const auto origin_ns = clock.at("origin_ns").get<int64_t>();
+        const auto scale = clock.at("ns_per_tick").get<double>();
+        if (!std::isfinite(scale) || scale <= 0) throw std::runtime_error("invalid profiler counter scale");
+        auto intervals = Json::parse(event.arg("wait_intervals"));
+        for (auto & interval : intervals) {
+            for (const auto endpoint : {1, 2}) {
+                // Subtract before scaling, as Torch does, to retain precision
+                // when the epoch is large. Keep nanoseconds for ownership.
+                const auto delta = interval.at(endpoint).get<int64_t>() - origin_tick;
+                interval[endpoint] = origin_ns + static_cast<int64_t>(delta * scale);
+            }
+        }
+        event.set_arg("wait_intervals", intervals.dump());
+        event.set_arg("wait_clock", "profiler_ns");
+    }
+}
+
 ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::vector<std::string> & input_contracts, size_t index,
                                       const ManifestTraceInputOptions & options) {
     const auto pid = pid_from_path(paths.torch[index]);
-    return load_torch_group(paths.torch[index],
+    auto input = load_torch_group(paths.torch[index],
                             select_by_pid(paths.ld_preload, pid, "LD_PRELOAD"),
                             select_sidecars(paths.python_probe, pid),
                             input_contracts,
                             options);
+    const auto clock = paths.host_clocks.find(paths.torch[index]);
+    normalize_wait_clock(input.events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
+    return input;
 }
 
 } // namespace

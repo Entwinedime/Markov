@@ -19,6 +19,8 @@
 
 using namespace markov::trace_graph;
 
+void check_native_stream_waits();
+
 namespace {
 core::TraceEvent event(std::string name, std::string pid, std::string tid, uint64_t ts, uint64_t dur,
                        std::string category = "cpu_op") {
@@ -537,6 +539,63 @@ void cpu_queue_order_follows_target_arrivals() {
     require(simulation::run_topological_simulation(partial).cpu_queue_count == 0, "a partially identified worker is not silently reordered");
 }
 
+void layer_wait_clock_is_local_to_each_trace() {
+    using Json = nlohmann::json;
+    char pattern[] = "/tmp/markov-clock-XXXXXX";
+    const auto * directory = mkdtemp(pattern);
+    require(directory != nullptr, "create isolated clock fixture");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto manifest_path = (cleanup.path / "manifest.json").string();
+    Json manifest;
+    for (int rank : {1, 2}) {
+        const auto trace_path = (cleanup.path / ("trace_pid" + std::to_string(rank) + ".json")).string();
+        const auto probe_path = (cleanup.path / ("probe_pid" + std::to_string(rank) + ".json")).string();
+        std::ofstream(trace_path) << Json::array({{{"name", "CPU work"}, {"cat", "cpu_op"}, {"ph", "X"},
+            {"ts", 100}, {"dur", 1}, {"pid", rank}, {"tid", 1}}});
+        std::ofstream(probe_path) << Json::array({{{"name", "runtime.hicache.layer_waits"}, {"cat", "runtime_diagnostic"},
+            {"ph", "X"}, {"ts", 100}, {"dur", 1}, {"pid", rank}, {"tid", 1},
+            {"args", {{"wait_clock", "npu_syscnt"}, {"wait_intervals", Json::array({{0, 90, 131}})}}}}});
+        manifest["trace"]["torch_trace_files"].push_back({{"path", trace_path}, {"host_clock", {
+            {"clock", "npu_syscnt"}, {"origin_tick", 100}, {"origin_ns", 1'700'000'000'000'000'123LL + rank}, {"ns_per_tick", rank * 10}}}});
+        manifest["sidecar"]["python_probe_files"].push_back({{"path", probe_path}});
+    }
+    std::ofstream(manifest_path) << manifest;
+    io::ManifestTraceInputOptions options;
+    options.threads = 2;
+    const auto inputs = io::load_trace_inputs_from_manifest(manifest_path, options);
+    require(inputs.size() == 2, "two rank-local trace inputs");
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        const auto & events = inputs[i].events;
+        const auto found = std::ranges::find_if(events, [](const auto & e) { return e.name == "runtime.hicache.layer_waits"; });
+        require(found != events.end() && found->arg("wait_clock") == "profiler_ns", "counter clock is explicitly normalized");
+        const int64_t rank = i + 1;
+        const auto row = Json::parse(found->arg("wait_intervals")).at(0);
+        require(row[1].get<int64_t>() == 1'700'000'000'000'000'123LL + rank - 100 * rank
+            && row[2].get<int64_t>() == 1'700'000'000'000'000'123LL + rank + 310 * rank,
+            "rank-local offsets preserve nanoseconds and samples before the clock anchor");
+        require(found->ts == 100 && found->dur == 1, "batch wall-clock envelope is not silently shifted");
+    }
+    manifest["trace"]["torch_trace_files"][0].erase("host_clock");
+    std::ofstream(manifest_path) << manifest;
+    bool rejected = false;
+    try { (void)io::load_trace_inputs_from_manifest(manifest_path, options); }
+    catch (const std::runtime_error & error) { rejected = std::string(error.what()).find("host_clock") != std::string::npos; }
+    require(rejected, "raw counters cannot be silently treated as epoch timestamps");
+    const auto probe_path = manifest["sidecar"]["python_probe_files"][0]["path"].get<std::string>();
+    Json old_probe;
+    std::ifstream(probe_path) >> old_probe;
+    old_probe[0]["args"].erase("wait_clock");
+    std::ofstream(probe_path) << old_probe;
+    const auto old_input = io::load_trace_inputs_from_manifest(manifest_path, options);
+    const auto & events = old_input[0].events;
+    const auto old = std::ranges::find_if(events, [](const auto & e) { return e.name == "runtime.hicache.layer_waits"; });
+    require(old->arg("wait_clock").empty() && Json::parse(old->arg("wait_intervals"))[0][1] == 90,
+            "historical wall-clock observations remain historical, not repaired by an invented offset");
+}
+
 void removed_cpu_tasks_do_not_become_residual_waits() {
     std::vector<core::TraceEvent> events;
     for (size_t i = 0; i < 3; ++i) {
@@ -610,6 +669,8 @@ int main() {
     client_input_reads_only_declared_source_observations();
     cpu_queue_order_follows_target_arrivals();
     removed_cpu_tasks_do_not_become_residual_waits();
+    layer_wait_clock_is_local_to_each_trace();
+    check_native_stream_waits();
     response_endpoint_preserves_background_resource_dependencies();
     std::cout << "Trace timing checks passed\n";
 }

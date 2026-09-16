@@ -40,6 +40,7 @@ struct DagBuildIndex {
     std::unordered_map<std::string, size_t> stream_alias_to_lane;
     std::vector<size_t> event_record_nodes;
     std::vector<size_t> event_wait_nodes;
+    std::vector<size_t> native_stream_wait_nodes;
     std::vector<size_t> stream_sync_nodes;
     std::vector<size_t> event_sync_nodes;
     std::vector<size_t> device_sync_nodes;

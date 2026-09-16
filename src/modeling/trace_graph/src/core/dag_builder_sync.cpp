@@ -9,6 +9,7 @@
 #include <ranges>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -169,6 +170,116 @@ void add_event_wait_dependency(DagGraph & graph, size_t wait_node, const EventWa
     if (record) graph.add_edge(*record, wait_node, DagEdgeKind::Sync);
 }
 
+struct StreamSubmission {
+    size_t position = 0;
+    uint64_t start_ns = 0, end_ns = 0;
+};
+
+struct StreamWaitPlacement {
+    size_t lane = 0, position = 0, host = 0, record = 0;
+    uint64_t start_ns = 0;
+};
+
+void add_unrecorded_stream_waits(DagGraph & graph, DagBuildIndex & index) {
+    // A runtime may omit a device WAIT when its event is already complete.
+    // Keep the program dependency: changing producer cost can make it block.
+    if (index.native_stream_wait_nodes.empty()) return;
+    StreamLaneMap streams;
+    std::unordered_map<size_t, std::vector<StreamSubmission>> submissions;
+    for (const auto & [lane, nodes] : index.lane_to_nodes) {
+        if (nodes.empty() || graph.node(nodes.front()).is_cpu) continue;
+        auto & ordered = submissions[lane];
+        for (size_t position = 0; position < nodes.size(); ++position) {
+            const auto & device = graph.event_for_node(nodes[position]);
+            const auto connection = index.connection_to_nodes.find(device.arg("connection_id"));
+            if (connection == index.connection_to_nodes.end()) continue;
+            const auto * host = unique_cpu_connection_event(graph, connection->second);
+            if (!host) continue;
+            const auto start = host_start_ns(*host);
+            ordered.push_back({position, start, start + host->dur * 1000 + host->dur_submicro_ns});
+            if (const auto raw = host->arg("Raw Stream"); !raw.empty()) {
+                const auto [found, inserted] = streams.emplace(raw, lane);
+                if (!inserted && found->second != lane) found->second = DagNode::kNoNode;
+            }
+        }
+        // A reordered or partially unknown host stream cannot identify a
+        // unique before/after boundary merely from device timestamps.
+        if (!std::ranges::is_sorted(ordered, {}, &StreamSubmission::start_ns)) ordered.clear();
+    }
+    for (const auto & [raw, lane] : streams) {
+        if (lane == DagNode::kNoNode) {
+            index.raw_stream_to_lane.erase(raw);
+            index.stream_alias_to_lane.erase(raw);
+        } else {
+            index.raw_stream_to_lane[raw] = lane;
+            index.stream_alias_to_lane[raw] = lane;
+        }
+    }
+
+    std::vector<StreamWaitPlacement> pending;
+    for (const auto host_id : index.native_stream_wait_nodes) {
+        const auto & host = graph.event_for_node(host_id);
+        const auto status = [&](const char * value) { graph.mutable_event_for_node(host_id).set_arg("stream_wait_binding", value); };
+        const auto connection = index.connection_to_nodes.find(host.arg("connection_id"));
+        if (connection != index.connection_to_nodes.end() && std::ranges::any_of(connection->second,
+            [&](size_t id) { return !graph.node(id).is_cpu; })) { status("observed_device"); continue; }
+        const auto event_id = event_id_from_cpu_record(host);
+        const auto records = event_id ? index.event_id_to_records.find(*event_id) : index.event_id_to_records.end();
+        const auto record = records == index.event_id_to_records.end() ? std::nullopt : captured_event_record(records->second, host);
+        if (!record) { status("missing_record"); continue; }
+        const auto stream = streams.find(host.arg("Raw Stream"));
+        if (stream == streams.end() || stream->second == DagNode::kNoNode) { status("missing_stream"); continue; }
+        const auto & ordered = submissions.at(stream->second);
+        if (ordered.empty()) { status("unordered_submissions"); continue; }
+        const auto start = host_start_ns(host), end = start + host.dur * 1000 + host.dur_submicro_ns;
+        const auto next = std::ranges::lower_bound(ordered, end, {}, &StreamSubmission::start_ns);
+        const auto & nodes = index.lane_to_nodes.at(stream->second);
+        const auto position = next == ordered.end() ? nodes.size() : next->position;
+        if ((next == ordered.begin() && position != 0)
+            || (next != ordered.begin() && (std::prev(next)->position + 1 != position || std::prev(next)->end_ns > start))) {
+            status("ambiguous_boundary"); continue;
+        }
+        pending.push_back({stream->second, position, host_id, *record, start});
+    }
+
+    std::ranges::sort(pending, [](const auto & a, const auto & b) {
+        return std::tie(a.lane, a.position, a.start_ns, a.host) < std::tie(b.lane, b.position, b.start_ns, b.host);
+    });
+    graph.reserve({.nodes = graph.node_count() + pending.size(), .edges = graph.edges().size() + 4 * pending.size()});
+    graph.mutable_events().reserve(graph.events().size() + pending.size());
+    for (size_t begin = 0; begin < pending.size();) {
+        size_t stop = begin + 1;
+        while (stop < pending.size() && pending[stop].lane == pending[begin].lane) ++stop;
+        auto & nodes = index.lane_to_nodes.at(pending[begin].lane);
+        std::vector<size_t> ordered;
+        ordered.reserve(nodes.size() + stop - begin);
+        size_t wait = begin;
+        for (size_t position = 0; position <= nodes.size(); ++position) {
+            while (wait < stop && pending[wait].position == position) {
+                const auto & placement = pending[wait++];
+                const auto host = graph.event_for_node(placement.host);
+                const auto id = graph.add_synthetic_node({.name = "logical_event_wait", .category = "dependency",
+                    .is_cpu = false, .lane_key = std::string(graph.lane_key(placement.lane)),
+                    .attrs = {{"Event Id", host.arg("Event Id")}, {"Raw Stream", host.arg("Raw Stream")}}});
+                graph.mutable_event_for_node(id).ts = host.ts;
+                graph.mutable_event_for_node(id).ts_submicro_ns = host.ts_submicro_ns;
+                graph.mutable_node(id).submit_ts = host.ts;
+                graph.add_edge(placement.host, id, DagEdgeKind::Correlation);
+                graph.add_edge(placement.record, id, DagEdgeKind::Sync);
+                graph.mutable_event_for_node(placement.host).set_arg("stream_wait_binding", "logical");
+                ordered.push_back(id);
+            }
+            if (position < nodes.size()) ordered.push_back(nodes[position]);
+        }
+        for (size_t i = 1; i < ordered.size(); ++i) {
+            if (graph.node(ordered[i - 1]).kind == DagNodeKind::Synthetic || graph.node(ordered[i]).kind == DagNodeKind::Synthetic)
+                graph.add_edge(ordered[i - 1], ordered[i], DagEdgeKind::Stream);
+        }
+        nodes = std::move(ordered);
+        begin = stop;
+    }
+}
+
 uint64_t earliest_notify_end(const DagGraph & graph, uint64_t model_start, const std::vector<size_t> & notify_wait_nodes) {
     uint64_t notify_end = model_start;
     for (const auto wait_node : notify_wait_nodes) {
@@ -256,6 +367,7 @@ void add_event_wait_edges(DagGraph & graph, DagBuildIndex & index) {
                                       .event_id_to_records = index.event_id_to_records,
                                   });
     }
+    add_unrecorded_stream_waits(graph, index);
 }
 
 void add_notify_wait_edges(DagGraph & graph, DagBuildIndex & index) {
