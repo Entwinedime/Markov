@@ -174,7 +174,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto exclusions = dag_builder_detail::control_exclusion_intervals(events, gpu_id);
     auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
     auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
-    auto normalized = normalize_events(std::move(split.executable_events));
+    auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);
     graph.set_hicache_fact_events(std::move(split.hicache_fact_events));

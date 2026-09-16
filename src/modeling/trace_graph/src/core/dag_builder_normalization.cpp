@@ -5,6 +5,7 @@
 #include "dag_builder_normalization.hpp"
 
 #include <algorithm>
+#include <map>
 #include <numeric>
 #include <ranges>
 #include <stdexcept>
@@ -22,14 +23,15 @@ using dag_builder_detail::resolve_event_lane;
 
 class EventNormalizer {
 public:
-    explicit EventNormalizer(std::vector<TraceEvent> events) : events_(std::move(events)), dropped_(events_.size(), false) {}
+    EventNormalizer(std::vector<TraceEvent> events, std::span<const TraceEvent> observations)
+        : events_(std::move(events)), dropped_(events_.size(), false), observations_(observations) {}
 
     [[nodiscard]] std::vector<TraceEvent> run() {
         build_event_order();
         coalesce_runtime_boundaries();
         auto deduped = move_retained_events();
         sort_equal_timestamp_groups(deduped);
-        return retain_cpu_leaves(std::move(deduped));
+        return retain_cpu_leaves(std::move(deduped), observations_);
     }
 
 private:
@@ -183,7 +185,8 @@ private:
      * executable graph nodes rather than nested CPU call frames. Semantic HiCache
      * facts are separated before normalization and do not enter this executable path.
      */
-    [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events) {
+    [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events,
+                                                                 std::span<const TraceEvent> observations) {
         auto lanes = build_lane_index(events);
         LeafSelection selection(events.size());
         for (auto & [lane, lane_events] : lanes) {
@@ -198,6 +201,7 @@ private:
             if (is_hicache_control_event(events[index])) selection.is_leaf[index] = false;
         }
         append_hicache_control_self_time(events, lanes, selection, result);
+        partition_control_self_time(result, observations);
         for (const auto index : std::views::iota(size_t{ 0 }, events.size())) {
             if (selection.is_leaf[index] && !selection.discarded[index]) result.push_back(std::move(events[index]));
         }
@@ -213,6 +217,38 @@ private:
         });
         for (const auto index : std::views::iota(size_t{ 0 }, result.size())) result[index].index = index;
         return result;
+    }
+
+    // These are generated remainders, not measured CPU instructions. A call
+    // boundary may subdivide them, but must not remove time or split real leaves.
+    static void partition_control_self_time(std::vector<TraceEvent> & remainders,
+                                             std::span<const TraceEvent> observations) {
+        std::map<std::pair<std::string, std::string>, std::vector<uint64_t>> boundaries;
+        for (const auto & call : observations) {
+            if (call.name != "runtime.cpu_collective" || call.dur == 0) continue;
+            auto & times = boundaries[{call.pid, call.tid}];
+            times.push_back(call.ts);
+            times.push_back(node_end_ts(call));
+        }
+        for (auto & [lane, times] : boundaries) {
+            std::ranges::sort(times);
+            times.erase(std::unique(times.begin(), times.end()), times.end());
+        }
+        std::vector<TraceEvent> pieces;
+        for (auto & remainder : remainders) {
+            const auto found = boundaries.find({remainder.pid, remainder.tid});
+            if (found == boundaries.end()) continue;
+            const auto end = node_end_ts(remainder);
+            for (auto cut = std::ranges::upper_bound(found->second, remainder.ts);
+                 cut != found->second.end() && *cut < end; ++cut) {
+                auto piece = remainder;
+                piece.dur = *cut - remainder.ts;
+                pieces.push_back(std::move(piece));
+                remainder.ts = *cut;
+            }
+            remainder.dur = end - remainder.ts;
+        }
+        remainders.insert(remainders.end(), std::make_move_iterator(pieces.begin()), std::make_move_iterator(pieces.end()));
     }
 
     static void append_hicache_control_self_time(const std::vector<TraceEvent> & events, const auto & lanes, const LeafSelection & selection,
@@ -370,11 +406,14 @@ private:
     std::vector<bool> dropped_;
     std::vector<size_t> event_order_;
     std::vector<size_t> boundary_order_;
+    std::span<const TraceEvent> observations_;
     bool sorted_by_timestamp_ = true;
 };
 
 } // namespace
 
-std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events) { return EventNormalizer(std::move(events)).run(); }
+std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events, std::span<const TraceEvent> runtime_observations) {
+    return EventNormalizer(std::move(events), runtime_observations).run();
+}
 
 } // namespace markov::trace_graph::core

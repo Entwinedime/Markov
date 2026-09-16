@@ -60,6 +60,34 @@ void native_wrapper_setup_cannot_shift_later_call_identities() {
     require(ambiguous[1].arg("Raw Stream").empty(), "two equally overlapping wrappers cannot prove native identity");
 }
 
+void collective_boundaries_only_partition_control_self_time() {
+    std::vector<core::TraceEvent> events{event("before", "1", "1", 0, 5),
+        event("hicache.control.prefetch_progress", "1", "1", 10, 80),
+        event("c10d::allreduce_", "1", "1", 40, 10), event("after", "1", "1", 100, 1)};
+    auto original = core::DagBuilder(1).build(events, 0);
+    auto collective = event("runtime.cpu_collective", "1", "1", 30, 40, "runtime_diagnostic");
+    collective.source_channel = core::TraceSourceChannel::PythonProbe;
+    events.push_back(collective);
+    auto other_thread = collective; other_thread.tid = "2"; other_thread.ts = 15;
+    events.push_back(other_thread);
+    auto inside_leaf = collective; inside_leaf.ts = 42; inside_leaf.dur = 6;
+    events.push_back(inside_leaf);
+    auto graph = core::DagBuilder(1).build(events, 0);
+    std::vector<std::pair<uint64_t, uint64_t>> slices;
+    for (const auto & observed : graph.events()) {
+        if (observed.arg("hicache_control_semantics") == "parent_self_time")
+            slices.emplace_back(observed.ts, observed.dur);
+        if (observed.name == "c10d::allreduce_")
+            require(observed.ts == 40 && observed.dur == 10, "diagnostics must not cut an executable CPU call");
+    }
+    require(slices == std::vector<std::pair<uint64_t, uint64_t>>{{10, 20}, {30, 10}, {50, 20}, {70, 20}},
+            "only same-thread collective boundaries split synthetic self-time without losing work");
+    require(graph.runtime_observations().size() == 3, "observations remain metadata, not extra execution");
+    const auto baseline = simulation::run_topological_simulation(original);
+    const auto split = simulation::run_topological_simulation(graph);
+    require(baseline.e2e_us == split.e2e_us, "splitting self-time must preserve full replay");
+}
+
 void cann_display_process_is_not_a_second_cpu_thread() {
     auto metadata = event("process_name", "900", "0", 0, 0, "");
     metadata.ph = 'M'; metadata.set_arg("name", "CANN");
@@ -680,6 +708,7 @@ void response_endpoint_preserves_background_resource_dependencies() {
 }
 
 int main() {
+    collective_boundaries_only_partition_control_self_time();
     native_wrapper_setup_cannot_shift_later_call_identities();
     cann_display_process_is_not_a_second_cpu_thread();
     worker_runtime_keeps_submission_and_device_dependencies();

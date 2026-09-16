@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -31,6 +32,7 @@ struct EventLaneIdentity {
 } // namespace dag_builder_detail
 
 /** @brief Deduplicates executable events and removes nested CPU parents. */
-[[nodiscard]] std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events);
+[[nodiscard]] std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events,
+                                                      std::span<const TraceEvent> runtime_observations = {});
 
 } // namespace markov::trace_graph::core
