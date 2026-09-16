@@ -164,16 +164,25 @@ void join_by_timestamp_search(std::vector<TraceEvent> & profiler_events, const s
 
         size_t nearest_index = group.timestamps.size();
         uint64_t nearest_difference = std::numeric_limits<uint64_t>::max();
+        bool ambiguous = false;
+        const auto event_end = core::checked_add_u64(event.ts, event.dur, "profiler call end overflow");
         for (size_t index = begin; index < end; ++index) {
             if (group.used[index]) continue;
-            const auto timestamp = group.timestamps[index];
-            const auto difference = event.ts >= timestamp ? event.ts - timestamp : timestamp - event.ts;
-            if (static_cast<double>(difference) <= options.tolerance_us && difference < nearest_difference) {
+            const auto & wrapper = *group.events[index];
+            const auto wrapper_end = core::checked_add_u64(wrapper.ts, wrapper.dur, "native wrapper end overflow");
+            // Wrapper setup can pause before entering the profiled API. Its
+            // start may be far away even though the API is inside its interval.
+            const auto difference = event.ts > wrapper_end ? event.ts - wrapper_end
+                                    : wrapper.ts > event_end ? wrapper.ts - event_end : uint64_t{0};
+            if (static_cast<double>(difference) > options.tolerance_us) continue;
+            if (difference < nearest_difference) {
                 nearest_difference = difference;
                 nearest_index = index;
+                ambiguous = false;
             }
+            else if (difference == nearest_difference) ambiguous = true;
         }
-        if (nearest_index < group.timestamps.size()) {
+        if (nearest_index < group.timestamps.size() && !ambiguous) {
             group.used[nearest_index] = true;
             inject_arguments(event, *group.events[nearest_index]);
             ++matched;

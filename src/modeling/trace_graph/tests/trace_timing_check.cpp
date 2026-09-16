@@ -35,6 +35,31 @@ void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+void native_wrapper_setup_cannot_shift_later_call_identities() {
+    auto metadata = event("process_name", "900", "0", 0, 0, "");
+    metadata.ph = 'M'; metadata.set_arg("name", "CANN");
+    const std::string name = "AscendCL@aclrtStreamWaitEvent";
+    std::vector<core::TraceEvent> profiler{metadata,
+        event(name, "900", "22", 950, 11), event(name, "900", "22", 1016, 4), event(name, "900", "22", 1222, 10)};
+    std::vector<core::TraceEvent> wrappers{
+        event(name, "20", "22", 0, 975), event(name, "20", "22", 1022, 12), event(name, "20", "22", 1228, 18)};
+    for (size_t i = 0; i < wrappers.size(); ++i) {
+        wrappers[i].set_arg("Function-Args.stream", "stream" + std::to_string(i));
+        wrappers[i].set_arg("Function-Args.event", "event" + std::to_string(i));
+    }
+    io::detail::join_custom_trace(profiler, wrappers, {});
+    for (size_t i = 0; i < wrappers.size(); ++i)
+        require(profiler[i + 1].arg("Raw Stream") == "stream" + std::to_string(i)
+                && profiler[i + 1].arg("Event Id") == "event" + std::to_string(i),
+                "long wrapper setup must not steal the next call's native arguments");
+    std::vector<core::TraceEvent> ambiguous{metadata, event(name, "900", "22", 5, 20)};
+    wrappers.resize(2);
+    wrappers[0].ts = 0; wrappers[0].dur = 10;
+    wrappers[1].ts = 20; wrappers[1].dur = 10;
+    io::detail::join_custom_trace(ambiguous, wrappers, {});
+    require(ambiguous[1].arg("Raw Stream").empty(), "two equally overlapping wrappers cannot prove native identity");
+}
+
 void cann_display_process_is_not_a_second_cpu_thread() {
     auto metadata = event("process_name", "900", "0", 0, 0, "");
     metadata.ph = 'M'; metadata.set_arg("name", "CANN");
@@ -655,6 +680,7 @@ void response_endpoint_preserves_background_resource_dependencies() {
 }
 
 int main() {
+    native_wrapper_setup_cannot_shift_later_call_identities();
     cann_display_process_is_not_a_second_cpu_thread();
     worker_runtime_keeps_submission_and_device_dependencies();
     device_clock_overlap_does_not_reverse_submission();
