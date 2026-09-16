@@ -161,6 +161,12 @@ NPU 兼容层可能再次包装 distributed 函数；同一调用栈内、同组
 以及实际 HiCache 逐层等待调用的起止时间。调用区间先缓存在内存，batch 结束时统一写出，完整保留列表；
 不逐次写 JSON、不增加设备同步、不采集 snapshot。没有启用 consumer 的 batch 保留空列表，失败调用标记为 raised。
 默认 off 不安装；建图只保存观测，尚不据此删除等待成本。该探针的真实模型采集开销仍需测量。
+NPU 的逐层区间使用 Torch 原始计数器（`wait_clock=npu_syscnt`），不与 Python 墙钟直接比较。
+采集结束后，manifest 的每份 Torch trace 保存自己的 `host_clock` 换算；建图读入时将区间转换为
+`profiler_ns` 纳秒边界。没有 NPU 计数器时显式记录 `unix_ns`，不初始化设备；batch 外层仍为墙钟区间。
+旧采集没有原始计数器，保持原样，不通过固定偏移修补。换算只解释时间来源，不是额外成本或模型系数。
+`profile.py` 入口会从导入搜索路径中移除自身目录，避免 Torch 间接导入 `cProfile` 时把它误当成标准库 `profile`。
+当前 consumer 未启用时的空列表仅表示探针未记录调用，不表示框架没有调用；不能据此推断新增等待的位置或零成本。
 
 HiCache probe target 声明位于：
 

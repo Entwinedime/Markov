@@ -115,6 +115,12 @@ source 观测、预测成本和最终图统计分别保留，不互相替代。
 
 HiCache 只能改写调用语义所归属的 CPU gap；其他线程的空白即使时间重叠，也不能被一并扣除。
 跨线程等待须由实际提交/完成依赖表达。当前 CPU 广播与规约尚未完全接入，不能靠扩大 HiCache 的时间归属范围弥补。
+逐层等待的原始 NPU 计数器由 manifest 中对应 Torch trace 的时钟元数据转换为纳秒，之后才可与 CPU 叶子核对边界；
+缺少换算时不能将计数器当成墙钟，旧墙钟观测也不被自动升级为已对齐数据。当前仍未接入逐层等待的增删变换。
+原生 `aclrtStreamWaitEvent` 即使没有设备 WAIT 记录，也可能在目标 I/O 变慢时阻塞后续计算。
+建图按 Event Id、Raw Stream 和唯一 CPU/device connection 的调用顺序补零成本等待点，绑定提交前最近的 Record；
+不延后此前已提交的工作，不阻塞 CPU 返回，并保留后续 stream/device synchronize 的依赖。
+已有设备等待不重复生成；身份缺失、别名冲突或调用顺序不确定时保留 `stream_wait_binding` 原因，不猜测连接。
 
 可选的 scheduler 响应观测若唯一位于原始 CPU 顺序 gap 内，建图将它拆成 begin/end 两个零耗时连接点。
 时间仍属于原 gap，分段后的观测长度用于排除区间计算；旧 CPU/设备节点的完成时刻不应改变。

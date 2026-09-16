@@ -414,6 +414,38 @@ R36 同时发现这次补采的通信探针存在嵌套重复记录，不能作�
 本次分层提交前再次通过 46 项 Python 测试、ruff、validation / Release 增量构建，以及 C++ I/O 与时序检查。
 提交按 CPU 队列修复、通信探针去重、回归测试和文档拆分；未重跑预测矩阵，实验数据及临时计划/日志继续保留在本地。
 
+R37 确认 Python 墙钟不能直接作为 Torch 叶子的删除边界：单卡 API 小测试中，128 次调用有 53 次
+墙钟边界切到后续操作，使用 Torch 本次采集的计数器换算后为 0。现已将原始计数器→每 rank 的 manifest 换算→
+C++ 纳秒边界接入；50 项 Python 测试、C++ 检查和两种构建通过，实际镜像端到端读入的 128 个区间均无交叉。
+旧 profile 不追溯修补；没有重采模型，也没有新 cross 成绩。证据为 `r37_wait_clock_retry/summary.json` 和 `r37_clock_loader_check.json`。
+
+同一 API 测试还确认，已完成事件的 128 次 CPU wait 可以完全没有设备 EVENT_WAIT 记录。
+当前图只为显式设备 WAIT 连接 Record，遗漏了这种潜在依赖：小图将复制变慢后，事件 102 µs 才就绪，
+消费端仍在 27 µs 完成（`r37_missing_device_wait.json`）。下一块按原生 Event/Stream 和提交顺序补齐逻辑等待，
+再继续 HiCache 逐层调用的双向增删；不能用一个成本倍率掩盖缺边。
+
+R38 已补齐无设备 WAIT 记录时的逻辑依赖。零成本等待点按原生 Event/Stream 与 host 调用顺序连接，
+不把异步 CPU 返回改成阻塞，也不延后前序设备工作。小图中复制变慢后消费端由错误的 27 µs 改为 105 µs，
+数据在 102 µs 就绪；重复等待、事件复用、尾部同步、身份缺失和顺序歧义检查通过。
+当前代码在 R34 base 上恢复 41496 个逻辑等待点，另有 112800 个 native 调用已有设备记录；
+HTTP 仍为 31.599557 秒，phase 同成本回放不改变任何变换前节点的完成时刻，证据 r38_source_same_cost_verified.json。
+50 项 Python 测试、C++ 检查和两种构建通过。尚未完成 HiCache 逐层调用的增删，也没有新 cross 精度；
+下一步同 base 单次补采已经启动，用于取得 R37 的精确计数器边界，不扩采 target 或矩阵。
+
+R39 的同 base 补采已完成，目录为 `data/profile_runs/sglang/20260916_000201_e2e_layer_waits_C5_W4_TP4`。
+正式 HTTP 窗口为 31.604075 秒，32 个请求的 forced-token 输出全部匹配，4 份 Torch、4 份 native 和 5 份 Python trace 齐全。
+原命令在导出后写 manifest 时退出码为 1：入口 `profile.py` 遮住了同名标准库，导致 Torch 导入失败。
+入口已修复；从已有产物恢复了 manifest，没有重跑负载，原失败及恢复时间口径保存在 `manifest_recovery` 中。
+
+`r39_layer_wait_ownership.json` 的 432 个 batch 中，41472 次已记录等待均能找到唯一提交和 CPU worker，
+微秒与纳秒检查都没有切到 CPU 叶子边界，区间未归属时间为 0。这仅证明已记录调用的 CPU 边界，
+不代表设备依赖已全部核实，更不代表跨配置预测已通过。
+另一个未完成项是 consumer 未启用时的调用观测：框架仍调用 `wait_until`，现探针却跳过了这些快速返回区间。
+后续需补齐这些调用位置，再实现逐层等待的双向增删；本次整理不新增预测结果或改动成本参数。
+
+本次提交前再次通过 51 项 Python 测试、ruff、C++ I/O 和时序检查，以及 validation / Release 增量构建检查。
+代码按采集层、建图层和文档层提交，测试随对应实现保留；原始数据及 `docs/tmp` 计划日志仍保留在本地，不纳入 Git。
+
 ## 09-14 泛化结果
 
 新 workload / 新 HiCache 配置 / TP=4 初步泛化实验已完成：C5 base × W4/W5 × G1/G2/G3，
