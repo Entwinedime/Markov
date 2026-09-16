@@ -151,6 +151,10 @@ http_body_sent 表示非流式 SGLang JSON 响应的最后 ASGI body send 返回
 
 `timing/full` 另外记录 CPU Gloo 的 `runtime.cpu_collective`：broadcast/all_reduce 的进程组名、成员、全局 rank、
 调用前后组内序号、tensor 元素数/类型，以及 root 或规约操作。只读元信息，不读取 tensor 内容、不增加同步。
+该序号是进程本地的底层计数；`monitored_barrier` 等操作可使各 rank 的计数不同，不能直接当作跨 rank 通信身份。
+另以 `collective_index` 记录每个进程组内从零开始的观测调用顺序，各公开入口与兼容包装共享计数；
+`observation_start_sequence` 保留开始观测时的底层序号。失败或合并提交也占用调用序号，不能当成已完成通信。
+跨 rank 对应仍须核对观测覆盖、成员与操作参数；这些字段本身不保证迟启探针或并发调用可以正确配对。
 `async_op=true` 时区间仅到提交返回，不能当作通信完成；合并提交或失败时序号可能没有推进，不能强行一一配对。
 默认 off 不安装，设备通信及其他 backend 原样调用。建图仅保留观测，不新增执行节点或重复收费；
 通用 CPU 通信依赖与真实模型采集开销尚未完成验证，不能用这些字段声称完整通信建模已完成。
@@ -159,14 +163,14 @@ NPU 兼容层可能再次包装 distributed 函数；同一调用栈内、同组
 
 `timing/full` 还记录 `runtime.hicache.layer_waits`：每个 forward batch 的请求、阶段、consumer index、层数，
 以及实际 HiCache 逐层等待调用的起止时间。调用区间先缓存在内存，batch 结束时统一写出，完整保留列表；
-不逐次写 JSON、不增加设备同步、不采集 snapshot。没有启用 consumer 的 batch 保留空列表，失败调用标记为 raised。
+不逐次写 JSON、不增加设备同步、不采集 snapshot。未启用 consumer 时也保留快速返回的调用区间，失败调用标记为 raised。
 默认 off 不安装；建图只保存观测，尚不据此删除等待成本。该探针的真实模型采集开销仍需测量。
 NPU 的逐层区间使用 Torch 原始计数器（`wait_clock=npu_syscnt`），不与 Python 墙钟直接比较。
 采集结束后，manifest 的每份 Torch trace 保存自己的 `host_clock` 换算；建图读入时将区间转换为
 `profiler_ns` 纳秒边界。没有 NPU 计数器时显式记录 `unix_ns`，不初始化设备；batch 外层仍为墙钟区间。
 旧采集没有原始计数器，保持原样，不通过固定偏移修补。换算只解释时间来源，不是额外成本或模型系数。
 `profile.py` 入口会从导入搜索路径中移除自身目录，避免 Torch 间接导入 `cProfile` 时把它误当成标准库 `profile`。
-当前 consumer 未启用时的空列表仅表示探针未记录调用，不表示框架没有调用；不能据此推断新增等待的位置或零成本。
+旧采集中 consumer 未启用时的空列表仅表示探针未记录调用，不表示框架没有调用；不能据此推断新增等待的位置或零成本。
 
 HiCache probe target 声明位于：
 

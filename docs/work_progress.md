@@ -446,6 +446,24 @@ R39 的同 base 补采已完成，目录为 `data/profile_runs/sglang/20260916_0
 本次提交前再次通过 51 项 Python 测试、ruff、C++ I/O 和时序检查，以及 validation / Release 增量构建检查。
 代码按采集层、建图层和文档层提交，测试随对应实现保留；原始数据及 `docs/tmp` 计划日志仍保留在本地，不纳入 Git。
 
+R40 修复了一处原生 trace 参数错配：wrapper 内的准备/调度间隔很长时，按开始时间最近会拿走下一条调用的参数，
+引起 54 条连续错位，进而令一个 rank 的 stream 归属冲突。现按调用区间距离关联，等距候选不猜测。
+新 base 的 41472 次活动等待现已全部接到设备等待与 Record，CPU 边界无切叶、无未覆盖时间。
+原图和 phase 同成本的 HTTP 均为 31.604299 秒，5114575 个变换前节点时刻完全不变；
+相对本次 HTTP 实测差约 0.224 ms。证据为 r40_wait_dependencies_repaired.json、r40_source_same_cost.json。
+
+未启用 consumer 的短调用观测也已补齐代码与小测试，但尚未以新探针重采模型。
+CPU 通信另有一个已确认的身份问题：monitored_barrier 会让各 rank 的底层序号推进不同，不能直接跨 rank 配对。
+实际四进程 Gloo 测试复现了该机制；后续改用有完整覆盖证据的共同通信调用顺序，不能硬编码 rank 偏移。
+51 项 Python 检查、C++ 检查与两种构建通过。逐层调用的双向变换及完整 cross 仍未完成，本轮没有新预测精度。
+
+R41 已为 CPU 通信探针增加按进程组共享的观测调用序号，同时保留底层序号与首次观测位置。
+实际四进程 Gloo 测试通过自动启动入口和 NPU 兼容包装：各 rank 的观测顺序一致，
+即使 barrier 后底层序号分别为 7、3、3、3，也不再将它们误当成相同通信必须一致的身份字段。
+证据为 r41_cpu_collective_runtime.json；这验证的是采集字段，不代表跨 rank 通信依赖已接入模型。
+本次整理提交前重新通过 53 项 Python 测试、ruff、C++ I/O 与时序检查、validation / Release 增量构建检查。
+采集代码、建图修复及文档分层提交，测试随实现保留；数据资产与临时计划日志仍仅保存在本地。
+
 ## 09-14 泛化结果
 
 新 workload / 新 HiCache 配置 / TP=4 初步泛化实验已完成：C5 base × W4/W5 × G1/G2/G3，
