@@ -76,14 +76,18 @@ oracle-cost replay 只诊断预测 operation/effect 的 cost binding 和 sensiti
 ## 5. Calibration
 
 - 平台 physical calibration 不运行任何 target workload，并显式声明 `physical_capture.page_token_sizes`；该物理域不能从 target 列表反推；
-- 固定校准只有一个逻辑 workload，在物理域的最小/最大 page 端点各采集相同请求；允许原样重复，不能按 target 缺口换 workload；
-- 同一模型、TP、I/O backend 和资源环境可共享固定校准；换平台环境必须重采；
-- selected base 的 profiles 只提供 source DAG、source 工作量和该 base 的 Prefill/Decode 参数，不能修改共享 HiCache I/O/control 参数；
-- target 的增删、重排、命名、profile 与 score 均不得改变校准输入、特征、系数或阈值；
+- 优先使用 selected base 的实测成本，其次使用有依据的成本外推；两者不足才补充独立测量，不强制双端点或固定重复配额；
+- 同一模型、TP、I/O backend 和资源环境可共享适用的独立校准；环境不匹配时不能沿用参数；
+- base profiles 提供 source DAG、工作量及可辨识的 HiCache I/O/control、Prefill/Decode 成本依据，不能把其他 base 或 target 真值伪装成独立校准；
+- 补采面向整组需求并由全部 target 共享。target 配置可以用于分析所需操作，配置名称、target profile、评分和逐格误差不能进入参数拟合或决定补采；
 - 60-cross 仅在预测全部结束后评分。精度不足报告 `MODEL_LIMITATION`，不触发 refit 或新候选。
 
-固定校准必须实际覆盖 Prefetch、Load、D2H、H2S existing/new 和相应 control。重复仅用于中位数与工作一致性检查；失败、重试和无效 trace
-全部计入累计预算。校准数据不足时停止并指出缺失语义，不用其他 base 或 target 真值作为隐藏 fallback。
+目标所需的 Prefetch、Load、D2H、H2S existing/new 和 control 必须有适用成本依据，不要求每项都重新独立采集。
+重复测量不能补齐缺失的分支或变量范围；失败、重试和无效 trace 全部计入累计预算。
+已有证据与外推都不足时报告具体缺口，不用其他 base 或 target 真值作为隐藏 fallback。
+模型可只包含已有依据的 I/O 服务；实际执行请求缺失服务时必须报告成本缺口，不能填零或改变执行分支。
+共享补采由这些执行需求触发，不因其他未用服务缺失而强制采集。CPU/phase 仍有前置要求，控制补采尚未覆盖全部分支。
+详见成本模型文档；这些是实现限制，不是永久合同。
 
 ## 6. Profiling
 
@@ -110,6 +114,7 @@ prefill/decode 语义模型。
 
 - active product surface 最终不超过 50,000 行；
 - 不通过压缩多语句、移出统计目录或删除必要注释达标；
+- Python、Shell、C/C++ 源码及头文件的代码块内部按逻辑步骤适当留空行，保持相关语句成组；不靠删除空行达成瘦身，具体规范见 AGENTS.md；
 - 删除死代码、重复检查、开发期测试入口和中间 proof output；
 - Debug 功能由 C++ build option 或 Python diagnostics 参数隔离；
 - 默认只保留 compact summary 和复现所需输入；

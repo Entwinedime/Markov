@@ -1,8 +1,39 @@
 # HiCache 验证与当前限制
 
-更新时间：2026-09-14。公式见 [HiCache 数值模型](../hicache_io_cost_model.md)，工作流见
+更新时间：2026-09-27。公式见 [HiCache 数值模型](../hicache_io_cost_model.md)，工作流见
 [建模开发说明](../modeling_development.md)。本文只维护当前修复口径的验收事实；内部 JSON 字段
 `hicache_direct` 指“HiCache I/O 与相关控制开销”，不是完整 E2E，也不是“只改数值”的结构假设。
+
+## 当前正式流程复验（09-27）
+
+现行 prepare-hicache 已完成五组共 60/60 预测，随后通过 evaluate-hicache --normal-http
+对 30 份正常运行重复测量完成独立评分。当前总体、逐 base 和最大误差统一见
+[工作进展](../work_progress.md#当前目标与未完成项)，原始结果在
+`data/modeling_runs/user_workflow_refactor_20260923/full60_current_20260927/normal_http_scores`。
+本次状态为 MODEL_LIMITATION：完整 E2E 门槛未通过，成本覆盖和执行式组件归属仍有限制。
+这批结果只作为随后规模性瘦身的对照，不证明之后工作树的精度。
+
+当前完整 HTTP 评分要求总面板和逐 base 的 WAPE ≤ 3%、单格 APE 的 P90 ≤ 5%，
+且 cross 的绝对误差总和优于直接沿用 base 实测墙钟的参照。self 单列，不要求优于自身零误差参照。
+缺失或无效窗口计入覆盖失败；gap、未归属成本及 Prefill/Decode 不从评分中剔除。
+下述 09-23 成绩是历史运行证据，不是当前未收口重构的统一验收成绩。
+
+正常运行重复测量取算术均值，保留样本数和范围；base 墙钟参照也来自正常运行。
+P90 采用最近秩，即排序后的第 ceil(0.9 × 格数) 项，不额外偏移一个格子。
+
+## 历史完整 E2E 复验（09-23）
+
+共享加载索引、加载提交、层等待校准先经过独立完整/轻量配对的 CPU 开销修正，再统一重跑 60 cross。
+**60/60 格完成预测及正常 HTTP 评分**，不排除 gap、未归属成本或 Prefill/Decode。WAPE **2.9460%**，
+P90 单格绝对误差 **6.1857%**，最大 **10.0601%**；同真值对照分别为 5.1984%、11.2721%、15.4552%。
+51 格改善、8 格持平、1 格轻微退步，执行一致性检查全部通过。该检查不等于所有成本都已准确归因；
+未测量的采集扰动、其他控制校准及成本覆盖告警仍保留。没有用 target 真值回写模型。
+
+逐格数据及测量边界见 [本轮结果](../../data/modeling_runs/hicache_calibration_cpu_correction_20260923/results.md)，
+过程见 [实现日志](../tmp/hicache_calibration_cpu_correction_log_20260923.md)。下方各节是 09-14 及更早的历史实验，
+其中隔离 gap 的指标和门槛不能直接当作这轮完整 E2E 的结论。
+
+## 09-14 及更早的分项与泛化实验
 
 最新的新 workload / 新配置 / TP=4 十二格泛化实验已完成，结果见第 10 节：组合耗时通过，但严格分项与结构仍有失败。
 第 1–9 节中的 60-cross 数字来自 09-12 历史对照，不是新面板成绩，也没有在 09-14 首次分配归属修复后重跑。
@@ -29,8 +60,9 @@
 - 同一份固定小型校准：page 32/128 两个端点，每端点 2 个成功重复；
 - 从自己的 base profiles 得到的 Prefill/Decode 参数。
 
-五个模型的 HiCache I/O/控制参数逐字段相同，Prefill/Decode 参数随 base 不同。所有模型的
-`target_inputs=[]`、`target_score_inputs=[]`。60 个预测全部完成后，独立 evaluator 才打开 15 个 target
+五个模型的 HiCache I/O/控制参数逐字段相同，Prefill/Decode 参数随 base 不同。历史摘要记录了
+`target_inputs=[]`、`target_score_inputs=[]`，但这两个常量字段本身不是隔离证据，现行流程已不再生成。
+60 个预测全部完成后，独立 evaluator 才打开 15 个 target
 profiles；评分记录 `parameters_or_capture_plan_changed=false`，没有用 target 结果回写参数。
 
 09-12 对照产物：

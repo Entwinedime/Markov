@@ -5,17 +5,13 @@
 当前建模主线是 SGLang HiCache 的 I/O/control 与 Prefill/Decode 变化：
 
 ```text
-profile manifest
-  -> source DAG
-  -> target HiCache effect plan
-  -> target phase work plan
-  -> HiCache I/O/control + phase cost plan
-  -> DAG patch
-  -> topological simulation
+base profile + target config + workload
+  -> source DAG 与 base 成本依据
+  -> 按执行规则生成 target 操作和依赖，估计成本
+  -> DAG 执行与完整 HTTP 时间预测
 ```
 
-HiCache I/O/control（内部 scope ID 为 `hicache_direct`）、`prefill` 和 `decode` 分别拥有自己的工作量与 cost；`gap` 仍未建模。结果同时报告独立 component 和排除
-residual gap 的组合 scope，不能让一个 component 的系数吸收另一个 component 的误差。
+HiCache I/O/control（内部 scope ID 为 `hicache_direct`）、Prefill 和 Decode 分别建模。默认预测不排除 gap 或未归属成本；仍沿用 base 的残余等待等近似，会随结果说明。执行完成不等于精度达标，当前执行式预测的分项归属评分尚不完整。
 
 ## 公开入口
 
@@ -73,22 +69,7 @@ profiling 与 modeling 的唯一正式交接面是每个 run 的 `profile_manife
 scripts/model.sh --help
 ```
 
-正式 HiCache 动作是：
-
-```text
-build-dag
-prepare-hicache
-evaluate-hicache
-```
-
-`prepare-hicache` 按 `base profiles → target-independent physical calibration → 固定小型 calibration →
-唯一 cost model → 全部 target prediction` 单向执行。固定 calibration 是同一 workload 在平台 page 域两端的采集，允许原样重复；
-它不查看 target 列表、target trace 或评分。`build-hicache-model`、`predict-hicache` 和
-`calibrate-hicache physical/runtime-dma` 是该流程的可独立排查阶段，不是另一套产品流程。
-
-除实际 SGLang/物理采集外，modeling 动作都在同一个 modeling 容器中完成；批量预测不会为每个 cell 再启动一个嵌套容器。
-
-SGLang 与 KTransformers 共用 framework-neutral DAG 入口：
+只需构建 source DAG 和仿真时，SGLang 与 KTransformers 共用入口：
 
 ```bash
 scripts/model.sh build-dag \
@@ -96,28 +77,35 @@ scripts/model.sh build-dag \
   --output-dir <dag-output>
 ```
 
-它只构图和仿真，不要求 HiCache。KTransformers manifest 显式记录 framework，当前提供 LD_PRELOAD CPU trace；
-HiCache prediction 只接受 SGLang source，并会对其他 framework 给出 capability 错误。
+该入口不要求 HiCache。以下 HiCache 预测流程只适用于 SGLang。
 
-一个 base 组的正式入口是：
+从 [最小组配置](configs/modeling/hicache_group_example.json) 开始：复制为自己的配置文件，
+将 `base_manifests` 中的占位路径换成实际 manifest，按需修改 target 配置及输出目录。然后先运行：
+
+```bash
+scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
+```
+
+最小配置没有补采预算，不启动额外设备采集；检查可能从 base trace 构图并写出报告。
+缺少依据时，按[组准备说明](docs/modeling_development.md#5-一个-base-组)声明已有校准或补采预算。
+输入齐备后执行：
 
 ```bash
 scripts/model.sh prepare-hicache --group <group_request.json>
 ```
 
-它需要该 base 的三个 profile、固定校准 profile 和平台物理校准；缺失且声明了预算时会采集，否则只报告缺项。单独重放已建模型时只需要
-source manifest、显式 target HiCache 配置和 one-base HiCache model：
+prepare 统一完成成本检查、必要的共享补采、构模和组预测，不需要手工串联内部阶段。
+成本优先来自 base 实测及有依据的外推，不足才使用共享独立校准。首次准备自动读取 base 部署的模型配置信息，
+不必声明物理采样或先采完整参数包；宿主机缺少模型配置时，会提示提供配置文件或适用的已有校准报告。
+未具备的 I/O 服务成本单独报告，目标执行确实用到时才触发共享补采。
+CPU 控制和计算参数仍有构模前置要求，自动补采尚未覆盖全部控制分支。
+不能保证任意组只靠 base 就能预测。
 
-```bash
-scripts/model.sh predict-hicache \
-  --source-manifest <source/profile_manifest.json> \
-  --target-config configs/modeling/hicache_target_example.json \
-  --hicache-io-model <one-base-model.json> \
-  --output-dir <prediction-output>
-```
+先看输出目录的 `group_summary.json` 了解准备状态与停止原因，再按其中的预测结果路径查看
+`workflow_summary.json`：`prediction.cells` 包含各格完整 HTTP 时间、执行状态和成本局限。
+失败格时间为 null，不算作零。结果文件、补采预算及失败处理详见[建模使用说明](docs/modeling_development.md)。
 
-真实 target profile 不属于该命令。5×3/12/60-cell 和 target oracle 只通过 `evaluate-hicache` 进入评分流程。
-已有预测使用只评分模式，不再执行模型：
+有 target 实测时，再对已完成的预测独立评分：
 
 ```bash
 scripts/model.sh evaluate-hicache \
@@ -126,15 +114,13 @@ scripts/model.sh evaluate-hicache \
   --output-dir <separate-score-output>
 ```
 
-可重复传入 `--prediction-dir` 评分多个 base；所有选中预测完成后才读取 target，分组报告误差。此模式不接受模型/补采输入。
-旧的“评分时重新预测”矩阵路径已删除。需要 oracle-cost 诊断时，预测阶段使用 `--diagnostics full` 保留操作详情，
-再给上述评分命令显式增加 `--oracle-cost-replay`；可用 `--oracle-max-runs 1` 限制每组诊断一个格。
-回放直接使用本次评分提取的 target 操作成本和原预测中的 base 观测，不再手工提供另一份成本文件。
-回放另记费用与状态，不参与模型估计或覆盖正式预测结果。
+预测不读取 target trace；评分不重新构模、补采或调参。完整 E2E 不排除 gap、未归属成本或计算阶段。
+单独构模/预测、详细诊断及保留的历史静态 oracle-cost 回放用法统一见建模使用说明。
 
 ## 可选 DAG 变换
 
-NodeScale 是框架无关的可选 DAG 变换。它按顺序匹配节点名称子串，并缩放节点耗时；没有配置时默认关闭：
+NodeScale 是框架无关的可选 DAG 变换。它按顺序匹配节点名称子串，并缩放节点耗时；没有配置时默认关闭。
+将以下内容保存为模型配置，并在 `build-dag` 命令中追加 `--model-config <model.json>`：
 
 ```json
 {
