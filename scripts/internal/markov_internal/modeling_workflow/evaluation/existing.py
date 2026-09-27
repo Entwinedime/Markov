@@ -14,8 +14,8 @@ from ...modeling.workload import discover_workload_window
 from ..planning.profile_runs import discover_profile_runs, parse_profile_run
 from ..prediction.hicache import execution_blockers
 from ..validations.final_dag.shape_oracle import extract_target_shape_oracle, patch_probe_contract_enabled
-from ..validations.hicache.phase.score import extract_target_phase_observation
-from .scoring import score_cell, score_metrics
+from ..validations.hicache.oracle_cost_replay.evidence import extract_target_phase_observation, prepare_replay_evidence
+from .http_metrics import score_cell, score_metrics
 
 
 def completed_predictions(directory: Path) -> list[tuple[dict, dict]]:
@@ -250,20 +250,9 @@ def _evaluate(
                 raise ValueError(f"target profile configuration differs from predicted configuration: {target.label}")
 
     phase_scores = output / "artifacts" / "target_phase_scores"
-    component_targets = {
-        (row["target_config"], row["workload_id"]) for _, row, _ in predictions if "execution" not in row
-    }
-    new_extractions = sum(
-        not (phase_scores / target.run_id / "run_summary.phase_carrier.json").is_file()
-        for key, target in targets.items()
-        if key in component_targets
-    )
 
     def observe(target):
-        key = (target.config_id, target.input_id)
         window = target.workload_window
-        if key not in component_targets:
-            return key, ({}, {}, window)
         observed = extract_target_phase_observation(
             target, phase_scores / target.run_id, threads=threads, file_threads=file_threads
         )
@@ -274,10 +263,18 @@ def _evaluate(
             window_end_us=window.end_ns // 1000 if window else None,
         )
         print(f"observed target: {target.label}", flush=True)
-        return (target.config_id, target.input_id), (observed, oracle, window)
+        return (target.config_id, target.input_id), (observed, oracle)
 
-    with ThreadPoolExecutor(max_workers=jobs) as executor:
-        observations = dict(executor.map(observe, targets.values()))
+    observations = {}
+    new_extractions = 0
+    if oracle_cost_replay:
+        new_extractions = sum(
+            not (phase_scores / target.run_id / "run_summary.phase_carrier.json").is_file()
+            for target in targets.values()
+        )
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            observations = dict(executor.map(observe, targets.values()))
+
     rows = []
     source_windows = {}
     for _, prediction, run in predictions:
@@ -295,19 +292,17 @@ def _evaluate(
             source_windows[source_manifest] = discover_workload_window({}, require_repo_path(source_manifest))
         if not normal_http:
             base_windows = (source_windows[source_manifest],)
-        observed, oracle, target_window = observations[key]
         row = score_cell(
             prediction,
             run,
-            observed,
-            oracle,
             targets[key].run_id,
-            include_oracle_costs=oracle_cost_replay,
             source_windows=base_windows,
             target_windows=tuple(sample.workload_window for sample in samples[key])
             if normal_http
-            else (target_window,),
+            else (targets[key].workload_window,),
         )
+        if oracle_cost_replay:
+            row.update(prepare_replay_evidence(prediction, run, *observations[key]))
         row["full_e2e"]["measurement_mode"] = "normal_http" if normal_http else "profiled_http"
         write_json(output / "cells" / f"{row['model_run_id']}.json", row)
         rows.append(row)
@@ -329,12 +324,12 @@ def _evaluate(
         "measurement_mode": "normal_http" if normal_http else "profiled_http",
         "evaluation_wall_seconds": time.monotonic() - started,
         "new_target_extractions": new_extractions,
-        "target_observations_reused": len(component_targets) - new_extractions,
-        "http_only_target_count": len(targets) - len(component_targets),
+        "target_observations_reused": len(observations) - new_extractions,
+        "http_only_target_count": len(targets) - len(observations),
         "costs": {str(path): recorded_costs(path) for path in prediction_dirs},
         "target_opened_after_all_selected_predictions": True,
         "parameters_or_capture_plan_changed": False,
-        "formal_and_owner_scope": "full HTTP formal window without exclusions; HiCache/phase and gap-excluded metrics retained separately",
+        "formal_and_owner_scope": "full HTTP formal window without exclusions; optional static oracle replay is diagnostic only",
     }
     if any(group["status"] != "PASS" for group in by_source.values()):
         result["status"] = "MODEL_LIMITATION"

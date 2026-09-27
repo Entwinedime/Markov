@@ -15,10 +15,10 @@ from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path, runn
 from .context import DiagnosticLevel
 from .base_capture import base_attempts, capture_base
 from .capture import capture_calibration, capture_usage, pending_group_capture, profile_usage
-from .fixed_calibration import materialize_fixed_calibration, plan_fixed_calibration
+from .fixed_calibration import plan_fixed_calibration
 from .group import GroupRequest
 from .group_cpu_service import cpu_service_plan, prepare_group_cpu_service
-from .control_acquisition import prepare_control_calibration
+from .control_acquisition import pending_control_experiments, prepare_control_calibration
 from ..common.commands import positive_int
 from .physical_capture import SERVICE_SAMPLERS, capture_physical, physical_attempts, physical_usage, prepare_platform
 
@@ -80,22 +80,8 @@ def predict_group(group: GroupRequest, summary: dict, *, model_run_jobs: int, di
         if group.raw.get("control_calibrations", {}).get("release_host"):
             attempted.add("release_regular")
         operations = ["io_service"] if service_needs else []
-        operations.extend(
-            name
-            for name in ("eviction_locked_candidate", "release_regular")
-            if "execution_control/" + name in components and name not in attempted
-        )
-        operations.extend(
-            sorted(
-                {
-                    coordinate["program"]
-                    for need in needs
-                    if need["component"] == "execution_control/prefetch"
-                    for coordinate in need["coordinates"]
-                }
-                - attempted
-            )
-        )
+        operations.extend(pending_control_experiments(needs, attempted))
+
         changed = stopped = False
         prediction_status = summary["status"]
         for operation in operations:
@@ -106,19 +92,12 @@ def predict_group(group: GroupRequest, summary: dict, *, model_run_jobs: int, di
                 acquisition = capture_physical(group, dry_run=False, required_components=service_needs)
                 summary["physical_capture_usage"] = physical_usage(physical_attempts(group))
                 acquired = acquisition["status"] == "physical_captured" or bool(acquisition.get("completed_components"))
-            elif operation in {"release_regular", "best_effort", "wait_complete", "local_return"}:
-                release = operation == "release_regular"
-                policy = "best_effort" if operation == "local_return" else operation
-                definition = materialize_fixed_calibration(
-                    group, **({"release_only": True} if release else {"prefetch_policy": policy})
-                )
-                acquisition = prepare_control_calibration(
-                    group, dict(definition=definition, operation="release_host" if release else "prefetch_wait")
-                )
-                acquired = acquisition["status"] == "control_calibrated"
-            else:
+            elif operation == "eviction_locked_candidate":
                 acquisition = acquire_eviction_cpu(group, needs)
                 acquired = acquisition["status"] == "cpu_primitive_measured" and not acquisition["reused"]
+            else:
+                acquisition = prepare_control_calibration(group, operation)
+                acquired = acquisition["status"] == "control_calibrated"
             summary.setdefault("captures", []).append(dict(acquisition, operation=operation))
             changed |= acquired
             complete = acquisition["status"] in {"physical_captured", "control_calibrated", "cpu_primitive_measured"}

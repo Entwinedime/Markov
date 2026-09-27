@@ -15,7 +15,6 @@ from .control_calibrations import control_calibrations, select_control_calibrati
 from .io_model_validation import (
     _points,
     _exact_object,
-    required_control_models,
     required_resource_lanes,
     required_service_models,
 )
@@ -39,8 +38,9 @@ class HiCacheIoModel:
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> HiCacheIoModel:
+        if raw.get("control_models"):
+            raise ValueError("Scalar control_models belong to historical static replay; rebuild the execution model")
         service_models = required_service_models(raw.get("service_models"))
-        control_models = required_control_models(raw.get("control_models"))
         resource_lanes = required_resource_lanes(raw.get("resource_lanes"))
         phase_cost = _phase_cost(raw.get("phase_cost"))
         fields = {
@@ -50,7 +50,6 @@ class HiCacheIoModel:
                 "kv_bytes_per_token_per_rank",
             ),
             "service_models": service_models,
-            "control_models": control_models,
             "resource_lanes": resource_lanes,
             "phase_cost": phase_cost,
         }
@@ -89,17 +88,11 @@ class HiCacheIoModel:
                 points = narrowed.pop("runtime_scale_points")
                 narrowed["runtime_scale"] = interpolate_cost_curve(points, page_bytes, "page_bytes", "runtime_scale")
             service_models[kind] = narrowed
-        controls = {kind: dict(values) for kind, values in self.fields["control_models"].items()}
-        if controls:
-            check = controls["prefetch"].pop("state_check_us_per_operation")
-            if prefetch_policy != "best_effort":
-                controls["prefetch"]["fixed_us_per_operation"] += check
         result = {
             "kv_bytes_per_page": page_bytes,
             "io_cost": {
                 "storage_batch_pages": self.fields["storage_batch_pages"],
                 "service_models": service_models,
-                "control_models": controls,
                 "resource_lanes": self.fields["resource_lanes"],
             },
             "phase_cost": self.fields["phase_cost"],

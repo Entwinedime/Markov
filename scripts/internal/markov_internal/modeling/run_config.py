@@ -31,6 +31,7 @@ class ModelingRunConfig:
     model_config_path: Path | None = None
     cpu_service_cost: Path | None = None
     trace_channels: tuple[str, ...] | None = None
+    hicache_static_replay: bool = False
 
     def to_raw(self) -> dict[str, Any]:
         """Serialize the execution inputs for replay through the public config entry."""
@@ -41,6 +42,8 @@ class ModelingRunConfig:
         cpp = {**self.cpp_config, "backend_kind": self.backend_kind}
         if self.trace_channels is not None:
             cpp["trace_channels"] = list(self.trace_channels)
+        if self.hicache_static_replay:
+            cpp["hicache_static_replay"] = True
         raw: dict[str, Any] = {
             "input": inputs,
             "output_dir": str(repo_relative_path(self.output_dir)),
@@ -89,7 +92,8 @@ class ModelingRunConfig:
             debug_logging=bool(output_flags.get("debug", False)),
         )
         backend_kind = str(cpp_config.get("backend_kind") or "release").strip().lower()
-        if outputs.module_summary and backend_kind != "validation":
+        static_replay = bool(cpp_config.get("hicache_static_replay", False))
+        if (outputs.module_summary or static_replay) and backend_kind != "validation":
             raise ValueError("Debug modeling outputs require cpp_trace_graph.backend_kind='validation'")
         service_cost = input_config.get("cpu_service_cost")
         model_config = raw.get("cpp_model_config")
@@ -105,6 +109,7 @@ class ModelingRunConfig:
             model_config_path=require_repo_path(model_config) if model_config is not None else None,
             cpu_service_cost=require_repo_path(service_cost) if service_cost else None,
             trace_channels=_trace_channels(cpp_config.get("trace_channels")),
+            hicache_static_replay=static_replay,
         )
 
 

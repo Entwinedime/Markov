@@ -196,6 +196,13 @@ def acquire_eviction_cpu(group, needs, *, dry_run=False):
         return len(samples)
 
     existing = _completed(physical_attempts(group), definition, "eviction_cpu")
+    source_ledger = sampling.get("reuse_ledger")
+    if existing is None and source_ledger:
+        existing = _completed(load_json(require_repo_path(source_ledger))["attempts"], definition, "eviction_cpu")
+        if existing is None:
+            return dict(
+                plan, stop_reason="Declared CPU measurement does not cover this environment and sampling domain"
+            )
     if existing:
         validate(require_repo_path(existing["report"]))
         return dict(plan, status="cpu_primitive_measured", report=existing["report"], reused=True)

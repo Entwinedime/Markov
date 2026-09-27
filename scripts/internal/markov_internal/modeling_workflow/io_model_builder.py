@@ -322,8 +322,8 @@ def _call_cost_curve(rows: list[dict[str, Any]], geometry: int) -> tuple[list[di
 
 def _profile_evidence(
     rows: list[dict], component: str, geometry: int, *, call_cost: bool
-) -> tuple[list[dict] | None, dict]:
-    """Choose base before shared observations and retain the failed base reason."""
+) -> tuple[list[dict] | None, dict, list[dict]]:
+    """Return the curve, provenance and supporting rows; missing evidence has no curve or rows."""
 
     base_gap = None
     base_rows = [row for row in rows if row["role"] == "base"]
@@ -338,11 +338,12 @@ def _profile_evidence(
             if origin == "base":
                 base_gap = str(error)
                 if len(base_rows) == len(rows):
-                    return None, dict(base_gap=base_gap, profile_gap=base_gap)
+                    return None, dict(base_gap=base_gap, profile_gap=base_gap), []
                 continue
-            return None, dict(base_gap=base_gap, profile_gap=str(error))
+            return None, dict(base_gap=base_gap, profile_gap=str(error)), []
 
         if call_cost:
+            pages = {page["page_size"] for page in detail["per_page"]}
             manifests = {
                 name
                 for page in detail["per_page"]
@@ -350,8 +351,14 @@ def _profile_evidence(
                 for name in anchor["source_manifests"]
             }
         else:
+            pages = {item["page_size"] for item in detail["per_capture"]}
             manifests = {item["source_manifest"] for item in detail["per_capture"]}
-        return curve, dict(detail, evidence_origin=origin, base_gap=base_gap, source_manifests=sorted(manifests))
+        selected = [row for row in rows if row["source_manifest"] in manifests and row["page_size"] in pages]
+        return (
+            curve,
+            dict(detail, evidence_origin=origin, base_gap=base_gap, source_manifests=sorted(manifests)),
+            selected,
+        )
 
 
 def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
@@ -388,29 +395,26 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
         ("write_host_to_storage_existing", "write_host_to_storage", "existing"),
         ("write_host_to_storage_new", "write_host_to_storage", "new"),
     ]
-    scales, sources, selected_rows = {}, {}, []
-    new_write = []
+    models, sources, selected_rows = {}, {}, []
     for component, family, state in components:
         if family == "prefetch" and stages is None:
             continue
         if family in {"load", "write_device_to_host"}:
             dma_rows = [row for row in rows if row["family"] == family]
-            curve, detail = _profile_evidence(dma_rows, component, geometry, call_cost=True)
+            curve, detail, selected = _profile_evidence(dma_rows, component, geometry, call_cost=True)
             if curve is not None:
-                services[family] = dict(direction=KIND_DIRECTIONS[family], page_bandwidth_points=curve)
-                scales[component] = [dict(page_bytes=point["page_bytes"], runtime_scale=1.0) for point in curve]
+                models[family] = dict(
+                    direction=KIND_DIRECTIONS[family],
+                    page_bandwidth_points=curve,
+                    runtime_scale_points=[dict(page_bytes=point["page_bytes"], runtime_scale=1.0) for point in curve],
+                )
                 sources[component] = dict(
                     detail,
                     parameter_basis="measured call setup and byte cost; no independent DMA curve or multiplier",
                     extrapolation="endpoint coefficients outside observed pages and call sizes are unverified",
                     timing_scope="observed DMA service; no residual CPU or target correction",
                 )
-                pages = {page["page_size"] for page in detail["per_page"]}
-                selected_rows.extend(
-                    row
-                    for row in dma_rows
-                    if row["source_manifest"] in detail["source_manifests"] and row["page_size"] in pages
-                )
+                selected_rows.extend(selected)
                 continue
         if family != "prefetch" and state != "new":
             parameter = "existing_key_bandwidth_points" if state == "existing" else "page_bandwidth_points"
@@ -430,7 +434,7 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
                 )
             )
         ]
-        curve, detail = _profile_evidence(eligible, component, geometry, call_cost=state == "new")
+        curve, detail, selected = _profile_evidence(eligible, component, geometry, call_cost=state == "new")
         if curve is None:
             independent = _independent_service_curve(physical, family, state)
             if independent is None:
@@ -438,10 +442,7 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
                     dict(component="service/" + component, reason=detail["profile_gap"], base_reason=detail["base_gap"])
                 )
                 continue
-            if state == "new":
-                new_write = independent
-            else:
-                scales[component] = independent
+            curve = independent
             sources[component] = dict(
                 detail,
                 evidence_origin="independent_physical",
@@ -452,32 +453,27 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
                 extrapolation="declared service formula outside measured work; inference contention is unverified",
                 timing_scope="independent I/O service; no target or runtime-residual fitting",
             )
-            continue
-
-        if state == "new":
-            new_write = curve
-            pages = {page["page_size"] for page in detail["per_page"]}
         else:
-            scales[component] = curve
-            pages = {item["page_size"] for item in detail["per_capture"]}
-        sources[component] = dict(
-            detail,
-            extrapolation="page-endpoint coefficients held constant outside measured pages; work scales through the declared service formula",
-            timing_scope="observed I/O service; unmeasured profiler/scheduling perturbation is not claimed removed",
-        )
-        selected_rows.extend(
-            row
-            for row in eligible
-            if row["source_manifest"] in detail["source_manifests"] and row["page_size"] in pages
-        )
-    available = set(scales) & set(OPERATION_KINDS)
-    if new_write or "write_host_to_storage_existing" in scales:
-        available.add("write_host_to_storage")
-    models = {
-        kind: _service_model(kind, services.get(kind, {}), scales, new_write)
-        for kind in OPERATION_KINDS
-        if kind in available
-    }
+            sources[component] = dict(
+                detail,
+                extrapolation="page-endpoint coefficients held constant outside measured pages; work scales through the declared service formula",
+                timing_scope="observed I/O service; unmeasured profiler/scheduling perturbation is not claimed removed",
+            )
+        selected_rows.extend(selected)
+
+        physical_service = services.get(family, {})
+        model = models.setdefault(family, {"direction": physical_service.get("direction", KIND_DIRECTIONS[family])})
+        if state == "new":
+            model["new_operation_points"] = curve
+        elif state == "existing":
+            model.update(
+                existing_key_bandwidth_points=physical_service["existing_key_bandwidth_points"],
+                existing_runtime_scale_points=curve,
+            )
+        elif family == "prefetch":
+            model.update(stages=dict(physical_service["stages"]), runtime_scale_points=curve)
+        else:
+            model.update(page_bandwidth_points=physical_service["page_bandwidth_points"], runtime_scale_points=curve)
     return dict(
         status="data_limitation" if missing else "ready",
         missing=missing,
@@ -523,29 +519,6 @@ def _independent_service_curve(physical: dict, family: str, state: str | None) -
         if not page_bytes:
             return None
     return [dict(page_bytes=page, runtime_scale=1.0) for page in page_bytes]
-
-
-def _service_model(
-    family: str, physical: dict[str, Any], scales: dict[str, list[dict[str, Any]]], new_write: list[dict[str, Any]]
-) -> dict[str, Any]:
-    fields = {"direction": physical.get("direction", KIND_DIRECTIONS[family])}
-    if family == "prefetch":
-        fields.update(
-            runtime_scale_points=scales[family],
-            stages=dict(physical["stages"]),
-        )
-    elif family in {"load", "write_device_to_host"}:
-        fields["page_bandwidth_points"] = physical["page_bandwidth_points"]
-        fields["runtime_scale_points"] = scales[family]
-    else:
-        if new_write:
-            fields["new_operation_points"] = new_write
-        if "write_host_to_storage_existing" in scales:
-            fields.update(
-                existing_key_bandwidth_points=physical["existing_key_bandwidth_points"],
-                existing_runtime_scale_points=scales["write_host_to_storage_existing"],
-            )
-    return fields
 
 
 def _io_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -626,7 +599,6 @@ def prepare_model(group: GroupRequest, captures: list[dict[str, Any]], *, output
         "storage_batch_pages": physical["storage_batch_pages"],
         "kv_bytes_per_token_per_rank": geometry,
         "service_models": evidence["models"],
-        "control_models": {},
         "resource_lanes": required_resource_lanes(physical.get("resource_lanes")),
         "phase_cost": phase,
     }

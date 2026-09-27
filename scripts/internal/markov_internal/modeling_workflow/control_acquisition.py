@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..common.io import load_json, write_json
@@ -11,14 +13,79 @@ from .capture import CONTROL_CAPTURE_STAGES, capture_calibration
 from .control_calibrations import control_calibrations
 from .group_cpu_service import prepare_group_cpu_service
 from .planning.profile_runs import discover_profile_runs, parse_server_command_flags
+from .types import ProfileRunRef
 
 if TYPE_CHECKING:
     from .group import GroupRequest
 
 
-def prepare_control_calibration(group: GroupRequest, plan: dict) -> dict:
-    definition = plan["definition"]
-    point = definition["point"]
+PREFETCH_CAPTURE_POLICIES = {
+    "local_return": "best_effort",
+    "best_effort": "best_effort",
+    "wait_complete": "wait_complete",
+}
+
+
+def pending_control_experiments(needs: Sequence[dict], attempted: set[str]) -> list[str]:
+    """Map execution demands to shared experiments, with queries exported last.
+
+    The caller owns the attempt lifecycle. Unknown programs stay unresolved;
+    they are not redirected to a different measurement.
+    """
+    components = {need["component"] for need in needs}
+    operations = [
+        name
+        for name in ("eviction_locked_candidate", "release_regular")
+        if "execution_control/" + name in components and name not in attempted
+    ]
+    waits = {
+        PREFETCH_CAPTURE_POLICIES[coordinate["program"]]
+        for need in needs
+        if need["component"] == "execution_control/prefetch"
+        for coordinate in need["coordinates"]
+        if coordinate["program"] in PREFETCH_CAPTURE_POLICIES
+    }
+    operations.extend(sorted(waits - attempted))
+
+    # The wait experiment may publish a paired trace that also supplies queries.
+    if "execution_control/prefetch_query" in components and "prefetch_query" not in attempted:
+        operations.append("prefetch_query")
+    return operations
+
+
+def prepare_control_calibration(group: GroupRequest, demand: str) -> dict:
+    """Resolve a shared control demand, then capture and export its normal CPU costs."""
+    # Materialization imports group definitions; keep that dependency local.
+    from .fixed_calibration import materialize_fixed_calibration
+
+    if demand == "prefetch_query":
+        operation = "prefetch_query"
+    elif demand == "release_regular":
+        operation = "release_host"
+    else:
+        operation = "prefetch_wait"
+    if operation == "prefetch_query":
+        # Group admission already checks these independent manifests and their
+        # environment. Re-export with current code; do not reuse old parameters.
+        for path in sorted(set(group.raw["control_calibrations"]["prefetch_wait"].values())):
+            existing = load_json(require_repo_path(path))
+            if existing.get("cost_basis") != "paired_cpu_service" or not existing.get("cpu_service_file"):
+                continue
+            (profile,) = discover_profile_runs((require_repo_path(existing["source_manifest"]),))
+            return _export_control(
+                group,
+                profile,
+                require_repo_path(existing["cpu_service_file"]),
+                group.output_dir / "control_calibration" / "shared_query",
+                operation,
+            )
+
+    if demand == "release_regular":
+        definition = materialize_fixed_calibration(group, release_only=True)
+    else:
+        policy = "wait_complete" if demand == "prefetch_query" else PREFETCH_CAPTURE_POLICIES[demand]
+        definition = materialize_fixed_calibration(group, prefetch_policy=policy)
+
     manifests = {}
     for stage in CONTROL_CAPTURE_STAGES:
         result = capture_calibration(group, definition, stage=stage)
@@ -47,20 +114,23 @@ def prepare_control_calibration(group: GroupRequest, plan: dict) -> dict:
     services = prepare_group_cpu_service(dict(pairs=[pair], existing_services=[]))
     full["cpu_service_cost"] = str(repo_relative_path(services[0]))
     write_json(ledger_path, ledger)
+    return _export_control(group, profile, services[0], output, operation)
+
+
+def _export_control(group: GroupRequest, profile: ProfileRunRef, service: Path, output: Path, operation: str) -> dict:
     # Export only the required operation, not every operation this workload
     # happens to contain. The paired capture is shared by the whole group.
-    operation = plan["operation"]
     path = output / (operation + ".json")
     subprocess.run(
         [
             str(ROOT_DIR / "scripts/model.sh"),
             "export-hicache-operation-costs",
             "--profile-manifest",
-            str(source),
+            str(profile.manifest_path),
             "--cpu-service-cost",
-            str(services[0]),
+            str(service),
             "--page-size",
-            str(point["page_size"]),
+            str(profile.hicache_config["page_size"]),
             "--operation",
             operation,
             "--output-dir",
@@ -79,5 +149,7 @@ def prepare_control_calibration(group: GroupRequest, plan: dict) -> dict:
     index = group.output_dir / "control_calibrations.json"
     write_json(index, control_calibrations(load_json(index) if index.exists() else {}, collection))
     return dict(
-        status="control_calibrated", profile_manifest=manifests["profiled_replay"], control_calibrations=collection
+        status="control_calibrated",
+        profile_manifest=str(repo_relative_path(profile.manifest_path)),
+        control_calibrations=collection,
     )

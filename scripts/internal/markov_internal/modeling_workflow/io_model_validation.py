@@ -103,22 +103,6 @@ def _service_model(kind: str, value: Any) -> dict[str, Any]:
     return model
 
 
-def required_control_models(value: Any) -> dict[str, dict[str, Any]]:
-    if value == {}:
-        return {}
-    raw_models = _exact_object(value, set(OPERATION_KINDS), "control_models")
-    output = {}
-    for kind in OPERATION_KINDS:
-        names = (
-            ("fixed_us_per_operation", "state_check_us_per_operation")
-            if kind == "prefetch"
-            else ("fixed_us_per_operation",)
-        )
-        raw = _exact_object(raw_models[kind], set(names), f"control_models.{kind}")
-        output[kind] = {name: nonnegative_finite_number(raw[name], f"control_models.{kind}.{name}") for name in names}
-    return output
-
-
 def required_resource_lanes(value: Any) -> dict[str, str]:
     raw = _exact_object(value, {"storage_read", "storage_write"}, "resource_lanes")
     if any(raw[name] not in {"shared", "scope"} for name in raw):

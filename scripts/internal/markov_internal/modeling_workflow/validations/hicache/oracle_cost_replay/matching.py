@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from ....evaluation.scoring import observed_direct_cost
+from .evidence import observed_direct_cost
 from ....io_model_contract import io_observation_ready
 
 
@@ -69,7 +69,7 @@ def target_operation_cell(ledger: dict, run: dict, kv_bytes_per_token: int) -> d
     }
 
 
-def build_score_only_target_oracle_catalog(
+def build_pair_oracle_override(
     pair_ledger: dict[str, Any],
     observed_cell: dict[str, Any],
     source_run: dict[str, Any],
@@ -94,36 +94,9 @@ def build_score_only_target_oracle_catalog(
     ):
         if str(observed_cell.get(field) or "") != str(pair_ledger.get(pair_field) or ""):
             raise OracleCostMatchError(f"score-only target {field} does not match the predicted pair")
-    observed_payload = {
-        "status": "READY",
-        "by_kind": observed_cell.get("by_kind"),
-    }
-    bridge = {
-        "target_actual": observed_payload,
-        "target_predicted": pair_ledger.get("target_predicted"),
-    }
-    actual = _flatten_records(bridge, "target_actual")
-    predicted = _flatten_records(bridge, "target_predicted")
-    return _build_target_oracle_catalog(
-        actual,
-        predicted,
-        source_run=source_run,
-        source_scope_records=pair_ledger["source_scope_records"],
-        workload_id=pair_ledger.get("workload_id"),
-        target_run_id=pair_ledger.get("target_run_id"),
-    )
-
-
-def _build_target_oracle_catalog(
-    actual: list[dict[str, Any]],
-    predicted: list[dict[str, Any]],
-    *,
-    source_run: dict[str, Any],
-    source_scope_records: list[dict],
-    workload_id: Any,
-    target_run_id: Any,
-) -> dict[str, Any]:
-    scope_to_lane = _map_scopes_to_observed_lanes(actual, predicted, source_run, source_scope_records)
+    actual = _flatten_records(observed_cell, "target_actual")
+    predicted = _flatten_records(pair_ledger["target_predicted"], "target_predicted")
+    scope_to_lane = _map_scopes_to_observed_lanes(actual, predicted, source_run, pair_ledger["source_scope_records"])
 
     matched: list[dict[str, Any]] = []
     consumed_record_ids: set[str] = set()
@@ -131,17 +104,9 @@ def _build_target_oracle_catalog(
     for kind in kinds:
         scopes = sorted({str(row["resource_scope"]) for row in predicted if row["kind"] == kind})
         for scope in scopes:
-            lane = scope_to_lane.get(scope)
-            if lane is None:
-                raise OracleCostMatchError(f"no observed resource lane for scope {scope!r}")
-            predicted_group = sorted(
-                (row for row in predicted if row["kind"] == kind and row["resource_scope"] == scope),
-                key=_predicted_order,
-            )
-            actual_group = sorted(
-                (row for row in actual if row["kind"] == kind and row["lane_base"] == lane),
-                key=_actual_order,
-            )
+            lane = scope_to_lane[scope]
+            predicted_group = [row for row in predicted if row["kind"] == kind and row["resource_scope"] == scope]
+            actual_group = [row for row in actual if row["kind"] == kind and row["lane_base"] == lane]
             group_matches = _partition_observed_records_by_shape(
                 predicted_group,
                 actual_group,
@@ -162,55 +127,13 @@ def _build_target_oracle_catalog(
         raise OracleCostMatchError(f"unmatched target-observed records: {missing[:5]}")
     effect_ids = [str(row["effect_id"]) for row in matched]
     if len(effect_ids) != len(set(effect_ids)):
-        raise OracleCostMatchError("target self-pair contains duplicate predicted effect IDs")
+        raise OracleCostMatchError("pair contains duplicate predicted effect IDs")
     if len(matched) != len(predicted):
         raise OracleCostMatchError(f"matched effect count {len(matched)} != predicted effect count {len(predicted)}")
 
     return {
-        "workload_id": workload_id,
-        "target_run_id": target_run_id,
         "costs": sorted(matched, key=lambda row: (int(row["logical_order_epoch"]), str(row["effect_id"]))),
     }
-
-
-def build_pair_oracle_override(pair_ledger: dict[str, Any], target_catalog: dict[str, Any]) -> dict[str, Any]:
-    """Attach target-observed costs to one source-derived target structure."""
-
-    _require_ready(pair_ledger)
-    if pair_ledger.get("workload_id") != target_catalog.get("workload_id"):
-        raise OracleCostMatchError("pair and target catalog workload identities differ")
-    if pair_ledger.get("target_run_id") != target_catalog.get("target_run_id"):
-        raise OracleCostMatchError("pair and target catalog run identities differ")
-    catalog_by_effect = {str(row["effect_id"]): row for row in target_catalog.get("costs", [])}
-    predicted = _flatten_records(pair_ledger, "target_predicted")
-    predicted_by_effect = {str(row["effect_id"]): row for row in predicted}
-    if len(predicted_by_effect) != len(predicted):
-        raise OracleCostMatchError("pair contains duplicate predicted effect IDs")
-    if set(predicted_by_effect) != set(catalog_by_effect):
-        missing = sorted(set(catalog_by_effect) - set(predicted_by_effect))
-        extra = sorted(set(predicted_by_effect) - set(catalog_by_effect))
-        raise OracleCostMatchError(f"pair/target effect identity mismatch: missing={missing[:3]}, extra={extra[:3]}")
-
-    costs: list[dict[str, Any]] = []
-    for effect_id, structure in predicted_by_effect.items():
-        oracle = catalog_by_effect[effect_id]
-        _require_same_target_shape(structure, oracle)
-        costs.append(
-            {
-                "effect_id": effect_id,
-                "effect_type": structure["effect_type"],
-                "direction": structure["direction"],
-                "resource_scope": structure["resource_scope"],
-                "resource_lane": structure["resource_lane"],
-                "logical_order_epoch": int(structure["logical_order_epoch"]),
-                "operation_count": int(structure["operation_count"]),
-                "page_count": int(structure["page_count"]),
-                "byte_count": int(structure["byte_count"]),
-                "service_us": int(oracle["service_us"]),
-                "control_us": int(oracle["control_us"]),
-            }
-        )
-    return {"costs": sorted(costs, key=lambda row: (int(row["logical_order_epoch"]), str(row["effect_id"])))}
 
 
 def _require_ready(ledger: dict[str, Any]) -> None:
@@ -218,8 +141,7 @@ def _require_ready(ledger: dict[str, Any]) -> None:
         raise OracleCostMatchError(f"direct-effect ledger is not READY: {ledger.get('pair_id')}")
 
 
-def _flatten_records(ledger: dict[str, Any], side: str) -> list[dict[str, Any]]:
-    payload = ledger.get(side)
+def _flatten_records(payload: dict[str, Any], side: str) -> list[dict[str, Any]]:
     if not isinstance(payload, dict) or payload.get("status") != "READY":
         raise OracleCostMatchError(f"{side} is not READY")
     rows: list[dict[str, Any]] = []
@@ -351,15 +273,6 @@ def _oracle_cost_record(model_record: dict[str, Any], observed: list[dict[str, A
         "service_us": sum(int(row.get("service_us") or 0) for row in observed),
         "control_us": sum(int(row.get("control_us") or 0) for row in observed),
     }
-
-
-def _require_same_target_shape(structure: dict[str, Any], oracle: dict[str, Any]) -> None:
-    fields = ("effect_type", "direction", "resource_scope", "resource_lane", *SHAPE_FIELDS)
-    mismatches = [field for field in fields if structure.get(field) != oracle.get(field)]
-    if mismatches:
-        raise OracleCostMatchError(
-            f"target effect shape changed across sources for {structure.get('effect_id')}: {mismatches}"
-        )
 
 
 def _predicted_order(row: dict[str, Any]) -> tuple[int, str]:

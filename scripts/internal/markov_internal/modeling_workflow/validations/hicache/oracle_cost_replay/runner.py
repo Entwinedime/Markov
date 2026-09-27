@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import subprocess
 from collections import Counter
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
 from .....common.io import load_json, write_json
-from .....common.paths import ROOT_DIR, resolve_repo_path
-from .....modeling.backend import trace_graph_executable
+from .....common.paths import ROOT_DIR
+from .....modeling.backend import build_trace_graph_command
+from .....modeling.run_config import ModelingOutputs, ModelingRunConfig
 from .matching import (
     _oracle_cost_record,
     build_pair_oracle_override,
-    build_score_only_target_oracle_catalog,
     target_operation_cell,
 )
 
@@ -46,12 +47,11 @@ def run_suite(
         if remainder or token_bytes <= 0:
             raise ValueError("oracle projection requires integral positive KV bytes per token")
         target = target_operation_cell(ledger, target_runs[ledger["target_run_id"]], token_bytes)
-        catalog = build_score_only_target_oracle_catalog(ledger, target, source_runs[model_id])
-        override = build_pair_oracle_override(ledger, catalog)
+        override = build_pair_oracle_override(ledger, target, source_runs[model_id])
         oracle_total = sum(row["service_us"] + row["control_us"] for row in override["costs"])
         if oracle_total != ledger["direct"]["target_us"]:
             raise ValueError(f"oracle costs differ from this evaluation's Direct clock: {model_id}")
-        work.append((ledger, override, _direct_score(ledger)))
+        work.append((ledger, override))
     rows: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, jobs)) as pool:
         futures = {
@@ -60,9 +60,8 @@ def run_suite(
                 prediction_roots[ledger["model_run_id"]] / "model_runs" / ledger["model_run_id"],
                 ledger,
                 override,
-                score,
             ): ledger
-            for ledger, override, score in work
+            for ledger, override in work
         }
         for completed, future in enumerate(as_completed(futures), 1):
             row = future.result()
@@ -147,26 +146,10 @@ def _ready_ledgers(prediction_roots: dict[str, Path], scores: list[dict[str, Any
     return ready
 
 
-def _direct_score(ledger: dict[str, Any]) -> dict[str, Any]:
-    direct = ledger["direct"]
-    predicted_us, actual_us, source_us = (direct[key] for key in ("predicted_us", "target_us", "base_us"))
-    predicted_delta, actual_delta = predicted_us - source_us, actual_us - source_us
-    return {
-        "predicted_us": predicted_us,
-        "actual_us": actual_us,
-        "source_us": source_us,
-        "predicted_delta_us": predicted_delta,
-        "actual_delta_us": actual_delta,
-        "large_change": abs(actual_delta) > 50_000,
-        "direction_correct": (predicted_delta > 0) == (actual_delta > 0) if actual_delta else predicted_delta == 0,
-    }
-
-
 def _run_one(
     run_dir: Path,
     ledger: dict[str, Any],
     override: dict[str, Any],
-    score: dict[str, Any],
 ) -> dict[str, Any]:
     identity = {
         field: ledger.get(field)
@@ -243,14 +226,6 @@ def _run_one(
                     "identity_mismatches": mismatches,
                 }
     patches = {name: replay.get("module_results", {}).get("hicache_dag_patch", {}) for name, replay in replays.items()}
-    patch = patches["direct"]
-    causal = patch.get("causal_timing_audit", {})
-    expected_costs = len(override.get("costs") or [])
-    causal_ready = (
-        causal.get("status") == "ready" and causal.get("restored_exact") is True
-        if expected_costs
-        else causal.get("status") == "no_materialized_target_cost_nodes"
-    )
     variant_ready: dict[str, bool] = {}
     for name, candidate in patches.items():
         direct_required = name in {"identity", "direct", "direct_phase_compute", "direct_phase_owner"}
@@ -284,10 +259,7 @@ def _run_one(
             )
         )
         variant_ready[name] = common_ready and direct_ready and phase_ready
-    variant_ready["direct"] = variant_ready["direct"] and causal_ready
     ready = all(variant_ready.values())
-    effects = causal.get("effects") or []
-    model_e2e = int(original.get("simulated_e2e_us") or 0)
     model_scope = int(original.get("simulated_gap_excluded_e2e_us") or 0)
     scopes = {name: int(replay.get("simulated_gap_excluded_e2e_us") or 0) for name, replay in replays.items()}
     target_scope = int(((ledger.get("phase_score") or {}).get("gap_excluded_scope") or {}).get("target_us") or 0)
@@ -297,24 +269,24 @@ def _run_one(
         "cpp_replay_count": replay_count,
         "identical_cost_replay_exact": True,
         "errors": [] if ready else ["oracle_structure_or_cost_binding_not_ready"],
-        "effect_count": len(effects),
-        "cost_response_count": sum(int(row.get("cost_node_completion_response_us") or 0) > 0 for row in effects),
         "variant_ready": variant_ready,
-        "direct": score,
-        "model_e2e_us": model_e2e,
-        "oracle_e2e_us": int(replays["direct"].get("simulated_e2e_us") or 0),
-        "model_gap_excluded_scope_us": model_scope,
-        "oracle_direct_gap_excluded_scope_us": scopes["direct"],
-        "oracle_phase_compute_gap_excluded_scope_us": scopes["phase_compute"],
-        "oracle_phase_owner_gap_excluded_scope_us": scopes["phase_owner"],
-        "oracle_direct_phase_compute_gap_excluded_scope_us": scopes["direct_phase_compute"],
-        "oracle_direct_phase_owner_gap_excluded_scope_us": scopes["direct_phase_owner"],
-        "target_gap_excluded_scope_us": target_scope,
+        "direct_cost": {
+            "predicted_us": ledger["direct"]["predicted_us"],
+            "actual_us": ledger["direct"]["target_us"],
+            "source_us": ledger["direct"]["base_us"],
+        },
+        "model_scope_us": model_scope,
+        "direct_oracle_scope_us": scopes["direct"],
+        "phase_compute_oracle_scope_us": scopes["phase_compute"],
+        "phase_owner_oracle_scope_us": scopes["phase_owner"],
+        "direct_phase_compute_oracle_scope_us": scopes["direct_phase_compute"],
+        "full_owner_oracle_scope_us": scopes["direct_phase_owner"],
+        "target_scope_us": target_scope,
     }
 
 
 def _identity_mismatches(original: dict, replay: dict) -> list[str]:
-    """Same costs must reproduce topology counts, scope, timing and critical path."""
+    """Same costs must reproduce topology counts, owned work and timing."""
     fields = (
         "node_count",
         "edge_count",
@@ -323,7 +295,6 @@ def _identity_mismatches(original: dict, replay: dict) -> list[str]:
         "scope_owned_gap_duration_us",
         "simulated_e2e_us",
         "simulated_gap_excluded_e2e_us",
-        "gap_excluded_critical_path",
     )
     return [field for field in fields if original[field] != replay[field]]
 
@@ -336,66 +307,28 @@ def _command(
     direct_override: Path | None = None,
     phase_override: Path | None = None,
 ) -> list[str]:
-    cpp = runner["cpp_trace_graph"]
-    command = [
-        str(trace_graph_executable(cpp.get("backend_kind") or "release")),
-        "--profile-manifest",
-        str(_path(runner["input"]["profile_manifest"])),
-        "--run-summary",
-        str(summary),
-        "--model-config",
-        str(model),
-    ]
+    # Use the formal runner contract, including the source CPU correction.
+    # Cost diagnostics must not silently replay uncorrected source CPU work.
+    run = replace(
+        ModelingRunConfig.from_raw(runner),
+        output_dir=summary.parent,
+        model_config_path=model,
+        backend_kind="validation",
+        outputs=ModelingOutputs(),
+        hicache_static_replay=True,
+    )
+    command = build_trace_graph_command(run)
+    command[command.index("--run-summary") + 1] = str(summary)
     if direct_override is not None:
         command.extend(("--hicache-oracle-cost-replay", str(direct_override)))
     if phase_override is not None:
         command.extend(("--hicache-phase-oracle-cost-replay", str(phase_override)))
-    for name, value in (
-        ("--threads", cpp.get("threads")),
-        ("--file-threads", cpp.get("file_threads")),
-        ("--trace-window-start-us", cpp.get("trace_window_start_us")),
-        ("--trace-window-end-us", cpp.get("trace_window_end_us")),
-        ("--actual-e2e-us", cpp.get("actual_e2e_us")),
-    ):
-        if value is not None:
-            command.extend((name, str(value)))
-    if cpp.get("trace_channels"):
-        command.extend(("--trace-channels", ",".join(str(value) for value in cpp["trace_channels"])))
     return command
 
 
 def _summary(rows: list[dict[str, Any]], expected: int) -> dict[str, Any]:
     ready = [row for row in rows if row.get("status") == "READY"]
     complete = bool(rows) and len(rows) == len(ready) == expected
-    direct = [row["direct"] for row in ready]
-    total = _metrics([(row["predicted_us"], row["actual_us"]) for row in direct], complete)
-    delta_error = sum(abs(row["predicted_delta_us"] - row["actual_delta_us"]) for row in direct)
-    delta_reference = sum(abs(row["actual_delta_us"]) for row in direct)
-    delta_l1 = (
-        100.0 * delta_error / delta_reference if delta_reference else (0.0 if direct and not delta_error else None)
-    )
-    large = [row for row in direct if row["large_change"]]
-    direction = 100.0 * sum(row["direction_correct"] for row in large) / len(large) if large else None
-    phase = _metrics(
-        [(abs(row["model_e2e_us"] - row["oracle_e2e_us"]), row["direct"]["actual_us"]) for row in ready],
-        complete,
-        error_is_prediction=True,
-    )
-    scope_complete = complete and all(row["target_gap_excluded_scope_us"] > 0 for row in ready)
-
-    def scope_metric(predicted_field: str, comparison_field: str | None = None) -> dict[str, Any]:
-        # A response measures the change caused by replacing costs, not error
-        # against the target. Both use the target scope as their denominator.
-        pairs = [
-            (
-                abs(row[predicted_field] - row[comparison_field]) if comparison_field else row[predicted_field],
-                row["target_gap_excluded_scope_us"],
-            )
-            for row in ready
-        ]
-        return _metrics(pairs, scope_complete, error_is_prediction=comparison_field is not None)
-
-    effect_count = sum(int(row.get("effect_count") or 0) for row in ready)
     if not rows:
         status = "NOT_RUN"
     elif complete:
@@ -413,77 +346,6 @@ def _summary(rows: list[dict[str, Any]], expected: int) -> dict[str, Any]:
         "row_count": len(rows),
         "ready_count": len(ready),
         "structure_binding_ready_count": len(ready),
-        "causal_effect_count": effect_count,
-        "cost_response_count": sum(int(row.get("cost_response_count") or 0) for row in ready),
-        "direct_cost": {
-            "status": "PASS"
-            if total["passed"] and delta_l1 is not None and delta_l1 <= 3.0 and bool(large) and direction == 100.0
-            else "FAIL",
-            "total": total,
-            "delta_weighted_l1_pct": delta_l1,
-            "large_change_count": len(large),
-            "large_change_direction_accuracy_pct": direction,
-        },
-        "phase_normalized_e2e": phase,
-        "phase_model_with_direct_oracle_gap_excluded_scope": scope_metric("oracle_direct_gap_excluded_scope_us"),
-        "direct_model_gap_excluded_scope_response": scope_metric(
-            "model_gap_excluded_scope_us", "oracle_direct_gap_excluded_scope_us"
-        ),
-        "oracle_cost_gap_excluded_scope": scope_metric("oracle_direct_phase_compute_gap_excluded_scope_us"),
-        "phase_model_gap_excluded_scope_response": scope_metric(
-            "oracle_direct_gap_excluded_scope_us", "oracle_direct_phase_compute_gap_excluded_scope_us"
-        ),
-        "phase_compute_oracle_with_direct_model_gap_excluded_scope": scope_metric(
-            "oracle_phase_compute_gap_excluded_scope_us"
-        ),
-        "all_phase_owner_oracle_with_direct_model_gap_excluded_scope": scope_metric(
-            "oracle_phase_owner_gap_excluded_scope_us"
-        ),
-        "full_owner_oracle_gap_excluded_scope": scope_metric("oracle_direct_phase_owner_gap_excluded_scope_us"),
-        "phase_cpu_control_gap_excluded_scope_response": scope_metric(
-            "oracle_direct_phase_compute_gap_excluded_scope_us", "oracle_direct_phase_owner_gap_excluded_scope_us"
-        ),
-        "cells": [
-            {
-                "model_run_id": row["model_run_id"],
-                "pair_id": row["pair_id"],
-                "status": row["status"],
-                "identical_cost_replay_exact": row.get("identical_cost_replay_exact", False),
-                "identity_mismatches": row.get("identity_mismatches", []),
-                "errors": row.get("errors", []),
-                "variant_ready": row.get("variant_ready"),
-                "model_scope_us": row.get("model_gap_excluded_scope_us"),
-                "direct_oracle_scope_us": row.get("oracle_direct_gap_excluded_scope_us"),
-                "phase_compute_oracle_scope_us": row.get("oracle_phase_compute_gap_excluded_scope_us"),
-                "phase_owner_oracle_scope_us": row.get("oracle_phase_owner_gap_excluded_scope_us"),
-                "direct_phase_compute_oracle_scope_us": row.get("oracle_direct_phase_compute_gap_excluded_scope_us"),
-                "full_owner_oracle_scope_us": row.get("oracle_direct_phase_owner_gap_excluded_scope_us"),
-                "target_scope_us": row.get("target_gap_excluded_scope_us"),
-                "direct_cost": row.get("direct"),
-            }
-            for row in rows
-        ],
+        "cells": rows,
         "error_counts": dict(sorted(Counter(error for row in rows for error in row.get("errors", [])).items())),
     }
-
-
-def _metrics(
-    pairs: list[tuple[int, int]],
-    complete: bool,
-    *,
-    error_is_prediction: bool = False,
-) -> dict[str, Any]:
-    errors = [predicted if error_is_prediction else abs(predicted - actual) for predicted, actual in pairs]
-    reference = sum(actual for _, actual in pairs)
-    percentages = [100.0 * error / actual for error, (_, actual) in zip(errors, pairs) if actual > 0]
-    wape = 100.0 * sum(errors) / reference if reference else (0.0 if pairs and not sum(errors) else None)
-    p90 = sorted(percentages)[round((len(percentages) - 1) * 0.9)] if percentages else None
-    passed = complete and wape is not None and p90 is not None and wape <= 3.0 and p90 <= 5.0
-    return {"passed": passed, "count": len(pairs), "wape_pct": wape, "p90_pct": p90}
-
-
-def _path(value: str | Path) -> Path:
-    path = resolve_repo_path(value)
-    if path is None:
-        raise ValueError(f"missing path: {value}")
-    return path

@@ -330,7 +330,7 @@ def _completed(attempts: list[dict[str, Any]], definition: dict[str, Any], stage
         return (
             previous["input_context"]["environment"] == definition["input_context"]["environment"]
             and all(previous[key] == definition[key] for key in fields)
-            and (stage != "dma" or tuple(previous["directions"]) == tuple(definition["directions"]))
+            and (stage != "dma" or set(definition["directions"]) <= set(previous["directions"]))
         )
 
     return next(

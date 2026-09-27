@@ -8,6 +8,36 @@ from statistics import mean
 from ...modeling.workload import WorkloadWindow
 
 
+def score_cell(
+    prediction: dict,
+    run: dict,
+    target_run_id: str,
+    *,
+    source_windows: tuple[WorkloadWindow | None, ...] = (),
+    target_windows: tuple[WorkloadWindow | None, ...] = (),
+) -> dict:
+    """Score completed predictions without extracting component or target-DAG costs."""
+    return {
+        **{key: value for key, value in prediction.items() if key not in {"shape", "target_hicache"}},
+        "target_run_id": target_run_id,
+        "target_observation_used": True,
+        "full_e2e": score_http(run, source_windows, target_windows),
+    }
+
+
+def score_metrics(rows: list[dict]) -> dict:
+    """HTTP-only acceptance; oracle diagnostics do not change this result."""
+    http = http_metrics(rows)
+    gates = http_gates(http)
+    return {
+        "status": "PASS" if all(gates.values()) else "MODEL_LIMITATION",
+        "acceptance_scope": "full_http_formal_window",
+        "cell_count": len(rows),
+        "gates": gates,
+        "full_e2e": http,
+    }
+
+
 def score_http(run: dict, source: tuple[WorkloadWindow | None, ...], target: tuple[WorkloadWindow | None, ...]) -> dict:
     """Compare duration means; retain real sample windows, never average trace coordinates."""
 

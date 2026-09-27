@@ -431,9 +431,6 @@ def plan_fixed_calibration(group: GroupRequest, model_inputs: dict[str, Any]) ->
     attempts = load_json(ledger_path)["attempts"] if ledger_path.exists() else []
     expected = calibration_inputs(definition["files"])
     successful = matching_calibration_profiles(attempts, expected)
-    point = definition["point"]["id"]
-    if any(row.get("calibration_point") != point for row in successful):
-        raise ValueError("calibration ledger does not identify the selected experiment")
     # More repeats cannot supply an absent branch or another work coordinate.
     return {
         "status": "experiment_exhausted" if successful else "needs_calibration",

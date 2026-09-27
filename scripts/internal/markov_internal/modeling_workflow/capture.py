@@ -167,11 +167,7 @@ def capture_calibration(group: GroupRequest, definition: dict[str, Any], *, stag
     point_id = point["id"]
     inputs = {key: definition["files"][key] for key in ("template", "config_specs")}
     current_inputs = calibration_inputs(inputs)
-    profiles = [
-        row
-        for row in matching_calibration_profiles(attempts, current_inputs, stage=stage)
-        if row.get("calibration_point") == point_id
-    ]
+    profiles = matching_calibration_profiles(attempts, current_inputs, stage=stage)
     mode = "capture" if stage in {"capture", "token_plan_capture"} else "replay"
     bundle = None
     replay_inputs = None

@@ -56,6 +56,8 @@ def build_trace_graph_command(run: ModelingRunConfig) -> list[str]:
         command.extend(["--cpu-service-cost", str(run.cpu_service_cost)])
     if run.outputs.debug_logging:
         command.append("--debug")
+    if run.hicache_static_replay:
+        command.append("--hicache-static-replay")
     if run.outputs.dag_chrome_trace:
         command.extend(["--graph-output", str(run.output_dir / "dag_chrome_trace.json")])
     if run.outputs.module_summary:
