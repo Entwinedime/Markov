@@ -4,6 +4,61 @@
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
+
+void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call,
+                                           const HiCacheHostExpansion & plan, bool candidate) {
+    for (const auto node : plan.resource_nodes()) {
+        const auto lane = source.graph().node(node).lane_id;
+        if (call.positions.contains(lane)) continue;
+
+        if (!candidate) {
+            call.positions.emplace(lane, observe_write_stream_position(source, node, call.pid, call.tid, call.at_us));
+            continue;
+        }
+
+        // Missing candidate resources matter only if the target selects them.
+        // Keep the original observation failure for that later demand.
+        auto & issues = capacity_position_errors_[call.owner];
+        if (issues.contains(lane)) continue;
+
+        try {
+            call.positions.emplace(lane, observe_write_stream_position(source, node, call.pid, call.tid, call.at_us));
+        }
+        catch (const std::runtime_error & error) {
+            issues.emplace(lane, error.what());
+        }
+    }
+}
+
+std::vector<HiCacheHostExpansion *> HiCacheWriteCalls::host_plans() {
+    std::vector<HiCacheHostExpansion *> plans;
+    for (auto & [id, donor] : templates_) plans.push_back(&donor.expansion);
+    for (auto & donor : eviction_controls_) plans.push_back(&donor.expansion);
+
+    for (auto & donor : load_admissions_) {
+        for (auto * step : { &donor.prefix, &donor.retry, &donor.clone })
+            if (*step) plans.push_back(&(*step)->work);
+        for (auto & step : donor.allocation) plans.push_back(&step.work);
+        plans.push_back(&donor.tail.work);
+        if (donor.failure) plans.push_back(&*donor.failure);
+    }
+
+    for (auto & [id, plan] : load_failure_templates_) plans.push_back(&plan);
+    return plans;
+}
+
+HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact,
+                                                           const model::HiCacheDeviceWrite & operation, HiCacheHostSequence & sequence,
+                                                           simulation::FutureDag & future) {
+    const auto projected = resize_write_pages(sample.expansion, operation.schedule.effective_byte_count, page_bytes_);
+    auto expanded = sequence.append(projected, operation.schedule.duration_us, sample.position_lanes);
+    const auto completion = writes_.submit_expanded(fact, operation, expanded.write_start, expanded.completion, future);
+
+    completions_.emplace(std::pair{ operation.header.cache_scope, operation.header.operation_id }, completion);
+    ++expanded_;
+    return expanded;
+}
+
 const HiCacheWriteCalls::WriteTemplate & HiCacheWriteCalls::select_write_template(const std::string & pid, const std::string & tid, uint64_t bytes) const {
     const WriteTemplate * selected = nullptr;
     uint64_t nearest = 0;
@@ -230,12 +285,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         }
         for (const auto & [id, donor] : templates_) {
             if (donor.pid != call.pid || donor.tid != call.tid) continue;
-            const auto locate = [&](size_t sample) {
-                const auto lane = graph.node(sample).lane_id;
-                if (!call.positions.contains(lane))
-                    call.positions.emplace(lane, observe_write_stream_position(bound_source, sample, call.pid, call.tid, call.at_us));
-            };
-            for (const auto node : donor.expansion.resource_nodes()) locate(node);
+            bind_call_resources(bound_source, call, donor.expansion);
         }
     }
     // Prepare the work outside complete write calls. These source regions are
@@ -261,7 +311,6 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     load_release_calibration(graph, queues);
     prepare_load_capacity(bound_source, queues);
     prepare_load_admissions(bound_source, queues);
-    prepare_generated_load_admissions(bound_source, queues);
     replace_source_evictions(graph, begin, end);
     bind_capacity_calls(patch::HiCacheSourceDagIndex(graph));
     prepare_empty_load_branches(graph);
@@ -342,13 +391,10 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
                     auto complete = completions_.find(key);
                     if (complete == completions_.end()) {
                         if (pending.header.source_node_id != call.owner) throw std::runtime_error("Unsubmitted target write belongs to another host action");
-                        const auto * donor = &select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
-                        const auto projected = resize_write_pages(donor->expansion, pending.schedule.effective_byte_count, page_bytes_);
-                        const auto expanded = sequence.append(projected, pending.schedule.duration_us, donor->position_lanes);
+                        const auto & donor = select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
+                        const auto expanded = submit_target_write(donor, fact, pending, sequence, future);
                         for (const auto successor : call.successors) future.depend(expanded.host_return, successor);
-                        const auto done = writes_.submit_expanded(fact, pending, expanded.write_start, expanded.completion, future);
-                        complete = completions_.emplace(key, done).first;
-                        ++expanded_;
+                        complete = completions_.find(key);
                     }
                     if (call.waiting) future.depend(complete->second, call.return_node);
                 }
@@ -377,28 +423,23 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
         const auto & branch = at->second;
         const auto * work = replay_.state().load_admission_work(replay_.fact(branch.owner).fact);
         if (!work) throw std::logic_error("Load allocation return lost its target work");
-        if (branch.expected_allocation && work->allocated != *branch.expected_allocation)
+        if (work->allocated != branch.expected_allocation)
             throw std::logic_error("Load allocation return disagrees with the projected target capacity outcome");
-        if (!work->allocated && branch.donor) throw std::runtime_error("New load admission needs a failed-return template after capacity exhaustion");
+        const auto & program = load_admissions_.at(branch.program);
         HiCacheHostSequence suffix(capacity_calls_.at(branch.owner).positions, stream_insertions_, future);
         size_t returned;
-        if (branch.donor) {
-            const auto & donor = load_admissions_.at(*branch.donor);
-            returned = suffix.append(donor.suffix, donor.suffix_lanes).host_return;
+        if (work->allocated) {
+            if (program.clone)
+                for (const auto pages : work->node_pages) {
+                    if (!pages) throw std::logic_error("Target load contains an empty promoted node");
+                    (void)suffix.append(program.clone->work, program.clone->lanes);
+                }
+            returned = suffix.append(program.tail.work, program.tail.lanes).host_return;
         }
         else {
-            const auto & fact = replay_.fact(branch.owner).fact;
-            const auto & program = generated_load_admissions_.at({ fact.pid, fact.tid });
-            for (const auto pages : work->allocated ? work->node_pages : std::vector<uint64_t>{}) {
-                if (!pages) throw std::logic_error("Target load contains an empty promoted node");
-                (void)suffix.append(program.clone, program.lanes);
-            }
-            if (work->allocated) returned = suffix.append(program.tail, {}).host_return;
-            else {
-                auto cleanup = load_failure_templates_.at(branch.owner);
-                for (auto & part : cleanup.nodes) part.work.name = "target failed load cleanup: base control cost proxy";
-                returned = suffix.append(cleanup, {}).host_return;
-            }
+            auto cleanup = load_failure_templates_.at(branch.owner);
+            for (auto & part : cleanup.nodes) part.work.name = "target failed load cleanup: base control cost proxy";
+            returned = suffix.append(cleanup, {}).host_return;
         }
         future.depend(returned, branch.continuation);
     }

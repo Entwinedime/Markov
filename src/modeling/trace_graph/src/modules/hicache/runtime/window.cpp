@@ -67,7 +67,6 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     confirmations.replace_load_tails(graph);
     writes.replace_active_load_branches(graph);
     loads.replace_source_submissions(graph);
-    loads.rebind_workers(graph);
     {
         const patch::HiCacheSourceDagIndex source(graph);
         core::DagMutationPlan plan{ .component = "cpu_collective" };
@@ -80,8 +79,13 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     }
     const auto preparation_source = observe_allocator_preparations(graph);
     const auto preparation_slots = bind_allocator_preparation_costs(graph, preparation_source);
-    writes.rebind_retained_resources(graph);
-    writes.rebind_consumers(patch::HiCacheSourceDagIndex(graph));
+    // No source regions are replaced after this point. Every generated host
+    // operation binds against the same surviving worker queues.
+    const auto workers = observe_host_worker_members(graph);
+    loads.rebind_workers(graph, workers);
+    layer_calls.rebind_workers(graph, workers);
+    write_confirmations.rebind_workers(graph, workers);
+    writes.rebind_retained_resources(graph, workers);
     std::map<size_t, size_t> preparation_at;
     for (const auto & [call, node] : preparation_slots) preparation_at.emplace(node, call);
     std::map<size_t, uint64_t> preparation_costs, operator_costs;

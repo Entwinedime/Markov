@@ -19,33 +19,26 @@ namespace markov::trace_graph::modules::hicache {
 
 namespace {
 
-double interpolate_curve(const std::vector<std::pair<double, double>> & points, double coordinate, bool logarithmic_value = true) {
+double interpolate_curve(const auto & points, double coordinate, auto axis, auto value, bool logarithmic_value = true) {
     if (points.empty() || coordinate <= 0.0) return 0.0;
-    if (coordinate <= points.front().first) return points.front().second;
-    if (coordinate >= points.back().first) return points.back().second;
+    if (coordinate <= axis(points.front())) return value(points.front());
+    if (coordinate >= axis(points.back())) return value(points.back());
     for (size_t index = 1; index < points.size(); ++index) {
         const auto & left = points[index - 1];
         const auto & right = points[index];
-        if (coordinate > right.first) continue;
-        const auto position = (std::log(coordinate) - std::log(left.first)) / (std::log(right.first) - std::log(left.first));
-        if (logarithmic_value) return std::exp(std::log(left.second) + position * (std::log(right.second) - std::log(left.second)));
-        return left.second + position * (right.second - left.second);
+        if (coordinate > axis(right)) continue;
+        const auto position = (std::log(coordinate) - std::log(axis(left))) / (std::log(axis(right)) - std::log(axis(left)));
+        if (logarithmic_value) return std::exp(std::log(value(left)) + position * (std::log(value(right)) - std::log(value(left))));
+        return value(left) + position * (value(right) - value(left));
     }
     return 0.0;
 }
 
-std::pair<double, double> interpolated_transfer(const auto & points, double page_bytes) {
-    std::vector<std::pair<double, double>> setup;
-    std::vector<std::pair<double, double>> bandwidth;
-    setup.reserve(points.size());
-    bandwidth.reserve(points.size());
-    for (const auto & point : points) {
-        setup.emplace_back(static_cast<double>(point.page_bytes), point.setup_us_per_operation);
-        bandwidth.emplace_back(static_cast<double>(point.page_bytes), point.bandwidth_bytes_per_sec);
-    }
+std::pair<double, double> interpolated_transfer(const std::vector<frontend::HiCacheIoTransferPoint> & points, double page_bytes) {
+    const auto axis = [](const auto & point) { return static_cast<double>(point.page_bytes); };
     return {
-        interpolate_curve(setup, page_bytes, false),
-        interpolate_curve(bandwidth, page_bytes),
+        interpolate_curve(points, page_bytes, axis, [](const auto & point) { return point.setup_us_per_operation; }, false),
+        interpolate_curve(points, page_bytes, axis, [](const auto & point) { return point.bandwidth_bytes_per_sec; }),
     };
 }
 
@@ -55,11 +48,13 @@ double interpolated_existing_key_bandwidth(const frontend::HiCacheIoServiceModel
         by_page[point.page_bytes].emplace_back(static_cast<double>(point.operation_pages), point.bandwidth_bytes_per_sec);
     std::vector<std::pair<double, double>> page_curve;
     page_curve.reserve(by_page.size());
+    const auto axis = [](const auto & point) { return point.first; };
+    const auto value = [](const auto & point) { return point.second; };
     for (auto & [calibrated_page, operation_curve] : by_page) {
         std::ranges::sort(operation_curve, {}, &std::pair<double, double>::first);
-        page_curve.emplace_back(static_cast<double>(calibrated_page), interpolate_curve(operation_curve, operation_pages));
+        page_curve.emplace_back(static_cast<double>(calibrated_page), interpolate_curve(operation_curve, operation_pages, axis, value));
     }
-    return interpolate_curve(page_curve, page_bytes);
+    return interpolate_curve(page_curve, page_bytes, axis, value);
 }
 
 } // namespace

@@ -203,7 +203,6 @@ public:
     void apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bool observe_effects = true,
                     HiCacheLifecycleExecution lifecycle = HiCacheLifecycleExecution::Immediate);
     [[nodiscard]] bool lifecycle_return_pending(const HiCacheFact & fact) const;
-    [[nodiscard]] bool lifecycle_insert_pending(const HiCacheFact & fact) const;
     /** Advance only whole target nodes covered by the ready logical prefix. */
     void advance_lifecycle_insert(const HiCacheFact & fact, uint64_t ready_tokens);
     void complete_lifecycle_return(const HiCacheFact & fact);

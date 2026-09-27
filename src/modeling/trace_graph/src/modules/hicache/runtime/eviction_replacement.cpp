@@ -103,36 +103,12 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
             if (action == Action::Submit) source_owners_.insert(calls_[index].owner);
             if (action == Action::Wait) wait_owners_.insert(calls_[index].owner);
         }
-    std::vector<HiCacheHostExpansion *> templates;
-    for (auto & [id, donor] : templates_) templates.push_back(&donor.expansion);
-    for (auto & donor : eviction_controls_) templates.push_back(&donor.expansion);
-    for (auto & donor : load_admissions_) {
-        templates.push_back(&donor.prefix);
-        templates.push_back(&donor.allocation);
-        templates.push_back(&donor.suffix);
-        if (donor.failure) templates.push_back(&*donor.failure);
-        if (donor.retry) templates.push_back(&*donor.retry);
-    }
-    for (auto & [id, donor] : load_failure_templates_) templates.push_back(&donor);
-    for (auto & [lane, program] : generated_load_admissions_) {
-        for (auto & operation : program.allocation) templates.push_back(&operation);
-        templates.push_back(&program.clone);
-    }
-    rebind_host_worker_queues(graph, templates);
     const patch::HiCacheSourceDagIndex surviving(graph);
     for (auto & call : replacements) {
-        const auto locate = [&](const HiCacheHostExpansion & expansion) {
-            const auto add = [&](size_t node) {
-                const auto lane = graph.node(node).lane_id;
-                if (!call.positions.contains(lane))
-                    call.positions.emplace(lane, observe_write_stream_position(surviving, node, call.pid, call.tid, call.at_us));
-            };
-            for (const auto node : expansion.resource_nodes()) add(node);
-        };
         for (const auto & [id, donor] : templates_)
-            if (donor.pid == call.pid && donor.tid == call.tid) locate(donor.expansion);
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.expansion);
         for (const auto & donor : eviction_controls_)
-            if (donor.pid == call.pid && donor.tid == call.tid) locate(donor.expansion);
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.expansion);
         if (!graph.node(call.return_node).active) throw std::runtime_error("Eviction replacement removed its allocation return");
         allocation_returns_[call.return_node].push_back(call.owner);
         capacity_at_.emplace(call.entry_node, call.owner);

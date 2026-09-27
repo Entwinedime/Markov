@@ -138,30 +138,9 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
         empty_load_branches_.emplace(gate, EmptyLoadBranch{ branch->owner, first, std::move(original) });
         Call call{ .owner = branch->owner, .pid = event.pid, .tid = event.tid, .at_us = event.ts, .entry_node = gate };
         call.lane = std::string(graph.node_lane_key(first));
-        const auto positions = [&](const HiCacheHostExpansion & plan) {
-            const auto observe = [&](size_t sample) {
-                const auto lane = graph.node(sample).lane_id;
-                if (call.positions.contains(lane) || capacity_position_errors_[call.owner].contains(lane)) return;
-                try {
-                    call.positions.emplace(lane, observe_write_stream_position(source, sample, call.pid, call.tid, call.at_us));
-                }
-                catch (const std::runtime_error & error) {
-                    capacity_position_errors_[call.owner].emplace(lane, error.what());
-                }
-            };
-            for (const auto node : plan.resource_nodes()) observe(node);
-        };
+        const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(source, call, plan, true); };
         for (const auto & donor : load_admissions_)
-            if (donor.pid == call.pid && donor.tid == call.tid) {
-                positions(donor.prefix);
-                positions(donor.allocation);
-                positions(donor.suffix);
-                if (donor.retry) positions(*donor.retry);
-            }
-        if (const auto at = generated_load_admissions_.find({ call.pid, call.tid }); at != generated_load_admissions_.end()) {
-            for (const auto & plan : at->second.allocation) positions(plan);
-            positions(at->second.clone);
-        }
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_load_resources(source, call, donor);
         for (const auto & [id, donor] : templates_)
             if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
         for (const auto & donor : eviction_controls_)
@@ -178,13 +157,20 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
 }
 
 void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
-    if (load_index_calibration_.empty()) return;
     const patch::HiCacheSourceDagIndex source(graph);
     std::vector<const HiCacheLoadBranch *> branches;
     std::vector<HiCacheHostTemplate> hosts;
     std::set<size_t> owners;
     for (const auto & branch : load_branches_) {
         if (branch.condition.arg("needed") != "true") continue;
+        // Base-derived clone primitives and independent primitives use the
+        // same target branch replacement. Unsupported aggregate evidence does
+        // not silently claim a new operation-count model.
+        if (load_index_calibration_.empty()
+            && !std::ranges::any_of(load_admissions_, [&](const auto & program) {
+                   return program.pid == branch.envelope.pid && program.tid == branch.envelope.tid && program.clone.has_value();
+               }))
+            continue;
         branches.push_back(&branch);
         owners.insert(branch.owner);
         const auto & first = graph.event_for_node(branch.entry_node);
@@ -211,9 +197,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     const patch::HiCacheSourceDagIndex retained(graph);
     for (const auto * branch : branches) {
         const auto key = std::pair{ branch->envelope.pid, branch->envelope.tid };
-        const auto program = generated_load_admissions_.find(key);
-        if (program == generated_load_admissions_.end())
-            throw std::runtime_error("Active load admission lacks independent costs or scheduler resource evidence");
+        const auto & program = load_admissions_.at(select_load_admission(key.first, key.second, 0));
         HiCacheHostExpansion empty;
         for (const auto & [node, candidate] : empty_load_branches_) {
             const auto & fact = replay_.fact(candidate.owner).fact;
@@ -223,8 +207,8 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
             }
         }
         if (empty.nodes.empty()) {
-            empty = program->second.tail;
-            for (auto & part : empty.nodes) part.work.name = "target no-load branch: independent bookkeeping cost proxy";
+            empty = program.tail.work;
+            for (auto & part : empty.nodes) part.work.name = "target no-load branch: bookkeeping cost proxy";
         }
         empty_load_branches_.emplace(branch->entry_node, EmptyLoadBranch{ branch->owner, branch->return_node, std::move(empty) });
         const auto & event = graph.event_for_node(branch->entry_node);
@@ -234,21 +218,8 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
                    .at_us = event.ts,
                    .entry_node = branch->entry_node,
                    .lane = std::string(graph.node_lane_key(branch->entry_node)) };
-        const auto positions = [&](const HiCacheHostExpansion & plan) {
-            const auto observe = [&](size_t sample) {
-                const auto lane = graph.node(sample).lane_id;
-                if (call.positions.contains(lane) || capacity_position_errors_[call.owner].contains(lane)) return;
-                try {
-                    call.positions.emplace(lane, observe_write_stream_position(retained, sample, call.pid, call.tid, call.at_us));
-                }
-                catch (const std::runtime_error & error) {
-                    capacity_position_errors_[call.owner].emplace(lane, error.what());
-                }
-            };
-            for (const auto node : plan.resource_nodes()) observe(node);
-        };
-        for (const auto & plan : program->second.allocation) positions(plan);
-        positions(program->second.clone);
+        const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(retained, call, plan, true); };
+        bind_load_resources(retained, call, program);
         for (const auto & [id, donor] : templates_)
             if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
         for (const auto & donor : eviction_controls_)
@@ -257,7 +228,7 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     }
 }
 
-void HiCacheWriteCalls::rebind_retained_resources(core::DagGraph & graph) {
+void HiCacheWriteCalls::rebind_retained_resources(core::DagGraph & graph, const std::map<size_t, size_t> & members) {
     // Bind after all source regions have been replaced, including load
     // submissions whose compute Records can be the next stream endpoint.
     const patch::HiCacheSourceDagIndex retained(graph);
@@ -273,15 +244,9 @@ void HiCacheWriteCalls::rebind_retained_resources(core::DagGraph & graph) {
     for (auto & [owner, call] : capacity_calls_) refresh(call);
     for (auto & [node, calls] : lifecycle_writes_at_)
         for (auto & call : calls) refresh(call);
-    std::vector<HiCacheHostExpansion *> plans;
-    for (auto & [id, donor] : templates_) plans.push_back(&donor.expansion);
-    for (auto & donor : eviction_controls_) plans.push_back(&donor.expansion);
-    for (auto & [id, plan] : load_failure_templates_) plans.push_back(&plan);
-    for (auto & [key, program] : generated_load_admissions_) {
-        for (auto & plan : program.allocation) plans.push_back(&plan);
-        plans.push_back(&program.clone);
-    }
-    rebind_host_worker_queues(graph, plans);
+    auto plans = host_plans();
+    rebind_host_worker_queues(graph, members, plans);
+    writes_.rebind_consumers(retained);
 }
 
 void HiCacheWriteCalls::prepare_load_capacity(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {

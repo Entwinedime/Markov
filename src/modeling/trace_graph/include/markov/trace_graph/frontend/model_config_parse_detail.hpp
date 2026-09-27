@@ -35,7 +35,6 @@ void require_exact_fields(const Json & object, const std::string & context, std:
 [[nodiscard]] double number_value(const Json & object, const std::string & key, double fallback);
 [[nodiscard]] uint64_t u64_value(const Json & object, const std::string & key, uint64_t fallback);
 [[nodiscard]] bool bool_value(const Json & object, const std::string & key, bool fallback);
-[[nodiscard]] std::map<std::string, std::string> string_map_value(const Json & object, const std::string & key);
 
 [[nodiscard]] std::map<std::string, HiCacheIoServiceModelConfig> parse_hicache_service_models(const Json & io_cost);
 [[nodiscard]] HiCacheIoCostConfig parse_hicache_io_cost(const Json & hicache);

@@ -11,6 +11,7 @@ public:
         : insertions_(insertions), calibration_(std::move(calibration)) {}
     using Consumer = std::function<const std::vector<size_t> &(const std::string &, uint64_t)>;
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end);
+    void rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members);
     void advance(size_t node, const Consumer & consumer, simulation::FutureDag & future);
     [[nodiscard]] size_t prepared_calls() const { return calls_.size(); }
     [[nodiscard]] size_t active_calls() const { return active_; }

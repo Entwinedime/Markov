@@ -18,6 +18,7 @@ public:
     void prepare(core::DagGraph & graph, const std::string & calibration, uint64_t begin, uint64_t end,
                  const std::vector<core::TraceEvent> & replaced, std::optional<uint64_t> idle_since_us = std::nullopt);
     void replace_source_tails(core::DagGraph & graph);
+    void rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members);
     size_t expand(const WriteConfirmationWork & work, model::HiCacheState & state,
                   const HiCacheWriteCalls & writes, simulation::FutureDag & future) const;
 private:

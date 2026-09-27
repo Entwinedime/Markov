@@ -110,18 +110,6 @@ bool bool_value(const Json & object, const std::string & key, bool def) {
     throw std::runtime_error("Model config field '" + key + "' must be a boolean");
 }
 
-std::map<std::string, std::string> string_map_value(const Json & object, const std::string & key) {
-    const auto it = object.find(key);
-    if (it == object.end()) return {};
-    if (!it->is_object()) throw std::runtime_error("Model config field '" + key + "' must be an object");
-    std::map<std::string, std::string> values;
-    for (const auto & [name, value] : it->items()) {
-        if (!value.is_string()) throw std::runtime_error("Model config field '" + key + "." + name + "' must be a string");
-        values.emplace(name, value.get<std::string>());
-    }
-    return values;
-}
-
 NodeScaleConfig parse_node_scale(const Json & root) {
     NodeScaleConfig config;
     const auto it = root.find("node_scale");

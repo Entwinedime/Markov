@@ -118,9 +118,12 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
         regions.push_back({*bound[2*i], *bound[2*i+1], &hosts[i]});
     }
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, regions));
+}
+
+void HiCacheWriteConfirmations::rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members) {
     std::vector<HiCacheHostExpansion *> plans;
     for (auto & [lane, samples] : templates_) for (auto & [count, plan] : samples) plans.push_back(&plan);
-    rebind_host_worker_queues(graph, plans);
+    rebind_host_worker_queues(graph, members, plans);
 }
 
 size_t expand_write_confirmation_batches(const HiCacheHostExpansion & empty,

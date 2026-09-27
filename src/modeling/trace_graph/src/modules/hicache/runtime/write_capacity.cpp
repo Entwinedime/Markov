@@ -205,14 +205,10 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             const auto operation =
                 std::ranges::find_if(queued, [&](const auto & write) { return write.node == victim && write.header.source_node_id == call.owner; });
             if (operation == queued.end()) throw std::runtime_error("Selected target victim has no queued write");
-            const auto * donor = &select_write_template(call.pid, call.tid, operation->schedule.effective_byte_count);
-            check_positions(donor->position_lanes);
-            const auto projected = resize_write_pages(donor->expansion, operation->schedule.effective_byte_count, page_bytes_);
-            const auto expanded = sequence.append(projected, operation->schedule.duration_us, donor->position_lanes);
-            const auto done = writes_.submit_expanded(fact, *operation, expanded.write_start, expanded.completion, future);
-            completions_.emplace(std::pair{ operation->header.cache_scope, operation->header.operation_id }, done);
+            const auto & donor = select_write_template(call.pid, call.tid, operation->schedule.effective_byte_count);
+            check_positions(donor.position_lanes);
+            const auto expanded = submit_target_write(donor, fact, *operation, sequence, future);
             last = expanded.host_return;
-            ++expanded_;
         }
         else {
             const auto & donor = select_host(step);

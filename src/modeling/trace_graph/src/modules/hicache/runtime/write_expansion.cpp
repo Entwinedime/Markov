@@ -53,10 +53,15 @@ HiCacheHostExpansion calibrated_cpu_control(std::string_view lane, double cost_u
     return plan;
 }
 
-void rebind_host_worker_queues(const core::DagGraph & graph, std::span<HiCacheHostExpansion *> plans) {
+std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph) {
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<size_t, size_t> members;
     for (const auto & task : queues.tasks) members.emplace(graph.node(task.first).lane_id, task.first);
+    return members;
+}
+
+void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members,
+                              std::span<HiCacheHostExpansion *> plans) {
     std::vector<std::pair<HiCacheHostExpansion::Node *, size_t>> bindings;
     for (auto * plan : plans)
         for (auto & node : plan->nodes) {

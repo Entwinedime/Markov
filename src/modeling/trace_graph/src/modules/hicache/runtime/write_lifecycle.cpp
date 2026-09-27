@@ -205,11 +205,7 @@ void HiCacheWriteCalls::bind_lifecycle_writes(core::DagGraph & graph) {
         }
         for (const auto & [id, donor] : templates_) {
             if (donor.pid != call.pid || donor.tid != call.tid || donor.write_back != std::optional<bool>{ write_back_ }) continue;
-            const auto locate = [&](size_t sample) {
-                const auto lane = graph.node(sample).lane_id;
-                if (!call.positions.contains(lane)) call.positions.emplace(lane, observe_write_stream_position(source, sample, call.pid, call.tid, call.at_us));
-            };
-            for (const auto node : donor.expansion.resource_nodes()) locate(node);
+            bind_call_resources(source, call, donor.expansion);
         }
         lifecycle_write_owners_.insert(call.owner);
         lifecycle_writes_at_[*nodes[i]].push_back(std::move(call));
@@ -227,13 +223,9 @@ void HiCacheWriteCalls::submit_lifecycle_writes(size_t node, uint64_t time, simu
         for (const auto & pending : replay_.state().pending_device_writes(fact)) {
             const auto key = std::pair{ pending.header.cache_scope, pending.header.operation_id };
             if (pending.header.source_node_id != call.owner || completions_.contains(key)) continue;
-            const auto * donor = &select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
-            const auto projected = resize_write_pages(donor->expansion, pending.schedule.effective_byte_count, page_bytes_);
-            const auto expanded = sequence.append(projected, pending.schedule.duration_us, donor->position_lanes);
+            const auto & donor = select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
+            const auto expanded = submit_target_write(donor, fact, pending, sequence, future);
             for (const auto successor : call.successors) future.depend(expanded.host_return, successor);
-            const auto done = writes_.submit_expanded(fact, pending, expanded.write_start, expanded.completion, future);
-            completions_.emplace(key, done);
-            ++expanded_;
         }
     }
 }

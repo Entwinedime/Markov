@@ -104,14 +104,17 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     const auto audit = patch::append_hicache_layer_wait_removals(source, removals, removal);
     if (audit.status != "ready") throw std::runtime_error("Layer call removal is incomplete");
     (void)core::apply_dag_mutation_plan(graph, removal);
-    std::vector<HiCacheHostExpansion *> templates;
     for (auto & [node, call] : calls_) {
         call.outside_gap_us = graph.cpu_service_gap_duration(node);
         graph.set_cpu_gap_after(node,0);
     }
     bind_inactive(graph, waits, begin, end);
+}
+
+void HiCacheLayerCalls::rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members) {
+    std::vector<HiCacheHostExpansion *> templates;
     for (auto & [node, call] : calls_) templates.push_back(&call.plan);
-    rebind_host_worker_queues(graph, templates);
+    rebind_host_worker_queues(graph, members, templates);
 }
 
 void HiCacheLayerCalls::advance(size_t node, const Consumer & consumer, simulation::FutureDag & future) {

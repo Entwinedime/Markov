@@ -85,9 +85,12 @@ struct HiCacheWriteExpansion : HiCacheHostExpansion {
 /** Pure CPU call; retain fractional microseconds across calls on this thread. */
 [[nodiscard]] HiCacheHostExpansion calibrated_cpu_control(std::string_view lane, double cost_us, double & remainder_us, std::string_view name);
 
-/** Rebind copied tasks after source-call removal, using surviving tasks on the
- * exact original worker lane. No queue or ready-delay estimate is invented. */
-void rebind_host_worker_queues(const core::DagGraph & graph, std::span<HiCacheHostExpansion *> plans);
+/** Observe surviving worker lanes once after all source replacements.
+ * Values are queue-member node IDs, not task costs or dispatch estimates. */
+[[nodiscard]] std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph);
+/** Rebind copied tasks using the final source graph's exact worker lanes. */
+void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members,
+                              std::span<HiCacheHostExpansion *> plans);
 
 /** Semantic resources observed inside a write call, independent of numeric
  * lane ids. Worker roles are identified by the calls submitting their tasks. */

@@ -486,12 +486,6 @@ bool HiCacheState::lifecycle_return_pending(const HiCacheFact & fact) const {
     return scope != scopes_.end() && scope->second.lifecycle_return && scope->second.lifecycle_return->fact_id == fact.source_node_id;
 }
 
-bool HiCacheState::lifecycle_insert_pending(const HiCacheFact & fact) const {
-    if (!lifecycle_return_pending(fact)) return false;
-    const auto & pending = *scopes_.at(normalized_scope(fact)).lifecycle_return;
-    return pending.cursor.offset < pending.pages.size();
-}
-
 void HiCacheState::advance_lifecycle_insert(const HiCacheFact & fact, uint64_t ready_tokens) {
     if (!lifecycle_return_pending(fact)) throw std::logic_error("Lifecycle insertion does not match its entry");
     auto & scope = scope_state(fact);

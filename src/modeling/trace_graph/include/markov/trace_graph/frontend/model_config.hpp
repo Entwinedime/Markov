@@ -25,8 +25,8 @@ struct NodeScaleConfig {
     std::vector<NodeScaleRuleConfig> rules{};
 };
 
-/** @brief One page-byte anchor in a runtime DMA calibration curve. */
-struct HiCacheIoPageBandwidthPoint {
+/** @brief Setup plus bandwidth at one page size, for DMA or new-key storage. */
+struct HiCacheIoTransferPoint {
     uint64_t page_bytes = 0;
     double bandwidth_bytes_per_sec = 0.0;
     double setup_us_per_operation = 0.0;
@@ -36,13 +36,6 @@ struct HiCacheIoPageBandwidthPoint {
 struct HiCacheIoExistingKeyBandwidthPoint {
     uint64_t page_bytes = 0;
     uint64_t operation_pages = 0;
-    double bandwidth_bytes_per_sec = 0.0;
-};
-
-/** @brief Runtime-batch new-write cost at one page size. */
-struct HiCacheIoNewOperationPoint {
-    uint64_t page_bytes = 0;
-    double setup_us_per_operation = 0.0;
     double bandwidth_bytes_per_sec = 0.0;
 };
 
@@ -61,8 +54,8 @@ struct HiCacheIoServiceModelConfig {
     std::string direction{};
     double runtime_scale = 1.0;
     double existing_runtime_scale = 1.0;
-    std::vector<HiCacheIoPageBandwidthPoint> page_bandwidth_points{};
-    std::vector<HiCacheIoNewOperationPoint> new_operation_points{};
+    std::vector<HiCacheIoTransferPoint> page_bandwidth_points{};
+    std::vector<HiCacheIoTransferPoint> new_operation_points{};
     std::vector<HiCacheIoExistingKeyBandwidthPoint> existing_key_bandwidth_points{};
     std::optional<HiCachePrefetchStagesConfig> stages;
 };

@@ -138,16 +138,14 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
     }
 }
 
-void HiCacheLoads::rebind_workers(const core::DagGraph & graph) {
+void HiCacheLoads::rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members) {
     std::vector<HiCacheHostExpansion *> plans;
     for (auto & donor : donors_) plans.push_back(&donor.plan);
-    rebind_host_worker_queues(graph, plans);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+    rebind_host_worker_queues(graph, members, plans);
+
     for (auto & [key, program] : generated_submissions_) {
         const auto lane = graph.node(program.worker).lane_id;
-        const auto at = std::ranges::find_if(queues.tasks, [&](const auto & task) { return graph.node(task.first).lane_id == lane; });
-        if (at == queues.tasks.end()) throw std::runtime_error("Generated load lost its proven worker FIFO");
-        program.worker = at->first;
+        program.worker = members.at(lane);
     }
 }
 

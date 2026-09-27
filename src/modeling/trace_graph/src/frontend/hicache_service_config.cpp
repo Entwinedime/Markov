@@ -24,36 +24,19 @@ double nonnegative_number(const Json & object, const std::string & field, const 
     return value;
 }
 
-std::vector<HiCacheIoPageBandwidthPoint> page_bandwidth_points(const Json & object, const std::string & field, const std::string & context) {
+std::vector<HiCacheIoTransferPoint> transfer_points(const Json & object, const std::string & field, const std::string & context) {
     const auto it = object.find(field);
     if (it == object.end() || !it->is_array() || it->empty()) throw std::runtime_error(context + "." + field + " requires measured anchors");
-    std::vector<HiCacheIoPageBandwidthPoint> points;
+    std::vector<HiCacheIoTransferPoint> points;
     uint64_t previous = 0;
     for (const auto & raw : *it) {
+        require_exact_fields(raw, context + "." + field, { "page_bytes", "setup_us_per_operation", "bandwidth_bytes_per_sec" });
         const auto page_bytes = u64_value(raw, "page_bytes", 0);
         const auto bandwidth = positive_number(raw, "bandwidth_bytes_per_sec", context + "." + field);
         if (page_bytes <= previous) throw std::runtime_error(context + "." + field + " page anchors must increase");
         points.push_back({ .page_bytes = page_bytes,
                            .bandwidth_bytes_per_sec = bandwidth,
                            .setup_us_per_operation = nonnegative_number(raw, "setup_us_per_operation", context + "." + field) });
-        previous = page_bytes;
-    }
-    return points;
-}
-
-std::vector<HiCacheIoNewOperationPoint> new_operation_points(const Json & object, const std::string & context) {
-    const auto it = object.find("new_operation_points");
-    if (it == object.end() || !it->is_array() || it->empty()) throw std::runtime_error(context + ".new_operation_points requires measured anchors");
-    std::vector<HiCacheIoNewOperationPoint> points;
-    uint64_t previous = 0;
-    for (const auto & raw : *it) {
-        const auto page_bytes = u64_value(raw, "page_bytes", 0);
-        if (page_bytes <= previous) throw std::runtime_error(context + ".new_operation_points page anchors must increase");
-        points.push_back({
-            .page_bytes = page_bytes,
-            .setup_us_per_operation = nonnegative_number(raw, "setup_us_per_operation", context + ".new_operation_points"),
-            .bandwidth_bytes_per_sec = positive_number(raw, "bandwidth_bytes_per_sec", context + ".new_operation_points"),
-        });
         previous = page_bytes;
     }
     return points;
@@ -116,12 +99,12 @@ std::map<std::string, HiCacheIoServiceModelConfig> parse_hicache_service_models(
         }
         else if (kind == "load" || kind == "write_device_to_host") {
             require_exact_fields(*raw, context, { "direction", "page_bandwidth_points", "runtime_scale" });
-            model.page_bandwidth_points = page_bandwidth_points(*raw, "page_bandwidth_points", context);
+            model.page_bandwidth_points = transfer_points(*raw, "page_bandwidth_points", context);
             model.runtime_scale = positive_number(*raw, "runtime_scale", context);
         }
         else {
             require_known_fields(*raw, context, { "direction", "new_operation_points", "existing_key_bandwidth_points", "existing_runtime_scale" });
-            if (raw->contains("new_operation_points")) model.new_operation_points = new_operation_points(*raw, context);
+            if (raw->contains("new_operation_points")) model.new_operation_points = transfer_points(*raw, "new_operation_points", context);
             if (raw->contains("existing_key_bandwidth_points")) {
                 model.existing_key_bandwidth_points = existing_key_points(*raw, context);
                 model.existing_runtime_scale = positive_number(*raw, "existing_runtime_scale", context);
