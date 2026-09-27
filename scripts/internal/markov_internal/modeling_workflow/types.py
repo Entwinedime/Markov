@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from .artifacts import ModelRunArtifacts
-    from .io_model import HiCacheIoModel
+from ..modeling.workload import WorkloadWindow, discover_workload_window
 
 
 @dataclass(frozen=True)
@@ -21,9 +20,18 @@ class ProfileRunRef:
     run_id: str
     config_id: str
     input_id: str
-    input_class: str
     python_probe_files: tuple[Path, ...]
     hicache_config: dict[str, Any] | None = None
+
+    @cached_property
+    def workload_window(self) -> WorkloadWindow | None:
+        """Read this immutable capture's window lazily, shared by its targets.
+
+        A new workflow creates new source objects; nothing is cached on disk.
+        Failed reads propagate without caching a fabricated window.
+        """
+
+        return discover_workload_window({}, self.manifest_path)
 
     @property
     def label(self) -> str:
@@ -34,19 +42,10 @@ class ProfileRunRef:
 
 @dataclass(frozen=True)
 class TargetHiCacheConfig:
-    """Explicit target policy/capacity input for one prediction."""
+    """Target policy/capacity input with prefetch_policy resolved at admission."""
 
     label: str
     fields: dict[str, Any]
-    source_path: Path | None = None
-
-    @classmethod
-    def from_profile(cls, profile: ProfileRunRef) -> TargetHiCacheConfig:
-        """Project an observed profile config into the prediction contract for scoring."""
-
-        if profile.hicache_config is None:
-            raise ValueError(f"profile has no HiCache config: {profile.label}")
-        return cls(label=profile.config_id, fields=dict(profile.hicache_config), source_path=profile.config_path)
 
     def matches_source(self, source: ProfileRunRef) -> bool:
         """Compare policy/capacity values without relying on experiment identifiers."""
@@ -57,51 +56,21 @@ class TargetHiCacheConfig:
 
 
 @dataclass(frozen=True)
-class CacheStatePredictionRef:
-    """Replay one source profile under an explicit target configuration."""
-
-    source: ProfileRunRef
-    target: TargetHiCacheConfig
-
-    @property
-    def input_id(self) -> str:
-        """Return the shared workload input identity for this prediction."""
-
-        return self.source.input_id
-
-    @property
-    def is_self(self) -> bool:
-        """Return whether source and target configurations are identical."""
-
-        return self.target.matches_source(self.source)
-
-    @property
-    def label(self) -> str:
-        """Return the compact source-to-target prediction label."""
-
-        return f"{self.input_id}/{self.source.config_id}->{self.target.label}"
-
-
-@dataclass(frozen=True)
 class ModelRunSpec:
-    """One HiCache I/O/control prediction executed by the C++ DAG model."""
+    """One source/target task; shared execution settings belong to WorkflowOptions."""
 
     run_id: str
-    source_profile: ProfileRunRef
-    target_config: TargetHiCacheConfig
     output_dir: Path
-    prediction: CacheStatePredictionRef
+    source: ProfileRunRef
+    target: TargetHiCacheConfig
     skip_reason: str = ""
-    trace_threads: int = 1
-    trace_file_threads: int = 1
-    trace_channels: tuple[str, ...] = ()
-    hicache_io_model: HiCacheIoModel | None = None
+    cpu_service_cost: Path | None = None
 
     @property
     def label(self) -> str:
         """Return the source-to-target prediction label."""
 
-        return self.prediction.label
+        return f"{self.source.input_id}/{self.source.config_id}->{self.target.label}"
 
 
 @dataclass(frozen=True)
@@ -110,41 +79,11 @@ class ModelRunResult:
 
     spec: ModelRunSpec
     return_code: int
-    elapsed_sec: float
-    artifacts: ModelRunArtifacts
-    skipped: bool = False
-    dry_run: bool = False
     skip_reason: str = ""
-    execution_error_tail: str = ""
+    missing_costs: tuple[dict[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:
-        """Return whether the spec ran successfully."""
+        """Command success only; DAG completion is checked from its execution report."""
 
-        return not self.skipped and self.return_code == 0
-
-
-@dataclass(frozen=True)
-class ModelRunCounts:
-    """Canonical model-run counts shared by progress and JSON summaries."""
-
-    handled: int
-    runnable: int
-    usable: int
-    errors: int
-    skipped: int
-    dry_run: int
-
-    @classmethod
-    def from_results(cls, results: list[ModelRunResult] | tuple[ModelRunResult, ...]) -> ModelRunCounts:
-        """Derive mutually consistent progress counters from completed results."""
-
-        runnable = [result for result in results if not result.skipped]
-        return cls(
-            handled=len(results),
-            runnable=len(runnable),
-            usable=sum(result.return_code == 0 for result in runnable),
-            errors=sum(result.return_code != 0 for result in runnable),
-            skipped=sum(result.skipped for result in results),
-            dry_run=sum(result.dry_run for result in results),
-        )
+        return not self.skip_reason and self.return_code == 0

@@ -4,21 +4,21 @@ from __future__ import annotations
 
 import copy
 from dataclasses import asdict
-import os
 from pathlib import Path
 import tempfile
 import time
 from typing import Any, TYPE_CHECKING
 
-from ..common.commands import command_tokens
+from ..common.commands import command_tokens, replace_command_option
 from ..common.io import load_json, write_json
 from ..common.naming import sanitize
 from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ..contracts.forced_token.bundle import resolve_forced_token_bundle_plan
-from ..profiling.suite import matrix_entries
+from ..profiling.suite import expand_suite, experiment_identity, filter_suite_experiments
+from ..workload_template.cli import parse_workload_command
 from ..workload_template.expand import request_token_budget
 from ..workload_template.schema import load_template
-from .capture import has_pending_capture, profile_usage, run_profile_attempt
+from .capture import pending_group_capture, profile_usage, recorded_capture, run_profile_attempt
 
 if TYPE_CHECKING:
     from .group import GroupRequest
@@ -30,40 +30,65 @@ def base_attempts(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _workload(raw: dict[str, Any], suite: dict[str, Any], workload: str) -> dict[str, Any]:
-    selected = copy.deepcopy(suite)
-    selected.pop("experiments", None)
+    experiments = filter_suite_experiments(
+        list(enumerate(expand_suite(suite), start=1)),
+        set(),
+        selected_servers={raw["base_config"]},
+        selected_inputs={workload},
+    )
+    if len(experiments) != 1:
+        raise ValueError("base acquisition requires one declared experiment per base/workload")
+
+    index, experiment = experiments[0]
+    selected = copy.deepcopy(experiment)
     selected.pop("run_id", None)
-    selected["matrix"] = {"servers": [copy.deepcopy(matrix_entries(suite["matrix"], "servers")[raw["base_config"]])],
-                          "inputs": [copy.deepcopy(matrix_entries(suite["matrix"], "inputs")[workload])]}
+    # Keep suite accounting and forced-token bundle output for this single run,
+    # without reconstructing matrix axes and losing experiment-level overrides.
+    selected["experiments"] = [{"id": experiment_identity(selected, index)}]
     selected.update(continue_on_error=False, name=f"{raw['base_config']}_{workload}_base")
-    selected["matrix"]["servers"][0]["server"]["startup_max_attempts"] = 1
-    selected.setdefault("metadata", {}).update(purpose="Group base acquisition, separate from fixed calibration.",
-                                               execution_contract="One declared base workload; serial and separately budgeted.")
-    argv = command_tokens(selected["matrix"]["inputs"][0]["bench"]["command"])
-    selected["matrix"]["inputs"][0]["bench"]["command"] = argv
-    if "--template" not in argv or "--forced-token-mode" not in argv or "--forced-token-plan" not in argv:
-        raise ValueError("base acquisition requires the normal template forced-token replay suite")
-    template = require_repo_path(argv[argv.index("--template") + 1])
-    config = require_repo_path(argv[argv.index("--config-specs") + 1])
-    return {"workload": workload, "suite": selected, "counts": request_token_budget(load_template(template)),
-            "inputs": {"suite": selected, "template": load_json(template), "config_specs": load_json(config),
-                       "forced_token_bundle": raw.get("forced_token_bundle")}}
-
-
-def matching_base_attempts(raw: dict[str, Any], suite: dict[str, Any], workload: str) -> list[dict[str, Any]]:
-    attempts = [row for row in base_attempts(raw) if row["workload"] == workload]
-    if not attempts:
-        return []
-    inputs = _workload(raw, suite, workload)["inputs"]
-    return [row for row in attempts if row["inputs"] == inputs]
+    selected["server"]["startup_max_attempts"] = 1
+    selected.setdefault("metadata", {}).update(
+        purpose="Group base acquisition, separate from fixed calibration.",
+        execution_contract="One declared base workload; serial and separately budgeted.",
+    )
+    argv = command_tokens(selected["bench"]["command"])
+    selected["bench"]["command"] = argv
+    args = parse_workload_command(argv)
+    if args is None or args.forced_token_mode != "replay" or not args.forced_token_plan:
+        raise ValueError("base acquisition requires a template forced-token replay experiment")
+    direct_replay = args.forced_token_plan != "{forced_token_plan}"
+    if direct_replay and raw.get("forced_token_bundle"):
+        raise ValueError("base replay must use either an explicit token plan or a bundle, not both")
+    template = load_template(require_repo_path(args.template))
+    config = require_repo_path(args.config_specs)
+    return {
+        "workload": workload,
+        "direct_replay": direct_replay,
+        "counts": request_token_budget(template),
+        "inputs": {
+            "suite": selected,
+            "template": dict(template.data),
+            "config_specs": load_json(config),
+            "forced_token_bundle": raw.get("forced_token_bundle"),
+        },
+    }
 
 
 def captured_base_manifests(raw: dict[str, Any], suite: dict[str, Any], missing: set[str]) -> list[Path]:
     """Admit only completed current-input base runs, never discover a target matrix."""
+    attempts = base_attempts(raw)
     result = []
     for workload in sorted(missing):
-        rows = matching_base_attempts(raw, suite, workload)
-        row = next((row for row in reversed(rows) if row["mode"] == "replay" and row["status"] == "completed"), None)
+        rows = [
+            row
+            for row in attempts
+            if row["workload"] == workload and row["mode"] == "replay" and row["status"] == "completed"
+        ]
+        if not rows:
+            continue
+
+        inputs = _workload(raw, suite, workload)["inputs"]
+        row = next((row for row in reversed(rows) if row["inputs"] == inputs), None)
         if row:
             result.append(require_repo_path(row["profile_manifest"]))
     return result
@@ -75,77 +100,95 @@ def capture_base(group: GroupRequest, *, dry_run: bool) -> dict[str, Any]:
     jobs = [_workload(group.raw, suite, workload) for workload in group.missing_base_workloads]
     attempts = base_attempts(group.raw)
     budget = group.base_budget
-    plan = {"status": "needs_base_capture", "requirements": [], "base_capture_usage": profile_usage(attempts),
-            "missing_base_workloads": list(group.missing_base_workloads),
-            "base_capture_budget": asdict(budget) if budget else None, "base_jobs": []}
+    plan = {
+        "status": "needs_base_capture",
+        "base_capture_usage": profile_usage(attempts),
+        "missing_base_workloads": list(group.missing_base_workloads),
+        "base_capture_budget": asdict(budget) if budget else None,
+        "base_jobs": [],
+    }
     for job in jobs:
         previous = [row for row in attempts if row["workload"] == job["workload"] and row["inputs"] == job["inputs"]]
-        captured = next((row for row in reversed(previous) if row["mode"] == "capture" and row["status"] == "completed"), None)
+        captured = next(
+            (row for row in reversed(previous) if row["mode"] == "capture" and row["status"] == "completed"), None
+        )
         job["bundle"] = group.raw.get("forced_token_bundle") or (captured["forced_token_bundle"] if captured else None)
-        job["modes"] = ["replay"] if job["bundle"] else ["capture", "replay"]
-        plan["base_jobs"].append({"workload": job["workload"], "modes": job["modes"],
-                                  "requests": len(job["modes"]) * job["counts"]["requests"],
-                                  "tokens": len(job["modes"]) * job["counts"]["tokens"]})
+        job["modes"] = ["replay"] if job["bundle"] or job["direct_replay"] else ["capture", "replay"]
+        plan["base_jobs"].append(
+            {
+                "workload": job["workload"],
+                "modes": job["modes"],
+                "requests": len(job["modes"]) * job["counts"]["requests"],
+                "tokens": len(job["modes"]) * job["counts"]["tokens"],
+            }
+        )
     if dry_run or budget is None:
         plan["stop_reason"] = "dry_run" if dry_run else "base_budget_required"
         return plan
-    if has_pending_capture(group.output_dir):
-        plan.update(status="capture_incomplete", stop_reason="inspect recorded live group container before resuming")
+    if reason := pending_group_capture(group.output_dir):
+        plan.update(status="capture_incomplete", stop_reason=reason)
         return plan
     ledger_path = group.output_dir / "base_capture_ledger.json"
     for job in jobs:
         for mode in job["modes"]:
             usage = profile_usage(attempts)
             counts = job["counts"]
-            limits = [key for key, extra in (("server_starts", 1), ("requests", counts["requests"]), ("tokens", counts["tokens"]))
-                      if usage[key] + extra > getattr(budget, key)]
-            remaining = budget.wall_seconds - usage["wall_seconds"]
-            if remaining <= 30:
-                limits.append("wall_seconds")
+            remaining, limits = budget.available_for(
+                usage, server_starts=1, requests=counts["requests"], tokens=counts["tokens"]
+            )
             if limits:
                 plan.update(status="base_budget_exhausted", limits=limits)
                 return plan
             work_root = group.output_dir / "base_captures"
             work_root.mkdir(parents=True, exist_ok=True)
             output = Path(tempfile.mkdtemp(prefix=f"{mode}_", dir=work_root))
-            config = copy.deepcopy(job["suite"])
-            argv = config["matrix"]["inputs"][0]["bench"]["command"]
+            config = copy.deepcopy(job["inputs"]["suite"])
+            argv = config["bench"]["command"]
             for flag, field in (("--template", "template"), ("--config-specs", "config_specs")):
                 path = output / f"{field}.json"
                 write_json(path, job["inputs"][field])
-                argv[argv.index(flag) + 1] = str(repo_relative_path(path))
+                replace_command_option(argv, flag, str(repo_relative_path(path)))
             if mode == "capture":
-                argv[argv.index("--forced-token-mode") + 1] = "capture"
-                index = argv.index("--forced-token-plan")
-                del argv[index:index + 2]
+                args = parse_workload_command(argv)
+                replace_command_option(argv, "--forced-token-mode", "capture")
+                replace_command_option(
+                    argv, "--forced-token-plan", str(Path(args.output_dir) / "forced_token_plan.json")
+                )
                 config["profiling"] = {"enabled": False, "channels": []}
                 config["run_root"] = "data/no_profile_runs/sglang"
                 config["metadata"]["profile_mode"] = "forced_token_capture"
-                config["metadata"]["full_dag_contract"] = "Not applicable to token capture; the subsequent replay produces source DAG traces."
+                config["metadata"]["full_dag_contract"] = (
+                    "Not applicable to token capture; the subsequent replay produces source DAG traces."
+                )
             config["run_id"] = sanitize(f"{time.strftime('%Y%m%d_%H%M%S')}_base_{output.name}")
             suite_path = output / "suite.json"
             write_json(suite_path, config)
             command = [str(ROOT_DIR / "scripts/profile.sh"), str(repo_relative_path(suite_path))]
-            row = {"workload": job["workload"], "inputs": job["inputs"], "mode": mode, "status": "running",
-                   "container": f"markov-base-{os.getpid()}-{time.time_ns()}", "started_at_unix": time.time(),
-                   "suite_dir": str(repo_relative_path(require_repo_path(config["run_root"]) / config["run_id"])),
-                   "suite_config": str(repo_relative_path(suite_path)), "command_log": str(repo_relative_path(output / "command.log")),
-                   "reserved_requests": counts["requests"], "reserved_tokens": counts["tokens"],
-                   "budgeted_output_tokens_per_request": counts["output_tokens_per_request"]}
-            if mode == "replay":
+            row = {
+                "workload": job["workload"],
+                "inputs": job["inputs"],
+                "mode": mode,
+                "suite_dir": str(repo_relative_path(require_repo_path(config["run_root"]) / config["run_id"])),
+                "suite_config": str(repo_relative_path(suite_path)),
+                "command_log": str(repo_relative_path(output / "command.log")),
+                "reserved_requests": counts["requests"],
+                "reserved_tokens": counts["tokens"],
+                "budgeted_output_tokens_per_request": counts["output_tokens_per_request"],
+            }
+            if mode == "replay" and job["bundle"]:
                 resolve_forced_token_bundle_plan(require_repo_path(job["bundle"]), job["workload"])
                 row["forced_token_bundle"] = job["bundle"]
                 command.extend(("--forced-token-bundle", job["bundle"]))
-            attempts.append(row)
-            write_json(ledger_path, {"attempts": attempts, "usage": profile_usage(attempts)})
-            print(f"base {job['workload']} {mode}: starting; remaining wall budget {remaining:.1f}s", flush=True)
             try:
-                run_profile_attempt(row, command, remaining)
+                with recorded_capture(ledger_path, {"attempts": attempts}, row, profile_usage, kind="base"):
+                    print(
+                        f"base {job['workload']} {mode}: starting; remaining wall budget {remaining:.1f}s", flush=True
+                    )
+                    run_profile_attempt(row, command, remaining)
             finally:
                 plan["base_capture_usage"] = profile_usage(attempts)
-                write_json(ledger_path, {"attempts": attempts, "usage": plan["base_capture_usage"]})
             if row["status"] != "completed":
-                plan.update(status=row["status"], failed_workload=job["workload"])
+                plan.update(status=row["status"], failed_workload=job["workload"], attempt=row)
                 return plan
             if mode == "capture":
                 job["bundle"] = row["forced_token_bundle"]

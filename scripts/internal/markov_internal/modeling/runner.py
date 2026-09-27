@@ -4,86 +4,77 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-from typing import Any
 
-from ..common.io import load_json
+from ..common.commands import positive_int
 from ..common.paths import require_repo_path, running_in_modeling_container
-from .backend import append_option, build_trace_graph_command, execute_trace_graph
-from .cpp_config import cpp_model_config_path, trace_graph_executable
-from .run_config import ModelingRunConfig
+from ..common.process import run_command
+from .backend import build_trace_graph_command
+from .run_config import ModelingOutputs, ModelingRunConfig
 from .workload import discover_workload_window
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse generated replay or direct manifest DAG-build inputs."""
 
-    parser = argparse.ArgumentParser(description="Run one generated C++ modeling config.")
+    parser = argparse.ArgumentParser(description="Build and simulate a source DAG, optionally applying a model.")
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--config", type=Path, help="self-contained modeling runner config")
     inputs.add_argument("--profile-manifest", type=Path, help="framework-neutral profile manifest")
     parser.add_argument("--output-dir", type=Path, help="required with --profile-manifest")
-    parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--file-threads", type=int, default=1)
+    parser.add_argument("--model-config", type=Path, help="optional DAG transforms with --profile-manifest")
+    parser.add_argument("--threads", type=positive_int)
+    parser.add_argument("--file-threads", type=positive_int)
     parser.add_argument("--emit-dag", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.config and (
+        args.output_dir is not None
+        or args.model_config is not None
+        or args.threads is not None
+        or args.file_threads is not None
+        or args.emit_dag
+    ):
+        parser.error("--config replays its stored options; use --profile-manifest for direct DAG options")
+    return args
 
 
-def run_from_config(
-    config_path: Path,
-) -> dict[str, Any]:
-    """Run C++ and return its canonical compact summary."""
-
-    run = ModelingRunConfig.load(config_path)
-    run.output_dir.mkdir(parents=True, exist_ok=True)
-
-    model_config_path = cpp_model_config_path(run.raw, run.mode)
-    if model_config_path is not None and not model_config_path.is_file():
-        raise FileNotFoundError(f"missing C++ model config: {model_config_path}")
-
-    execute_trace_graph(build_trace_graph_command(run, model_config_path))
-    return load_json(run.output_dir / "run_summary.json")
-
-
-def run_from_manifest(args: argparse.Namespace) -> dict[str, Any]:
+def manifest_run_config(args: argparse.Namespace) -> ModelingRunConfig:
+    """Prepare the framework-neutral DAG request for the common execution path."""
     if args.output_dir is None:
         raise SystemExit("--profile-manifest requires --output-dir")
     manifest, output = require_repo_path(args.profile_manifest), require_repo_path(args.output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    command = [
-        str(trace_graph_executable({})), "--profile-manifest", str(manifest),
-        "--run-summary", str(output / "run_summary.json"),
-    ]
-    append_option(command, "--threads", args.threads)
-    append_option(command, "--file-threads", args.file_threads)
+    cpp_config = {"threads": args.threads or 1, "file_threads": args.file_threads or 1}
     window = discover_workload_window({}, manifest)
     if window is not None:
-        append_option(command, "--trace-window-start-us", window.start_ns // 1000)
-        append_option(command, "--trace-window-end-us", window.end_ns // 1000)
-    if args.emit_dag:
-        command.extend(("--graph-output", str(output / "dag_chrome_trace.json")))
-    execute_trace_graph(command)
-    return load_json(output / "run_summary.json")
+        cpp_config["trace_window_start_us"] = window.start_ns // 1000
+        cpp_config["trace_window_end_us"] = window.end_ns // 1000
+    return ModelingRunConfig(
+        output,
+        manifest,
+        cpp_config,
+        ModelingOutputs(dag_chrome_trace=args.emit_dag),
+        model_config_path=require_repo_path(args.model_config) if args.model_config else None,
+    )
 
 
-def main(
-    argv: list[str] | None = None,
-) -> int:
-    """Run the container CLI while keeping help available on the host."""
+def main(argv: list[str] | None = None) -> int:
+    """Run C++ with inherited output and preserve its exit status.
 
-    effective_argv = sys.argv[1:] if argv is None else argv
-    if any(argument in {"-h", "--help"} for argument in effective_argv):
-        parse_args(effective_argv)
-        return 0
+    The workflow owns log retention and summary reading; this process only
+    translates the request. Argument parsing keeps help available on the host.
+    """
+
+    args = parse_args(argv)
     if not running_in_modeling_container():
         raise SystemExit("use scripts/model.sh for containerized DAG modeling")
-    args = parse_args(effective_argv)
+
     if args.config:
-        run_from_config(require_repo_path(args.config))
+        run = ModelingRunConfig.load(require_repo_path(args.config))
     else:
-        run_from_manifest(args)
-    return 0
+        run = manifest_run_config(args)
+
+    run.output_dir.mkdir(parents=True, exist_ok=True)
+    return run_command(build_trace_graph_command(run)).returncode
 
 
 if __name__ == "__main__":

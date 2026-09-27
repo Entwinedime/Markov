@@ -3,66 +3,57 @@
 from __future__ import annotations
 
 import json
-import shlex
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ...common.io import load_json
-from ...common.manifest import existing_manifest_files
-from ...common.paths import map_repo_path
+from ...common.manifest import manifest_files, profile_labels
+from ...common.paths import map_repo_path, repo_relative_path
 from ...common.commands import command_tokens
 from ..types import ProfileRunRef
 
 
-@dataclass(frozen=True)
-class ProfileRunDiscovery:
-    """Discover profile runs from suite directories and explicit manifests."""
+def discover_profile_runs(
+    manifests: tuple[Path, ...], *, profile_run_dirs: tuple[Path, ...] = ()
+) -> list[ProfileRunRef]:
+    """Parse explicit profiles; directory selection is for independent evaluation."""
 
-    profile_run_dirs: tuple[Path, ...]
-    manifests: tuple[Path, ...]
-
-    def discover(self) -> list[ProfileRunRef]:
-        """Return parsed profile runs in deterministic input/config/run order."""
-
-        manifest_paths: set[Path] = {path.resolve() for path in self.manifests}
-        for run_dir in self.profile_run_dirs:
-            manifest_paths.update(path.resolve() for path in run_dir.glob("*/profile_manifest.json"))
-            direct = run_dir / "profile_manifest.json"
-            if direct.is_file():
-                manifest_paths.add(direct.resolve())
-        parser = ProfileRunParser()
-        runs = [parser.from_manifest(path) for path in sorted(manifest_paths)]
-        return sorted(runs, key=lambda run: (run.input_id, run.config_id, run.run_id))
+    manifest_paths = {path.resolve() for path in manifests}
+    for run_dir in profile_run_dirs:
+        manifest_paths.update(path.resolve() for path in run_dir.glob("*/profile_manifest.json"))
+        direct = run_dir / "profile_manifest.json"
+        if direct.is_file():
+            manifest_paths.add(direct.resolve())
+    runs = [parse_profile_run(path) for path in sorted(manifest_paths)]
+    return sorted(runs, key=lambda run: (run.input_id, run.config_id, run.run_id))
 
 
-@dataclass(frozen=True)
-class ProfileRunParser:
-    """Convert one ``profile_manifest.json`` into the workflow run contract."""
+def parse_profile_run(manifest_path: Path) -> ProfileRunRef:
+    """Parse a manifest and its referenced profiling configuration."""
 
-    def from_manifest(self, manifest_path: Path) -> ProfileRunRef:
-        """Parse a manifest and its referenced profiling configuration."""
-
-        manifest = load_json(manifest_path)
-        run_dir = map_repo_path(Path(str(manifest["run_dir"])))
-        config_path = map_repo_path(Path(str(manifest["config_path"])))
-        config = load_json(config_path)
-        framework = str(manifest.get("framework") or config.get("framework") or "sglang")
-        if framework != "sglang":
-            raise ValueError(f"{framework} supports framework-neutral build-dag, not HiCache prediction")
-        metadata = config["metadata"]
-        sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
-        return ProfileRunRef(
-            manifest_path=manifest_path,
-            run_dir=run_dir,
-            config_path=config_path,
-            run_id=str(manifest["run_id"]),
-            config_id=str(metadata["suite_server_id"]),
-            input_id=str(metadata["suite_input_id"]),
-            input_class=str(metadata.get("input_class") or "manual"),
-            python_probe_files=tuple(existing_manifest_files(sidecar.get("python_probe_files", []))),
-            hicache_config=extract_hicache_modeling_config(config, run_dir),
-        )
+    manifest = load_json(manifest_path)
+    run_dir = map_repo_path(Path(str(manifest["run_dir"])))
+    config_path = map_repo_path(Path(str(manifest["config_path"])))
+    config = load_json(config_path)
+    framework = str(manifest.get("framework") or config.get("framework") or "sglang")
+    if framework != "sglang":
+        raise ValueError(f"{framework} supports framework-neutral build-dag, not HiCache prediction")
+    run_id = str(manifest.get("run_id") or repo_relative_path(manifest_path.parent))
+    # Suite labels identify matrix axes. Ordinary profiles need no matrix;
+    # explicit labels allow multiple workloads to share one base identity.
+    name = str(config.get("name") or run_id)
+    config_id, input_id = profile_labels(config, name)
+    sidecar = manifest.get("sidecar") if isinstance(manifest.get("sidecar"), dict) else {}
+    return ProfileRunRef(
+        manifest_path=manifest_path,
+        run_dir=run_dir,
+        config_path=config_path,
+        run_id=run_id,
+        config_id=config_id,
+        input_id=input_id,
+        python_probe_files=tuple(manifest_files(sidecar.get("python_probe_files", []))),
+        hicache_config=extract_hicache_modeling_config(config, run_dir),
+    )
 
 
 def extract_hicache_modeling_config(config: dict[str, Any], run_dir: Path) -> dict[str, Any] | None:
@@ -168,17 +159,17 @@ def parse_server_command_flags(path: Path) -> dict[str, str]:
 
     if not path.is_file():
         return {}
-    try:
-        tokens = shlex.split(path.read_text(encoding="utf-8"))
-    except ValueError:
-        return {}
-
-    return parse_server_command_tokens(tokens)
+    return parse_server_command_tokens(command_tokens(path.read_text(encoding="utf-8")))
 
 
 def parse_server_command_tokens(tokens: list[str]) -> dict[str, str]:
-    """Parse an argv-style server command into normalized option values."""
+    """Parse server options once, including supported model/TP aliases.
 
+    Repeated aliases have the same last-option-wins behavior as argparse.
+    Multi-value options such as NUMA placement retain every value.
+    """
+
+    aliases = {"model": "model_path", "tensor_parallel_size": "tp_size", "tp": "tp_size"}
     flags: dict[str, str] = {}
     index = 0
     while index < len(tokens):
@@ -192,7 +183,8 @@ def parse_server_command_tokens(tokens: list[str]) -> dict[str, str]:
         while index < len(tokens) and not tokens[index].startswith("--"):
             values.append(tokens[index])
             index += 1
-        flags[key.replace("-", "_")] = " ".join(values) if values else "true"
+        key = key.replace("-", "_")
+        flags[aliases.get(key, key)] = " ".join(values) if values else "true"
     return flags
 
 

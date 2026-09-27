@@ -22,9 +22,7 @@ def index_roles(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     return result
 
 
-def request_events(
-    opportunity: dict[str, Any], events: list[dict[str, Any]], window_end: int
-) -> list[dict[str, Any]]:
+def request_events(opportunity: dict[str, Any], events: list[dict[str, Any]], window_end: int) -> list[dict[str, Any]]:
     request_id = str(opportunity["request_id"])
     start = int(opportunity["anchor"]["ts"])
     return [
@@ -55,9 +53,7 @@ def request_window_end(
     return min(candidates) if candidates else 2**63 - 1
 
 
-def prefetch_operation_window_end(
-    opportunity: dict[str, Any], opportunities: list[dict[str, Any]]
-) -> int:
+def prefetch_operation_window_end(opportunity: dict[str, Any], opportunities: list[dict[str, Any]]) -> int:
     """Keep payload observation open until a repeated candidate."""
 
     start = int(opportunity["anchor"]["ts"])
@@ -80,9 +76,7 @@ def cache_extend_consumer(
     candidates = [
         event
         for event in role_events.get("cache_extend_input", [])
-        if event["pid"] == opportunity["pid"]
-        and event["ts"] >= start
-        and request_id in request_ids(event["args"])
+        if event["pid"] == opportunity["pid"] and event["ts"] >= start and request_id in request_ids(event["args"])
     ]
     return min(candidates, key=event_sort_key) if candidates else None
 
@@ -327,9 +321,7 @@ def opportunity_identities(event: dict[str, Any]) -> list[tuple[str, dict[str, A
     if len(request_values) != len(spans):
         return []
     return [
-        (str(request_id), span)
-        for request_id, raw_span in zip(request_values, spans)
-        if (span := object_arg(raw_span))
+        (str(request_id), span) for request_id, raw_span in zip(request_values, spans) if (span := object_arg(raw_span))
     ]
 
 
@@ -393,8 +385,3 @@ def optional_bool(value: Any) -> bool | None:
         if normalized in {"false", "0"}:
             return False
     return None
-
-
-def nested_value(payload: dict[str, Any], object_key: str, value_key: str) -> Any:
-    value = payload.get(object_key)
-    return value.get(value_key) if isinstance(value, dict) else None

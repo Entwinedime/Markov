@@ -7,9 +7,7 @@ import math
 from typing import Any
 
 from .....common.io import load_json
-from .....modeling.backend import append_option, execute_trace_graph
-from .....modeling.cpp_config import trace_graph_executable
-from .....modeling.workload import discover_workload_window
+from .....modeling.backend import append_option, execute_trace_graph, trace_graph_executable
 from ....types import ProfileRunRef
 
 
@@ -31,7 +29,7 @@ def extract_target_phase_observation(
     if not summary_path.is_file():
         output_dir.mkdir(parents=True, exist_ok=True)
         command = [
-            str(trace_graph_executable({"cpp_trace_graph": {"backend_kind": "validation"}})),
+            str(trace_graph_executable("validation")),
             "--profile-manifest",
             str(target.manifest_path),
             "--run-summary",
@@ -40,7 +38,7 @@ def extract_target_phase_observation(
         ]
         append_option(command, "--threads", threads)
         append_option(command, "--file-threads", file_threads)
-        window = discover_workload_window({}, target.manifest_path)
+        window = target.workload_window
         if window is not None:
             append_option(command, "--trace-window-start-us", window.start_ns // 1000)
             append_option(command, "--trace-window-end-us", window.end_ns // 1000)
@@ -101,12 +99,12 @@ def compare_phase_work(
 
     prefill_keys_exact = predicted_prefills.keys() == target_prefills.keys()
     decode_keys_exact = predicted_decodes.keys() == target_decodes.keys()
-    prefill_mismatch_count = sum(
-        predicted_prefills.get(key) != value for key, value in target_prefills.items()
-    ) + len(predicted_prefills.keys() - target_prefills.keys())
-    decode_mismatch_count = sum(
-        predicted_decodes.get(key) != value for key, value in target_decodes.items()
-    ) + len(predicted_decodes.keys() - target_decodes.keys())
+    prefill_mismatch_count = sum(predicted_prefills.get(key) != value for key, value in target_prefills.items()) + len(
+        predicted_prefills.keys() - target_prefills.keys()
+    )
+    decode_mismatch_count = sum(predicted_decodes.get(key) != value for key, value in target_decodes.items()) + len(
+        predicted_decodes.keys() - target_decodes.keys()
+    )
     work_exact = (
         phase_work.get("status") == "ready"
         and invalid_target_batch_count == 0
@@ -154,20 +152,12 @@ def _not_ready(blocker: str) -> dict[str, Any]:
     }
 
 
-def _compare_phase_carrier(
-    prediction_summary: dict[str, Any], target_payload: dict[str, Any]
-) -> dict[str, Any]:
+def _compare_phase_carrier(prediction_summary: dict[str, Any], target_payload: dict[str, Any]) -> dict[str, Any]:
     predicted_modules = prediction_summary.get("module_results")
-    predicted_patch = (
-        predicted_modules.get("hicache_dag_patch") if isinstance(predicted_modules, dict) else None
-    )
+    predicted_patch = predicted_modules.get("hicache_dag_patch") if isinstance(predicted_modules, dict) else None
     predicted = predicted_patch.get("phase_carrier") if isinstance(predicted_patch, dict) else None
     target_modules = target_payload.get("module_results")
-    target_module = (
-        target_modules.get("hicache_observed_phase_carrier")
-        if isinstance(target_modules, dict)
-        else None
-    )
+    target_module = target_modules.get("hicache_observed_phase_carrier") if isinstance(target_modules, dict) else None
     target = target_module.get("carrier") if isinstance(target_module, dict) else None
     if not isinstance(predicted, dict) or not isinstance(target, dict):
         return {"ready": False, "exact": False, "blockers": ["phase_carrier_audit_missing"]}
@@ -251,34 +241,32 @@ def _compare_phase_cost(
             collective[pair] = min(value, collective.get(pair, value))
             rank_collective[(phase, key[0], request)] = value
 
-    samples: dict[str, list[tuple[int, int]]] = {
-        "prefill_kernel": [],
-        "prefill_collective": [],
-        "prefill_compute": [],
-        "prefill_submit_template": [],
-        "decode_paged_attention": [],
-        "decode_kernel": [],
-        "decode_collective": [],
-        "decode_compute": [],
-        "decode_submit_template": [],
-        "combined_compute": [],
+    phases = {
+        phase: {(int(row["logical_input"]), str(row["request_id"])): row for row in phase_work.get(phase + "s") or []}
+        for phase in ("prefill", "decode")
     }
-    prefills = {
-        (int(row["logical_input"]), str(row["request_id"])): row for row in phase_work.get("prefills") or []
-    }
-    decodes = {
-        (int(row["logical_input"]), str(row["request_id"])): row for row in phase_work.get("decodes") or []
-    }
-    source_prefill_collective: dict[str, int] = {}
-    source_decode_collective: dict[str, int] = {}
-    for rows, destination in (
-        (prefills.values(), source_prefill_collective),
-        (decodes.values(), source_decode_collective),
-    ):
-        for row in rows:
-            request = str(row["request_id"])
+    source_collective: dict[tuple[str, str], int] = {}
+    for phase, rows in phases.items():
+        for (_, request), row in rows.items():
             value = int(row["collective_cost"]["source_duration_us"])
-            destination[request] = min(value, destination.get(request, value))
+            pair = (phase, request)
+            source_collective[pair] = min(value, source_collective.get(pair, value))
+
+    samples: dict[str, list[tuple[int, int]]] = {
+        name: []
+        for name in (
+            "prefill_kernel",
+            "prefill_collective",
+            "prefill_compute",
+            "prefill_submit_template",
+            "decode_paged_attention",
+            "decode_kernel",
+            "decode_collective",
+            "decode_compute",
+            "decode_submit_template",
+            "combined_compute",
+        )
+    }
     device_oracle_costs: list[dict[str, Any]] = []
     all_owner_device_oracle_costs: list[dict[str, Any]] = []
     control_oracle_costs: list[dict[str, Any]] = []
@@ -286,87 +274,54 @@ def _compare_phase_cost(
     combined_target_us = 0
     combined_source_us = 0
     for key, target in targets.items():
-        prefill = prefills[key]
-        decode = decodes[key]
-        request = key[1]
-        predicted_prefill_kernel = int(prefill["kernel_cost"]["predicted_duration_us"])
-        target_prefill_kernel = target["prefill_kernel"]
-        predicted_prefill_collective = int(prefill["collective_cost"]["predicted_duration_us"])
-        target_prefill_collective = collective[("prefill", request)]
-        predicted_prefill_submit = int(prefill["submit_cost"]["predicted_duration_us"])
-        predicted_decode_kernel = int(decode["kernel_cost"]["predicted_duration_us"])
-        predicted_decode_paged_attention = int(decode["predicted_paged_attention_duration_us"])
-        target_decode_kernel = target["decode_kernel"]
-        predicted_decode_collective = int(decode["collective_cost"]["predicted_duration_us"])
-        target_decode_collective = collective[("decode", request)]
-        predicted_decode_submit = int(decode["submit_cost"]["predicted_duration_us"])
-        source_prefill_compute = int(prefill["kernel_cost"]["source_duration_us"]) + source_prefill_collective[request]
-        source_decode_compute = int(decode["kernel_cost"]["source_duration_us"]) + source_decode_collective[request]
-        rank, request_id = key
-        prefill_effect = f"hicache_phase:{request_id}:prefill:{rank}:"
-        decode_effect = f"hicache_phase:{request_id}:decode:{rank}:"
-        if include_oracle_costs:
-            device_oracle_costs.extend(
-                (
-                    {"effect_id": prefill_effect + "common_kernel", "duration_us": target["prefill_common_kernel"]},
-                    {"effect_id": prefill_effect + "prefix_attention", "duration_us": target["prefill_prefix_attention"]},
-                    {"effect_id": prefill_effect + "collective", "duration_us": target_prefill_collective},
-                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel,
-                     "paged_attention_duration_us": target["decode_paged_attention"]},
-                    {"effect_id": decode_effect + "collective", "duration_us": target_decode_collective},
-                )
+        rank, request = key
+        predicted_compute = 0
+        target_compute = 0
+        for phase, rows in phases.items():
+            row = rows[key]
+            kernel = int(row["kernel_cost"]["predicted_duration_us"])
+            communication = int(row["collective_cost"]["predicted_duration_us"])
+            target_kernel = target[phase + "_kernel"]
+            target_communication = collective[(phase, request)]
+            compute = (kernel + communication, target_kernel + target_communication)
+            samples[phase + "_kernel"].append((kernel, target_kernel))
+            samples[phase + "_collective"].append((communication, target_communication))
+            samples[phase + "_compute"].append(compute)
+            samples[phase + "_submit_template"].append(
+                (int(row["submit_cost"]["predicted_duration_us"]), target[phase + "_submit"])
             )
-            all_owner_device_oracle_costs.extend(
-                (
-                    {"effect_id": prefill_effect + "common_kernel", "duration_us": target["prefill_common_kernel"]},
-                    {"effect_id": prefill_effect + "prefix_attention", "duration_us": target["prefill_prefix_attention"]},
-                    {
-                        "effect_id": prefill_effect + "collective",
-                        "duration_us": rank_collective[("prefill", rank, request)],
-                    },
-                    {"effect_id": decode_effect + "kernel", "duration_us": target_decode_kernel,
-                     "paged_attention_duration_us": target["decode_paged_attention"]},
-                    {
-                        "effect_id": decode_effect + "collective",
-                        "duration_us": rank_collective[("decode", rank, request)],
-                    },
+            if phase == "decode":
+                samples["decode_paged_attention"].append(
+                    (int(row["predicted_paged_attention_duration_us"]), target["decode_paged_attention"])
                 )
+
+            predicted_compute += compute[0]
+            target_compute += compute[1]
+            combined_source_us += int(row["kernel_cost"]["source_duration_us"]) + source_collective[(phase, request)]
+            if not include_oracle_costs:
+                continue
+
+            effect = f"hicache_phase:{request}:{phase}:{rank}:"
+            families = ("common_kernel", "prefix_attention") if phase == "prefill" else ("kernel",)
+            kernels = [
+                {"effect_id": effect + family, "duration_us": target[phase + "_" + family]} for family in families
+            ]
+            if phase == "decode":
+                kernels[0]["paged_attention_duration_us"] = target["decode_paged_attention"]
+
+            # Both replays use the same kernels. Communication alone differs:
+            # one uses the request-wide minimum, the other each owning rank.
+            device_oracle_costs.extend(kernels)
+            all_owner_device_oracle_costs.extend(dict(kernel) for kernel in kernels)
+            device_oracle_costs.append({"effect_id": effect + "collective", "duration_us": target_communication})
+            all_owner_device_oracle_costs.append(
+                {"effect_id": effect + "collective", "duration_us": rank_collective[(phase, rank, request)]}
             )
-            control_oracle_costs.extend(
-                (
-                    {"effect_id": prefill_effect + "submit", "duration_us": target["prefill_submit"]},
-                    {"effect_id": decode_effect + "submit", "duration_us": target["decode_submit"]},
-                )
-            )
-        pairs = {
-            "prefill_kernel": (predicted_prefill_kernel, target_prefill_kernel),
-            "prefill_collective": (predicted_prefill_collective, target_prefill_collective),
-            "prefill_compute": (
-                predicted_prefill_kernel + predicted_prefill_collective,
-                target_prefill_kernel + target_prefill_collective,
-            ),
-            "prefill_submit_template": (predicted_prefill_submit, target["prefill_submit"]),
-            "decode_paged_attention": (
-                predicted_decode_paged_attention,
-                target["decode_paged_attention"],
-            ),
-            "decode_kernel": (predicted_decode_kernel, target_decode_kernel),
-            "decode_collective": (predicted_decode_collective, target_decode_collective),
-            "decode_compute": (
-                predicted_decode_kernel + predicted_decode_collective,
-                target_decode_kernel + target_decode_collective,
-            ),
-            "decode_submit_template": (predicted_decode_submit, target["decode_submit"]),
-            "combined_compute": (
-                predicted_prefill_kernel + predicted_prefill_collective + predicted_decode_kernel + predicted_decode_collective,
-                target_prefill_kernel + target_prefill_collective + target_decode_kernel + target_decode_collective,
-            ),
-        }
-        for name, pair in pairs.items():
-            samples[name].append(pair)
-        combined_predicted_us += pairs["combined_compute"][0]
-        combined_target_us += pairs["combined_compute"][1]
-        combined_source_us += source_prefill_compute + source_decode_compute
+            control_oracle_costs.append({"effect_id": effect + "submit", "duration_us": target[phase + "_submit"]})
+
+        samples["combined_compute"].append((predicted_compute, target_compute))
+        combined_predicted_us += predicted_compute
+        combined_target_us += target_compute
     predicted_delta = combined_predicted_us - combined_source_us
     target_delta = combined_target_us - combined_source_us
     result = {
@@ -400,8 +355,7 @@ def _decode_paged_attention_duration(row: dict[str, Any]) -> int:
     return sum(
         int(value.get("duration_us") or 0)
         for name, value in families.items()
-        if isinstance(value, dict)
-        and "attention" in name.lower()
+        if isinstance(value, dict) and "attention" in name.lower()
     )
 
 

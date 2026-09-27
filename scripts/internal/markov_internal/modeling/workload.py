@@ -2,19 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json
-from ..common.paths import map_repo_path, require_repo_path
+from ..common.paths import require_repo_path
 
 
 @dataclass(frozen=True)
 class WorkloadWindow:
-    """Observed workload interval represented in nanoseconds."""
+    """Observed trace-clock interval in nanoseconds, never a duration-only report."""
 
     report_path: Path
     start_ns: int
@@ -23,13 +22,32 @@ class WorkloadWindow:
     source: str = "workload_report"
 
 
+def controlled_request_window(formal: WorkloadWindow) -> WorkloadWindow:
+    """Use all controlled requests for independent cost measurement, not E2E scoring."""
+
+    report = load_json(formal.report_path)
+    requests = [row for row in report.get("requests", []) if isinstance(row, dict) and row.get("kind") == "request"]
+    starts = [float(row["start_time_ms"]) for row in requests if row.get("start_time_ms") is not None]
+    ends = [float(row["end_time_ms"]) for row in requests if row.get("end_time_ms") is not None]
+    if len(starts) != len(requests) or len(ends) != len(requests) or not requests:
+        raise ValueError("fixed calibration requires timestamps for every controlled request")
+    start_ns = int(min(starts) * 1_000_000)
+    end_ns = int(max(ends) * 1_000_000)
+    return WorkloadWindow(formal.report_path, start_ns, end_ns, end_ns - start_ns, "all_controlled_requests")
+
+
 def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | None) -> WorkloadWindow | None:
     """Discover a workload interval from explicit config or profile artifacts."""
 
     explicit = input_cfg.get("workload_report")
     if isinstance(explicit, str):
-        return load_workload_window(require_repo_path(explicit))
-    if manifest_path is None or not manifest_path.is_file():
+        path = require_repo_path(explicit)
+        if path.suffix == ".jsonl":
+            raise ValueError(
+                "bench-serving duration alone cannot define a trace window; provide a timestamped workload report"
+            )
+        return load_workload_window(path)
+    if manifest_path is None:
         return None
     manifest = load_json(manifest_path)
     reports = manifest.get("bench", {}).get("workload_report_files", [])
@@ -37,26 +55,14 @@ def discover_workload_window(input_cfg: dict[str, Any], manifest_path: Path | No
         raise ValueError("multiple workload reports; select input.workload_report explicitly")
     if reports:
         return load_workload_window(require_repo_path(reports[0]["path"]))
-    run_dir_raw = manifest.get("run_dir")
-    run_dir = map_repo_path(Path(str(run_dir_raw))) if isinstance(run_dir_raw, str) else manifest_path.parent
-    candidates = sorted(run_dir.glob("bench/**/workload_report.json"))
-    if len(candidates) > 1:
-        raise ValueError("multiple workload reports; select input.workload_report explicitly")
-    if candidates:
-        return load_workload_window(candidates[0])
-    bench_candidates = sorted(run_dir.glob("bench/**/*.jsonl"))
-    for path in reversed(bench_candidates):
-        window = load_bench_serving_window(path)
-        if window is not None:
-            return window
+    # bench_serving_files contain aggregate durations, not trace-clock bounds.
+    # Leave generic DAG builds unfiltered; window-dependent workflows reject None.
     return None
 
 
 def load_workload_window(path: Path) -> WorkloadWindow | None:
     """Derive the request envelope from a ``workload_report.json`` file."""
 
-    if not path.is_file():
-        return None
     report = load_json(path)
     formal_window = report.get("formal_window")
     if formal_window is not None and not isinstance(formal_window, dict):
@@ -64,7 +70,7 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
     formal_source = formal_window if isinstance(formal_window, dict) else report
     formal_start_ms = optional_float(formal_source.get("formal_begin_ms"))
     formal_end_ms = optional_float(formal_source.get("formal_end_ms"))
-    if formal_start_ms is not None or formal_end_ms is not None:
+    if formal_window is not None or formal_start_ms is not None or formal_end_ms is not None:
         if (
             formal_start_ms is None
             or formal_end_ms is None
@@ -108,33 +114,6 @@ def load_workload_window(path: Path) -> WorkloadWindow | None:
     if not starts or not ends:
         return None
     return WorkloadWindow(path, min(starts), max(ends), max(ends) - min(starts), "workload_report")
-
-
-def load_bench_serving_window(path: Path) -> WorkloadWindow | None:
-    """Read aggregate duration from the final SGLang bench-serving JSONL row."""
-
-    if not path.is_file():
-        return None
-    last: dict[str, Any] | None = None
-    with path.open("r", encoding="utf-8") as file_obj:
-        for line in file_obj:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                last = value
-    if last is None:
-        return None
-
-    duration_s = optional_float(last.get("duration"))
-    if duration_s is None or duration_s <= 0:
-        return None
-    actual = int(duration_s * 1_000_000_000)
-    return WorkloadWindow(path, 0, actual, actual, "sglang_bench_serving_duration")
 
 
 def optional_float(value: Any) -> float | None:

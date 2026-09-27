@@ -1,49 +1,31 @@
-"""Build the one fixed-calibration HiCache service/control/phase model."""
+"""Build shared HiCache costs from base evidence, supplemented only for missing costs."""
 
 from __future__ import annotations
 
-import argparse
 import math
 from pathlib import Path
 from statistics import median
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..common.io import load_json, write_json
-from ..common.paths import require_repo_path
-from .control_cost import control_models
-from .coverage import scan_model_inputs
-from .io_model import HiCacheIoModel
-from .io_model_contract import OPERATION_KINDS, io_observation_ready
-from .io_model_validation import required_resource_lanes
-from .phase_calibration import build_phase_cost
+from ..common.io import write_json
+from .io_model import HiCacheIoModel, interpolate_cost_curve
+from .io_model_contract import (
+    OPERATION_KINDS,
+    KIND_DIRECTIONS,
+    io_observation_ready,
+    positive_u64,
+    positive_finite_number,
+    nonnegative_finite_number,
+)
+from .io_model_validation import _points, required_resource_lanes, required_prefetch_stages
+from .phase_calibration import build_phase_cost, MissingPhaseEvidence
 
-
-def _log_interpolate(points: list[dict[str, Any]], coordinate: float, coordinate_field: str,
-                     value_field: str, *, log_value: bool = True) -> float:
-    ordered = sorted(points, key=lambda point: float(point[coordinate_field]))
-    if coordinate <= float(ordered[0][coordinate_field]):
-        return float(ordered[0][value_field])
-    if coordinate >= float(ordered[-1][coordinate_field]):
-        return float(ordered[-1][value_field])
-    for left, right in zip(ordered, ordered[1:]):
-        if coordinate > float(right[coordinate_field]):
-            continue
-        position = (math.log(coordinate) - math.log(float(left[coordinate_field]))) / (
-            math.log(float(right[coordinate_field])) - math.log(float(left[coordinate_field]))
-        )
-        left_value = float(left[value_field])
-        right_value = float(right[value_field])
-        if log_value:
-            return math.exp(math.log(left_value) + position * (math.log(right_value) - math.log(left_value)))
-        return left_value + position * (right_value - left_value)
-    raise RuntimeError("physical calibration interpolation failed")
+if TYPE_CHECKING:
+    from .group import GroupRequest
 
 
-def _new_parameters(points: list[dict[str, Any]], page_bytes: float) -> tuple[float, float]:
-    return (
-        _log_interpolate(points, page_bytes, "page_bytes", "setup_us_per_operation", log_value=False),
-        _log_interpolate(points, page_bytes, "page_bytes", "bandwidth_bytes_per_sec"),
-    )
+class MissingCostEvidence(ValueError):
+    """A supported cost form lacks measurements that identify its parameters."""
 
 
 def _existing_bandwidth(points: list[dict[str, Any]], page_bytes: float, operation_pages: float) -> float:
@@ -53,31 +35,28 @@ def _existing_bandwidth(points: list[dict[str, Any]], page_bytes: float, operati
     curve = [
         {
             "page_bytes": calibrated_page,
-            "bandwidth_bytes_per_sec": _log_interpolate(
+            "bandwidth_bytes_per_sec": interpolate_cost_curve(
                 values, operation_pages, "operation_pages", "bandwidth_bytes_per_sec"
             ),
         }
         for calibrated_page, values in sorted(by_page.items())
     ]
-    return _log_interpolate(curve, page_bytes, "page_bytes", "bandwidth_bytes_per_sec")
+    return interpolate_cost_curve(curve, page_bytes, "page_bytes", "bandwidth_bytes_per_sec")
 
 
-def _h2s_projection(observed: dict[str, Any], service: dict[str, Any], page_bytes: float) -> tuple[float, float]:
+def _existing_write_projection(observed: dict[str, Any], service: dict[str, Any], page_bytes: float) -> float:
     existing = 0.0
-    new = 0.0
     for batch in observed["storage_service_batches"]:
         existing_pages = int(batch["storage_existing_page_count"])
-        new_pages = int(batch["storage_new_page_count"])
         if existing_pages:
             bandwidth = _existing_bandwidth(service["existing_key_bandwidth_points"], page_bytes, batch["page_count"])
             existing += existing_pages * page_bytes * 1e6 / bandwidth
-        if new_pages:
-            setup, bandwidth = _new_parameters(service["new_operation_points"], page_bytes)
-            new += setup + new_pages * page_bytes * 1e6 / bandwidth
-    return existing, new
+    return existing
 
 
-def _physical_service(observed: dict[str, Any], services: dict[str, Any], geometry: int) -> dict[str, Any] | None:
+def observed_service_work(observed: dict[str, Any], geometry: int) -> dict[str, Any] | None:
+    """Extract measured work without requiring or estimating physical costs."""
+
     kind = observed.get("kind")
     if kind not in OPERATION_KINDS or not io_observation_ready(observed) or not observed["service_observed"]:
         return None
@@ -88,32 +67,30 @@ def _physical_service(observed: dict[str, Any], services: dict[str, Any], geomet
         return None
     page_bytes = page_size * geometry
     byte_count = pages * page_bytes
-    model = services[kind]
-    existing = new = 0.0
+    existing_pages = new_pages = 0
+    copied_pages = None
     if kind == "prefetch":
         calls = len(observed["storage_service_batches"])
         if calls == 0:
             return None
-        physical_us = (
-            calls * float(model.get("setup_us_per_operation") or 0.0)
-            + pages * float(model.get("setup_us_per_page") or 0.0)
-            + byte_count * 1e6 / float(model["bandwidth_bytes_per_sec"])
-        )
-    elif kind in {"load", "write_device_to_host"}:
-        bandwidth = _log_interpolate(model["page_bandwidth_points"], page_bytes, "page_bytes", "bandwidth_bytes_per_sec")
-        setup = _log_interpolate(model["page_bandwidth_points"], page_bytes, "page_bytes", "setup_us_per_operation", log_value=False)
-        physical_us = setup * observed["operation_count"] + byte_count * 1e6 / bandwidth
-    else:
+        batches = observed["storage_service_batches"]
+        if sum(int(batch["page_count"]) for batch in batches) != pages or any(
+            batch.get("copied_page_count") is None
+            or not 0 < int(batch["copied_page_count"]) <= int(batch["page_count"])
+            for batch in batches
+        ):
+            return None
+        copied_pages = sum(int(batch["copied_page_count"]) for batch in batches)
+    elif kind == "write_host_to_storage":
         if not observed.get("storage_residency_observed") or not observed.get("storage_service_batches"):
             return None
-        existing, new = _h2s_projection(observed, model, page_bytes)
-        physical_us = existing + new
-    if physical_us <= 0:
-        return None
+        batches = observed["storage_service_batches"]
+        existing_pages = sum(int(batch["storage_existing_page_count"]) for batch in batches)
+        new_pages = sum(int(batch["storage_new_page_count"]) for batch in batches)
+
     if kind in {"prefetch", "write_host_to_storage"}:
         service_call_bytes = [
-            int(batch["page_count"]) * page_bytes
-            for batch in observed.get("storage_service_batches", [])
+            int(batch["page_count"]) * page_bytes for batch in observed.get("storage_service_batches", [])
         ]
     else:
         operation_count = int(observed.get("operation_count") or 0)
@@ -122,11 +99,11 @@ def _physical_service(observed: dict[str, Any], services: dict[str, Any], geomet
         "family": kind,
         "source_manifest": None,
         "observed_service_us": service_us,
-        "physical_service_us": physical_us,
-        "physical_existing_us": existing,
-        "physical_new_us": new,
+        "storage_existing_page_count": existing_pages,
+        "storage_new_page_count": new_pages,
         "page_size": page_size,
         "page_count": pages,
+        "copied_page_count": copied_pages,
         "byte_count": byte_count,
         "storage_new_batch_pages": [
             int(batch.get("storage_new_page_count") or 0)
@@ -135,6 +112,54 @@ def _physical_service(observed: dict[str, Any], services: dict[str, Any], geomet
         ],
         "service_call_bytes": service_call_bytes,
     }
+
+
+def _physical_service(observed: dict[str, Any], services: dict[str, Any], geometry: int) -> dict[str, Any] | None:
+    row = observed_service_work(observed, geometry)
+    if row is None:
+        return None
+
+    kind = row["family"]
+    # Pure-new writes identify their own setup and bandwidth. They do not use
+    # the existing-key curve, even when that independent measurement is absent.
+    if kind == "write_host_to_storage" and row["storage_existing_page_count"] == 0:
+        row["physical_service_us"] = 0.0
+        return row
+
+    model = services.get(kind, {})
+    pages, byte_count = row["page_count"], row["byte_count"]
+    page_bytes = row["page_size"] * geometry
+    if kind == "prefetch":
+        if "stages" not in model:
+            return None
+        stages = model["stages"]
+        physical_us = (
+            (stages["before_copy_us_per_page"] + stages["before_copy_us_per_byte"] * page_bytes) * pages
+            + (stages["copy_publish_us_per_page"] + stages["copy_publish_us_per_byte"] * page_bytes)
+            * row["copied_page_count"]
+            + stages["return_us_per_operation"] * len(row["service_call_bytes"])
+            + stages["return_us_per_page"] * pages
+        )
+    elif kind in {"load", "write_device_to_host"}:
+        if not model.get("page_bandwidth_points"):
+            return row  # Keep raw DMA work available for base-only identification.
+        bandwidth = interpolate_cost_curve(
+            model["page_bandwidth_points"], page_bytes, "page_bytes", "bandwidth_bytes_per_sec"
+        )
+        setup = interpolate_cost_curve(
+            model["page_bandwidth_points"], page_bytes, "page_bytes", "setup_us_per_operation", log_value=False
+        )
+        physical_us = setup * observed["operation_count"] + byte_count * 1e6 / bandwidth
+    else:
+        if not model.get("existing_key_bandwidth_points"):
+            return None
+        physical_us = _existing_write_projection(observed, model, page_bytes)
+
+    if physical_us <= 0 and row["storage_new_page_count"] == 0:
+        return None
+
+    row["physical_service_us"] = physical_us
+    return row
 
 
 def service_observation_rows(physical: dict[str, Any], captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -152,184 +177,375 @@ def service_observation_rows(physical: dict[str, Any], captures: list[dict[str, 
 
 
 def _runtime_scale_curve(
-    rows: list[dict[str, Any]], family: str, geometry: int, *, storage_state: str | None = None
+    rows: list[dict[str, Any]], component: str, geometry: int
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    selected = [row for row in rows if row["family"] == family]
-    physical_field = "physical_service_us"
-    if storage_state is not None:
-        other = "new" if storage_state == "existing" else "existing"
-        selected = [
-            row
-            for row in selected
-            if row[f"physical_{storage_state}_us"] > 0 and row[f"physical_{other}_us"] == 0
-        ]
-        physical_field = f"physical_{storage_state}_us"
+    """Estimate a multiplier from rows already selected for one service/state."""
     by_capture: dict[str, list[dict[str, Any]]] = {}
-    for row in selected:
+    for row in rows:
         by_capture.setdefault(row["source_manifest"], []).append(row)
     details = []
     for source, values in sorted(by_capture.items()):
         observed = math.fsum(row["observed_service_us"] for row in values)
-        physical = math.fsum(row[physical_field] for row in values)
+        physical = math.fsum(row["physical_service_us"] for row in values)
         if observed <= 0 or physical <= 0:
             continue
         ratio = observed / physical
-        details.append({"source_manifest": source, "role": values[0]["role"], "page_size": values[0]["page_size"],
-                        "operation_count": len(values),
-                        "observed_service_us": observed, "physical_service_us": physical,
-                        "runtime_scale": ratio})
+        details.append(
+            {
+                "source_manifest": source,
+                "role": values[0]["role"],
+                "page_size": values[0]["page_size"],
+                "operation_count": len(values),
+                "observed_service_us": observed,
+                "physical_service_us": physical,
+                "runtime_scale": ratio,
+            }
+        )
     if not details:
-        suffix = f" {storage_state}" if storage_state else ""
-        raise ValueError(f"base plus fixed calibration did not identify {family}{suffix} service")
+        raise MissingCostEvidence(f"no positive measurements identify {component} service")
     points = []
     anchors_by_page: dict[int, list[dict[str, Any]]] = {}
     for row in details:
         anchors_by_page.setdefault(row["page_size"], []).append(row)
     for page_size, page_rows in sorted(anchors_by_page.items()):
-        points.append({
-            "page_bytes": page_size * geometry,
-            "runtime_scale": median(row["runtime_scale"] for row in page_rows),
-            "source_manifests": [row["source_manifest"] for row in page_rows],
-            "repeat_count": len(page_rows),
-        })
-    observed_total = math.fsum(row["observed_service_us"] for row in selected)
-    physical_total = math.fsum(row[physical_field] for row in selected)
-    actual = [row["observed_service_us"] for row in selected]
-    predicted = [
-        row[physical_field] * _log_interpolate(points, row["page_size"] * geometry, "page_bytes", "runtime_scale")
-        for row in selected
-    ]
+        points.append(
+            {
+                "page_bytes": page_size * geometry,
+                "runtime_scale": median(row["runtime_scale"] for row in page_rows),
+                "source_manifests": [row["source_manifest"] for row in page_rows],
+                "repeat_count": len(page_rows),
+            }
+        )
+    observed_total = math.fsum(row["observed_service_us"] for row in rows)
+    physical_total = math.fsum(row["physical_service_us"] for row in rows)
     model_points = [{"page_bytes": row["page_bytes"], "runtime_scale": row["runtime_scale"]} for row in points]
     return model_points, {
         "formula": (
-            "at each fixed page endpoint: median repeat observed/physical scale; "
-            "log interpolation between the two endpoint anchors"
+            "per observed page size: median capture-level observed/physical ratio; "
+            "log interpolation only when multiple page anchors exist"
         ),
         "unit": "dimensionless",
         "capture_count": len(details),
         "page_anchor_count": len(points),
-        "operation_count": len(selected),
+        "operation_count": len(rows),
         "observed_service_us": observed_total,
         "physical_service_us": physical_total,
         "per_capture": details,
         "points": points,
-        "input_reconstruction_wape": sum(abs(a - p) for a, p in zip(actual, predicted)) / observed_total,
     }
 
 
-def _new_write_curve(rows: list[dict[str, Any]], geometry: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Identify per-service-call setup and bytes cost from pure-new operations.
+def _call_cost_curve(rows: list[dict[str, Any]], geometry: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Identify T = calls * setup + bytes / bandwidth for one service family.
 
-    Divide both measured time and bytes by the number of calls before solving
-    the two anchors. This preserves T = calls * setup + bytes / bandwidth even
-    when an operation spans several (possibly unequal) storage batches.
+    Rows belong to one family; storage rows must contain pure-new writes.
+    Normalize by calls before solving the two observed size anchors. Negative
+    setup or nonpositive byte cost is insufficient evidence, not a value to clip.
     """
 
-    selected = [row for row in rows if row["family"] == "write_host_to_storage"
-                and row["physical_new_us"] > 0 and row["physical_existing_us"] == 0]
-    by_capture: dict[str, list[dict[str, Any]]] = {}
-    for row in selected:
-        by_capture.setdefault(row["source_manifest"], []).append(row)
-    fits = []
-    for source, values in sorted(by_capture.items()):
-        samples: dict[float, list[float]] = {}
+    by_page: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_page.setdefault(row["page_size"], []).append(row)
+    fits, rejected = [], []
+    for page, values in sorted(by_page.items()):
+        samples: dict[float, list[dict]] = {}
         for row in values:
-            calls = len(row["storage_new_batch_pages"])
-            samples.setdefault(row["byte_count"] / calls, []).append(row["observed_service_us"] / calls)
-        anchors = [{"bytes_per_call": size, "duration_us_per_call": median(times), "sample_count": len(times)}
-                   for size, times in sorted(samples.items())]
+            calls = len(
+                row["storage_new_batch_pages"]
+                if row["family"] == "write_host_to_storage"
+                else row["service_call_bytes"]
+            )
+            if calls == 0:
+                continue
+            samples.setdefault(row["byte_count"] / calls, []).append(
+                dict(
+                    source=row["source_manifest"],
+                    role=row.get("role", "calibration"),
+                    duration=row["observed_service_us"] / calls,
+                )
+            )
+        anchors = []
+        for size, observations in sorted(samples.items()):
+            chosen = [row for row in observations if row["role"] == "base"] or observations
+            per_source = {}
+            for row in chosen:
+                per_source.setdefault(row["source"], []).append(row["duration"])
+            anchors.append(
+                dict(
+                    bytes_per_call=size,
+                    duration_us_per_call=median(median(times) for times in per_source.values()),
+                    sample_count=len(chosen),
+                    source_manifests=sorted(per_source),
+                )
+            )
         if len(anchors) < 2:
-            raise ValueError("fixed calibration needs two new-write bytes-per-call sizes at every page endpoint")
+            rejected.append(dict(page_size=page, reason="two distinct bytes-per-call sizes required"))
+            continue
         short, long = anchors[0], anchors[-1]
         slope = (long["duration_us_per_call"] - short["duration_us_per_call"]) / (
             long["bytes_per_call"] - short["bytes_per_call"]
         )
         setup = short["duration_us_per_call"] - slope * short["bytes_per_call"]
         if setup < 0 or slope <= 0:
-            raise ValueError("fixed calibration did not identify non-negative new-write setup and bandwidth")
-        fits.append({
-            "source_manifest": source,
-            "page_size": values[0]["page_size"],
-            "setup_us_per_operation": setup,
-            "bandwidth_bytes_per_sec": 1_000_000.0 / slope,
-            "fit_anchors": [short, long],
-            "observed_anchors": anchors,
-        })
-    points = []
-    for page_size in sorted({row["page_size"] for row in fits}):
-        repeats = [row for row in fits if row["page_size"] == page_size]
-        points.append({
-            "page_bytes": page_size * geometry,
-            "setup_us_per_operation": median(row["setup_us_per_operation"] for row in repeats),
-            "bandwidth_bytes_per_sec": median(row["bandwidth_bytes_per_sec"] for row in repeats),
-        })
-    if len(points) < 2:
-        raise ValueError("fixed calibration did not cover both new-write page endpoints")
+            rejected.append(
+                dict(page_size=page, reason="measurements do not identify non-negative setup and positive bandwidth")
+            )
+            continue
+        fits.append(
+            {
+                "page_size": page,
+                "setup_us_per_operation": setup,
+                "bandwidth_bytes_per_sec": 1_000_000.0 / slope,
+                "fit_anchors": [short, long],
+                "observed_anchors": anchors,
+            }
+        )
+    points = [
+        dict(
+            page_bytes=row["page_size"] * geometry,
+            setup_us_per_operation=row["setup_us_per_operation"],
+            bandwidth_bytes_per_sec=row["bandwidth_bytes_per_sec"],
+        )
+        for row in fits
+    ]
+    if not points:
+        raise MissingCostEvidence("bytes-per-call measurements cannot identify setup and bandwidth: " + str(rejected))
     return points, {
-        "formula": "per endpoint: operation duration = new_service_calls * setup_per_call + bytes / sustained_bandwidth",
-        "parameter_method": "normalize each operation by service-call count; solve two size anchors; median across repeats",
+        "formula": "per endpoint: operation duration = service_calls * setup_per_call + bytes / bandwidth",
+        "parameter_method": "normalize by service-call count; prefer base per size; median per capture then per size; solve two anchors",
         "units": {"setup_us_per_operation": "microseconds", "bandwidth_bytes_per_sec": "bytes/second"},
-        "per_capture": fits,
+        "per_page": fits,
+        "unidentified_pages": rejected,
         "points": points,
     }
+
+
+def _profile_evidence(
+    rows: list[dict], component: str, geometry: int, *, call_cost: bool
+) -> tuple[list[dict] | None, dict]:
+    """Choose base before shared observations and retain the failed base reason."""
+
+    base_gap = None
+    base_rows = [row for row in rows if row["role"] == "base"]
+    for origin, candidates in (("base", base_rows), ("base_with_supplement", rows)):
+        try:
+            curve, detail = (
+                _call_cost_curve(candidates, geometry)
+                if call_cost
+                else _runtime_scale_curve(candidates, component, geometry)
+            )
+        except MissingCostEvidence as error:
+            if origin == "base":
+                base_gap = str(error)
+                if len(base_rows) == len(rows):
+                    return None, dict(base_gap=base_gap, profile_gap=base_gap)
+                continue
+            return None, dict(base_gap=base_gap, profile_gap=str(error))
+
+        if call_cost:
+            manifests = {
+                name
+                for page in detail["per_page"]
+                for anchor in page["fit_anchors"]
+                for name in anchor["source_manifests"]
+            }
+        else:
+            manifests = {item["source_manifest"] for item in detail["per_capture"]}
+        return curve, dict(detail, evidence_origin=origin, base_gap=base_gap, source_manifests=sorted(manifests))
+
+
+def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
+    """The same evidence decision drives service readiness and model construction.
+
+    Captures have unique manifests and admitted roles from prepare_model.
+    A base-derived multiplier may project sizes through the physical model. A
+    second calibrated page endpoint is not a prerequisite for that projection.
+    This function does not certify CPU overhead or an unobserved backend.
+    """
+    if physical is None:
+        return dict(
+            status="data_limitation",
+            missing=[dict(component="physical", reason="platform_model_not_available")],
+            sources={},
+            models={},
+            rows=[],
+        )
+    services = dict(physical["service_models"])
+    stages = services.get("prefetch", {}).get("stages")
+    missing = []
+    if stages is None:
+        missing.append(
+            dict(
+                component="physical/prefetch_stages",
+                reason="read_copy_return_measurements_missing; total service time cannot identify stage costs",
+            )
+        )
+    else:
+        required_prefetch_stages(stages)
+    rows = service_observation_rows(physical, captures)
+    geometry = int(physical["kv_geometry"]["kv_bytes_per_token_per_rank"])
+    components = [(kind, kind, None) for kind in OPERATION_KINDS[:-1]] + [
+        ("write_host_to_storage_existing", "write_host_to_storage", "existing"),
+        ("write_host_to_storage_new", "write_host_to_storage", "new"),
+    ]
+    scales, sources, selected_rows = {}, {}, []
+    new_write = []
+    for component, family, state in components:
+        if family == "prefetch" and stages is None:
+            continue
+        if family in {"load", "write_device_to_host"}:
+            dma_rows = [row for row in rows if row["family"] == family]
+            curve, detail = _profile_evidence(dma_rows, component, geometry, call_cost=True)
+            if curve is not None:
+                services[family] = dict(direction=KIND_DIRECTIONS[family], page_bandwidth_points=curve)
+                scales[component] = [dict(page_bytes=point["page_bytes"], runtime_scale=1.0) for point in curve]
+                sources[component] = dict(
+                    detail,
+                    parameter_basis="measured call setup and byte cost; no independent DMA curve or multiplier",
+                    extrapolation="endpoint coefficients outside observed pages and call sizes are unverified",
+                    timing_scope="observed DMA service; no residual CPU or target correction",
+                )
+                pages = {page["page_size"] for page in detail["per_page"]}
+                selected_rows.extend(
+                    row
+                    for row in dma_rows
+                    if row["source_manifest"] in detail["source_manifests"] and row["page_size"] in pages
+                )
+                continue
+        if family != "prefetch" and state != "new":
+            parameter = "existing_key_bandwidth_points" if state == "existing" else "page_bandwidth_points"
+            if not services.get(family, {}).get(parameter):
+                missing.append(dict(component="physical/" + component, reason=parameter + "_missing"))
+                continue
+
+        eligible = [
+            row
+            for row in rows
+            if row["family"] == family
+            and (
+                state is None
+                or (
+                    row[f"storage_{state}_page_count"] > 0
+                    and row[f"storage_{'existing' if state == 'new' else 'new'}_page_count"] == 0
+                )
+            )
+        ]
+        curve, detail = _profile_evidence(eligible, component, geometry, call_cost=state == "new")
+        if curve is None:
+            independent = _independent_service_curve(physical, family, state)
+            if independent is None:
+                missing.append(
+                    dict(component="service/" + component, reason=detail["profile_gap"], base_reason=detail["base_gap"])
+                )
+                continue
+            if state == "new":
+                new_write = independent
+            else:
+                scales[component] = independent
+            sources[component] = dict(
+                detail,
+                evidence_origin="independent_physical",
+                measurement_sources=list(physical["measurement_sources"]),
+                measurement_scope=physical.get("measurement_scope", {}),
+                points=independent,
+                formula="independently measured service formula; no runtime multiplier estimated",
+                extrapolation="declared service formula outside measured work; inference contention is unverified",
+                timing_scope="independent I/O service; no target or runtime-residual fitting",
+            )
+            continue
+
+        if state == "new":
+            new_write = curve
+            pages = {page["page_size"] for page in detail["per_page"]}
+        else:
+            scales[component] = curve
+            pages = {item["page_size"] for item in detail["per_capture"]}
+        sources[component] = dict(
+            detail,
+            extrapolation="page-endpoint coefficients held constant outside measured pages; work scales through the declared service formula",
+            timing_scope="observed I/O service; unmeasured profiler/scheduling perturbation is not claimed removed",
+        )
+        selected_rows.extend(
+            row
+            for row in eligible
+            if row["source_manifest"] in detail["source_manifests"] and row["page_size"] in pages
+        )
+    available = set(scales) & set(OPERATION_KINDS)
+    if new_write or "write_host_to_storage_existing" in scales:
+        available.add("write_host_to_storage")
+    models = {
+        kind: _service_model(kind, services.get(kind, {}), scales, new_write)
+        for kind in OPERATION_KINDS
+        if kind in available
+    }
+    return dict(
+        status="data_limitation" if missing else "ready",
+        missing=missing,
+        sources=sources,
+        models=models,
+        rows=selected_rows,
+    )
+
+
+def _independent_service_curve(physical: dict, family: str, state: str | None) -> list[dict] | None:
+    """Use declared primitive measurements only after workload evidence is exhausted.
+
+    Unit scales express the absence of a runtime correction, not a measured
+    workload response. In particular, they must not create observation coverage.
+    """
+
+    if not physical.get("measurement_sources"):
+        return None
+
+    service = physical["service_models"].get(family, {})
+    if state == "new":
+        points = service.get("new_operation_points")
+        if not points:
+            return None
+        return _points(
+            points,
+            "physical new-write parameters",
+            dict(
+                page_bytes=positive_u64,
+                setup_us_per_operation=nonnegative_finite_number,
+                bandwidth_bytes_per_sec=positive_finite_number,
+            ),
+            ("page_bytes",),
+        )
+
+    if family == "prefetch":
+        # Prefetch stages are validated before selection. This reference point
+        # encodes an identity multiplier at every page size, not a sampled page.
+        page_bytes = [int(physical["kv_geometry"]["kv_bytes_per_token_per_rank"])]
+    else:
+        field = "existing_key_bandwidth_points" if state == "existing" else "page_bandwidth_points"
+        page_bytes = sorted({point["page_bytes"] for point in service[field]})
+        if not page_bytes:
+            return None
+    return [dict(page_bytes=page, runtime_scale=1.0) for page in page_bytes]
 
 
 def _service_model(
     family: str, physical: dict[str, Any], scales: dict[str, list[dict[str, Any]]], new_write: list[dict[str, Any]]
 ) -> dict[str, Any]:
-    fields = {"direction": physical["direction"]}
+    fields = {"direction": physical.get("direction", KIND_DIRECTIONS[family])}
     if family == "prefetch":
         fields.update(
-            setup_us_per_operation=physical["setup_us_per_operation"],
-            setup_us_per_page=physical["setup_us_per_page"],
-            bandwidth_bytes_per_sec=physical["bandwidth_bytes_per_sec"],
             runtime_scale_points=scales[family],
+            stages=dict(physical["stages"]),
         )
     elif family in {"load", "write_device_to_host"}:
         fields["page_bandwidth_points"] = physical["page_bandwidth_points"]
         fields["runtime_scale_points"] = scales[family]
     else:
-        fields.update(
-            new_operation_points=new_write,
-            existing_key_bandwidth_points=physical["existing_key_bandwidth_points"],
-            existing_runtime_scale_points=scales["write_host_to_storage_existing"],
-        )
+        if new_write:
+            fields["new_operation_points"] = new_write
+        if "write_host_to_storage_existing" in scales:
+            fields.update(
+                existing_key_bandwidth_points=physical["existing_key_bandwidth_points"],
+                existing_runtime_scale_points=scales["write_host_to_storage_existing"],
+            )
     return fields
-
-
-def _row_prediction(
-    row: dict[str, Any], scales: dict[str, list[dict[str, Any]]], geometry: int,
-    new_write: list[dict[str, Any]],
-) -> float:
-    page_bytes = row["page_size"] * geometry
-    if row["family"] != "write_host_to_storage":
-        scale = _log_interpolate(scales[row["family"]], page_bytes, "page_bytes", "runtime_scale")
-        return row["physical_service_us"] * scale
-    existing_scale = _log_interpolate(
-        scales["write_host_to_storage_existing"], page_bytes, "page_bytes", "runtime_scale"
-    )
-    setup, bandwidth = _new_parameters(new_write, page_bytes)
-    new_service = sum(setup + pages * page_bytes * 1e6 / bandwidth for pages in row["storage_new_batch_pages"])
-    return row["physical_existing_us"] * existing_scale + new_service
-
-
-def _reconstruction(
-    rows: list[dict[str, Any]], scales: dict[str, list[dict[str, Any]]], geometry: int,
-    new_write: list[dict[str, Any]],
-) -> dict[str, Any]:
-    result = {}
-    for family in OPERATION_KINDS:
-        values = [row for row in rows if row["family"] == family]
-        actual = sum(row["observed_service_us"] for row in values)
-        predicted = [_row_prediction(row, scales, geometry, new_write) for row in values]
-        error = sum(abs(row["observed_service_us"] - estimate) for row, estimate in zip(values, predicted))
-        result[family] = {
-            "operation_count": len(values),
-            "observed_service_us": actual,
-            "predicted_service_us": sum(predicted),
-            "wape": error / actual if actual else None,
-        }
-    return result
 
 
 def _io_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -338,7 +554,9 @@ def _io_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
     page_bytes = sorted({int(row["byte_count"] / row["page_count"]) for row in rows if row["page_count"] > 0})
     calls: dict[str, dict[str, Any]] = {}
     for family in OPERATION_KINDS:
-        values = [float(value) for row in rows if row["family"] == family for value in row["service_call_bytes"] if value > 0]
+        values = [
+            float(value) for row in rows if row["family"] == family for value in row["service_call_bytes"] if value > 0
+        ]
         if values:
             calls[family] = {
                 "min": min(values),
@@ -346,52 +564,83 @@ def _io_coverage(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "sample_count": len(values),
             }
     return {
-        "source": "fixed_calibration_observations",
-        "page_bytes": {"min": min(page_bytes), "max": max(page_bytes), "anchors": page_bytes},
+        "source": "selected_base_and_supplement_observations",
+        "page_bytes": {"min": min(page_bytes), "max": max(page_bytes), "anchors": page_bytes} if page_bytes else None,
         "service_call_bytes": calls,
         "outside_domain_behavior": "page endpoint clamp; service-call size remains a physical-model projection and is reported unverified",
     }
 
 
-def build_io_model(physical: dict[str, Any], captures: list[dict[str, Any]], base_page_size: int) -> tuple[dict, dict, dict]:
-    unique = {capture["source_manifest"]: capture for capture in captures}
-    fixed = [capture for capture in unique.values() if capture["role"] == "calibration"]
-    bases = [capture for capture in unique.values() if capture["role"] == "base"]
-    captures = [*bases, *fixed]
-    model_rows = service_observation_rows(physical, fixed)
+def prepare_model(group: GroupRequest, captures: list[dict[str, Any]], *, output: Path | None = None) -> dict[str, Any]:
+    """Select costs once and optionally publish a model, returning its input report.
+
+    Missing I/O services remain absent; execution reports a gap if it uses them.
+    Base, geometry and phase gaps prevent publication. Execution control costs
+    come from operation observations, not the historical static scalar model.
+    """
+
+    # Primitive acquisition imports group definitions, so keep this dependency local.
+    from .calibration.eviction_cpu import group_locked_candidate_cost
+
+    if any(capture["role"] not in {"base", "calibration"} for capture in captures):
+        raise ValueError("Cost evidence must be base or independent calibration, never target observations")
+    if len({capture["source_manifest"] for capture in captures}) != len(captures):
+        raise ValueError("Provide each observation manifest once; repeated captures need distinct manifests")
+
+    bases = [capture for capture in captures if capture["role"] == "base"]
+    calibration = [capture for capture in captures if capture["role"] == "calibration"]
+    physical = group.physical
+    evidence = service_cost_evidence(physical, captures)
+    missing = list(evidence["missing"]) if physical is None else []
+    if len(bases) != len(group.sources):
+        missing.append({"component": "base", "reason": "base_observations_incomplete"})
+    phase, phase_summary = None, {}
+    try:
+        phase, phase_summary = build_phase_cost(captures, int(group.sources[0].hicache_config["page_size"]))
+    except MissingPhaseEvidence as error:
+        missing.append({"component": "phase", "reason": str(error)})
+
+    report = {
+        "status": "ready" if not missing else "data_limitation",
+        "missing": missing,
+        "service_gaps": evidence["missing"] if physical is not None else [],
+        "base_profile_count": len(bases),
+        "calibration_profile_count": len(calibration),
+        "service_observation_count": {
+            kind: sum(row["family"] == kind for row in evidence["rows"]) for kind in OPERATION_KINDS
+        },
+        "service_evidence": evidence["sources"],
+        "execution_control_scope": "prefetch programs requested on execution; other CPU and phase prerequisites remain",
+        "phase_evidence": phase_summary.get("parameter_sources", {}),
+        "target_configurations": [target.label for target in group.targets],
+    }
+    if output is None:
+        return report
+    if missing:
+        write_json(output / "model_build_summary.json", {"status": "needs_calibration_data", "model_inputs": report})
+        return report
+
     geometry = int(physical["kv_geometry"]["kv_bytes_per_token_per_rank"])
-    scales = {}
-    service_sources = {}
-    for family in OPERATION_KINDS[:-1]:
-        scales[family], service_sources[family] = _runtime_scale_curve(model_rows, family, geometry)
-    scales["write_host_to_storage_existing"], service_sources["write_host_to_storage_existing"] = (
-        _runtime_scale_curve(model_rows, "write_host_to_storage", geometry, storage_state="existing")
-    )
-    new_write, service_sources["write_host_to_storage_new"] = _new_write_curve(model_rows, geometry)
-    controls, control_sources = control_models(fixed)
-    phase, phase_summary = build_phase_cost(captures, base_page_size)
-    physical_services = physical["service_models"]
+    service_sources = evidence["sources"]
     model = {
         "storage_batch_pages": physical["storage_batch_pages"],
         "kv_bytes_per_token_per_rank": geometry,
-        "service_models": {
-            family: _service_model(family, physical_services[family], scales, new_write) for family in OPERATION_KINDS
-        },
-        "control_models": controls,
+        "service_models": evidence["models"],
+        "control_models": {},
         "resource_lanes": required_resource_lanes(physical.get("resource_lanes")),
         "phase_cost": phase,
-        "io_coverage": _io_coverage(model_rows),
     }
-    normalized = HiCacheIoModel.from_raw(Path("hicache_io_model.json"), model).fields
+    if group.control_sources:
+        model["control_calibrations"] = group.raw["control_calibrations"]
     summary = {
         "status": "ready",
+        "service_gaps": evidence["missing"],
         "model_form": (
-            "physical service times fixed endpoint scales; new H2S uses directly measured setup plus bandwidth"
+            "base-first service evidence; independent primitive costs fill gaps without an inferred runtime multiplier"
         ),
         "parameter_sources": {
-            "physical": "explicit platform calibration",
+            "physical": "base deployment metadata and declared independent service measurements",
             "service_runtime_scales": service_sources,
-            "control": control_sources,
             "phase": phase_summary["parameter_sources"],
         },
         "platform_measurement": {
@@ -401,55 +650,25 @@ def build_io_model(physical: dict[str, Any], captures: list[dict[str, Any]], bas
         },
         "observation_sources": {
             "base": [capture["source_manifest"] for capture in bases],
-            "fixed_calibration": [capture["source_manifest"] for capture in fixed],
+            "fixed_calibration": [capture["source_manifest"] for capture in calibration],
         },
-        "direct_input_reconstruction": {
-            "base": _reconstruction(service_observation_rows(physical, bases), scales, geometry, new_write),
-            "fixed_calibration": _reconstruction(service_observation_rows(physical, fixed), scales, geometry, new_write),
-        },
-        "phase": phase_summary,
-        "io_coverage": model["io_coverage"],
-        "target_inputs": [],
-        "target_score_inputs": [],
-        "accuracy_verified": False,
+        "phase": {key: value for key, value in phase_summary.items() if key != "parameter_sources"},
+        "io_coverage": _io_coverage(evidence["rows"]),
     }
-    return normalized, summary, {"phase_cost": phase, "summary": phase_summary}
-
-
-def main(argv: list[str] | None = None) -> int:
-    from .group import GroupRequest
-    from .observations import group_observations
-
-    parser = argparse.ArgumentParser(description="Build one base's fixed-calibration HiCache model.")
-    parser.add_argument("--group", required=True, type=Path)
-    parser.add_argument("--output-dir", type=Path)
-    args = parser.parse_args(argv)
-    group = GroupRequest.load(require_repo_path(args.group))
-    output = require_repo_path(args.output_dir) if args.output_dir else group.output_dir
-    captures = group_observations(group)
-    readiness = scan_model_inputs(group, captures)
-    output.mkdir(parents=True, exist_ok=True)
-    if readiness["status"] != "ready":
-        write_json(output / "model_build_summary.json", {"status": "needs_calibration_data", "model_inputs": readiness})
-        print(f"model not built: {len(readiness['missing'])} fixed-input requirements remain")
-        return 2
-    model, summary, phase = build_io_model(
-        group.physical,
-        captures,
-        int(group.sources[0].hicache_config["page_size"]),
-    )
-    summary.update(base_group=group.base_config, model_inputs=readiness)
-    write_json(output / "phase_calibration.json", phase)
+    summary["base_group"] = group.base_config
+    summary["parameter_sources"]["execution_control"] = group.control_sources
+    operation_costs, operation_evidence = group_locked_candidate_cost(group)
+    if operation_costs:
+        model.update(operation_costs)
+        summary["parameter_sources"]["locked_candidate"] = operation_evidence
+    model = HiCacheIoModel.from_raw(model).fields
     write_json(output / "hicache_io_model.json", model)
     write_json(output / "model_build_summary.json", summary)
-    group_summary = group.output_dir / "group_summary.json"
-    if output == group.output_dir and group_summary.exists():
-        state = load_json(group_summary)
-        state.update(status="model_built", predictions_completed=0, accuracy_verified=False)
-        write_json(group_summary, state)
-    print(f"model={output / 'hicache_io_model.json'}")
-    return 0
+    return report
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # The public build action shares preparation's observation admission path.
+    from .observations import main
+
+    raise SystemExit(main(build_model=True))

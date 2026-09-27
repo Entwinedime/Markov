@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -94,43 +93,12 @@ def dtype_bytes(dtype: str) -> int:
     return widths[normalized]
 
 
-def filesystem_type(path: Path) -> str:
-    """Return the filesystem type containing a calibration directory."""
-
-    result = subprocess.run(
-        ["stat", "-f", "-c", "%T", str(path)],
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-    return result.stdout.strip() if result.returncode == 0 else "unknown"
-
-
 def required_positive_int(value: Any, field: str) -> int:
     """Validate one positive integer from model metadata."""
 
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"model config field {field!r} must be a positive integer")
     return value
-
-
-def positive_int(value: str) -> int:
-    """Parse one positive CLI integer."""
-
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("expected a positive integer")
-    return parsed
-
-
-def nonnegative_int(value: str) -> int:
-    """Parse one non-negative CLI integer."""
-
-    parsed = int(value)
-    if parsed < 0:
-        raise argparse.ArgumentTypeError("expected a non-negative integer")
-    return parsed
 
 
 def unit_interval(value: str) -> float:

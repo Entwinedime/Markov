@@ -8,7 +8,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..physical_calibration import nonnegative_int, positive_int, unit_interval
+from ...common.commands import nonnegative_int, positive_int
+from ..physical_calibration import unit_interval
 
 
 DEFAULT_PAGE_TOKEN_SIZES = "32,64,128"
@@ -89,40 +90,40 @@ def apply_numa_preference(node: int | None) -> int | None:
 @dataclass(frozen=True)
 class CalibrationOptions:
     output_dir: Path
-    model_config: Path
-    tensor_parallel_size: int
     storage_dir: Path
-    runtime_dma_report: Path
     page_token_sizes: str
     burst_bytes_per_scope: int
     warmup: int
     repeats: int
-    isolated_repeats: int
     storage_existing_operation_pages: str
     storage_new_write_queue_bytes_per_scope: str
     storage_new_write_operation_bytes_per_scope: str
     selection_percentile: float
-    kv_element_bytes: int
     storage_scope_cpu_sets: str
     force: bool
+    base_report: Path
+    service: str
+
 
 def parse_args(argv: list[str] | None = None) -> CalibrationOptions:
     parser = argparse.ArgumentParser(description="Calibrate compact HiCache physical I/O primitives.")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--model-config", type=Path, required=True)
-    parser.add_argument("--tensor-parallel-size", type=positive_int, required=True)
     parser.add_argument("--storage-dir", type=Path, required=True)
-    parser.add_argument("--runtime-dma-report", type=Path, required=True, help="DMA measured at the deployment TP scope count")
     parser.add_argument("--page-token-sizes", default=DEFAULT_PAGE_TOKEN_SIZES)
     parser.add_argument("--burst-bytes-per-scope", type=positive_int, default=DEFAULT_BURST_BYTES_PER_SCOPE)
     parser.add_argument("--warmup", type=nonnegative_int, default=1)
     parser.add_argument("--repeats", type=positive_int, default=5)
-    parser.add_argument("--isolated-repeats", type=positive_int, default=5)
     parser.add_argument("--storage-existing-operation-pages", default=DEFAULT_EXISTING_OPERATION_PAGES)
     parser.add_argument("--storage-new-write-queue-bytes-per-scope", default=DEFAULT_NEW_WRITE_QUEUE_BYTES)
     parser.add_argument("--storage-new-write-operation-bytes-per-scope", default="")
     parser.add_argument("--selection-percentile", type=unit_interval, default=0.25)
-    parser.add_argument("--kv-element-bytes", type=nonnegative_int, default=0)
     parser.add_argument("--storage-scope-cpu-sets", default="")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--base-report",
+        type=Path,
+        required=True,
+        help="retain unrelated services from this independent physical report",
+    )
+    parser.add_argument("--service", choices=("prefetch", "existing_write", "new_write"), required=True)
     return CalibrationOptions(**vars(parser.parse_args(argv)))

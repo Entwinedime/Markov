@@ -3,226 +3,102 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
 from typing import Any
 
-from ...common.io import load_json, write_json
-from ..planning.specs import ModelRunRequest
-from ..types import CacheStatePredictionRef, ModelRunResult, ModelRunSpec
-from ..validations.base_dag.preflight import DagTracePreflightCheck
-from ..validations.hicache.preflight.state_input_preflight import HiCacheStateInputPreflightCheck
-from ..validations.final_dag.shape_compare import predicted_shape
-from .ledger import predicted_aggregates
+from ...common.io import load_json
+from ..types import ModelRunResult
 
 
-@dataclass(frozen=True)
-class HiCachePredictionRequest:
-    """Predict target DAG effects and costs without reading target observations."""
-
-    name = "hicache_prediction"
-
-    def preflight_checks(self) -> tuple[type, ...]:
-        return (DagTracePreflightCheck, HiCacheStateInputPreflightCheck)
-
-    def build_model_run_requests(self, context: Any) -> list[ModelRunRequest]:
-        predictions = [
-            CacheStatePredictionRef(source=source, target=target)
-            for source in context.runs
-            for target in context.options.target_configs
-        ]
-        if context.options.max_predictions > 0:
-            predictions = predictions[: context.options.max_predictions]
-        if not predictions:
-            raise ValueError("HiCache prediction produced no source/target requests")
-        return self.requests_for(predictions)
-
-    @staticmethod
-    def requests_for(predictions: list[CacheStatePredictionRef]) -> list[ModelRunRequest]:
-        return [
-            ModelRunRequest(
-                source_profile=prediction.source,
-                target_config=prediction.target,
-                prediction=prediction,
-            )
-            for prediction in predictions
-        ]
-
-    def analyze(
-        self,
-        context: Any,
-        specs: list[ModelRunSpec],
-        results: dict[str, ModelRunResult],
-    ) -> dict[str, Any]:
-        rows: list[dict[str, Any]] = []
-        progress = context.reporter.start_stage(
-            self.name,
-            len(specs),
-            "source-only HiCache I/O/control + Prefill/Decode",
-            unit="prediction",
-        )
-        for spec in specs:
-            result = results[spec.run_id]
-            row = self.build_row(result)
-            rows.append(row)
-            if result.ok and not result.dry_run:
-                run = load_json(result.artifacts.run_summary_json)
-                run["prediction"] = prediction_evidence(result, row)
-                write_json(result.artifacts.run_summary_json, run)
-            if context.options.artifact_policy.keep_debug_artifacts:
-                write_json(context.artifacts.debug_row_path(spec.run_id), row)
-            progress.advance(self.progress_metrics(rows))
-        summary = self.summarize(context, rows)
-        progress.finish(str(summary["status"]), self.summary_text(summary))
-        return summary
-
-    @staticmethod
-    def build_row(result: ModelRunResult) -> dict[str, Any]:
-        spec = result.spec
-        predicted, prediction_errors = predicted_aggregates(result)
-        run_summary = result.artifacts.load_if_present(result.artifacts.run_summary_json)
-        patch = _dict_field(_dict_field(run_summary, "module_results"), "hicache_dag_patch")
-        validation = _dict_field(patch, "validation")
-        resources = _dict_field(patch, "io_resources")
-
-        structure_blockers: list[str] = []
-        if result.skipped:
-            structure_blockers.append(result.skip_reason or "skipped")
-        if result.return_code != 0:
-            structure_blockers.append("model_command_failed")
-        structure_blockers.extend(prediction_errors)
-        if validation.get("status") != "ready":
-            structure_blockers.append("dag_patch_validation_not_ready")
-        if resources.get("status") != "ready":
-            structure_blockers.append("io_resources_not_ready")
-        if patch.get("topology_valid") is not True:
-            structure_blockers.append("topology_invalid")
-        if patch.get("phase_patch_status") != "ready":
-            structure_blockers.append("phase_patch_not_ready")
-
-        cost_blockers: list[str] = []
-        if patch.get("status") not in {"applied", "no_mutation_required"}:
-            cost_blockers.append("dag_patch_not_applied")
-        cost_blockers.extend(f"dag_patch_apply:{value}" for value in sorted(patch.get("blocker_counts") or {}))
-
-        records = [
-            record
-            for aggregate in (predicted.get("by_kind") or {}).values()
-            if isinstance(aggregate, dict)
-            for record in aggregate.get("records") or []
-            if isinstance(record, dict)
-        ]
-        missing_mapping = sum(
-            record.get("source_carrier_state") == "present" and not record.get("source_io_operation_record_ids")
-            for record in records
-        )
-        if missing_mapping:
-            structure_blockers.append("source_carrier_record_mapping_missing")
-
-        structure_blockers = sorted(set(structure_blockers))
-        cost_blockers = sorted(set(cost_blockers))
-        structure_ready = not structure_blockers
-        io_domain = (
-            spec.hicache_io_model.domain_status(
-                int(spec.target_config.fields.get("page_size") or 0),
-                predicted.get("by_kind") or {},
-            )
-            if spec.hicache_io_model is not None
-            else {"status": "unverified", "reason": "missing_hicache_io_model"}
-        )
-        return {
-            "model_run_id": spec.run_id,
-            "pair_id": spec.prediction.label,
-            "workload_id": spec.prediction.input_id,
-            "source_run_id": spec.source_profile.run_id,
-            "source_config_id": spec.source_profile.config_id,
-            "target_config": spec.target_config.label,
-            "target_config_path": str(spec.target_config.source_path) if spec.target_config.source_path else None,
-            "is_self": spec.prediction.is_self,
-            "status": "READY"
-            if structure_ready and not cost_blockers
-            else ("STRUCTURE_READY" if structure_ready else "NOT_READY"),
-            "structure_ready": structure_ready,
-            "structure_blockers": structure_blockers,
-            "cost_blockers": cost_blockers,
-            "phase_modeled": patch.get("phase_patch_status") == "ready",
-            "io_domain": io_domain,
-            "target_predicted": predicted,
-            "source_record_mapping": {
-                "predicted_record_count": len(records),
-                "source_carrier_present_count": sum(
-                    record.get("source_carrier_state") == "present" for record in records
-                ),
-                "source_mapped_record_count": sum(
-                    bool(record.get("source_io_operation_record_ids")) for record in records
-                ),
-                "target_created_record_count": sum(
-                    record.get("source_carrier_state") == "absent" for record in records
-                ),
-                "missing_required_mapping_count": missing_mapping,
-                "mapping_complete": missing_mapping == 0,
-            },
-        }
-
-    @staticmethod
-    def progress_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
-        return {
-            "prediction-ready": f"{sum(row['structure_ready'] for row in rows)}/{len(rows)}",
-            "cost-ready": f"{sum(row['status'] == 'READY' for row in rows)}/{len(rows)}",
-        }
-
-    @staticmethod
-    def summarize(context: Any, rows: list[dict[str, Any]]) -> dict[str, Any]:
-        ready_count = sum(row.get("status") == "READY" for row in rows)
-        blockers: Counter[str] = Counter()
-        for row in rows:
-            blockers.update(str(value) for value in row.get("structure_blockers") or [])
-            blockers.update(str(value) for value in row.get("cost_blockers") or [])
-        return {
-            "status": "READY" if rows and ready_count == len(rows) else "CHECK",
-            "mode": "prediction",
-            "dag_model_count": len(rows),
-            "ready_count": ready_count,
-            "structure_ready_count": sum(row.get("structure_ready") is True for row in rows),
-            "blocker_counts": dict(sorted(blockers.items())),
-            "source_profile_count": len({row.get("source_run_id") for row in rows}),
-            "target_score_cell_count": 0,
-            "phase_modeled_cell_count": sum(row.get("phase_modeled") is True for row in rows),
-            "phase_limitation_cell_count": sum(row.get("phase_modeled") is not True for row in rows),
-            "residual_gap_modeled": False,
-            "io_domain_counts": dict(sorted(Counter(
-                str(row.get("io_domain", {}).get("status") or "unverified") for row in rows
-            ).items())),
-            "bounded_by_max_predictions": context.options.max_predictions > 0,
-        }
-
-    @staticmethod
-    def summary_text(summary: dict[str, Any]) -> str:
-        return (
-            f"DAG models={summary['dag_model_count']} | "
-            f"prediction-ready={summary['structure_ready_count']}/{summary['dag_model_count']} | "
-            f"cost-ready={summary['ready_count']}/{summary['dag_model_count']}"
-        )
+def read_row(result: ModelRunResult) -> dict[str, Any]:
+    """Read one completed attempt; failed or unstarted work never reads old output."""
+    report = result.spec.output_dir / "run_summary.json"
+    run = load_json(report) if result.ok and report.is_file() else {}
+    return build_row(result, run)
 
 
-def _dict_field(payload: dict[str, Any], name: str) -> dict[str, Any]:
-    value = payload.get(name)
-    return value if isinstance(value, dict) else {}
+def build_row(result: ModelRunResult, run_summary: dict[str, Any]) -> dict[str, Any]:
+    """Bind source/target identity to execution, not structure or accuracy acceptance."""
 
-
-def prediction_evidence(result: ModelRunResult, row: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Project completed output, never rerun a model to recover missing evidence."""
-
-    if not result.artifacts.model_summary_json.is_file():
-        raise ValueError(f"prediction has neither retained scoring evidence nor full details: {result.spec.label}")
-    row = dict(row if row is not None else HiCachePredictionRequest.build_row(result))
-    aggregate = row["target_predicted"]
-    if aggregate["resource_status"] != "ready":
-        raise ValueError(f"prediction cost summary is incomplete: {result.spec.label}")
-    row["target_predicted"] = {
-        "totals": aggregate["totals"],
-        "by_kind": {kind: {key: value for key, value in values.items() if key != "records"}
-                    for kind, values in aggregate["by_kind"].items()},
+    execution = run_summary.get("module_results", {}).get("hicache_execution", {})
+    spec = result.spec
+    # Skipped or failed commands have their own cause; no execution report is
+    # expected. Check report integrity only after a successful command.
+    blockers = execution_blockers(execution) if result.ok else []
+    if result.skip_reason:
+        blockers.append(result.skip_reason)
+    if result.return_code != 0:
+        blockers.append("model_command_failed")
+    return {
+        "model_run_id": spec.run_id,
+        "pair_id": spec.label,
+        "workload_id": spec.source.input_id,
+        "source_run_id": spec.source.run_id,
+        "source_manifest": str(spec.source.manifest_path),
+        "source_config_id": spec.source.config_id,
+        "target_config": spec.target.label,
+        "target_hicache": dict(spec.target.fields),
+        "is_self": spec.target.matches_source(spec.source),
+        "status": "NOT_READY" if blockers else "EXECUTED",
+        "blockers": blockers,
+        "http_e2e_us": execution.get("http_us") if not blockers else None,
+        "cost_coverage": execution.get("cost_coverage", "unknown"),
+        "approximations": execution.get("remaining_approximations", []),
+        "missing_costs": list(result.missing_costs),
     }
-    row["shape"] = predicted_shape(load_json(result.artifacts.model_summary_json))
-    row["target_hicache"] = dict(result.spec.target_config.fields)
-    return row
+
+
+def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    completed_count = sum(row["status"] == "EXECUTED" for row in rows)
+    blockers: Counter[str] = Counter()
+    for row in rows:
+        blockers.update(row["blockers"])
+    return {
+        "status": "EXECUTED" if rows and completed_count == len(rows) else "CHECK",
+        "mode": "prediction",
+        "dag_model_count": len(rows),
+        "completed_count": completed_count,
+        "blocker_counts": dict(sorted(blockers.items())),
+        "residual_gap_modeled": False,
+        "cost_coverage_counts": dict(sorted(Counter(row["cost_coverage"] for row in rows).items())),
+        "missing_costs": shared_cost_gaps(rows),
+        "cost_requirements_complete": completed_count == len(rows) and bool(rows),
+        "cells": rows,
+    }
+
+
+def shared_cost_gaps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One demand per operation for the group; retain all observed work coordinates.
+
+    These are first encountered gaps, not a complete inventory or permission to
+    collect. The acquisition planner must still establish a suitable experiment.
+    """
+    gaps = {}
+    for row in rows:
+        for need in row["missing_costs"]:
+            gap = gaps.setdefault(
+                need["component"], dict(component=need["component"], reasons=[], coordinates=[], cells=[])
+            )
+            if need["reason"] not in gap["reasons"]:
+                gap["reasons"].append(need["reason"])
+            if need["coordinates"] not in gap["coordinates"]:
+                gap["coordinates"].append(need["coordinates"])
+            if row["model_run_id"] not in gap["cells"]:
+                gap["cells"].append(row["model_run_id"])
+    return list(gaps.values())
+
+
+def execution_blockers(execution: dict[str, Any]) -> list[str]:
+    """Execution integrity, independent of target observations or cost accuracy."""
+
+    if not execution:
+        return ["execution_result_missing"]
+    blockers = []
+    if (
+        execution.get("status") != "executed"
+        or not execution.get("prepared_facts")
+        or execution.get("consumed_facts") != execution.get("prepared_facts")
+    ):
+        blockers.append("state_execution_incomplete")
+    if execution.get("confirmations", {}).get("partial_window_rounds") != 0:
+        blockers.append("confirmation_window_incomplete")
+    return blockers

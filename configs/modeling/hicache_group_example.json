@@ -1,0 +1,5 @@
+{
+  "base_manifests": ["<base-profile>/profile_manifest.json"],
+  "target_configs": ["configs/modeling/hicache_target_example.json"],
+  "output_dir": "data/modeling_runs/my_hicache_group"
+}

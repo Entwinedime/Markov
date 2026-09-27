@@ -1,74 +1,65 @@
-"""Top-level orchestration for the host-side modeling workflow."""
+"""Plan, execute and report source-only predictions in the modeling environment."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
-from .artifacts import WorkflowArtifactLayout, prune_debug_details
-from .context import WorkflowContext, WorkflowOptions
-from .execution.model_executor import ModelRunExecutor
-from .planning.plan_io import write_model_run_plan
-from .planning.profile_runs import ProfileRunDiscovery
-from .planning.specs import ModelRunPlanner
-from .preflight import PreflightRunner
-from .prediction.hicache import HiCachePredictionRequest
-from .progress import WorkflowProgressReporter
-from .reporting.workflow_summary import write_workflow_summary
-from .types import ProfileRunRef
+from ..common.io import write_json
+from ..common.paths import repo_relative_path
+from .context import WorkflowOptions
+from .execution.model_executor import run_model_runs
+from .planning.profile_runs import discover_profile_runs
+from .planning.specs import plan_model_runs
+from .preflight import preflight_sources
+from .prediction.hicache import build_row, read_row, summarize
+from .types import ModelRunResult
 
 
-@dataclass(frozen=True)
-class WorkflowRunner:
-    """Run preflight, C++ modeling cells, and Python validation analysis.
+def run_workflow(options: WorkflowOptions) -> int:
+    """Plan, execute and report predictions; return a nonzero status for incomplete work."""
 
-    The runner owns sequencing only. Validation objects define their required
-    C++ cells and analyze the resulting artifacts; the runner does not encode
-    validation-specific fixture or comparison behavior.
-    """
+    options.output_dir.mkdir(parents=True, exist_ok=True)
+    runs = discover_profile_runs(options.source_manifests)
 
-    options: WorkflowOptions
+    preflight_report = preflight_sources(options, runs)
+    specs = plan_model_runs(options, runs, preflight_report)
+    rows = {
+        spec.run_id: build_row(ModelRunResult(spec, 0, skip_reason=spec.skip_reason or "not_started"), {})
+        for spec in specs
+    }
+    # Publish the planned cells before starting any command. An interruption
+    # leaves an incomplete current attempt, never a previous successful report.
+    summary = {
+        "diagnostics": options.diagnostics.value,
+        "profile_run_count": len(runs),
+        "model_run_count": len(specs),
+        "model_run_error_count": 0,
+        "preflight_ready": preflight_report["ready"],
+        "prediction": summarize(list(rows.values())),
+    }
+    report_path = options.output_dir / "workflow_summary.json"
+    write_json(report_path, summary)
 
-    def run(self) -> int:
-        """Execute the complete workflow and write its aggregate summary."""
+    for result in run_model_runs(options, specs):
+        rows[result.spec.run_id] = read_row(result)
+        summary["model_run_error_count"] += result.return_code != 0
+        summary["prediction"] = summarize(list(rows.values()))
+        write_json(report_path, summary)
 
-        artifacts = WorkflowArtifactLayout(self.options.output_dir)
-        artifacts.ensure_base_dirs()
-        runs = self._selected_runs()
-        prediction = HiCachePredictionRequest()
-        context = WorkflowContext(
-            options=self.options,
-            runs=runs,
-            artifacts=artifacts,
-            reporter=WorkflowProgressReporter(),
-        )
-
-        preflight_report = PreflightRunner(context, list(prediction.preflight_checks())).run()
-        requests = prediction.build_model_run_requests(context)
-        specs = ModelRunPlanner(context, artifacts, preflight_report).build(requests)
-        write_model_run_plan(
-            artifacts,
-            runs,
-            specs,
-        )
-        results = ModelRunExecutor(context, specs).run()
-        prediction_summary = prediction.analyze(context, specs, results)
-        prune_debug_details(
-            (result.artifacts for result in results.values()),
-            self.options.artifact_policy,
-        )
-        write_workflow_summary(
-            context,
-            specs=specs,
-            preflight_report=preflight_report,
-            results=results,
-            prediction_summary=prediction_summary,
-        )
-        return 0 if self.options.dry_run or prediction_summary["status"] == "READY" else 2
-
-    def _selected_runs(self) -> list[ProfileRunRef]:
-        if not self.options.source_manifests or not self.options.target_configs:
-            raise SystemExit("Prediction requires --source-manifest and --target-config.")
-        runs = ProfileRunDiscovery((), self.options.source_manifests).discover()
-        if not runs:
-            raise SystemExit("No profile manifests matched the requested workflow.")
-        return runs
+    prediction_summary = summary["prediction"]
+    print(
+        f"prediction={prediction_summary['status']} "
+        f"completed={prediction_summary['completed_count']}/{len(specs)} "
+        f"cost-coverage={prediction_summary['cost_coverage_counts']}",
+        flush=True,
+    )
+    print("Predicted HTTP time (not measured target time):")
+    for row in rows.values():
+        duration = row["http_e2e_us"]
+        detail = f"{duration / 1_000_000:.6f} s" if duration is not None else "not predicted"
+        reasons = [need["component"] for need in row["missing_costs"]] or row["blockers"]
+        if reasons:
+            detail += " | " + ", ".join(reasons)
+        print(f"  {row['source_config_id']} -> {row['target_config']} | {row['workload_id']} | {detail}")
+    print(
+        f"Costs may be extrapolated and retain base waits; inspect coverage and approximations in {repo_relative_path(report_path)}"
+    )
+    return 0 if options.dry_run or prediction_summary["status"] == "EXECUTED" else 2

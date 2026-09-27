@@ -1,13 +1,10 @@
-"""Shared parsing and identity helpers for the HiCache token-path contract."""
+"""Token dictionary checks for already decoded source probe facts."""
 
 from __future__ import annotations
 
 import hashlib
-import json
 from typing import Any
 
-TokenUnit = tuple[int, ...]
-TokenPath = tuple[TokenUnit, ...]
 UINT32_MAX = (1 << 32) - 1
 
 
@@ -16,135 +13,43 @@ def fact_items(value: Any) -> list[Any]:
 
     if isinstance(value, list):
         return value
-    if value is None:
-        return []
-    return [value]
+    return [] if value is None else [value]
 
 
-def maybe_json(value: Any) -> Any:
-    """Decode a trace argument that may contain one or two JSON string layers."""
+def token_dictionary_issue_count(value: dict[str, Any]) -> int:
+    """Count invalid token data, declared length and path-identity mismatches.
 
-    if not isinstance(value, str):
-        return value
-    text = value.strip()
-    if not text:
-        return value
-    try:
-        decoded = json.loads(text)
-        if isinstance(decoded, str):
-            nested = decoded.strip()
-            if nested.startswith(("{", "[")):
-                return json.loads(nested)
-        return decoded
-    except json.JSONDecodeError:
-        return value
-
-
-def token_id_path(value: Any) -> TokenPath | None:
-    """Parse ``token_dictionary.token_ids`` while preserving composite tokens.
-
-    The C++ hash contract serializes every token component as unsigned 32-bit
-    little-endian data. Values outside that domain are rejected here so quality
-    audit reports an invalid dictionary instead of failing during hashing.
+    The source accumulator supplies a decoded dictionary with list-valued
+    token_ids. Composite tokens retain their boundaries for the token count,
+    while hashing uses the probe's flattened unsigned-32-bit little-endian data.
+    This is trace token identity, not artifact version or freshness checking.
     """
 
-    value = maybe_json(value)
-    if not isinstance(value, dict):
-        return None
-    raw_tokens = value.get("token_ids")
-    if not isinstance(raw_tokens, list):
-        return None
-
-    parsed: list[TokenUnit] = []
-    for token in raw_tokens:
-        unit = _token_unit_or_none(token)
-        if unit is None:
-            return None
-        parsed.append(unit)
-    return tuple(parsed)
-
-
-def _token_unit_or_none(token: Any) -> TokenUnit | None:
-    """Parse one scalar or composite token without leaking conversion errors."""
-
-    raw_unit = token if isinstance(token, (list, tuple)) else (token,)
-    try:
-        unit = tuple(_u32_token_component(item) for item in raw_unit)
-    except (TypeError, ValueError):
-        return None
-    return unit or None
-
-
-def _u32_token_component(value: Any) -> int:
-    """Parse one token component under the shared unsigned-32-bit contract."""
-
-    if isinstance(value, bool):
-        raise ValueError("boolean token components are invalid")
-    parsed = int(value)
-    if parsed < 0 or parsed > UINT32_MAX:
-        raise ValueError("token component is outside the unsigned 32-bit range")
-    return parsed
-
-
-def token_path_count(tokens: TokenPath) -> int:
-    """Return the number of model tokens represented by a parsed path."""
-
-    return len(tokens)
-
-
-def token_path_hash(tokens: TokenPath) -> str:
-    """Hash a token path with the probe's unsigned-32-bit LE algorithm."""
-
+    tokens = value["token_ids"]
     hasher = hashlib.sha256()
     for token in tokens:
-        for item in token:
-            hasher.update(int(item).to_bytes(4, byteorder="little", signed=False))
-    return "sha256_u32le:" + hasher.hexdigest()
+        components = token if isinstance(token, (list, tuple)) else (token,)
+        if not components:
+            return 1
+        for component in components:
+            if isinstance(component, bool):
+                return 1
+            try:
+                number = int(component)
+            except (TypeError, ValueError):
+                return 1
+            if not 0 <= number <= UINT32_MAX:
+                return 1
+            hasher.update(number.to_bytes(4, byteorder="little", signed=False))
 
-
-def token_dictionary_issues(value: Any) -> list[dict[str, Any]]:
-    """Validate count and path identity when ``token_ids`` are available."""
-
-    value = maybe_json(value)
-    if not isinstance(value, dict) or "token_ids" not in value:
-        return []
-
-    path_id = str(value.get("token_path_id") or value.get("path_id") or "")
-    declared_count = _int_or_none(value.get("token_count"))
-    tokens = token_id_path(value)
-    if tokens is None:
-        return [{"issue": "token_dictionary_token_ids_invalid", "path_id": path_id}]
-
-    issues: list[dict[str, Any]] = []
-    actual_count = token_path_count(tokens)
-    if declared_count is not None and declared_count != actual_count:
-        issues.append(
-            {
-                "issue": "token_dictionary_token_count_mismatch",
-                "path_id": path_id,
-                "token_count": declared_count,
-                "token_ids": actual_count,
-            }
-        )
-    if path_id:
-        computed_path_id = token_path_hash(tokens)
-        if computed_path_id != path_id:
-            issues.append(
-                {
-                    "issue": "token_dictionary_hash_mismatch",
-                    "path_id": path_id,
-                    "computed_path_id": computed_path_id,
-                }
-            )
-    return issues
-
-
-def _int_or_none(value: Any) -> int | None:
-    """Parse an integer while treating booleans and invalid values as absent."""
-
-    if value is None or isinstance(value, bool):
-        return None
+    declared = value.get("token_count")
     try:
-        return int(value)
+        count = None if declared is None or isinstance(declared, bool) else int(declared)
     except (TypeError, ValueError):
-        return None
+        count = None
+
+    issues = int(count is not None and count != len(tokens))
+    path_id = str(value.get("token_path_id") or value.get("path_id") or "")
+    if path_id and path_id != "sha256_u32le:" + hasher.hexdigest():
+        issues += 1
+    return issues

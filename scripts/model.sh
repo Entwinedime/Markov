@@ -11,35 +11,34 @@ cd "$ROOT_DIR"
 
 usage() {
     cat >&2 <<'EOF'
-usage:
+Main workflow:
+  scripts/model.sh prepare-hicache --group <group_request.json> [--dry-run]
   scripts/model.sh build-dag (--profile-manifest <manifest> --output-dir <dir> | --config <runner_config.json>)
-  scripts/model.sh calibrate-hicache <physical|runtime-dma> [options]
-  scripts/model.sh build-hicache-model --group <group_request.json> [--output-dir <dir>]
-  scripts/model.sh prepare-hicache --group <group_request.json> [--dry-run] [--calibration-only] [--refresh-observations] [--model-run-jobs <n>] [--diagnostics off|full]
-  scripts/model.sh predict-hicache [workflow options]
-  scripts/model.sh evaluate-hicache --prediction-dir <completed-output> --profile-run-dir <target-suite> --output-dir <score-output> [--oracle-cost-replay]
+  scripts/model.sh evaluate-hicache --prediction-dir <completed-output> --profile-run-dir <target-suite> --output-dir <score-output>
 
-prepare-hicache coordinates containers from the host. Its dry-run writes fixed-input
-and readiness plans without starting an inference server. With sufficient admitted
-group observations it builds one model and predicts the group. --calibration-only
-stops before model build/prediction. Missing base runs require a separate
-base_capture_budget; without it only a plan is returned.
-Missing physical data requires a separately budgeted physical_capture request;
-without it only a measurement plan is returned. That request must explicitly
-declare target-independent physical_capture.page_token_sizes.
+Start with prepare-hicache for one base and a group of targets. It coordinates
+base evidence, shared calibration, model construction and prediction. Evaluation
+is separate: target measurements are not required to make predictions.
+Use --dry-run to inspect the plan without starting an inference server.
 
-Physical/runtime-DMA calibration runs in the SGLang device environment.
-Other modeling actions run inside one modeling container. predict-hicache selects
-the HiCache I/O/control prediction and executes its model cells in that same
-container; it does not start one nested container per cell.
-
-examples:
-  scripts/model.sh build-dag --profile-manifest <profile_manifest.json> --output-dir <dag-output>
-  scripts/model.sh calibrate-hicache physical --help
-  scripts/model.sh calibrate-hicache runtime-dma --help
-  scripts/model.sh build-hicache-model --help
+Individual stages and diagnostics (normally coordinated by prepare-hicache):
   scripts/model.sh predict-hicache --source-manifest <manifest> --target-config <config> --hicache-io-model <model>
-  scripts/model.sh evaluate-hicache --prediction-dir <predictions> --profile-run-dir <suite> --output-dir <scores>
+  scripts/model.sh build-hicache-model --group <group_request.json> [--output-dir <dir>]
+  scripts/model.sh prepare-cpu-service --light-manifest <manifest> --profile-manifest <manifest> --tp-size <n> --output-dir <dir>
+  scripts/model.sh export-hicache-operation-costs --profile-manifest <independent-manifest> --cpu-service-cost <paired-service> --page-size <n> --output-dir <dir>
+  scripts/model.sh calibrate-hicache <physical|runtime-dma|eviction-cpu> [options]
+
+Missing base captures need base_capture_budget. Missing physical measurements
+need a budgeted physical_capture request with explicit page_token_sizes.
+Without the required budget/input, preparation reports the missing work instead
+of starting an unbounded capture. --calibration-only stops before prediction.
+
+prepare-hicache coordinates containers from the host. Device calibration uses
+SGLang; DAG construction and prediction use modeling. Prediction cells share
+one modeling container. Build-dag also supports KTransformers without HiCache.
+
+Run an action with --help for its options. See docs/modeling_development.md for
+group inputs, supported cost coverage and the limitations of current predictions.
 EOF
 }
 
@@ -55,57 +54,52 @@ fi
 
 action=$1
 shift
-container_command=()
-action_args=()
 model_environment=modeling
+calibration_kind=""
 
-case "$action" in
-    prepare-hicache)
+if [ "$action" = calibrate-hicache ]; then
+    if [ $# -eq 0 ]; then
+        usage
+        exit 2
+    fi
+    calibration_kind=$1
+    shift
+    model_environment=sglang
+fi
+
+case "$action:$calibration_kind" in
+    export-hicache-operation-costs:)
+        module=modeling_workflow.calibration.operation_costs
+        ;;
+    prepare-cpu-service:)
+        module=modeling_workflow.calibration.prepare_cpu_service
+        ;;
+    prepare-hicache:)
         exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.prepare "$@"
         ;;
-    build-dag)
-        container_command=(python3 scripts/internal/entrypoints/model.py)
-        action_args=("$@")
+    build-dag:)
+        module=modeling.runner
         ;;
-    calibrate-hicache)
-        calibration_kind=${1:-}
-        if [ -z "$calibration_kind" ]; then
-            usage
-            exit 2
-        fi
-        shift
-        case "$calibration_kind" in
-            physical)
-                model_environment=sglang
-                container_command=(python3 -m markov_internal.modeling_workflow.io_calibration)
-                action_args=("$@")
-                ;;
-            runtime-dma)
-                model_environment=sglang
-                container_command=(python3 -m markov_internal.modeling_workflow.runtime_dma_calibration)
-                action_args=("$@")
-                ;;
-            *)
-                echo "unknown HiCache calibration kind: $calibration_kind" >&2
-                usage
-                exit 2
-                ;;
-        esac
+    calibrate-hicache:physical)
+        module=modeling_workflow.io_calibration
         ;;
-    build-hicache-model)
-        container_command=(python3 -m markov_internal.modeling_workflow.io_model_builder)
-        action_args=("$@")
+    calibrate-hicache:runtime-dma)
+        module=modeling_workflow.runtime_dma_calibration
         ;;
-    predict-hicache)
-        container_command=(python3 scripts/internal/entrypoints/modeling_workflow.py)
-        action_args=("$@")
+    calibrate-hicache:eviction-cpu)
+        module=modeling_workflow.calibration.eviction_cpu
         ;;
-    evaluate-hicache)
-        container_command=(python3 -m markov_internal.modeling_workflow.evaluation.existing)
-        action_args=("$@")
+    build-hicache-model:)
+        module=modeling_workflow.io_model_builder
+        ;;
+    predict-hicache:)
+        module=modeling_workflow.cli
+        ;;
+    evaluate-hicache:)
+        module=modeling_workflow.evaluation.existing
         ;;
     *)
-        echo "unknown modeling action: $action" >&2
+        echo "unknown modeling action: $action${calibration_kind:+/$calibration_kind}" >&2
         usage
         exit 2
         ;;
@@ -114,35 +108,25 @@ esac
 # 将仓库内的宿主机绝对路径投影为容器挂载路径。文档和配置仍优先使用
 # repo-relative path；这个转换只处理用户手动传入的仓库内绝对路径。
 container_arg() {
-    local arg=$1
-    local name
-    local value
+    local value=$1
+    local prefix=""
 
-    if [ "$arg" = "$ROOT_DIR" ]; then
-        printf '%s\n' "$CONTAINER_ROOT"
-        return
+    if [[ "$value" == --*=* ]]; then
+        prefix="${value%%=*}="
+        value="${value#*=}"
     fi
-    if [[ "$arg" == "$ROOT_DIR/"* ]]; then
-        printf '%s/%s\n' "$CONTAINER_ROOT" "${arg#"$ROOT_DIR"/}"
-        return
+
+    if [ "$value" = "$ROOT_DIR" ]; then
+        value=$CONTAINER_ROOT
+    elif [[ "$value" == "$ROOT_DIR/"* ]]; then
+        value="$CONTAINER_ROOT/${value#"$ROOT_DIR"/}"
     fi
-    if [[ "$arg" == --*=* ]]; then
-        name="${arg%%=*}"
-        value="${arg#*=}"
-        if [ "$value" = "$ROOT_DIR" ]; then
-            printf '%s=%s\n' "$name" "$CONTAINER_ROOT"
-            return
-        fi
-        if [[ "$value" == "$ROOT_DIR/"* ]]; then
-            printf '%s=%s/%s\n' "$name" "$CONTAINER_ROOT" "${value#"$ROOT_DIR"/}"
-            return
-        fi
-    fi
-    printf '%s\n' "$arg"
+
+    printf '%s%s\n' "$prefix" "$value"
 }
 
 container_args=()
-for arg in "${action_args[@]}"; do
+for arg in "$@"; do
     container_args+=("$(container_arg "$arg")")
 done
 
@@ -152,4 +136,4 @@ if [ "$model_environment" = sglang ]; then
 fi
 exec "$SCRIPT_DIR/run.sh" "$model_environment" -- \
     env PYTHONPATH="$model_python_path" \
-    "${container_command[@]}" "${container_args[@]}"
+    python3 -m "markov_internal.$module" "${container_args[@]}"

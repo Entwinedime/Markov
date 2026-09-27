@@ -50,17 +50,3 @@ def positive_finite_number(value: Any, field: str) -> float:
     if normalized <= 0.0:
         raise ValueError(f"HiCache model field '{field}' must be a finite positive number")
     return normalized
-
-
-def rounded_positive_u64(value: Any, field: str) -> int:
-    normalized = positive_finite_number(value, field)
-    rounded = int(round(normalized))
-    if rounded <= 0 or rounded > MAX_U64:
-        raise ValueError(f"HiCache model field '{field}' cannot be represented as uint64")
-    return rounded
-
-
-def is_missing_contract_value(value: Any) -> bool:
-    if value is None or value == "" or value == {}:
-        return True
-    return isinstance(value, int) and not isinstance(value, bool) and value == 0

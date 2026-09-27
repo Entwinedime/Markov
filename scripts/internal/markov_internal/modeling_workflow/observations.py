@@ -1,34 +1,39 @@
-"""Extract and admit base plus fixed-calibration observations."""
+"""Extract base and explicitly sourced, group-shared calibration observations."""
 
 from __future__ import annotations
 
-import time
+import argparse
+from tempfile import TemporaryDirectory
 from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json, write_json
-from ..common.naming import sanitize
-from ..common.paths import repo_relative_path, require_repo_path
-from ..modeling.backend import append_option, execute_trace_graph
-from ..modeling.cpp_config import trace_graph_executable
-from ..modeling.workload import WorkloadWindow, discover_workload_window
-from .capture import calibration_inputs, completed_profile
-from .coverage import scan_model_inputs
-from .fixed_calibration import calibration_page_sizes, materialize_fixed_calibration
-from .group import GroupRequest, source_environment
-from .planning.profile_runs import ProfileRunDiscovery
+from ..common.paths import repo_relative_path, require_repo_path, running_in_modeling_container
+from ..modeling.backend import append_option, execute_trace_graph, trace_graph_executable
+from ..modeling.workload import WorkloadWindow, controlled_request_window
+from .capture import completed_profile
+from .io_model_builder import prepare_model
+from .group import GroupRequest, environments_match, source_environment
+from .group_cpu_service import cpu_service_plan, prepare_group_cpu_service
+from .context import cpu_service_inputs
+from .planning.profile_runs import discover_profile_runs
 from .types import ProfileRunRef
 
 
 def _source_command(
-    source: ProfileRunRef, summary_path: Path, window: WorkloadWindow, threads: int
+    source: ProfileRunRef,
+    summary_path: Path,
+    window: WorkloadWindow,
+    threads: int,
+    cpu_service: Path | None = None,
 ) -> list[str]:
     command = [
-        str(trace_graph_executable({})),
+        str(trace_graph_executable()),
         "--profile-manifest",
         str(source.manifest_path),
         "--run-summary",
         str(summary_path),
+        "--source-observations-only",
         "--trace-channels",
         "torch,ld_preload,python_probe",
         "--threads",
@@ -38,44 +43,34 @@ def _source_command(
     ]
     append_option(command, "--trace-window-start-us", window.start_ns // 1000)
     append_option(command, "--trace-window-end-us", window.end_ns // 1000)
+    if cpu_service is not None:
+        command.extend(("--cpu-service-cost", str(cpu_service)))
     return command
 
 
-def _full_request_window(formal: WorkloadWindow) -> WorkloadWindow:
-    """Use every controlled request for calibration I/O, not for phase timing."""
-
-    report = load_json(formal.report_path)
-    requests = [row for row in report.get("requests", [])
-                if isinstance(row, dict) and row.get("kind") == "request"]
-    starts = [float(row["start_time_ms"]) for row in requests if row.get("start_time_ms") is not None]
-    ends = [float(row["end_time_ms"]) for row in requests if row.get("end_time_ms") is not None]
-    if len(starts) != len(requests) or len(ends) != len(requests) or not requests:
-        raise ValueError("fixed calibration requires timestamps for every controlled request")
-    start_ns = int(min(starts) * 1_000_000)
-    end_ns = int(max(ends) * 1_000_000)
-    return WorkloadWindow(formal.report_path, start_ns, end_ns, end_ns - start_ns, "all_controlled_requests")
-
-
-def scan_observations(source: ProfileRunRef, output_dir: Path, *, role: str, threads: int = 4) -> dict[str, Any]:
+def scan_observations(
+    source: ProfileRunRef, scratch_root: Path, *, role: str, threads: int = 4, cpu_service: Path | None = None
+) -> dict[str, Any]:
     """Extract observed work/cost from a source profile without a target config."""
 
-    summary_path = output_dir / "run_summary.json"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    window = discover_workload_window({}, source.manifest_path)
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    window = source.workload_window
     if window is None:
         raise ValueError(f"model input has no declared formal workload window: {source.manifest_path}")
-    execute_trace_graph(_source_command(source, summary_path, window, threads))
-    summary = load_json(summary_path)
-    io_window = window
-    if role == "calibration":
-        io_window = _full_request_window(window)
-        io_summary_path = output_dir / "io_run_summary.json"
-        execute_trace_graph(_source_command(source, io_summary_path, io_window, threads))
-        summary["source_io_observations"] = load_json(io_summary_path)["source_io_observations"]
-    return {
+    io_window = controlled_request_window(window) if role == "calibration" else window
+    # Only extracted observations are consumed later. Isolate transient C++
+    # reports per invocation; unrelated captures may have identical run names.
+    with TemporaryDirectory(prefix="observations_", dir=scratch_root) as directory:
+        summary_path = Path(directory) / "run_summary.json"
+        execute_trace_graph(_source_command(source, summary_path, window, threads, cpu_service))
+        summary = load_json(summary_path)
+        if (io_window.start_ns, io_window.end_ns) != (window.start_ns, window.end_ns):
+            execute_trace_graph(_source_command(source, summary_path, io_window, threads, cpu_service))
+            summary["source_io_observations"] = load_json(summary_path)["source_io_observations"]
+    observation = {
         "source_manifest": str(repo_relative_path(source.manifest_path)),
-        "summary_path": str(repo_relative_path(summary_path)),
         "role": role,
+        "cpu_service_cost": str(repo_relative_path(cpu_service)) if cpu_service else None,
         "observation_window": {
             "kind": "declared_formal_workload",
             "report": str(repo_relative_path(window.report_path)),
@@ -92,119 +87,108 @@ def scan_observations(source: ProfileRunRef, output_dir: Path, *, role: str, thr
         "source_io_observations": summary["source_io_observations"],
         "source_phase_observations": summary["source_phase_observations"],
     }
+    return observation
 
 
-def _fixed_manifests(group: GroupRequest) -> tuple[Path, ...]:
+def _calibration_inputs(group: GroupRequest) -> dict[Path, Path | None]:
+    """Bind admitted captures to their CPU correction from the same completed attempt."""
     ledger_path = group.output_dir / "capture_ledger.json"
-    manifests = list(group.fixed_calibration_manifests)
+    inputs = {path.resolve(): None for path in group.fixed_calibration_manifests}
     if ledger_path.exists():
         ledger = load_json(ledger_path)
         if ledger.get("base_config") != group.base_config:
-            raise ValueError("fixed calibration output belongs to another base")
-        expected = calibration_inputs(materialize_fixed_calibration(group)["files"])
+            raise ValueError("calibration output belongs to another base")
         for row in ledger["attempts"]:
-            if "calibration_inputs" in row and calibration_inputs(row["calibration_inputs"]) != expected:
-                raise ValueError("fixed calibration ledger contains a different fixed endpoint suite")
-            if completed_profile(row):
-                manifests.append(require_repo_path(row["profile_manifest"]))
-    return tuple(dict.fromkeys(manifests))
+            if completed_profile(row) and (row.get("stage") != "profiled_replay" or row.get("cpu_service_cost")):
+                manifest = require_repo_path(row["profile_manifest"]).resolve()
+                service = row.get("cpu_service_cost")
+                inputs[manifest] = require_repo_path(service) if service else None
+    if inputs.keys() & {source.manifest_path.resolve() for source in group.sources}:
+        raise ValueError("base measurements are not independent calibration")
+    return inputs
 
 
-def _calibration_observations(group: GroupRequest, cached: dict[Path, dict[str, Any]], *, refresh: bool) -> tuple[list[dict], int]:
-    manifests = _fixed_manifests(group)
-    if not manifests:
-        return [], 0
-    environment = source_environment(group.sources[0])
-    endpoints, _ = calibration_page_sizes(group)
-    observations = []
-    reused = 0
-    for source in ProfileRunDiscovery((), manifests).discover():
-        if source_environment(source) != environment:
-            raise ValueError("fixed calibration changed model, TP or runtime resources")
-        config = source.hicache_config or {}
-        if (int(config.get("page_size") or 0) not in endpoints
-                or config.get("write_policy") != "write_back"
-                or config.get("prefetch_policy") != "wait_complete"):
-            raise ValueError("fixed calibration profile does not use a declared endpoint and controlled policy")
-        if source.manifest_path in cached and not refresh:
-            observations.append(cached[source.manifest_path])
-            reused += 1
-            continue
-        started = time.monotonic()
-        observation = scan_observations(
-            source,
-            group.output_dir / "calibration_observations" / sanitize(source.run_dir.parent.name),
-            role="calibration",
-        )
-        observation["extraction_wall_seconds"] = time.monotonic() - started
-        observations.append(observation)
-    return observations, reused
-
-
-def scan_group(group: GroupRequest, *, refresh: bool = False) -> dict[str, Any]:
-    """Refresh the fixed model inputs; target declarations are never inspected."""
+def scan_group(
+    group: GroupRequest,
+    *,
+    refresh: bool = False,
+    cpu_services: tuple[Path, ...] = (),
+    build_model: bool = False,
+    model_output: Path | None = None,
+) -> dict[str, Any]:
+    """Observe and select costs once, optionally publishing the ready group model."""
 
     document_path = group.output_dir / "observations.json"
     previous = load_json(document_path).get("captures", []) if document_path.exists() else []
     cached = {require_repo_path(row["source_manifest"]): row for row in previous}
+    base_services = cpu_service_inputs(
+        list(cpu_services), tuple(source.manifest_path.resolve() for source in group.sources)
+    )
+    calibration_services = _calibration_inputs(group)
+    calibration_sources = discover_profile_runs(tuple(calibration_services))
+    environment = source_environment(group.sources[0]) if calibration_sources else None
     observations = []
-    base_reused = 0
-    for source in group.sources:
-        if source.manifest_path in cached and cached[source.manifest_path].get("role") == "base" and not refresh:
-            observations.append(cached[source.manifest_path])
-            base_reused += 1
-        else:
-            observations.append(
-                scan_observations(
-                    source,
-                    group.output_dir / "base_observations" / sanitize(source.input_id),
-                    role="base",
-                )
+    reused = {"base": 0, "calibration": 0}
+    for role, sources, services in (
+        ("base", group.sources, base_services),
+        ("calibration", calibration_sources, calibration_services),
+    ):
+        for source in sources:
+            if role == "calibration" and not environments_match(source_environment(source), environment):
+                raise ValueError("calibration changed model, TP or runtime resources")
+
+            service = services.get(source.manifest_path.resolve())
+            cached_source = cached.get(source.manifest_path, {})
+            reusable = (
+                not refresh
+                and cached_source.get("role") == role
+                and cached_source.get("cpu_service_cost") == (str(repo_relative_path(service)) if service else None)
             )
-    calibration, calibration_reused = _calibration_observations(group, cached, refresh=refresh)
-    observations.extend(calibration)
-    readiness = scan_model_inputs(group, observations)
-    result = {
-        "status": "ready_for_model_build" if readiness["status"] == "ready" else "needs_calibration_data",
-        "model_inputs": readiness,
-        "base_observations_reused": base_reused,
-        "calibration_observations_reused": calibration_reused,
-        "target_inputs": [],
-    }
+            if role == "base":
+                reusable = (
+                    reusable and cached_source.get("source_io_observations", {}).get("cpu_cost_basis") is not None
+                )
+            if reusable:
+                observations.append(cached_source)
+                reused[role] += 1
+            else:
+                observations.append(scan_observations(source, group.output_dir, role=role, cpu_service=service))
+
     write_json(document_path, {"captures": observations})
-    write_json(group.output_dir / "calibration_plan.json", result)
-    return result
+    readiness = prepare_model(group, observations, output=(model_output or group.output_dir) if build_model else None)
+    readiness.update(base_observations_reused=reused["base"], calibration_observations_reused=reused["calibration"])
+    write_json(group.output_dir / "model_inputs.json", readiness)
+    return readiness
 
 
-def group_observations(group: GroupRequest) -> list[dict[str, Any]]:
-    path = group.output_dir / "observations.json"
-    if not path.exists():
-        raise ValueError("scan base and fixed calibration observations before model build")
-    captures = load_json(path)["captures"]
-    base_paths = {source.manifest_path for source in group.sources}
-    observed_bases = {require_repo_path(row["source_manifest"]) for row in captures if row["role"] == "base"}
-    if observed_bases != base_paths:
-        raise ValueError("stored base observations do not match the group request")
-    admitted = set(_fixed_manifests(group))
-    observed_calibration = {require_repo_path(row["source_manifest"]) for row in captures if row["role"] == "calibration"}
-    if observed_calibration != admitted:
-        raise ValueError("stored fixed calibration observations do not match the ledger")
-    return captures
-
-
-def main(argv: list[str] | None = None) -> int:
-    import argparse
-    from ..common.paths import running_in_modeling_container
-
-    parser = argparse.ArgumentParser(description="Extract one base group's fixed model inputs.")
+def main(argv: list[str] | None = None, *, build_model: bool = False) -> int:
+    parser = argparse.ArgumentParser(description="Inspect group costs and optionally publish a ready model.")
     parser.add_argument("--group", required=True, type=Path)
     parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--build-model", action="store_true", help="publish the model when cost inputs are ready")
+    parser.add_argument("--output-dir", type=Path, help="model output; observations remain in the group directory")
+    parser.add_argument("--cpu-service-cost", type=Path, action="append", default=[])
     args = parser.parse_args(argv)
     if not running_in_modeling_container():
         raise SystemExit("use scripts/model.sh prepare-hicache for host orchestration")
-    result = scan_group(GroupRequest.load(require_repo_path(args.group)), refresh=args.refresh)
-    print(f"model_inputs={result['model_inputs']['status']} fixed_profiles={result['model_inputs']['fixed_calibration_profile_count']}")
-    return 0
+    group = GroupRequest.load(require_repo_path(args.group))
+    services = args.cpu_service_cost
+    if not services:
+        plan = cpu_service_plan(group)
+        services = prepare_group_cpu_service(plan, dry_run=True)
+        if plan["status"] not in {"prepared", "not_requested"}:
+            print("CPU inputs need preparation; run scripts/model.sh prepare-hicache --group <group.json>")
+            return 2
+
+    result = scan_group(
+        group,
+        refresh=args.refresh,
+        cpu_services=tuple(services),
+        build_model=build_model or args.build_model,
+        model_output=require_repo_path(args.output_dir) if args.output_dir else None,
+    )
+    print(f"model_inputs={result['status']} calibration_profiles={result['calibration_profile_count']}")
+    return 2 if build_model and result["status"] != "ready" else 0
 
 
 if __name__ == "__main__":

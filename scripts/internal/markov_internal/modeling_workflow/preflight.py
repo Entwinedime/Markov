@@ -1,117 +1,71 @@
-"""Preflight contracts evaluated before model-run planning."""
+"""Source readiness shared by prediction planning and the user-facing report."""
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from ..common.io import write_json
-from .progress import count_text
+from .progress import StageProgress, count_text
+from .types import ProfileRunRef
+from .validations.hicache.preflight.profile import audit_hicache_profile
 
 if TYPE_CHECKING:
-    from .context import WorkflowContext
+    from .context import WorkflowOptions
 
 
-class PreflightCheck(ABC):
-    """Inspect profile inputs required by one or more validation objects."""
+def preflight_sources(options: WorkflowOptions, runs: list[ProfileRunRef]) -> dict[str, Any]:
+    """Audit each source once; retain compact blockers even without diagnostics."""
 
-    name: str
-    detail_fields: tuple[str, ...] = ("rows",)
-
-    @abstractmethod
-    def run(self, context: WorkflowContext) -> dict[str, Any]:
-        """Execute the check and return its complete in-memory summary."""
-
-    def progress_text(self, summary: dict[str, Any]) -> str:
-        """Render the compact result shown on the final preflight line."""
-
-        return f"{self.name} ready={summary.get('ready')}"
-
-    def compact_summary(self, summary: dict[str, Any]) -> dict[str, Any]:
-        """Remove per-run details from the top-level persisted summary."""
-
-        compact = dict(summary)
-        for field_name in self.detail_fields:
-            compact.pop(field_name, None)
-        return compact
-
-
-@dataclass
-class PreflightRunner:
-    """Execute and aggregate preflight checks requested by validations."""
-
-    context: WorkflowContext
-    check_types: list[type[PreflightCheck]]
-    summaries: dict[str, Any] = field(default_factory=dict)
-
-    def run(self) -> dict[str, Any]:
-        """Run each distinct check once and retain full details for planning."""
-
-        ordered_checks = self._ordered_checks()
-        progress = self.context.reporter.start_stage(
-            "preflight",
-            len(ordered_checks),
-            "HiCache I/O/control + Prefill/Decode prediction",
-            unit="check",
+    progress = StageProgress("preflight", len(runs), "Source traces and HiCache facts", unit="source")
+    retain_details = options.diagnostics.keep_debug_artifacts
+    sources: list[dict[str, Any]] = []
+    for index, run in enumerate(runs, start=1):
+        audit = audit_hicache_profile(run.manifest_path)
+        audit_path = options.output_dir / "artifacts" / "preflight" / f"source_{index}.profile_audit.json"
+        if retain_details:
+            write_json(audit_path, audit)
+        coverage = audit["trace_channel_coverage"]
+        errors = audit["artifact_errors"]
+        full_trace_ready = (
+            all(coverage[f"{channel}_trace_files"] > 0 for channel in ("torch", "ld_preload", "python_probe"))
+            and "trace_channel_missing" not in errors
+            and "sidecar_only_trace" not in errors
         )
-        for check in ordered_checks:
-            self.summaries[check.name] = check.run(self.context)
-            progress.advance(self._running_metrics())
-        report = self._report(ordered_checks)
-        write_json(self.context.artifacts.preflight_summary_path, self._compact_report(report, ordered_checks))
-        status, summary = self._done_summary(report, ordered_checks)
-        progress.finish(status, summary)
-        return report
+        skip_reason = ""
+        if not full_trace_ready:
+            skip_reason = "full_dag_trace_not_ready"
+            if errors:
+                skip_reason += ":" + ",".join(errors)
+        elif not audit["workflow_input_ready"]:
+            skip_reason = "source_workflow_input_not_ready"
+        sources.append(
+            {
+                "run_id": run.run_id,
+                "config_id": run.config_id,
+                "input_id": run.input_id,
+                "manifest_path": str(run.manifest_path),
+                "audit_path": str(audit_path) if retain_details else None,
+                "full_trace_ready": full_trace_ready,
+                "workflow_input_ready": audit["workflow_input_ready"],
+                "skip_reason": skip_reason,
+                "missing_trace_channels": audit["missing_trace_channels"],
+                "artifact_errors": errors,
+                "workflow_input_errors": audit["workflow_input_errors"],
+            }
+        )
+        progress.advance({"ready": count_text(int(full_trace_ready and audit["workflow_input_ready"]), 1)})
 
-    def _ordered_checks(self) -> list[PreflightCheck]:
-        checks: dict[str, type[PreflightCheck]] = {}
-        for check_type in self.check_types:
-            existing = checks.get(check_type.name)
-            if existing is not None and existing is not check_type:
-                raise ValueError(
-                    f"Conflicting preflight check name {check_type.name!r}: "
-                    f"{existing.__module__}.{existing.__qualname__} and "
-                    f"{check_type.__module__}.{check_type.__qualname__}"
-                )
-            checks.setdefault(check_type.name, check_type)
-        return [check_type() for check_type in checks.values()]
-
-    def _running_metrics(self) -> dict[str, Any]:
-        ready = sum(1 for summary in self.summaries.values() if summary.get("ready") is True)
-        return {"ready": count_text(ready, len(self.summaries))}
-
-    def _report(self, ordered_checks: list[PreflightCheck]) -> dict[str, Any]:
-        return {
-            "selected_checks": [check.name for check in ordered_checks],
-            "run_count": len(self.context.runs),
-            "ready": all(bool(summary.get("ready")) for summary in self.summaries.values()) if self.summaries else True,
-            "checks": self.summaries,
-        }
-
-    def _compact_report(
-        self,
-        report: dict[str, Any],
-        ordered_checks: list[PreflightCheck],
-    ) -> dict[str, Any]:
-        checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
-        compact_checks = {
-            check.name: check.compact_summary(checks[check.name])
-            for check in ordered_checks
-            if isinstance(checks.get(check.name), dict)
-        }
-        return {**report, "checks": compact_checks}
-
-    def _done_summary(
-        self,
-        report: dict[str, Any],
-        ordered_checks: list[PreflightCheck],
-    ) -> tuple[str, str]:
-        checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
-        status = "OK" if report.get("ready") is True else "CHECK"
-        parts = [f"{len(checks)} checks"]
-        for check in ordered_checks:
-            summary = checks.get(check.name)
-            if isinstance(summary, dict):
-                parts.append(check.progress_text(summary))
-        return status, " | ".join(parts)
+    run_count = len(runs)
+    dag_ready = sum(row["full_trace_ready"] for row in sources)
+    state_ready = sum(row["workflow_input_ready"] for row in sources)
+    report = {
+        "run_count": run_count,
+        "ready": run_count > 0 and dag_ready == state_ready == run_count,
+        "full_trace_ready_count": dag_ready,
+        "workflow_input_ready_count": state_ready,
+        "sources": sources,
+    }
+    write_json(options.output_dir / "preflight_summary.json", report)
+    detail = f"full-dag {count_text(dag_ready, run_count)} | hicache {count_text(state_ready, run_count)}"
+    progress.finish("OK" if report["ready"] else "CHECK", detail)
+    return report

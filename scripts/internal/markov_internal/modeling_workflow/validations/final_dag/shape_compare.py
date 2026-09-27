@@ -2,32 +2,13 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any
 
-from .shape_facts import nested_value, scoped_resource_lane, u64
+from .shape_facts import scoped_resource_lane
 
 
 ACTIVE_STATES = {"required", "partial"}
 ARRIVAL_SCHEDULE_SENSITIVE_EFFECTS = {"loadback", "prefetch_visibility_dependency"}
-
-
-def compare_predicted_shape(
-    model_summary: dict[str, Any],
-    oracle: dict[str, Any],
-) -> dict[str, Any]:
-    """Compare stable effect shape; target observations never change prediction."""
-
-    return compare_shape(predicted_shape(model_summary), oracle)
-
-
-def predicted_shape(model_summary: dict[str, Any]) -> dict[str, Any]:
-    """Retain only the semantic projection required for later target scoring."""
-
-    rows, lanes = _predicted_shape(_effect_decisions(model_summary))
-    effects = [{key: value for key, value in row.items() if key not in {"effect_family_key", "resource_lane", "eligibility_epoch"}}
-               for row in rows]
-    return {"effects": effects, "lane_orders": lanes}
 
 
 def compare_shape(shape: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
@@ -115,10 +96,7 @@ def _field_schedule_sensitivity(predicted_row: dict[str, Any], field: str) -> st
     """Assign ownership to relation fields whose value follows a sensitive sibling."""
 
     sensitivity = str(predicted_row.get("schedule_sensitivity") or "")
-    if (
-        predicted_row.get("effect_type") == "prefetch_io_operation"
-        and field in {"consumer_role", "blocking_relation"}
-    ):
+    if predicted_row.get("effect_type") == "prefetch_io_operation" and field in {"consumer_role", "blocking_relation"}:
         return schedule_sensitivity("prefetch_visibility_dependency")
     return sensitivity
 
@@ -159,86 +137,6 @@ def schedule_sensitivity(effect_type: str) -> str:
     return "arrival_schedule_sensitive" if effect_type in ARRIVAL_SCHEDULE_SENSITIVE_EFFECTS else "schedule_invariant"
 
 
-def _predicted_shape(decisions: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
-    families: dict[str, dict[str, dict[str, Any]]] = defaultdict(dict)
-    for decision in decisions:
-        families[str(decision.get("effect_family_key") or "")][str(decision.get("effect_type") or "")] = decision
-    rows: list[dict[str, Any]] = []
-    lane_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for decision in decisions:
-        effect_type = str(decision.get("effect_type") or "")
-        state = str(decision.get("target_effect_state") or "unresolved")
-        consumer_role, blocking = _predicted_relation(
-            effect_type,
-            state,
-            decision,
-            families[str(decision.get("effect_family_key") or "")],
-        )
-        row = {
-            "effect_key": str(decision.get("effect_key") or ""),
-            "effect_family_key": str(decision.get("effect_family_key") or ""),
-            "effect_type": effect_type,
-            "target_effect_state": state,
-            "direction": str(decision.get("direction") or ""),
-            "consumer_role": consumer_role,
-            "blocking_relation": blocking,
-            "schedule_sensitivity": str(decision.get("schedule_sensitivity") or "unclassified"),
-            "resource_lane": scoped_resource_lane(
-                str(decision.get("cache_scope") or ""), str(decision.get("resource_lane") or "")
-            ),
-            "eligibility_epoch": u64(decision.get("eligibility_epoch")),
-            "operation_count": u64(decision.get("operation_count")),
-            "effective_page_count": u64(decision.get("effective_page_count")),
-            "completed_page_count": u64(decision.get("completed_page_count")),
-            "storage_existing_page_count": u64(decision.get("storage_existing_page_count")),
-            "storage_new_page_count": u64(decision.get("storage_new_page_count")),
-            "storage_batches": [
-                (
-                    u64(batch.get("operation_index")),
-                    u64(batch.get("page_count")),
-                    u64(batch.get("existing_page_count")),
-                    u64(batch.get("new_page_count")),
-                )
-                for batch in decision.get("storage_service_batches", [])
-                if isinstance(batch, dict)
-            ],
-        }
-        rows.append(row)
-        if state in ACTIVE_STATES and row["resource_lane"]:
-            lane_rows[row["resource_lane"]].append(row)
-    lane_orders: dict[str, list[str]] = {}
-    for lane, values in sorted(lane_rows.items()):
-        values.sort(key=lambda row: (row["eligibility_epoch"], row["effect_key"]))
-        lane_orders[lane] = [str(row["effect_key"]) for row in values]
-    return rows, lane_orders
-
-
-def _predicted_relation(
-    effect_type: str, state: str, decision: dict[str, Any], family: dict[str, dict[str, Any]]
-) -> tuple[str, str]:
-    if state not in ACTIVE_STATES:
-        return "none", "none"
-    if effect_type == "loadback":
-        return "foreground_cache_consumer", "blocking"
-    if effect_type == "prefetch_io_operation":
-        visibility = str(family.get("prefetch_visibility_dependency", {}).get("target_effect_state") or "")
-        return ("prefetch_visibility_dependency" if visibility in ACTIVE_STATES else "background_completion"), "background"
-    if effect_type == "prefetch_visibility_dependency":
-        return str(nested_value(decision, "consumer_boundary", "source_fact_role") or "cache_extend_input"), "blocking"
-    if effect_type == "commit_device_to_host":
-        if str(family.get("commit_host_to_storage", {}).get("target_effect_state") or "") in ACTIVE_STATES:
-            return "commit_host_to_storage", "family_internal"
-        if str(family.get("commit_capacity_gate", {}).get("target_effect_state") or "") in ACTIVE_STATES:
-            return "commit_capacity_gate", "family_internal"
-        return "commit_completion", "family_internal"
-    if effect_type == "commit_host_to_storage":
-        capacity = str(family.get("commit_capacity_gate", {}).get("target_effect_state") or "")
-        return ("commit_capacity_gate" if capacity in ACTIVE_STATES else "storage_completion"), "family_internal"
-    if effect_type == "commit_capacity_gate":
-        return str(decision.get("consumer_role") or "next_capacity_consumer"), "blocking"
-    return "unknown", "unknown"
-
-
 def _comparison_result(
     *,
     ready: bool,
@@ -256,15 +154,3 @@ def _comparison_result(
         "schedule_sensitive_count": schedule_count,
         "diagnostic_exact": mismatch_count == 0,
     }
-
-
-def _effect_decisions(model_summary: dict[str, Any]) -> list[dict[str, Any]]:
-    modules = model_summary.get("modules") if isinstance(model_summary.get("modules"), list) else []
-    for module in modules:
-        if not isinstance(module, dict) or module.get("name") != "HiCacheModule":
-            continue
-        hicache = module.get("hicache") if isinstance(module.get("hicache"), dict) else {}
-        ledger = hicache.get("effect_decisions") if isinstance(hicache.get("effect_decisions"), dict) else {}
-        decisions = ledger.get("decisions") if isinstance(ledger.get("decisions"), list) else []
-        return [decision for decision in decisions if isinstance(decision, dict)]
-    return []

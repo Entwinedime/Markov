@@ -8,6 +8,10 @@ from statistics import median
 from typing import Any
 
 
+class MissingPhaseEvidence(ValueError):
+    """Required measured work is absent; malformed input is a separate error."""
+
+
 def prefill_features(new_tokens: int, context_tokens: int) -> tuple[float, float, float]:
     return 1.0, float(new_tokens), new_tokens * (context_tokens + new_tokens / 2.0)
 
@@ -46,31 +50,96 @@ def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None
     return [values[index][-1] for index in range(size)]
 
 
+def _feature_matrix(
+    rows: list[dict[str, float]], features: tuple[str, ...]
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
+    """Build normalized feature products once for fitting and identifiability."""
+
+    # Token pairs can be millions while the fixed column is one. Normalize
+    # units before solving so large features do not erase the fixed term.
+    scales = {name: max((abs(row[name]) for row in rows), default=0.0) or 1.0 for name in features}
+    columns = {name: [row[name] / scales[name] for row in rows] for name in features}
+    matrix = {
+        left: {right: sum(a * b for a, b in zip(columns[left], columns[right])) for right in features}
+        for left in features
+    }
+    return scales, matrix
+
+
 def _fit_nonnegative(rows: list[dict[str, float]], target: str, features: tuple[str, ...]) -> dict[str, float]:
+    scales, products = _feature_matrix(rows, features)
+    responses = {name: sum((row[name] / scales[name]) * row[target] for row in rows) for name in features}
     best: tuple[float, dict[str, float]] | None = None
     for count in range(1, len(features) + 1):
         for active in itertools.combinations(features, count):
-            matrix = [[sum(row[left] * row[right] for row in rows) for right in active] for left in active]
-            vector = [sum(row[name] * row[target] for row in rows) for name in active]
+            matrix = [[products[left][right] for right in active] for left in active]
+            vector = [responses[name] for name in active]
             solution = _solve(matrix, vector)
             if solution is None or any(value < 0 for value in solution):
                 continue
-            coefficients = dict(zip(active, solution))
-            error = sum((sum(coefficients.get(name, 0.0) * row[name] for name in features) - row[target]) ** 2
-                        for row in rows)
+            coefficients = {name: value / scales[name] for name, value in zip(active, solution)}
+            error = sum(
+                (sum(coefficients.get(name, 0.0) * row[name] for name in features) - row[target]) ** 2 for row in rows
+            )
             if best is None or error < best[0]:
                 best = error, coefficients
     if best is None:
-        raise ValueError(f"phase observations do not identify a non-negative {target} model")
+        raise MissingPhaseEvidence(f"phase observations do not identify a non-negative {target} model")
     return {name: best[1].get(name, 0.0) for name in features}
 
 
-def _metrics(actual: list[float], predicted: list[float]) -> dict[str, float]:
-    errors = sorted(abs(value - estimate) / max(value, 1.0) for value, estimate in zip(actual, predicted))
-    return {
-        "wape": sum(abs(value - estimate) for value, estimate in zip(actual, predicted)) / sum(actual),
-        "p90_ape": errors[min(len(errors) - 1, math.ceil(0.9 * len(errors)) - 1)],
-    }
+def _feature_rank(rows: list[dict], features: tuple[str, ...]) -> int:
+    _, products = _feature_matrix(rows, features)
+    for count in range(len(features), 0, -1):
+        for active in itertools.combinations(features, count):
+            matrix = [[products[left][right] for right in active] for left in active]
+            if _solve(matrix, [0.0] * count) is not None:
+                return count
+    return 0
+
+
+def _regression_evidence(rows: list[dict], features: tuple[str, ...]) -> tuple[list[dict], dict]:
+    """Add shared captures only when they distinguish another feature direction.
+
+    Selection uses measured work, never fitted error or target timings. Rank is
+    an identifiability check, not a guarantee of conditioning or extrapolation accuracy.
+    """
+    selected = [row for row in rows if row["role"] == "base"]
+    rank = base_rank = _feature_rank(selected, features)
+    candidates: dict[str, list[dict]] = {}
+    for row in rows:
+        if row["role"] == "calibration":
+            candidates.setdefault(row["source_manifest"], []).append(row)
+    while candidates and rank < len(features):
+        choices = [
+            (_feature_rank(selected + values, features), -len(values), source) for source, values in candidates.items()
+        ]
+        new_rank, _, source = max(choices)
+        if new_rank <= rank:
+            break
+        selected.extend(candidates.pop(source))
+        rank = new_rank
+    if not selected:
+        raise MissingPhaseEvidence("no measured work for " + ", ".join(features))
+    return selected, dict(
+        features=list(features),
+        base_feature_rank=base_rank,
+        selected_feature_rank=rank,
+        feature_ranges={
+            name: [min(row[name] for row in selected), max(row[name] for row in selected)] for name in features
+        },
+        evidence_origin="base"
+        if all(row["role"] == "base" for row in selected)
+        else "base_plus_independent"
+        if base_rank
+        else "independent_calibration",
+        source_manifests=sorted({source for row in selected for source in row["source_manifests"]}),
+        limitation=(
+            "coefficients are not separately identifiable; prediction outside measured feature relations is uncertain"
+            if rank < len(features)
+            else "full feature rank does not verify accuracy outside measured work"
+        ),
+    )
 
 
 def _rows(captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -78,7 +147,7 @@ def _rows(captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for capture in captures:
         observed = capture.get("source_phase_observations", {})
         if observed.get("status") != "ready":
-            raise ValueError("phase observations are not ready")
+            raise MissingPhaseEvidence("phase observations are not ready")
         for row in observed["observations"]:
             request_ids = row.get("request_ids")
             if not isinstance(request_ids, list) or len(request_ids) != 1:
@@ -87,24 +156,28 @@ def _rows(captures: list[dict[str, Any]]) -> list[dict[str, Any]]:
             new = int(row["prefill_token_count"])
             if new <= 0 or new > prompt:
                 raise ValueError("phase calibration found invalid token work")
-            rows.append({
-                "source_manifest": capture["source_manifest"],
-                "source_manifests": [capture["source_manifest"]],
-                "role": capture["role"],
-                "request": str(request_ids[0]),
-                "rank": int(row["logical_input"]),
-                "page_size": int(row["source_page_size"]),
-                "prompt": prompt,
-                "new": new,
-                "context": prompt - new,
-                "attention": new * (prompt - new + new / 2.0),
-                "common": float(row["prefill_common_kernel_duration_us"]),
-                "prefix": float(row["prefill_prefix_attention_duration_us"]),
-                "prefill_collective": float(row["prefill_collective_duration_us"]),
-                "decode_iterations": int(row["decode_iteration_count"]),
-                "decode_collective": float(row["decode_collective_duration_us"]),
-                "paged": float(paged_attention_family(row)["duration_us"]),
-            })
+            rows.append(
+                {
+                    "source_manifest": capture["source_manifest"],
+                    "source_manifests": [capture["source_manifest"]],
+                    "role": capture["role"],
+                    "request": str(request_ids[0]),
+                    "rank": int(row["logical_input"]),
+                    "page_size": int(row["source_page_size"]),
+                    "prompt": prompt,
+                    "new": new,
+                    "context": prompt - new,
+                    "attention": new * (prompt - new + new / 2.0),
+                    "common": float(row["prefill_common_kernel_duration_us"]),
+                    "prefix": float(row["prefill_prefix_attention_duration_us"]),
+                    "prefill_collective": float(row["prefill_collective_duration_us"]),
+                    "decode_iterations": int(row["decode_iteration_count"]),
+                    "decode_collective": float(row["decode_collective_duration_us"]),
+                    "paged": float(paged_attention_family(row)["duration_us"])
+                    if row["decode_iteration_count"]
+                    else 0.0,
+                }
+            )
     return rows
 
 
@@ -118,44 +191,26 @@ _DURATION_FIELDS = (
 
 
 def _collapse_calibration_repeats(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Make repeats at each fixed endpoint one logical phase experiment."""
+    """Collapse identical measured work, not every experiment at the same page size."""
 
     bases = [row for row in rows if row["role"] == "base"]
-    calibration = [row for row in rows if row["role"] == "calibration"]
-    if not calibration:
-        return bases
-    manifests_by_page = {
-        page: {row["source_manifest"] for row in calibration if row["page_size"] == page}
-        for page in {row["page_size"] for row in calibration}
-    }
-    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
-    for row in calibration:
-        key = (
-            row["request"],
-            row["rank"],
-            row["page_size"],
-            row["prompt"],
-            row["new"],
-            row["context"],
-            row["decode_iterations"],
-        )
-        grouped.setdefault(key, []).append(row)
-    if any({row["source_manifest"] for row in values} != manifests_by_page[values[0]["page_size"]]
-           for values in grouped.values()):
-        raise ValueError("fixed calibration repeats do not contain the same phase observations")
-
-    collapsed = []
-    for values in grouped.values():
-        row = dict(values[0])
-        row.update(
-            source_manifest=f"fixed_calibration/page_{row['page_size']}",
-            source_manifests=sorted(manifests_by_page[row["page_size"]]),
-            repeat_count=len(values),
-        )
-        for field in _DURATION_FIELDS:
-            row[field] = median(value[field] for value in values)
-        collapsed.append(row)
-    return [*bases, *collapsed]
+    by_source: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if row["role"] == "calibration":
+            by_source.setdefault(row["source_manifest"], []).append(row)
+    work_fields = ("request", "rank", "page_size", "prompt", "new", "context", "decode_iterations")
+    cohorts: dict[tuple, list[list[dict[str, Any]]]] = {}
+    for values in by_source.values():
+        ordered = sorted(values, key=lambda row: tuple(row[field] for field in work_fields))
+        work = tuple(tuple(row[field] for field in work_fields) for row in ordered)
+        cohorts.setdefault(work, []).append(ordered)
+    for repeats in cohorts.values():
+        manifests = sorted(values[0]["source_manifest"] for values in repeats)
+        for values in zip(*repeats):
+            row = dict(values[0], source_manifest=manifests[0], source_manifests=manifests, repeat_count=len(repeats))
+            row.update({field: median(value[field] for value in values) for field in _DURATION_FIELDS})
+            bases.append(row)
+    return bases
 
 
 def _intrinsic_requests(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -175,8 +230,15 @@ def _intrinsic_requests(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _token_curve(rows: list[dict[str, Any]], target: str) -> tuple[list[dict[str, float]], dict[str, Any]]:
-    """Build one measured token-cost curve with equal logical-source weight."""
+    """Use a base curve when identifiable; supplement only missing token anchors."""
 
+    bases = [row for row in rows if row["role"] == "base"]
+    base_tokens = {row["new"] for row in bases}
+    rows = (
+        bases
+        if len(base_tokens) >= 2
+        else [*bases, *(row for row in rows if row["role"] == "calibration" and row["new"] not in base_tokens)]
+    )
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for row in rows:
         grouped.setdefault((row["source_manifest"], row["new"]), []).append(row)
@@ -198,15 +260,19 @@ def _token_curve(rows: list[dict[str, Any]], target: str) -> tuple[list[dict[str
         for new_tokens in sorted({row["new_tokens"] for row in anchors})
     ]
     if len(raw_points) < 2:
-        raise ValueError(f"phase observations do not identify a {target} token curve")
+        raise MissingPhaseEvidence(
+            f"phase observations do not identify a {target} token curve: two token anchors required"
+        )
     points = []
     for raw in raw_points:
-        points.append({
-            **raw,
-            # More token work cannot reduce intrinsic cost.  Clamp only the
-            # downward measurement noise; do not fit another free coefficient.
-            "duration_us": max(raw["duration_us"], points[-1]["duration_us"] if points else 0.0),
-        })
+        points.append(
+            {
+                **raw,
+                # More token work cannot reduce intrinsic cost.  Clamp only the
+                # downward measurement noise; do not fit another free coefficient.
+                "duration_us": max(raw["duration_us"], points[-1]["duration_us"] if points else 0.0),
+            }
+        )
     adjustment = sum(point["duration_us"] - raw["duration_us"] for raw, point in zip(raw_points, points))
     return points, {
         "formula": (
@@ -214,24 +280,17 @@ def _token_curve(rows: list[dict[str, Any]], target: str) -> tuple[list[dict[str
             "anchor; linear interpolation between anchors"
         ),
         "unit": "microseconds",
+        "evidence_origin": "base"
+        if len(base_tokens) >= 2
+        else "base_plus_independent"
+        if bases
+        else "independent_calibration",
+        "extrapolation": "endpoint linear slope, clamped at zero; outside measured token range is unverified",
         "logical_anchors": anchors,
         "raw_points": raw_points,
         "points": points,
         "monotonic_adjustment_us": adjustment,
     }
-
-
-def _curve_value(points: list[dict[str, float]], new_tokens: int) -> float:
-    if new_tokens <= points[0]["new_tokens"]:
-        left, right = points[:2]
-    elif new_tokens >= points[-1]["new_tokens"]:
-        left, right = points[-2:]
-    else:
-        left, right = next(
-            (left, right) for left, right in zip(points, points[1:]) if new_tokens <= right["new_tokens"]
-        )
-    position = (new_tokens - left["new_tokens"]) / (right["new_tokens"] - left["new_tokens"])
-    return max(0.0, left["duration_us"] + position * (right["duration_us"] - left["duration_us"]))
 
 
 def _component(coefficients: dict[str, float]) -> dict[str, float]:
@@ -255,21 +314,33 @@ def build_phase_cost(captures: list[dict[str, Any]], base_page_size: int) -> tup
         if row["prefix"] <= 0:
             continue
         fixed, new, attention = prefill_features(row["new"], row["context"])
-        prefix_rows.append({"fixed": fixed, "new": new, "attention": attention, "duration": row["prefix"]})
+        prefix_rows.append({**row, "fixed": fixed, "new": new, "attention": attention, "duration": row["prefix"]})
+    prefix_rows, prefix_source = _regression_evidence(prefix_rows, ("fixed", "new", "attention"))
     prefix_coefficients = _fit_nonnegative(prefix_rows, "duration", ("fixed", "new", "attention"))
 
-    decode_rows = []
-    for row in rows:
-        if row["decode_iterations"] <= 0 or row["paged"] <= 0:
-            continue
-        fixed, context, pages = decode_features(row["prompt"], row["page_size"], base_page_size)
-        decode_rows.append({"fixed": fixed, "context": context, "pages": pages,
-                            "duration": row["paged"] / row["decode_iterations"]})
-    decode_coefficients = _fit_nonnegative(decode_rows, "duration", ("fixed", "context", "pages"))
-    collective_per_iteration = [row["decode_collective"] / row["decode_iterations"] for row in intrinsic
-                                if row["decode_iterations"] > 0 and row["decode_collective"] > 0]
-    if not collective_per_iteration:
-        raise ValueError("Decode collective work was not observed")
+    needs_decode = any(row["role"] == "base" and row["decode_iterations"] > 0 for row in rows)
+    if needs_decode:
+        decode_rows = []
+        for row in rows:
+            if row["decode_iterations"] <= 0 or row["paged"] <= 0:
+                continue
+            fixed, context, pages = decode_features(row["prompt"], row["page_size"], base_page_size)
+            decode_rows.append(
+                {
+                    **row,
+                    "fixed": fixed,
+                    "context": context,
+                    "pages": pages,
+                    "duration": row["paged"] / row["decode_iterations"],
+                }
+            )
+        decode_rows, decode_source = _regression_evidence(decode_rows, ("fixed", "context", "pages"))
+        decode_coefficients = _fit_nonnegative(decode_rows, "duration", ("fixed", "context", "pages"))
+        collective_rows = [row for row in intrinsic if row["decode_iterations"] > 0 and row["decode_collective"] > 0]
+        collective_rows = [row for row in collective_rows if row["role"] == "base"] or collective_rows
+        collective_per_iteration = [row["decode_collective"] / row["decode_iterations"] for row in collective_rows]
+        if not collective_per_iteration:
+            raise MissingPhaseEvidence("Decode collective work was not observed")
 
     phase = {
         "prefill_common_kernel": {"new_token_points": common_points},
@@ -280,8 +351,10 @@ def build_phase_cost(captures: list[dict[str, Any]], base_page_size: int) -> tup
             "fixed_us_per_iteration": decode_coefficients["fixed"],
             "per_context_token_us": decode_coefficients["context"],
             "per_effective_page_us": decode_coefficients["pages"],
-        },
-        "decode_collective": _component({"fixed": median(collective_per_iteration)}),
+        }
+        if needs_decode
+        else None,
+        "decode_collective": _component({"fixed": median(collective_per_iteration)}) if needs_decode else None,
         "coverage": {
             "min_new_tokens": min(row["new"] for row in rows),
             "max_new_tokens": max(row["new"] for row in rows),
@@ -289,45 +362,36 @@ def build_phase_cost(captures: list[dict[str, Any]], base_page_size: int) -> tup
             "max_context_tokens": max(row["context"] for row in rows),
             "min_attention_token_pairs": min(row["attention"] for row in rows),
             "max_attention_token_pairs": max(row["attention"] for row in rows),
-            "min_decode_context_tokens": min(row["prompt"] for row in rows if row["decode_iterations"] > 0),
-            "max_decode_context_tokens": max(row["prompt"] for row in rows if row["decode_iterations"] > 0),
+            "min_decode_context_tokens": min(row["prompt"] for row in rows if row["decode_iterations"] > 0)
+            if needs_decode
+            else None,
+            "max_decode_context_tokens": max(row["prompt"] for row in rows if row["decode_iterations"] > 0)
+            if needs_decode
+            else None,
             "base_page_size": base_page_size,
         },
     }
-    common_actual = [row["common"] for row in rows]
-    common_predicted = [_curve_value(common_points, row["new"]) for row in rows]
-    collective_actual = [row["prefill_collective"] for row in intrinsic]
-    collective_predicted = [_curve_value(collective_points, row["new"]) for row in intrinsic]
-    prefix_actual = [row["duration"] for row in prefix_rows]
-    prefix_predicted = [sum(prefix_coefficients[name] * row[name] for name in prefix_coefficients) for row in prefix_rows]
-    decode_actual = [row["duration"] for row in decode_rows]
-    decode_predicted = [sum(decode_coefficients[name] * row[name] for name in decode_coefficients) for row in decode_rows]
-    sources = [{"source_manifest": capture["source_manifest"], "role": capture["role"]} for capture in captures]
     summary = {
         "status": "ready",
-        "source_manifests": sources,
-        "target_inputs": [],
         "parameter_sources": {
             "common_kernel": common_source,
-            "prefix_attention": "non-negative fixed + new_tokens + attention_token_pairs",
+            "prefix_attention": prefix_source,
             "prefill_collective": collective_source,
-            "decode_paged_attention": "non-negative fixed + context_tokens + effective_pages; kernel page is base page",
-            "decode_collective": "median rank-min duration per decode iteration",
-        },
-        "fit": {
-            "prefill_common_kernel": _metrics(common_actual, common_predicted),
-            "prefill_prefix_attention": _metrics(prefix_actual, prefix_predicted),
-            "prefill_collective": _metrics(collective_actual, collective_predicted),
-            "decode_paged_attention": _metrics(decode_actual, decode_predicted),
+            "decode_paged_attention": decode_source
+            if needs_decode
+            else {"reason": "base_workloads_have_no_decode_iterations"},
+            "decode_collective": dict(
+                formula="median rank-min duration per decode iteration",
+                evidence_origin="base" if collective_rows[0]["role"] == "base" else "independent_calibration",
+                source_manifests=sorted({source for row in collective_rows for source in row["source_manifests"]}),
+                limitation="assumes constant collective cost per iteration within the same TP and runtime",
+            )
+            if needs_decode
+            else {"reason": "base_workloads_have_no_decode_iterations"},
         },
         "raw_observation_count": len(raw_rows),
         "logical_observation_count": len(rows),
         "request_count": len(intrinsic),
-        "fixed_calibration_repeat_count_by_endpoint": {
-            str(page): len({row["source_manifest"] for row in raw_rows
-                            if row["role"] == "calibration" and row["page_size"] == page})
-            for page in sorted({row["page_size"] for row in raw_rows if row["role"] == "calibration"})
-        },
-        "repeat_weighting": "identical repeats form one median logical anchor per page endpoint",
+        "repeat_weighting": "captures with identical request/rank/token/page work form one median logical experiment",
     }
     return phase, summary

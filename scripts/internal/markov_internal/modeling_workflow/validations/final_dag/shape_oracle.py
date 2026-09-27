@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -57,6 +58,8 @@ _EFFECT_DESCRIPTORS = {
         ("commit_capacity_gate", "none", ""),
     ),
 }
+
+
 def extract_target_shape_oracle(
     trace_paths: Iterable[Path],
     *,
@@ -120,8 +123,9 @@ def _load_fact_events(
     events: list[dict[str, Any]] = []
     errors: Counter[str] = Counter()
     for file_index, path in enumerate(trace_paths):
-        rows, status = load_chrome_trace_events(path, auto_repair=True)
-        if not status.loaded:
+        try:
+            rows = load_chrome_trace_events(path)
+        except (FileNotFoundError, IsADirectoryError, json.JSONDecodeError):
             errors["target_trace_load_failed"] += 1
             continue
         for ordinal, event in enumerate(rows):

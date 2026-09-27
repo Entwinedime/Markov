@@ -46,16 +46,27 @@ def target_operation_cell(ledger: dict, run: dict, kv_bytes_per_token: int) -> d
         if "source_start_us" not in row or "timing_fact_node_id" not in row:
             raise OracleCostMatchError("target observation lacks operation order; re-extract into a fresh score output")
         service, control = observed_direct_cost(row)
-        record = {"record_id": row["record_id"], "resource_lane": f"{row['resource_scope']}/{direction}",
-                  "logical_input": inputs[row["pid"]], "source_start_us": row["source_start_us"],
-                  "timing_fact_node_id": row["timing_fact_node_id"],
-                  "operation_count": row["operation_count"], "page_count": pages,
-                  "byte_count": pages * row["page_size"] * kv_bytes_per_token,
-                  "completed_page_count": tokens // row["page_size"],
-                  "service_us": service, "control_us": control}
+        record = {
+            "record_id": row["record_id"],
+            "resource_lane": f"{row['resource_scope']}/{direction}",
+            "logical_input": inputs[row["pid"]],
+            "source_start_us": row["source_start_us"],
+            "timing_fact_node_id": row["timing_fact_node_id"],
+            "operation_count": row["operation_count"],
+            "page_count": pages,
+            "byte_count": pages * row["page_size"] * kv_bytes_per_token,
+            "completed_page_count": tokens // row["page_size"],
+            "service_us": service,
+            "control_us": control,
+        }
         by_kind.setdefault(row["kind"], {"records": []})["records"].append(record)
-    return {"status": "READY", "config_id": ledger["target_config_id"], "run_id": ledger["target_run_id"],
-            "workload_id": ledger["workload_id"], "by_kind": by_kind}
+    return {
+        "status": "READY",
+        "config_id": ledger["target_config_id"],
+        "run_id": ledger["target_run_id"],
+        "workload_id": ledger["workload_id"],
+        "by_kind": by_kind,
+    }
 
 
 def build_score_only_target_oracle_catalog(
@@ -231,7 +242,10 @@ def _flatten_records(ledger: dict[str, Any], side: str) -> list[dict[str, Any]]:
 
 
 def _map_scopes_to_observed_lanes(
-    actual: list[dict[str, Any]], predicted: list[dict[str, Any]], source_run: dict[str, Any], source_scope_records: list[dict]
+    actual: list[dict[str, Any]],
+    predicted: list[dict[str, Any]],
+    source_run: dict[str, Any],
+    source_scope_records: list[dict],
 ) -> dict[str, str]:
     # Source operation IDs bind the predicted scope to its own trace's rank.
     # Target node IDs, process IDs and arrival order are not cross-trace identities.
