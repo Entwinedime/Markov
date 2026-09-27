@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from typing import Any
 
 from .common import (
@@ -17,7 +18,6 @@ def _extract_token_path(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """按 source spec 读取 token path 并生成 dictionary 记录。"""
@@ -25,18 +25,18 @@ def _extract_token_path(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
-    found, value = _extract_source_value(parts[0], "token_path", bound, args, kwargs, result)
+    found, value = _extract_source_value(parts[0], "token_path", bound, args, result)
     if not found:
         return (False, None)
-    scope = _scope_from_optional_source(parts[1], bound, args, kwargs, result) if len(parts) > 1 else ""
-    return (True, _token_path_record(_tokens_for_path(value), scope, _token_dictionary_bucket(bound)))
+    scope = _scope_from_optional_source(parts[1], bound, args, result) if len(parts) > 1 else ""
+    tokens, path_id = _observed_token_path(value, bound)
+    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound), path_id=path_id))
 
 
 def _extract_token_span(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """按 source spec 读取完整 token path，并返回覆盖全路径的 span。"""
@@ -44,53 +44,64 @@ def _extract_token_span(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, None)
-    found, value = _extract_source_value(parts[0], "token_span", bound, args, kwargs, result)
+    found, value = _extract_source_value(parts[0], "token_span", bound, args, result)
     if not found:
         return (False, None)
-    tokens = _tokens_for_path(value)
-    return (True, _token_span_record(tokens, 0, len(tokens)))
+    tokens, path_id = _observed_token_path(value, bound)
+    return (True, _token_span_record(tokens, 0, len(tokens), path_id=path_id))
+
+
+def _observed_token_path(value: Any, bound: dict[str, Any]) -> tuple[list[Any], str]:
+    # `bound` lives for one emitted event. Retain the object along with its id:
+    # no id reuse, stale request cache, or cross-phase mutable-token reuse.
+    cache = bound.setdefault("__trace_sim_token_paths", {})
+    key = id(value)
+    if key not in cache:
+        tokens = _tokens_for_path(value)
+        cache[key] = (value, tokens, _token_path_id(tokens))
+    _, tokens, path_id = cache[key]
+    return tokens, path_id
 
 
 def _extract_request_token_path(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """从 request 对象提取指定模式的 token path。"""
 
-    found, tokens, scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    found, tokens, scope = _extract_request_tokens_and_scope(spec, bound, args, result)
     if not found:
         return (False, None)
-    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound)))
+    tokens, path_id = _observed_token_path(tokens, bound)
+    return (True, _token_path_record(tokens, scope, _token_dictionary_bucket(bound), path_id=path_id))
 
 
 def _extract_request_token_span(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """从 request 对象提取指定模式的 token span。"""
 
-    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, result)
     if not found:
         return (False, None)
-    return (True, _token_span_record(tokens, 0, len(tokens)))
+    tokens, path_id = _observed_token_path(tokens, bound)
+    return (True, _token_span_record(tokens, 0, len(tokens), path_id=path_id))
 
 
 def _extract_request_tokens(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
     """从 request source spec 返回 token 列表。"""
 
-    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, kwargs, result)
+    found, tokens, _scope = _extract_request_tokens_and_scope(spec, bound, args, result)
     return (found, tokens)
 
 
@@ -98,7 +109,6 @@ def _extract_request_list(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
     """按 source spec 读取 batch 当前 request 列表。"""
@@ -106,7 +116,7 @@ def _extract_request_list(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, [])
-    found, value = _extract_source_value(parts[0], "request_list", bound, args, kwargs, result)
+    found, value = _extract_source_value(parts[0], "request_list", bound, args, result)
     if not found or value is None:
         return (False, [])
     if isinstance(value, list):
@@ -132,7 +142,6 @@ def _extract_request_token_records(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[tuple[Any, list[Any], str]]]:
     """读取 batch request token path，并保留与 `self.reqs` 相同的顺序。"""
@@ -140,11 +149,11 @@ def _extract_request_token_records(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, [])
-    found, requests = _extract_request_list(parts[0], bound, args, kwargs, result)
+    found, requests = _extract_request_list(parts[0], bound, args, result)
     if not found:
         return (False, [])
     mode = parts[1] if len(parts) > 1 else "active"
-    scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
+    scope = _scope_from_optional_source(parts[2], bound, args, result) if len(parts) > 2 else ""
     return (True, [(req, _request_tokens(req, mode), scope) for req in requests])
 
 
@@ -152,12 +161,11 @@ def _extract_request_token_path_records(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
     """为 batch request 生成 token dictionary 数组。"""
 
-    found, rows = _extract_request_token_records(spec, bound, args, kwargs, result)
+    found, rows = _extract_request_token_records(spec, bound, args, result)
     if not found:
         return (False, [])
     bucket = _token_dictionary_bucket(bound)
@@ -168,12 +176,11 @@ def _extract_request_token_span_records(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
     """为 batch request 生成 token span 数组。"""
 
-    found, rows = _extract_request_token_records(spec, bound, args, kwargs, result)
+    found, rows = _extract_request_token_records(spec, bound, args, result)
     if not found:
         return (False, [])
     return (True, [_token_span_record(tokens, 0, len(tokens)) for _req, tokens, _scope in rows])
@@ -183,12 +190,11 @@ def _extract_request_token_count_records(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[int]]:
     """为 batch request 生成 token count 数组。"""
 
-    found, rows = _extract_request_token_records(spec, bound, args, kwargs, result)
+    found, rows = _extract_request_token_records(spec, bound, args, result)
     if not found:
         return (False, [])
     return (True, [len(tokens) for _req, tokens, _scope in rows])
@@ -198,7 +204,6 @@ def _extract_request_tokens_and_scope(
     spec: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any], str]:
     """解析 request source spec，返回 token 列表和可选 cache scope。"""
@@ -206,20 +211,26 @@ def _extract_request_tokens_and_scope(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if not parts:
         return (False, [], "")
-    found_req, req = _extract_source_value(parts[0], "request", bound, args, kwargs, result)
+    found_req, req = _extract_source_value(parts[0], "request", bound, args, result)
     if not found_req or req is None:
         return (False, [], "")
     mode = parts[1] if len(parts) > 1 else "active"
-    scope = _scope_from_optional_source(parts[2], bound, args, kwargs, result) if len(parts) > 2 else ""
-    tokens = _request_tokens(req, mode)
+    scope = _scope_from_optional_source(parts[2], bound, args, result) if len(parts) > 2 else ""
+    # One emitted event observes one request/mode snapshot. The bound context
+    # is discarded after emission; retaining req prevents object-id reuse.
+    cache = bound.setdefault("__trace_sim_request_tokens", {})
+    key = (id(req), mode.lower())
+    if key not in cache:
+        cache[key] = (req, _request_tokens(req, mode))
+    tokens = cache[key][1]
     return (True, tokens, scope)
 
 
-def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any]:
+def _token_span_record(tokens: list[Any], begin: int, end: int, *, path_id: str | None = None) -> dict[str, Any]:
     """生成 token span 记录，引用同一 hash 算法下的 path id。"""
 
     return {
-        "path_id": _token_path_id(tokens),
+        "path_id": path_id if path_id is not None else _token_path_id(tokens),
         "begin": begin,
         "end": end,
         "token_count": len(tokens),
@@ -227,10 +238,12 @@ def _token_span_record(tokens: list[Any], begin: int, end: int) -> dict[str, Any
     }
 
 
-def _token_path_record(tokens: list[Any], scope: str = "", bucket: str = "unknown") -> dict[str, Any]:
+def _token_path_record(
+    tokens: list[Any], scope: str = "", bucket: str = "unknown", *, path_id: str | None = None
+) -> dict[str, Any]:
     """生成 token dictionary 记录，并在同一 scope 内只携带一次 token_ids。"""
 
-    path_id = _token_path_id(tokens)
+    path_id = path_id if path_id is not None else _token_path_id(tokens)
     row: dict[str, Any] = {
         "token_path_id": path_id,
         "token_count": len(tokens),
@@ -259,10 +272,9 @@ def _token_dictionary_bucket(bound: dict[str, Any]) -> str:
 def _token_path_id(tokens: list[Any]) -> str:
     """按 SGLang token 序列生成稳定 path hash。"""
 
-    hasher = hashlib.sha256()
-    for token in tokens:
-        _hash_one_token_id(hasher, token)
-    return "sha256_u32le:" + hasher.hexdigest()
+    words = [int(item) for token in tokens for item in (token if isinstance(token, (list, tuple)) else (token,))]
+    payload = struct.pack(f"<{len(words)}I", *words)
+    return "sha256_u32le:" + hashlib.sha256(payload).hexdigest()
 
 
 def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
@@ -275,16 +287,6 @@ def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
         else:
             result.append(int(token))
     return result
-
-
-def _hash_one_token_id(hasher: "hashlib._Hash", token: Any) -> None:
-    """把单个 token 或复合 token 按 u32le 写入 hash。"""
-
-    if isinstance(token, (list, tuple)):
-        for item in token:
-            hasher.update(int(item).to_bytes(4, byteorder="little", signed=False))
-    else:
-        hasher.update(int(token).to_bytes(4, byteorder="little", signed=False))
 
 
 def _tokens_for_path(value: Any) -> list[Any]:

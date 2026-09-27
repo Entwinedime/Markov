@@ -1,4 +1,5 @@
 #include "framework/framework.hpp"
+#include "framework/stream_sync_scope.hpp"
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -34,6 +35,8 @@ HOOKFW_DEFINE_TARGET(aclrt_synchronize_stream, aclrt_synchronize_stream_fn_t, "A
 
 int __attribute__((noinline, visibility("default"))) aclrt_synchronize_stream_hook(void * stream) asm("aclrtSynchronizeStream");
 int aclrt_synchronize_stream_hook(void * stream) {
+    HookFrameWork::StreamSyncScope scope(stream);
+    if (scope.Nested()) return aclrt_synchronize_stream_target().Original()(stream);
     return HOOKFW_INVOKE(aclrt_synchronize_stream,
                          {
                              { "stream", std::to_string(reinterpret_cast<uintptr_t>(stream)) }
@@ -49,6 +52,8 @@ HOOKFW_DEFINE_TARGET(aclrt_synchronize_stream_with_timeout, aclrt_synchronize_st
 int __attribute__((noinline, visibility("default"))) aclrt_synchronize_stream_with_timeout_hook(void * stream,
                                                                                                 int32_t timeout) asm("aclrtSynchronizeStreamWithTimeout");
 int aclrt_synchronize_stream_with_timeout_hook(void * stream, int32_t timeout) {
+    HookFrameWork::StreamSyncScope scope(stream);
+    if (scope.Nested()) return aclrt_synchronize_stream_with_timeout_target().Original()(stream, timeout);
     return HOOKFW_INVOKE(aclrt_synchronize_stream_with_timeout,
                          {
                              {  "stream", std::to_string(reinterpret_cast<uintptr_t>(stream)) },

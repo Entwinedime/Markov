@@ -52,12 +52,12 @@ def load_template(path: Path) -> Template:
         raise TemplateValidationError(f"invalid JSON template {path}: {error}") from error
     if not isinstance(data, dict):
         raise TemplateValidationError(f"template {path} must be a JSON object")
-    _validate_template_shape(data, path)
+    _validate_template_shape(data)
     return Template(path=path, data=data)
 
 
 def load_config_specs(path: Path) -> dict[str, ConfigSpec]:
-    """Load the five resolved-target HiCache configuration contracts."""
+    """Load resolved HiCache configuration contracts."""
 
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -116,7 +116,7 @@ def load_config_specs(path: Path) -> dict[str, ConfigSpec]:
     return result
 
 
-def _validate_template_shape(data: Mapping[str, Any], path: Path) -> None:
+def _validate_template_shape(data: Mapping[str, Any]) -> None:
     """Validate template fields that are independent of a tokenizer."""
 
     _required_nonempty_string(data, "id", "template")
@@ -156,12 +156,19 @@ def _validate_template_shape(data: Mapping[str, Any], path: Path) -> None:
         tokens = request_def.get("prompt_token_ids")
         parts = request_def.get("prompt_parts", [])
         if tokens is not None:
-            if "prompt_parts" in request_def or not isinstance(tokens, list) or not tokens or any(
-                not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in tokens
+            if (
+                "prompt_parts" in request_def
+                or not isinstance(tokens, list)
+                or not tokens
+                or any(not isinstance(token, int) or isinstance(token, bool) or token < 0 for token in tokens)
             ):
-                raise TemplateValidationError(f"request definition {request_name} needs nonnegative token ids, without prompt_parts")
+                raise TemplateValidationError(
+                    f"request definition {request_name} needs nonnegative token ids, without prompt_parts"
+                )
         elif not isinstance(parts, list) or not parts:
-            raise TemplateValidationError(f"request definition {request_name} must contain prompt_parts or prompt_token_ids")
+            raise TemplateValidationError(
+                f"request definition {request_name} must contain prompt_parts or prompt_token_ids"
+            )
         for part_index, part in enumerate(parts):
             if not isinstance(part, dict) or set(part) - {"ref", "text"}:
                 raise TemplateValidationError(
@@ -247,10 +254,14 @@ def _validate_two_stage_layout(
     if not prepare_steps or not formal_steps:
         raise TemplateValidationError("two-stage workload needs requests on both sides of the boundary")
     request_kinds = {"request", "repeat_request"}
-    if (not any(step.get("kind") in request_kinds for step in prepare_steps)
-            or any(step.get("kind") not in request_kinds | {"barrier"} for step in prepare_steps)
-            or any(step.get("kind") not in request_kinds for step in formal_steps)):
-        raise TemplateValidationError("preparation allows requests/settling barriers; the formal stage allows only requests")
+    if (
+        not any(step.get("kind") in request_kinds for step in prepare_steps)
+        or any(step.get("kind") not in request_kinds | {"barrier"} for step in prepare_steps)
+        or any(step.get("kind") not in request_kinds for step in formal_steps)
+    ):
+        raise TemplateValidationError(
+            "preparation allows requests/settling barriers; the formal stage allows only requests"
+        )
     if any(step.get("measure") is not False for step in prepare_steps):
         raise TemplateValidationError("all preparation requests must set measure=false")
     if steps[barrier_position].get("measure") is not False or steps[checkpoint_position].get("measure") is not False:
@@ -259,6 +270,7 @@ def _validate_two_stage_layout(
         raise TemplateValidationError("all formal-stage requests must set measure=true")
     if start_step != formal_steps[0].get("id") or end_step != formal_steps[-1].get("id"):
         raise TemplateValidationError("formal_window must cover the complete request sequence after the boundary")
+
 
 def _validate_step(
     step: Any,
@@ -274,15 +286,14 @@ def _validate_step(
     if step_id in known_step_ids:
         raise TemplateValidationError(f"duplicate step id: {step_id}")
     kind = _required_nonempty_string(step, "kind", f"steps[{step_index}]")
-    if kind not in {"request", "repeat_request", "barrier", "checkpoint", "wait"}:
+    if kind not in {"request", "repeat_request", "barrier", "checkpoint"}:
         raise TemplateValidationError(f"steps[{step_index}].kind is unsupported: {kind}")
     _required_nonempty_string(step, "phase", f"steps[{step_index}]")
     if not isinstance(step.get("measure"), bool):
         raise TemplateValidationError(f"steps[{step_index}].measure must be boolean")
     if kind in {"request", "repeat_request"}:
         request_name = _required_nonempty_string(step, "request", f"steps[{step_index}]")
-        if not _request_definition_exists(request_name, request_defs):
-            raise TemplateValidationError(f"steps[{step_index}] references unknown request {request_name}")
+        resolve_request_definition(request_defs, request_name)
         if kind == "repeat_request":
             _required_nonnegative_int(step, "count", f"steps[{step_index}]")
     elif kind == "barrier":
@@ -295,8 +306,6 @@ def _validate_step(
             raise TemplateValidationError(f"steps[{step_index}].assertions must be non-empty")
         for assertion_index, assertion in enumerate(assertions):
             _validate_checkpoint_assertion(assertion, step_index, assertion_index, request_defs)
-    else:
-        _required_nonnegative_int(step, "duration_ms", f"steps[{step_index}]")
 
 
 def _validate_checkpoint_assertion(
@@ -312,8 +321,9 @@ def _validate_checkpoint_assertion(
         raise TemplateValidationError(f"{context} must be an object")
     _required_nonempty_string(assertion, "id", context)
     request_name = _required_nonempty_string(assertion, "request", context)
-    if "{i}" in request_name or not _request_definition_exists(request_name, request_defs):
+    if "{i}" in request_name:
         raise TemplateValidationError(f"{context}.request must name one concrete request")
+    resolve_request_definition(request_defs, request_name)
     if assertion.get("range") not in {"anchor", "admission_tail"}:
         raise TemplateValidationError(f"{context}.range must be anchor or admission_tail")
     expect = _required_object(assertion, "expect", context)
@@ -327,20 +337,22 @@ def _validate_checkpoint_assertion(
             raise TemplateValidationError(f"{context}.expect.{key} must be one of: {allowed_text}")
 
 
-def _request_definition_exists(request_name: str, request_defs: Mapping[str, Any]) -> bool:
-    """Return whether exact or one-index-pattern request definition exists."""
+def resolve_request_definition(
+    request_defs: Mapping[str, Any], request_name: str
+) -> tuple[Mapping[str, Any], int | None]:
+    """Resolve an exact name or numeric index after validating definition shapes."""
 
     if request_name in request_defs:
-        return True
-    for pattern in request_defs:
+        return request_defs[request_name], None
+    for pattern, definition in request_defs.items():
         if "{i}" not in pattern:
             continue
         prefix, suffix = pattern.split("{i}", 1)
         if request_name.startswith(prefix) and request_name.endswith(suffix):
             middle = request_name[len(prefix) : len(request_name) - len(suffix) if suffix else None]
             if middle.isdigit():
-                return True
-    return False
+                return definition, int(middle)
+    raise TemplateValidationError(f"request {request_name} does not resolve to a request definition")
 
 
 def _required_object(data: Mapping[str, Any], field: str, context: str) -> Mapping[str, Any]:

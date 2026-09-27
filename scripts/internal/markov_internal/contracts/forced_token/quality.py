@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Any
 
 from .constants import (
@@ -14,7 +12,6 @@ from .constants import (
     FORCED_TOKEN_ERROR_PLAN_MISSING,
     FORCED_TOKEN_ERROR_REQUEST_COUNT,
 )
-from .plan import non_negative_int
 
 
 def empty_forced_token_quality() -> dict[str, Any]:
@@ -34,16 +31,6 @@ def empty_forced_token_quality() -> dict[str, Any]:
     }
 
 
-def forced_token_quality_from_workload_report(path: Path | None) -> dict[str, Any]:
-    if path is None or not path.is_file():
-        return empty_forced_token_quality()
-    try:
-        report = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return empty_forced_token_quality()
-    return forced_token_quality_from_report(report) if isinstance(report, dict) else empty_forced_token_quality()
-
-
 def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
     result = empty_forced_token_quality()
     forced = report.get("forced_token")
@@ -55,11 +42,11 @@ def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
             "enabled": True,
             "mode": mode,
             "plan_workload_id": forced.get("plan_workload_id"),
-            "request_count": non_negative_int(forced.get("request_count")),
-            "output_checked_count": non_negative_int(forced.get("output_checked_count")),
-            "mismatch_count": non_negative_int(forced.get("mismatch_count")),
-            "unchecked_count": non_negative_int(forced.get("unchecked_count")),
-            "prompt_mismatch_count": non_negative_int(forced.get("prompt_mismatch_count")),
+            "request_count": forced["request_count"],
+            "output_checked_count": forced["output_checked_count"],
+            "mismatch_count": forced["mismatch_count"],
+            "unchecked_count": forced["unchecked_count"],
+            "prompt_mismatch_count": forced["prompt_mismatch_count"],
             "all_actual_outputs_match_plan": forced.get("all_actual_outputs_match_plan"),
             "plan_written": forced.get("plan_written"),
         }
@@ -71,7 +58,7 @@ def forced_token_quality_from_report(report: dict[str, Any]) -> dict[str, Any]:
         if result["plan_written"] is not True:
             errors.append(FORCED_TOKEN_ERROR_PLAN_MISSING)
     elif mode == "replay":
-        if result["all_actual_outputs_match_plan"] is not True:
+        if result["all_actual_outputs_match_plan"] is not True or result["mismatch_count"]:
             errors.append(FORCED_TOKEN_ERROR_OUTPUT_MISMATCH)
         if result["unchecked_count"] or result["output_checked_count"] != result["request_count"]:
             errors.append(FORCED_TOKEN_ERROR_OUTPUT_UNCHECKED)

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import builtins
+import functools
 import importlib
 import os
 import sys
 import threading
 from types import ModuleType
 
-from trace_sim_probe.writer import probe_debug_enabled
+from trace_sim_probe.writer import _truthy
+from trace_sim_probe.schema import runtime_probe_names
 
 
 _INSTALLED = False
@@ -19,63 +21,50 @@ _IMPORT_GUARD = threading.local()
 _PROBES: tuple[ModuleType, ...] | None = None
 
 
-def _truthy(value: str | None) -> bool:
-    """解析 probe 启用环境变量。"""
-
-    return value is not None and value.lower() not in ("", "0", "false", "no", "off")
-
-
 def _probes() -> tuple[ModuleType, ...]:
-    """Load semantic probes and explicitly enabled runtime diagnostics once."""
+    """Load consumer-required observations and optional runtime diagnostics once."""
 
     global _PROBES
     if _PROBES is None:
-        try:
-            probes = [importlib.import_module("trace_sim_probe.probes.hicache.callable")]
-            if os.environ.get("TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS", "off") in {"timing", "full"}:
-                probes.append(importlib.import_module("trace_sim_probe.probes.runtime_preparation"))
-                probes.append(importlib.import_module("trace_sim_probe.probes.response_boundaries"))
-                probes.append(importlib.import_module("trace_sim_probe.probes.cpu_collectives"))
-                probes.append(importlib.import_module("trace_sim_probe.probes.layer_waits"))
-            _PROBES = tuple(probes)
-        except Exception as exc:
-            if probe_debug_enabled():
-                print(f"[trace_sim_probe] failed to load probes: {exc}", file=sys.stderr)
-            raise
+        probes = [importlib.import_module("trace_sim_probe.probes.generic_callable")]
+        consumers = tuple(os.environ.get("TRACE_SIM_PYTHON_PROBE_CONSUMERS", "").split(","))
+        diagnostics = os.environ.get("TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS", "off")
+        probes.extend(
+            importlib.import_module("trace_sim_probe.probes." + name)
+            for name in runtime_probe_names(consumers, diagnostics)
+        )
+        _PROBES = tuple(probes)
     return _PROBES
 
 
-def _apply_probe_to_loaded_modules(probe) -> None:
+def _apply_probe_to_loaded_modules(probe: ModuleType) -> None:
     """对当前已加载的目标模块立即安装 probe。"""
 
     targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
     for target in targets:
         module = sys.modules.get(target)
         if module is not None:
-            _safe_install(probe, module)
+            probe.install(module)
 
 
-def _safe_install(probe, module: ModuleType) -> None:
-    """安装 probe；profiling 合同错误必须直接暴露。"""
-
-    try:
-        probe.install(module)
-    except Exception as exc:
-        if probe_debug_enabled():
-            print(f"[trace_sim_probe] probe install failed for {module.__name__}: {exc}", file=sys.stderr)
-        raise
-
-
-def _post_import_apply(module_name: str) -> None:
-    """一次 import 完成后，对相关目标模块补装 probe。"""
-
+@functools.cache
+def _matching_probes(module_name: str) -> tuple[ModuleType, ...]:
+    """Probe targets are fixed at startup; repeated imports need no new scan."""
+    matches = []
     for probe in _probes():
         targets: tuple[str, ...] = getattr(probe, "TARGET_MODULES", ())
         if any(
             module_name == target or module_name.startswith(target + ".") or target.startswith(module_name + ".")
             for target in targets
         ):
-            _apply_probe_to_loaded_modules(probe)
+            matches.append(probe)
+    return tuple(matches)
+
+
+def _post_import_apply(module_name: str) -> None:
+    """Recheck installation even when the module-name match was cached."""
+    for probe in _matching_probes(module_name):
+        _apply_probe_to_loaded_modules(probe)
 
 
 def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):

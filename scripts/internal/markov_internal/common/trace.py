@@ -10,64 +10,25 @@ parsers.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
-@dataclass(frozen=True)
-class TraceLoadStatus:
-    """Observable outcome of loading one trace file."""
+def load_chrome_trace_events(path: Path, *, auto_repair: bool = True) -> list[dict[str, Any]]:
+    """Load events; missing files and invalid JSON raise rather than imply an empty trace.
 
-    path: str
-    loaded: bool
-    event_count: int
-    repaired: bool = False
-    error: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        """Return the stable JSON representation used by audit artifacts."""
-
-        return {
-            "path": self.path,
-            "loaded": self.loaded,
-            "event_count": self.event_count,
-            "repaired": self.repaired,
-            "error": self.error,
-        }
-
-
-def load_chrome_trace(path: Path, *, auto_repair: bool = True) -> tuple[Any, list[dict[str, Any]], TraceLoadStatus]:
-    """Load a Chrome trace payload, dictionary events, and status metadata."""
-
-    if not path.is_file():
-        return None, [], TraceLoadStatus(str(path), loaded=False, event_count=0, error="missing_file")
-
+    Only a missing container footer may be repaired. Partial events remain errors.
+    """
     text = path.read_text(encoding="utf-8").strip()
     try:
         payload = json.loads(text)
-        events = trace_events_from_payload(payload)
-        return payload, events, TraceLoadStatus(str(path), loaded=True, event_count=len(events))
-    except json.JSONDecodeError as error:
-        if not auto_repair:
-            return None, [], TraceLoadStatus(str(path), loaded=False, event_count=0, error=str(error))
-        repaired = repair_streamed_chrome_trace_text(text)
-        if repaired == text:
-            return None, [], TraceLoadStatus(str(path), loaded=False, event_count=0, error=str(error))
+    except json.JSONDecodeError:
+        closed = repair_streamed_chrome_trace_text(text) if auto_repair else text
+        if closed == text:
+            raise
+        payload = json.loads(closed)
 
-    try:
-        payload = json.loads(repaired)
-        events = trace_events_from_payload(payload)
-        return payload, events, TraceLoadStatus(str(path), loaded=True, event_count=len(events), repaired=True)
-    except json.JSONDecodeError as repair_error:
-        return None, [], TraceLoadStatus(str(path), loaded=False, event_count=0, error=str(repair_error))
-
-
-def load_chrome_trace_events(path: Path, *, auto_repair: bool = True) -> tuple[list[dict[str, Any]], TraceLoadStatus]:
-    """Load only dictionary events plus trace status metadata."""
-
-    _payload, events, status = load_chrome_trace(path, auto_repair=auto_repair)
-    return events, status
+    return trace_events_from_payload(payload)
 
 
 def trace_events_from_payload(payload: Any) -> list[dict[str, Any]]:
@@ -83,14 +44,12 @@ def repair_streamed_chrome_trace_text(text: str) -> str:
     """Close a streamed trace only when its final event object is complete."""
 
     stripped = text.strip()
-    if not stripped:
+    # Only append the missing container footer. Never discard a partial event
+    # after the last complete object: that would turn lost data into success.
+    if not stripped.endswith("}"):
         return text
     if stripped.startswith('{"traceEvents":[') and not stripped.endswith("]}"):
-        end = stripped.rfind("}")
-        if end >= 0:
-            return stripped[: end + 1].rstrip(",") + "]}"
-    if stripped.startswith("[") and not stripped.endswith("]"):
-        end = stripped.rfind("}")
-        if end >= 0:
-            return stripped[: end + 1].rstrip(",") + "]"
+        return stripped + "]}"
+    if stripped.startswith("["):
+        return stripped + "]"
     return text

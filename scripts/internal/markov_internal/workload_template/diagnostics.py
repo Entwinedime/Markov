@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, Iterable, Mapping
 
-from .expand import RequestPlan, prefix_token_digest
+from .expand import RequestPlan
 from .schema import ConfigSpec, TemplateValidationError
 
 
@@ -17,12 +18,21 @@ def evaluate_assertion(
     """Project one canonical request range onto read-only per-rank node snapshots."""
 
     start, end = _assertion_range(request, range_kind, config)
+    # This digest is the server diagnostic's token-path identity, not an artifact
+    # version/checksum. Extend one prefix state instead of hashing every prefix
+    # from scratch, and share the resulting lookup across ranks.
+    digest = hashlib.sha256()
+    prefix_digests = {0: "sha256_u32le:" + digest.hexdigest()}
+    for position, token in enumerate(request.prompt_token_ids, 1):
+        digest.update(token.to_bytes(4, byteorder="little", signed=False))
+        if position % config.page_size == 0:
+            prefix_digests[position] = "sha256_u32le:" + digest.hexdigest()
     rank_results: list[dict[str, Any]] = []
     for rank in snapshot.get("ranks", []):
         if not isinstance(rank, dict):
             rank_results.append({"covered": False, "reason": "invalid_rank"})
             continue
-        rank_results.append(_evaluate_range_on_rank(rank, request.prompt_token_ids, start, end, config.page_size))
+        rank_results.append(_evaluate_range_on_rank(rank, prefix_digests, start, end, config.page_size))
     return {
         "range_start": start,
         "range_end": end,
@@ -61,19 +71,13 @@ def _assertion_range(request: RequestPlan, range_kind: str, config: ConfigSpec) 
 
 def _evaluate_range_on_rank(
     rank: Mapping[str, Any],
-    input_ids: Iterable[int],
+    expected_prefix_digests: Mapping[int, str],
     start: int,
     end: int,
     page_size: int,
 ) -> dict[str, Any]:
     if start < 0 or end <= start:
         return {"covered": False, "reason": "invalid_range"}
-    token_ids = tuple(input_ids)
-    if end > len(token_ids):
-        return {"covered": False, "reason": "invalid_range"}
-    expected_prefix_digests = {
-        position: prefix_token_digest(token_ids[:position]) for position in range(0, len(token_ids) + 1, page_size)
-    }
     nodes = rank.get("nodes")
     if not isinstance(nodes, list):
         return {"covered": False, "reason": "nodes_missing"}

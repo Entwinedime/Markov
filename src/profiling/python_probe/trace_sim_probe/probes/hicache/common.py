@@ -5,32 +5,18 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from trace_sim_probe.probes import generic_callable as _base
-
-
-def _extract_source_value(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, Any]:
-    """委托通用 probe source 语法读取原始值。"""
-
-    return _base._extract_raw_value(source, field_name, bound, args, kwargs, result)
+from trace_sim_probe.probes.generic_callable import _extract_raw_value as _extract_source_value
 
 
 def _scope_from_optional_source(
     source: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> str:
     """从可选 source 读取 cache_scope，缺失时返回空字符串。"""
 
-    found, value = _extract_source_value(source, "cache_scope", bound, args, kwargs, result)
+    found, value = _extract_source_value(source, "cache_scope", bound, args, result)
     return _cache_scope_key(value) if found else ""
 
 

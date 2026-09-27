@@ -5,31 +5,44 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .paths import map_repo_path
+from .paths import map_repo_path, require_repo_path
 
 
-def existing_manifest_files(entries: Any) -> list[Path]:
-    """Resolve manifest file entries that currently exist in this checkout.
+def profile_labels(config: dict[str, Any], fallback: str = "") -> tuple[str, str]:
+    """Return config/workload labels; matrix labels precede ordinary metadata.
 
-    A manifest entry may be a path string or an object containing ``path`` and an
-    optional ``exists`` flag. Container paths are projected into the active host
-    checkout before existence is checked.
+    Labels select and display inputs, not model parameters. Callers reading an
+    existing manifest may supply its run name when neither label was declared.
+    """
+    metadata = config.get("metadata", {})
+    return (
+        str(metadata.get("suite_server_id") or metadata.get("config_id") or fallback),
+        str(metadata.get("suite_input_id") or metadata.get("workload_id") or fallback),
+    )
+
+
+def workload_report_path(manifest: dict[str, Any]) -> Path:
+    """Resolve the one declared workload report required by HiCache workflows.
+
+    Never discover reports by directory layout or ignore a missing declared file;
+    its reader reports that failure rather than substituting another artifact.
     """
 
-    if not isinstance(entries, list):
-        return []
+    reports = manifest["bench"]["workload_report_files"]
+    if len(reports) != 1:
+        raise ValueError(f"expected one manifest-declared workload report, found {len(reports)}")
+    return require_repo_path(reports[0]["path"])
 
-    paths: list[Path] = []
+
+def manifest_files(entries: list[str | dict[str, Any]]) -> list[Path]:
+    """Resolve all declared files without silently filtering missing assets.
+
+    A declared unavailable entry is invalid, as in the C++ reader. Identity
+    readers need only paths; consumers check current availability when used.
+    """
+    paths = set()
     for entry in entries:
-        if isinstance(entry, dict):
-            if entry.get("exists", True) is False:
-                continue
-            raw_path = entry.get("path")
-        else:
-            raw_path = entry
-        if not isinstance(raw_path, str) or not raw_path:
-            continue
-        path = map_repo_path(Path(raw_path))
-        if path.is_file():
-            paths.append(path)
-    return sorted(set(paths))
+        if isinstance(entry, dict) and entry.get("exists", True) is not True:
+            raise ValueError(f"manifest declares an unavailable file: {entry['path']}")
+        paths.add(map_repo_path(Path(entry["path"] if isinstance(entry, dict) else entry)))
+    return sorted(paths)

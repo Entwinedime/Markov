@@ -27,9 +27,15 @@ class ProfilerClockCheck(unittest.TestCase):
         singleton = Config()
         singleton._start_cnt = 999
         vendor = SimpleNamespace(ProfilerConfig=lambda: singleton)
-        with tempfile.TemporaryDirectory() as directory, patch.dict(sys.modules, {
-            "torch_npu.profiler.analysis._profiler_config": vendor,
-        }):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(
+                sys.modules,
+                {
+                    "torch_npu.profiler.analysis._profiler_config": vendor,
+                },
+            ),
+        ):
             for rank in (1, 2, 3):
                 root = Path(directory) / f"{rank}_ascend_pt"
                 root.mkdir()

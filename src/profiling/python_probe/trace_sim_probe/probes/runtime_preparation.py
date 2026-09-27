@@ -1,4 +1,4 @@
-"""Optional host preparation intervals, not HiCache facts or device costs.
+"""Host preparation observations for DAG modeling, not HiCache state facts.
 
 Triton preparation may load a disk cache entry or compile a new variant. With
 async compilation the interval ends at submission return, not kernel readiness.
@@ -7,13 +7,14 @@ No tensor contents, cache keys, snapshots or per-launch records are collected.
 
 from __future__ import annotations
 
-import functools
 import inspect
 import sys
 from contextvars import ContextVar
+from functools import partial
 from types import ModuleType
+from typing import Any, Callable
 
-from trace_sim_probe.patching import PATCH_MARKER
+from trace_sim_probe.patching import PATCH_MARKER, install_wrapper
 from trace_sim_probe.writer import get_writer
 
 
@@ -25,14 +26,8 @@ TARGET_MODULES = tuple(_TARGETS)
 _PREPARATION = ContextVar("triton_preparation", default=None)
 
 
-def _observe_ir_entry(module):
-    owner = getattr(module, "ASTSource", None)
-    original = getattr(owner, "make_ir", None)
-    if original is None or getattr(original, PATCH_MARKER, False):
-        return
-
-    @functools.wraps(original)
-    def observed(source, *args, **kwargs):
+def _ir_entry(original: Callable[..., Any]) -> Callable[..., Any]:
+    def observed(source: Any, *args: Any, **kwargs: Any) -> Any:
         current = _PREPARATION.get()
         if current is not None:
             instance, fields = current
@@ -40,24 +35,13 @@ def _observe_ir_entry(module):
                 fields["path"] = "compiled"
         return original(source, *args, **kwargs)
 
-    setattr(observed, PATCH_MARKER, True)
-    owner.make_ir = observed
+    return observed
 
 
-def install(module: ModuleType) -> None:
-    """Wrap already imported methods; do not import Triton or initialize devices."""
-
-    if module.__name__ == "triton.compiler.compiler":
-        _observe_ir_entry(module)
-    class_name, method, event = _TARGETS[module.__name__]
-    owner = getattr(module, class_name, None)
-    original = getattr(owner, method, None)
-    if original is None or getattr(original, PATCH_MARKER, False):
-        return
+def _preparation(original: Callable[..., Any], module: ModuleType, method: str, event: str) -> Callable[..., Any]:
     parameters = inspect.signature(original)
 
-    @functools.wraps(original)
-    def measured(instance, *args, **kwargs):
+    def measured(instance: Any, *args: Any, **kwargs: Any) -> Any:
         if method == "_init_handles" and instance.module is not None:
             return original(instance, *args, **kwargs)
 
@@ -75,7 +59,8 @@ def install(module: ModuleType) -> None:
         if method == "_do_compile":
             # Ascend installs its own IR wrapper lazily on first compilation.
             # Observe the current entry again on a later preparation call.
-            _observe_ir_entry(sys.modules.get("triton.compiler.compiler"))
+            compiler = sys.modules.get("triton.compiler.compiler")
+            install_wrapper(getattr(compiler, "ASTSource", None), "make_ir", _ir_entry)
             active_mode = getattr(getattr(module, "_async_compile", None), "active_mode", None)
             mode = "unknown" if active_mode is None else "sync" if active_mode.get() is None else "async"
             fields.update(execution_mode=mode, path="async_submit" if mode == "async" else "unknown")
@@ -99,5 +84,16 @@ def install(module: ModuleType) -> None:
                 _PREPARATION.reset(token)
             writer.duration_event(event, start, end, "runtime_diagnostic", fields)
 
-    setattr(measured, PATCH_MARKER, True)
-    setattr(owner, method, measured)
+    return measured
+
+
+def install(module: ModuleType) -> None:
+    """Wrap already imported methods; do not import Triton or initialize devices."""
+
+    if module.__name__ == "triton.compiler.compiler":
+        install_wrapper(getattr(module, "ASTSource", None), "make_ir", _ir_entry)
+
+    class_name, method, event = _TARGETS[module.__name__]
+    install_wrapper(
+        getattr(module, class_name, None), method, partial(_preparation, module=module, method=method, event=event)
+    )

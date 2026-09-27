@@ -13,24 +13,21 @@ from ..common.logging import log
 from ..common.paths import prepend_repo_src_to_sys_path
 from ..common.process import start_process, stop_process, wait_for_ready
 from .artifacts import write_profile_manifest, write_run_inputs
-from .drain import capture_tail_policy
 from .environments import build_bench_env, build_server_env
 from .forced_workflow import preflight_forced_token_contract
 from .frameworks import framework_adapter, validate_framework_channels
+from .probe_targets import select_python_probe_targets
 from .profiler_api import (
     should_stop_torch_profiler_after_workload,
     start_torch_profiler,
     stop_torch_profiler,
-    torch_profile_enabled,
 )
 from .runtime import (
-    ModelConfigBackup,
     RunLayout,
-    apply_model_config_overrides,
     build_bench_command,
-    channel_config,
-    expand_command_placeholders,
-    restore_model_config,
+    expand_runtime_value,
+    model_path_from_config,
+    temporary_model_config,
 )
 from .storage_cleanup import cleanup_run_local_hicache_storage
 
@@ -43,7 +40,7 @@ class ProfileRun:
     """Own the server, profiler, workload, restoration, and manifest lifecycle."""
 
     def __init__(self, cfg: dict[str, Any], *, dry_run: bool) -> None:
-        """Normalize config, layout, and server/workload commands for one run."""
+        """Prepare and check one run without starting processes or writing files."""
 
         self.cfg = cfg
         self.dry_run = dry_run
@@ -51,9 +48,12 @@ class ProfileRun:
         self.adapter = framework_adapter(self.framework)
         self.runtime = normalize_profiling_config(cfg)
         validate_framework_channels(self.adapter, self.runtime.channels)
-        # Validate capture-tail settings before starting a model server.
-        capture_tail = capture_tail_policy(cfg)
-        self.post_workload_drain_sec = capture_tail["post_workload_drain_sec"]
+        self.python_targets = (
+            select_python_probe_targets(self.runtime.python_consumers, diagnostics=self.runtime.python_diagnostics)
+            if self.runtime.enabled and "python_probe" in self.runtime.channels
+            else []
+        )
+
         self.cleanup_hicache_storage_after_run = bool(cfg.get("cleanup_hicache_storage_after_run", False))
         self.sync_filesystem_after_hicache_storage_cleanup = bool(
             cfg.get("sync_filesystem_after_hicache_storage_cleanup", False)
@@ -64,17 +64,24 @@ class ProfileRun:
             )
         self.layout = RunLayout.from_config(cfg, framework=self.framework)
         self.server_cfg = cfg.get("server", {})
-        self.server_command = expand_command_placeholders(
+        self.server_command = expand_runtime_value(
             command_from_config(self.server_cfg["command"]), self.layout, self.cfg
         )
-        self.bench_command = build_bench_command(
-            cfg.get("bench", {}), self.layout, self.cfg, framework=self.framework
+        self.bench_command = build_bench_command(cfg.get("bench", {}), self.layout, self.cfg, framework=self.framework)
+        self.model_path = model_path_from_config(cfg, self.server_command)
+
+        preflight_forced_token_contract(
+            self.bench_command,
+            experiment_id=str(self.cfg.get("id") or self.cfg.get("name") or "profile"),
         )
 
     def run(self) -> Path:
         """Execute the run and always persist a terminal profile manifest."""
 
-        self.layout.prepare(clean=bool(self.cfg.get("clean_run_dir", False)))
+        clean = bool(self.cfg.get("clean_run_dir", False))
+        if self.layout.run_dir.exists() and any(self.layout.run_dir.iterdir()) and (self.dry_run or not clean):
+            raise FileExistsError(f"Profiling run directory is not empty: {self.layout.run_dir}; choose a new run_id")
+        self.layout.prepare(clean=clean and not self.dry_run)
         write_run_inputs(
             self.layout.run_dir,
             self.cfg,
@@ -84,100 +91,90 @@ class ProfileRun:
 
         log(f"Run dir: {self.layout.run_dir}")
         started_at = time.time()
-        if self.dry_run:
-            storage_cleanup = None
-            if self.adapter.hicache:
-                storage_cleanup = {
-                    "status": (
-                        "planned_after_server_exit"
-                        if self.cleanup_hicache_storage_after_run
-                        else "not_requested"
-                    ),
-                    "removed": False,
-                    "filesystem_sync_after_removal": self.sync_filesystem_after_hicache_storage_cleanup,
-                }
-            write_profile_manifest(
-                self.layout.run_dir,
-                cfg=self.cfg,
-                runtime=self.runtime,
-                started_at=started_at,
-                status="dry_run",
-                dry_run=True,
-                workload_started=False,
-                storage_cleanup=storage_cleanup,
-            )
-            return self.layout.run_dir
-
-        status = "completed"
+        status = "dry_run" if self.dry_run else "completed"
         error: str | None = None
-        backup: ModelConfigBackup | None = None
         server_process: subprocess.Popen[Any] | None = None
         server_env: dict[str, str] = {}
         workload_started = False
         storage_cleanup: dict[str, Any] | None = None
         if self.adapter.hicache:
             storage_cleanup = {"status": "not_requested", "removed": False}
+            if self.dry_run:
+                if self.cleanup_hicache_storage_after_run:
+                    storage_cleanup["status"] = "planned_after_server_exit"
+                storage_cleanup["filesystem_sync_after_removal"] = self.sync_filesystem_after_hicache_storage_cleanup
+
         try:
-            server_env = build_server_env(self.cfg, self.runtime, self.layout, self.adapter)
-            backup = apply_model_config_overrides(self.cfg, self.server_command, self.layout)
+            if self.dry_run:
+                return self.layout.run_dir
 
-            server_process = self._start_server(server_env)
-            log("Server is ready.")
+            server_env = build_server_env(self.cfg, self.runtime, self.layout, self.adapter, self.python_targets)
+            with temporary_model_config(self.cfg, self.model_path, self.layout):
+                try:
+                    server_process = self._start_server(server_env)
+                    log("Server is ready.")
 
-            profile_cfg = channel_config(self.cfg, "torch")
-            torch_enabled = self.adapter.profiler_api and torch_profile_enabled(self.runtime, self.cfg)
-            if torch_enabled:
-                start_torch_profiler(self.layout, self.server_cfg, profile_cfg)
+                    profile_cfg = self.runtime.channel_options["torch"]
+                    torch_enabled = (
+                        self.adapter.profiler_api
+                        and self.runtime.enabled
+                        and "torch" in self.runtime.channels
+                        and profile_cfg.get("enabled", True)
+                    )
+                    if torch_enabled:
+                        start_torch_profiler(self.layout, self.server_cfg, self.runtime)
 
-            if self.bench_command is not None:
-                workload_started = True
-                self._run_bench(server_env)
+                    if self.bench_command is not None:
+                        workload_started = True
+                        self._run_bench(server_env)
 
-            drain_sec = self.post_workload_drain_sec
-            if drain_sec > 0:
-                log(
-                    f"Keeping capture channels active for {drain_sec:g}s after the workload "
-                    "to retain asynchronous lifecycle tail evidence."
-                )
-                time.sleep(drain_sec)
+                    drain_sec = self.runtime.post_workload_drain_sec
+                    if drain_sec > 0:
+                        log(
+                            f"Keeping capture channels active for {drain_sec:g}s after the workload "
+                            "to retain asynchronous lifecycle tail evidence."
+                        )
+                        time.sleep(drain_sec)
 
-            if torch_enabled and should_stop_torch_profiler_after_workload(profile_cfg):
-                stop_torch_profiler(self.layout, self.server_cfg, profile_cfg)
-
-        except Exception as exc:
+                    if torch_enabled and should_stop_torch_profiler_after_workload(profile_cfg):
+                        stop_torch_profiler(self.layout, self.server_cfg, profile_cfg)
+                finally:
+                    stop_process(server_process)
+                    shutdown_cooldown_sec = float(self.server_cfg.get("shutdown_cooldown_sec", 0))
+                    if server_process is not None and shutdown_cooldown_sec > 0:
+                        log(f"Cooling down after server shutdown for {shutdown_cooldown_sec:g}s.")
+                        time.sleep(shutdown_cooldown_sec)
+                    try:
+                        storage_cleanup = self._cleanup_hicache_storage(server_env)
+                    except Exception as cleanup_error:
+                        status = "failed"
+                        cleanup_message = f"HiCache storage cleanup failed: {cleanup_error}"
+                        error = f"{error}; {cleanup_message}" if error else cleanup_message
+                        storage_cleanup = {
+                            "status": "failed",
+                            "removed": False,
+                            "error": str(cleanup_error),
+                        }
+        except BaseException as exc:
             status = "failed"
-            error = str(exc)
+            error = str(exc) or type(exc).__name__
             raise
         finally:
-            stop_process(server_process)
-            shutdown_cooldown_sec = float(self.server_cfg.get("shutdown_cooldown_sec", 0))
-            if server_process is not None and shutdown_cooldown_sec > 0:
-                log(f"Cooling down after server shutdown for {shutdown_cooldown_sec:g}s.")
-                time.sleep(shutdown_cooldown_sec)
-            try:
-                storage_cleanup = self._cleanup_hicache_storage(server_env)
-            except Exception as cleanup_error:
-                status = "failed"
-                cleanup_message = f"HiCache storage cleanup failed: {cleanup_error}"
-                error = f"{error}; {cleanup_message}" if error else cleanup_message
-                storage_cleanup = {
-                    "status": "failed",
-                    "removed": False,
-                    "error": str(cleanup_error),
-                }
-            restore_model_config(backup)
             write_profile_manifest(
                 self.layout.run_dir,
                 cfg=self.cfg,
                 runtime=self.runtime,
+                python_targets=self.python_targets,
                 started_at=started_at,
                 status=status,
-                dry_run=False,
+                dry_run=self.dry_run,
                 workload_started=workload_started,
                 error=error,
                 storage_cleanup=storage_cleanup,
             )
 
+        if status == "failed":
+            raise RuntimeError(error)
         log("Profile run completed.")
         return self.layout.run_dir
 
@@ -199,12 +196,6 @@ class ProfileRun:
             sync_after_removal=self.sync_filesystem_after_hicache_storage_cleanup,
         )
 
-    def _wait_for_server(self, process: subprocess.Popen[Any]) -> None:
-        """Wait for readiness while surfacing early exit and timeout failures."""
-
-        ready_url = self.server_cfg.get("ready_url", self.adapter.default_ready_url)
-        wait_for_ready(process, ready_url, int(self.server_cfg.get("ready_timeout_sec", 1800)))
-
     def _start_server(self, server_env: dict[str, str]) -> subprocess.Popen[Any]:
         """Start the server with bounded, clean retries before workload execution."""
 
@@ -220,11 +211,18 @@ class ProfileRun:
             log(f"Starting {self.framework} server (attempt {attempt}/{max_attempts}).")
             process = start_process(self.server_command, self.layout.log_dir / "server.log", server_env)
             try:
-                self._wait_for_server(process)
+                wait_for_ready(
+                    process,
+                    self.server_cfg.get("ready_url", self.adapter.default_ready_url),
+                    int(self.server_cfg.get("ready_timeout_sec", 1800)),
+                )
                 return process
-            except Exception as error:
-                errors.append(str(error))
+            except BaseException as error:
                 stop_process(process)
+                # Interrupts release the process but must not start a retry.
+                if not isinstance(error, Exception):
+                    raise
+                errors.append(str(error))
                 if attempt >= max_attempts:
                     raise RuntimeError(
                         f"server failed to become ready after {max_attempts} attempts: {errors}"
@@ -247,9 +245,7 @@ class ProfileRun:
             shutil.rmtree(self.layout.trace_dir)
         storage_raw = server_env.get("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR") if self.adapter.hicache else None
         if storage_raw:
-            storage_dir = Path(storage_raw).resolve()
-            if storage_dir.is_relative_to(self.layout.run_dir.resolve()) and storage_dir.exists():
-                shutil.rmtree(storage_dir)
+            cleanup_run_local_hicache_storage(self.layout.run_dir, storage_raw, enabled=True)
         self.layout.prepare(clean=False)
 
     def _run_bench(self, server_env: dict[str, str]) -> None:
@@ -258,31 +254,14 @@ class ProfileRun:
         log("Running workload.")
         bench_env = build_bench_env(
             self.cfg,
-            self.server_cfg,
-            self.server_command,
             server_env,
             self.layout,
+            self.model_path,
         )
         bench_proc = start_process(self.bench_command, self.layout.log_dir / "bench.log", bench_env)
-        bench_code = bench_proc.wait()
+        try:
+            bench_code = bench_proc.wait()
+        finally:
+            stop_process(bench_proc)
         if bench_code != 0:
             raise RuntimeError(f"bench command failed, code={bench_code}")
-
-
-def run_profile(cfg: dict[str, Any], dry_run: bool) -> Path:
-    """Execute one already expanded profiling configuration."""
-
-    return ProfileRun(cfg, dry_run=dry_run).run()
-
-
-def preflight_profile_config(cfg: dict[str, Any]) -> dict[str, Any]:
-    """Run read-only contract preflight for one expanded configuration."""
-
-    probe = ProfileRun(cfg, dry_run=True)
-    metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
-    exp_id = str(cfg.get("id") or cfg.get("name") or "profile")
-    return preflight_forced_token_contract(
-        probe.bench_command,
-        metadata,
-        experiment_id=exp_id,
-    )

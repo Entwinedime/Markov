@@ -49,9 +49,11 @@ class LayerWaitCheck(unittest.TestCase):
         self.worker = TpModelWorker()
         self.counter = LayerDoneCounter()
         self.worker.hicache_layer_transfer_counter = self.counter
-        self.batch = types.SimpleNamespace(reqs=[types.SimpleNamespace(rid="request")],
-                                           forward_mode=types.SimpleNamespace(name="DECODE"),
-                                           hicache_consumer_index=0)
+        self.batch = types.SimpleNamespace(
+            reqs=[types.SimpleNamespace(rid="request")],
+            forward_mode=types.SimpleNamespace(name="DECODE"),
+            hicache_consumer_index=0,
+        )
         self.writer = Mock()
         self.writer.now_us.side_effect = range(100, 200)
         writer_patch = patch.object(probe, "get_writer", return_value=self.writer)
@@ -68,8 +70,7 @@ class LayerWaitCheck(unittest.TestCase):
         self.assertEqual(record["status"], "returned")
         self.assertEqual(record["phase"], "DECODE")
         self.assertEqual(record["layer_count"], 64)
-        self.assertEqual([row[0] for row in record["wait_intervals"]],
-                         [layer for layer in range(64) for _ in range(2)])
+        self.assertEqual([row[0] for row in record["wait_intervals"]], [layer for layer in range(64) for _ in range(2)])
         self.assertTrue(all(end >= start for _, start, end in record["wait_intervals"]))
         self.assertEqual(self.counter.event_wait.call_count, 128)
         self.assertIsNone(probe._BATCH.get())
@@ -83,7 +84,7 @@ class LayerWaitCheck(unittest.TestCase):
         record = self.writer.duration_event.call_args.args[4]
         self.assertEqual(record["consumer_index"], -1)
         self.assertEqual(record["wait_clock"], "npu_syscnt")
-        self.assertEqual(record["wait_intervals"], [(i // 2, 1000 + 2*i, 1001 + 2*i) for i in range(128)])
+        self.assertEqual(record["wait_intervals"], [(i // 2, 1000 + 2 * i, 1001 + 2 * i) for i in range(128)])
         self.counter.event_wait.assert_not_called()
         self.assertEqual(ticks.call_count, 256)
         self.assertIsNone(probe._BATCH.get())

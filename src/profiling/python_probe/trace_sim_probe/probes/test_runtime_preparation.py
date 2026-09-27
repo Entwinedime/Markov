@@ -1,24 +1,13 @@
-"""Small, device-free checks for optional runtime preparation markers."""
+"""Small, device-free checks for runtime preparation observations."""
 
 import types
 import unittest
 from unittest.mock import Mock, patch
 
-from trace_sim_probe import bootstrap
 from trace_sim_probe.probes import runtime_preparation as probe
 
 
 class RuntimePreparationCheck(unittest.TestCase):
-    def test_default_off_and_explicit_diagnostics(self):
-        for level, count in (("off", 1), ("timing", 5), ("full", 5)):
-            with self.subTest(level=level), patch.object(bootstrap, "_PROBES", None), \
-                    patch.dict("os.environ", {"TRACE_SIM_PYTHON_PROBE_DIAGNOSTICS": level}), \
-                    patch.object(bootstrap.importlib, "import_module") as load:
-                self.assertEqual(len(bootstrap._probes()), count)
-                self.assertEqual(load.call_count, count)
-                bootstrap._probes()
-                self.assertEqual(load.call_count, count)
-
     def test_prepare_preserves_return_and_exception(self):
         class JITFunction:
             fn = staticmethod(lambda: None)
@@ -108,8 +97,10 @@ class RuntimePreparationCheck(unittest.TestCase):
         writer.now_us.return_value = 10  # Identical timings cannot classify paths.
         original_entry = ASTSource.make_ir
         ASTSource.make_ir = lambda self: original_entry(self)  # Lazy backend wrapper, no copied marker.
-        with patch.object(probe, "get_writer", return_value=writer), \
-                patch.dict("sys.modules", {compiler.__name__: compiler}):
+        with (
+            patch.object(probe, "get_writer", return_value=writer),
+            patch.dict("sys.modules", {compiler.__name__: compiler}),
+        ):
             for path in ("compile", "cached", "nested", "hook"):
                 JITFunction()._do_compile(path)
             with self.assertRaisesRegex(ValueError, "compile failed"):
@@ -117,8 +108,10 @@ class RuntimePreparationCheck(unittest.TestCase):
             mode.return_value = object()
             JITFunction()._do_compile("compile")
         fields = [call.args[4] for call in writer.duration_event.call_args_list]
-        self.assertEqual([row["path"] for row in fields],
-                         ["compiled", "disk_cache", "compiled", "disk_cache", "unknown", "compiled", "async_submit"])
+        self.assertEqual(
+            [row["path"] for row in fields],
+            ["compiled", "disk_cache", "compiled", "disk_cache", "unknown", "compiled", "async_submit"],
+        )
         self.assertEqual(fields[-2]["status"], "raised")
         self.assertEqual(fields[-1]["execution_mode"], "async")
         self.assertIsNone(probe._PREPARATION.get())
@@ -143,14 +136,6 @@ class RuntimePreparationCheck(unittest.TestCase):
         module = types.ModuleType("triton.runtime.jit")
         probe.install(module)
         self.assertFalse(hasattr(module, "JITFunction"))
-
-    def test_parent_import_installs_loaded_child(self):
-        module = types.ModuleType("triton.runtime.jit")
-        plugin = types.SimpleNamespace(TARGET_MODULES=(module.__name__,), install=Mock())
-        with patch.object(bootstrap, "_PROBES", (plugin,)), \
-                patch.dict("sys.modules", {module.__name__: module}):
-            bootstrap._post_import_apply("triton")
-        plugin.install.assert_called_once_with(module)
 
 
 if __name__ == "__main__":

@@ -103,8 +103,10 @@ class ResponseBoundaryCheck(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await response({}, None, send), "original result")
         self.assertEqual(len(forwarded), len(messages))
         self.assertTrue(all(left is right for left, right in zip(forwarded, messages)))
-        self.assertEqual([call.args[0] for call in writer.duration_event.call_args_list],
-                         ["runtime.response.serialize", "runtime.response.http_body_sent"])
+        self.assertEqual(
+            [call.args[0] for call in writer.duration_event.call_args_list],
+            ["runtime.response.serialize", "runtime.response.http_body_sent"],
+        )
 
         async def failed_send(message):
             raise ValueError("network failed")
@@ -135,13 +137,21 @@ class ResponseBoundaryCheck(unittest.IsolatedAsyncioTestCase):
         self.assertIs(wrapped, SchedulerRequestReceiver.recv_requests)
         receiver = SchedulerRequestReceiver()
         receiver.fail = False
-        receiver.requests = [types.SimpleNamespace(rid="one"), types.SimpleNamespace(batch=[types.SimpleNamespace(rid="two")])]
+        receiver.requests = [
+            types.SimpleNamespace(rid="one"),
+            types.SimpleNamespace(batch=[types.SimpleNamespace(rid="two")]),
+        ]
         writer = Mock()
         writer.now_us.side_effect = [200, 300]
-        with patch.object(probe, "get_writer", return_value=writer), patch.object(probe.time, "time_ns", return_value=100_000):
+        with (
+            patch.object(probe, "get_writer", return_value=writer),
+            patch.object(probe.time, "time_ns", return_value=100_000),
+        ):
             self.assertIs(receiver.recv_requests(), receiver.requests)
-        self.assertEqual([call.args[0] for call in writer.duration_event.call_args_list],
-                         ["runtime.request.socket_received", "runtime.request.dispatch_ready", "runtime.request.receive"])
+        self.assertEqual(
+            [call.args[0] for call in writer.duration_event.call_args_list],
+            ["runtime.request.socket_received", "runtime.request.dispatch_ready", "runtime.request.receive"],
+        )
         for call in writer.duration_event.call_args_list:
             if call.args[0] != "runtime.request.receive":
                 self.assertEqual(call.args[1], call.args[2])
@@ -179,8 +189,13 @@ class ResponseBoundaryCheck(unittest.IsolatedAsyncioTestCase):
                 manager._send_one_request(request, fail=True)
         calls = writer.duration_event.call_args_list
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0].args, ("runtime.request.tokenizer_submit", 10, 20, "runtime_diagnostic", {"request_ids": ["one"]}))
-        self.assertEqual(calls[1].args, ("runtime.request.tokenizer_submit", 30, 40, "runtime_diagnostic", {"request_ids": ["one", "two"]}))
+        self.assertEqual(
+            calls[0].args, ("runtime.request.tokenizer_submit", 10, 20, "runtime_diagnostic", {"request_ids": ["one"]})
+        )
+        self.assertEqual(
+            calls[1].args,
+            ("runtime.request.tokenizer_submit", 30, 40, "runtime_diagnostic", {"request_ids": ["one", "two"]}),
+        )
         with patch.object(probe, "get_writer") as get_writer:
             manager._send_batch_request([])
             get_writer.assert_not_called()
@@ -192,9 +207,13 @@ class ResponseBoundaryCheck(unittest.IsolatedAsyncioTestCase):
             try:
                 with patch.object(probe, "get_writer", return_value=writer):
                     self.assertIs(probe._submit(True)(lambda instance, batch: batch)(None, requests), requests)
+                    self.assertIs(probe._submit(True)(lambda instance, batch: batch)(None, requests), requests)
             finally:
                 writer.close()
+            writer.close()
+            writer.duration_event("after_close", 0, 1, "test")
             events = json.loads(writer.path.read_text())["traceEvents"]
+        self.assertEqual(len(events), 2)
         self.assertEqual(events[0]["args"]["request_ids"], [item.rid for item in requests])
 
 

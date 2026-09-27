@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, Union
+from collections.abc import Iterator
+from typing import Any, Mapping, Protocol, Union
 
-from .schema import Template, TemplateValidationError
+from .schema import Template, TemplateValidationError, resolve_request_definition
 
 
 class Tokenizer(Protocol):
@@ -31,9 +31,10 @@ class RequestPlan:
     tail_tokens: int
     max_new_tokens: int
 
+
 @dataclass(frozen=True)
 class StaticPlanStep:
-    """One barrier, checkpoint, or explicit wait in the fixed logical sequence."""
+    """One barrier or checkpoint in the fixed logical sequence."""
 
     step_id: str
     sequence_id: int
@@ -41,6 +42,7 @@ class StaticPlanStep:
     phase: str
     measure: bool
     details: Mapping[str, Any]
+
 
 PlanStep = Union[RequestPlan, StaticPlanStep]
 
@@ -75,6 +77,7 @@ class CanonicalPlan:
                 )
         return result
 
+
 def load_tokenizer(model_path: str) -> Tokenizer:
     """Load the model tokenizer only for design-time compilation and dry-runs."""
 
@@ -91,13 +94,10 @@ def expand_template(
 ) -> CanonicalPlan:
     """Expand a template and enforce request token contracts."""
 
-    raw_steps = template.data["steps"]
-    requests: list[RequestPlan] = []
     all_steps: list[PlanStep] = []
-    sequence_id = 0
-    for raw_step in raw_steps:
-        expanded = _expand_step(template, raw_step)
-        for expanded_step in expanded:
+    for raw_step in template.data["steps"]:
+        for expanded_step in _expand_step(raw_step):
+            sequence_id = len(all_steps)
             if expanded_step["kind"] == "request":
                 request = _build_request_plan(
                     template,
@@ -105,28 +105,28 @@ def expand_template(
                     sequence_id,
                     tokenizer,
                 )
-                requests.append(request)
                 all_steps.append(request)
             else:
                 static_step = StaticPlanStep(
-                    step_id=str(expanded_step["id"]),
+                    step_id=expanded_step["id"],
                     sequence_id=sequence_id,
-                    kind=str(expanded_step["kind"]),
-                    phase=str(expanded_step["phase"]),
-                    measure=bool(expanded_step["measure"]),
+                    kind=expanded_step["kind"],
+                    phase=expanded_step["phase"],
+                    measure=expanded_step["measure"],
                     details=_static_step_details(expanded_step),
                 )
                 all_steps.append(static_step)
-            sequence_id += 1
 
-    formal_window = template.data["formal_window"]
-    formal_start = str(formal_window["start_step"])
-    formal_end = str(formal_window["end_step"])
+    # The schema fixes the formal stage; repeats may expand its declared boundary
+    # into several requests. Execution needs the actual first/last expanded IDs.
+    formal_requests = [step for step in all_steps if isinstance(step, RequestPlan) and step.measure]
+    if not formal_requests:
+        raise TemplateValidationError("the formal stage must contain at least one expanded request")
     return CanonicalPlan(
         template=template,
         steps=tuple(all_steps),
-        formal_start_step=formal_start,
-        formal_end_step=formal_end,
+        formal_start_step=formal_requests[0].step_id,
+        formal_end_step=formal_requests[-1].step_id,
     )
 
 
@@ -137,45 +137,31 @@ def request_token_budget(template: Template) -> dict[str, int]:
     This estimate includes preparation requests, not only the formal window.
     """
     counts = []
-    output = int(template.data["defaults"]["sampling"]["max_new_tokens"])
+    output = template.data["defaults"]["sampling"]["max_new_tokens"]
     for raw in template.data["steps"]:
-        for step in _expand_step(template, raw):
+        for step in _expand_step(raw):
             if step["kind"] == "request":
-                definition, _ = _resolve_request_definition(template, step["request"])
+                definition, _ = resolve_request_definition(template.data["request_defs"], step["request"])
                 contract = definition["token_contract"]
-                counts.append(int(contract["anchor_tokens"]) + int(contract["tail_tokens"]) + output)
+                counts.append(contract["anchor_tokens"] + contract["tail_tokens"] + output)
     return {"requests": len(counts), "tokens": sum(counts), "output_tokens_per_request": output}
 
 
-def prefix_token_digest(token_ids: Iterable[int]) -> str:
-    """Return a raw token-prefix digest shared with the read-only diagnostic."""
+def _expand_step(raw_step: Mapping[str, Any]) -> Iterator[Mapping[str, Any]]:
+    """Yield validated steps in fixed order; consumers must not mutate them."""
 
-    return (
-        "sha256_u32le:"
-        + hashlib.sha256(
-            b"".join(int(token_id).to_bytes(4, byteorder="little", signed=False) for token_id in token_ids)
-        ).hexdigest()
-    )
+    if raw_step["kind"] != "repeat_request":
+        yield raw_step
+        return
 
-
-def _expand_step(template: Template, raw_step: Mapping[str, Any]) -> list[dict[str, Any]]:
-    """Expand repeat_request while preserving the template's fixed order."""
-
-    kind = str(raw_step["kind"])
-    if kind != "repeat_request":
-        result = dict(raw_step)
-        if kind == "request":
-            result["kind"] = "request"
-        return [result]
-    count = int(raw_step["count"])
-    result: list[dict[str, Any]] = []
+    count = raw_step["count"]
     for repeat_index in range(count):
-        step = dict(raw_step)
-        step["kind"] = "request"
-        step["id"] = _format_repeated_step_id(str(raw_step["id"]), repeat_index, count)
-        step["request"] = _format_index(str(raw_step["request"]), repeat_index)
-        result.append(step)
-    return result
+        yield {
+            **raw_step,
+            "kind": "request",
+            "id": _format_repeated_step_id(raw_step["id"], repeat_index, count),
+            "request": _format_index(raw_step["request"], repeat_index),
+        }
 
 
 def _format_repeated_step_id(step_id: str, repeat_index: int, count: int) -> str:
@@ -202,8 +188,8 @@ def _build_request_plan(
 ) -> RequestPlan:
     """Render one request and verify its local text/token contract."""
 
-    request_name = str(raw_step["request"])
-    request_definition, request_index = _resolve_request_definition(template, request_name)
+    request_name = raw_step["request"]
+    request_definition, request_index = resolve_request_definition(template.data["request_defs"], request_name)
     if "prompt_token_ids" in request_definition:
         token_ids = tuple(request_definition["prompt_token_ids"])
     else:
@@ -214,45 +200,25 @@ def _build_request_plan(
     if not token_ids:
         raise TemplateValidationError(f"request {request_name} rendered an empty token sequence")
     token_contract = request_definition["token_contract"]
-    anchor_tokens = int(token_contract["anchor_tokens"])
-    expected_tail_tokens = int(token_contract["tail_tokens"])
+    anchor_tokens = token_contract["anchor_tokens"]
+    expected_tail_tokens = token_contract["tail_tokens"]
     actual_tail_tokens = len(token_ids) - anchor_tokens
     if actual_tail_tokens != expected_tail_tokens:
         raise TemplateValidationError(
             f"request {request_name}: tail token contract expected {expected_tail_tokens}, got {actual_tail_tokens}"
         )
     return RequestPlan(
-        step_id=str(raw_step["id"]),
+        step_id=raw_step["id"],
         sequence_id=sequence_id,
         logical_request_id=f"{template.workload_id}:{raw_step['id']}",
         request_name=request_name,
-        phase=str(raw_step["phase"]),
-        measure=bool(raw_step["measure"]),
+        phase=raw_step["phase"],
+        measure=raw_step["measure"],
         prompt_token_ids=token_ids,
         anchor_tokens=anchor_tokens,
         tail_tokens=actual_tail_tokens,
-        max_new_tokens=int(template.data["defaults"]["sampling"]["max_new_tokens"]),
+        max_new_tokens=template.data["defaults"]["sampling"]["max_new_tokens"],
     )
-
-
-def _resolve_request_definition(template: Template, request_name: str) -> tuple[Mapping[str, Any], int | None]:
-    """Resolve a concrete name against an exact or indexed request definition."""
-
-    request_defs = template.data["request_defs"]
-    exact = request_defs.get(request_name)
-    if isinstance(exact, dict):
-        return exact, None
-    for pattern, request_definition in request_defs.items():
-        if "{i}" not in pattern or not isinstance(request_definition, dict):
-            continue
-        prefix, suffix = pattern.split("{i}", 1)
-        if not request_name.startswith(prefix) or not request_name.endswith(suffix):
-            continue
-        stop = len(request_name) - len(suffix) if suffix else len(request_name)
-        index_text = request_name[len(prefix) : stop]
-        if index_text.isdigit():
-            return request_definition, int(index_text)
-    raise TemplateValidationError(f"request {request_name} does not resolve to a request definition")
 
 
 def _render_prompt(template: Template, request_definition: Mapping[str, Any], request_index: int | None) -> str:
@@ -261,24 +227,20 @@ def _render_prompt(template: Template, request_definition: Mapping[str, Any], re
     rendered_parts: list[str] = []
     format_index = 0 if request_index is None else request_index
     branch_markers = request_definition.get("branch_markers")
-    declared_branch_marker = request_definition.get("branch_marker")
-    branch_marker = None
-    if isinstance(declared_branch_marker, str) and declared_branch_marker:
-        branch_marker = declared_branch_marker
-    elif isinstance(branch_markers, dict):
-        candidate = branch_markers.get(str(format_index))
-        if not isinstance(candidate, str) or not candidate:
+    branch_marker = request_definition.get("branch_marker")
+    if branch_markers is not None:
+        branch_marker = branch_markers.get(str(format_index))
+        if branch_marker is None:
             raise TemplateValidationError(f"request index {format_index} has no branch marker")
-        branch_marker = candidate
     fragments = template.data["fragments"]
     for part in request_definition["prompt_parts"]:
         if "ref" in part:
-            fragment = fragments[str(part["ref"])]
-            source_text = str(fragment["text"])
-            repeat_count = int(fragment["repeat"])
+            fragment = fragments[part["ref"]]
+            source_text = fragment["text"]
+            repeat_count = fragment["repeat"]
             rendered_parts.append(_format_request_text(source_text, format_index, branch_marker) * repeat_count)
         else:
-            rendered_parts.append(_format_request_text(str(part["text"]), format_index, branch_marker))
+            rendered_parts.append(_format_request_text(part["text"], format_index, branch_marker))
     return "".join(rendered_parts)
 
 
@@ -296,11 +258,9 @@ def _format_request_text(value: str, request_index: int, branch_marker: str | No
 def _static_step_details(raw_step: Mapping[str, Any]) -> dict[str, Any]:
     """Copy only fixed state-gate fields into the canonical plan."""
 
-    kind = str(raw_step["kind"])
+    kind = raw_step["kind"]
     if kind == "barrier":
-        return {"scope": raw_step["scope"], "timeout_sec": int(raw_step["timeout_sec"])}
+        return {"scope": raw_step["scope"], "timeout_sec": raw_step["timeout_sec"]}
     if kind == "checkpoint":
         return {"assertions": raw_step["assertions"]}
-    if kind == "wait":
-        return {"duration_ms": int(raw_step["duration_ms"])}
     raise TemplateValidationError(f"unsupported static step kind: {kind}")

@@ -1,6 +1,7 @@
 [
   {
     "id": "hiradix.match_prefix.cache_lookup_input",
+    "capture_emission_timing": {"diagnostics": "timing"},
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.match_prefix",
     "events": {"end": "hicache_cache_lookup_input_end"},
@@ -47,6 +48,7 @@
   },
   {
     "id": "hiradix.cache_finished_req.cache_lifecycle_commit",
+    "capture_emission_timing": {"diagnostics": "timing"},
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_finished_req",
     "events": {"end": "hicache_cache_finished_req_lifecycle_commit_end"},
@@ -102,6 +104,7 @@
   },
   {
     "id": "hiradix.cache_unfinished_req.cache_lifecycle_commit",
+    "capture_emission_timing": {"diagnostics": "timing"},
     "module": "sglang.srt.mem_cache.hiradix_cache",
     "target": "HiRadixCache.cache_unfinished_req",
     "events": {"end": "hicache_cache_unfinished_req_lifecycle_commit_end"},
@@ -113,6 +116,10 @@
       {
         "name": "lifecycle_kind",
         "source": "const:unfinished"
+      },
+      {
+        "name": "chunked",
+        "source": "arg:chunked"
       },
       {
         "name": "request_id",
@@ -499,9 +506,6 @@
     "capture_thread_timing": {
       "diagnostics": "timing"
     },
-    "capture_function_profile": {
-      "diagnostics": "full"
-    },
     "events": {"end": "hicache_storage_write_service_observed_end"},
     "fact": {
       "class": "timing_observation",
@@ -534,6 +538,7 @@
   },
   {
     "id": "hicache_controller.writeback_enqueue_observed",
+    "capture_emission_timing": {"diagnostics": "timing"},
     "module": "sglang.srt.managers.cache_controller",
     "target": "HiCacheController.write_storage",
     "events": {"end": "hicache_writeback_enqueue_observed_end"},
@@ -550,14 +555,6 @@
       {
         "name": "source_page_size",
         "source": "self.page_size"
-      },
-      {
-        "name": "token_dictionary",
-        "source": "token_path:arg:token_ids"
-      },
-      {
-        "name": "full_path_span",
-        "source": "token_span:arg:token_ids"
       },
       {
         "name": "token_count",
@@ -654,9 +651,6 @@
     "target": "HiCacheController._generic_page_get",
     "capture_thread_timing": {
       "diagnostics": "timing"
-    },
-    "capture_function_profile": {
-      "diagnostics": "full"
     },
     "events": {"end": "hicache_storage_read_service_observed_end"},
     "fact": {

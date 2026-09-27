@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS
+from profiling.python_probe.trace_sim_probe.schema import HICACHE_FACT_CONSUMERS, runtime_probe_names
 
 
 KNOWN_CHANNELS = {"torch", "python_probe", "ld_preload"}
-PYTHON_PROBE_DIAGNOSTICS = frozenset({"off", "timing", "full"})
+PYTHON_PROBE_DIAGNOSTICS = frozenset({"off", "timing"})
 
 
 @dataclass(frozen=True)
@@ -18,9 +19,22 @@ class ProfilingRuntimeConfig:
 
     enabled: bool
     channels: tuple[str, ...]
+    channel_options: dict[str, dict[str, Any]]
     python_consumers: tuple[str, ...]
     python_diagnostics: str
     debug: bool
+    post_workload_drain_sec: float
+    python_probe_flush_interval_sec: float
+
+    def output_path(self, run_dir: Path, channel: str) -> Path:
+        """Resolve the configured torch directory or hook filename prefix relative to the run."""
+
+        key, default = {
+            "torch": ("output_dir", "trace/torch"),
+            "ld_preload": ("trace_output", "trace/ld_preload/cpu_trace.json"),
+        }[channel]
+        path = Path(self.channel_options[channel].get(key, default)).expanduser()
+        return run_dir / path
 
     def to_manifest_fragment(self) -> dict[str, Any]:
         """生成写入 profile manifest 的采集配置摘要。"""
@@ -30,7 +44,15 @@ class ProfilingRuntimeConfig:
             "channels_enabled": list(self.channels),
             "python_consumers": list(self.python_consumers),
             "python_diagnostics": self.python_diagnostics,
+            "python_runtime_probes": list(runtime_probe_names(self.python_consumers, self.python_diagnostics))
+            if self.enabled and "python_probe" in self.channels
+            else [],
             "debug": self.debug,
+            "capture_tail_contract": {
+                "post_workload_drain_sec": self.post_workload_drain_sec,
+                "python_probe_flush_interval_sec": self.python_probe_flush_interval_sec,
+                "semantic_lifecycle_closure_required_downstream": "hicache_input_contract" in self.python_consumers,
+            },
         }
 
 
@@ -47,10 +69,18 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
         raise TypeError("profiling must be an object")
     enabled = _as_bool(profiling.get("enabled"), default=True)
 
-    channels = _normalize_channels(profiling.get("channels"), cfg)
-    python_probe_cfg = profiling.get("python_probe") or {}
-    if not isinstance(python_probe_cfg, dict):
-        raise TypeError("profiling.python_probe must be an object")
+    # Validate external channel objects once; consumers treat these options as read-only.
+    channel_options = {}
+    for channel in ("torch", "python_probe", "ld_preload"):
+        options = profiling.get(channel)
+        if options is None:
+            options = {}
+        if not isinstance(options, dict):
+            raise TypeError(f"profiling.{channel} must be an object")
+        channel_options[channel] = options
+
+    channels = _normalize_channels(profiling.get("channels"), channel_options)
+    python_probe_cfg = channel_options["python_probe"]
 
     if "python_probe" in channels:
         python_consumers = _parse_python_consumers(python_probe_cfg.get("consumers"))
@@ -58,16 +88,36 @@ def normalize_profiling_config(cfg: dict[str, Any]) -> ProfilingRuntimeConfig:
     else:
         python_consumers = ()
         python_diagnostics = "off"
+
+    # Retain asynchronous tail evidence without extending the formal workload window.
+    drain_sec = float(cfg.get("post_workload_drain_sec", 0))
+    if drain_sec < 0:
+        raise ValueError("post_workload_drain_sec must be non-negative")
+    try:
+        flush_interval_sec = float(python_probe_cfg.get("flush_interval_sec", 0))
+    except (TypeError, ValueError) as error:
+        raise ValueError("profiling.python_probe.flush_interval_sec must be numeric") from error
+    if flush_interval_sec < 0:
+        raise ValueError("profiling.python_probe.flush_interval_sec must be non-negative")
+    if flush_interval_sec > 0 and drain_sec < flush_interval_sec:
+        raise ValueError(
+            "post_workload_drain_sec must be at least profiling.python_probe.flush_interval_sec "
+            "when periodic probe flushing is enabled"
+        )
+
     return ProfilingRuntimeConfig(
         enabled=enabled,
         channels=channels,
+        channel_options=channel_options,
         python_consumers=python_consumers,
         python_diagnostics=python_diagnostics,
         debug=_as_bool(profiling.get("debug", cfg.get("debug")), default=False),
+        post_workload_drain_sec=drain_sec,
+        python_probe_flush_interval_sec=flush_interval_sec,
     )
 
 
-def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
+def _normalize_channels(value: Any, options: dict[str, dict[str, Any]]) -> tuple[str, ...]:
     """规整采集 channel 列表。
 
     未显式配置时按各 channel 的 enabled 字段推断，仍只允许当前主线认可的三类 channel。
@@ -79,35 +129,14 @@ def _normalize_channels(value: Any, cfg: dict[str, Any]) -> tuple[str, ...]:
         return ()
     channels = _as_str_tuple(value, default=(), field_name="profiling.channels")
     if not channels:
-        inferred: list[str] = []
-        profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
-        torch_cfg = _channel_cfg(cfg, "torch")
-        python_probe_cfg = profiling.get("python_probe") if isinstance(profiling.get("python_probe"), dict) else {}
-        ld_preload_cfg = _channel_cfg(cfg, "ld_preload")
-        if torch_cfg.get("enabled", True):
-            inferred.append("torch")
-        if python_probe_cfg.get("enabled", False):
-            inferred.append("python_probe")
-        if ld_preload_cfg.get("enabled", False):
-            inferred.append("ld_preload")
-        channels = tuple(inferred) or ("torch",)
+        channels = tuple(
+            channel for channel, config in options.items() if config.get("enabled", channel == "torch")
+        ) or ("torch",)
     canonical = tuple(channel.replace("-", "_").lower() for channel in channels)
     unknown = [channel for channel in canonical if channel not in KNOWN_CHANNELS]
     if unknown:
         raise ValueError(f"unknown profiling channel: {unknown}")
     return _unique(canonical)
-
-
-def _channel_cfg(cfg: dict[str, Any], profiling_key: str) -> dict[str, Any]:
-    """读取 `profiling.<channel>` 对象；显式配置必须是 object。"""
-
-    profiling = cfg.get("profiling") if isinstance(cfg.get("profiling"), dict) else {}
-    current = profiling.get(profiling_key)
-    if current is not None and not isinstance(current, dict):
-        raise TypeError(f"profiling.{profiling_key} must be an object")
-    if isinstance(current, dict):
-        return current
-    return {}
 
 
 def _parse_python_consumers(raw: Any) -> tuple[str, ...]:

@@ -11,15 +11,10 @@ from ..common.paths import ROOT_DIR, prepend_repo_src_to_sys_path
 prepend_repo_src_to_sys_path()
 
 from profiling.config import PYTHON_PROBE_DIAGNOSTICS  # noqa: E402
-from profiling.python_probe.trace_sim_probe.schema import validate_hicache_fact  # noqa: E402
+from profiling.python_probe.trace_sim_probe.schema import HICACHE_CONSUMERS_BY_CLASS, validate_hicache_fact  # noqa: E402
 
 
 DEFAULT_HICACHE_TARGET_CATALOG = ROOT_DIR / "configs/profiling/hicache_probe_targets.json"
-FACT_CONSUMERS = {
-    "workload_identity": ("hicache_state_model", "hicache_input_contract"),
-    "source_actual": ("hicache_dag_patch",),
-    "timing_observation": ("hicache_dag_patch",),
-}
 
 
 def select_python_probe_targets(
@@ -45,12 +40,10 @@ def select_python_probe_targets(
     selected: list[dict[str, Any]] = []
     for index, raw_target in enumerate(raw_targets):
         target = validated_catalog_target(raw_target, index, catalog_path)
-        for key in ("capture_thread_timing", "capture_function_profile"):
+        for key in ("capture_thread_timing", "capture_emission_timing"):
             _resolve_capture_policy(target, key, diagnostics)
-        if target.get("diagnostics", "off") == "full" and diagnostics != "full":
-            continue
         fact = target["fact"]
-        allowed = set(FACT_CONSUMERS[fact["class"]])
+        allowed = HICACHE_CONSUMERS_BY_CLASS[fact["class"]]
         selected_consumers = [consumer for consumer in requested_consumers if consumer in allowed]
         if not selected_consumers:
             continue
@@ -73,7 +66,6 @@ def validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[s
     _validate_target_identity(target, prefix)
     _validate_target_events(target.get("events"), prefix)
     _validate_target_fact(target.get("fact"), prefix)
-    _validate_target_diagnostics(target.get("diagnostics", "off"), prefix)
     return target
 
 
@@ -109,22 +101,14 @@ def _validate_target_fact(fact: Any, prefix: str) -> None:
         raise ValueError(f"{prefix}.fact.class must be a non-empty string")
     if not isinstance(role, str) or not role:
         raise ValueError(f"{prefix}.fact.role must be a non-empty string")
-    consumers = FACT_CONSUMERS.get(fact_class)
+    consumers = HICACHE_CONSUMERS_BY_CLASS.get(fact_class)
     if consumers is None:
         raise ValueError(f"{prefix}.fact.class is unsupported: {fact_class!r}")
-    validate_hicache_fact(fact_class, role, consumers)
-
-
-def _validate_target_diagnostics(value: Any, prefix: str) -> None:
-    """Validate the catalog-owned capture policy without inferring it from identity."""
-
-    if not isinstance(value, str) or value not in PYTHON_PROBE_DIAGNOSTICS:
-        allowed = ", ".join(sorted(PYTHON_PROBE_DIAGNOSTICS))
-        raise ValueError(f"{prefix}.diagnostics must be one of: {allowed}")
+    validate_hicache_fact(fact_class, role, tuple(consumers))
 
 
 def _resolve_capture_policy(target: dict[str, Any], key: str, diagnostics: str) -> None:
-    """Resolve optional thread clocks/function profiling from the catalog."""
+    """Resolve optional thread and emission clocks from the catalog."""
 
     value = target.get(key)
     if value is None or isinstance(value, bool):
@@ -134,7 +118,7 @@ def _resolve_capture_policy(target: dict[str, Any], key: str, diagnostics: str) 
     required = value["diagnostics"]
     if required not in PYTHON_PROBE_DIAGNOSTICS or required == "off":
         raise ValueError(f"python probe target {target['id']!r} {key} requires a diagnostic mode")
-    if diagnostics == required or diagnostics == "full":
+    if diagnostics == required:
         target[key] = True
     else:
         target.pop(key)

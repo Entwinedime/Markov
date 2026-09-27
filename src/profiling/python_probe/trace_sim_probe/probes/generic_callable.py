@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Callable
@@ -19,8 +20,6 @@ from trace_sim_probe.patching import PATCH_MARKER
 from trace_sim_probe.schema import validate_hicache_fact
 from trace_sim_probe.writer import get_writer, probe_debug_enabled
 from .thread_timing import (
-    _function_profile_summary,
-    _new_function_profile,
     _thread_timing_delta,
     _thread_timing_snapshot,
 )
@@ -57,33 +56,29 @@ class TargetSpec:
 
     id: str
     module_name: str
-    qualname: str
     target: str
     events: dict[str, str]
     fields: tuple[FieldSpec, ...]
     fact: FactSpec
     emit_when: tuple[EmitCondition, ...] = ()
     capture_thread_timing: bool = False
-    capture_function_profile: bool = False
+    capture_emission_timing: bool = False
 
 
 _TARGETS = None
-_PATCHED: set[str] = set()
 SourceExtractor = Callable[
-    [str, str, dict[str, Any], tuple[Any, ...], dict[str, Any], Any],
+    [str, str, dict[str, Any], tuple[Any, ...], Any],
     tuple[bool, bool, Any],
 ]
-_SOURCE_EXTRACTORS: list[SourceExtractor] = []
 
 
-def register_source_extractor(extractor: SourceExtractor) -> None:
-    """注册非通用 source 解析器。
+@functools.cache
+def _source_extractors() -> tuple[SourceExtractor, ...]:
+    # HiCache helpers use the generic value reader. Defer this import until
+    # wrapper installation to avoid a cycle, before any measured calls run.
+    from .hicache.sources import HICACHE_SOURCE_EXTRACTORS
 
-    `generic_callable` 只内置 Python 通用取值语法。面向具体子模块的 source，
-    例如 HiCache page hash，应由对应 probe 插件注册。
-    """
-
-    _SOURCE_EXTRACTORS.append(extractor)
+    return HICACHE_SOURCE_EXTRACTORS
 
 
 def _load_targets() -> list[TargetSpec]:
@@ -112,16 +107,13 @@ def _load_targets() -> list[TargetSpec]:
 def install(module: ModuleType) -> None:
     """在模块加载后安装该模块匹配的 callable wrapper。"""
 
-    targets_by_qualname: dict[str, list[TargetSpec]] = {}
+    targets_by_callable: dict[str, list[TargetSpec]] = {}
     for target in _load_targets():
         if module.__name__ == target.module_name:
-            targets_by_qualname.setdefault(target.qualname, []).append(target)
+            targets_by_callable.setdefault(target.target, []).append(target)
 
-    for targets in targets_by_qualname.values():
+    for targets in targets_by_callable.values():
         target = targets[0]
-        patch_key = f"{target.module_name}:{target.qualname}"
-        if patch_key in _PATCHED:
-            continue
         resolved = _resolve_target(module, target)
         if resolved is None:
             continue
@@ -131,7 +123,6 @@ def install(module: ModuleType) -> None:
         wrapped = _wrap_callable(tuple(targets), original)
         setattr(wrapped, PATCH_MARKER, True)
         setattr(owner, attr_name, wrapped)
-        _PATCHED.add(patch_key)
         if probe_debug_enabled():
             target_ids = ",".join(item.id for item in targets)
             print(f"[trace_sim_probe] patched {target.target} targets={target_ids}", file=sys.stderr)
@@ -159,20 +150,19 @@ def _parse_target(raw: dict[str, Any]) -> TargetSpec:
     capture_thread_timing = raw.get("capture_thread_timing", False)
     if not isinstance(capture_thread_timing, bool):
         raise ValueError(f"python_probe target {target_id!r} capture_thread_timing must be a boolean")
-    capture_function_profile = raw.get("capture_function_profile", False)
-    if not isinstance(capture_function_profile, bool):
-        raise ValueError(f"python_probe target {target_id!r} capture_function_profile must be a boolean")
+    capture_emission_timing = raw.get("capture_emission_timing", False)
+    if not isinstance(capture_emission_timing, bool):
+        raise ValueError(f"python_probe target {target_id!r} capture_emission_timing must be a boolean")
     return TargetSpec(
         id=target_id,
         module_name=module_name,
-        qualname=target,
         target=target,
         events=events,
         fields=tuple(fields),
         fact=fact,
         emit_when=emit_when,
         capture_thread_timing=capture_thread_timing,
-        capture_function_profile=capture_function_profile,
+        capture_emission_timing=capture_emission_timing,
     )
 
 
@@ -183,7 +173,7 @@ def _resolve_target(module: ModuleType, target: TargetSpec) -> tuple[Any, str, A
     是类对象；这样同一个 generic probe 可以覆盖模块函数和类方法。
     """
 
-    parts = [part for part in target.qualname.split(".") if part]
+    parts = [part for part in target.target.split(".") if part]
     if not parts:
         return None
     owner: Any = module
@@ -278,8 +268,13 @@ def _parse_emit_condition(raw: Any, target_id: str, index: int) -> EmitCondition
 def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> Callable[..., Any]:
     """包装同步或异步 callable，并按 target phase 配置发事件。"""
 
-    capture_function_profile = any(target.capture_function_profile for target in targets)
-    capture_thread_timing = capture_function_profile or any(target.capture_thread_timing for target in targets)
+    _source_extractors()
+    # The installed callable is fixed; only its argument values change per call.
+    try:
+        argument_spec = inspect.signature(fn)
+    except (TypeError, ValueError):
+        argument_spec = None
+    capture_thread_timing = any(target.capture_thread_timing for target in targets)
 
     if inspect.iscoroutinefunction(fn):
 
@@ -287,36 +282,26 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
             timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
             started = get_writer().now_us()
-            _emit_targets(targets, fn, args, kwargs, None, "start", started, started, None)
+            _emit_targets(targets, argument_spec, args, kwargs, None, "start", started, started, None)
             result = await fn(*args, **kwargs)
             ended = get_writer().now_us()
             timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
             timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
-            _emit_targets(targets, fn, args, kwargs, result, "end", started, ended, timing)
+            _emit_targets(targets, argument_spec, args, kwargs, result, "end", started, ended, timing)
             return result
 
         return async_wrapped
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        profile = _new_function_profile() if capture_function_profile else None
         timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
         started = get_writer().now_us()
-        _emit_targets(targets, fn, args, kwargs, None, "start", started, started, None)
-        if profile is not None:
-            profile.enable()
-        try:
-            result = fn(*args, **kwargs)
-        finally:
-            if profile is not None:
-                profile.disable()
+        _emit_targets(targets, argument_spec, args, kwargs, None, "start", started, started, None)
+        result = fn(*args, **kwargs)
         ended = get_writer().now_us()
         timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
         timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
-        if timing is not None:
-            timing.update(_function_profile_summary(profile) if capture_function_profile else
-                          {"thread_function_profile_status": "disabled"})
-        _emit_targets(targets, fn, args, kwargs, result, "end", started, ended, timing)
+        _emit_targets(targets, argument_spec, args, kwargs, result, "end", started, ended, timing)
         return result
 
     return wrapped
@@ -324,7 +309,7 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
 
 def _emit_targets(
     targets: tuple[TargetSpec, ...],
-    fn: Callable[..., Any],
+    signature: inspect.Signature | None,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     result: Any,
@@ -335,30 +320,37 @@ def _emit_targets(
 ) -> None:
     """对同一个 callable 上绑定的多个 target 逐一发事件。"""
 
+    arguments = None
     for target in targets:
         if phase not in target.events:
             continue
-        _emit(target, fn, args, kwargs, result, phase, start_us, end_us, thread_timing)
+        binding_start = _emission_clock() if target.capture_emission_timing else None
+        if arguments is None:
+            arguments = _bind_arguments(signature, args, kwargs)
+        # Mutable request snapshots and fact metadata belong to one event.
+        bound = dict(arguments) if len(targets) > 1 else arguments
+        _emit(target, bound, args, result, phase, start_us, end_us, thread_timing, binding_start)
 
 
 def _emit(
     target: TargetSpec,
-    fn: Callable[..., Any],
+    bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
     phase: str,
     start_us: int,
     end_us: int,
     thread_timing: dict[str, Any] | None,
+    binding_start: tuple[int, int] | None,
 ) -> None:
     """构造 Chrome trace event。"""
 
-    bound = _bind_arguments(fn, args, kwargs)
     _bind_trace_context(bound, target, phase)
-    if not _should_emit_target(target, bound, args, kwargs, result):
+    if not _should_emit_target(target, bound, args, result):
         return
-    fields, missing = _collect_fields(target, bound, args, kwargs, result)
+    fields_start = _emission_clock() if target.capture_emission_timing else None
+    fields, missing = _collect_fields(target, bound, args, result)
+    fields_end = _emission_clock() if target.capture_emission_timing else None
     event_name = target.events[phase]
     base_args = {
         "domain": "python_probe",
@@ -368,9 +360,11 @@ def _emit(
         "status": "completed" if phase == "end" else phase,
         "missing_required_fields": missing,
     }
-    if (target.capture_thread_timing or target.capture_function_profile) and thread_timing is not None:
+    if target.capture_thread_timing and thread_timing is not None:
         base_args.update(thread_timing)
-    get_writer().duration_event(
+    writer = get_writer()
+    write_start = _emission_clock() if target.capture_emission_timing else None
+    writer.duration_event(
         event_name,
         start_us,
         end_us,
@@ -386,6 +380,32 @@ def _emit(
             },
         },
     )
+    if target.capture_emission_timing:
+        write_end = _emission_clock()
+        # These diagnostic writes are deliberately outside the measured stages.
+        for stage, begin, finish in (
+            ("binding", binding_start, fields_start),
+            ("fields", fields_start, fields_end),
+            ("writer", write_start, write_end),
+        ):
+            writer.duration_event(
+                "python_probe.emission_work",
+                begin[0],
+                finish[0],
+                "runtime_diagnostic",
+                {
+                    "observed_target_id": target.id,
+                    "phase": phase,
+                    "stage": stage,
+                    "observed_start_us": start_us,
+                    "observed_end_us": end_us,
+                    "thread_cpu_ns": finish[1] - begin[1],
+                },
+            )
+
+
+def _emission_clock() -> tuple[int, int]:
+    return time.time_ns() // 1000, time.thread_time_ns()
 
 
 def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -> None:
@@ -401,7 +421,6 @@ def _collect_fields(
     target: TargetSpec,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[dict[str, Any], list[str]]:
     """采集 target 字段。"""
@@ -409,7 +428,7 @@ def _collect_fields(
     fields: dict[str, Any] = {}
     missing: list[str] = []
     for field in target.fields:
-        found, value = _extract_field(field, bound, args, kwargs, result)
+        found, value = _extract_field(field, bound, args, result)
         if found:
             fields[field.name] = value
         elif field.required:
@@ -421,28 +440,15 @@ def _should_emit_target(
     target: TargetSpec,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> bool:
     """判断 target 的所有 emit_when 条件是否满足。"""
 
     for condition in target.emit_when:
-        if not _condition_matches(condition, bound, args, kwargs, result):
+        found, value = _extract_raw_value(condition.source, "_emit_when", bound, args, result)
+        if not found or not _has_value(value):
             return False
     return True
-
-
-def _condition_matches(
-    condition: EmitCondition,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> bool:
-    """执行单个 emit_when 条件判断。"""
-
-    found, value = _extract_raw_value(condition.source, "_emit_when", bound, args, kwargs, result)
-    return found and _has_value(value)
 
 
 def _has_value(value: Any) -> bool:
@@ -457,13 +463,18 @@ def _has_value(value: Any) -> bool:
     return True
 
 
-def _bind_arguments(fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+def _bind_arguments(
+    signature: inspect.Signature | None, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any]:
     """Resolve positional, keyword, and default arguments into one field context."""
 
     values = {f"arg{index}": value for index, value in enumerate(args)}
     values.update(kwargs)
+    if signature is None:
+        return values
+
     try:
-        binding = inspect.signature(fn).bind_partial(*args, **kwargs)
+        binding = signature.bind_partial(*args, **kwargs)
         binding.apply_defaults()
         values.update(binding.arguments)
     except (TypeError, ValueError):
@@ -475,14 +486,13 @@ def _extract_field(
     field: FieldSpec,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """提取单个字段；writer 统一负责最终 JSON 收敛。"""
 
     source = field.source.strip()
     try:
-        found, value = _extract_raw_value(source, field.name, bound, args, kwargs, result)
+        found, value = _extract_raw_value(source, field.name, bound, args, result)
         return (found, value if found else None)
     except Exception as exc:
         return (False, {"extract_error": type(exc).__name__})
@@ -493,7 +503,6 @@ def _extract_raw_value(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, Any]:
     """按 source 表达式读取原始值。
@@ -502,13 +511,14 @@ def _extract_raw_value(
     tensor/list/tuple等对象，再记录长度，避免把大对象字符串化后才取长度。
     """
 
-    handled, found, value = _extract_transform_source(source, field_name, bound, args, kwargs, result)
+    handled, found, value = _extract_transform_source(source, field_name, bound, args, result)
     if handled:
         return (found, value)
 
-    handled, found, value = _extract_custom_source(source, field_name, bound, args, kwargs, result)
-    if handled:
-        return (found, value)
+    for extractor in _source_extractors():
+        handled, found, value = extractor(source, field_name, bound, args, result)
+        if handled:
+            return (found, value)
 
     return _extract_builtin_source(source, field_name, bound, args, result)
 
@@ -518,38 +528,20 @@ def _extract_transform_source(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
     """处理 `len:` / `list:` 这类包装型 source。"""
 
     if source.startswith("len:"):
-        found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+        found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, result)
         if not found:
             return (True, False, None)
         return (True, True, _safe_len(value))
     if source.startswith("list:"):
-        found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, kwargs, result)
+        found, value = _extract_raw_value(source.split(":", 1)[1], field_name, bound, args, result)
         if not found:
             return (True, False, None)
         return (True, True, _safe_list(value))
-    return (False, False, None)
-
-
-def _extract_custom_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """把专用 source 交给已注册的插件解析器。"""
-
-    for extractor in _SOURCE_EXTRACTORS:
-        handled, found, value = extractor(source, field_name, bound, args, kwargs, result)
-        if handled:
-            return (True, found, value)
     return (False, False, None)
 
 
@@ -586,7 +578,7 @@ def _extract_builtin_source(
 def _extract_arg_source(key: str, bound: dict[str, Any], args: tuple[Any, ...]) -> tuple[bool, Any]:
     """读取 `arg:<name>[.<path>]` 或 `arg:<index>[.<path>]`。"""
 
-    head, path = _split_head_path(key)
+    head, _, path = key.partition(".")
     if head.isdigit():
         index = int(head)
         if index >= len(args):
@@ -597,15 +589,6 @@ def _extract_arg_source(key: str, bound: dict[str, Any], args: tuple[Any, ...]) 
             return (False, None)
         value = bound[head]
     return _read_path(value, path) if path else (True, value)
-
-
-def _split_head_path(value: str) -> tuple[str, str]:
-    """把 `head.tail.path` 拆成首段和剩余路径。"""
-
-    head, separator, path = value.partition(".")
-    if not separator:
-        return (head, "")
-    return (head, path)
 
 
 def _read_path(obj: Any, path: str) -> tuple[bool, Any]:
@@ -628,8 +611,6 @@ def _read_path(obj: Any, path: str) -> tuple[bool, Any]:
                     return (False, None)
                 cursor = cursor[index]
             else:
-                if not hasattr(cursor, part):
-                    return (False, None)
                 cursor = getattr(cursor, part)
         except (KeyError, IndexError, TypeError, AttributeError):
             return (False, None)

@@ -1,17 +1,10 @@
-"""Diagnostic-only thread clocks and bounded per-call function statistics."""
+"""Diagnostic-only thread clocks and scheduling counters."""
 
 from __future__ import annotations
 
-import cProfile
-import os
 import resource
-import sys
-import threading
 import time
 from typing import Any
-
-
-_THREAD_SCHEDSTAT_STATE = threading.local()
 
 
 def _thread_schedstat_snapshot() -> dict[str, int] | None:
@@ -23,23 +16,11 @@ def _thread_schedstat_snapshot() -> dict[str, int] | None:
     later diagnostic distinguish scheduled-out time from blocking/sleeping.
     """
 
-    identity = (os.getpid(), threading.get_native_id())
-    descriptor = getattr(_THREAD_SCHEDSTAT_STATE, "descriptor", None)
-    cached_identity = getattr(_THREAD_SCHEDSTAT_STATE, "identity", None)
     try:
-        if descriptor is None or cached_identity != identity:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            descriptor = os.open(
-                f"/proc/self/task/{identity[1]}/schedstat",
-                os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
-            )
-            _THREAD_SCHEDSTAT_STATE.descriptor = descriptor
-            _THREAD_SCHEDSTAT_STATE.identity = identity
-        fields = os.pread(descriptor, 256, 0).decode("ascii").split()
+        # Scope ownership to this read; thread-local integer descriptors would
+        # survive worker exit and require a separate cleanup mechanism.
+        with open("/proc/thread-self/schedstat", encoding="ascii") as stream:
+            fields = stream.read(256).split()
         if len(fields) < 3:
             return None
         values = [int(fields[index]) for index in range(3)]
@@ -51,13 +32,6 @@ def _thread_schedstat_snapshot() -> dict[str, int] | None:
             "schedstat_timeslices": values[2],
         }
     except (OSError, UnicodeError, ValueError):
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        _THREAD_SCHEDSTAT_STATE.descriptor = None
-        _THREAD_SCHEDSTAT_STATE.identity = None
         return None
 
 
@@ -177,24 +151,3 @@ def _thread_timing_delta(
         ),
         **schedstat_fields,
     }
-
-
-def _new_function_profile() -> cProfile.Profile | None:
-    # Never replace a profiler already owned by this thread (including nesting).
-    return cProfile.Profile() if sys.getprofile() is None else None
-
-
-def _function_profile_summary(profile: cProfile.Profile | None) -> dict[str, Any]:
-    if profile is None:
-        return {"thread_function_profile_status": "another_profiler_active"}
-    rows = []
-    for entry in profile.getstats():
-        code = entry.code
-        rows.append({"function": code if isinstance(code, str) else getattr(code, "co_qualname", code.co_name),
-                     "file": None if isinstance(code, str) else code.co_filename,
-                     "line": None if isinstance(code, str) else code.co_firstlineno,
-                     "calls": entry.callcount, "recursive_calls": entry.reccallcount,
-                     "inclusive_wall_us": entry.totaltime * 1e6, "self_wall_us": entry.inlinetime * 1e6})
-    return {"thread_function_profile_status": "recorded",
-            "thread_function_profile": sorted(rows, key=lambda row: row["inclusive_wall_us"], reverse=True),
-            "thread_function_profile_semantics": "Diagnostic cProfile wall clocks in this synchronous call/thread, including instrumentation effects. Inclusive rows nest and must not be added together; no locals, tensor snapshots, new fact nodes, or cost-model admission."}

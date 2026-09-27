@@ -1,24 +1,29 @@
-"""Optional request/response observations, not execution costs or client completion.
+"""Request/response observations for DAG consumers, not extra execution costs.
 
 Record request IDs at ingress and terminal response boundaries only. Never
 inspect serialized bodies, tokens, or cache state. ASGI send completion is
 distinct from the bench client's receipt.
 """
 
-import functools
 import time
+from types import ModuleType
 
-from trace_sim_probe.patching import PATCH_MARKER
+from trace_sim_probe.patching import install_wrapper
 from trace_sim_probe.writer import get_writer
 
 
 def _terminal_ids(output):
-    return [rid for rid, reason in zip(getattr(output, "rids", ()) or (), getattr(output, "finished_reasons", ()) or ())
-            if reason is not None]
+    return [
+        rid
+        for rid, reason in zip(getattr(output, "rids", ()) or (), getattr(output, "finished_reasons", ()) or ())
+        if reason is not None
+    ]
 
 
 def _record(stage, request_ids, start, end):
-    get_writer().duration_event("runtime.response." + stage, start, end, "runtime_diagnostic", {"request_ids": request_ids})
+    get_writer().duration_event(
+        "runtime.response." + stage, start, end, "runtime_diagnostic", {"request_ids": request_ids}
+    )
 
 
 def _sender(original):
@@ -30,6 +35,7 @@ def _sender(original):
         result = original(instance, output, *args, **kwargs)
         _record("scheduler_send", ids, start, get_writer().now_us())
         return result
+
     return send
 
 
@@ -49,11 +55,17 @@ def _receiver(stage):
                 if ids:
                     writer = get_writer()
                     now = writer.now_us()
-                    writer.duration_event("runtime.request." + stage, now, now, "runtime_diagnostic", {"request_ids": ids})
+                    writer.duration_event(
+                        "runtime.request." + stage, now, now, "runtime_diagnostic", {"request_ids": ids}
+                    )
                     if start is not None:
-                        writer.duration_event("runtime.request.receive", start, now, "runtime_diagnostic", {"request_ids": ids})
+                        writer.duration_event(
+                            "runtime.request.receive", start, now, "runtime_diagnostic", {"request_ids": ids}
+                        )
             return requests
+
         return receive
+
     return wrap
 
 
@@ -68,9 +80,13 @@ def _submit(batch):
             start = writer.now_us()
             result = original(instance, request, *args, **kwargs)
             # Returning from the submission method is not a socket delivery ACK.
-            writer.duration_event("runtime.request.tokenizer_submit", start, writer.now_us(), "runtime_diagnostic", {"request_ids": ids})
+            writer.duration_event(
+                "runtime.request.tokenizer_submit", start, writer.now_us(), "runtime_diagnostic", {"request_ids": ids}
+            )
             return result
+
         return submit
+
     return wrap
 
 
@@ -83,6 +99,7 @@ def _tokenizer(original):
         result = await original(instance, output, *args, **kwargs)
         _record("tokenizer_dispatch", ids, start, get_writer().now_us())
         return result
+
     return dispatch
 
 
@@ -99,6 +116,7 @@ def _response_init(original):
         instance._trace_sim_response_ids = ids
         if ids:
             _record("serialize", ids, start, get_writer().now_us())
+
     return initialize
 
 
@@ -116,6 +134,7 @@ def _response_send(original):
             return result
 
         return await original(instance, scope, receive, observed_send)
+
     return respond
 
 
@@ -138,15 +157,8 @@ _TARGETS = {
 TARGET_MODULES = tuple(_TARGETS)
 
 
-def install(module):
+def install(module: ModuleType) -> None:
     """Wrap loaded classes, including inherited response methods, exactly once."""
     for class_name, method, wrapper in _TARGETS[module.__name__]:
         owner = getattr(module, class_name, None)
-        if owner is None:
-            continue
-        original = getattr(owner, method, None)
-        if original is None or getattr(original, PATCH_MARKER, False):
-            continue
-        measured = functools.wraps(original)(wrapper(original))
-        setattr(measured, PATCH_MARKER, True)
-        setattr(owner, method, measured)
+        install_wrapper(owner, method, wrapper)

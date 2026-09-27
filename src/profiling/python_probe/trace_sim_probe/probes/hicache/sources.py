@@ -1,10 +1,8 @@
-"""HiCache probe source extractor 注册。"""
+"""HiCache probe 字段提取器。"""
 
 from __future__ import annotations
 
 from typing import Any
-
-from trace_sim_probe.probes import generic_callable as _base
 
 from .common import _cache_scope_key, _extract_source_value
 from .context import _HICACHE_SEQUENCE_BY_SCOPE
@@ -30,229 +28,54 @@ def _source_spec(source: str, prefix: str) -> str | None:
     return source.split(":", 1)[1]
 
 
-def _token_path_source(
+_TOKEN_EXTRACTORS = {
+    "token_path": _extract_token_path,
+    "token_span": _extract_token_span,
+    "request_token_path": _extract_request_token_path,
+    "request_token_span": _extract_request_token_span,
+    "request_token_paths": _extract_request_token_path_records,
+    "request_token_spans": _extract_request_token_span_records,
+    "request_token_counts": _extract_request_token_count_records,
+}
+
+
+def _hicache_value_source(
     source: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
-    """处理 `token_path:` source，生成完整 token dictionary 引用。"""
+    """Dispatch scalar/request fields once; unknown sources remain unhandled."""
 
-    spec = _source_spec(source, "token_path:")
-    if spec is None:
+    kind, separator, spec = source.partition(":")
+    if not separator:
         return (False, False, None)
-    found, value = _extract_token_path(spec, bound, args, kwargs, result)
-    return (True, found, value if found else None)
-
-
-def _token_span_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 `token_span:` source，生成同一 token path 内的 span 引用。"""
-
-    spec = _source_spec(source, "token_span:")
-    if spec is None:
-        return (False, False, None)
-    found, value = _extract_token_span(spec, bound, args, kwargs, result)
-    return (True, found, value)
-
-
-def _request_token_path_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 request 级 token path source，覆盖 active/fill/committed 等模式。"""
-
-    spec = _source_spec(source, "request_token_path:")
-    if spec is None:
-        return (False, False, None)
-    found, value = _extract_request_token_path(spec, bound, args, kwargs, result)
-    return (True, found, value if found else None)
-
-
-def _request_token_span_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 request 级 token span source，避免重复携带完整 token 列表。"""
-
-    spec = _source_spec(source, "request_token_span:")
-    if spec is None:
-        return (False, False, None)
-    found, value = _extract_request_token_span(spec, bound, args, kwargs, result)
-    return (True, found, value)
-
-
-def _request_token_count_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 request token 数量 source，用于 target-derived page 投影。"""
-
-    spec = _source_spec(source, "request_token_count:")
-    if spec is None:
-        return (False, False, None)
-    found, tokens = _extract_request_tokens(spec, bound, args, kwargs, result)
-    return (True, found, len(tokens) if found else None)
-
-
-def _request_ids_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 batch 级 `request_ids:` source。"""
-
-    spec = _source_spec(source, "request_ids:")
-    if spec is None:
-        return (False, False, None)
-    found, requests = _extract_request_list(spec, bound, args, kwargs, result)
-    if not found:
-        return (True, False, None)
-    return (True, True, [_request_id(req) for req in requests])
-
-
-def _request_positions_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 batch 级 `request_positions:` source。"""
-
-    spec = _source_spec(source, "request_positions:")
-    if spec is None:
-        return (False, False, None)
-    found, requests = _extract_request_list(spec, bound, args, kwargs, result)
-    if not found:
-        return (True, False, None)
-    return (
-        True,
-        True,
-        [
-            {
-                "request_id": _request_id(req),
-                "index": index,
-            }
-            for index, req in enumerate(requests)
-        ],
-    )
-
-
-def _request_token_paths_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 batch 级 request token dictionary 数组。"""
-
-    spec = _source_spec(source, "request_token_paths:")
-    if spec is None:
-        return (False, False, None)
-    found, rows = _extract_request_token_path_records(spec, bound, args, kwargs, result)
-    return (True, found, rows if found else None)
-
-
-def _request_token_spans_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 batch 级 request token span 数组。"""
-
-    spec = _source_spec(source, "request_token_spans:")
-    if spec is None:
-        return (False, False, None)
-    found, rows = _extract_request_token_span_records(spec, bound, args, kwargs, result)
-    return (True, found, rows if found else None)
-
-
-def _request_token_counts_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """处理 batch 级 request token count 数组。"""
-
-    spec = _source_spec(source, "request_token_counts:")
-    if spec is None:
-        return (False, False, None)
-    found, rows = _extract_request_token_count_records(spec, bound, args, kwargs, result)
-    return (True, found, rows if found else None)
-
-
-def _hicache_cache_scope_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """生成 rank/object 绑定的 cache_scope 路由键。"""
-
-    spec = _source_spec(source, "hicache_cache_scope:")
-    if spec is None:
-        return (False, False, None)
-    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
-    if not found:
-        return (True, False, None)
-    return (True, True, _cache_scope_key(value))
-
-
-def _hicache_seq_source(
-    source: str,
-    field_name: str,
-    bound: dict[str, Any],
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
-    result: Any,
-) -> tuple[bool, bool, Any]:
-    """按 cache_scope 生成单调 seq_no，维持 atomic fact 顺序。"""
-
-    spec = _source_spec(source, "hicache_seq:")
-    if spec is None:
-        return (False, False, None)
-    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
-    if not found:
-        return (True, False, None)
-    scope = _cache_scope_key(value)
-    next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
-    _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
-    return (True, True, next_seq)
+    extractor = _TOKEN_EXTRACTORS.get(kind)
+    if extractor is not None:
+        found, value = extractor(spec, bound, args, result)
+        return (True, found, value if found else None)
+    if kind == "request_token_count":
+        found, tokens = _extract_request_tokens(spec, bound, args, result)
+        return (True, found, len(tokens) if found else None)
+    if kind in ("request_ids", "request_positions"):
+        found, requests = _extract_request_list(spec, bound, args, result)
+        if not found:
+            return (True, False, None)
+        if kind == "request_ids":
+            return (True, True, [_request_id(req) for req in requests])
+        return (True, True, [{"request_id": _request_id(req), "index": index} for index, req in enumerate(requests)])
+    if kind in ("hicache_cache_scope", "hicache_seq"):
+        found, value = _extract_source_value(spec, field_name, bound, args, result)
+        if not found:
+            return (True, False, None)
+        scope = _cache_scope_key(value)
+        if kind == "hicache_cache_scope":
+            return (True, True, scope)
+        next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
+        _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
+        return (True, True, next_seq)
+    return (False, False, None)
 
 
 def _operation_batch_values(
@@ -261,7 +84,6 @@ def _operation_batch_values(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, list[Any]]:
     """Read one controller operation queue without retaining operation objects."""
@@ -269,7 +91,7 @@ def _operation_batch_values(
     spec = _source_spec(source, prefix)
     if spec is None:
         return (False, [])
-    found, value = _extract_source_value(spec, field_name, bound, args, kwargs, result)
+    found, value = _extract_source_value(spec, field_name, bound, args, result)
     if not found or value is None:
         return (True, [])
     try:
@@ -283,13 +105,12 @@ def _hicache_operation_node_ids_source(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
     """Extract stable tree-node IDs from a pending controller operation batch."""
 
     handled, operations = _operation_batch_values(
-        source, "hicache_operation_node_ids:", field_name, bound, args, kwargs, result
+        source, "hicache_operation_node_ids:", field_name, bound, args, result
     )
     if not handled:
         return (False, False, None)
@@ -317,13 +138,12 @@ def _hicache_operation_token_count_source(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
     """Sum token slots represented by a pending controller operation batch."""
 
     handled, operations = _operation_batch_values(
-        source, "hicache_operation_token_count:", field_name, bound, args, kwargs, result
+        source, "hicache_operation_token_count:", field_name, bound, args, result
     )
     if not handled:
         return (False, False, None)
@@ -346,7 +166,6 @@ def _hicache_pending_write_node_ids_source(
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
-    kwargs: dict[str, Any],
     result: Any,
 ) -> tuple[bool, bool, Any]:
     """Resolve one write-through ACK to the tree nodes it is releasing."""
@@ -357,8 +176,8 @@ def _hicache_pending_write_node_ids_source(
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) != 2:
         return (True, False, None)
-    ack_found, ack_value = _extract_source_value(parts[0], field_name, bound, args, kwargs, result)
-    scope_found, scope = _extract_source_value(parts[1], field_name, bound, args, kwargs, result)
+    ack_found, ack_value = _extract_source_value(parts[0], field_name, bound, args, result)
+    scope_found, scope = _extract_source_value(parts[1], field_name, bound, args, result)
     if not ack_found or not scope_found or scope is None:
         return (True, False, None)
     pending = getattr(scope, "ongoing_write_through", None)
@@ -379,27 +198,9 @@ def _hicache_pending_write_node_ids_source(
     return (True, bool(node_ids), node_ids)
 
 
-_HICACHE_SOURCE_EXTRACTORS = (
-    _token_path_source,
-    _token_span_source,
-    _request_token_path_source,
-    _request_token_span_source,
-    _request_token_count_source,
-    _request_ids_source,
-    _request_positions_source,
-    _request_token_paths_source,
-    _request_token_spans_source,
-    _request_token_counts_source,
-    _hicache_cache_scope_source,
-    _hicache_seq_source,
+HICACHE_SOURCE_EXTRACTORS = (
+    _hicache_value_source,
     _hicache_operation_node_ids_source,
     _hicache_operation_token_count_source,
     _hicache_pending_write_node_ids_source,
 )
-
-
-def register_source_extractors() -> None:
-    """注册 HiCache 专用 source extractor。"""
-
-    for extractor in _HICACHE_SOURCE_EXTRACTORS:
-        _base.register_source_extractor(extractor)

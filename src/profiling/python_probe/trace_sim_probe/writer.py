@@ -21,6 +21,7 @@ _FULL_LIST_KEYS = {
     "token_ids",
     "hash_value",
     "request_ids",
+    "requests",
     "members",
     "wait_intervals",
 }
@@ -60,10 +61,8 @@ class ChromeTraceWriter:
         )
         self._file: TextIO = self.path.open("w", encoding="utf-8")
         self._file.write('{"traceEvents":[')
-        self._first_event = True
         self._event_count = 0
         self._flushed_event_count = 0
-        self._closed = False
         self._lock = threading.Lock()
         self._flush_stop = threading.Event()
         self._flush_thread: threading.Thread | None = None
@@ -92,7 +91,6 @@ class ChromeTraceWriter:
     ) -> None:
         """追加一条 duration event；文件按事件流写入，并按批次 flush。"""
 
-        tid = threading.get_native_id() if hasattr(threading, "get_native_id") else threading.get_ident()
         event = {
             "name": name,
             "cat": cat,
@@ -100,7 +98,7 @@ class ChromeTraceWriter:
             "ts": int(start_us),
             "dur": max(0, int(end_us - start_us)),
             "pid": self.pid,
-            "tid": tid,
+            "tid": threading.get_native_id(),
             "args": _jsonable(args or {}),
         }
         with self._lock:
@@ -114,22 +112,19 @@ class ChromeTraceWriter:
         if flush_thread is not None and flush_thread is not threading.current_thread():
             flush_thread.join(timeout=max(1.0, self._flush_interval_sec * 2.0))
         with self._lock:
-            if self._closed:
+            if self._file.closed:
                 return
             self._file.write("]}\n")
             self._file.flush()
             self._file.close()
-            self._closed = True
 
     def _write_event_locked(self, event: dict[str, Any]) -> None:
         """在持锁状态下追加单个 event，避免多线程交错写 JSON。"""
 
-        if self._closed:
+        if self._file.closed:
             return
-        if not self._first_event:
+        if self._event_count:
             self._file.write(",")
-        else:
-            self._first_event = False
         self._file.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")))
         self._event_count += 1
         if self._event_count % self._flush_every == 0:
@@ -140,7 +135,7 @@ class ChromeTraceWriter:
 
         while not self._flush_stop.wait(self._flush_interval_sec):
             with self._lock:
-                if self._closed:
+                if self._file.closed:
                     return
                 self._flush_locked()
 

@@ -1,10 +1,8 @@
-"""Artifact writing and latency summaries for JSON manual workloads."""
+"""Latency summaries for JSON manual workloads."""
 
 from __future__ import annotations
 
-import json
 import statistics
-from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 
@@ -30,17 +28,3 @@ def latency_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
             }
         )
     return result
-
-
-def write_outputs(
-    output_dir: Path,
-    *,
-    summary: Mapping[str, Any],
-) -> None:
-    """Persist the single workload report consumed by profiling and modeling."""
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "workload_report.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )

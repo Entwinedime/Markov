@@ -9,15 +9,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from ..common.io import write_json
 from ..contracts.forced_token.plan import (
-    index_plan_requests_by_logical_id,
     int_list,
     load_forced_token_plan,
     validate_plan_contract,
 )
 from .diagnostics import assertion_matches, evaluate_assertion
-from .expand import CanonicalPlan, RequestPlan
-from .report import latency_summary, write_outputs
+from .expand import CanonicalPlan, RequestPlan, StaticPlanStep
+from .report import latency_summary
 from .schema import ConfigSpec, TemplateValidationError
 
 
@@ -56,7 +56,6 @@ def execute_workload(
     output_dir.mkdir(parents=True, exist_ok=True)
     replay_requests: dict[str, Mapping[str, Any]] = {}
     if mode == "replay":
-        assert forced_token_plan_path is not None
         replay_requests = _validate_replay_plan(plan, forced_token_plan_path)
     rows: list[dict[str, Any]] = []
     captured_requests: list[dict[str, Any]] = []
@@ -89,7 +88,7 @@ def execute_workload(
                     base_url=base_url,
                     timeout_sec=timeout_sec,
                     mode=mode,
-                    replay_request=replay_requests.get(step.logical_request_id),
+                    replay_request=replay_requests[step.logical_request_id] if mode == "replay" else None,
                 )
                 rows.append(row)
                 if captured is not None:
@@ -116,9 +115,7 @@ def execute_workload(
                     }
                 )
                 continue
-            if step.kind == "wait":
-                row = _execute_explicit_wait(step)
-            elif step.kind == "barrier":
+            if step.kind == "barrier":
                 if not require_diagnostic:
                     row = _gate_not_available_row(step, "diagnostic_required")
                 else:
@@ -147,33 +144,6 @@ def execute_workload(
                 stopped_reason = str(row.get("failure_reason") or "gate_failed")
                 break
 
-    forced_summary = _forced_token_summary(
-        mode=mode,
-        plan=plan,
-        forced_token_plan_path=forced_token_plan_path,
-        rows=rows,
-        capture_written=False,
-    )
-    if (
-        mode == "capture"
-        and stopped_reason is None
-        and len(captured_requests) == len(plan.requests)
-        and forced_token_plan_path is not None
-    ):
-        captured_plan = _build_captured_forced_plan(plan, captured_requests)
-        forced_token_plan_path.parent.mkdir(parents=True, exist_ok=True)
-        forced_token_plan_path.write_text(
-            json.dumps(captured_plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        forced_summary = _forced_token_summary(
-            mode=mode,
-            plan=plan,
-            forced_token_plan_path=forced_token_plan_path,
-            rows=rows,
-            capture_written=True,
-        )
-
     if formal_begin_ms is None or formal_end_ms is None:
         formal_window = {
             "status": "incomplete",
@@ -190,7 +160,17 @@ def execute_workload(
             "formal_end_ms": formal_end_ms,
             "e2e_ms": formal_end_ms - formal_begin_ms,
         }
-    success = stopped_reason is None and _forced_summary_ready(forced_summary)
+    capture_written = mode == "capture" and stopped_reason is None
+    if capture_written:
+        write_json(forced_token_plan_path, {"workload_id": plan.template.workload_id, "requests": captured_requests})
+    forced_summary = _forced_token_summary(
+        mode=mode,
+        plan=plan,
+        forced_token_plan_path=forced_token_plan_path,
+        rows=rows,
+        capture_written=capture_written,
+    )
+    success = stopped_reason is None and forced_summary["ready"]
     summary = {
         "status": "completed" if success else "failed",
         "failure_reason": stopped_reason,
@@ -202,8 +182,9 @@ def execute_workload(
         "total": latency_summary(rows),
         "measure_true": latency_summary([row for row in rows if row.get("measure") is True]),
         "requests": rows,
+        "input_tokens": {name: list(request.prompt_token_ids) for name, request in plan.request_by_name.items()},
     }
-    write_outputs(output_dir, summary=summary)
+    write_json(output_dir / "workload_report.json", summary)
     if not success:
         raise WorkloadExecutionError(stopped_reason or "forced_token_contract_failed")
     return True
@@ -221,11 +202,10 @@ def _validate_replay_plan(plan: CanonicalPlan, plan_path: Path) -> dict[str, Map
     )
     if errors:
         raise TemplateValidationError("forced token replay plan rejected: " + ", ".join(errors))
-    indexed = index_plan_requests_by_logical_id(forced_plan)
+    indexed = {request["logical_request_id"]: request for request in forced_plan["requests"]}
     for request in plan.requests:
         captured = indexed[request.logical_request_id]
-        captured_input_ids = int_list(captured.get("origin_input_ids"))
-        if captured_input_ids is None or tuple(captured_input_ids) != request.prompt_token_ids:
+        if tuple(captured["origin_input_ids"]) != request.prompt_token_ids:
             raise TemplateValidationError(f"forced plan origin input mismatch: {request.logical_request_id}")
         if len(captured["forced_output_ids"]) != request.max_new_tokens:
             raise TemplateValidationError(f"forced plan output length mismatch: {request.logical_request_id}")
@@ -240,15 +220,17 @@ def _execute_request(
     mode: str,
     replay_request: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Send one synchronous HTTP request and record only observed response facts."""
+    """Send a request; replay_request comes from the already validated replay plan."""
 
+    # Replay identities and lengths were checked before execution. The request
+    # carries the same prompt/sampling settings; only forced output is added.
+    body = _request_body(request, return_tokens=mode != "none")
     if mode == "replay":
-        if replay_request is None:
-            raise TemplateValidationError(f"missing replay request for {request.logical_request_id}")
-        body = _replay_body(replay_request)
-    else:
-        body = _normal_body(request, capture=mode == "capture")
+        body["trace_sim_forced_output_ids"] = replay_request["forced_output_ids"]
+
     response = _post_json(base_url.rstrip("/") + "/generate", body, timeout_sec, None)
+    output_ids = response.pop("_output_ids", None)
+    prompt_ids = response.pop("_prompt_ids", None)
     row: dict[str, Any] = {
         "kind": "request",
         "step_id": request.step_id,
@@ -264,23 +246,37 @@ def _execute_request(
     }
     captured: dict[str, Any] | None = None
     if mode == "capture" and row.get("status") == "ok":
-        captured = _capture_request_record(request, row)
-        if captured is None:
-            row["status"] = "error"
-            row["failure_reason"] = "capture_response_missing_token_ids"
-        elif len(captured["forced_output_ids"]) != request.max_new_tokens:
+        if output_ids is None or prompt_ids != list(request.prompt_token_ids):
+            row.update(status="error", failure_reason="capture_response_missing_token_ids")
+        elif len(output_ids) != request.max_new_tokens:
             row.update(status="error", failure_reason="capture_output_length_mismatch")
-            captured = None
+        else:
+            captured = {
+                "logical_request_id": request.logical_request_id,
+                "origin_input_ids": prompt_ids,
+                "forced_output_ids": output_ids,
+            }
+
     if mode == "replay":
-        _apply_replay_checks(row, replay_request)
-    row.pop("_response_json", None)
+        expected_output = replay_request["forced_output_ids"]
+        output_matches = output_ids == expected_output
+        prompt_matches = prompt_ids == replay_request["origin_input_ids"]
+        row.update(
+            forced_output_count=len(expected_output),
+            forced_token_output_checked=output_ids is not None,
+            actual_output_matches_forced=output_matches,
+            actual_prompt_matches_plan=prompt_matches,
+        )
+        if row.get("status") == "ok" and not (output_matches and prompt_matches):
+            row.update(status="error", failure_reason="forced_token_replay_mismatch")
+
     if row.get("status") != "ok" and "failure_reason" not in row:
         row["failure_reason"] = str(row.get("error") or "request_failed")
     return row, captured
 
 
-def _normal_body(request: RequestPlan, *, capture: bool) -> dict[str, Any]:
-    """Build deterministic capture/normal body without config-dependent branches."""
+def _request_body(request: RequestPlan, *, return_tokens: bool) -> dict[str, Any]:
+    """Build the shared deterministic request body for all execution modes."""
 
     body = {
         "input_ids": list(request.prompt_token_ids),
@@ -294,32 +290,9 @@ def _normal_body(request: RequestPlan, *, capture: bool) -> dict[str, Any]:
             "sampling_seed": 20260729,
         },
     }
-    if capture:
+    if return_tokens:
         body["return_prompt_token_ids"] = True
     return body
-
-
-def _replay_body(captured_request: Mapping[str, Any]) -> dict[str, Any]:
-    """Build forced-output replay body from captured origin/output token ids."""
-
-    origin_input_ids = int_list(captured_request.get("origin_input_ids"))
-    forced_output_ids = int_list(captured_request.get("forced_output_ids"))
-    if origin_input_ids is None or forced_output_ids is None:
-        raise TemplateValidationError("forced replay request is missing token arrays")
-    return {
-        "input_ids": origin_input_ids,
-        "rid": captured_request["logical_request_id"],
-        "return_prompt_token_ids": True,
-        "sampling_params": {
-            "max_new_tokens": len(forced_output_ids),
-            "temperature": 0,
-            "top_p": 1.0,
-            "top_k": 1,
-            "ignore_eos": True,
-            "sampling_seed": 20260729,
-        },
-        "trace_sim_forced_output_ids": forced_output_ids,
-    }
 
 
 def _post_json(
@@ -377,10 +350,9 @@ def _response_facts(payload: bytes) -> dict[str, Any]:
         return {}
     if not isinstance(parsed, dict):
         return {}
-    result: dict[str, Any] = {}
-    result["_response_json"] = parsed
     output_ids = int_list(parsed.get("output_ids"))
     prompt_ids = int_list(parsed.get("prompt_token_ids"))
+    result: dict[str, Any] = {"_output_ids": output_ids, "_prompt_ids": prompt_ids}
     if output_ids is not None:
         result["actual_output_count"] = len(output_ids)
     if prompt_ids is not None:
@@ -388,78 +360,8 @@ def _response_facts(payload: bytes) -> dict[str, Any]:
     return result
 
 
-def _capture_request_record(request: RequestPlan, row: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Construct one replay request from observed server tokens."""
-
-    response = row.get("_response_json")
-    if not isinstance(response, dict):
-        return None
-    origin_input_ids = int_list(response.get("prompt_token_ids"))
-    output_ids = int_list(response.get("output_ids"))
-    if origin_input_ids is None or output_ids is None:
-        return None
-    if tuple(origin_input_ids) != request.prompt_token_ids:
-        return None
-    return {
-        "logical_request_id": request.logical_request_id,
-        "origin_input_ids": origin_input_ids,
-        "forced_output_ids": output_ids,
-    }
-
-
-def _apply_replay_checks(row: dict[str, Any], captured_request: Mapping[str, Any] | None) -> None:
-    """Record exact forced-output and origin-input checks for a replay request."""
-
-    if captured_request is None:
-        row["status"] = "error"
-        row["failure_reason"] = "forced_token_plan_missing_request"
-        return
-    response = row.pop("_response_json", None)
-    expected_output_ids = int_list(captured_request.get("forced_output_ids")) or []
-    expected_input_ids = int_list(captured_request.get("origin_input_ids")) or []
-    actual_output_ids = int_list(response.get("output_ids")) if isinstance(response, dict) else None
-    actual_input_ids = int_list(response.get("prompt_token_ids")) if isinstance(response, dict) else None
-    row.update(
-        {
-            "forced_output_count": len(expected_output_ids),
-            "forced_token_output_checked": actual_output_ids is not None,
-            "actual_output_matches_forced": actual_output_ids == expected_output_ids,
-            "actual_prompt_matches_plan": actual_input_ids == expected_input_ids,
-        }
-    )
-    if row.get("status") == "ok" and (
-        actual_output_ids is None
-        or actual_input_ids is None
-        or actual_output_ids != expected_output_ids
-        or actual_input_ids != expected_input_ids
-    ):
-        row["status"] = "error"
-        row["failure_reason"] = "forced_token_replay_mismatch"
-
-
-def _execute_explicit_wait(step: Any) -> dict[str, Any]:
-    """Execute the only allowed explicit wait, preserving it in the report."""
-
-    duration_ms = int(step.details["duration_ms"])
-    start_wall = time.time() * 1000.0
-    start_monotonic = time.perf_counter() * 1000.0
-    time.sleep(duration_ms / 1000.0)
-    return {
-        "kind": "wait",
-        "step_id": step.step_id,
-        "sequence_id": step.sequence_id,
-        "phase": step.phase,
-        "measure": step.measure,
-        "status": "ok",
-        "duration_ms": duration_ms,
-        "start_time_ms": start_wall,
-        "end_time_ms": time.time() * 1000.0,
-        "latency_ms": time.perf_counter() * 1000.0 - start_monotonic,
-    }
-
-
 def _execute_barrier(
-    step: Any,
+    step: StaticPlanStep,
     *,
     diagnostic_url: str,
     timeout_sec: float,
@@ -495,7 +397,7 @@ def _execute_barrier(
 
 
 def _execute_checkpoint(
-    step: Any,
+    step: StaticPlanStep,
     *,
     plan: CanonicalPlan,
     config: ConfigSpec,
@@ -622,7 +524,7 @@ def _validate_startup_snapshot(snapshot: Mapping[str, Any], config: ConfigSpec |
     return None
 
 
-def _gate_not_available_row(step: Any, reason: str) -> dict[str, Any]:
+def _gate_not_available_row(step: StaticPlanStep, reason: str) -> dict[str, Any]:
     """Construct a terminal row when a required read-only gate is unavailable."""
 
     return {
@@ -637,7 +539,7 @@ def _gate_not_available_row(step: Any, reason: str) -> dict[str, Any]:
 
 
 def _gate_failure_row(
-    step: Any,
+    step: StaticPlanStep,
     reason: str,
     start_wall: float,
     polls: int,
@@ -660,15 +562,6 @@ def _gate_failure_row(
     }
 
 
-def _build_captured_forced_plan(plan: CanonicalPlan, requests: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the immutable standard forced-token plan after a complete capture."""
-
-    return {
-        "workload_id": plan.template.workload_id,
-        "requests": requests,
-    }
-
-
 def _forced_token_summary(
     *,
     mode: str,
@@ -686,11 +579,7 @@ def _forced_token_summary(
     output_mismatches = [row for row in replay_rows if row.get("actual_output_matches_forced") is False]
     prompt_mismatches = [row for row in replay_rows if row.get("actual_prompt_matches_plan") is False]
     replay_ready = (
-        bool(replay_rows)
-        and not unchecked
-        and not output_mismatches
-        and not prompt_mismatches
-        and plan_exists
+        bool(replay_rows) and not unchecked and not output_mismatches and not prompt_mismatches and plan_exists
     )
     return {
         "enabled": mode != "none",
@@ -710,9 +599,3 @@ def _forced_token_summary(
         else None,
         "plan_written": capture_written if mode == "capture" else None,
     }
-
-
-def _forced_summary_ready(summary: Mapping[str, Any]) -> bool:
-    """Return only the explicit forced-token readiness bit."""
-
-    return bool(summary.get("ready"))

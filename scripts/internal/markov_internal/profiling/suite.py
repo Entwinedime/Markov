@@ -6,16 +6,12 @@ import copy
 from typing import Any
 
 from ..common.naming import sanitize
+from ..common.manifest import profile_labels
 
 
 INTERNAL_SUITE_KEYS = {"experiments", "matrix", "continue_on_error", "$unset"}
 MATRIX_ENTRY_META_KEYS = {"id", "name", "description", "$unset"}
 EXPERIMENT_REF_KEYS = {"server_ref", "input_ref"}
-PROFILE_EXPERIMENTS_ENV = "TRACE_SIM_PROFILE_EXPERIMENTS"
-PROFILE_INPUTS_ENV = "TRACE_SIM_PROFILE_INPUTS"
-PROFILE_SERVERS_ENV = "TRACE_SIM_PROFILE_SERVERS"
-PROFILE_FORCED_TOKEN_BUNDLE_ENV = "TRACE_SIM_FORCED_TOKEN_BUNDLE"
-PROFILE_CHANNELS_ENV = "TRACE_SIM_PROFILE_CHANNELS"
 
 
 def narrow_profile_channels(cfg: dict[str, Any], requested: set[str]) -> dict[str, Any]:
@@ -109,12 +105,12 @@ def apply_unset(value: dict[str, Any], paths: Any) -> None:
         delete_path(value, path)
 
 
-def parse_experiment_selection(raw_values: list[str] | None, env_value: str | None = None) -> set[str]:
-    """Parse comma-separated selectors from CLI values and an environment value."""
+def parse_experiment_selection(raw_values: list[str]) -> set[str]:
+    """Parse repeated, comma-separated CLI selectors."""
 
     selected: set[str] = set()
-    for raw in [*(raw_values or []), env_value or ""]:
-        for item in str(raw).split(","):
+    for raw in raw_values:
+        for item in raw.split(","):
             item = item.strip()
             if item:
                 selected.add(item)
@@ -177,102 +173,6 @@ def matrix_entries(matrix: dict[str, Any], key: str) -> dict[str, dict[str, Any]
     return entries
 
 
-def matrix_entry_override(entry: dict[str, Any]) -> dict[str, Any]:
-    """Strip matrix metadata while preserving fields that participate in merge."""
-
-    return {key: value for key, value in entry.items() if key not in MATRIX_ENTRY_META_KEYS}
-
-
-def attach_suite_metadata(
-    cfg: dict[str, Any],
-    *,
-    experiment_id: str,
-    server_id: str | None,
-    input_id: str | None,
-) -> None:
-    """Attach suite provenance to one expanded experiment."""
-
-    metadata = cfg.get("metadata")
-    if metadata is None:
-        metadata = {}
-    if not isinstance(metadata, dict):
-        raise TypeError("metadata must be an object")
-    metadata = dict(metadata)
-    metadata.setdefault("suite_experiment_id", experiment_id)
-    if server_id is not None:
-        metadata.setdefault("suite_server_id", server_id)
-    if input_id is not None:
-        metadata.setdefault("suite_input_id", input_id)
-    cfg["metadata"] = metadata
-
-
-def generated_matrix_experiments(matrix: dict[str, Any]) -> list[dict[str, Any]]:
-    """Generate the server/input Cartesian product when experiments are omitted."""
-
-    servers = matrix_entries(matrix, "servers")
-    inputs = matrix_entries(matrix, "inputs")
-    experiments: list[dict[str, Any]] = []
-    for server_id in servers:
-        for input_id in inputs:
-            experiment_id = f"{server_id}_{input_id}"
-            experiments.append(
-                {
-                    "id": experiment_id,
-                    "name": experiment_id,
-                    "server_ref": server_id,
-                    "input_ref": input_id,
-                }
-            )
-    return experiments
-
-
-def expand_matrix_experiment(
-    common: dict[str, Any],
-    matrix: dict[str, Any],
-    experiment: dict[str, Any],
-    index: int,
-) -> dict[str, Any]:
-    """Expand one matrix experiment into an executable single-run config."""
-
-    servers = matrix_entries(matrix, "servers")
-    inputs = matrix_entries(matrix, "inputs")
-
-    server_ref = experiment.get("server_ref")
-    input_ref = experiment.get("input_ref")
-    if not isinstance(server_ref, str) or not server_ref.strip():
-        raise ValueError(f"experiments[{index - 1}].server_ref must reference matrix.servers")
-    if not isinstance(input_ref, str) or not input_ref.strip():
-        raise ValueError(f"experiments[{index - 1}].input_ref must reference matrix.inputs")
-    server_id = server_ref.strip()
-    input_id = input_ref.strip()
-    if server_id not in servers:
-        raise ValueError(f"experiments[{index - 1}].server_ref references unknown server: {server_id}")
-    if input_id not in inputs:
-        raise ValueError(f"experiments[{index - 1}].input_ref references unknown input: {input_id}")
-
-    experiment_id = str(experiment.get("id") or f"{server_id}_{input_id}").strip()
-    if not experiment_id:
-        raise ValueError(f"experiments[{index - 1}].id must not be empty")
-    merged = deep_merge(common, matrix_entry_override(servers[server_id]))
-    apply_unset(merged, servers[server_id].get("$unset"))
-    merged = deep_merge(merged, matrix_entry_override(inputs[input_id]))
-    apply_unset(merged, inputs[input_id].get("$unset"))
-
-    experiment_override = {key: value for key, value in experiment.items() if key not in EXPERIMENT_REF_KEYS}
-    reject_profiling_override(experiment_override, f"experiments[{index - 1}]")
-    merged = deep_merge(merged, experiment_override)
-    apply_unset(merged, experiment.get("$unset"))
-    merged["id"] = experiment_id
-    merged["name"] = str(experiment.get("name") or experiment_id)
-    attach_suite_metadata(
-        merged,
-        experiment_id=experiment_id,
-        server_id=server_id,
-        input_id=input_id,
-    )
-    return merged
-
-
 def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand a suite, returning a plain single-run config unchanged."""
 
@@ -283,8 +183,11 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
 
     if matrix is not None and not isinstance(matrix, dict):
         raise TypeError("matrix must be an object")
+    if matrix is not None:
+        servers = matrix_entries(matrix, "servers")
+        inputs = matrix_entries(matrix, "inputs")
     if experiments is None:
-        experiments = generated_matrix_experiments(matrix)
+        experiments = [{"server_ref": server, "input_ref": workload} for server in servers for workload in inputs]
     if not isinstance(experiments, list) or not experiments:
         raise ValueError("experiments must be a non-empty list")
 
@@ -293,21 +196,49 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     for index, experiment in enumerate(experiments, start=1):
         if not isinstance(experiment, dict):
             raise TypeError(f"experiments[{index - 1}] must be an object")
+
+        merged = common
+        provenance = {}
         if matrix is not None:
-            merged = expand_matrix_experiment(common, matrix, experiment, index)
+            for axis, entries in (("server", servers), ("input", inputs)):
+                reference = experiment.get(f"{axis}_ref")
+                if not isinstance(reference, str) or not reference.strip():
+                    raise ValueError(f"experiments[{index - 1}].{axis}_ref must reference matrix.{axis}s")
+                entry_id = reference.strip()
+                if entry_id not in entries:
+                    raise ValueError(f"experiments[{index - 1}].{axis}_ref references unknown {axis}: {entry_id}")
+
+                entry = entries[entry_id]
+                merged = deep_merge(
+                    merged, {key: value for key, value in entry.items() if key not in MATRIX_ENTRY_META_KEYS}
+                )
+                apply_unset(merged, entry.get("$unset"))
+                provenance[f"suite_{axis}_id"] = entry_id
+
+            default_id = f"{provenance['suite_server_id']}_{provenance['suite_input_id']}"
+            experiment_id = str(experiment.get("id") or default_id).strip()
+            if not experiment_id:
+                raise ValueError(f"experiments[{index - 1}].id must not be empty")
+            override = {key: value for key, value in experiment.items() if key not in EXPERIMENT_REF_KEYS}
         else:
-            reject_profiling_override(experiment, f"experiments[{index - 1}]")
             experiment_id = experiment_identity(experiment, index)
-            merged = deep_merge(common, experiment)
-            apply_unset(merged, experiment.get("$unset"))
-            merged["id"] = experiment_id
-            merged["name"] = str(experiment.get("name") or experiment_id)
-            attach_suite_metadata(
-                merged,
-                experiment_id=experiment_id,
-                server_id=None,
-                input_id=None,
-            )
+            override = experiment
+
+        reject_profiling_override(override, f"experiments[{index - 1}]")
+        merged = deep_merge(merged, override)
+        apply_unset(merged, experiment.get("$unset"))
+        merged["id"] = experiment_id
+        merged["name"] = str(experiment.get("name") or experiment_id)
+
+        metadata = merged.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise TypeError("metadata must be an object")
+        metadata.setdefault("suite_experiment_id", experiment_id)
+        for key, value in provenance.items():
+            metadata.setdefault(key, value)
+        merged["metadata"] = metadata
         expanded.append(merged)
     return expanded
 
@@ -319,25 +250,7 @@ def filter_suite_experiments(
     selected_inputs: set[str] | None = None,
     selected_servers: set[str] | None = None,
 ) -> list[tuple[int, dict[str, Any]]]:
-    """Filter expanded experiments by validated CLI/environment selectors."""
-
-    selected_inputs = selected_inputs or set()
-    selected_servers = selected_servers or set()
-    available_inputs = sorted(
-        {
-            str((experiment.get("metadata") or {}).get("suite_input_id"))
-            for _index, experiment in experiments
-            if isinstance(experiment.get("metadata"), dict) and (experiment.get("metadata") or {}).get("suite_input_id")
-        }
-    )
-    available_servers = sorted(
-        {
-            str((experiment.get("metadata") or {}).get("suite_server_id"))
-            for _index, experiment in experiments
-            if isinstance(experiment.get("metadata"), dict)
-            and (experiment.get("metadata") or {}).get("suite_server_id")
-        }
-    )
+    """Filter expanded experiments by CLI selectors without changing their order."""
 
     if not selected_experiments:
         selected = list(experiments)
@@ -356,35 +269,22 @@ def filter_suite_experiments(
             available = ", ".join(str(item[1].get("id") or item[1].get("name") or item[0]) for item in experiments)
             raise ValueError(f"unknown experiment selector(s): {', '.join(missing)}; available: {available}")
 
-    missing_inputs = selected_inputs - set(available_inputs)
-    if missing_inputs:
-        raise ValueError(
-            f"unknown input selector(s): {', '.join(sorted(missing_inputs))}; "
-            f"available inputs: {', '.join(available_inputs)}"
-        )
-    missing_servers = selected_servers - set(available_servers)
-    if missing_servers:
-        raise ValueError(
-            f"unknown server selector(s): {', '.join(sorted(missing_servers))}; "
-            f"available servers: {', '.join(available_servers)}"
-        )
-
-    def metadata_value(experiment: dict[str, Any], key: str) -> str:
-        """Read one string-valued suite metadata field."""
-
-        metadata = experiment.get("metadata") if isinstance(experiment.get("metadata"), dict) else {}
-        value = metadata.get(key)
-        return str(value) if isinstance(value, str) else ""
-
-    filtered = [
-        (index, experiment)
-        for index, experiment in selected
-        if (not selected_inputs or metadata_value(experiment, "suite_input_id") in selected_inputs)
-        and (not selected_servers or metadata_value(experiment, "suite_server_id") in selected_servers)
-    ]
-    if not filtered:
+    for position, axis, requested in ((1, "input", selected_inputs), (0, "server", selected_servers)):
+        if not requested:
+            continue
+        available = {profile_labels(experiment)[position] for _, experiment in experiments} - {""}
+        missing = requested - available
+        if missing:
+            raise ValueError(
+                f"unknown {axis} selector(s): {', '.join(sorted(missing))}; "
+                f"available {axis}s: {', '.join(sorted(available))}"
+            )
+        selected = [
+            (index, experiment) for index, experiment in selected if profile_labels(experiment)[position] in requested
+        ]
+    if not selected:
         raise ValueError("no experiments matched the selected experiment/input/server combination")
-    return filtered
+    return selected
 
 
 def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
@@ -393,19 +293,3 @@ def suite_profile_mode(cfg: dict[str, Any]) -> str | None:
     metadata = cfg.get("metadata") if isinstance(cfg.get("metadata"), dict) else {}
     value = metadata.get("profile_mode")
     return str(value) if isinstance(value, str) and value else None
-
-
-def summarize_suite_forced_token_contracts(contracts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Summarize forced-token modes and business readiness across a suite."""
-
-    modes = sorted({str(contract.get("mode") or "none") for contract in contracts})
-    errors = sorted({str(error) for contract in contracts for error in contract.get("errors", [])})
-    workloads = sorted({str(contract.get("workload_id")) for contract in contracts if contract.get("workload_id")})
-    return {
-        "mode_count": {
-            mode: sum(1 for contract in contracts if str(contract.get("mode") or "none") == mode) for mode in modes
-        },
-        "errors": errors,
-        "ready": not errors,
-        "workload_ids": workloads,
-    }

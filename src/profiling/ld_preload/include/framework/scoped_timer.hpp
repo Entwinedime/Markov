@@ -5,6 +5,7 @@
 #include "framework/pmu_recorder.hpp"
 #include "framework/trace_logger.hpp"
 #include <initializer_list>
+#include <optional>
 #include <sstream>
 #include <stdint.h>
 #include <string>
@@ -28,6 +29,10 @@ namespace HookFrameWork {
 class ScopedTimer {
 public:
     explicit ScopedTimer(const std::string & name, std::initializer_list<HookArgInfo> trace_args) : name_(name), start_us_(GetRealtimeUs()) {
+        static const bool sync_thread_cpu = ParseEnvFlag("HOOK_SYNC_THREAD_CPU", false);
+        static const bool memcpy2d_timing = ParseEnvFlag("HOOK_MEMCPY2D_TIMING", false);
+        if ((sync_thread_cpu && name_.starts_with("AscendCL@aclrtSynchronize"))
+            || (memcpy2d_timing && name_ == "AscendCL@aclrtMemcpy2dAsync")) start_thread_cpu_ = ThreadCpuNs();
         /**
          * @brief PMU 是可选增强事实；读取失败不影响基础 runtime_op 事件输出。
          */
@@ -43,11 +48,14 @@ public:
     }
 
     ~ScopedTimer() {
+        const auto end_thread_cpu = start_thread_cpu_ ? ThreadCpuNs() : std::nullopt;
         /**
          * @brief 析构时输出事件，确保 wrapper 中真实函数抛出或提前返回时仍能记录已完成范围。
          */
         const pid_t tid{ static_cast<pid_t>(syscall(SYS_gettid)) };
         const uint64_t dur_us{ GetRealtimeUs() - start_us_ };
+        const auto cpu_field = end_thread_cpu && *end_thread_cpu >= *start_thread_cpu_
+            ? ", \"thread_cpu_ns\": " + std::to_string(*end_thread_cpu - *start_thread_cpu_) : std::string{};
         const std::string args_str{ "\"args\": {"
                                     "\"domain\": \"ld_preload\", "
                                     "\"event_kind\": \"runtime_op\", "
@@ -55,12 +63,17 @@ public:
                                     + std::string(HOOK_PROFILE_NAME)
                                     + "\", "
                                       "\"hook_event_name\": \""
-                                    + EscapeJsonString(name_) + "\", " + function_args_str_ + ", " + ProcessPMUSnapshot() + "}" };
+                                    + EscapeJsonString(name_) + "\", " + function_args_str_ + ", " + ProcessPMUSnapshot() + cpu_field + "}" };
 
         TraceLogger::Get().LogEvent(name_, start_us_, dur_us, tid, args_str);
     }
 
 private:
+    static std::optional<uint64_t> ThreadCpuNs() {
+        timespec value{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) != 0) return std::nullopt;
+        return static_cast<uint64_t>(value.tv_sec) * 1'000'000'000ULL + value.tv_nsec;
+    }
     /** @brief 读取墙钟时间，单位为微秒，对齐 Chrome trace 的 ts/dur 字段。 */
     static uint64_t GetRealtimeUs() {
         struct timespec ts;
@@ -94,6 +107,7 @@ private:
 
     const std::string name_;
     const uint64_t start_us_;
+    std::optional<uint64_t> start_thread_cpu_;
     PmuSnapshot start_pmu_;
     bool pmu_snapshot_ok_{ false };
     std::string function_args_str_;

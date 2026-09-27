@@ -10,9 +10,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,73 +18,37 @@ from typing import Any
 from ..common.io import load_json, write_json as dump_json
 from ..common.logging import log
 from ..common.naming import sanitize
-from ..common.paths import ROOT_DIR, resolve_repo_path
-from .executor import preflight_profile_config, run_profile
-from ..contracts.forced_token.bundle import forced_token_bundle_summary
+from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path, resolve_repo_path
+from .executor import ProfileRun
+from .frameworks import framework_adapter
 from .forced_workflow import (
     build_forced_token_bundle,
     inject_forced_token_bundle_plan,
 )
 from .suite import (
-    PROFILE_EXPERIMENTS_ENV,
-    PROFILE_CHANNELS_ENV,
-    PROFILE_FORCED_TOKEN_BUNDLE_ENV,
-    PROFILE_INPUTS_ENV,
-    PROFILE_SERVERS_ENV,
     experiment_identity,
     expand_suite,
     filter_suite_experiments,
     parse_experiment_selection,
     narrow_profile_channels,
     suite_profile_mode,
-    summarize_suite_forced_token_contracts,
 )
-
-
-@dataclass(frozen=True)
-class _PreparedExperiment:
-    """One validated suite experiment with stable display and artifact metadata."""
-
-    ordinal: int
-    index: int
-    name: str
-    config: dict[str, Any]
-    forced_token_contract: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class _SuiteExecution:
-    """Execution outcome retained until the aggregate suite artifact is written."""
-
-    run_dirs: list[Path]
-    failures: list[dict[str, Any]]
-    attempted_count: int
-    fatal_error: Exception | None
 
 
 def run_profile_suite(
     cfg: dict[str, Any],
     dry_run: bool,
-    selected_experiments: set[str] | None = None,
-    selected_inputs: set[str] | None = None,
-    selected_servers: set[str] | None = None,
+    experiments: list[tuple[int, dict[str, Any]]],
     *,
     forced_token_bundle: Path | None = None,
 ) -> list[Path]:
     """Execute one run or suite and persist one concise result artifact."""
 
     is_suite = "experiments" in cfg or "matrix" in cfg
-    all_experiments = list(enumerate(expand_suite(cfg), start=1))
-    experiments = filter_suite_experiments(
-        all_experiments,
-        selected_experiments or set(),
-        selected_inputs=selected_inputs,
-        selected_servers=selected_servers,
-    )
     if len(experiments) == 1 and not is_suite:
         experiment = inject_forced_token_bundle_plan(experiments[0][1], forced_token_bundle)
-        preflight_profile_config(experiment)
-        return [run_profile(experiment, dry_run)]
+        run = ProfileRun(experiment, dry_run=dry_run)
+        return [run.run()]
 
     framework = cfg.get("framework", "sglang")
     suite_name = sanitize(str(cfg.get("name", f"{framework}-profile-suite")))
@@ -94,152 +56,128 @@ def run_profile_suite(
     suite_id = cfg.get("run_id") or f"{time.strftime('%Y%m%d_%H%M%S')}_{suite_name}"
     suite_dir = suite_root / sanitize(str(suite_id))
     continue_on_error = bool(cfg.get("continue_on_error", False))
-    prepared_experiments = _prepare_suite_experiments(experiments, suite_dir, forced_token_bundle)
+    prepared_experiments = _prepare_suite_experiments(experiments, suite_dir, forced_token_bundle, dry_run=dry_run)
 
     suite_dir.mkdir(parents=True, exist_ok=True)
     log(f"Suite dir: {suite_dir}")
 
-    execution = _execute_suite_experiments(
-        prepared_experiments,
-        dry_run=dry_run,
-        continue_on_error=continue_on_error,
-    )
-    generated_bundle, bundle_error = _build_capture_bundle_if_requested(
-        cfg,
-        dry_run=dry_run,
-        suite_dir=suite_dir,
-        run_dirs=execution.run_dirs,
-        failures=execution.failures,
-    )
-    if bundle_error:
-        execution.failures.append({"name": "forced_token_bundle", "error": bundle_error})
-
-    dump_json(
-        suite_dir / "suite_result.json",
-        {
-            "suite_dir": str(suite_dir),
-            "suite_name": suite_name,
-            "framework": framework,
-            "profile_mode": suite_profile_mode(cfg),
-            "dry_run": bool(dry_run),
-            "planned_count": len(prepared_experiments),
-            "attempted_count": execution.attempted_count,
-            "completed_count": len(execution.run_dirs),
-            "failure_count": len(execution.failures),
-            "aborted_count": len(prepared_experiments) - execution.attempted_count,
-            "status": "failed" if execution.failures else "completed",
-            "runs": [str(path) for path in execution.run_dirs],
-            "failures": execution.failures,
-            "forced_token_contracts": summarize_suite_forced_token_contracts(
-                [experiment.forced_token_contract for experiment in prepared_experiments]
-            ),
-            "forced_token_bundle": forced_token_bundle_summary(forced_token_bundle)
-            if forced_token_bundle is not None
-            else None,
-            "generated_forced_token_bundle": generated_bundle,
-        },
-    )
-    if bundle_error:
-        raise ValueError(f"forced token bundle aggregation failed: {bundle_error}")
-    if execution.fatal_error is not None:
-        raise RuntimeError(
-            f"profile suite failed: {execution.failures[-1]['name']}: {execution.fatal_error}"
-        ) from execution.fatal_error
-    return execution.run_dirs
+    run_dirs: list[Path] = []
+    failures: list[dict[str, Any]] = []
+    attempted_count = 0
+    generated_bundle = None
+    finished = False
+    summary = {
+        "suite_dir": str(suite_dir),
+        "suite_name": suite_name,
+        "framework": framework,
+        "profile_mode": suite_profile_mode(cfg),
+        "dry_run": dry_run,
+        "planned_count": len(prepared_experiments),
+        "profile_manifests": [str(run.layout.run_dir / "profile_manifest.json") for _, run in prepared_experiments],
+        "status": "running",
+        "forced_token_bundle": {"path": str(forced_token_bundle)} if forced_token_bundle is not None else None,
+    }
+    # Declare output locations before inference, including runs that may fail or
+    # be interrupted. Consumers must not discover another manifest by globbing.
+    dump_json(suite_dir / "suite_result.json", summary)
+    try:
+        for ordinal, (index, run) in enumerate(prepared_experiments, start=1):
+            name = sanitize(str(run.cfg.get("name", f"experiment-{index}")))
+            log(f"Suite experiment {ordinal}/{len(prepared_experiments)} (#{index}): {name}")
+            attempted_count += 1
+            try:
+                run_dirs.append(run.run())
+            except BaseException as error:
+                failures.append({"name": name, "error": str(error) or type(error).__name__})
+                if not isinstance(error, Exception) or not continue_on_error:
+                    raise
+        if suite_profile_mode(cfg) == "forced_token_capture" and not dry_run and not failures:
+            try:
+                generated_bundle = build_forced_token_bundle(suite_dir, run_dirs)
+                log(f"Forced token bundle: {generated_bundle['path']}")
+            except BaseException as error:
+                failures.append({"name": "forced_token_bundle", "error": str(error) or type(error).__name__})
+                raise
+        finished = True
+    finally:
+        dump_json(
+            suite_dir / "suite_result.json",
+            {
+                **summary,
+                "attempted_count": attempted_count,
+                "completed_count": len(run_dirs),
+                "failure_count": len(failures),
+                "aborted_count": len(prepared_experiments) - attempted_count,
+                "status": "completed" if finished and not failures else "failed",
+                "runs": [str(path) for path in run_dirs],
+                "failures": failures,
+                "generated_forced_token_bundle": generated_bundle,
+            },
+        )
+    if failures:
+        raise RuntimeError(f"{len(failures)} profiling experiments failed; see {suite_dir / 'suite_result.json'}")
+    return run_dirs
 
 
 def _prepare_suite_experiments(
     experiments: list[tuple[int, dict[str, Any]]],
     suite_dir: Path,
     forced_token_bundle: Path | None,
-) -> list[_PreparedExperiment]:
+    *,
+    dry_run: bool,
+) -> list[tuple[int, ProfileRun]]:
     """Inject run-local paths and validate every selected experiment upfront."""
 
-    prepared: list[_PreparedExperiment] = []
-    for ordinal, (index, experiment) in enumerate(experiments, start=1):
+    prepared = []
+    for index, experiment in experiments:
         name = sanitize(str(experiment.get("name", f"experiment-{index}")))
         config = inject_forced_token_bundle_plan(experiment, forced_token_bundle)
         config["run_root"] = str(suite_dir)
         config["run_id"] = f"{index:02d}_{name}"
-        prepared.append(
-            _PreparedExperiment(
-                ordinal=ordinal,
-                index=index,
-                name=name,
-                config=config,
-                forced_token_contract=preflight_profile_config(config),
-            )
-        )
+        prepared.append((index, ProfileRun(config, dry_run=dry_run)))
     return prepared
 
 
-def _execute_suite_experiments(
-    experiments: list[_PreparedExperiment],
-    *,
-    dry_run: bool,
-    continue_on_error: bool,
-) -> _SuiteExecution:
-    """Run prepared experiments sequentially under the suite failure policy."""
+def parse_args(argv: list[str] | None = None, *, host: bool = False) -> argparse.Namespace:
+    """Share selection options; only the host uses a positional config path."""
 
-    run_dirs: list[Path] = []
-    failures: list[dict[str, Any]] = []
-    fatal_error: Exception | None = None
-    attempted_count = 0
-    for experiment in experiments:
-        attempted_count += 1
-        log(f"Suite experiment {experiment.ordinal}/{len(experiments)} (#{experiment.index}): {experiment.name}")
-        try:
-            run_dirs.append(run_profile(experiment.config, dry_run))
-        except Exception as error:
-            failures.append(
-                {
-                    "name": experiment.name,
-                    "error": str(error),
-                }
-            )
-            if not continue_on_error:
-                fatal_error = error
-                break
-    return _SuiteExecution(run_dirs, failures, attempted_count, fatal_error)
-
-
-def _build_capture_bundle_if_requested(
-    cfg: dict[str, Any],
-    *,
-    dry_run: bool,
-    suite_dir: Path,
-    run_dirs: list[Path],
-    failures: list[dict[str, Any]],
-) -> tuple[dict[str, Any] | None, str | None]:
-    """Build a capture bundle only after every selected experiment succeeds."""
-
-    if suite_profile_mode(cfg) != "forced_token_capture" or dry_run or failures:
-        return None, None
-    try:
-        bundle = build_forced_token_bundle(suite_dir, run_dirs)
-        log(f"Forced token bundle: {bundle.get('path')}")
-        return bundle, None
-    except Exception as error:
-        return None, str(error)
-
-
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse the container-side profiling runner CLI."""
-
-    parser = argparse.ArgumentParser(description="Run profiling experiments.")
-    parser.add_argument("--config", required=True, help="JSON profile config path")
-    parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
-    parser.add_argument("--experiment", action="append", default=[], help="run one experiment id/name; may be repeated")
-    parser.add_argument(
-        "--experiments", action="append", default=[], help="comma-separated experiment ids/names to run"
+    parser = argparse.ArgumentParser(
+        prog="scripts/profile.sh" if host else None,
+        description="Run profiling experiments in the framework selected by the JSON config.",
+        allow_abbrev=False,
     )
-    parser.add_argument("--input", action="append", default=[], help="run one suite input id; may be repeated")
-    parser.add_argument("--inputs", action="append", default=[], help="comma-separated suite input ids to run")
-    parser.add_argument("--server", action="append", default=[], help="run one suite server id; may be repeated")
-    parser.add_argument("--servers", action="append", default=[], help="comma-separated suite server ids to run")
+    if host:
+        parser.add_argument("config", help="JSON profile config path inside the repository")
+    else:
+        parser.add_argument("--config", required=True, help="JSON profile config path")
+    parser.add_argument("--dry-run", action="store_true", help="expand config and manifest without starting the server")
+    parser.add_argument(
+        "--experiment",
+        "--experiments",
+        dest="experiments",
+        action="append",
+        default=[],
+        help="Experiment ids/names, comma-separated or repeated.",
+    )
+    parser.add_argument(
+        "--input",
+        "--inputs",
+        dest="inputs",
+        action="append",
+        default=[],
+        help="Suite input ids, comma-separated or repeated.",
+    )
+    parser.add_argument(
+        "--server",
+        "--servers",
+        dest="servers",
+        action="append",
+        default=[],
+        help="Suite server ids, comma-separated or repeated.",
+    )
     parser.add_argument(
         "--forced-token-bundle",
-        help="Explicit forced_token_bundle.json required by forced-token replay suites.",
+        help="Resolve {forced_token_plan} in replay commands from a workload-to-plan bundle.",
     )
     parser.add_argument(
         "--channels",
@@ -253,6 +191,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def host_main(argv: list[str] | None = None) -> None:
+    """Replace the host launcher with Docker; no server or profile runs on the host."""
+
+    args = parse_args(argv, host=True)
+    config = require_repo_path(args.config).resolve()
+    config_relative = repo_relative_path(config)
+    framework = framework_adapter(load_json(config).get("framework", "sglang"))
+    container_root = Path("/workspace/trace-sim")
+    runner_args = ["--config", str(container_root / config_relative)]
+    for option in ("experiments", "inputs", "servers", "channels"):
+        runner_args.extend(f"--{option}={value}" for value in getattr(args, option))
+    for option in ("dry_run", "list_experiments"):
+        if getattr(args, option):
+            runner_args.append("--" + option.replace("_", "-"))
+    if args.forced_token_bundle:
+        bundle = require_repo_path(args.forced_token_bundle).resolve()
+        bundle_relative = repo_relative_path(bundle)
+        if not bundle.is_file():
+            raise FileNotFoundError(f"forced token bundle does not exist: {bundle}")
+        runner_args.extend(("--forced-token-bundle", str(container_root / bundle_relative)))
+
+    command = ["docker", "compose", "-f", "docker/compose/inference.yml", "run", "--rm"]
+    name = os.environ.get("TRACE_SIM_PROFILE_CONTAINER_NAME")
+    if name:
+        command.extend(("--name", name))
+    container_command = """
+set -euo pipefail
+set +u
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+set -u
+export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
+export HOOK_ASCENDCL_SO_PATH="/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so"
+export PYTHONPATH="scripts/internal${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m markov_internal.profiling.runner "$@"
+"""
+    command.extend((framework.name + "-profile", "bash", "-lc", container_command, "bash", *runner_args))
+    os.chdir(ROOT_DIR)
+    os.execvp(command[0], command)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Execute profiling or list the selected expanded experiments."""
 
@@ -261,32 +239,17 @@ def main(argv: list[str] | None = None) -> int:
     if config_path is None or not config_path.is_file():
         raise FileNotFoundError(f"missing config: {args.config}")
     cfg = load_json(config_path)
-    selected_channels = parse_experiment_selection(
-        args.channels,
-        os.environ.get(PROFILE_CHANNELS_ENV),
-    )
+    selected_channels = parse_experiment_selection(args.channels)
     if selected_channels:
         cfg = narrow_profile_channels(cfg, selected_channels)
-    selected_experiments = parse_experiment_selection(
-        [*args.experiment, *args.experiments],
-        os.environ.get(PROFILE_EXPERIMENTS_ENV),
+    forced_token_bundle = resolve_repo_path(args.forced_token_bundle)
+    experiments = filter_suite_experiments(
+        list(enumerate(expand_suite(cfg), start=1)),
+        parse_experiment_selection(args.experiments),
+        selected_inputs=parse_experiment_selection(args.inputs),
+        selected_servers=parse_experiment_selection(args.servers),
     )
-    selected_inputs = parse_experiment_selection(
-        [*args.input, *args.inputs],
-        os.environ.get(PROFILE_INPUTS_ENV),
-    )
-    selected_servers = parse_experiment_selection(
-        [*args.server, *args.servers],
-        os.environ.get(PROFILE_SERVERS_ENV),
-    )
-    forced_token_bundle = resolve_repo_path(args.forced_token_bundle or os.environ.get(PROFILE_FORCED_TOKEN_BUNDLE_ENV))
     if args.list_experiments:
-        experiments = filter_suite_experiments(
-            list(enumerate(expand_suite(cfg), start=1)),
-            selected_experiments,
-            selected_inputs=selected_inputs,
-            selected_servers=selected_servers,
-        )
         for index, experiment in experiments:
             exp_id = experiment.get("id") or experiment_identity(experiment, index)
             exp_name = experiment.get("name") or exp_id
@@ -300,9 +263,7 @@ def main(argv: list[str] | None = None) -> int:
     run_dirs = run_profile_suite(
         cfg,
         args.dry_run,
-        selected_experiments,
-        selected_inputs,
-        selected_servers,
+        experiments,
         forced_token_bundle=forced_token_bundle,
     )
     for run_dir in run_dirs:
@@ -311,10 +272,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except (FileNotFoundError, ValueError) as exc:
-        print(str(exc), file=sys.stderr)
-        raise SystemExit(2) from exc
-    except KeyboardInterrupt:
-        raise SystemExit(130) from None
+    raise SystemExit(main())

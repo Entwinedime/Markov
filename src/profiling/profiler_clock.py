@@ -21,5 +21,9 @@ def read_host_clock(trace: Path) -> dict | None:
         scale = 1000.0 / config._freq
     else:
         origin, scale = 0, 1.0
-    return {"clock": "npu_syscnt", "origin_tick": origin,
-            "origin_ns": config.get_local_time(config.get_timestamp_from_syscnt(origin)), "ns_per_tick": scale}
+    return {
+        "clock": "npu_syscnt",
+        "origin_tick": origin,
+        "origin_ns": config.get_local_time(config.get_timestamp_from_syscnt(origin)),
+        "ns_per_tick": scale,
+    }

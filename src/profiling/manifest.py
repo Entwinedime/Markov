@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from glob import escape
 from pathlib import Path
 from typing import Any
 
@@ -27,12 +28,14 @@ def build_profile_manifest(
 
     trace_dir = run_dir / "trace"
     python_probe_dir = trace_dir / "python_probe"
-    torch_trace_files = _glob_files(trace_dir / "torch", "**/trace_view.json")
+    torch_dir = runtime.output_path(run_dir, "torch")
+    hook_prefix = runtime.output_path(run_dir, "ld_preload")
+    torch_trace_files = _glob_files(torch_dir, "**/trace_view.json")
     for entry in torch_trace_files:
         clock = read_host_clock(Path(entry["path"]))
         if clock is not None:
             entry["host_clock"] = clock
-    ld_preload_trace_files = _glob_files(trace_dir / "ld_preload", "*")
+    ld_preload_trace_files = _glob_files(hook_prefix.parent, escape(hook_prefix.name) + ".rank*.pid*.json")
     python_probe_files = _glob_files(python_probe_dir, "*.json")
     collection_errors = [error] if error else []
     return {
@@ -57,13 +60,14 @@ def build_profile_manifest(
         },
         "trace": {
             "root": str(trace_dir),
-            "torch_trace_dir": str(trace_dir / "torch"),
+            "torch_trace_dir": str(torch_dir),
             "torch_trace_files": torch_trace_files,
-            "ld_preload_trace_dir": str(trace_dir / "ld_preload"),
+            "ld_preload_trace_dir": str(hook_prefix.parent),
             "ld_preload_trace_files": ld_preload_trace_files,
         },
         "bench": {
             "workload_report_files": _glob_files(run_dir / "bench", "**/workload_report.json"),
+            "bench_serving_files": _glob_files(run_dir / "bench", "**/*.jsonl"),
         },
         "sidecar": {
             "python_probe_dir": str(python_probe_dir),
@@ -72,17 +76,11 @@ def build_profile_manifest(
     }
 
 
-def _path_info(path: Path) -> dict[str, Any]:
-    """生成单个 trace 文件的存在性和大小摘要。"""
-
-    return {
-        "path": str(path),
-        "exists": path.exists(),
-        "bytes": path.stat().st_size if path.is_file() else None,
-    }
-
-
 def _glob_files(path: Path, pattern: str) -> list[dict[str, Any]]:
     """按 glob 收集 trace 文件，并转换成 manifest 路径条目。"""
 
-    return [_path_info(item) for item in sorted(path.glob(pattern)) if item.is_file()]
+    return [
+        {"path": str(item), "exists": True, "bytes": item.stat().st_size}
+        for item in sorted(path.glob(pattern))
+        if item.is_file()
+    ]
