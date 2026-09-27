@@ -19,13 +19,23 @@ namespace markov::trace_graph::modules::hicache {
 
 struct HiCacheLayerWaitObservation;
 
-namespace patch {
-struct HiCacheIoOperationLedger;
-}
-
 struct HiCachePhaseCostFamily {
     size_t node_count = 0;
     uint64_t duration_us = 0;
+};
+
+/** @brief Device work and correlated CPU submission costs for either phase. */
+struct HiCachePhaseNodeObservation {
+    size_t device_node_count = 0;
+    uint64_t device_duration_us = 0;
+    size_t compute_node_count = 0;
+    uint64_t compute_duration_us = 0;
+    uint64_t kernel_duration_us = 0;
+    uint64_t collective_duration_us = 0;
+    std::vector<size_t> collective_node_ids;
+    std::vector<size_t> submit_cpu_node_ids;
+    std::map<std::string, HiCachePhaseCostFamily> kernel_families;
+    uint64_t submit_cpu_duration_us = 0;
 };
 
 /** @brief One cache-extend batch joined to its Torch execution markers. */
@@ -39,33 +49,15 @@ struct HiCachePhaseObservation {
     uint64_t prefill_token_count = 0;
     uint64_t prefill_start_us = 0;
     uint64_t prefill_duration_us = 0;
-    size_t prefill_device_node_count = 0;
-    uint64_t prefill_device_duration_us = 0;
-    size_t prefill_compute_node_count = 0;
-    uint64_t prefill_compute_duration_us = 0;
-    uint64_t prefill_kernel_duration_us = 0;
+    HiCachePhaseNodeObservation prefill;
     uint64_t prefill_common_kernel_duration_us = 0;
     uint64_t prefill_prefix_attention_duration_us = 0;
-    uint64_t prefill_collective_duration_us = 0;
     std::vector<size_t> prefill_common_kernel_node_ids;
     std::vector<size_t> prefill_prefix_attention_node_ids;
-    std::vector<size_t> prefill_collective_node_ids;
-    std::vector<size_t> prefill_submit_cpu_node_ids;
-    std::map<std::string, HiCachePhaseCostFamily> prefill_kernel_families;
-    uint64_t prefill_submit_cpu_duration_us = 0;
     uint64_t decode_iteration_count = 0;
     uint64_t decode_duration_us = 0;
-    size_t decode_device_node_count = 0;
-    uint64_t decode_device_duration_us = 0;
-    size_t decode_compute_node_count = 0;
-    uint64_t decode_compute_duration_us = 0;
-    uint64_t decode_kernel_duration_us = 0;
-    uint64_t decode_collective_duration_us = 0;
+    HiCachePhaseNodeObservation decode;
     std::vector<size_t> decode_kernel_node_ids;
-    std::vector<size_t> decode_collective_node_ids;
-    std::vector<size_t> decode_submit_cpu_node_ids;
-    std::map<std::string, HiCachePhaseCostFamily> decode_kernel_families;
-    uint64_t decode_submit_cpu_duration_us = 0;
 };
 
 /** @brief Compact completeness audit and request-level phase observations. */
@@ -96,8 +88,7 @@ struct HiCachePhaseObservationAudit {
 [[nodiscard]] bool is_hicache_paged_attention(std::string_view name);
 
 /** @brief Sum the semantic paged-attention family in one Decode observation. */
-[[nodiscard]] uint64_t hicache_paged_attention_duration(
-    const std::map<std::string, HiCachePhaseCostFamily> & families);
+[[nodiscard]] uint64_t hicache_paged_attention_duration(const std::map<std::string, HiCachePhaseCostFamily> & families);
 
 /**
  * @brief Joins request-bearing cache-extend facts to Torch phase markers.
@@ -106,10 +97,6 @@ struct HiCachePhaseObservationAudit {
  * does not use a fixed time tolerance. Marker intervals remain observations, not
  * ownership windows for Direct I/O or residual CPU gaps.
  */
-[[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph,
-                                                                  const HiCacheLayerWaitObservation * layer_waits = nullptr);
-
-/** @brief Marks source ownership and returns the same observed I/O ledger for calibration. */
-patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & graph);
+[[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits = nullptr);
 
 } // namespace markov::trace_graph::modules::hicache

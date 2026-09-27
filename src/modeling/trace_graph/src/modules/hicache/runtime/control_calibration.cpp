@@ -1,5 +1,7 @@
-#include "markov/trace_graph/modules/hicache/runtime/write_calibration.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
+#include <cmath>
+#include <fstream>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
@@ -7,15 +9,40 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 using Json = nlohmann::json;
 
+Json read_control_calibration(const std::string & path, std::string_view operation) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("Cannot read independent control calibration: " + path);
+    auto document = Json::parse(file);
+    if (document.at("role") != "fixed_calibration" || document.at("operation") != operation || document.at("source_manifest").get<std::string>().empty())
+        throw std::runtime_error("Control calibration lacks independent provenance for " + std::string(operation));
+    return document;
+}
+
+uint64_t read_control_duration(const Json & value) {
+    const auto cost = value.get<double>();
+    if (!std::isfinite(cost) || cost < 0 || cost >= std::ldexp(1.0, 64)) throw std::invalid_argument("Invalid control cost in microseconds");
+    return static_cast<uint64_t>(std::floor(cost + 0.5));
+}
+
+LoadIndexOperationCost read_load_operation_cost(const Json & row) {
+    return { read_control_duration(row.at("main_us")),
+             read_control_duration(row.at("main_residual_us")),
+             read_control_duration(row.at("worker_us")),
+             read_control_duration(row.at("dispatch_us")),
+             read_control_duration(row.at("device_us")) };
+}
+
 Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t end, bool release_only) {
     const patch::HiCacheSourceDagIndex initial(graph);
     std::vector<core::TraceEvent> points;
     std::vector<std::pair<patch::HiCacheSourceFactNode, HiCacheEvictionRegion>> regions;
     const auto boundary = [&](const auto & fact, uint64_t first, uint64_t last) {
-        for (const auto at : {first, last}) {
+        for (const auto at : { first, last }) {
             core::TraceEvent point;
             point.name = "independent write boundary";
-            point.pid = fact.pid; point.tid = fact.tid; point.ts = at;
+            point.pid = fact.pid;
+            point.tid = fact.tid;
+            point.ts = at;
             points.push_back(std::move(point));
         }
     };
@@ -118,8 +145,7 @@ void bind_calibration_workers(const Json & submissions, const core::DagGraph & b
     }
 }
 
-Json export_host_template(const core::DagGraph & graph, const HiCacheHostExpansion & plan,
-                           const std::map<std::string, size_t> & roles) {
+Json export_host_template(const core::DagGraph & graph, const HiCacheHostExpansion & plan, const std::map<std::string, size_t> & roles) {
     std::map<std::string, std::string> lane_roles;
     for (const auto & [role, node] : roles) {
         const auto [at, inserted] = lane_roles.emplace(std::string(graph.node_lane_key(node)), role);
@@ -137,17 +163,23 @@ Json export_host_template(const core::DagGraph & graph, const HiCacheHostExpansi
     for (const auto & node : plan.nodes) {
         const auto & work = node.work;
         if (!work.attrs.empty() || work.observed_point) throw std::runtime_error("Portable write work must not retain source coordinates or opaque attributes");
-        Json row{{"name", work.name}, {"category", work.category}, {"is_cpu", work.is_cpu},
-                 {"resource", lane_roles.at(work.lane_key)}, {"duration", work.duration},
-                 {"cpu_gap_after", work.cpu_gap_after}, {"counts_toward_e2e", work.counts_toward_e2e}};
+        Json row{
+            {              "name",                    work.name },
+            {          "category",                work.category },
+            {            "is_cpu",                  work.is_cpu },
+            {          "resource", lane_roles.at(work.lane_key) },
+            {          "duration",                work.duration },
+            {     "cpu_gap_after",           work.cpu_gap_after },
+            { "counts_toward_e2e",       work.counts_toward_e2e }
+        };
         if (node.submission) row["submission"] = *node.submission;
         if (node.queue_member) row["queue_resource"] = role_for(*node.queue_member);
         if (work.cpu_task_ready_delay_us) row["ready_delay_us"] = *work.cpu_task_ready_delay_us;
         output["nodes"].push_back(std::move(row));
     }
-    for (const auto & edge : plan.edges) output["edges"].push_back({edge.from, edge.to, static_cast<int>(edge.kind)});
-    for (const auto & stream : plan.streams) output["streams"].push_back({role_for(stream.source_node), stream.first, stream.last});
-    for (const auto & wait : plan.waits) output["waits"].push_back({role_for(wait.source_node), wait.consumer});
+    for (const auto & edge : plan.edges) output["edges"].push_back({ edge.from, edge.to, static_cast<int>(edge.kind) });
+    for (const auto & stream : plan.streams) output["streams"].push_back({ role_for(stream.source_node), stream.first, stream.last });
+    for (const auto & wait : plan.waits) output["waits"].push_back({ role_for(wait.source_node), wait.consumer });
     for (const auto & wait : plan.event_waits) output["event_waits"].push_back(wait.consumer);
     return output;
 }

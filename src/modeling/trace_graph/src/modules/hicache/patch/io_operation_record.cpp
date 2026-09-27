@@ -2,8 +2,8 @@
  * @file
  * @brief Materializes one source-observed HiCache I/O operation record.
  */
-#include "io_operation_ledger_detail.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/modules/hicache/patch/io_operation_ledger_detail.hpp"
 
 #include <algorithm>
 #include <ranges>
@@ -51,7 +51,6 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         .completion_anchor_node_id = ownership.completion_anchor_node_id,
         .runtime_copy_observed = !ownership.owned_node_ids.empty(),
         .foreground_consumer_required = kind == HiCacheIoOperationKind::Prefetch || kind == HiCacheIoOperationKind::Load,
-        .evidence = { timing.fact_role, "same_pid_tid_call_containment" },
     };
     uint64_t items = 0, existing = 0, fresh = 0;
     bool complete_branches = !services.empty();
@@ -74,7 +73,6 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         existing = core::checked_add_u64(existing, *service->storage_existing_page_count, "Storage existing page count exceeds uint64 range");
         fresh = core::checked_add_u64(fresh, *service->storage_new_page_count, "Storage new page count exceeds uint64 range");
     }
-    if (!services.empty()) record.evidence.push_back("nested_storage_service_observation");
     if (kind == HiCacheIoOperationKind::WriteHostToStorage && complete_branches && record.source_page_size > 0) {
         const auto completed_pages = record.completed_token_count / record.source_page_size;
         // Completed payload and the nested batches must agree. Missing or partial
@@ -84,21 +82,19 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
             record.storage_residency_observed = true;
             record.storage_existing_page_count = existing;
             record.storage_new_page_count = fresh;
-            record.evidence.push_back("actual_storage_write_branch_counts");
         }
     }
-    if (timing_view.source_page_size == 0 && scope_page_size == 0 && trace_page_size > 0) record.evidence.push_back("unique_source_trace_page_size_fallback");
     if (call_start != nullptr) record.control_fact_node_ids.push_back(call_start->node_id);
     const auto * load_decision = kind == HiCacheIoOperationKind::Load ? load_decision_for_timing(source, timing_view) : nullptr;
     if (kind == HiCacheIoOperationKind::Load && record.request_id.empty() && load_decision != nullptr) {
         record.request_id = load_decision->request_id;
         record.control_fact_node_ids.push_back(load_decision->node_id);
-        record.evidence.push_back("tree_node_identity");
         if (record.effective_token_count == 0) record.effective_token_count = load_decision->effective_token_count;
     }
     if (kind == HiCacheIoOperationKind::Load && record.completed_token_count > 0 && load_decision != nullptr)
         build_load_admission_control(source, *load_decision, record);
 
+    bool foreground_gap_projection = false;
     if (kind == HiCacheIoOperationKind::Prefetch && !record.request_id.empty()) {
         if (const auto * candidate = request_role_before(source, record.request_id, record.pid, "prefetch_candidate_anchor", record.source_start_us)) {
             const auto foreground = source.timing_interval_ownership(candidate->pid, candidate->tid, record.source_start_us, record.observed_duration_us);
@@ -114,7 +110,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
                 record.completion_anchor_node_id = foreground.completion_anchor_node_id;
                 record.runtime_copy_observed = false;
                 record.control_fact_node_ids.push_back(candidate->node_id);
-                record.evidence.push_back("wait_complete_foreground_gap_projection");
+                foreground_gap_projection = true;
             }
         }
     }
@@ -125,7 +121,6 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
     if (consumer != nullptr) {
         record.consumer_anchor_node_id = source.cpu_boundary_at_or_after(consumer->pid, consumer->tid, fact_boundary(*consumer));
         record.control_fact_node_ids.push_back(consumer->node_id);
-        record.evidence.push_back("consumer_same_pid_tid_boundary");
     }
 
     if (kind == HiCacheIoOperationKind::Prefetch) {
@@ -133,13 +128,11 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         if (!record.consumer_anchor_node_id && record.completion_join_contract_ready && record.terminal_control_anchor_node_id
             && *record.terminal_control_anchor_node_id < source.graph().node_count()) {
             record.consumer_anchor_node_id = record.terminal_control_anchor_node_id;
-            record.evidence.push_back("prefetch_terminal_ready_consumer_boundary");
         }
     }
     else if (kind == HiCacheIoOperationKind::Load) {
         const auto closure = source.device_transfer_closure(timing_view, device_trace_direction(kind));
         build_loadback_readiness_contract(source, record, closure);
-        record.evidence.push_back("loadback_host_submission_not_completion");
     }
     else if (kind == HiCacheIoOperationKind::WriteDeviceToHost) {
         const auto closure = source.device_transfer_closure(timing_view, device_trace_direction(kind));
@@ -180,9 +173,7 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
             record.completion_join_contract_ready = true;
             record.completion_wait_status = "ready_zero_payload_control_boundary";
             record.completion_wait_reason = "zero-payload source I/O reaches its canonical consumer through the immediate-ready control branch";
-            record.evidence.push_back("zero_payload_foreground_control_boundary");
         }
-        record.evidence.push_back(record.completed_token_count_present ? "explicit_zero_completed_payload" : "inferred_zero_effective_payload");
         record.status = "ready";
         record.reason = "zero completed payload requires no timing ownership or foreground consumer; probe wall span remains residual";
         return record;
@@ -205,7 +196,6 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         }
         clear_host_ownership();
         record.foreground_consumer_required = false;
-        record.evidence.push_back("background_h2s_without_executable_cpu_lane");
         record.status = "ready_background_unmaterialized";
         record.reason = "background H2S has exact operation identity but no retained executable CPU lane; it remains an asynchronous ledger artifact until a "
                         "target capacity gate makes it causal";
@@ -213,7 +203,6 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
     }
     if (kind == HiCacheIoOperationKind::WriteDeviceToHost && record.source_readiness_topology_ready) {
         clear_host_ownership();
-        record.evidence.push_back("device_to_host_host_submission_cpu_ownership_not_required");
         record.status = "ready";
         record.reason = "D2H identity, payload, device transfer, completion, and readiness joins are complete; host submission CPU self-time remains residual";
         return record;
@@ -221,13 +210,11 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
     if (kind == HiCacheIoOperationKind::WriteDeviceToHost && record.completion_wait_status == "ready_background_transfer_only"
         && !record.device_transfer_node_ids.empty()) {
         clear_host_ownership();
-        record.evidence.push_back("device_to_host_host_submission_cpu_ownership_not_required");
         record.status = "ready_background_transfer_only";
         record.reason = "background D2H identity, payload, and device transfers are exact; incomplete completion topology must not be carried";
         return record;
     }
 
-    const bool foreground_gap_projection = std::ranges::find(record.evidence, "wait_complete_foreground_gap_projection") != record.evidence.end();
     if (ownership.status != "ready" && !foreground_gap_projection) append_reason(record, ownership.reason);
     if (foreground_gap_projection && record.owned_gap_duration_us == 0) append_reason(record, "blocking prefetch has no owned foreground CPU gap");
     if (record.foreground_consumer_required && record.request_id.empty()) append_reason(record, "foreground I/O operation has no exact request identity");

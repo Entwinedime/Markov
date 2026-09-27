@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/frontend/model_config.hpp"
 
-#include "model_config_parse_detail.hpp"
+#include "markov/trace_graph/frontend/model_config_parse_detail.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"

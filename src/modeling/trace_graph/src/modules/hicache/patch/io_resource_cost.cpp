@@ -2,7 +2,7 @@
  * @file
  * @brief Interpretable per-effect service and control cost assembly.
  */
-#include "io_resource_cost.hpp"
+#include "markov/trace_graph/modules/hicache/patch/io_resource_cost.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 

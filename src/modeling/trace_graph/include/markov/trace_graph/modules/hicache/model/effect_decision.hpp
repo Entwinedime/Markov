@@ -181,19 +181,11 @@ struct HiCacheEffectDecisionLedger {
     std::map<std::string, uint64_t> not_patchable_reasons;
 
     [[nodiscard]] uint64_t patchable_count() const;
-    [[nodiscard]] uint64_t not_patchable_count() const;
-    [[nodiscard]] uint64_t deferred_count() const;
     [[nodiscard]] uint64_t unresolved_count() const;
-    [[nodiscard]] uint64_t schedule_sensitive_count() const;
-    [[nodiscard]] std::map<std::string, uint64_t> counts_by_effect_type() const;
-    [[nodiscard]] std::map<std::string, uint64_t> counts_by_target_effect_state() const;
-    [[nodiscard]] std::map<std::string, uint64_t> counts_by_schedule_sensitivity() const;
-    [[nodiscard]] std::map<std::string, uint64_t> counts_by_source_carrier_state() const;
 };
 
 [[nodiscard]] std::string hicache_effect_type_name(HiCacheEffectType type);
 [[nodiscard]] std::string hicache_transfer_direction_name(HiCacheTransferDirection direction);
-[[nodiscard]] std::string hicache_effect_patch_status_name(HiCacheEffectPatchStatus status);
 [[nodiscard]] std::string hicache_target_effect_state_name(HiCacheTargetEffectState state);
 [[nodiscard]] std::string hicache_schedule_sensitivity_name(HiCacheScheduleSensitivity sensitivity);
 [[nodiscard]] std::string hicache_source_carrier_state_name(HiCacheSourceCarrierState state);

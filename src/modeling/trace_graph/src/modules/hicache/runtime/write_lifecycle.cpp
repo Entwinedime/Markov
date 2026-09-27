@@ -1,6 +1,6 @@
-#include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/write_calibration.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include <algorithm>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -20,13 +20,15 @@ void HiCacheWriteCalls::load_release_calibration(const core::DagGraph & graph, c
     std::set<std::pair<std::string, std::string>> seen;
     std::vector<EvictionControl> imported;
     for (const auto & base : eviction_controls_) {
-        if ((base.region.kind != Kind::ReleaseBackup && base.region.kind != Kind::ReleaseRegular)
-            || seen.contains({base.pid, base.tid})) continue;
+        if ((base.region.kind != Kind::ReleaseBackup && base.region.kind != Kind::ReleaseRegular) || seen.contains({ base.pid, base.tid })) continue;
         if (base.expansion.streams.size() != 1) continue;
         const auto main_lane = base.expansion.nodes.at(base.expansion.host_return).work.lane_key;
         std::optional<size_t> main;
         for (const auto & [original, local] : base.expansion.source_nodes)
-            if (graph.node(original).is_cpu && graph.node_lane_key(original) == main_lane) { main = original; break; }
+            if (graph.node(original).is_cpu && graph.node_lane_key(original) == main_lane) {
+                main = original;
+                break;
+            }
         if (!main) continue;
         // Both branches call allocator.free. Reuse only its resources; the
         // ordinary-release CPU work and dependencies come from calibration.
@@ -34,8 +36,8 @@ void HiCacheWriteCalls::load_release_calibration(const core::DagGraph & graph, c
         const auto rank = graph.node(*main).gpu_id;
         const auto covered = [&](const HiCacheEvictionRegion & region) {
             return std::ranges::any_of(eviction_controls_, [&](const auto & donor) {
-                return donor.pid == base.pid && donor.tid == base.tid && donor.region.kind == region.kind
-                    && donor.region.control_phase == region.control_phase && donor.region.preceding_kind == region.preceding_kind;
+                return donor.pid == base.pid && donor.tid == base.tid && donor.region.kind == region.kind && donor.region.control_phase == region.control_phase
+                       && donor.region.preceding_kind == region.preceding_kind;
             });
         };
         for (const auto & sample : input.at("rows")) {
@@ -52,19 +54,20 @@ void HiCacheWriteCalls::load_release_calibration(const core::DagGraph & graph, c
         }
         // Ordinary eviction also has work between consecutive releases. It
         // does not require a write-back submission or completion template.
-        if (input.contains("eviction_controls")) for (const auto & sample : input.at("eviction_controls")) {
-            if (sample.at("status") != "ready" || sample.at("rank").get<int>() != rank
-                || sample.at("kind").get<int>() != static_cast<int>(Kind::Control)
-                || !sample.contains("preceding_operation")
-                || sample.at("preceding_operation").at("kind").get<int>() != static_cast<int>(Kind::ReleaseRegular)) continue;
-            HiCacheEvictionRegion region{};
-            region.kind = Kind::Control;
-            region.control_phase = static_cast<HiCacheEvictionRegion::ControlPhase>(sample.at("phase").get<int>());
-            region.preceding_kind = Kind::ReleaseRegular;
-            if (covered(region)) continue;
-            auto expansion = import_host_template(sample.at("template"), graph, queues, roles);
-            imported.push_back({ base.pid, base.tid, region, std::move(expansion), {}, true });
-        }
+        if (input.contains("eviction_controls"))
+            for (const auto & sample : input.at("eviction_controls")) {
+                if (sample.at("status") != "ready" || sample.at("rank").get<int>() != rank || sample.at("kind").get<int>() != static_cast<int>(Kind::Control)
+                    || !sample.contains("preceding_operation")
+                    || sample.at("preceding_operation").at("kind").get<int>() != static_cast<int>(Kind::ReleaseRegular))
+                    continue;
+                HiCacheEvictionRegion region{};
+                region.kind = Kind::Control;
+                region.control_phase = static_cast<HiCacheEvictionRegion::ControlPhase>(sample.at("phase").get<int>());
+                region.preceding_kind = Kind::ReleaseRegular;
+                if (covered(region)) continue;
+                auto expansion = import_host_template(sample.at("template"), graph, queues, roles);
+                imported.push_back({ base.pid, base.tid, region, std::move(expansion), {}, true });
+            }
         seen.emplace(base.pid, base.tid);
     }
     for (auto & sample : imported) eviction_controls_.push_back(std::move(sample));
@@ -84,15 +87,11 @@ void HiCacheWriteCalls::load_write_calibration(core::DagGraph & graph, const sim
     const auto import = [&](const std::string & pid, const std::string & tid, const std::map<std::string, size_t> & roles) {
         const auto rank = graph.node(roles.at("main")).gpu_id;
         for (const auto & sample : input.at("rows")) {
-            if (sample.at("status") != "ready" || sample.at("rank").get<int>() != rank
-                || sample.at("write_back").get<bool>() != write_back_) continue;
+            if (sample.at("status") != "ready" || sample.at("rank").get<int>() != rank || sample.at("write_back").get<bool>() != write_back_) continue;
             auto sample_roles = roles;
-            if (sample.contains("worker_submissions"))
-                bind_calibration_workers(sample.at("worker_submissions"), graph, queues, sample_roles);
+            if (sample.contains("worker_submissions")) bind_calibration_workers(sample.at("worker_submissions"), graph, queues, sample_roles);
             auto expansion = import_write_template(sample.at("template"), graph, queues, sample_roles);
-            std::vector<size_t> lanes;
-            for (const auto & stream : expansion.streams) lanes.push_back(graph.node(stream.source_node).lane_id);
-            for (const auto & wait : expansion.waits) lanes.push_back(graph.node(wait.source_node).lane_id);
+            auto lanes = expansion.resource_lanes(graph);
             imported.push_back({ sample.at("write_back").get<bool>(), roles.at("compute_ready"), std::move(expansion), pid, tid, std::move(lanes), true });
         }
     };
@@ -102,14 +101,17 @@ void HiCacheWriteCalls::load_write_calibration(core::DagGraph & graph, const sim
         if (base.write_back == std::optional<bool>{ write_back_ }) controls_ready.emplace(base.pid, base.tid);
     }
     for (const auto & base : eviction_controls_) {
-        if ((seen.contains({base.pid, base.tid}) && (!write_back_ || controls_ready.contains({base.pid, base.tid})))
-            || (base.region.kind != HiCacheEvictionRegion::Kind::ReleaseRegular
-                && base.region.kind != HiCacheEvictionRegion::Kind::ReleaseBackup)
-            || base.expansion.streams.size() != 1) continue;
+        if ((seen.contains({ base.pid, base.tid }) && (!write_back_ || controls_ready.contains({ base.pid, base.tid })))
+            || (base.region.kind != HiCacheEvictionRegion::Kind::ReleaseRegular && base.region.kind != HiCacheEvictionRegion::Kind::ReleaseBackup)
+            || base.expansion.streams.size() != 1)
+            continue;
         const auto & lane = base.expansion.nodes.at(base.expansion.host_return).work.lane_key;
         std::optional<size_t> main;
         for (const auto & [original, local] : base.expansion.source_nodes)
-            if (graph.node(original).is_cpu && graph.node_lane_key(original) == lane) { main = original; break; }
+            if (graph.node(original).is_cpu && graph.node_lane_key(original) == lane) {
+                main = original;
+                break;
+            }
         if (!main) continue;
         const auto compute = base.expansion.streams.front().source_node;
         // Both release branches call allocator.free on compute; validate every device node
@@ -117,15 +119,24 @@ void HiCacheWriteCalls::load_write_calibration(core::DagGraph & graph, const sim
         const auto control_roles = host_resource_roles(graph, base.expansion, *main, compute);
         const auto rank = graph.node(*main).gpu_id;
         const bool covered = std::ranges::any_of(input.at("rows"), [&](const auto & sample) {
-            return sample.at("status") == "ready" && sample.at("rank") == rank
-                && sample.at("write_back") == write_back_;
+            return sample.at("status") == "ready" && sample.at("rank") == rank && sample.at("write_back") == write_back_;
         });
         if (!covered) continue;
-        if (!seen.contains({base.pid, base.tid})) {
-            const auto resource = graph.add_synthetic_node({.name = "unused HiCache write stream", .is_cpu = false,
-                .lane_key = "hicache.write:" + std::to_string(graph.node_count()), .duration = 0,
-                .observed_point = core::DagObservedPoint{base.pid, base.tid, 0, rank}});
-            import(base.pid, base.tid, {{"main", *main}, {"compute_ready", compute}, {"payload", resource}});
+        if (!seen.contains({ base.pid, base.tid })) {
+            const auto resource = graph.add_synthetic_node({
+                .name = "unused HiCache write stream",
+                .is_cpu = false,
+                .lane_key = "hicache.write:" + std::to_string(graph.node_count()),
+                .duration = 0,
+                .observed_point = core::DagObservedPoint{ base.pid, base.tid, 0, rank }
+            });
+            import(base.pid,
+                   base.tid,
+                   {
+                       {          "main",    *main },
+                       { "compute_ready",  compute },
+                       {       "payload", resource }
+            });
             graph.mutable_node(resource).active = false; // Resource identity, not executable work.
         }
         if (write_back_ && input.contains("eviction_controls")) {
@@ -179,15 +190,15 @@ void HiCacheWriteCalls::bind_lifecycle_writes(core::DagGraph & graph) {
         for (const auto & step : lifecycle_ready_steps(insert)) append(step.ready);
         auto end = insert.envelope;
         const auto ns = end.ts_submicro_ns + end.dur_submicro_ns;
-        end.ts += end.dur + ns / 1000;
-        end.ts_submicro_ns = ns % 1000;
+        end.ts += end.dur + ns / 1'000;
+        end.ts_submicro_ns = ns % 1'000;
         append(std::move(end));
     }
     const auto nodes = bind_hicache_control_points(graph, points);
     const patch::HiCacheSourceDagIndex source(graph);
     for (size_t i = 0; i < points.size(); ++i) {
         if (!nodes[i]) throw std::runtime_error("Lifecycle write lacks an exact ready boundary");
-        Call call{.owner = owners[i], .pid = points[i].pid, .tid = points[i].tid, .at_us = points[i].ts, .entry_node = *nodes[i]};
+        Call call{ .owner = owners[i], .pid = points[i].pid, .tid = points[i].tid, .at_us = points[i].ts, .entry_node = *nodes[i] };
         for (const auto edge_id : source.outgoing_edge_ids(*nodes[i])) {
             const auto & edge = graph.edge(edge_id);
             if (edge.active && graph.node(edge.dst).active) call.successors.push_back(edge.dst);
@@ -196,11 +207,9 @@ void HiCacheWriteCalls::bind_lifecycle_writes(core::DagGraph & graph) {
             if (donor.pid != call.pid || donor.tid != call.tid || donor.write_back != std::optional<bool>{ write_back_ }) continue;
             const auto locate = [&](size_t sample) {
                 const auto lane = graph.node(sample).lane_id;
-                if (!call.positions.contains(lane))
-                    call.positions.emplace(lane, observe_write_stream_position(source, sample, call.pid, call.tid, call.at_us));
+                if (!call.positions.contains(lane)) call.positions.emplace(lane, observe_write_stream_position(source, sample, call.pid, call.tid, call.at_us));
             };
-            for (const auto & stream : donor.expansion.streams) locate(stream.source_node);
-            for (const auto & wait : donor.expansion.waits) locate(wait.source_node);
+            for (const auto node : donor.expansion.resource_nodes()) locate(node);
         }
         lifecycle_write_owners_.insert(call.owner);
         lifecycle_writes_at_[*nodes[i]].push_back(std::move(call));
@@ -216,7 +225,7 @@ void HiCacheWriteCalls::submit_lifecycle_writes(size_t node, uint64_t time, simu
         fact.execution_anchor_node_id = node;
         HiCacheHostSequence sequence(call.positions, stream_insertions_, future);
         for (const auto & pending : replay_.state().pending_device_writes(fact)) {
-            const auto key = std::pair{pending.header.cache_scope, pending.header.operation_id};
+            const auto key = std::pair{ pending.header.cache_scope, pending.header.operation_id };
             if (pending.header.source_node_id != call.owner || completions_.contains(key)) continue;
             const auto * donor = &select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
             const auto projected = resize_write_pages(donor->expansion, pending.schedule.effective_byte_count, page_bytes_);

@@ -2,8 +2,8 @@
  * @file
  * @brief Validates complete DAG mutation plans against prospective topology.
  */
-#include "dag_mutation_internal.hpp"
-#include "dag_topology.hpp"
+#include "markov/trace_graph/core/dag_mutation_internal.hpp"
+#include "markov/trace_graph/core/dag_topology.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -226,9 +226,11 @@ private:
             if (!node.active) add_issue(prospective_.plan_issues, "inactive_cpu_gap_update", "CPU gap update targets an inactive node", { mutation.node_id });
             if (!node.is_cpu) add_issue(prospective_.plan_issues, "non_cpu_gap_update", "CPU gap update targets a non-CPU node", { mutation.node_id });
             if (mutation.retained_ranges) {
-                try { graph_.validate_cpu_gap_ranges(mutation.node_id,mutation.duration,*mutation.retained_ranges); }
-                catch (const std::exception& error) {
-                    add_issue(prospective_.plan_issues,"invalid_cpu_gap_ranges",error.what(),{mutation.node_id});
+                try {
+                    graph_.validate_cpu_gap_ranges(mutation.node_id, mutation.duration, *mutation.retained_ranges);
+                }
+                catch (const std::exception & error) {
+                    add_issue(prospective_.plan_issues, "invalid_cpu_gap_ranges", error.what(), { mutation.node_id });
                 }
             }
             if (disabled_nodes.contains(mutation.node_id)) {

@@ -5,7 +5,7 @@
  * Joining happens in memory before DAG construction. It preserves lazy argument
  * storage and never materializes a merged trace file.
  */
-#include "trace_channel_join.hpp"
+#include "markov/trace_graph/io/trace_channel_join.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
@@ -75,7 +75,8 @@ void normalize_runtime_cpu_lanes(std::vector<TraceEvent> & events) {
     for (const auto & event : events) {
         if (event.ph != 'X' || event.pid == runtime_pid || event.source_channel != core::TraceSourceChannel::Torch
             || (event.cat != "cpu_op" && event.cat != "enqueue" && event.cat != "dequeue") || event.has_arg("Physic Stream Id") || event.has_arg("streamId")
-            || event.tid.empty() || event.tid == "-1") continue;
+            || event.tid.empty() || event.tid == "-1")
+            continue;
         const auto [found, inserted] = host_process_by_thread.emplace(event.tid, event.pid);
         if (!inserted && found->second != event.pid) found->second.clear();
     }
@@ -161,8 +162,7 @@ void join_by_timestamp_search(std::vector<TraceEvent> & profiler_events, const s
             const auto wrapper_end = core::checked_add_u64(wrapper.ts, wrapper.dur, "native wrapper end overflow");
             // Wrapper setup can pause before entering the profiled API. Its
             // start may be far away even though the API is inside its interval.
-            const auto difference = event.ts > wrapper_end ? event.ts - wrapper_end
-                                    : wrapper.ts > event_end ? wrapper.ts - event_end : uint64_t{0};
+            const auto difference = event.ts > wrapper_end ? event.ts - wrapper_end : wrapper.ts > event_end ? wrapper.ts - event_end : uint64_t{ 0 };
             if (static_cast<double>(difference) > options.tolerance_us) continue;
             if (difference < nearest_difference) {
                 nearest_difference = difference;

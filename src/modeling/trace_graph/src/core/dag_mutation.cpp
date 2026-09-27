@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/core/dag_mutation.hpp"
 
-#include "dag_mutation_internal.hpp"
+#include "markov/trace_graph/core/dag_mutation_internal.hpp"
 
 #include <stdexcept>
 #include <string_view>

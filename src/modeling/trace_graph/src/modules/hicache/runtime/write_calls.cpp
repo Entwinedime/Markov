@@ -4,8 +4,7 @@
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-const HiCacheWriteCalls::WriteTemplate & HiCacheWriteCalls::select_write_template(
-    const std::string & pid, const std::string & tid, uint64_t bytes) const {
+const HiCacheWriteCalls::WriteTemplate & HiCacheWriteCalls::select_write_template(const std::string & pid, const std::string & tid, uint64_t bytes) const {
     const WriteTemplate * selected = nullptr;
     uint64_t nearest = 0;
     for (const auto & [id, candidate] : templates_) {
@@ -16,8 +15,7 @@ const HiCacheWriteCalls::WriteTemplate & HiCacheWriteCalls::select_write_templat
         const auto distance = source_bytes > bytes ? source_bytes - bytes : bytes - source_bytes;
         // Compatible base geometry can be extrapolated before consulting an
         // independent measurement, even when that measurement is closer in size.
-        if (!selected || (selected->independent && !candidate.independent)
-            || (selected->independent == candidate.independent && distance < nearest)) {
+        if (!selected || (selected->independent && !candidate.independent) || (selected->independent == candidate.independent && distance < nearest)) {
             selected = &candidate;
             nearest = distance;
         }
@@ -77,9 +75,8 @@ size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std
     return owner->fact.source_node_id;
 }
 
-std::vector<HiCacheCapacityGuard> observe_capacity_guards(
-    const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts,
-    std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end) {
+std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts,
+                                                          std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end) {
     std::vector<HiCacheCapacityGuard> guards;
     std::set<size_t> owners;
     for (const auto & event : observations) {
@@ -165,8 +162,8 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         actions.emplace_back(action, call);
     };
     for (const auto & record : ledger.records) {
-        if (record.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost
-            || !in_scope(record.pid, record.tid, record.source_start_us, record.source_end_us)) continue;
+        if (record.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost || !in_scope(record.pid, record.tid, record.source_start_us, record.source_end_us))
+            continue;
         const auto owner = observe_write_call_owner(source, replay_.facts(), record.pid, record.tid, record.source_start_us, record.source_end_us);
         writes_.add_source(source, record);
         point(record.pid, record.tid, record.source_start_us, Action::Submit, calls_.size());
@@ -212,9 +209,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         const auto host = observe_write_host_template(bound_source, record);
         try {
             auto expansion = prepare_write_expansion(bound_source, queues, record, host, writes_.source_completion(record.timing_fact_node_id));
-            std::vector<size_t> lanes;
-            for (const auto & stream : expansion.streams) lanes.push_back(graph.node(stream.source_node).lane_id);
-            for (const auto & wait : expansion.waits) lanes.push_back(graph.node(wait.source_node).lane_id);
+            auto lanes = expansion.resource_lanes(graph);
             templates_.emplace(record.timing_fact_node_id,
                                WriteTemplate{ host.write_back,
                                               writes_.source_start_record(bound_source, record.timing_fact_node_id),
@@ -240,8 +235,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
                 if (!call.positions.contains(lane))
                     call.positions.emplace(lane, observe_write_stream_position(bound_source, sample, call.pid, call.tid, call.at_us));
             };
-            for (const auto & stream : donor.expansion.streams) locate(stream.source_node);
-            for (const auto & wait : donor.expansion.waits) locate(wait.source_node);
+            for (const auto node : donor.expansion.resource_nodes()) locate(node);
         }
     }
     // Prepare the work outside complete write calls. These source regions are
@@ -296,8 +290,7 @@ void HiCacheWriteCalls::applied(const model::HiCacheReplayFact & item) const {
     }
     for (const auto & write : replay_.state().pending_device_writes(fact))
         if (write.header.source_node_id == fact.source_node_id && !source_owners_.contains(fact.source_node_id)
-            && !lifecycle_write_owners_.contains(fact.source_node_id)
-            && !capacity_calls_.contains(fact.source_node_id)
+            && !lifecycle_write_owners_.contains(fact.source_node_id) && !capacity_calls_.contains(fact.source_node_id)
             && !(wait_owners_.contains(fact.source_node_id)
                  && std::ranges::any_of(templates_, [&](const auto & entry) { return entry.second.pid == fact.pid && entry.second.tid == fact.tid; })))
             throw std::runtime_error("Target adds a write without a host submission template" + location());
@@ -392,9 +385,10 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
         if (branch.donor) {
             const auto & donor = load_admissions_.at(*branch.donor);
             returned = suffix.append(donor.suffix, donor.suffix_lanes).host_return;
-        } else {
+        }
+        else {
             const auto & fact = replay_.fact(branch.owner).fact;
-            const auto & program = generated_load_admissions_.at({fact.pid, fact.tid});
+            const auto & program = generated_load_admissions_.at({ fact.pid, fact.tid });
             for (const auto pages : work->allocated ? work->node_pages : std::vector<uint64_t>{}) {
                 if (!pages) throw std::logic_error("Target load contains an empty promoted node");
                 (void)suffix.append(program.clone, program.lanes);

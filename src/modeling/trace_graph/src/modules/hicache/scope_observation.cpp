@@ -9,16 +9,16 @@ HiCacheScopeObservation observe_hicache_scope(const core::DagGraph & graph) {
     HiCacheScopeObservation observed;
     const patch::HiCacheSourceDagIndex source(graph);
     const auto layer_waits = observe_hicache_layer_waits(source);
-    const auto phases = observe_hicache_phases(graph, &layer_waits);
+    observed.phases = observe_hicache_phases(graph, &layer_waits);
     const auto own_nodes = [&](const auto & nodes) { observed.nodes.insert(nodes.begin(), nodes.end()); };
-    for (const auto & phase : phases.observations) {
+    for (const auto & phase : observed.phases.observations) {
         own_nodes(phase.prefill_common_kernel_node_ids);
         own_nodes(phase.prefill_prefix_attention_node_ids);
-        own_nodes(phase.prefill_collective_node_ids);
-        own_nodes(phase.prefill_submit_cpu_node_ids);
+        own_nodes(phase.prefill.collective_node_ids);
+        own_nodes(phase.prefill.submit_cpu_node_ids);
         own_nodes(phase.decode_kernel_node_ids);
-        own_nodes(phase.decode_collective_node_ids);
-        own_nodes(phase.decode_submit_cpu_node_ids);
+        own_nodes(phase.decode.collective_node_ids);
+        own_nodes(phase.decode.submit_cpu_node_ids);
     }
     observed.operations = patch::build_hicache_io_operation_ledger(source);
     const auto own_gaps = [&](const std::vector<patch::HiCacheCpuGapSlice> & slices) {
@@ -58,12 +58,6 @@ void apply_observed_hicache_scope(core::DagGraph & graph, const HiCacheScopeObse
     for (const auto id : observed.nodes) graph.set_scope_node_owned(id);
     for (const auto & [node, intervals] : observed.gap_intervals)
         for (const auto & [begin, end] : intervals) graph.add_scope_gap_duration(node, end - begin);
-}
-
-patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & graph) {
-    auto observed = observe_hicache_scope(graph);
-    apply_observed_hicache_scope(graph, observed);
-    return std::move(observed.operations);
 }
 
 } // namespace markov::trace_graph::modules::hicache

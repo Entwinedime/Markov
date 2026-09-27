@@ -1,5 +1,6 @@
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_queries.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
+#include "markov/trace_graph/modules/hicache/missing_cost.hpp"
 #include "markov/trace_graph/modules/hicache/model/prefetch_wait_calibration.hpp"
 #include <algorithm>
 #include <set>
@@ -49,6 +50,14 @@ PrefetchQueryTemplate observe_prefetch_query_template(const core::DagGraph & gra
 void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config,
                                   std::map<size_t, std::vector<size_t>> & facts_at, uint64_t begin_us, uint64_t end_us, ReturnObserver observer) {
     if (state_) throw std::logic_error("Prefetch queries are already bound");
+    state_ = &replay.state();
+    observer_ = std::move(observer);
+    worker_ = std::make_unique<model::HiCachePrefetchExecution>(*state_, config);
+
+    // Candidate creation requires a query even when its eventual cache hit is empty.
+    // With no candidates, keep the worker lifecycle but require no query timing.
+    if (std::ranges::none_of(replay.facts(), [](const auto & item) { return item.role == HiCacheFactRole::PrefetchCandidateAnchor; })) return;
+
     const patch::HiCacheSourceDagIndex source(graph);
     const auto collectives = observe_cpu_collectives(source);
     template_ = observe_prefetch_query_template(graph, collectives, observe_prefetch_workers(source, collectives), begin_us, end_us);
@@ -56,10 +65,7 @@ void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelRep
         const auto calibration = model::read_prefetch_query_calibration(config.prefetch_query_calibration);
         template_ = {.timing = calibration.timing, .calibration_manifest = calibration.source_manifest};
     }
-    if (!template_.issue.empty()) throw std::runtime_error(template_.issue);
-    state_ = &replay.state();
-    observer_ = std::move(observer);
-    worker_ = std::make_unique<model::HiCachePrefetchExecution>(*state_, config);
+    if (!template_.issue.empty()) throw MissingCostEvidence("execution_control/prefetch_query", nlohmann::json::object(), template_.issue);
     std::map<std::string, int> ranks;
     for (const auto & round : collectives.rounds)
         for (const auto & call : round.calls) {

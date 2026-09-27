@@ -139,10 +139,10 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
             prefill.common_kernel_cost = node_cost(source.prefill_common_kernel_duration_us, common_duration, source.prefill_common_kernel_node_ids);
             prefill.prefix_attention_cost = node_cost(source.prefill_prefix_attention_duration_us, prefix_duration, source.prefill_prefix_attention_node_ids);
             (void)core::checked_add_u64(common_duration, prefix_duration, "HiCache prefill kernel duration exceeds uint64 range");
-            prefill.collective_cost = node_cost(source.prefill_collective_duration_us,
+            prefill.collective_cost = node_cost(source.prefill.collective_duration_us,
                                                 token_curve_duration(phase_cost.prefill_collective, prefill.prefill_token_count),
-                                                source.prefill_collective_node_ids);
-            prefill.submit_cost = node_cost(source.prefill_submit_cpu_duration_us, source.prefill_submit_cpu_duration_us, source.prefill_submit_cpu_node_ids);
+                                                source.prefill.collective_node_ids);
+            prefill.submit_cost = node_cost(source.prefill.submit_cpu_duration_us, source.prefill.submit_cpu_duration_us, source.prefill.submit_cpu_node_ids);
         }
 
         HiCacheDecodeWorkItem decode{
@@ -162,8 +162,8 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
                                           "Executed Decode requires measured phase costs");
             decode.feature_covered =
                 prefill.prompt_token_count >= phase_cost.min_decode_context_tokens && prefill.prompt_token_count <= phase_cost.max_decode_context_tokens;
-            decode.source_paged_attention_duration_us = hicache_paged_attention_duration(source.decode_kernel_families);
-            if (decode.source_paged_attention_duration_us == 0 || decode.source_paged_attention_duration_us > source.decode_kernel_duration_us) {
+            decode.source_paged_attention_duration_us = hicache_paged_attention_duration(source.decode.kernel_families);
+            if (decode.source_paged_attention_duration_us == 0 || decode.source_paged_attention_duration_us > source.decode.kernel_duration_us) {
                 (void)core::checked_increment_u64(work.blockers["source_decode_paged_attention_missing"], "HiCache phase blocker count exceeds uint64 range");
             }
             else {
@@ -172,19 +172,19 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
                 decode.effective_page_count = effective_pages;
                 decode.predicted_paged_attention_duration_us =
                     core::checked_multiply_u64(paged_per_iteration, decode.iteration_count, "HiCache Decode paged-attention duration exceeds uint64 range");
-                const auto source_non_paged = source.decode_kernel_duration_us - decode.source_paged_attention_duration_us;
-                decode.kernel_cost = node_cost(source.decode_kernel_duration_us,
+                const auto source_non_paged = source.decode.kernel_duration_us - decode.source_paged_attention_duration_us;
+                decode.kernel_cost = node_cost(source.decode.kernel_duration_us,
                                                core::checked_add_u64(source_non_paged,
                                                                      decode.predicted_paged_attention_duration_us,
                                                                      "HiCache Decode kernel duration exceeds uint64 range"),
                                                source.decode_kernel_node_ids);
             }
-            decode.collective_cost = node_cost(source.decode_collective_duration_us,
+            decode.collective_cost = node_cost(source.decode.collective_duration_us,
                                                core::checked_multiply_u64(phase_duration(*phase_cost.decode_collective, 0, decode.prompt_token_count, 0.0),
                                                                           decode.iteration_count,
                                                                           "HiCache decode collective duration exceeds uint64 range"),
-                                               source.decode_collective_node_ids);
-            decode.submit_cost = node_cost(source.decode_submit_cpu_duration_us, source.decode_submit_cpu_duration_us, source.decode_submit_cpu_node_ids);
+                                               source.decode.collective_node_ids);
+            decode.submit_cost = node_cost(source.decode.submit_cpu_duration_us, source.decode.submit_cpu_duration_us, source.decode.submit_cpu_node_ids);
         }
         work.decodes.push_back(std::move(decode));
     }

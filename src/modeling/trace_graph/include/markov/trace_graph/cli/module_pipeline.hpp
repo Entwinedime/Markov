@@ -29,7 +29,7 @@ public:
 #ifdef DEBUG
     [[nodiscard]] static ModulePipeline from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay = {},
                                                     const std::string & hicache_phase_oracle_cost_replay = {},
-                                                    bool hicache_canonical_observed_phase_scope = false);
+                                                    bool hicache_canonical_observed_phase_scope = false, bool hicache_static_replay = false);
 #else
     [[nodiscard]] static ModulePipeline from_config(const std::string & filename);
 #endif

@@ -2,7 +2,7 @@
  * @file
  * @brief Parser for compact HiCache control and resource-lane coefficients.
  */
-#include "model_config_parse_detail.hpp"
+#include "markov/trace_graph/frontend/model_config_parse_detail.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -14,9 +14,9 @@ namespace {
 
 std::map<std::string, HiCacheIoControlModelConfig> control_models(const Json & io_cost) {
     const auto models = io_cost.find("control_models");
-    if (models != io_cost.end() && models->is_object() && models->empty()) return {};
-    if (models == io_cost.end() || !models->is_object() || models->size() != kIoKinds.size())
-        throw std::runtime_error("hicache.io_cost.control_models must contain four families");
+    // Execution uses operation costs. Only historical static patches need these coefficients.
+    if (models == io_cost.end() || (models->is_object() && models->empty())) return {};
+    if (!models->is_object() || models->size() != kIoKinds.size()) throw std::runtime_error("hicache.io_cost.control_models must contain four families");
     std::map<std::string, HiCacheIoControlModelConfig> output;
     for (const auto & [kind_view, direction] : kIoKinds) {
         (void)direction;

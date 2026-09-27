@@ -8,7 +8,7 @@
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 
-#include "dag_builder_stages.hpp"
+#include "markov/trace_graph/core/dag_builder_stages.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -107,26 +107,22 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
     for (auto & event : events) {
         // Keep the admission envelope even when child work covers all of its
         // self time. The original still participates in CPU normalization.
-        if (event.source_channel == TraceSourceChannel::Torch && event.ph == 'X'
-            && event.name == "hicache.control.host_load_branch")
+        if (event.source_channel == TraceSourceChannel::Torch && event.ph == 'X' && event.name == "hicache.control.host_load_branch")
             split.runtime_observations.push_back(event);
         // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
             if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.cpu_collective"
                 || event.name == "runtime.hicache.layer_waits" || event.name == "runtime.hicache.prefetch_check"
-                || event.name == "runtime.hicache.prefetch_progress"
-                || event.name == "runtime.hicache.write_policy_check"
+                || event.name == "runtime.hicache.prefetch_progress" || event.name == "runtime.hicache.write_policy_check"
                 || event.name == "runtime.hicache.radix_insert" || event.name == "runtime.hicache.node_publish"
-                || event.name == "runtime.hicache.device_restore"
-                || event.name == "runtime.hicache.prefetch_stop" || event.name == "runtime.hicache.prefetch_publish"
-                || event.name == "runtime.hicache.prefetch_read" || event.name == "runtime.hicache.prefetch_query"
-                || event.name == "runtime.hicache.host_release" || event.name == "runtime.hicache.storage_drain"
-                || event.name == "runtime.hicache.prefetch_enqueue" || event.name == "runtime.hicache.load_completion"
-                || event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.decode_allocation"
-                || event.name == "runtime.hicache.capacity_guard" || event.name == "runtime.hicache.load_allocation"
-                || event.name == "runtime.hicache.host_load_check"
-                || event.name == "runtime.hicache.device_release_backup"
-                || event.name == "runtime.hicache.allocator_free"
+                || event.name == "runtime.hicache.device_restore" || event.name == "runtime.hicache.prefetch_stop"
+                || event.name == "runtime.hicache.prefetch_publish" || event.name == "runtime.hicache.prefetch_read"
+                || event.name == "runtime.hicache.prefetch_query" || event.name == "runtime.hicache.host_release"
+                || event.name == "runtime.hicache.storage_drain" || event.name == "runtime.hicache.prefetch_enqueue"
+                || event.name == "runtime.hicache.load_completion" || event.name == "runtime.hicache.write_completion"
+                || event.name == "runtime.hicache.decode_allocation" || event.name == "runtime.hicache.capacity_guard"
+                || event.name == "runtime.hicache.load_allocation" || event.name == "runtime.hicache.host_load_check"
+                || event.name == "runtime.hicache.device_release_backup" || event.name == "runtime.hicache.allocator_free"
                 || event.name == "runtime.hicache.device_release_regular") {
                 split.runtime_observations.push_back(std::move(event));
                 continue;
@@ -140,7 +136,8 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
                 split.request_observations.push_back(std::move(event));
             }
             else if (event.name == "runtime.response.scheduler_send" || event.name == "runtime.request.socket_received"
-                || event.name == "runtime.request.dispatch_ready") split.request_observations.push_back(std::move(event));
+                     || event.name == "runtime.request.dispatch_ready")
+                split.request_observations.push_back(std::move(event));
             continue;
         }
         if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));

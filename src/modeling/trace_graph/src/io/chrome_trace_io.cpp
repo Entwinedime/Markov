@@ -4,9 +4,9 @@
  */
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 
-#include "../json_scan.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/json_scan.hpp"
 
 #include <nlohmann/json.hpp>
 

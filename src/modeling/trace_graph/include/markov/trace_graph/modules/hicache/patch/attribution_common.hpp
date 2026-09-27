@@ -22,7 +22,7 @@ void sort_unique(std::vector<size_t> & values);
 
 void append_snapshot_isolated_control_ownership(const HiCacheSourceDagIndex & source, const HiCacheTimingIntervalOwnership & ownership, std::string_view pid,
                                                 std::string_view tid, HiCacheSourceAttribution & output);
-void finalize_source_control_ownership(const HiCacheSourceDagIndex & source, HiCacheSourceAttribution & output);
+void finalize_source_control_ownership(HiCacheSourceAttribution & output);
 void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size_t> carrier_nodes, std::string reason, HiCacheSourceAttribution & output);
 void copy_completion_wait_contract(const HiCacheIoOperationRecord & operation, HiCacheSourceAttribution & output);
 void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations, const model::HiCacheEffectDecision & decision,

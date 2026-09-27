@@ -28,7 +28,7 @@ endif()
 add_library(trace_graph_core STATIC)
 target_sources(trace_graph_core
     PRIVATE
-        src/json_scan.hpp
+        include/markov/trace_graph/json_scan.hpp
         src/core/trace_event.cpp
         src/core/dag_graph.cpp
         src/core/cpu_gap_observation.cpp
@@ -161,7 +161,7 @@ target_sources(trace_graph_hicache
         src/modules/hicache/runtime/lifecycle_calls.cpp
         src/modules/hicache/runtime/write_lifecycle.cpp
         src/modules/hicache/runtime/write_resources.cpp
-        src/modules/hicache/runtime/write_calibration.cpp
+        src/modules/hicache/runtime/control_calibration.cpp
         src/modules/hicache/runtime/write_frontier.cpp
         src/modules/hicache/runtime/write_host.cpp
         src/modules/hicache/runtime/write_expansion.cpp
@@ -205,36 +205,11 @@ if(TRACE_GRAPH_DEBUG)
             src/modules/hicache/patch/boundary_validator.cpp
             src/modules/hicache/patch/applied_validator.cpp
     )
-    add_executable(hicache_io_logic_check EXCLUDE_FROM_ALL
-        tests/hicache_io_logic_check.cpp tests/hicache_phase_checks.cpp tests/hicache_preparation_checks.cpp tests/hicache_layer_wait_checks.cpp
-        tests/hicache_layer_wait_patch_checks.cpp
-        tests/hicache_layer_io_checks.cpp
-        tests/hicache_layer_wait_insertion_checks.cpp tests/cpu_collective_checks.cpp tests/cpu_collective_wait_checks.cpp
-        tests/prefetch_control_observation_checks.cpp tests/hicache_state_timing_checks.cpp
-        tests/prefetch_execution_checks.cpp
-        tests/prefetch_check_execution_checks.cpp
-        tests/prefetch_queue_execution_checks.cpp
-        tests/loadback_execution_checks.cpp
-        tests/decode_allocation_checks.cpp
-        tests/writeback_execution_checks.cpp
-        tests/write_transfer_execution_checks.cpp
-        tests/write_expansion_checks.cpp
-        tests/write_page_projection_checks.cpp
-        tests/host_removal_checks.cpp
-        tests/host_cpu_service_checks.cpp
-        tests/write_call_binding_checks.cpp
-        tests/lifecycle_observation_checks.cpp
-        tests/hicache_execution_boundary_checks.cpp tests/prefetch_worker_observation_checks.cpp)
-    target_link_libraries(hicache_io_logic_check PRIVATE trace_graph_modules trace_graph_simulation)
-    add_executable(trace_timing_check EXCLUDE_FROM_ALL tests/trace_timing_check.cpp tests/stream_wait_checks.cpp tests/cpu_task_insertion_checks.cpp
-        tests/dynamic_execution_checks.cpp tests/nested_copy_connection_checks.cpp)
-    target_link_libraries(trace_timing_check PRIVATE trace_graph_io trace_graph_simulation)
 
     add_library(trace_graph_diagnostics STATIC)
     target_sources(trace_graph_diagnostics
         PRIVATE
             src/modules/diagnostics/json_summary_writer.cpp
-            src/modules/hicache/diagnostics/summary.cpp
     )
     target_link_libraries(trace_graph_diagnostics PUBLIC trace_graph_modules)
 

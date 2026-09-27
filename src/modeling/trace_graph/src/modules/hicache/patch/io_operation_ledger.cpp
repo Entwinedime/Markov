@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 
-#include "io_operation_ledger_detail.hpp"
+#include "markov/trace_graph/modules/hicache/patch/io_operation_ledger_detail.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
@@ -244,14 +244,6 @@ void sort_unique(std::vector<size_t> & values) {
     values.erase(std::unique(values.begin(), values.end()), values.end());
 }
 
-uint64_t gap_duration(std::span<const HiCacheCpuGapSlice> slices) {
-    uint64_t total = 0;
-    for (const auto & slice : slices) {
-        total = core::checked_add_u64(total, slice.owned_duration_us(), "HiCache completion-wait gap duration exceeds uint64 range");
-    }
-    return total;
-}
-
 std::vector<size_t> explicit_control_nodes(const HiCacheSourceDagIndex & source, const HiCacheTimingIntervalOwnership & ownership) {
     std::vector<size_t> nodes;
     for (const auto node_id : ownership.owned_node_ids) {
@@ -327,7 +319,6 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
         record.completion_wait_status = "ready";
         record.completion_join_contract_ready = true;
         record.completion_wait_reason = "the first progress check is immediately ready and supplies the target-side control branch";
-        record.evidence.push_back("prefetch_immediate_ready_control_boundary");
         return;
     }
 
@@ -347,10 +338,6 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     const auto wait_window_duration = first_true->timestamp_us - first_false->timestamp_us;
     const auto wait_ownership = source.timing_interval_ownership(first_false->pid, first_false->tid, first_false->timestamp_us, wait_window_duration);
     record.completion_wait_slices = wait_ownership.owned_gap_slices;
-    record.completion_wait_gap_duration_us = gap_duration(record.completion_wait_slices);
-    record.completion_wait_duration_us = record.source_completion_us > record.control_ready_us ? record.source_completion_us - record.control_ready_us : 0;
-    const auto completion_or_control = std::max(record.control_ready_us, record.source_completion_us);
-    record.polling_lag_us = record.wait_exit_start_us > completion_or_control ? record.wait_exit_start_us - completion_or_control : 0;
     record.source_completion_wait_blocking = true;
 
     const bool valid_order = record.control_ready_us <= record.source_completion_us && record.source_completion_us <= record.wait_exit_end_us;
@@ -364,7 +351,6 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     record.completion_wait_status = "ready";
     record.completion_join_contract_ready = true;
     record.completion_wait_reason = "first false progress is control-ready; storage completion and one retained terminal true check close the foreground wait";
-    record.evidence.push_back("prefetch_false_to_completion_to_true_contract");
 }
 
 void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record, const HiCacheDeviceTransferClosure & closure) {
@@ -397,15 +383,12 @@ void build_loadback_readiness_contract(const HiCacheSourceDagIndex & source, HiC
             std::max(record.source_completion_us, fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur }));
     }
     record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
-    record.completion_wait_duration_us = record.device_transfer_duration_us;
     record.source_completion_wait_blocking = true;
     record.completion_join_contract_ready = true;
     record.source_readiness_topology_ready = true;
     record.completion_wait_status = "ready_existing_device_event_join";
     record.completion_wait_reason =
         "host submission is preserved while direction-matched device transfers retain their existing event record/wait joins to the consumer";
-    record.evidence.push_back("loadback_device_transfer_submit_closure");
-    record.evidence.push_back("loadback_existing_layer_event_readiness_join");
 }
 
 void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & source, HiCacheIoOperationRecord & record,
@@ -424,14 +407,9 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
     }
     if (closure.status == "transfer_only") {
         record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
-        record.completion_wait_duration_us = record.device_transfer_duration_us;
         record.source_completion_wait_blocking = false;
         record.completion_wait_status = "ready_background_transfer_only";
         record.completion_wait_reason = "background device-to-host transfer is exact, but no retained completion/readiness topology is available for reuse";
-        record.evidence.push_back("device_to_host_transfer_submit_closure");
-        record.evidence.push_back("device_to_host_background_transfer_only");
-        record.evidence.push_back("device_to_host_readiness_topology_not_reusable");
-        record.evidence.push_back("device_to_host_host_submission_not_completion");
         return;
     }
     if (closure.status != "ready") {
@@ -439,15 +417,11 @@ void build_device_to_host_readiness_contract(const HiCacheSourceDagIndex & sourc
         return;
     }
     record.completion_wait_owned_node_ids = record.device_transfer_node_ids;
-    record.completion_wait_duration_us = record.device_transfer_duration_us;
     record.source_completion_wait_blocking = false;
     record.completion_join_contract_ready = true;
     record.source_readiness_topology_ready = true;
     record.completion_wait_status = "ready_existing_device_event_join";
     record.completion_wait_reason = "host submission is preserved while direction-matched device-to-host transfers retain their existing completion topology";
-    record.evidence.push_back("device_to_host_transfer_submit_closure");
-    record.evidence.push_back("device_to_host_existing_event_readiness_join");
-    record.evidence.push_back("device_to_host_host_submission_not_completion");
 }
 
 void build_load_admission_control(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & decision, HiCacheIoOperationRecord & record) {
@@ -463,11 +437,6 @@ void build_load_admission_control(const HiCacheSourceDagIndex & source, const Hi
             continue;
         }
         record.admission_explicit_node_ids.push_back(node_id);
-    }
-    if (ownership.status == "ready") {
-        record.evidence.push_back("loadback_admission_control_interval");
-        record.evidence.push_back("loadback_admission_explicit_children_only");
-        record.evidence.push_back("loadback_admission_python_self_and_gap_are_nuisance");
     }
 }
 
@@ -501,7 +470,6 @@ HiCacheIoOperationLedger build_hicache_io_operation_ledger(const HiCacheSourceDa
         const auto kind = io_operation_ledger_detail::operation_kind(fact.fact_role);
         if (!kind || fact.fact_class != "timing_observation" || fact.phase != "end" || fact.duration_us == 0) return;
         auto record = io_operation_ledger_detail::build_record(source, fact, *kind);
-        if (causal_tail) record.evidence.push_back("causal_tail_context");
         (void)core::checked_increment_u64(ledger.counts_by_status[record.status], "HiCache I/O ledger status count exceeds uint64 range");
         if (!hicache_io_operation_record_ready(record)) {
             (void)core::checked_increment_u64(ledger.unresolved_reasons[record.reason], "HiCache I/O ledger unresolved count exceeds uint64 range");

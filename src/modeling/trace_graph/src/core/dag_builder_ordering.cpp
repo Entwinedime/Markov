@@ -2,7 +2,7 @@
  * @file
  * @brief Orders execution lanes and separates CPU queue service from arrival waits.
  */
-#include "dag_builder_stages.hpp"
+#include "markov/trace_graph/core/dag_builder_stages.hpp"
 
 #include <algorithm>
 #include <ranges>
@@ -92,12 +92,12 @@ void normalize_cpu_queue_waits(DagGraph & graph) {
         const auto & next = graph.event_for_node(edge.dst);
         if (!graph.node(edge.dst).is_cpu) continue;
         const auto & source = graph.node(edge.src);
-        if (edge.kind == DagEdgeKind::Sequential && source.lane_id == graph.node(edge.dst).lane_id)
-            before.worker = edge.src;
+        if (edge.kind == DagEdgeKind::Sequential && source.lane_id == graph.node(edge.dst).lane_id) before.worker = edge.src;
         if (edge.kind != DagEdgeKind::Correlation || !source.is_cpu || source.lane_id == graph.node(edge.dst).lane_id) continue;
         const auto & submit = graph.event_for_node(edge.src);
         if (submit.cat == "enqueue" && submit.pid == next.pid && !submit.arg("correlation_id").empty()
-            && submit.arg("correlation_id") == next.arg("correlation_id")) before.submission = edge.src;
+            && submit.arg("correlation_id") == next.arg("correlation_id"))
+            before.submission = edge.src;
     }
     for (size_t id = 0; id < predecessors.size(); ++id) {
         const auto & before = predecessors[id];

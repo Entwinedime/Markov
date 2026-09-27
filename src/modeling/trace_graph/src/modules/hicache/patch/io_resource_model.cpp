@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/modules/hicache/patch/io_resource_model.hpp"
 
-#include "io_resource_cost.hpp"
+#include "markov/trace_graph/modules/hicache/patch/io_resource_cost.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -49,8 +49,7 @@ std::string hicache_io_cost_status_name(HiCacheIoCostStatus status) {
     return "unknown";
 }
 
-HiCacheIoResourcePlan build_hicache_io_resource_plan(const model::HiCacheEffectDecisionLedger & decisions,
-                                                      const frontend::HiCacheIoCostConfig & model_fields) {
+HiCacheIoResourcePlan build_hicache_io_resource_plan(const model::HiCacheEffectDecisionLedger & decisions, const frontend::HiCacheIoCostConfig & model_fields) {
     HiCacheIoResourcePlan plan;
     plan.byte_projection_available = decisions.byte_projection_available;
     plan.kv_bytes_per_page = decisions.kv_bytes_per_page;

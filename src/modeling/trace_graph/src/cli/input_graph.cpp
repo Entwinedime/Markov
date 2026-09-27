@@ -1,4 +1,4 @@
-#include "input_graph.hpp"
+#include "markov/trace_graph/cli/input_graph.hpp"
 
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"

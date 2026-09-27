@@ -4,7 +4,7 @@
  */
 #pragma once
 
-#include "dag_builder_normalization.hpp"
+#include "markov/trace_graph/core/dag_builder_normalization.hpp"
 
 #include "markov/trace_graph/core/dag_graph.hpp"
 

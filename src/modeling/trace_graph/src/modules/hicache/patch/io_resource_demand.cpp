@@ -2,7 +2,7 @@
  * @file
  * @brief Operation-family naming and deterministic lane ordering.
  */
-#include "io_resource_demand.hpp"
+#include "markov/trace_graph/modules/hicache/patch/io_resource_demand.hpp"
 
 #include <algorithm>
 #include <map>

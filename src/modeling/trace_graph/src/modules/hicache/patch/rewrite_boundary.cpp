@@ -1,4 +1,4 @@
-#include "rewrite_boundary.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_boundary.hpp"
 
 #include <algorithm>
 #include <map>
@@ -148,7 +148,6 @@ void fold_shared_immediate_ready_completion_joins(std::vector<HiCacheRewriteDeci
         loadback->completion_join_required = false;
         loadback->completion_control_ingress_edge_id = std::nullopt;
         loadback->consumer_anchors = { *loadback->wait_exit_anchor_node_id };
-        loadback->consumer_anchor_method = "shared_prefetch_ready_consumer";
         loadback->reason = "request Load follows ready Prefetch control before releasing the shared native consumer";
     }
 }

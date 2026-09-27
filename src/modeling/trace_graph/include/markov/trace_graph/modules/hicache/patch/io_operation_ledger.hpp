@@ -81,9 +81,6 @@ struct HiCacheIoOperationRecord {
     uint64_t source_completion_us = 0;
     uint64_t wait_exit_start_us = 0;
     uint64_t wait_exit_end_us = 0;
-    uint64_t completion_wait_duration_us = 0;
-    uint64_t completion_wait_gap_duration_us = 0;
-    uint64_t polling_lag_us = 0;
     uint64_t retained_terminal_control_us = 0;
     /** Retained explicit CPU work, excluding wrapper self, gaps and wait nodes. */
     uint64_t terminal_control_us = 0;
@@ -97,7 +94,6 @@ struct HiCacheIoOperationRecord {
     std::vector<HiCacheCpuGapSlice> completion_wait_slices;
     bool runtime_copy_observed = false;
     bool foreground_consumer_required = false;
-    std::vector<std::string> evidence;
     std::string reason;
 };
 

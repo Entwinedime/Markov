@@ -62,8 +62,6 @@ struct HiCacheRewriteDecision {
     std::vector<HiCacheCpuGapSlice> owned_gap_slices;
     std::vector<size_t> source_control_duration_nodes;
     std::vector<HiCacheCpuGapSlice> source_control_gap_slices;
-    std::vector<HiCacheCpuGapSlice> source_gap_removal_slices;
-    uint64_t observed_io_duration_us = 0;
     uint64_t owned_gap_duration_us = 0;
     uint64_t target_host_control_duration_us = 0;
     bool target_host_control_required = false;
@@ -75,15 +73,9 @@ struct HiCacheRewriteDecision {
     std::vector<size_t> target_host_control_exit_node_ids;
     std::optional<size_t> target_host_control_ingress_edge_id = std::nullopt;
     std::vector<size_t> target_host_control_ingress_edge_ids;
-    uint64_t source_gap_removal_duration_us = 0;
-    uint64_t residual_unknown_duration_us = 0;
-    std::string observed_span_semantics = "unknown";
-    std::string completion_wait_status = "not_applicable";
-    std::string completion_wait_reason;
     bool completion_join_contract_ready = false;
     bool completion_join_required = false;
     bool completion_join_uses_service = false;
-    bool source_effect_schedule_aligned = true;
     bool source_readiness_topology_reused = false;
     bool source_completion_wait_blocking = false;
     bool source_control_removal_required = false;
@@ -92,10 +84,6 @@ struct HiCacheRewriteDecision {
     uint64_t source_completion_us = 0;
     uint64_t wait_exit_start_us = 0;
     uint64_t wait_exit_end_us = 0;
-    uint64_t completion_wait_duration_us = 0;
-    uint64_t completion_wait_gap_duration_us = 0;
-    uint64_t polling_lag_us = 0;
-    uint64_t retained_terminal_control_us = 0;
     std::optional<size_t> control_ready_anchor_node_id = std::nullopt;
     std::optional<size_t> wait_exit_anchor_node_id = std::nullopt;
     std::optional<size_t> terminal_control_anchor_node_id = std::nullopt;
@@ -111,7 +99,6 @@ struct HiCacheRewriteDecision {
     /** @brief Proven executable launch anchor required for synthetic insertion. */
     std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     std::vector<size_t> consumer_anchors;
-    std::string consumer_anchor_method;
     std::string family_consumer_synthetic_id;
     std::string reason;
     std::string blocker;

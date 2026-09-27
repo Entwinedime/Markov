@@ -1,4 +1,4 @@
-#include "cpu_service_preparation.hpp"
+#include "markov/trace_graph/cli/cpu_service_preparation.hpp"
 #include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/modules/hicache/forward_cpu_service.hpp"
 #include "markov/trace_graph/modules/hicache/host_cpu_service.hpp"

@@ -1,4 +1,4 @@
-#include "rewrite_mutation.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_mutation.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -55,8 +55,7 @@ void append_target_host_control_node(core::DagMutationPlan & plan, const HiCache
     });
     if (decision.target_host_control_terminal) {
         if (decision.completion_join_required) return; // Wired after max(control-ready, I/O completion).
-        if (decision.target_host_control_ingress_edge_ids.empty()
-            || decision.target_host_control_exit_node_ids.size() != 1)
+        if (decision.target_host_control_ingress_edge_ids.empty() || decision.target_host_control_exit_node_ids.size() != 1)
             throw std::logic_error("HiCache zero-payload terminal control requires consumer readiness ingresses and one exit");
         plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
             .synthetic_id = decision.target_host_control_terminal_join_synthetic_id,

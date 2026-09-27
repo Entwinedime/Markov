@@ -16,8 +16,7 @@ void HiCacheWriteCalls::bind_capacity_calls(const patch::HiCacheSourceDagIndex &
             result.push_back(lane);
             samples[{ pid, tid }].emplace(lane, node);
         };
-        for (const auto & stream : plan.streams) add(stream.source_node);
-        for (const auto & wait : plan.waits) add(wait.source_node);
+        for (const auto node : plan.resource_nodes()) add(node);
         return result;
     };
     for (const auto & [id, donor] : templates_) (void)lanes(donor.expansion, donor.pid, donor.tid);

@@ -2,7 +2,7 @@
  * @file
  * @brief Shared exact-ledger attribution helper implementation.
  */
-#include "attribution_common.hpp"
+#include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -106,39 +106,22 @@ void append_snapshot_isolated_control_ownership(const HiCacheSourceDagIndex & so
     }
 }
 
-void finalize_source_control_ownership(const HiCacheSourceDagIndex & source, HiCacheSourceAttribution & output) {
+void finalize_source_control_ownership(HiCacheSourceAttribution & output) {
     sort_unique(output.source_control_duration_nodes);
-    for (size_t node_id : output.source_control_duration_nodes) {
-        const auto source_duration = source.graph().node(node_id).duration;
-        output.source_control_duration_us =
-            core::checked_add_u64(output.source_control_duration_us, source_duration, "HiCache source CPU-control duration exceeds uint64 range");
-    }
-    const auto merge_gaps = [](std::vector<HiCacheCpuGapSlice> gaps) {
-        std::ranges::sort(gaps, [](const auto & left, const auto & right) {
-            if (left.owner_node_id != right.owner_node_id) return left.owner_node_id < right.owner_node_id;
-            if (left.owned_start_us != right.owned_start_us) return left.owned_start_us < right.owned_start_us;
-            return left.owned_end_us < right.owned_end_us;
-        });
-        std::vector<HiCacheCpuGapSlice> merged;
-        for (const auto & gap : gaps) {
-            if (!merged.empty() && merged.back().owner_node_id == gap.owner_node_id && gap.owned_start_us <= merged.back().owned_end_us) {
-                merged.back().owned_end_us = std::max(merged.back().owned_end_us, gap.owned_end_us);
-            }
-            else merged.push_back(gap);
-        }
-        return merged;
-    };
-    output.source_control_gap_slices = merge_gaps(std::move(output.source_control_gap_slices));
+
     std::ranges::sort(output.source_control_gap_slices, [](const auto & left, const auto & right) {
         if (left.owner_node_id != right.owner_node_id) return left.owner_node_id < right.owner_node_id;
         if (left.owned_start_us != right.owned_start_us) return left.owned_start_us < right.owned_start_us;
         return left.owned_end_us < right.owned_end_us;
     });
+    std::vector<HiCacheCpuGapSlice> merged;
     for (const auto & gap : output.source_control_gap_slices) {
-        output.source_control_gap_duration_us = core::checked_add_u64(output.source_control_gap_duration_us,
-                                                                      gap.owned_duration_us(),
-                                                                      "HiCache source CPU-control gap duration exceeds uint64 range");
+        if (!merged.empty() && merged.back().owner_node_id == gap.owner_node_id && gap.owned_start_us <= merged.back().owned_end_us) {
+            merged.back().owned_end_us = std::max(merged.back().owned_end_us, gap.owned_end_us);
+        }
+        else merged.push_back(gap);
     }
+    output.source_control_gap_slices = std::move(merged);
 }
 
 void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size_t> carrier_nodes, std::string reason, HiCacheSourceAttribution & output) {
@@ -177,7 +160,6 @@ void assign_carrier_nodes(const HiCacheSourceDagIndex & source, std::vector<size
 
 void copy_completion_wait_contract(const HiCacheIoOperationRecord & operation, HiCacheSourceAttribution & output) {
     output.observed_span_semantics = operation.observed_span_semantics;
-    output.completion_wait_status = operation.completion_wait_status;
     output.completion_wait_reason = operation.completion_wait_reason;
     output.completion_join_contract_ready = operation.completion_join_contract_ready;
     output.source_readiness_topology_ready = operation.source_readiness_topology_ready;
@@ -186,10 +168,6 @@ void copy_completion_wait_contract(const HiCacheIoOperationRecord & operation, H
     output.source_completion_us = operation.source_completion_us;
     output.wait_exit_start_us = operation.wait_exit_start_us;
     output.wait_exit_end_us = operation.wait_exit_end_us;
-    output.completion_wait_duration_us = operation.completion_wait_duration_us;
-    output.completion_wait_gap_duration_us = operation.completion_wait_gap_duration_us;
-    output.polling_lag_us = operation.polling_lag_us;
-    output.retained_terminal_control_us = operation.retained_terminal_control_us;
     output.control_ready_anchor_node_id = operation.control_ready_anchor_node_id;
     output.wait_exit_anchor_node_id = operation.wait_exit_anchor_node_id;
     output.terminal_control_anchor_node_id = operation.terminal_control_anchor_node_id;

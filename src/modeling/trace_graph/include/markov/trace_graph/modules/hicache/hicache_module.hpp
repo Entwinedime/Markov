@@ -29,11 +29,6 @@ public:
     /** @brief Extracts approved HiCache facts and executes canonical target-state replay. */
     void apply(core::DagGraph & graph) override;
 
-    /** @brief Reports whether apply() produced a diagnostics summary. */
-#ifdef DEBUG
-    [[nodiscard]] bool has_summary() const override;
-#endif
-
     /** @brief Returns the complete effect-decision ledger in Release and Debug builds. */
     [[nodiscard]] const model::HiCacheEffectDecisionLedger & effect_decisions() const { return result_->effect_decisions; }
 
@@ -43,9 +38,6 @@ public:
 private:
     frontend::HiCacheConfig config_;
     std::shared_ptr<model::HiCacheModelResult> result_;
-#ifdef DEBUG
-    bool applied_ = false;
-#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache

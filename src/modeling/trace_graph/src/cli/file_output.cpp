@@ -2,7 +2,7 @@
  * @file
  * @brief Implements checked JSON and text artifact output.
  */
-#include "file_output.hpp"
+#include "markov/trace_graph/cli/file_output.hpp"
 
 #include <nlohmann/json.hpp>
 

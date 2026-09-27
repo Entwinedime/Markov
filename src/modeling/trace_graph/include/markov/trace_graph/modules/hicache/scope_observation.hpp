@@ -1,5 +1,6 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
+#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include <map>
 #include <unordered_set>
 
@@ -10,6 +11,7 @@ namespace markov::trace_graph::modules::hicache {
  */
 struct HiCacheScopeObservation {
     patch::HiCacheIoOperationLedger operations;
+    HiCachePhaseObservationAudit phases;
     std::unordered_set<size_t> nodes;
     std::map<size_t, std::vector<std::pair<uint64_t, uint64_t>>> gap_intervals;
 };

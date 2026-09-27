@@ -2,7 +2,7 @@
  * @file
  * @brief Creates base DAG nodes and temporary identity indices.
  */
-#include "dag_builder_stages.hpp"
+#include "markov/trace_graph/core/dag_builder_stages.hpp"
 #include <nlohmann/json.hpp>
 
 #include <ranges>

@@ -50,8 +50,8 @@ model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationA
             .source_prefill_token_count = row.prefill_token_count,
             .common_kernel_cost = cost(row.prefill_common_kernel_duration_us, row.prefill_common_kernel_node_ids),
             .prefix_attention_cost = cost(row.prefill_prefix_attention_duration_us, row.prefill_prefix_attention_node_ids),
-            .collective_cost = cost(row.prefill_collective_duration_us, row.prefill_collective_node_ids),
-            .submit_cost = cost(row.prefill_submit_cpu_duration_us, row.prefill_submit_cpu_node_ids),
+            .collective_cost = cost(row.prefill.collective_duration_us, row.prefill.collective_node_ids),
+            .submit_cost = cost(row.prefill.submit_cpu_duration_us, row.prefill.submit_cpu_node_ids),
             .feature_covered = true,
         });
         work.decodes.push_back(model::HiCacheDecodeWorkItem{
@@ -61,11 +61,11 @@ model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationA
             .prompt_token_count = row.prompt_token_count,
             .target_page_size = row.source_page_size,
             .iteration_count = row.decode_iteration_count,
-            .source_paged_attention_duration_us = hicache_paged_attention_duration(row.decode_kernel_families),
-            .predicted_paged_attention_duration_us = hicache_paged_attention_duration(row.decode_kernel_families),
-            .kernel_cost = cost(row.decode_kernel_duration_us, row.decode_kernel_node_ids),
-            .collective_cost = cost(row.decode_collective_duration_us, row.decode_collective_node_ids),
-            .submit_cost = cost(row.decode_submit_cpu_duration_us, row.decode_submit_cpu_node_ids),
+            .source_paged_attention_duration_us = hicache_paged_attention_duration(row.decode.kernel_families),
+            .predicted_paged_attention_duration_us = hicache_paged_attention_duration(row.decode.kernel_families),
+            .kernel_cost = cost(row.decode.kernel_duration_us, row.decode_kernel_node_ids),
+            .collective_cost = cost(row.decode.collective_duration_us, row.decode.collective_node_ids),
+            .submit_cost = cost(row.decode.submit_cpu_duration_us, row.decode.submit_cpu_node_ids),
             .feature_covered = true,
         });
     }

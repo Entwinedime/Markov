@@ -387,70 +387,36 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                                                           : audit.decode_device_families[phase_family_name(event.name)];
         ++family.node_count;
         family.duration_us = core::checked_add_u64(family.duration_us, node.duration, "HiCache phase family duration exceeds uint64 range");
-        if (owner->kind == PhaseKind::Prefill) {
-            ++observation.prefill_device_node_count;
-            observation.prefill_device_duration_us = core::checked_add_u64(
-                observation.prefill_device_duration_us, node.duration, "HiCache prefill device duration exceeds uint64 range");
-            if (!is_device_control_anchor(event.name)) {
-                ++observation.prefill_compute_node_count;
-                observation.prefill_compute_duration_us = core::checked_add_u64(
-                    observation.prefill_compute_duration_us, node.duration, "HiCache prefill compute duration exceeds uint64 range");
-                if (is_collective_node(event.name)) {
-                    observation.prefill_collective_node_ids.push_back(node.id);
-                    observation.prefill_collective_duration_us = core::checked_add_u64(observation.prefill_collective_duration_us,
-                                                                                       node.duration,
-                                                                                       "HiCache prefill collective duration exceeds uint64 range");
-                }
-                else {
-                    if (is_attention_node(event.name)) {
-                        observation.prefill_prefix_attention_node_ids.push_back(node.id);
-                        observation.prefill_prefix_attention_duration_us = core::checked_add_u64(
-                            observation.prefill_prefix_attention_duration_us,
-                            node.duration,
-                            "HiCache prefill prefix-attention duration exceeds uint64 range");
-                    }
-                    else {
-                        observation.prefill_common_kernel_node_ids.push_back(node.id);
-                        observation.prefill_common_kernel_duration_us = core::checked_add_u64(
-                            observation.prefill_common_kernel_duration_us,
-                            node.duration,
-                            "HiCache prefill common-kernel duration exceeds uint64 range");
-                    }
-                    auto & kernel_family = observation.prefill_kernel_families[phase_family_name(event.name)];
-                    ++kernel_family.node_count;
-                    kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us,
-                                                                      node.duration,
-                                                                      "HiCache prefill kernel family duration exceeds uint64 range");
-                    observation.prefill_kernel_duration_us = core::checked_add_u64(
-                        observation.prefill_kernel_duration_us, node.duration, "HiCache prefill kernel duration exceeds uint64 range");
-                }
-            }
+        auto & phase = owner->kind == PhaseKind::Prefill ? observation.prefill : observation.decode;
+        ++phase.device_node_count;
+        phase.device_duration_us = core::checked_add_u64(phase.device_duration_us, node.duration, "HiCache phase device duration exceeds uint64 range");
+        if (is_device_control_anchor(event.name)) continue;
+
+        ++phase.compute_node_count;
+        phase.compute_duration_us = core::checked_add_u64(phase.compute_duration_us, node.duration, "HiCache phase compute duration exceeds uint64 range");
+        if (is_collective_node(event.name)) {
+            phase.collective_node_ids.push_back(node.id);
+            phase.collective_duration_us =
+                core::checked_add_u64(phase.collective_duration_us, node.duration, "HiCache phase collective duration exceeds uint64 range");
+            continue;
+        }
+
+        auto & kernel_family = phase.kernel_families[phase_family_name(event.name)];
+        ++kernel_family.node_count;
+        kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us, node.duration, "HiCache kernel family duration exceeds uint64 range");
+        phase.kernel_duration_us = core::checked_add_u64(phase.kernel_duration_us, node.duration, "HiCache phase kernel duration exceeds uint64 range");
+        if (owner->kind == PhaseKind::Decode) { observation.decode_kernel_node_ids.push_back(node.id); }
+        else if (is_attention_node(event.name)) {
+            observation.prefill_prefix_attention_node_ids.push_back(node.id);
+            observation.prefill_prefix_attention_duration_us = core::checked_add_u64(observation.prefill_prefix_attention_duration_us,
+                                                                                     node.duration,
+                                                                                     "HiCache prefill prefix-attention duration exceeds uint64 range");
         }
         else {
-            ++observation.decode_device_node_count;
-            observation.decode_device_duration_us = core::checked_add_u64(
-                observation.decode_device_duration_us, node.duration, "HiCache decode device duration exceeds uint64 range");
-            if (!is_device_control_anchor(event.name)) {
-                ++observation.decode_compute_node_count;
-                observation.decode_compute_duration_us = core::checked_add_u64(
-                    observation.decode_compute_duration_us, node.duration, "HiCache decode compute duration exceeds uint64 range");
-                if (is_collective_node(event.name)) {
-                    observation.decode_collective_node_ids.push_back(node.id);
-                    observation.decode_collective_duration_us = core::checked_add_u64(observation.decode_collective_duration_us,
-                                                                                      node.duration,
-                                                                                      "HiCache decode collective duration exceeds uint64 range");
-                }
-                else {
-                    observation.decode_kernel_node_ids.push_back(node.id);
-                    auto & kernel_family = observation.decode_kernel_families[phase_family_name(event.name)];
-                    ++kernel_family.node_count;
-                    kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us,
-                                                                      node.duration,
-                                                                      "HiCache decode kernel family duration exceeds uint64 range");
-                    observation.decode_kernel_duration_us = core::checked_add_u64(
-                        observation.decode_kernel_duration_us, node.duration, "HiCache decode kernel duration exceeds uint64 range");
-                }
-            }
+            observation.prefill_common_kernel_node_ids.push_back(node.id);
+            observation.prefill_common_kernel_duration_us = core::checked_add_u64(observation.prefill_common_kernel_duration_us,
+                                                                                  node.duration,
+                                                                                  "HiCache prefill common-kernel duration exceeds uint64 range");
         }
     }
 
@@ -503,16 +469,9 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         const auto & node = graph.node(node_id);
         auto & observation = audit.observations[owner->observation_index];
         ++audit.phase_owned_submit_cpu_node_count;
-        if (owner->kind == PhaseKind::Prefill) {
-            observation.prefill_submit_cpu_node_ids.push_back(node_id);
-            observation.prefill_submit_cpu_duration_us = core::checked_add_u64(
-                observation.prefill_submit_cpu_duration_us, node.duration, "HiCache prefill CPU duration exceeds uint64 range");
-        }
-        else {
-            observation.decode_submit_cpu_node_ids.push_back(node_id);
-            observation.decode_submit_cpu_duration_us = core::checked_add_u64(
-                observation.decode_submit_cpu_duration_us, node.duration, "HiCache decode CPU duration exceeds uint64 range");
-        }
+        auto & phase = owner->kind == PhaseKind::Prefill ? observation.prefill : observation.decode;
+        phase.submit_cpu_node_ids.push_back(node_id);
+        phase.submit_cpu_duration_us = core::checked_add_u64(phase.submit_cpu_duration_us, node.duration, "HiCache phase CPU duration exceeds uint64 range");
     }
 
     for (const auto & markers : prefills_by_pid | std::views::values) {

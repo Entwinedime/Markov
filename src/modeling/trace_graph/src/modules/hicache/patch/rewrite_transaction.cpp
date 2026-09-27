@@ -4,10 +4,10 @@
  */
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 
-#include "rewrite_boundary.hpp"
-#include "rewrite_decision.hpp"
-#include "rewrite_mutation.hpp"
-#include "rewrite_normalization.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_boundary.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_decision.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_mutation.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_normalization.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 

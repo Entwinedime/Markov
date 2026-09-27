@@ -34,6 +34,7 @@ struct CliOptions {
     std::string hicache_oracle_cost_replay;
     std::string hicache_phase_oracle_cost_replay;
     bool hicache_canonical_observed_phase_scope = false;
+    bool hicache_static_replay = false;
 #endif
     io::ManifestTraceInputOptions trace_input;
 #ifdef DEBUG

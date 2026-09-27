@@ -50,6 +50,11 @@ struct HiCacheHostExpansion {
     std::vector<Wait> event_waits;
     std::map<size_t, size_t> source_nodes;
     size_t host_return = 0;
+
+    /** In expand_host position order: emitted streams, then stream barriers.
+     * Repeated resources remain repeated; event waits are bound separately. */
+    [[nodiscard]] std::vector<size_t> resource_nodes() const;
+    [[nodiscard]] std::vector<size_t> resource_lanes(const core::DagGraph & graph) const;
 };
 
 struct HiCacheWriteExpansion : HiCacheHostExpansion {
@@ -61,14 +66,14 @@ struct HiCacheWriteExpansion : HiCacheHostExpansion {
 /** Generate pure CPU work and its return, with independently supplied cost.
  * Residual service remains distinct and must finish before the return node.
  * This constructor never requires a source execution template. */
-[[nodiscard]] HiCacheHostExpansion generated_cpu_control(std::string_view lane, double cpu_us, double residual_us,
-                                                         std::pair<double, double> & remainders, std::string_view name);
+[[nodiscard]] HiCacheHostExpansion generated_cpu_control(std::string_view lane, double cpu_us, double residual_us, std::pair<double, double> & remainders,
+                                                         std::string_view name);
 
 /** Ordered target event waits. Costs are independent inputs; event identities
  * are bound by expand_host, never copied from a source check. Per-event service
  * is aggregated after completion; this is not a measured latency upper bound. */
 [[nodiscard]] HiCacheHostExpansion generated_completion_check(std::string_view lane, size_t events, double entry_cpu_us, double entry_residual_us,
-    double event_cpu_us, double event_residual_us, std::pair<double, double> & remainders);
+                                                              double event_cpu_us, double event_residual_us, std::pair<double, double> & remainders);
 
 /** Generate target FAST2D K/V page count/bytes, retaining preparation and tail.
  * CPU per-page costs are a constant-cost extrapolation across page widths;
@@ -86,19 +91,16 @@ void rebind_host_worker_queues(const core::DagGraph & graph, std::span<HiCacheHo
 
 /** Semantic resources observed inside a write call, independent of numeric
  * lane ids. Worker roles are identified by the calls submitting their tasks. */
-[[nodiscard]] std::map<std::string, size_t> write_resource_roles(
-    const core::DagGraph & graph, const HiCacheWriteExpansion & plan, size_t compute_record);
+[[nodiscard]] std::map<std::string, size_t> write_resource_roles(const core::DagGraph & graph, const HiCacheWriteExpansion & plan, size_t compute_record);
 
 /** Host work with optional explicitly identified compute stream. Worker identities
  * come from original submission calls, not generated names or calibration ids. */
-[[nodiscard]] std::map<std::string, size_t> host_resource_roles(
-    const core::DagGraph & graph, const HiCacheHostExpansion & plan, size_t main_node,
-    std::optional<size_t> compute_node = {});
+[[nodiscard]] std::map<std::string, size_t> host_resource_roles(const core::DagGraph & graph, const HiCacheHostExpansion & plan, size_t main_node,
+                                                                std::optional<size_t> compute_node = {});
 
 /** Resource identity only, witnessed by the same main lane's real submissions. */
-[[nodiscard]] std::optional<size_t> find_host_worker_resource(
-    const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues,
-    size_t main_node, std::string_view submission_name);
+[[nodiscard]] std::optional<size_t> find_host_worker_resource(const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues, size_t main_node,
+                                                              std::string_view submission_name);
 
 [[nodiscard]] HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                           const HiCacheHostTemplate & host, std::string_view prefix = "target control: ");

@@ -2,13 +2,10 @@
  * @file
  * @brief Prefetch and Load request I/O ledger attribution.
  */
-#include "attribution_common.hpp"
-
-#include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include <algorithm>
 #include <limits>
-#include <span>
 
 namespace markov::trace_graph::modules::hicache::patch::attribution_detail {
 
@@ -51,20 +48,6 @@ std::optional<HiCacheIoOperationKind> operation_kind_for_effect(HiCacheEffectTyp
     return std::nullopt;
 }
 
-std::vector<HiCacheCpuGapSlice> proportional_tail_removal(std::span<const HiCacheCpuGapSlice> source_slices, uint64_t removal_tokens, uint64_t source_tokens) {
-    std::vector<HiCacheCpuGapSlice> output;
-    if (removal_tokens == 0 || source_tokens == 0) return output;
-    output.reserve(source_slices.size());
-    for (const auto & slice : source_slices) {
-        const auto removal_duration = core::ceil_multiply_divide_u64(slice.owned_duration_us(), removal_tokens, source_tokens);
-        if (!removal_duration || *removal_duration == 0) continue;
-        auto removal = slice;
-        removal.owned_start_us = removal.owned_end_us - std::min(*removal_duration, removal.owned_duration_us());
-        output.push_back(removal);
-    }
-    return output;
-}
-
 } // namespace
 
 void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCacheIoOperationLedger & operations, const HiCacheEffectDecision & decision,
@@ -94,18 +77,15 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
             if (consumer < source.graph().node_count() && source.graph().node(consumer).active && source.graph().node(consumer).is_cpu) {
                 const auto & event = source.graph().event_for_node(consumer);
                 output.observed_span_semantics = "operation_absent";
-                output.completion_wait_status = "ready";
                 output.completion_wait_reason =
                     "source has no foreground I/O operation; the canonical consumer sequential ingress is the immediate-ready control branch";
                 output.completion_join_contract_ready = true;
                 output.control_ready_us = event.ts;
                 output.wait_exit_start_us = event.ts;
                 output.wait_exit_end_us = fact_end(HiCacheSourceFactNode{ .timestamp_us = event.ts, .duration_us = event.dur });
-                output.retained_terminal_control_us = event.dur;
                 output.control_ready_anchor_node_id = consumer;
                 output.wait_exit_anchor_node_id = consumer;
                 output.terminal_control_anchor_node_id = consumer;
-                output.evidence.push_back("foreground_io_absent_canonical_consumer_control_boundary");
             }
         }
         return;
@@ -128,9 +108,6 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
     }
     output.source_completed_token_count = operation.completed_token_count;
     output.target_effective_token_count = target_effective_token_count(decision);
-    output.observed_io_duration_us = operation.observed_duration_us;
-    output.residual_unknown_duration_us = operation.observed_duration_us;
-    output.evidence.insert(output.evidence.end(), operation.evidence.begin(), operation.evidence.end());
     if (operation.kind == HiCacheIoOperationKind::Prefetch) {
         output.source_control_duration_nodes = operation.terminal_control_node_ids;
         output.source_control_removal_required = !output.source_control_duration_nodes.empty();
@@ -141,10 +118,7 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
         return;
     }
     if (!operation.runtime_node_ids.empty()) {
-        assign_carrier_nodes(source,
-                             operation.runtime_node_ids,
-                             "source I/O timing interval owns exact retained runtime leaves and CPU gaps",
-                             output);
+        assign_carrier_nodes(source, operation.runtime_node_ids, "source I/O timing interval owns exact retained runtime leaves and CPU gaps", output);
     }
     else {
         output.source_carrier_state = HiCacheSourceCarrierState::Present;
@@ -153,19 +127,12 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
     if (operation.kind == HiCacheIoOperationKind::Prefetch && operation.completion_join_contract_ready) {
         output.owned_duration_nodes = operation.completion_wait_owned_node_ids;
         output.owned_gap_slices.clear();
-        output.source_gap_removal_slices.clear();
         output.owned_gap_duration_us = 0;
-        output.source_gap_removal_duration_us = 0;
-        output.evidence.push_back("completion_join_replaces_payload_ratio_gap_timing");
     }
     else if (operation.kind == HiCacheIoOperationKind::Load && operation.source_readiness_topology_ready) {
         output.owned_duration_nodes = operation.device_transfer_node_ids;
         output.owned_gap_slices.clear();
         output.owned_gap_duration_us = 0;
-        output.residual_unknown_duration_us = operation.observed_duration_us;
-        output.evidence.push_back("loadback_host_submission_duration_preserved");
-        output.evidence.push_back("loadback_device_transfer_duration_owned");
-        output.evidence.push_back("loadback_existing_event_join_preserved");
         append_snapshot_isolated_control_ownership(
             source,
             source.timing_interval_ownership(operation.pid, operation.tid, operation.source_start_us, operation.observed_duration_us),
@@ -181,37 +148,16 @@ void classify_io_from_ledger(const HiCacheSourceDagIndex & source, const HiCache
         output.source_control_gap_slices.insert(output.source_control_gap_slices.end(),
                                                 operation.admission_cpu_gap_slices.begin(),
                                                 operation.admission_cpu_gap_slices.end());
-        finalize_source_control_ownership(source, output);
+        finalize_source_control_ownership(output);
         output.source_control_removal_required = !output.source_control_duration_nodes.empty() || !output.source_control_gap_slices.empty();
-        if (output.source_control_removal_required) {
-            output.evidence.push_back("source_loadback_host_control_fully_owned");
-            output.evidence.push_back("source_host_control_snapshot_excluded");
-            output.evidence.push_back("source_host_control_logical_input_gap_projection");
-        }
     }
     else {
         output.owned_gap_slices = operation.cpu_gap_slices;
         output.owned_gap_duration_us = operation.owned_gap_duration_us;
     }
-    if (!operation.completion_join_contract_ready && operation.foreground_consumer_required
-        && output.target_effective_token_count < output.source_completed_token_count && !operation.cpu_gap_slices.empty()) {
-        const auto removed_token_count = output.source_completed_token_count - output.target_effective_token_count;
-        output.source_gap_removal_slices = proportional_tail_removal(operation.cpu_gap_slices, removed_token_count, output.source_completed_token_count);
-        for (const auto & slice : output.source_gap_removal_slices) {
-            output.source_gap_removal_duration_us = core::checked_add_u64(output.source_gap_removal_duration_us,
-                                                                          slice.owned_duration_us(),
-                                                                          "HiCache source CPU gap removal duration exceeds uint64 range");
-        }
-    }
-    const auto owned_duration =
-        core::checked_add_u64(operation.owned_node_duration_us, operation.owned_gap_duration_us, "HiCache attributed owned I/O duration exceeds uint64 range");
-    output.residual_unknown_duration_us = operation.observed_duration_us > owned_duration ? operation.observed_duration_us - owned_duration : 0;
     output.start_anchor = operation.source_anchor_node_id;
     output.completion_anchor = operation.completion_anchor_node_id;
-    if (output.consumer_anchors.empty() && operation.consumer_anchor_node_id) {
-        output.consumer_anchors.push_back(*operation.consumer_anchor_node_id);
-        output.consumer_anchor_method = "io_operation_ledger_consumer_boundary";
-    }
+    if (output.consumer_anchors.empty() && operation.consumer_anchor_node_id) { output.consumer_anchors.push_back(*operation.consumer_anchor_node_id); }
 }
 
 } // namespace markov::trace_graph::modules::hicache::patch::attribution_detail

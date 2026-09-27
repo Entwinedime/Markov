@@ -2,12 +2,12 @@
  * @file
  * @brief Normalizes executable trace events before DAG node creation.
  */
-#include "dag_builder_normalization.hpp"
+#include "markov/trace_graph/core/dag_builder_normalization.hpp"
 
 #include <algorithm>
 #include <map>
-#include <numeric>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <ranges>
 #include <stdexcept>
 #include <tuple>
@@ -226,9 +226,8 @@ private:
     // A device copy can name its enclosing operator's connection rather than
     // the nested memcpy API's. Removing the CPU wrapper must not orphan that
     // copy. Only a unique contained memcpy leaf proves this correspondence.
-    static void retain_nested_copy_connections(std::vector<TraceEvent> & events,
-                                                const std::unordered_map<std::string, LaneEvents> & lanes,
-                                                const LeafSelection & selection) {
+    static void retain_nested_copy_connections(std::vector<TraceEvent> & events, const std::unordered_map<std::string, LaneEvents> & lanes,
+                                               const LeafSelection & selection) {
         std::unordered_set<std::string> copy_connections;
         for (const auto & event : events)
             if (event.name == "MEMCPY_ASYNC" && resolve_event_lane(event, false).is_device) {
@@ -249,10 +248,15 @@ private:
                     const auto id = *it;
                     const auto & child = events[id];
                     if (!selection.is_leaf[id] || selection.discarded[id]
-                        || (child.name != "AscendCL@aclrtMemcpyAsync" && child.name != "AscendCL@aclrtMemcpy2dAsync")) continue;
+                        || (child.name != "AscendCL@aclrtMemcpyAsync" && child.name != "AscendCL@aclrtMemcpy2dAsync"))
+                        continue;
                     if (submicro_timestamp(child) < submicro_timestamp(parent)
-                        || submicro_timestamp(child) + submicro_duration(child) > submicro_timestamp(parent) + submicro_duration(parent)) continue;
-                    if (submit) { ambiguous = true; break; }
+                        || submicro_timestamp(child) + submicro_duration(child) > submicro_timestamp(parent) + submicro_duration(parent))
+                        continue;
+                    if (submit) {
+                        ambiguous = true;
+                        break;
+                    }
                     submit = id;
                 }
                 if (!submit || ambiguous || events[*submit].arg("connection_id") == connection) continue;
@@ -469,9 +473,8 @@ std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events, std::sp
     // A candidate must not participate in leaf selection: a zero-duration
     // child could otherwise discard a real call crossing the window cut.
     for (auto & head : heads) {
-        const auto covered = std::ranges::any_of(normalized, [&](const auto & event) {
-            return event.pid == head.pid && event.tid == head.tid && event.ts <= head.ts;
-        });
+        const auto covered =
+            std::ranges::any_of(normalized, [&](const auto & event) { return event.pid == head.pid && event.tid == head.tid && event.ts <= head.ts; });
         if (!covered) normalized.push_back(std::move(head));
     }
     if (!heads.empty()) std::ranges::stable_sort(normalized, {}, &TraceEvent::ts);

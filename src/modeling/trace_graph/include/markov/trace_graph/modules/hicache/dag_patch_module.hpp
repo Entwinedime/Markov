@@ -33,46 +33,6 @@ namespace markov::trace_graph::modules::hicache {
 [[nodiscard]] bool append_hicache_reused_loadback_dependencies(const model::HiCachePhaseWorkLedger & phase_work,
                                                                const patch::HiCacheShadowRewriteTransaction & shadow, core::DagMutationPlan & plan);
 
-/** @brief Debug-only zero-cost counterfactual over one materialized target DAG. */
-struct HiCacheEffectCausalTimingAudit {
-    std::string effect_id;
-    std::string effect_type;
-    std::string rewrite_kind;
-    std::string causal_path_kind;
-    std::string status = "not_run";
-    uint64_t target_cost_node_count = 0;
-    uint64_t target_cost_duration_us = 0;
-    uint64_t completion_join_node_count = 0;
-    uint64_t consumer_node_count = 0;
-    uint64_t cost_node_completion_response_us = 0;
-    uint64_t completion_join_start_response_us = 0;
-    uint64_t consumer_start_response_us = 0;
-    uint64_t source_completion_wait_duration_us = 0;
-    uint64_t source_completion_wait_gap_duration_us = 0;
-    uint64_t source_residual_unknown_duration_us = 0;
-    bool foreground_path_expected = false;
-    bool completion_join_required = false;
-    bool source_readiness_topology_reused = false;
-    bool source_completion_wait_blocking = false;
-};
-
-/** @brief Debug-only zero-cost counterfactual over one materialized target DAG. */
-struct HiCacheCausalTimingAudit {
-    std::string status = "not_run";
-    uint64_t target_cost_node_count = 0;
-    uint64_t target_cost_duration_us = 0;
-    uint64_t full_with_target_cost_us = 0;
-    uint64_t full_without_target_cost_us = 0;
-    uint64_t full_target_cost_response_us = 0;
-    uint64_t control_with_target_cost_us = 0;
-    uint64_t control_without_target_cost_us = 0;
-    uint64_t control_target_cost_response_us = 0;
-    uint64_t local_cost_sensitive_effect_count = 0;
-    uint64_t local_cost_hidden_effect_count = 0;
-    std::vector<HiCacheEffectCausalTimingAudit> effects;
-    bool restored_exact = false;
-};
-
 /** @brief Debug-only exact binding of target-observed costs to predicted phase carriers. */
 struct HiCachePhaseOracleCostReplayAudit {
     std::string status = "disabled";
@@ -105,7 +65,6 @@ struct HiCacheDagPatchResult {
     patch::HiCacheBoundaryValidationCatalog boundary_validation;
     patch::HiCacheAppliedPatchValidation applied_validation;
     std::map<std::string, uint64_t> apply_blockers;
-    HiCacheCausalTimingAudit causal_timing_audit;
     HiCachePhaseOracleCostReplayAudit phase_oracle_cost_replay;
     core::DagTopologyValidationReport topology;
 };
@@ -120,17 +79,14 @@ struct HiCacheDagPatchResult {
 class HiCacheDagPatchModule final : public SimulationModule {
 public:
     explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false);
-    HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result,
-                          bool source_target_same_config,
-                          std::string oracle_cost_replay_path,
+    HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config, std::string oracle_cost_replay_path,
                           std::string phase_oracle_cost_replay_path);
 
     [[nodiscard]] std::string_view name() const noexcept override;
     void apply(core::DagGraph & graph) override;
     [[nodiscard]] bool has_summary() const override;
-    /** @brief Measures target-cost wall-time influence while preserving the final graph state. */
-    void run_causal_timing_audit(core::DagGraph & graph);
     [[nodiscard]] const HiCacheDagPatchResult & result() const { return result_; }
+    [[nodiscard]] const model::HiCacheEffectDecisionLedger & effect_decisions() const { return model_result_->effect_decisions; }
 
 private:
     std::shared_ptr<const model::HiCacheModelResult> model_result_;

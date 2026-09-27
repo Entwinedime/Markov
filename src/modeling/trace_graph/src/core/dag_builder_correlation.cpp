@@ -2,7 +2,7 @@
  * @file
  * @brief Builds runtime-to-device causality chains and submission metadata.
  */
-#include "dag_builder_stages.hpp"
+#include "markov/trace_graph/core/dag_builder_stages.hpp"
 
 #include <algorithm>
 #include <future>

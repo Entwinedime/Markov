@@ -4,10 +4,10 @@
  */
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 
-#include "trace_channel_join.hpp"
+#include "markov/trace_graph/io/trace_channel_join.hpp"
 
-#include "markov/trace_graph/io/chrome_trace_io.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/io/chrome_trace_io.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -190,8 +190,8 @@ bool semantic_tail_context_event(const TraceEvent & event) { return event.source
 
 bool semantic_prelude_context_event(const TraceEvent & event) {
     return event.source_channel == TraceSourceChannel::PythonProbe
-        && (event.has_arg_key_hint("fact") || (event.name == "runtime.hicache.layer_waits"
-            && event.arg("consumer_index") == "-1" && event.arg("status") == "returned"));
+           && (event.has_arg_key_hint("fact")
+               || (event.name == "runtime.hicache.layer_waits" && event.arg("consumer_index") == "-1" && event.arg("status") == "returned"));
 }
 
 void append_causality_identity(const TraceEvent & event, std::string_view key, std::unordered_set<std::string> & identities) {
@@ -243,19 +243,18 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     // now, so filtering cannot orphan a child from its observed queue task.
     using Lane = std::pair<std::string, std::string>;
     using Time = unsigned __int128;
-    const auto start_ns = [](const TraceEvent & event) -> Time { return Time(event.ts) * 1000 + event.ts_submicro_ns; };
-    const auto end_ns = [&](const TraceEvent & event) { return start_ns(event) + Time(event.dur) * 1000 + event.dur_submicro_ns; };
+    const auto start_ns = [](const TraceEvent & event) -> Time { return Time(event.ts) * 1'000 + event.ts_submicro_ns; };
+    const auto end_ns = [&](const TraceEvent & event) { return start_ns(event) + Time(event.dur) * 1'000 + event.dur_submicro_ns; };
     std::map<Lane, std::vector<size_t>> tail_tasks;
     for (size_t i = 0; i < input.events.size(); ++i) {
         const auto & event = input.events[i];
-        if (event.cat == "dequeue" && end_ns(event) > Time(end) * 1000 && !event.arg("correlation_id").empty())
-            tail_tasks[{event.pid, event.tid}].push_back(i);
+        if (event.cat == "dequeue" && end_ns(event) > Time(end) * 1'000 && !event.arg("correlation_id").empty())
+            tail_tasks[{ event.pid, event.tid }].push_back(i);
     }
-    for (auto & [lane, tasks] : tail_tasks)
-        std::ranges::sort(tasks, {}, [&](size_t i) { return start_ns(input.events[i]); });
+    for (auto & [lane, tasks] : tail_tasks) std::ranges::sort(tasks, {}, [&](size_t i) { return start_ns(input.events[i]); });
     for (auto & event : input.events) {
         if (event.ts <= end || !event.arg("correlation_id").empty()) continue;
-        const auto lane = tail_tasks.find({event.pid, event.tid});
+        const auto lane = tail_tasks.find({ event.pid, event.tid });
         if (lane == tail_tasks.end()) continue;
         auto parent = std::ranges::upper_bound(lane->second, start_ns(event), {}, [&](size_t i) { return start_ns(input.events[i]); });
         if (parent == lane->second.begin()) continue;
@@ -295,9 +294,9 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         // its nested semantic boundaries too, without admitting new endpoints.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
             && std::ranges::any_of(lifecycle_tail_calls, [&](const auto * call) {
-                return event.pid == call->pid && event.tid == call->tid
-                    && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
-            })) mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+                   return event.pid == call->pid && event.tid == call->tid && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
+               }))
+            mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
         if (event.source_channel != TraceSourceChannel::PythonProbe
             && (overlaps_tail_context(event, semantic_tail_intervals) || strictly_nested_in_cross_boundary_call(event, cross_boundary_semantic_calls)))
             mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
@@ -307,15 +306,16 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     // Retain that call (including nested leaves), not an arbitrary time margin.
     std::map<Lane, std::optional<size_t>> return_successors;
     for (const auto & event : input.events) {
-        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective"
-            && event.ts >= start && event.ts <= end && event.dur <= end - event.ts)
-            return_successors.try_emplace({event.pid, event.tid}, std::nullopt);
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective" && event.ts >= start && event.ts <= end
+            && event.dur <= end - event.ts)
+            return_successors.try_emplace({ event.pid, event.tid }, std::nullopt);
     }
     for (size_t i = 0; i < input.events.size(); ++i) {
         const auto & event = input.events[i];
-        if (event.ts <= end || event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op"
-            || event.has_arg_key_hint("streamId") || event.has_arg_key_hint("Physic Stream Id")) continue;
-        const auto lane = return_successors.find({event.pid, event.tid});
+        if (event.ts <= end || event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op" || event.has_arg_key_hint("streamId")
+            || event.has_arg_key_hint("Physic Stream Id"))
+            continue;
+        const auto lane = return_successors.find({ event.pid, event.tid });
         if (lane == return_successors.end()) continue;
         auto & chosen = lane->second;
         if (!chosen || start_ns(event) < start_ns(input.events[*chosen])
@@ -324,7 +324,7 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     }
     for (auto & event : input.events) {
         if (event.ts <= end || event.source_channel == TraceSourceChannel::PythonProbe) continue;
-        const auto lane = return_successors.find({event.pid, event.tid});
+        const auto lane = return_successors.find({ event.pid, event.tid });
         if (lane == return_successors.end() || !lane->second) continue;
         const auto & boundary = input.events[*lane->second];
         if (start_ns(event) >= start_ns(boundary) && end_ns(event) <= end_ns(boundary))
@@ -336,17 +336,16 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     for (size_t i = 0; i < input.events.size(); ++i) {
         const auto & event = input.events[i];
         if (event.source_channel == TraceSourceChannel::PythonProbe
-            && (event.name == "runtime.hicache.storage_drain"
-                || (event.name == "runtime.cpu_collective" && event.arg("role") == "storage_control_drain")))
-            storage_boundaries[{event.pid, event.tid}].push_back(i);
+            && (event.name == "runtime.hicache.storage_drain" || (event.name == "runtime.cpu_collective" && event.arg("role") == "storage_control_drain")))
+            storage_boundaries[{ event.pid, event.tid }].push_back(i);
     }
     for (auto & [lane, ids] : storage_boundaries) {
         std::ranges::stable_sort(ids, {}, [&](size_t i) { return start_ns(input.events[i]); });
         for (size_t i = 1; i < ids.size(); ++i) {
             const auto & before = input.events[ids[i - 1]];
             auto & after = input.events[ids[i]];
-            if (before.name == "runtime.cpu_collective" && before.ts >= start && before.ts <= end
-                && after.name == "runtime.hicache.storage_drain" && after.ts > end)
+            if (before.name == "runtime.cpu_collective" && before.ts >= start && before.ts <= end && after.name == "runtime.hicache.storage_drain"
+                && after.ts > end)
                 mark_causal_tail(after, in_window_connection_ids, in_window_correlation_ids);
         }
     }
@@ -369,20 +368,21 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     // first retained CPU leaf otherwise loses its observed entry interval.
     std::map<Lane, bool> head_context;
     for (const auto & event : input.events) {
-        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective"
-            && event.arg("status") == "returned" && event.ts >= start && event.ts <= end && event.dur <= end - event.ts)
-            head_context.try_emplace({event.pid, event.tid}, false);
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective" && event.arg("status") == "returned"
+            && event.ts >= start && event.ts <= end && event.dur <= end - event.ts)
+            head_context.try_emplace({ event.pid, event.tid }, false);
     }
     for (const auto & event : input.events) {
         if (event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op") continue;
-        const auto found = head_context.find({event.pid, event.tid});
-        if (found != head_context.end() && end_ns(event) < Time(start) * 1000) found->second = true;
+        const auto found = head_context.find({ event.pid, event.tid });
+        if (found != head_context.end() && end_ns(event) < Time(start) * 1'000) found->second = true;
     }
     std::erase_if(input.events, [&](const TraceEvent & event) {
         // Pre-window preparation is model context, not pre-window execution.
         // DagBuilder retains these envelopes only as non-executable metadata.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
-            && (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load") && event.ts <= end) return false;
+            && (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load") && event.ts <= end)
+            return false;
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
         const bool retained_causal_tail = event.arg("formal_window_context") == "causal_tail";
         return event_end < start || (event.ts > end && !retained_causal_tail);
@@ -439,17 +439,16 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
 
 void normalize_wait_clock(std::vector<TraceEvent> & events, const Json & clock) {
     for (auto & event : events) {
-        if (event.source_channel != TraceSourceChannel::PythonProbe || event.name != "runtime.hicache.layer_waits"
-            || event.arg("wait_clock") != "npu_syscnt") continue;
-        if (clock.value("clock", "") != "npu_syscnt")
-            throw std::runtime_error("NPU layer-wait counters require the matching Torch trace host_clock");
+        if (event.source_channel != TraceSourceChannel::PythonProbe || event.name != "runtime.hicache.layer_waits" || event.arg("wait_clock") != "npu_syscnt")
+            continue;
+        if (clock.value("clock", "") != "npu_syscnt") throw std::runtime_error("NPU layer-wait counters require the matching Torch trace host_clock");
         const auto origin_tick = clock.at("origin_tick").get<int64_t>();
         const auto origin_ns = clock.at("origin_ns").get<int64_t>();
         const auto scale = clock.at("ns_per_tick").get<double>();
         if (!std::isfinite(scale) || scale <= 0) throw std::runtime_error("invalid profiler counter scale");
         auto intervals = Json::parse(event.arg("wait_intervals"));
         for (auto & interval : intervals) {
-            for (const auto endpoint : {1, 2}) {
+            for (const auto endpoint : { 1, 2 }) {
                 // Subtract before scaling, as Torch does, to retain precision
                 // when the epoch is large. Keep nanoseconds for ownership.
                 const auto delta = interval.at(endpoint).get<int64_t>() - origin_tick;
@@ -465,10 +464,10 @@ ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::ve
                                       const ManifestTraceInputOptions & options) {
     const auto pid = pid_from_path(paths.torch[index]);
     auto input = load_torch_group(paths.torch[index],
-                            select_by_pid(paths.ld_preload, pid, "LD_PRELOAD"),
-                            select_sidecars(paths.python_probe, pid),
-                            input_contracts,
-                            options);
+                                  select_by_pid(paths.ld_preload, pid, "LD_PRELOAD"),
+                                  select_sidecars(paths.python_probe, pid),
+                                  input_contracts,
+                                  options);
     const auto clock = paths.host_clocks.find(paths.torch[index]);
     normalize_wait_clock(input.events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
     normalize_wait_clock(input.prelude_context_events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
@@ -515,13 +514,14 @@ std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::strin
 ManifestClientInput load_client_requests_from_manifest(const std::string & manifest_path) {
     const auto manifest = load_manifest(manifest_path);
     const auto reports = manifest.value("bench", Json::object()).value("workload_report_files", Json::array());
-    if (reports.size() != 1) return {"missing_or_multiple_workload_reports", {}};
+    if (reports.size() != 1) return { "missing_or_multiple_workload_reports", {} };
     const auto paths = existing_paths(reports, "workload report");
     Json report;
     std::ifstream(paths.front()) >> report;
     const auto window = report.value("formal_window", Json::object());
-    if (report.value("status", "") != "completed" || !window.is_object() || !window.contains("formal_begin_ms")
-        || !window.contains("formal_end_ms") || !report.contains("requests")) return {"missing_completed_formal_window", {}};
+    if (report.value("status", "") != "completed" || !window.is_object() || !window.contains("formal_begin_ms") || !window.contains("formal_end_ms")
+        || !report.contains("requests"))
+        return { "missing_completed_formal_window", {} };
     const auto timestamp = [](const Json & row, const char * key) {
         const auto value = row.at(key).get<double>() * 1000.0;
         if (!std::isfinite(value) || value < 0 || value >= static_cast<double>(std::numeric_limits<uint64_t>::max()))
@@ -530,36 +530,34 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
     };
     const auto begin = timestamp(window, "formal_begin_ms");
     const auto end = timestamp(window, "formal_end_ms");
-    ManifestClientInput result{"ready", {}};
+    ManifestClientInput result{ "ready", {} };
     bool inside = false;
     uint64_t prelude_finish = 0;
     bool prelude_ordered = true;
     for (const auto & row : report.at("requests")) {
         if (!row.contains("start_time_ms") || !row.contains("end_time_ms")) {
             result.hicache_idle_since_us.reset();
-            if (inside) return {"formal_step_without_timing", {}};
+            if (inside) return { "formal_step_without_timing", {} };
             continue;
         }
         const auto start = timestamp(row, "start_time_ms"), finish = timestamp(row, "end_time_ms");
         if (finish <= begin) {
             prelude_ordered &= start >= prelude_finish && finish >= start && result.requests.empty();
             prelude_finish = std::max(prelude_finish, finish);
-            if (row.value("kind", "") == "barrier" && row.value("scope", "") == "hicache_idle"
-                && row.value("status", "") == "ok" && prelude_ordered)
+            if (row.value("kind", "") == "barrier" && row.value("scope", "") == "hicache_idle" && row.value("status", "") == "ok" && prelude_ordered)
                 result.hicache_idle_since_us = finish;
-            else if (!prelude_ordered || row.value("kind", "") != "checkpoint" || row.value("status", "") != "ok")
-                result.hicache_idle_since_us.reset();
+            else if (!prelude_ordered || row.value("kind", "") != "checkpoint" || row.value("status", "") != "ok") result.hicache_idle_since_us.reset();
             continue;
         }
         if (start >= end) continue;
-        if (row.value("kind", "") != "request") return {"formal_control_step_not_modeled", {}};
-        if (row.value("status", "") != "ok") return {"failed_formal_request", {}};
-        result.requests.push_back({row.at("logical_request_id").get<std::string>(), start, finish, 0});
+        if (row.value("kind", "") != "request") return { "formal_control_step_not_modeled", {} };
+        if (row.value("status", "") != "ok") return { "failed_formal_request", {} };
+        result.requests.push_back({ row.at("logical_request_id").get<std::string>(), start, finish, 0 });
         inside = finish < end;
     }
     std::ranges::sort(result.requests, {}, &core::ClientRequestTiming::start_us);
     if (result.requests.empty() || result.requests.front().start_us != begin || result.requests.back().end_us != end)
-        return {"formal_request_envelope_mismatch", {}};
+        return { "formal_request_envelope_mismatch", {} };
 
     std::unordered_map<std::string, std::vector<uint64_t>> submits;
     TraceReadOptions options;
@@ -574,7 +572,7 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
     }
     for (auto & request : result.requests) {
         const auto & found = submits[request.request_id];
-        if (found.size() != 1) return {"missing_or_ambiguous_tokenizer_submit", {}};
+        if (found.size() != 1) return { "missing_or_ambiguous_tokenizer_submit", {} };
         request.frontend_end_us = found.front();
     }
     return result;

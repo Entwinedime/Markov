@@ -1,7 +1,6 @@
-#include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
-#include <cmath>
-#include <fstream>
+#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -9,23 +8,9 @@ namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph) {
     if (submission_calibration_.empty()) return;
-    std::ifstream file(submission_calibration_);
-    if (!file) throw std::runtime_error("Cannot read independent load submission costs");
-    const auto document = nlohmann::json::parse(file);
-    if (document.at("role") != "fixed_calibration" || document.at("operation") != "load_submission"
-        || document.at("backend") != "kernel_ascend" || document.at("layout") != "page_first_direct"
-        || document.at("source_manifest").get<std::string>().empty())
+    const auto document = read_control_calibration(submission_calibration_, "load_submission");
+    if (document.at("backend") != "kernel_ascend" || document.at("layout") != "page_first_direct")
         throw std::runtime_error("Generated load requires independent Ascend page-first submission costs");
-    const auto duration = [](const nlohmann::json & value) {
-        const auto cost = value.get<double>();
-        if (!std::isfinite(cost) || cost < 0 || cost >= std::ldexp(1.0, 64))
-            throw std::invalid_argument("Invalid load submission cost");
-        return static_cast<uint64_t>(std::floor(cost + 0.5));
-    };
-    const auto read_cost = [&](const nlohmann::json & c) {
-        return LoadIndexOperationCost{duration(c.at("main_us")), duration(c.at("main_residual_us")),
-            duration(c.at("worker_us")), duration(c.at("dispatch_us")), duration(c.at("device_us"))};
-    };
     const patch::HiCacheSourceDagIndex initial(graph);
     std::vector<std::pair<patch::HiCacheSourceFactNode, HiCacheEvictionRegion>> releases;
     std::vector<core::TraceEvent> points;
@@ -34,9 +19,12 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph) {
         for (const auto & region : observe_eviction_regions(initial, fact)) {
             if (region.kind != HiCacheEvictionRegion::Kind::ReleaseRegular && region.kind != HiCacheEvictionRegion::Kind::ReleaseBackup) continue;
             releases.emplace_back(fact, region);
-            for (const auto at : {region.begin, region.end}) {
+            for (const auto at : { region.begin, region.end }) {
                 core::TraceEvent point;
-                point.name = "load compute role boundary"; point.pid = fact.pid; point.tid = fact.tid; point.ts = at;
+                point.name = "load compute role boundary";
+                point.pid = fact.pid;
+                point.tid = fact.tid;
+                point.ts = at;
                 points.push_back(std::move(point));
             }
         }
@@ -46,7 +34,7 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph) {
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<std::pair<std::string, std::string>, size_t> compute_roles;
     const auto witness = [&](const std::string & pid, const std::string & tid, size_t node) {
-        const auto [at, inserted] = compute_roles.emplace(std::pair{pid, tid}, node);
+        const auto [at, inserted] = compute_roles.emplace(std::pair{ pid, tid }, node);
         if (!inserted && graph.node(at->second).lane_id != graph.node(node).lane_id)
             throw std::runtime_error("Scheduler load submission has conflicting compute roles");
     };
@@ -66,7 +54,7 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph) {
     for (const auto & call : observe_hicache_layer_waits(source).calls)
         if (call.before) layers[graph.event_for_node(*call.before).pid].insert(call.layer);
     for (const auto & load : loads_) {
-        const auto key = std::pair{load.fact.pid, load.fact.tid};
+        const auto key = std::pair{ load.fact.pid, load.fact.tid };
         if (generated_submissions_.contains(key) || !compute_roles.contains(key)) continue;
         const auto main = source.cpu_boundary_at_or_before(key.first, key.second, load.record.source_start_us);
         if (!main) continue;
@@ -77,22 +65,26 @@ void HiCacheLoads::prepare_generated_submissions(core::DagGraph & graph) {
             throw std::runtime_error("Generated load requires the base model's complete layer identities");
         const auto rank = graph.node(*main).gpu_id;
         const nlohmann::json * row = nullptr;
-        for (const auto & sample : document.at("ranks")) if (sample.at("rank").get<int>() == rank) {
-            if (row) throw std::runtime_error("Duplicate load submission calibration rank");
-            row = &sample;
-        }
+        for (const auto & sample : document.at("ranks"))
+            if (sample.at("rank").get<int>() == rank) {
+                if (row) throw std::runtime_error("Duplicate load submission calibration rank");
+                row = &sample;
+            }
         if (!row) continue;
         const auto & costs = row->at("costs");
-        LoadSubmissionCost cost{read_cost(costs.at("before_sync")), read_cost(costs.at("start_record")),
-            read_cost(costs.at("wait_event")), read_cost(costs.at("first_copy")), read_cost(costs.at("copy")),
-            read_cost(costs.at("first_layer_record")), read_cost(costs.at("layer_record")), read_cost(costs.at("tail"))};
+        LoadSubmissionCost cost{ read_load_operation_cost(costs.at("before_sync")),  read_load_operation_cost(costs.at("start_record")),
+                                 read_load_operation_cost(costs.at("wait_event")),   read_load_operation_cost(costs.at("first_copy")),
+                                 read_load_operation_cost(costs.at("copy")),         read_load_operation_cost(costs.at("first_layer_record")),
+                                 read_load_operation_cost(costs.at("layer_record")), read_load_operation_cost(costs.at("tail")) };
         // An identity for a target-only resource, not a zero-cost executable op.
-        const auto stream = graph.add_synthetic_node({.name = "unused target load stream", .is_cpu = false,
+        const auto stream = graph.add_synthetic_node({
+            .name = "unused target load stream",
+            .is_cpu = false,
             .lane_key = "hicache.generated_load:" + key.first + ":" + key.second,
-            .observed_point = core::DagObservedPoint{key.first, key.second, 0, rank}});
+            .observed_point = core::DagObservedPoint{ key.first, key.second, 0, rank }
+        });
         graph.mutable_node(stream).active = false;
-        generated_submissions_.emplace(key, GeneratedSubmission{*main, resources->worker, resources->compute,
-            stream, model_layers.size(), cost});
+        generated_submissions_.emplace(key, GeneratedSubmission{ *main, resources->worker, resources->compute, stream, model_layers.size(), cost });
     }
 }
 

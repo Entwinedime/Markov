@@ -37,13 +37,6 @@ std::string_view HiCacheModule::name() const noexcept { return kModuleName; }
  */
 void HiCacheModule::apply(core::DagGraph & graph) {
     *result_ = model::apply_hicache_model(graph, config_);
-#ifdef DEBUG
-    applied_ = true;
-#endif
 }
-
-#ifdef DEBUG
-bool HiCacheModule::has_summary() const { return applied_; }
-#endif
 
 } // namespace markov::trace_graph::modules::hicache

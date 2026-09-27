@@ -6,15 +6,15 @@
  * and artifact generation are injected at phase boundaries without duplicating the
  * workflow itself.
  */
-#include "workflow.hpp"
+#include "markov/trace_graph/cli/workflow.hpp"
 
-#include "cpu_service_preparation.hpp"
-#include "file_output.hpp"
-#include "hicache_observations.hpp"
-#include "input_graph.hpp"
-#include "module_pipeline.hpp"
-#include "options.hpp"
-#include "run_summary.hpp"
+#include "markov/trace_graph/cli/cpu_service_preparation.hpp"
+#include "markov/trace_graph/cli/file_output.hpp"
+#include "markov/trace_graph/cli/hicache_observations.hpp"
+#include "markov/trace_graph/cli/input_graph.hpp"
+#include "markov/trace_graph/cli/module_pipeline.hpp"
+#include "markov/trace_graph/cli/options.hpp"
+#include "markov/trace_graph/cli/run_summary.hpp"
 #include <nlohmann/json.hpp>
 
 #include "markov/trace_graph/cli/debug_support.hpp"
@@ -80,13 +80,6 @@ nlohmann::json client_request_result(const DagGraph & graph, const core::ClientR
     };
 }
 
-#ifdef DEBUG
-void run_post_simulation_diagnostics(DagGraph & graph, const ModulePipeline & pipeline) {
-    for (const auto & module : pipeline.modules()) {
-        if (auto * patch = dynamic_cast<modules::hicache::HiCacheDagPatchModule *>(module.get())) patch->run_causal_timing_audit(graph);
-    }
-}
-#endif
 
 void write_graph_output(const CliOptions & options, const DagGraph & graph) {
     if (!options.outputs.graph.empty()) io::write_chrome_trace_dag(options.outputs.graph, graph);
@@ -99,7 +92,8 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     auto modules = ModulePipeline::from_config(options.model_config,
                                                options.hicache_oracle_cost_replay,
                                                options.hicache_phase_oracle_cost_replay,
-                                               options.hicache_canonical_observed_phase_scope);
+                                               options.hicache_canonical_observed_phase_scope,
+                                               options.hicache_static_replay);
 #else
     auto modules = ModulePipeline::from_config(options.model_config);
 #endif
@@ -143,11 +137,11 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     nlohmann::json source_io;
     modules::hicache::HiCachePhaseObservationAudit source_phase;
     if (include_source_observations) {
-        const auto source_scope = modules::hicache::observe_hicache_scope(graph);
+        auto source_scope = modules::hicache::observe_hicache_scope(graph);
         source_io = hicache_io_observations(graph, source_scope.operations, !options.cpu_service_cost.empty());
         // Observation alone must not lock CPU gaps before execution binds.
         if (!modules.uses_hicache_execution()) modules::hicache::apply_observed_hicache_scope(graph, source_scope);
-        source_phase = modules::hicache::observe_hicache_phases(graph);
+        source_phase = std::move(source_scope.phases);
     }
     // Request availability is an input dependency, not a scoring-only adjustment.
     // Keep the same anchors throughout modeling, execution and HTTP reporting.
@@ -176,9 +170,6 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
         (void)simulation::run_control_topological_simulation(graph);
         (void)simulation::run_gap_excluded_topological_simulation(graph);
     }
-#ifdef DEBUG
-    run_post_simulation_diagnostics(graph, modules);
-#endif
     const auto client_result = client_request_result(graph, client_chain, simulation);
 
     write_graph_output(options, graph);

@@ -2,7 +2,7 @@
  * @file
  * @brief Commit D2H/H2S exact-ledger attribution and lifecycle identity.
  */
-#include "attribution_common.hpp"
+#include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -128,8 +128,7 @@ const HiCacheSourceFactNode * delayed_write_back_owner(const HiCacheSourceDagInd
             || (fact_boundary(*latest_input) == fact_boundary(candidate) && fact_precedes(*latest_input, candidate)))
             latest_input = &candidate;
     }
-    return latest_input != nullptr && latest_input->fact_role == "cache_extend_input" && latest_input->phase == "start"
-               ? latest_input : nullptr;
+    return latest_input != nullptr && latest_input->fact_role == "cache_extend_input" && latest_input->phase == "start" ? latest_input : nullptr;
 }
 
 const HiCacheSourceFactNode * paired_tail_call_end(const HiCacheSourceDagIndex & source, const HiCacheSourceFactNode & start) {
@@ -277,22 +276,13 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
     }
 
     output.consumer_anchors.clear();
-    output.consumer_anchor_method = "background_device_to_host_without_direct_foreground_consumer";
     output.source_completed_token_count = 0;
     output.target_effective_token_count = target_effective_token_count(decision);
-    output.observed_io_duration_us = 0;
-    output.residual_unknown_duration_us = 0;
     output.source_readiness_topology_ready = true;
     output.completion_join_contract_ready = true;
-    output.completion_wait_status = "ready_existing_device_event_join";
     output.completion_wait_reason = "all lifecycle-local D2H operations retain exact source device-transfer completion topology";
     const auto enqueues = commit_d2h_enqueues(source, anchor);
     output.source_effect_schedule_aligned = std::ranges::all_of(enqueues, [&](const auto * enqueue) { return nested_call(*enqueue, anchor); });
-    output.evidence.push_back(output.source_effect_schedule_aligned ? "d2h_lifecycle_local_schedule" : "d2h_delayed_write_back_schedule");
-    if (!output.source_effect_schedule_aligned) {
-        output.evidence.push_back("d2h_capacity_result_trigger_owner");
-        output.evidence.push_back("d2h_victim_page_identity_complete");
-    }
     bool source_transfer_set_ready = true;
     for (const auto * record : records) {
         output.io_operation_record_ids.push_back(record->record_id);
@@ -312,12 +302,6 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
         output.source_completed_token_count = core::checked_add_u64(output.source_completed_token_count,
                                                                     record->completed_token_count,
                                                                     "HiCache attributed D2H token count exceeds uint64 range");
-        output.observed_io_duration_us = core::checked_add_u64(output.observed_io_duration_us,
-                                                               record->device_transfer_duration_us,
-                                                               "HiCache attributed D2H transfer duration exceeds uint64 range");
-        output.residual_unknown_duration_us = core::checked_add_u64(output.residual_unknown_duration_us,
-                                                                    record->observed_duration_us,
-                                                                    "HiCache attributed D2H host-submission duration exceeds uint64 range");
         append_snapshot_isolated_control_ownership(
             source,
             source.timing_interval_ownership(record->pid, record->tid, record->source_start_us, record->observed_duration_us),
@@ -328,8 +312,6 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
         source_transfer_set_ready = source_transfer_set_ready && !record->device_transfer_node_ids.empty();
         output.source_readiness_topology_ready = output.source_readiness_topology_ready && record->source_readiness_topology_ready;
         output.completion_join_contract_ready = output.completion_join_contract_ready && record->completion_join_contract_ready;
-        output.evidence.insert(output.evidence.end(), record->evidence.begin(), record->evidence.end());
-        output.evidence.push_back("d2h_operation_ledger_record:" + record->record_id);
     }
     sort_unique(output.timing_fact_nodes);
     sort_unique(output.control_fact_nodes);
@@ -341,13 +323,8 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
     std::ranges::sort(output.io_operation_record_ids);
     output.io_operation_record_ids.erase(std::unique(output.io_operation_record_ids.begin(), output.io_operation_record_ids.end()),
                                          output.io_operation_record_ids.end());
-    finalize_source_control_ownership(source, output);
+    finalize_source_control_ownership(output);
     output.source_control_removal_required = !output.source_control_duration_nodes.empty() || !output.source_control_gap_slices.empty();
-    if (output.source_control_removal_required) {
-        output.evidence.push_back("source_d2h_host_control_fully_owned");
-        output.evidence.push_back("source_host_control_snapshot_excluded");
-        output.evidence.push_back("source_host_control_logical_input_gap_projection");
-    }
     if (!source_transfer_set_ready || output.owned_duration_nodes.empty()) {
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
         output.reason = "exact D2H operation set has no complete device-transfer closure";
@@ -355,22 +332,18 @@ void classify_commit_d2h_from_ledger(const HiCacheSourceDagIndex & source, const
     }
     if (!output.source_readiness_topology_ready) {
         output.completion_join_contract_ready = false;
-        output.completion_wait_status = "ready_background_transfer_only";
         output.completion_wait_reason = "background D2H transfer nodes are exact, but incomplete source completion topology cannot be carried";
     }
     output.source_carrier_state = HiCacheSourceCarrierState::Present;
     output.observed_span_semantics = "host_submission";
     if (!output.source_readiness_topology_ready) {
         output.reason = "exact background D2H transfer set is source-owned, but its incomplete completion topology requires target-boundary reconstruction";
-        output.evidence.push_back("d2h_source_transfer_rebuild_required");
     }
     else {
         output.reason = output.source_effect_schedule_aligned
                             ? "exact lifecycle-local D2H operation set owns the original device transfers and readiness topology"
                             : "exact delayed write-back D2H operation set is source-owned but must be rescheduled at the target lifecycle boundary";
-        output.evidence.push_back("d2h_source_transfer_topology_reused");
     }
-    output.evidence.push_back("d2h_tree_node_set_exact");
     (void)source;
 }
 
@@ -380,7 +353,6 @@ void classify_commit_h2s_from_ledger(const HiCacheSourceDagIndex & source, const
     if (records.empty()) {
         if (all_capacity_releases_in_tail(source, anchor)) {
             output.source_carrier_state = HiCacheSourceCarrierState::Absent;
-            output.evidence.push_back("post_window_commit_capacity_release_observed");
             output.reason = "source H2S completes after the measured window and has no formal consumer";
             return;
         }
@@ -392,7 +364,6 @@ void classify_commit_h2s_from_ledger(const HiCacheSourceDagIndex & source, const
         output.timing_fact_nodes.push_back(record->timing_fact_node_id);
         output.control_fact_nodes.insert(output.control_fact_nodes.end(), record->control_fact_node_ids.begin(), record->control_fact_node_ids.end());
         output.operation_chain_nodes.insert(output.operation_chain_nodes.end(), record->control_fact_node_ids.begin(), record->control_fact_node_ids.end());
-        output.evidence.push_back("h2s_operation_ledger_record:" + record->record_id);
     }
     sort_unique(output.timing_fact_nodes);
     sort_unique(output.control_fact_nodes);

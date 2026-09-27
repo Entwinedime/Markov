@@ -2,7 +2,7 @@
  * @file
  * @brief Builds and executes the configured model-module pipeline.
  */
-#include "module_pipeline.hpp"
+#include "markov/trace_graph/cli/module_pipeline.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/frontend/model_config.hpp"
@@ -19,7 +19,8 @@ namespace markov::trace_graph::cli {
 
 #ifdef DEBUG
 ModulePipeline ModulePipeline::from_config(const std::string & filename, const std::string & hicache_oracle_cost_replay,
-                                           const std::string & hicache_phase_oracle_cost_replay, bool hicache_canonical_observed_phase_scope) {
+                                           const std::string & hicache_phase_oracle_cost_replay, bool hicache_canonical_observed_phase_scope,
+                                           bool hicache_static_replay) {
 #else
 ModulePipeline ModulePipeline::from_config(const std::string & filename) {
 #endif
@@ -37,11 +38,13 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
     pipeline.modules_.reserve(3);
     if (config.node_scale.enabled) { pipeline.modules_.push_back(std::make_unique<modules::node_scale::NodeScaleModule>(config.node_scale)); }
     if (config.hicache.enabled) {
-        bool oracle = false;
+        bool static_replay = false;
 #ifdef DEBUG
-        oracle = !hicache_oracle_cost_replay.empty() || !hicache_phase_oracle_cost_replay.empty();
+        // A baseline must use the same static path as cost-injection replays.
+        // Selecting it does not read any target evidence or restore old rules.
+        static_replay = hicache_static_replay || !hicache_oracle_cost_replay.empty() || !hicache_phase_oracle_cost_replay.empty();
 #endif
-        if (config.hicache.dag_patch_enabled && !oracle) {
+        if (config.hicache.dag_patch_enabled && !static_replay) {
             const auto & policy = config.source_prefetch_policy;
             if (policy != "timeout" && policy != "wait_complete" && policy != "best_effort")
                 throw std::invalid_argument("HiCache execution requires explicit source_prefetch_policy in the model config");

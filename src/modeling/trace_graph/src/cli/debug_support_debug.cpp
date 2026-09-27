@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/cli/debug_support.hpp"
 
-#include "file_output.hpp"
+#include "markov/trace_graph/cli/file_output.hpp"
 
 #include "markov/trace_graph/modules/diagnostics/json_summary_writer.hpp"
 

@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
 
-#include "attribution_common.hpp"
+#include "markov/trace_graph/modules/hicache/patch/attribution_common.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -20,11 +20,6 @@ using model::HiCacheSourceCarrierState;
 
 enum class ConsumerAnchorResolution : std::uint8_t { Missing, Ready, Invalid };
 
-bool requires_source_consumer_anchor(HiCacheEffectType effect_type) {
-    return effect_type == HiCacheEffectType::Loadback || effect_type == HiCacheEffectType::PrefetchIo || effect_type == HiCacheEffectType::PrefetchVisibility
-           || effect_type == HiCacheEffectType::CommitCapacityGate;
-}
-
 ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
                                                 HiCacheSourceAttribution & output) {
     if (!decision.consumer_boundary.source_node_id) return ConsumerAnchorResolution::Missing;
@@ -38,7 +33,6 @@ ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & so
     if (node_id >= source.graph().node_count() || !source.graph().node(node_id).active) return ConsumerAnchorResolution::Invalid;
     output.consumer_anchors.push_back(node_id);
     sort_unique(output.consumer_anchors);
-    output.consumer_anchor_method = "target_canonical_consumer";
     return ConsumerAnchorResolution::Ready;
 }
 
@@ -59,23 +53,13 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
     output.source_execution_anchor_node_id = source.cpu_boundary_at_or_before(anchor->pid, anchor->tid, fact_boundary(*anchor));
     if (!output.source_execution_anchor_node_id)
         output.source_execution_anchor_node_id = source.cpu_boundary_at_or_after(anchor->pid, anchor->tid, fact_boundary(*anchor));
-    output.evidence.push_back("source_opportunity_anchor");
     const auto consumer_resolution = append_target_consumer(source, decision, output);
     if (consumer_resolution == ConsumerAnchorResolution::Invalid) {
         output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
-        output.consumer_anchor_method = "invalid_target_canonical_consumer";
         output.reason = "target consumer boundary does not resolve to its declared active source fact";
         return output;
     }
-    if (consumer_resolution == ConsumerAnchorResolution::Missing) {
-        if (requires_source_consumer_anchor(decision.effect_type)) output.consumer_anchor_method = "source_fact_has_no_executable_anchor";
-        else output.consumer_anchor_method = "asynchronous_effect_no_source_consumer";
-    }
-    if (decision.effect_type == HiCacheEffectType::CommitHostToStorage) {
-        output.consumer_anchors.clear();
-        output.consumer_anchor_method = "target_h2s_background_without_foreground_consumer";
-        output.evidence.push_back("host_storage_write_remains_background");
-    }
+    if (decision.effect_type == HiCacheEffectType::CommitHostToStorage) output.consumer_anchors.clear();
 
     switch (decision.effect_type) {
     case HiCacheEffectType::PrefetchIo:
@@ -107,7 +91,6 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
             if (all_capacity_releases_in_tail(source, *anchor)) {
                 output.source_carrier_state = HiCacheSourceCarrierState::Absent;
                 output.reason = "source capacity release completes after the measured window";
-                output.evidence.push_back("post_window_commit_capacity_release_observed");
                 break;
             }
             output.source_carrier_state = HiCacheSourceCarrierState::Unobservable;
@@ -162,10 +145,6 @@ HiCacheSourceAttributionCatalog build_hicache_source_attribution(const HiCacheSo
     catalog.records.reserve(decisions.decisions.size());
     for (const auto & decision : decisions.decisions) {
         auto record = attribution_detail::attribute_one(source, decision, operations);
-        const auto state = model::hicache_source_carrier_state_name(record.source_carrier_state);
-        (void)core::checked_increment_u64(catalog.counts_by_source_carrier_state[state], "HiCache source carrier-state count exceeds uint64 range");
-        (void)core::checked_increment_u64(catalog.counts_by_effect_type[model::hicache_effect_type_name(record.effect_type)],
-                                          "HiCache source attribution effect-type count exceeds uint64 range");
         if (record.source_carrier_state == model::HiCacheSourceCarrierState::Unobservable
             || record.source_carrier_state == model::HiCacheSourceCarrierState::Ambiguous)
             (void)core::checked_increment_u64(catalog.blocker_counts[record.reason], "HiCache source attribution blocker count exceeds uint64 range");

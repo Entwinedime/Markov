@@ -1,4 +1,4 @@
-#include "rewrite_normalization.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_normalization.hpp"
 
 #include <map>
 #include <ranges>

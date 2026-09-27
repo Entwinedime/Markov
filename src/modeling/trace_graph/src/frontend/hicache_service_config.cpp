@@ -2,7 +2,7 @@
  * @file
  * @brief Parser for the compact HiCache service coefficients.
  */
-#include "model_config_parse_detail.hpp"
+#include "markov/trace_graph/frontend/model_config_parse_detail.hpp"
 
 #include <cmath>
 #include <stdexcept>

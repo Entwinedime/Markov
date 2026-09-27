@@ -2,8 +2,8 @@
  * @file
  * @brief TraceGraph process entry point.
  */
-#include "options.hpp"
-#include "workflow.hpp"
+#include "markov/trace_graph/cli/options.hpp"
+#include "markov/trace_graph/cli/workflow.hpp"
 
 #include "markov/trace_graph/core/logger.hpp"
 

@@ -1,4 +1,4 @@
-#include "rewrite_decision.hpp"
+#include "markov/trace_graph/modules/hicache/patch/rewrite_decision.hpp"
 
 #include <algorithm>
 #include <ranges>
@@ -97,16 +97,13 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .owned_gap_slices = attribution->owned_gap_slices,
         .source_control_duration_nodes = attribution->source_control_duration_nodes,
         .source_control_gap_slices = attribution->source_control_gap_slices,
-        .source_gap_removal_slices = attribution->source_gap_removal_slices,
-        .observed_io_duration_us = attribution->observed_io_duration_us,
         .owned_gap_duration_us = attribution->owned_gap_duration_us,
         .target_host_control_duration_us = cost == nullptr ? 0 : cost->host_control_duration_us,
-        .target_host_control_required =
-            cost != nullptr && cost->host_control_operation_count > 0
-            && (cost->zero_payload_control
-                || ((effect.effect_type == HiCacheEffectType::PrefetchIo || effect.effect_type == HiCacheEffectType::Loadback
-                     || effect.effect_type == HiCacheEffectType::CommitDeviceToHost)
-                    && effect.target_effect_state != HiCacheTargetEffectState::NotRequired)),
+        .target_host_control_required = cost != nullptr && cost->host_control_operation_count > 0
+                                        && (cost->zero_payload_control
+                                            || ((effect.effect_type == HiCacheEffectType::PrefetchIo || effect.effect_type == HiCacheEffectType::Loadback
+                                                 || effect.effect_type == HiCacheEffectType::CommitDeviceToHost)
+                                                && effect.target_effect_state != HiCacheTargetEffectState::NotRequired)),
         .target_host_control_terminal = cost != nullptr && cost->host_control_operation_count > 0 && effect.effect_type == HiCacheEffectType::PrefetchIo,
         .target_host_control_synthetic_id = "hicache_host_control:" + effect.effect_key,
         .target_host_control_terminal_join_synthetic_id = "hicache_terminal_control_join:" + effect.effect_key,
@@ -125,20 +122,13 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
             }(),
         .target_host_control_ingress_edge_id = std::nullopt,
         .target_host_control_ingress_edge_ids = {},
-        .source_gap_removal_duration_us = attribution->source_gap_removal_duration_us,
-        .residual_unknown_duration_us = attribution->residual_unknown_duration_us,
-        .observed_span_semantics = attribution->observed_span_semantics,
-        .completion_wait_status = attribution->completion_wait_status,
-        .completion_wait_reason = attribution->completion_wait_reason,
         .completion_join_contract_ready = attribution->completion_join_contract_ready,
         .completion_join_required =
-            ((effect.effect_type == HiCacheEffectType::PrefetchIo
-              && (effect.consumer_dependency_required || effect.policy_wait_duration_us > 0))
+            ((effect.effect_type == HiCacheEffectType::PrefetchIo && (effect.consumer_dependency_required || effect.policy_wait_duration_us > 0))
              || (effect.effect_type == HiCacheEffectType::Loadback && !reuse_source_readiness_topology))
             && attribution->completion_join_contract_ready
             && (attribution->source_carrier_state == HiCacheSourceCarrierState::Present || effect.target_effect_state != HiCacheTargetEffectState::NotRequired),
         .completion_join_uses_service = effect.effect_type != HiCacheEffectType::PrefetchIo || effect.consumer_dependency_required,
-        .source_effect_schedule_aligned = attribution->source_effect_schedule_aligned,
         .source_readiness_topology_reused = reuse_source_readiness_topology,
         .source_completion_wait_blocking = attribution->source_completion_wait_blocking,
         .source_control_removal_required = attribution->source_control_removal_required,
@@ -147,10 +137,6 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .source_completion_us = attribution->source_completion_us,
         .wait_exit_start_us = attribution->wait_exit_start_us,
         .wait_exit_end_us = attribution->wait_exit_end_us,
-        .completion_wait_duration_us = attribution->completion_wait_duration_us,
-        .completion_wait_gap_duration_us = attribution->completion_wait_gap_duration_us,
-        .polling_lag_us = attribution->polling_lag_us,
-        .retained_terminal_control_us = attribution->retained_terminal_control_us,
         .control_ready_anchor_node_id = attribution->control_ready_anchor_node_id,
         .wait_exit_anchor_node_id = attribution->wait_exit_anchor_node_id,
         .terminal_control_anchor_node_id = attribution->terminal_control_anchor_node_id,
@@ -163,7 +149,6 @@ HiCacheRewriteDecision classify(const HiCacheEffectDecision & effect, const HiCa
         .source_fact_node_id = effect.source_node_id,
         .source_execution_anchor_node_id = source_execution_anchor,
         .consumer_anchors = attribution->consumer_anchors,
-        .consumer_anchor_method = attribution->consumer_anchor_method,
     };
 
     if (cost != nullptr && cost->zero_payload_control && decision.policy_wait_duration_us == 0) {

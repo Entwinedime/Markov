@@ -197,17 +197,6 @@ struct DagGraphCapacity {
     size_t edges = 0;
 };
 
-#ifdef DEBUG
-/** @brief One compact step in a diagnostic critical path. */
-struct DagCriticalPathStep {
-    size_t node_id = 0;
-    size_t predecessor_node_id = std::numeric_limits<size_t>::max();
-    DagEdgeKind incoming_edge_kind = DagEdgeKind::Sequential;
-    uint64_t incoming_delay_us = 0;
-    uint64_t effective_duration_us = 0;
-};
-#endif
-
 /**
  * @brief Owns normalized events, compact nodes, hard edges, and simulation state.
  *
@@ -387,15 +376,6 @@ public:
     /** @brief Stores the observed trace timestamp window for diagnostics. */
     void set_real_e2e_time(uint64_t value) { real_e2e_time_ = value; }
 
-    /** @brief Stores the reconstructed owner-only critical path for diagnostics. */
-    void set_gap_excluded_critical_path(std::vector<DagCriticalPathStep> path) {
-        gap_excluded_critical_path_ = std::move(path);
-    }
-
-    /** @brief Returns the owner-only critical path reconstructed by simulation. */
-    [[nodiscard]] const std::vector<DagCriticalPathStep> & gap_excluded_critical_path() const {
-        return gap_excluded_critical_path_;
-    }
 #endif
 
     /** @brief Computes all run-summary counts in one node pass and one edge pass. */
@@ -457,9 +437,6 @@ private:
 #ifdef DEBUG
     /** @brief Observed input timestamp window, retained only for diagnostics. */
     uint64_t real_e2e_time_ = 0;
-
-    /** @brief Compact owner-only path retained only by validation builds. */
-    std::vector<DagCriticalPathStep> gap_excluded_critical_path_;
 #endif
 
     /** @brief Reader record count retained across normalization for run summaries. */
