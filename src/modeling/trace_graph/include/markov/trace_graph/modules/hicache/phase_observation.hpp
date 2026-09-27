@@ -43,21 +43,15 @@ struct HiCachePhaseObservation {
     uint64_t prefill_device_duration_us = 0;
     size_t prefill_compute_node_count = 0;
     uint64_t prefill_compute_duration_us = 0;
-    size_t prefill_kernel_node_count = 0;
     uint64_t prefill_kernel_duration_us = 0;
-    size_t prefill_common_kernel_node_count = 0;
     uint64_t prefill_common_kernel_duration_us = 0;
-    size_t prefill_prefix_attention_node_count = 0;
     uint64_t prefill_prefix_attention_duration_us = 0;
-    size_t prefill_collective_node_count = 0;
     uint64_t prefill_collective_duration_us = 0;
-    std::vector<size_t> prefill_kernel_node_ids;
     std::vector<size_t> prefill_common_kernel_node_ids;
     std::vector<size_t> prefill_prefix_attention_node_ids;
     std::vector<size_t> prefill_collective_node_ids;
     std::vector<size_t> prefill_submit_cpu_node_ids;
     std::map<std::string, HiCachePhaseCostFamily> prefill_kernel_families;
-    size_t prefill_submit_cpu_node_count = 0;
     uint64_t prefill_submit_cpu_duration_us = 0;
     uint64_t decode_iteration_count = 0;
     uint64_t decode_duration_us = 0;
@@ -65,15 +59,12 @@ struct HiCachePhaseObservation {
     uint64_t decode_device_duration_us = 0;
     size_t decode_compute_node_count = 0;
     uint64_t decode_compute_duration_us = 0;
-    size_t decode_kernel_node_count = 0;
     uint64_t decode_kernel_duration_us = 0;
-    size_t decode_collective_node_count = 0;
     uint64_t decode_collective_duration_us = 0;
     std::vector<size_t> decode_kernel_node_ids;
     std::vector<size_t> decode_collective_node_ids;
     std::vector<size_t> decode_submit_cpu_node_ids;
     std::map<std::string, HiCachePhaseCostFamily> decode_kernel_families;
-    size_t decode_submit_cpu_node_count = 0;
     uint64_t decode_submit_cpu_duration_us = 0;
 };
 

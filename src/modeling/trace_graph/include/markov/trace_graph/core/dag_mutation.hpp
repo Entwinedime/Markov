@@ -73,6 +73,7 @@ struct DagSetCpuGapMutation {
     uint64_t duration = 0;
     std::string effect_id{};
     std::string reason{};
+    std::optional<DagGraph::CpuGapRanges> retained_ranges = std::nullopt;
 };
 
 /**

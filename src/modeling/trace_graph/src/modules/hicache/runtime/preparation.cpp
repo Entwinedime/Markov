@@ -1,5 +1,6 @@
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/modules/hicache/fact.hpp"
 #include <algorithm>
 #include <bit>
 #include <limits>
@@ -44,7 +45,7 @@ std::vector<Span> interval_union(std::vector<Span> intervals) {
     return result;
 }
 
-void observe_costs(const core::DagGraph& graph, AllocatorPreparationPlan& plan) {
+void observe_costs(const core::DagGraph& graph, AllocatorPreparationObservation& plan) {
     std::map<std::string, std::map<std::string, std::vector<uint64_t>>> samples;
     std::map<std::string, std::vector<const Event*>> loads;
     std::map<AllocatorSpecialization, std::vector<const Event*>> compiles;
@@ -151,18 +152,76 @@ std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(c
 }
 }
 
-AllocatorPreparationPlan plan_allocator_preparations(
-    const core::DagGraph& graph, const std::vector<model::HiCacheAllocatorWorkItem>& calls) {
-    AllocatorPreparationPlan result;
+AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph& graph) {
+    AllocatorPreparationObservation result;
     observe_costs(graph, result);
-    std::map<std::string, std::set<AllocatorSpecialization>> prepared;
-    std::set<std::string> supported, uncertain;
-    for (const auto& event : graph.runtime_observations()) {
-        if (event.name == "runtime.triton.prepare" && allocator_event(event) && observed_specialization(event)) supported.insert(event.pid);
+    // Source batches bound observations even when target execution has not yet
+    // reached them. Never infer an owner from the nearest arbitrary CPU event.
+    std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> batches;
+    for (const auto& event : graph.hicache_fact_events()) {
+        if (event.arg("fact").empty() || parse_hicache_fact_metadata(event).role != "cache_extend_input") continue;
+        batches[{event.pid, event.tid}].emplace_back(event.ts, result.calls.size());
+        result.calls.push_back({.source_fact_id=event.index, .pid=event.pid, .tid=event.tid,
+            .begin_us=event.ts, .end_us=std::numeric_limits<uint64_t>::max()});
     }
+    for (auto& [lane, boundaries] : batches) {
+        std::ranges::sort(boundaries);
+        for (size_t i = 1; i < boundaries.size(); ++i) result.calls[boundaries[i-1].second].end_us = boundaries[i].first;
+    }
+    std::map<std::string, uint64_t> first_load;
+    for (const auto& event : graph.runtime_observations()) {
+        if (!allocator_event(event)) continue;
+        if (event.name == "runtime.triton.prepare" && observed_specialization(event)) result.supported_pids.insert(event.pid);
+        if (event.name == "runtime.triton.load") {
+            const auto [entry, added] = first_load.emplace(event.pid, event.ts);
+            if (!added) entry->second = std::min(entry->second, event.ts);
+        }
+    }
+    for (const auto& event : graph.runtime_observations()) {
+        if (!allocator_event(event)) continue;
+        const auto lane = batches.find({event.pid, event.tid});
+        if (lane == batches.end()) continue;
+        const auto& boundaries = lane->second;
+        const auto after = std::ranges::upper_bound(boundaries, event.ts, {}, &std::pair<uint64_t, size_t>::first);
+        if (after == boundaries.begin()) continue; // Prelude supplies samples, not a formal cost.
+        auto& call = result.calls[std::prev(after)->second];
+        const auto end = core::checked_add_u64(event.ts, event.dur, "preparation observation end overflow");
+        const auto observed = observed_specialization(event);
+        if (!observed || event.arg("status") != "returned" || end > call.end_us
+            || (call.specialization && call.specialization != observed)) {
+            ++call.issues["preparation_observation_not_bound"]; continue;
+        }
+        call.specialization = observed;
+        call.intervals.emplace_back(event.ts, end);
+        if (event.name == "runtime.triton.prepare") {
+            call.required = true;
+            call.path = event.arg("path");
+            if (event.arg("execution_mode") == "async") ++call.issues["preparation_async_interval_incomplete"];
+        }
+        if (event.name == "runtime.triton.load" && event.ts == first_load.at(event.pid)) call.first_load = true;
+    }
+    const auto anchors = allocator_gap_anchors(graph);
+    for (auto& call : result.calls) {
+        call.intervals = interval_union(std::move(call.intervals));
+        std::vector<size_t> matches;
+        const auto lane = anchors.find({call.pid, call.tid});
+        if (lane != anchors.end()) for (const auto& [ts, node] : lane->second)
+            if (ts >= call.begin_us && ts < call.end_us) matches.push_back(node);
+        if (matches.size() == 1) call.submit_gap_node = matches.front();
+    }
+    return result;
+}
+
+AllocatorPreparationPlan predict_allocator_preparations(
+    const AllocatorPreparationObservation& source, const std::vector<model::HiCacheAllocatorWorkItem>& calls) {
+    AllocatorPreparationPlan result;
+    result.source_parallel_compilation = source.source_parallel_compilation;
+    result.cost_samples = source.cost_samples;
+    std::map<std::string, std::set<AllocatorSpecialization>> prepared;
+    std::set<std::string> uncertain;
     for (const auto& call : calls) {
         AllocatorPreparation item;
-        if (!supported.contains(call.pid)) item.status = "unsupported_signature";
+        if (!source.supported_pids.contains(call.pid)) item.status = "unsupported_signature";
         else if (call.allocated_pages >= 200) item.status = "naive_path";
         else if (!call.free_index_offset || !call.extend_tokens || !call.batch_size
                  || call.extend_tokens > (uint64_t{1} << 63) || call.batch_size > (uint64_t{1} << 63)) {
@@ -182,93 +241,55 @@ AllocatorPreparationPlan plan_allocator_preparations(
         result.calls.push_back(std::move(item));
     }
     assign_cache_paths(calls, result);
-
-    // A cache_extend input is the start of one sequential batch preparation.
-    // Restrict each observation to that same thread's batch interval; never use
-    // the nearest arbitrary CPU event or a request/workload name as a rule.
-    std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> batches;
-    std::vector<Lane> call_lanes(calls.size());
-    std::vector<Span> call_windows(calls.size(), {0, std::numeric_limits<uint64_t>::max()});
     for (size_t i = 0; i < calls.size(); ++i) {
         if (!calls[i].formal) continue;
-        const auto fact = std::ranges::find_if(graph.hicache_fact_events(), [&](const auto& event) {
-            return event.index == calls[i].source_fact_id && event.pid == calls[i].pid;
+        const auto found = std::ranges::find_if(source.calls, [&](const auto& call) {
+            return call.source_fact_id == calls[i].source_fact_id && call.pid == calls[i].pid;
         });
-        if (fact == graph.hicache_fact_events().end()) { ++result.blockers["source_batch_boundary_missing"]; continue; }
-        batches[{fact->pid, fact->tid}].emplace_back(fact->ts, i);
-        call_lanes[i] = {fact->pid, fact->tid};
-        call_windows[i].first = fact->ts;
-    }
-    for (auto& [lane, boundaries] : batches) {
-        std::ranges::sort(boundaries);
-        for (size_t i = 1; i < boundaries.size(); ++i) call_windows[boundaries[i - 1].second].second = boundaries[i].first;
-    }
-    std::vector<bool> source_required(calls.size());
-    std::vector<bool> source_first_load(calls.size());
-    std::vector<std::optional<AllocatorSpecialization>> source_variants(calls.size());
-    std::vector<std::string> source_paths(calls.size());
-    std::vector<std::vector<Span>> source_spans(calls.size());
-    std::map<std::string, uint64_t> first_load;
-    for (const auto& event : graph.runtime_observations()) if (allocator_event(event) && event.name == "runtime.triton.load") {
-        const auto [entry, added] = first_load.emplace(event.pid, event.ts);
-        if (!added) entry->second = std::min(entry->second, event.ts);
-    }
-    std::map<Lane, std::vector<Span>> removed;
-    for (const auto& event : graph.runtime_observations()) {
-        if (!allocator_event(event)) continue;
-        const Lane lane{event.pid, event.tid};
-        const auto lane_batches = batches.find(lane);
-        if (lane_batches == batches.end()) continue;
-        const auto& boundaries = lane_batches->second;
-        auto after = std::ranges::upper_bound(boundaries, event.ts, {}, &std::pair<uint64_t, size_t>::first);
-        if (after == boundaries.begin()) continue; // Prelude is context, not a formal cost.
-        const auto i = std::prev(after)->second;
-        const auto end = core::checked_add_u64(event.ts, event.dur, "preparation observation end overflow");
-        const auto observed = observed_specialization(event);
-        if (!observed || event.arg("status") != "returned" || (after != boundaries.end() && end > after->first)
-            || (source_variants[i] && source_variants[i] != observed)) {
-            ++result.blockers["preparation_observation_not_bound"]; continue;
-        }
-        source_variants[i] = observed;
-        source_spans[i].emplace_back(event.ts, end);
-        if (event.name == "runtime.triton.prepare") {
-            source_required[i] = true;
-            source_paths[i] = event.arg("path");
-            if (event.arg("execution_mode") == "async") ++result.blockers["preparation_async_interval_incomplete"];
-        }
-        if (event.name == "runtime.triton.load" && event.ts == first_load.at(event.pid)) source_first_load[i] = true;
-    }
-    std::map<size_t, uint64_t> estimated;
-    for (size_t i = 0; i < calls.size(); ++i) {
-        if (!calls[i].formal) continue;
-        result.observed_formal_calls += source_required[i];
+        if (found == source.calls.end()) { ++result.blockers["source_batch_boundary_missing"]; continue; }
+        for (const auto& [issue, count] : found->issues) result.blockers[issue] += count;
+        result.observed_formal_calls += found->required;
         const auto& target = result.calls[i];
-        if (target.status == "required" && source_required[i] && target.specialization == source_variants[i]
-            && target.first_load == source_first_load[i] && (source_paths[i].empty() || source_paths[i] == target.path)) continue;
+        AllocatorPreparationCpuCost cpu{.source_call=static_cast<size_t>(found-source.calls.begin())};
+        if (target.status == "required" && found->required && target.specialization == found->specialization
+            && target.first_load == found->first_load && (found->path.empty() || found->path == target.path)) {
+            cpu.retain_source = true;
+            for (const auto& [begin, end] : found->intervals)
+                cpu.duration_us = core::checked_add_u64(cpu.duration_us, end-begin, "preparation coverage overflow");
+            result.cpu_costs.push_back(cpu);
+            continue;
+        }
         if (target.status == "required") {
             const auto costs = result.cost_samples.find(calls[i].pid);
             if (!result.source_parallel_compilation) ++result.blockers["preparation_compilation_context_uncovered"];
             else if (target.first_load) ++result.blockers["preparation_first_runtime_state_uncovered"];
             else if (costs == result.cost_samples.end() || !costs->second.contains(target.path)
                      || !costs->second.contains("variant_load")) ++result.blockers["new_preparation_cost_uncovered"];
-            else estimated[i] = core::checked_add_u64(costs->second.at(target.path).median_us,
+            else cpu.duration_us = core::checked_add_u64(costs->second.at(target.path).median_us,
                 costs->second.at("variant_load").median_us, "predicted preparation cost overflow");
         } else if (target.status != "already_prepared" && target.status != "naive_path") continue;
-        auto& spans = removed[call_lanes[i]];
-        spans.insert(spans.end(), source_spans[i].begin(), source_spans[i].end());
+        result.cpu_costs.push_back(cpu);
     }
+    if (!result.blockers.empty() || calls.empty()) {
+        result.cpu_costs.clear();
+        result.status = source.supported_pids.empty() ? "unavailable" : "partial";
+    } else result.status = "ready";
+    return result;
+}
 
+AllocatorPreparationPlan plan_allocator_preparations(
+    const core::DagGraph& graph, const std::vector<model::HiCacheAllocatorWorkItem>& calls) {
+    const auto source = observe_allocator_preparations(graph);
+    auto result = predict_allocator_preparations(source, calls);
+    std::map<Lane, std::vector<Span>> removed;
     std::map<size_t, uint64_t> added;
-    if (!estimated.empty()) {
-        const auto anchors = allocator_gap_anchors(graph);
-        for (const auto& [i, cost] : estimated) {
-            std::vector<size_t> matches;
-            const auto found = anchors.find(call_lanes[i]);
-            if (found != anchors.end()) for (const auto& [ts, node] : found->second)
-                if (ts >= call_windows[i].first && ts < call_windows[i].second) matches.push_back(node);
-            if (matches.size() != 1 || !added.emplace(matches.front(), cost).second)
-                ++result.blockers["preparation_submit_anchor_not_unique"];
-        }
+    for (const auto& cost : result.cpu_costs) {
+        if (cost.retain_source) continue;
+        const auto& call = source.calls.at(cost.source_call);
+        auto& spans = removed[{call.pid, call.tid}];
+        spans.insert(spans.end(), call.intervals.begin(), call.intervals.end());
+        if (cost.duration_us && (!call.submit_gap_node || !added.emplace(*call.submit_gap_node, cost.duration_us).second))
+            ++result.blockers["preparation_submit_anchor_not_unique"];
     }
 
     uint64_t required_coverage = 0;
@@ -302,7 +323,7 @@ AllocatorPreparationPlan plan_allocator_preparations(
         result.mutation.set_cpu_gaps.clear();
         result.removed_coverage_us = 0;
         result.added_cost_us = 0;
-        result.status = supported.empty() ? "unavailable" : "partial";
+        result.status = source.supported_pids.empty() ? "unavailable" : "partial";
     } else result.status = "ready";
     return result;
 }

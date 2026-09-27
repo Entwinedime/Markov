@@ -59,7 +59,9 @@ struct MaterializedPlan {
     std::set<size_t> redirected_edges;
     std::set<std::pair<size_t, std::string>> duration_updates;
     std::set<size_t> e2e_eligibility_updates;
+    std::set<size_t> disabled_nodes;
     std::set<std::pair<size_t, std::string>> cpu_gap_updates;
+    std::unordered_map<size_t,std::vector<size_t>> sync_sources;
 };
 
 /** @brief Index the journal once; preserve the original matching and duplicate rules. */
@@ -67,12 +69,15 @@ struct JournalIndex {
     using Records = std::vector<const core::DagMutationRecord *>;
     std::map<core::DagMutationAction, Records> by_action;
     std::unordered_map<size_t, Records> by_node;
+    std::unordered_map<std::string, Records> by_synthetic_id;
     std::map<std::pair<size_t, size_t>, Records> by_added_edge;
 
-    explicit JournalIndex(const core::DagMutationJournal & journal) {
+    JournalIndex(const core::DagGraph & graph, const core::DagMutationJournal & journal) {
         for (const auto & record : journal.records) {
             by_action[record.action].push_back(&record);
             if (record.node_id) by_node[*record.node_id].push_back(&record);
+            if (record.action == core::DagMutationAction::AddSyntheticNode && record.node_id && *record.node_id < graph.node_count())
+                by_synthetic_id[std::string(graph.event_for_node(*record.node_id).arg("synthetic_id"))].push_back(&record);
             if (record.action == core::DagMutationAction::AddEdge && record.src && record.dst)
                 by_added_edge[{*record.src, *record.dst}].push_back(&record);
         }
@@ -86,6 +91,11 @@ struct JournalIndex {
     [[nodiscard]] std::span<const core::DagMutationRecord * const> node_records(size_t node_id) const {
         const auto found = by_node.find(node_id);
         return found == by_node.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
+    }
+
+    [[nodiscard]] std::span<const core::DagMutationRecord * const> synthetic_records(const std::string & id) const {
+        const auto found = by_synthetic_id.find(id);
+        return found == by_synthetic_id.end() ? std::span<const core::DagMutationRecord * const>{} : found->second;
     }
 
     [[nodiscard]] std::span<const core::DagMutationRecord * const> added_edge_records(size_t src, size_t dst) const {
@@ -107,10 +117,31 @@ const core::DagMutationRecord * unique_record(std::span<const core::DagMutationR
 MaterializedPlan materialize_plan_index(const core::DagGraph & graph, const core::DagMutationPlan & plan, const core::DagMutationJournal & journal,
                                         HiCacheAppliedPatchValidation & validation) {
     MaterializedPlan output;
-    const JournalIndex journal_index(journal);
-    for (const auto & record : journal.records) output.changed_effects.insert(record.effect_id);
+    const JournalIndex journal_index(graph, journal);
+    std::unordered_map<size_t,size_t> disabled_edge_records;
+    for (const auto & record : journal.records) {
+        output.changed_effects.insert(record.effect_id);
+        if (record.action == core::DagMutationAction::DisableEdge && record.edge_index) ++disabled_edge_records[*record.edge_index];
+    }
+    for (const auto& edge : graph.edges())
+        if (edge.active && edge.kind == core::DagEdgeKind::Sync) output.sync_sources[edge.dst].push_back(edge.src);
+    for (const auto id : plan.disable_edges) {
+        if (disabled_edge_records[id] != 1 || id >= graph.edge_count() || graph.edge(id).active) {
+            output.ready = false;
+            add_blocker(validation,"disabled_edge_journal_mismatch");
+        }
+    }
+    for (const auto id : plan.disable_nodes) {
+        const auto* record = unique_record(journal_index.node_records(id), [&](const auto& item) {
+            return item.action == core::DagMutationAction::DisableNode;
+        });
+        if (!record || id >= graph.node_count() || graph.node(id).active) {
+            output.ready = false;
+            add_blocker(validation, "disabled_node_journal_mismatch");
+        } else output.disabled_nodes.insert(id);
+    }
     for (const auto & synthetic : plan.synthetic_nodes) {
-        const auto * record = unique_record(journal_index.action_records(core::DagMutationAction::AddSyntheticNode), [&](const auto & candidate) {
+        const auto * record = unique_record(journal_index.synthetic_records(synthetic.synthetic_id), [&](const auto & candidate) {
             if (candidate.effect_id != synthetic.effect_id || !candidate.node_id || *candidate.node_id >= graph.node_count()) return false;
             return graph.event_for_node(*candidate.node_id).arg("synthetic_id") == synthetic.synthetic_id;
         });
@@ -302,8 +333,23 @@ bool synthetic_exact(const HiCacheRewriteDecision & decision, const core::DagGra
     if (found == materialized.synthetic_nodes.end()) return false;
     const auto node_id = found->second;
     const auto expected_lane = decision.resource_lane.empty() ? std::string_view{ "hicache_dependency" } : std::string_view{ decision.resource_lane };
-    const bool effect_ready = graph.node(node_id).active && !graph.node(node_id).counts_toward_e2e && graph.node(node_id).duration == decision.duration_us
+    const bool effect_ready = graph.node(node_id).active && !graph.node(node_id).counts_toward_e2e
+                              && graph.node(node_id).duration == (decision.layer_io.empty() ? decision.duration_us : 0)
                               && graph.node_lane_key(node_id) == expected_lane;
+    uint64_t service_total = 0;
+    size_t previous = node_id;
+    for (const auto& layer : decision.layer_io) {
+        for (const auto& [id,cost] : {std::pair{layer.service_id,layer.service_us},std::pair{layer.ready_id,layer.record_us}}) {
+            const auto found = materialized.synthetic_nodes.find(id);
+            if (found == materialized.synthetic_nodes.end()) return false;
+            const auto& node = graph.node(found->second);
+            if (!node.active || node.is_cpu || node.counts_toward_e2e || node.duration != cost
+                || graph.node_lane_key(node.id) != expected_lane || !added_edge_exists(materialized,previous,node.id,decision.effect_id)) return false;
+            previous = node.id;
+        }
+        service_total = core::checked_add_u64(service_total,layer.service_us,"layer I/O cost total overflow");
+    }
+    if (!decision.layer_io.empty() && service_total != decision.duration_us) return false;
     const bool host_control_ready = target_host_control_exact(decision, graph, materialized);
     const auto policy_wait = materialized.synthetic_nodes.find(decision.policy_wait_synthetic_id);
     const bool policy_wait_ready = decision.policy_wait_duration_us == 0
@@ -322,7 +368,8 @@ bool synthetic_exact(const HiCacheRewriteDecision & decision, const core::DagGra
 bool observable_endpoint_exact(const HiCacheRewriteDecision & decision, const core::DagGraph & graph, const MaterializedPlan & materialized) {
     const auto exact = [&](const auto & nodes) {
         return std::ranges::all_of(nodes, [&](size_t node_id) {
-            return node_id < graph.node_count() && !graph.node(node_id).counts_toward_e2e && materialized.e2e_eligibility_updates.contains(node_id);
+            return materialized.disabled_nodes.contains(node_id)
+                || (node_id < graph.node_count() && !graph.node(node_id).counts_toward_e2e && materialized.e2e_eligibility_updates.contains(node_id));
         });
     };
     return exact(decision.owned_duration_nodes) && exact(decision.source_completion_node_ids) && exact(decision.readiness_join_node_ids)
@@ -367,6 +414,20 @@ bool ingress_exact(const HiCacheRewriteDecision & decision, const MaterializedPl
 }
 
 bool consumer_exact(const HiCacheRewriteDecision & decision, const MaterializedPlan & materialized) {
+    if (!decision.layer_io.empty()) {
+        if (decision.completion_join_uses_service) return false;
+        for (const auto& layer : decision.layer_io) {
+            const auto ready = materialized.synthetic_nodes.find(layer.ready_id);
+            if (ready == materialized.synthetic_nodes.end() || layer.waits.empty()) return false;
+            for (const auto& reference : layer.waits) {
+                const auto wait = resolve_ref(reference,materialized.synthetic_nodes);
+                if (!wait) return false;
+                const auto sources = materialized.sync_sources.find(*wait);
+                if (sources == materialized.sync_sources.end() || sources->second != std::vector<size_t>{ready->second}) return false;
+            }
+        }
+        if (!decision.completion_join_required) return true;
+    }
     if (synthetic_rewrite(decision.rewrite_kind) && !decision.consumer_dependency_required && decision.policy_wait_duration_us == 0) {
         if (decision.completion_join_required) return false;
         std::vector<size_t> service_endpoints;
@@ -533,7 +594,8 @@ std::set<EdgeKey> expected_family_edges(const HiCacheShadowRewriteTransaction & 
 }
 
 std::vector<size_t> lane_endpoints(const HiCacheRewriteDecision & decision, const MaterializedPlan & materialized, bool completion) {
-    const auto synthetic = materialized.synthetic_nodes.find(decision.synthetic_id);
+    const auto synthetic = materialized.synthetic_nodes.find(completion && !decision.layer_io.empty()
+        ? decision.layer_io.back().ready_id : decision.synthetic_id);
     if (synthetic != materialized.synthetic_nodes.end()) return { synthetic->second };
     if (!decision.source_readiness_topology_reused) return {};
     const auto & nodes = completion && !decision.source_completion_node_ids.empty()

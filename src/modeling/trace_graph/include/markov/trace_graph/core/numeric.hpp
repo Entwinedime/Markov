@@ -81,13 +81,6 @@ namespace markov::trace_graph::core {
     return value;
 }
 
-/** @brief Parses a finite value that is greater than or equal to zero. */
-[[nodiscard]] inline std::optional<double> parse_nonnegative_double(std::string_view text) {
-    const auto value = parse_finite_double(text);
-    if (!value || *value < 0.0) return std::nullopt;
-    return value;
-}
-
 /**
  * @brief Converts a finite non-negative double to uint64_t by truncating fractions.
  *

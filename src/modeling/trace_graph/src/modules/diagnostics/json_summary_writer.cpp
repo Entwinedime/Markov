@@ -19,7 +19,7 @@ using Json = nlohmann::json;
 Json hicache_summary(const hicache::HiCacheModule & module) {
     return Json{
         {    "name",                                                            "HiCacheModule" },
-        { "hicache", Json::parse(hicache::diagnostics::summary_json(module.effect_decisions())) },
+        { "hicache", hicache::diagnostics::summary_json(module.effect_decisions()) },
     };
 }
 
@@ -27,13 +27,15 @@ Json io_resource_summary(const hicache::patch::HiCacheIoResourcePlan & resources
     Json costs = Json::array();
     for (const auto & cost : resources.costs) {
         Json batches = Json::array();
-        for (const auto & batch : cost.storage_service_batches)
+        for (const auto & batch : cost.storage_service_batches) {
             batches.push_back({
                 {             "operation_index",     batch.operation_index },
                 {                  "page_count",          batch.page_count },
                 { "storage_existing_page_count", batch.existing_page_count },
                 {      "storage_new_page_count",      batch.new_page_count }
             });
+            if (batch.copied_page_count) batches.back()["copied_page_count"] = *batch.copied_page_count;
+        }
         costs.push_back({
             {                    "effect_id",                                                             cost.effect_id },
             {                  "effect_type",                 hicache::model::hicache_effect_type_name(cost.effect_type) },
@@ -117,14 +119,13 @@ Json patch_summary(const hicache::HiCacheDagPatchModule & module) {
 
 } // namespace
 
-std::string module_summary_json(const SimulationModule & module) {
-    if (const auto * hicache_module = dynamic_cast<const hicache::HiCacheModule *>(&module)) return hicache_summary(*hicache_module).dump();
-    if (const auto * patch_module = dynamic_cast<const hicache::HiCacheDagPatchModule *>(&module)) return patch_summary(*patch_module).dump();
+Json module_summary_json(const SimulationModule & module) {
+    if (const auto * hicache_module = dynamic_cast<const hicache::HiCacheModule *>(&module)) return hicache_summary(*hicache_module);
+    if (const auto * patch_module = dynamic_cast<const hicache::HiCacheDagPatchModule *>(&module)) return patch_summary(*patch_module);
     return Json{
         {           "name",             module.name() },
         { "summary_status", "unsupported_module_type" },
-    }
-        .dump();
+    };
 }
 
 } // namespace markov::trace_graph::modules::diagnostics

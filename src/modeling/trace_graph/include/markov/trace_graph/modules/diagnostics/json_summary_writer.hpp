@@ -10,11 +10,11 @@
 
 #include "markov/trace_graph/modules/module.hpp"
 
-#include <string>
+#include <nlohmann/json_fwd.hpp>
 
 namespace markov::trace_graph::modules::diagnostics {
 
-/** @brief Serializes the summary of one executed module to JSON text. */
-[[nodiscard]] std::string module_summary_json(const SimulationModule & module);
+/** @brief Builds one module's JSON value; the CLI serializes the final document. */
+[[nodiscard]] nlohmann::json module_summary_json(const SimulationModule & module);
 
 } // namespace markov::trace_graph::modules::diagnostics

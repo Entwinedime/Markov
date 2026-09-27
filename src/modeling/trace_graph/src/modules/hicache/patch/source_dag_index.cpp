@@ -6,12 +6,10 @@
 
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <iterator>
 #include <limits>
 #include <ranges>
 #include <set>
@@ -27,12 +25,6 @@ using Json = nlohmann::json;
 
 uint64_t saturated_add(uint64_t start, uint64_t duration) {
     return duration > std::numeric_limits<uint64_t>::max() - start ? std::numeric_limits<uint64_t>::max() : start + duration;
-}
-
-template <typename Index> void append_identity(const core::TraceEvent & event, std::string_view key, size_t node_id, Index & index) {
-    if (!event.has_arg_key_hint(key)) return;
-    auto value = event.arg(key);
-    if (!value.empty()) index[std::move(value)].push_back(node_id);
 }
 
 bool fact_candidate(const core::TraceEvent & event) { return event.source_channel == core::TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
@@ -83,11 +75,55 @@ std::optional<bool> bool_arg(const core::TraceEvent & event, std::string_view ke
     return std::nullopt;
 }
 
+// Window and tail facts share the same observed fields. The caller assigns
+// their identity and applies the relevant lifecycle validation.
+HiCacheSourceFactNode fact_record(const core::TraceEvent & event, size_t fact_id) {
+    auto metadata = parse_hicache_fact_metadata(event);
+    auto operation_id = event.arg("operation_id");
+    if (operation_id.empty() && event.has_arg_key_hint("node_id")) operation_id = event.arg("node_id");
+
+    std::optional<uint64_t> object_node_id;
+    if (event.has_arg_key_hint("node_id")) {
+        const auto raw_node_id = event.find_arg("node_id");
+        if (raw_node_id) object_node_id = core::parse_u64(*raw_node_id);
+    }
+
+    return HiCacheSourceFactNode{
+        .node_id = fact_id,
+        .event_index = event.index,
+        .timestamp_us = event.ts,
+        .duration_us = event.dur,
+        .pid = event.pid,
+        .tid = event.tid,
+        .target_id = event.arg("target_id"),
+        .phase = event.arg("phase"),
+        .fact_class = std::move(metadata.fact_class),
+        .fact_role = std::move(metadata.role),
+        .request_id = event.arg("request_id"),
+        .batch_request_ids = request_ids_arg(event),
+        .operation_id = std::move(operation_id),
+        .cache_scope = event.arg("cache_scope"),
+        .object_node_id = object_node_id,
+        .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
+        .source_page_size = event.arg_u64("source_page_size", 0),
+        .service_item_count = event.arg_u64("service_item_count", 0),
+        .storage_existing_page_count = core::parse_u64(event.arg("storage_existing_page_count")),
+        .storage_new_page_count = core::parse_u64(event.arg("storage_new_page_count")),
+        .token_count = event.arg_u64("token_count", 0),
+        .effective_token_count = event.arg_u64("effective_token_count", 0),
+        .completed_token_count = event.arg_u64("completed_token_count", 0),
+        .completed_token_count_present = event.has_arg_key_hint("completed_token_count"),
+        .progress_ready = bool_arg(event, "progress_ready"),
+        .host_available_tokens_at_return = core::parse_exact_u64(event.arg("host_available_tokens_at_return")),
+        .write_back = bool_arg(event, "write_back"),
+        .operation_node_ids = u64_array_arg(event, "operation_node_ids"),
+        .page_hashes = string_array_arg(event, "page_hashes"),
+    };
+}
+
 } // namespace source_dag_index_detail
 
 HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : graph_(graph) {
-    stats_.stored_node_count = graph.node_count();
-    stats_.dag_patch_contract_ready = graph.has_input_contract("hicache_dag_patch");
     incoming_offsets_.assign(graph.node_count() + 1, 0);
     outgoing_offsets_.assign(graph.node_count() + 1, 0);
 
@@ -98,8 +134,11 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
     std::unordered_map<std::string, PendingControlInterval> pending_control_intervals;
 
     for (const auto & node : graph.nodes()) {
+        if (!node.is_cpu) {
+            const auto direction = graph.event_for_node(node.id).arg("operation");
+            if (!direction.empty()) device_nodes_by_direction_[direction].push_back(node.id);
+        }
         if (!node.active) continue;
-        ++stats_.active_node_count;
         if (node.is_cpu) {
             const auto & event = graph.event_for_node(node.id);
             auto lane_key = cpu_lane_key(event.pid, event.tid);
@@ -147,129 +186,40 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
     HiCacheFactParser source_fact_parser;
     for (const auto & event : graph.hicache_fact_events()) source_fact_parser.observe_token_dictionaries(event);
     for (const auto & event : graph.tail_context_events()) source_fact_parser.observe_token_dictionaries(event);
-    const runtime::HiCacheTargetPager source_pager;
 
-    const auto append_fact = [&](const core::TraceEvent & event, size_t fact_id, std::optional<size_t> execution_anchor_node_id) {
-        if (!source_dag_index_detail::fact_candidate(event)) return;
+    for (const auto & event : graph.hicache_fact_events()) {
+        if (!source_dag_index_detail::fact_candidate(event)) continue;
         try {
-            auto metadata = parse_hicache_fact_metadata(event);
-            auto operation_id = event.arg("operation_id");
-            if (operation_id.empty() && event.has_arg_key_hint("node_id")) operation_id = event.arg("node_id");
-            std::optional<uint64_t> object_node_id;
-            if (event.has_arg_key_hint("node_id")) {
-                const auto raw_node_id = event.find_arg("node_id");
-                if (raw_node_id) object_node_id = core::parse_u64(*raw_node_id);
+            const auto fact_id = event.index;
+            auto fact = source_dag_index_detail::fact_record(event, fact_id);
+            if (fact.fact_role == "cache_lifecycle_commit") {
+                // Preserve lifecycle field validation; page identity is computed
+                // by the state model, not duplicated in this attribution index.
+                (void)source_fact_parser.parse(fact_id, event, std::nullopt);
             }
-            std::vector<std::string> source_page_hashes;
-            if (metadata.role == "cache_lifecycle_commit") {
-                const auto parsed_fact = source_fact_parser.parse(fact_id, event, execution_anchor_node_id);
-                const auto page_path = source_pager.project(parsed_fact, parsed_fact.full_path_tokens);
-                source_page_hashes.reserve(page_path.pages.size());
-                std::ranges::transform(page_path.pages, std::back_inserter(source_page_hashes), [](const auto & page) { return page.hash; });
-            }
+
             const auto fact_index = fact_nodes_.size();
-            fact_nodes_.push_back(HiCacheSourceFactNode{
-                .node_id = fact_id,
-                .execution_anchor_node_id = execution_anchor_node_id,
-                .event_index = event.index,
-                .event_name = event.name,
-                .timestamp_us = event.ts,
-                .duration_us = event.dur,
-                .pid = event.pid,
-                .tid = event.tid,
-                .target_id = event.arg("target_id"),
-                .phase = event.arg("phase"),
-                .fact_class = std::move(metadata.fact_class),
-                .fact_role = std::move(metadata.role),
-                .request_id = event.arg("request_id"),
-                .batch_request_ids = source_dag_index_detail::request_ids_arg(event),
-                .operation_id = std::move(operation_id),
-                .cache_scope = event.arg("cache_scope"),
-                .object_node_id = object_node_id,
-                .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
-                .source_page_size = event.arg_u64("source_page_size", 0),
-                .service_item_count = event.arg_u64("service_item_count", 0),
-                .storage_existing_page_count = core::parse_u64(event.arg("storage_existing_page_count")),
-                .storage_new_page_count = core::parse_u64(event.arg("storage_new_page_count")),
-                .token_count = event.arg_u64("token_count", 0),
-                .effective_token_count = event.arg_u64("effective_token_count", 0),
-                .completed_token_count = event.arg_u64("completed_token_count", 0),
-                .completed_token_count_present = event.has_arg_key_hint("completed_token_count"),
-                .progress_ready = source_dag_index_detail::bool_arg(event, "progress_ready"),
-                .host_available_tokens_at_return = core::parse_exact_u64(event.arg("host_available_tokens_at_return")),
-                .write_back = source_dag_index_detail::bool_arg(event, "write_back"),
-                .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
-                .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
-                .source_page_hashes = std::move(source_page_hashes),
-            });
+            fact_nodes_.push_back(std::move(fact));
             fact_index_by_node_.emplace(fact_id, fact_index);
-            source_dag_index_detail::append_identity(event, "request_id", fact_id, nodes_by_request_);
-            source_dag_index_detail::append_identity(event, "operation_id", fact_id, nodes_by_operation_);
+            if (!fact_nodes_.back().request_id.empty()) nodes_by_request_[fact_nodes_.back().request_id].push_back(fact_id);
             nodes_by_fact_role_[fact_nodes_.back().fact_role].push_back(fact_id);
             for (const auto & request_id : fact_nodes_.back().batch_request_ids) nodes_by_request_[request_id].push_back(fact_id);
-            ++stats_.counts_by_fact_class[fact_nodes_.back().fact_class];
-            ++stats_.counts_by_fact_role[fact_nodes_.back().fact_role];
-            if (!fact_nodes_.back().request_id.empty() || !fact_nodes_.back().batch_request_ids.empty())
-                ++stats_.request_identity_counts_by_fact_role[fact_nodes_.back().fact_role];
-            if (!fact_nodes_.back().operation_id.empty()) ++stats_.operation_identity_counts_by_fact_role[fact_nodes_.back().fact_role];
-            if (fact_nodes_.back().fact_class == "workload_identity") ++stats_.workload_identity_fact_count;
-            else if (fact_nodes_.back().fact_class == "source_actual") ++stats_.source_actual_fact_count;
-            else if (fact_nodes_.back().fact_class == "timing_observation") ++stats_.timing_observation_fact_count;
         }
         catch (const std::exception &) {
-            ++stats_.malformed_fact_count;
+            // Malformed facts cannot supply attribution evidence.
         }
-    };
+    }
 
-    for (const auto & event : graph.hicache_fact_events()) append_fact(event, event.index, std::nullopt);
-
+    const auto tail_offset = hicache_tail_fact_offset(graph.hicache_fact_events());
     for (const auto & event : graph.tail_context_events()) {
         if (!source_dag_index_detail::fact_candidate(event)) continue;
         try {
-            auto metadata = parse_hicache_fact_metadata(event);
-            auto operation_id = event.arg("operation_id");
-            if (operation_id.empty() && event.has_arg_key_hint("node_id")) operation_id = event.arg("node_id");
-            std::optional<uint64_t> object_node_id;
-            if (event.has_arg_key_hint("node_id")) {
-                const auto raw_node_id = event.find_arg("node_id");
-                if (raw_node_id) object_node_id = core::parse_u64(*raw_node_id);
-            }
             const auto tail_fact_index = tail_context_facts_.size();
-            if (tail_fact_index > std::numeric_limits<size_t>::max() - graph.node_count())
+            if (event.index > std::numeric_limits<size_t>::max() - tail_offset) {
                 throw std::overflow_error("HiCache tail fact identity exceeds size_t range");
-            const auto tail_fact_node_id = graph.node_count() + tail_fact_index;
-            tail_context_facts_.push_back(HiCacheSourceFactNode{
-                .node_id = tail_fact_node_id,
-                .event_index = event.index,
-                .event_name = event.name,
-                .timestamp_us = event.ts,
-                .duration_us = event.dur,
-                .pid = event.pid,
-                .tid = event.tid,
-                .target_id = event.arg("target_id"),
-                .phase = event.arg("phase"),
-                .fact_class = std::move(metadata.fact_class),
-                .fact_role = std::move(metadata.role),
-                .request_id = event.arg("request_id"),
-                .batch_request_ids = source_dag_index_detail::request_ids_arg(event),
-                .operation_id = std::move(operation_id),
-                .cache_scope = event.arg("cache_scope"),
-                .object_node_id = object_node_id,
-                .full_path_span = parse_hicache_token_span_arg(event, "full_path_span"),
-                .source_page_size = event.arg_u64("source_page_size", 0),
-                .service_item_count = event.arg_u64("service_item_count", 0),
-                .storage_existing_page_count = core::parse_u64(event.arg("storage_existing_page_count")),
-                .storage_new_page_count = core::parse_u64(event.arg("storage_new_page_count")),
-                .token_count = event.arg_u64("token_count", 0),
-                .effective_token_count = event.arg_u64("effective_token_count", 0),
-                .completed_token_count = event.arg_u64("completed_token_count", 0),
-                .completed_token_count_present = event.has_arg_key_hint("completed_token_count"),
-                .progress_ready = source_dag_index_detail::bool_arg(event, "progress_ready"),
-                .host_available_tokens_at_return = core::parse_exact_u64(event.arg("host_available_tokens_at_return")),
-                .write_back = source_dag_index_detail::bool_arg(event, "write_back"),
-                .operation_node_ids = source_dag_index_detail::u64_array_arg(event, "operation_node_ids"),
-                .page_hashes = source_dag_index_detail::string_array_arg(event, "page_hashes"),
-            });
+            }
+            const auto tail_fact_node_id = tail_offset + event.index;
+            tail_context_facts_.push_back(source_dag_index_detail::fact_record(event, tail_fact_node_id));
             tail_fact_index_by_node_.emplace(tail_fact_node_id, tail_fact_index);
         }
         catch (const std::exception &) {
@@ -284,14 +234,13 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
             throw std::logic_error("Source DAG index found an active edge attached to an inactive node");
         ++outgoing_offsets_[edge.src + 1];
         ++incoming_offsets_[edge.dst + 1];
-        ++stats_.active_edge_count;
     }
     for (size_t node_id = 0; node_id < graph.node_count(); ++node_id) {
         outgoing_offsets_[node_id + 1] += outgoing_offsets_[node_id];
         incoming_offsets_[node_id + 1] += incoming_offsets_[node_id];
     }
-    outgoing_edge_ids_.resize(stats_.active_edge_count);
-    incoming_edge_ids_.resize(stats_.active_edge_count);
+    outgoing_edge_ids_.resize(outgoing_offsets_.back());
+    incoming_edge_ids_.resize(incoming_offsets_.back());
     auto outgoing_cursor = outgoing_offsets_;
     auto incoming_cursor = incoming_offsets_;
     for (size_t edge_index = 0; edge_index < graph.edge_count(); ++edge_index) {
@@ -301,23 +250,14 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
         incoming_edge_ids_[incoming_cursor[edge.dst]++] = edge_index;
     }
 
-    fact_nodes_in_time_order_.reserve(fact_nodes_.size());
-    std::ranges::transform(fact_nodes_, std::back_inserter(fact_nodes_in_time_order_), [](const auto & fact) { return fact.node_id; });
-    std::ranges::sort(fact_nodes_in_time_order_, [&](size_t left_node_id, size_t right_node_id) {
-        const auto * left = fact_node(left_node_id);
-        const auto * right = fact_node(right_node_id);
-        if (left->timestamp_us != right->timestamp_us) return left->timestamp_us < right->timestamp_us;
-        if (left->pid != right->pid) return left->pid < right->pid;
-        if (left->tid != right->tid) return left->tid < right->tid;
-        if (left->event_name != right->event_name) return left->event_name < right->event_name;
-        if (left->event_index != right->event_index) return left->event_index < right->event_index;
-        return left_node_id < right_node_id;
-    });
     for (auto & [lane_key, nodes] : cpu_nodes_by_lane_) {
         std::ranges::sort(nodes, [&](size_t left_node_id, size_t right_node_id) {
             const auto & left = graph_.event_for_node(left_node_id);
             const auto & right = graph_.event_for_node(right_node_id);
             if (left.ts != right.ts) return left.ts < right.ts;
+            // An inserted point at a leaf's entry precedes that leaf. Putting
+            // it after the leaf would count the leaf again as the point's gap.
+            if ((left.dur == 0) != (right.dur == 0)) return left.dur == 0;
             return left_node_id < right_node_id;
         });
         auto & prefix_ends = cpu_prefix_end_us_by_lane_[lane_key];
@@ -329,10 +269,6 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
             prefix_ends.push_back(frontier_end);
         }
     }
-    stats_.fact_node_count = fact_nodes_.size();
-    stats_.request_identity_count = nodes_by_request_.size();
-    stats_.operation_identity_count = nodes_by_operation_.size();
-    stats_.status = stats_.malformed_fact_count == 0 ? "ready" : "partial";
 }
 
 std::span<const size_t> HiCacheSourceDagIndex::incoming_edge_ids(size_t node_id) const {
@@ -361,13 +297,31 @@ std::span<const size_t> HiCacheSourceDagIndex::nodes_for_fact_role(std::string_v
 
 std::span<const size_t> HiCacheSourceDagIndex::nodes_for_request(std::string_view request_id) const { return find_nodes(nodes_by_request_, request_id); }
 
-std::span<const size_t> HiCacheSourceDagIndex::nodes_for_operation(std::string_view operation_id) const { return find_nodes(nodes_by_operation_, operation_id); }
-
 std::span<const size_t> HiCacheSourceDagIndex::cpu_nodes_on_lane(std::string_view pid, std::string_view tid) const {
     return find_nodes(cpu_nodes_by_lane_, cpu_lane_key(pid, tid));
 }
 
+std::span<const size_t> HiCacheSourceDagIndex::cpu_interval_candidates(std::string_view pid, std::string_view tid, uint64_t begin_us, uint64_t end_us) const {
+    const auto key = cpu_lane_key(pid, tid);
+    const auto nodes = find_nodes(cpu_nodes_by_lane_, key);
+    if (nodes.empty() || end_us <= begin_us) return {};
+
+    const auto & ends = cpu_prefix_end_us_by_lane_.at(key);
+    const auto first = static_cast<size_t>(std::ranges::upper_bound(ends, begin_us) - ends.begin());
+    const auto last = static_cast<size_t>(std::ranges::lower_bound(nodes, end_us, {}, [&](size_t id) { return graph_.event_for_node(id).ts; }) - nodes.begin());
+    return nodes.subspan(first, last - first);
+}
+
 std::string HiCacheSourceDagIndex::cpu_lane_key(std::string_view pid, std::string_view tid) { return std::string(pid) + "\x1f" + std::string(tid); }
+
+std::optional<size_t> HiCacheSourceDagIndex::cpu_node_starting_at(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const {
+    const auto nodes = cpu_nodes_on_lane(pid, tid);
+    const auto first = std::ranges::lower_bound(nodes, timestamp_us, {}, [&](size_t id) { return graph_.event_for_node(id).ts; });
+    if (first == nodes.end() || graph_.event_for_node(*first).ts != timestamp_us) return std::nullopt;
+    const auto next = std::next(first);
+    if (next != nodes.end() && graph_.event_for_node(*next).ts == timestamp_us) return std::nullopt;
+    return *first;
+}
 
 std::optional<size_t> HiCacheSourceDagIndex::cpu_boundary_at_or_before(std::string_view pid, std::string_view tid, uint64_t timestamp_us) const {
     const auto nodes = find_nodes(cpu_nodes_by_lane_, cpu_lane_key(pid, tid));
@@ -392,7 +346,9 @@ std::optional<size_t> HiCacheSourceDagIndex::cpu_boundary_at_or_after(std::strin
     return bound == nodes.end() ? std::nullopt : std::optional<size_t>{ *bound };
 }
 
-HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(const HiCacheSourceFactNode & fact) const { return timing_interval_ownership(fact.pid, fact.tid, fact.timestamp_us, fact.duration_us); }
+HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(const HiCacheSourceFactNode & fact) const {
+    return timing_interval_ownership(fact.pid, fact.tid, fact.timestamp_us, fact.duration_us);
+}
 
 HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(std::string_view pid, std::string_view tid, uint64_t start_us,
                                                                                 uint64_t duration_us) const {
@@ -423,8 +379,7 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
     });
     const auto first_index = static_cast<size_t>(first - nodes.begin());
     // Earlier nodes cannot be owned; a prefix maximum still detects any long enclosing leaf.
-    bool partial_node_overlap = first_index > 0 && output.interval_end_us > start_us
-                                && cpu_prefix_end_us_by_lane_.at(lane_key)[first_index - 1] > start_us;
+    bool partial_node_overlap = first_index > 0 && output.interval_end_us > start_us && cpu_prefix_end_us_by_lane_.at(lane_key)[first_index - 1] > start_us;
     for (size_t node_id : std::span<const size_t>{ first, last }) {
         const auto & event = graph_.event_for_node(node_id);
         const auto event_end = source_dag_index_detail::saturated_add(event.ts, event.dur);
@@ -441,33 +396,17 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
     }
 
     if (!output.owned_node_ids.empty()) {
-        auto frontier_node_id = output.owned_node_ids.front();
-        const auto & first = graph_.event_for_node(frontier_node_id);
+        const auto & first = graph_.event_for_node(output.owned_node_ids.front());
         auto frontier_end = source_dag_index_detail::saturated_add(first.ts, first.dur);
         for (size_t index = 1; index < output.owned_node_ids.size(); ++index) {
-            const auto overlapping_node_id = output.owned_node_ids[index];
-            const auto & overlapping = graph_.event_for_node(overlapping_node_id);
+            const auto & overlapping = graph_.event_for_node(output.owned_node_ids[index]);
             const auto overlapping_end = source_dag_index_detail::saturated_add(overlapping.ts, overlapping.dur);
             const auto overlap_end = std::min(frontier_end, overlapping_end);
             if (overlap_end > overlapping.ts) {
-                const auto duration = overlap_end - overlapping.ts;
-                const auto & frontier = graph_.event_for_node(frontier_node_id);
-                output.overlapping_node_slices.push_back(HiCacheCpuOverlapSlice{
-                    .frontier_node_id = frontier_node_id,
-                    .overlapping_node_id = overlapping_node_id,
-                    .frontier_event_name = frontier.name,
-                    .overlapping_event_name = overlapping.name,
-                    .overlap_start_us = overlapping.ts,
-                    .overlap_end_us = overlap_end,
-                });
-                output.overlapping_node_duration_us =
-                    core::checked_add_u64(output.overlapping_node_duration_us, duration, "HiCache overlapping CPU leaf duration exceeds uint64 range");
-                output.max_node_overlap_us = std::max(output.max_node_overlap_us, duration);
+                output.has_node_overlap = true;
+                break;
             }
-            if (overlapping_end > frontier_end) {
-                frontier_node_id = overlapping_node_id;
-                frontier_end = overlapping_end;
-            }
+            frontier_end = std::max(frontier_end, overlapping_end);
         }
     }
 
@@ -487,7 +426,6 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
         output.owned_gap_slices.push_back(HiCacheCpuGapSlice{
             .owner_node_id = previous_node_id,
             .successor_node_id = successor_node_id,
-            .logical_input_id = graph_.node(previous_node_id).gpu_id,
             .gap_start_us = gap_start,
             .gap_end_us = gap_end,
             .owned_start_us = owned_start,
@@ -525,8 +463,7 @@ std::optional<HiCacheTimingIntervalOwnership> HiCacheSourceDagIndex::enclosing_c
         if (candidate.pid != fact.pid || candidate.tid != fact.tid) continue;
         const auto candidate_start_with_tolerance =
             candidate.start_us > timestamp_rounding_tolerance_us ? candidate.start_us - timestamp_rounding_tolerance_us : 0;
-        const auto candidate_end_with_tolerance =
-            source_dag_index_detail::saturated_add(candidate.end_us, timestamp_rounding_tolerance_us);
+        const auto candidate_end_with_tolerance = source_dag_index_detail::saturated_add(candidate.end_us, timestamp_rounding_tolerance_us);
         if (candidate_start_with_tolerance > fact.timestamp_us || candidate_end_with_tolerance < fact_end_us) continue;
         const auto candidate_duration = candidate.end_us - candidate.start_us;
         if (best == nullptr || candidate_duration < best->end_us - best->start_us) best = &candidate;
@@ -559,7 +496,8 @@ HiCacheDeviceTransferClosure HiCacheSourceDagIndex::device_transfer_closure(cons
 
     const auto interval_end = source_dag_index_detail::saturated_add(submission.timestamp_us, submission.duration_us);
     const auto logical_input = *logical_inputs.begin();
-    for (const auto & node : graph_.nodes()) {
+    for (const auto id : find_nodes(device_nodes_by_direction_, direction)) {
+        const auto & node = graph_.node(id);
         if (!node.active || node.is_cpu || node.gpu_id != logical_input) continue;
         const auto & event = graph_.event_for_node(node.id);
         if (event.arg("operation") != direction) continue;

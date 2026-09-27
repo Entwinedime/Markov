@@ -41,16 +41,12 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
         .source_end_us = fact_end(timing),
         .observed_duration_us = timing.duration_us,
         .observed_span_semantics = observed_span_semantics(kind),
-        .observed_service_start_us = services.empty() ? 0 : services.front()->timestamp_us,
         .owned_node_duration_us = ownership.owned_node_duration_us,
         .owned_gap_duration_us = ownership.owned_gap_duration_us,
-        .overlapping_node_duration_us = ownership.overlapping_node_duration_us,
-        .max_node_overlap_us = ownership.max_node_overlap_us,
         .uncovered_duration_us = ownership.uncovered_duration_us,
         .timing_fact_node_id = timing.node_id,
         .runtime_node_ids = ownership.owned_node_ids,
         .cpu_gap_slices = ownership.owned_gap_slices,
-        .cpu_overlap_slices = ownership.overlapping_node_slices,
         .source_anchor_node_id = ownership.start_anchor_node_id,
         .completion_anchor_node_id = ownership.completion_anchor_node_id,
         .runtime_copy_observed = !ownership.owned_node_ids.empty(),
@@ -112,13 +108,10 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
                 record.cpu_gap_slices = foreground.owned_gap_slices;
                 record.owned_node_duration_us = 0;
                 record.owned_gap_duration_us = foreground.owned_gap_duration_us;
-                record.overlapping_node_duration_us = 0;
-                record.max_node_overlap_us = 0;
                 record.uncovered_duration_us =
                     record.observed_duration_us > record.owned_gap_duration_us ? record.observed_duration_us - record.owned_gap_duration_us : 0;
                 record.source_anchor_node_id = foreground.start_anchor_node_id;
                 record.completion_anchor_node_id = foreground.completion_anchor_node_id;
-                record.cpu_overlap_slices.clear();
                 record.runtime_copy_observed = false;
                 record.control_fact_node_ids.push_back(candidate->node_id);
                 record.evidence.push_back("wait_complete_foreground_gap_projection");
@@ -159,11 +152,8 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
                                                             && record.wait_exit_anchor_node_id && record.terminal_control_anchor_node_id;
         record.runtime_node_ids.clear();
         record.cpu_gap_slices.clear();
-        record.cpu_overlap_slices.clear();
         record.owned_node_duration_us = 0;
         record.owned_gap_duration_us = 0;
-        record.overlapping_node_duration_us = 0;
-        record.max_node_overlap_us = 0;
         record.uncovered_duration_us = record.observed_duration_us;
         record.source_anchor_node_id = std::nullopt;
         record.completion_anchor_node_id = std::nullopt;
@@ -201,11 +191,8 @@ HiCacheIoOperationRecord build_record(const HiCacheSourceDagIndex & source, cons
     const auto clear_host_ownership = [&] {
         record.runtime_node_ids.clear();
         record.cpu_gap_slices.clear();
-        record.cpu_overlap_slices.clear();
         record.owned_node_duration_us = 0;
         record.owned_gap_duration_us = 0;
-        record.overlapping_node_duration_us = 0;
-        record.max_node_overlap_us = 0;
         record.uncovered_duration_us = record.observed_duration_us;
         record.source_anchor_node_id = std::nullopt;
         record.completion_anchor_node_id = std::nullopt;

@@ -31,7 +31,7 @@ ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & so
     const auto * fact = source.fact_node(*decision.consumer_boundary.source_node_id);
     if (fact == nullptr || (!decision.consumer_boundary.source_fact_role.empty() && fact->fact_role != decision.consumer_boundary.source_fact_role))
         return ConsumerAnchorResolution::Invalid;
-    auto anchor = decision.consumer_boundary.execution_anchor_node_id ? decision.consumer_boundary.execution_anchor_node_id : fact->execution_anchor_node_id;
+    auto anchor = decision.consumer_boundary.execution_anchor_node_id;
     if (!anchor) anchor = source.cpu_boundary_at_or_after(fact->pid, fact->tid, fact_boundary(*fact));
     if (!anchor) return ConsumerAnchorResolution::Missing;
     const auto node_id = *anchor;
@@ -40,29 +40,6 @@ ConsumerAnchorResolution append_target_consumer(const HiCacheSourceDagIndex & so
     sort_unique(output.consumer_anchors);
     output.consumer_anchor_method = "target_canonical_consumer";
     return ConsumerAnchorResolution::Ready;
-}
-
-bool append_unique_sequential_successor(const HiCacheSourceDagIndex & source, size_t source_node_id, HiCacheSourceAttribution & output) {
-    const auto * source_fact = source.fact_node(source_node_id);
-    if (source_fact == nullptr || !source_fact->execution_anchor_node_id) {
-        output.consumer_anchor_method = "source_fact_has_no_executable_anchor";
-        return false;
-    }
-    const auto anchor_node_id = *source_fact->execution_anchor_node_id;
-    std::vector<size_t> successors;
-    for (size_t edge_index : source.outgoing_edge_ids(anchor_node_id)) {
-        const auto & edge = source.graph().edge(edge_index);
-        if (edge.kind == core::DagEdgeKind::Sequential) successors.push_back(edge.dst);
-    }
-    sort_unique(successors);
-    if (successors.size() != 1) {
-        output.consumer_anchor_method = successors.empty() ? "missing" : "ambiguous_sequential_successor";
-        return false;
-    }
-    output.consumer_anchors.push_back(successors.front());
-    sort_unique(output.consumer_anchors);
-    output.consumer_anchor_method = "unique_original_sequential_successor";
-    return true;
 }
 
 HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, const HiCacheEffectDecision & decision,
@@ -79,9 +56,7 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
         output.reason = "source opportunity anchor is missing from the semantic DAG index";
         return output;
     }
-    output.source_execution_anchor_node_id = anchor->execution_anchor_node_id;
-    if (!output.source_execution_anchor_node_id)
-        output.source_execution_anchor_node_id = source.cpu_boundary_at_or_before(anchor->pid, anchor->tid, fact_boundary(*anchor));
+    output.source_execution_anchor_node_id = source.cpu_boundary_at_or_before(anchor->pid, anchor->tid, fact_boundary(*anchor));
     if (!output.source_execution_anchor_node_id)
         output.source_execution_anchor_node_id = source.cpu_boundary_at_or_after(anchor->pid, anchor->tid, fact_boundary(*anchor));
     output.evidence.push_back("source_opportunity_anchor");
@@ -93,7 +68,7 @@ HiCacheSourceAttribution attribute_one(const HiCacheSourceDagIndex & source, con
         return output;
     }
     if (consumer_resolution == ConsumerAnchorResolution::Missing) {
-        if (requires_source_consumer_anchor(decision.effect_type)) (void)append_unique_sequential_successor(source, decision.source_node_id, output);
+        if (requires_source_consumer_anchor(decision.effect_type)) output.consumer_anchor_method = "source_fact_has_no_executable_anchor";
         else output.consumer_anchor_method = "asynchronous_effect_no_source_consumer";
     }
     if (decision.effect_type == HiCacheEffectType::CommitHostToStorage) {
@@ -204,11 +179,10 @@ HiCacheSourceAttributionCatalog build_hicache_source_attribution(const HiCacheSo
     }
     for (const auto & operation : operations.records) {
         if (operation.kind != HiCacheIoOperationKind::WriteDeviceToHost || !attribution_detail::ledger_record_ready(operation)) continue;
-        (void)core::checked_increment_u64(catalog.d2h_ready_record_count, "HiCache ready D2H ledger count exceeds uint64 range");
         const auto count = d2h_claim_counts[operation.record_id];
-        if (count == 1) (void)core::checked_increment_u64(catalog.d2h_claimed_record_count, "HiCache claimed D2H ledger count exceeds uint64 range");
-        else if (count == 0) (void)core::checked_increment_u64(catalog.d2h_unclaimed_record_count, "HiCache unclaimed D2H ledger count exceeds uint64 range");
-        else (void)core::checked_increment_u64(catalog.d2h_multiply_claimed_record_count, "HiCache multiply claimed D2H ledger count exceeds uint64 range");
+        if (count == 0) (void)core::checked_increment_u64(catalog.d2h_unclaimed_record_count, "HiCache unclaimed D2H ledger count exceeds uint64 range");
+        else if (count > 1)
+            (void)core::checked_increment_u64(catalog.d2h_multiply_claimed_record_count, "HiCache multiply claimed D2H ledger count exceeds uint64 range");
     }
     if (catalog.d2h_unclaimed_record_count > 0)
         catalog.blocker_counts["ready D2H ledger record has no lifecycle attribution"] = catalog.d2h_unclaimed_record_count;

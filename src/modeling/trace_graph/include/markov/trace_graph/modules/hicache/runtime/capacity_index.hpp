@@ -1,6 +1,6 @@
 /**
  * @file
- * @brief Incremental HiCache host/device capacity index and Debug diagnostics.
+ * @brief Incremental HiCache host/device capacity index.
  */
 #pragma once
 
@@ -11,7 +11,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -27,9 +26,8 @@ using radix::HiCacheTokenRadixTree;
  * @brief Minimal projection needed to account and rank one radix node.
  *
  * The canonical radix node remains the residency and reference source of truth. This
- * record caches only fields needed by capacity accounting and victim selection. Large
- * page lists and owner maps are retained exclusively in Debug builds for consistency
- * audits; Release updates therefore do not copy them on every state transition.
+ * record caches only fields needed by capacity accounting and victim selection;
+ * page lists and owner maps remain on the canonical tree.
  */
 struct HiCacheCapacityNodeRecord {
     HiCacheNodeId node_id = 0;
@@ -39,7 +37,6 @@ struct HiCacheCapacityNodeRecord {
     uint64_t last_access_order = 0;
     bool device_present = false;
     bool host_visible = false;
-    bool storage_readable = false;
     uint64_t host_ref_total = 0;
     bool device_evictable = false;
     bool host_evictable = false;
@@ -56,15 +53,7 @@ struct HiCacheCapacityNodeRecord {
 struct HiCacheCapacitySnapshot {
     uint64_t occupied_device_pages = 0;
     uint64_t occupied_host_pages = 0;
-    uint64_t readable_storage_pages = 0;
     uint64_t reserved_host_pages = 0;
-};
-
-/** @brief Capacity and allocation context attached to one victim selection. */
-struct HiCacheVictimRequest {
-    uint64_t capacity_pages = 0;
-    uint64_t requested_pages = 0;
-    std::string_view reason;
 };
 
 /**
@@ -72,38 +61,27 @@ struct HiCacheVictimRequest {
  *
  * Insert, split, residency, and reference mutations explicitly synchronize the affected
  * closure. Allocation policy can then read counts and the first ordered victim without
- * rescanning the entire canonical tree. Audit methods independently derive the expected
- * state in Debug builds and never feed decisions back into the model.
+ * rescanning the entire canonical tree.
  */
 class HiCacheCapacityIndex {
 public:
     /** @brief Synchronizes changed nodes plus ancestors and direct children affecting leaf eligibility. */
-    void sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes, uint64_t reserved_host_pages, std::string_view reason);
+    void sync_nodes(const HiCacheTokenRadixTree & tree, const std::vector<HiCacheNodeId> & seed_nodes, uint64_t reserved_host_pages);
 
     /** @brief Synchronizes only asynchronous host reservation, without observing tree nodes. */
-    void sync_reservation(uint64_t reserved_host_pages, std::string_view reason);
+    void sync_reservation(uint64_t reserved_host_pages);
 
     /** @brief Returns the current constant-size capacity view. */
     [[nodiscard]] const HiCacheCapacitySnapshot & snapshot() const { return snapshot_; }
 
 
-    /** @brief Returns L1 pages beyond configured target capacity. */
-    [[nodiscard]] uint64_t device_excess_pages(uint64_t capacity_pages) const;
-
-    /** @brief Returns L2 pages beyond capacity, including active prefetch reservations. */
-    [[nodiscard]] uint64_t host_excess_pages(uint64_t capacity_pages) const;
-
     /** @brief Returns the first ordered L1 victim, or no value when none is evictable. */
     [[nodiscard]] std::optional<HiCacheNodeId> first_device_victim() const;
+    /** Snapshot candidate identities for one eviction call, not a copy of residency. */
+    [[nodiscard]] std::vector<HiCacheNodeId> device_victims() const;
 
     /** @brief Returns the first unreferenced L2 victim, or no value when none is evictable. */
     [[nodiscard]] std::optional<HiCacheNodeId> first_host_victim() const;
-
-    /** @brief Selects the current L1 victim and records an explanation in Debug builds. */
-    std::optional<HiCacheNodeId> select_device_victim(const HiCacheVictimRequest & request);
-
-    /** @brief Selects the current L2 victim and records an explanation in Debug builds. */
-    std::optional<HiCacheNodeId> select_host_victim(const HiCacheVictimRequest & request);
 
 private:
     struct VictimKey {
@@ -116,7 +94,6 @@ private:
 
     uint64_t occupied_device_pages_ = 0;
     uint64_t occupied_host_pages_ = 0;
-    uint64_t readable_storage_pages_ = 0;
     uint64_t reserved_host_pages_ = 0;
     std::map<HiCacheNodeId, HiCacheCapacityNodeRecord> records_;
     std::set<VictimKey> evictable_device_leaves_;

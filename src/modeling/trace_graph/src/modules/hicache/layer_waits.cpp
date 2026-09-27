@@ -93,6 +93,7 @@ HiCacheLayerWaitObservation observe_hicache_layer_waits(const patch::HiCacheSour
             call.layer = interval.at(0).get<uint64_t>();
             call.position = positions[call.layer]++;
             call.enabled = enabled;
+            call.batch_start_ns = start_ns(batch);
             call.start_ns = interval.at(1).get<uint64_t>();
             call.end_ns = interval.at(2).get<uint64_t>();
             if (call.end_ns < call.start_ns || call.start_ns < previous_end || call.layer >= batch.arg_u64("layer_count"))

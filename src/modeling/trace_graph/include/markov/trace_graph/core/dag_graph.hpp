@@ -5,6 +5,7 @@
 #pragma once
 
 #include "markov/trace_graph/core/trace_event.hpp"
+#include "markov/trace_graph/core/cpu_service_cost.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +82,13 @@ struct DagEdge {
     [[nodiscard]] std::string_view reason() const;
 };
 
+/** Source coordinates of an observed instant, not its predicted execution time. */
+struct DagObservedPoint {
+    std::string pid, tid;
+    uint64_t timestamp_us = 0;
+    int gpu_id = 0;
+};
+
 /** @brief Execution identity and optional provenance for a synthetic node. */
 struct DagSyntheticNodeSpec {
     std::string name;
@@ -90,6 +98,12 @@ struct DagSyntheticNodeSpec {
     uint64_t duration = 0;
     bool counts_toward_e2e = false;
     std::unordered_map<std::string, std::string> attrs;
+    /** Single CPU task: unique incoming Correlation is its submission; lane is its FIFO resource. */
+    std::optional<uint64_t> cpu_task_ready_delay_us;
+    /** Residual sequential delay after a model-created CPU boundary, not service time. */
+    uint64_t cpu_gap_after = 0;
+    /** Only boundaries anchored to real observations have source coordinates. */
+    std::optional<DagObservedPoint> observed_point;
 };
 
 /**
@@ -108,6 +122,10 @@ struct DagNode {
 
     /** @brief Whether this node may independently define the business E2E endpoint. */
     bool counts_toward_e2e = true;
+    /** Model-created single-leaf task, without fabricated source timestamps or correlation IDs. */
+    bool explicit_cpu_task = false;
+    /** A synthetic observation fragment retains original CPU coordinates, not newly modeled service. */
+    bool observed_cpu_coordinates = false;
 
     /** @brief Index into the owning graph's event vector. */
     size_t event_index = 0;
@@ -259,7 +277,14 @@ public:
     void set_node_counts_toward_e2e(size_t node_id, bool value);
 
     /** @brief Updates the residual delay carried by one CPU node's sequential edge. */
-    void set_cpu_gap_after(size_t node_id, uint64_t duration);
+    using CpuGapRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+    void validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges& ranges) const;
+    void set_cpu_gap_after(size_t node_id, uint64_t duration, std::optional<CpuGapRanges> ranges = std::nullopt);
+
+    CpuServiceCost& cpu_service_cost() { return cpu_service_cost_; }
+    [[nodiscard]] const CpuServiceCost& cpu_service_cost() const { return cpu_service_cost_; }
+    [[nodiscard]] uint64_t cpu_service_node_duration(size_t node_id) const;
+    [[nodiscard]] uint64_t cpu_service_gap_duration(size_t node_id) const;
 
     /** @brief Clears the Direct/Prefill/Decode owner mask used by scope replay. */
     void clear_scope_ownership();
@@ -291,9 +316,6 @@ public:
     /** @brief Returns nodes visible in the active graph view. */
     [[nodiscard]] size_t active_node_count() const;
 
-    /** @brief Returns active nodes originating from input trace events. */
-    [[nodiscard]] size_t active_trace_node_count() const;
-
     /** @brief Returns active synthetic nodes created by graph mutations. */
     [[nodiscard]] size_t active_synthetic_node_count() const;
 
@@ -317,9 +339,6 @@ public:
 
     /** @brief Returns whether the profile manifest enabled one named input contract. */
     [[nodiscard]] bool has_input_contract(std::string_view contract) const;
-
-    /** @brief Returns the compact sorted manifest contract set. */
-    [[nodiscard]] const std::vector<std::string> & input_contracts() const { return input_contracts_; }
 
     /** @brief Replaces in-window HiCache facts excluded from executable DAG topology. */
     void set_hicache_fact_events(std::vector<TraceEvent> events) { hicache_fact_events_ = std::move(events); }
@@ -379,14 +398,8 @@ public:
     }
 #endif
 
-    /** @brief Counts active dependencies by semantic edge kind. */
-    [[nodiscard]] std::unordered_map<std::string, size_t> edge_counts_by_kind() const;
-
     /** @brief Computes all run-summary counts in one node pass and one edge pass. */
     [[nodiscard]] DagGraphSummaryStats summary_stats() const;
-
-    /** @brief Returns the device ID assigned to this logical input. */
-    [[nodiscard]] int gpu_id() const { return gpu_id_; }
 
     /** @brief Stores the critical-path duration produced by simulation. */
     void set_e2e_time(uint64_t value) { e2e_time_ = value; }
@@ -473,6 +486,8 @@ private:
 
     /** @brief Small source phase side table retained after nested CPU parents are removed. */
     std::vector<DagPhaseMarkerEvent> phase_marker_events_;
+    CpuServiceCost cpu_service_cost_;
+    std::unordered_map<size_t, CpuGapRanges> retained_cpu_gap_ranges_;
 };
 
 } // namespace markov::trace_graph::core

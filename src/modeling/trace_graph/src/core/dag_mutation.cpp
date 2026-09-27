@@ -24,7 +24,7 @@ size_t resolve_applied_ref(const DagNodeRef & ref, const std::unordered_map<std:
 
 class DagMutationApplier {
 public:
-    DagMutationApplier(DagGraph & graph, const DagMutationPlan & plan) : graph_(graph), plan_(plan), nodes_disabled_by_plan_(graph.node_count(), false) {
+    DagMutationApplier(DagGraph & graph, const DagMutationPlan & plan) : graph_(graph), plan_(plan) {
         result_.journal.component = plan.component;
         result_.journal.active_nodes_before = graph.active_node_count();
         result_.journal.active_edges_before = graph.active_edge_count();
@@ -118,8 +118,8 @@ private:
     void set_cpu_gaps() {
         for (const auto & mutation : plan_.set_cpu_gaps) {
             const auto old_gap = graph_.node(mutation.node_id).cpu_gap_after;
-            if (old_gap == mutation.duration) continue;
-            graph_.set_cpu_gap_after(mutation.node_id, mutation.duration);
+            if (old_gap == mutation.duration && !mutation.retained_ranges) continue;
+            graph_.set_cpu_gap_after(mutation.node_id, mutation.duration, mutation.retained_ranges);
             result_.journal.records.push_back(DagMutationRecord{
                 .action = DagMutationAction::SetCpuGap,
                 .effect_id = mutation.effect_id,
@@ -174,7 +174,6 @@ private:
         auto & node = graph_.mutable_node(node_id);
         if (!node.active) return;
         node.active = false;
-        nodes_disabled_by_plan_[node_id] = true;
         result_.journal.records.push_back(DagMutationRecord{
             .action = DagMutationAction::DisableNode,
             .effect_id = {},
@@ -185,7 +184,7 @@ private:
 
     void disable_incident_edge(size_t edge_index) {
         const auto & edge = graph_.edge(edge_index);
-        if (!edge.active || (!nodes_disabled_by_plan_[edge.src] && !nodes_disabled_by_plan_[edge.dst])) return;
+        if (!edge.active || (graph_.node(edge.src).active && graph_.node(edge.dst).active)) return;
         disable_tracked_edge(edge_index);
         result_.journal.records.push_back(DagMutationRecord{
             .action = DagMutationAction::DisableEdge,
@@ -217,7 +216,6 @@ private:
     DagGraph & graph_;
     const DagMutationPlan & plan_;
     DagMutationResult result_;
-    std::vector<bool> nodes_disabled_by_plan_;
     EffectEdgeCounts active_effect_edges_;
 };
 

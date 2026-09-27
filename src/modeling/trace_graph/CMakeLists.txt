@@ -28,6 +28,7 @@ endif()
 add_library(trace_graph_core STATIC)
 target_sources(trace_graph_core
     PRIVATE
+        src/json_scan.hpp
         src/core/trace_event.cpp
         src/core/dag_graph.cpp
         src/core/cpu_gap_observation.cpp
@@ -48,6 +49,7 @@ add_library(trace_graph_io STATIC)
 target_sources(trace_graph_io
     PRIVATE
         src/io/chrome_trace_io.cpp
+        src/io/cpu_service_input.cpp
         src/io/trace_channel_join.cpp
         src/io/trace_manifest_input.cpp
 )
@@ -76,20 +78,43 @@ target_sources(trace_graph_hicache
     PRIVATE
         src/modules/hicache/fact.cpp
         src/modules/hicache/phase_observation.cpp
+        src/modules/hicache/phase_carrier.cpp
         src/modules/hicache/layer_waits.cpp
+        src/modules/hicache/cpu_collectives.cpp
+        src/modules/hicache/cpu_collective_timing.cpp
+        src/modules/hicache/prefetch_control_observation.cpp
+        src/modules/hicache/prefetch_worker_observation.cpp
+        src/modules/hicache/scope_observation.cpp
+        src/modules/hicache/patch/cpu_collective_waits.cpp
+        src/modules/hicache/patch/cpu_collective_composition.cpp
         src/modules/hicache/router.cpp
+        src/modules/hicache/forward_cpu_service.cpp
+        src/modules/hicache/host_cpu_service.cpp
         src/modules/hicache/policy.cpp
         src/modules/hicache/radix/token_radix_tree.cpp
         src/modules/hicache/radix/node_split_policy.cpp
         src/modules/hicache/runtime/token_store.cpp
         src/modules/hicache/runtime/target_pager.cpp
         src/modules/hicache/runtime/capacity_index.cpp
+        src/modules/hicache/runtime/eviction_sequence.cpp
+        src/modules/hicache/runtime/write_capacity.cpp
+        src/modules/hicache/runtime/load_capacity.cpp
+        src/modules/hicache/runtime/load_admission.cpp
+        src/modules/hicache/runtime/layer_calls.cpp
         src/modules/hicache/runtime/device_allocator.cpp
         src/modules/hicache/runtime/ref_ledger.cpp
         src/modules/hicache/runtime/target_control_clock.cpp
         src/modules/hicache/runtime/async_state.cpp
         src/modules/hicache/storage/storage_directory.cpp
         src/modules/hicache/model/state.cpp
+        src/modules/hicache/model/prefetch_control.cpp
+        src/modules/hicache/model/prefetch_execution.cpp
+        src/modules/hicache/model/prefetch_check_execution.cpp
+        src/modules/hicache/model/prefetch_queue_execution.cpp
+        src/modules/hicache/model/prefetch_scheduler_body.cpp
+        src/modules/hicache/model/prefetch_wait_execution.cpp
+        src/modules/hicache/model/prefetch_wait_calibration.cpp
+        src/modules/hicache/patch/prefetch_control_region.cpp
         src/modules/hicache/model/effect_decision.cpp
         src/modules/hicache/model/effect_ledger.cpp
         src/modules/hicache/patch/io_resource_demand.cpp
@@ -99,25 +124,51 @@ target_sources(trace_graph_hicache
         src/modules/hicache/patch/io_operation_ledger.cpp
         src/modules/hicache/patch/io_operation_record.cpp
         src/modules/hicache/patch/source_dag_index.cpp
+        src/modules/hicache/patch/source_stream_order.cpp
+        src/modules/hicache/patch/layer_wait_patch.cpp
+        src/modules/hicache/patch/layer_wait_insertion.cpp
+        src/modules/hicache/patch/layer_io.cpp
         src/modules/hicache/patch/attribution_common.cpp
         src/modules/hicache/patch/attribution_io.cpp
         src/modules/hicache/patch/attribution_commit.cpp
         src/modules/hicache/patch/attribution.cpp
-        src/modules/hicache/patch/rewrite_boundary.cpp
-        src/modules/hicache/patch/rewrite_decision.cpp
-        src/modules/hicache/patch/rewrite_dependencies.cpp
-        src/modules/hicache/patch/rewrite_mutation.cpp
-        src/modules/hicache/patch/rewrite_normalization.cpp
-        src/modules/hicache/patch/rewrite_transaction.cpp
-        src/modules/hicache/patch/boundary_validator.cpp
-        src/modules/hicache/patch/applied_validator.cpp
         src/modules/hicache/model/request_model.cpp
+        src/modules/hicache/model/decode_allocation_model.cpp
+        src/modules/hicache/model/decode_observation.cpp
         src/modules/hicache/model/prefetch_model.cpp
         src/modules/hicache/model/host_storage_model.cpp
         src/modules/hicache/model/writeback_model.cpp
+        src/modules/hicache/model/loadback_model.cpp
         src/modules/hicache/model/finalizer.cpp
         src/modules/hicache/model/apply_model.cpp
+        src/modules/hicache/model/replay.cpp
+        src/modules/hicache/execution_boundaries.cpp
+        src/modules/hicache/control_points.cpp
         src/modules/hicache/runtime/preparation.cpp
+        src/modules/hicache/runtime/preparation_execution.cpp
+        src/modules/hicache/runtime/prefetch_queries.cpp
+        src/modules/hicache/runtime/prefetch_waits.cpp
+        src/modules/hicache/runtime/queue_confirmations.cpp
+        src/modules/hicache/runtime/write_confirmations.cpp
+        src/modules/hicache/runtime/loads.cpp
+        src/modules/hicache/runtime/load_execution.cpp
+        src/modules/hicache/runtime/load_submission.cpp
+        src/modules/hicache/runtime/load_insertion.cpp
+        src/modules/hicache/runtime/inactive_layer_calls.cpp
+        src/modules/hicache/runtime/writes.cpp
+        src/modules/hicache/runtime/write_calls.cpp
+        src/modules/hicache/runtime/lifecycle_observation.cpp
+        src/modules/hicache/runtime/lifecycle_calls.cpp
+        src/modules/hicache/runtime/write_lifecycle.cpp
+        src/modules/hicache/runtime/write_resources.cpp
+        src/modules/hicache/runtime/write_calibration.cpp
+        src/modules/hicache/runtime/write_frontier.cpp
+        src/modules/hicache/runtime/write_host.cpp
+        src/modules/hicache/runtime/write_expansion.cpp
+        src/modules/hicache/runtime/write_page_projection.cpp
+        src/modules/hicache/runtime/host_removal.cpp
+        src/modules/hicache/runtime/eviction_replacement.cpp
+        src/modules/hicache/runtime/window.cpp
 )
 target_link_libraries(trace_graph_hicache PUBLIC trace_graph_core trace_graph_frontend crypto)
 
@@ -126,9 +177,6 @@ target_sources(trace_graph_modules
     PRIVATE
         src/modules/node_scale/node_scale_module.cpp
         src/modules/hicache/hicache_module.cpp
-        src/modules/hicache/dag_patch_module.cpp
-        src/modules/hicache/phase_carrier.cpp
-        src/modules/hicache/observed_carrier.cpp
 )
 target_link_libraries(trace_graph_modules
     PUBLIC
@@ -138,16 +186,48 @@ target_link_libraries(trace_graph_modules
 )
 
 add_library(trace_graph_cli_support STATIC)
-target_sources(trace_graph_cli_support PRIVATE src/cli/file_output.cpp)
+target_sources(trace_graph_cli_support PRIVATE src/cli/file_output.cpp src/cli/input_graph.cpp)
+target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_frontend trace_graph_io)
 if(TRACE_GRAPH_DEBUG)
+    target_sources(trace_graph_modules PRIVATE
+        src/modules/hicache/dag_patch_module.cpp
+        src/modules/hicache/observed_carrier.cpp
+    )
     target_sources(trace_graph_hicache
         PRIVATE
             src/modules/hicache/patch/oracle_cost_replay.cpp
+            src/modules/hicache/patch/rewrite_boundary.cpp
+            src/modules/hicache/patch/rewrite_decision.cpp
+            src/modules/hicache/patch/rewrite_dependencies.cpp
+            src/modules/hicache/patch/rewrite_mutation.cpp
+            src/modules/hicache/patch/rewrite_normalization.cpp
+            src/modules/hicache/patch/rewrite_transaction.cpp
+            src/modules/hicache/patch/boundary_validator.cpp
+            src/modules/hicache/patch/applied_validator.cpp
     )
     add_executable(hicache_io_logic_check EXCLUDE_FROM_ALL
-        tests/hicache_io_logic_check.cpp tests/hicache_phase_checks.cpp tests/hicache_preparation_checks.cpp tests/hicache_layer_wait_checks.cpp)
+        tests/hicache_io_logic_check.cpp tests/hicache_phase_checks.cpp tests/hicache_preparation_checks.cpp tests/hicache_layer_wait_checks.cpp
+        tests/hicache_layer_wait_patch_checks.cpp
+        tests/hicache_layer_io_checks.cpp
+        tests/hicache_layer_wait_insertion_checks.cpp tests/cpu_collective_checks.cpp tests/cpu_collective_wait_checks.cpp
+        tests/prefetch_control_observation_checks.cpp tests/hicache_state_timing_checks.cpp
+        tests/prefetch_execution_checks.cpp
+        tests/prefetch_check_execution_checks.cpp
+        tests/prefetch_queue_execution_checks.cpp
+        tests/loadback_execution_checks.cpp
+        tests/decode_allocation_checks.cpp
+        tests/writeback_execution_checks.cpp
+        tests/write_transfer_execution_checks.cpp
+        tests/write_expansion_checks.cpp
+        tests/write_page_projection_checks.cpp
+        tests/host_removal_checks.cpp
+        tests/host_cpu_service_checks.cpp
+        tests/write_call_binding_checks.cpp
+        tests/lifecycle_observation_checks.cpp
+        tests/hicache_execution_boundary_checks.cpp tests/prefetch_worker_observation_checks.cpp)
     target_link_libraries(hicache_io_logic_check PRIVATE trace_graph_modules trace_graph_simulation)
-    add_executable(trace_timing_check EXCLUDE_FROM_ALL tests/trace_timing_check.cpp tests/stream_wait_checks.cpp)
+    add_executable(trace_timing_check EXCLUDE_FROM_ALL tests/trace_timing_check.cpp tests/stream_wait_checks.cpp tests/cpu_task_insertion_checks.cpp
+        tests/dynamic_execution_checks.cpp tests/nested_copy_connection_checks.cpp)
     target_link_libraries(trace_timing_check PRIVATE trace_graph_io trace_graph_simulation)
 
     add_library(trace_graph_diagnostics STATIC)
@@ -165,10 +245,14 @@ else()
 endif()
 
 add_executable(trace_graph)
+add_executable(hicache_calibration_export EXCLUDE_FROM_ALL src/cli/hicache_calibration_export.cpp)
+add_dependencies(trace_graph hicache_calibration_export)
+target_link_libraries(hicache_calibration_export PRIVATE trace_graph_cli_support trace_graph_modules trace_graph_simulation)
 target_sources(trace_graph
     PRIVATE
         src/cli/options.cpp
         src/cli/module_pipeline.cpp
+        src/cli/cpu_service_preparation.cpp
         src/cli/hicache_observations.cpp
         src/cli/run_summary.cpp
         src/cli/workflow.cpp

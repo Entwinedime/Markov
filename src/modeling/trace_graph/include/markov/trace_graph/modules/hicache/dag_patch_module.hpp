@@ -1,20 +1,24 @@
 /**
  * @file
- * @brief HiCache effect resource planning and DAG mutation orchestration.
+ * @brief Diagnostic-only static HiCache patch and oracle replay.
  */
 #pragma once
 
+#ifdef DEBUG
+
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
-#include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 #include "markov/trace_graph/modules/hicache/patch/applied_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
 #include "markov/trace_graph/modules/hicache/patch/boundary_validator.hpp"
+#include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_resource_model.hpp"
+#include "markov/trace_graph/modules/hicache/patch/layer_wait_patch.hpp"
 #include "markov/trace_graph/modules/hicache/patch/rewrite_transaction.hpp"
 #include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/module.hpp"
 
 #include <cstdint>
@@ -25,7 +29,10 @@
 
 namespace markov::trace_graph::modules::hicache {
 
-#ifdef DEBUG
+/** Connect request prefetch to reused H2D work in the historical static patch. */
+[[nodiscard]] bool append_hicache_reused_loadback_dependencies(const model::HiCachePhaseWorkLedger & phase_work,
+                                                               const patch::HiCacheShadowRewriteTransaction & shadow, core::DagMutationPlan & plan);
+
 /** @brief Debug-only zero-cost counterfactual over one materialized target DAG. */
 struct HiCacheEffectCausalTimingAudit {
     std::string effect_id;
@@ -77,7 +84,6 @@ struct HiCachePhaseOracleCostReplayAudit {
     bool effect_identity_exact = false;
     bool target_e2e_consumed = false;
 };
-#endif
 
 /** @brief Business result for the HiCache patch plan and applied mutation journal. */
 struct HiCacheDagPatchResult {
@@ -88,60 +94,53 @@ struct HiCacheDagPatchResult {
     size_t phase_owner_conflict_count = 0;
     HiCachePhaseCarrierAudit phase_carrier;
     runtime::AllocatorPreparationPlan runtime_preparation;
+    patch::HiCacheLayerWaitPatch layer_wait_patch;
+    patch::CpuCollectivePatch cpu_collective_patch;
     core::DagMutationPlan plan;
     core::DagMutationJournal journal;
     patch::HiCacheIoResourcePlan io_resources;
-    patch::HiCacheSourceDagIndexStats source_index;
     patch::HiCacheIoOperationLedger io_operation_ledger;
     patch::HiCacheSourceAttributionCatalog source_attribution;
     patch::HiCacheShadowRewriteTransaction shadow_rewrite;
     patch::HiCacheBoundaryValidationCatalog boundary_validation;
     patch::HiCacheAppliedPatchValidation applied_validation;
     std::map<std::string, uint64_t> apply_blockers;
-#ifdef DEBUG
     HiCacheCausalTimingAudit causal_timing_audit;
     HiCachePhaseOracleCostReplayAudit phase_oracle_cost_replay;
     core::DagTopologyValidationReport topology;
-#endif
 };
 
 /**
- * @brief Consumes an immutable state-replay result and applies one validated DAG plan.
+ * @brief Applies the historical static plan for oracle replay and semantic checks.
  *
  * Resource costs and lane dependencies are computed without changing the graph. Concrete
- * rewrites remain empty until source attribution is available, and future mutations must use
- * `DagMutationPlan` so they cannot bypass atomic prevalidation.
+ * rewrites use `DagMutationPlan` and its atomic prevalidation. Ordinary prediction
+ * uses runtime::execute_hicache_window, not this module.
  */
 class HiCacheDagPatchModule final : public SimulationModule {
 public:
     explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false);
-#ifdef DEBUG
     HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result,
                           bool source_target_same_config,
                           std::string oracle_cost_replay_path,
                           std::string phase_oracle_cost_replay_path);
-#endif
 
     [[nodiscard]] std::string_view name() const noexcept override;
     void apply(core::DagGraph & graph) override;
-#ifdef DEBUG
     [[nodiscard]] bool has_summary() const override;
     /** @brief Measures target-cost wall-time influence while preserving the final graph state. */
     void run_causal_timing_audit(core::DagGraph & graph);
-#endif
     [[nodiscard]] const HiCacheDagPatchResult & result() const { return result_; }
 
 private:
     std::shared_ptr<const model::HiCacheModelResult> model_result_;
     bool source_target_same_config_ = false;
-#ifdef DEBUG
     std::string oracle_cost_replay_path_;
     std::string phase_oracle_cost_replay_path_;
-#endif
     HiCacheDagPatchResult result_;
-#ifdef DEBUG
     bool applied_ = false;
-#endif
 };
 
 } // namespace markov::trace_graph::modules::hicache
+
+#endif // DEBUG

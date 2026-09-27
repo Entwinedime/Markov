@@ -26,33 +26,8 @@ uint64_t HiCacheTargetControlClock::next_enqueue_epoch() {
     return core::checked_increment_u64(enqueue_epoch_, "HiCache enqueue epoch exceeds uint64 range");
 }
 
-/** @brief Records the terminal target boundary used to settle remaining operations. */
-uint64_t HiCacheTargetControlClock::record_target_finalize_boundary(const std::string & cache_scope, uint64_t ts) {
-    return record_boundary(cache_scope, {}, "finalize", "target_finalize", 0, ts, true);
-}
-
-uint64_t HiCacheTargetControlClock::record_fact_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
-                                                         size_t source_event_index, uint64_t ts) {
-    return record_boundary(cache_scope, request_key, kind, "canonical_fact", source_event_index, ts, false);
-}
-
-/**
- * @brief Allocates one boundary epoch and, in Debug, records its provenance.
- *
- * Production callers consume only the epoch. Debug builds retain the descriptive record
- * needed to reproduce boundary order in summaries.
- */
-uint64_t HiCacheTargetControlClock::record_boundary(const std::string & cache_scope, const std::string & request_key, const std::string & kind,
-                                                    const std::string & source, size_t source_event_index, uint64_t ts, bool terminal) {
-    const auto boundary_epoch = core::checked_increment_u64(boundary_epoch_, "HiCache boundary epoch exceeds uint64 range");
-    (void)cache_scope;
-    (void)request_key;
-    (void)kind;
-    (void)source;
-    (void)source_event_index;
-    (void)ts;
-    (void)terminal;
-    return boundary_epoch;
+uint64_t HiCacheTargetControlClock::next_boundary_epoch() {
+    return core::checked_increment_u64(boundary_epoch_, "HiCache boundary epoch exceeds uint64 range");
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

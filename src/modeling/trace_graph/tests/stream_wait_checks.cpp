@@ -119,11 +119,61 @@ void check_native_stream_waits() {
     auto overlap = fixture(); overlap[7].tid = "3"; overlap[8].ts = 21; overlap[8].dur = 3;
     auto ambiguous = core::DagBuilder(1).build(overlap, 0);
     require(logical_waits(ambiguous) == 0, "overlapping host submissions do not prove a wait boundary");
+#ifdef DEBUG
+    require(ambiguous.event_for_node(find(ambiguous, "AscendCL@aclrtStreamWaitEvent")).arg("stream_wait_boundary_reason")
+                == "overlapping_host_submission", "overlap diagnosis must distinguish missing device anchors");
+#endif
 
     auto conflict = fixture(); conflict[2].set_arg("Raw Stream", "consumer");
     require(logical_waits(core::DagBuilder(1).build(conflict, 0)) == 0, "one raw stream cannot silently alias two device lanes");
     auto unknown = fixture(); unknown[5].set_arg("connection_id", "unmatched");
-    require(logical_waits(core::DagBuilder(1).build(unknown, 0)) == 0, "an unanchored neighboring device node leaves the boundary unproven");
+    auto unanchored = core::DagBuilder(1).build(unknown, 0);
+    require(logical_waits(unanchored) == 0, "an unanchored neighboring device node leaves the boundary unproven");
+#ifdef DEBUG
+    require(unanchored.event_for_node(find(unanchored, "AscendCL@aclrtStreamWaitEvent")).arg("stream_wait_boundary_reason")
+                == "unanchored_device_neighbor", "missing device submission must retain its specific diagnosis");
+#endif
     auto reversed = fixture(); reversed[6].ts = 30;
     require(logical_waits(core::DagBuilder(1).build(reversed, 0)) == 0, "device order conflicting with host submissions is not guessed");
+
+    auto padding_events = fixture();
+    padding_events.push_back(event("PLACE_HOLDER_SQE", "11", 22, 0, "18446744073709551615", true));
+    for (const auto nanos : {0u, 20u, 999u}) {
+      padding_events.back().dur_submicro_ns = nanos;
+      for (const auto & costs : {std::pair{9u, 2u}, {100u, 2u}, {9u, 100u}, {100u, 100u}}) {
+        auto plain = core::DagBuilder(1).build(fixture(), 0);
+        auto padded = core::DagBuilder(1).build(padding_events, 0);
+        require(logical_waits(padded) == 1, "zero-cost queue padding must not hide a proven wait");
+        require(padded.node(find(padded, "PLACE_HOLDER_SQE")).active, "queue padding stays in its original stream");
+        require(padded.event_for_node(find(padded, "PLACE_HOLDER_SQE")).dur_submicro_ns == nanos,
+                "submicrosecond padding retains its original measured duration");
+        for (auto * candidate : {&plain, &padded}) {
+            candidate->set_node_duration(find(*candidate, "copy"), costs.first);
+            candidate->set_node_duration(find(*candidate, "prior"), costs.second);
+        }
+        require(simulation::run_topological_simulation(plain).e2e_us == simulation::run_topological_simulation(padded).e2e_us,
+                "padding preserves timing with either or both producer streams slowed");
+        for (const auto name : {"copy", "EVENT_RECORD", "prior", "consume", "AscendCL@aclrtStreamWaitEvent"})
+            require(plain.node(find(plain, name)).completion_time == padded.node(find(padded, name)).completion_time,
+                    "padding must preserve each producer, consumer and asynchronous host completion, not only E2E");
+      }
+    }
+    for (const auto nanos : {1000u, 1020u}) {
+        auto nonzero = padding_events;
+        nonzero.back().dur = nanos / 1000;
+        nonzero.back().dur_submicro_ns = nanos % 1000;
+        require(logical_waits(core::DagBuilder(1).build(nonzero, 0)) == 0, "nonzero modeled unanchored work cannot be crossed");
+    }
+    auto dependent_padding = padding_events;
+    dependent_padding.back().set_arg("connection_id", "padding");
+    dependent_padding.push_back(event("Node@launch", "3", 10, 1, "padding"));
+    dependent_padding.push_back(event("Node@launch", "4", 15, 1, "padding"));
+    auto dependent = core::DagBuilder(1).build(dependent_padding, 0);
+    const auto placeholder = find(dependent, "PLACE_HOLDER_SQE");
+    require(std::ranges::any_of(dependent.edges(), [&](const auto & edge) {
+                return edge.active && edge.dst == placeholder && edge.kind == core::DagEdgeKind::Correlation;
+            }), "counterexample must contain an actual non-stream dependency on the placeholder");
+    require(logical_waits(dependent) == 0, "an externally dependent placeholder cannot be treated as transparent");
+    padding_events.back().name = "unknown zero-cost device work";
+    require(logical_waits(core::DagBuilder(1).build(padding_events, 0)) == 0, "unknown zero-duration work is not classified as queue padding");
 }

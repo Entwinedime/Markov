@@ -1,8 +1,11 @@
 /** @file Exact call ownership, independent of target costs. */
 #include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "markov/trace_graph/modules/hicache/scope_observation.hpp"
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/modules/hicache/host_cpu_service.hpp"
+#include <nlohmann/json.hpp>
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -73,6 +76,52 @@ core::DagGraph fixture() {
 } // namespace
 
 void check_hicache_layer_waits() {
+    // Ownership must reject overlapping leaves, but touching endpoints are safe.
+    for (const uint64_t second_start : { 15, 20 }) {
+        core::DagGraph source({ event("first", 10, 10), event("second", second_start, 10) }, 0);
+        source.add_node(0, true, "CPU:1:1");
+        source.add_node(1, true, "CPU:1:1");
+
+        const auto ownership = patch::HiCacheSourceDagIndex(source).timing_interval_ownership("1", "1", 10, 20);
+        require(ownership.owned_node_ids.size() == 2 && ownership.has_node_overlap == (second_start < 20),
+                "CPU ownership preserves overlap rejection without retaining overlap records");
+    }
+
+    using Json = nlohmann::json;
+    const Json measured{{"pid", "1"}, {"tid", "1"}, {"request_id", "request"},
+                        {"phase", "step[EXTEND"}, {"method", "hicache.layer_wait"},
+                        {"layer_calls", Json::array({Json::array({0, true})})},
+                        {"exclusive_ranges_ns", Json::array({Json::array({51000, 53000})})},
+                        {"measured_service_delta_us", 5}};
+    for (const int delta : {5, -3}) {
+        auto source = fixture();
+        auto row = measured;
+        row["measured_service_delta_us"] = delta;
+        attach_host_cpu_service(source, Json{{"rows", Json::array({row})}});
+        require(source.cpu_service_cost().duration({"1", "1"}, 20, 40) == 20-delta,
+                "layer CPU budget belongs to identity-matched profiler range");
+        require(source.cpu_service_cost().duration({"1", "1"}, 51, 53) == 2,
+                "wall-clock timer range must not modify an unrelated source leaf");
+    }
+    for (const bool wrong_request : {false, true}) {
+        auto source = fixture();
+        auto row = measured;
+        if (wrong_request) row["request_id"] = "other";
+        else row["layer_calls"][0][1] = false;
+        bool rejected = false;
+        try { attach_host_cpu_service(source, Json{{"rows", Json::array({row})}}); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "layer work identity cannot be inferred from nearby time");
+    }
+    {
+        auto source = fixture();
+        auto row = measured;
+        row["phase"] = "step[DECODE";
+        row["layer_calls"][0][1] = false;
+        row["measured_service_delta_us"] = 0;
+        attach_host_cpu_service(source, Json{{"rows", Json::array({row})}});
+        require(source.cpu_service_cost().empty(), "sub-tick zero budget cannot invent source cost");
+    }
     auto child = event("child", 10, 0);
     child.ts_submicro_ns = 500; child.dur_submicro_ns = 100;
     const auto control = core::DagBuilder(1).build({event("hicache.control.check", 10, 10), child, event("next", 30, 1)}, 0);
@@ -96,12 +145,28 @@ void check_hicache_layer_waits() {
     require(old_phase.status == "ready" && phase.status == "ready", "fixture must exercise complete phase ownership");
     require(old_phase.phase_owned_submit_cpu_node_count == phase.phase_owned_submit_cpu_node_count + 2,
             "phase must not retain the HiCache enqueue or its correlated worker");
-    (void)mark_observed_hicache_scope(graph);
+    // Reading calibration/scope evidence must not mutate either physical time
+    // or an existing diagnostic mask. The explicit projection remains separate.
+    graph.set_scope_node_owned(0);
+    graph.add_scope_gap_duration(0, 1);
+    const auto scope = observe_hicache_scope(graph);
+    require(graph.scope_node_owned(0) && graph.scope_gap_duration(0) == 1 && !graph.scope_node_owned(1),
+            "source scope observation must not clear or apply a diagnostic mask");
+    require(scope.gap_intervals.at(0) == std::vector<std::pair<uint64_t, uint64_t>>{{20, 25}}
+            && scope.gap_intervals.at(1) == std::vector<std::pair<uint64_t, uint64_t>>{{30, 40}},
+            "scope evidence retains exact gap positions, not just total durations");
+    require(simulation::run_topological_simulation(graph).e2e_us == original, "source observation cannot change full timing");
+    apply_observed_hicache_scope(graph, scope);
     require(graph.scope_node_owned(1) && graph.scope_node_owned(4) && graph.scope_node_owned(6),
             "moving calls out of phase must preserve their HiCache scope ownership");
     require(graph.scope_gap_duration(0) == 5 && graph.scope_gap_duration(1) == 10,
             "only gaps inside the exact call envelope belong to the HiCache call");
     require(simulation::run_topological_simulation(graph).e2e_us == original, "ownership must not alter full timing");
+    const auto projected = simulation::run_gap_excluded_topological_simulation(graph).e2e_us;
+    (void)mark_observed_hicache_scope(graph);
+    require(simulation::run_gap_excluded_topological_simulation(graph).e2e_us == projected
+            && graph.scope_gap_duration(0) == 5 && graph.scope_gap_duration(1) == 10,
+            "legacy marking and explicit observation/application have the same projection without accumulating ownership");
 
     graph.disable_edge(2);
     const auto missing = observe_hicache_layer_waits(patch::HiCacheSourceDagIndex(graph));

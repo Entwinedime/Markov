@@ -7,6 +7,7 @@
 #include "io_operation_ledger_detail.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -268,7 +269,7 @@ std::vector<size_t> explicit_control_nodes(const HiCacheSourceDagIndex & source,
 uint64_t explicit_control_duration(const HiCacheSourceDagIndex & source, const std::vector<size_t> & nodes) {
     uint64_t duration = 0;
     for (const auto node_id : nodes)
-        duration = core::checked_add_u64(duration, source.graph().node(node_id).duration, "HiCache explicit control duration overflow");
+        duration = core::checked_add_u64(duration, source.graph().cpu_service_node_duration(node_id), "HiCache explicit control duration overflow");
     return duration;
 }
 
@@ -333,11 +334,8 @@ void build_prefetch_completion_wait_contract(const HiCacheSourceDagIndex & sourc
     for (const auto * check : false_checks) {
         if (check->timestamp_us > first_true->timestamp_us) break;
         auto ownership = source.timing_interval_ownership(*check);
-        const auto nodes = explicit_control_nodes(source, ownership);
-        if (!nodes.empty()) record.progress_check_cpu_samples_us.push_back(explicit_control_duration(source, nodes));
         // The fact ends before probe serialization; the scheduler marker encloses
         // the whole call. Retire that obsolete false check, not just its interior.
-        // Keep calibration samples above restricted to explicit function work.
         const auto call = source.enclosing_control_interval_ownership(*check, "hicache.control.prefetch_progress");
         if (call && call->status == "ready") ownership = *call;
         record.completion_wait_owned_node_ids.insert(record.completion_wait_owned_node_ids.end(),
@@ -504,7 +502,6 @@ HiCacheIoOperationLedger build_hicache_io_operation_ledger(const HiCacheSourceDa
         if (!kind || fact.fact_class != "timing_observation" || fact.phase != "end" || fact.duration_us == 0) return;
         auto record = io_operation_ledger_detail::build_record(source, fact, *kind);
         if (causal_tail) record.evidence.push_back("causal_tail_context");
-        (void)core::checked_increment_u64(ledger.counts_by_kind[hicache_io_operation_kind_name(*kind)], "HiCache I/O ledger kind count exceeds uint64 range");
         (void)core::checked_increment_u64(ledger.counts_by_status[record.status], "HiCache I/O ledger status count exceeds uint64 range");
         if (!hicache_io_operation_record_ready(record)) {
             (void)core::checked_increment_u64(ledger.unresolved_reasons[record.reason], "HiCache I/O ledger unresolved count exceeds uint64 range");
@@ -513,6 +510,46 @@ HiCacheIoOperationLedger build_hicache_io_operation_ledger(const HiCacheSourceDa
     };
     for (const auto & fact : source.fact_nodes()) append_fact(fact, false);
     for (const auto & fact : source.tail_context_facts()) append_fact(fact, true);
+    const auto services = observe_prefetch_services(source);
+    std::map<size_t, const PrefetchServiceObservation *> prefetch_work;
+    for (const auto & service : services) prefetch_work.emplace(service.service_fact, &service);
+    for (auto & record : ledger.records) {
+        if (record.kind != HiCacheIoOperationKind::Prefetch) continue;
+        uint64_t read_pages = 0;
+        for (const auto & batch : record.storage_service_batches)
+            read_pages = core::checked_add_u64(read_pages, batch.item_count, "prefetch observed read pages overflow");
+        // An explicit worker-local completed counter covering every read page
+        // also proves full copying. A guessed payload or cross-rank MIN does not.
+        const bool fully_published = record.completed_token_count_present && record.source_page_size > 0
+                                     && record.completed_token_count % record.source_page_size == 0
+                                     && record.completed_token_count / record.source_page_size == read_pages;
+        for (auto & batch : record.storage_service_batches) {
+            const auto found = prefetch_work.find(batch.fact_node_id);
+            const auto * service = found == prefetch_work.end() ? nullptr : found->second;
+            if (service && service->observed_work) {
+                batch.copied_page_count = service->observed_work->copied_pages;
+                batch.published_page_count = service->observed_work->published_pages;
+            }
+            else if (fully_published && (!service || (!service->read && service->publications.empty()))) {
+                batch.copied_page_count = batch.published_page_count = batch.item_count;
+            }
+        }
+        // A locally continuous suffix can still omit earlier successful copies.
+        // Reconcile the whole operation against the worker's final counter.
+        if (record.completed_token_count_present
+            && std::ranges::all_of(record.storage_service_batches, [](const auto & batch) { return batch.published_page_count.has_value(); })) {
+            uint64_t published = 0;
+            for (const auto & batch : record.storage_service_batches)
+                published = core::checked_add_u64(published, *batch.published_page_count, "prefetch observed publications overflow");
+            if (record.source_page_size == 0 || record.completed_token_count % record.source_page_size != 0
+                || published != record.completed_token_count / record.source_page_size) {
+                for (auto & batch : record.storage_service_batches) {
+                    batch.copied_page_count.reset();
+                    batch.published_page_count.reset();
+                }
+            }
+        }
+    }
     if (ledger.records.empty()) ledger.status = "no_observed_io";
     else if (ledger.unresolved_count() == 0) ledger.status = "ready";
     else if (ledger.ready_count() > 0) ledger.status = "partial";

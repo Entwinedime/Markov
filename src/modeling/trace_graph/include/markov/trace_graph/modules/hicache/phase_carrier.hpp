@@ -38,6 +38,14 @@ struct HiCachePhaseCarrierAudit {
     std::map<std::string, uint64_t> blockers;
 };
 
+/** Project one already-admitted request/rank onto its source operators, without
+ * adding topology or requiring other requests/ranks to have been admitted.
+ * Live execution consumes the returned durations when those operators start;
+ * the caller must reject updates to operators that have already started.
+ */
+[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_operator_costs(const core::DagGraph & graph,
+    const model::HiCachePrefillWorkItem & prefill, const model::HiCacheDecodeWorkItem & decode, core::DagMutationPlan & plan);
+
 /**
  * @brief Appends one request/rank semantic phase graph to an existing atomic plan.
  *

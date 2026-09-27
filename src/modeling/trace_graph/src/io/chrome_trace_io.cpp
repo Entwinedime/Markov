@@ -4,6 +4,7 @@
  */
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 
+#include "../json_scan.hpp"
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 
@@ -155,74 +156,13 @@ private:
         return std::string(value);
     }
 
-    void skip_string() {
-        if (p_ >= end_ || *p_ != '"') return;
-        ++p_;
-        bool escaped = false;
-        while (p_ < end_) {
-            const char value = *p_++;
-            if (escaped) {
-                escaped = false;
-                continue;
-            }
-            if (value == '\\') {
-                escaped = true;
-                continue;
-            }
-            if (value == '"') return;
-        }
-    }
-
     std::string_view parse_primitive_view() {
         const char * start = p_;
         while (p_ < end_ && *p_ != ',' && *p_ != '}' && *p_ != ']' && static_cast<unsigned char>(*p_) > ' ') ++p_;
         return std::string_view(start, static_cast<size_t>(p_ - start));
     }
 
-    void skip_value() {
-        // Skip an arbitrary nested JSON value while preserving scanner synchronization.
-        skip_ws();
-        if (p_ >= end_) return;
-        if (*p_ == '"') {
-            skip_string();
-            return;
-        }
-        if (*p_ == '{') {
-            ++p_;
-            int depth = 1;
-            while (p_ < end_ && depth > 0) {
-                if (*p_ == '"') skip_string();
-                else if (*p_ == '{') {
-                    ++depth;
-                    ++p_;
-                }
-                else if (*p_ == '}') {
-                    --depth;
-                    ++p_;
-                }
-                else ++p_;
-            }
-            return;
-        }
-        if (*p_ == '[') {
-            ++p_;
-            int depth = 1;
-            while (p_ < end_ && depth > 0) {
-                if (*p_ == '"') skip_string();
-                else if (*p_ == '[') {
-                    ++depth;
-                    ++p_;
-                }
-                else if (*p_ == ']') {
-                    --depth;
-                    ++p_;
-                }
-                else ++p_;
-            }
-            return;
-        }
-        (void)parse_primitive_view();
-    }
+    void skip_value() { p_ += json_detail::skip_value(std::string_view(p_, static_cast<size_t>(end_ - p_)), 0); }
 
     core::ParsedU64Decimal parse_u64_value(std::string_view field) {
         // Chrome producers emit timestamps and durations as integers, decimals, or numeric

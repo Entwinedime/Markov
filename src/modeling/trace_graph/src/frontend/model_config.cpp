@@ -166,6 +166,15 @@ HiCacheConfig parse_hicache(const Json & root) {
         throw std::runtime_error("Invalid hicache.write_policy: " + config.write_policy);
     config.write_through_threshold = u64_value(object, "write_through_threshold", 0);
     config.prefetch_policy = lower(string_value(object, "prefetch_policy", "timeout"));
+    config.prefetch_wait_calibration = string_value(object, "prefetch_wait_calibration", "");
+    config.prefetch_query_calibration = string_value(object, "prefetch_query_calibration", "");
+    config.load_index_calibration = string_value(object, "load_index_calibration", "");
+    config.load_submission_calibration = string_value(object, "load_submission_calibration", "");
+    config.layer_wait_calibration = string_value(object, "layer_wait_calibration", "");
+    config.prefetch_cpu_calibrations = object.value("prefetch_cpu_calibrations", std::vector<std::string>{});
+    config.write_host_calibration = string_value(object, "write_host_calibration", "");
+    config.release_host_calibration = string_value(object, "release_host_calibration", "");
+    config.write_confirmation_calibration = string_value(object, "write_confirmation_calibration", "");
     if (config.prefetch_policy == "observed")
         throw std::runtime_error("hicache.prefetch_policy=observed is not supported; use an explicit target prefetch policy");
     if (config.prefetch_policy.empty()) config.prefetch_policy = "timeout";
@@ -189,9 +198,10 @@ HiCacheConfig parse_hicache(const Json & root) {
     config.io_cost = parse_hicache_io_cost(object);
     if (const auto phase_cost = object.find("phase_cost"); phase_cost != object.end() && !phase_cost->is_null()) {
         if (!phase_cost->is_object()) throw std::runtime_error("hicache.phase_cost must be an object");
-        require_exact_fields(*phase_cost,
-                             "hicache.phase_cost",
-                             { "prefill_common_kernel", "prefill_collective", "prefill_prefix_attention", "decode_paged_attention", "decode_collective", "coverage" });
+        require_exact_fields(
+            *phase_cost,
+            "hicache.phase_cost",
+            { "prefill_common_kernel", "prefill_collective", "prefill_prefix_attention", "decode_paged_attention", "decode_collective", "coverage" });
         const auto parse_component = [&](const char * name) {
             const auto item = phase_cost->find(name);
             if (item == phase_cost->end() || !item->is_object()) throw std::runtime_error(std::string("hicache.phase_cost.") + name + " must be an object");
@@ -204,15 +214,13 @@ HiCacheConfig parse_hicache(const Json & root) {
                 .per_attention_token_pair_us = number_value(*item, "per_attention_token_pair_us", 0.0),
                 .per_context_token_us = number_value(*item, "per_context_token_us", 0.0),
             };
-            if (value.fixed_us < 0.0 || value.per_new_token_us < 0.0 || value.per_attention_token_pair_us < 0.0
-                || value.per_context_token_us < 0.0)
+            if (value.fixed_us < 0.0 || value.per_new_token_us < 0.0 || value.per_attention_token_pair_us < 0.0 || value.per_context_token_us < 0.0)
                 throw std::runtime_error(std::string("HiCache phase coefficients must be non-negative for ") + name);
             return value;
         };
         const auto parse_token_curve = [&](const char * name) {
             const auto item = phase_cost->find(name);
-            if (item == phase_cost->end() || !item->is_object())
-                throw std::runtime_error(std::string("hicache.phase_cost.") + name + " must be an object");
+            if (item == phase_cost->end() || !item->is_object()) throw std::runtime_error(std::string("hicache.phase_cost.") + name + " must be an object");
             require_exact_fields(*item, std::string("hicache.phase_cost.") + name, { "new_token_points" });
             const auto points = item->find("new_token_points");
             if (points == item->end() || !points->is_array() || points->size() < 2)
@@ -221,8 +229,7 @@ HiCacheConfig parse_hicache(const Json & root) {
             uint64_t previous_tokens = 0;
             double previous_duration = 0.0;
             for (const auto & point : *points) {
-                require_exact_fields(point, std::string("hicache.phase_cost.") + name + ".new_token_points",
-                                     { "new_tokens", "duration_us" });
+                require_exact_fields(point, std::string("hicache.phase_cost.") + name + ".new_token_points", { "new_tokens", "duration_us" });
                 const auto tokens = u64_value(point, "new_tokens", 0);
                 const auto duration = number_value(point, "duration_us", 0.0);
                 if (tokens <= previous_tokens || duration <= 0.0 || duration < previous_duration)
@@ -238,44 +245,57 @@ HiCacheConfig parse_hicache(const Json & root) {
         config.phase_cost.prefill_collective = parse_token_curve("prefill_collective");
         config.phase_cost.prefill_prefix_attention = parse_component("prefill_prefix_attention");
         const auto decode_paged_attention = phase_cost->find("decode_paged_attention");
-        if (decode_paged_attention == phase_cost->end() || !decode_paged_attention->is_object())
-            throw std::runtime_error("hicache.phase_cost.decode_paged_attention must be an object");
-        require_exact_fields(*decode_paged_attention,
-                             "hicache.phase_cost.decode_paged_attention",
-                             { "kernel_page_tokens", "fixed_us_per_iteration", "per_context_token_us", "per_effective_page_us" });
-        config.phase_cost.decode_paged_attention = HiCacheDecodePagedAttentionCostConfig{
-            .kernel_page_tokens = u64_value(*decode_paged_attention, "kernel_page_tokens", 0),
-            .fixed_us_per_iteration = number_value(*decode_paged_attention, "fixed_us_per_iteration", 0.0),
-            .per_context_token_us = number_value(*decode_paged_attention, "per_context_token_us", 0.0),
-            .per_effective_page_us = number_value(*decode_paged_attention, "per_effective_page_us", 0.0),
-        };
-        if (config.phase_cost.decode_paged_attention.kernel_page_tokens == 0
-            || config.phase_cost.decode_paged_attention.fixed_us_per_iteration < 0.0
-            || config.phase_cost.decode_paged_attention.per_context_token_us < 0.0
-            || config.phase_cost.decode_paged_attention.per_effective_page_us < 0.0)
-            throw std::runtime_error("HiCache Decode paged-attention fields must be non-negative and kernel_page_tokens positive");
-        config.phase_cost.decode_collective = parse_component("decode_collective");
+        if (decode_paged_attention->is_null() != phase_cost->at("decode_collective").is_null())
+            throw std::runtime_error("Decode attention and collective costs must be supplied together");
+        if (!decode_paged_attention->is_null()) {
+            if (decode_paged_attention == phase_cost->end() || !decode_paged_attention->is_object())
+                throw std::runtime_error("hicache.phase_cost.decode_paged_attention must be an object");
+            require_exact_fields(*decode_paged_attention,
+                                 "hicache.phase_cost.decode_paged_attention",
+                                 { "kernel_page_tokens", "fixed_us_per_iteration", "per_context_token_us", "per_effective_page_us" });
+            config.phase_cost.decode_paged_attention = HiCacheDecodePagedAttentionCostConfig{
+                .kernel_page_tokens = u64_value(*decode_paged_attention, "kernel_page_tokens", 0),
+                .fixed_us_per_iteration = number_value(*decode_paged_attention, "fixed_us_per_iteration", 0.0),
+                .per_context_token_us = number_value(*decode_paged_attention, "per_context_token_us", 0.0),
+                .per_effective_page_us = number_value(*decode_paged_attention, "per_effective_page_us", 0.0),
+            };
+            if (config.phase_cost.decode_paged_attention->kernel_page_tokens == 0 || config.phase_cost.decode_paged_attention->fixed_us_per_iteration < 0.0
+                || config.phase_cost.decode_paged_attention->per_context_token_us < 0.0
+                || config.phase_cost.decode_paged_attention->per_effective_page_us < 0.0)
+                throw std::runtime_error("HiCache Decode paged-attention fields must be non-negative and kernel_page_tokens positive");
+            config.phase_cost.decode_collective = parse_component("decode_collective");
+        }
         const auto coverage = phase_cost->find("coverage");
         if (coverage == phase_cost->end() || !coverage->is_object()) throw std::runtime_error("hicache.phase_cost.coverage must be an object");
         require_exact_fields(*coverage,
                              "hicache.phase_cost.coverage",
-                             { "min_new_tokens", "max_new_tokens", "min_context_tokens", "max_context_tokens", "min_attention_token_pairs", "max_attention_token_pairs", "min_decode_context_tokens", "max_decode_context_tokens", "base_page_size" });
+                             { "min_new_tokens",
+                               "max_new_tokens",
+                               "min_context_tokens",
+                               "max_context_tokens",
+                               "min_attention_token_pairs",
+                               "max_attention_token_pairs",
+                               "min_decode_context_tokens",
+                               "max_decode_context_tokens",
+                               "base_page_size" });
         config.phase_cost.min_new_tokens = u64_value(*coverage, "min_new_tokens", 0);
         config.phase_cost.max_new_tokens = u64_value(*coverage, "max_new_tokens", 0);
         config.phase_cost.min_context_tokens = u64_value(*coverage, "min_context_tokens", 0);
         config.phase_cost.max_context_tokens = u64_value(*coverage, "max_context_tokens", 0);
         config.phase_cost.min_attention_token_pairs = number_value(*coverage, "min_attention_token_pairs", 0.0);
         config.phase_cost.max_attention_token_pairs = number_value(*coverage, "max_attention_token_pairs", 0.0);
-        config.phase_cost.min_decode_context_tokens = u64_value(*coverage, "min_decode_context_tokens", 0);
-        config.phase_cost.max_decode_context_tokens = u64_value(*coverage, "max_decode_context_tokens", 0);
+        if (config.phase_cost.decode_paged_attention) {
+            config.phase_cost.min_decode_context_tokens = u64_value(*coverage, "min_decode_context_tokens", 0);
+            config.phase_cost.max_decode_context_tokens = u64_value(*coverage, "max_decode_context_tokens", 0);
+        }
+        else if (!coverage->at("min_decode_context_tokens").is_null() || !coverage->at("max_decode_context_tokens").is_null())
+            throw std::runtime_error("Absent Decode costs cannot declare measured context coverage");
         config.phase_cost.base_page_size = u64_value(*coverage, "base_page_size", 0);
-        if (config.phase_cost.min_new_tokens > config.phase_cost.max_new_tokens
-            || config.phase_cost.min_context_tokens > config.phase_cost.max_context_tokens
+        if (config.phase_cost.min_new_tokens > config.phase_cost.max_new_tokens || config.phase_cost.min_context_tokens > config.phase_cost.max_context_tokens
             || config.phase_cost.min_attention_token_pairs > config.phase_cost.max_attention_token_pairs
             || config.phase_cost.min_decode_context_tokens > config.phase_cost.max_decode_context_tokens)
             throw std::runtime_error("HiCache phase coverage minima must not exceed maxima");
-        if (config.phase_cost.base_page_size == 0)
-            throw std::runtime_error("HiCache phase selected-base page size must be positive");
+        if (config.phase_cost.base_page_size == 0) throw std::runtime_error("HiCache phase selected-base page size must be positive");
     }
     if (const auto dag_patch = object.find("dag_patch"); dag_patch != object.end() && !dag_patch->is_null()) {
         if (!dag_patch->is_object()) throw std::runtime_error("Model config field 'hicache.dag_patch' must be an object");
@@ -299,6 +319,7 @@ ModelConfig ModelConfig::from_file(const std::string & filename) {
     ModelConfig config;
     config.node_scale = parse_node_scale(root);
     config.hicache = parse_hicache(root);
+    config.source_prefetch_policy = model_config_detail::string_value(root, "source_prefetch_policy", "");
 
     auto & logger = core::Logger::instance();
     if (logger.enabled(core::Logger::Info)) logger.info() << "Loaded model config from " << filename;

@@ -64,9 +64,69 @@ void phase_operators_preserve_interleaving() {
         const auto audit = append_hicache_phase_carrier_plan(target,costs,plan);
         require(audit.status == "ready", "observed operators supply the phase structure");
         const auto mutation = core::apply_dag_mutation_plan(target,plan);
-        return simulation::run_topological_simulation(target).e2e_us;
+        const auto expected = simulation::run_topological_simulation(target).e2e_us;
+        auto live = source;
+        std::map<size_t,uint64_t> durations;
+        const auto actual = simulation::run_topological_simulation(live,
+            [&](size_t node,uint64_t,uint64_t duration) { return durations.contains(node) ? durations.at(node) : duration; },
+            [&](size_t node,uint64_t,simulation::FutureDag&) {
+                if(node != first) return;
+                core::DagMutationPlan operators;
+                const auto single = append_hicache_phase_operator_costs(live,costs.prefills.front(),costs.decodes.front(),operators);
+                require(single.status == "ready" && operators.synthetic_nodes.empty() && operators.add_edges.empty(),
+                        "admission-time projection reuses operator costs without rebuilding phase topology");
+                for(const auto& update:operators.set_node_durations) durations.emplace(update.node_id,update.duration);
+                require(append_hicache_phase_operator_costs(live,costs.prefills.front(),costs.decodes.front(),operators).status == "blocked",
+                        "one operator cannot be owned twice by repeated admission");
+            }).e2e_us;
+        require(actual == expected && simulation::run_topological_simulation(live).e2e_us == expected,
+                "live phase costs and subsequent static replay must match the existing phase projection");
+        auto wrong = costs.decodes.front(); wrong.request_id = "another request";
+        core::DagMutationPlan mismatch;
+        require(append_hicache_phase_operator_costs(source,costs.prefills.front(),wrong,mismatch).status == "blocked"
+                && mismatch.set_node_durations.empty(), "request identity cannot cross phase cost ownership");
+        return expected;
     };
     require(replay(graph,work) == original, "same costs retain interleaved submission, compute and communication");
+    auto pipelined = graph;
+    const auto h2d_first = pipelined.add_synthetic_node({.name="layer 1 H2D", .is_cpu=false, .duration=5});
+    const auto h2d_last = pipelined.add_synthetic_node({.name="layer 2 H2D", .is_cpu=false, .duration=100});
+    pipelined.add_edge(h2d_first,h2d_last,core::DagEdgeKind::Stream);
+    pipelined.add_edge(h2d_first,common1,core::DagEdgeKind::Sync);
+    pipelined.add_edge(h2d_last,common2,core::DagEdgeKind::Sync);
+    patch::HiCacheShadowRewriteTransaction shadow;
+    patch::HiCacheRewriteDecision loadback;
+    loadback.effect_type = model::HiCacheEffectType::Loadback;
+    loadback.cache_scope = "scope:1"; loadback.request_id = "request";
+    loadback.source_readiness_topology_reused = true;
+    loadback.owned_duration_nodes = {h2d_first,h2d_last};
+    shadow.decisions.push_back(loadback);
+    for (const auto duration : {100, 300}) {
+        auto target = pipelined;
+        target.set_node_duration(h2d_last,duration);
+        const auto source_time = simulation::run_topological_simulation(target).e2e_us;
+        core::DagMutationPlan combined{.component="hicache"};
+        require(append_hicache_phase_carrier_plan(target,work,combined).status == "ready"
+                && append_hicache_reused_loadback_dependencies(work,shadow,combined), "combined I/O and phase boundaries are supported");
+        (void)core::apply_dag_mutation_plan(target,combined);
+        require(simulation::run_topological_simulation(target).e2e_us == source_time && target.node(common1).completion_time == 15,
+                "later-layer H2D cannot block earlier-layer compute through a whole-Prefill barrier");
+        target = pipelined;
+        target.set_node_duration(h2d_last,duration);
+        core::DagMutationPlan after_prefetch{.component="hicache"};
+        after_prefetch.synthetic_nodes.push_back({.synthetic_id="prefetch", .node={.name="prefetch", .is_cpu=false, .duration=50},
+                                                .effect_id="prefetch"});
+        auto with_prefetch = shadow;
+        patch::HiCacheRewriteDecision prefetch;
+        prefetch.effect_type = model::HiCacheEffectType::PrefetchIo;
+        prefetch.cache_scope = "scope:1"; prefetch.request_id = "request"; prefetch.synthetic_id = "prefetch";
+        with_prefetch.decisions.push_back(prefetch);
+        require(append_hicache_phase_carrier_plan(target,work,after_prefetch).status == "ready"
+                && append_hicache_reused_loadback_dependencies(work,with_prefetch,after_prefetch), "prefetch precedes reused loadback");
+        (void)core::apply_dag_mutation_plan(target,after_prefetch);
+        require(simulation::run_topological_simulation(target).e2e_us == source_time + 50 && target.node(common1).completion_time == 65,
+                "removing the whole-Prefill barrier must not remove upstream prefetch readiness");
+    }
     auto larger = work;
     larger.prefills[0].common_kernel_cost.predicted_duration_us = 40;
     require(replay(graph,larger) == 54, "longer device work propagates to the true CPU synchronization");

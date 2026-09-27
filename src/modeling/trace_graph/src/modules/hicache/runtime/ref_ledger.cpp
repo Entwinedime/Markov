@@ -4,13 +4,8 @@
  */
 #include "markov/trace_graph/modules/hicache/runtime/ref_ledger.hpp"
 
-#include "markov/trace_graph/core/numeric.hpp"
-
 #include <algorithm>
 #include <ranges>
-#include <set>
-#include <stdexcept>
-#include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -27,18 +22,6 @@ std::vector<HiCacheNodeId> repeated_nodes(HiCacheNodeId node_id, uint64_t count)
 using ref_ledger_detail::count_node;
 using ref_ledger_detail::repeated_nodes;
 
-
-/**
- * @brief Returns or creates the reverse-index record for one reference owner.
- *
- * The owner dimension permits an atomic lifecycle release across lock and host chains.
- * Capacity and victim policy continue to read the canonical counters on radix nodes.
- */
-HiCacheRefOwnerRecord & HiCacheRefLedger::ensure_owner(const std::string & owner_id, const OwnerMetadata & metadata) {
-    auto & record = owners_[owner_id];
-    (void)metadata;
-    return record;
-}
 
 HiCacheRefChange HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, const std::string & owner_id) {
     // This is the only owner-wide release path. It updates radix counters and the reverse
@@ -59,43 +42,31 @@ HiCacheRefChange HiCacheRefLedger::release_owner(HiCacheTokenRadixTree & tree, c
     return change;
 }
 
-HiCacheRefChange HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
-                                                const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
+HiCacheRefChange HiCacheRefLedger::acquire_lock(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::vector<HiCacheNodeId> & nodes) {
     // Lock references protect device and host eviction while a request executes or a
     // backup acknowledgement is outstanding.
     if (owner_id.empty() || nodes.empty()) return {};
 
-    auto & record = ensure_owner(owner_id,
-                                 OwnerMetadata{
-                                     .owner_kind = owner_kind,
-                                     .request_key = request_key,
-                                     .operation_id = operation_id,
-                                 });
+    auto & record = owners_[owner_id];
     tree.add_lock_ref(nodes, owner_id);
     record.lock_nodes.insert(record.lock_nodes.end(), nodes.begin(), nodes.end());
     record.active = true;
     return HiCacheRefChange{ .affected_nodes = nodes };
 }
 
-HiCacheRefChange HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::string & owner_kind,
-                                                const std::string & request_key, const std::string & operation_id, const std::vector<HiCacheNodeId> & nodes) {
+HiCacheRefChange HiCacheRefLedger::acquire_host(HiCacheTokenRadixTree & tree, const std::string & owner_id, const std::vector<HiCacheNodeId> & nodes) {
     // Host references protect L2 values throughout prefetch reservation and consumption;
     // capacity cleanup must skip leaves that still carry one.
     if (owner_id.empty() || nodes.empty()) return {};
 
-    auto & record = ensure_owner(owner_id,
-                                 OwnerMetadata{
-                                     .owner_kind = owner_kind,
-                                     .request_key = request_key,
-                                     .operation_id = operation_id,
-                                 });
+    auto & record = owners_[owner_id];
     tree.add_host_ref(nodes, owner_id);
     record.host_nodes.insert(record.host_nodes.end(), nodes.begin(), nodes.end());
     record.active = true;
     return HiCacheRefChange{ .affected_nodes = nodes };
 }
 
-void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, std::string_view reason) {
+void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree) {
     // Radix splits copy child references to a new prefix node. Mirror those copies into
     // owner chains or release_owner would leave the new counters behind.
     for (const auto & node : tree.nodes()) {
@@ -121,9 +92,6 @@ void HiCacheRefLedger::sync_tree_ref_copies(const HiCacheTokenRadixTree & tree, 
             record.host_nodes.insert(record.host_nodes.end(), copied_nodes.begin(), copied_nodes.end());
         }
     }
-#ifndef DEBUG
-    (void)reason;
-#endif
 }
 
 

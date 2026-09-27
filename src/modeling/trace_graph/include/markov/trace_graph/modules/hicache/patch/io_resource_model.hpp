@@ -44,7 +44,7 @@ struct HiCacheIoCostRecord {
     uint64_t effective_byte_count = 0;
     uint64_t storage_existing_page_count = 0;
     uint64_t storage_new_page_count = 0;
-    /** Predicted per-operation existing-key H2S shape used by canonical storage cost. */
+    /** Executed batches: H2S key residency or prefetch read/copy work. */
     std::vector<model::HiCacheStorageBatchWork> storage_service_batches;
     uint64_t storage_existing_byte_count = 0;
     uint64_t storage_new_byte_count = 0;

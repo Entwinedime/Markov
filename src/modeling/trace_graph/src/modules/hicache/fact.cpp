@@ -307,6 +307,13 @@ uint64_t hicache_fact_boundary_timestamp(const TraceEvent & event) {
     return core::checked_add_u64(event.ts, event.dur, "HiCache end-fact timestamp exceeds uint64 range");
 }
 
+size_t hicache_tail_fact_offset(std::span<const TraceEvent> formal_facts) {
+    size_t offset = 0;
+    for (const auto & event : formal_facts)
+        offset = std::max(offset, core::checked_add_u64(event.index, 1, "HiCache formal fact identity exceeds size_t range"));
+    return offset;
+}
+
 HiCacheTokenSpan parse_hicache_token_span_arg(const TraceEvent & event, std::string_view key) { return token_span_from_json(parse_json_arg(event.arg(key))); }
 
 bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
@@ -324,6 +331,8 @@ bool HiCacheFactParser::is_hicache_event(const TraceEvent & event) const {
 }
 
 void HiCacheFactParser::observe_token_dictionaries(const TraceEvent & event) {
+    // Prelude context also carries timing-only observations, not state facts.
+    if (event.cat == "runtime_diagnostic" && event.arg("fact").empty()) return;
     if (!state_model_dictionary_source(event)) return;
     // A dictionary is a same-contract side table for span-only facts. Only eligible phases
     // may populate it, preventing partial or diagnostic events from contaminating replay.
@@ -372,10 +381,10 @@ HiCacheTokenPath HiCacheFactParser::resolve_span(const HiCacheTokenSpan & span) 
     return slice_path(it->second, span.begin, span.end);
 }
 
-bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact) {
-    if (!fact.full_path_span.valid) return false;
-    if (fact.full_path_span.token_count == 0) return fact.full_path_span.begin == fact.full_path_span.end;
-    return static_cast<uint64_t>(fact.full_path_tokens.size()) == fact.full_path_span.token_count;
+bool hicache_token_path_resolved(const HiCacheTokenSpan & span, const HiCacheTokenPath & tokens) {
+    if (!span.valid) return false;
+    if (span.token_count == 0) return span.begin == span.end;
+    return static_cast<uint64_t>(tokens.size()) == span.token_count;
 }
 
 bool HiCacheFact::has_consumer(std::string_view consumer) const { return consumer_list_contains(consumers, consumer); }
@@ -388,17 +397,6 @@ void HiCacheFactParser::parse_batch_fields(HiCacheFact & fact, const TraceEvent 
     const auto spans = parse_json_arg(event.arg("full_path_spans"));
     const auto token_counts_value = parse_json_arg(event.arg("token_counts"));
     const auto token_counts = token_counts_value.is_array() ? json_u64_values(token_counts_value) : std::vector<uint64_t>{};
-
-    fact.batch_request_ids_array = request_ids_value.is_array();
-    fact.batch_positions_array = positions.is_array();
-    fact.batch_token_dictionaries_array = dictionaries.is_array();
-    fact.batch_spans_array = spans.is_array();
-    fact.batch_token_counts_array = token_counts_value.is_array();
-    fact.batch_request_id_count = request_ids_value.is_array() ? static_cast<uint64_t>(request_ids_value.size()) : 0;
-    fact.batch_position_count = positions.is_array() ? static_cast<uint64_t>(positions.size()) : 0;
-    fact.batch_token_dictionary_count = dictionaries.is_array() ? static_cast<uint64_t>(dictionaries.size()) : 0;
-    fact.batch_span_count = spans.is_array() ? static_cast<uint64_t>(spans.size()) : 0;
-    fact.batch_token_count_count = token_counts_value.is_array() ? static_cast<uint64_t>(token_counts_value.size()) : 0;
 
     fact.batch_paths.reserve(request_ids.size());
     for (size_t index = 0; index < request_ids.size(); ++index) {
@@ -414,14 +412,34 @@ void HiCacheFactParser::parse_batch_fields(HiCacheFact & fact, const TraceEvent 
         fact.batch_paths.push_back(std::move(entry));
     }
 
-    fact.batch_request_ids_unique = batch_request_ids_unique(request_ids_value);
+    auto & errors = fact.batch_input_errors;
+    const auto array_size = [](const auto & value) { return value.is_array() ? value.size() : size_t{ 0 }; };
+    const auto request_count = array_size(request_ids_value);
+    if (fact.batch_kind != "extend") errors.push_back("missing_batch_kind_extend");
+    if (!request_ids_value.is_array()) errors.push_back("request_ids_not_array");
+    if (!positions.is_array()) errors.push_back("request_positions_not_array");
+    if (!dictionaries.is_array()) errors.push_back("token_dictionaries_not_array");
+    if (!spans.is_array()) errors.push_back("full_path_spans_not_array");
+    if (!token_counts_value.is_array()) errors.push_back("token_counts_not_array");
+    if (fact.batch_paths.empty()) errors.push_back("missing_batch_paths");
+    if (request_count == 0) errors.push_back("missing_batch_request_ids");
+    if (fact.batch_size != fact.batch_paths.size()) errors.push_back("batch_size_mismatch");
+    if (array_size(positions) != request_count) errors.push_back("request_positions_length_mismatch");
+    if (array_size(dictionaries) != request_count) errors.push_back("token_dictionaries_length_mismatch");
+    if (array_size(spans) != request_count) errors.push_back("full_path_spans_length_mismatch");
+    if (array_size(token_counts_value) != request_count) errors.push_back("token_counts_length_mismatch");
+    if (!batch_request_ids_unique(request_ids_value)) errors.push_back("duplicate_batch_request_id");
     const auto position_validation = validate_batch_positions(positions, request_ids_value);
-    fact.batch_positions_cover_indexes = position_validation.covers_indexes;
-    fact.batch_positions_match_request_ids = position_validation.matches_request_ids;
+    if (!position_validation.covers_indexes) errors.push_back("request_positions_coverage");
+    if (!position_validation.matches_request_ids) errors.push_back("request_positions_request_id_mismatch");
+    if (fact.batch_paths.empty() || !std::ranges::all_of(fact.batch_paths, [](const auto & entry) {
+            return !entry.request_id.empty() && hicache_token_path_resolved(entry.full_path_span, entry.full_path_tokens);
+        }))
+        errors.push_back("batch_token_dictionary_or_full_path_span");
 }
 
 HiCacheFact HiCacheFactParser::parse(size_t source_fact_id, const TraceEvent & event, std::optional<size_t> execution_anchor_node_id) const {
-    // Parsing normalizes fields and hydrates spans only. Routing remains a separate strict gate.
+    // Normalize fields, hydrate spans and record batch errors; routing decides admission.
     HiCacheFact fact;
     const auto metadata = fact_metadata_from_event(event);
     fact.source_node_id = source_fact_id;
@@ -445,6 +463,10 @@ HiCacheFact HiCacheFactParser::parse(size_t source_fact_id, const TraceEvent & e
     if (fact.operation_id.empty()) fact.operation_id = event.arg("node_id");
     fact.cache_scope = event.arg("cache_scope");
     fact.lifecycle_kind = event.arg("lifecycle_kind");
+    const auto chunked = event.arg("chunked");
+    if (chunked == "true") fact.chunked = true;
+    else if (chunked == "false") fact.chunked = false;
+    else if (!chunked.empty()) throw std::runtime_error("HiCache chunked must be a boolean");
     fact.batch_kind = event.arg("batch_kind");
     fact.seq_no = event.arg_u64("seq_no", 0);
     fact.source_page_size = event.arg_u64("source_page_size", 0);

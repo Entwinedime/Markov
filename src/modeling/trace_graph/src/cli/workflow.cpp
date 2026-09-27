@@ -8,147 +8,76 @@
  */
 #include "workflow.hpp"
 
+#include "cpu_service_preparation.hpp"
+#include "file_output.hpp"
+#include "hicache_observations.hpp"
+#include "input_graph.hpp"
 #include "module_pipeline.hpp"
 #include "options.hpp"
 #include "run_summary.hpp"
-#include "hicache_observations.hpp"
 #include <nlohmann/json.hpp>
 
 #include "markov/trace_graph/cli/debug_support.hpp"
-#include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/core/logger.hpp"
-#include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/frontend/trace_normalizer.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
+#include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
+#ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
+#endif
+#include "markov/trace_graph/modules/hicache/missing_cost.hpp"
+#include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "markov/trace_graph/modules/hicache/scope_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <algorithm>
-#include <future>
-#include <limits>
+#include <fstream>
 #include <stdexcept>
 #include <utility>
-#include <vector>
 
 namespace markov::trace_graph::cli {
 
 namespace {
 
-using core::DagBuilder;
 using core::DagGraph;
 
-#ifdef DEBUG
-
-void set_observed_e2e_time(DagGraph & graph) {
-    uint64_t real_min = 0;
-    uint64_t real_max = 0;
-    bool has_real_time = false;
-    for (const auto & node : graph.nodes()) {
-        const auto & event = graph.event_for_node(node.id);
-        if (!has_real_time || event.ts < real_min) real_min = event.ts;
-        real_max = std::max(real_max, core::checked_add_u64(event.ts, event.dur, "trace timestamp overflow while measuring observed E2E"));
-        has_real_time = true;
-    }
-    graph.set_real_e2e_time(has_real_time && real_max > real_min ? real_max - real_min : 0);
-}
-
-#endif
-
-struct InputBuildResult {
-    size_t index = 0;
-    DagGraph graph;
-};
-
-/** @brief One independently buildable logical trace and its worker allocation. */
-struct InputBuildRequest {
-    io::ManifestTraceInput input;
-    size_t index = 0;
-    size_t thread_count = 1;
-};
-
-InputBuildResult build_input_graph(InputBuildRequest request) {
-    if (request.index > static_cast<size_t>(std::numeric_limits<int>::max())) throw std::overflow_error("Logical trace input index exceeds GPU ID range");
-    frontend::normalize_trace_events(request.input.events);
-    DagBuilder builder(request.thread_count);
-    auto graph = builder.build(std::move(request.input.events), static_cast<int>(request.index));
-#ifdef DEBUG
-    set_observed_e2e_time(graph);
-#endif
-    graph.set_input_contracts(std::move(request.input.input_contracts));
-    graph.set_context_events(std::move(request.input.context_events));
-    graph.set_prelude_context_events(std::move(request.input.prelude_context_events));
-    graph.set_tail_context_events(std::move(request.input.tail_context_events));
-    return InputBuildResult{
-        .index = request.index,
-        .graph = std::move(graph),
-    };
-}
-
-std::vector<DagGraph> build_graphs(std::vector<io::ManifestTraceInput> inputs, size_t thread_budget) {
-    const size_t concurrency = std::max<size_t>(1, std::min(thread_budget, inputs.size()));
-    const size_t build_threads = std::max<size_t>(1, thread_budget / concurrency);
-    std::vector<DagGraph> graphs(inputs.size());
-    auto accept_result = [&](InputBuildResult result) { graphs[result.index] = std::move(result.graph); };
-
-    if (concurrency == 1) {
-        for (size_t index = 0; index < inputs.size(); ++index) {
-            accept_result(build_input_graph(InputBuildRequest{
-                .input = std::move(inputs[index]),
-                .index = index,
-                .thread_count = build_threads,
-            }));
-        }
-    }
-    else {
-        for (size_t begin = 0; begin < inputs.size(); begin += concurrency) {
-            const size_t end = std::min(inputs.size(), begin + concurrency);
-            std::vector<std::future<InputBuildResult>> futures;
-            futures.reserve(end - begin);
-            for (size_t index = begin; index < end; ++index) {
-                futures.push_back(std::async(std::launch::async, [&inputs, index, build_threads] {
-                    return build_input_graph(InputBuildRequest{
-                        .input = std::move(inputs[index]),
-                        .index = index,
-                        .thread_count = build_threads,
-                    });
-                }));
-            }
-            for (auto & future : futures) accept_result(future.get());
-        }
-    }
-    return graphs;
-}
-
-void simulate(DagGraph & graph) {
-    (void)simulation::run_topological_simulation(graph);
-    (void)simulation::run_control_topological_simulation(graph);
-    (void)simulation::run_gap_excluded_topological_simulation(graph);
-}
-
-nlohmann::json replay_client_requests(DagGraph & graph, const io::ManifestClientInput & input) {
+nlohmann::json client_request_result(const DagGraph & graph, const core::ClientRequestChain & chain, const simulation::SimulationResult & replay) {
     using Json = nlohmann::json;
-    if (input.status != "ready") return {{"status", input.status}};
-    const auto server_e2e = graph.e2e_time();
-    const auto chain = core::connect_client_requests(graph, input.requests);
-    if (chain.status != "connected") return {{"status", chain.status}};
-    const auto replay = simulation::run_topological_simulation(graph);
+    if (chain.status != "connected")
+        return {
+            { "status", chain.status }
+        };
+
     uint64_t completion = 0;
     Json requests = Json::array();
     for (const auto & request : chain.requests) {
         const auto end = graph.node(request.completion).completion_time;
         completion = std::max(completion, end);
-        requests.push_back({{"request_id", request.request_id}, {"start_us", graph.node(request.start).completion_time}, {"completion_us", end}});
+        requests.push_back({
+            {    "request_id",                        request.request_id },
+            {      "start_us", graph.node(request.start).completion_time },
+            { "completion_us",                                       end }
+        });
     }
-    return {{"status", "connected"}, {"e2e_us", completion}, {"server_graph_e2e_us", server_e2e},
-            {"peripheral_cost_source", "base_frontend_response_and_client_intervals"}, {"source_residual_waits_retained", true},
-            {"cpu_task_queues", {{"queue_count", replay.cpu_queue_count}, {"task_count", replay.cpu_task_count},
-                {"max_depth", replay.max_cpu_queue_depth},
-                {"arrival_basis", "submission_return_upper_bound"}, {"submission_overlap_count", replay.submission_overlap_count},
-                {"submission_overlap_total_us", replay.submission_overlap_total_us}, {"submission_overlap_max_us", replay.submission_overlap_max_us}}},
-            {"component_metrics_before_client_chain", true}, {"requests", requests}};
+    return {
+        {                                "status","connected"                                                  },
+        {                                "e2e_us",                                    completion },
+        {                     "full_graph_e2e_us",                                 replay.e2e_us },
+        {                "peripheral_cost_source", "base_frontend_response_and_client_intervals" },
+        {        "source_residual_waits_retained",                                          true },
+        {                       "cpu_task_queues",
+         { { "queue_count", replay.cpu_queue_count },
+         { "task_count", replay.cpu_task_count },
+         { "max_depth", replay.max_cpu_queue_depth },
+         { "arrival_basis", "submission_return_upper_bound" },
+         { "submission_overlap_count", replay.submission_overlap_count },
+         { "submission_overlap_total_us", replay.submission_overlap_total_us },
+         { "submission_overlap_max_us", replay.submission_overlap_max_us } }                    },
+        { "component_metrics_before_client_chain",                                         false },
+        {                              "requests",                                      requests }
+    };
 }
 
 #ifdef DEBUG
@@ -175,28 +104,88 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     auto modules = ModulePipeline::from_config(options.model_config);
 #endif
     auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
-    const auto client_input = options.trace_input.include_python_probe ? io::load_client_requests_from_manifest(options.profile_manifest)
-                                                                    : io::ManifestClientInput{"python_probe_channel_disabled", {}};
-    auto graphs = build_graphs(std::move(inputs), options.trace_input.threads);
-    auto graph = DagGraph::merge(std::move(graphs));
+    const auto client_input = options.trace_input.include_python_probe && !options.source_observations_only
+                                  ? io::load_client_requests_from_manifest(options.profile_manifest)
+                                  : io::ManifestClientInput{ "python_probe_channel_disabled", {} };
+    auto graph = build_input_graph(std::move(inputs), options.trace_input.threads);
+    if (!options.prepare_cpu_service.empty()) {
+        if (client_input.status != "ready") throw std::runtime_error("CPU service preparation needs complete client requests");
+        const auto chain = core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us);
+        if (chain.status != "connected") throw std::runtime_error("CPU service preparation could not bind the client chain");
+        prepare_cpu_service(graph, options.profile_manifest, options.prepare_cpu_service, options.cpu_service_output);
+        return 0;
+    }
+    if (!options.cpu_service_cost.empty()) {
+        std::ifstream input(options.cpu_service_cost);
+        if (!input) throw std::runtime_error("Cannot open CPU service cost file: " + options.cpu_service_cost);
+        graph.cpu_service_cost() = io::read_cpu_service_cost(input, options.profile_manifest);
+    }
 #ifdef DEBUG
     if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
 #endif
 
-    const auto source_io = hicache_io_observations(graph, modules::hicache::mark_observed_hicache_scope(graph));
-    const auto source_phase = modules::hicache::observe_hicache_phases(graph);
-    modules.apply(graph, logger);
-    simulate(graph);
+    if (options.source_observations_only) {
+        const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
+        const auto operations = modules::hicache::patch::build_hicache_io_operation_ledger(source);
+        auto io = hicache_io_observations(graph, operations, !options.cpu_service_cost.empty());
+        write_json_file(options.outputs.run_summary,
+                        {
+                            {    "source_io_observations",                                                                          io },
+                            { "source_phase_observations", hicache_phase_observations(modules::hicache::observe_hicache_phases(graph)) }
+        });
+        return 0;
+    }
+
+    bool include_source_observations = modules.needs_hicache_observations();
+#ifdef DEBUG
+    include_source_observations |= !options.outputs.model_summary.empty();
+#endif
+    nlohmann::json source_io;
+    modules::hicache::HiCachePhaseObservationAudit source_phase;
+    if (include_source_observations) {
+        const auto source_scope = modules::hicache::observe_hicache_scope(graph);
+        source_io = hicache_io_observations(graph, source_scope.operations, !options.cpu_service_cost.empty());
+        // Observation alone must not lock CPU gaps before execution binds.
+        if (!modules.uses_hicache_execution()) modules::hicache::apply_observed_hicache_scope(graph, source_scope);
+        source_phase = modules::hicache::observe_hicache_phases(graph);
+    }
+    // Request availability is an input dependency, not a scoring-only adjustment.
+    // Keep the same anchors throughout modeling, execution and HTTP reporting.
+    const auto client_chain = client_input.status == "ready" ? core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us)
+                                                             : core::ClientRequestChain{ client_input.status, {} };
+    const auto begin = client_input.requests.empty() ? 0 : client_input.requests.front().start_us;
+    const auto end = client_input.requests.empty() ? 0 : client_input.requests.back().end_us;
+    try {
+        modules.apply(graph, logger, client_chain, begin, end);
+    }
+    catch (const modules::hicache::MissingCostEvidence & error) {
+        if (!options.outputs.run_summary.empty())
+            write_json_file(options.outputs.run_summary,
+                            {
+                                {                "status",                            "data_limitation" },
+                                {         "missing_costs", nlohmann::json::array({ error.requirement }) },
+                                { "requirements_complete",                                        false }
+            });
+        throw;
+    }
+    // HiCache has already executed the target DAG. Its component ownership is
+    // not available, so stripped-scope replays cannot supply valid metrics.
+    const auto * execution = modules.execution_result();
+    const auto simulation = execution ? execution->simulation : simulation::run_topological_simulation(graph);
+    if (!execution && include_source_observations) {
+        (void)simulation::run_control_topological_simulation(graph);
+        (void)simulation::run_gap_excluded_topological_simulation(graph);
+    }
 #ifdef DEBUG
     run_post_simulation_diagnostics(graph, modules);
 #endif
-    const auto client_result = replay_client_requests(graph, client_input);
+    const auto client_result = client_request_result(graph, client_chain, simulation);
 
     write_graph_output(options, graph);
 #ifdef DEBUG
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
-    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, source_phase, client_result);
+    write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, source_phase, client_result, execution, include_source_observations);
     return 0;
 }
 

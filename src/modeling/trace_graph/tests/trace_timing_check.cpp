@@ -1,9 +1,12 @@
 /** @file Small trace timing checks, enabled only in explicit validation builds. */
 #include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/client_requests.hpp"
+#include "markov/trace_graph/core/cpu_service_cost.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
+#include "markov/trace_graph/io/cpu_service_input.hpp"
 #include <nlohmann/json.hpp>
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include "../src/io/trace_channel_join.hpp"
@@ -14,12 +17,17 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
+#include <sstream>
 #include <tuple>
 
 using namespace markov::trace_graph;
 
 void check_native_stream_waits();
+void check_cpu_task_insertion();
+void check_dynamic_execution();
+void check_nested_copy_connections();
 
 namespace {
 core::TraceEvent event(std::string name, std::string pid, std::string tid, uint64_t ts, uint64_t dur,
@@ -33,6 +41,94 @@ core::TraceEvent event(std::string name, std::string pid, std::string tid, uint6
 
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+void lazy_arguments_preserve_json_values_and_copy_ownership() {
+    const auto raw = std::make_shared<const std::string>(
+        R"({"ignored":[{"text":"quote\" and } bracket"},[1,2]],"nested":{"value":7},"na\u006de":"\u4e2d\u6587\ud83d\ude00"})");
+    core::TraceEvent source;
+    source.set_args_json_slice(raw, { 0, raw->size() });
+    require(source.arg("nested.value") == "7", "lazy lookup must skip mixed nested JSON values");
+    const auto decoded = nlohmann::json::parse(*raw).at("name").get<std::string>();
+    require(source.arg("name") == decoded, "lazy string keys and values must decode Unicode including surrogate pairs");
+
+    source.set_arg("override", "source");
+    core::TraceEvent assigned;
+    assigned = source;
+    assigned.set_arg("override", "copy");
+    require(source.arg("override") == "source" && assigned.arg("override") == "copy", "assignment must retain independent overrides");
+    require(assigned.arg("name") == assigned.args_map().at("name"), "lazy and materialized Unicode values must agree");
+    core::TraceEvent donor;
+    donor.pid = "donor";
+    donor.set_arg("override", "merged");
+    assigned.merge_args_from(donor);
+    require(assigned.arg("override") == "merged" && assigned.args_map().at("pid") == source.pid, "argument merge must preserve the receiving event's identity");
+}
+
+void cpu_service_input_uses_source_coordinates() {
+    using Json = nlohmann::json;
+    const Json span{
+        {        "pid", "p" },
+        {        "tid", "t" },
+        {   "begin_us", 100 },
+        {     "end_us", 110 },
+        { "service_us",   4 }
+    };
+    const Json input{{"source_manifest","base/profile_manifest.json"},{"spans",Json::array({span})}};
+    const auto read = [](const Json& value) {
+        std::istringstream stream(value.dump());
+        return io::read_cpu_service_cost(stream, "base/profile_manifest.json");
+    };
+    const auto cost = read(input);
+    require(cost.duration({"p","t"},100,110)==4, "CPU service input changed measured cost");
+    require(cost.duration({"p","t"},100,103)+cost.duration({"p","t"},103,110)==4,
+            "CPU service input does not preserve split costs");
+    require(cost.duration({"other","t"},100,110)==10, "Unmeasured thread was changed");
+    std::stringstream encoded;
+    io::write_cpu_service_cost(encoded, "base/profile_manifest.json", cost);
+    const auto restored = io::read_cpu_service_cost(encoded, "base/profile_manifest.json");
+    for (uint64_t begin=95; begin<=115; ++begin)
+        for (uint64_t end=begin; end<=115; ++end)
+            require(restored.duration({"p","t"},begin,end)==cost.duration({"p","t"},begin,end),
+                    "CPU service roundtrip changed an interval");
+    const auto rejects = [&](Json value) {
+        bool rejected = false;
+        try { (void)read(value); } catch (const std::exception&) { rejected = true; }
+        require(rejected, "Invalid CPU service input accepted");
+    };
+    auto invalid = input; invalid["source_manifest"]="other/profile_manifest.json"; rejects(invalid);
+    invalid=input; invalid["spans"].push_back(span); rejects(invalid);
+    invalid=input; invalid["spans"][0]["service_us"]=-1; rejects(invalid);
+    invalid=input; invalid["spans"][0]["begin_us"]=100.5; rejects(invalid);
+    invalid=input; invalid["spans"][0]["end_us"]=100; rejects(invalid);
+    invalid=input; invalid["spans"][0]["tid"]=""; rejects(invalid);
+}
+
+void costs_follow_execution_not_topological_list_order() {
+    core::DagGraph graph;
+    const auto slow = graph.add_synthetic_node({.name = "slow thread", .duration = 100});
+    const auto fast = graph.add_synthetic_node({.name = "fast thread", .duration = 10});
+    const auto later = graph.add_synthetic_node({.name = "future state", .counts_toward_e2e = true});
+    const auto earlier = graph.add_synthetic_node({.name = "earlier observation", .counts_toward_e2e = true});
+    graph.add_edge(slow, later, core::DagEdgeKind::Mutation);
+    graph.add_edge(fast, earlier, core::DagEdgeKind::Sequential);
+    graph.mutable_node(fast).cpu_gap_after = 3;
+    graph.mutable_node(earlier).cpu_ready_delay_before = 2;
+    std::vector<size_t> order;
+    bool future = false;
+    const auto result = simulation::run_topological_simulation(graph, [&](size_t id, uint64_t at, uint64_t duration) {
+        order.push_back(id);
+        if (id == later) { require(at == 100, "late boundary follows its work"); future = true; }
+        if (id == earlier) {
+            require(!future && at == 15, "a legal topological order must not expose future state or double-charge ready delay");
+            return uint64_t{7};
+        }
+        return duration;
+    });
+    require(order == std::vector<size_t>{slow, fast, earlier, later} && result.e2e_us == 100,
+            "cost callbacks must execute once in time order, including zero-cost boundaries");
+    require(graph.node(earlier).completion_time == 22 && graph.node(earlier).duration == 7,
+            "the chosen duration must be stored and executed exactly once");
 }
 
 void native_wrapper_setup_cannot_shift_later_call_identities() {
@@ -86,6 +182,63 @@ void collective_boundaries_only_partition_control_self_time() {
     const auto baseline = simulation::run_topological_simulation(original);
     const auto split = simulation::run_topological_simulation(graph);
     require(baseline.e2e_us == split.e2e_us, "splitting self-time must preserve full replay");
+}
+
+void nested_host_load_branch_preserves_time(bool needed, bool fully_covered = false) {
+    std::vector<core::TraceEvent> events{event("before", "1", "1", 0, 5), event("after", "1", "1", 100, 5)};
+    if (fully_covered) events.push_back(event("whole branch child", "1", "1", 10, 80));
+    else if (needed) {
+        events.push_back(event("hicache.control.load_back_admission", "1", "1", 20, 30));
+        events.push_back(event("allocation", "1", "1", 25, 10));
+        events.push_back(event("prefix concat", "1", "1", 60, 15));
+    }
+    auto baseline = core::DagBuilder(1).build(events, 0);
+    events.push_back(event("hicache.control.host_load_branch", "1", "1", 10, 80));
+    auto check = event("runtime.hicache.host_load_check", "1", "1", 15, 0, "runtime_diagnostic");
+    check.source_channel = core::TraceSourceChannel::PythonProbe;
+    check.set_arg("request_id", "request");
+    check.set_arg("needed", needed ? "true" : "false");
+    events.push_back(check);
+    auto graph = core::DagBuilder(1).build(events, 0);
+    require(simulation::run_topological_simulation(graph).e2e_us == simulation::run_topological_simulation(baseline).e2e_us,
+            "outer host-load range must not add nested CPU work twice");
+    uint64_t owned_us = 0;
+    for (const auto & node : graph.nodes()) {
+        const auto & observed = graph.event_for_node(node.id);
+        if (node.active && node.is_cpu && observed.ts >= 10 && observed.ts + observed.dur <= 90) owned_us += node.duration;
+    }
+    require(owned_us == 80, "nested admission, prefix update and outer self must partition the branch exactly");
+    const auto & observations = graph.runtime_observations();
+    const auto branch = std::ranges::find(observations, "hicache.control.host_load_branch", &core::TraceEvent::name);
+    const auto condition = std::ranges::find(observations, "runtime.hicache.host_load_check", &core::TraceEvent::name);
+    require(observations.size() == 2 && condition != observations.end() && condition->arg("needed") == (needed ? "true" : "false"),
+            "branch check is metadata, including the source-false case");
+    require(branch != observations.end() && branch->pid == "1" && branch->tid == "1" && branch->ts == 10 && branch->dur == 80,
+            "original admission boundaries must survive CPU self decomposition");
+    if (fully_covered)
+        require(std::ranges::none_of(graph.events(), [](const auto & e) { return e.name == "hicache.control.host_load_branch.self"; }),
+                "envelope must survive even without an outer self fragment");
+}
+
+void unknown_stream_sync_preserves_observed_wait() {
+    for (const std::string stream : {std::string{}, std::string{"not-a-known-stream"}}) {
+        auto launch = event("Node@launch", "1", "1", 0, 5);
+        launch.set_arg("connection_id", "launch");
+        auto kernel = event("kernel", "2", "3", 5, 100, "Kernel");
+        kernel.set_arg("Physic Stream Id", "3");
+        kernel.set_arg("connection_id", "launch");
+        auto sync = event("AscendCL@aclrtSynchronizeStreamWithTimeout", "1", "1", 10, 120);
+        if (!stream.empty()) sync.set_arg("Raw Stream", stream);
+        auto graph = core::DagBuilder(1).build({launch, kernel, sync}, 0);
+        const auto found = std::ranges::find_if(graph.nodes(), [&](const auto& node) {
+            return graph.event_for_node(node.id).name == sync.name;
+        });
+        require(found != graph.nodes().end() && found->duration == 120,
+                "unknown stream must retain its observed blocking interval");
+        require(std::ranges::none_of(graph.edges(), [&](const auto& edge) {
+            return edge.active && edge.dst == found->id && edge.kind == core::DagEdgeKind::Sync;
+        }), "missing stream identity cannot create a device-wide barrier");
+    }
 }
 
 void cann_display_process_is_not_a_second_cpu_thread() {
@@ -185,12 +338,13 @@ void event_binding_selects_cpu_role_not_first_timestamp() {
     core::add_event_wait_edges(graph, index);
     require(std::ranges::any_of(graph.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 2 && edge.kind == core::DagEdgeKind::Sync; }),
             "event identity comes from the unique CPU view even when device is first");
-    require(index.raw_stream_to_lane.at("raw7") == graph.node(0).lane_id, "stream alias comes from that same CPU record");
+    require(index.stream_alias_to_lane.at("raw7") == graph.node(0).lane_id, "stream alias comes from that same CPU record");
     auto extra_host = host_record; extra_host.tid = "23";
     core::DagGraph ambiguous({record, host_record, wait, host_wait, extra_host}, 0);
     auto ambiguous_index = core::create_node_index(ambiguous);
     core::add_event_wait_edges(ambiguous, ambiguous_index);
-    require(ambiguous.active_edge_count() == 0 && ambiguous_index.raw_stream_to_lane.empty(), "ambiguous CPU views must not guess an event binding");
+    require(ambiguous.active_edge_count() == 0 && !ambiguous_index.stream_alias_to_lane.contains("raw7"),
+            "ambiguous CPU views must not guess an event binding");
 }
 
 void runtime_diagnostics_do_not_add_or_remove_work() {
@@ -206,12 +360,22 @@ void runtime_diagnostics_do_not_add_or_remove_work() {
     auto layer_waits = observation;
     layer_waits.name = "runtime.hicache.layer_waits";
     layer_waits.set_arg("consumer_index", "0");
-    auto graph = core::DagBuilder(1).build({before, observation, collective, layer_waits, response, after}, 0);
+    auto empty_load_check = observation;
+    empty_load_check.name = "runtime.hicache.host_load_check";
+    empty_load_check.dur = 0;
+    empty_load_check.set_arg("request_id", "request");
+    empty_load_check.set_arg("needed", "false");
+    auto load_check = empty_load_check;
+    load_check.dur = 1;
+    load_check.set_arg("needed", "true");
+    auto graph = core::DagBuilder(1).build({before, observation, collective, layer_waits, empty_load_check, load_check, response, after}, 0);
     require(graph.node_count() == 4 && graph.active_edge_count() == 3, "response boundaries partition the gap without materializing diagnostic work");
     require(graph.hicache_fact_events().empty(), "runtime diagnostic is not a HiCache fact");
-    require(graph.runtime_observations().size() == 3 && graph.runtime_observations().front().dur == 200
+    require(graph.runtime_observations().size() == 5 && graph.runtime_observations().front().dur == 200
                 && graph.runtime_observations()[1].arg("sequence_before") == "7"
-                && graph.runtime_observations().back().arg("consumer_index") == "0",
+                && graph.runtime_observations()[2].arg("consumer_index") == "0"
+                && graph.runtime_observations()[3].arg("needed") == "false"
+                && graph.runtime_observations()[4].arg("needed") == "true",
             "preparation, collective and layer-wait envelopes retain metadata without becoming execution");
     require(simulation::run_topological_simulation(graph).e2e_us == 110, "retain the full 90 us CPU gap");
     graph.set_scope_node_owned(0);
@@ -277,7 +441,7 @@ void event_wait_follows_record_at_host_submission() {
     core::DagGraph cpu_sync({record, host_record, later_record, later_host, host_sync}, 0);
     auto sync_index = core::create_node_index(cpu_sync);
     core::add_event_wait_edges(cpu_sync, sync_index);
-    core::add_event_sync_edges(cpu_sync, sync_index);
+    core::add_sync_edges(cpu_sync, sync_index);
     require(std::ranges::any_of(cpu_sync.edges(), [](const auto& edge) { return edge.src == 0 && edge.dst == 4; }),
             "host event synchronization also waits for the record captured at its own call");
 
@@ -429,13 +593,22 @@ void serial_http_clients_follow_responses_not_background_work() {
     auto invalid = requests; invalid.back().request_id = "missing";
     require(core::connect_client_requests(incomplete, invalid).status != "connected" && incomplete.node_count() == graph.node_count(),
             "missing source observations leave the graph unchanged");
-    const auto chain = core::connect_client_requests(graph, requests);
+    const auto server_only = graph;
+    const auto chain = core::connect_client_requests(graph, requests, 0);
+    require(chain.hicache_idle_since_us == 0, "client chain preserves the explicit idle boundary");
     require(chain.status == "connected" && chain.requests.size() == 2, "complete source requests form a client chain");
     for (const auto [compute, expected] : {std::pair{100, 185}, {50, 135}, {150, 235}}) {
         graph.set_node_duration(compute1, compute);
         require(simulation::run_topological_simulation(graph).e2e_us == 500, "background work remains in the graph metric");
         require(graph.node(chain.requests.back().completion).completion_time == static_cast<uint64_t>(expected),
                 "HTTP completion follows changed compute without double-counting the existing server gap");
+        auto late_connected = server_only;
+        late_connected.set_node_duration(compute1, compute);
+        const auto late_chain = core::connect_client_requests(late_connected, requests);
+        (void)simulation::run_topological_simulation(late_connected);
+        require(graph.node(chain.requests[1].start).completion_time == late_connected.node(late_chain.requests[1].start).completion_time
+                    && graph.node(chain.requests[1].completion).completion_time == late_connected.node(late_chain.requests[1].completion).completion_time,
+                "client dependencies connected before modeling preserve cost-change results and next-request availability");
     }
     graph.set_node_duration(background, 1000);
     graph.mutable_node(send1).cpu_gap_after = 60;
@@ -473,6 +646,45 @@ void client_input_reads_only_declared_source_observations() {
     const auto input = io::load_client_requests_from_manifest(manifest_path);
     require(input.status == "ready" && input.requests.size() == 2 && input.requests.back().frontend_end_us == 130,
             "source report and submission observations are joined by request identity");
+    require(!input.hicache_idle_since_us, "a report without an idle barrier cannot imply a quiescent start");
+    {
+        auto shifted = report;
+        shifted["formal_window"]["formal_begin_ms"] = 1.0;
+        shifted["formal_window"]["formal_end_ms"] = 1.185;
+        for (auto & request : shifted["requests"])
+            for (const auto * key : {"start_time_ms", "end_time_ms"})
+                request[key] = request[key].get<double>() + 1.0;
+        auto shifted_events = events;
+        for (auto & event : shifted_events) event["ts"] = event["ts"].get<uint64_t>() + 1000;
+        std::ofstream(probe_path) << shifted_events;
+        Json idle = {{"kind", "barrier"}, {"scope", "hicache_idle"}, {"status", "ok"},
+                     {"start_time_ms", 0.8}, {"end_time_ms", 0.9}};
+        Json checkpoint = {{"kind", "checkpoint"}, {"status", "ok"},
+                           {"start_time_ms", 0.91}, {"end_time_ms", 0.92}};
+        shifted["requests"].insert(shifted["requests"].begin(), checkpoint);
+        shifted["requests"].insert(shifted["requests"].begin(), idle);
+        const auto observed_idle = [&](const Json & value) {
+            std::ofstream(report_path) << value;
+            const auto parsed = io::load_client_requests_from_manifest(manifest_path);
+            require(parsed.status == "ready", "boundary evidence must not change formal request validity");
+            return parsed.hicache_idle_since_us;
+        };
+        require(observed_idle(shifted) == 900, "a successful idle barrier survives a read-only checkpoint");
+        auto changed = shifted;
+        changed["requests"][0]["status"] = "failed";
+        require(!observed_idle(changed), "a failed idle barrier cannot establish initial state");
+        changed = shifted;
+        changed["requests"][1] = row("intervening", 0.91, 0.92);
+        require(!observed_idle(changed), "a request after the barrier invalidates quiescence");
+        changed = shifted;
+        changed["requests"][1].erase("end_time_ms");
+        require(!observed_idle(changed), "an untimed later step invalidates quiescence");
+        changed = shifted;
+        std::swap(changed["requests"][0], changed["requests"][1]);
+        require(!observed_idle(changed), "out-of-order prelude timing cannot establish quiescence");
+        std::ofstream(report_path) << report;
+        std::ofstream(probe_path) << events;
+    }
     const auto client_events = events;
     events = Json::array();
     for (const auto ts : {10, 100, 300}) events.push_back({{"name", "runtime.triton.prepare"}, {"cat", "runtime_diagnostic"},
@@ -498,6 +710,178 @@ void client_input_reads_only_declared_source_observations() {
     require(io::load_client_requests_from_manifest(manifest_path).status == "formal_step_without_timing", "untimed steps cannot disappear");
     std::ofstream(manifest_path) << Json::object();
     require(io::load_client_requests_from_manifest(manifest_path).requests.empty(), "old manifests do not invent client observations");
+}
+
+void causal_tail_keeps_worker_submission(bool reverse_order) {
+    using Json = nlohmann::json;
+    char pattern[] = "/tmp/markov-tail-XXXXXX";
+    const auto* directory = mkdtemp(pattern);
+    require(directory != nullptr, "create isolated tail fixture");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto trace_path = (cleanup.path / "trace.pid1.json").string();
+    const auto manifest_path = (cleanup.path / "manifest.json").string();
+    const auto row = [](const char* name, const char* cat, int tid, int ts, int dur, Json args) {
+        return Json{{"name", name}, {"cat", cat}, {"ph", "X"}, {"pid", 1}, {"tid", tid},
+                    {"ts", ts}, {"dur", dur}, {"args", args}};
+    };
+    // File order must not decide whether a retained child keeps its task identity.
+    Json events = Json::array({
+        row("formal work", "cpu_op", 1, 100, 5, {{"connection_id", "17"}}),
+        row("Enqueue@task", "enqueue", 1, 120, 3, {{"correlation_id", "job"}}),
+        row("Dequeue@task", "dequeue", 2, 130, 20, {{"correlation_id", "job"}}),
+        row("worker child", "cpu_op", 2, 135, 4, {{"connection_id", "17"}}),
+        row("worker sibling", "cpu_op", 2, 142, 3, Json::object()),
+        row("unrelated tail", "cpu_op", 3, 135, 4, Json::object()),
+        row("unrelated next task", "cpu_op", 2, 151, 4, Json::object())});
+    if (reverse_order) std::reverse(events.begin(), events.end());
+    std::ofstream(trace_path) << events;
+    Json manifest;
+    manifest["trace"]["torch_trace_files"] = Json::array({{{"path", trace_path}, {"exists", true}}});
+    std::ofstream(manifest_path) << manifest;
+    io::ManifestTraceInputOptions options;
+    options.window_start_us = 90; options.window_end_us = 110;
+    auto inputs = io::load_trace_inputs_from_manifest(manifest_path, options);
+    const auto& retained = inputs.front().events;
+    for (const auto* name : {"Enqueue@task", "Dequeue@task", "worker child", "worker sibling"}) {
+        const auto found = std::ranges::find_if(retained, [&](const auto& e) { return e.name == name; });
+        require(found != retained.end(), "causal tail must retain the complete worker task and its submission");
+        require(found->arg("counts_toward_e2e") == "false", "tail closure must not select a new E2E endpoint");
+    }
+    require(std::ranges::none_of(retained, [](const auto& e) { return e.name.starts_with("unrelated"); }),
+            "worker closure cannot retain unrelated overlapping tail work");
+    auto graph = core::DagBuilder(1).build(std::move(inputs.front().events), 0);
+    const auto result = simulation::run_topological_simulation(graph);
+    require(result.cpu_queue_count == 1 && result.cpu_task_count == 1,
+            "retained tail children must form one recognized queue task");
+    require(result.e2e_us == 5, "background tail completion must not replace the formal endpoint");
+}
+
+void lifecycle_tail_keeps_nested_boundaries() {
+    using Json = nlohmann::json;
+    char pattern[] = "/tmp/markov-lifecycle-tail-XXXXXX";
+    const auto* directory = mkdtemp(pattern);
+    require(directory != nullptr, "create lifecycle tail fixture");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto trace = (cleanup.path / "trace.pid1.json").string();
+    const auto probe = (cleanup.path / "probe.pid1.json").string();
+    const auto manifest = (cleanup.path / "manifest.json").string();
+    const auto row = [](const char* name, const char* cat, int tid, int ts, int dur, Json args) {
+        return Json{{"name", name}, {"cat", cat}, {"ph", "X"}, {"pid", 1}, {"tid", tid},
+                    {"ts", ts}, {"dur", dur}, {"args", args}};
+    };
+    std::ofstream(trace) << Json::array({row("formal", "cpu_op", 1, 100, 5, Json::object())});
+    std::ofstream(probe) << Json::array({
+        row("lifecycle", "hicache", 2, 120, 30,
+            {{"phase", "end"}, {"fact", {{"role", "cache_lifecycle_commit"}}}}),
+        row("runtime.hicache.radix_insert", "runtime_diagnostic", 2, 125, 20, Json::object()),
+        row("runtime.hicache.node_publish", "runtime_diagnostic", 2, 130, 1, Json::object()),
+        row("wrong thread", "runtime_diagnostic", 3, 130, 1, Json::object()),
+        row("later call", "runtime_diagnostic", 2, 151, 1, Json::object())});
+    Json input;
+    input["trace"]["torch_trace_files"] = Json::array({{{"path", trace}}});
+    input["sidecar"]["python_probe_files"] = Json::array({{{"path", probe}}});
+    std::ofstream(manifest) << input;
+    io::ManifestTraceInputOptions options;
+    options.window_start_us = 90; options.window_end_us = 110;
+    auto loaded = io::load_trace_inputs_from_manifest(manifest, options);
+    require(loaded.front().tail_context_events.size() == 1, "tail lifecycle remains a single fact");
+    const auto& retained = loaded.front().events;
+    for (const auto* name : {"runtime.hicache.radix_insert", "runtime.hicache.node_publish"}) {
+        const auto found = std::ranges::find_if(retained, [&](const auto& e) { return e.name == name; });
+        require(found != retained.end() && found->arg("formal_window_context") == "causal_tail"
+                && found->arg("counts_toward_e2e") == "false", "tail metadata must not become an endpoint");
+    }
+    require(std::ranges::none_of(retained, [](const auto& e) { return e.name == "wrong thread" || e.name == "later call"; }),
+            "tail lifecycle closure cannot include unrelated observations");
+}
+
+void collective_return_keeps_window_successor() {
+    using Json = nlohmann::json;
+    char pattern[] = "/tmp/markov-return-XXXXXX";
+    const auto* directory = mkdtemp(pattern);
+    require(directory != nullptr, "create return-boundary fixture");
+    struct Cleanup {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove_all(path, error); }
+    } cleanup{directory};
+    const auto trace = (cleanup.path / "trace.pid1.json").string();
+    const auto probe = (cleanup.path / "probe.pid1.json").string();
+    const auto manifest = (cleanup.path / "manifest.json").string();
+    const auto row = [](const char* name, int tid, int ts, int dur) {
+        return Json{{"name", name}, {"cat", "cpu_op"}, {"ph", "X"}, {"pid", 1}, {"tid", tid},
+                    {"ts", ts}, {"dur", dur}, {"args", Json::object()}};
+    };
+    std::ofstream(trace) << Json::array({row("before", 1, 90, 5), row("c10d::allreduce_", 1, 110, 10),
+        row("next parent", 1, 160, 5), row("next child", 1, 161, 2),
+        row("unrelated lane", 2, 156, 1), row("later work", 1, 170, 5)});
+    auto call = row("runtime.cpu_collective", 1, 100, 50);
+    call["cat"] = "runtime_diagnostic";
+    call["args"]["role"] = "storage_control_drain";
+    call["args"]["status"] = "returned";
+    auto drain = row("runtime.hicache.storage_drain", 1, 158, 1);
+    drain["cat"] = "runtime_diagnostic";
+    auto later_drain = drain;
+    later_drain["ts"] = 175;
+    std::ofstream(probe) << Json::array({call, drain, later_drain});
+    Json input;
+    input["trace"]["torch_trace_files"] = Json::array({{{"path", trace}}});
+    input["sidecar"]["python_probe_files"] = Json::array({{{"path", probe}}});
+    std::ofstream(manifest) << input;
+    io::ManifestTraceInputOptions options;
+    options.window_start_us = 85; options.window_end_us = 155;
+    auto loaded = io::load_trace_inputs_from_manifest(manifest, options);
+    const auto& events = loaded.front().events;
+    for (const auto* name : {"next parent", "next child"}) {
+        const auto found = std::ranges::find_if(events, [&](const auto& e) { return e.name == name; });
+        require(found != events.end(), "return gap requires the next complete CPU call as boundary context");
+        require(found->arg("counts_toward_e2e") == "false", "successor is not a formal endpoint");
+    }
+    require(std::ranges::none_of(events, [](const auto& e) { return e.name == "later work" || e.name == "unrelated lane"; }),
+            "return boundary does not retain later calls or other lanes");
+    require(std::ranges::count_if(events, [](const auto& e) { return e.name == "runtime.hicache.storage_drain"; }) == 1,
+            "retain only the application following the in-window MIN");
+    auto graph = core::DagBuilder(1).build(std::move(loaded.front().events), 0);
+    require(simulation::run_topological_simulation(graph).e2e_us == 30, "successor must not enlarge selected E2E");
+    for (const uint64_t cut : {100, 105}) {
+        options.window_start_us = cut;
+        auto clipped = io::load_trace_inputs_from_manifest(manifest, options);
+        const auto & retained = clipped.front().events;
+        const auto anchor = std::ranges::find_if(retained, [](const auto & e) { return e.name == "formal_window.cpu_begin"; });
+        require((anchor != retained.end()) == (cut == 100), "only a complete in-window collective gets a proven head gap");
+        require(std::ranges::none_of(retained, [](const auto & e) { return e.name == "before"; }),
+                "head boundary must not restore pre-window execution");
+        if (anchor == retained.end()) continue;
+        require(anchor->ts == cut && anchor->dur == 0 && anchor->arg("counts_toward_e2e") == "false",
+                "head is a zero-service cut point, not a business endpoint");
+        auto head_graph = core::DagBuilder(1).build(std::move(clipped.front().events), 0);
+        require(simulation::run_topological_simulation(head_graph).e2e_us == 20,
+                "retain ten microseconds of observed entry gap without preceding call cost");
+    }
+    std::ofstream(trace) << Json::array({row("c10d::allreduce_", 1, 110, 10), row("next parent", 1, 160, 5)});
+    options.window_start_us = 100;
+    auto no_predecessor = io::load_trace_inputs_from_manifest(manifest, options);
+    require(std::ranges::none_of(no_predecessor.front().events, [](const auto & e) { return e.name == "formal_window.cpu_begin"; }),
+            "a trace with no earlier same-thread CPU evidence cannot invent a head gap");
+    for (const bool parent : {true, false}) {
+        Json rows = Json::array({row("before", 1, 80, 5), row("crossing", 1, 95, 40), row("next parent", 1, 160, 5)});
+        if (parent) rows.push_back(row("c10d::allreduce_", 1, 110, 10));
+        std::ofstream(trace) << rows;
+        auto input = io::load_trace_inputs_from_manifest(manifest, options);
+        auto cut_graph = core::DagBuilder(1).build(std::move(input.front().events), 0);
+        const auto has = [&](const char * name) {
+            return std::ranges::any_of(cut_graph.events(), [&](const auto & e) { return e.name == name; });
+        };
+        require(has("formal_window.cpu_begin") == parent, "crossing parents cannot hide a missing entry gap, but real crossing leaves must remain intact");
+        require(has("crossing") != parent, "head candidate must not alter CPU parent/leaf selection");
+        require(simulation::run_topological_simulation(cut_graph).e2e_us == (parent ? 20 : 40),
+                "head selection preserves observed gap or full real leaf, never both");
+    }
 }
 
 void queue_wait_follows_task_arrival() {
@@ -610,7 +994,8 @@ void layer_wait_clock_is_local_to_each_trace() {
             {"ts", 100}, {"dur", 1}, {"pid", rank}, {"tid", 1}}});
         std::ofstream(probe_path) << Json::array({{{"name", "runtime.hicache.layer_waits"}, {"cat", "runtime_diagnostic"},
             {"ph", "X"}, {"ts", 100}, {"dur", 1}, {"pid", rank}, {"tid", 1},
-            {"args", {{"wait_clock", "npu_syscnt"}, {"wait_intervals", Json::array({{0, 90, 131}})}}}}});
+            {"args", {{"wait_clock", "npu_syscnt"}, {"consumer_index", -1}, {"status", "returned"},
+                {"wait_intervals", Json::array({{0, 90, 131}})}}}}});
         manifest["trace"]["torch_trace_files"].push_back({{"path", trace_path}, {"host_clock", {
             {"clock", "npu_syscnt"}, {"origin_tick", 100}, {"origin_ns", 1'700'000'000'000'000'123LL + rank}, {"ns_per_tick", rank * 10}}}});
         manifest["sidecar"]["python_probe_files"].push_back({{"path", probe_path}});
@@ -630,6 +1015,20 @@ void layer_wait_clock_is_local_to_each_trace() {
             && row[2].get<int64_t>() == 1'700'000'000'000'000'123LL + rank + 310 * rank,
             "rank-local offsets preserve nanoseconds and samples before the clock anchor");
         require(found->ts == 100 && found->dur == 1, "batch wall-clock envelope is not silently shifted");
+    }
+    auto window = options;
+    window.window_start_us = 200;
+    window.window_end_us = 300;
+    const auto windowed = io::load_trace_inputs_from_manifest(manifest_path, window);
+    for (size_t i = 0; i < windowed.size(); ++i) {
+        require(std::ranges::none_of(windowed[i].events, [](const auto & e) { return e.name == "runtime.hicache.layer_waits"; }),
+                "preparation timing must not enter the formal executable input");
+        const auto & context = windowed[i].prelude_context_events;
+        require(context.size() == 1 && context.front().arg("wait_clock") == "profiler_ns",
+                "inactive preparation timing survives only as normalized context");
+        const auto original = std::ranges::find_if(inputs[i].events, [](const auto & e) { return e.name == "runtime.hicache.layer_waits"; });
+        require(context.front().arg("wait_intervals") == original->arg("wait_intervals"),
+                "formal and preparation timing use the same rank-local counter conversion");
     }
     manifest["trace"]["torch_trace_files"][0].erase("host_clock");
     std::ofstream(manifest_path) << manifest;
@@ -708,9 +1107,84 @@ void response_endpoint_preserves_background_resource_dependencies() {
 }
 
 int main() {
+    core::Logger::instance().set_level(core::Logger::Warn);
+
+    cpu_service_input_uses_source_coordinates();
+    lazy_arguments_preserve_json_values_and_copy_ownership();
+    {
+        auto graph = core::DagBuilder(1).build({event("first", "p", "t", 100, 10), event("second", "p", "t", 130, 10)}, 0);
+        const auto first = std::ranges::find_if(graph.nodes(), [](const auto& n) { return n.original_cpu_gap_after == 20; });
+        require(first != graph.nodes().end(), "retained-range fixture gap");
+        const auto id=first->id;
+        graph.cpu_service_cost().add({"p","t"},{110,115,1});
+        graph.cpu_service_cost().add({"p","t"},{115,125,8});
+        graph.cpu_service_cost().add({"p","t"},{125,130,4});
+        core::DagMutationPlan plan{.component="retained_gap_test"};
+        plan.set_cpu_gaps.push_back({.node_id=id,.duration=10,
+            .retained_ranges=core::DagGraph::CpuGapRanges{{110,115},{125,130}}});
+        (void)core::apply_dag_mutation_plan(graph,plan);
+        require(graph.cpu_service_gap_duration(id)==5 && graph.node(id).cpu_gap_after==10,
+                "retained pieces must integrate their own density, not scale the whole gap");
+        require(simulation::run_topological_simulation(graph).e2e_us==25,
+                "replay must consume retained service exactly once");
+        plan.set_cpu_gaps.front().retained_ranges=core::DagGraph::CpuGapRanges{{110,116},{115,119}};
+        bool rejected=false;
+        try { (void)core::apply_dag_mutation_plan(graph,plan); } catch (const std::exception&) { rejected=true; }
+        require(rejected && graph.cpu_service_gap_duration(id)==5 && graph.node(id).cpu_gap_after==10,
+                "overlapping retained ranges fail before mutating the graph");
+        graph.set_cpu_gap_after(id,10,core::DagGraph::CpuGapRanges{{110,112},{112,115},{125,130}});
+        require(graph.cpu_service_gap_duration(id)==5,"adjacent retained slices conserve integer service");
+        graph.set_cpu_gap_after(id,0,core::DagGraph::CpuGapRanges{});
+        require(graph.cpu_service_gap_duration(id)==0,"fully removed gap has no service");
+    }
+    {
+        auto graph = core::DagBuilder(1).build({event("first", "p", "t", 100, 10), event("second", "p", "t", 130, 10)}, 0);
+        require(simulation::run_topological_simulation(graph).e2e_us == 40, "service test baseline");
+        graph.cpu_service_cost().add({"p","t"}, {100,110,4});
+        graph.cpu_service_cost().add({"p","t"}, {110,130,8});
+        require(simulation::run_topological_simulation(graph).e2e_us == 22, "full simulation must consume normal node and gap service");
+        require(simulation::run_topological_simulation(graph).e2e_us == 22, "service replay must not apply reductions twice");
+        const auto first = std::ranges::find_if(graph.nodes(), [](const auto& n) { return n.is_cpu && n.original_cpu_gap_after == 20; });
+        require(first != graph.nodes().end() && first->duration == 10 && first->cpu_gap_after == 20,
+                "service query must retain original execution ownership");
+        const auto first_id = first->id;
+        graph.set_cpu_gap_after(first_id, 9);
+        bool rejected = false;
+        try { (void)graph.cpu_service_gap_duration(first_id); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "partially rewritten gap cannot lose its service coordinates silently");
+    }
+    {
+        core::CpuServiceCost cost;
+        const core::CpuServiceCost::Lane lane{"pid", "tid"};
+        require(cost.empty() && cost.duration(lane, 0, 100) == 100, "empty CPU service must preserve costs");
+        cost.add(lane, {20, 30, 13}); // Measured service can increase, too.
+        cost.add(lane, {10, 20, 3}); // Insertion order is not temporal order.
+        require(cost.duration(lane, 0, 40) == 36, "service must preserve uncovered time");
+        require(cost.duration({"pid", "other"}, 0, 40) == 40, "service must not cross threads");
+        for (uint64_t split = 0; split <= 40; ++split)
+            require(cost.duration(lane, 0, split) + cost.duration(lane, split, 40) == 36,
+                    "service slices must conserve their whole cost");
+        bool rejected = false;
+        try { cost.add(lane, {19, 21, 1}); } catch (const std::invalid_argument&) { rejected = true; }
+        require(rejected && cost.duration(lane, 0, 40) == 36, "overlapping service must not alter existing costs");
+        cost.add(lane, {30, 40, 0});
+        require(cost.duration(lane, 30, 40) == 0, "zero service is valid");
+        const auto max = std::numeric_limits<uint64_t>::max();
+        core::CpuServiceCost large;
+        large.add(lane, {0, max, max});
+        require(large.duration(lane, 1, max) == max-1, "cumulative service multiplication must not overflow");
+    }
+    check_nested_copy_connections();
+    check_dynamic_execution();
+    costs_follow_execution_not_topological_list_order();
+    check_cpu_task_insertion();
     collective_boundaries_only_partition_control_self_time();
+    nested_host_load_branch_preserves_time(false);
+    nested_host_load_branch_preserves_time(true);
+    nested_host_load_branch_preserves_time(true, true);
     native_wrapper_setup_cannot_shift_later_call_identities();
     cann_display_process_is_not_a_second_cpu_thread();
+    unknown_stream_sync_preserves_observed_wait();
     worker_runtime_keeps_submission_and_device_dependencies();
     device_clock_overlap_does_not_reverse_submission();
     event_binding_selects_cpu_role_not_first_timestamp();
@@ -722,6 +1196,10 @@ int main() {
     cache_facts_do_not_create_device_barriers();
     serial_http_clients_follow_responses_not_background_work();
     client_input_reads_only_declared_source_observations();
+    causal_tail_keeps_worker_submission(false);
+    causal_tail_keeps_worker_submission(true);
+    lifecycle_tail_keeps_nested_boundaries();
+    collective_return_keeps_window_successor();
     cpu_queue_order_follows_target_arrivals();
     removed_cpu_tasks_do_not_become_residual_waits();
     layer_wait_clock_is_local_to_each_trace();

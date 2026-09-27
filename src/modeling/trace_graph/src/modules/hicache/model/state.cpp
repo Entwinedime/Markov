@@ -52,13 +52,22 @@ void HiCacheState::register_prefetch_control_boundary(const HiCacheFact & fact) 
     for (const auto & entry : fact.batch_paths) { register_request(entry.request_id); }
 }
 
-void HiCacheState::begin_formal_window() {
+void HiCacheState::begin_formal_window(bool execution_prefetch_control) {
+    execution_prefetch_control_ = execution_prefetch_control;
+    prefetch_lane_queue_.clear();
     formal_window_active_ = true;
     formal_boundary_seen_ = true;
     prefetch_control_boundaries_.clear();
     for (auto & scope : scopes_ | std::views::values) {
+        scope.eviction_work.clear();
+        scope.load_admission_work.clear();
         scope.requests.clear();
         scope.pending_write_through_backups.clear();
+        scope.pending_loadbacks.clear();
+        scope.load_ack_queue.clear();
+        scope.prefetch_revoke_queue.clear();
+        scope.backup_ack_queue.clear();
+        scope.prefetch_host_release_queue.clear();
         scope.async_ops.clear_operations_for_window_boundary();
     }
 }
@@ -107,10 +116,7 @@ bool HiCacheState::inserted_device_dirty_visible_at_insert_boundary() const {
 }
 
 /**
- * @brief Records token-path resolution state in the Debug summary.
- *
- * Missing paths, phase errors, and diagnostic counters are centralized here so
- * individual role handlers do not reinterpret token-directory failure semantics.
+ * @brief Projects a successfully resolved token path into target pages.
  */
 
 HiCachePagePath HiCacheState::page_path_from_resolution(const HiCacheFact & fact, const HiCacheTokenResolution & resolution) const {
@@ -126,20 +132,18 @@ HiCachePagePath HiCacheState::page_path_from_resolution(const HiCacheFact & fact
  * after every relevant mutation avoids full-tree rescans and prevents it from becoming
  * a hidden source of state.
  */
-void HiCacheState::sync_capacity(ScopedState & scope, const std::string & cache_scope, const std::vector<HiCacheNodeId> & node_ids,
-                                 const std::string & reason) {
+void HiCacheState::sync_capacity(ScopedState & scope, const std::string & cache_scope, const std::vector<HiCacheNodeId> & node_ids) {
     const auto reserved = scope.async_ops.reserved_pages(cache_scope);
     if (node_ids.empty()) {
-        (void)scope.capacity.sync_reservation(reserved, reason);
+        scope.capacity.sync_reservation(reserved);
         return;
     }
-    scope.refs.sync_tree_ref_copies(scope.tree, reason);
-    (void)scope.capacity.sync_nodes(scope.tree, node_ids, reserved, reason);
+    scope.refs.sync_tree_ref_copies(scope.tree);
+    scope.capacity.sync_nodes(scope.tree, node_ids, reserved);
 }
 
 /** @brief Synchronizes terminal, ancestor, new, and restored nodes after insertion. */
-void HiCacheState::sync_capacity_for_insert(ScopedState & scope, const std::string & cache_scope, const HiCacheInsertResult & insert,
-                                            const std::string & reason) {
+void HiCacheState::sync_capacity_for_insert(ScopedState & scope, const std::string & cache_scope, const HiCacheInsertResult & insert) {
     std::set<HiCacheNodeId> nodes;
     if (insert.terminal_node != 0) nodes.insert(insert.terminal_node);
     nodes.insert(insert.touched_nodes.begin(), insert.touched_nodes.end());
@@ -147,13 +151,13 @@ void HiCacheState::sync_capacity_for_insert(ScopedState & scope, const std::stri
     nodes.insert(insert.restored_device_nodes.begin(), insert.restored_device_nodes.end());
     nodes.insert(insert.dirtied_device_nodes.begin(), insert.dirtied_device_nodes.end());
     nodes.insert(insert.new_host_nodes.begin(), insert.new_host_nodes.end());
-    sync_capacity(scope, cache_scope, { nodes.begin(), nodes.end() }, reason);
+    sync_capacity(scope, cache_scope, { nodes.begin(), nodes.end() });
 }
 
 /** @brief Synchronizes capacity eligibility for nodes affected by a reference change. */
-void HiCacheState::sync_capacity_for_ref(ScopedState & scope, const std::string & cache_scope, const HiCacheRefChange & change, const std::string & reason) {
+void HiCacheState::sync_capacity_for_ref(ScopedState & scope, const std::string & cache_scope, const HiCacheRefChange & change) {
     std::set<HiCacheNodeId> nodes{ change.affected_nodes.begin(), change.affected_nodes.end() };
-    sync_capacity(scope, cache_scope, { nodes.begin(), nodes.end() }, reason);
+    sync_capacity(scope, cache_scope, { nodes.begin(), nodes.end() });
 }
 
 
@@ -164,15 +168,17 @@ void HiCacheState::sync_capacity_for_ref(ScopedState & scope, const std::string 
  * at the target-control boundary, and only then enter their role handler. Every
  * handler therefore observes the same token timeline and reference/capacity baseline.
  */
-void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bool observe_effects) {
+void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bool observe_effects, HiCacheLifecycleExecution lifecycle) {
     // A graph without explicit prelude context never calls begin_formal_window().
     // Mark its first modeled fact as formal before a handler can create storage I/O,
     // otherwise ordinary formal writes would be mislabeled as prelude pressure.
     if (observe_effects) formal_window_active_ = true;
     if (role != HiCacheFactRole::Unknown) {
         auto & scope = scope_state(fact);
+        if (scope.allocation) throw std::runtime_error("Cache fact reached an unfinished allocation");
+        if (scope.lifecycle_return) throw std::runtime_error("Cache fact reached an unfinished lifecycle return");
         advance_storage_backups(fact, scope);
-        drain_write_through_backup_refs(fact, scope, "write_through_backup_ack_boundary");
+        drain_write_through_backup_refs(fact, scope);
         advance_storage_backups(fact, scope);
         advance_ready_prefetches(fact);
     }
@@ -188,8 +194,11 @@ void HiCacheState::apply_fact(const HiCacheFact & fact, HiCacheFactRole role, bo
     case HiCacheFactRole::CacheExtendInput:
         apply_cache_extend_input(fact);
         break;
+    case HiCacheFactRole::CacheDecodeAllocation:
+        apply_cache_decode_allocation(fact);
+        break;
     case HiCacheFactRole::CacheLifecycleCommit:
-        apply_cache_lifecycle_commit(fact);
+        apply_cache_lifecycle_commit(fact, lifecycle);
         break;
     case HiCacheFactRole::Unknown:
         break;

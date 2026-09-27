@@ -25,6 +25,8 @@ struct HiCacheStorageServiceBatch {
     uint64_t item_count = 0;
     std::optional<uint64_t> existing_page_count;
     std::optional<uint64_t> new_page_count;
+    std::optional<uint64_t> copied_page_count;
+    std::optional<uint64_t> published_page_count;
 };
 
 struct HiCacheIoOperationRecord {
@@ -49,15 +51,12 @@ struct HiCacheIoOperationRecord {
     std::string observed_span_semantics = "unknown";
     /** Ordered, non-overlapping calls; gaps between calls are not service time. */
     std::vector<HiCacheStorageServiceBatch> storage_service_batches;
-    uint64_t observed_service_start_us = 0;
     uint64_t observed_service_duration_us = 0;
     bool storage_residency_observed = false;
     uint64_t storage_existing_page_count = 0;
     uint64_t storage_new_page_count = 0;
     uint64_t owned_node_duration_us = 0;
     uint64_t owned_gap_duration_us = 0;
-    uint64_t overlapping_node_duration_us = 0;
-    uint64_t max_node_overlap_us = 0;
     uint64_t uncovered_duration_us = 0;
     size_t timing_fact_node_id = 0;
     std::vector<size_t> control_fact_node_ids;
@@ -71,7 +70,6 @@ struct HiCacheIoOperationRecord {
     uint64_t device_transfer_duration_us = 0;
     bool source_readiness_topology_ready = false;
     std::vector<HiCacheCpuGapSlice> cpu_gap_slices;
-    std::vector<HiCacheCpuOverlapSlice> cpu_overlap_slices;
     std::optional<size_t> source_anchor_node_id = std::nullopt;
     std::optional<size_t> completion_anchor_node_id = std::nullopt;
     std::optional<size_t> consumer_anchor_node_id = std::nullopt;
@@ -92,8 +90,6 @@ struct HiCacheIoOperationRecord {
     /** Observed return-state, not target state or a positive-payload entry-state estimate. */
     std::optional<uint64_t> host_available_tokens_at_return;
     std::vector<size_t> terminal_control_node_ids;
-    /** False checks observe the state-check primitive without terminal commit. */
-    std::vector<uint64_t> progress_check_cpu_samples_us;
     std::optional<size_t> control_ready_anchor_node_id = std::nullopt;
     std::optional<size_t> wait_exit_anchor_node_id = std::nullopt;
     std::optional<size_t> terminal_control_anchor_node_id = std::nullopt;
@@ -108,7 +104,6 @@ struct HiCacheIoOperationRecord {
 struct HiCacheIoOperationLedger {
     std::string status = "not_built";
     std::vector<HiCacheIoOperationRecord> records;
-    std::map<std::string, uint64_t> counts_by_kind;
     std::map<std::string, uint64_t> counts_by_status;
     std::map<std::string, uint64_t> unresolved_reasons;
 

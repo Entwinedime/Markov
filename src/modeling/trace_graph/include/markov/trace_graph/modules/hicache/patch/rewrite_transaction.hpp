@@ -30,6 +30,13 @@ enum class HiCacheRewriteKind : std::uint8_t {
     Reject,
 };
 
+struct HiCacheLayerIo {
+    uint64_t layer = 0;
+    std::string service_id, ready_id;
+    uint64_t service_us = 0, record_us = 0;
+    std::vector<core::DagNodeRef> waits;
+};
+
 /** @brief One explicit rewrite decision, including why shadow planning may be blocked. */
 struct HiCacheRewriteDecision {
     std::string effect_id;
@@ -47,6 +54,8 @@ struct HiCacheRewriteDecision {
     uint64_t policy_wait_duration_us = 0;
     std::string resource_lane;
     std::string synthetic_id;
+    /** The original synthetic node becomes a zero-cost start when service is expanded. */
+    std::vector<HiCacheLayerIo> layer_io;
     std::string policy_wait_synthetic_id;
     std::vector<size_t> carrier_nodes;
     std::vector<size_t> owned_duration_nodes;

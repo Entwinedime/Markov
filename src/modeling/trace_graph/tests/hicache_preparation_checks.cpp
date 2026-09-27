@@ -43,6 +43,7 @@ core::DagGraph source_graph() {
     graph.add_edge(2,3,core::DagEdgeKind::Correlation);
     graph.add_edge(4,2,core::DagEdgeKind::Sequential);
     auto fact = graph.event_for_node(0); fact.index = 0;
+    fact.set_arg("fact", R"({"class":"workload_identity","role":"cache_extend_input","consumers":["hicache_state_model"]})");
     graph.set_hicache_fact_events({fact});
     graph.set_runtime_observations({preparation(10,100,64), preparation(111,200,64,true),
                                    preparation(320,40,128), preparation(361,4,128,true)});
@@ -59,6 +60,11 @@ void check_hicache_preparation_costs() {
     auto graph = source_graph();
     const auto warm = call("1","warm",64), formal = call("1","formal",256,true);
     const auto plan = runtime::plan_allocator_preparations(graph,{warm,formal});
+    const auto observation = runtime::observe_allocator_preparations(graph);
+    const auto predicted = runtime::predict_allocator_preparations(observation,{warm,formal});
+    require(predicted.status == "ready" && predicted.mutation.empty() && predicted.cpu_costs.size() == 1
+            && predicted.cpu_costs.front().duration_us == 74 && !predicted.cpu_costs.front().retain_source,
+            "pure prediction shares measured costs with static mutation without editing the graph");
     require(plan.status == "ready" && plan.source_parallel_compilation, "confirmed source path supports the parallel cold approximation");
     require(plan.cost_samples.at("1").at("compiled").median_us == 70
             && plan.cost_samples.at("1").at("variant_load").median_us == 4, "use measured medians, excluding the first runtime load");
@@ -66,6 +72,20 @@ void check_hicache_preparation_costs() {
             && plan.mutation.set_cpu_gaps.size() == 1 && plan.mutation.set_cpu_gaps[0].node_id == 0
             && plan.mutation.set_cpu_gaps[0].duration == 76, "new cost belongs before enqueue, not at the device or phase end");
     require(simulation::run_topological_simulation(graph).e2e_us == 21, "source worker is initially busy");
+    auto live = graph;
+    const auto saved = live.nodes();
+    const auto slots = runtime::bind_allocator_preparation_costs(live, observation);
+    require(slots.size() == 1 && simulation::run_topological_simulation(live).e2e_us == 21,
+            "reserving preparation preserves the source timeline");
+    for (const auto& node : saved)
+        require(node.simulation_start == live.node(node.id).simulation_start && node.completion_time == live.node(node.id).completion_time,
+                "preparation reservation preserves every original node time");
+    const auto live_time = simulation::run_topological_simulation(live,[&](size_t node,uint64_t,uint64_t duration) {
+        if (node != slots.begin()->second) return duration;
+        return runtime::predict_allocator_preparations(observation,{warm,formal}).cpu_costs.front().duration_us;
+    }).e2e_us;
+    require(live_time == 84 && simulation::run_topological_simulation(live).e2e_us == live_time,
+            "cost chosen at actual preparation start matches static insertion and survives replay");
     const auto applied = core::apply_dag_mutation_plan(graph,plan.mutation);
     require(simulation::run_topological_simulation(graph).e2e_us == 84, "preparation shifts real submission while retaining worker overlap");
     graph = source_graph();
@@ -92,6 +112,33 @@ void check_hicache_preparation_costs() {
     events.push_back(preparation(1002,30,512)); events.push_back(preparation(1032,4,512,true));
     atomic.set_runtime_observations(events);
     auto reuse = call("1","reuse",64,true), later = formal; later.source_fact_id = 1;
+    auto prefix = atomic;
+    auto prefix_events = events;
+    prefix_events.push_back(preparation(1202,35,1024));
+    prefix_events.push_back(preparation(1237,4,1024,true));
+    prefix.set_runtime_observations(prefix_events);
+    const auto prefix_plan = runtime::plan_allocator_preparations(prefix,{warm,reuse});
+    require(prefix_plan.status == "ready" && prefix_plan.observed_formal_calls == 1
+            && prefix_plan.removed_coverage_us == 34 && prefix_plan.mutation.set_cpu_gaps.size() == 1
+            && prefix_plan.mutation.set_cpu_gaps[0].duration == 56,
+            "unexecuted later source batches bound prefix preparation; their cost and residual gap remain untouched");
+    auto covered = atomic;
+    const auto source_time = simulation::run_topological_simulation(covered).e2e_us;
+    const auto covered_nodes = covered.nodes();
+    const auto covered_source = runtime::observe_allocator_preparations(covered);
+    const auto covered_slots = runtime::bind_allocator_preparation_costs(covered,covered_source);
+    require(covered_slots.size() == 1 && covered.node(covered_slots.begin()->second).duration == 34
+            && covered.node(covered_slots.begin()->second).cpu_gap_after == 56
+            && simulation::run_topological_simulation(covered).e2e_us == source_time,
+            "only measured compile/load coverage becomes execution; residual gap is retained");
+    for (const auto& node : covered_nodes)
+        require(node.simulation_start == covered.node(node.id).simulation_start && node.completion_time == covered.node(node.id).completion_time,
+                "moving observed preparation to a cost node preserves all original work");
+    const auto reused_time = simulation::run_topological_simulation(covered,[&](size_t node,uint64_t,uint64_t duration) {
+        return node == covered_slots.begin()->second ? uint64_t{0} : duration;
+    }).e2e_us;
+    require(source_time == reused_time+34 && simulation::run_topological_simulation(covered).e2e_us == reused_time,
+            "target cache hit removes preparation but not the residual gap");
     const auto failed = runtime::plan_allocator_preparations(atomic,{warm,reuse,later});
     require(failed.blockers.contains("preparation_submit_anchor_not_unique") && failed.mutation.empty()
             && failed.removed_coverage_us == 0 && failed.added_cost_us == 0, "do not delete source cost when target addition is uncovered");

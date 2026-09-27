@@ -25,15 +25,15 @@ uint64_t operation_count(const model::HiCacheEffectDecision & decision) {
 }
 
 std::optional<uint64_t> project_service(HiCacheIoCostRecord & record, const model::HiCacheEffectDecision & decision,
-                                      const frontend::HiCacheIoServiceModelConfig & service) {
+                                        const frontend::HiCacheIoServiceModelConfig & service) {
     if (decision.effective_byte_count % decision.effective_page_count != 0) return std::nullopt;
     const auto page_bytes = decision.effective_byte_count / decision.effective_page_count;
     record.storage_existing_byte_count =
         core::checked_multiply_u64(decision.storage_existing_page_count, page_bytes, "HiCache existing-storage bytes exceed uint64 range");
     record.storage_new_byte_count = core::checked_multiply_u64(decision.storage_new_page_count, page_bytes, "HiCache new-storage bytes exceed uint64 range");
     uint64_t duration = 0;
-    const auto add = [&](uint64_t pages, uint64_t calls, uint64_t existing) {
-        const auto cost = hicache_service_cost(service, page_bytes, pages, calls, existing);
+    const auto add = [&](uint64_t pages, uint64_t calls, uint64_t existing, std::optional<uint64_t> copied = std::nullopt) {
+        const auto cost = hicache_service_cost(service, page_bytes, pages, calls, existing, copied);
         if (!cost) return false;
         duration = core::checked_add_u64(duration, cost->duration_us, "I/O service duration overflow");
         record.calibration_setup_us += cost->setup_us;
@@ -48,21 +48,20 @@ std::optional<uint64_t> project_service(HiCacheIoCostRecord & record, const mode
         uint64_t pages = 0, existing = 0, fresh = 0;
         for (const auto & batch : decision.storage_service_batches) {
             if (batch.operation_index >= record.operation_count || batch.page_count == 0
-                || (storage_write && (batch.existing_page_count > batch.page_count
-                                     || batch.new_page_count != batch.page_count - batch.existing_page_count))) return std::nullopt;
+                || (storage_write && (batch.existing_page_count > batch.page_count || batch.new_page_count != batch.page_count - batch.existing_page_count)))
+                return std::nullopt;
             pages = core::checked_add_u64(pages, batch.page_count, "Storage service pages overflow");
             existing = core::checked_add_u64(existing, batch.existing_page_count, "Storage existing pages overflow");
             fresh = core::checked_add_u64(fresh, batch.new_page_count, "Storage new pages overflow");
-            if (!add(batch.page_count, 1, batch.existing_page_count)) return std::nullopt;
+            if (!add(batch.page_count, 1, batch.existing_page_count, batch.copied_page_count)) return std::nullopt;
         }
-        if (pages != decision.effective_page_count || existing != decision.storage_existing_page_count
-            || fresh != decision.storage_new_page_count) return std::nullopt;
+        if (pages != decision.effective_page_count || existing != decision.storage_existing_page_count || fresh != decision.storage_new_page_count)
+            return std::nullopt;
     }
     else if (!add(decision.effective_page_count, record.operation_count, 0)) return std::nullopt;
     const auto physical = record.calibration_setup_us + record.calibration_transfer_us;
-    record.runtime_scale = storage_write && physical > 0.0
-                               ? (record.storage_existing_service_us + record.storage_new_service_us) / physical
-                               : service.runtime_scale;
+    record.runtime_scale =
+        storage_write && physical > 0.0 ? (record.storage_existing_service_us + record.storage_new_service_us) / physical : service.runtime_scale;
     return duration;
 }
 
@@ -182,7 +181,12 @@ HiCacheIoCostRecord cost_record(const model::HiCacheEffectDecision & decision, c
     record.duration_us = *duration;
     record.resource_lane = hicache_resource_lane(model_fields, kind, decision.cache_scope);
 
-    if (kind == "prefetch" && (control == model_fields.control_models.end() || control->second.fixed_us_per_operation <= 0.0)) {
+    if (control == model_fields.control_models.end()) {
+        record.status = HiCacheIoCostStatus::MissingHostControlModel;
+        record.reason = "missing_static_host_control_model";
+        return record;
+    }
+    if (kind == "prefetch" && control->second.fixed_us_per_operation <= 0.0) {
         record.status = HiCacheIoCostStatus::MissingHostControlModel;
         record.reason = "missing_prefetch_positive_payload_control";
         return record;

@@ -83,8 +83,6 @@ struct HiCacheSourceAttributionCatalog {
     std::map<std::string, uint64_t> counts_by_source_carrier_state;
     std::map<std::string, uint64_t> counts_by_effect_type;
     std::map<std::string, uint64_t> blocker_counts;
-    uint64_t d2h_ready_record_count = 0;
-    uint64_t d2h_claimed_record_count = 0;
     uint64_t d2h_unclaimed_record_count = 0;
     uint64_t d2h_multiply_claimed_record_count = 0;
 

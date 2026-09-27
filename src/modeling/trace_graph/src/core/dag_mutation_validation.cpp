@@ -3,6 +3,7 @@
  * @brief Validates complete DAG mutation plans against prospective topology.
  */
 #include "dag_mutation_internal.hpp"
+#include "dag_topology.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -30,11 +31,6 @@ struct VirtualEdge {
     bool added_after_node_disable = false;
     std::string effect_id;
     size_t source_edge_index = kInvalidIndex;
-};
-
-struct DfsFrame {
-    size_t node_id = kInvalidIndex;
-    size_t next_edge_index = 0;
 };
 
 struct ProspectiveGraph {
@@ -143,6 +139,10 @@ private:
 
     void register_synthetic_nodes() {
         for (const auto & mutation : plan_.synthetic_nodes) {
+            if (mutation.node.cpu_task_ready_delay_us && !mutation.node.is_cpu)
+                add_issue(prospective_.plan_issues, "non_cpu_task", "explicit CPU task must use a CPU node");
+            if (mutation.node.cpu_gap_after && (!mutation.node.is_cpu || mutation.node.cpu_task_ready_delay_us))
+                add_issue(prospective_.plan_issues, "invalid_synthetic_cpu_gap", "residual gap requires a non-worker CPU boundary");
             if (mutation.synthetic_id.empty()) {
                 add_issue(prospective_.plan_issues, "empty_synthetic_id", "synthetic node id must not be empty");
                 prospective_.active_nodes.push_back(true);
@@ -225,6 +225,12 @@ private:
             const auto & node = graph_.node(mutation.node_id);
             if (!node.active) add_issue(prospective_.plan_issues, "inactive_cpu_gap_update", "CPU gap update targets an inactive node", { mutation.node_id });
             if (!node.is_cpu) add_issue(prospective_.plan_issues, "non_cpu_gap_update", "CPU gap update targets a non-CPU node", { mutation.node_id });
+            if (mutation.retained_ranges) {
+                try { graph_.validate_cpu_gap_ranges(mutation.node_id,mutation.duration,*mutation.retained_ranges); }
+                catch (const std::exception& error) {
+                    add_issue(prospective_.plan_issues,"invalid_cpu_gap_ranges",error.what(),{mutation.node_id});
+                }
+            }
             if (disabled_nodes.contains(mutation.node_id)) {
                 add_issue(prospective_.plan_issues,
                           "cpu_gap_disable_conflict",
@@ -351,49 +357,6 @@ struct TopologyAdjacency {
     std::vector<size_t> destinations;
 };
 
-std::vector<size_t> find_cycle_nodes(const TopologyAdjacency & adjacency, const std::vector<bool> & active_nodes,
-                                     const std::vector<size_t> & remaining_indegree) {
-    std::vector<int> state(active_nodes.size(), 0);
-    std::vector<size_t> path;
-    std::vector<size_t> position(active_nodes.size(), kInvalidIndex);
-    std::vector<DfsFrame> dfs;
-
-    for (size_t start = 0; start < active_nodes.size(); ++start) {
-        if (!active_nodes[start] || remaining_indegree[start] <= 0 || state[start] != 0) continue;
-        path.clear();
-        dfs.clear();
-        state[start] = 1;
-        position[start] = 0;
-        path.push_back(start);
-        dfs.push_back(DfsFrame{ .node_id = start, .next_edge_index = adjacency.offsets[start] });
-
-        while (!dfs.empty()) {
-            auto & frame = dfs.back();
-            bool descended = false;
-            while (frame.next_edge_index < adjacency.offsets[frame.node_id + 1]) {
-                const auto dst = adjacency.destinations[frame.next_edge_index++];
-                if (!active_nodes[dst] || remaining_indegree[dst] <= 0) continue;
-                if (state[dst] == 0) {
-                    state[dst] = 1;
-                    position[dst] = path.size();
-                    path.push_back(dst);
-                    dfs.push_back(DfsFrame{ .node_id = dst, .next_edge_index = adjacency.offsets[dst] });
-                    descended = true;
-                    break;
-                }
-                if (state[dst] == 1) return std::vector<size_t>(path.begin() + static_cast<std::ptrdiff_t>(position[dst]), path.end());
-            }
-            if (descended) continue;
-            const auto done = frame.node_id;
-            dfs.pop_back();
-            state[done] = 2;
-            position[done] = kInvalidIndex;
-            path.pop_back();
-        }
-    }
-    return {};
-}
-
 struct TopologyEdgeView {
     size_t src = 0;
     size_t dst = 0;
@@ -501,7 +464,7 @@ DagTopologyValidationReport validate_topology(const std::vector<bool> & active_n
     auto scan = scan_topology_edges(active_nodes, edge_count, std::move(initial_issues), edge_at);
     const auto adjacency = build_topology_adjacency(scan, edge_count, edge_at);
     if (consume_acyclic_prefix(active_nodes, adjacency, scan.indegree) != scan.report.active_node_count) {
-        scan.report.cycle_nodes = find_cycle_nodes(adjacency, active_nodes, scan.indegree);
+        scan.report.cycle_nodes = detail::find_unresolved_cycle(adjacency.offsets, adjacency.destinations, scan.indegree);
         add_issue(scan.report.issues, "active_dag_cycle", "active DAG contains a cycle", scan.report.cycle_nodes);
     }
     return std::move(scan.report);

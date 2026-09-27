@@ -39,6 +39,7 @@ Json effect_json(const HiCacheEffectDecision & effect) {
             {"existing_page_count", batch.existing_page_count},
             {"new_page_count", batch.new_page_count},
         });
+        if (batch.copied_page_count) batches.back()["copied_page_count"] = *batch.copied_page_count;
     }
     return {
         {              "effect_key",                                                         effect.effect_key },
@@ -92,8 +93,8 @@ Json effect_plan_json(const HiCacheEffectDecisionLedger & plan) {
 
 } // namespace
 
-std::string summary_json(const HiCacheEffectDecisionLedger & effect_plan) {
-    return Json{ { "effect_decisions", effect_plan_json(effect_plan) } }.dump();
+Json summary_json(const HiCacheEffectDecisionLedger & effect_plan) {
+    return Json{ { "effect_decisions", effect_plan_json(effect_plan) } };
 }
 
 } // namespace markov::trace_graph::modules::hicache::diagnostics

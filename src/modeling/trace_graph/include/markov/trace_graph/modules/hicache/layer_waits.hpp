@@ -16,6 +16,7 @@ struct HiCacheLayerWaitCall {
     uint64_t layer = 0;
     size_t position = 0;
     bool enabled = false;
+    uint64_t batch_start_ns = 0;
     uint64_t start_ns = 0;
     uint64_t end_ns = 0;
     std::optional<size_t> before, after, submission, worker, device_wait, record;

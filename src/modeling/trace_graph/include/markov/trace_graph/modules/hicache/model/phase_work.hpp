@@ -37,7 +37,6 @@ struct HiCachePrefillWorkItem {
     double attention_token_pairs = 0.0;
     HiCachePhaseNodeCostPlan common_kernel_cost;
     HiCachePhaseNodeCostPlan prefix_attention_cost;
-    HiCachePhaseNodeCostPlan kernel_cost;
     HiCachePhaseNodeCostPlan collective_cost;
     HiCachePhaseNodeCostPlan submit_cost;
     bool feature_covered = false;

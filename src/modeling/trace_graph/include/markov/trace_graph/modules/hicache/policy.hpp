@@ -9,16 +9,11 @@
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <vector>
 
 namespace markov::trace_graph::modules::hicache {
 
 /**
  * @brief Resolved target policy consumed by the state machine.
- *
- * Core fields are the compact production policy. Debug builds additionally retain source
- * attribution and human-readable rules for summaries, keeping explanatory metadata out
- * of every Release model instance.
  */
 struct HiCacheResolvedPolicyState {
     uint64_t l1_capacity_pages = 0;
@@ -35,86 +30,6 @@ struct HiCacheResolvedPolicyState {
     double prefetch_timeout_base_sec = 0.0;
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
-#ifdef DEBUG
-    uint64_t page_size = 0;
-    std::string page_size_source;
-    std::string l1_capacity_source;
-    std::string l2_capacity_source;
-    std::string write_policy_source;
-    std::string write_through_threshold_source;
-    std::string prefetch_policy_source;
-    uint64_t prefetch_threshold_tokens = 0;
-    std::string prefetch_threshold_source;
-    std::string prefetch_capacity_limit_source;
-    std::string host_cleanup_budget_rule;
-    std::string host_cleanup_budget_source;
-    std::string extend_allocation_rule;
-    std::string device_allocator_need_sort_source;
-    std::string storage_hit_policy;
-    std::string storage_hit_policy_source;
-    std::string prefetch_timeout_source;
-    std::string prefetch_timeout_rule;
-    std::string prefetch_rate_limit_rule;
-    std::vector<std::string> resolution_notes;
-#endif
-};
-
-/**
- * @brief Diagnostic record for one runtime policy branch.
- *
- * Resolved policy explains static configuration; this record explains why one request or
- * boundary was accepted, rejected, delayed, or truncated under its current target state.
- */
-struct HiCachePolicyDecisionRecord {
-    uint64_t decision_epoch = 0;
-    std::string cache_scope{};
-    std::string request_key{};
-    std::string operation_id{};
-    std::string role{};
-    std::string event_name{};
-    std::string policy_area{};
-    std::string policy_name{};
-    std::string decision{};
-    std::string reason{};
-    bool accepted = false;
-    uint64_t requested_pages = 0;
-    uint64_t requested_tokens = 0;
-    uint64_t candidate_pages = 0;
-    uint64_t hit_pages = 0;
-    uint64_t hit_count = 0;
-    uint64_t batch_size = 0;
-    uint64_t accepted_tokens = 0;
-    uint64_t target_device_prefix_tokens = 0;
-    uint64_t prior_committed_prefix_tokens = 0;
-    uint64_t allocation_prefix_tokens = 0;
-    uint64_t extend_tokens = 0;
-    uint64_t allocated_pages = 0;
-    uint64_t active_request_pages = 0;
-    uint64_t active_requested_pages = 0;
-    uint64_t capacity_pages = 0;
-    uint64_t occupied_pages = 0;
-    uint64_t reserved_pages = 0;
-    uint64_t allocator_free_pages = 0;
-    uint64_t allocator_release_pages = 0;
-    uint64_t allocator_available_pages = 0;
-    uint64_t allocator_available_before_pages = 0;
-    uint64_t allocator_consumed_pages = 0;
-    uint64_t allocator_released_pages = 0;
-    uint64_t lifecycle_duplicate_pages = 0;
-    uint64_t lifecycle_tail_pages = 0;
-    uint64_t threshold_pages = 0;
-    uint64_t limit_pages = 0;
-    uint64_t source_boundary_ts = 0;
-    uint64_t policy_stop_ts = 0;
-    uint64_t target_boundary_ts = 0;
-    uint64_t timeout_deadline_ts = 0;
-    uint64_t io_start_ts = 0;
-    uint64_t io_ready_ts = 0;
-    uint64_t completed_byte_count = 0;
-    bool io_completed = false;
-    bool timed_out = false;
-    bool boundary_adjusted = false;
-    std::vector<std::string> pages{};
 };
 
 /** @brief Target-derived inputs used to compute the configured prefetch deadline. */
@@ -132,11 +47,6 @@ struct HiCachePrefetchTimeoutInput {
 class HiCachePolicy {
 public:
     explicit HiCachePolicy(const frontend::HiCacheConfig & config = frontend::HiCacheConfig{});
-
-#ifdef DEBUG
-    /** @brief Returns resolved policy including Debug source attribution. */
-    [[nodiscard]] const HiCacheResolvedPolicyState & resolved() const { return resolved_; }
-#endif
 
     /** @brief Returns the request-hit threshold for write-through backup. */
     [[nodiscard]] uint64_t write_through_threshold() const;

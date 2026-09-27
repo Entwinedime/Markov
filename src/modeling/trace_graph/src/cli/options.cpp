@@ -75,8 +75,14 @@ void select_trace_channels(io::ManifestTraceInputOptions & options, const std::s
 }
 
 void validate_options(const CliOptions & options) {
+    if (options.source_observations_only && (!options.model_config.empty() || !options.prepare_cpu_service.empty() || !options.outputs.graph.empty()))
+        throw CliUsageError("Source observation extraction cannot be combined with model, CPU preparation or graph output");
     if (options.profile_manifest.empty()) throw CliUsageError("--profile-manifest is required");
-    if (options.outputs.run_summary.empty()) throw CliUsageError("--run-summary is required");
+    if (options.prepare_cpu_service.empty() != options.cpu_service_output.empty())
+        throw CliUsageError("--prepare-cpu-service and --cpu-service-output must be supplied together");
+    if (!options.prepare_cpu_service.empty() && (!options.model_config.empty() || !options.cpu_service_cost.empty()))
+        throw CliUsageError("CPU service preparation uses source measurements, not target models or existing service costs");
+    if (options.prepare_cpu_service.empty() && options.outputs.run_summary.empty()) throw CliUsageError("--run-summary is required");
     if (options.trace_input.window_start_us.has_value() != options.trace_input.window_end_us.has_value()) {
         throw CliUsageError("--trace-window-start-us and --trace-window-end-us must be provided together");
     }
@@ -109,6 +115,10 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--trace-channels") select_trace_channels(options.trace_input, next_value(index, argc, argv, argument));
         else if (argument == "--graph-output") options.outputs.graph = next_value(index, argc, argv, argument);
         else if (argument == "--model-config") options.model_config = next_value(index, argc, argv, argument);
+        else if (argument == "--cpu-service-cost") options.cpu_service_cost = next_value(index, argc, argv, argument);
+        else if (argument == "--prepare-cpu-service") options.prepare_cpu_service = next_value(index, argc, argv, argument);
+        else if (argument == "--cpu-service-output") options.cpu_service_output = next_value(index, argc, argv, argument);
+        else if (argument == "--source-observations-only") options.source_observations_only = true;
 #ifdef DEBUG
         else if (argument == "--actual-e2e-us") { options.actual_e2e_us = nonnegative_u64(next_value(index, argc, argv, argument), argument); }
         else if (argument == "--hicache-oracle-cost-replay") options.hicache_oracle_cost_replay = next_value(index, argc, argv, argument);
@@ -137,6 +147,10 @@ void print_usage(const char * program) {
               << "  --trace-window-end-us N         Inclusive workload-window end timestamp\n\n"
               << "Model and output:\n"
               << "  --model-config FILE             Optional SimulationModule config\n"
+              << "  --cpu-service-cost FILE         Optional same-base CPU service intervals\n"
+              << "  --prepare-cpu-service FILE      Generate service intervals from same-base measurements; no prediction\n"
+              << "  --cpu-service-output FILE       Output for --prepare-cpu-service (replaces --run-summary)\n"
+              << "  --source-observations-only      Extract model inputs without client replay or simulation\n"
               << "  --graph-output FILE             Optional full DAG Chrome trace\n"
 #ifdef DEBUG
               << "  --actual-e2e-us N               Explicit workload E2E used by validation\n"

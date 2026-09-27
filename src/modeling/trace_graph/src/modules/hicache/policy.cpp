@@ -104,23 +104,7 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
     const auto prefetch_capacity_limit_pages = derived_prefetch_capacity_limit_pages(config);
     const auto write_through_threshold = derived_write_threshold(config, write_policy);
 
-#ifdef DEBUG
-    const auto prefetch_threshold_tokens =
-        config.prefetch_threshold_pages > 0
-            ? core::checked_multiply_u64(config.prefetch_threshold_pages, page_size, "HiCache prefetch threshold token projection exceeds uint64 range")
-            : std::max(policy_detail::kSglangDefaultPrefetchThresholdTokens, page_size);
-    const std::string prefetch_threshold_source =
-        config.prefetch_threshold_pages > 0 ? "target_config.prefetch_threshold_pages" : "sglang: max(prefetch_threshold=256 tokens, page_size)";
-    const std::string prefetch_capacity_limit_source = config.prefetch_capacity_limit_pages > 0
-                                                           ? "target_config.prefetch_capacity_limit_pages"
-                                                           : "sglang: floor(0.8 * max(l2_capacity_pages - l1_capacity_pages, 0))";
-    const std::string write_through_threshold_source = config.write_through_threshold > 0          ? "target_config.write_through_threshold"
-                                                       : write_policy == "write_through"           ? "sglang: write_through threshold = 1"
-                                                       : write_policy == "write_through_selective" ? "sglang: write_through_selective threshold = 2"
-                                                                                                   : "write_back: hit-count backup disabled";
-#endif
-
-    HiCacheResolvedPolicyState resolved{
+    return HiCacheResolvedPolicyState{
         .l1_capacity_pages = config.l1_capacity_pages,
         .l2_capacity_pages = config.l2_capacity_pages,
         .write_policy = write_policy,
@@ -135,39 +119,7 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
         .prefetch_timeout_base_sec = config.prefetch_timeout_base_sec,
         .prefetch_timeout_per_ki_token_sec = config.prefetch_timeout_per_ki_token_sec,
         .prefetch_timeout_max_sec = config.prefetch_timeout_max_sec,
-#ifdef DEBUG
-        .page_size = page_size,
-        .page_size_source = config.page_size > 0 ? "target_config.page_size" : "fallback: 1 page per token for policy projection only",
-        .l1_capacity_source = "target_config.l1_capacity_pages",
-        .l2_capacity_source = "target_config.l2_capacity_pages",
-        .write_policy_source = "target_config.write_policy or ModelConfig default",
-        .write_through_threshold_source = write_through_threshold_source,
-        .prefetch_policy_source = "target_config.prefetch_policy or ModelConfig default",
-        .prefetch_threshold_tokens = prefetch_threshold_tokens,
-        .prefetch_threshold_source = prefetch_threshold_source,
-        .prefetch_capacity_limit_source = prefetch_capacity_limit_source,
-        .host_cleanup_budget_rule = "current_target_request_pages",
-        .host_cleanup_budget_source = "sglang: cleanup budget follows current page-aligned target request",
-        .extend_allocation_rule = "sglang paged extend pressure: extend_num_tokens + batch_size * page_size; page_size=1 uses extend_num_tokens",
-        .device_allocator_need_sort_source = "target_config.device_allocator_need_sort or derived from target_config.disaggregation_mode",
-        .storage_hit_policy = "continuous_prefix",
-        .storage_hit_policy_source = "sglang: storage hit query keeps only contiguous hit prefix",
-        .prefetch_timeout_source = config.prefetch_timeout_configured ? "target_config.prefetch_timeout_*" : "not configured in target config",
-        .prefetch_timeout_rule = "min(max, base + per_ki_token * token_count / 1024)",
-        .prefetch_rate_limit_rule = "active_requested_pages >= prefetch_capacity_limit_pages",
-        .resolution_notes = {},
-#endif
     };
-
-#ifdef DEBUG
-    if (config.page_size == 0) resolved.resolution_notes.push_back("policy projection used fallback page_size=1 because target_config.page_size is missing");
-    if (!config.prefetch_timeout_configured && prefetch_policy == "timeout")
-        resolved.resolution_notes.push_back("timeout policy is selected, but modeled timeout requires explicit target timeout config");
-    if (prefetch_capacity_limit_pages == 0)
-        resolved.resolution_notes.push_back("prefetch capacity limit is zero, so SGLang-style rate limit suppresses storage prefetch");
-#endif
-
-    return resolved;
 }
 
 HiCachePolicy::HiCachePolicy(const HiCacheConfig & config) : resolved_(resolve_hicache_policy(config)) {}

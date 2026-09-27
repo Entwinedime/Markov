@@ -11,6 +11,10 @@
 
 namespace markov::trace_graph::core {
 
+/** Stream/device barriers include newly inserted prior work; event synchronization does not. */
+[[nodiscard]] bool synchronizes_device_frontier(const TraceEvent& event);
+[[nodiscard]] bool synchronizes_recorded_event(const TraceEvent& event);
+
 /**
  * @brief Converts normalized trace events into a simulatable base DAG.
  *

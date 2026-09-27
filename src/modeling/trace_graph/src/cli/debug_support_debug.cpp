@@ -10,8 +10,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <ranges>
-
 namespace markov::trace_graph::cli {
 
 namespace {
@@ -23,11 +21,9 @@ using Json = nlohmann::json;
 void write_module_summary(const std::string & filename, const std::vector<std::unique_ptr<modules::SimulationModule>> & modules) {
     Json root;
     root["modules"] = Json::array();
-    std::ranges::for_each(modules, [&](const auto & module) {
-        if (!module || !module->has_summary()) return;
-        auto summary = Json::parse(modules::diagnostics::module_summary_json(*module));
-        root["modules"].push_back(std::move(summary));
-    });
+    for (const auto & module : modules) {
+        if (module && module->has_summary()) root["modules"].push_back(modules::diagnostics::module_summary_json(*module));
+    }
     write_json_file(filename, root);
 }
 

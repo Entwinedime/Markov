@@ -63,6 +63,8 @@ struct ManifestTraceInput {
 struct ManifestClientInput {
     std::string status;
     std::vector<core::ClientRequestTiming> requests;
+    /** Successful workload idle barrier, with no subsequent pre-window work. */
+    std::optional<uint64_t> hicache_idle_since_us;
 };
 
 /** Source manifest only; absent or unsupported client observations stay explicit. */

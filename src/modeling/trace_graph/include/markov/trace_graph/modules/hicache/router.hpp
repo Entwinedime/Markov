@@ -23,6 +23,9 @@ enum class HiCacheFactRole : std::uint8_t {
     CacheLookupInput,
     CacheExtendInput,
     CacheLifecycleCommit,
+    // Execution action derived from an observed allocation and approved input;
+    // not an additional raw probe-fact role accepted by the router.
+    CacheDecodeAllocation,
 };
 
 /**
@@ -41,16 +44,14 @@ struct HiCacheFactRoute {
 /** @brief Parses a role token into the active whitelist enum. */
 [[nodiscard]] HiCacheFactRole parse_hicache_fact_role(std::string_view role);
 
-/** @brief Returns the stable artifact name for a role. */
-[[nodiscard]] std::string hicache_fact_role_name(HiCacheFactRole role);
-
 /** @brief Applies consumer, phase, class, and role gates to one fact. */
 [[nodiscard]] HiCacheFactRoute route_hicache_fact(const HiCacheFact & fact);
 
 /**
- * @brief Returns missing required fields for one approved role.
+ * @brief Returns input errors for a parser-produced fact and one approved role.
  *
- * Missing fields become explicit contract errors; source outcomes are never used as fallback.
+ * Batch shape errors come from parsing; scalar identity/path requirements are checked here.
+ * Source outcomes are never used as fallback. Call before admitting the fact to replay.
  */
 [[nodiscard]] std::vector<std::string> hicache_required_fact_errors(const HiCacheFact & fact, HiCacheFactRole role);
 

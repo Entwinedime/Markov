@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -48,6 +49,9 @@ struct HiCacheFactMetadata {
 /** @brief Returns the semantic boundary timestamp of a catalog phase event. */
 [[nodiscard]] uint64_t hicache_fact_boundary_timestamp(const core::TraceEvent & event);
 
+/** Tail identities follow the formal fact IDs, independent of executable DAG size. */
+[[nodiscard]] size_t hicache_tail_fact_offset(std::span<const core::TraceEvent> formal_facts);
+
 /**
  * @brief Immutable reference to a half-open interval in a token dictionary path.
  *
@@ -83,8 +87,9 @@ struct HiCacheBatchPathEntry {
 /**
  * @brief Atomic fact parsed from one HiCache trace event.
  *
- * This record carries only catalog-declared fields. The router separately enforces class,
- * role, phase, and consumer eligibility before target replay.
+ * Raw records carry catalog-declared fields. The router enforces class, role,
+ * phase and consumer eligibility. Execution may also derive an allocation action
+ * from those approved inputs and a separately observed CPU boundary.
  */
 struct HiCacheFact {
     /** @brief Stable semantic-fact identity from the canonical fact side-table. */
@@ -93,7 +98,7 @@ struct HiCacheFact {
     std::optional<size_t> execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
     uint64_t source_ts = 0; ///< Original semantic boundary on the source wall clock.
-    uint64_t ts = 0;  ///< Residual-gap-excluded boundary used by target state replay.
+    uint64_t ts = 0;  ///< State execution boundary on the shared absolute microsecond clock.
     uint64_t dur = 0; ///< Chrome trace duration in microseconds.
 
     std::string pid;
@@ -110,43 +115,36 @@ struct HiCacheFact {
     std::string operation_id;
     std::string cache_scope;
     std::string lifecycle_kind;
+    std::optional<bool> chunked;
     std::string batch_kind;
 
     uint64_t seq_no = 0;
     uint64_t source_page_size = 0;
     uint64_t token_count = 0;
     uint64_t batch_size = 0;
-    uint64_t batch_request_id_count = 0;
-    uint64_t batch_position_count = 0;
-    uint64_t batch_token_dictionary_count = 0;
-    uint64_t batch_span_count = 0;
-    uint64_t batch_token_count_count = 0;
     int64_t priority = 0;
     bool is_start = false;
     bool is_end = false;
-    bool batch_request_ids_array = false;
-    bool batch_positions_array = false;
-    bool batch_token_dictionaries_array = false;
-    bool batch_spans_array = false;
-    bool batch_token_counts_array = false;
-    bool batch_request_ids_unique = false;
-    bool batch_positions_cover_indexes = false;
-    bool batch_positions_match_request_ids = true;
+    // Raw batch shape errors are recorded once at parsing, not as duplicate flags/counts.
+    std::vector<std::string> batch_input_errors;
 
     HiCacheTokenSpan full_path_span;
     HiCacheTokenPath full_path_tokens;
     std::vector<HiCacheBatchPathEntry> batch_paths;
+    // Derived decode actions retain the approved extend paths as provenance.
+    // The iteration indices identify calls; they are not source allocated pages.
+    std::vector<uint64_t> decode_iterations;
     /** @brief Returns whether catalog metadata declares the requested consumer. */
     [[nodiscard]] bool has_consumer(std::string_view consumer) const;
 };
 
 /**
- * @brief Returns whether the fact-local full path is complete enough for replay.
+ * @brief Returns whether a span and its hydrated token path are complete enough for replay.
  *
  * An explicit zero-length span is valid and means no complete target page. A non-empty span
  * must hydrate to exactly its declared token count; no other role or source result fills gaps.
  */
-[[nodiscard]] bool hicache_fact_has_resolved_full_path(const HiCacheFact & fact);
+[[nodiscard]] bool hicache_token_path_resolved(const HiCacheTokenSpan & span, const HiCacheTokenPath & tokens);
 
 /**
  * @brief HiCache event parser and approved token-dictionary index.

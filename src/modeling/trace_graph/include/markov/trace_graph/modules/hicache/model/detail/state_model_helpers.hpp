@@ -81,9 +81,6 @@ struct ExtendAllocationIntent {
     uint64_t requested_tokens = 0;
     uint64_t requested_pages = 0;
     uint64_t allocated_pages = 0;
-
-    /** @brief Reports whether this extend creates allocator pressure. */
-    [[nodiscard]] bool needs_pressure() const { return requested_pages > 0; }
 };
 
 /** @brief Raw token dimensions used to derive one extend-allocation intent. */
@@ -182,13 +179,12 @@ inline uint64_t allocation_cleanup_target(const HostCleanupInput & input) {
 /** @brief Performs saturating subtraction for unsigned counters. */
 inline uint64_t bounded_subtract(uint64_t value, uint64_t decrement) { return decrement >= value ? 0 : value - decrement; }
 
-/** @brief Builds an operation header with stable source-fact provenance. */
-inline HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, const std::string & operation_id, const HiCacheFact & fact,
-                                                    const std::string & cache_scope, const std::string & request_key, const std::string & owner,
-                                                    const std::vector<std::string> & pages, uint64_t enqueue_epoch) {
+/** @brief Binds an operation to its source fact; effect opportunities own token and execution-anchor provenance. */
+inline HiCacheOperationHeader make_operation_header(const std::string & operation_id, const HiCacheFact & fact, const std::string & cache_scope,
+                                                    const std::string & request_key, const std::string & owner, const std::vector<std::string> & pages,
+                                                    uint64_t enqueue_epoch) {
     return HiCacheOperationHeader{
         .operation_id = operation_id,
-        .kind = kind,
         .cache_scope = cache_scope,
         .request_key = request_key,
         .request_id = fact.request_id,
@@ -197,13 +193,7 @@ inline HiCacheOperationHeader make_operation_header(HiCacheOperationKind kind, c
         .enqueue_epoch = enqueue_epoch,
         .enqueue_ts = fact.ts,
         .source_node_id = fact.source_node_id,
-        .source_execution_anchor_node_id = fact.execution_anchor_node_id,
         .source_event_index = fact.source_event_index,
-        .source_fact_seq_no = fact.seq_no,
-        .source_fact_role = fact.role,
-        .source_token_path_id = fact.full_path_span.path_id,
-        .source_token_begin = fact.full_path_span.begin,
-        .source_token_end = fact.full_path_span.end,
     };
 }
 

@@ -6,7 +6,8 @@
 
 namespace markov::trace_graph::core {
 
-ClientRequestChain connect_client_requests(DagGraph & graph, std::span<const ClientRequestTiming> requests) {
+ClientRequestChain connect_client_requests(DagGraph & graph, std::span<const ClientRequestTiming> requests,
+                                         std::optional<uint64_t> hicache_idle_since_us) {
     if (requests.empty()) return {};
     struct Boundaries { std::vector<size_t> received, sent; };
     std::unordered_map<std::string, Boundaries> boundaries;
@@ -36,7 +37,7 @@ ClientRequestChain connect_client_requests(DagGraph & graph, std::span<const Cli
         previous_end = request.end_us;
     }
 
-    ClientRequestChain result{"connected", {}};
+    ClientRequestChain result{"connected", {}, hicache_idle_since_us};
     size_t previous_completion = DagNode::kNoNode;
     previous_end = requests.front().start_us;
     for (const auto & request : requests) {

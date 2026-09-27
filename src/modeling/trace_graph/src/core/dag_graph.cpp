@@ -123,6 +123,9 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
 
 size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     if (spec.name.empty()) throw std::invalid_argument("synthetic DAG node name must not be empty");
+    if (spec.cpu_task_ready_delay_us && !spec.is_cpu) throw std::invalid_argument("explicit CPU task must use a CPU node");
+    if (spec.cpu_gap_after && (!spec.is_cpu || spec.cpu_task_ready_delay_us))
+        throw std::invalid_argument("residual gap requires a non-worker CPU boundary");
     TraceEvent event;
     event.index = events_.size();
     event.source_channel = TraceSourceChannel::Synthetic;
@@ -133,6 +136,11 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     event.dur = spec.duration;
     event.pid = std::to_string(gpu_id_);
     event.tid = spec.lane_key;
+    if (spec.observed_point) {
+        event.pid = spec.observed_point->pid;
+        event.tid = spec.observed_point->tid;
+        event.ts = spec.observed_point->timestamp_us;
+    }
     event.set_arg("node_kind", "synthetic");
     event.set_arg("counts_toward_e2e", spec.counts_toward_e2e ? "true" : "false");
     for (const auto & [key, value] : spec.attrs) event.set_arg(key, value);
@@ -142,6 +150,10 @@ size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     auto & node = nodes_[node_id];
     node.kind = DagNodeKind::Synthetic;
     node.counts_toward_e2e = spec.counts_toward_e2e;
+    node.explicit_cpu_task = spec.cpu_task_ready_delay_us.has_value();
+    node.cpu_ready_delay_before = spec.cpu_task_ready_delay_us.value_or(0);
+    node.cpu_gap_after = spec.cpu_gap_after;
+    if (spec.observed_point) node.gpu_id = spec.observed_point->gpu_id;
     return node_id;
 }
 
@@ -196,11 +208,65 @@ DagNode & DagGraph::mutable_node(size_t node_id) {
 
 void DagGraph::set_node_duration(size_t node_id, uint64_t duration) { mutable_node(node_id).duration = duration; }
 
+uint64_t DagGraph::cpu_service_node_duration(size_t id) const {
+    const auto& n = node(id);
+    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates)
+        || n.duration == 0) return n.duration;
+    const auto& e = event_for_node(id);
+    const auto service = cpu_service_cost_.duration({e.pid,e.tid}, e.ts, checked_add_u64(e.ts,e.dur,"CPU service event end overflow"));
+    if (service == e.dur) return n.duration;
+    if (n.duration != e.dur) throw std::runtime_error("CPU service overlaps an already remodeled node");
+    return service;
+}
+
+uint64_t DagGraph::cpu_service_gap_duration(size_t id) const {
+    const auto& n = node(id);
+    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates)
+        || n.cpu_gap_after == 0) return n.cpu_gap_after;
+    const auto& e = event_for_node(id);
+    const auto begin = checked_add_u64(e.ts,e.dur,"CPU service gap begin overflow");
+    const auto end = checked_add_u64(begin,n.original_cpu_gap_after,"CPU service gap end overflow");
+    if (const auto found = retained_cpu_gap_ranges_.find(id); found != retained_cpu_gap_ranges_.end()) {
+        validate_cpu_gap_ranges(id,n.cpu_gap_after,found->second);
+        uint64_t service = 0;
+        for (const auto& [lo,hi] : found->second)
+            service = checked_add_u64(service,cpu_service_cost_.duration({e.pid,e.tid},lo,hi),"Retained gap service overflow");
+        return service;
+    }
+    const auto service = cpu_service_cost_.duration({e.pid,e.tid},begin,end);
+    if (service == n.original_cpu_gap_after) return n.cpu_gap_after;
+    if (n.cpu_gap_after != n.original_cpu_gap_after)
+        throw std::runtime_error("CPU service overlaps a partially remodeled gap without retained coordinates: node="
+            +std::to_string(id)+" event="+e.name+" gap="+std::to_string(n.cpu_gap_after)
+            +" original="+std::to_string(n.original_cpu_gap_after)+" begin="+std::to_string(begin));
+    return service;
+}
+
 void DagGraph::set_node_counts_toward_e2e(size_t node_id, bool value) { mutable_node(node_id).counts_toward_e2e = value; }
 
-void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration) {
+void DagGraph::validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges& ranges) const {
+    const auto& n = node(node_id);
+    if (!n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates))
+        throw std::invalid_argument("Retained gap ranges require original CPU coordinates");
+    const auto& event = event_for_node(node_id);
+    const auto begin = checked_add_u64(event.ts,event.dur,"Retained gap begin overflow");
+    const auto end = checked_add_u64(begin,n.original_cpu_gap_after,"Retained gap end overflow");
+    uint64_t cursor=begin,total=0;
+    for (const auto& [lo,hi] : ranges) {
+        if (lo<cursor || hi<=lo || hi>end) throw std::invalid_argument("Retained gap ranges overlap or exceed their source");
+        total=checked_add_u64(total,hi-lo,"Retained gap length overflow");
+        cursor=hi;
+    }
+    if (total!=duration) throw std::invalid_argument("Retained gap ranges do not account for the remaining duration");
+}
+
+void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration, std::optional<CpuGapRanges> ranges) {
     auto & target = mutable_node(node_id);
     if (!target.is_cpu) throw std::invalid_argument("CPU gap update requires a CPU node");
+    if (ranges) {
+        validate_cpu_gap_ranges(node_id,duration,*ranges);
+        retained_cpu_gap_ranges_[node_id]=std::move(*ranges);
+    } else retained_cpu_gap_ranges_.erase(node_id);
     target.cpu_gap_after = duration;
 }
 
@@ -250,10 +316,6 @@ size_t DagGraph::active_node_count() const {
     return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active; }));
 }
 
-size_t DagGraph::active_trace_node_count() const {
-    return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active && node.kind == DagNodeKind::TraceEvent; }));
-}
-
 size_t DagGraph::active_synthetic_node_count() const {
     return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active && node.kind == DagNodeKind::Synthetic; }));
 }
@@ -277,15 +339,6 @@ void DagGraph::set_input_contracts(std::vector<std::string> contracts) {
 }
 
 bool DagGraph::has_input_contract(std::string_view contract) const { return std::ranges::binary_search(input_contracts_, contract); }
-
-std::unordered_map<std::string, size_t> DagGraph::edge_counts_by_kind() const {
-    std::unordered_map<std::string, size_t> counts;
-    std::ranges::for_each(edges_, [&](const auto & edge) {
-        if (!edge.active || edge.src >= nodes_.size() || edge.dst >= nodes_.size() || !nodes_[edge.src].active || !nodes_[edge.dst].active) return;
-        counts[edge_kind_name(edge.kind)]++;
-    });
-    return counts;
-}
 
 DagGraphSummaryStats DagGraph::summary_stats() const {
     DagGraphSummaryStats stats;
@@ -579,6 +632,9 @@ private:
 DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     if (graphs.empty()) return DagGraph();
     if (graphs.size() == 1) return std::move(graphs.front());
+    for (const auto& graph : graphs)
+        if (!graph.cpu_service_cost().empty() || !graph.retained_cpu_gap_ranges_.empty())
+            throw std::invalid_argument("Attach CPU service measurements and retained ranges after merging source graphs");
     return GraphMerger(std::move(graphs)).run();
 }
 

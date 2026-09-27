@@ -17,6 +17,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <map>
 #include <ranges>
 #include <regex>
 #include <stdexcept>
@@ -188,7 +189,9 @@ bool token_dictionary_context_event(const TraceEvent & event) {
 bool semantic_tail_context_event(const TraceEvent & event) { return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
 
 bool semantic_prelude_context_event(const TraceEvent & event) {
-    return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact");
+    return event.source_channel == TraceSourceChannel::PythonProbe
+        && (event.has_arg_key_hint("fact") || (event.name == "runtime.hicache.layer_waits"
+            && event.arg("consumer_index") == "-1" && event.arg("status") == "returned"));
 }
 
 void append_causality_identity(const TraceEvent & event, std::string_view key, std::unordered_set<std::string> & identities) {
@@ -235,9 +238,34 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     if (!options.window_start_us || !options.window_end_us) return;
     const auto start = *options.window_start_us;
     const auto end = *options.window_end_us;
+    // Tail children may be retained through a device connection before CPU
+    // leaf selection inherits their submission identity. Preserve that identity
+    // now, so filtering cannot orphan a child from its observed queue task.
+    using Lane = std::pair<std::string, std::string>;
+    using Time = unsigned __int128;
+    const auto start_ns = [](const TraceEvent & event) -> Time { return Time(event.ts) * 1000 + event.ts_submicro_ns; };
+    const auto end_ns = [&](const TraceEvent & event) { return start_ns(event) + Time(event.dur) * 1000 + event.dur_submicro_ns; };
+    std::map<Lane, std::vector<size_t>> tail_tasks;
+    for (size_t i = 0; i < input.events.size(); ++i) {
+        const auto & event = input.events[i];
+        if (event.cat == "dequeue" && end_ns(event) > Time(end) * 1000 && !event.arg("correlation_id").empty())
+            tail_tasks[{event.pid, event.tid}].push_back(i);
+    }
+    for (auto & [lane, tasks] : tail_tasks)
+        std::ranges::sort(tasks, {}, [&](size_t i) { return start_ns(input.events[i]); });
+    for (auto & event : input.events) {
+        if (event.ts <= end || !event.arg("correlation_id").empty()) continue;
+        const auto lane = tail_tasks.find({event.pid, event.tid});
+        if (lane == tail_tasks.end()) continue;
+        auto parent = std::ranges::upper_bound(lane->second, start_ns(event), {}, [&](size_t i) { return start_ns(input.events[i]); });
+        if (parent == lane->second.begin()) continue;
+        const auto & task = input.events[*--parent];
+        if (end_ns(event) <= end_ns(task)) event.set_arg("correlation_id", task.arg("correlation_id"));
+    }
     std::unordered_set<std::string> in_window_connection_ids;
     std::unordered_set<std::string> in_window_correlation_ids;
     std::vector<TimeInterval> semantic_tail_intervals;
+    std::vector<const TraceEvent *> lifecycle_tail_calls;
     std::vector<ThreadCallInterval> cross_boundary_semantic_calls;
     for (const auto & event : input.events) {
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
@@ -254,6 +282,8 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         if (event.ts > end && semantic_tail_context_event(event)) {
             input.tail_context_events.push_back(event);
             if (event.dur > 0) semantic_tail_intervals.emplace_back(event.ts, event_end);
+            if (event.arg("phase") == "end" && Json::parse(event.arg("fact")).value("role", "") == "cache_lifecycle_commit")
+                lifecycle_tail_calls.push_back(&event);
         }
         if (event_end < start || event.ts > end) continue;
         append_causality_identity(event, "connection_id", in_window_connection_ids);
@@ -261,16 +291,92 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     }
     for (auto & event : input.events) {
         if (event.ts <= end) continue;
+        // A retained lifecycle still executes after the HTTP endpoint. Keep
+        // its nested semantic boundaries too, without admitting new endpoints.
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
+            && std::ranges::any_of(lifecycle_tail_calls, [&](const auto * call) {
+                return event.pid == call->pid && event.tid == call->tid
+                    && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
+            })) mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
         if (event.source_channel != TraceSourceChannel::PythonProbe
             && (overlaps_tail_context(event, semantic_tail_intervals) || strictly_nested_in_cross_boundary_call(event, cross_boundary_semantic_calls)))
             mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
     }
+    // A collective can return after its last CPU leaf but before the window
+    // ends. Its return gap needs the next same-lane call as an observed boundary.
+    // Retain that call (including nested leaves), not an arbitrary time margin.
+    std::map<Lane, std::optional<size_t>> return_successors;
+    for (const auto & event : input.events) {
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective"
+            && event.ts >= start && event.ts <= end && event.dur <= end - event.ts)
+            return_successors.try_emplace({event.pid, event.tid}, std::nullopt);
+    }
+    for (size_t i = 0; i < input.events.size(); ++i) {
+        const auto & event = input.events[i];
+        if (event.ts <= end || event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op"
+            || event.has_arg_key_hint("streamId") || event.has_arg_key_hint("Physic Stream Id")) continue;
+        const auto lane = return_successors.find({event.pid, event.tid});
+        if (lane == return_successors.end()) continue;
+        auto & chosen = lane->second;
+        if (!chosen || start_ns(event) < start_ns(input.events[*chosen])
+            || (start_ns(event) == start_ns(input.events[*chosen]) && end_ns(event) > end_ns(input.events[*chosen])))
+            chosen = i;
+    }
     for (auto & event : input.events) {
-        if (event.ts <= end || event.arg("formal_window_context") == "causal_tail") continue;
-        const bool causal_tail = shares_causality_identity(event, "connection_id", in_window_connection_ids)
-                                 || shares_causality_identity(event, "correlation_id", in_window_correlation_ids);
-        if (!causal_tail) continue;
-        mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+        if (event.ts <= end || event.source_channel == TraceSourceChannel::PythonProbe) continue;
+        const auto lane = return_successors.find({event.pid, event.tid});
+        if (lane == return_successors.end() || !lane->second) continue;
+        const auto & boundary = input.events[*lane->second];
+        if (start_ns(event) >= start_ns(boundary) && end_ns(event) <= end_ns(boundary))
+            mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+    }
+    // Storage state is applied after its MIN, in a separate probe. Keep the
+    // first following application as evidence even when it falls past the cut.
+    std::map<Lane, std::vector<size_t>> storage_boundaries;
+    for (size_t i = 0; i < input.events.size(); ++i) {
+        const auto & event = input.events[i];
+        if (event.source_channel == TraceSourceChannel::PythonProbe
+            && (event.name == "runtime.hicache.storage_drain"
+                || (event.name == "runtime.cpu_collective" && event.arg("role") == "storage_control_drain")))
+            storage_boundaries[{event.pid, event.tid}].push_back(i);
+    }
+    for (auto & [lane, ids] : storage_boundaries) {
+        std::ranges::stable_sort(ids, {}, [&](size_t i) { return start_ns(input.events[i]); });
+        for (size_t i = 1; i < ids.size(); ++i) {
+            const auto & before = input.events[ids[i - 1]];
+            auto & after = input.events[ids[i]];
+            if (before.name == "runtime.cpu_collective" && before.ts >= start && before.ts <= end
+                && after.name == "runtime.hicache.storage_drain" && after.ts > end)
+                mark_causal_tail(after, in_window_connection_ids, in_window_correlation_ids);
+        }
+    }
+    // Boundary calls can also carry queue identities. Close those dependencies
+    // along with the original causal tail, independently of file order.
+    bool changed;
+    do {
+        changed = false;
+        for (auto & event : input.events) {
+            if (event.ts <= end || event.arg("formal_window_context") == "causal_tail") continue;
+            const bool causal_tail = shares_causality_identity(event, "connection_id", in_window_connection_ids)
+                                     || shares_causality_identity(event, "correlation_id", in_window_correlation_ids);
+            if (!causal_tail) continue;
+            mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+            changed = true;
+        }
+    } while (changed);
+    // If the cut lies in a proven same-thread gap, retain the cut itself,
+    // not the preceding call's execution. A collective starting before the
+    // first retained CPU leaf otherwise loses its observed entry interval.
+    std::map<Lane, bool> head_context;
+    for (const auto & event : input.events) {
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective"
+            && event.arg("status") == "returned" && event.ts >= start && event.ts <= end && event.dur <= end - event.ts)
+            head_context.try_emplace({event.pid, event.tid}, false);
+    }
+    for (const auto & event : input.events) {
+        if (event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op") continue;
+        const auto found = head_context.find({event.pid, event.tid});
+        if (found != head_context.end() && end_ns(event) < Time(start) * 1000) found->second = true;
     }
     std::erase_if(input.events, [&](const TraceEvent & event) {
         // Pre-window preparation is model context, not pre-window execution.
@@ -281,6 +387,21 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         const bool retained_causal_tail = event.arg("formal_window_context") == "causal_tail";
         return event_end < start || (event.ts > end && !retained_causal_tail);
     });
+    for (const auto & [lane, has_predecessor] : head_context) {
+        if (!has_predecessor) continue;
+        // Eligibility against executable work is checked after CPU-leaf
+        // normalization: a crossing parent is not necessarily retained work.
+        TraceEvent boundary;
+        boundary.name = "formal_window.cpu_begin";
+        boundary.cat = "observed_boundary";
+        boundary.ph = 'X';
+        boundary.pid = lane.first;
+        boundary.tid = lane.second;
+        boundary.ts = start;
+        boundary.source_channel = TraceSourceChannel::Synthetic;
+        boundary.set_arg("counts_toward_e2e", "false");
+        input.events.push_back(std::move(boundary));
+    }
     for (size_t index = 0; index < input.events.size(); ++index) input.events[index].index = index;
 }
 
@@ -350,6 +471,7 @@ ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::ve
                             options);
     const auto clock = paths.host_clocks.find(paths.torch[index]);
     normalize_wait_clock(input.events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
+    normalize_wait_clock(input.prelude_context_events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
     return input;
 }
 
@@ -410,13 +532,26 @@ ManifestClientInput load_client_requests_from_manifest(const std::string & manif
     const auto end = timestamp(window, "formal_end_ms");
     ManifestClientInput result{"ready", {}};
     bool inside = false;
+    uint64_t prelude_finish = 0;
+    bool prelude_ordered = true;
     for (const auto & row : report.at("requests")) {
         if (!row.contains("start_time_ms") || !row.contains("end_time_ms")) {
+            result.hicache_idle_since_us.reset();
             if (inside) return {"formal_step_without_timing", {}};
             continue;
         }
         const auto start = timestamp(row, "start_time_ms"), finish = timestamp(row, "end_time_ms");
-        if (finish <= begin || start >= end) continue;
+        if (finish <= begin) {
+            prelude_ordered &= start >= prelude_finish && finish >= start && result.requests.empty();
+            prelude_finish = std::max(prelude_finish, finish);
+            if (row.value("kind", "") == "barrier" && row.value("scope", "") == "hicache_idle"
+                && row.value("status", "") == "ok" && prelude_ordered)
+                result.hicache_idle_since_us = finish;
+            else if (!prelude_ordered || row.value("kind", "") != "checkpoint" || row.value("status", "") != "ok")
+                result.hicache_idle_since_us.reset();
+            continue;
+        }
+        if (start >= end) continue;
         if (row.value("kind", "") != "request") return {"formal_control_step_not_modeled", {}};
         if (row.value("status", "") != "ok") return {"failed_formal_request", {}};
         result.requests.push_back({row.at("logical_request_id").get<std::string>(), start, finish, 0});

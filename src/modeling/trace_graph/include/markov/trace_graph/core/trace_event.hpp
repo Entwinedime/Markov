@@ -111,13 +111,13 @@ private:
     };
 
     void ensure_args_materialized() const;
+    void append_args_to(TraceArgMap & output) const;
     void commit_arg_overrides();
     void append_arg_layers_from(const TraceEvent & other);
     [[nodiscard]] bool lookup_arg_layers(std::string_view key, std::string * value) const;
     [[nodiscard]] bool lookup_raw_arg(std::string_view key, std::string * value) const;
 
     mutable bool args_materialized_ = false;
-    std::unique_ptr<std::string> owned_args_json_;
     std::shared_ptr<const std::string> args_buffer_;
     size_t args_offset_ = 0;
     size_t args_length_ = 0;

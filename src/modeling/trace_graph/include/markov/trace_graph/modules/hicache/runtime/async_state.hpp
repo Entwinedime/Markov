@@ -1,26 +1,16 @@
 /**
  * @file
- * @brief Target-derived HiCache prefetch, writeback, loadback, and storage operations.
+ * @brief Target-derived HiCache prefetch, loadback, and storage operations.
  */
 #pragma once
 
 #include <cstdint>
 #include <optional>
-#include <span>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-
-/**
- * @brief Kind of target-derived cache operation.
- *
- * SGLang gives these operations distinct control paths, while they share identity,
- * scope, request ownership, affected nodes/pages, and lifecycle boundaries.
- */
-enum class HiCacheOperationKind : std::uint8_t { Prefetch, Writeback, Loadback, Storage };
 
 /**
  * @brief Common operation lifecycle state.
@@ -47,7 +37,6 @@ enum class HiCachePrefetchState : std::uint8_t { Pending, Ready, Applied, Suppre
  */
 struct HiCacheOperationHeader {
     std::string operation_id;
-    HiCacheOperationKind kind = HiCacheOperationKind::Prefetch;
     std::string cache_scope;
     std::string request_key;
     std::string request_id;
@@ -71,23 +60,21 @@ struct HiCacheOperationHeader {
     bool consumer_source_available = false;
     /** @brief Semantic fact identity for the operation opportunity. */
     size_t source_node_id = 0;
-    /** @brief Executable anchor for the operation opportunity, when trace evidence proves one. */
-    std::optional<size_t> source_execution_anchor_node_id = std::nullopt;
     size_t source_event_index = 0;
-    uint64_t source_fact_seq_no = 0;
-    std::string source_fact_role;
-    std::string source_token_path_id;
-    uint64_t source_token_begin = 0;
-    uint64_t source_token_end = 0;
 };
 
 struct HiCacheIoBatchSchedule {
     uint64_t page_count = 0;
     uint64_t start_ts = 0;
     uint64_t ready_ts = 0;
+    std::vector<uint64_t> page_ready_ts;
+    // Present for measured staged prefetch: includes the rejected final copy.
+    std::optional<uint64_t> copied_page_count;
 };
 
-/** @brief Executed service batches, separate from any early consumer/stop boundary. */
+/** Service batches, separate from an early consumer boundary. Execution-driven
+ * prefetch carries the full plan until its stop event resolves executed work.
+ */
 struct HiCacheIoSchedule {
     bool available = false;
     std::string resource_lane;
@@ -118,6 +105,11 @@ struct HiCachePrefetchOperation {
     std::vector<std::string> completed_pages;
     HiCacheIoSchedule io_schedule;
     uint64_t completed_byte_count = 0;
+    // Present only once the execution-driven foreground stop has happened.
+    std::optional<uint64_t> execution_stop_ts;
+    std::optional<uint64_t> query_sample_ts;
+    std::optional<uint64_t> query_return_ts;
+    std::optional<uint64_t> io_return_ts;
     uint64_t policy_stop_ts = 0;
     uint64_t target_boundary_ts = 0;
     uint64_t timeout_deadline_ts = 0;
@@ -127,25 +119,10 @@ struct HiCachePrefetchOperation {
     bool timed_out = false;
     uint64_t requested_host_pages = 0;
     uint64_t reserved_host_pages = 0;
-    /** Target-derived host-pool state immediately before this reservation. */
-    uint64_t host_capacity_pages_at_enqueue = 0;
-    uint64_t host_occupied_pages_at_enqueue = 0;
+    /** Outstanding reservations before this enqueue, retained for lifecycle diagnostics. */
     uint64_t host_reserved_pages_at_enqueue = 0;
-    uint64_t active_requested_pages_at_enqueue = 0;
     /** Logical capacity minus residency/reservations before terminal mutation; not an observed free-list size. */
     std::optional<uint64_t> host_available_pages_at_control;
-    /**
-     * Target-derived storage-key recency immediately before the read.
-     *
-     * The distance is measured in bytes read or written after the last modeled
-     * access to each hit page.  Unlike a config/workload label, it can be replayed for
-     * any target geometry and is the relevant state for selecting between the
-     * calibrated warm and cold storage-read curves.
-     */
-    uint64_t storage_reuse_distance_sum_bytes_at_enqueue = 0;
-    uint64_t storage_reuse_distance_max_bytes_at_enqueue = 0;
-    uint64_t storage_reuse_distance_known_pages_at_enqueue = 0;
-    uint64_t storage_reuse_distance_unknown_pages_at_enqueue = 0;
     /** The terminal consumer waits for the full service completion. */
     bool service_consumer_dependency_required = false;
     /** Published pages require a causal terminal boundary, possibly a timeout gate. */
@@ -153,14 +130,11 @@ struct HiCachePrefetchOperation {
     HiCachePrefetchState prefetch_state = HiCachePrefetchState::Pending;
 };
 
-/** @brief Node-level writeback triggered by dirty L1 eviction. */
-struct HiCacheWritebackOperation {
-    HiCacheOperationHeader header;
-};
-
 /** @brief Modeled transfer of a host/storage-visible prefix back to L1. */
 struct HiCacheLoadbackOperation {
     HiCacheOperationHeader header;
+    // Batch replay's per-operation estimate. Execution mode stores service once
+    // in HiCacheLoadbackBatch and advances this header on the actual callback.
     HiCacheIoSchedule io_schedule;
 };
 
@@ -178,6 +152,9 @@ struct HiCacheStorageOperation {
     std::vector<std::string> capacity_gate_pages;
     HiCacheIoSchedule device_to_host_schedule;
     HiCacheIoSchedule host_to_storage_schedule;
+    std::optional<uint64_t> device_completed_at;
+    // Host allocation exists before DMA acknowledgement makes it visible.
+    uint64_t reserved_host_pages = 0;
     bool host_materialized = false;
     bool storage_committed = false;
 };
@@ -186,14 +163,14 @@ struct HiCacheStorageOperation {
  * @brief Canonical table of target-derived asynchronous operations.
  *
  * Source-observed actual completion does not live here. Every stored state is derived for
- * the target configuration. The request reverse index intentionally contains prefetches
- * only because reservation drain is its sole production consumer.
+ * the target configuration. The request reverse index contains prefetches in insertion
+ * order: its last entry serves point queries, while reservation drain uses the full list.
  */
 class HiCacheAsyncOperationTable {
 public:
     /**
      * @brief Inserts a new target-derived prefetch operation.
-     * @throws std::invalid_argument if its identity or kind is malformed.
+     * @throws std::invalid_argument if its operation or request identity is empty.
      * @throws std::logic_error if the operation ID already exists.
      */
     void insert_prefetch(HiCachePrefetchOperation op);
@@ -206,11 +183,7 @@ public:
 
     /** @brief Advances prefetch-specific and common lifecycle state by operation ID. */
     void set_prefetch_state_by_id(const std::string & operation_id, HiCachePrefetchState prefetch_state, HiCacheOperationState operation_state,
-                                  std::string_view reason, uint64_t transition_ts = 0);
-
-    /** @brief Advances the latest prefetch operation for a request. */
-    void set_prefetch_state(const std::string & request_key, HiCachePrefetchState prefetch_state, HiCacheOperationState operation_state,
-                            std::string_view reason, uint64_t transition_ts = 0);
+                                  uint64_t transition_ts = 0);
 
     /** @brief Returns the mutable prefetch index for finalization inside the state machine. */
     [[nodiscard]] std::unordered_map<std::string, HiCachePrefetchOperation> & prefetch_ops() { return prefetch_by_id_; }
@@ -227,15 +200,6 @@ public:
     /** @brief Releases drainable prefetch reservations at a request reuse/release boundary. */
     uint64_t release_prefetch_pending_host_pages_for_request(const std::string & request_key);
 
-    /** @brief Inserts a new writeback operation and rejects duplicate IDs. */
-    void insert_writeback(HiCacheWritebackOperation op);
-
-    /** @brief Advances common lifecycle state for a writeback operation. */
-    void set_writeback_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts = 0);
-
-    /** @brief Returns all writeback operations. */
-    [[nodiscard]] const std::unordered_map<std::string, HiCacheWritebackOperation> & writeback_ops() const { return writeback_by_id_; }
-
     /** @brief Inserts a new modeled loadback operation and rejects duplicate IDs. */
     void insert_loadback(HiCacheLoadbackOperation op);
 
@@ -246,7 +210,7 @@ public:
     [[nodiscard]] const HiCacheLoadbackOperation * loadback_for_request(const std::string & request_key) const;
 
     /** @brief Advances common lifecycle state for a loadback operation. */
-    void set_loadback_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts = 0);
+    void set_loadback_state(const std::string & operation_id, HiCacheOperationState state, uint64_t transition_ts = 0);
 
     /** @brief Returns all loadback operations. */
     [[nodiscard]] const std::unordered_map<std::string, HiCacheLoadbackOperation> & loadback_ops() const { return loadback_by_id_; }
@@ -255,7 +219,7 @@ public:
     void insert_storage(HiCacheStorageOperation op);
 
     /** @brief Advances common lifecycle state for a storage operation. */
-    void set_storage_state(const std::string & operation_id, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts = 0);
+    void set_storage_state(const std::string & operation_id, HiCacheOperationState state, uint64_t transition_ts = 0);
 
     /** @brief Assigns pages protected by the write-through ACK/release gate. */
     void set_storage_capacity_gate_pages(const std::string & operation_id, std::vector<std::string> pages);
@@ -276,27 +240,19 @@ public:
     [[nodiscard]] const HiCacheStorageOperation * storage_operation(const std::string & operation_id) const;
 
 
-    /** @brief Returns a stable read-only view of prefetch IDs associated with a request. */
-    [[nodiscard]] std::span<const std::string> operations_for_request(const std::string & request_key) const;
-
     /** @brief Drops terminal operation provenance when a new measured window begins. */
     void clear_operations_for_window_boundary();
 
 private:
     uint64_t lifecycle_epoch_ = 0;
     std::unordered_map<std::string, HiCachePrefetchOperation> prefetch_by_id_;
-    std::unordered_map<std::string, std::string> latest_prefetch_id_by_request_;
-    std::unordered_map<std::string, HiCacheWritebackOperation> writeback_by_id_;
     std::unordered_map<std::string, HiCacheLoadbackOperation> loadback_by_id_;
     std::unordered_map<std::string, std::string> latest_loadback_id_by_request_;
     std::unordered_map<std::string, HiCacheStorageOperation> storage_by_id_;
     std::unordered_map<std::string, std::vector<std::string>> operation_ids_by_request_;
 
-    /** @brief Adds a prefetch ID to the request reservation-drain index. */
-    void index_prefetch(const HiCacheOperationHeader & header);
-
-    /** @brief Advances common lifecycle state and records a Debug transition. */
-    void transition_header(HiCacheOperationHeader & header, HiCacheOperationState state, std::string_view reason, uint64_t transition_ts);
+    /** @brief Advances common lifecycle state and its completion time. */
+    void transition_header(HiCacheOperationHeader & header, HiCacheOperationState state, uint64_t transition_ts);
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

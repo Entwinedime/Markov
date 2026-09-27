@@ -83,12 +83,9 @@ struct HiCacheEffectOpportunity {
     HiCacheTransferDirection direction = HiCacheTransferDirection::None;
     std::string cache_scope;
     std::string state_scope_key;
-    std::string request_identity;
     std::string request_id_provenance;
     std::string source_fact_role;
     uint64_t source_fact_ordinal = 0;
-    uint64_t decision_ordinal = 0;
-    uint64_t source_fact_seq_no = 0;
     /** @brief Semantic fact identity, not necessarily an executable DAG node. */
     size_t source_node_id = 0;
     /** @brief Optional proven executable anchor for the opportunity fact. */
@@ -107,6 +104,7 @@ struct HiCacheStorageBatchWork {
     uint64_t page_count = 0;
     uint64_t existing_page_count = 0;
     uint64_t new_page_count = 0;
+    std::optional<uint64_t> copied_page_count;
 };
 
 /**

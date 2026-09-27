@@ -46,17 +46,25 @@ struct HiCacheIoNewOperationPoint {
     double bandwidth_bytes_per_sec = 0.0;
 };
 
+/** @brief File read/copy/publication stages measured by fixed physical calibration. */
+struct HiCachePrefetchStagesConfig {
+    double before_copy_us_per_page = 0.0;
+    double before_copy_us_per_byte = 0.0;
+    double copy_publish_us_per_page = 0.0;
+    double copy_publish_us_per_byte = 0.0;
+    double return_us_per_operation = 0.0;
+    double return_us_per_page = 0.0;
+};
+
 /** @brief One direction-specific physical service curve in the unified I/O model. */
 struct HiCacheIoServiceModelConfig {
     std::string direction{};
-    double setup_us_per_operation = 0.0;
-    double setup_us_per_page = 0.0;
-    double bandwidth_bytes_per_sec = 0.0;
     double runtime_scale = 1.0;
     double existing_runtime_scale = 1.0;
     std::vector<HiCacheIoPageBandwidthPoint> page_bandwidth_points{};
     std::vector<HiCacheIoNewOperationPoint> new_operation_points{};
     std::vector<HiCacheIoExistingKeyBandwidthPoint> existing_key_bandwidth_points{};
+    std::optional<HiCachePrefetchStagesConfig> stages;
 };
 
 /** @brief One measured fixed host-control cost per I/O operation. */
@@ -76,6 +84,10 @@ struct HiCacheIoCostConfig {
     std::map<std::string, HiCacheIoServiceModelConfig> service_models{};
     std::map<std::string, HiCacheIoControlModelConfig> control_models{};
     HiCacheIoResourceLanesConfig resource_lanes{};
+    /** Independent CPU-envelope calibration, per empty blocking write check. */
+    std::optional<double> empty_write_check_us;
+    std::optional<double> locked_candidate_us;
+    double locked_candidate_log2_heap_us = 0.0;
 };
 
 /** @brief Monotone cost response for one source-owned phase node family. */
@@ -111,8 +123,8 @@ struct HiCachePhaseCostConfig {
     HiCachePhaseTokenCostConfig prefill_common_kernel;
     HiCachePhaseTokenCostConfig prefill_collective;
     HiCachePhaseLinearCostConfig prefill_prefix_attention;
-    HiCacheDecodePagedAttentionCostConfig decode_paged_attention;
-    HiCachePhaseLinearCostConfig decode_collective;
+    std::optional<HiCacheDecodePagedAttentionCostConfig> decode_paged_attention;
+    std::optional<HiCachePhaseLinearCostConfig> decode_collective;
     uint64_t min_new_tokens = 0;
     uint64_t max_new_tokens = 0;
     uint64_t min_context_tokens = 0;
@@ -139,6 +151,15 @@ struct HiCacheConfig {
     std::string write_policy = "write_through";
     uint64_t write_through_threshold = 0;
     std::string prefetch_policy = "timeout";
+    std::string prefetch_wait_calibration;              // Independent branch timing, used only when base has no active wait.
+    std::string prefetch_query_calibration;             // Independent query CPU/communication costs, not a source DAG.
+    std::string load_index_calibration;                 // Independent index-operation costs; no target topology.
+    std::string load_submission_calibration;            // Independent Ascend submission costs, not a target DAG.
+    std::string layer_wait_calibration;                 // Independent event-wait submission costs.
+    std::vector<std::string> prefetch_cpu_calibrations; // Policy-independent local return costs only.
+    std::string write_host_calibration;                 // Independent host-call templates for write policies absent from the base.
+    std::string release_host_calibration;               // Independent ordinary release work, rebound to base allocator resources.
+    std::string write_confirmation_calibration;         // Independent nonblocking ACK tails, including empty checks.
     uint64_t prefetch_threshold_pages = 0;
     uint64_t prefetch_capacity_limit_pages = 0;
     bool prefetch_timeout_configured = false;
@@ -161,6 +182,7 @@ struct HiCacheConfig {
 struct ModelConfig {
     NodeScaleConfig node_scale;
     HiCacheConfig hicache;
+    std::string source_prefetch_policy; // Source observation context, not a target policy/outcome.
 
     /** @brief Loads and validates one narrow model-configuration JSON file. */
     [[nodiscard]] static ModelConfig from_file(const std::string & filename);

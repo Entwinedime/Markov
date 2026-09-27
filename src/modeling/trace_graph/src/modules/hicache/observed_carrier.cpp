@@ -50,7 +50,6 @@ model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationA
             .source_prefill_token_count = row.prefill_token_count,
             .common_kernel_cost = cost(row.prefill_common_kernel_duration_us, row.prefill_common_kernel_node_ids),
             .prefix_attention_cost = cost(row.prefill_prefix_attention_duration_us, row.prefill_prefix_attention_node_ids),
-            .kernel_cost = cost(row.prefill_kernel_duration_us, row.prefill_kernel_node_ids),
             .collective_cost = cost(row.prefill_collective_duration_us, row.prefill_collective_node_ids),
             .submit_cost = cost(row.prefill_submit_cpu_duration_us, row.prefill_submit_cpu_node_ids),
             .feature_covered = true,

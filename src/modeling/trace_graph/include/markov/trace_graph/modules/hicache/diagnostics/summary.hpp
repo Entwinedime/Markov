@@ -6,13 +6,13 @@
 
 #include "markov/trace_graph/modules/hicache/model/effect_decision.hpp"
 
-#include <string>
+#include <nlohmann/json_fwd.hpp>
 
 namespace markov::trace_graph::modules::hicache::diagnostics {
 
 /**
- * @brief Serializes only fields consumed by current structure validation.
+ * @brief Builds the JSON value consumed by structure validation, without encoding text.
  */
-[[nodiscard]] std::string summary_json(const model::HiCacheEffectDecisionLedger & effect_plan);
+[[nodiscard]] nlohmann::json summary_json(const model::HiCacheEffectDecisionLedger & effect_plan);
 
 } // namespace markov::trace_graph::modules::hicache::diagnostics

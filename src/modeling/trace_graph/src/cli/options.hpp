@@ -26,6 +26,10 @@ struct OutputPaths {
 struct CliOptions {
     std::string profile_manifest;
     std::string model_config;
+    std::string cpu_service_cost;
+    std::string prepare_cpu_service;
+    std::string cpu_service_output;
+    bool source_observations_only = false;
 #ifdef DEBUG
     std::string hicache_oracle_cost_replay;
     std::string hicache_phase_oracle_cost_replay;

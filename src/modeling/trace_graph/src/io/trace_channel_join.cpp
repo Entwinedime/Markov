@@ -28,7 +28,6 @@ using core::TraceEvent;
 using Json = nlohmann::json;
 
 struct CustomEventGroup {
-    std::vector<uint64_t> timestamps;
     std::vector<const TraceEvent *> events;
     std::vector<bool> used;
 };
@@ -90,26 +89,16 @@ void normalize_runtime_cpu_lanes(std::vector<TraceEvent> & events) {
 }
 
 std::unordered_map<std::string, CustomEventGroup> group_custom_events(const std::vector<TraceEvent> & events) {
-    using TimestampedEvent = std::pair<uint64_t, const TraceEvent *>;
-    std::unordered_map<std::string, std::vector<TimestampedEvent>> grouped;
+    std::unordered_map<std::string, CustomEventGroup> grouped;
     for (const auto & event : events) {
-        if (event.ph == 'X') grouped[custom_key(event)].push_back({ event.ts, &event });
+        if (event.ph == 'X') grouped[custom_key(event)].events.push_back(&event);
     }
 
-    std::unordered_map<std::string, CustomEventGroup> result;
-    result.reserve(grouped.size());
-    for (auto & [key, rows] : grouped) {
-        std::ranges::sort(rows, {}, &TimestampedEvent::first);
-        auto & group = result[key];
-        group.timestamps.reserve(rows.size());
-        group.events.reserve(rows.size());
-        for (const auto & [timestamp, event] : rows) {
-            group.timestamps.push_back(timestamp);
-            group.events.push_back(event);
-        }
-        group.used.resize(rows.size(), false);
+    for (auto & [key, group] : grouped) {
+        std::ranges::sort(group.events, {}, &TraceEvent::ts);
+        group.used.resize(group.events.size(), false);
     }
-    return result;
+    return grouped;
 }
 
 std::string function_argument(const TraceEvent & event, const std::string & key) {
@@ -157,12 +146,12 @@ void join_by_timestamp_search(std::vector<TraceEvent> & profiler_events, const s
         ++candidates;
 
         auto & group = group_entry->second;
-        const auto insertion = std::upper_bound(group.timestamps.begin(), group.timestamps.end(), event.ts);
-        const auto insertion_index = static_cast<size_t>(std::distance(group.timestamps.begin(), insertion));
+        const auto insertion = std::ranges::upper_bound(group.events, event.ts, {}, &TraceEvent::ts);
+        const auto insertion_index = static_cast<size_t>(std::distance(group.events.begin(), insertion));
         const auto begin = insertion_index > options.search_window ? insertion_index - options.search_window : 0;
-        const auto end = std::min(group.timestamps.size(), insertion_index + options.search_window);
+        const auto end = std::min(group.events.size(), insertion_index + options.search_window);
 
-        size_t nearest_index = group.timestamps.size();
+        size_t nearest_index = group.events.size();
         uint64_t nearest_difference = std::numeric_limits<uint64_t>::max();
         bool ambiguous = false;
         const auto event_end = core::checked_add_u64(event.ts, event.dur, "profiler call end overflow");
@@ -182,7 +171,7 @@ void join_by_timestamp_search(std::vector<TraceEvent> & profiler_events, const s
             }
             else if (difference == nearest_difference) ambiguous = true;
         }
-        if (nearest_index < group.timestamps.size() && !ambiguous) {
+        if (nearest_index < group.events.size() && !ambiguous) {
             group.used[nearest_index] = true;
             inject_arguments(event, *group.events[nearest_index]);
             ++matched;

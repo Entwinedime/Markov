@@ -77,7 +77,6 @@ struct HiCachePathLookup {
     std::vector<std::string> topology_pages;
     std::vector<std::string> device_pages;
     std::vector<std::string> host_pages;
-    std::vector<std::string> storage_pages;
     std::vector<std::string> visible_pages;
     std::vector<HiCacheNodeId> topology_chain;
     std::vector<HiCacheNodeId> device_chain;
@@ -94,11 +93,19 @@ struct HiCacheInsertResult {
     uint64_t inserted_key_pages = 0;
     uint64_t page_aligned_key_pages = 0;
     std::vector<HiCacheNodeId> touched_nodes;
+    /** @brief Resident hits and newly created nodes, excluding restored device values. */
+    std::vector<HiCacheNodeId> hit_count_nodes;
     std::vector<HiCacheNodeId> new_device_nodes;
     std::vector<HiCacheNodeId> restored_device_nodes;
     /** @brief Nodes that changed from clean to dirty during this device insertion. */
     std::vector<HiCacheNodeId> dirtied_device_nodes;
     std::vector<HiCacheNodeId> new_host_nodes;
+};
+
+struct HiCacheDeviceInsertCursor {
+    size_t offset = 0;
+    HiCacheNodeId parent = 0;
+    HiCacheInsertResult result;
 };
 
 /**
@@ -157,9 +164,6 @@ public:
     [[nodiscard]] HiCacheCacheNode * mutable_node(HiCacheNodeId node_id);
 
 
-    /** @brief Reports whether a page belongs to the active radix topology. */
-    [[nodiscard]] bool contains_page(const std::string & page) const;
-
     /** @brief Resolves the active node that owns a page. */
     [[nodiscard]] std::optional<HiCacheNodeId> node_for_page(const std::string & page) const;
 
@@ -168,9 +172,6 @@ public:
 
     /** @brief Returns the root-to-terminal ancestor chain, excluding the root. */
     [[nodiscard]] std::vector<HiCacheNodeId> ancestor_node_ids(HiCacheNodeId terminal_node) const;
-
-    /** @brief Flattens compressed groups from root through the terminal node. */
-    [[nodiscard]] std::vector<std::string> flattened_pages(HiCacheNodeId terminal_node) const;
 
 
     /** @brief Looks up a page path and refreshes access order for matched nodes. */
@@ -185,15 +186,15 @@ public:
 
     /** @brief Inserts device residency and applies target priority and dirty state. */
     HiCacheInsertResult insert_device_path(const std::vector<std::string> & pages, int64_t priority, bool dirty);
+    /** Process only the next path node; callers may execute its write policy before continuing. */
+    std::optional<HiCacheInsertResult> insert_device_step(const std::vector<std::string> & pages, int64_t priority, bool dirty,
+                                                          HiCacheDeviceInsertCursor & cursor, std::optional<size_t> available_pages = std::nullopt);
 
     /** @brief Materializes a complete page path into host residency. */
     HiCacheInsertResult insert_host_path(const std::vector<std::string> & pages, bool storage_readable);
 
     /** @brief Materializes only node groups fully covered by `visible_pages`. */
     HiCacheInsertResult insert_host_path(const std::vector<std::string> & pages, const std::set<std::string> & visible_pages, bool storage_readable);
-
-    /** @brief Refreshes access order for capacity-victim selection. */
-    void touch_chain(const std::vector<HiCacheNodeId> & chain);
 
     /** @brief Adds one lock-reference count for an owner along a node chain. */
     void add_lock_ref(const std::vector<HiCacheNodeId> & chain, const std::string & owner);
@@ -212,9 +213,6 @@ public:
 
     /** @brief Removes device residency, optionally materializing a readable host backup. */
     void demote_device_to_host(HiCacheNodeId node_id, bool ensure_host);
-
-    /** @brief Removes ordinary device residency without changing host or storage state. */
-    void remove_device_regular(HiCacheNodeId node_id);
 
     /** @brief Removes a host leaf or subtree under SGLang eviction semantics. */
     [[nodiscard]] HiCacheHostEvictionResult evict_host_leaf(HiCacheNodeId node_id);

@@ -3,6 +3,7 @@
  * @brief Creates base DAG nodes and temporary identity indices.
  */
 #include "dag_builder_stages.hpp"
+#include <nlohmann/json.hpp>
 
 #include <ranges>
 #include <string_view>
@@ -22,7 +23,6 @@ class NodeIndexer {
 public:
     explicit NodeIndexer(DagGraph & graph) : graph_(graph) {
         index_.lane_to_nodes.reserve(256);
-        index_.raw_stream_to_lane.reserve(256);
         index_.stream_alias_to_lane.reserve(512);
         index_.device_sync_nodes.reserve(16);
         index_.notify_record_nodes.reserve(64);
@@ -45,6 +45,9 @@ private:
 
         if (identity.is_device) register_device_aliases(event, identity, lane_id);
         index_causality_identity(event, node_id, "connection_id", index_.connection_to_nodes);
+        if (event.has_arg_key_hint("enclosing_copy_connections"))
+            for (const auto & connection : nlohmann::json::parse(event.arg("enclosing_copy_connections")))
+                index_.connection_to_nodes[connection.get<std::string>()].push_back(node_id);
         index_causality_identity(event, node_id, "correlation_id", index_.correlation_to_nodes);
         classify_special_event(event, node_id);
     }

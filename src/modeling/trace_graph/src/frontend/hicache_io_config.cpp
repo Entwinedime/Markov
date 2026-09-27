@@ -14,6 +14,7 @@ namespace {
 
 std::map<std::string, HiCacheIoControlModelConfig> control_models(const Json & io_cost) {
     const auto models = io_cost.find("control_models");
+    if (models != io_cost.end() && models->is_object() && models->empty()) return {};
     if (models == io_cost.end() || !models->is_object() || models->size() != kIoKinds.size())
         throw std::runtime_error("hicache.io_cost.control_models must contain four families");
     std::map<std::string, HiCacheIoControlModelConfig> output;
@@ -56,12 +57,37 @@ HiCacheIoCostConfig parse_hicache_io_cost(const Json & object) {
     const auto raw = object.find("io_cost");
     if (raw == object.end()) return config;
     if (!raw->is_object()) throw std::runtime_error("hicache.io_cost must be an object");
-    require_exact_fields(*raw, "hicache.io_cost", { "storage_batch_pages", "service_models", "control_models", "resource_lanes" });
+    require_known_fields(*raw,
+                         "hicache.io_cost",
+                         { "storage_batch_pages",
+                           "service_models",
+                           "control_models",
+                           "resource_lanes",
+                           "empty_write_check_us",
+                           "locked_candidate_us",
+                           "locked_candidate_log2_heap_us" });
     config.storage_batch_pages = u64_value(*raw, "storage_batch_pages", 0);
     if (config.storage_batch_pages == 0) throw std::runtime_error("HiCache storage batch pages must be positive");
     config.service_models = parse_hicache_service_models(*raw);
     config.control_models = control_models(*raw);
     config.resource_lanes = resource_lanes(*raw);
+    for (const auto & [name, field] : std::vector<std::pair<std::string, std::optional<double> *>>{
+             { "empty_write_check_us", &config.empty_write_check_us },
+             {  "locked_candidate_us",  &config.locked_candidate_us }
+    }) {
+        if (!raw->contains(name)) continue;
+        if (!raw->at(name).is_number()) throw std::runtime_error("hicache.io_cost." + name + " must be a number");
+        const auto value = number_value(*raw, name, 0.0);
+        if (!std::isfinite(value) || value <= 0.0) throw std::runtime_error("hicache.io_cost." + name + " must be positive and finite");
+        *field = value;
+    }
+    if (raw->contains("locked_candidate_log2_heap_us")) {
+        const auto & slope = raw->at("locked_candidate_log2_heap_us");
+        if (!config.locked_candidate_us || !slope.is_number()) throw std::runtime_error("Locked-candidate heap cost requires a fixed cost and numeric slope");
+        config.locked_candidate_log2_heap_us = slope.get<double>();
+        if (!std::isfinite(config.locked_candidate_log2_heap_us) || config.locked_candidate_log2_heap_us < 0)
+            throw std::runtime_error("Locked-candidate heap slope must be finite and nonnegative");
+    }
     return config;
 }
 

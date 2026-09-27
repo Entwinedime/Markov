@@ -396,17 +396,13 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 observation.prefill_compute_duration_us = core::checked_add_u64(
                     observation.prefill_compute_duration_us, node.duration, "HiCache prefill compute duration exceeds uint64 range");
                 if (is_collective_node(event.name)) {
-                    ++observation.prefill_collective_node_count;
                     observation.prefill_collective_node_ids.push_back(node.id);
                     observation.prefill_collective_duration_us = core::checked_add_u64(observation.prefill_collective_duration_us,
                                                                                        node.duration,
                                                                                        "HiCache prefill collective duration exceeds uint64 range");
                 }
                 else {
-                    ++observation.prefill_kernel_node_count;
-                    observation.prefill_kernel_node_ids.push_back(node.id);
                     if (is_attention_node(event.name)) {
-                        ++observation.prefill_prefix_attention_node_count;
                         observation.prefill_prefix_attention_node_ids.push_back(node.id);
                         observation.prefill_prefix_attention_duration_us = core::checked_add_u64(
                             observation.prefill_prefix_attention_duration_us,
@@ -414,7 +410,6 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                             "HiCache prefill prefix-attention duration exceeds uint64 range");
                     }
                     else {
-                        ++observation.prefill_common_kernel_node_count;
                         observation.prefill_common_kernel_node_ids.push_back(node.id);
                         observation.prefill_common_kernel_duration_us = core::checked_add_u64(
                             observation.prefill_common_kernel_duration_us,
@@ -440,14 +435,12 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 observation.decode_compute_duration_us = core::checked_add_u64(
                     observation.decode_compute_duration_us, node.duration, "HiCache decode compute duration exceeds uint64 range");
                 if (is_collective_node(event.name)) {
-                    ++observation.decode_collective_node_count;
                     observation.decode_collective_node_ids.push_back(node.id);
                     observation.decode_collective_duration_us = core::checked_add_u64(observation.decode_collective_duration_us,
                                                                                       node.duration,
                                                                                       "HiCache decode collective duration exceeds uint64 range");
                 }
                 else {
-                    ++observation.decode_kernel_node_count;
                     observation.decode_kernel_node_ids.push_back(node.id);
                     auto & kernel_family = observation.decode_kernel_families[phase_family_name(event.name)];
                     ++kernel_family.node_count;
@@ -511,13 +504,11 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         auto & observation = audit.observations[owner->observation_index];
         ++audit.phase_owned_submit_cpu_node_count;
         if (owner->kind == PhaseKind::Prefill) {
-            ++observation.prefill_submit_cpu_node_count;
             observation.prefill_submit_cpu_node_ids.push_back(node_id);
             observation.prefill_submit_cpu_duration_us = core::checked_add_u64(
                 observation.prefill_submit_cpu_duration_us, node.duration, "HiCache prefill CPU duration exceeds uint64 range");
         }
         else {
-            ++observation.decode_submit_cpu_node_count;
             observation.decode_submit_cpu_node_ids.push_back(node_id);
             observation.decode_submit_cpu_duration_us = core::checked_add_u64(
                 observation.decode_submit_cpu_duration_us, node.duration, "HiCache decode CPU duration exceeds uint64 range");
@@ -543,68 +534,5 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     return audit;
 }
 
-patch::HiCacheIoOperationLedger mark_observed_hicache_scope(core::DagGraph & graph) {
-    graph.clear_scope_ownership();
-    const auto source = patch::HiCacheSourceDagIndex(graph);
-    const auto layer_waits = observe_hicache_layer_waits(source);
-    const auto phases = observe_hicache_phases(graph, &layer_waits);
-    const auto own_nodes = [&](const std::vector<size_t> & nodes) {
-        for (const auto node_id : nodes) graph.set_scope_node_owned(node_id);
-    };
-    for (const auto & phase : phases.observations) {
-        own_nodes(phase.prefill_common_kernel_node_ids);
-        own_nodes(phase.prefill_prefix_attention_node_ids);
-        own_nodes(phase.prefill_collective_node_ids);
-        own_nodes(phase.prefill_submit_cpu_node_ids);
-        own_nodes(phase.decode_kernel_node_ids);
-        own_nodes(phase.decode_collective_node_ids);
-        own_nodes(phase.decode_submit_cpu_node_ids);
-    }
-
-    auto operations = patch::build_hicache_io_operation_ledger(source);
-    std::map<size_t, std::vector<std::pair<uint64_t, uint64_t>>> gap_intervals;
-    const auto own_gaps = [&](const std::vector<patch::HiCacheCpuGapSlice> & slices) {
-        for (const auto & slice : slices) {
-            if (slice.owned_end_us > slice.owned_start_us)
-                gap_intervals[slice.owner_node_id].emplace_back(slice.owned_start_us, slice.owned_end_us);
-        }
-    };
-    for (const auto node_id : layer_waits.cpu_node_ids) graph.set_scope_node_owned(node_id);
-    for (const auto node_id : layer_waits.device_wait_node_ids) graph.set_scope_node_owned(node_id);
-    for (const auto & call : layer_waits.calls) if (call.issue.empty()) own_gaps(call.cpu.owned_gap_slices);
-    for (const auto & operation : operations.records) {
-        own_nodes(operation.runtime_node_ids);
-        own_nodes(operation.admission_explicit_node_ids);
-        own_nodes(operation.terminal_control_node_ids);
-        own_nodes(operation.device_transfer_node_ids);
-        own_nodes(operation.device_completion_node_ids);
-        own_nodes(operation.readiness_join_node_ids);
-        own_nodes(operation.completion_wait_owned_node_ids);
-        own_gaps(operation.cpu_gap_slices);
-        // The operation ledger deliberately separates explicit admission children
-        // from Python wrapper self-time and idle slices.  Only the former is active
-        // Direct control, together with the explicit terminal-check children;
-        // wrapper/probe overhead remains residual Gap.
-    }
-    for (auto & [node_id, intervals] : gap_intervals) {
-        std::ranges::sort(intervals);
-        uint64_t total = 0;
-        uint64_t begin = 0;
-        uint64_t end = 0;
-        bool active = false;
-        for (const auto & interval : intervals) {
-            if (!active || interval.first > end) {
-                if (active) total = core::checked_add_u64(total, end - begin, "HiCache scope gap duration exceeds uint64 range");
-                begin = interval.first;
-                end = interval.second;
-                active = true;
-            }
-            else end = std::max(end, interval.second);
-        }
-        if (active) total = core::checked_add_u64(total, end - begin, "HiCache scope gap duration exceeds uint64 range");
-        graph.add_scope_gap_duration(node_id, total);
-    }
-    return operations;
-}
 
 } // namespace markov::trace_graph::modules::hicache

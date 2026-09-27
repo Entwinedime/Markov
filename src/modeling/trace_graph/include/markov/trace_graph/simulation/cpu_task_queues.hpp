@@ -1,4 +1,5 @@
-/** @file Source task identities; queue order is resolved during full simulation. */
+/** @file Source task identities shared by template observation and simulation.
+ * Queue order is resolved during full simulation, never copied from a donor. */
 #pragma once
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include <vector>

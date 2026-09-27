@@ -36,7 +36,6 @@ struct DagBuildIndex {
     std::unordered_map<std::string, std::vector<size_t>> correlation_to_nodes;
     std::unordered_map<std::string, std::vector<size_t>> connection_to_nodes;
     std::unordered_map<std::string, std::vector<DagEventRecord>> event_id_to_records;
-    std::unordered_map<std::string, size_t> raw_stream_to_lane;
     std::unordered_map<std::string, size_t> stream_alias_to_lane;
     std::vector<size_t> event_record_nodes;
     std::vector<size_t> event_wait_nodes;
@@ -58,9 +57,7 @@ void add_sequential_edges(DagGraph & graph, DagBuildIndex & index);
 void add_event_wait_edges(DagGraph & graph, DagBuildIndex & index);
 void add_notify_wait_edges(DagGraph & graph, DagBuildIndex & index);
 void add_model_execute_edges(DagGraph & graph, DagBuildIndex & index);
-void add_stream_sync_edges(DagGraph & graph, DagBuildIndex & index);
-void add_event_sync_edges(DagGraph & graph, DagBuildIndex & index);
-void add_device_sync_edges(DagGraph & graph, DagBuildIndex & index);
+void add_sync_edges(DagGraph & graph, DagBuildIndex & index);
 void finalize_sync_nodes(DagGraph & graph, const DagBuildIndex & index);
 void normalize_cpu_queue_waits(DagGraph & graph);
 

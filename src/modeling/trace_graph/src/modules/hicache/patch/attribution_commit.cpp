@@ -18,7 +18,7 @@ using model::HiCacheEffectDecision;
 using model::HiCacheSourceCarrierState;
 
 bool role_contract_available(const HiCacheSourceDagIndex & source, std::string_view role) {
-    return source.stats().dag_patch_contract_ready || !source.nodes_for_fact_role(role).empty();
+    return source.graph().has_input_contract("hicache_dag_patch") || !source.nodes_for_fact_role(role).empty();
 }
 
 namespace {

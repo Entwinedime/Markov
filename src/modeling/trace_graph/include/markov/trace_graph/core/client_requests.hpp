@@ -22,12 +22,15 @@ struct ClientRequestNodes {
 struct ClientRequestChain {
     std::string status = "missing_requests";
     std::vector<ClientRequestNodes> requests;
+    /** Source workload proves quiescence from this barrier through its formal start. */
+    std::optional<uint64_t> hicache_idle_since_us;
 };
 
 /** Attach only after every serial request has unique, ordered source boundaries.
  * Costs are measured source frontend/response/client work, never target labels.
  * Existing server work and residual waits remain; this does not certify accuracy.
  */
-[[nodiscard]] ClientRequestChain connect_client_requests(DagGraph & graph, std::span<const ClientRequestTiming> requests);
+[[nodiscard]] ClientRequestChain connect_client_requests(DagGraph & graph, std::span<const ClientRequestTiming> requests,
+                                                        std::optional<uint64_t> hicache_idle_since_us = std::nullopt);
 
 } // namespace markov::trace_graph::core

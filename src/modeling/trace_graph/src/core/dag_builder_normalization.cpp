@@ -7,10 +7,12 @@
 #include <algorithm>
 #include <map>
 #include <numeric>
+#include <nlohmann/json.hpp>
 #include <ranges>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace markov::trace_graph::core {
@@ -24,7 +26,9 @@ using dag_builder_detail::resolve_event_lane;
 class EventNormalizer {
 public:
     EventNormalizer(std::vector<TraceEvent> events, std::span<const TraceEvent> observations)
-        : events_(std::move(events)), dropped_(events_.size(), false), observations_(observations) {}
+        : events_(std::move(events)),
+          dropped_(events_.size(), false),
+          observations_(observations) {}
 
     [[nodiscard]] std::vector<TraceEvent> run() {
         build_event_order();
@@ -185,8 +189,7 @@ private:
      * executable graph nodes rather than nested CPU call frames. Semantic HiCache
      * facts are separated before normalization and do not enter this executable path.
      */
-    [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events,
-                                                                 std::span<const TraceEvent> observations) {
+    [[nodiscard]] static std::vector<TraceEvent> retain_cpu_leaves(std::vector<TraceEvent> events, std::span<const TraceEvent> observations) {
         auto lanes = build_lane_index(events);
         LeafSelection selection(events.size());
         for (auto & [lane, lane_events] : lanes) {
@@ -194,6 +197,7 @@ private:
             if (!lane_events.has_cpu) continue;
             mark_lane_leaves(events, lane_events.indices, selection);
         }
+        retain_nested_copy_connections(events, lanes, selection);
 
         std::vector<TraceEvent> result;
         result.reserve(events.size());
@@ -219,14 +223,57 @@ private:
         return result;
     }
 
+    // A device copy can name its enclosing operator's connection rather than
+    // the nested memcpy API's. Removing the CPU wrapper must not orphan that
+    // copy. Only a unique contained memcpy leaf proves this correspondence.
+    static void retain_nested_copy_connections(std::vector<TraceEvent> & events,
+                                                const std::unordered_map<std::string, LaneEvents> & lanes,
+                                                const LeafSelection & selection) {
+        std::unordered_set<std::string> copy_connections;
+        for (const auto & event : events)
+            if (event.name == "MEMCPY_ASYNC" && resolve_event_lane(event, false).is_device) {
+                const auto connection = event.arg("connection_id");
+                if (!connection.empty()) copy_connections.insert(connection);
+            }
+        for (const auto & [lane, items] : lanes) {
+            if (!items.has_cpu) continue;
+            for (const auto parent_id : items.indices) {
+                if (selection.is_leaf[parent_id] || selection.discarded[parent_id]) continue;
+                const auto & parent = events[parent_id];
+                const auto connection = parent.arg("connection_id");
+                if (!copy_connections.contains(connection)) continue;
+                std::optional<size_t> submit;
+                bool ambiguous = false;
+                auto begin = std::ranges::lower_bound(items.indices, parent.ts, {}, [&](size_t id) { return events[id].ts; });
+                for (auto it = begin; it != items.indices.end() && events[*it].ts <= node_end_ts(parent); ++it) {
+                    const auto id = *it;
+                    const auto & child = events[id];
+                    if (!selection.is_leaf[id] || selection.discarded[id]
+                        || (child.name != "AscendCL@aclrtMemcpyAsync" && child.name != "AscendCL@aclrtMemcpy2dAsync")) continue;
+                    if (submicro_timestamp(child) < submicro_timestamp(parent)
+                        || submicro_timestamp(child) + submicro_duration(child) > submicro_timestamp(parent) + submicro_duration(parent)) continue;
+                    if (submit) { ambiguous = true; break; }
+                    submit = id;
+                }
+                if (!submit || ambiguous || events[*submit].arg("connection_id") == connection) continue;
+                auto & child = events[*submit];
+                const auto existing = child.arg("enclosing_copy_connections");
+                auto aliases = existing.empty() ? nlohmann::json::array() : nlohmann::json::parse(existing);
+                if (std::find(aliases.begin(), aliases.end(), nlohmann::json(connection)) == aliases.end()) aliases.push_back(connection);
+                child.set_arg("enclosing_copy_connections", aliases.dump());
+            }
+        }
+    }
+
     // These are generated remainders, not measured CPU instructions. A call
     // boundary may subdivide them, but must not remove time or split real leaves.
-    static void partition_control_self_time(std::vector<TraceEvent> & remainders,
-                                             std::span<const TraceEvent> observations) {
+    static void partition_control_self_time(std::vector<TraceEvent> & remainders, std::span<const TraceEvent> observations) {
         std::map<std::pair<std::string, std::string>, std::vector<uint64_t>> boundaries;
         for (const auto & call : observations) {
-            if (call.name != "runtime.cpu_collective" || call.dur == 0) continue;
-            auto & times = boundaries[{call.pid, call.tid}];
+            if (call.name != "runtime.cpu_collective" && call.name != "runtime.hicache.prefetch_check" && call.name != "runtime.hicache.prefetch_stop"
+                && call.name != "runtime.hicache.prefetch_enqueue")
+                continue;
+            auto & times = boundaries[{ call.pid, call.tid }];
             times.push_back(call.ts);
             times.push_back(node_end_ts(call));
         }
@@ -236,11 +283,10 @@ private:
         }
         std::vector<TraceEvent> pieces;
         for (auto & remainder : remainders) {
-            const auto found = boundaries.find({remainder.pid, remainder.tid});
+            const auto found = boundaries.find({ remainder.pid, remainder.tid });
             if (found == boundaries.end()) continue;
             const auto end = node_end_ts(remainder);
-            for (auto cut = std::ranges::upper_bound(found->second, remainder.ts);
-                 cut != found->second.end() && *cut < end; ++cut) {
+            for (auto cut = std::ranges::upper_bound(found->second, remainder.ts); cut != found->second.end() && *cut < end; ++cut) {
                 auto piece = remainder;
                 piece.dur = *cut - remainder.ts;
                 pieces.push_back(std::move(piece));
@@ -413,7 +459,23 @@ private:
 } // namespace
 
 std::vector<TraceEvent> normalize_events(std::vector<TraceEvent> events, std::span<const TraceEvent> runtime_observations) {
-    return EventNormalizer(std::move(events), runtime_observations).run();
+    std::vector<TraceEvent> heads;
+    std::erase_if(events, [&](auto & event) {
+        if (event.source_channel != TraceSourceChannel::Synthetic || event.name != "formal_window.cpu_begin") return false;
+        heads.push_back(std::move(event));
+        return true;
+    });
+    auto normalized = EventNormalizer(std::move(events), runtime_observations).run();
+    // A candidate must not participate in leaf selection: a zero-duration
+    // child could otherwise discard a real call crossing the window cut.
+    for (auto & head : heads) {
+        const auto covered = std::ranges::any_of(normalized, [&](const auto & event) {
+            return event.pid == head.pid && event.tid == head.tid && event.ts <= head.ts;
+        });
+        if (!covered) normalized.push_back(std::move(head));
+    }
+    if (!heads.empty()) std::ranges::stable_sort(normalized, {}, &TraceEvent::ts);
+    return normalized;
 }
 
 } // namespace markov::trace_graph::core
