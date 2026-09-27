@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...modeling.workload import WorkloadWindow
 from ..io_model_contract import OPERATION_KINDS
 from ..validations.final_dag.shape_compare import compare_shape
 from ..validations.hicache.phase.score import PHASE_DELTA_MATERIAL_THRESHOLD_US, compare_phase_work
+from .http_metrics import http_gates, http_metrics, score_http
 
 
 def observed_direct_cost(row: dict[str, Any]) -> tuple[int, int]:
@@ -22,12 +24,6 @@ def observed_direct_cost(row: dict[str, Any]) -> tuple[int, int]:
     return service, control
 
 
-def direct_total(run: dict[str, Any]) -> int:
-    """Executed service and intrinsic control; storage retains its declared clock."""
-
-    return sum(sum(observed_direct_cost(row)) for row in run["source_io_observations"]["observations"])
-
-
 def direct_by_kind(run: dict[str, Any]) -> dict[str, dict[str, int]]:
     result = {kind: {"service_us": 0, "control_us": 0} for kind in OPERATION_KINDS}
     for row in run["source_io_observations"]["observations"]:
@@ -39,13 +35,47 @@ def direct_by_kind(run: dict[str, Any]) -> dict[str, dict[str, int]]:
 
 
 def score_cell(
-    prediction: dict, run: dict, observed: dict, oracle: dict, target_run_id: str, *, include_oracle_costs: bool = False
+    prediction: dict,
+    run: dict,
+    observed: dict,
+    oracle: dict,
+    target_run_id: str,
+    *,
+    include_oracle_costs: bool = False,
+    source_windows: tuple[WorkloadWindow | None, ...] = (),
+    target_windows: tuple[WorkloadWindow | None, ...] = (),
 ) -> dict:
+    result = {
+        **{key: value for key, value in prediction.items() if key not in {"shape", "target_hicache"}},
+        "target_run_id": target_run_id,
+        "target_observation_used": True,
+        "full_e2e": score_http(run, source_windows, target_windows),
+    }
+
+    if "execution" in prediction:
+        if include_oracle_costs:
+            raise ValueError("execution cost replay requires target operation mapping")
+        unavailable = {"status": "unavailable_execution_projection"}
+        return {
+            **result,
+            "structure_exact": None,
+            "shape_score": unavailable,
+            "phase_structure_exact": None,
+            "phase_score": {
+                **unavailable,
+                "cost": {"ready": False, "metrics": {}},
+                "gap_excluded_scope": {"ready": False},
+            },
+            "direct": None,
+        }
+
     shape = compare_shape(prediction["shape"], oracle)
     phase = compare_phase_work(run, observed, include_oracle_costs=include_oracle_costs)
     totals = prediction["target_predicted"]["totals"]
-    predicted, target, base = totals["service_us"] + totals["control_us"], direct_total(observed), direct_total(run)
     source_kinds, target_kinds = direct_by_kind(run), direct_by_kind(observed)
+    predicted = totals["service_us"] + totals["control_us"]
+    target = sum(sum(cost.values()) for cost in target_kinds.values())
+    base = sum(sum(cost.values()) for cost in source_kinds.values())
     by_kind = {}
     for kind in OPERATION_KINDS:
         projected = prediction["target_predicted"]["by_kind"][kind]
@@ -61,25 +91,32 @@ def score_cell(
         }
     component_error = sum(item["absolute_error_us"] for item in by_kind.values())
     return {
-        **{key: value for key, value in prediction.items() if key not in {"shape", "target_hicache"}},
-        "target_run_id": target_run_id, "target_observation_used": True,
-        "structure_exact": shape["acceptance_ready"], "shape_score": shape,
-        "phase_structure_exact": phase["structure_exact"], "phase_score": phase,
-        "direct": {"predicted_us": predicted, "target_us": target, "base_us": base,
-                   "absolute_error_us": abs(predicted - target), "ape": abs(predicted - target) / target if target else None,
-                   "component_absolute_error_us": component_error,
-                   "component_ape": component_error / target if target else None,
-                   "target_delta_us": target - base, "by_kind": by_kind},
+        **result,
+        "structure_exact": shape["acceptance_ready"],
+        "shape_score": shape,
+        "phase_structure_exact": phase["structure_exact"],
+        "phase_score": phase,
+        "direct": {
+            "predicted_us": predicted,
+            "target_us": target,
+            "base_us": base,
+            "absolute_error_us": abs(predicted - target),
+            "ape": abs(predicted - target) / target if target else None,
+            "component_absolute_error_us": component_error,
+            "component_ape": component_error / target if target else None,
+            "target_delta_us": target - base,
+            "by_kind": by_kind,
+        },
     }
 
 
 def score_metrics(rows: list[dict]) -> dict:
-    """Keep the established gates and per-cell percentile units, including missing evidence."""
+    """Full HTTP plus retained scope/component gates; missing cells cannot pass."""
 
     scope = _gap_excluded_scope_metrics(rows)
     phase = _phase_cost_metrics(rows)
     delta = _phase_delta_metrics(rows)
-    values = [row["direct"] for row in rows]
+    values = [row["direct"] for row in rows if row["direct"] is not None]
     apes = sorted(row["ape"] for row in values if row["ape"] is not None)
     total = sum(row["target_us"] for row in values)
     error = sum(row["absolute_error_us"] for row in values)
@@ -94,43 +131,66 @@ def score_metrics(rows: list[dict]) -> dict:
         kind_apes = sorted(item["ape"] for item in items if item["ape"] is not None)
         by_kind[kind] = {
             "wape": kind_error / kind_total if kind_total else None,
-            "p90_ape": kind_apes[min(len(kind_apes) - 1, int(.9 * len(kind_apes)))] if kind_apes else None,
-            "absolute_error_us": kind_error,
-            "target_total_us": kind_total,
+            "p90_ape": kind_apes[min(len(kind_apes) - 1, int(0.9 * len(kind_apes)))] if kind_apes else None,
+            "absolute_error_us": kind_error if items else None,
+            "target_total_us": kind_total if items else None,
         }
-    direct = {"wape": error / total if total else None,
-              "p90_ape": apes[min(len(apes) - 1, int(.9 * len(apes)))] if apes else None,
-              "noncancelling_component_wape": component_error / total if total else None,
-              "noncancelling_component_p90_ape": component_apes[
-                  min(len(component_apes) - 1, int(.9 * len(component_apes)))
-              ] if component_apes else None,
-              "component_absolute_error_us": component_error,
-              "within_cell_component_cancellation_us": component_error - error,
-              "delta_weighted_l1": error / change if change else None, "absolute_error_us": error,
-              "zero_target_count": len(values) - len(apes), "by_kind": by_kind}
+    direct = {
+        "wape": error / total if total else None,
+        "cell_count": len(values),
+        "expected_cell_count": len(rows),
+        "status": "available" if rows and len(values) == len(rows) else "incomplete",
+        "p90_ape": apes[min(len(apes) - 1, int(0.9 * len(apes)))] if apes else None,
+        "noncancelling_component_wape": component_error / total if total else None,
+        "noncancelling_component_p90_ape": component_apes[min(len(component_apes) - 1, int(0.9 * len(component_apes)))]
+        if component_apes
+        else None,
+        "component_absolute_error_us": component_error if values else None,
+        "within_cell_component_cancellation_us": component_error - error if values else None,
+        "delta_weighted_l1": error / change if change else None,
+        "absolute_error_us": error if values else None,
+        "zero_target_count": len(values) - len(apes),
+        "by_kind": by_kind,
+    }
 
     def within(value, maximum):
         return value is not None and value <= maximum
 
+    http = http_metrics(rows)
     gates = {
-        "structure": bool(rows) and all(row["status"] == "READY" and row["structure_exact"]
-                                        and row["phase_structure_exact"] for row in rows),
-        "scope": scope["cell_count"] == len(rows) and within(scope["wape"], .03) and within(scope["p90_ape"], .05),
+        **http_gates(http),
+        "structure": bool(rows)
+        and all(row["status"] == "READY" and row["structure_exact"] and row["phase_structure_exact"] for row in rows),
+        "scope": scope["cell_count"] == len(rows) and within(scope["wape"], 0.03) and within(scope["p90_ape"], 0.05),
         "phase": all(row["phase_score"]["cost"]["ready"] for row in rows)
-                 and all(phase.get(name, {}).get("cell_count") == len(rows)
-                     and within(phase.get(name, {}).get("wape"), .015)
-                     and within(phase.get(name, {}).get("cell_p90_ape"), .03)
-                     for name in ("prefill_compute", "decode_compute", "combined_compute")),
-        "phase_delta": delta["cell_count"] == len(rows) and within(delta["weighted_l1"], .02)
-                       and delta["large_change_direction_accuracy"] in (None, 1),
-        "direct": direct["zero_target_count"] == 0 and within(direct["wape"], .03)
-                  and within(direct["p90_ape"], .05)
-                  and within(direct["noncancelling_component_wape"], .03)
-                  and within(direct["noncancelling_component_p90_ape"], .05)
-                  and within(direct["delta_weighted_l1"], .03),
+        and all(
+            phase.get(name, {}).get("cell_count") == len(rows)
+            and within(phase.get(name, {}).get("wape"), 0.015)
+            and within(phase.get(name, {}).get("cell_p90_ape"), 0.03)
+            for name in ("prefill_compute", "decode_compute", "combined_compute")
+        ),
+        "phase_delta": delta["cell_count"] == len(rows)
+        and within(delta["weighted_l1"], 0.02)
+        and delta["large_change_direction_accuracy"] in (None, 1),
+        "direct": bool(rows)
+        and len(values) == len(rows)
+        and direct["zero_target_count"] == 0
+        and within(direct["wape"], 0.03)
+        and within(direct["p90_ape"], 0.05)
+        and within(direct["noncancelling_component_wape"], 0.03)
+        and within(direct["noncancelling_component_p90_ape"], 0.05)
+        and within(direct["delta_weighted_l1"], 0.03),
     }
-    return {"status": "PASS" if all(gates.values()) else "MODEL_LIMITATION", "cell_count": len(rows),
-            "gates": gates, "scope": scope, "phase": phase, "phase_delta": delta, "direct": direct}
+    return {
+        "status": "PASS" if all(gates.values()) else "MODEL_LIMITATION",
+        "cell_count": len(rows),
+        "gates": gates,
+        "full_e2e": http,
+        "scope": scope,
+        "phase": phase,
+        "phase_delta": delta,
+        "direct": direct,
+    }
 
 
 def _phase_cost_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -147,17 +207,19 @@ def _phase_cost_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
             for row in rows
             if row.get("phase_modeled") is True and name in row["phase_score"]["cost"]["metrics"]
         ]
-        target_total = sum(int(item.get("target_total_us") or 0) for item in metrics)
-        weighted_l1 = sum(int(item.get("weighted_l1_us") or 0) for item in metrics)
+        metrics = [item for item in metrics if item["sample_count"] > 0]
+        target_total = sum(int(item["target_total_us"]) for item in metrics)
+        weighted_l1 = sum(int(item["weighted_l1_us"]) for item in metrics)
         p90_values = sorted(float(item["p90_ape"]) for item in metrics if item.get("p90_ape") is not None)
         result[name] = {
             "cell_count": len(metrics),
-            "wape": weighted_l1 / max(target_total, 1),
+            "wape": weighted_l1 / max(target_total, 1) if metrics else None,
             "cell_p90_ape": p90_values[min(len(p90_values) - 1, int(0.9 * len(p90_values)))] if p90_values else None,
-            "weighted_l1_us": weighted_l1,
-            "target_total_us": target_total,
+            "weighted_l1_us": weighted_l1 if metrics else None,
+            "target_total_us": target_total if metrics else None,
         }
     return result
+
 
 def _gap_excluded_scope_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     values = [
@@ -177,6 +239,7 @@ def _gap_excluded_scope_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "target_total_us": target_total if values else None,
         "target_opened_after_prediction": True,
     }
+
 
 def _phase_delta_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
     values = [
