@@ -53,6 +53,11 @@ base profile + 一组 target 配置
 资源顺序由操作计划统一给出：先是执行的 stream，再是等待的 stream；同一资源重复出现时不能去重，
 显式 event completion 则另外绑定。main、worker、设备服务与 residual gap 也不能合并为一个成本。
 
+当前全流程重构正在实施，尚未统一验收：源片段替换结束后，再统一观察保留下来的 worker 队列，
+加载、层等待、写完成确认与写入共用这份资源依据。各组件不在删除中间片段后分别认定最终队列。
+候选分支的资源不足仍在目标实际需要时报告；已确定执行的调用则立即要求可用资源。
+本轮进展与统一检查安排见 [重构计划](tmp/end_to_end_refactor_plan_20260927.md)。
+
 ### 输入来源
 
 profiling 与 modeling 只通过 `profile_manifest.json` 交接，不扫描目录猜输入。
