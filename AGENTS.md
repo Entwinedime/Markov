@@ -65,7 +65,7 @@
 - 使用 C++23、CMake 3.20 及以上，保持关闭编译器语言扩展；新增源文件必须加入所属 CMake target。
 - 使用仓库 `.clang-format`：4 空格、禁止 Tab、160 列；不得用个人 LLVM/Google 默认样式覆盖项目配置。
 - 类型沿用 `PascalCase`，函数和变量沿用 `snake_case`，私有成员沿用后缀 `_`；修改已有接口时保持兼容的命名风格，不做无关批量更名。
-- 公共头文件放在 `include/markov/trace_graph/` 对应层级，实现放在 `src/`；内部辅助头保留在实现目录。头文件使用 `#pragma once`，直接包含所用类型的声明头，不依赖偶然的传递包含。
+- TraceGraph 头文件统一放在 `include/markov/trace_graph/` 对应层级，内部辅助头也不与实现混放；实现放在 `src/`。统一使用从 include 根开始的完整引用路径；目录位置不改变接口的内部/公开属性。头文件使用 `#pragma once`，直接包含所用类型的声明头，不依赖偶然的传递包含。
 - 沿用 `markov::trace_graph` 及所属模块命名空间；头文件不得使用 `using namespace`。非公开辅助实现放入匿名或专用 detail 命名空间。
 - 使用 RAII 和明确所有权；优先值语义、容器及 `std::unique_ptr`，仅在确有共享所有权时使用 `std::shared_ptr`。裸指针、引用和 `std::string_view` 不得超出被引用对象的生命周期。
 - 不修改的对象使用 `const`；只读大对象优先常量引用。只读字符串视图不得保存对临时字符串的引用；注意容器扩容导致的引用和迭代器失效。
@@ -96,13 +96,13 @@
 
 从仓库根目录执行，与修改范围匹配。先运行小范围语义检查，再进行必要的构建或关键 cell 验证；不得以旧产物代替当前工作树结果。
 
-### 测试代码保持最少
+### 不维护独立测试文件
 
-- **默认不新增测试代码**：普通修改优先使用现有测试、静态检查、构建和必要的实际运行验证；不得为每次改动惯例性增加测试文件、测试入口、mock 框架或验证脚本。
-- 仅在用户明确要求，或存在现有验证无法覆盖的重要行为风险时，新增最小的语义测试；说明其验证的具体风险。不得为简单封装、字段转发、显然的标准库行为或纯格式改动编写测试。
-- 不编写镜像实现、重复断言、只检查源码文本或私有调用顺序的测试；不追求测试数量和覆盖率数字，不构造庞大夹具来验证简单逻辑。
-- 临时排查脚本和中间 proof output 不进入正式代码；相关改动使测试失效或重复时一并精简。保留仍有实际价值的行为验证，不做无关的批量删除。
-- 验证达到所需证据后停止；没有新改动、失败或未解决风险时，不反复运行或扩大测试范围。
+- 按用户要求，自有 Shell、Python、C++ 模块不保留独立测试脚本、test_*.py、测试夹具、C++ 测试程序或 CTest target；不把被删测试改名放回其他目录。
+- 不新增或恢复独立测试文件，除非用户再次明确要求。使用静态检查、正式程序构建和少量真实输入的公开入口运行验证修改。
+- 正式输入校验、数据隔离、DAG 安全检查、独立评分和显式静态成本回放属于产品能力，不作为测试代码删除。
+- 第三方测试与历史实验资产不在本项源码清理范围。历史测试通过记录仅描述当时验证，不作为当前可运行入口。
+- 达到所需证据后停止；没有新改动、失败或未解决风险时，不反复运行或扩大检查范围。
 
 ### 静态检查
 
@@ -120,14 +120,8 @@ Python 全量 lint 的现有入口为 `python3 -m ruff check scripts src/profili
 
 ### Python 行为检查
 
-优先运行修改模块旁的现有 `unittest`，例如：
-
-```bash
-PYTHONPATH=src:scripts/internal:src/profiling/python_probe python3 -m unittest \
-  profiling.test_profiler_clock markov_internal.modeling.test_backend
-```
-
-确有必要新增测试时，只验证本次涉及的关键外部行为或业务不变量，不扩成穷举式边界检查套件。纯文档改动无需新增测试，也无需运行设备采集或全量业务测试。
+运行改动涉及的公开入口，使用适用的已有真实输入或 dry-run 检查参数与流程；dry-run 不证明实际执行成功。
+不得为替代被删测试而新建测试模块、mock 框架或持久验证脚本。纯文档改动不需要设备采集或业务运行。
 
 ### C++ 构建与语义检查
 
@@ -138,14 +132,16 @@ scripts/run.sh modeling -- bash -lc \
   'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-release -G Ninja -DCMAKE_BUILD_TYPE=Release -DTRACE_GRAPH_DEBUG=OFF && cmake --build build/modeling/trace_graph-release --target trace_graph -j2'
 ```
 
-修改 DAG、HiCache 或时序语义时，再执行显式 validation 构建及相关检查：
+修改 DAG、HiCache 或时序语义时，再执行显式 validation 构建，并按风险选择实际输入验证：
 
 ```bash
 scripts/run.sh modeling -- bash -lc \
-  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTRACE_GRAPH_DEBUG=ON && cmake --build build/modeling/trace_graph-validation --target trace_graph trace_timing_check hicache_io_logic_check -j2 && build/modeling/trace_graph-validation/trace_timing_check && build/modeling/trace_graph-validation/hicache_io_logic_check'
+  'cmake -S src/modeling/trace_graph -B build/modeling/trace_graph-validation -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTRACE_GRAPH_DEBUG=ON && cmake --build build/modeling/trace_graph-validation --target trace_graph -j2'
 ```
 
-这两个检查目标为 `EXCLUDE_FROM_ALL`，普通默认构建不会执行它们；当前不应将单独运行 `ctest` 视为完成验证。涉及构建配置或大型 C++ 重构时，使用新的构建目录完成 clean Release/validation 验证。hook 改动按目标框架使用现有 `scripts/build.sh` 与 `scripts/internal/hooks/build.sh` 流程验证。
+不再提供独立 C++ 测试或 CTest 目标；validation 构建用于正式诊断与静态成本回放，不是测试工程。
+大型实现重构或编译设置变化时用新目录完成 clean Release/validation 构建；仅移除测试 target 时可重新配置已有构建目录并构建正式目标。
+hook 改动按目标框架使用现有 `scripts/build.sh` 与 `scripts/internal/hooks/build.sh` 流程验证。
 
 模型或公式修改后按项目约束运行少量语义关键 cell；cost 简化前后使用同一组 cell。最终 60-cross 仅在公式固定后运行，不作为普通改动的默认检查。环境、设备或数据不足时说明未验证的范围。
 

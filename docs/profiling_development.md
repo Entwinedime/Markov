@@ -71,7 +71,7 @@ Ascend 长 trace 的导出峰值内存可能远高于采集阶段。可在实验
 `SGLANG_NPU_PROFILER_SERIAL_EXPORT=1`，只将采集停止后的 NPU 导出回调按 rank 串行执行；
 不改变正式请求、采样窗口或模型参数。该开关适用于当前 scheduler profiler，默认关闭。
 长 trace 实验同时设置 `profiling.torch.strict_stop=true`，并按串行导出总时长配置 `stop_timeout_sec`；
-本轮 TP=2/4 泛化实验使用 14400 秒上限，不代表预期每次需要四小时。导出不与重型 DAG 建模并发。
+09-14 的 TP=2/4 泛化实验使用 14400 秒上限，不代表预期每次需要四小时。导出不与重型 DAG 建模并发。
 默认宽松停止模式可能把 API 超时保存为 `profile_stop_response.json` 的 warning，因此 manifest completed
 及 trace 文件存在均不能替代文件完整性和下游设备/phase 语义检查。不完整导出优先从保留的原始数据离线恢复，不能当作成本误差拟合。
 
@@ -433,7 +433,7 @@ DMA 校准使用 `scripts/model.sh calibrate-hicache runtime-dma`，只输出设
 `--dry-run` 成功但没有 trace：这是正常的；它只展开配置和命令。
 
 Python probe 出现大 gap：先确认使用当前 snapshot-free catalog，再做同配置的 timing/off 对照。
-完整 E2E 开发正在把可识别的同步等待改为依赖；剩余未知时间仍保留，不能因为尚未归属就直接删除。
+可识别的部分同步等待已改为依赖；剩余未知时间仍保留，不能因为尚未归属就直接删除。当前覆盖与限制见工作进展。
 
 设备缓存释放的观测分两层：原有 `device_release_backup/regular` 标记整段调用，新增 `runtime.hicache.allocator_free` 只在这两种调用内部记录 paged/token allocator 的 free 区间。字段包括所属释放分支、token 数、页大小、是否立即回收及 need_sort；只读取 tensor.numel 和 Python 标量，不读取索引内容、不做 snapshot 或设备同步。释放之外的 allocator.free 不输出事件，异常仍原样抛出。
 

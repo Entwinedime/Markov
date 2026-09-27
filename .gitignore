@@ -27,6 +27,7 @@ data/tmp/**
 data/traces/raw/**
 data/traces/merged/**
 data/traces/dag/**
+export_only_prof_dir
 
 # ppts
 ppts

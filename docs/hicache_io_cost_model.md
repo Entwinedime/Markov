@@ -14,6 +14,11 @@ load submission 和 layer wait 的共享操作成本；不能将原始 profiler 
 同时保留每个 rank 首次观察到的本地提前返回成本；这条分支在策略判断之前执行，不能借活跃等待成本代替。
 缺少预取查询依据时，可用 `--operation prefetch_query` 从独立 trace 导出首个完整查询，
 供整组复用。查询局部区间仍保留观测墙钟包络；不能把配对修正文件存在等同于全部开销已分离。
+只有执行事实中存在预取候选时才要求查询成本；最终命中为空也需要查询，但没有候选时不读取查询校准或触发补采。
+缺少 base 查询片段时现已报告可补采的查询成本需求。先从组内已声明、经环境准入且有配对 CPU 修正的
+预取等待校准来源重新导出查询成本；无此来源再使用共享三阶段实验。导出失败不发布索引，也不静默启动
+新采集绕过错误。成功后才重建组模型，一次准备不会反复重采同一需求。已有来源的真实数据复用已验证，
+无来源时的新增设备补采分支尚待验收。
 独立操作成本导出与 I/O 观测共用全部受控请求的时间范围，包括准备请求，但不包含服务器启动。
 这是校准取数范围，不改变 base 预测或 target 评分的正式窗口；缺少本地返回成本时，执行报告对应补采需求。
 可重复 `--operation` 只导出所缺操作；不指定时保持 load index、load submission、layer wait 三类。
@@ -54,6 +59,11 @@ scripts/model.sh export-hicache-operation-costs \
 每个操作在临时目录完成提取和成本整理后才发布最终文件；失败不会留下可被恢复流程误认作成功的半成品。
 重复导出使用当前实现计算所选操作，并在成功后原子替换其成本文件；失败保留此前完整文件，但命令仍失败。
 组恢复复用原始测量，不以已有导出文件作为跳过当前计算的依据；未选操作及原始采集保持不变。
+同组内复用按实际 template/config_specs 内容、成功状态和采集阶段匹配，不再额外要求账本中的
+校准点名称相同；轻量回放仍须绑定对应完整采集的 token bundle。名称不是成本适用性的证明，
+这也不扩大到任意跨环境或跨实验复用。
+DMA 原始补采按方向覆盖关系复用：测过 H2D 和 D2H 的同一实验可以满足仅缺其中一个方向的需求，
+反过来不行。设备/NUMA、页大小、操作规模、重复设置和报告来源仍须匹配，不把未测方向视为已有成本。
 `prefetch_wait.json` 按其中的 `source_policy` 放入组级 `control_calibrations.prefetch_wait`；此操作只保留最终文件，不额外复制一份 audit。
 CPU 校正只覆盖有配对依据的区间，调度间隔和 collective 时间仍带来源条件限制。
 `--operation write_host` 导出写传输及其淘汰控制片段，保留资源角色、提交/等待依赖、CPU 与残余间隔。
@@ -116,8 +126,9 @@ base 的一个规模可与独立测量的另一个规模组合；有相同规模
 模型中的倍率 1 表示“不追加修正”，不是测得运行时与独立实验完全相同；其曲线参考点也不是新的观测。
 独立报告必须有原始测量来源，并明确未使用 target trace 或 E2E；缺阶段、缺参数或来源不明仍报告缺口。
 
-这一改造尚未完成整条流程：物理输入仍为必要输入；CPU control 与 phase 已接入 base 优先选择，
-但写入、淘汰等执行分支的需求检查尚不完整，不能把“构模成功”当作全部 target 都有成本依据。
+部署几何仍须明确，但首次构模不要求已有完整物理测量报告；base 能辨识的服务不强制独立重测。
+CPU control 与 phase 已接入 base 优先选择，但写入、淘汰等执行分支的需求检查尚不完整，
+不能把“构模成功”当作全部 target 都有成本依据。
 
 ## 3. 按缺口选择共享实验
 
@@ -133,10 +144,14 @@ token 记录不启用 profiler，也不作为成本样本，状态检查仍保�
 三次运行及失败重试都计入预算。现有 `fixed_calibration` 内部名称不代表必须采两端点或固定重复次数。
 
 `control_models` 中的 commit、state-check 和 load admission 标量用于历史静态图变换，不参与现行执行式预测。
-新模型不再估计这些参数，`control_models` 保持为空；已删除专用标量估计器和 false-check 样本导出，
-也不再报告这条旧路径的成本缺口。历史模型中的参数仍可读取和投影，历史静态回放若实际需要却缺少
-这些参数，仍报告成本不足，不按零计算；不使用新模型替代历史回放所需的原模型。
+正式 Python 构模和预测不再生成、校验或投影这套标量；带非空 `control_models` 的旧模型不能作为
+现行预测输入，需重新构模。已有空字段模型仍可读取，新输出不再保留空占位字段。
+历史静态 oracle 回放直接读取原预测的 C++ 配置，保留其中的标量及原有成本缺失检查；
+不经过上述 Python 模型投影，也不使用新模型替代历史回放所需的原模型。
 现行执行式预测仍使用操作级 CPU 成本与同源校正，不能将上述解耦理解为不再建模控制开销。
+
+服务构模在选定证据后直接生成该服务的参数，不再把倍率、新页写入参数分散保存后重新拼装。
+支持域统计与参数来源使用同一次证据选择返回的观测；base 优先、独立测量补缺及缺失不填零的规则不变。
 
 物理报告在组输入处必须明确声明未使用 target workload trace 和 target E2E；标记缺失或不是 false 均拒绝。
 该限制在任何物理成本投影之前执行，不仅约束独立参数兜底。部署元数据不冒充独立测量，仍需实际测量来源才能提供独立成本。
@@ -176,8 +191,8 @@ CPU 校正和 `release_host` 导出，再重建组成本并恢复预测。只有
 | Prefetch runtime scale；未直接辨识的 Load/D2H runtime scale | 优先 base；无法辨识时补独立校准 | 每个页大小、每次 profile 的 observed/physical 总时间比，再取中位数 |
 | H2S existing runtime scale | 优先 base 的纯 existing batch | 同上；缺少时才用独立观测 |
 | H2S new setup 与 bandwidth | 优先 base，再用已有共享 workload；仍不能辨识时复用已声明的独立物理参数 | 观测按调用数归一化，由两个规模确定直线；物理补充直接使用已测系数，不再按 target 修正 |
-| Prefetch commit/state-check control | 优先经同源 CPU 校正的 base；缺少时用共享观测 | 每份采集先取中位数，再对所选采集取中位数 |
-| Load admission control | 同上 | 同上 |
+| 执行式 CPU 控制操作 | 优先适用的 base 片段，缺少时用同源校正的共享操作测量 | 按操作、资源和规模选取；部分整段复用仍是近似 |
+| 静态 Prefetch commit/state-check、Load admission 标量 | 静态诊断显式提供的 base 或独立成本 | 历史估计取观测中位数；不由当前正式构模生成 |
 | Prefill/Decode 参数 | 优先 base；缺少独立变量或 token 锚点时补共享观测 | 实测 token 曲线或简单非负线性模型 |
 
 不存在 config ID、workload ID、cell ID、target residual、逐格倍率、growth correction 或 target page 枚举参数。
@@ -301,13 +316,19 @@ setup 和 bandwidth 优先由 base 中两个不同的每次调用字节规模确
 
 ## 6. HiCache control、timeout 与资源
 
+现行执行式路径生成目标 CPU 操作和依赖，再从适用 base 或共享校准取得操作成本。
+查询、加载提交、层等待、写入和释放并非统一的一个常数；普通释放的近邻规模片段仍有外推限制。
+是否执行由 target 状态和规则决定，缺成本不会改成不执行，也不能计零。
+
+以下标量规则仅用于保留的静态诊断，不是现行执行式 CPU 成本模型：
+
 - Prefetch 始终支付一次 terminal commit；`wait_complete` 和 `timeout` 另支付一次 state check，`best_effort` 不支付；
 - Load 支付一次 admission 固定成本；
-- D2H/H2S 当前没有独立 owner control，固定为 0；
+- 静态 D2H/H2S 没有单列 owner control；该字段为 0 不表示执行式写入/释放没有 CPU 成本；
 - 零载荷 Prefetch 只落 control，不伪造 service bytes；
 - page/operation 计数仍由结构模型决定，control 系数不吸收 service 或 gap。
 
-I/O 并发用 resource lane 和 DAG dependency 表达，不把各 operation wall time直接相加：storage read/write、H2D、D2H 按平台声明决定
+两条路径都用 resource lane 和 DAG dependency 表达 I/O 并发，不把各 operation wall time直接相加：storage read/write、H2D、D2H 按平台声明决定
 是共享 lane 还是每 rank lane。状态回放和最终 DAG 都调用同一个 service 估计；不存在另一套 planning bandwidth。
 
 Prefetch 另外区分三个时间概念：
@@ -425,4 +446,5 @@ sensitivity；它不是完整 target 时序同构证明，不是预测成绩，�
 WAPE/p90/delta 为 5.186%/32.518%/8.121%，严格 gate 未通过。09-14 又完成新 workload、新配置及
 TP=4 的十二格泛化实验；两批结果、严格结构口径和不抵消分项统一见
 [验证与当前限制](validation/hicache_validation.md)，不能把旧 60 格当作新面板成绩。
-新结果暴露完整前缀匹配边界、短超时等待/可见性投影及成本泛化限制；没有根据 target 分数追加参数或改变公式。
+这些历史结果暴露完整前缀匹配边界、短超时等待/可见性投影及成本泛化限制；尚缺当前实现上的关闭证据。
+不能把旧缺陷描述直接当作当前代码结论，也不能根据 target 分数追加参数。

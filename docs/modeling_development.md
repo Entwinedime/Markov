@@ -21,12 +21,39 @@ base profile + 一组 target 配置
 完整预测不排除 gap、未归属成本或 Prefill/Decode，但部分残余等待仍沿用 base 近似。
 “执行完成”不是“误差达标”，也不证明所有目标的成本都能可靠外推。
 
-目前仍需要物理服务测量依据；按需补采尚未覆盖所有写入、淘汰和局部返回分支。
+部署信息与服务成本依据分别准备；base 无法辨识的服务可能需要独立测量，并非先采完整物理包。
+按需补采尚未覆盖所有写入、淘汰和局部返回分支。
 已验证的同 TP 预测不意味着支持 TP=2→TP=4 扩图：更换 TP、模型或资源环境需要相应的 base 和适用校准。
 采集命令省略 TP 参数时，组环境匹配和控制校准均采用 SGLang 的默认 TP=1，不要求用户重复声明。
 详细限制以运行结果和成本来源报告为准。
 
-## 2. 准备输入
+共享控制补采按实际实验去重：本地提前返回和 best-effort 等待缺口共用一次 best-effort 实验。
+若同时缺少预取查询成本，先完成等待实验，再从已准入的完整/轻量配对来源导出查询成本；
+没有适用来源才安排新采集。一次 prepare 不为同一个实验反复补采；仍未覆盖的需求保留在缺口报告中。
+
+## 2. 输入与职责
+
+### 代码分工
+
+同一份信息尽量只有一个所有者；观察到的源执行与预测出的目标执行不是两份需要互相同步的状态。
+
+| 信息 | 所有者 | 不负责什么 |
+| --- | --- | --- |
+| 原始事实、源节点和观测区间 | source DAG、fact、source_dag_index | 不决定 target 采用哪个分支 |
+| 源 I/O 操作、工作量及其归属 | io_operation_ledger、attribution | 不把源耗时当成目标完成时刻 |
+| 目标缓存状态、操作数量与生命周期 | model 状态机与 runtime | 不按有没有源模板决定合法分支是否存在 |
+| 源 host 调用的成本与依赖片段 | runtime/write_host | 不负责目标图落图 |
+| 独立控制成本的读取、转换和资源绑定 | runtime/control_calibration、write_resources | 不读取 target trace 或决定目标工作量 |
+| 目标提交、等待与传输计划 | runtime/load_execution 等操作生成器 | 不在生成时重新解析校准文件 |
+| 共享资源顺序、操作展开和依赖连接 | runtime/write_expansion、FutureDag | 不重新推导缓存策略 |
+| 成本需求与共享实验的对应 | Python control_acquisition、物理采样器 | 不看 target 分数，也不维护另一份组状态 |
+| 准备、尝试记账、恢复整组预测 | Python prepare | 不实现各实验的测量细节 |
+
+源样本与独立测量仍有不同的读取方式，但得到的 host 操作计划通过同一个落图入口执行。
+资源顺序由操作计划统一给出：先是执行的 stream，再是等待的 stream；同一资源重复出现时不能去重，
+显式 event completion 则另外绑定。main、worker、设备服务与 residual gap 也不能合并为一个成本。
+
+### 输入来源
 
 profiling 与 modeling 只通过 `profile_manifest.json` 交接，不扫描目录猜输入。
 运行期间不要修改已选 profile。
@@ -179,7 +206,8 @@ wall_seconds、container_starts、logical_io_bytes。省略 workload budget 等�
 每项补采按自己的规模检查累计预算，不因某个大实验超限而跳过后续较小实验或已有测量复用。
 例如物理 I/O 与锁定候选 CPU 原语共用物理预算，但 CPU 原语不消耗 I/O 字节配额；控制 workload 使用另一份预算。
 成功补采后继续预测，新出现的需求仍按相应账本检查。被拒绝的同一项需求本次运行不重复尝试；
-不能增加预算、清空账本或把未完成测量当作零成本来继续。
+流程不能自行突破预算、清空账本或把未完成测量当作零成本来继续。
+经用户授权调整累计上限时，只更新组配置的预算，历史成功、失败和重试用量仍保留。
 某项缺少采样声明、适用采样器或物理预算时，保留该项缺口，其他独立需求仍可继续补充；
 这类未启动采集的情况不视为进程失败。同一项需求本次运行只尝试一次，不反复生成相同实验。
 例如只声明了 `eviction_cpu` 的组遇到 I/O 缺口，会提示补充 `physical_capture.page_token_sizes`，
@@ -217,6 +245,9 @@ target 若用实验配置名简写，读取展开后的实际 server 命令；�
 实际 I/O 补采仍须声明页域、适用放置和预算；没有页域时不会自动沿用账本中的旧 I/O 测量。
 仅补锁定淘汰候选 CPU 原语时声明 `physical_capture.eviction_cpu` 的 heap_sizes、batch、repeats，
 不要求 DMA 页域，逻辑 I/O 字节为零。原理及外推限制见[锁定候选成本](hicache_io_cost_model.md#61-淘汰时跳过锁定候选的-cpu-成本)。
+另一组已有适用测量时，可在 `physical_capture.eviction_cpu.reuse_ledger` 显式填写其
+`physical_capture_ledger.json` 路径。只复用环境、CPU 绑定和采样域相符的成功测量；
+来源不相符则报告缺口，不静默换成新采集。旧账本及耗用留在原处，新组引用原始报告，不复制或清零历史用量。
 
 ### CPU 采集开销校正
 
@@ -288,8 +319,11 @@ forward、HiCache host 和 scheduler 的观测与配对分别放在 `calibration
 
 组级 `control_calibrations` 声明已有操作成本文件：prefetch_wait 按策略、write_host 按页大小和写策略索引，
 load_index、load_submission、layer_wait 等按操作名声明。导出用法见[共享 CPU 操作校准](hicache_io_cost_model.md#共享-cpu-操作校准的采集开销)。
-base 没有完整预取查询片段时，可用同一导出入口的 `--operation prefetch_query` 从已有独立采集提取，
-在 `control_calibrations.prefetch_query` 声明后供整组使用。查询局部区间仍是观测墙钟包络，
+base 没有完整预取查询片段且未提供适用校准时，执行器报告 `execution_control/prefetch_query`。
+组流程先从已声明、同环境且有配对 CPU 修正的预取等待校准来源重新导出查询成本，不要求等待策略相同。
+没有这类来源时使用共享 wait-complete 校准实验，复用匹配的原始采集或在预算内完成三阶段采集，只导出查询成本，
+自动加入 `control_calibrations.prefetch_query`。也可用 `--operation prefetch_query` 手动导出并声明。
+已有来源的复用/导出已用真实独立采集验证；无已有来源时的新增设备补采尚待验收。查询局部区间仍是观测墙钟包络，
 不能把配对文件存在解释成所有查询开销都已剥离；成本文件保留未校正等待等限制。
 
 显式声明与组内已完成导出合并，同一操作以显式声明为准。组输入先核对来源、环境及预取策略族，
@@ -483,7 +517,8 @@ workflow_summary.json，不在两个文件中重复保存。各阶段不再输�
 评分先核对组摘要的完成状态，再读取对应 C++ 执行结果，最后才打开 target 数据。
 历史结果原有的任务索引与逐格身份仍可读取，静态 oracle-cost 回放不受影响；不迁移或删除历史数据。
 
-失败或未执行格的预测时间为 null，不按零计。cost_coverage=partial 表示估计仍有局限，不等于没有预测值。
+失败或未执行格的预测时间为 null，不按零计。cost_coverage=partial 表示估计仍有局限，不等于没有预测值，
+也不是已计算出的逐操作成本覆盖率。
 损坏的运行摘要直接报错，不把错误类型的内容替换为空对象后伪装成普通未执行结果。
 EXECUTED 表示事实及操作已完成执行，不证明结构与 target 一致，更不证明精度达标。
 
@@ -513,7 +548,7 @@ scripts/model.sh evaluate-hicache \
 作为“不改变 base 耗时”的比较基线；不能用带采集的 base 墙钟代替。
 同一配置与 workload 的重复运行按正式窗口耗时取算术平均，结果保留报告路径、样本数和最小/最大值。
 评分核对请求顺序、失败请求及已报告的 token 回放失败，不排除 gap、未归属成本或计算阶段。
-不加该参数时仍使用单份 target profile，重复身份会报歧义；历史静态组件与 oracle 诊断保持此路径。
+不加该参数时仍使用单份 target profile，重复身份会报歧义；历史静态 oracle 诊断保持此路径。
 所有选中预测完成后才读取 target；输出必须与预测目录分离。
 评分不采集、不重预测、不改模型，也不触发 refit。
 
@@ -521,12 +556,40 @@ scripts/model.sh evaluate-hicache \
 不以 target DAG 回放或预测图后台终点为真值。报告总面板、逐 base、self 和 base-wall 参照；
 缺失格不从验收中删除。具体阈值及当前成绩统一见[验证说明](validation/hicache_validation.md)。
 
-历史静态资产仍可显式使用 `--oracle-cost-replay`，前提是已有完整操作映射和诊断数据。
-它先验证相同预测成本回放，再替换 target 成本做敏感性分析；不证明完整 target 时序同构，
-也不计作预测精度。`--oracle-max-runs 1` 表示每个 base 选一个 cell，该 cell 会运行一次基准及五种成本变体。
-回放只选择结构完全匹配的历史静态格子；整组没有合适格子时，回放摘要为 `NOT_RUN`，列出被排除数量，
-不启动 C++ 回放，也不把缺失误差记为零或中断已经完成的独立评分。
-现行执行式预测缺映射，不能靠开启 diagnostics full 就获得这项能力。
+普通评分不再生成历史逐组件结构、phase 成本、delta 和去 gap 汇总，也不为这些报告构建 target DAG。
+`gate_summary.json` 的 `acceptance_scope=full_http_formal_window`；PASS 只表示完整 HTTP 与 base-wall
+门槛通过，不证明成本覆盖完整或各组件准确。成本覆盖限制继续保留在逐格执行结果中。
+历史细分报告及其数据不删除；不把停止输出的指标记为零或视为通过。
+
+### 显式静态成本回放
+
+静态成本回放仅用于诊断。在 validation runner 的 `cpp_trace_graph` 中设置
+`hicache_static_replay: true`，可以先用当前规则生成不注入 target 成本的静态对照；
+Release 不接受该选项，正常 HiCache 预测仍采用执行式路径。随后成本回放共用正式 runner 的
+manifest、窗口和源 CPU 校正，不能漏掉 CPU 校正后再声称“只替换了目标成本”。
+这不保证旧静态资产相容，也不把静态诊断当作当前执行式预测的精度证据。
+静态标量控制成本须显式提供，不能直接拿执行式模型的细粒度控制文件替代。
+目前，包含无源坐标的重建 gap 的静态图不能再叠加源 CPU 校正；这种输入会报错。
+不带 CPU 校正的静态诊断必须从一开始就使用同一未校正对照，不能中途丢掉校正项以通过恒等性检查，
+也不能将其耗时当作正常 HTTP 预测。
+显式 `model_summary.json` 中的 `hicache_dag_patch.target_effects` 保留严格配对所需的目标工作量、
+操作身份和资源顺序，直接来自模型计划。它不是重新执行一套缓存逻辑，也不恢复已删的细分评分表。
+其中操作数量指实际传输服务次数；零载荷终止控制仍在 I/O 成本记录中单独计费。
+
+相容的静态预测资产可显式使用 `--oracle-cost-replay`，前提是已有完整操作映射和诊断数据。
+先验证相同预测成本回放，再执行五种真实 target 成本替换；结果只用于诊断，不计入预测精度或回写参数。
+`--oracle-max-runs 1` 表示每个 base 选一个 cell，每格包含一次基准和五种成本变体。
+只选择结构严格匹配的格子；没有合适输入时报告 `NOT_RUN` 及排除原因，不填零、不影响已完成的独立评分。
+现行执行式预测缺少这套完整映射，不能仅开启 diagnostics full 就获得静态回放能力。
+
+诊断摘要保留必要的目标操作计划、patch 成本、source attribution、图规模、ownership 和失败原因。
+同成本恒等性比较计时、图规模及归属汇总，不声称比较逐段关键路径或证明完整 target 图同构。
+保留去 gap 的诊断时长，不再生成逐家族/逐请求分段、分项 WAPE/P90 或另一套总 gate。
+这不改变正式预测对 residual gap 的保留。
+
+09-12 旧聚合 Prefetch 参数不被当前分阶段解析器接受；旧结果只作历史证据，不恢复旧规则或转换参数冒充复现。
+09-27 已在相容的 C3→C5/W1 输入完成严格配对及真实成本回放，具体证据与失败范围见
+[验证说明](validation/hicache_validation.md#现行静态回放的已验证范围)，不能据此承诺所有静态输入都可用。
 
 ## 9. 开发边界与实现位置
 
@@ -536,9 +599,17 @@ target 配置与执行规则生成操作，成本估计提供耗时；不得从 
 预取检查与重试由执行式 DAG 生成；通信采用同一组观测时序构建入口、worker 与返回依赖，
 不再保留测试专用的标量预取循环/通信回放。历史静态 DAG patch 和显式 oracle-cost 诊断仍保留。
 
-trace 读取器与事件参数查询共用 `src/json_scan.hpp` 定位 JSON 片段，保留共享缓冲区和延迟解析，
+TraceGraph 的头文件统一位于 `include/markov/trace_graph/`，与 `src/` 的实现按模块对应；
+内部辅助头也遵守这一布局，位置变化不表示它成为公开 API。项目不再维护独立测试文件和测试夹具。
+引用统一写为 `markov/trace_graph/...`，不通过相对路径引用 src 内部文件。
+
+trace 读取器与事件参数查询共用 `include/markov/trace_graph/json_scan.hpp` 定位 JSON 片段，保留共享缓冲区和延迟解析，
 不为简化实现而构造整份 trace 的 JSON 对象。转义字符串由现有 JSON 库解码，保证按需查询与完整
 参数展开对 Unicode 的解释一致；跨采集通道合并参数时保留接收事件的默认 pid/tid。
+
+Prefill 与 Decode 的设备、通信和提交 CPU 观测共用节点成本结构及统计逻辑；
+Prefill 的普通计算与注意力仍分别保存。诊断归属与输出复用同一份 phase 观测，
+不重复解析；对外观测字段、成本公式和历史静态回放接口不变。
 
 维护时必须保留：
 

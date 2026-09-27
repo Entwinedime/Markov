@@ -6,20 +6,44 @@
 
 ## 当前正式流程复验（09-27）
 
-现行 prepare-hicache 已完成五组共 60/60 预测，随后通过 evaluate-hicache --normal-http
-对 30 份正常运行重复测量完成独立评分。当前总体、逐 base 和最大误差统一见
+重构后的 prepare-hicache 已完成五组共 60/60 预测，随后通过 evaluate-hicache --normal-http
+对原 30 份正常运行重复测量完成独立评分。当前总体、逐 base 和最大误差统一见
 [工作进展](../work_progress.md#当前目标与未完成项)，原始结果在
-`data/modeling_runs/user_workflow_refactor_20260923/full60_current_20260927/normal_http_scores`。
+`data/modeling_runs/user_workflow_refactor_20260923/modular_refactor_20260927/full60/normal_http_scores`。
 本次状态为 MODEL_LIMITATION：完整 E2E 门槛未通过，成本覆盖和执行式组件归属仍有限制。
-这批结果只作为随后规模性瘦身的对照，不证明之后工作树的精度。
+60 份 run_summary 与重构前 `full60_current_20260927` 相同，证明本轮结果保持，不证明误差已经解决。
 
 当前完整 HTTP 评分要求总面板和逐 base 的 WAPE ≤ 3%、单格 APE 的 P90 ≤ 5%，
 且 cross 的绝对误差总和优于直接沿用 base 实测墙钟的参照。self 单列，不要求优于自身零误差参照。
 缺失或无效窗口计入覆盖失败；gap、未归属成本及 Prefill/Decode 不从评分中剔除。
-下述 09-23 成绩是历史运行证据，不是当前未收口重构的统一验收成绩。
+下述 09-23 成绩是历史运行证据，不能代替当前代码的统一验收。
 
 正常运行重复测量取算术均值，保留样本数和范围；base 墙钟参照也来自正常运行。
 P90 采用最近秩，即排序后的第 ceil(0.9 × 格数) 项，不额外偏移一个格子。
+WAPE 为逐格绝对时间误差之和除以真实时间之和；APE 为单格绝对误差除以该格真实时间。
+两次重复不足以确定完整波动分布；60 格复用 15 个配置/workload 的真值，不是 60 个独立新场景。
+成本收益报告仍为 `INCOMPLETE_COST_EVIDENCE`：旧资产首次取得成本和同口径实测对照不完整，
+不能仅凭本轮没有重采，就声称首次使用成本很低或已证明预测比逐目标实测更省。
+
+09-27 诊断瘦身后，普通评分只汇总完整 HTTP 和 base-wall 门槛，并标注验收范围；不再输出历史
+scope、phase、phase delta、HiCache 分项及结构总 gate。数值公式和 HTTP 阈值没有放宽。
+旧报告和下述历史成绩原样保留；停止生成细分报告不表示这些项目已经通过。
+显式历史 oracle 回放仍要求严格结构匹配，保留同成本恒等性和五种成本替换诊断。
+实际执行 09-12 资产时发现旧聚合 Prefetch 参数与当前解析器不兼容，回放在 DAG 执行前失败；
+本批删除前后均能复现。下文历史成功结果不代表这条旧资产路径现已重新通过。
+按用户最新确认，旧结果仅作历史证据，不恢复旧运行规则；保留能力的验收对象改为现行规则下的静态回放。
+
+### 现行静态回放的已验证范围
+
+本轮 C3→C5/W1 使用相容的当前规则输入，384 项操作及阶段工作严格匹配、88 项 I/O 逐项绑定。
+原成本填回恒等，五种真实 target 成本替换均完成，图规模和归属计数不变，target E2E 未参与成本设置。
+本轮根目录为 `data/modeling_runs/user_workflow_refactor_20260923/modular_refactor_20260927`；
+证据为 `static_admitted/admission.json`、`static_admitted/oracle_audit.json` 和 `static_final/final_audit.json`。
+此前 `static_compatible` 的源成本扰动仅验证敏感性，不能冒充真实 target 成本替换。
+
+该诊断明确采用未校正 profile 对照；它不是正常 HTTP 精度，也不是执行式 60 格的全量结构验收。
+部分静态重建 gap 缺少源坐标，仍不能叠加源 CPU 校正；C1→C3 缺 inactive layer 样本的尝试也仍失败。
+命令退出 0 但内部 patch blocked 的结果不算通过。具体调用与成本合同见建模说明第 8 节。
 
 ## 历史完整 E2E 复验（09-23）
 
@@ -29,20 +53,33 @@ P90 单格绝对误差 **6.1857%**，最大 **10.0601%**；同真值对照分别
 51 格改善、8 格持平、1 格轻微退步，执行一致性检查全部通过。该检查不等于所有成本都已准确归因；
 未测量的采集扰动、其他控制校准及成本覆盖告警仍保留。没有用 target 真值回写模型。
 
-逐格数据及测量边界见 [本轮结果](../../data/modeling_runs/hicache_calibration_cpu_correction_20260923/results.md)，
-过程见 [实现日志](../tmp/hicache_calibration_cpu_correction_log_20260923.md)。下方各节是 09-14 及更早的历史实验，
+逐格数据及测量边界见 [本轮结果](../../data/modeling_runs/hicache_calibration_cpu_correction_20260923/results.md)。
+原逐轮日志统一保存于[文档归档](../work_progress.md#文档整理记录09-27)。下方分项章节是 09-14 及更早的历史实验，
 其中隔离 gap 的指标和门槛不能直接当作这轮完整 E2E 的结论。
+
+## 历史结构生成与误差归因（09-21 至 09-23）
+
+09-21 的 `hicache_semantic_generation_20260921/independent_full60` 完成 60/60 正常 HTTP 评分：
+WAPE 5.1984%、P90 11.2721%、最大 15.4552%。源绑定、状态消费、层调用、分配准备和执行后重放检查通过；
+这是一组生成规则及执行一致性证据，不是 target 全图同构。旧 `full60` 的 4.5024% 混入过 C5 base I/O 比例，
+不能作为独立输入成绩。原始输入、执行审计和数值见该目录 `inputs.json`、`execution_audit.json`、`full60_results.json`。
+
+09-23 的 `hicache_error_diagnosis_20260923` 保存代表格自身回放和成本敏感性实验。
+它定位到新生成层等待、加载提交使用未经同源校正的共享 CPU 成本，而 base 已有操作使用了配对校正。
+随后独立校准补齐 full/light 配对，得到上节的精度改善；没有用 target 残差拟合参数。
+敏感性置零只能说明影响大小，不代表这些 CPU 工作都可删除；C2/W3 的自身回放偏差也没有被该项完全解释。
+后续需分别检查自身基线和配置变化量，不能把 self 误差作为整行补偿。
 
 ## 09-14 及更早的分项与泛化实验
 
-最新的新 workload / 新配置 / TP=4 十二格泛化实验已完成，结果见第 10 节：组合耗时通过，但严格分项与结构仍有失败。
+09-14 的新 workload / 新配置 / TP=4 十二格实验结果见第 10 节：组合耗时通过，但严格分项与结构仍有失败。
 第 1–9 节中的 60-cross 数字来自 09-12 历史对照，不是新面板成绩，也没有在 09-14 首次分配归属修复后重跑。
 
 09-12 使用当时的生产 patch 完成了 60-cross，并重新提取 15 份 target 评分 DAG。该面板数值来自该次执行，
 与 09-11 普通预测误差相同；修复的是验证合同和零成本控制边界，没有调参数提高成绩。
 60 格的 effect shape 全部严格一致；旧的 1,376 项差异来自 target visibility 页数漏填。
 旧 oracle 约 13% 偏差也受回放清零 terminal control、改变依赖的缺陷污染，不能作为真实调度误差证据。
-五个代表格均通过相同成本回放恒等性与五种真实成本变体。过程与证据见 [本轮日志](../tmp/hicache_gap_excluded_causal_log_20260912.md)。
+五个代表格均通过相同成本回放恒等性与五种真实成本变体，证据见下文历史资产路径；原日志保存在文档归档。
 
 ## 1. 验证对象与信息边界
 
@@ -76,8 +113,8 @@ data/modeling_runs/hicache_gap_excluded_causal_20260912/
 
 ## 2. 主目标与分项诊断门槛
 
-当前阶段主目标是总体及逐 base 的组合 scope WAPE ≤ 3%、p90 ≤ 5%，争取总体 WAPE ≤ 1%。
-下列分项旧门槛继续保留为诊断，不要求为了全部通过而强行拟合；evaluator 的全 gate 状态与主目标是否通过分开报告。
+该历史阶段的主目标是总体及逐 base 的组合 scope WAPE ≤ 3%、p90 ≤ 5%，争取总体 WAPE ≤ 1%。
+下列门槛用于解读历史报告，不是瘦身后普通 evaluator 的输出合同；不要求为了全部通过而强行拟合。
 
 WAPE 是绝对误差总和除以 target 总量；scope/I/O p90 是 cell 级 APE 的第 90 百分位。
 Phase 的 WAPE 累计 request/rank 成本误差；phase p90 则先在每格内计算 request/rank APE 的 p90，
@@ -128,9 +165,10 @@ phase 工作量/结构也为 60/60 一致。
 terminal control，删节点后意外把请求前驱接到后台 service。因此旧约 13% 偏差不能用来判断真实调度模型。
 
 当前回放原样注入每个 operation 的 service 与 intrinsic control；控制边界不依赖 duration 是否为零。
-先执行相同预测成本回放，确认计时、节点/边计数、ownership 和关键路径完全复现，再执行五种 target 成本变体：
+先执行相同预测成本回放，确认计时、节点/边计数和 ownership 汇总复现，再执行五种 target 成本变体：
 HiCache I/O/控制、phase device、完整 phase owner，以及两种组合。target 变体继续检查结构计数和原有依赖验证。
 这些检查仍不是完整 target 图同构证明，oracle 结果也不计入普通预测精度或回写参数。
+09-27 瘦身后不再输出或比较逐段关键路径诊断报告；仍计算去 gap 的仿真时长，历史报告不改写。
 
 五格共 30 次回放均 READY（5 次相同成本、25 次 target 成本变体），覆盖等待、超时及 best-effort。
 这是显式选取的五个代表格，不是全部 60 格的 oracle。结果保存在本轮根目录 `representative_oracle/summary.json`。
@@ -184,7 +222,7 @@ C4/W2→C3 仍有 60,758 us 残差，尚未单独归因；phase submit 总成本
 旧文档的“60/60 exact”也来自较弱的结构检查。当前只保留一套生产实现和一套当前结果；旧目录仅作为历史参照，
 不得用于宣称当前 gate 通过。
 
-## 9. 当前限制与停止边界
+## 9. 09-12 当时的限制与停止边界
 
 - 存储 service 仍是函数墙钟代理，不应称作纯磁盘传输时间；不能简单减去 thread CPU 或所有等待。
 - 资源 lane 表达必要串行关系，不是完整的 CPU/内存/文件系统竞争模型。
@@ -277,8 +315,8 @@ Prefetch 与 H2S 占不抵消分项绝对误差约 97.4%。其成本总和不是
 - **成本泛化限制**：真实 workload 的 Prefetch/H2S 成本偏差仍大，Prefill 请求级尾部误差也存在。
   本轮没有证明所有偏差的唯一物理原因，未据此增加拟合项、target correction 或新校准。
 
-上述新缺陷保留为本轮初步泛化发现，尚未修复。后续优先对齐前两项语义，再用代表格独立验证结构与成本，
-保留本轮预测作为原始对照，不将看过 target 后的修复回归称为首次盲测成绩。
+上述问题是 09-14 的初步泛化发现，尚缺当前执行式实现上的关闭证据。后续先复现，再判断修复范围；
+不能直接用旧代码描述断言当前缺陷相同，也不能视为已经解决。保留原预测作对照，修复回归不称为首次盲测。
 
 ### 10.4 复现资产与完成边界
 
@@ -301,7 +339,7 @@ TP4 固定校准使用 927.67 s / 4 次启动 / 56 请求 / 143416 tokens；物�
 最终十二份 target 均完成独立 DAG/phase/I/O 提取，两卡每通道两 rank、四卡每通道四 rank。
 曾发生 TP4/W5 source 导出不完整：保留原始失败，使用原始采集数据串行重导出恢复，没有重发请求。
 正式 target 导出均正常完成；采集期间修复首次分配写回归属，并为 NPU profiler 增加可选串行导出。
-机制测试、代表格及正式十二格回归证据见 [执行日志](../tmp/hicache_generalization_log_20260914.md)。
+机制测试和采集过程日志已保存到文档归档；正式十二格证据仍在上述运行资产中。
 
 本次“扩展 workload/配置并实际验证 TP=4”的初步实验已完成，不等于模型全面达标。
 没有重跑旧 60-cross、没有做本轮 target-cost oracle replay，也未实现跨 TP 扩图。

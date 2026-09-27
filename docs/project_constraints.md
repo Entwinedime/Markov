@@ -39,10 +39,11 @@ HiCache I/O/control 与 phase 必须分项验收，任一 component 的系数不
 被误报为某一个 component 的误差。
 
 已完成阶段以排除 residual gap 和未归属成本后的三组件组合 scope 为主指标（总体和逐 base WAPE ≤ 3%、p90 ≤ 5%，争取 WAPE ≤ 1%）。
-分项继续完整报告既有误差与 gate；无法由机制解释的分项偏差不强行拟合。主目标通过不等于所有分项 gate 通过，
-evaluator 的 `MODEL_LIMITATION` 必须保留其原有含义。
+历史分项误差与 gate 结论保留，无法由机制解释的分项偏差不强行拟合。按用户 09-27 的瘦身取舍，
+普通 evaluator 不再重新生成这些历史细分报告，当前 PASS/MODEL_LIMITATION 只评价明确标注的完整 HTTP
+验收范围，不代表组件精度或成本覆盖完整，也不追溯改变历史全 gate 的失败结论。
 
-下一阶段主目标是完整 HTTP 正式窗口 E2E：预测值与 target 实测比较，不与 target DAG 模拟值混淆。
+当前主目标是完整 HTTP 正式窗口 E2E：预测值与 target 实测比较，不与 target DAG 模拟值混淆。
 先验证同成本图变换和 CPU 等待依赖，再处理剩余成本误差；不得清除 gap/未归属成本后仍称完整预测。
 当前误差、诊断证据与后续顺序见 `docs/work_progress.md`，历史分项成绩不追溯改写。
 
@@ -63,7 +64,7 @@ component 由 mutation 的语义 ownership 声明。核心层只要求 owner 明
 
 - effect plan 先于 cost plan；
 - phase work plan 先于 phase cost plan；
-- cost model 不决定结构；
+- 合法操作及依赖规则不由成本样本是否存在决定；service 耗时可通过实际完成、超时与发布事件影响目标执行，不能用 target 残差反推结构；
 - patch 必须是一次原子 mutation；
 - concurrency/queue/overlap 通过 resource lane 和 dependency 表达；
 - I/O 实际执行量与最终缓存可见量分别保存；0 页可见不能抹掉已经执行的 service；
@@ -112,11 +113,12 @@ prefill/decode 语义模型。
 
 ## 8. 代码与产物
 
-- active product surface 最终不超过 50,000 行；
+- 按 09-27 最新用户要求，代码量作为观察指标，不再以 50,000 行作为最终验收门槛；以完成模块重构、理顺逻辑并保留必要能力为目标；
 - 不通过压缩多语句、移出统计目录或删除必要注释达标；
 - Python、Shell、C/C++ 源码及头文件的代码块内部按逻辑步骤适当留空行，保持相关语句成组；不靠删除空行达成瘦身，具体规范见 AGENTS.md；
 - 删除死代码、重复检查、开发期测试入口和中间 proof output；
 - Debug 功能由 C++ build option 或 Python diagnostics 参数隔离；
+- 自有 Shell、Python、C++ 不保留独立测试文件、夹具或测试构建目标；使用正式入口、静态检查和实际运行验证，产品诊断与评分仍保留；
 - 默认只保留 compact summary 和复现所需输入；
 - 项目只维护当前实现，不用内部身份字段、文件摘要或冻结副本管理迭代。
 
@@ -128,7 +130,7 @@ prefill/decode 语义模型。
 - cost 简化前后使用同一组关键 cell；
 - clean Release/validation build 必须通过；
 - final 60 cross 只在公式固定后运行；
-- 总量误差与不抵消的 I/O 分项误差同时验收，不能用不同类别的正负误差抵消过 gate；
+- 完整 HTTP 是当前正式评分；若报告 I/O 分项准确性，须同时检查总量和不抵消分项，不能用不同类别的正负误差抵消宣称分项通过；
 - 结构 exact 必须覆盖操作数、执行/完成页、batch、existing/new 与必要依赖；调度敏感差异单列但不计 exact；
 - 大型重构必须新建一份短期 plan 与 append-only log；收口时把稳定结论合并回主文档并删除临时副本；
 - 旧 artifact 只能作为参考，不能代替当前工作树运行结果。
