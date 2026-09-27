@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 from dataclasses import dataclass
 import math
 from pathlib import Path
@@ -28,7 +27,7 @@ class HiCacheIoModel:
 
     @classmethod
     def load(cls, path: Path) -> HiCacheIoModel:
-        """Load the one canonical HiCache model contract without conversion."""
+        """Load and validate the group-wide numerical model at its input boundary."""
 
         resolved = require_repo_path(path)
         raw = load_json(resolved)
@@ -69,7 +68,7 @@ class HiCacheIoModel:
     def narrow_config(
         self, page_size: int, prefetch_policy: str, write_policy: str = "write_through"
     ) -> dict[str, Any]:
-        """Project a validated target into C++ costs without changing this model."""
+        """Project a target into execution fields; nested coefficients remain read-only."""
 
         page_bytes = page_size * self.fields["kv_bytes_per_token_per_rank"]
         if page_bytes > MAX_U64:
@@ -77,7 +76,9 @@ class HiCacheIoModel:
 
         service_models = {}
         for kind, values in self.fields["service_models"].items():
-            narrowed = copy.deepcopy(values)
+            # Only top-level curve fields are replaced. Coefficients and point
+            # tables are shared read-only, like phase_cost and resource_lanes.
+            narrowed = dict(values)
             if kind == "write_host_to_storage":
                 if "existing_runtime_scale_points" in narrowed:
                     existing = narrowed.pop("existing_runtime_scale_points")
