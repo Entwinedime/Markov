@@ -37,12 +37,6 @@ void HiCacheLoads::prepare_insertions(core::DagGraph & graph, std::span<const st
         if (!host.worker_nodes.empty() || !empty.streams.empty() || !empty.waits.empty() || !empty.event_waits.empty())
             throw std::runtime_error("Empty load contains device or worker work");
         Insertion insertion{ std::move(empty), *boundaries[2 * i], {} };
-        if (const auto at = generated_submissions_.find({ record.pid, record.tid }); at != generated_submissions_.end()) {
-            const auto & program = at->second;
-            insertion.positions.emplace(graph.node(program.compute).lane_id,
-                                        observe_write_stream_position(source, program.compute, record.pid, record.tid, record.source_start_us));
-            insertion.positions.emplace(graph.node(program.stream).lane_id, HiCacheWriteStreamPosition{});
-        }
         for (const auto & donor : donors_) {
             if (donor.pid != record.pid || donor.tid != record.tid) continue;
             const auto observe = [&](size_t node) {
@@ -55,32 +49,32 @@ void HiCacheLoads::prepare_insertions(core::DagGraph & graph, std::span<const st
         insertions_.emplace(i, std::move(insertion));
         empty_hosts.emplace(i, std::move(host));
     }
+    core::DagMutationPlan replacement{ .component = "hicache_load_submission" };
+    std::map<size_t, uint64_t> remaining_gaps;
     for (const auto & [i, host] : empty_hosts) {
         const auto & record = loads_[i].record;
         const auto first = insertions_.at(i).continuation;
-        const auto gate = graph.add_synthetic_node({
-            .name = "load call entry",
-            .category = "execution_gate",
-            .lane_key = std::string(graph.node_lane_key(first)),
-            .observed_point = core::DagObservedPoint{ record.pid, record.tid, record.source_start_us, graph.node(first).gpu_id }
-        });
-        for (const auto edge : source.incoming_edge_ids(first))
-            if (graph.edge(edge).active && graph.edge(edge).dst == first) graph.mutable_edge(edge).dst = gate;
-        graph.add_edge(gate, first, core::DagEdgeKind::Sequential);
-        for (auto at = submit_at_.begin(); at != submit_at_.end(); ++at)
-            if (at->second == i) {
-                submit_at_.erase(at);
-                break;
-            }
-        submit_at_.emplace(gate, i);
-        for (const auto node : host.main.owned_node_ids) graph.set_node_duration(node, 0);
+        (void)append_host_entry_gate(source,
+                                     first,
+                                     { record.pid, record.tid, record.source_start_us, graph.node(first).gpu_id },
+                                     "load_entry:" + std::to_string(i),
+                                     "load call entry",
+                                     replacement);
+        for (const auto node : host.main.owned_node_ids) replacement.set_node_durations.push_back({ node, 0 });
         for (const auto & gap : host.main.owned_gap_slices) {
-            auto & remaining = graph.mutable_node(gap.owner_node_id).cpu_gap_after;
+            auto & remaining = remaining_gaps.try_emplace(gap.owner_node_id, graph.node(gap.owner_node_id).cpu_gap_after).first->second;
             const auto owned = gap.owned_end_us - gap.owned_start_us;
             if (remaining < owned) throw std::runtime_error("Empty load gap ownership exceeds its retained interval");
             remaining -= owned;
         }
     }
+    for (const auto & [node, duration] : remaining_gaps) replacement.set_cpu_gaps.push_back({ node, duration });
+
+    // Publish callback bindings only after the entire prospective replacement
+    // is accepted. A missing boundary must not leave a half-rewired source DAG.
+    const auto applied = core::apply_dag_mutation_plan(graph, replacement);
+    std::erase_if(submit_at_, [&](const auto & entry) { return empty_hosts.contains(entry.second); });
+    for (const auto & [i, host] : empty_hosts) submit_at_.emplace(applied.synthetic_node_ids.at("load_entry:" + std::to_string(i)), i);
 }
 
 void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
@@ -138,7 +132,13 @@ void HiCacheLoads::replace_source_submissions(core::DagGraph & graph) {
     }
 }
 
-void HiCacheLoads::rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members) {
+void HiCacheLoads::rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members) {
+    const auto & graph = source.graph();
+    for (auto & [index, insertion] : insertions_) {
+        const auto & record = loads_[index].record;
+        rebind_host_stream_positions(source, insertion.positions, record.pid, record.tid, record.source_start_us);
+    }
+
     std::vector<HiCacheHostExpansion *> plans;
     for (auto & donor : donors_) plans.push_back(&donor.plan);
     rebind_host_worker_queues(graph, members, plans);

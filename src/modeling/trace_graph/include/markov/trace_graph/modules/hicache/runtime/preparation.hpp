@@ -32,6 +32,7 @@ struct AllocatorPreparationSourceCall {
     bool required = false, first_load = false;
     std::string path;
     std::vector<std::pair<uint64_t, uint64_t>> intervals;
+    uint64_t service_duration_us = 0; // Same-source CPU correction over the interval union.
     std::optional<size_t> submit_gap_node;
     std::map<std::string, uint64_t> issues;
 };
@@ -57,20 +58,20 @@ struct AllocatorPreparationPlan {
     std::map<std::string, uint64_t> blockers;
     size_t observed_formal_calls = 0;
     uint64_t removed_coverage_us = 0; // Across ranks; not an E2E saving.
-    uint64_t added_cost_us = 0; // Across ranks, not critical-path time.
+    uint64_t added_cost_us = 0;       // Across ranks, not critical-path time.
     bool source_parallel_compilation = false;
     std::map<std::string, std::map<std::string, PreparationCostSamples>> cost_samples;
-    core::DagMutationPlan mutation{.component = "runtime_preparation", .reason = "target allocator preparation demand"};
+    core::DagMutationPlan mutation{ .component = "runtime_preparation", .reason = "target allocator preparation demand" };
 };
 
-[[nodiscard]] AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph& graph);
+[[nodiscard]] AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph & graph);
 
 /** Predict from base observations and the already-known target call history.
  * No graph mutation or target measurements. The caller must schedule these
  * costs before their work starts; later calls cannot revise executed costs.
  */
-[[nodiscard]] AllocatorPreparationPlan predict_allocator_preparations(
-    const AllocatorPreparationObservation& source, const std::vector<model::HiCacheAllocatorWorkItem>& calls);
+[[nodiscard]] AllocatorPreparationPlan predict_allocator_preparations(const AllocatorPreparationObservation & source,
+                                                                      const std::vector<model::HiCacheAllocatorWorkItem> & calls);
 
 /** Reserve a CPU cost node before each observed allocator submission.
  * Returns source-call index -> node. Measured preparation is moved out of its
@@ -78,10 +79,8 @@ struct AllocatorPreparationPlan {
  * A call without a submission site is left unbound, never assigned a guessed
  * location. The execution caller must reject any required cost at such a call.
  */
-[[nodiscard]] std::map<size_t, size_t> bind_allocator_preparation_costs(
-    core::DagGraph& graph, const AllocatorPreparationObservation& source);
+[[nodiscard]] std::map<size_t, size_t> bind_allocator_preparation_costs(core::DagGraph & graph, const AllocatorPreparationObservation & source);
 
-[[nodiscard]] AllocatorPreparationPlan plan_allocator_preparations(
-    const core::DagGraph& graph, const std::vector<model::HiCacheAllocatorWorkItem>& calls);
+[[nodiscard]] AllocatorPreparationPlan plan_allocator_preparations(const core::DagGraph & graph, const std::vector<model::HiCacheAllocatorWorkItem> & calls);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

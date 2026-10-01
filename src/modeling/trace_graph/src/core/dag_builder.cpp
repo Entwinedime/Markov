@@ -45,15 +45,10 @@ struct ExecutionAndFactEvents {
     std::vector<TraceEvent> runtime_observations;
 };
 
-std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, int gpu_id) {
-    std::vector<const TraceEvent *> extends;
-    std::vector<const TraceEvent *> decodes;
+std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, const std::vector<DagPhaseMarkerEvent> & markers,
+                                                                     int gpu_id) {
     std::vector<DagControlExclusionInterval> intervals;
     for (const auto & event : events) {
-        if (event.source_channel == TraceSourceChannel::Torch && event.ph == 'X' && event.pid == event.tid) {
-            if (event.name.starts_with("step[EXTEND")) extends.push_back(&event);
-            else if (event.name.starts_with("step[DECODE")) decodes.push_back(&event);
-        }
         const bool profiling_snapshot =
             event.name.ends_with(":state_snapshot") || (event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("state_snapshot"));
         if (event.ph == 'X' && profiling_snapshot && event.dur > 0) {
@@ -65,21 +60,26 @@ std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::
             });
         }
     }
-    const auto event_order = [](const TraceEvent * left, const TraceEvent * right) {
-        if (left->ts != right->ts) return left->ts < right->ts;
-        return left->index < right->index;
-    };
-    std::ranges::sort(extends, event_order);
-    std::ranges::sort(decodes, event_order);
+
+    // The phase side table already owns source-order marker selection. Reuse it
+    // for the control metric instead of independently selecting and sorting phases.
+    std::vector<const TraceEvent *> decodes;
+    for (const auto & marker : markers) {
+        if (marker.event.name.starts_with("step[DECODE")) decodes.push_back(&marker.event);
+    }
+
     size_t decode_index = 0;
-    for (const auto * extend : extends) {
-        while (decode_index < decodes.size() && node_end_ts(*decodes[decode_index]) <= extend->ts) ++decode_index;
+    for (const auto & marker : markers) {
+        const auto & extend = marker.event;
+        if (!extend.name.starts_with("step[EXTEND")) continue;
+
+        while (decode_index < decodes.size() && node_end_ts(*decodes[decode_index]) <= extend.ts) ++decode_index;
         if (decode_index >= decodes.size()) break;
         const auto end_us = node_end_ts(*decodes[decode_index++]);
-        if (end_us <= extend->ts) continue;
+        if (end_us <= extend.ts) continue;
         intervals.push_back(DagControlExclusionInterval{
             .gpu_id = gpu_id,
-            .start_us = extend->ts,
+            .start_us = extend.ts,
             .end_us = end_us,
             .kind = DagControlExclusionKind::PrefillDecode,
         });
@@ -187,8 +187,8 @@ DagBuilder::DagBuilder(size_t threads) : threads_(std::max<size_t>(1, threads)) 
 
 DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto parsed_count = events.size();
-    auto exclusions = dag_builder_detail::control_exclusion_intervals(events, gpu_id);
     auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
+    auto exclusions = dag_builder_detail::control_exclusion_intervals(events, phase_markers, gpu_id);
     auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
     auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
     DagGraph graph(std::move(normalized), gpu_id);

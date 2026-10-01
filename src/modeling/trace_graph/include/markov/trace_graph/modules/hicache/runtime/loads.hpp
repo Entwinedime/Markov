@@ -3,22 +3,12 @@
 #include "markov/trace_graph/modules/hicache/patch/io_operation_ledger.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_io.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_consumers.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
-#include <functional>
 #include <set>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-
-enum class LoadExecutionStage { Submission, DeviceStart, DeviceComplete };
-struct LoadExecutionEvent {
-    LoadExecutionStage stage;
-    std::string pid;
-    uint64_t timestamp_us;
-    size_t operations = 0;
-    uint64_t bytes = 0, service_us = 0, source_transfer_us = 0;
-};
 
 /** Controller-scoped queue submission and target H2D execution at source load
  * sites. With independent submission costs, target state supplies batches and
@@ -33,15 +23,18 @@ struct LoadExecutionEvent {
 class HiCacheLoads {
 public:
     explicit HiCacheLoads(HiCacheWriteStreamInsertions & insertions, const frontend::HiCacheConfig & config = {})
-        : page_bytes_(config.kv_bytes_per_page), submission_calibration_(config.load_submission_calibration), stream_insertions_(insertions) {}
-    using Observer = std::function<void(const LoadExecutionEvent &)>;
-    void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin_us, uint64_t end_us, Observer observer = {});
+        : page_bytes_(config.kv_bytes_per_page),
+          submission_calibration_(config.load_submission_calibration),
+          stream_insertions_(insertions) {}
+    void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin_us, uint64_t end_us);
     // Layer consumers must first detach from the old completion records.
     void replace_source_submissions(core::DagGraph & graph);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
-    void rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members);
     [[nodiscard]] size_t source_submissions() const { return loads_.size(); }
     [[nodiscard]] size_t completed_batches() const { return completed_; }
+    [[nodiscard]] size_t base_cost_batches() const { return base_cost_batches_; }
+    [[nodiscard]] size_t shared_cost_batches() const { return shared_cost_batches_; }
     [[nodiscard]] const std::vector<size_t> & layer_consumer(const std::string & pid, uint64_t batch_start_ns) const {
         return forward_records_.at({ pid, batch_start_ns });
     }
@@ -62,6 +55,7 @@ private:
     struct GeneratedSubmission {
         size_t main, worker, compute, stream, layers;
         LoadSubmissionCost cost;
+        bool base_cost = false;
     };
     std::map<std::pair<std::string, std::string>, GeneratedSubmission> generated_submissions_;
     core::DagGraph * graph_ = nullptr;
@@ -89,8 +83,8 @@ private:
     std::map<std::pair<std::string, uint64_t>, std::vector<size_t>> forward_records_;
     std::map<size_t, size_t> submit_at_, start_at_, complete_at_;
     model::HiCacheState * state_ = nullptr;
-    Observer observer_;
     size_t completed_ = 0;
+    size_t base_cost_batches_ = 0, shared_cost_batches_ = 0;
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

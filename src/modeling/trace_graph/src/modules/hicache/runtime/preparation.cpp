@@ -14,58 +14,68 @@ using Span = std::pair<uint64_t, uint64_t>;
 using Lane = std::pair<std::string, std::string>;
 using Json = nlohmann::json;
 
-bool allocator_event(const Event& event) {
-    return event.arg("kernel") == "alloc_extend_kernel" || event.arg("kernel") == "alloc_extend_kernel_aiv";
+uint64_t observed_service(const core::DagGraph & graph, const Event & event) {
+    return graph.cpu_service_cost().duration({ event.pid, event.tid },
+                                             event.ts,
+                                             core::checked_add_u64(event.ts, event.dur, "preparation observation end overflow"));
 }
 
-std::optional<AllocatorSpecialization> observed_specialization(const Event& event) {
+bool allocator_event(const Event & event) { return event.arg("kernel") == "alloc_extend_kernel" || event.arg("kernel") == "alloc_extend_kernel_aiv"; }
+
+std::optional<AllocatorSpecialization> observed_specialization(const Event & event) {
     // This is the installed NPU allocator's actual signature, not a kernel-name
     // guess. The generic SGLang Triton allocator has different constexpr inputs.
     const auto constants = Json::parse(event.arg("constants", "{}"));
     const auto signature = Json::parse(event.arg("signature", "{}"));
     const auto properties = Json::parse(event.arg("argument_properties", "{}"));
-    for (const auto* name : {"pre_lens_ptr", "seq_lens_ptr", "last_loc_ptr", "free_page_ptr", "out_indices"})
+    for (const auto * name : { "pre_lens_ptr", "seq_lens_ptr", "last_loc_ptr", "free_page_ptr", "out_indices" })
         if (signature.value(name, "") != "*i64") return std::nullopt;
-    for (const auto* name : {"bs_upper", "page_size", "max_num_extend_tokens", "BLOCK_SIZE"})
+    for (const auto * name : { "bs_upper", "page_size", "max_num_extend_tokens", "BLOCK_SIZE" })
         if (!constants.contains(name) || !constants[name].is_number_unsigned()) return std::nullopt;
-    if (constants["BLOCK_SIZE"] != 2048 || !properties.contains("tt.divisibility")) return std::nullopt;
+    if (constants["BLOCK_SIZE"] != 2'048 || !properties.contains("tt.divisibility")) return std::nullopt;
     const auto aligned = properties.at("tt.divisibility").get<std::vector<int>>();
-    for (const int pointer : {0, 1, 2, 4}) if (std::ranges::find(aligned, pointer) == aligned.end()) return std::nullopt;
-    return AllocatorSpecialization{constants["page_size"], constants["bs_upper"], constants["max_num_extend_tokens"],
-        std::ranges::find(aligned, 3) == aligned.end() ? uint64_t{8} : uint64_t{0}};
+    for (const int pointer : { 0, 1, 2, 4 })
+        if (std::ranges::find(aligned, pointer) == aligned.end()) return std::nullopt;
+    return AllocatorSpecialization{ constants["page_size"],
+                                    constants["bs_upper"],
+                                    constants["max_num_extend_tokens"],
+                                    std::ranges::find(aligned, 3) == aligned.end() ? uint64_t{ 8 } : uint64_t{ 0 } };
 }
 
 std::vector<Span> interval_union(std::vector<Span> intervals) {
     std::ranges::sort(intervals);
     std::vector<Span> result;
-    for (const auto& span : intervals) {
+    for (const auto & span : intervals) {
         if (!result.empty() && span.first <= result.back().second) result.back().second = std::max(result.back().second, span.second);
         else result.push_back(span);
     }
     return result;
 }
 
-void observe_costs(const core::DagGraph& graph, AllocatorPreparationObservation& plan) {
+void observe_costs(const core::DagGraph & graph, AllocatorPreparationObservation & plan) {
     std::map<std::string, std::map<std::string, std::vector<uint64_t>>> samples;
-    std::map<std::string, std::vector<const Event*>> loads;
-    std::map<AllocatorSpecialization, std::vector<const Event*>> compiles;
+    std::map<std::string, std::vector<const Event *>> loads;
+    std::map<AllocatorSpecialization, std::vector<const Event *>> compiles;
     bool parallel = true;
-    for (const auto& event : graph.runtime_observations()) {
+    for (const auto & event : graph.runtime_observations()) {
         if (!allocator_event(event)) continue;
         const auto specialization = observed_specialization(event);
-        if (!specialization || event.arg("status") != "returned") { parallel = false; continue; }
+        if (!specialization || event.arg("status") != "returned") {
+            parallel = false;
+            continue;
+        }
         if (event.name == "runtime.triton.load") loads[event.pid].push_back(&event);
         if (event.name != "runtime.triton.prepare") continue;
         const auto path = event.arg("path");
         const bool sync = event.arg("execution_mode") == "sync";
-        if (sync && (path == "compiled" || path == "disk_cache")) samples[event.pid][path].push_back(event.dur);
+        if (sync && (path == "compiled" || path == "disk_cache")) samples[event.pid][path].push_back(observed_service(graph, event));
         if (sync && path == "compiled") compiles[*specialization].push_back(&event);
         else parallel = false;
     }
-    for (const auto& [specialization, events] : compiles) {
+    for (const auto & [specialization, events] : compiles) {
         uint64_t begin = 0, end = std::numeric_limits<uint64_t>::max();
         std::set<std::string> ranks;
-        for (const auto* event : events) {
+        for (const auto * event : events) {
             begin = std::max(begin, event->ts);
             end = std::min(end, core::checked_add_u64(event->ts, event->dur, "preparation end overflow"));
             if (!ranks.insert(event->pid).second) parallel = false;
@@ -73,19 +83,19 @@ void observe_costs(const core::DagGraph& graph, AllocatorPreparationObservation&
         if (begin >= end) parallel = false;
     }
     plan.source_parallel_compilation = parallel && !compiles.empty();
-    for (auto& [pid, events] : loads) {
+    for (auto & [pid, events] : loads) {
         std::ranges::sort(events, {}, &Event::ts);
-        for (size_t i = 0; i < events.size(); ++i)
-            samples[pid][i == 0 ? "first_load" : "variant_load"].push_back(events[i]->dur);
+        for (size_t i = 0; i < events.size(); ++i) samples[pid][i == 0 ? "first_load" : "variant_load"].push_back(observed_service(graph, *events[i]));
     }
-    for (auto& [pid, paths] : samples) for (auto& [path, values] : paths) {
-        std::ranges::sort(values);
-        const auto left = values[(values.size() - 1) / 2], right = values[values.size() / 2];
-        plan.cost_samples[pid][path] = {values.size(), values.front(), left + (right - left) / 2, values.back()};
-    }
+    for (auto & [pid, paths] : samples)
+        for (auto & [path, values] : paths) {
+            std::ranges::sort(values);
+            const auto left = values[(values.size() - 1) / 2], right = values[values.size() / 2];
+            plan.cost_samples[pid][path] = { values.size(), values.front(), left + (right - left) / 2, values.back() };
+        }
 }
 
-void assign_cache_paths(const std::vector<model::HiCacheAllocatorWorkItem>& calls, AllocatorPreparationPlan& plan) {
+void assign_cache_paths(const std::vector<model::HiCacheAllocatorWorkItem> & calls, AllocatorPreparationPlan & plan) {
     // A batch is shared across ranks, including repeated chunks of the same
     // logical request. Publish its new disk entries only after the whole batch.
     using Batch = std::pair<std::vector<std::string>, size_t>;
@@ -94,45 +104,45 @@ void assign_cache_paths(const std::vector<model::HiCacheAllocatorWorkItem>& call
     std::vector<std::vector<size_t>> batches;
     for (size_t i = 0; i < calls.size(); ++i) {
         if (calls[i].request_ids.empty()) continue;
-        const Batch key{calls[i].request_ids, occurrences[calls[i].pid][calls[i].request_ids]++};
+        const Batch key{ calls[i].request_ids, occurrences[calls[i].pid][calls[i].request_ids]++ };
         const auto [entry, added] = indexes.emplace(key, batches.size());
         if (added) batches.emplace_back();
         batches[entry->second].push_back(i);
     }
     std::set<AllocatorSpecialization> disk;
     bool uncertain = false;
-    for (const auto& batch : batches) {
+    for (const auto & batch : batches) {
         for (const auto i : batch) {
-            auto& item = plan.calls[i];
+            auto & item = plan.calls[i];
             if (item.status == "already_prepared") item.path = "memory_cache";
             if (item.status == "required" && item.specialization)
                 item.path = disk.contains(*item.specialization) ? "disk_cache" : uncertain ? "unknown" : "compiled";
         }
         for (const auto i : batch) {
-            const auto& item = plan.calls[i];
+            const auto & item = plan.calls[i];
             if (item.status == "required" && item.specialization) disk.insert(*item.specialization);
             if (item.status == "unknown" || item.status == "possibly_required" || item.status == "unsupported_signature") uncertain = true;
         }
     }
 }
 
-std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(const core::DagGraph& graph) {
+std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(const core::DagGraph & graph) {
     std::map<size_t, std::vector<size_t>> parents;
     std::vector<size_t> devices;
-    for (const auto& node : graph.nodes()) {
+    for (const auto & node : graph.nodes()) {
         if (node.active && !node.is_cpu && graph.event_for_node(node.id).name == "alloc_extend_kernel") {
             devices.push_back(node.id);
             parents[node.id];
         }
     }
     auto frontier = devices;
-    for (const auto kind : {core::DagEdgeKind::Correlation, core::DagEdgeKind::Correlation, core::DagEdgeKind::Sequential}) {
+    for (const auto kind : { core::DagEdgeKind::Correlation, core::DagEdgeKind::Correlation, core::DagEdgeKind::Sequential }) {
         std::set<size_t> wanted(frontier.begin(), frontier.end());
-        for (const auto& edge : graph.edges())
-            if (edge.active && edge.kind == kind && wanted.contains(edge.dst) && graph.node(edge.src).active)
-                parents[edge.dst].push_back(edge.src);
+        for (const auto & edge : graph.edges())
+            if (edge.active && edge.kind == kind && wanted.contains(edge.dst) && graph.node(edge.src).active) parents[edge.dst].push_back(edge.src);
         frontier.clear();
-        for (const auto id : wanted) if (parents[id].size() == 1) frontier.push_back(parents[id].front());
+        for (const auto id : wanted)
+            if (parents[id].size() == 1) frontier.push_back(parents[id].front());
     }
     std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> anchors;
     for (const auto device : devices) {
@@ -142,34 +152,35 @@ std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(c
         const auto enqueue = parents[launch].front();
         if (parents[enqueue].size() != 1) continue;
         const auto before = parents[enqueue].front();
-        const auto& event = graph.event_for_node(enqueue);
-        const auto& prior = graph.event_for_node(before);
-        if (event.name != "Enqueue@alloc_extend_kernel" || !graph.node(enqueue).is_cpu || !graph.node(before).is_cpu
-            || event.pid != prior.pid || event.tid != prior.tid) continue;
-        anchors[{event.pid, event.tid}].emplace_back(event.ts, before);
+        const auto & event = graph.event_for_node(enqueue);
+        const auto & prior = graph.event_for_node(before);
+        if (event.name != "Enqueue@alloc_extend_kernel" || !graph.node(enqueue).is_cpu || !graph.node(before).is_cpu || event.pid != prior.pid
+            || event.tid != prior.tid)
+            continue;
+        anchors[{ event.pid, event.tid }].emplace_back(event.ts, before);
     }
     return anchors;
 }
-}
+} // namespace
 
-AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph& graph) {
+AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph & graph) {
     AllocatorPreparationObservation result;
     observe_costs(graph, result);
     // Source batches bound observations even when target execution has not yet
     // reached them. Never infer an owner from the nearest arbitrary CPU event.
     std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> batches;
-    for (const auto& event : graph.hicache_fact_events()) {
+    for (const auto & event : graph.hicache_fact_events()) {
         if (event.arg("fact").empty() || parse_hicache_fact_metadata(event).role != "cache_extend_input") continue;
-        batches[{event.pid, event.tid}].emplace_back(event.ts, result.calls.size());
-        result.calls.push_back({.source_fact_id=event.index, .pid=event.pid, .tid=event.tid,
-            .begin_us=event.ts, .end_us=std::numeric_limits<uint64_t>::max()});
+        batches[{ event.pid, event.tid }].emplace_back(event.ts, result.calls.size());
+        result.calls.push_back(
+            { .source_fact_id = event.index, .pid = event.pid, .tid = event.tid, .begin_us = event.ts, .end_us = std::numeric_limits<uint64_t>::max() });
     }
-    for (auto& [lane, boundaries] : batches) {
+    for (auto & [lane, boundaries] : batches) {
         std::ranges::sort(boundaries);
-        for (size_t i = 1; i < boundaries.size(); ++i) result.calls[boundaries[i-1].second].end_us = boundaries[i].first;
+        for (size_t i = 1; i < boundaries.size(); ++i) result.calls[boundaries[i - 1].second].end_us = boundaries[i].first;
     }
     std::map<std::string, uint64_t> first_load;
-    for (const auto& event : graph.runtime_observations()) {
+    for (const auto & event : graph.runtime_observations()) {
         if (!allocator_event(event)) continue;
         if (event.name == "runtime.triton.prepare" && observed_specialization(event)) result.supported_pids.insert(event.pid);
         if (event.name == "runtime.triton.load") {
@@ -177,19 +188,19 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
             if (!added) entry->second = std::min(entry->second, event.ts);
         }
     }
-    for (const auto& event : graph.runtime_observations()) {
+    for (const auto & event : graph.runtime_observations()) {
         if (!allocator_event(event)) continue;
-        const auto lane = batches.find({event.pid, event.tid});
+        const auto lane = batches.find({ event.pid, event.tid });
         if (lane == batches.end()) continue;
-        const auto& boundaries = lane->second;
+        const auto & boundaries = lane->second;
         const auto after = std::ranges::upper_bound(boundaries, event.ts, {}, &std::pair<uint64_t, size_t>::first);
         if (after == boundaries.begin()) continue; // Prelude supplies samples, not a formal cost.
-        auto& call = result.calls[std::prev(after)->second];
+        auto & call = result.calls[std::prev(after)->second];
         const auto end = core::checked_add_u64(event.ts, event.dur, "preparation observation end overflow");
         const auto observed = observed_specialization(event);
-        if (!observed || event.arg("status") != "returned" || end > call.end_us
-            || (call.specialization && call.specialization != observed)) {
-            ++call.issues["preparation_observation_not_bound"]; continue;
+        if (!observed || event.arg("status") != "returned" || end > call.end_us || (call.specialization && call.specialization != observed)) {
+            ++call.issues["preparation_observation_not_bound"];
+            continue;
         }
         call.specialization = observed;
         call.intervals.emplace_back(event.ts, end);
@@ -201,39 +212,45 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
         if (event.name == "runtime.triton.load" && event.ts == first_load.at(event.pid)) call.first_load = true;
     }
     const auto anchors = allocator_gap_anchors(graph);
-    for (auto& call : result.calls) {
+    for (auto & call : result.calls) {
         call.intervals = interval_union(std::move(call.intervals));
+        for (const auto & [begin, end] : call.intervals)
+            call.service_duration_us = core::checked_add_u64(call.service_duration_us,
+                                                             graph.cpu_service_cost().duration({ call.pid, call.tid }, begin, end),
+                                                             "preparation service overflow");
+
         std::vector<size_t> matches;
-        const auto lane = anchors.find({call.pid, call.tid});
-        if (lane != anchors.end()) for (const auto& [ts, node] : lane->second)
-            if (ts >= call.begin_us && ts < call.end_us) matches.push_back(node);
+        const auto lane = anchors.find({ call.pid, call.tid });
+        if (lane != anchors.end())
+            for (const auto & [ts, node] : lane->second)
+                if (ts >= call.begin_us && ts < call.end_us) matches.push_back(node);
         if (matches.size() == 1) call.submit_gap_node = matches.front();
     }
     return result;
 }
 
-AllocatorPreparationPlan predict_allocator_preparations(
-    const AllocatorPreparationObservation& source, const std::vector<model::HiCacheAllocatorWorkItem>& calls) {
+AllocatorPreparationPlan predict_allocator_preparations(const AllocatorPreparationObservation & source,
+                                                        const std::vector<model::HiCacheAllocatorWorkItem> & calls) {
     AllocatorPreparationPlan result;
     result.source_parallel_compilation = source.source_parallel_compilation;
     result.cost_samples = source.cost_samples;
     std::map<std::string, std::set<AllocatorSpecialization>> prepared;
     std::set<std::string> uncertain;
-    for (const auto& call : calls) {
+    for (const auto & call : calls) {
         AllocatorPreparation item;
         if (!source.supported_pids.contains(call.pid)) item.status = "unsupported_signature";
         else if (call.allocated_pages >= 200) item.status = "naive_path";
-        else if (!call.free_index_offset || !call.extend_tokens || !call.batch_size
-                 || call.extend_tokens > (uint64_t{1} << 63) || call.batch_size > (uint64_t{1} << 63)) {
+        else if (!call.free_index_offset || !call.extend_tokens || !call.batch_size || call.extend_tokens > (uint64_t{ 1 } << 63)
+                 || call.batch_size > (uint64_t{ 1 } << 63)) {
             item.status = "unknown";
             uncertain.insert(call.pid);
-        } else {
-            item.specialization = AllocatorSpecialization{call.page_size, std::bit_ceil(call.batch_size),
-                std::bit_ceil(call.extend_tokens), (*call.free_index_offset % 2) * 8};
-            auto& cache = prepared[call.pid];
+        }
+        else {
+            item.specialization =
+                AllocatorSpecialization{ call.page_size, std::bit_ceil(call.batch_size), std::bit_ceil(call.extend_tokens), (*call.free_index_offset % 2) * 8 };
+            auto & cache = prepared[call.pid];
             item.first_load = cache.empty();
-            item.status = cache.contains(*item.specialization) ? "already_prepared" :
-                uncertain.contains(call.pid) ? "possibly_required" : "required";
+            item.status = cache.contains(*item.specialization) ? "already_prepared" : uncertain.contains(call.pid) ? "possibly_required" : "required";
             cache.insert(*item.specialization);
         }
         if (call.formal && (item.status == "unknown" || item.status == "possibly_required" || item.status == "unsupported_signature"))
@@ -243,19 +260,20 @@ AllocatorPreparationPlan predict_allocator_preparations(
     assign_cache_paths(calls, result);
     for (size_t i = 0; i < calls.size(); ++i) {
         if (!calls[i].formal) continue;
-        const auto found = std::ranges::find_if(source.calls, [&](const auto& call) {
-            return call.source_fact_id == calls[i].source_fact_id && call.pid == calls[i].pid;
-        });
-        if (found == source.calls.end()) { ++result.blockers["source_batch_boundary_missing"]; continue; }
-        for (const auto& [issue, count] : found->issues) result.blockers[issue] += count;
+        const auto found =
+            std::ranges::find_if(source.calls, [&](const auto & call) { return call.source_fact_id == calls[i].source_fact_id && call.pid == calls[i].pid; });
+        if (found == source.calls.end()) {
+            ++result.blockers["source_batch_boundary_missing"];
+            continue;
+        }
+        for (const auto & [issue, count] : found->issues) result.blockers[issue] += count;
         result.observed_formal_calls += found->required;
-        const auto& target = result.calls[i];
-        AllocatorPreparationCpuCost cpu{.source_call=static_cast<size_t>(found-source.calls.begin())};
-        if (target.status == "required" && found->required && target.specialization == found->specialization
-            && target.first_load == found->first_load && (found->path.empty() || found->path == target.path)) {
+        const auto & target = result.calls[i];
+        AllocatorPreparationCpuCost cpu{ .source_call = static_cast<size_t>(found - source.calls.begin()) };
+        if (target.status == "required" && found->required && target.specialization == found->specialization && target.first_load == found->first_load
+            && (found->path.empty() || found->path == target.path)) {
             cpu.retain_source = true;
-            for (const auto& [begin, end] : found->intervals)
-                cpu.duration_us = core::checked_add_u64(cpu.duration_us, end-begin, "preparation coverage overflow");
+            cpu.duration_us = found->service_duration_us;
             result.cpu_costs.push_back(cpu);
             continue;
         }
@@ -263,58 +281,64 @@ AllocatorPreparationPlan predict_allocator_preparations(
             const auto costs = result.cost_samples.find(calls[i].pid);
             if (!result.source_parallel_compilation) ++result.blockers["preparation_compilation_context_uncovered"];
             else if (target.first_load) ++result.blockers["preparation_first_runtime_state_uncovered"];
-            else if (costs == result.cost_samples.end() || !costs->second.contains(target.path)
-                     || !costs->second.contains("variant_load")) ++result.blockers["new_preparation_cost_uncovered"];
-            else cpu.duration_us = core::checked_add_u64(costs->second.at(target.path).median_us,
-                costs->second.at("variant_load").median_us, "predicted preparation cost overflow");
-        } else if (target.status != "already_prepared" && target.status != "naive_path") continue;
+            else if (costs == result.cost_samples.end() || !costs->second.contains(target.path) || !costs->second.contains("variant_load"))
+                ++result.blockers["new_preparation_cost_uncovered"];
+            else
+                cpu.duration_us = core::checked_add_u64(costs->second.at(target.path).median_us,
+                                                        costs->second.at("variant_load").median_us,
+                                                        "predicted preparation cost overflow");
+        }
+        else if (target.status != "already_prepared" && target.status != "naive_path") continue;
         result.cpu_costs.push_back(cpu);
     }
     if (!result.blockers.empty() || calls.empty()) {
         result.cpu_costs.clear();
         result.status = source.supported_pids.empty() ? "unavailable" : "partial";
-    } else result.status = "ready";
+    }
+    else result.status = "ready";
     return result;
 }
 
-AllocatorPreparationPlan plan_allocator_preparations(
-    const core::DagGraph& graph, const std::vector<model::HiCacheAllocatorWorkItem>& calls) {
+AllocatorPreparationPlan plan_allocator_preparations(const core::DagGraph & graph, const std::vector<model::HiCacheAllocatorWorkItem> & calls) {
     const auto source = observe_allocator_preparations(graph);
     auto result = predict_allocator_preparations(source, calls);
     std::map<Lane, std::vector<Span>> removed;
     std::map<size_t, uint64_t> added;
-    for (const auto& cost : result.cpu_costs) {
+    for (const auto & cost : result.cpu_costs) {
         if (cost.retain_source) continue;
-        const auto& call = source.calls.at(cost.source_call);
-        auto& spans = removed[{call.pid, call.tid}];
+        const auto & call = source.calls.at(cost.source_call);
+        auto & spans = removed[{ call.pid, call.tid }];
         spans.insert(spans.end(), call.intervals.begin(), call.intervals.end());
         if (cost.duration_us && (!call.submit_gap_node || !added.emplace(*call.submit_gap_node, cost.duration_us).second))
             ++result.blockers["preparation_submit_anchor_not_unique"];
     }
 
     uint64_t required_coverage = 0;
-    for (auto& [lane, spans] : removed) {
+    for (auto & [lane, spans] : removed) {
         spans = interval_union(std::move(spans));
-        for (const auto& [begin, end] : spans) required_coverage = core::checked_add_u64(required_coverage, end - begin, "preparation coverage overflow");
+        for (const auto & [begin, end] : spans) required_coverage = core::checked_add_u64(required_coverage, end - begin, "preparation coverage overflow");
     }
-    for (const auto& node : graph.nodes()) {
+    for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || (!node.original_cpu_gap_after && !added.contains(node.id))) continue;
-        const auto& event = graph.event_for_node(node.id);
-        const auto found = removed.find({event.pid, event.tid});
+        const auto & event = graph.event_for_node(node.id);
+        const auto found = removed.find({ event.pid, event.tid });
         if (found == removed.end() && !added.contains(node.id)) continue;
         const auto begin = core::checked_add_u64(event.ts, event.dur, "CPU observation end overflow");
         const auto end = core::checked_add_u64(begin, node.original_cpu_gap_after, "CPU gap end overflow");
         uint64_t covered = 0;
-        if (found != removed.end()) for (const auto& [left, right] : found->second)
-            if (std::max(begin, left) < std::min(end, right)) covered += std::min(end, right) - std::max(begin, left);
-        const auto extra = added.contains(node.id) ? added.at(node.id) : uint64_t{0};
+        if (found != removed.end())
+            for (const auto & [left, right] : found->second)
+                if (std::max(begin, left) < std::min(end, right)) covered += std::min(end, right) - std::max(begin, left);
+        const auto extra = added.contains(node.id) ? added.at(node.id) : uint64_t{ 0 };
         if (!covered && !extra) continue;
         if (node.cpu_gap_after != node.original_cpu_gap_after || graph.scope_gap_duration(node.id)) {
-            ++result.blockers["preparation_gap_already_modified"]; continue;
+            ++result.blockers["preparation_gap_already_modified"];
+            continue;
         }
-        result.mutation.set_cpu_gaps.push_back({node.id,
-            core::checked_add_u64(node.cpu_gap_after - covered, extra, "target preparation gap overflow"),
-            "allocator_preparation", "replace observed preparation with target first-use cost; retain residual source time"});
+        result.mutation.set_cpu_gaps.push_back({ node.id,
+                                                 core::checked_add_u64(node.cpu_gap_after - covered, extra, "target preparation gap overflow"),
+                                                 "allocator_preparation",
+                                                 "replace observed preparation with target first-use cost; retain residual source time" });
         result.removed_coverage_us = core::checked_add_u64(result.removed_coverage_us, covered, "preparation coverage overflow");
         result.added_cost_us = core::checked_add_u64(result.added_cost_us, extra, "preparation cost overflow");
     }
@@ -324,7 +348,8 @@ AllocatorPreparationPlan plan_allocator_preparations(
         result.removed_coverage_us = 0;
         result.added_cost_us = 0;
         result.status = source.supported_pids.empty() ? "unavailable" : "partial";
-    } else result.status = "ready";
+    }
+    else result.status = "ready";
     return result;
 }
 

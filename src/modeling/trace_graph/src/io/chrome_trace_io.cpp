@@ -7,6 +7,7 @@
 #include "markov/trace_graph/core/logger.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/json_scan.hpp"
+#include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -631,11 +632,13 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
             << "      \"cat\": \"sim_" << escape_json(event.cat) << "\",\n"
             << "      \"ph\": \"X\",\n"
             << "      \"ts\": " << (real_min + node.simulation_start) << ",\n"
-            << "      \"dur\": " << node.duration << ",\n"
+            << "      \"dur\": " << (node.completion_time - node.simulation_start) << ",\n"
             << "      \"pid\": " << pid << ",\n"
             << "      \"tid\": " << tid << ",\n"
             << "      \"args\": {\"node_id\":" << node.id << ",\"event_index\":" << node.event_index << ",\"node_kind\":\""
-            << (node.kind == core::DagNodeKind::Synthetic ? "synthetic" : "trace_event") << "\"}\n"
+            << (node.kind == core::DagNodeKind::Synthetic ? "synthetic" : "trace_event") << "\",\"is_cpu\":" << (node.is_cpu ? "true" : "false")
+            << ",\"lane_id\":" << node.lane_id << ",\"cpu_gap_after_us\":" << simulation::topological_edge_delay_us(graph, node, core::DagEdgeKind::Sequential)
+            << ",\"cpu_ready_delay_before_us\":" << graph.cpu_service_ready_delay(node.id, node.cpu_ready_delay_before) << "}\n"
             << "    }";
     }
 
@@ -658,7 +661,7 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
             << "      \"name\": \"edge\",\n"
             << "      \"cat\": \"edge\",\n"
             << "      \"ph\": \"s\",\n"
-            << "      \"ts\": " << (real_min + src_node.simulation_start + src_node.duration) << ",\n"
+            << "      \"ts\": " << (real_min + src_node.completion_time) << ",\n"
             << "      \"pid\": " << src_pid << ",\n"
             << "      \"tid\": " << src_tid << ",\n"
             << "      \"id\": \"" << edge_id << "\",\n"

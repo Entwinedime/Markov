@@ -163,7 +163,7 @@ public:
             for (const auto & task : queues_.tasks) {
                 result_.submission_overlap_count += task.submission_overlap_us != 0;
                 result_.submission_overlap_total_us =
-                    checked_add(result_.submission_overlap_total_us, task.submission_overlap_us, "queue overlap total overflow");
+                    core::checked_add_u64(result_.submission_overlap_total_us, task.submission_overlap_us, "queue overlap total overflow");
                 result_.submission_overlap_max_us = std::max(result_.submission_overlap_max_us, task.submission_overlap_us);
             }
         }
@@ -186,10 +186,8 @@ private:
     void launch_task(size_t task_id) {
         const auto & task = queues_.tasks[task_id];
         const auto ready = std::max(start_time_[task.first], workers_[task.queue].free_us);
-        events_.emplace(checked_add(ready, task.ready_delay_us, "queue ready delay overflow"),
-                        QueueEventKind::Start,
-                        task.first,
-                        ready_generation_[task.first]);
+        const auto delay = mode_ == ReplayMode::Full ? graph_.cpu_service_ready_delay(task.first, task.ready_delay_us) : task.ready_delay_us;
+        events_.emplace(core::checked_add_u64(ready, delay, "queue ready delay overflow"), QueueEventKind::Start, task.first, ready_generation_[task.first]);
     }
 
     void admit_task(size_t queue) {
@@ -213,7 +211,10 @@ private:
         }
         else {
             const auto kind = deferred_boundaries_.contains(id) ? QueueEventKind::DeferredStart : QueueEventKind::Start;
-            events_.emplace(checked_add(start_time_[id], effective_ready_delay(nodes_[id]), "CPU ready delay overflow"), kind, id, ready_generation_[id]);
+            events_.emplace(core::checked_add_u64(start_time_[id], effective_ready_delay(nodes_[id]), "CPU ready delay overflow"),
+                            kind,
+                            id,
+                            ready_generation_[id]);
         }
     }
 
@@ -260,15 +261,11 @@ private:
         }
     }
 
-    [[nodiscard]] static uint64_t checked_add(uint64_t left, uint64_t right, const char * message) {
-        if (left > std::numeric_limits<uint64_t>::max() - right) throw std::overflow_error(message);
-        return left + right;
-    }
-
     void execute_node(size_t node_id) {
         result_.processed_nodes++;
         execution_[node_id] = Execution::Running;
-        if (!chronological_) start_time_[node_id] = checked_add(start_time_[node_id], effective_ready_delay(nodes_[node_id]), "DAG CPU ready-delay overflow");
+        if (!chronological_)
+            start_time_[node_id] = core::checked_add_u64(start_time_[node_id], effective_ready_delay(nodes_[node_id]), "DAG CPU ready-delay overflow");
         if (expand_at_start_) {
             expanding_node_ = node_id;
             expand_at_start_(node_id, start_time_[node_id], *this);
@@ -278,7 +275,7 @@ private:
         auto & node = graph_.mutable_node(node_id);
         if (cost_at_start_) node.duration = cost_at_start_(node_id, start_time_[node_id], node.duration);
         if (deferred_boundaries_.contains(node_id) && node.duration) throw std::logic_error("Deferred observation cannot acquire a service cost");
-        const auto completion_time = checked_add(start_time_[node_id], effective_node_duration(node), "DAG simulation timestamp overflow");
+        const auto completion_time = core::checked_add_u64(start_time_[node_id], effective_node_duration(node), "DAG simulation timestamp overflow");
         completion_time_[node_id] = completion_time;
         if (mode_ == ReplayMode::Full) {
             node.simulation_start = start_time_[node_id];
@@ -294,7 +291,7 @@ private:
 
     void propagate_edge(const core::DagNode & source, size_t dst, core::DagEdgeKind kind) {
         const auto delay = effective_edge_delay(source, kind);
-        const auto candidate = checked_add(completion_time_[source.id], delay, "DAG simulation edge-delay overflow");
+        const auto candidate = core::checked_add_u64(completion_time_[source.id], delay, "DAG simulation edge-delay overflow");
         start_time_[dst] = std::max(start_time_[dst], candidate);
         storage_.indegree[dst]--;
         if (storage_.indegree[dst] == 0) make_ready(dst);
@@ -397,6 +394,7 @@ private:
     [[nodiscard]] uint64_t effective_ready_delay(const core::DagNode & node) const {
         if (mode_ == ReplayMode::GapExcluded) return 0;
         const auto delay = node.cpu_ready_delay_before;
+        if (mode_ == ReplayMode::Full) return graph_.cpu_service_ready_delay(node.id, delay);
         if (mode_ != ReplayMode::ControlOnly || delay == 0) return delay;
         const auto start = graph_.event_for_node(node.id).ts;
         return delay - control_exclusions_.overlap_us(node.gpu_id, start - delay, start);
@@ -407,7 +405,7 @@ private:
         if (mode_ == ReplayMode::GapExcluded) return graph_.scope_node_owned(node.id) ? node.duration : 0;
         if (mode_ != ReplayMode::ControlOnly || node.kind == core::DagNodeKind::Synthetic || node.duration == 0) return node.duration;
         const auto & event = graph_.event_for_node(node.id);
-        const auto event_end = checked_add(event.ts, event.dur, "trace event end exceeds uint64 range");
+        const auto event_end = core::checked_add_u64(event.ts, event.dur, "trace event end exceeds uint64 range");
         const auto overlap = control_exclusions_.overlap_us(node.gpu_id, event.ts, event_end);
         return scaled_outside_duration(node.duration, event.dur, overlap);
     }
@@ -419,8 +417,8 @@ private:
         if (mode_ == ReplayMode::GapExcluded) return graph_.scope_gap_duration(source.id);
         if (source.original_cpu_gap_after == 0) return current_delay;
         const auto & event = graph_.event_for_node(source.id);
-        const auto gap_start = checked_add(event.ts, event.dur, "CPU gap start exceeds uint64 range");
-        const auto gap_end = checked_add(gap_start, source.original_cpu_gap_after, "CPU gap end exceeds uint64 range");
+        const auto gap_start = core::checked_add_u64(event.ts, event.dur, "CPU gap start exceeds uint64 range");
+        const auto gap_end = core::checked_add_u64(gap_start, source.original_cpu_gap_after, "CPU gap end exceeds uint64 range");
         const auto overlap = control_exclusions_.overlap_us(source.gpu_id, gap_start, gap_end);
         return scaled_outside_duration(current_delay, source.original_cpu_gap_after, overlap);
     }
@@ -477,16 +475,8 @@ private:
 
 } // namespace topological_simulator_detail
 
-SimulationResult run_topological_simulation(core::DagGraph & graph) {
-    return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::Full).run();
-}
-
 SimulationResult run_control_topological_simulation(core::DagGraph & graph) {
     return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::ControlOnly).run();
-}
-
-SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start) {
-    return topological_simulator_detail::TopologicalSimulation(graph, topological_simulator_detail::ReplayMode::Full, cost_at_start).run();
 }
 
 SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start, const ExpandAtStart & expand_at_start) {

@@ -12,28 +12,6 @@ struct PrefetchWaitTemplate {
     std::string calibration_manifest;
     std::map<int, std::string> local_return_calibration_manifests;
 };
-struct PrefetchWaitReturn {
-    std::string request_id;
-    int rank;
-    uint64_t timestamp_us;
-    size_t checks, visible_pages;
-    bool stopped;
-    // Snapshot at foreground return; absent timestamps are unavailable or pending.
-    std::optional<uint64_t> query_return_us, io_start_us, first_page_us, last_page_us;
-    std::optional<uint64_t> stop_us, visible_us, worker_return_us;
-};
-struct PrefetchSchedulerReturn {
-    std::string request_id;
-    int rank;
-    uint64_t timestamp_us;
-    model::PrefetchSchedulerAction action;
-    uint64_t batches = 0;
-};
-struct PrefetchWaitObserver {
-    std::function<void(const PrefetchWaitReturn &)> returned;
-    std::function<void(const PrefetchSchedulerReturn &)> scheduler;
-};
-
 /** Replaces source wait regions with target-driven loops over one serial HTTP
  * window. Uses same-base branch work, not source decisions or retry counts.
  * Source policy parses source observations; target policy drives execution.
@@ -43,13 +21,11 @@ struct PrefetchWaitObserver {
 class HiCachePrefetchWaits {
 public:
     void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, std::string_view source_policy, const std::string & target_policy,
-              const core::ClientRequestChain & chain, PrefetchWaitObserver observer = {}, const std::string & calibration_path = {},
-              const std::vector<std::string> & cpu_calibrations = {});
+              const core::ClientRequestChain & chain, const std::string & calibration_path = {}, const std::vector<std::string> & cpu_calibrations = {});
     void start(simulation::FutureDag & future);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
     [[nodiscard]] const std::vector<core::TraceEvent> & replaced_intervals() const { return replaced_; }
     [[nodiscard]] const PrefetchWaitTemplate & source_template() const { return template_; }
-    [[nodiscard]] size_t request_count() const { return waits_.size(); }
 
 private:
     struct Wait {
@@ -66,7 +42,6 @@ private:
     model::HiCacheState * state_ = nullptr;
     std::vector<core::TraceEvent> replaced_;
     PrefetchWaitTemplate template_;
-    PrefetchWaitObserver observer_;
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

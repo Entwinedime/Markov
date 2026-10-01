@@ -161,23 +161,18 @@ TraceReadOptions sidecar_read_options(const ManifestTraceInputOptions & options)
     };
 }
 
-struct ChannelTraceRead {
-    std::vector<TraceEvent> events;
-};
-
-ChannelTraceRead read_channel_trace(const std::string & path, const TraceReadOptions & options, TraceSourceChannel channel) {
-    ChannelTraceRead result;
-    result.events = read_chrome_trace(path, options);
-    for (auto & event : result.events) event.source_channel = channel;
-    return result;
+std::vector<TraceEvent> read_channel_trace(const std::string & path, const TraceReadOptions & options, TraceSourceChannel channel) {
+    auto events = read_chrome_trace(path, options);
+    for (auto & event : events) event.source_channel = channel;
+    return events;
 }
 
 void append_trace_files(ManifestTraceInput & input, const std::vector<std::string> & paths, const TraceReadOptions & options, TraceSourceChannel channel) {
     for (const auto & path : paths) {
-        auto read = read_channel_trace(path, options, channel);
+        auto events = read_channel_trace(path, options, channel);
         const auto offset = input.events.size();
-        for (size_t index = 0; index < read.events.size(); ++index) read.events[index].index = offset + index;
-        input.events.insert(input.events.end(), std::make_move_iterator(read.events.begin()), std::make_move_iterator(read.events.end()));
+        for (size_t index = 0; index < events.size(); ++index) events[index].index = offset + index;
+        input.events.insert(input.events.end(), std::make_move_iterator(events.begin()), std::make_move_iterator(events.end()));
     }
 }
 
@@ -409,11 +404,9 @@ ManifestTraceInput load_torch_group(const std::string & torch_path, const std::s
                                     const std::vector<std::string> & input_contracts, const ManifestTraceInputOptions & options) {
     ManifestTraceInput input;
     input.input_contracts = input_contracts;
-    auto torch = read_channel_trace(torch_path, profiler_read_options(options), TraceSourceChannel::Torch);
-    input.events = std::move(torch.events);
+    input.events = read_channel_trace(torch_path, profiler_read_options(options), TraceSourceChannel::Torch);
     if (!custom_path.empty()) {
-        auto custom = read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
-        detail::join_custom_trace(input.events, std::move(custom.events), options);
+        detail::join_custom_trace(input.events, read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload), options);
     }
     append_trace_files(input, sidecar_paths, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
@@ -425,12 +418,7 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
                                          const ManifestTraceInputOptions & options) {
     ManifestTraceInput input;
     input.input_contracts = input_contracts;
-    for (const auto & path : paths.ld_preload) {
-        auto custom = read_channel_trace(path, sidecar_read_options(options), TraceSourceChannel::LdPreload);
-        const auto offset = input.events.size();
-        for (size_t index = 0; index < custom.events.size(); ++index) custom.events[index].index = offset + index;
-        input.events.insert(input.events.end(), std::make_move_iterator(custom.events.begin()), std::make_move_iterator(custom.events.end()));
-    }
+    append_trace_files(input, paths.ld_preload, sidecar_read_options(options), TraceSourceChannel::LdPreload);
     append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
     detail::retain_duration_events(input.events);
     retain_trace_window(input, options);
@@ -496,17 +484,14 @@ std::vector<ManifestTraceInput> load_trace_inputs_from_manifest(const std::strin
 
     for (size_t begin = 0; begin < paths.torch.size(); begin += concurrency) {
         const auto end = std::min(paths.torch.size(), begin + concurrency);
-        std::vector<std::future<std::pair<size_t, ManifestTraceInput>>> futures;
+        std::vector<std::future<ManifestTraceInput>> futures;
         futures.reserve(end - begin);
         for (size_t index = begin; index < end; ++index) {
-            futures.push_back(std::async(std::launch::async, [&paths, &input_contracts, &options, index] {
-                return std::make_pair(index, load_logical_input(paths, input_contracts, index, options));
-            }));
+            futures.push_back(std::async(std::launch::async,
+                                         [&paths, &input_contracts, &options, index] { return load_logical_input(paths, input_contracts, index, options); }));
         }
-        for (auto & future : futures) {
-            auto [index, input] = future.get();
-            inputs[index] = std::move(input);
-        }
+        // Join in manifest order, independently of worker completion order.
+        for (size_t index = begin; index < end; ++index) inputs[index] = futures[index - begin].get();
     }
     return inputs;
 }

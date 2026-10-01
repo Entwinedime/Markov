@@ -72,10 +72,6 @@ std::optional<size_t> resolve_node_ref(const DagNodeRef & ref, const Prospective
     return found->second;
 }
 
-bool same_edge(const VirtualEdge & lhs, const VirtualEdge & rhs) {
-    return lhs.active && rhs.active && lhs.src == rhs.src && lhs.dst == rhs.dst && lhs.kind == rhs.kind && lhs.effect_id == rhs.effect_id;
-}
-
 class ProspectiveGraphBuilder {
 public:
     ProspectiveGraphBuilder(const DagGraph & graph, const DagMutationPlan & plan) : graph_(graph), plan_(plan) {
@@ -100,7 +96,7 @@ private:
     void copy_active_graph() {
         if (plan_.component.empty())
             add_issue(prospective_.plan_issues, "empty_component", "non-empty DAG mutation plan requires one semantic component owner");
-        active_effect_edges_.reserve(plan_.redirect_edges.size() + plan_.add_edges.size());
+        active_effect_edges_.reserve(graph_.edge_count() + plan_.redirect_edges.size() + plan_.add_edges.size());
         prospective_.active_nodes.reserve(graph_.node_count() + plan_.synthetic_nodes.size());
         for (const auto & node : graph_.nodes()) prospective_.active_nodes.push_back(node.active);
         prospective_.edges.reserve(graph_.edge_count() + plan_.add_edges.size() + plan_.redirect_edges.size());
@@ -126,14 +122,9 @@ private:
     }
 
     void append_edge_if_unique(VirtualEdge edge) {
-        if (!edge.effect_id.empty()) {
-            const auto key = effect_edge_key(edge.src, edge.dst, edge.kind, edge.effect_id);
-            if (active_effect_edges_.contains(key)) return;
-            increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id);
-            prospective_.edges.push_back(std::move(edge));
-            return;
-        }
-        if (std::ranges::any_of(prospective_.edges, [&](const auto & existing) { return same_edge(existing, edge); })) return;
+        const auto key = effect_edge_key(edge.src, edge.dst, edge.kind, edge.effect_id);
+        if (active_effect_edges_.contains(key)) return;
+        increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id);
         prospective_.edges.push_back(std::move(edge));
     }
 

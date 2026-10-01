@@ -8,12 +8,11 @@ using Control = PrefetchControlObservation;
 using Action = model::PrefetchSchedulerAction;
 
 void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, std::string_view source_policy, const std::string & target_policy,
-                                const core::ClientRequestChain & chain, PrefetchWaitObserver observer, const std::string & calibration_path,
+                                const core::ClientRequestChain & chain, const std::string & calibration_path,
                                 const std::vector<std::string> & cpu_calibrations) {
     if (state_) throw std::logic_error("Prefetch waits are already bound");
     state_ = &replay.state();
     clients_ = chain.requests;
-    observer_ = std::move(observer);
     const patch::HiCacheSourceDagIndex source(graph);
     const auto rounds = observe_cpu_collectives(source);
     const auto workers = observe_prefetch_workers(source, rounds);
@@ -130,11 +129,8 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
 
 void HiCachePrefetchWaits::scheduler_action(Wait & wait, Action action, const model::PrefetchSchedulerBoundary & boundary, uint64_t time) {
     if (!active_http_ || *active_http_ != wait.request) throw std::runtime_error("Scheduler wait is outside its active serial HTTP request");
-    if (action == Action::Receive) {
-        // The next serial HTTP request cannot arrive until this one completes.
-        if (boundary.apply && observer_.scheduler) observer_.scheduler({ wait.request, boundary.rank, time, action });
-        return;
-    }
+    // The next serial HTTP request cannot arrive until this one completes.
+    if (action == Action::Receive) return;
     auto fact = wait.facts.at(boundary.rank);
     fact.ts = time;
     auto & samples = wait.samples[boundary.step];
@@ -147,7 +143,6 @@ void HiCachePrefetchWaits::scheduler_action(Wait & wait, Action action, const mo
     if (action == Action::LoadCompletion) state_->acknowledge_loads(fact, count);
     else if (action == Action::WriteCompletion) state_->acknowledge_writes(fact, count);
     else throw std::runtime_error("Storage drain must be handled by the shared wait executor");
-    if (observer_.scheduler) observer_.scheduler({ wait.request, boundary.rank, time, action, count });
 }
 
 void HiCachePrefetchWaits::start(simulation::FutureDag & future) {
@@ -170,32 +165,7 @@ void HiCachePrefetchWaits::advance(size_t node, uint64_t time, simulation::Futur
             active_http_.reset();
         }
     }
-    for (auto & wait : waits_)
-        if (const auto rank = wait->execution->advance(node, time, future)) {
-            const auto * operation = state_->prefetch_operation(wait->facts.at(*rank));
-            if (observer_.returned) {
-                PrefetchWaitReturn row{ wait->request,
-                                        *rank,
-                                        time,
-                                        wait->execution->checks_issued(),
-                                        operation ? operation->completed_pages.size() : 0,
-                                        operation && operation->execution_stop_ts.has_value() };
-                if (operation) {
-                    row.query_return_us = operation->query_return_ts;
-                    if (operation->payload_transfer_issued && operation->io_schedule.start_ts <= time) row.io_start_us = operation->io_schedule.start_ts;
-                    for (const auto & batch : operation->io_schedule.batches)
-                        for (const auto at : batch.page_ready_ts) {
-                            if (at > time) continue;
-                            if (!row.first_page_us || at < *row.first_page_us) row.first_page_us = at;
-                            if (!row.last_page_us || at > *row.last_page_us) row.last_page_us = at;
-                        }
-                    row.stop_us = operation->execution_stop_ts;
-                    if (operation->target_boundary_ts) row.visible_us = operation->target_boundary_ts;
-                    row.worker_return_us = operation->io_return_ts;
-                }
-                observer_.returned(row);
-            }
-        }
+    for (auto & wait : waits_) wait->execution->advance(node, time, future);
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

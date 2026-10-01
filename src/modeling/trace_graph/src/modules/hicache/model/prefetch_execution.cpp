@@ -19,9 +19,9 @@ core::DagSyntheticNodeSpec task(const HiCachePrefetchOperation & op, std::string
 }
 } // namespace
 
-std::optional<size_t> HiCachePrefetchExecution::enqueue(const HiCacheFact & candidate, simulation::FutureDag & future) {
+void HiCachePrefetchExecution::enqueue(const HiCacheFact & candidate, simulation::FutureDag & future) {
     const auto * op = state_.prefetch_candidate_operation(candidate);
-    if (!op || !op->payload_transfer_issued) return std::nullopt;
+    if (!op || !op->payload_transfer_issued) return;
     if (submitted_.contains(op)) throw std::logic_error("Prefetch payload already submitted to execution");
     const auto index = executions_.size();
     const auto begin = future.append(task(*op, "hicache_prefetch_worker_start"));
@@ -29,11 +29,10 @@ std::optional<size_t> HiCachePrefetchExecution::enqueue(const HiCacheFact & cand
     future.depend(begin, complete);
     if (const auto tail = lane_tail_.find(op->io_schedule.resource_lane); tail != lane_tail_.end()) future.depend(tail->second, begin);
     lane_tail_[op->io_schedule.resource_lane] = complete;
-    submitted_.emplace(op, complete);
+    submitted_.insert(op);
     executions_.push_back({ op, complete, op->hit_pages.size(), {} });
     events_.emplace(begin, Event{ index, Step::Begin });
     events_.emplace(complete, Event{ index, Step::Complete });
-    return complete;
 }
 
 void HiCachePrefetchExecution::schedule(size_t index, Step step, uint64_t duration, simulation::FutureDag & future) {

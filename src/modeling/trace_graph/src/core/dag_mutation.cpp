@@ -28,7 +28,7 @@ public:
         result_.journal.component = plan.component;
         result_.journal.active_nodes_before = graph.active_node_count();
         result_.journal.active_edges_before = graph.active_edge_count();
-        active_effect_edges_.reserve(plan.redirect_edges.size() + plan.add_edges.size());
+        active_effect_edges_.reserve(graph.edge_count() + plan.redirect_edges.size() + plan.add_edges.size());
         for (const auto & edge : graph.edges()) {
             if (edge.active) increment_effect_edge(active_effect_edges_, edge.src, edge.dst, edge.kind, edge.effect_id());
         }
@@ -57,11 +57,8 @@ private:
     }
 
     [[nodiscard]] std::optional<size_t> add_tracked_edge(size_t src, size_t dst, DagEdgeKind kind, const std::string & effect_id, const std::string & reason) {
-        if (!effect_id.empty()) {
-            const auto key = effect_edge_key(src, dst, kind, effect_id);
-            if (active_effect_edges_.contains(key)) return std::nullopt;
-        }
-        else if (graph_.has_active_edge(src, dst, kind, effect_id)) return std::nullopt;
+        const auto key = effect_edge_key(src, dst, kind, effect_id);
+        if (active_effect_edges_.contains(key)) return std::nullopt;
 
         const auto edge_index = graph_.add_edge(src, dst, kind, effect_id, reason);
         increment_effect_edge(active_effect_edges_, src, dst, kind, effect_id);

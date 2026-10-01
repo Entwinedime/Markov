@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 
 namespace markov::trace_graph::simulation {
 
@@ -37,19 +38,9 @@ struct SimulationResult {
 }
 
 /** Full-replay edge cost, including optional normal CPU service measurements. */
-[[nodiscard]] inline uint64_t topological_edge_delay_us(const core::DagGraph& graph, const core::DagNode& source, core::DagEdgeKind kind) {
+[[nodiscard]] inline uint64_t topological_edge_delay_us(const core::DagGraph & graph, const core::DagNode & source, core::DagEdgeKind kind) {
     return topological_edge_delay_us(source, kind) ? graph.cpu_service_gap_duration(source.id) : 0;
 }
-
-/**
- * @brief Resolves correlated CPU task queues and replays the active DAG.
- *
- * Proven inter-task CPU lane order is a resource schedule, not a fixed causal
- * dependency. Full replay replaces it by arrival-order FIFO and writes the chosen
- * order back to the graph. All other active edges remain hard dependencies.
- * Invalid endpoints, cycles and stalled queues throw; no partial result is returned.
- */
-[[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph);
 
 /** Compute the current node's duration at its actual start, after dependencies
  * and CPU queue admission. Calls follow nondecreasing simulated time (ties use
@@ -62,7 +53,6 @@ struct SimulationResult {
  * This is a causal cost hook, not support for live structural DAG rewriting.
  */
 using NodeCostAtStart = std::function<uint64_t(size_t node_id, uint64_t start_us, uint64_t duration_us)>;
-[[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start);
 
 /** Only valid during the expansion callback. New work depends on the current
  * node's completion and inherits its rank. Further edges may constrain nodes
@@ -88,12 +78,18 @@ public:
     virtual void depend(size_t predecessor, size_t successor, core::DagEdgeKind kind = core::DagEdgeKind::Mutation) = 0;
 };
 using ExpandAtStart = std::function<void(size_t node_id, uint64_t start_us, FutureDag & future)>;
-/** Expansion runs before cost_at_start. All topology changes go through future;
+/** Resolves correlated CPU task queues and replays the active DAG. With no hooks,
+ * this executes existing work only. Proven inter-task CPU lane order is a resource
+ * schedule, not a fixed causal dependency: full replay replaces it by arrival-order
+ * FIFO and writes the chosen order back to the graph. Other edges remain hard
+ * dependencies. Invalid endpoints, cycles and stalled queues throw without a result.
+ *
+ * Expansion runs before cost_at_start. All topology changes go through future;
  * callbacks must not mutate graph storage themselves. The resulting graph keeps
  * the generated work and can be replayed without expansion for verification.
  */
-[[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start,
-                                                         const ExpandAtStart & expand_at_start);
+[[nodiscard]] SimulationResult run_topological_simulation(core::DagGraph & graph, const NodeCostAtStart & cost_at_start = {},
+                                                          const ExpandAtStart & expand_at_start = {});
 
 /**
  * @brief Replays the active DAG while contracting source snapshot and model blackbox spans.

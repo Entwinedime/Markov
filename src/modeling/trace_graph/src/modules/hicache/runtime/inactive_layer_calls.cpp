@@ -46,6 +46,12 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
     }
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<std::pair<size_t, size_t>, std::optional<LoadIndexResources>> resources;
+    core::DagMutationPlan insertion{ .component = "hicache_layer_wait" };
+    struct PlannedCall {
+        Call call;
+        core::DagNodeRef successor;
+    };
+    std::map<std::string, PlannedCall> pending;
     for (auto & [boundary, observed] : groups) {
         std::ranges::sort(observed, {}, &HiCacheLayerWaitCall::start_ns);
         const auto [before, after] = boundary;
@@ -59,7 +65,7 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
             throw std::runtime_error("Inactive layer calls do not occupy one intact CPU gap");
         const auto lane = std::string(graph.node_lane_key(before));
         const auto service = [&](uint64_t lo, uint64_t hi) { return graph.cpu_service_cost().duration({ event.pid, event.tid }, lo, hi); };
-        std::vector<size_t> gates;
+        std::vector<core::DagNodeRef> gates;
         uint64_t previous_end = gap_begin * 1'000;
         for (size_t i = 0; i < observed.size(); ++i) {
             const auto & call = *observed[i];
@@ -68,11 +74,13 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
             const auto samples = donors.find({ event.pid, call.phase });
             const auto & position = positions.at(&call);
             if (position.before.size() > 1) throw std::runtime_error("Inactive layer call has multiple stream predecessors");
-            const auto gate = graph.add_synthetic_node({
-                .name = "inactive layer call entry",
-                .category = "execution_gate",
-                .lane_key = lane,
-                .observed_point = core::DagObservedPoint{ event.pid, event.tid, call.start_ns / 1'000, graph.node(before).gpu_id }
+            const auto gate = core::DagNodeRef::synthetic("layer_entry:" + std::to_string(before) + ":" + std::to_string(i));
+            insertion.synthetic_nodes.push_back({
+                gate.synthetic_id,
+                { .name = "inactive layer call entry",
+                               .category = "execution_gate",
+                               .lane_key = lane,
+                               .observed_point = core::DagObservedPoint{ event.pid, event.tid, call.start_ns / 1'000, graph.node(before).gpu_id } }
             });
             const auto next = i + 1 < observed.size() ? observed[i + 1]->start_ns / 1'000 : gap_end;
             Call target{
@@ -106,20 +114,29 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
                 else target.insertion_issue = "independent_layer_wait_cost_missing";
             }
             else if (samples == donors.end() && !position.issue.empty()) target.insertion_issue = position.issue;
-            calls_.emplace(gate, std::move(target));
+            pending.emplace(gate.synthetic_id, PlannedCall{ std::move(target), {} });
             gates.push_back(gate);
         }
-        graph.mutable_edge(edges.front()).active = false;
+        insertion.disable_edges.push_back(edges.front());
         const auto prefix_end = observed.front()->start_ns / 1'000;
         core::DagGraph::CpuGapRanges prefix;
         if (prefix_end > gap_begin) prefix.emplace_back(gap_begin, prefix_end);
-        graph.set_cpu_gap_after(before, prefix_end - gap_begin, std::move(prefix));
-        graph.add_edge(before, gates.front(), core::DagEdgeKind::Sequential);
+        insertion.set_cpu_gaps.push_back({ .node_id = before, .duration = prefix_end - gap_begin, .retained_ranges = std::move(prefix) });
+        insertion.add_edges.push_back({ core::DagNodeRef::existing(before), gates.front(), core::DagEdgeKind::Sequential });
         for (size_t i = 0; i < gates.size(); ++i) {
-            const auto next = i + 1 < gates.size() ? gates[i + 1] : after;
-            calls_.at(gates[i]).successors.push_back(next);
-            graph.add_edge(gates[i], next, core::DagEdgeKind::Sequential);
+            const auto next = i + 1 < gates.size() ? gates[i + 1] : core::DagNodeRef::existing(after);
+            pending.at(gates[i].synthetic_id).successor = next;
+            insertion.add_edges.push_back({ gates[i], next, core::DagEdgeKind::Sequential });
         }
+    }
+
+    // Keep source observation and target insertion separate. In particular,
+    // one invalid later gap must not leave earlier layer calls half-rewired.
+    const auto applied = core::apply_dag_mutation_plan(graph, insertion);
+    for (auto & [id, planned] : pending) {
+        const auto & next = planned.successor;
+        planned.call.successors.push_back(next.existing_node_id ? *next.existing_node_id : applied.synthetic_node_ids.at(next.synthetic_id));
+        calls_.emplace(applied.synthetic_node_ids.at(id), std::move(planned.call));
     }
 }
 

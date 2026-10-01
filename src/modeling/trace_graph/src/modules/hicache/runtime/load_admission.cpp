@@ -1,7 +1,7 @@
+#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
-#include "markov/trace_graph/core/numeric.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -13,12 +13,18 @@ void HiCacheWriteCalls::split_load_tail(const core::DagGraph & graph, size_t mai
     if (source.streams.size() != 1 || !source.waits.empty() || !source.event_waits.empty()) return;
 
     std::vector<size_t> submissions;
+    bool after_clones = false;
     for (size_t i = 0; i < source.nodes.size(); ++i) {
         const auto & node = source.nodes[i];
         if (!node.work.is_cpu || node.queue_member) continue;
         const auto & name = node.work.name;
         if (name.find("Enqueue@") == std::string::npos) continue;
-        if (!name.ends_with("Enqueue@aclnnInplaceCopy")) return;
+        if (!name.ends_with("Enqueue@aclnnInplaceCopy")) {
+            if (submissions.empty()) return;
+            after_clones = true;
+            continue;
+        }
+        if (after_clones) return;
         submissions.push_back(i);
     }
     if (submissions.empty()) return;
@@ -26,6 +32,7 @@ void HiCacheWriteCalls::split_load_tail(const core::DagGraph & graph, size_t mai
     LoadIndexOperationCost total;
     std::optional<size_t> worker;
     std::set<size_t> devices;
+    std::set<size_t> removed;
     size_t previous = 0;
     const auto add = [](uint64_t & sum, uint64_t value) { sum = core::checked_add_u64(sum, value, "Load clone cost overflow"); };
     for (const auto submission : submissions) {
@@ -54,34 +61,69 @@ void HiCacheWriteCalls::split_load_tail(const core::DagGraph & graph, size_t mai
         add(total.worker_us, source.nodes[*job].work.duration);
         add(total.dispatch_us, source.nodes[*job].work.cpu_task_ready_delay_us.value());
         add(total.device_us, source.nodes[*device].work.duration);
+        for (size_t i = previous; i <= submission; ++i) removed.insert(i);
+        removed.insert(*job);
+        removed.insert(*device);
         previous = submission + 1;
     }
-    // Do not silently drop a different device primitive or unowned worker.
-    if (devices.size() != std::ranges::count_if(source.nodes, [](const auto & node) { return !node.work.is_cpu; })
-        || submissions.size() != std::ranges::count_if(source.nodes, [](const auto & node) { return node.queue_member.has_value(); }))
-        return;
 
-    uint64_t tail_us = 0, residual_us = 0;
-    for (size_t i = previous; i < source.nodes.size(); ++i) {
-        const auto & node = source.nodes[i];
-        if (!node.work.is_cpu || node.queue_member) continue;
-        add(tail_us, node.work.duration);
-        add(residual_us, node.work.cpu_gap_after);
+    // The enclosing host-load branch can concatenate the promoted prefix after
+    // load_back returns. Repeat only its clone prefix; preserve the remaining
+    // CPU, worker and device work once, including that concatenation.
+    HiCacheHostExpansion tail;
+    std::map<size_t, size_t> retained;
+    for (size_t i = 0; i < source.nodes.size(); ++i) {
+        if (removed.contains(i)) continue;
+        retained.emplace(i, tail.nodes.size());
+        tail.nodes.push_back(source.nodes[i]);
+    }
+    for (auto & node : tail.nodes) {
+        if (!node.submission) continue;
+        const auto at = retained.find(*node.submission);
+        if (at == retained.end()) return;
+        node.submission = at->second;
+    }
+    for (const auto & edge : source.edges) {
+        const bool from = retained.contains(edge.from), to = retained.contains(edge.to);
+        if (from && to) tail.edges.push_back({ retained.at(edge.from), retained.at(edge.to), edge.kind });
+        else if (from) return;
+        else if (to && edge.kind != core::DagEdgeKind::Sequential && edge.kind != core::DagEdgeKind::Stream) return;
+    }
+    for (const auto & [original, local] : source.source_nodes)
+        if (retained.contains(local)) tail.source_nodes.emplace(original, retained.at(local));
+    tail.host_return = retained.at(source.host_return);
+    std::vector<size_t> first, last;
+    for (size_t i = 0; i < tail.nodes.size(); ++i) {
+        if (tail.nodes[i].work.is_cpu) continue;
+        bool before = false, after = false;
+        for (const auto & edge : tail.edges) {
+            if (edge.kind != core::DagEdgeKind::Stream) continue;
+            before |= edge.to == i;
+            after |= edge.from == i;
+        }
+        if (!before) first.push_back(i);
+        if (!after) last.push_back(i);
+    }
+    if (!first.empty()) {
+        if (first.size() != 1 || last.size() != 1) return;
+        tail.streams.push_back({ source.streams.front().source_node, first.front(), last.front() });
     }
     // A source-only per-call mean, not a target fit. Keep worker dispatch and
     // residual CPU separate; size-dependent clone costs remain an extrapolation.
     const auto count = submissions.size();
-    for (const auto field : { &LoadIndexOperationCost::main_us, &LoadIndexOperationCost::main_residual_us,
-                              &LoadIndexOperationCost::worker_us, &LoadIndexOperationCost::dispatch_us, &LoadIndexOperationCost::device_us }) {
+    for (const auto field : { &LoadIndexOperationCost::main_us,
+                              &LoadIndexOperationCost::main_residual_us,
+                              &LoadIndexOperationCost::worker_us,
+                              &LoadIndexOperationCost::dispatch_us,
+                              &LoadIndexOperationCost::device_us }) {
         auto & value = total.*field;
         value = value / count + (value % count >= (count + 1) / 2);
     }
     const auto compute = source.streams.front().source_node;
-    program.clone = LoadStep{ generate_load_index_operation(graph, main, *worker, compute, total, "clone: base per-call cost"),
-                              { graph.node(compute).lane_id } };
-    std::pair<double, double> remainder{};
-    program.tail = LoadStep{ generated_cpu_control(graph.node_lane_key(main), tail_us, residual_us, remainder,
-                                                   "target load admission bookkeeping: base cost"), {} };
+    program.clone =
+        LoadStep{ generate_load_index_operation(graph, main, *worker, compute, total, "clone: base per-call cost"), { graph.node(compute).lane_id } };
+    auto lanes = tail.resource_lanes(graph);
+    program.tail = LoadStep{ std::move(tail), std::move(lanes) };
 }
 
 void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
@@ -90,7 +132,8 @@ void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSo
     const auto & graph = source.graph();
     for (const auto & branch : load_branches_) {
         const auto key = std::pair{ branch.envelope.pid, branch.envelope.tid };
-        if (std::ranges::any_of(load_admissions_, [&](const auto & sample) { return sample.pid == key.first && sample.tid == key.second; })) continue;
+        if (std::ranges::any_of(load_admissions_, [&](const auto & sample) { return sample.pid == key.first && sample.tid == key.second && !sample.tokens; }))
+            continue;
         std::optional<size_t> compute;
         const auto witness = [&](size_t node) {
             if (compute && graph.node(*compute).lane_id != graph.node(node).lane_id)
@@ -117,27 +160,30 @@ void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSo
         if (!row) continue;
         const auto operation = [&](const char * name) {
             const auto & cost = row->at("operations").at(name);
-            return LoadStep{ generate_load_index_operation(graph, branch.entry_node, resources->worker, resources->compute, read_load_operation_cost(cost), name),
-                             { graph.node(*compute).lane_id } };
+            return LoadStep{
+                generate_load_index_operation(graph, branch.entry_node, resources->worker, resources->compute, read_load_operation_cost(cost), name),
+                { graph.node(*compute).lane_id }
+            };
         };
         LoadAdmissionProgram program{ .pid = key.first, .tid = key.second };
         for (const auto * name : { "multiply", "range", "add" }) program.allocation.push_back(operation(name));
         program.clone = operation("clone");
         std::pair<double, double> remainder{};
         program.tail.work = generated_cpu_control(graph.node_lane_key(branch.entry_node),
-                                             read_control_duration(row->at("tail_us")),
-                                             read_control_duration(row->at("tail_residual_us")),
-                                             remainder,
-                                             "target load admission bookkeeping");
+                                                  read_control_duration(row->at("tail_us")),
+                                                  read_control_duration(row->at("tail_residual_us")),
+                                                  remainder,
+                                                  "target load admission bookkeeping");
         load_admissions_.push_back(std::move(program));
     }
 }
 
 void HiCacheWriteCalls::prepare_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
-    if (!load_index_calibration_.empty()) {
-        prepare_generated_load_admissions(source, queues);
-        return;
-    }
+    // Page geometry belongs to source request inputs, not load-return facts.
+    // A process uses one allocator geometry throughout the admitted capture.
+    std::map<std::string, uint64_t> source_pages;
+    for (const auto & fact : source.fact_nodes())
+        if (fact.fact_role == "cache_extend_input" && fact.phase == "start") source_pages.try_emplace(fact.pid, fact.source_page_size);
 
     for (const auto & branch : load_branches_) {
         if (branch.condition.arg("needed") != "true") continue;
@@ -164,11 +210,13 @@ void HiCacheWriteCalls::prepare_load_admissions(const patch::HiCacheSourceDagInd
             return LoadStep{ std::move(work), std::move(lanes) };
         };
         LoadAdmissionProgram donor{ .pid = first.pid,
-                                     .tid = first.tid,
-                                     .tokens = admission->effective_token_count,
-                                     .prefix = region(end_us(branch.condition), first.ts),
-                                     .allocation = { region(last.ts, last.ts + last.dur) },
-                                     .tail = region(last.ts + last.dur, end_us(branch.envelope)) };
+                                    .tid = first.tid,
+                                    .tokens = admission->effective_token_count,
+                                    .source_page_size = source_pages.at(first.pid),
+                                    .direct_allocation = attempts.size() == 1,
+                                    .prefix = region(end_us(branch.condition), first.ts),
+                                    .allocation = { region(last.ts, last.ts + last.dur) },
+                                    .tail = region(last.ts + last.dur, end_us(branch.envelope)) };
         split_load_tail(source.graph(), branch.entry_node, donor);
         if (first.arg("allocated") == "false") {
             const patch::HiCacheSourceFactNode * eviction = nullptr;
@@ -181,15 +229,29 @@ void HiCacheWriteCalls::prepare_load_admissions(const patch::HiCacheSourceDagInd
             if (!eviction) throw std::runtime_error("Load retry lacks its source capacity envelope");
             auto failure = region(first.ts, eviction->timestamp_us).work;
             if (failure.streams.empty() && failure.waits.empty() && failure.event_waits.empty()) donor.failure = std::move(failure);
-            if (eviction->timestamp_us + eviction->duration_us < last.ts) {
-                donor.retry = region(eviction->timestamp_us + eviction->duration_us, last.ts);
-            }
+            if (eviction->timestamp_us + eviction->duration_us < last.ts) { donor.retry = region(eviction->timestamp_us + eviction->duration_us, last.ts); }
         }
         load_admissions_.push_back(std::move(donor));
     }
+
+    // Independent primitives supplement source evidence; declaring them must
+    // not prevent collecting an applicable same-base operation.
+    prepare_generated_load_admissions(source, queues);
 }
 
-size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens) const {
+size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens, bool direct_allocation) const {
+    if (direct_allocation) {
+        for (size_t i = 0; i < load_admissions_.size(); ++i) {
+            const auto & sample = load_admissions_[i];
+            // Equal allocation work with a separately repeatable clone has
+            // direct source evidence. Do not reuse an eviction/retry envelope
+            // for a branch that succeeds immediately.
+            if (sample.pid == pid && sample.tid == tid && sample.tokens == tokens && sample.source_page_size == page_size_ && sample.clone
+                && sample.direct_allocation)
+                return i;
+        }
+    }
+
     size_t selected = load_admissions_.size();
     uint64_t nearest = UINT64_MAX;
     for (size_t i = 0; i < load_admissions_.size(); ++i) {
@@ -207,8 +269,7 @@ size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const s
             nearest = distance;
         }
     }
-    if (selected == load_admissions_.size())
-        throw std::runtime_error("Load admission lacks base or independent costs on its scheduler resources");
+    if (selected == load_admissions_.size()) throw std::runtime_error("Load admission lacks base or independent costs on its scheduler resources");
     return selected;
 }
 
@@ -229,19 +290,19 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
         future.depend(restored.host_return, branch.continuation);
         return;
     }
-    const auto selected = select_load_admission(item.fact.pid, item.fact.tid, work->requested_pages * page_size_);
-    const auto & program = load_admissions_[selected];
     auto & call = capacity_calls_.at(branch.owner);
     auto fact = item.fact;
     fact.ts = time;
     fact.execution_anchor_node_id = node;
 
+    const bool allocated = replay_.state().load_allocation_will_succeed(fact);
+    const bool evict = replay_.state().eviction_work(fact) != nullptr;
+    const auto selected = select_load_admission(fact.pid, fact.tid, work->requested_pages * page_size_, allocated && !evict && !allocator_need_sort_);
+    const auto & program = load_admissions_[selected];
+
     // Aggregate source evidence only describes a successful allocation. Keep
     // that limitation explicit; it does not supply a failed-return cost.
-    const bool allocated = replay_.state().load_allocation_will_succeed(fact);
-    if (!allocated && program.tokens)
-        throw std::runtime_error("Aggregate base load cost does not cover allocation failure");
-    const bool evict = replay_.state().eviction_work(fact) != nullptr;
+    if (!allocated && program.tokens) throw std::runtime_error("Aggregate base load cost does not cover allocation failure");
     const LoadAdmissionProgram * retry_cost = nullptr;
     if (evict || !allocated) {
         if (program.tokens) {
@@ -261,7 +322,8 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
             }
             std::pair<double, double> remainder{};
             load_failure_templates_.insert_or_assign(
-                branch.owner, generated_cpu_control(call.lane, cpu, residual, remainder, "target failed allocation: base no-load control cost proxy"));
+                branch.owner,
+                generated_cpu_control(call.lane, cpu, residual, remainder, "target failed allocation: base no-load control cost proxy"));
         }
     }
 

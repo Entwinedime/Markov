@@ -1,19 +1,18 @@
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include <algorithm>
 #include <set>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin_us, uint64_t end_us, Observer observer) {
+void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin_us, uint64_t end_us) {
     if (state_) throw std::logic_error("Loads are already bound");
     state_ = &replay.state();
     graph_ = &graph;
-    observer_ = std::move(observer);
     const patch::HiCacheSourceDagIndex source(graph);
     const auto ledger = patch::build_hicache_io_operation_ledger(source);
     const auto waits = observe_hicache_layer_waits(source);
@@ -69,11 +68,10 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
     }
     std::set<std::pair<std::string, uint64_t>> batches;
     for (const auto & call : waits.calls) {
-        if (call.batch_start_ns / 1000 < begin_us || call.batch_start_ns / 1000 > end_us) continue;
+        if (call.batch_start_ns / 1'000 < begin_us || call.batch_start_ns / 1'000 > end_us) continue;
         if (!call.issue.empty() || !call.before) {
-            auto detail = "Forward consumer needs a complete layer-wait observation: request=" + call.request_id
-                          + " phase=" + call.phase + " layer=" + std::to_string(call.layer)
-                          + " position=" + std::to_string(call.position)
+            auto detail = "Forward consumer needs a complete layer-wait observation: request=" + call.request_id + " phase=" + call.phase
+                          + " layer=" + std::to_string(call.layer) + " position=" + std::to_string(call.position)
                           + " issue=" + (call.issue.empty() ? "missing_cpu_boundary" : call.issue);
             if (call.worker) detail += " stream_wait_binding=" + graph.event_for_node(*call.worker).arg("stream_wait_binding");
             throw std::runtime_error(detail);
@@ -86,7 +84,7 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
         point.name = "layer_consumer_forward";
         point.pid = anchor.pid;
         point.tid = anchor.tid;
-        point.ts = call.batch_start_ns / 1000;
+        point.ts = call.batch_start_ns / 1'000;
         points.push_back(std::move(point));
     }
     std::vector<core::TraceEvent> call_points;
@@ -106,6 +104,7 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
         if (!node) throw std::runtime_error("Forward consumer has no CPU boundary");
         forward_at_[*node].push_back(i);
     }
+    core::DagMutationPlan source_costs{ .component = "hicache_load_transfer" };
     for (size_t i = 0; i < loads_.size(); ++i) {
         const auto & load = loads_[i];
         if (!submissions[i]) throw std::runtime_error("Load submission has no CPU boundary");
@@ -117,8 +116,10 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
         if (!start_at_.emplace(first, i).second || !complete_at_.emplace(last, i).second)
             throw std::runtime_error("Source load batches share transfer or completion carriers");
         if (graph.node(last).duration) throw std::runtime_error("Load completion needs a zero-cost final Record boundary");
-        for (const auto id : load.record.device_transfer_node_ids) graph.set_node_duration(id, 0);
+        for (const auto id : load.record.device_transfer_node_ids) source_costs.set_node_durations.push_back({ id, 0 });
     }
+    (void)core::apply_dag_mutation_plan(graph, source_costs);
+
     prepare_generated_submissions(graph);
     prepare_insertions(graph, boundaries);
 }
@@ -133,7 +134,8 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
             if (!load.batch) {
                 const auto empty = expand_host(insertion.empty, {}, future);
                 future.depend(empty.host_return, insertion.continuation);
-            } else {
+            }
+            else {
                 const Donor * donor = nullptr;
                 uint64_t best = UINT64_MAX;
                 const auto bytes = load.batch->io_schedule.effective_byte_count;
@@ -144,25 +146,33 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                     if (candidate.pid != load.fact.pid || candidate.tid != load.fact.tid) continue;
                     const auto size = candidate.plan.payload_bytes;
                     const auto distance = size > bytes ? size - bytes : bytes - size;
-                    if (!donor || distance < best) { donor = &candidate; best = distance; }
+                    if (!donor || distance < best) {
+                        donor = &candidate;
+                        best = distance;
+                    }
                 }
                 std::optional<Donor> generated;
                 if (!donor) {
-                    const auto program = generated_submissions_.find({load.fact.pid, load.fact.tid});
+                    const auto program = generated_submissions_.find({ load.fact.pid, load.fact.tid });
                     if (program == generated_submissions_.end()) throw std::runtime_error("New load lacks independent submission costs or scheduler resources");
                     if (!page_bytes_ || bytes % page_bytes_) throw std::runtime_error("Target load is not whole KV pages");
                     const auto & p = program->second;
-                    auto built = generate_load_submission(*graph_, p.main, p.worker, p.compute, p.stream,
-                        bytes / page_bytes_, page_bytes_, p.layers, p.cost);
-                    generated.emplace(Donor{load.fact.pid, load.fact.tid, std::move(built.plan), std::move(built.layer_records),
-                        {graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id}});
+                    if (p.base_cost) ++base_cost_batches_;
+                    else ++shared_cost_batches_;
+                    auto built = generate_load_submission(*graph_, p.main, p.worker, p.compute, p.stream, bytes / page_bytes_, page_bytes_, p.layers, p.cost);
+                    generated.emplace(Donor{
+                        load.fact.pid,
+                        load.fact.tid,
+                        std::move(built.plan),
+                        std::move(built.layer_records),
+                        { graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id }
+                    });
                     donor = &*generated;
                 }
                 HiCacheHostSequence sequence(insertion.positions, stream_insertions_, future);
                 const auto expanded = sequence.append(donor->plan, load.batch->io_schedule.duration_us, donor->lanes);
                 future.depend(expanded.host_return, insertion.continuation);
-                for (const auto record : donor->records)
-                    load.layers.push_back({ load.layers.size(), 0, 0, expanded.nodes.at(record) });
+                for (const auto record : donor->records) load.layers.push_back({ load.layers.size(), 0, 0, expanded.nodes.at(record) });
                 complete_at_.emplace(expanded.completion, at->second);
             }
         }
@@ -174,27 +184,17 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
         if (load.batch)
             for (const auto & layer : load.layers) records.push_back(layer.source_record);
         consumers_.submitted(load.fact.pid, std::move(records));
-        if (observer_)
-            observer_({ LoadExecutionStage::Submission,
-                        load.fact.pid,
-                        time,
-                        load.batch ? load.batch->operations.size() : 0,
-                        load.batch ? load.batch->io_schedule.effective_byte_count : 0,
-                        load.batch ? load.batch->io_schedule.duration_us : 0,
-                        load.record.device_transfer_duration_us });
     }
     if (const auto at = start_at_.find(node); at != start_at_.end()) {
         auto & load = loads_[at->second];
         if (load.batch) {
-            if (observer_) observer_({ LoadExecutionStage::DeviceStart, load.fact.pid, time });
             std::vector<uint64_t> bytes;
             std::vector<size_t> records;
             for (const auto & layer : load.layers) {
                 bytes.push_back(layer.bytes);
                 records.push_back(layer.source_record);
             }
-            (void)generate_load_layer_transfers(future, node, load.batch->io_schedule.resource_lane,
-                                               bytes, load.batch->io_schedule.duration_us, records);
+            (void)generate_load_layer_transfers(future, node, load.batch->io_schedule.resource_lane, bytes, load.batch->io_schedule.duration_us, records);
         }
     }
     if (const auto at = complete_at_.find(node); at != complete_at_.end()) {
@@ -203,14 +203,12 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
             load.fact.ts = time;
             state_->complete_loadback_batch(load.fact, load.batch->id);
             ++completed_;
-            if (observer_) observer_({ LoadExecutionStage::DeviceComplete, load.fact.pid, time });
         }
     }
     if (const auto at = forward_at_.find(node); at != forward_at_.end())
         for (const auto index : at->second) {
             const auto & forward = forwards_.at(index);
-            forward_records_.emplace(std::pair{ forward.pid, forward.start_ns },
-                                     consumers_.forward(forward.pid, forward.request, forward.extend));
+            forward_records_.emplace(std::pair{ forward.pid, forward.start_ns }, consumers_.forward(forward.pid, forward.request, forward.extend));
         }
 }
 

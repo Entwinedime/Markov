@@ -11,17 +11,6 @@ struct QueueConfirmationCoverage {
     size_t replaced_rounds = 0, partial_window_rounds = 0;
 };
 
-struct QueueConfirmationReturn {
-    size_t round;
-    int rank;
-    uint64_t timestamp_us;
-    bool storage;
-    model::HiCachePrefetchQueueSizes queues;
-    uint64_t local_loads = 0, confirmed_loads = 0, remaining_loads = 0;
-    bool write = false;
-    uint64_t local_writes = 0, confirmed_writes = 0, remaining_writes = 0;
-};
-
 struct WriteConfirmationWork {
     size_t round;
     int rank;
@@ -42,13 +31,12 @@ struct WriteConfirmationWork {
  */
 class HiCacheQueueConfirmations {
 public:
-    using ReturnObserver = std::function<void(const QueueConfirmationReturn &)>;
     // Called after MIN, before state publication. The caller owns source-tail
     // replacement and returns the last node of the corresponding target work.
     using WriteWork = std::function<std::optional<size_t>(const WriteConfirmationWork &, simulation::FutureDag &)>;
     void bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin_us, uint64_t end_us,
-              const std::vector<core::TraceEvent> & replaced = {}, ReturnObserver observer = {}, WriteWork write_work = {},
-              std::optional<uint64_t> idle_since_us = std::nullopt, bool generate_load_tails = false);
+              const std::vector<core::TraceEvent> & replaced = {}, WriteWork write_work = {}, std::optional<uint64_t> idle_since_us = std::nullopt,
+              bool generate_load_tails = false);
     void replace_load_tails(core::DagGraph & graph);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
     [[nodiscard]] const QueueConfirmationCoverage & coverage() const { return coverage_; }
@@ -77,7 +65,6 @@ private:
     std::map<size_t, std::vector<Point>> at_;
     model::HiCacheState * state_ = nullptr;
     QueueConfirmationCoverage coverage_;
-    ReturnObserver observer_;
     WriteWork write_work_;
     struct LoadTailCost {
         double empty_cpu = 0, empty_gap = 0, batch_cpu = 0, batch_gap = 0;

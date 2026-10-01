@@ -2,8 +2,13 @@
 #include <nlohmann/json.hpp>
 
 namespace markov::trace_graph::io {
-void write_cpu_service_cost(std::ostream & output, const std::filesystem::path & source_manifest, const core::CpuServiceCost & cost) {
-    output << "{\n  \"source_manifest\": " << nlohmann::json(source_manifest.generic_string()).dump() << ",\n  \"spans\": [";
+void write_cpu_service_cost(std::ostream & output, const std::filesystem::path & source_manifest, const core::CpuServiceCost & cost,
+                            const nlohmann::json & reference_io) {
+    output << "{\n  \"source_manifest\": " << nlohmann::json(source_manifest.generic_string()).dump();
+    // Paired service evidence is provenance for model preparation, not a second
+    // correction applied by the CPU simulator.
+    if (!reference_io.is_null()) output << ",\n  \"reference_io\": " << reference_io.dump();
+    output << ",\n  \"spans\": [";
     bool first = true;
     for (const auto & [lane, intervals] : cost.lanes()) {
         for (const auto & span : intervals) {

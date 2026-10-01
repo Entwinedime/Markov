@@ -91,22 +91,24 @@ void HiCacheWriteCalls::bind_load_attempts(core::DagGraph & graph, uint64_t begi
     }
     const auto bound = bind_hicache_control_points(graph, points);
     const patch::HiCacheSourceDagIndex bounded(graph);
+    core::DagMutationPlan entries{ .component = "hicache_load_allocation" };
     for (size_t i = 0; i < load_attempts_.size(); ++i) {
         if (!bound[2 * i] || !bound[2 * i + 1]) throw std::runtime_error("Load attempt lacks exact entry/return boundaries");
         const auto first = *bound[2 * i];
         // Keep the original entry's work and gap after the new branch. A
         // callback on that entry itself could overlap them with the eviction.
-        const auto gate = graph.add_synthetic_node({
-            .name = "load allocation entry",
-            .category = "execution_gate",
-            .lane_key = std::string(graph.node_lane_key(first)),
-            .observed_point =
-                core::DagObservedPoint{ load_attempts_[i].event.pid, load_attempts_[i].event.tid, load_attempts_[i].event.ts, graph.node(first).gpu_id }
-        });
-        for (const auto edge : bounded.incoming_edge_ids(first))
-            if (graph.edge(edge).active && graph.edge(edge).dst == first) graph.mutable_edge(edge).dst = gate;
-        graph.add_edge(gate, first, core::DagEdgeKind::Sequential);
-        load_attempts_[i].entry_node = gate;
+        const auto & event = load_attempts_[i].event;
+        (void)append_host_entry_gate(bounded,
+                                     first,
+                                     { event.pid, event.tid, event.ts, graph.node(first).gpu_id },
+                                     "allocation_entry:" + std::to_string(i),
+                                     "load allocation entry",
+                                     entries);
+    }
+
+    const auto applied = core::apply_dag_mutation_plan(graph, entries);
+    for (size_t i = 0; i < load_attempts_.size(); ++i) {
+        load_attempts_[i].entry_node = applied.synthetic_node_ids.at("allocation_entry:" + std::to_string(i));
         load_attempts_[i].return_node = *bound[2 * i + 1];
     }
 }
@@ -120,23 +122,22 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
         const auto end_us = [](const auto & e) { return (e.ts * 1'000 + e.ts_submicro_ns + e.dur * 1'000 + e.dur_submicro_ns) / 1'000; };
         hosts.emplace_back(&branch, observe_host_template(source, branch.envelope.pid, branch.envelope.tid, end_us(branch.condition), end_us(branch.envelope)));
     }
+    core::DagMutationPlan replacement{ .component = "hicache_load_admission" };
+    std::map<size_t, uint64_t> remaining_gaps;
+    std::map<std::string, std::pair<EmptyLoadBranch, Call>> pending;
     for (const auto & [branch, host] : hosts) {
         auto original = prepare_host_expansion(source, queues, host, "no host load: ");
         if (!host.worker_nodes.empty() || !original.streams.empty() || !original.waits.empty() || !original.event_waits.empty())
             throw std::runtime_error("Inactive host-load branch contains device or worker work");
         const auto first = branch->entry_node;
         const auto event = graph.event_for_node(first);
-        const auto gate = graph.add_synthetic_node({
-            .name = "host load branch entry",
-            .category = "execution_gate",
-            .lane_key = std::string(graph.node_lane_key(first)),
-            .observed_point = core::DagObservedPoint{ event.pid, event.tid, event.ts, graph.node(first).gpu_id }
-        });
-        for (const auto id : source.incoming_edge_ids(first))
-            if (graph.edge(id).active && graph.edge(id).dst == first) graph.mutable_edge(id).dst = gate;
-        graph.add_edge(gate, first, core::DagEdgeKind::Sequential);
-        empty_load_branches_.emplace(gate, EmptyLoadBranch{ branch->owner, first, std::move(original) });
-        Call call{ .owner = branch->owner, .pid = event.pid, .tid = event.tid, .at_us = event.ts, .entry_node = gate };
+        const auto gate = append_host_entry_gate(source,
+                                                 first,
+                                                 { event.pid, event.tid, event.ts, graph.node(first).gpu_id },
+                                                 "branch_entry:" + std::to_string(first),
+                                                 "host load branch entry",
+                                                 replacement);
+        Call call{ .owner = branch->owner, .pid = event.pid, .tid = event.tid, .at_us = event.ts };
         call.lane = std::string(graph.node_lane_key(first));
         const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(source, call, plan, true); };
         for (const auto & donor : load_admissions_)
@@ -145,14 +146,28 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
             if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
         for (const auto & donor : eviction_controls_)
             if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
-        if (!capacity_calls_.emplace(call.owner, std::move(call)).second) throw std::runtime_error("Inactive load branch overlaps another capacity entry");
-        for (const auto id : host.main.owned_node_ids) graph.set_node_duration(id, 0);
+        pending.emplace(gate.synthetic_id,
+                        std::pair{
+                            EmptyLoadBranch{ branch->owner, first, std::move(original) },
+                            std::move(call)
+        });
+        for (const auto id : host.main.owned_node_ids) replacement.set_node_durations.push_back({ id, 0 });
         for (const auto & gap : host.main.owned_gap_slices) {
-            auto & retained = graph.mutable_node(gap.owner_node_id).cpu_gap_after;
+            auto & retained = remaining_gaps.try_emplace(gap.owner_node_id, graph.node(gap.owner_node_id).cpu_gap_after).first->second;
             const auto owned = gap.owned_duration_us();
             if (retained < owned) throw std::runtime_error("Inactive branch gap ownership exceeds its retained interval");
             retained -= owned;
         }
+    }
+    for (const auto & [node, duration] : remaining_gaps) replacement.set_cpu_gaps.push_back({ node, duration });
+
+    const auto applied = core::apply_dag_mutation_plan(graph, replacement);
+    for (auto & [id, entry] : pending) {
+        auto & [branch, call] = entry;
+        const auto gate = applied.synthetic_node_ids.at(id);
+        call.entry_node = gate;
+        empty_load_branches_.emplace(gate, std::move(branch));
+        if (!capacity_calls_.emplace(call.owner, std::move(call)).second) throw std::runtime_error("Inactive load branch overlaps another capacity entry");
     }
 }
 
@@ -166,10 +181,9 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
         // Base-derived clone primitives and independent primitives use the
         // same target branch replacement. Unsupported aggregate evidence does
         // not silently claim a new operation-count model.
-        if (load_index_calibration_.empty()
-            && !std::ranges::any_of(load_admissions_, [&](const auto & program) {
-                   return program.pid == branch.envelope.pid && program.tid == branch.envelope.tid && program.clone.has_value();
-               }))
+        if (load_index_calibration_.empty() && !std::ranges::any_of(load_admissions_, [&](const auto & program) {
+                return program.pid == branch.envelope.pid && program.tid == branch.envelope.tid && program.clone.has_value();
+            }))
             continue;
         branches.push_back(&branch);
         owners.insert(branch.owner);
@@ -207,8 +221,16 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
             }
         }
         if (empty.nodes.empty()) {
-            empty = program.tail.work;
-            for (auto & part : empty.nodes) part.work.name = "target no-load branch: bookkeeping cost proxy";
+            // No inactive source branch was measured. The existing proxy is
+            // CPU bookkeeping only, not the successful branch's concatenation.
+            double cpu = 0, residual = 0;
+            for (const auto & part : program.tail.work.nodes) {
+                if (!part.work.is_cpu || part.queue_member) continue;
+                cpu += part.work.duration;
+                residual += part.work.cpu_gap_after;
+            }
+            std::pair<double, double> remainder{};
+            empty = generated_cpu_control(graph.node_lane_key(branch->entry_node), cpu, residual, remainder, "target no-load branch: bookkeeping cost proxy");
         }
         empty_load_branches_.emplace(branch->entry_node, EmptyLoadBranch{ branch->owner, branch->return_node, std::move(empty) });
         const auto & event = graph.event_for_node(branch->entry_node);
@@ -219,7 +241,8 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
                    .entry_node = branch->entry_node,
                    .lane = std::string(graph.node_lane_key(branch->entry_node)) };
         const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(retained, call, plan, true); };
-        bind_load_resources(retained, call, program);
+        for (const auto & donor : load_admissions_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_load_resources(retained, call, donor);
         for (const auto & [id, donor] : templates_)
             if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
         for (const auto & donor : eviction_controls_)
@@ -228,17 +251,11 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     }
 }
 
-void HiCacheWriteCalls::rebind_retained_resources(core::DagGraph & graph, const std::map<size_t, size_t> & members) {
+void HiCacheWriteCalls::rebind_retained_resources(const patch::HiCacheSourceDagIndex & retained, const std::map<size_t, size_t> & members) {
     // Bind after all source regions have been replaced, including load
     // submissions whose compute Records can be the next stream endpoint.
-    const patch::HiCacheSourceDagIndex retained(graph);
-    const auto refresh = [&](Call & call) {
-        for (auto & [lane, position] : call.positions) {
-            if ((!position.before || graph.node(*position.before).active) && (!position.after || graph.node(*position.after).active)) continue;
-            const auto sample = position.before ? *position.before : *position.after;
-            position = observe_write_stream_position(retained, sample, call.pid, call.tid, call.at_us);
-        }
-    };
+    const auto & graph = retained.graph();
+    const auto refresh = [&](Call & call) { rebind_host_stream_positions(retained, call.positions, call.pid, call.tid, call.at_us); };
     for (auto & call : calls_)
         if (graph.node(call.entry_node).active) refresh(call);
     for (auto & [owner, call] : capacity_calls_) refresh(call);

@@ -5,12 +5,10 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-HiCachePrefetchQueueExecution::HiCachePrefetchQueueExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, PrefetchQueueTiming timing,
-                                                             PrefetchQueueAction action)
+HiCachePrefetchQueueExecution::HiCachePrefetchQueueExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, PrefetchQueueTiming timing)
     : state_(state),
       facts_(std::move(facts)),
-      timing_(std::move(timing)),
-      action_(action) {
+      timing_(std::move(timing)) {
     const auto & agreement = timing_.agreement;
     const bool local = facts_.size() == 1 && agreement.calls.empty();
     if (facts_.empty() || !agreement.issue.empty() || (!local && agreement.calls.size() != facts_.size()))
@@ -47,7 +45,7 @@ size_t HiCachePrefetchQueueExecution::boundary(int rank, Step step, size_t previ
 }
 
 void HiCachePrefetchQueueExecution::enter(int rank, size_t node, const HiCacheFact & fact, simulation::FutureDag & future) {
-    const bool active = action_ == PrefetchQueueAction::Drain || state_.prefetch_candidate_operation(fact);
+    const bool active = state_.prefetch_candidate_operation(fact) != nullptr;
     if (participating_ && *participating_ != active) throw std::logic_error("Prefetch query cannot mix absent candidates with collective participants");
     participating_ = active;
     if (!active) return;
@@ -79,20 +77,13 @@ std::optional<int> HiCachePrefetchQueueExecution::advance(size_t node, uint64_t 
     }
     if (step == Step::Finished) return rank;
     if (step == Step::Sample) {
-        if (action_ == PrefetchQueueAction::Query) samples_[rank].hits = state_.query_prefetch_storage(fact);
-        else samples_[rank].queues = state_.prefetch_queue_sizes(fact);
+        samples_[rank] = state_.query_prefetch_storage(fact);
         return std::nullopt;
     }
     if (samples_.size() != facts_.size()) throw std::logic_error("Prefetch queue MIN returned before all local samples");
     auto common = samples_.begin()->second;
-    for (const auto & [peer, sample] : samples_) {
-        common.hits = std::min(common.hits, sample.hits);
-        common.queues.revoked_operations = std::min(common.queues.revoked_operations, sample.queues.revoked_operations);
-        common.queues.backup_acks = std::min(common.queues.backup_acks, sample.queues.backup_acks);
-        common.queues.released_pages = std::min(common.queues.released_pages, sample.queues.released_pages);
-    }
-    if (action_ == PrefetchQueueAction::Query) state_.complete_prefetch_query(fact, common.hits);
-    else state_.drain_prefetch_queues(fact, common.queues);
+    for (const auto & [peer, sample] : samples_) common = std::min(common, sample);
+    state_.complete_prefetch_query(fact, common);
     return std::nullopt;
 }
 

@@ -10,11 +10,10 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, uint64_t begin, uint64_t finish,
-                                     const std::vector<core::TraceEvent> & replaced, ReturnObserver observer, WriteWork write_work,
-                                     std::optional<uint64_t> idle_since_us, bool generate_load_tails) {
+                                     const std::vector<core::TraceEvent> & replaced, WriteWork write_work, std::optional<uint64_t> idle_since_us,
+                                     bool generate_load_tails) {
     if (state_) throw std::logic_error("Queue confirmations are already bound");
     state_ = &replay.state();
-    observer_ = std::move(observer);
     write_work_ = std::move(write_work);
     const patch::HiCacheSourceDagIndex source(graph);
     const auto collectives = observe_cpu_collectives(source);
@@ -69,8 +68,8 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
             else {
                 const auto name = write ? "runtime.hicache.write_completion" : "runtime.hicache.load_completion";
                 for (const auto & candidate : events)
-                    if (candidate.name == name && candidate.pid == event.pid && candidate.tid == event.tid
-                        && candidate.ts <= event.ts && candidate.ts + candidate.dur >= event.ts + event.dur) {
+                    if (candidate.name == name && candidate.pid == event.pid && candidate.tid == event.tid && candidate.ts <= event.ts
+                        && candidate.ts + candidate.dur >= event.ts + event.dur) {
                         if (envelope) throw std::runtime_error("Multiple completion check envelopes");
                         envelope = &candidate;
                     }
@@ -83,9 +82,7 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
         // Bind that retained return below; it is execution context, not a new
         // scoring endpoint. A pre-window prefix needs the workload's explicit
         // idle barrier, not a source queue count or an arbitrary time margin.
-        if (std::ranges::any_of(envelopes, [&](const auto * event) {
-                return event->ts < begin && (!idle_since_us || event->ts < *idle_since_us);
-            })) {
+        if (std::ranges::any_of(envelopes, [&](const auto * event) { return event->ts < begin && (!idle_since_us || event->ts < *idle_since_us); })) {
             ++coverage_.partial_window_rounds;
             continue;
         }
@@ -94,9 +91,9 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
             const auto & event = events.at(call.observation);
             const auto * envelope = envelopes[i];
             if (envelope->ts < begin) check.idle_prefix_ranks.insert(call.rank);
-            if (!call.issue.empty()) throw std::runtime_error("Queue confirmation call: " + call.issue
-                + " pid=" + event.pid + " role=" + role + " start_us=" + std::to_string(event.ts)
-                + " duration_us=" + std::to_string(event.dur));
+            if (!call.issue.empty())
+                throw std::runtime_error("Queue confirmation call: " + call.issue + " pid=" + event.pid + " role=" + role
+                                         + " start_us=" + std::to_string(event.ts) + " duration_us=" + std::to_string(event.dur));
             std::optional<HiCacheFact> identity;
             for (const auto & item : replay.facts())
                 if (item.fact.pid == event.pid) {
@@ -108,12 +105,12 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
             for (const auto phase : { Phase::Sample, Phase::Work, Phase::Apply }) {
                 if (phase == Phase::Work && (storage || (write ? !write_work_ : !generate_load_tails))) continue;
                 core::TraceEvent point;
-                point.name = phase == Phase::Apply ? "queue_confirmation_return"
-                             : phase == Phase::Work ? "queue_confirmation_work" : "queue_confirmation_sample";
+                point.name = phase == Phase::Apply  ? "queue_confirmation_return"
+                             : phase == Phase::Work ? "queue_confirmation_work"
+                                                    : "queue_confirmation_sample";
                 point.pid = event.pid;
                 point.tid = event.tid;
-                point.ts = phase == Phase::Apply ? envelope->ts + envelope->dur
-                           : phase == Phase::Work ? event.ts + event.dur : event.ts;
+                point.ts = phase == Phase::Apply ? envelope->ts + envelope->dur : phase == Phase::Work ? event.ts + event.dur : event.ts;
                 points.push_back(std::move(point));
                 actions.push_back({ checks_.size(), call.rank, phase });
             }
@@ -139,19 +136,26 @@ void HiCacheQueueConfirmations::bind(core::DagGraph & graph, model::HiCacheModel
                 throw std::runtime_error("Write confirmation needs distinct MIN and state-return boundaries");
     // A MIN result cannot be used until every member has supplied its sample.
     // Keep native communication dependencies too; this adds no service cost.
-    core::DagMutationPlan agreement{.component = "queue_confirmation_agreement"};
+    core::DagMutationPlan agreement{ .component = "queue_confirmation_agreement" };
     for (const auto & check : checks_)
         for (const auto & [rank, sample] : check.sample_nodes)
             for (const auto & [member, use] : check.work_nodes.empty() ? check.return_nodes : check.work_nodes)
-                if (sample != use) agreement.add_edges.push_back({core::DagNodeRef::existing(sample), core::DagNodeRef::existing(use), core::DagEdgeKind::Mutation});
+                if (sample != use)
+                    agreement.add_edges.push_back({ core::DagNodeRef::existing(sample), core::DagNodeRef::existing(use), core::DagEdgeKind::Mutation });
     (void)core::apply_dag_mutation_plan(graph, agreement);
 }
 
 void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
     const patch::HiCacheSourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    struct Tail { size_t entry, exit; HiCacheHostTemplate host; };
-    struct Samples { double empty_cpu = 0, empty_gap = 0, cpu = 0, gap = 0; size_t empty = 0, batches = 0; };
+    struct Tail {
+        size_t entry, exit;
+        HiCacheHostTemplate host;
+    };
+    struct Samples {
+        double empty_cpu = 0, empty_gap = 0, cpu = 0, gap = 0;
+        size_t empty = 0, batches = 0;
+    };
     std::map<std::pair<std::string, std::string>, Samples> samples;
     std::vector<Tail> tails;
     for (const auto & check : checks_) {
@@ -170,14 +174,19 @@ void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
                 cpu += part.work.duration;
                 gap += part.work.cpu_gap_after;
             }
-            auto & observed = samples[{first.pid, first.tid}];
+            auto & observed = samples[{ first.pid, first.tid }];
             if (plan.event_waits.empty()) {
-                observed.empty_cpu += cpu; observed.empty_gap += gap; ++observed.empty;
-            } else {
-                observed.cpu += cpu; observed.gap += gap; observed.batches += plan.event_waits.size();
+                observed.empty_cpu += cpu;
+                observed.empty_gap += gap;
+                ++observed.empty;
+            }
+            else {
+                observed.cpu += cpu;
+                observed.gap += gap;
+                observed.batches += plan.event_waits.size();
             }
             load_tail_lanes_.emplace(entry, std::string(graph.node_lane_key(entry)));
-            tails.push_back({entry, exit, std::move(host)});
+            tails.push_back({ entry, exit, std::move(host) });
         }
     }
     for (const auto & [lane, observed] : samples) {
@@ -191,7 +200,7 @@ void HiCacheQueueConfirmations::replace_load_tails(core::DagGraph & graph) {
         load_tail_costs_.emplace(lane, cost);
     }
     std::vector<HiCacheHostRegion> regions;
-    for (const auto & tail : tails) regions.push_back({tail.entry, tail.exit, &tail.host});
+    for (const auto & tail : tails) regions.push_back({ tail.entry, tail.exit, &tail.host });
     // These are complete, bound MIN rounds. Target completion is sampled by
     // the queue state, so old source EventSynchronize dependencies must leave
     // with the old tail. Reference release remains at the generated return.
@@ -212,8 +221,7 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
             else if (check.write) sample.writes = state_->write_completion_count(fact);
             else sample.loads = state_->load_completion_count(fact);
             if (check.idle_prefix_ranks.contains(action.rank)
-                && (sample.loads || sample.writes || sample.storage.revoked_operations
-                    || sample.storage.backup_acks || sample.storage.released_pages))
+                && (sample.loads || sample.writes || sample.storage.revoked_operations || sample.storage.backup_acks || sample.storage.released_pages))
                 throw std::runtime_error("Pre-window confirmation no longer has an idle target prefix");
             continue;
         }
@@ -228,20 +236,21 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
         }
         if (action.phase == Phase::Work) {
             if (check.write) {
-                if (const auto last = write_work_({action.check, action.rank, fact, common.writes}, future))
+                if (const auto last = write_work_({ action.check, action.rank, fact, common.writes }, future))
                     future.depend(*last, check.return_nodes.at(action.rank));
-            } else {
-                if (common.loads > state_->load_completion_count(fact))
-                    throw std::logic_error("Target load confirmation prefix is no longer complete");
-                auto & cost = load_tail_costs_.at({fact.pid, fact.tid});
+            }
+            else {
+                if (common.loads > state_->load_completion_count(fact)) throw std::logic_error("Target load confirmation prefix is no longer complete");
+                auto & cost = load_tail_costs_.at({ fact.pid, fact.tid });
                 std::optional<size_t> previous = node;
-                for (uint64_t i = 0; i < std::max(uint64_t{1}, common.loads); ++i) {
+                for (uint64_t i = 0; i < std::max(uint64_t{ 1 }, common.loads); ++i) {
                     const auto plan = generated_cpu_control(load_tail_lanes_.at(node),
-                        common.loads ? cost.batch_cpu : cost.empty_cpu,
-                        common.loads ? cost.batch_gap : cost.empty_gap, cost.remainder,
-                        common.loads ? (cost.batch_proxy ? "target load acknowledgement: base empty-tail cost proxy"
-                                                       : "target load acknowledgement: base per-batch CPU cost")
-                                     : "target empty load confirmation");
+                                                            common.loads ? cost.batch_cpu : cost.empty_cpu,
+                                                            common.loads ? cost.batch_gap : cost.empty_gap,
+                                                            cost.remainder,
+                                                            common.loads ? (cost.batch_proxy ? "target load acknowledgement: base empty-tail cost proxy"
+                                                                                             : "target load acknowledgement: base per-batch CPU cost")
+                                                                         : "target empty load confirmation");
                     previous = expand_host(plan, {}, future, previous).host_return;
                 }
                 future.depend(*previous, check.return_nodes.at(action.rank));
@@ -251,19 +260,6 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
         if (check.storage) state_->drain_prefetch_queues(fact, common.storage);
         else if (check.write) state_->acknowledge_writes(fact, common.writes);
         else state_->acknowledge_loads(fact, common.loads);
-        if (observer_)
-            observer_({ action.check,
-                        action.rank,
-                        time,
-                        check.storage,
-                        common.storage,
-                        check.samples.at(action.rank).loads,
-                        common.loads,
-                        check.storage || check.write ? 0 : state_->load_completion_count(fact),
-                        check.write,
-                        check.samples.at(action.rank).writes,
-                        common.writes,
-                        check.write ? state_->write_completion_count(fact) : 0 });
     }
 }
 

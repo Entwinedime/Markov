@@ -37,7 +37,12 @@ double interpolate_curve(const auto & points, double coordinate, auto axis, auto
 std::pair<double, double> interpolated_transfer(const std::vector<frontend::HiCacheIoTransferPoint> & points, double page_bytes) {
     const auto axis = [](const auto & point) { return static_cast<double>(point.page_bytes); };
     return {
-        interpolate_curve(points, page_bytes, axis, [](const auto & point) { return point.setup_us_per_operation; }, false),
+        interpolate_curve(
+            points,
+            page_bytes,
+            axis,
+            [](const auto & point) { return point.setup_us_per_operation; },
+            false),
         interpolate_curve(points, page_bytes, axis, [](const auto & point) { return point.bandwidth_bytes_per_sec; }),
     };
 }

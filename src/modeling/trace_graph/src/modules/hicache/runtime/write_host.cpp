@@ -222,7 +222,7 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
             previous_end = std::max(previous_end, event.ts + event.dur);
             mapped.emplace(node, plan.nodes.size());
         }
-        spec.cpu_task_ready_delay_us = task.ready_delay_us;
+        spec.cpu_task_ready_delay_us = graph.cpu_service_ready_delay(task.first, task.ready_delay_us);
         plan.nodes.push_back({ std::move(spec), mapped.at(task.submission), task.first });
     }
 

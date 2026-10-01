@@ -26,18 +26,13 @@
 
 namespace markov::trace_graph::modules::hicache {
 
-HiCacheDagPatchModule::HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config)
-    : model_result_(std::move(model_result)),
-      source_target_same_config_(source_target_same_config) {
-    if (!model_result_) throw std::invalid_argument("HiCacheDagPatchModule requires a shared model result");
-}
-
 HiCacheDagPatchModule::HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config,
-                                             std::string oracle_cost_replay_path,
-                                             std::string phase_oracle_cost_replay_path)
-    : HiCacheDagPatchModule(std::move(model_result), source_target_same_config) {
-    oracle_cost_replay_path_ = std::move(oracle_cost_replay_path);
-    phase_oracle_cost_replay_path_ = std::move(phase_oracle_cost_replay_path);
+                                             std::string oracle_cost_replay_path, std::string phase_oracle_cost_replay_path)
+    : model_result_(std::move(model_result)),
+      source_target_same_config_(source_target_same_config),
+      oracle_cost_replay_path_(std::move(oracle_cost_replay_path)),
+      phase_oracle_cost_replay_path_(std::move(phase_oracle_cost_replay_path)) {
+    if (!model_result_) throw std::invalid_argument("HiCacheDagPatchModule requires a shared model result");
 }
 
 std::string_view HiCacheDagPatchModule::name() const noexcept { return "HiCacheDagPatchModule"; }
@@ -82,21 +77,18 @@ std::optional<int> logical_input_for_scope(std::string_view scope) {
     return static_cast<int>(one_based - 1);
 }
 
-bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph,
-                                                   const model::HiCachePhaseWorkLedger & phase_work,
-                                                   const patch::HiCacheShadowRewriteTransaction & shadow,
-                                                   core::DagMutationPlan & plan) {
+bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph, const model::HiCachePhaseWorkLedger & phase_work,
+                                                   const patch::HiCacheShadowRewriteTransaction & shadow, core::DagMutationPlan & plan) {
     std::set<std::string> synthetic_ids;
     for (const auto & node : plan.synthetic_nodes) synthetic_ids.insert(node.synthetic_id);
     using RequestKey = std::pair<int, std::string>;
     std::map<RequestKey, std::string> prefetch_by_request_rank;
     for (const auto & decision : shadow.decisions) {
-        if (decision.effect_type != model::HiCacheEffectType::PrefetchIo || decision.request_id.empty()
-            || decision.synthetic_id.empty() || !synthetic_ids.contains(decision.synthetic_id))
+        if (decision.effect_type != model::HiCacheEffectType::PrefetchIo || decision.request_id.empty() || decision.synthetic_id.empty()
+            || !synthetic_ids.contains(decision.synthetic_id))
             continue;
         const auto logical_input = logical_input_for_scope(decision.cache_scope);
-        if (!logical_input || !prefetch_by_request_rank.emplace(RequestKey{ *logical_input, decision.request_id }, decision.synthetic_id).second)
-            return false;
+        if (!logical_input || !prefetch_by_request_rank.emplace(RequestKey{ *logical_input, decision.request_id }, decision.synthetic_id).second) return false;
     }
     struct Boundary {
         int logical_input = 0;
@@ -128,10 +120,8 @@ bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph,
         const auto previous = previous_by_input.find(current.logical_input);
         if (previous != previous_by_input.end() && !current.prefetch_synthetic_id.empty()) {
             plan.add_edges.push_back(core::DagAddEdgeMutation{
-                .src = core::DagNodeRef::synthetic(hicache_phase_carrier_synthetic_id(previous->second->request_id,
-                                                                                      previous->second->logical_input,
-                                                                                      "decode",
-                                                                                      "complete")),
+                .src = core::DagNodeRef::synthetic(
+                    hicache_phase_carrier_synthetic_id(previous->second->request_id, previous->second->logical_input, "decode", "complete")),
                 .dst = core::DagNodeRef::synthetic(current.prefetch_synthetic_id),
                 .kind = core::DagEdgeKind::Mutation,
                 .effect_id = "hicache_request_phase_direct_boundary",
@@ -145,22 +135,21 @@ bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph,
 
 } // namespace
 
-bool append_hicache_reused_loadback_dependencies(const model::HiCachePhaseWorkLedger & phase_work,
-                                             const patch::HiCacheShadowRewriteTransaction & shadow,
-                                             core::DagMutationPlan & plan) {
+bool append_hicache_reused_loadback_dependencies(const model::HiCachePhaseWorkLedger & phase_work, const patch::HiCacheShadowRewriteTransaction & shadow,
+                                                 core::DagMutationPlan & plan) {
     std::set<std::string> synthetic_ids;
     for (const auto & node : plan.synthetic_nodes) synthetic_ids.insert(node.synthetic_id);
     using RequestKey = std::pair<int, std::string>;
     std::map<RequestKey, std::string> prefetch_by_request_rank;
     for (const auto & decision : shadow.decisions) {
-        if (decision.effect_type != model::HiCacheEffectType::PrefetchIo || decision.request_id.empty()
-            || decision.synthetic_id.empty() || !synthetic_ids.contains(decision.synthetic_id))
+        if (decision.effect_type != model::HiCacheEffectType::PrefetchIo || decision.request_id.empty() || decision.synthetic_id.empty()
+            || !synthetic_ids.contains(decision.synthetic_id))
             continue;
         const auto logical_input = logical_input_for_scope(decision.cache_scope);
         const auto & ready = decision.target_host_control_required ? decision.target_host_control_synthetic_id
-                              : decision.completion_join_required ? decision.completion_join_synthetic_id : decision.synthetic_id;
-        if (!logical_input || !prefetch_by_request_rank.emplace(RequestKey{ *logical_input, decision.request_id }, ready).second)
-            return false;
+                             : decision.completion_join_required   ? decision.completion_join_synthetic_id
+                                                                   : decision.synthetic_id;
+        if (!logical_input || !prefetch_by_request_rank.emplace(RequestKey{ *logical_input, decision.request_id }, ready).second) return false;
     }
     std::map<RequestKey, const model::HiCachePrefillWorkItem *> prefill_by_request_rank;
     for (const auto & prefill : phase_work.prefills) {
@@ -201,9 +190,7 @@ std::string decode_phase_effect(const model::HiCacheDecodeWorkItem & item, std::
     return "hicache_phase:" + item.request_id + ":decode:" + std::to_string(item.logical_input) + ":" + std::string(family);
 }
 
-void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
-                                    const std::string & filename,
-                                    HiCachePhaseOracleCostReplayAudit & audit) {
+void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work, const std::string & filename, HiCachePhaseOracleCostReplayAudit & audit) {
     if (filename.empty()) return;
     std::ifstream stream(filename);
     if (!stream) throw std::invalid_argument("cannot open HiCache phase oracle-cost replay input: " + filename);
@@ -212,8 +199,7 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
     if (!root.is_object() || !root.contains("phase_costs") || !root.at("phase_costs").is_array())
         throw std::invalid_argument("HiCache phase oracle-cost replay requires phase_costs");
     for (std::string_view forbidden : { "target_e2e_us", "actual_e2e_us", "target_prediction_us" }) {
-        if (root.contains(std::string(forbidden)))
-            throw std::invalid_argument("HiCache phase oracle-cost replay must not consume target E2E fields");
+        if (root.contains(std::string(forbidden))) throw std::invalid_argument("HiCache phase oracle-cost replay must not consume target E2E fields");
     }
     std::unordered_map<std::string, uint64_t> supplied;
     std::unordered_map<std::string, uint64_t> supplied_attention;
@@ -222,8 +208,8 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
         const auto & rows = root.at(std::string(field));
         if (!rows.is_array()) throw std::invalid_argument("HiCache phase oracle-cost collection must be an array");
         for (const auto & row : rows) {
-            if (!row.is_object() || !row.contains("effect_id") || !row.at("effect_id").is_string()
-                || !row.contains("duration_us") || !row.at("duration_us").is_number_unsigned())
+            if (!row.is_object() || !row.contains("effect_id") || !row.at("effect_id").is_string() || !row.contains("duration_us")
+                || !row.at("duration_us").is_number_unsigned())
                 throw std::invalid_argument("invalid HiCache phase oracle-cost record");
             const auto effect = row.at("effect_id").get<std::string>();
             if (effect.empty() || !supplied.emplace(effect, row.at("duration_us").get<uint64_t>()).second)
@@ -248,12 +234,9 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
         if (found == supplied.end()) throw std::invalid_argument("missing HiCache phase oracle cost for effect: " + effect);
         cost.predicted_duration_us = found->second;
         consumed.insert(effect);
-        audit.oracle_duration_us = core::checked_add_u64(audit.oracle_duration_us,
-                                                         found->second,
-                                                         "HiCache phase oracle duration exceeds uint64 range");
-        audit.applied_duration_us = core::checked_add_u64(audit.applied_duration_us,
-                                                          cost.predicted_duration_us,
-                                                          "HiCache applied phase oracle duration exceeds uint64 range");
+        audit.oracle_duration_us = core::checked_add_u64(audit.oracle_duration_us, found->second, "HiCache phase oracle duration exceeds uint64 range");
+        audit.applied_duration_us =
+            core::checked_add_u64(audit.applied_duration_us, cost.predicted_duration_us, "HiCache applied phase oracle duration exceeds uint64 range");
         ++audit.applied_cost_count;
     };
     for (auto & item : phase_work.prefills) {
@@ -266,15 +249,13 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work,
         const auto kernel_effect = decode_phase_effect(item, "kernel");
         apply(item.kernel_cost, kernel_effect);
         const auto attention = supplied_attention.find(kernel_effect);
-        if (attention == supplied_attention.end())
-            throw std::invalid_argument("missing Decode attention oracle cost for effect: " + kernel_effect);
+        if (attention == supplied_attention.end()) throw std::invalid_argument("missing Decode attention oracle cost for effect: " + kernel_effect);
         item.predicted_paged_attention_duration_us = attention->second;
         apply(item.collective_cost, decode_phase_effect(item, "collective"));
         if (include_control) apply(item.submit_cost, decode_phase_effect(item, "submit"));
     }
     if (consumed.size() != supplied.size()) throw std::invalid_argument("HiCache phase oracle-cost replay contains unknown effects");
-    audit.effect_identity_exact = audit.required_cost_count == audit.supplied_cost_count
-                                  && audit.applied_cost_count == audit.required_cost_count;
+    audit.effect_identity_exact = audit.required_cost_count == audit.supplied_cost_count && audit.applied_cost_count == audit.required_cost_count;
     audit.status = audit.effect_identity_exact ? "ready" : "invalid";
 }
 
@@ -291,8 +272,11 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
     result_.source_attribution = patch::build_hicache_source_attribution(source_index, model_result_->effect_decisions, result_.io_operation_ledger);
     result_.io_resources = patch::build_hicache_io_resource_plan(model_result_->effect_decisions, model_result_->io_cost_model);
     patch::apply_hicache_oracle_cost_replay(result_.io_resources, oracle_cost_replay_path_);
-    result_.shadow_rewrite = patch::build_hicache_shadow_rewrite_transaction(
-        graph, model_result_->effect_decisions, result_.source_attribution, result_.io_resources, source_target_same_config_);
+    result_.shadow_rewrite = patch::build_hicache_shadow_rewrite_transaction(graph,
+                                                                             model_result_->effect_decisions,
+                                                                             result_.source_attribution,
+                                                                             result_.io_resources,
+                                                                             source_target_same_config_);
     result_.boundary_validation = patch::validate_hicache_shadow_boundaries(graph, result_.shadow_rewrite);
     build_apply_gate(result_, *model_result_);
     result_.plan = result_.apply_blockers.empty() ? executable_plan(result_.shadow_rewrite) : blocked_plan();
@@ -306,8 +290,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
         if (result_.apply_blockers.empty()) result_.phase_carrier = append_hicache_phase_carrier_plan(graph, phase_work, result_.plan);
         result_.phase_duration_update_count = result_.plan.set_node_durations.size() - before;
         result_.phase_owner_conflict_count = result_.phase_carrier.owner_conflict_count;
-        if (result_.phase_carrier.status == "ready"
-            && append_hicache_reused_loadback_dependencies(phase_work, result_.shadow_rewrite, result_.plan)
+        if (result_.phase_carrier.status == "ready" && append_hicache_reused_loadback_dependencies(phase_work, result_.shadow_rewrite, result_.plan)
             && append_sequential_request_prefetch_boundaries(graph, phase_work, result_.shadow_rewrite, result_.plan)) {
             result_.plan.component = "hicache";
             result_.plan.reason = "atomic Direct and Prefill/Decode target transaction";
@@ -319,14 +302,16 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
         }
     }
     if (result_.apply_blockers.empty() && model_result_->phase_cost_model.enabled) {
-        auto& preparation = result_.runtime_preparation;
+        auto & preparation = result_.runtime_preparation;
         preparation = runtime::plan_allocator_preparations(graph, phase_work.allocator_calls);
-        for (const auto& change : preparation.mutation.set_cpu_gaps) {
-            if (std::ranges::any_of(result_.plan.set_cpu_gaps, [&](const auto& existing) { return existing.node_id == change.node_id; }))
+        for (const auto & change : preparation.mutation.set_cpu_gaps) {
+            if (std::ranges::any_of(result_.plan.set_cpu_gaps, [&](const auto & existing) { return existing.node_id == change.node_id; }))
                 ++preparation.blockers["preparation_conflicts_with_hicache_patch"];
         }
-        if (preparation.blockers.empty()) result_.plan.set_cpu_gaps.insert(result_.plan.set_cpu_gaps.end(),
-            preparation.mutation.set_cpu_gaps.begin(), preparation.mutation.set_cpu_gaps.end());
+        if (preparation.blockers.empty())
+            result_.plan.set_cpu_gaps.insert(result_.plan.set_cpu_gaps.end(),
+                                             preparation.mutation.set_cpu_gaps.begin(),
+                                             preparation.mutation.set_cpu_gaps.end());
         else {
             preparation.status = preparation.status == "unavailable" ? "unavailable" : "partial";
             preparation.mutation.set_cpu_gaps.clear();
@@ -335,8 +320,8 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
         }
     }
     if (result_.apply_blockers.empty() && !source_target_same_config_) {
-        result_.layer_wait_patch = patch::append_hicache_layer_wait_plan(source_index,
-            observe_hicache_layer_waits(source_index), result_.shadow_rewrite.decisions, result_.plan);
+        result_.layer_wait_patch =
+            patch::append_hicache_layer_wait_plan(source_index, observe_hicache_layer_waits(source_index), result_.shadow_rewrite.decisions, result_.plan);
         if (result_.layer_wait_patch.status == "blocked") add_apply_blocker(result_, "layer_wait_transition_incomplete");
     }
     // Source component labels are not target costs or mutation claims. Source
@@ -351,8 +336,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
     if (result_.apply_blockers.empty()) {
         const bool materialized_topology_valid = mutation.topology.ok();
         result_.applied_validation =
-            patch::validate_hicache_applied_patch(
-                graph, result_.shadow_rewrite, result_.io_resources, result_.plan, mutation, materialized_topology_valid);
+            patch::validate_hicache_applied_patch(graph, result_.shadow_rewrite, result_.io_resources, result_.plan, mutation, materialized_topology_valid);
         if (result_.applied_validation.status != "ready") {
             std::string detail = "materialized HiCache DAG patch failed post-apply semantic validation: ready="
                                  + std::to_string(result_.applied_validation.ready_count()) + "/" + std::to_string(result_.applied_validation.records.size())
@@ -360,8 +344,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
                                  + ", topology_exact=" + std::to_string(result_.applied_validation.topology_exact)
                                  + ", family_dependencies_exact=" + std::to_string(result_.applied_validation.family_dependencies_exact)
                                  + ", lane_dependencies_exact=" + std::to_string(result_.applied_validation.lane_dependencies_exact);
-            for (const auto & [reason, count] : result_.applied_validation.blocker_counts)
-                detail += "; " + reason + "=" + std::to_string(count);
+            for (const auto & [reason, count] : result_.applied_validation.blocker_counts) detail += "; " + reason + "=" + std::to_string(count);
             size_t sample_count = 0;
             for (const auto & record : result_.applied_validation.records) {
                 if (record.ready || sample_count >= 5) continue;
@@ -374,9 +357,8 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
                     if (decision != result_.shadow_rewrite.decisions.end() && decision->completion_control_ingress_edge_id) {
                         const auto id = *decision->completion_control_ingress_edge_id;
                         const auto & edge = graph.edge(id);
-                        detail += ", control_ingress=" + std::to_string(id)
-                                  + ", original_src=" + std::to_string(edge.src) + ":" + graph.event_for_node(edge.src).name
-                                  + ", src_active=" + std::to_string(graph.node(edge.src).active)
+                        detail += ", control_ingress=" + std::to_string(id) + ", original_src=" + std::to_string(edge.src) + ":"
+                                  + graph.event_for_node(edge.src).name + ", src_active=" + std::to_string(graph.node(edge.src).active)
                                   + ", original_dst=" + std::to_string(edge.dst) + ":" + graph.event_for_node(edge.dst).name
                                   + ", dst_active=" + std::to_string(graph.node(edge.dst).active);
                     }

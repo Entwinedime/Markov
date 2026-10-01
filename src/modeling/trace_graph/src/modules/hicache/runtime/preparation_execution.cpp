@@ -36,6 +36,10 @@ std::map<size_t, size_t> bind_allocator_preparation_costs(core::DagGraph & graph
             coverage = core::checked_add_u64(coverage, right - left, "preparation coverage overflow");
         }
         if (coverage > node.cpu_gap_after) throw std::runtime_error("Allocator preparation intervals overlap");
+        // The synthetic node has no source cost coordinates. Materialize the
+        // corrected partition now, so moving this gap does not discard its
+        // existing CPU correction or apply it again during simulation.
+        const auto gap_service = graph.cpu_service_cost().duration({ call.pid, call.tid }, begin, end);
         const auto name = "allocator_preparation:" + std::to_string(i);
         names.emplace(i, name);
         plan.synthetic_nodes.push_back({
@@ -44,8 +48,9 @@ std::map<size_t, size_t> bind_allocator_preparation_costs(core::DagGraph & graph
                      .category = "runtime_preparation",
                      .is_cpu = true,
                      .lane_key = std::string(graph.node_lane_key(before)),
-                     .duration = coverage,
-                     .cpu_gap_after = node.cpu_gap_after - coverage }
+                     .duration = call.service_duration_us,
+                     .cpu_gap_after = gap_service - call.service_duration_us,
+                     .observed_point = core::DagObservedPoint{ call.pid, call.tid, begin, node.gpu_id } }
         });
         plan.set_cpu_gaps.push_back({ .node_id = before, .duration = 0 });
         plan.add_edges.push_back({ .src = Ref::existing(before), .dst = Ref::synthetic(name), .kind = Kind::Sequential });
@@ -55,18 +60,7 @@ std::map<size_t, size_t> bind_allocator_preparation_costs(core::DagGraph & graph
     }
     const auto applied = core::apply_dag_mutation_plan(graph, plan);
     std::map<size_t, size_t> result;
-    for (const auto & [call, name] : names) {
-        const auto id = applied.synthetic_node_ids.at(name);
-        const auto & observed = source.calls[call];
-        const auto before = *observed.submit_gap_node;
-        const auto start = graph.event_for_node(before).ts + graph.event_for_node(before).dur;
-        auto & event = graph.mutable_event_for_node(id);
-        event.pid = observed.pid;
-        event.tid = observed.tid;
-        event.ts = start;
-        graph.mutable_node(id).gpu_id = graph.node(before).gpu_id;
-        result.emplace(call, id);
-    }
+    for (const auto & [call, name] : names) result.emplace(call, applied.synthetic_node_ids.at(name));
     return result;
 }
 

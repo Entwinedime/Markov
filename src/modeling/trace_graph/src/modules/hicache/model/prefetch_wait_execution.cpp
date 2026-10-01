@@ -4,22 +4,19 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-std::optional<PrefetchWaitTiming> observe_prefetch_stop_timing(
-    const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
-    const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
+std::optional<PrefetchWaitTiming> observe_prefetch_stop_timing(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
+                                                               const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
     if (ranks.empty()) return std::nullopt;
     PrefetchWaitTiming result;
     std::optional<size_t> completion;
     for (const auto & [rank, calls] : ranks) {
-        if (calls.size() != 1 || calls.front().local_return || !calls.front().stop || calls.front().state_round)
-            return std::nullopt;
+        if (calls.size() != 1 || calls.front().local_return || !calls.front().stop || calls.front().state_round) return std::nullopt;
         const auto & call = calls.front();
         if (!call.issue.empty() || call.rank != rank || !call.completion_round || call.cpu.empty())
             throw std::invalid_argument("Immediate stop requires complete ranked progress observations");
-        if (completion && completion != call.completion_round)
-            throw std::invalid_argument("Immediate stop ranks do not share a completion MIN");
+        if (completion && completion != call.completion_round) throw std::invalid_argument("Immediate stop ranks do not share a completion MIN");
         completion = call.completion_round;
-        result.check.cpu.emplace(rank, observe_prefetch_check_cpu(call,&source));
+        result.check.cpu.emplace(rank, observe_prefetch_check_cpu(call, &source));
     }
     result.check.completion_min = observe_cpu_collective_timing(source.graph(), rounds.rounds.at(*completion));
     if (!result.check.completion_min.issue.empty() || result.check.completion_min.calls.size() != ranks.size()
@@ -28,9 +25,9 @@ std::optional<PrefetchWaitTiming> observe_prefetch_stop_timing(
     return result;
 }
 
-std::optional<PrefetchWaitTiming> observe_prefetch_wait_timing(
-    const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
-    const PrefetchWorkerObservations & workers, const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
+std::optional<PrefetchWaitTiming> observe_prefetch_wait_timing(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
+                                                               const PrefetchWorkerObservations & workers,
+                                                               const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
     if (ranks.empty()) return std::nullopt;
     for (const auto & [rank, calls] : ranks)
         for (const auto & call : calls)
@@ -39,7 +36,8 @@ std::optional<PrefetchWaitTiming> observe_prefetch_wait_timing(
     if (std::ranges::any_of(ranks, [](const auto & pair) {
             return pair.second.size() < 2 || pair.second.front().local_return || pair.second.front().stop || !pair.second.front().state_round
                    || !pair.second.back().stop;
-        })) return std::nullopt;
+        }))
+        return std::nullopt;
     PrefetchWaitTiming result;
     auto & timing = result.check;
     std::vector<PrefetchControlObservation> first, next;
@@ -47,8 +45,8 @@ std::optional<PrefetchWaitTiming> observe_prefetch_wait_timing(
         if (!calls.back().completion_round) throw std::invalid_argument("Active wait has no terminal completion round");
         first.push_back(calls.front());
         next.push_back(calls[1]);
-        auto cpu = observe_prefetch_check_cpu(calls.front(),&source);
-        const auto terminal = observe_prefetch_check_cpu(calls.back(),&source);
+        auto cpu = observe_prefetch_check_cpu(calls.front(), &source);
+        const auto terminal = observe_prefetch_check_cpu(calls.back(), &source);
         cpu.max_to_stop = terminal.max_to_stop;
         cpu.stop_to_min = terminal.stop_to_min;
         cpu.min_to_visible = terminal.min_to_visible;
@@ -94,7 +92,6 @@ void HiCachePrefetchWaitExecution::issue_check(const CpuRankNodes & entries, sim
     const auto returned = run->start(entries, future);
     for (const auto & [rank, node] : returned) future.depend(node, returned_.at(rank));
     checks_.push_back({ std::move(run), returned });
-    ++checks_issued_;
 }
 
 void HiCachePrefetchWaitExecution::retry(const CpuRankNodes & entries, simulation::FutureDag & future) {
@@ -128,7 +125,7 @@ void HiCachePrefetchWaitExecution::dispatch(const Action & action, uint64_t time
     state_.drain_prefetch_queues(fact, common);
 }
 
-std::optional<int> HiCachePrefetchWaitExecution::advance(size_t node, uint64_t time, simulation::FutureDag & future) {
+void HiCachePrefetchWaitExecution::advance(size_t node, uint64_t time, simulation::FutureDag & future) {
     if (const auto at = actions_.find(node); at != actions_.end()) {
         const auto action = at->second;
         actions_.erase(at);
@@ -148,9 +145,6 @@ std::optional<int> HiCachePrefetchWaitExecution::advance(size_t node, uint64_t t
         if (at->finished == facts_.size()) at = checks_.erase(at);
         else ++at;
     }
-    for (const auto & [rank, returned] : returned_)
-        if (node == returned) return rank;
-    return std::nullopt;
 }
 
 } // namespace markov::trace_graph::modules::hicache::model

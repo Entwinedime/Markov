@@ -78,9 +78,8 @@ struct HiCacheDagPatchResult {
  */
 class HiCacheDagPatchModule final : public SimulationModule {
 public:
-    explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false);
-    HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config, std::string oracle_cost_replay_path,
-                          std::string phase_oracle_cost_replay_path);
+    explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false,
+                                   std::string oracle_cost_replay_path = {}, std::string phase_oracle_cost_replay_path = {});
 
     [[nodiscard]] std::string_view name() const noexcept override;
     void apply(core::DagGraph & graph) override;

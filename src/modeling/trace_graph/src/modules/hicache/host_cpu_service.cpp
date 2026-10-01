@@ -148,6 +148,44 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
     return retained;
 }
 
+nlohmann::json attach_hook_recorder_cpu_service(core::DagGraph & graph, const nlohmann::json & writes) {
+    size_t applied = 0, retained = 0;
+    uint64_t removed_us = 0;
+    for (const auto & write : writes) {
+        const auto begin_ns = write.at("begin_ns").get<uint64_t>();
+        const auto end_ns = write.at("end_ns").get<uint64_t>();
+        const auto cpu_ns = write.at("thread_cpu_ns").get<uint64_t>();
+        if (end_ns <= begin_ns || cpu_ns > end_ns - begin_ns) throw std::invalid_argument("Invalid hook recorder measurement");
+
+        const core::CpuServiceCost::Lane lane{ std::to_string(write.at("pid").get<uint64_t>()), std::to_string(write.at("tid").get<uint64_t>()) };
+        const auto begin = begin_ns / 1'000, end = end_ns / 1'000, reduction = cpu_ns / 1'000;
+        // Sub-microsecond work is retained. Never round removal above the
+        // measured budget or charge overlapping source corrections twice.
+        if (reduction == 0) {
+            ++retained;
+            continue;
+        }
+        const auto found = graph.cpu_service_cost().lanes().find(lane);
+        if (found != graph.cpu_service_cost().lanes().end()) {
+            const auto & spans = found->second;
+            const auto at = std::lower_bound(spans.begin(), spans.end(), begin, [](const auto & span, uint64_t time) { return span.end_us <= time; });
+            if (at != spans.end() && at->begin_us < end) {
+                ++retained;
+                continue;
+            }
+        }
+        graph.cpu_service_cost().add(lane, { begin, end, end - begin - reduction });
+        removed_us += reduction;
+        ++applied;
+    }
+    return {
+        {    "measured_writes", writes.size() },
+        {       "bound_writes",       applied },
+        {    "retained_writes",      retained },
+        { "bound_reduction_us",    removed_us }
+    };
+}
+
 nlohmann::json attach_recorder_cpu_service(core::DagGraph & graph, const nlohmann::json & writes) {
     auto rows = nlohmann::json::array();
     core::CpuServiceCost selected_ranges;

@@ -230,9 +230,7 @@ void HiCacheState::apply_cache_lookup_input(const HiCacheFact & fact) {
  */
 std::optional<std::vector<HiCacheFact>> HiCacheState::resolve_cache_extend_entry_facts(const HiCacheFact & fact,
                                                                                        const HiCacheBatchTokenResolution & batch_resolution) {
-    if (!batch_resolution.ok()) {
-        return std::nullopt;
-    }
+    if (!batch_resolution.ok()) { return std::nullopt; }
 
     std::vector<HiCacheFact> entry_facts;
     entry_facts.reserve(fact.batch_paths.size());
@@ -473,10 +471,18 @@ void HiCacheState::apply_cache_lifecycle_commit(const HiCacheFact & fact, HiCach
     }
     request.kv_allocated_pages =
         core::checked_add_u64(request.kv_allocated_pages, consumed_decode_pages, "HiCache request decode page count exceeds uint64 range");
-    scope.lifecycle_return = PendingLifecycleReturn{
-        fact.source_node_id, key, kind, 0, protected_pages_before_insert,
-        extended_pages, total_committed_pages, static_cast<uint64_t>(pages.size()), lifecycle_token_count,
-        pages, page_path.page_size, fact.ts };
+    scope.lifecycle_return = PendingLifecycleReturn{ fact.source_node_id,
+                                                     key,
+                                                     kind,
+                                                     0,
+                                                     protected_pages_before_insert,
+                                                     extended_pages,
+                                                     total_committed_pages,
+                                                     static_cast<uint64_t>(pages.size()),
+                                                     lifecycle_token_count,
+                                                     pages,
+                                                     page_path.page_size,
+                                                     fact.ts };
     if (execution != HiCacheLifecycleExecution::Stepped) advance_lifecycle_insert(fact, lifecycle_token_count);
     if (execution == HiCacheLifecycleExecution::Immediate) complete_lifecycle_return(fact);
 }

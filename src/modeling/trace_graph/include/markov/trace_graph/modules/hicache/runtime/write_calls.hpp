@@ -1,9 +1,9 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/lifecycle_observation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/lifecycle_observation.hpp"
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -23,11 +23,11 @@ struct HiCacheLoadBranch {
     core::TraceEvent envelope, condition;
     size_t entry_node = 0, return_node = 0;
 };
-[[nodiscard]] std::vector<HiCacheLoadBranch> observe_load_branches(
-    std::span<const core::TraceEvent> observations, std::span<const model::HiCacheReplayFact> facts, uint64_t begin, uint64_t end);
-[[nodiscard]] std::vector<HiCacheCapacityGuard> observe_capacity_guards(
-    const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts,
-    std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end);
+[[nodiscard]] std::vector<HiCacheLoadBranch> observe_load_branches(std::span<const core::TraceEvent> observations,
+                                                                   std::span<const model::HiCacheReplayFact> facts, uint64_t begin, uint64_t end);
+[[nodiscard]] std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSourceDagIndex & source,
+                                                                        std::span<const model::HiCacheReplayFact> facts,
+                                                                        std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end);
 
 /** Bind observed host calls to target state operations. Source envelopes locate
  * execution, not target victim counts. Unsupported new host branches stay
@@ -35,17 +35,26 @@ struct HiCacheLoadBranch {
 class HiCacheWriteCalls {
 public:
     [[nodiscard]] size_t completion_for(const model::HiCacheDeviceWrite & write) const {
-        return completions_.at({write.header.cache_scope, write.header.operation_id});
+        return completions_.at({ write.header.cache_scope, write.header.operation_id });
     }
     HiCacheWriteCalls(model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, HiCacheWriteStreamInsertions & insertions)
-        : replay_(replay), writes_(replay.state()), stream_insertions_(insertions), page_size_(config.page_size), page_bytes_(config.kv_bytes_per_page), write_back_(config.write_policy == "write_back"),
-          empty_write_check_us_(config.io_cost.empty_write_check_us), locked_candidate_us_(config.io_cost.locked_candidate_us), locked_candidate_log2_heap_us_(config.io_cost.locked_candidate_log2_heap_us), write_host_calibration_(config.write_host_calibration),
-          release_host_calibration_(config.release_host_calibration), load_index_calibration_(config.load_index_calibration),
+        : replay_(replay),
+          writes_(replay.state()),
+          stream_insertions_(insertions),
+          page_size_(config.page_size),
+          page_bytes_(config.kv_bytes_per_page),
+          write_back_(config.write_policy == "write_back"),
+          empty_write_check_us_(config.io_cost.empty_write_check_us),
+          locked_candidate_us_(config.io_cost.locked_candidate_us),
+          locked_candidate_log2_heap_us_(config.io_cost.locked_candidate_log2_heap_us),
+          write_host_calibration_(config.write_host_calibration),
+          release_host_calibration_(config.release_host_calibration),
+          load_index_calibration_(config.load_index_calibration),
           allocator_need_sort_(config.device_allocator_need_sort) {}
     void bind(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void replace_active_load_branches(core::DagGraph & graph);
     // Finalize resource and consumer bindings after all source replacements.
-    void rebind_retained_resources(core::DagGraph & graph, const std::map<size_t, size_t> & members);
+    void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members);
     void applied(const model::HiCacheReplayFact & input) const;
     /** Returns facts whose allocations completed at this boundary. */
     std::vector<size_t> advance(size_t node, uint64_t time, simulation::FutureDag & future);
@@ -80,8 +89,7 @@ private:
     };
     // Candidate load/capacity resources are required only when target work uses
     // them. Other calls fail immediately if their observed resource is unbound.
-    void bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call,
-                             const HiCacheHostExpansion & plan, bool candidate = false);
+    void bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const HiCacheHostExpansion & plan, bool candidate = false);
     [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
     void bind_capacity_calls(const patch::HiCacheSourceDagIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
@@ -96,8 +104,7 @@ private:
     void prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
     void start_load_branch(size_t node, uint64_t time, simulation::FutureDag & future);
     void prepare_load_capacity(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
-    std::optional<size_t> expand_capacity(Call & call, const HiCacheFact & fact, simulation::FutureDag & future,
-                                         std::optional<size_t> previous = std::nullopt);
+    std::optional<size_t> expand_capacity(Call & call, const HiCacheFact & fact, simulation::FutureDag & future, std::optional<size_t> previous = std::nullopt);
     model::HiCacheModelReplay & replay_;
     HiCacheWrites writes_;
     HiCacheWriteStreamInsertions & stream_insertions_;
@@ -113,9 +120,8 @@ private:
     const WriteTemplate & select_write_template(const std::string & pid, const std::string & tid, uint64_t bytes) const;
     // Submit one target write and register its completion. Callers retain
     // ownership of their host continuation and allocation return boundaries.
-    HiCacheExpandedWrite submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact,
-                                             const model::HiCacheDeviceWrite & operation, HiCacheHostSequence & sequence,
-                                             simulation::FutureDag & future);
+    HiCacheExpandedWrite submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
+                                             HiCacheHostSequence & sequence, simulation::FutureDag & future);
     struct EvictionControl {
         std::string pid, tid;
         HiCacheEvictionRegion region;
@@ -149,6 +155,8 @@ private:
         // Observed aggregate costs have a sampled token count. Primitive costs
         // instead provide a clone operation repeated for target promoted nodes.
         std::optional<uint64_t> tokens;
+        uint64_t source_page_size = 0;
+        bool direct_allocation = false;
         std::optional<LoadStep> prefix, retry, clone;
         std::vector<LoadStep> allocation;
         LoadStep tail;
@@ -158,9 +166,12 @@ private:
     // Recognized asynchronous clone samples become a per-node operation and
     // a once-per-admission CPU tail; unsupported source geometry stays explicit.
     void split_load_tail(const core::DagGraph & graph, size_t main, LoadAdmissionProgram & program);
-    [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens) const;
+    [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens, bool direct_allocation = false) const;
     void bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program);
-    struct LoadBranchReturn { size_t owner, program, continuation; bool expected_allocation; };
+    struct LoadBranchReturn {
+        size_t owner, program, continuation;
+        bool expected_allocation;
+    };
     std::map<size_t, LoadBranchReturn> load_branch_returns_;
     std::map<size_t, HiCacheHostExpansion> load_failure_templates_;
     std::map<size_t, std::vector<size_t>> allocation_returns_;

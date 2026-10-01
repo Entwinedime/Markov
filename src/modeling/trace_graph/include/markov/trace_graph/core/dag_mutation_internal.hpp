@@ -31,6 +31,8 @@ struct EffectEdgeKeyHash {
     }
 };
 
+// Empty effect IDs participate in identity too. Counts preserve duplicate
+// source edges when a mutation disables only one of their occurrences.
 using EffectEdgeCounts = std::unordered_map<EffectEdgeKey, size_t, EffectEdgeKeyHash>;
 
 inline EffectEdgeKey effect_edge_key(size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
@@ -43,12 +45,10 @@ inline EffectEdgeKey effect_edge_key(size_t src, size_t dst, DagEdgeKind kind, s
 }
 
 inline void increment_effect_edge(EffectEdgeCounts & counts, size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
-    if (effect_id.empty()) return;
     ++counts[effect_edge_key(src, dst, kind, effect_id)];
 }
 
 inline void decrement_effect_edge(EffectEdgeCounts & counts, size_t src, size_t dst, DagEdgeKind kind, std::string_view effect_id) {
-    if (effect_id.empty()) return;
     const auto key = effect_edge_key(src, dst, kind, effect_id);
     const auto found = counts.find(key);
     if (found == counts.end()) return;

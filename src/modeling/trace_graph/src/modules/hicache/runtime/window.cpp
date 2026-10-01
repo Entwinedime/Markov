@@ -1,14 +1,14 @@
 #include "markov/trace_graph/modules/hicache/runtime/window.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/lifecycle_calls.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_queries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/lifecycle_calls.hpp"
 #include <algorithm>
 #include <set>
 #include <stdexcept>
@@ -16,7 +16,7 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 
 HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const frontend::HiCacheConfig & config, std::string_view source_policy,
-                                           const core::ClientRequestChain & chain, uint64_t begin, uint64_t end, PrefetchWaitObserver wait_observer) {
+                                           const core::ClientRequestChain & chain, uint64_t begin, uint64_t end) {
     if (chain.status != "connected" || chain.requests.empty() || end <= begin)
         throw std::invalid_argument("HiCache execution requires a connected serial HTTP window");
     HiCacheWindowResult output;
@@ -38,8 +38,7 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     HiCacheWriteConfirmations write_confirmations;
     queries.bind(graph, replay, config, facts_at, begin, end);
     output.query_calibration_manifest = queries.source_template().calibration_manifest;
-    waiting.bind(graph, replay, source_policy, config.prefetch_policy, chain, std::move(wait_observer), config.prefetch_wait_calibration,
-                 config.prefetch_cpu_calibrations);
+    waiting.bind(graph, replay, source_policy, config.prefetch_policy, chain, config.prefetch_wait_calibration, config.prefetch_cpu_calibrations);
     output.wait_template_request = waiting.source_template().request_id;
     output.wait_calibration_manifest = waiting.source_template().calibration_manifest;
     output.local_return_calibration_manifests = waiting.source_template().local_return_calibration_manifests;
@@ -62,7 +61,13 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     }
     for (const auto & [node, ids] : facts_at)
         if (!ids.empty() && !graph.node(node).active) throw std::runtime_error("Eviction replacement removed a state input boundary");
-    confirmations.bind(graph, replay, begin, end, waiting.replaced_intervals(), {}, confirmation_work, chain.hicache_idle_since_us,
+    confirmations.bind(graph,
+                       replay,
+                       begin,
+                       end,
+                       waiting.replaced_intervals(),
+                       confirmation_work,
+                       chain.hicache_idle_since_us,
                        !config.load_submission_calibration.empty());
     confirmations.replace_load_tails(graph);
     writes.replace_active_load_branches(graph);
@@ -81,11 +86,14 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     const auto preparation_slots = bind_allocator_preparation_costs(graph, preparation_source);
     // No source regions are replaced after this point. Every generated host
     // operation binds against the same surviving worker queues.
-    const auto workers = observe_host_worker_members(graph);
-    loads.rebind_workers(graph, workers);
-    layer_calls.rebind_workers(graph, workers);
-    write_confirmations.rebind_workers(graph, workers);
-    writes.rebind_retained_resources(graph, workers);
+    {
+        const patch::HiCacheSourceDagIndex retained(graph);
+        const auto workers = observe_host_worker_members(graph);
+        loads.rebind_retained_resources(retained, workers);
+        layer_calls.rebind_workers(graph, workers);
+        write_confirmations.rebind_workers(graph, workers);
+        writes.rebind_retained_resources(retained, workers);
+    }
     std::map<size_t, size_t> preparation_at;
     for (const auto & [call, node] : preparation_slots) preparation_at.emplace(node, call);
     std::map<size_t, uint64_t> preparation_costs, operator_costs;
@@ -180,6 +188,8 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const fronten
     output.preparation_slots = preparation_slots.size();
     output.changed_operators = operator_costs.size();
     output.source_load_submissions = loads.source_submissions();
+    output.load_submission_base_cost_batches = loads.base_cost_batches();
+    output.load_submission_shared_cost_batches = loads.shared_cost_batches();
     output.completed_load_batches = loads.completed_batches();
     output.prepared_layer_calls = layer_calls.prepared_calls();
     output.active_layer_calls = layer_calls.active_calls();

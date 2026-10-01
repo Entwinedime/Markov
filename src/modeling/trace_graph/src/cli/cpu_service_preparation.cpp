@@ -24,9 +24,11 @@ void prepare_cpu_service(core::DagGraph & graph, const std::string & manifest, c
     const auto retained = modules::hicache::attach_host_cpu_service(graph, data.at("host_measurements"));
     auto recorder = nlohmann::json{};
     if (data.contains("recorder_writes")) recorder = modules::hicache::attach_recorder_cpu_service(graph, data.at("recorder_writes"));
+    auto hook_recorder = nlohmann::json{};
+    if (data.contains("hook_recorder_writes")) hook_recorder = modules::hicache::attach_hook_recorder_cpu_service(graph, data.at("hook_recorder_writes"));
     std::ofstream file(output);
     if (!file) throw std::runtime_error("Cannot open CPU service output");
-    io::write_cpu_service_cost(file, manifest, graph.cpu_service_cost());
+    io::write_cpu_service_cost(file, manifest, graph.cpu_service_cost(), data.value("reference_io", nlohmann::json{}));
 
     int64_t retained_cpu = 0;
     for (const auto & row : retained) retained_cpu += row.at("retained_reduction_us").get<int64_t>();
@@ -51,6 +53,7 @@ void prepare_cpu_service(core::DagGraph & graph, const std::string & manifest, c
         recorder.erase("rows");
         result["source_recorder_correction"] = std::move(recorder);
     }
+    if (!hook_recorder.is_null()) result["hook_recorder_correction"] = std::move(hook_recorder);
     audit << result.dump(2) << '\n';
 }
 } // namespace markov::trace_graph::cli

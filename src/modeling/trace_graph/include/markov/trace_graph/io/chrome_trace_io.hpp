@@ -44,6 +44,9 @@ struct TraceReadOptions {
 
 /**
  * @brief Writes the active simulated DAG as a Chrome trace with flow dependencies.
+ * Requires completed full simulation. Bars and flow origins use actual simulated
+ * start/completion times, including CPU correction. Node arguments expose lane,
+ * sequential CPU gap and ready delay in microseconds for timing diagnostics.
  */
 void write_chrome_trace_dag(const std::string & filename, const core::DagGraph & graph);
 

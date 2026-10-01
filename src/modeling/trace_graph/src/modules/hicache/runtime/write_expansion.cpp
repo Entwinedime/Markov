@@ -60,8 +60,17 @@ std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & grap
     return members;
 }
 
-void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members,
-                              std::span<HiCacheHostExpansion *> plans) {
+void rebind_host_stream_positions(const patch::HiCacheSourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
+                                  const std::string & pid, const std::string & tid, uint64_t at_us) {
+    const auto & graph = source.graph();
+    for (auto & [lane, position] : positions) {
+        if ((!position.before || graph.node(*position.before).active) && (!position.after || graph.node(*position.after).active)) continue;
+        const auto sample = position.before ? *position.before : *position.after;
+        position = observe_write_stream_position(source, sample, pid, tid, at_us);
+    }
+}
+
+void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members, std::span<HiCacheHostExpansion *> plans) {
     std::vector<std::pair<HiCacheHostExpansion::Node *, size_t>> bindings;
     for (auto * plan : plans)
         for (auto & node : plan->nodes) {

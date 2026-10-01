@@ -21,6 +21,9 @@ struct CpuCollectiveTiming {
 };
 
 /** Source-measured delays/remainders, not pure calibrated communication service.
+ * Caller before/submit/after work includes bound same-source CPU correction.
+ * Dispatch and worker remainder retain observed cross-thread timing; they do
+ * not inherit correction from the caller lane. All durations are microseconds.
  * Shared by static DAG mutation and execution-driven collective generation.
  */
 [[nodiscard]] CpuCollectiveTiming observe_cpu_collective_timing(const core::DagGraph & graph, const CpuCollectiveRound & round);

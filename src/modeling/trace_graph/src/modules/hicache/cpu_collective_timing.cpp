@@ -57,11 +57,16 @@ CpuCollectiveTiming observe_cpu_collective_timing(const core::DagGraph & graph, 
             result.issue = "inconsistent_call_timing";
             return result;
         }
-        timing.before_submit = submit.ts - event.ts;
-        timing.submission = submit.dur;
+        // Generated nodes have no observed CPU coordinates: transfer the
+        // already measured local service, not the uncorrected trace duration.
+        // Dispatch and peer rendezvous remain separate wall-clock evidence;
+        // caller CPU correction must not shorten another thread's waiting.
+        const core::CpuServiceCost::Lane caller{ event.pid, event.tid };
+        timing.before_submit = graph.cpu_service_cost().duration(caller, event.ts, submit.ts);
+        timing.submission = graph.cpu_service_cost().duration(caller, submit.ts, submitted);
         timing.dispatch = worker.ts - submit.ts;
         timing.worker_remainder = worked - latest;
-        timing.after_join = returned - std::max(submitted, worked);
+        timing.after_join = graph.cpu_service_cost().duration(caller, std::max(submitted, worked), returned);
     }
     return result;
 }

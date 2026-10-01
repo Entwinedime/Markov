@@ -126,7 +126,8 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             auto document = hc::model::encode_prefetch_wait_calibration({ manifest, request, policy, *timing });
             (void)hc::model::decode_prefetch_wait_calibration(document);
             document["estimator"] = "First complete active request and first local return per rank in source time order; target state determines retries.";
-            document["limitations"] = "CPU correction only where paired measurements exist; scheduler gaps and collective timing retain source conditions.";
+            document["limitations"] = "Local CPU correction only where paired measurements exist; residual scheduler gaps, collective dispatch and worker "
+                                      "timing retain source conditions.";
             publish(std::move(document));
             return 0;
         }
@@ -229,6 +230,28 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                 if (layers.empty()) throw std::runtime_error("No complete independent load layers");
                 const auto host = hc::runtime::observe_host_template(bounded, record.pid, record.tid, record.source_start_us, record.source_end_us);
                 const auto plan = hc::runtime::prepare_write_expansion(bounded, queues, record, host, layers.back().source_record);
+                const auto costs = hc::runtime::observe_load_submission_cost(plan, layers.size());
+                if (!costs) throw std::runtime_error("Load submission cannot be partitioned into supported Ascend operations");
+                using Cost = hc::runtime::LoadSubmissionCost;
+                for (const auto & [name, member] : {
+                         std::pair{        "before_sync",        &Cost::before_sync },
+                         {       "start_record",       &Cost::start_record },
+                         {         "wait_event",         &Cost::wait_event },
+                         {         "first_copy",         &Cost::first_copy },
+                         {               "copy",               &Cost::copy },
+                         { "first_layer_record", &Cost::first_layer_record },
+                         {       "layer_record",       &Cost::layer_record },
+                         {               "tail",               &Cost::tail }
+                }) {
+                    const auto & cost = *costs.*member;
+                    row["costs"][name] = {
+                        {          "main_us",          cost.main_us },
+                        { "main_residual_us", cost.main_residual_us },
+                        {        "worker_us",        cost.worker_us },
+                        {      "dispatch_us",      cost.dispatch_us },
+                        {        "device_us",        cost.device_us }
+                    };
+                }
                 row.update(expansion_observation(plan));
                 for (const auto & [node, bytes] : plan.payload) row["nodes"][node]["payload_bytes"] = bytes;
 

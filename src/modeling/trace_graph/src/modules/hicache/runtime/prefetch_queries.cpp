@@ -48,10 +48,9 @@ PrefetchQueryTemplate observe_prefetch_query_template(const core::DagGraph & gra
 }
 
 void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config,
-                                  std::map<size_t, std::vector<size_t>> & facts_at, uint64_t begin_us, uint64_t end_us, ReturnObserver observer) {
+                                  std::map<size_t, std::vector<size_t>> & facts_at, uint64_t begin_us, uint64_t end_us) {
     if (state_) throw std::logic_error("Prefetch queries are already bound");
     state_ = &replay.state();
-    observer_ = std::move(observer);
     worker_ = std::make_unique<model::HiCachePrefetchExecution>(*state_, config);
 
     // Candidate creation requires a query even when its eventual cache hit is empty.
@@ -63,7 +62,7 @@ void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelRep
     template_ = observe_prefetch_query_template(graph, collectives, observe_prefetch_workers(source, collectives), begin_us, end_us);
     if (!template_.issue.empty() && !config.prefetch_query_calibration.empty()) {
         const auto calibration = model::read_prefetch_query_calibration(config.prefetch_query_calibration);
-        template_ = {.timing = calibration.timing, .calibration_manifest = calibration.source_manifest};
+        template_ = { .timing = calibration.timing, .calibration_manifest = calibration.source_manifest };
     }
     if (!template_.issue.empty()) throw MissingCostEvidence("execution_control/prefetch_query", nlohmann::json::object(), template_.issue);
     std::map<std::string, int> ranks;
@@ -110,13 +109,12 @@ void HiCachePrefetchQueries::bind(core::DagGraph & graph, model::HiCacheModelRep
         if (!node || graph.node(*node).duration) throw std::runtime_error("Enqueue needs an exact zero-cost execution boundary");
         facts_at[*node].push_back(fact.source_node_id);
         query.entries[rank] = *node;
-        entries_.push_back({ request, rank, fact.source_ts, points[i].ts });
     }
     for (auto & [request, query] : requests) {
         if (query.facts.size() != template_.timing.cpu.size()
             || std::ranges::any_of(query.facts, [&](const auto & item) { return !template_.timing.cpu.contains(item.first); }))
             throw std::runtime_error("Candidate group does not match query communication membership");
-        query.execution = std::make_unique<model::HiCachePrefetchQueueExecution>(*state_, query.facts, template_.timing, model::PrefetchQueueAction::Query);
+        query.execution = std::make_unique<model::HiCachePrefetchQueueExecution>(*state_, query.facts, template_.timing);
         queries_.push_back(std::move(query));
     }
     std::ranges::sort(queries_, {}, [](const auto & query) { return query.facts.begin()->second.source_ts; });
@@ -142,9 +140,7 @@ void HiCachePrefetchQueries::advance(size_t node, uint64_t time, simulation::Fut
     for (auto & query : queries_)
         if (const auto rank = query.execution->advance(node, time, future)) {
             const auto & fact = query.facts.at(*rank);
-            const auto * operation = state_->prefetch_candidate_operation(fact);
-            const auto payload = worker_->enqueue(fact, future);
-            if (observer_) observer_({ fact.request_id, *rank, time, operation ? operation->hit_pages.size() : 0, operation != nullptr, payload.has_value() });
+            worker_->enqueue(fact, future);
         }
     worker_->advance(node, time, future);
 }

@@ -5,8 +5,7 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call,
-                                           const HiCacheHostExpansion & plan, bool candidate) {
+void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const HiCacheHostExpansion & plan, bool candidate) {
     for (const auto node : plan.resource_nodes()) {
         const auto lane = source.graph().node(node).lane_id;
         if (call.positions.contains(lane)) continue;
@@ -47,9 +46,8 @@ std::vector<HiCacheHostExpansion *> HiCacheWriteCalls::host_plans() {
     return plans;
 }
 
-HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact,
-                                                           const model::HiCacheDeviceWrite & operation, HiCacheHostSequence & sequence,
-                                                           simulation::FutureDag & future) {
+HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
+                                                            HiCacheHostSequence & sequence, simulation::FutureDag & future) {
     const auto projected = resize_write_pages(sample.expansion, operation.schedule.effective_byte_count, page_bytes_);
     auto expanded = sequence.append(projected, operation.schedule.duration_us, sample.position_lanes);
     const auto completion = writes_.submit_expanded(fact, operation, expanded.write_start, expanded.completion, future);

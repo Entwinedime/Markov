@@ -4,7 +4,6 @@
 
 namespace markov::trace_graph::modules::hicache::model {
 
-enum class PrefetchQueueAction { Query, Drain };
 struct PrefetchQueueCpuTiming {
     uint64_t before_sample, sample_to_min, min_to_apply;
 };
@@ -13,15 +12,14 @@ struct PrefetchQueueTiming {
     CpuCollectiveTiming agreement;
 };
 
-/** One query or scheduler drain over a complete TP group. Both sample local
- * state, MIN the snapshots, then apply at each rank's return. Query facts must
- * identify the original candidates; drain facts identify scopes. Local CPU
- * delays are explicit measured inputs, not inferred from target outcomes.
- * Drain covers prefetch revokes, storage backup ACKs and host-page releases.
+/** One query over a complete TP group: sample local hits, take their MIN,
+ * then apply at each rank's return. Facts identify the original candidates.
+ * Local CPU delays are measured inputs, not inferred from target outcomes.
+ * Scheduler drains belong to the foreground wait/confirmation execution.
  */
 class HiCachePrefetchQueueExecution {
 public:
-    HiCachePrefetchQueueExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, PrefetchQueueTiming timing, PrefetchQueueAction action);
+    HiCachePrefetchQueueExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, PrefetchQueueTiming timing);
     // Call before the earliest entry. Caller serializes query-thread entries
     // using these return gates, independently of payload-worker completion.
     CpuRankNodes start(const CpuRankNodes & entries, simulation::FutureDag & future);
@@ -32,10 +30,6 @@ public:
     std::optional<int> advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
 
 private:
-    struct Sample {
-        uint64_t hits = 0;
-        HiCachePrefetchQueueSizes queues;
-    };
     enum class Step { Entry, Sample, Apply, Finished };
     struct Event {
         int rank;
@@ -46,8 +40,7 @@ private:
     HiCacheState & state_;
     std::map<int, HiCacheFact> facts_;
     PrefetchQueueTiming timing_;
-    PrefetchQueueAction action_;
-    std::map<int, Sample> samples_;
+    std::map<int, uint64_t> samples_;
     std::unordered_map<size_t, Event> events_;
     CpuRankNodes owners_, entries_, returned_;
     std::optional<CpuCollectiveExecution> agreement_;

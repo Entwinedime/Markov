@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include "markov/trace_graph/core/trace_event.hpp"
 #include "markov/trace_graph/core/cpu_service_cost.hpp"
+#include "markov/trace_graph/core/trace_event.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -267,13 +267,16 @@ public:
 
     /** @brief Updates the residual delay carried by one CPU node's sequential edge. */
     using CpuGapRanges = std::vector<std::pair<uint64_t, uint64_t>>;
-    void validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges& ranges) const;
+    void validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges & ranges) const;
     void set_cpu_gap_after(size_t node_id, uint64_t duration, std::optional<CpuGapRanges> ranges = std::nullopt);
 
-    CpuServiceCost& cpu_service_cost() { return cpu_service_cost_; }
-    [[nodiscard]] const CpuServiceCost& cpu_service_cost() const { return cpu_service_cost_; }
+    CpuServiceCost & cpu_service_cost() { return cpu_service_cost_; }
+    [[nodiscard]] const CpuServiceCost & cpu_service_cost() const { return cpu_service_cost_; }
     [[nodiscard]] uint64_t cpu_service_node_duration(size_t node_id) const;
     [[nodiscard]] uint64_t cpu_service_gap_duration(size_t node_id) const;
+    // Observed ready delay ends at this source node's start. Generated tasks
+    // already carry estimated cost and must not be corrected a second time.
+    [[nodiscard]] uint64_t cpu_service_ready_delay(size_t node_id, uint64_t observed_delay_us) const;
 
     /** @brief Clears the Direct/Prefill/Decode owner mask used by scope replay. */
     void clear_scope_ownership();
@@ -304,9 +307,6 @@ public:
 
     /** @brief Returns nodes visible in the active graph view. */
     [[nodiscard]] size_t active_node_count() const;
-
-    /** @brief Returns active synthetic nodes created by graph mutations. */
-    [[nodiscard]] size_t active_synthetic_node_count() const;
 
     /** @brief Returns total edge storage, including tombstoned edges. */
     [[nodiscard]] size_t edge_count() const { return edges_.size(); }

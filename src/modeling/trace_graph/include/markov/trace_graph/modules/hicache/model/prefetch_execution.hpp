@@ -4,6 +4,7 @@
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <deque>
+#include <unordered_set>
 
 namespace markov::trace_graph::modules::hicache::model {
 
@@ -16,9 +17,9 @@ namespace markov::trace_graph::modules::hicache::model {
 class HiCachePrefetchExecution {
 public:
     HiCachePrefetchExecution(HiCacheState & state, const frontend::HiCacheConfig & config) : state_(state), config_(config) {}
-    // No node for a suppressed/revoked query. Returned completion is a resource
-    // boundary, not a foreground dependency or an HTTP endpoint.
-    std::optional<size_t> enqueue(const HiCacheFact & candidate, simulation::FutureDag & future);
+    // Suppressed/revoked queries add no work. Worker completion remains a
+    // private resource boundary, not a foreground dependency or HTTP endpoint.
+    void enqueue(const HiCacheFact & candidate, simulation::FutureDag & future);
     void advance(size_t node, uint64_t absolute_time_us, simulation::FutureDag & future);
 
 private:
@@ -43,7 +44,7 @@ private:
     std::deque<Execution> executions_;
     std::unordered_map<size_t, Event> events_;
     std::unordered_map<std::string, size_t> lane_tail_;
-    std::unordered_map<const HiCachePrefetchOperation *, size_t> submitted_;
+    std::unordered_set<const HiCachePrefetchOperation *> submitted_;
 };
 
 } // namespace markov::trace_graph::modules::hicache::model

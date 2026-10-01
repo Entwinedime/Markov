@@ -124,8 +124,7 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
 size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
     if (spec.name.empty()) throw std::invalid_argument("synthetic DAG node name must not be empty");
     if (spec.cpu_task_ready_delay_us && !spec.is_cpu) throw std::invalid_argument("explicit CPU task must use a CPU node");
-    if (spec.cpu_gap_after && (!spec.is_cpu || spec.cpu_task_ready_delay_us))
-        throw std::invalid_argument("residual gap requires a non-worker CPU boundary");
+    if (spec.cpu_gap_after && (!spec.is_cpu || spec.cpu_task_ready_delay_us)) throw std::invalid_argument("residual gap requires a non-worker CPU boundary");
     TraceEvent event;
     event.index = events_.size();
     event.source_channel = TraceSourceChannel::Synthetic;
@@ -209,64 +208,72 @@ DagNode & DagGraph::mutable_node(size_t node_id) {
 void DagGraph::set_node_duration(size_t node_id, uint64_t duration) { mutable_node(node_id).duration = duration; }
 
 uint64_t DagGraph::cpu_service_node_duration(size_t id) const {
-    const auto& n = node(id);
-    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates)
-        || n.duration == 0) return n.duration;
-    const auto& e = event_for_node(id);
-    const auto service = cpu_service_cost_.duration({e.pid,e.tid}, e.ts, checked_add_u64(e.ts,e.dur,"CPU service event end overflow"));
+    const auto & n = node(id);
+    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates) || n.duration == 0) return n.duration;
+    const auto & e = event_for_node(id);
+    const auto service = cpu_service_cost_.duration({ e.pid, e.tid }, e.ts, checked_add_u64(e.ts, e.dur, "CPU service event end overflow"));
     if (service == e.dur) return n.duration;
     if (n.duration != e.dur) throw std::runtime_error("CPU service overlaps an already remodeled node");
     return service;
 }
 
+uint64_t DagGraph::cpu_service_ready_delay(size_t id, uint64_t observed_delay_us) const {
+    const auto & n = node(id);
+    if (cpu_service_cost_.empty() || !n.is_cpu || observed_delay_us == 0 || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates))
+        return observed_delay_us;
+    const auto & event = event_for_node(id);
+    return cpu_service_cost_.duration({ event.pid, event.tid }, event.ts - observed_delay_us, event.ts);
+}
+
 uint64_t DagGraph::cpu_service_gap_duration(size_t id) const {
-    const auto& n = node(id);
-    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates)
-        || n.cpu_gap_after == 0) return n.cpu_gap_after;
-    const auto& e = event_for_node(id);
-    const auto begin = checked_add_u64(e.ts,e.dur,"CPU service gap begin overflow");
-    const auto end = checked_add_u64(begin,n.original_cpu_gap_after,"CPU service gap end overflow");
+    const auto & n = node(id);
+    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates) || n.cpu_gap_after == 0)
+        return n.cpu_gap_after;
+    const auto & e = event_for_node(id);
+    const auto begin = checked_add_u64(e.ts, e.dur, "CPU service gap begin overflow");
+    const auto end = checked_add_u64(begin, n.original_cpu_gap_after, "CPU service gap end overflow");
     if (const auto found = retained_cpu_gap_ranges_.find(id); found != retained_cpu_gap_ranges_.end()) {
-        validate_cpu_gap_ranges(id,n.cpu_gap_after,found->second);
+        validate_cpu_gap_ranges(id, n.cpu_gap_after, found->second);
         uint64_t service = 0;
-        for (const auto& [lo,hi] : found->second)
-            service = checked_add_u64(service,cpu_service_cost_.duration({e.pid,e.tid},lo,hi),"Retained gap service overflow");
+        for (const auto & [lo, hi] : found->second)
+            service = checked_add_u64(service, cpu_service_cost_.duration({ e.pid, e.tid }, lo, hi), "Retained gap service overflow");
         return service;
     }
-    const auto service = cpu_service_cost_.duration({e.pid,e.tid},begin,end);
+    const auto service = cpu_service_cost_.duration({ e.pid, e.tid }, begin, end);
     if (service == n.original_cpu_gap_after) return n.cpu_gap_after;
     if (n.cpu_gap_after != n.original_cpu_gap_after)
-        throw std::runtime_error("CPU service overlaps a partially remodeled gap without retained coordinates: node="
-            +std::to_string(id)+" event="+e.name+" gap="+std::to_string(n.cpu_gap_after)
-            +" original="+std::to_string(n.original_cpu_gap_after)+" begin="+std::to_string(begin));
+        throw std::runtime_error("CPU service overlaps a partially remodeled gap without retained coordinates: node=" + std::to_string(id) + " event=" + e.name
+                                 + " gap=" + std::to_string(n.cpu_gap_after) + " original=" + std::to_string(n.original_cpu_gap_after)
+                                 + " begin=" + std::to_string(begin));
     return service;
 }
 
 void DagGraph::set_node_counts_toward_e2e(size_t node_id, bool value) { mutable_node(node_id).counts_toward_e2e = value; }
 
-void DagGraph::validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges& ranges) const {
-    const auto& n = node(node_id);
+void DagGraph::validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges & ranges) const {
+    const auto & n = node(node_id);
     if (!n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates))
         throw std::invalid_argument("Retained gap ranges require original CPU coordinates");
-    const auto& event = event_for_node(node_id);
-    const auto begin = checked_add_u64(event.ts,event.dur,"Retained gap begin overflow");
-    const auto end = checked_add_u64(begin,n.original_cpu_gap_after,"Retained gap end overflow");
-    uint64_t cursor=begin,total=0;
-    for (const auto& [lo,hi] : ranges) {
-        if (lo<cursor || hi<=lo || hi>end) throw std::invalid_argument("Retained gap ranges overlap or exceed their source");
-        total=checked_add_u64(total,hi-lo,"Retained gap length overflow");
-        cursor=hi;
+    const auto & event = event_for_node(node_id);
+    const auto begin = checked_add_u64(event.ts, event.dur, "Retained gap begin overflow");
+    const auto end = checked_add_u64(begin, n.original_cpu_gap_after, "Retained gap end overflow");
+    uint64_t cursor = begin, total = 0;
+    for (const auto & [lo, hi] : ranges) {
+        if (lo < cursor || hi <= lo || hi > end) throw std::invalid_argument("Retained gap ranges overlap or exceed their source");
+        total = checked_add_u64(total, hi - lo, "Retained gap length overflow");
+        cursor = hi;
     }
-    if (total!=duration) throw std::invalid_argument("Retained gap ranges do not account for the remaining duration");
+    if (total != duration) throw std::invalid_argument("Retained gap ranges do not account for the remaining duration");
 }
 
 void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration, std::optional<CpuGapRanges> ranges) {
     auto & target = mutable_node(node_id);
     if (!target.is_cpu) throw std::invalid_argument("CPU gap update requires a CPU node");
     if (ranges) {
-        validate_cpu_gap_ranges(node_id,duration,*ranges);
-        retained_cpu_gap_ranges_[node_id]=std::move(*ranges);
-    } else retained_cpu_gap_ranges_.erase(node_id);
+        validate_cpu_gap_ranges(node_id, duration, *ranges);
+        retained_cpu_gap_ranges_[node_id] = std::move(*ranges);
+    }
+    else retained_cpu_gap_ranges_.erase(node_id);
     target.cpu_gap_after = duration;
 }
 
@@ -285,8 +292,7 @@ void DagGraph::set_scope_node_owned(size_t node_id) {
 void DagGraph::add_scope_gap_duration(size_t node_id, uint64_t duration) {
     if (node_id >= nodes_.size()) throw std::out_of_range("scope gap owner node ID out of range");
     scope_gap_durations_[node_id] = checked_add_u64(scope_gap_durations_[node_id], duration, "scope-owned CPU gap exceeds uint64 range");
-    if (scope_gap_durations_[node_id] > nodes_[node_id].cpu_gap_after)
-        throw std::logic_error("scope-owned CPU gap exceeds materialized CPU gap");
+    if (scope_gap_durations_[node_id] > nodes_[node_id].cpu_gap_after) throw std::logic_error("scope-owned CPU gap exceeds materialized CPU gap");
 }
 
 bool DagGraph::scope_node_owned(size_t node_id) const {
@@ -314,10 +320,6 @@ std::optional<size_t> DagGraph::find_lane_id(std::string_view lane_key_value) co
 
 size_t DagGraph::active_node_count() const {
     return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active; }));
-}
-
-size_t DagGraph::active_synthetic_node_count() const {
-    return static_cast<size_t>(std::ranges::count_if(nodes_, [](const auto & node) { return node.active && node.kind == DagNodeKind::Synthetic; }));
 }
 
 size_t DagGraph::active_edge_count() const {
@@ -358,7 +360,7 @@ DagGraphSummaryStats DagGraph::summary_stats() const {
 
 class DagGraph::GraphMerger {
 public:
-    explicit GraphMerger(std::vector<DagGraph> graphs) : graphs_(std::move(graphs)), merged_({}, 0), node_offsets_(graphs_.size() + 1, 0) {}
+    explicit GraphMerger(std::vector<DagGraph> graphs) : graphs_(std::move(graphs)), merged_({}, 0), node_offsets_(graphs_.size(), 0) {}
 
     [[nodiscard]] DagGraph run() {
         reserve_node_storage();
@@ -392,10 +394,10 @@ private:
     }
 
     void reserve_node_storage() {
-        total_events_ = checked_total([](const auto & graph) { return graph.events_.size(); }, "event");
         total_nodes_ = checked_total([](const auto & graph) { return graph.nodes_.size(); }, "node");
         total_edges_ = checked_total([](const auto & graph) { return graph.edges_.size(); }, "edge");
-        merged_.events_.reserve(total_events_);
+        merged_.events_.reserve(checked_total([](const auto & graph) { return graph.events_.size(); }, "event"));
+        merged_.parsed_record_count_ = checked_total([](const auto & graph) { return graph.parsed_record_count_; }, "parsed-record");
         merged_.hicache_fact_events_.reserve(checked_total([](const auto & graph) { return graph.hicache_fact_events_.size(); }, "HiCache fact"));
         merged_.runtime_observations_.reserve(checked_total([](const auto & graph) { return graph.runtime_observations_.size(); }, "runtime observation"));
         merged_.context_events_.reserve(checked_total([](const auto & graph) { return graph.context_events_.size(); }, "context event"));
@@ -414,25 +416,16 @@ private:
         for (size_t graph_index = 0; graph_index < graphs_.size(); ++graph_index) {
             auto & graph = graphs_[graph_index];
             node_offsets_[graph_index] = node_offset;
-            merge_parsed_record_count(graph);
-            merge_input_contracts(graph);
+            merged_.input_contracts_.insert(merged_.input_contracts_.end(), graph.input_contracts_.begin(), graph.input_contracts_.end());
             merged_.runtime_observations_.insert(merged_.runtime_observations_.end(),
-                std::make_move_iterator(graph.runtime_observations_.begin()), std::make_move_iterator(graph.runtime_observations_.end()));
-            for (auto & fact : graph.hicache_fact_events_) {
-                fact.index = merged_.hicache_fact_events_.size();
-                merged_.hicache_fact_events_.push_back(std::move(fact));
-            }
+                                                 std::make_move_iterator(graph.runtime_observations_.begin()),
+                                                 std::make_move_iterator(graph.runtime_observations_.end()));
+            append_indexed_events(merged_.hicache_fact_events_, graph.hicache_fact_events_);
             merged_.context_events_.insert(merged_.context_events_.end(),
                                            std::make_move_iterator(graph.context_events_.begin()),
                                            std::make_move_iterator(graph.context_events_.end()));
-            for (auto & event : graph.prelude_context_events_) {
-                event.index = merged_.prelude_context_events_.size();
-                merged_.prelude_context_events_.push_back(std::move(event));
-            }
-            for (auto & event : graph.tail_context_events_) {
-                event.index = merged_.tail_context_events_.size();
-                merged_.tail_context_events_.push_back(std::move(event));
-            }
+            append_indexed_events(merged_.prelude_context_events_, graph.prelude_context_events_);
+            append_indexed_events(merged_.tail_context_events_, graph.tail_context_events_);
             merged_.control_exclusion_intervals_.insert(merged_.control_exclusion_intervals_.end(),
                                                         std::make_move_iterator(graph.control_exclusion_intervals_.begin()),
                                                         std::make_move_iterator(graph.control_exclusion_intervals_.end()));
@@ -450,23 +443,19 @@ private:
             event_offset += graph.events_.size();
             node_offset += graph.nodes_.size();
         }
-        node_offsets_[graphs_.size()] = node_offset;
+        merged_.set_input_contracts(std::move(merged_.input_contracts_));
 #ifdef DEBUG
         merged_.real_e2e_time_ = has_real_time_ && real_max_ > real_min_ ? real_max_ - real_min_ : 0;
 #endif
     }
 
-    void merge_input_contracts(const DagGraph & graph) {
-        merged_.input_contracts_.insert(merged_.input_contracts_.end(), graph.input_contracts_.begin(), graph.input_contracts_.end());
-        std::ranges::sort(merged_.input_contracts_);
-        merged_.input_contracts_.erase(std::unique(merged_.input_contracts_.begin(), merged_.input_contracts_.end()), merged_.input_contracts_.end());
-    }
-
-    void merge_parsed_record_count(const DagGraph & graph) {
-        if (graph.parsed_record_count_ > std::numeric_limits<size_t>::max() - merged_.parsed_record_count_) {
-            throw std::length_error("DAG merge parsed-record count overflow");
+    // Each owning event table has its own index space. Keep source vector sizes
+    // intact until node/event offsets have been advanced for this rank.
+    static void append_indexed_events(std::vector<TraceEvent> & destination, std::vector<TraceEvent> & source) {
+        for (auto & event : source) {
+            event.index = destination.size();
+            destination.push_back(std::move(event));
         }
-        merged_.parsed_record_count_ += graph.parsed_record_count_;
     }
 
     void remap_nodes(DagGraph & graph, const GraphRelocation & relocation) {
@@ -502,10 +491,7 @@ private:
         merged_.nodes_.insert(merged_.nodes_.end(), std::make_move_iterator(graph.nodes_.begin()), std::make_move_iterator(graph.nodes_.end()));
         merged_.scope_node_owned_.resize(merged_.nodes_.size(), 0);
         merged_.scope_gap_durations_.resize(merged_.nodes_.size(), 0);
-        for (auto & event : graph.events_) {
-            event.index = merged_.events_.size();
-            merged_.events_.push_back(std::move(event));
-        }
+        append_indexed_events(merged_.events_, graph.events_);
     }
 
     [[nodiscard]] static size_t max_occurrence_count(const HcclRanks & ranks) {
@@ -619,7 +605,6 @@ private:
     DagGraph merged_;
     std::vector<size_t> node_offsets_;
     HcclGroups hccl_groups_;
-    size_t total_events_ = 0;
     size_t total_nodes_ = 0;
     size_t total_edges_ = 0;
 #ifdef DEBUG
@@ -632,7 +617,7 @@ private:
 DagGraph DagGraph::merge(std::vector<DagGraph> graphs) {
     if (graphs.empty()) return DagGraph();
     if (graphs.size() == 1) return std::move(graphs.front());
-    for (const auto& graph : graphs)
+    for (const auto & graph : graphs)
         if (!graph.cpu_service_cost().empty() || !graph.retained_cpu_gap_ranges_.empty())
             throw std::invalid_argument("Attach CPU service measurements and retained ranges after merging source graphs");
     return GraphMerger(std::move(graphs)).run();

@@ -10,9 +10,9 @@ namespace markov::trace_graph::simulation::detail {
 namespace {
 constexpr auto none = core::DagNode::kNoNode;
 using Identity = std::tuple<int, std::string, std::string>;
-}
+} // namespace
 
-CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
+CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph) {
     CpuTaskQueues result;
     result.node_task.assign(graph.node_count(), none);
     result.submitted_task.assign(graph.node_count(), none);
@@ -20,14 +20,14 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
     std::map<size_t, std::vector<size_t>> lanes;
     std::map<size_t, std::vector<size_t>> modeled_tasks, modeled_submissions;
     const auto identity = [&](size_t id) {
-        const auto& event = graph.event_for_node(id);
-        return Identity{graph.node(id).gpu_id, event.pid, event.arg("correlation_id")};
+        const auto & event = graph.event_for_node(id);
+        return Identity{ graph.node(id).gpu_id, event.pid, event.arg("correlation_id") };
     };
     const auto end = [&](size_t id) {
-        const auto& event = graph.event_for_node(id);
+        const auto & event = graph.event_for_node(id);
         return core::checked_add_u64(event.ts, event.dur, "CPU task observation end overflow");
     };
-    for (const auto& node : graph.nodes()) {
+    for (const auto & node : graph.nodes()) {
         if (!node.is_cpu) continue;
         if (node.explicit_cpu_task) {
             if (node.active) {
@@ -38,20 +38,28 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
         }
         lanes[node.lane_id].push_back(node.id);
         if (!node.active) continue;
-        const auto& event = graph.event_for_node(node.id);
+        const auto & event = graph.event_for_node(node.id);
         if (event.cat == "enqueue" && !event.arg("correlation_id").empty()) submissions[identity(node.id)].push_back(node.id);
     }
-    if (!modeled_tasks.empty()) for (const auto& edge : graph.edges()) {
-        if (edge.active && edge.kind == core::DagEdgeKind::Correlation && graph.node(edge.dst).explicit_cpu_task
-            && graph.node(edge.dst).active && graph.node(edge.src).active)
+    // Inspect dependencies once, not once per CPU lane in a potentially large DAG.
+    std::set<size_t> cross_lane_delays;
+    for (const auto & edge : graph.edges()) {
+        if (!edge.active) continue;
+
+        if (edge.kind == core::DagEdgeKind::Sequential && graph.node(edge.src).lane_id != graph.node(edge.dst).lane_id)
+            cross_lane_delays.insert(graph.node(edge.src).lane_id);
+
+        if (!modeled_tasks.empty() && edge.kind == core::DagEdgeKind::Correlation && graph.node(edge.dst).explicit_cpu_task && graph.node(edge.dst).active
+            && graph.node(edge.src).active)
             modeled_submissions[edge.dst].push_back(edge.src);
     }
-    for (auto& [lane, ids] : lanes) {
-        const auto& additions = modeled_tasks[lane];
+
+    for (auto & [lane, ids] : lanes) {
+        const auto & additions = modeled_tasks[lane];
         const auto reject_insertion = [&] {
             if (!additions.empty()) throw std::runtime_error("cannot insert CPU task into an unrecognized worker queue");
         };
-        std::ranges::sort(ids, {}, [&](size_t id) { return std::pair{graph.event_for_node(id).ts, id}; });
+        std::ranges::sort(ids, {}, [&](size_t id) { return std::pair{ graph.event_for_node(id).ts, id }; });
         // Task removal changes the queue, not the source-measured ready delay.
         // Otherwise a removed task's service is charged again as its successor's gap.
         std::vector<size_t> active_ids;
@@ -72,7 +80,10 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
             if (found == submissions.end() || found->second.size() != 1 || graph.node(found->second.front()).lane_id == lane) break;
             producers.push_back(found->second.front());
         }
-        if (producers.size() != ids.size()) { reject_insertion(); continue; }
+        if (producers.size() != ids.size()) {
+            reject_insertion();
+            continue;
+        }
         std::vector<CpuTask> tasks;
         std::set<size_t> seen;
         for (size_t begin = 0; begin < ids.size();) {
@@ -80,28 +91,31 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
             while (stop < ids.size() && producers[stop] == producers[begin]) ++stop;
             const auto submit = producers[begin], first = ids[begin], last = ids[stop - 1];
             const auto start = graph.event_for_node(first).ts;
-            if (!seen.insert(submit).second || result.submitted_task[submit] != none
-                || graph.event_for_node(submit).ts > start || observed_previous_ends[begin] > start) break;
+            if (!seen.insert(submit).second || result.submitted_task[submit] != none || graph.event_for_node(submit).ts > start
+                || observed_previous_ends[begin] > start)
+                break;
             const auto ready = std::max(end(submit), observed_previous_ends[begin]);
-            tasks.push_back({first, last, submit, result.queue_count, start > ready ? start - ready : 0, ready > start ? ready - start : 0});
+            tasks.push_back({ first, last, submit, result.queue_count, start > ready ? start - ready : 0, ready > start ? ready - start : 0 });
             begin = stop;
         }
         size_t covered = 0;
-        for (const auto& task : tasks) {
+        for (const auto & task : tasks) {
             while (covered < ids.size() && producers[covered] == task.submission) ++covered;
         }
-        if (covered != ids.size()) { reject_insertion(); continue; } // Partial identity is not a queue contract.
-        const bool changed_cost = std::ranges::any_of(tasks, [&](const auto& task) {
-            const auto& last = graph.node(task.last);
+        if (covered != ids.size()) {
+            reject_insertion();
+            continue;
+        } // Partial identity is not a queue contract.
+        const bool changed_cost = std::ranges::any_of(tasks, [&](const auto & task) {
+            const auto & last = graph.node(task.last);
             return graph.scope_gap_duration(task.last) != 0 || (last.cpu_gap_after != 0 && last.cpu_gap_after != last.original_cpu_gap_after);
         });
-        const bool cross_lane_delay = std::ranges::any_of(graph.edges(), [&](const auto& edge) {
-            return edge.active && edge.kind == core::DagEdgeKind::Sequential && graph.node(edge.src).lane_id == lane
-                   && graph.node(edge.dst).lane_id != lane;
-        });
-        if (changed_cost || cross_lane_delay) { reject_insertion(); continue; }
+        if (changed_cost || cross_lane_delays.contains(lane)) {
+            reject_insertion();
+            continue;
+        }
         for (const auto id : additions) {
-            const auto& incoming = modeled_submissions[id];
+            const auto & incoming = modeled_submissions[id];
             if (incoming.size() != 1 || !graph.node(incoming.front()).is_cpu || graph.node(incoming.front()).lane_id == lane)
                 throw std::runtime_error("explicit CPU task requires one cross-thread CPU submission");
             const auto submit = incoming.front();
@@ -109,11 +123,11 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
                 throw std::runtime_error("one CPU submission cannot identify multiple queue tasks");
             if (graph.node(id).cpu_gap_after != 0 || graph.scope_gap_duration(id) != 0)
                 throw std::runtime_error("explicit CPU task cannot carry an unmodeled sequential gap");
-            tasks.push_back({id, id, submit, result.queue_count, graph.node(id).cpu_ready_delay_before, 0});
+            tasks.push_back({ id, id, submit, result.queue_count, graph.node(id).cpu_ready_delay_before, 0 });
         }
         ++result.queue_count;
         size_t offset = 0;
-        for (const auto& task : tasks) {
+        for (const auto & task : tasks) {
             const auto task_id = result.tasks.size();
             result.submitted_task[task.submission] = task_id;
             while (offset < ids.size() && producers[offset] == task.submission) result.node_task[ids[offset++]] = task_id;
@@ -124,31 +138,31 @@ CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph) {
     return result;
 }
 
-bool CpuTaskQueues::replaces(const core::DagEdge& edge) const {
+bool CpuTaskQueues::replaces(const core::DagEdge & edge) const {
     if (tasks.empty() || edge.kind != core::DagEdgeKind::Sequential) return false;
     const auto from = node_task.at(edge.src), to = node_task.at(edge.dst);
     return from != none && to != none && from != to && tasks[from].queue == tasks[to].queue;
 }
 
-void CpuTaskQueues::materialize(core::DagGraph& graph, const std::vector<std::vector<size_t>>& order) const {
+void CpuTaskQueues::materialize(core::DagGraph & graph, const std::vector<std::vector<size_t>> & order) const {
     if (tasks.empty()) return;
     std::vector<size_t> desired(graph.node_count(), none);
     std::vector<bool> retained(graph.node_count(), false);
-    for (const auto& queue : order) {
+    for (const auto & queue : order) {
         for (size_t index = 1; index < queue.size(); ++index) desired[tasks[queue[index]].first] = tasks[queue[index - 1]].last;
     }
     for (size_t id = 0; id < graph.edge_count(); ++id) {
-        const auto& edge = graph.edge(id);
+        const auto & edge = graph.edge(id);
         if (!edge.active || !replaces(edge)) continue;
         if (desired[edge.dst] == edge.src && !retained[edge.dst]) retained[edge.dst] = true;
         else graph.disable_edge(id);
     }
-    for (const auto& task : tasks) {
+    for (const auto & task : tasks) {
         graph.mutable_node(task.first).cpu_ready_delay_before = task.ready_delay_us;
         graph.mutable_node(task.last).cpu_gap_after = 0;
     }
-    for (const auto& task : tasks) if (desired[task.first] != none && !retained[task.first])
-        graph.add_edge(desired[task.first], task.first, core::DagEdgeKind::Sequential);
+    for (const auto & task : tasks)
+        if (desired[task.first] != none && !retained[task.first]) graph.add_edge(desired[task.first], task.first, core::DagEdgeKind::Sequential);
 }
 
 } // namespace markov::trace_graph::simulation::detail

@@ -1,9 +1,9 @@
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_patch.hpp"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
-#include <nlohmann/json.hpp>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -20,17 +20,17 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     std::set<std::pair<std::string, std::string>> workload_requests;
     for (const auto & event : graph.prelude_context_events()) {
         if (!event.has_arg_key_hint("fact") || event.arg("request_id").empty()) continue;
-        if (nlohmann::json::parse(event.arg("fact")).value("class", "") == "workload_identity")
-            workload_requests.emplace(event.pid, event.arg("request_id"));
+        if (nlohmann::json::parse(event.arg("fact")).value("class", "") == "workload_identity") workload_requests.emplace(event.pid, event.arg("request_id"));
     }
     for (const auto & batch : graph.prelude_context_events()) {
-        if (batch.name != "runtime.hicache.layer_waits" || batch.arg("consumer_index") != "-1"
-            || batch.arg("status") != "returned" || batch.arg("wait_clock") != "profiler_ns") continue;
+        if (batch.name != "runtime.hicache.layer_waits" || batch.arg("consumer_index") != "-1" || batch.arg("status") != "returned"
+            || batch.arg("wait_clock") != "profiler_ns")
+            continue;
         const auto requests = nlohmann::json::parse(batch.arg("request_ids"));
-        if (requests.size() != 1 || !workload_requests.contains({batch.pid, requests.at(0).get<std::string>()})) continue;
-        const auto first = batch.ts * 1000 + batch.ts_submicro_ns;
-        const auto last = first + batch.dur * 1000 + batch.dur_submicro_ns;
-        if (last > begin * 1000) continue;
+        if (requests.size() != 1 || !workload_requests.contains({ batch.pid, requests.at(0).get<std::string>() })) continue;
+        const auto first = batch.ts * 1'000 + batch.ts_submicro_ns;
+        const auto last = first + batch.dur * 1'000 + batch.dur_submicro_ns;
+        if (last > begin * 1'000) continue;
         std::vector<uint64_t> costs;
         uint64_t previous = first;
         for (const auto & interval : nlohmann::json::parse(batch.arg("wait_intervals"))) {
@@ -40,12 +40,12 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             costs.push_back(stop - start);
             previous = stop;
         }
-        auto & samples = preparation_inactive[{batch.pid, batch.arg("phase")}];
+        auto & samples = preparation_inactive[{ batch.pid, batch.arg("phase") }];
         samples.insert(samples.end(), costs.begin(), costs.end());
     }
     for (const auto & call : waits.calls) {
         const auto & anchor = graph.event_for_node(*call.before);
-        const bool in_window = call.start_ns / 1000 >= begin && call.end_ns / 1000 <= end;
+        const bool in_window = call.start_ns / 1'000 >= begin && call.end_ns / 1'000 <= end;
         if (!call.enabled) {
             if (in_window) inactive[{ anchor.pid, call.phase }].push_back(call.end_ns - call.start_ns);
             continue;
@@ -81,9 +81,13 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     for (const auto & removal : removals) {
         const auto & observed = *removal.call;
         const auto & event = graph.event_for_node(*observed.submission);
-        Call call{ .pid = event.pid, .phase = observed.phase, .lane = std::string(graph.node_lane_key(*observed.submission)),
-                   .batch_start_ns = observed.batch_start_ns, .layer = observed.layer,
-                   .position = positions.at(*observed.device_wait), .device_lane = graph.node(*observed.device_wait).lane_id };
+        Call call{ .pid = event.pid,
+                   .phase = observed.phase,
+                   .lane = std::string(graph.node_lane_key(*observed.submission)),
+                   .batch_start_ns = observed.batch_start_ns,
+                   .layer = observed.layer,
+                   .position = positions.at(*observed.device_wait),
+                   .device_lane = graph.node(*observed.device_wait).lane_id };
         HiCacheHostTemplate host{ .main = observed.cpu, .worker_nodes = { *observed.worker } };
         call.plan = prepare_host_expansion(source, queues, host, "target layer wait: ");
         if (call.plan.streams.size() != 1 || call.plan.event_waits.size() != 1 || !call.plan.waits.empty())
@@ -106,7 +110,7 @@ void HiCacheLayerCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     (void)core::apply_dag_mutation_plan(graph, removal);
     for (auto & [node, call] : calls_) {
         call.outside_gap_us = graph.cpu_service_gap_duration(node);
-        graph.set_cpu_gap_after(node,0);
+        graph.set_cpu_gap_after(node, 0);
     }
     bind_inactive(graph, waits, begin, end);
 }
@@ -126,19 +130,22 @@ void HiCacheLayerCalls::advance(size_t node, const Consumer & consumer, simulati
     if (records.empty()) {
         if (call.source_inactive_us) {
             returned = future.append({ .name = "original inactive layer return", .lane_key = call.lane, .duration = *call.source_inactive_us });
-        } else {
+        }
+        else {
             const auto key = std::pair{ call.pid, call.phase };
             const auto sample = inactive_ns_.find(key);
             if (sample == inactive_ns_.end()) throw std::runtime_error("Base lacks an inactive layer-call return sample");
             auto & remainder = remainder_ns_[key];
             const auto ns = remainder + sample->second;
-            returned = future.append({ .name = "inactive layer return", .lane_key = call.lane, .duration = ns / 1000 });
-            remainder = ns % 1000;
+            returned = future.append({ .name = "inactive layer return", .lane_key = call.lane, .duration = ns / 1'000 });
+            remainder = ns % 1'000;
         }
         ++inactive_;
-    } else {
-        if (!call.insertion_issue.empty()) throw std::runtime_error("Target layer wait cannot be inserted: " + call.insertion_issue
-            + " pid=" + call.pid + " batch_ns=" + std::to_string(call.batch_start_ns) + " layer=" + std::to_string(call.layer));
+    }
+    else {
+        if (!call.insertion_issue.empty())
+            throw std::runtime_error("Target layer wait cannot be inserted: " + call.insertion_issue + " pid=" + call.pid
+                                     + " batch_ns=" + std::to_string(call.batch_start_ns) + " layer=" + std::to_string(call.layer));
         const auto record = records.at(call.layer);
         const auto position = insertions_.position(call.device_lane, call.position);
         const auto expanded = expand_host(call.plan, std::span(&position, 1), future, std::nullopt, std::span(&record, 1));

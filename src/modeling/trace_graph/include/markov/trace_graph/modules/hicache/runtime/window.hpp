@@ -2,8 +2,8 @@
 #include "markov/trace_graph/core/client_requests.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 namespace markov::trace_graph::modules::hicache::runtime {
@@ -16,6 +16,7 @@ struct HiCacheWindowResult {
     size_t prepared_facts = 0, consumed_facts = 0, phase_admissions = 0;
     size_t decode_allocations = 0;
     size_t source_load_submissions = 0, completed_load_batches = 0;
+    size_t load_submission_base_cost_batches = 0, load_submission_shared_cost_batches = 0;
     size_t prepared_layer_calls = 0, active_layer_calls = 0, inactive_layer_calls = 0;
     size_t source_write_submissions = 0, completed_writes = 0, resumed_allocations = 0;
     size_t prepared_write_templates = 0;
@@ -41,7 +42,6 @@ struct HiCacheWindowResult {
  * This reports execution consistency, not complete cost-model coverage/accuracy.
  */
 [[nodiscard]] HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const frontend::HiCacheConfig & config, std::string_view source_policy,
-                                                         const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us,
-                                                         PrefetchWaitObserver wait_observer = {});
+                                                         const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us);
 
 } // namespace markov::trace_graph::modules::hicache::runtime
