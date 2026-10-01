@@ -1,10 +1,20 @@
 # HiCache 验证与当前限制
 
-更新时间：2026-09-27。公式见 [HiCache 数值模型](../hicache_io_cost_model.md)，工作流见
+更新时间：2026-09-28。公式见 [HiCache 数值模型](../hicache_io_cost_model.md)，工作流见
 [建模开发说明](../modeling_development.md)。本文只维护当前修复口径的验收事实；内部 JSON 字段
 `hicache_direct` 指“HiCache I/O 与相关控制开销”，不是完整 E2E，也不是“只改数值”的结构假设。
 
-## 当前正式流程复验（09-27）
+## 最新完整 E2E 复验（09-28）
+
+`data/modeling_runs/e2e_accuracy_20260928/mutation_index/normal_http_scores` 汇总五组 60/60，
+使用原 30 份正常 HTTP 测量独立评分，无排除项。WAPE 3.230%、P90 6.717%、最大 9.612%，
+53/60 低于 6%；整体仍为 MODEL_LIMITATION，仅 C3 通过组级指标。来源变化、逐组结果和剩余问题见
+[工作进展](../work_progress.md#最新完整-60-格)。本次矩阵未启动新采集，不能据此声称所有历史依据的取得成本为零。
+旧结果保留为对照，不代表当前成绩；评分没有回写模型或改变采集计划。
+本轮边索引优化后，60 份运行摘要及完整 E2E 评分与 `collective_cpu` 一致，
+受支持静态回放的运行和模型摘要也一致。精度未改变；按用户要求完成本轮后暂停推进。
+
+## 重构流程复验（09-27）
 
 重构后的 prepare-hicache 已完成五组共 60/60 预测，随后通过 evaluate-hicache --normal-http
 对原 30 份正常运行重复测量完成独立评分。当前总体、逐 base 和最大误差统一见

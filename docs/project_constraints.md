@@ -126,13 +126,14 @@ prefill/decode 语义模型。
 
 ## 9. 验证纪律
 
-- 每个代码块修改后先运行少量语义关键 cell；
+- 本轮全流程重构按用户最新要求，全部代码重构收口后再统一编译、检查、运行完整 60 cross 并集中修复 bug；实施中只做源码、调用关系与 diff 审查，不逐块构建或跑 cell；
 - cost 简化前后使用同一组关键 cell；
 - clean Release/validation build 必须通过；
 - final 60 cross 只在公式固定后运行；
 - 完整 HTTP 是当前正式评分；若报告 I/O 分项准确性，须同时检查总量和不抵消分项，不能用不同类别的正负误差抵消宣称分项通过；
 - 结构 exact 必须覆盖操作数、执行/完成页、batch、existing/new 与必要依赖；调度敏感差异单列但不计 exact；
 - 大型重构必须新建一份短期 plan 与 append-only log；收口时把稳定结论合并回主文档并删除临时副本；
+- 日志仅在阶段收口、重大决策或必要阻塞交接时简短追加，普通工作批次不逐轮记录；
 - 旧 artifact 只能作为参考，不能代替当前工作树运行结果。
 
 5×3、单 base 12-cross 和五 base 60-cross 是数据驱动的 evaluation 面板，不是 predictor 的产品合同。业务核心不得固定

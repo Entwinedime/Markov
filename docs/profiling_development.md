@@ -41,6 +41,7 @@ workload 环境和 manifest 读取共用同一标签选择规则，不必为选�
 ### 配置、执行与失败处理
 
 宿主机按配置选择容器，以参数数组传递仓库内配置和 bundle 路径；容器按模块启动，保留框架原有 Python 搜索路径。
+profiling、modeling 和 hook 构建共用 `run.sh` 启动一次性容器；profiling 自己保留所需的 Ascend 环境初始化。
 选择实验只用命令行：支持 `--选项 值`、`--选项=值`、单数/复数别名、重复选择和逗号列表，不支持缩写；
 多次 `--channels` 合并。`TRACE_SIM_PROFILE_CONTAINER_NAME` 只用于定位本次容器和预算超时清理。
 
@@ -124,6 +125,8 @@ forced-token 合同固定真实 request 顺序、输入 tokens 和输出 tokens�
 组流程的 base 自动补采也使用同一参数解析，不再要求参数必须以分开的两个字符串书写。
 生成 capture/replay 配置时修改最后一次出现的参数；省略的默认配置路径在需要替换为本次输入时显式追加。
 CPU 校正的轻量回放不替换 workload 参数，直接保留 base 命令和已使用的 token-plan 路径。
+生成的轻量配置同时开启已有的 `SGLANG_HICACHE_IO_TIMING`，在同一趟回放中记录预取服务，
+不增加启动或请求。配对成本文件可携带这部分显式测量；构模前仍需核对 source 的实际 I/O 工作量。
 组流程中受预算管理的轻量回放每次只启动一次服务；普通 profiling 的配置化启动重试不受此限制。
 正式阶段含重复请求时，计时边界对应展开后的第一条和最后一条请求。
 模板加载统一校验字段类型，执行计划与宿主机预算共用逐项展开逻辑，不再先构造重复步骤的中间列表。
@@ -181,6 +184,14 @@ SGLang HiCache 使用：
 
 SGLang 的同步 hook 覆盖 ACL 与下层 runtime 入口，同线程、同 stream 的嵌套调用只记录外层一次。
 可选环境变量 `HOOK_SYNC_THREAD_CPU=1` 在同步事件的 `args.thread_cpu_ns` 中记录线程 CPU 时间，默认关闭。
+
+`HOOK_EMISSION_TIMING=1` 可测量 hook 日志的格式化、加锁、写出及 flush 开销，默认关闭。
+下一条同线程事件的顶层 `hook_recorder_previous` 携带上次写出的 `start_ns`、`end_ns` 和
+`thread_cpu_ns`；不增加额外事件。墙钟范围包含锁等待，但可扣除的预算仅为实测线程 CPU。
+末次写出没有后继事件时、时钟读取失败或时钟异常时测量缺失，不视为零。测量不覆盖进入
+LogEvent 前的参数组装、PMU、wrapper 等全部开销，测量用时钟本身也有未完整覆盖的成本。
+显式 recorder 校正可读取同源完整采集的这些测量；旧 trace 不补造数据。构建和首批真实配对已通过，
+但首批短区间存在缺测；随后修正了时钟采样顺序，覆盖改善仍待真实运行确认。已有部署库不会自动更新。
 
 SGLang LD profile 的 `HOOK_MEMCPY2D_TIMING=1` 可单独记录 `aclrtMemcpy2dAsync` 的几何、方向、stream及wall/线程CPU时间，默认关闭。不读取张量内容或snapshot；线程CPU仍包含wrapper入口及参数格式化，不包含最终trace写出。它用于核对提交调用中的CPU工作和等待，不能直接把wall−CPU当可删除成本。实际symbol绑定和调用覆盖需在运行镜像验证后，才能用于校准。
 它包含同步内部轮询和少量 wrapper 工作，不等于设备等待时长；时钟读取失败时字段缺失，不记作零。

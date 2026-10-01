@@ -53,8 +53,11 @@ base profile + 一组 target 配置
 资源顺序由操作计划统一给出：先是执行的 stream，再是等待的 stream；同一资源重复出现时不能去重，
 显式 event completion 则另外绑定。main、worker、设备服务与 residual gap 也不能合并为一个成本。
 
-当前全流程重构正在实施，尚未统一验收：源片段替换结束后，再统一观察保留下来的 worker 队列，
+当前全流程重构已完成统一验收：源片段替换结束后，再统一观察保留下来的 worker 队列，
 加载、层等待、写完成确认与写入共用这份资源依据。各组件不在删除中间片段后分别认定最终队列。
+加载和写入的 stream 插入端点也在此时按同一份最终源图刷新。加载提交、分配入口与空加载分支
+共用入口规划，先通过完整 mutation 应用改边及成本替换，再登记执行回调。
+非活跃层等待也先规划整组插入再应用；allocator preparation 的源坐标在创建时提供，不再事后修补。
 候选分支的资源不足仍在目标实际需要时报告；已确定执行的调用则立即要求可用资源。
 本轮进展与统一检查安排见 [重构计划](tmp/end_to_end_refactor_plan_20260927.md)。
 
@@ -66,6 +69,10 @@ profiling 与 modeling 只通过 `profile_manifest.json` 交接，不扫描目�
 一个 base 组可以包含多个 workload，但每个 workload 只选一份 base profile；
 这些 profiles 必须属于同一个 base HiCache 配置，模型、TP、后端和资源环境相容。
 配置名、workload 名只是身份，不作为拟合变量，也不能代替实际配置与环境核对。
+
+环境比较区分运行资源与采集控制：`HOOK_EMISSION_TIMING` 和
+`SGLANG_NPU_PROFILER_SERIAL_EXPORT`、`SGLANG_HICACHE_IO_TIMING` 不作为资源匹配维度，原采集配置仍保留这些开关。
+这不放宽模型、TP、设备或线程资源匹配，也不表示观测开销已全部消除；CPU 校正仍须绑定实际源采集。
 
 target 文件只含 `{name?, hicache}`，示例见
 [hicache_target_example.json](../configs/modeling/hicache_target_example.json)。
@@ -121,6 +128,10 @@ scripts/model.sh build-dag --config <runner_config.json>
 批量预测直接使用已解析的运行对象，同时保存同一对象的 `runner_config.json` 供上述命令复现。
 文件入口负责校验外部配置；内部执行不再先拼原始字典再重新解析。正式窗口保存在执行参数中，
 来源仍是 source manifest 指向的 workload 报告，不额外保存一份无人消费的窗口 metadata。
+
+显式 DAG Chrome 导出使用完整仿真的实际起止时间，包含 CPU 校正；不能把原始节点 duration
+当作校正后的运行时长。节点参数同时保留 lane、顺序 CPU 间隔和就绪延迟（微秒），便于区分服务与等待。
+依赖 flow 的跨度可能还包含其他前驱造成的等待，不能将所有 flow 长度相加当作关键路径成本。
 缺少 HiCache 成本模型的任务在规划阶段跳过；执行适配层只处理已具备模型的任务，直接生成 C++ 模型配置，
 不再保留无模型执行分支或外包一层随后拆掉的配置字段。
 
@@ -611,6 +622,12 @@ TraceGraph 的头文件统一位于 `include/markov/trace_graph/`，与 `src/` �
 trace 读取器与事件参数查询共用 `include/markov/trace_graph/json_scan.hpp` 定位 JSON 片段，保留共享缓冲区和延迟解析，
 不为简化实现而构造整份 trace 的 JSON 对象。转义字符串由现有 JSON 库解码，保证按需查询与完整
 参数展开对 Unicode 的解释一致；跨采集通道合并参数时保留接收事件的默认 pid/tid。
+
+跨 rank 合图保留各输入的顺序，事件与语义侧表各自重新编号，输入合同在合并后统一去重。
+计算阶段标记只选择、排序一次，控制成本回放复用同一份源标记；它仍是独立诊断，不改变完整 HTTP 口径。
+普通回放与动态展开共用一个仿真入口；CPU 队列识别统一扫描依赖边，再按各线程的提交关系建立 FIFO，
+不为每条线程重新扫描整张图。这些整理已完成重构后的统一验收；范围和限制见工作进展，
+不能据此声称后续成本修正或完整 target 结构已经通过验收。
 
 Prefill 与 Decode 的设备、通信和提交 CPU 观测共用节点成本结构及统计逻辑；
 Prefill 的普通计算与注意力仍分别保存。诊断归属与输出复用同一份 phase 观测，
