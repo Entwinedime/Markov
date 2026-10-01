@@ -1,6 +1,34 @@
 """Measure scheduler CPU while retaining selection/run/result forward semantics."""
 
+from collections import defaultdict
+from statistics import median
+
 from .cpu_scopes import exclusive_cpu_parts, paired_service
+
+
+def _pending_prefetch_work(scope: dict, timers: list[dict]) -> tuple[str, ...] | None:
+    """Identify a single-request pending branch, not arbitrary empty selections."""
+    if len(scope["identity"]["request_ids"]) != 1:
+        return None
+    calls = [
+        row
+        for row in timers
+        if (row["pid"], row["tid"]) == (scope["pid"], scope["tid"])
+        and scope["start_ns"] <= row["start_ns"] < scope["end_ns"]
+    ]
+    progress = [row for row in calls if row["name"] == "hicache.wait.progress"]
+    if len(progress) != 1:
+        return None
+    identity = progress[0]["identity"]
+    if (
+        identity["request_ids"] != scope["identity"]["request_ids"]
+        or not identity["operation_present"]
+        or not identity["operation_issued"]
+        or identity["ready"]
+        or any(not row["returned"] or row["end_ns"] > scope["end_ns"] for row in calls)
+    ):
+        return None
+    return tuple(row["name"] for row in sorted(calls, key=lambda row: row["start_ns"]))
 
 
 def observe_scheduler_cpu(
@@ -21,6 +49,7 @@ def observe_scheduler_cpu(
     rows, partial, outside_http, boundary_rows = [], [], [], []
     formal_requests = {r["request_id"] for r in steps["rows"]}
     consumed_results = set()
+    wait_timers = [row for row in timers if row["name"].startswith("hicache.wait.")]
     for scope in sorted(timers, key=lambda row: row["start_ns"]):
         begin, end = scope["start_ns"], scope["end_ns"]
         # Input processing has its own request-level audit, not a forward phase.
@@ -110,6 +139,7 @@ def observe_scheduler_cpu(
                 exclusive_ranges_ns=parts["exclusive_ranges_ns"],
                 outside_child_sync_calls=parts["sync_calls"],
                 exclusive_service_cpu_us=own_cpu,
+                pending_prefetch_work=_pending_prefetch_work(scope, wait_timers) if phase == "empty" else None,
             )
         )
     bindings = [
@@ -146,6 +176,52 @@ def _index(document):
     return result
 
 
+def _pair_pending_prefetch(light: dict, profiled: dict) -> tuple[list[dict], list[dict]]:
+    """Estimate same-base per-call recorder/profiler CPU, preserving source variation.
+
+    Poll counts legitimately differ between captures. Match measured branch work,
+    not loop ordinals or total wall time; other empty branches stay uncorrected.
+    """
+    groups = []
+    for document in (light, profiled):
+        grouped = defaultdict(list)
+        for row in document["rows"]:
+            work = row["pending_prefetch_work"]
+            if work is not None and row["child_calls"] == 0 and row["outside_child_sync_calls"] == 0:
+                grouped[row["identity"]["tp_rank"], work].append(row)
+        groups.append(grouped)
+
+    rows, estimates = [], []
+    for key, source in groups[1].items():
+        reference = groups[0].get(key)
+        if not reference:
+            continue
+        normal = median(row["exclusive_service_cpu_us"] for row in reference)
+        measured = median(row["exclusive_service_cpu_us"] for row in source)
+        delta = measured - normal
+        applied = 0
+        for row in source:
+            service = row["exclusive_service_cpu_us"] - delta
+            if service < 0:
+                continue
+            # Retain within-source variation instead of replacing every poll
+            # with the median; existing source-coordinate binding owns rounding.
+            estimate = dict(row, exclusive_service_cpu_us=service)
+            rows.append(dict(paired_service(estimate, row), phase="empty", forward_ordinal=None))
+            applied += 1
+        estimates.append(
+            dict(
+                rank=key[0],
+                work=key[1],
+                light_calls=len(reference),
+                profiled_calls=len(source),
+                applied_calls=applied,
+                per_call_cpu_delta_us=delta,
+            )
+        )
+    return rows, estimates
+
+
 def pair_scheduler_cpu(light: dict, profiled: dict) -> dict:
     before, after = _index(light), _index(profiled)
     boundary = _index({"rows": light.get("boundary_observations", [])})
@@ -173,12 +249,15 @@ def pair_scheduler_cpu(light: dict, profiled: dict) -> dict:
         ):
             raise ValueError("Scheduler pair has different measured child or sync work")
         rows.append(dict(paired_service(old, new), phase=key[3], forward_ordinal=key[4]))
+    pending_rows, pending_estimates = _pair_pending_prefetch(light, profiled)
+    rows.extend(pending_rows)
     result = dict(
-        scope="Measured same-base scheduler service; unmatched tail and empty selections not normalized",
+        scope="Same-base scheduler service; pending polls use matched-work per-call CPU estimates",
         source_manifest=profiled["source_manifest"],
         light_manifest=light["source_manifest"],
         unmatched_light_keys=sorted(before.keys() - after.keys()),
         rows=rows,
+        pending_prefetch_estimates=pending_estimates,
     )
     if recovered:
         result["light_boundary_keys"] = recovered

@@ -153,6 +153,12 @@ def scan_group(
                 reused[role] += 1
             else:
                 observations.append(scan_observations(source, group.output_dir, role=role, cpu_service=service))
+            # Refresh the explicit paired evidence even when source trace facts
+            # are reused. Never infer a sibling measurement file from its name.
+            reference = load_json(service).get("reference_io") if service else None
+            observations[-1].pop("reference_io", None)
+            if reference is not None:
+                observations[-1]["reference_io"] = reference
 
     write_json(document_path, {"captures": observations})
     readiness = prepare_model(group, observations, output=(model_output or group.output_dir) if build_model else None)

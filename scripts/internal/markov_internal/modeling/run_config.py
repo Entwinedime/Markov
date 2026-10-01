@@ -25,8 +25,12 @@ class ModelingRunConfig:
 
     output_dir: Path
     profile_manifest: Path
-    cpp_config: dict[str, Any]
     outputs: ModelingOutputs
+    threads: int | None = None
+    file_threads: int | None = None
+    trace_window_start_us: int | None = None
+    trace_window_end_us: int | None = None
+    actual_e2e_us: int | None = None
     backend_kind: str = "release"
     model_config_path: Path | None = None
     cpu_service_cost: Path | None = None
@@ -39,7 +43,12 @@ class ModelingRunConfig:
         inputs = {"profile_manifest": str(repo_relative_path(self.profile_manifest))}
         if self.cpu_service_cost is not None:
             inputs["cpu_service_cost"] = str(repo_relative_path(self.cpu_service_cost))
-        cpp = {**self.cpp_config, "backend_kind": self.backend_kind}
+        cpp: dict[str, Any] = {
+            name: value
+            for name in ("threads", "file_threads", "trace_window_start_us", "trace_window_end_us", "actual_e2e_us")
+            if (value := getattr(self, name)) is not None
+        }
+        cpp["backend_kind"] = self.backend_kind
         if self.trace_channels is not None:
             cpp["trace_channels"] = list(self.trace_channels)
         if self.hicache_static_replay:
@@ -103,8 +112,12 @@ class ModelingRunConfig:
         return cls(
             output_dir=require_repo_path(output_value),
             profile_manifest=require_repo_path(manifest_value),
-            cpp_config=cpp_config,
             outputs=outputs,
+            threads=cpp_config.get("threads"),
+            file_threads=cpp_config.get("file_threads"),
+            trace_window_start_us=cpp_config.get("trace_window_start_us"),
+            trace_window_end_us=cpp_config.get("trace_window_end_us"),
+            actual_e2e_us=cpp_config.get("actual_e2e_us"),
             backend_kind=backend_kind,
             model_config_path=require_repo_path(model_config) if model_config is not None else None,
             cpu_service_cost=require_repo_path(service_cost) if service_cost else None,

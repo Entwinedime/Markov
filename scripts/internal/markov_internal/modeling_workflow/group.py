@@ -344,11 +344,16 @@ def source_environment(source: ProfileRunRef) -> dict[str, Any]:
         "chunked_prefill_size",
         "disable_cuda_graph",
     )
+    # Capture destinations and observer/export switches are provenance, not
+    # runtime resources. Correction remains bound to the actual source capture;
+    # ignoring these switches does not certify its completeness.
+    capture_options = {
+        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
+        "HOOK_EMISSION_TIMING",
+        "SGLANG_NPU_PROFILER_SERIAL_EXPORT",
+        "SGLANG_HICACHE_IO_TIMING",
+    }
     return {
         "server": {name: flags.get(name) for name in names},
-        "env": {
-            key: value
-            for key, value in config.get("env", {}).items()
-            if key != "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
-        },
+        "env": {key: value for key, value in config.get("env", {}).items() if key not in capture_options},
     }

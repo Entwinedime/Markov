@@ -16,22 +16,16 @@ def runner_config(spec: ModelRunSpec, options: WorkflowOptions) -> ModelingRunCo
     """Build one runner configuration from its sole source/target prediction."""
 
     diagnostics = options.diagnostics.keep_debug_artifacts
-    cpp_config = {
-        "threads": options.trace_threads,
-        "file_threads": options.trace_file_threads,
-    }
     window = spec.source.workload_window
-    if window is not None:
-        cpp_config["trace_window_start_us"] = window.start_ns // 1000
-        cpp_config["trace_window_end_us"] = window.end_ns // 1000
-        if diagnostics:
-            cpp_config["actual_e2e_us"] = window.actual_e2e_ns // 1000
-
     return ModelingRunConfig(
         output_dir=spec.output_dir,
         profile_manifest=spec.source.manifest_path,
-        cpp_config=cpp_config,
         outputs=ModelingOutputs(module_summary=diagnostics),
+        threads=options.trace_threads,
+        file_threads=options.trace_file_threads,
+        trace_window_start_us=window.start_ns // 1000 if window else None,
+        trace_window_end_us=window.end_ns // 1000 if window else None,
+        actual_e2e_us=window.actual_e2e_ns // 1000 if window and diagnostics else None,
         backend_kind="validation" if diagnostics else "release",
         model_config_path=spec.output_dir / "cpp_model_config.json",
         cpu_service_cost=spec.cpu_service_cost,

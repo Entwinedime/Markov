@@ -43,16 +43,15 @@ def manifest_run_config(args: argparse.Namespace) -> ModelingRunConfig:
     if args.output_dir is None:
         raise SystemExit("--profile-manifest requires --output-dir")
     manifest, output = require_repo_path(args.profile_manifest), require_repo_path(args.output_dir)
-    cpp_config = {"threads": args.threads or 1, "file_threads": args.file_threads or 1}
     window = discover_workload_window({}, manifest)
-    if window is not None:
-        cpp_config["trace_window_start_us"] = window.start_ns // 1000
-        cpp_config["trace_window_end_us"] = window.end_ns // 1000
     return ModelingRunConfig(
-        output,
-        manifest,
-        cpp_config,
-        ModelingOutputs(dag_chrome_trace=args.emit_dag),
+        output_dir=output,
+        profile_manifest=manifest,
+        outputs=ModelingOutputs(dag_chrome_trace=args.emit_dag),
+        threads=args.threads or 1,
+        file_threads=args.file_threads or 1,
+        trace_window_start_us=window.start_ns // 1000 if window else None,
+        trace_window_end_us=window.end_ns // 1000 if window else None,
         model_config_path=require_repo_path(args.model_config) if args.model_config else None,
     )
 

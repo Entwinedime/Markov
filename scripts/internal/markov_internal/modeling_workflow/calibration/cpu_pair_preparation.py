@@ -52,6 +52,36 @@ def _trace_events(manifest: dict, channel: str = "ld_preload"):
         yield from load_chrome_trace_events(path)
 
 
+def _reference_prefetch_services(timers: list[dict], steps: list[dict], report: dict) -> list[dict]:
+    """Keep measured light service on base request/rank identities, not target times."""
+    light_ranks = {row["pid"]: row["identity"]["tp_rank"] for row in steps[0]["rows"]}
+    source_pids = {row["identity"]["tp_rank"]: row["pid"] for row in steps[1]["rows"]}
+    window = report["formal_window"]
+    begin, end = [round(window[key] * 1_000_000) for key in ("formal_begin_ms", "formal_end_ms")]
+    rows = []
+    for timer in sorted(timers, key=lambda row: row["start_ns"]):
+        if timer["name"] != "hicache.io.storage_read" or not begin <= timer["start_ns"] < end:
+            continue
+        if not timer["returned"] or timer["end_ns"] <= timer["start_ns"]:
+            raise ValueError("Light prefetch service measurement is incomplete")
+        identity = timer["identity"]
+        (request,) = identity["request_ids"]
+        rows.append(
+            dict(
+                pid=str(source_pids[light_ranks[timer["pid"]]]),
+                request_id=request,
+                page_size=identity["page_size"],
+                page_count=identity["page_count"],
+                copied_page_count=sum(mark["stage"] == "copy" for mark in identity["stage_boundaries"]),
+                published_page_count=sum(
+                    mark["stage"] == "publish" and mark["published"] for mark in identity["stage_boundaries"]
+                ),
+                service_us=(timer["end_ns"] - timer["start_ns"]) / 1000,
+            )
+        )
+    return rows
+
+
 def prepare_forward_cpu_pair(
     light_manifest: Path,
     profiled_manifest: Path,
@@ -117,12 +147,22 @@ def prepare_forward_cpu_pair(
             "rows": host_rows,
         },
     }
+    if captures[0]["config"].get("env", {}).get("SGLANG_HICACHE_IO_TIMING") == "1" and not {
+        "torch",
+        "python_probe",
+    }.intersection(captures[0]["manifest"]["profiling"]["channels_enabled"]):
+        measurements["reference_io"] = dict(
+            manifest=str(repo_relative_path(manifests[0])),
+            prefetch=_reference_prefetch_services(timers[0], steps, captures[0]["report"]),
+        )
     if correct_recorder:
-        from .recorder_correction import source_writes
+        from .recorder_correction import hook_writes, source_writes
 
         formal = captures[1]["report"]["formal_window"]
         begin, end = [round(formal[key] * 1_000_000) for key in ("formal_begin_ms", "formal_end_ms")]
         measurements["recorder_writes"] = source_writes(timers[1], begin, end)
+        if captures[1]["config"].get("env", {}).get("HOOK_EMISSION_TIMING") == "1":
+            measurements["hook_recorder_writes"] = hook_writes(_trace_events(captures[1]["manifest"]), begin, end)
         measurements["observer_correction"] = dict(
             scope="Measured light recorder CPU inside paired envelopes only", unmeasured_overhead_removed=False
         )

@@ -68,4 +68,6 @@ def light_capture_config(profile_manifest: Path, output_dir: Path, bundle: Path 
     config["server"]["startup_max_attempts"] = 1
     config["profiling"].update(enabled=True, channels=["ld_preload"])
     config["env"]["SGLANG_STEP_TIMING_DIR"] = str(Path(CONTAINER_REPO_PREFIXES[0]) / timing_dir)
+    # The existing light replay also measures prefetch service; no extra run.
+    config["env"]["SGLANG_HICACHE_IO_TIMING"] = "1"
     return config

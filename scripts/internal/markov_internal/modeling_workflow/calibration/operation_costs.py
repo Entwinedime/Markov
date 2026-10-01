@@ -14,7 +14,7 @@ from ...common.paths import require_repo_path, repo_relative_path
 from ...modeling.workload import controlled_request_window, discover_workload_window
 from ..context import DiagnosticLevel
 from ..planning.profile_runs import discover_profile_runs
-from .operation_sampling import index_costs, submission_costs
+from .operation_sampling import index_costs
 
 FIELDS = ("main_us", "main_residual_us", "after_us", "after_residual_us", "worker_us", "dispatch_us", "device_us")
 
@@ -67,7 +67,7 @@ def summarize(audit: dict, operation: str, page_size: int) -> dict:
                 )
             )
         elif operation == "load_submission":
-            samples = [submission_costs(r) for r in rows]
+            samples = [r["costs"] for r in rows]
             ranks.append(
                 dict(
                     rank=rank,

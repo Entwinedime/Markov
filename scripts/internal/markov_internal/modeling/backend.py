@@ -49,7 +49,7 @@ def build_trace_graph_command(run: ModelingRunConfig) -> list[str]:
         ("trace_window_end_us", "--trace-window-end-us"),
         ("actual_e2e_us", "--actual-e2e-us"),
     ):
-        append_option(command, option, run.cpp_config.get(field))
+        append_option(command, option, getattr(run, field))
     if run.trace_channels is not None:
         append_option(command, "--trace-channels", ",".join(run.trace_channels))
     if run.cpu_service_cost is not None:

@@ -7,6 +7,46 @@ Target timings never enter these corrections.
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from copy import deepcopy
+from typing import Any, Iterable
+
+
+def hook_writes(events: Iterable[dict[str, Any]], begin_ns: int, end_ns: int) -> list[dict[str, Any]]:
+    """Read completed same-thread logger measurements from an opted-in capture.
+
+    Coordinates include lock waiting, but only measured thread CPU is removable.
+    The final unreported write and wrapper work outside LogEvent stay uncorrected.
+    Missing measurements in the selected window are an input error, not zero cost.
+    """
+    previous = {}
+    rows = []
+    for event in events:
+        if event.get("ph") != "X":
+            continue
+
+        lane = event["pid"], event["tid"]
+        writer = previous.get(lane)
+        previous[lane] = event
+        emission = event.get("hook_recorder_previous")
+        if emission is None:
+            continue
+
+        start, stop, cpu = emission["start_ns"], emission["end_ns"], emission["thread_cpu_ns"]
+        if not start < stop or not 0 <= cpu <= stop - start:
+            raise ValueError("Invalid hook recorder CPU measurement")
+        # A nested hook can be written before its enclosing API finishes. The
+        # carrier's end, not its start, bounds the preceding completed write.
+        if (
+            writer is None
+            or (writer["ts"] + writer["dur"]) * 1000 > start
+            or stop > (event["ts"] + event["dur"] + 1) * 1000
+        ):
+            raise ValueError("Hook recorder measurement is not between same-thread writes")
+        if begin_ns <= start and stop <= end_ns:
+            rows.append(dict(pid=lane[0], tid=lane[1], begin_ns=start, end_ns=stop, thread_cpu_ns=cpu))
+
+    if not rows:
+        raise ValueError("Hook emission timing was declared but no complete measurements cover the formal window")
+    return rows
 
 
 def clean_reference(records):

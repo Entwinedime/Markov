@@ -14,7 +14,11 @@ def validate_base_pair(configs: tuple[dict, dict], reports: tuple[dict, dict], p
             for key, value in config.items()
             if key not in {"name", "id", "run_id", "run_root", "metadata", "profiling"}
         }
-        result["env"] = {key: value for key, value in config.get("env", {}).items() if key != "SGLANG_STEP_TIMING_DIR"}
+        result["env"] = {
+            key: value
+            for key, value in config.get("env", {}).items()
+            if key not in {"SGLANG_STEP_TIMING_DIR", "SGLANG_HICACHE_IO_TIMING"}
+        }
         # Restart limits govern acquisition attempts, not successful inference.
         result["server"] = {key: value for key, value in result["server"].items() if key != "startup_max_attempts"}
         return result

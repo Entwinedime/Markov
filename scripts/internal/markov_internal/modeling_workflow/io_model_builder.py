@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from pathlib import Path
 from statistics import median
 from typing import TYPE_CHECKING, Any
@@ -167,11 +168,28 @@ def service_observation_rows(physical: dict[str, Any], captures: list[dict[str, 
     geometry = int(physical["kv_geometry"]["kv_bytes_per_token_per_rank"])
     rows = []
     for capture in captures:
+        reference = capture.get("reference_io")
+        measured = defaultdict(list)
+        if reference is not None:
+            for batch in reference["prefetch"]:
+                measured[batch["pid"], batch["request_id"]].append(batch)
         for observed in capture["source_io_observations"]["observations"]:
+            measurement_manifest = None
+            batches = measured.get((observed["pid"], observed["request_id"]), [])
+            if observed["kind"] == "prefetch" and batches:
+                expected = [
+                    (observed["page_size"], batch["page_count"], batch["copied_page_count"])
+                    for batch in observed["storage_service_batches"]
+                ]
+                actual = [(batch["page_size"], batch["page_count"], batch["copied_page_count"]) for batch in batches]
+                if expected == actual:
+                    observed = dict(observed, service_us=math.fsum(batch["service_us"] for batch in batches))
+                    measurement_manifest = reference["manifest"]
             row = _physical_service(observed, services, geometry)
             if row is not None:
                 row["source_manifest"] = capture["source_manifest"]
                 row["role"] = capture["role"]
+                row["measurement_manifest"] = measurement_manifest
                 rows.append(row)
     return rows
 
@@ -193,6 +211,10 @@ def _runtime_scale_curve(
         details.append(
             {
                 "source_manifest": source,
+                "measurement_manifests": sorted(
+                    {row["measurement_manifest"] for row in values if row["measurement_manifest"] is not None}
+                ),
+                "profiled_service_operations": sum(row["measurement_manifest"] is None for row in values),
                 "role": values[0]["role"],
                 "page_size": values[0]["page_size"],
                 "operation_count": len(values),
@@ -327,7 +349,9 @@ def _profile_evidence(
 
     base_gap = None
     base_rows = [row for row in rows if row["role"] == "base"]
-    for origin, candidates in (("base", base_rows), ("base_with_supplement", rows)):
+    light_base = [row for row in base_rows if row["measurement_manifest"] is not None]
+    choices = [("base_light", light_base)] if light_base else []
+    for origin, candidates in choices + [("base", base_rows), ("base_with_supplement", rows)]:
         try:
             curve, detail = (
                 _call_cost_curve(candidates, geometry)
@@ -335,6 +359,8 @@ def _profile_evidence(
                 else _runtime_scale_curve(candidates, component, geometry)
             )
         except MissingCostEvidence as error:
+            if origin == "base_light":
+                continue
             if origin == "base":
                 base_gap = str(error)
                 if len(base_rows) == len(rows):
@@ -353,7 +379,7 @@ def _profile_evidence(
         else:
             pages = {item["page_size"] for item in detail["per_capture"]}
             manifests = {item["source_manifest"] for item in detail["per_capture"]}
-        selected = [row for row in rows if row["source_manifest"] in manifests and row["page_size"] in pages]
+        selected = [row for row in candidates if row["source_manifest"] in manifests and row["page_size"] in pages]
         return (
             curve,
             dict(detail, evidence_origin=origin, base_gap=base_gap, source_manifests=sorted(manifests)),
@@ -457,7 +483,11 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
             sources[component] = dict(
                 detail,
                 extrapolation="page-endpoint coefficients held constant outside measured pages; work scales through the declared service formula",
-                timing_scope="observed I/O service; unmeasured profiler/scheduling perturbation is not claimed removed",
+                timing_scope=(
+                    "paired light I/O wall service; timer overhead and runtime variation remain"
+                    if detail["evidence_origin"] == "base_light"
+                    else "observed I/O service; unmeasured profiler/scheduling perturbation is not claimed removed"
+                ),
             )
         selected_rows.extend(selected)
 

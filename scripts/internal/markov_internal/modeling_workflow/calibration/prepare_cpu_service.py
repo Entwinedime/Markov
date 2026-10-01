@@ -61,6 +61,8 @@ def prepare_cpu_service(
             applied_new_host_reduction_us=existing + correction["applied_added_integer_reduction_us"],
         )
         measurements["source_recorder_correction"] = correction
+        if "hook_recorder_correction" in audit:
+            measurements["hook_recorder_correction"] = audit["hook_recorder_correction"]
     measurements["preparation"] = dict(tp_size=tp_size, correct_recorder=correct_recorder)
     write_json(measurement_path, measurements)
     return service_path
