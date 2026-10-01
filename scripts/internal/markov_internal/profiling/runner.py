@@ -212,10 +212,6 @@ def host_main(argv: list[str] | None = None) -> None:
             raise FileNotFoundError(f"forced token bundle does not exist: {bundle}")
         runner_args.extend(("--forced-token-bundle", str(container_root / bundle_relative)))
 
-    command = ["docker", "compose", "-f", "docker/compose/inference.yml", "run", "--rm"]
-    name = os.environ.get("TRACE_SIM_PROFILE_CONTAINER_NAME")
-    if name:
-        command.extend(("--name", name))
     container_command = """
 set -euo pipefail
 set +u
@@ -226,9 +222,21 @@ export HOOK_ASCENDCL_SO_PATH="/usr/local/Ascend/ascend-toolkit/latest/lib64/liba
 export PYTHONPATH="scripts/internal${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m markov_internal.profiling.runner "$@"
 """
-    command.extend((framework.name + "-profile", "bash", "-lc", container_command, "bash", *runner_args))
-    os.chdir(ROOT_DIR)
-    os.execvp(command[0], command)
+    command = [
+        str(ROOT_DIR / "scripts/run.sh"),
+        framework.name,
+        "--",
+        "bash",
+        "-lc",
+        container_command,
+        "bash",
+        *runner_args,
+    ]
+    environment = dict(os.environ)
+    # Preserve the public profiling name used to stop a budgeted capture.
+    if name := environment.get("TRACE_SIM_PROFILE_CONTAINER_NAME"):
+        environment["TRACE_SIM_RUN_CONTAINER_NAME"] = name
+    os.execve(command[0], command, environment)
 
 
 def main(argv: list[str] | None = None) -> int:

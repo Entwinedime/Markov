@@ -55,4 +55,4 @@ fi
 if [ "$service" = "modeling" ]; then
     container_args+=(-e TRACE_SIM_MODELING_CONTAINER=1)
 fi
-docker compose -f "$(compose_file)" run "${container_args[@]}" "$service" "$@"
+exec docker compose -f "$(compose_file)" run "${container_args[@]}" "$service" "$@"

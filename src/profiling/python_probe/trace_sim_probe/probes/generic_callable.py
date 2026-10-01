@@ -345,7 +345,8 @@ def _emit(
 ) -> None:
     """构造 Chrome trace event。"""
 
-    _bind_trace_context(bound, target, phase)
+    bound["__trace_sim_phase"] = phase
+    bound["__trace_sim_fact_consumers"] = target.fact.consumers
     if not _should_emit_target(target, bound, args, result):
         return
     fields_start = _emission_clock() if target.capture_emission_timing else None
@@ -406,15 +407,6 @@ def _emit(
 
 def _emission_clock() -> tuple[int, int]:
     return time.time_ns() // 1000, time.thread_time_ns()
-
-
-def _bind_trace_context(bound: dict[str, Any], target: TargetSpec, phase: str) -> None:
-    """把 fact 元数据注入 source extractor 可见的取值上下文。"""
-
-    bound["__trace_sim_phase"] = phase
-    bound["__trace_sim_fact_class"] = target.fact.fact_class
-    bound["__trace_sim_fact_role"] = target.fact.role
-    bound["__trace_sim_fact_consumers"] = target.fact.consumers
 
 
 def _collect_fields(

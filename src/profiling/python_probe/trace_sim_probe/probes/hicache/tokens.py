@@ -317,10 +317,8 @@ def _request_tokens(req: Any, mode: str) -> list[Any]:
     """按 SGLang request 阶段选择可建模 token 序列。"""
 
     normalized = (mode or "active").lower()
-    if normalized == "fill":
+    if normalized in ("fill", "extend"):
         return _request_fill_tokens(req)
-    if normalized == "extend":
-        return _request_extend_tokens(req)
     if normalized in ("prefetch", "prefetch_candidate"):
         return _request_prefetch_tokens(req)
     if normalized in ("origin_output", "full"):
@@ -360,12 +358,6 @@ def _request_fill_tokens(req: Any) -> list[Any]:
     if tokens:
         return tokens
     return []
-
-
-def _request_extend_tokens(req: Any) -> list[Any]:
-    """读取 `ScheduleBatch.prepare_for_extend` 已接受的 fill path。"""
-
-    return _request_fill_tokens(req)
 
 
 def _request_prefetch_tokens(req: Any) -> list[Any]:

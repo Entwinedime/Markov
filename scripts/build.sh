@@ -38,7 +38,7 @@ if [ -z "$TARGET" ] || [ "$TARGET" = "-h" ] || [ "$TARGET" = "--help" ]; then
     exit 0
 fi
 shift
-container_service "$TARGET" >/dev/null
+SERVICE="$(container_service "$TARGET")"
 
 SKIP_ENV=0
 IMAGE_ONLY=0
@@ -77,47 +77,17 @@ if [ "$TARGET" = "modeling" ]; then
     exit 0
 fi
 
-profile_service "$TARGET" >/dev/null
-
-# 构建框架基础环境镜像。
-build_env_image() {
-    local framework=$1
-
-    case "$framework" in
-        sglang)
-            docker build \
-                -f docker/images/base/sglang/Dockerfile \
-                -t markov-trace-sim-sglang-env:ubuntu22.04 \
-                docker/images/base/sglang
-            ;;
-        ktransformers)
-            docker build \
-                -f docker/images/base/ktransformers/Dockerfile \
-                -t markov-trace-sim-ktransformers-env:ubuntu22.04 \
-                docker/images/base/ktransformers
-            ;;
-    esac
-}
-
-# 构建包含源码安装层的 runtime service 镜像。
-build_runtime_image() {
-    local service
-    service="$(profile_service "$TARGET")"
-    docker compose -f "$(compose_file)" build "$service"
-}
-
-# 在 runtime 容器内构建对应 profile 的 libhook.so。
-build_hook() {
-    run_in_container "$TARGET" bash -lc "set -euo pipefail; scripts/internal/hooks/build.sh '$TARGET'"
-}
-
+# 两个推理框架采用相同镜像布局；各自的依赖和安装步骤留在 Dockerfile。
 if [ "$HOOK_ONLY" != "1" ]; then
     if [ "$SKIP_ENV" != "1" ]; then
-        build_env_image "$TARGET"
+        docker build \
+            -f "docker/images/base/$TARGET/Dockerfile" \
+            -t "markov-trace-sim-$TARGET-env:ubuntu22.04" \
+            "docker/images/base/$TARGET"
     fi
-    build_runtime_image
+    docker compose -f "$(compose_file)" build "$SERVICE"
 fi
 
 if [ "$IMAGE_ONLY" != "1" ]; then
-    build_hook
+    "$SCRIPT_DIR/run.sh" "$TARGET" -- bash -lc 'exec scripts/internal/hooks/build.sh "$@"' bash "$TARGET"
 fi
