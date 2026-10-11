@@ -292,7 +292,7 @@ def _jsonable_token_ids(tokens: list[Any]) -> list[Any]:
 def _tokens_for_path(value: Any) -> list[Any]:
     """读取完整 token 序列。
 
-    通用 probe 的 `_safe_list` 会截断到 64 个元素，适合作摘要；token dictionary
+    字段取值的 list 摘要会截断到 64 个元素；token dictionary
     需要完整 token 序列，不能在这里截断。
     """
 

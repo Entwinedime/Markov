@@ -136,7 +136,7 @@ def _normalize_channels(value: Any, options: dict[str, dict[str, Any]]) -> tuple
     unknown = [channel for channel in canonical if channel not in KNOWN_CHANNELS]
     if unknown:
         raise ValueError(f"unknown profiling channel: {unknown}")
-    return _unique(canonical)
+    return tuple(dict.fromkeys(canonical))
 
 
 def _parse_python_consumers(raw: Any) -> tuple[str, ...]:
@@ -148,7 +148,7 @@ def _parse_python_consumers(raw: Any) -> tuple[str, ...]:
     unknown = [consumer for consumer in consumers if consumer not in HICACHE_FACT_CONSUMERS]
     if unknown:
         raise ValueError(f"unknown profiling.python_probe.consumers: {unknown}")
-    return _unique(consumers)
+    return tuple(dict.fromkeys(consumers))
 
 
 def _parse_python_diagnostics(raw: Any) -> str:
@@ -185,15 +185,3 @@ def _as_bool(value: Any, *, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     raise TypeError("boolean config values must use true/false")
-
-
-def _unique(values: tuple[str, ...]) -> tuple[str, ...]:
-    """保持顺序去重。"""
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        if value not in seen:
-            seen.add(value)
-            result.append(value)
-    return tuple(result)

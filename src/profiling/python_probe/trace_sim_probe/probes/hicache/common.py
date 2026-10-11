@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from trace_sim_probe.probes.generic_callable import _extract_raw_value as _extract_source_value
+from ..values import extract_value as _extract_source_value
 
 
 def _scope_from_optional_source(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from ..common.io import load_json
@@ -11,7 +10,7 @@ from ..common.paths import ROOT_DIR, prepend_repo_src_to_sys_path
 prepend_repo_src_to_sys_path()
 
 from profiling.config import PYTHON_PROBE_DIAGNOSTICS  # noqa: E402
-from profiling.python_probe.trace_sim_probe.schema import HICACHE_CONSUMERS_BY_CLASS, validate_hicache_fact  # noqa: E402
+from profiling.python_probe.trace_sim_probe.schema import parse_target  # noqa: E402
 
 
 DEFAULT_HICACHE_TARGET_CATALOG = ROOT_DIR / "configs/profiling/hicache_probe_targets.json"
@@ -38,57 +37,23 @@ def select_python_probe_targets(
 
     selected: list[dict[str, Any]] = []
     for index, raw_target in enumerate(raw_targets):
-        target = _catalog_target(raw_target, index, catalog_path)
+        if not isinstance(raw_target, dict):
+            raise ValueError(f"{catalog_path}: targets[{index}] must be an object")
+        target = dict(raw_target)
         for key in ("capture_thread_timing", "capture_emission_timing"):
             _resolve_capture_policy(target, key, diagnostics)
-        fact = target["fact"]
-        allowed = HICACHE_CONSUMERS_BY_CLASS[fact["class"]]
-        selected_consumers = [consumer for consumer in requested_consumers if consumer in allowed]
-        if not selected_consumers:
+
+        specification = parse_target(target, requested_consumers=requested_consumers)
+        fact = specification.fact
+        if not fact.consumers:
             continue
         target["fact"] = {
-            "class": fact["class"],
-            "role": fact["role"],
-            "consumers": selected_consumers,
+            "class": fact.fact_class,
+            "role": fact.role,
+            "consumers": list(fact.consumers),
         }
         selected.append(target)
     return selected
-
-
-def _catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[str, Any]:
-    """Validate and copy one catalog entry before consumer filtering."""
-
-    if not isinstance(raw, dict):
-        raise ValueError(f"{catalog_path}: targets[{index}] must be an object")
-    target = dict(raw)
-    prefix = f"{catalog_path}: targets[{index}]"
-    for key in ("id", "module", "target"):
-        if not isinstance(target.get(key), str) or not target.get(key):
-            raise ValueError(f"{prefix}.{key} must be a non-empty string")
-
-    events = target.get("events")
-    if not isinstance(events, dict) or not events:
-        raise ValueError(f"{prefix}.events must be a non-empty phase-to-event-name object")
-    for phase, event_name in events.items():
-        if phase not in {"start", "end"}:
-            raise ValueError(f"{prefix}.events contains unsupported phase {phase!r}")
-        if not isinstance(event_name, str) or not event_name:
-            raise ValueError(f"{prefix}.events[{phase!r}] must be a non-empty string")
-
-    fact = target.get("fact")
-    if not isinstance(fact, dict):
-        raise ValueError(f"{prefix}.fact must be an object")
-    fact_class = fact.get("class")
-    role = fact.get("role")
-    if not isinstance(fact_class, str) or not fact_class:
-        raise ValueError(f"{prefix}.fact.class must be a non-empty string")
-    if not isinstance(role, str) or not role:
-        raise ValueError(f"{prefix}.fact.role must be a non-empty string")
-    consumers = HICACHE_CONSUMERS_BY_CLASS.get(fact_class)
-    if consumers is None:
-        raise ValueError(f"{prefix}.fact.class is unsupported: {fact_class!r}")
-    validate_hicache_fact(fact_class, role, tuple(consumers))
-    return target
 
 
 def _resolve_capture_policy(target: dict[str, Any], key: str, diagnostics: str) -> None:

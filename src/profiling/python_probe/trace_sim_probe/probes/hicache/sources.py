@@ -20,14 +20,6 @@ from .tokens import (
 )
 
 
-def _source_spec(source: str, prefix: str) -> str | None:
-    """如果 source 命中特定前缀，返回冒号后的参数段。"""
-
-    if not source.startswith(prefix):
-        return None
-    return source.split(":", 1)[1]
-
-
 _TOKEN_EXTRACTORS = {
     "token_path": _extract_token_path,
     "token_span": _extract_token_span,
@@ -39,14 +31,18 @@ _TOKEN_EXTRACTORS = {
 }
 
 
-def _hicache_value_source(
+def extract_source(
     source: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     result: Any,
 ) -> tuple[bool, bool, Any]:
-    """Dispatch scalar/request fields once; unknown sources remain unhandled."""
+    """Resolve a HiCache expression; unknown prefixes fall through to the caller.
+
+    Return handled, found, value. Missing runtime metadata is not synthesized;
+    field requirements and JSON conversion remain the emitter's responsibility.
+    """
 
     kind, separator, spec = source.partition(":")
     if not separator:
@@ -75,45 +71,46 @@ def _hicache_value_source(
         next_seq = _HICACHE_SEQUENCE_BY_SCOPE.get(scope, 0) + 1
         _HICACHE_SEQUENCE_BY_SCOPE[scope] = next_seq
         return (True, True, next_seq)
+    if kind == "hicache_operation_node_ids":
+        found, value = _operation_node_ids(spec, field_name, bound, args, result)
+        return (True, found, value)
+    if kind == "hicache_operation_token_count":
+        found, value = _operation_token_count(spec, field_name, bound, args, result)
+        return (True, found, value)
+    if kind == "hicache_pending_write_node_ids":
+        found, value = _pending_write_node_ids(spec, field_name, bound, args, result)
+        return (True, found, value)
     return (False, False, None)
 
 
 def _operation_batch_values(
-    source: str,
-    prefix: str,
+    spec: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     result: Any,
-) -> tuple[bool, list[Any]]:
+) -> list[Any]:
     """Read one controller operation queue without retaining operation objects."""
 
-    spec = _source_spec(source, prefix)
-    if spec is None:
-        return (False, [])
     found, value = _extract_source_value(spec, field_name, bound, args, result)
     if not found or value is None:
-        return (True, [])
+        return []
     try:
-        return (True, list(value))
+        return list(value)
     except TypeError:
-        return (True, [])
+        return []
 
 
-def _hicache_operation_node_ids_source(
-    source: str,
+def _operation_node_ids(
+    spec: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     result: Any,
-) -> tuple[bool, bool, Any]:
+) -> tuple[bool, list[int]]:
     """Extract stable tree-node IDs from a pending controller operation batch."""
 
-    handled, operations = _operation_batch_values(
-        source, "hicache_operation_node_ids:", field_name, bound, args, result
-    )
-    if not handled:
-        return (False, False, None)
+    operations = _operation_batch_values(spec, field_name, bound, args, result)
     node_ids: list[int] = []
     seen: set[int] = set()
     for operation in operations:
@@ -130,23 +127,19 @@ def _hicache_operation_node_ids_source(
                 continue
             seen.add(node_id)
             node_ids.append(node_id)
-    return (True, bool(node_ids), node_ids)
+    return (bool(node_ids), node_ids)
 
 
-def _hicache_operation_token_count_source(
-    source: str,
+def _operation_token_count(
+    spec: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     result: Any,
-) -> tuple[bool, bool, Any]:
+) -> tuple[bool, int | None]:
     """Sum token slots represented by a pending controller operation batch."""
 
-    handled, operations = _operation_batch_values(
-        source, "hicache_operation_token_count:", field_name, bound, args, result
-    )
-    if not handled:
-        return (False, False, None)
+    operations = _operation_batch_values(spec, field_name, bound, args, result)
     total = 0
     found = False
     for operation in operations:
@@ -158,34 +151,31 @@ def _hicache_operation_token_count_source(
             found = True
         except TypeError:
             continue
-    return (True, found, total if found else None)
+    return (found, total if found else None)
 
 
-def _hicache_pending_write_node_ids_source(
-    source: str,
+def _pending_write_node_ids(
+    spec: str,
     field_name: str,
     bound: dict[str, Any],
     args: tuple[Any, ...],
     result: Any,
-) -> tuple[bool, bool, Any]:
+) -> tuple[bool, Any]:
     """Resolve one write-through ACK to the tree nodes it is releasing."""
 
-    spec = _source_spec(source, "hicache_pending_write_node_ids:")
-    if spec is None:
-        return (False, False, None)
     parts = [part.strip() for part in spec.split(",") if part.strip()]
     if len(parts) != 2:
-        return (True, False, None)
+        return (False, None)
     ack_found, ack_value = _extract_source_value(parts[0], field_name, bound, args, result)
     scope_found, scope = _extract_source_value(parts[1], field_name, bound, args, result)
     if not ack_found or not scope_found or scope is None:
-        return (True, False, None)
+        return (False, None)
     pending = getattr(scope, "ongoing_write_through", None)
     if not isinstance(pending, dict):
-        return (True, False, None)
+        return (False, None)
     entry = pending.get(ack_value)
     if not isinstance(entry, tuple) or len(entry) < 3:
-        return (True, False, None)
+        return (False, None)
     nodes = entry[2]
     node_ids: list[int] = []
     for node in nodes:
@@ -195,12 +185,4 @@ def _hicache_pending_write_node_ids_source(
             continue
         if node_id not in node_ids:
             node_ids.append(node_id)
-    return (True, bool(node_ids), node_ids)
-
-
-HICACHE_SOURCE_EXTRACTORS = (
-    _hicache_value_source,
-    _hicache_operation_node_ids_source,
-    _hicache_operation_token_count_source,
-    _hicache_pending_write_node_ids_source,
-)
+    return (bool(node_ids), node_ids)
