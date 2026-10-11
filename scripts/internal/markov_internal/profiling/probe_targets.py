@@ -27,11 +27,10 @@ def select_python_probe_targets(
     Each target's ``events`` mapping declares whether it emits start or end
     records. The exact selected objects are shared by server injection,
     the profile manifest, and post-capture quality audit.
+    Consumer and diagnostic choices come from the normalized runtime config;
+    this boundary validates the catalog, not those choices again.
     """
 
-    if diagnostics not in PYTHON_PROBE_DIAGNOSTICS:
-        allowed = ", ".join(sorted(PYTHON_PROBE_DIAGNOSTICS))
-        raise ValueError(f"python probe diagnostics must be one of: {allowed}")
     catalog_path = DEFAULT_HICACHE_TARGET_CATALOG
     raw_targets = load_json(catalog_path)
     if not isinstance(raw_targets, list):
@@ -39,7 +38,7 @@ def select_python_probe_targets(
 
     selected: list[dict[str, Any]] = []
     for index, raw_target in enumerate(raw_targets):
-        target = validated_catalog_target(raw_target, index, catalog_path)
+        target = _catalog_target(raw_target, index, catalog_path)
         for key in ("capture_thread_timing", "capture_emission_timing"):
             _resolve_capture_policy(target, key, diagnostics)
         fact = target["fact"]
@@ -56,43 +55,27 @@ def select_python_probe_targets(
     return selected
 
 
-def validated_catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[str, Any]:
+def _catalog_target(raw: Any, index: int, catalog_path: Path) -> dict[str, Any]:
     """Validate and copy one catalog entry before consumer filtering."""
 
     if not isinstance(raw, dict):
         raise ValueError(f"{catalog_path}: targets[{index}] must be an object")
     target = dict(raw)
     prefix = f"{catalog_path}: targets[{index}]"
-    _validate_target_identity(target, prefix)
-    _validate_target_events(target.get("events"), prefix)
-    _validate_target_fact(target.get("fact"), prefix)
-    return target
-
-
-def _validate_target_identity(target: dict[str, Any], prefix: str) -> None:
-    """Require stable catalog identity and import-target fields."""
-
     for key in ("id", "module", "target"):
         if not isinstance(target.get(key), str) or not target.get(key):
             raise ValueError(f"{prefix}.{key} must be a non-empty string")
 
-
-def _validate_target_events(events: Any, prefix: str) -> None:
-    """Validate the phase-to-event mapping emitted by one probe target."""
-
+    events = target.get("events")
     if not isinstance(events, dict) or not events:
         raise ValueError(f"{prefix}.events must be a non-empty phase-to-event-name object")
-    allowed_phases = {"start", "end"}
     for phase, event_name in events.items():
-        if phase not in allowed_phases:
+        if phase not in {"start", "end"}:
             raise ValueError(f"{prefix}.events contains unsupported phase {phase!r}")
         if not isinstance(event_name, str) or not event_name:
             raise ValueError(f"{prefix}.events[{phase!r}] must be a non-empty string")
 
-
-def _validate_target_fact(fact: Any, prefix: str) -> None:
-    """Validate one target's routed HiCache fact declaration."""
-
+    fact = target.get("fact")
     if not isinstance(fact, dict):
         raise ValueError(f"{prefix}.fact must be an object")
     fact_class = fact.get("class")
@@ -105,6 +88,7 @@ def _validate_target_fact(fact: Any, prefix: str) -> None:
     if consumers is None:
         raise ValueError(f"{prefix}.fact.class is unsupported: {fact_class!r}")
     validate_hicache_fact(fact_class, role, tuple(consumers))
+    return target
 
 
 def _resolve_capture_policy(target: dict[str, Any], key: str, diagnostics: str) -> None:

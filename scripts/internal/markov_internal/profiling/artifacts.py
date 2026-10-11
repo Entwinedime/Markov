@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ..common.commands import command_to_text
 from ..common.io import write_json
@@ -13,6 +13,9 @@ from ..common.paths import prepend_repo_src_to_sys_path
 prepend_repo_src_to_sys_path()
 
 from profiling import build_profile_manifest  # noqa: E402
+
+if TYPE_CHECKING:
+    from profiling.config import ProfilingRuntimeConfig
 
 
 def write_run_inputs(
@@ -38,7 +41,7 @@ def write_run_inputs(
 def write_profile_manifest(
     run_dir: Path,
     cfg: dict[str, Any],
-    runtime: Any,
+    runtime: ProfilingRuntimeConfig,
     *,
     python_targets: list[dict[str, Any]],
     started_at: float,
