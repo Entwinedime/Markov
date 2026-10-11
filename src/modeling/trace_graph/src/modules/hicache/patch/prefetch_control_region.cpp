@@ -205,14 +205,6 @@ std::vector<PrefetchControlRegion> prepare_spans(core::DagGraph & graph, const s
 }
 } // namespace
 
-std::vector<PrefetchControlRegion> prepare_prefetch_control_regions(core::DagGraph & graph, const std::vector<PrefetchControlObservation> & controls,
-                                                                    const CpuCollectiveObservation & collectives) {
-    const HiCacheSourceDagIndex source(graph);
-    std::vector<SourceSpan> spans;
-    for (const auto & c : controls) spans.push_back(span_for(c, source));
-    return prepare_spans(graph, spans, collectives);
-}
-
 std::vector<PrefetchControlRegion> prepare_prefetch_wait_regions(core::DagGraph & graph, const std::vector<PrefetchControlObservation> & controls,
                                                                  const CpuCollectiveObservation & collectives, const PrefetchWorkerObservations & workers) {
     if (controls.empty()) return {};

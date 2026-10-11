@@ -3,7 +3,14 @@
 #include "markov/trace_graph/modules/hicache/model/prefetch_scheduler_body.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
 #include <nlohmann/json_fwd.hpp>
+#include <optional>
+#include <string>
+#include <vector>
 
 namespace markov::trace_graph::source_dag {
 
@@ -31,10 +38,9 @@ struct PrefetchCheckCpuTiming {
 // Extract only the branch actually observed. Counterfactual branch costs remain
 // absent in this observation; independent samples train their cost models.
 // A measured zero remains distinct from an unobserved branch.
-// Supplying the source reads service costs on unchanged observation coordinates.
-// Without it, this remains a raw calibration export.
+// Reads service costs on unchanged observation coordinates from the same graph.
 [[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed,
-                                                                const patch::HiCacheSourceDagIndex * source = nullptr);
+                                                                const patch::HiCacheSourceDagIndex & source);
 struct PrefetchSchedulerStep {
     PrefetchSchedulerAction action;
     size_t source_round;
@@ -62,16 +68,5 @@ struct PrefetchSchedulerBody {
                                                                     const PrefetchWorkerObservations & workers,
                                                                     const std::vector<PrefetchControlObservation> & previous,
                                                                     const std::vector<PrefetchControlObservation> & next);
-
-// Immediate stop has one call per rank and a MIN, but no MAX or retry body.
-[[nodiscard]] std::optional<PrefetchSchedulerTiming> observe_prefetch_stop_timing(const patch::HiCacheSourceDagIndex & source,
-                                                                                  const CpuCollectiveObservation & rounds,
-                                                                                  const std::map<int, std::vector<PrefetchControlObservation>> & ranks);
-// One request, chronological calls per rank. No active retry returns nullopt;
-// incomplete evidence for an active retry is an error, never a zero cost.
-[[nodiscard]] std::optional<PrefetchSchedulerTiming> observe_prefetch_wait_timing(const patch::HiCacheSourceDagIndex & source,
-                                                                                  const CpuCollectiveObservation & rounds,
-                                                                                  const PrefetchWorkerObservations & workers,
-                                                                                  const std::map<int, std::vector<PrefetchControlObservation>> & ranks);
 
 } // namespace markov::trace_graph::source_dag

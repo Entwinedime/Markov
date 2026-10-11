@@ -103,7 +103,7 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
             // A donor from another source request would be an online cost fit.
             std::optional<uint64_t> local;
             for (const auto & call : calls)
-                if (call.local_return) local = source_dag::observe_prefetch_check_cpu(call, &source).no_operation_return;
+                if (call.local_return) local = source_dag::observe_prefetch_check_cpu(call, source).no_operation_return;
             if (local) migrated_returns.emplace(rank, *local);
             core::TraceEvent interval;
             interval.pid = first->pid;

@@ -161,7 +161,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                         if (!call.issue.empty()) continue;
                         if (call.state_round) check_rounds.insert(*call.state_round);
                         if (call.completion_round) check_rounds.insert(*call.completion_round);
-                        const auto measured = source_dag::observe_prefetch_check_cpu(call, &source);
+                        const auto measured = source_dag::observe_prefetch_check_cpu(call, source);
                         const auto * fact = source.fact_node(call.progress_fact);
                         const auto record = [&](std::string_view role, std::optional<uint64_t> duration_us) {
                             if (!duration_us) return;

@@ -176,18 +176,16 @@ PrefetchSchedulerTiming prefetch_scheduler_timing(const PrefetchSchedulerBody & 
     return timing;
 }
 
-PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const patch::HiCacheSourceDagIndex * source) {
+PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const patch::HiCacheSourceDagIndex & source) {
     if (!observed.issue.empty()) throw std::invalid_argument("Prefetch CPU template requires a complete observed call");
-    const auto * fact = source ? source->fact_node(observed.progress_fact) : nullptr;
-    if (source && !fact) throw std::invalid_argument("Prefetch service has no source identity");
+    const auto * fact = source.fact_node(observed.progress_fact);
+    if (!fact) throw std::invalid_argument("Prefetch service has no source identity");
     const auto duration = [&](std::initializer_list<std::string_view> roles) {
         uint64_t total = 0;
         for (const auto role : roles) {
             const auto found = std::ranges::find(observed.cpu, role, &PrefetchControlCpuInterval::role);
             if (found == observed.cpu.end()) throw std::invalid_argument("Missing prefetch CPU interval: " + std::string(role));
-            const auto service =
-                source ? source->graph().cpu_service_cost().duration({ fact->pid, fact->tid }, found->cpu.interval_start_us, found->cpu.interval_end_us)
-                       : found->cpu.observed_duration_us;
+            const auto service = source.graph().cpu_service_cost().duration({ fact->pid, fact->tid }, found->cpu.interval_start_us, found->cpu.interval_end_us);
             total = core::checked_add_u64(total, service, "Prefetch branch service overflow");
         }
         return total;
@@ -208,53 +206,6 @@ PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservati
         cpu.min_to_visible = duration({ "after_min" });
     }
     return cpu;
-}
-
-std::optional<PrefetchSchedulerTiming> observe_prefetch_stop_timing(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
-                                                                    const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
-    if (ranks.empty()) return std::nullopt;
-    std::optional<size_t> completion;
-    for (const auto & [rank, calls] : ranks) {
-        if (calls.size() != 1 || calls.front().local_return || !calls.front().stop || calls.front().state_round) return std::nullopt;
-        const auto & call = calls.front();
-        if (!call.issue.empty() || call.rank != rank || !call.completion_round || call.cpu.empty())
-            throw std::invalid_argument("Immediate stop requires complete ranked progress observations");
-        if (completion && completion != call.completion_round) throw std::invalid_argument("Immediate stop ranks do not share a completion MIN");
-        completion = call.completion_round;
-    }
-    const auto measured = observe_cpu_collective_timing(source.graph(), rounds.rounds.at(*completion));
-    if (!measured.issue.empty() || measured.calls.size() != ranks.size()
-        || std::ranges::any_of(measured.calls, [&](const auto & item) { return !ranks.contains(item.first); }))
-        throw std::invalid_argument("Immediate stop requires a complete all-rank MIN");
-    return PrefetchSchedulerTiming{};
-}
-
-std::optional<PrefetchSchedulerTiming> observe_prefetch_wait_timing(const patch::HiCacheSourceDagIndex & source, const CpuCollectiveObservation & rounds,
-                                                                    const PrefetchWorkerObservations & workers,
-                                                                    const std::map<int, std::vector<PrefetchControlObservation>> & ranks) {
-    if (ranks.empty()) return std::nullopt;
-    for (const auto & [rank, calls] : ranks)
-        for (const auto & call : calls)
-            if (!call.issue.empty() || call.rank != rank || call.cpu.empty())
-                throw std::invalid_argument("Wait timing requires valid ranked progress observations");
-    if (std::ranges::any_of(ranks, [](const auto & pair) {
-            return pair.second.size() < 2 || pair.second.front().local_return || pair.second.front().stop || !pair.second.front().state_round
-                   || !pair.second.back().stop;
-        }))
-        return std::nullopt;
-    std::vector<PrefetchControlObservation> first, next;
-    for (const auto & [rank, calls] : ranks) {
-        if (!calls.back().completion_round) throw std::invalid_argument("Active wait has no terminal completion round");
-        first.push_back(calls.front());
-        next.push_back(calls[1]);
-    }
-    const auto body = observe_prefetch_scheduler_body(source, rounds, workers, first, next);
-    if (!body.issue.empty()) throw std::runtime_error("Active wait scheduler measurement incomplete: " + body.issue);
-    for (const auto & step : body.steps)
-        if ((step.action == PrefetchSchedulerAction::WriteCompletion || step.action == PrefetchSchedulerAction::LoadCompletion)
-            && step.completion_observations.size() != ranks.size())
-            throw std::runtime_error("Wait template has no complete confirmation boundary");
-    return prefetch_scheduler_timing(body, source.graph());
 }
 
 } // namespace markov::trace_graph::source_dag
