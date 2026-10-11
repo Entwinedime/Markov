@@ -10,7 +10,7 @@ from typing import Any
 
 from ...common.io import load_json
 from ...common.manifest import manifest_files, profile_labels
-from ...common.paths import map_repo_path, repo_relative_path
+from ...common.paths import map_repo_path, repo_relative_path, require_repo_path
 from ...common.commands import command_tokens
 from ..workload import WorkloadWindow, discover_workload_window
 
@@ -43,6 +43,21 @@ class ProfileRunRef:
         """Return the compact input/config label used in progress and artifacts."""
 
         return f"{self.input_id}/{self.config_id}"
+
+
+def cpu_service_inputs(paths: list[Path], sources: tuple[Path, ...]) -> dict[Path, Path]:
+    """Bind explicit service files to their own selected captures, never targets."""
+
+    inputs = {}
+    for path in paths:
+        path = require_repo_path(path)
+        source = require_repo_path(load_json(path)["source_manifest"]).resolve()
+        if source not in sources:
+            raise ValueError(f"CPU service input does not belong to a selected source: {path}")
+        if source in inputs:
+            raise ValueError(f"Multiple CPU service inputs for the same source: {source}")
+        inputs[source] = path
+    return inputs
 
 
 def discover_profile_runs(

@@ -37,15 +37,15 @@ class WorkflowOptions:
     target_configs: tuple[TargetHiCacheConfig, ...]
     output_dir: Path
     diagnostics: DiagnosticLevel
+    hicache_io_model: HiCacheIoModel
+    cost_deployment: dict[str, object]
+    cost_sources: tuple[str, ...]
+    cost_source_manifests: tuple[Path, ...]
     dry_run: bool = False
     continue_on_error: bool = False
     trace_threads: int = 1
     trace_file_threads: int = 1
     model_run_jobs: int = 1
-    hicache_io_model: HiCacheIoModel | None = None
     cpu_service_costs: dict[Path, Path] = field(default_factory=dict)
-    cost_deployment: dict[str, object] | None = None
-    cost_sources: tuple[str, ...] = ()
-    cost_source_manifests: tuple[Path, ...] = ()
     source_resources: dict[str, str] | None = None
     experiment_reports: bool = False

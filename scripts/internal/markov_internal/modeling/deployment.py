@@ -83,12 +83,6 @@ def source_environment(source: ProfileRunRef, resources: dict[str, str] | None =
     }
 
 
-def environments_match(first: dict[str, Any], second: dict[str, Any]) -> bool:
-    """Compare the semantic declarations, without digest or version handshakes."""
-
-    return first == second
-
-
 def require_cost_environment(deployment: dict[str, Any]) -> None:
     """Reject fitting/application under an undeclared hardware/runtime domain.
 

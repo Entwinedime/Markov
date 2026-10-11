@@ -5,13 +5,12 @@ from __future__ import annotations
 from ..common.io import write_json
 from ..common.paths import repo_relative_path
 from .context import WorkflowOptions
-from .execution.model_executor import run_model_runs
+from .execution.model_executor import plan_model_runs, run_model_runs
 from ..modeling.source_dag.profiles import discover_profile_runs
-from .structure.specs import plan_model_runs
 from .preflight import preflight_sources
 from .execution.results import build_row, read_row, summarize
 from .types import ModelRunResult
-from ..modeling.deployment import environments_match, require_cost_environment, source_environment
+from ..modeling.deployment import source_environment
 
 
 def run_workflow(options: WorkflowOptions) -> int:
@@ -23,13 +22,8 @@ def run_workflow(options: WorkflowOptions) -> int:
         source.manifest_path.resolve() for source in runs
     }:
         raise ValueError("current base captures must be excluded from independently trained prediction costs")
-    if options.cost_deployment is not None:
-        require_cost_environment(options.cost_deployment)
-        if any(
-            not environments_match(source_environment(source, options.source_resources), options.cost_deployment)
-            for source in runs
-        ):
-            raise ValueError("database cost model does not apply to the selected source deployment")
+    if any(source_environment(source, options.source_resources) != options.cost_deployment for source in runs):
+        raise ValueError("database cost model does not apply to the selected source deployment")
 
     preflight_report = preflight_sources(options, runs)
     specs = plan_model_runs(options, runs, preflight_report)

@@ -1,21 +1,55 @@
-"""Execution and compact persistence of normalized model-run cells."""
+"""Plan and execute source/target prediction cells with compact persistence."""
 
 from __future__ import annotations
 
 import concurrent.futures
 from collections.abc import Iterator
+from itertools import product
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ...common.io import load_json, write_json
+from ...common.naming import safe_slug
 from ...common.process import run_command
 from ...modeling.backend import build_trace_graph_command
+from ...modeling.source_dag.profiles import ProfileRunRef
 from ..progress import StageProgress
 from ..types import ModelRunResult, ModelRunSpec
 from .runner_adapter import hicache_model_config, runner_config
 
 if TYPE_CHECKING:
     from ..context import WorkflowOptions
+
+
+def plan_model_runs(
+    options: WorkflowOptions, runs: list[ProfileRunRef], preflight_report: dict[str, Any]
+) -> list[ModelRunSpec]:
+    """Plan cells from admitted targets and source readiness, not cost availability.
+
+    The public boundary has already admitted the required independent package.
+    A planned cell can still report a concrete cost gap during target execution.
+    """
+
+    source_readiness = {row["manifest_path"]: row for row in preflight_report["sources"]}
+    specs = []
+    for source, target in product(runs, options.target_configs):
+        pair = f"{safe_slug(source.config_id)}_to_{safe_slug(target.label)}"
+        run_id = "__".join(("hicache", safe_slug(source.input_id), pair))
+        specs.append(
+            ModelRunSpec(
+                run_id=run_id,
+                output_dir=options.output_dir / "model_runs" / run_id,
+                source=source,
+                target=target,
+                skip_reason=source_readiness[str(source.manifest_path)]["skip_reason"],
+                cpu_service_cost=options.cpu_service_costs.get(source.manifest_path.resolve()),
+            )
+        )
+
+    run_ids = [spec.run_id for spec in specs]
+    if len(run_ids) != len(set(run_ids)):
+        raise ValueError("HiCache prediction plan produced duplicate source/target/workload cells")
+    return sorted(specs, key=lambda spec: spec.run_id)
 
 
 def run_model_runs(options: WorkflowOptions, specs: list[ModelRunSpec]) -> Iterator[ModelRunResult]:

@@ -8,7 +8,7 @@ from typing import Any
 from ...common.io import load_json
 from ...common.paths import repo_relative_path, require_repo_path
 from ..deployment import require_cost_environment, source_environment
-from ..source_dag.profiles import discover_profile_runs
+from ..source_dag.profiles import cpu_service_inputs, discover_profile_runs
 from .database import CostDatabase, OperationObservation, merge_control_measurements
 from .io import service_cost_evidence
 from .models import ModelSpec, train_models
@@ -173,21 +173,6 @@ def import_evidence(
             )
 
     return database.import_measurements(measurements, evidence, replace_captures=replace_captures)
-
-
-def cpu_service_inputs(paths: list[Path], sources: tuple[Path, ...]) -> dict[Path, Path]:
-    """Bind explicit service files to their own selected captures, never targets."""
-
-    inputs = {}
-    for path in paths:
-        path = require_repo_path(path)
-        source = require_repo_path(load_json(path)["source_manifest"]).resolve()
-        if source not in sources:
-            raise ValueError(f"CPU service input does not belong to a selected source: {path}")
-        if source in inputs:
-            raise ValueError(f"Multiple CPU service inputs for the same source: {source}")
-        inputs[source] = path
-    return inputs
 
 
 def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]:

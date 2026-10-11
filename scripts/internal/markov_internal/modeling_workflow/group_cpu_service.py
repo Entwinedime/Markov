@@ -7,9 +7,8 @@ import subprocess
 
 from ..common.paths import ROOT_DIR, require_repo_path, repo_relative_path
 from ..common.io import load_json
-from ..modeling.cost.package import cpu_service_inputs
 from .cpu_capture import capture_light_base
-from ..modeling.source_dag.profiles import parse_server_command_flags
+from ..modeling.source_dag.profiles import cpu_service_inputs, parse_server_command_flags
 
 
 def cpu_service_plan(group) -> dict:

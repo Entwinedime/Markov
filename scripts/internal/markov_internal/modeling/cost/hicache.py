@@ -4,30 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from pathlib import Path
 from typing import Any
 
-from ...common.io import load_json
-from ...common.paths import require_repo_path
 from .io_contract import MAX_U64, positive_u64
 from .io_validation import required_resource_lanes, required_service_models
 
 
 @dataclass(frozen=True)
 class HiCacheIoModel:
-    """Validated numerical fields for the workflow-wide HiCache cost model."""
+    """Admitted I/O and operator models projected into target execution."""
 
     fields: dict[str, Any]
-
-    @classmethod
-    def load(cls, path: Path) -> HiCacheIoModel:
-        """Load and validate the group-wide numerical model at its input boundary."""
-
-        resolved = require_repo_path(path)
-        raw = load_json(resolved)
-        if not isinstance(raw, dict):
-            raise TypeError(f"HiCache model must be a JSON object: {resolved}")
-        return cls.from_raw(raw)
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> HiCacheIoModel:
@@ -45,9 +32,8 @@ class HiCacheIoModel:
             ),
             "service_models": service_models,
             "resource_lanes": resource_lanes,
+            "operator_models": raw["operator_models"],
         }
-        if "operator_models" in raw:
-            fields["operator_models"] = raw["operator_models"]
         return cls(fields=fields)
 
     def narrow_config(self, page_size: int) -> dict[str, Any]:
@@ -79,9 +65,8 @@ class HiCacheIoModel:
                 "service_models": service_models,
                 "resource_lanes": self.fields["resource_lanes"],
             },
+            "operator_models": self.fields["operator_models"],
         }
-        if "operator_models" in self.fields:
-            result["operator_models"] = self.fields["operator_models"]
         return result
 
 

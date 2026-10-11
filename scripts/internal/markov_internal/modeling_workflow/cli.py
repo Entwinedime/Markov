@@ -9,9 +9,10 @@ from ..common.commands import positive_int
 from ..common.io import load_json
 from ..common.paths import require_repo_path
 from ..modeling.cost.hicache import HiCacheIoModel
-from ..modeling.cost.package import cpu_service_inputs
+from ..modeling.deployment import require_cost_environment
+from ..modeling.source_dag.profiles import cpu_service_inputs
 from .context import DiagnosticLevel, WorkflowOptions
-from .structure.target_configs import load_target_configs
+from .types import TargetHiCacheConfig
 from .workflow import run_workflow
 
 
@@ -88,6 +89,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     trained = load_json(require_repo_path(args.cost_model))
+    require_cost_environment(trained["deployment"])
     sources = tuple(require_repo_path(path).resolve() for path in args.source_manifest)
     output = (
         require_repo_path(args.output_dir)
@@ -96,11 +98,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     numerical = {**trained["hicache"], "operator_models": trained["operator_models"]}
     io_model = HiCacheIoModel.from_raw(numerical)
+    targets = tuple(TargetHiCacheConfig.load(path) for path in args.target_config)
+    if len({target.label for target in targets}) != len(targets):
+        raise ValueError("target config names must be unique within one prediction request")
 
     options = WorkflowOptions(
         source_manifests=sources,
         cpu_service_costs=cpu_service_inputs(args.cpu_service_cost, sources),
-        target_configs=load_target_configs(args.target_config),
+        target_configs=targets,
         output_dir=output,
         diagnostics=DiagnosticLevel(args.diagnostics),
         dry_run=args.dry_run,

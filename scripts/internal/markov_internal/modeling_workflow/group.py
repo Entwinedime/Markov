@@ -15,7 +15,7 @@ from typing import Any
 from ..common.io import load_json
 from ..common.manifest import profile_labels
 from ..common.paths import require_repo_path
-from ..modeling.deployment import environments_match, source_environment
+from ..modeling.deployment import source_environment
 from ..contracts.forced_token.bundle import resolve_forced_token_bundle_plan
 from ..contracts.forced_token.plan import load_forced_token_plan
 from ..profiling.suite import expand_suite
@@ -28,7 +28,6 @@ from ..modeling.source_dag.profiles import (
     discover_profile_runs,
     extract_hicache_from_server_command,
 )
-from .structure.target_configs import load_target_config, parse_target_config
 from .types import TargetHiCacheConfig
 
 
@@ -161,7 +160,7 @@ class GroupRequest:
         if len({json.dumps(run.hicache_config, sort_keys=True) for run in sources}) > 1:
             raise ValueError("base manifests must share one HiCache configuration")
         environments = [source_environment(run, raw.get("resource_environment")) for run in sources]
-        if environments and any(not environments_match(value, environments[0]) for value in environments[1:]):
+        if environments and any(value != environments[0] for value in environments[1:]):
             raise ValueError("base manifests must share model, TP and runtime resource settings")
 
         declared_targets = raw.get("target_configs")
@@ -172,7 +171,7 @@ class GroupRequest:
         targets = []
         for target in declared_targets:
             if isinstance(target, dict):
-                targets.append(parse_target_config(target))
+                targets.append(TargetHiCacheConfig.from_raw(target))
             elif isinstance(target, str) and target in servers:
                 policies = [extract_hicache_from_server_command(command) for command in servers[target]]
                 fields = policies[0]
@@ -182,9 +181,9 @@ class GroupRequest:
                     raise ValueError(
                         f"target label has different experiment configurations; use an explicit target: {target}"
                     )
-                targets.append(parse_target_config({"name": target, "hicache": fields}))
+                targets.append(TargetHiCacheConfig.from_raw({"name": target, "hicache": fields}))
             elif isinstance(target, str):
-                targets.append(load_target_config(Path(target)))
+                targets.append(TargetHiCacheConfig.load(Path(target)))
             else:
                 raise ValueError("target configuration must be a policy object or path/name")
         if len({target.label for target in targets}) != len(targets):
@@ -307,8 +306,9 @@ def _admit_controls(group: GroupRequest, collection: dict[str, Any]) -> None:
             raise ValueError("base measurements are not independent control calibration")
         if manifest not in admitted_manifests:
             (source,) = discover_profile_runs((manifest,))
-            if base_environment is not None and not environments_match(
-                source_environment(source, group.raw.get("resource_environment")), base_environment
+            if (
+                base_environment is not None
+                and source_environment(source, group.raw.get("resource_environment")) != base_environment
             ):
                 raise ValueError(f"control calibration changed model, TP or runtime resources: {path}")
             admitted_manifests.add(manifest)

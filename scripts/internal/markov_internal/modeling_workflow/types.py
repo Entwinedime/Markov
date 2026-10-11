@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..common.io import load_json
+from ..common.paths import require_repo_path
+from ..modeling.cost.control import CALIBRATION_FIELDS
+from ..modeling.cost.io_contract import positive_u64
 from ..modeling.source_dag.profiles import ProfileRunRef
 
 
@@ -15,6 +19,47 @@ class TargetHiCacheConfig:
 
     label: str
     fields: dict[str, Any]
+
+    @classmethod
+    def load(cls, path: Path) -> TargetHiCacheConfig:
+        """Load a policy-only declaration; observations and costs are forbidden."""
+
+        resolved = require_repo_path(path)
+        return cls.from_raw(load_json(resolved), resolved)
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any], source_path: Path | None = None) -> TargetHiCacheConfig:
+        """Admit explicit files and inline group targets through the same boundary."""
+
+        if not isinstance(raw, dict) or not isinstance(raw.get("hicache"), dict):
+            raise ValueError(f"target config must contain a hicache object: {source_path}")
+        if set(raw) - {"name", "hicache"}:
+            raise ValueError("target declaration accepts only name and hicache policy/capacity")
+
+        fields: dict[str, Any] = dict(raw["hicache"])
+        if any(
+            field in fields
+            for field in (
+                "io_cost",
+                "phase_cost",
+                "operator_models",
+                "kv_bytes_per_page",
+                "dag_patch",
+                *CALIBRATION_FIELDS,
+                "control_calibrations",
+            )
+        ):
+            raise ValueError(f"target config cannot contain HiCache model fields: {source_path}")
+
+        fields["page_size"] = positive_u64(fields.get("page_size"), "target hicache.page_size")
+        fields.setdefault("prefetch_policy", "timeout")
+        if fields["prefetch_policy"] not in {"best_effort", "wait_complete", "timeout"}:
+            raise ValueError("target prefetch policy must identify the actual control path")
+
+        label = str(raw.get("name") or (source_path.stem if source_path else ""))
+        if not label:
+            raise ValueError("inline target declaration requires a name")
+        return cls(label=label, fields=fields)
 
     def matches_source(self, source: ProfileRunRef) -> bool:
         """Compare policy/capacity values without relying on experiment identifiers."""
