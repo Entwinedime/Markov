@@ -312,6 +312,7 @@ manifest 只声明实际配置、文件、采集状态与窗口，不存内部�
 | profiling/executor、runtime、environments | 单次生命周期、命令、目录与环境 |
 | `src/profiling/config.py`、manifest.py、profiler_clock.py | 配置规整、交接文件与时钟证据 |
 | Python probe bootstrap/patching/schema | 安装、重复包装与事实路由 |
+| probes/values 与 probes/hicache | 参数/返回值读取与 HiCache 语义字段，不负责安装或写事件 |
 | probes/ 与 hicache_probe_targets.json | 实际框架边界、必要元数据和调用时钟 |
 | LD_PRELOAD targets/framework | 原生 hook 与轻量计时 |
 
@@ -319,5 +320,10 @@ manifest 只声明实际配置、文件、采集状态与窗口，不存内部�
 多个 target 共享参数映射但不共享事实上下文；属性读取一次，避免 getter 改变采集语义。
 模块名匹配可缓存，安装成功不永久缓存：后续导入、部分初始化与函数替换仍检查。
 通用 callable 与固定 HiCache 提取器共用安装，不再维护可变插件注册表和转发层。
+catalog 选择与运行时安装共用 `schema.parse_target`，字段、条件和 fact 规则只维护一份；
+字段或条件格式错误在采集预检查时报错，不必等服务器启动。安装输入按模块和 callable 一次分组，
+仍保留同一函数上的 target 顺序及每次导入后的重查。
+`probes/values.extract_value` 处理参数、返回值、路径和组合表达式，HiCache 前缀由固定分派处理。
+token 提取器不再依赖 callable 安装器；摘要 list 与完整 token 字典仍分别取值，缺失不填零。
 probe 导入不得初始化设备或启动运行；新增包装不得读 tensor、snapshot 或额外同步。
 真实覆盖、额外扰动及支持范围须通过正式采集验证，不能以字段存在或构建通过代替。
