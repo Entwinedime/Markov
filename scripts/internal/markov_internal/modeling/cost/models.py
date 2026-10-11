@@ -84,35 +84,37 @@ def train_models(
     models = []
     unmeasured_implementations = []
     for spec in specifications:
-        operation_rows = [
-            row
-            for operation in spec.source_operations
-            for row in observations_by_operation[operation]
-        ]
+        implementation_rows: dict[str, list[OperationObservation]] = defaultdict(list)
+        for operation in spec.source_operations:
+            for row in observations_by_operation[operation]:
+                implementation_rows[row.implementation].append(row)
+
         if spec.implementation != "*":
-            models.append(_train_model(spec, [row for row in operation_rows if row.implementation == spec.implementation]))
+            models.append(_train_model(spec, implementation_rows[spec.implementation]))
             continue
 
+        scopes = {
+            name: {row.timing_scope for row in rows}
+            for name, rows in implementation_rows.items()
+        }
         implementations = sorted(
-            {row.implementation for row in operation_rows if row.timing_scope == spec.timing_scope}
+            name for name, available in scopes.items() if spec.timing_scope in available
         )
-        for implementation in sorted({row.implementation for row in operation_rows} - set(implementations)):
+        for implementation in sorted(scopes.keys() - set(implementations)):
             unmeasured_implementations.append(
                 {
                     "operation": spec.operation,
                     "implementation": implementation,
                     "timing_scope": spec.timing_scope,
                     "reason": "missing_timing_scope",
-                    "available_timing_scopes": sorted(
-                        {row.timing_scope for row in operation_rows if row.implementation == implementation}
-                    ),
+                    "available_timing_scopes": sorted(scopes[implementation]),
                 }
             )
         # A direct call need not have queued-worker measurements. Wildcards
         # select implementations measured in this scope, not every backend
         # ever seen under the same operation name.
         models.extend(
-            _train_model(replace(spec, implementation=name), [row for row in operation_rows if row.implementation == name])
+            _train_model(replace(spec, implementation=name), implementation_rows[name])
             for name in implementations
         )
         if not implementations:
@@ -122,8 +124,8 @@ def train_models(
                     "implementation": "*",
                     "timing_scope": spec.timing_scope,
                     "status": "missing_data",
-                    "reason": "missing_timing_scope" if operation_rows else "missing_operation",
-                    "available_timing_scopes": sorted({row.timing_scope for row in operation_rows}),
+                    "reason": "missing_timing_scope" if scopes else "missing_operation",
+                    "available_timing_scopes": sorted({scope for available in scopes.values() for scope in available}),
                     "features": list(spec.required_features),
                     "ineligible_measurements": 0,
                 }

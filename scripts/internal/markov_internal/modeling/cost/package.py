@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ from ...common.io import load_json
 from ...common.paths import repo_relative_path, require_repo_path
 from ..deployment import require_cost_environment, source_environment
 from ..source_dag.profiles import cpu_service_inputs, discover_profile_runs
+from .control import ControlMeasurement, control_entries
 from .database import CostDatabase, OperationObservation, merge_control_measurements
 from .io import service_cost_evidence
 from .models import ModelSpec, train_models
@@ -185,15 +187,11 @@ def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]
 
     rows: list[OperationObservation] = []
 
-    def collect(value: dict[str, Any]) -> None:
-        if "role" not in value:
-            for child in value.values():
-                collect(child)
-            return
-
+    for _, value in control_entries(evidence["payload"].get("control_measurements", {})):
         observations = value.get("operator_observations", [])
         if not observations:
-            return
+            continue
+
         # Query rows explicitly measure coarse wall intervals, not corrected
         # CPU service. Other primitive exports retain the paired-CPU contract.
         coarse_query = value.get("operation") == "prefetch_query"
@@ -226,8 +224,19 @@ def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]
                 )
             )
 
-    collect(evidence["payload"].get("control_measurements", {}))
     return rows
+
+
+def _with_measurement_sources(value: dict[str, Any]) -> dict[str, Any]:
+    """Embed source pairing during import without modifying the measured document."""
+
+    if "measurement_manifests" in value:
+        return value
+    manifests = [value["source_manifest"]]
+    if value.get("cost_basis") == "paired_cpu_service":
+        correction = load_json(require_repo_path(value["cpu_service_file"]))
+        manifests.append(correction["light_manifest"])
+    return dict(value, measurement_manifests=manifests)
 
 
 def embed_control_measurements(collection: dict[str, Any]) -> dict[str, Any]:
@@ -242,19 +251,14 @@ def embed_control_measurements(collection: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, str):
             value = load_json(require_repo_path(value))
         if "role" in value:
-            if value.get("cost_basis") == "paired_cpu_service" and "measurement_manifests" not in value:
-                correction = load_json(require_repo_path(value["cpu_service_file"]))
-                value = dict(value, measurement_manifests=[value["source_manifest"], correction["light_manifest"]])
-            elif "measurement_manifests" not in value:
-                value = dict(value, measurement_manifests=[value["source_manifest"]])
-            return value
+            return _with_measurement_sources(value)
 
         return {key: embed(child) for key, child in value.items()}
 
     return {key: embed(value) for key, value in collection.items()}
 
 
-def control_evidence(collection: dict[str, Any], deployment: dict[str, Any]) -> list[dict[str, Any]]:
+def control_evidence(measurements: Sequence[ControlMeasurement], deployment: dict[str, Any]) -> list[dict[str, Any]]:
     """Group explicit control documents by their actual source capture.
 
     A group configuration and a stringified path collection are not capture
@@ -264,13 +268,8 @@ def control_evidence(collection: dict[str, Any], deployment: dict[str, Any]) -> 
 
     captures: dict[str, dict[str, Any]] = {}
 
-    def collect(value: dict[str, Any], keys: tuple[str, ...]) -> None:
-        if "role" not in value:
-            for key, child in value.items():
-                collect(child, (*keys, key))
-            return
-
-        source = discover_profile_runs((require_repo_path(value["source_manifest"]),))[0]
+    for measurement in measurements:
+        source = measurement.source
         evidence = captures.setdefault(
             source.run_id,
             dict(
@@ -282,11 +281,10 @@ def control_evidence(collection: dict[str, Any], deployment: dict[str, Any]) -> 
             ),
         )
         selected = evidence["payload"]["control_measurements"]
-        for key in keys[:-1]:
+        for key in measurement.selection[:-1]:
             selected = selected.setdefault(key, {})
-        merge_control_measurements(selected, {keys[-1]: value})
 
-    for operation, value in embed_control_measurements(collection).items():
-        collect(value, (operation,))
+        value = _with_measurement_sources(measurement.document)
+        merge_control_measurements(selected, {measurement.selection[-1]: value})
 
     return list(captures.values())

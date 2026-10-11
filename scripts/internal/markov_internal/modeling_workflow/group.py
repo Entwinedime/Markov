@@ -22,7 +22,7 @@ from ..profiling.suite import expand_suite
 from ..workload_template.cli import parse_workload_command
 from .base_capture import captured_base_manifests
 from .capture import CAPTURE_CLEANUP_RESERVE_SEC
-from ..modeling.cost.control import control_calibrations
+from ..modeling.cost.control import ControlMeasurement, control_calibrations, read_control_measurements
 from ..modeling.source_dag.profiles import (
     ProfileRunRef,
     discover_profile_runs,
@@ -217,7 +217,7 @@ class GroupRequest:
         return admitted_physical_calibration(captured_physical_declaration(self)) or declared or platform_inputs(self)
 
     @cached_property
-    def controls(self) -> dict[str, Any]:
+    def controls(self) -> tuple[ControlMeasurement, ...]:
         """Resolve independent control inputs for acquisition, not normal prediction.
 
         A fresh group after capture resolves the updated collection. Admission
@@ -228,8 +228,9 @@ class GroupRequest:
         collection = control_calibrations(
             load_json(generated) if generated.exists() else {}, self.raw.get("control_calibrations", {})
         )
-        _admit_controls(self, collection)
-        return collection
+        measurements = read_control_measurements(collection)
+        _admit_controls(self, measurements)
+        return measurements
 
     @property
     def missing_base_workloads(self) -> tuple[str, ...]:
@@ -280,7 +281,7 @@ def admitted_physical_calibration(declaration: dict[str, Any] | None) -> dict[st
     return admitted
 
 
-def _admit_controls(group: GroupRequest, collection: dict[str, Any]) -> None:
+def _admit_controls(group: GroupRequest, measurements: tuple[ControlMeasurement, ...]) -> None:
     """Reuse explicitly shared measurements, not per-target costs or old models.
 
     C++ validates operation semantics when consuming these measurements. This
@@ -290,25 +291,23 @@ def _admit_controls(group: GroupRequest, collection: dict[str, Any]) -> None:
     base_environment = (
         source_environment(group.sources[0], group.raw.get("resource_environment")) if group.sources else None
     )
-    paths = set(collection["prefetch_wait"].values())
-    paths.update(path for policies in collection["write_host"].values() for path in policies.values())
-    paths.update(value for key, value in collection.items() if key not in {"prefetch_wait", "write_host"})
     base_manifests = {source.manifest_path for source in group.sources}
     admitted_manifests: set[Path] = set()
-    for path in sorted(paths):
-        document = load_json(require_repo_path(path))
-        for policy, wait_path in collection["prefetch_wait"].items():
-            if wait_path == path and (policy == "best_effort") != (document["source_policy"] == "best_effort"):
+    for measurement in measurements:
+        document = measurement.document
+        if measurement.selection[0] == "prefetch_wait":
+            policy = measurement.selection[1]
+            if (policy == "best_effort") != (document["source_policy"] == "best_effort"):
                 raise ValueError("shared prefetch calibration does not match its declared program")
 
-        manifest = require_repo_path(document["source_manifest"])
+        source = measurement.source
+        manifest = source.manifest_path
         if manifest in base_manifests:
             raise ValueError("base measurements are not independent control calibration")
         if manifest not in admitted_manifests:
-            (source,) = discover_profile_runs((manifest,))
             if (
                 base_environment is not None
                 and source_environment(source, group.raw.get("resource_environment")) != base_environment
             ):
-                raise ValueError(f"control calibration changed model, TP or runtime resources: {path}")
+                raise ValueError(f"control calibration changed model, TP or runtime resources: {measurement.path}")
             admitted_manifests.add(manifest)

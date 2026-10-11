@@ -12,6 +12,7 @@ import sqlite3
 from typing import Any
 
 from ...common.paths import require_repo_path
+from .control import control_entries
 
 
 @dataclass(frozen=True)
@@ -85,16 +86,8 @@ def evidence_manifests(evidence: dict[str, Any]) -> set[str]:
     elif evidence["kind"] == "physical_io":
         manifests.update(payload["measurement_sources"])
     elif evidence["kind"] == "control_costs":
-
-        def collect(value: dict[str, Any]) -> None:
-            if "role" in value:
-                manifests.update(value["measurement_manifests"])
-                return
-
-            for child in value.values():
-                collect(child)
-
-        collect(payload["control_measurements"])
+        for _, value in control_entries(payload["control_measurements"]):
+            manifests.update(value["measurement_manifests"])
 
     return manifests
 

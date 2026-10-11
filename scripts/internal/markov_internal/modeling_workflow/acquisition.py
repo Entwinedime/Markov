@@ -9,6 +9,7 @@ from typing import Any
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ..common.process import run_command
+from ..modeling.cost.models import ModelSpec
 from ..modeling.cost.package import control_evidence
 from ..modeling.deployment import source_environment
 from .calibration.eviction_cpu import acquire_eviction_cpu, locked_candidate_observations
@@ -33,7 +34,9 @@ def _run_action(action: str, *arguments: str) -> int:
     return run_command([str(ROOT_DIR / "scripts/model.sh"), action, *arguments]).returncode
 
 
-def _import_acquired(group: GroupRequest, acquisitions: list[dict[str, Any]]) -> bool:
+def _import_acquired(
+    group: GroupRequest, acquisitions: list[dict[str, Any]], request: dict[str, Any]
+) -> bool:
     """Admit new independent captures, then explicitly retrain one shared model.
 
     The offline request excludes every selected base. Acquisition never uses
@@ -41,7 +44,6 @@ def _import_acquired(group: GroupRequest, acquisitions: list[dict[str, Any]]) ->
     """
 
     database = group.raw["cost_database"]
-    request = load_json(require_repo_path(group.raw["cost_training"]))
     ledger_path = group.output_dir / "capture_ledger.json"
     deployment = source_environment(group.sources[0], group.raw.get("resource_environment"))
     resource_path = group.output_dir / "resource_environment.json"
@@ -165,6 +167,8 @@ class CostAcquisition:
         self.group = group
         self.attempted: set[str] = set()
         self.database_refreshed = False
+        self.training: dict[str, Any] | None = None
+        self.specifications: list[ModelSpec] = []
 
     def advance(self, needs: list[dict[str, Any]]) -> dict[str, Any]:
         """Prepare evidence for the next prediction, without executing it."""
@@ -173,8 +177,11 @@ class CostAcquisition:
         if not group.raw.get("cost_database") or not group.raw.get("cost_training"):
             return {"status": "acquisition_requires_database_and_training_request"}
 
-        training = load_json(require_repo_path(group.raw["cost_training"]))
-        needs, undeclared, corrections = declared_cost_demands(needs, training["models"])
+        if self.training is None:
+            self.training = load_json(require_repo_path(group.raw["cost_training"]))
+            self.specifications = [ModelSpec.from_raw(model) for model in self.training["models"]]
+        training = self.training
+        needs, undeclared, corrections = declared_cost_demands(needs, self.specifications)
         outcome: dict[str, Any] = {}
         if undeclared:
             outcome["undeclared_operator_models"] = undeclared
@@ -225,7 +232,7 @@ class CostAcquisition:
         self.group = group
         if not evidence_ready:
             return dict(outcome, status="acquisition_incomplete", captures=captures)
-        if not _import_acquired(group, captures):
+        if not _import_acquired(group, captures, training):
             return dict(outcome, status="shared_training_incomplete", captures=captures)
 
         return dict(outcome, status="costs_prepared", captures=captures)

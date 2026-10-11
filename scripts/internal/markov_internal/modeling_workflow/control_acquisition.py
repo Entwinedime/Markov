@@ -9,13 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, require_repo_path, repo_relative_path
-from ..modeling.cost.models import ModelSpec
 from .capture import CONTROL_CAPTURE_STAGES, capture_calibration
 from ..modeling.cost.control import control_calibrations
 from .group_cpu_service import prepare_group_cpu_service
 from ..modeling.source_dag.profiles import ProfileRunRef, discover_profile_runs, parse_server_command_flags
 
 if TYPE_CHECKING:
+    from ..modeling.cost.models import ModelSpec
     from .group import GroupRequest
 
 
@@ -33,7 +33,9 @@ def operator_requirements(needs: Sequence[dict], operation: str) -> list[dict]:
     ]
 
 
-def declared_cost_demands(needs: Sequence[dict], models: Sequence[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+def declared_cost_demands(
+    needs: Sequence[dict], specifications: Sequence[ModelSpec]
+) -> tuple[list[dict], list[dict], list[dict]]:
     """Separate missing measurements from operations with no training definition.
 
     Return collectable demands, undeclared models and demands requiring a
@@ -42,9 +44,6 @@ def declared_cost_demands(needs: Sequence[dict], models: Sequence[dict]) -> tupl
     Non-operator demands keep their existing collection path.
     """
 
-    # Training declarations are external input. Reject an unsupported form
-    # before starting a capture, using the offline trainer's same contract.
-    specifications = [ModelSpec.from_raw(model) for model in models]
     collectable, undeclared, corrections = [], [], []
     for need in needs:
         if need["component"].rsplit("/", 1)[-1] in {"feature", "model"}:
@@ -230,14 +229,18 @@ def prepare_control_calibration(group: GroupRequest, demand: str, needs: Sequenc
     if operation == "prefetch_query":
         # Group admission already checks these independent manifests and their
         # environment. Re-export with current code; do not reuse old parameters.
-        for path in sorted(set(group.controls["prefetch_wait"].values())):
-            existing = load_json(require_repo_path(path))
+        waiting = {
+            measurement.path: measurement
+            for measurement in group.controls
+            if measurement.selection[0] == "prefetch_wait"
+        }
+        for _, measurement in sorted(waiting.items()):
+            existing = measurement.document
             if existing.get("cost_basis") != "paired_cpu_service" or not existing.get("cpu_service_file"):
                 continue
-            (profile,) = discover_profile_runs((require_repo_path(existing["source_manifest"]),))
             return _export_control(
                 group,
-                profile,
+                measurement.source,
                 require_repo_path(existing["cpu_service_file"]),
                 group.output_dir / "control_calibration" / "shared_query",
                 operation,
