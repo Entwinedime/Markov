@@ -408,6 +408,8 @@ load_index、load_submission、layer_wait 等按操作名声明。导出用法�
 4. 同次准备不重复尝试同一实验。已做实验仍未解决的缺口保留并停止，不按 target 分数重训或扩大实验。
 
 `prepare.py` 负责源准备与预测，`acquisition.py` 负责可选恢复；具体实验由控制、计算与物理采样模块完成。
+一次恢复会话只读取和解析一次训练请求，缺口分析与后续训练使用同一组模型定义。
+需要修改定义时重新运行 prepare；采集后的组输入和累计预算仍按实际状态更新，不冻结文件。
 补采得到的成本包由整组 target 共享，不读取 target trace 或逐格误差。更新成本包后，不沿用旧包下已经完成的预测格。
 离线训练可发布本次有依据的部分模型；未用模型缺数据不提前阻断执行，实际缺口继续明确报告。
 训练失败时保留原包并停止，不能把原文件当成本次训练成果。
@@ -702,6 +704,16 @@ Attention、metadata、dense 和通信共用 `PhaseCallPosition` 表达源请求
 一次只读导出共享同一源索引和 CPU 队列；需要切分边界的导出使用私有图并重新建立索引，
 不得将切分前的索引用于切分后的图。入库前的证据展开与准入由 Python `cost/package` 组织，
 数据库负责原子去重和持久化，CLI 只选择输入与输出。
+
+共享控制输入在使用时由组解析为 `ControlMeasurement`，保留 policy/page 选择、测量文档和源采集身份；
+准入、query 重新导出和证据分组复用这个对象，不各自重读同一文件。数据库证据与观测提取共用
+`control_entries` 遍历嵌入文档，遍历本身不读文件；公开配置与入库格式没有改变。
+
+运行时用 `HiCacheHostExpansion::append_main` 拼接局部 CPU 顺序链，返回实际生成的槽位，
+不靠固定编号连接。各执行分支仍自己声明 worker、设备流及同步等待；这个入口不查询成本。
+纯 CPU 操作共用 `cost::estimate_host_operation(..., false)` 请求 service 和 residual 两个口径，
+不把 worker 或阻塞读回成本并入其中。源构图、对应和成本提取通过 `TraceEvent::start_ns/end_ns`
+读取保留小数精度的 trace 坐标，不与预测时钟或校正后的 CPU service 混用。
 
 Python 的 target 声明由 `modeling_workflow/types.py` 中的 `TargetHiCacheConfig` 一次准入；
 源 CPU 校正的对应关系由 `modeling/source_dag/profiles.py` 处理，不依赖离线训练模块。
