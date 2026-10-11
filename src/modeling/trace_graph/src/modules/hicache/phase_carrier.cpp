@@ -18,27 +18,23 @@
 
 namespace markov::trace_graph::modules::hicache {
 
-std::string hicache_phase_carrier_synthetic_id(std::string_view request_id,
-                                               int logical_input,
-                                               std::string_view phase,
-                                               std::string_view family) {
-    return "hicache_phase_carrier:hicache_phase:" + std::string(request_id) + ":" + std::string(phase) + ":"
-           + std::to_string(logical_input) + ":" + std::string(family);
+std::string hicache_phase_carrier_synthetic_id(std::string_view request_id, int logical_input, std::string_view phase, std::string_view family) {
+    return "hicache_phase_carrier:hicache_phase:" + std::string(request_id) + ":" + std::string(phase) + ":" + std::to_string(logical_input) + ":"
+           + std::string(family);
 }
 
 namespace {
 
-using model::HiCacheDecodeWorkItem;
-using model::HiCachePhaseNodeCostPlan;
-using model::HiCachePrefillWorkItem;
+using StaticDecodeCost = cost::StaticDecodeCost;
+using StaticPhaseNodeCost = cost::StaticPhaseNodeCost;
+using StaticPrefillCost = cost::StaticPrefillCost;
 
 void add_blocker(HiCachePhaseCarrierAudit & audit, std::string blocker) {
     (void)core::checked_increment_u64(audit.blockers[std::move(blocker)], "HiCache phase-carrier blocker count exceeds uint64 range");
 }
 
 std::string phase_effect(std::string_view request_id, int logical_input, std::string_view phase, std::string_view family) {
-    return "hicache_phase:" + std::string(request_id) + ":" + std::string(phase) + ":" + std::to_string(logical_input) + ":"
-           + std::string(family);
+    return "hicache_phase:" + std::string(request_id) + ":" + std::string(phase) + ":" + std::to_string(logical_input) + ":" + std::string(family);
 }
 
 std::string carrier_id(std::string_view effect_id) { return "hicache_phase_carrier:" + std::string(effect_id); }
@@ -60,16 +56,15 @@ std::optional<size_t> ordered_node(const core::DagGraph & graph, const std::vect
     return result;
 }
 
-bool project_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan & cost, std::string_view effect_id, bool cpu,
-                  core::DagMutationPlan & plan, std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
+bool project_cost(const core::DagGraph & graph, const StaticPhaseNodeCost & cost, std::string_view effect_id, bool cpu, core::DagMutationPlan & plan,
+                  std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
     if (cost.source_duration_us == 0 && cost.predicted_duration_us != 0) {
         add_blocker(audit, "phase_operator_template_missing");
         return false;
     }
     uint64_t actual = 0;
     for (const auto node_id : cost.source_node_ids) {
-        if (node_id >= graph.node_count() || !graph.node(node_id).active || graph.node(node_id).is_cpu != cpu
-            || !owned_nodes.insert(node_id).second) {
+        if (node_id >= graph.node_count() || !graph.node(node_id).active || graph.node(node_id).is_cpu != cpu || !owned_nodes.insert(node_id).second) {
             ++audit.owner_conflict_count;
             add_blocker(audit, "phase_source_owner_invalid");
             return false;
@@ -83,9 +78,8 @@ bool project_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan &
     uint64_t cumulative = 0, assigned = 0;
     for (const auto node_id : cost.source_node_ids) {
         cumulative += graph.node(node_id).duration; // Bounded by the checked total.
-        const auto projected = cost.source_duration_us
-            ? core::floor_multiply_divide_u64(cumulative, cost.predicted_duration_us, cost.source_duration_us)
-            : std::optional<uint64_t>{0};
+        const auto projected = cost.source_duration_us ? core::floor_multiply_divide_u64(cumulative, cost.predicted_duration_us, cost.source_duration_us)
+                                                       : std::optional<uint64_t>{ 0 };
         if (!projected) {
             add_blocker(audit, "phase_projection_overflow");
             return false;
@@ -103,23 +97,21 @@ bool project_cost(const core::DagGraph & graph, const HiCachePhaseNodeCostPlan &
     return true;
 }
 
-bool project_decode_kernels(const core::DagGraph& graph, const HiCacheDecodeWorkItem& decode,
-                            core::DagMutationPlan& plan, std::set<size_t>& owned_nodes, HiCachePhaseCarrierAudit& audit) {
-    const auto& total = decode.kernel_cost;
-    if (decode.source_paged_attention_duration_us > total.source_duration_us
-        || decode.predicted_paged_attention_duration_us > total.predicted_duration_us) {
+bool project_decode_kernels(const core::DagGraph & graph, const StaticDecodeCost & decode, core::DagMutationPlan & plan, std::set<size_t> & owned_nodes,
+                            HiCachePhaseCarrierAudit & audit) {
+    const auto & total = decode.kernel_cost;
+    if (decode.source_paged_attention_duration_us > total.source_duration_us || decode.predicted_paged_attention_duration_us > total.predicted_duration_us) {
         add_blocker(audit, "decode_attention_exceeds_kernel_cost");
         return false;
     }
-    HiCachePhaseNodeCostPlan attention{decode.source_paged_attention_duration_us, decode.predicted_paged_attention_duration_us, {}};
-    HiCachePhaseNodeCostPlan common{total.source_duration_us - attention.source_duration_us,
-                                   total.predicted_duration_us - attention.predicted_duration_us, {}};
+    StaticPhaseNodeCost attention{ decode.source_paged_attention_duration_us, decode.predicted_paged_attention_duration_us, {} };
+    StaticPhaseNodeCost common{ total.source_duration_us - attention.source_duration_us, total.predicted_duration_us - attention.predicted_duration_us, {} };
     for (const auto id : total.source_node_ids) {
         if (id >= graph.node_count()) {
             add_blocker(audit, "phase_source_owner_invalid");
             return false;
         }
-        auto& family = is_hicache_paged_attention(graph.event_for_node(id).name) ? attention : common;
+        auto & family = is_hicache_paged_attention(graph.event_for_node(id).name) ? attention : common;
         family.source_node_ids.push_back(id);
     }
     // Keep the existing aggregate effect identity, but never spread attention
@@ -130,7 +122,7 @@ bool project_decode_kernels(const core::DagGraph& graph, const HiCacheDecodeWork
 }
 
 struct CarrierRecord {
-    const HiCachePrefillWorkItem * prefill = nullptr;
+    const StaticPrefillCost * prefill = nullptr;
     uint64_t order_ts = 0;
     std::string prefill_start;
     std::string prefill_complete;
@@ -138,9 +130,8 @@ struct CarrierRecord {
     std::string decode_complete;
 };
 
-void append_boundary_node(core::DagMutationPlan & plan, std::string_view synthetic_id, std::string_view effect_id,
-                         std::string_view request_id, int logical_input, std::string_view phase, std::string_view family,
-                         bool endpoint, HiCachePhaseCarrierAudit & audit) {
+void append_boundary_node(core::DagMutationPlan & plan, std::string_view synthetic_id, std::string_view effect_id, std::string_view request_id,
+                          int logical_input, std::string_view phase, std::string_view family, bool endpoint, HiCachePhaseCarrierAudit & audit) {
     plan.synthetic_nodes.push_back(core::DagSyntheticNodeMutation{
         .synthetic_id = std::string(synthetic_id),
         .node = core::DagSyntheticNodeSpec{
@@ -163,8 +154,8 @@ void append_boundary_node(core::DagMutationPlan & plan, std::string_view synthet
     ++audit.synthetic_carrier_count;
 }
 
-void append_edge(core::DagMutationPlan & plan, core::DagNodeRef src, core::DagNodeRef dst, std::string effect_id,
-                 std::string reason, HiCachePhaseCarrierAudit & audit) {
+void append_edge(core::DagMutationPlan & plan, core::DagNodeRef src, core::DagNodeRef dst, std::string effect_id, std::string reason,
+                 HiCachePhaseCarrierAudit & audit) {
     plan.add_edges.push_back(core::DagAddEdgeMutation{
         .src = std::move(src),
         .dst = std::move(dst),
@@ -175,11 +166,10 @@ void append_edge(core::DagMutationPlan & plan, core::DagNodeRef src, core::DagNo
     ++audit.dependency_count;
 }
 
-bool project_operators(const core::DagGraph & graph, const HiCachePrefillWorkItem & prefill, const HiCacheDecodeWorkItem & decode,
-                       core::DagMutationPlan & plan, std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
-    const auto project = [&](const HiCachePhaseNodeCostPlan& cost, std::string_view phase, std::string_view family, bool cpu = false) {
-        return project_cost(graph, cost, phase_effect(prefill.request_id, prefill.logical_input, phase, family),
-                            cpu, plan, owned_nodes, audit);
+bool project_operators(const core::DagGraph & graph, const StaticPrefillCost & prefill, const StaticDecodeCost & decode, core::DagMutationPlan & plan,
+                       std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit) {
+    const auto project = [&](const StaticPhaseNodeCost & cost, std::string_view phase, std::string_view family, bool cpu = false) {
+        return project_cost(graph, cost, phase_effect(prefill.request_id, prefill.logical_input, phase, family), cpu, plan, owned_nodes, audit);
     };
     bool ready = project(prefill.submit_cost, "prefill", "submit", true);
     ready = project(decode.submit_cost, "decode", "submit", true) && ready;
@@ -191,9 +181,8 @@ bool project_operators(const core::DagGraph & graph, const HiCachePrefillWorkIte
     return ready;
 }
 
-bool append_record(const core::DagGraph & graph, const HiCachePrefillWorkItem & prefill, const HiCacheDecodeWorkItem & decode,
-                   core::DagMutationPlan & plan, std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit,
-                   CarrierRecord & record) {
+bool append_record(const core::DagGraph & graph, const StaticPrefillCost & prefill, const StaticDecodeCost & decode, core::DagMutationPlan & plan,
+                   std::set<size_t> & owned_nodes, HiCachePhaseCarrierAudit & audit, CarrierRecord & record) {
     const auto first_prefill = ordered_node(graph, prefill.submit_cost.source_node_ids, false);
     const auto last_prefill = ordered_node(graph, prefill.submit_cost.source_node_ids, true);
     const auto first_decode = ordered_node(graph, decode.submit_cost.source_node_ids, false);
@@ -212,28 +201,35 @@ bool append_record(const core::DagGraph & graph, const HiCachePrefillWorkItem & 
         .decode_start = carrier_id(phase_effect(decode.request_id, decode.logical_input, "decode", "start")),
         .decode_complete = carrier_id(phase_effect(decode.request_id, decode.logical_input, "decode", "complete")),
     };
-    const auto boundaries = [&](std::string_view phase, const std::string& start, const std::string& complete,
-                                size_t first, size_t last,
-                                std::initializer_list<const HiCachePhaseNodeCostPlan*> families) {
+    const auto boundaries = [&](std::string_view phase,
+                                const std::string & start,
+                                const std::string & complete,
+                                size_t first,
+                                size_t last,
+                                std::initializer_list<const StaticPhaseNodeCost *>
+                                    families) {
         const auto boundary_effect = phase_effect(prefill.request_id, prefill.logical_input, phase, "boundary");
         append_boundary_node(plan, start, boundary_effect, prefill.request_id, prefill.logical_input, phase, "start", false, audit);
         append_boundary_node(plan, complete, boundary_effect, prefill.request_id, prefill.logical_input, phase, "complete", true, audit);
         const auto connect = [&](core::DagNodeRef from, core::DagNodeRef to) {
-            append_edge(plan, std::move(from), std::move(to), boundary_effect,
-                        "phase boundary connects work without relocating its execution cost", audit);
+            append_edge(plan, std::move(from), std::move(to), boundary_effect, "phase boundary connects work without relocating its execution cost", audit);
         };
         connect(core::DagNodeRef::existing(first), core::DagNodeRef::synthetic(start));
         connect(core::DagNodeRef::synthetic(start), core::DagNodeRef::synthetic(complete));
         connect(core::DagNodeRef::existing(last), core::DagNodeRef::synthetic(complete));
-        for (const auto* cost : families) for (const auto id : cost->source_node_ids) {
-            connect(core::DagNodeRef::synthetic(start), core::DagNodeRef::existing(id));
-            connect(core::DagNodeRef::existing(id), core::DagNodeRef::synthetic(complete));
-        }
+        for (const auto * cost : families)
+            for (const auto id : cost->source_node_ids) {
+                connect(core::DagNodeRef::synthetic(start), core::DagNodeRef::existing(id));
+                connect(core::DagNodeRef::existing(id), core::DagNodeRef::synthetic(complete));
+            }
     };
-    boundaries("prefill", record.prefill_start, record.prefill_complete, *first_prefill, *last_prefill,
-               {&prefill.common_kernel_cost, &prefill.prefix_attention_cost, &prefill.collective_cost});
-    boundaries("decode", record.decode_start, record.decode_complete, *first_decode, *last_decode,
-               {&decode.kernel_cost, &decode.collective_cost});
+    boundaries("prefill",
+               record.prefill_start,
+               record.prefill_complete,
+               *first_prefill,
+               *last_prefill,
+               { &prefill.common_kernel_cost, &prefill.prefix_attention_cost, &prefill.collective_cost });
+    boundaries("decode", record.decode_start, record.decode_complete, *first_decode, *last_decode, { &decode.kernel_cost, &decode.collective_cost });
     // CPU preparation may overlap prior device work. Original stream and sync
     // edges, not a whole-Prefill-to-first-Decode-submit edge, constrain execution.
     return true;
@@ -241,27 +237,8 @@ bool append_record(const core::DagGraph & graph, const HiCachePrefillWorkItem & 
 
 } // namespace
 
-HiCachePhaseCarrierAudit append_hicache_phase_operator_costs(const core::DagGraph & graph,
-    const model::HiCachePrefillWorkItem & prefill, const model::HiCacheDecodeWorkItem & decode, core::DagMutationPlan & plan) {
-    HiCachePhaseCarrierAudit audit;
-    if (std::tie(prefill.pid, prefill.request_id, prefill.logical_input) != std::tie(decode.pid, decode.request_id, decode.logical_input)) {
-        add_blocker(audit, "decode_request_rank_missing");
-    } else if (prefill.common_kernel_cost.source_node_ids.empty() || prefill.collective_cost.source_node_ids.empty()
-               || prefill.submit_cost.source_node_ids.empty() || decode.kernel_cost.source_node_ids.empty()
-               || decode.collective_cost.source_node_ids.empty() || decode.submit_cost.source_node_ids.empty()) {
-        add_blocker(audit, "source_phase_cost_nodes_missing");
-    } else {
-        std::set<size_t> owned;
-        for (const auto & update : plan.set_node_durations) owned.insert(update.node_id);
-        if (project_operators(graph, prefill, decode, plan, owned, audit)) audit.request_count = audit.request_rank_count = 1;
-    }
-    audit.status = audit.blockers.empty() && audit.owner_conflict_count == 0 ? "ready" : "blocked";
-    return audit;
-}
-
-HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph,
-                                                            const model::HiCachePhaseWorkLedger & phase_work,
-                                                            core::DagMutationPlan & plan) {
+HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const cost::StaticPhaseCosts & phase_work,
+                                                           core::DagMutationPlan & plan) {
     HiCachePhaseCarrierAudit audit;
     if (phase_work.status != "ready" || phase_work.cost_status != "ready") {
         add_blocker(audit, "phase_work_or_cost_not_ready");
@@ -269,7 +246,7 @@ HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph 
         return audit;
     }
     using RequestKey = std::pair<std::string, std::string>;
-    std::map<RequestKey, const HiCacheDecodeWorkItem *> decodes;
+    std::map<RequestKey, const StaticDecodeCost *> decodes;
     for (const auto & decode : phase_work.decodes) {
         if (!decodes.emplace(RequestKey{ decode.pid, decode.request_id }, &decode).second) add_blocker(audit, "duplicate_decode_request_rank");
     }
@@ -308,8 +285,7 @@ HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph 
         else group->push_back(&record);
     }
     std::ranges::sort(request_groups, [](const auto & left, const auto & right) {
-        return std::ranges::min(left, {}, &CarrierRecord::order_ts)->order_ts
-               < std::ranges::min(right, {}, &CarrierRecord::order_ts)->order_ts;
+        return std::ranges::min(left, {}, &CarrierRecord::order_ts)->order_ts < std::ranges::min(right, {}, &CarrierRecord::order_ts)->order_ts;
     });
     audit.request_count = request_groups.size();
     for (size_t index = 1; index < request_groups.size(); ++index) {

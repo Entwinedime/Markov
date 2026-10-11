@@ -173,6 +173,8 @@ bool lookup_json_arg(std::string_view raw_args, std::string_view key, std::strin
 
 TraceEvent::TraceEvent(const TraceEvent & other)
     : index(other.index),
+      source_record_offset(other.source_record_offset),
+      source_record_file(other.source_record_file),
       source_channel(other.source_channel),
       event_id(other.event_id),
       name(other.name),

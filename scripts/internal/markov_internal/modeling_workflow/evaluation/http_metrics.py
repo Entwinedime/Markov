@@ -96,6 +96,7 @@ def http_metrics(rows: list[dict]) -> dict:
     values = [row["full_e2e"] for row in rows if row.get("full_e2e", {}).get("ready") is True]
     total = sum(item["target_us"] for item in values)
     absolute = sum(item["absolute_error_us"] for item in values)
+    signed = sum(item["signed_error_us"] for item in values)
     base_error = sum(item["base_absolute_error_us"] for item in values)
     apes = sorted(item["ape"] for item in values)
     cross = [row["full_e2e"] for row in rows if not row["is_self"] and row.get("full_e2e", {}).get("ready") is True]
@@ -114,6 +115,11 @@ def http_metrics(rows: list[dict]) -> dict:
         ],
         "wape": absolute / total if total else None,
         "p90_ape": apes[math.ceil(0.9 * len(apes)) - 1] if apes else None,
+        "max_ape": apes[-1] if apes else None,
+        "signed_error_us": signed,
+        "weighted_signed_error": signed / total if total else None,
+        "mean_signed_error_us": signed / len(values) if values else None,
+        "bias_convention": "prediction minus measurement; positive means overprediction",
         "absolute_error_us": absolute,
         "target_total_us": total,
         "base_wall_wape": base_error / total if total else None,
@@ -133,6 +139,28 @@ def http_metrics(rows: list[dict]) -> dict:
             if row.get("full_e2e", {}).get("ready") and row["full_e2e"]["ape"] > 0.05
         ],
     }
+
+
+def cost_query_domain(prediction: dict) -> str:
+    """Classify recorded operator queries, not all costs or prediction confidence.
+
+    An outside coordinate takes precedence over an unseen joint work point.
+    Missing query evidence is distinct from an explicitly empty query set.
+    """
+
+    report = prediction.get("independent_operator_queries")
+    if report is None:
+        return "not_recorded"
+
+    queries = report["rows"]
+    if not queries:
+        return "no_independent_operator_queries"
+    if any(row["outside_range_queries"] for row in queries):
+        return "outside_measured_ranges"
+    if any(row["unseen_combination_queries"] for row in queries):
+        return "within_ranges_unseen_combination"
+
+    return "measured_operator_query_points"
 
 
 def http_gates(metrics: dict) -> dict[str, bool]:

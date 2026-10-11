@@ -1,8 +1,13 @@
-#include "markov/trace_graph/modules/hicache/missing_cost.hpp"
+#include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/hicache_release.hpp"
+#include "markov/trace_graph/cost/missing_evidence.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -19,7 +24,9 @@ void HiCacheWriteCalls::bind_capacity_calls(const patch::HiCacheSourceDagIndex &
         for (const auto node : plan.resource_nodes()) add(node);
         return result;
     };
-    for (const auto & [id, donor] : templates_) (void)lanes(donor.expansion, donor.pid, donor.tid);
+    for (const auto & [key, resources] : write_resources_) {
+        for (const auto node : { resources.compute, resources.transfer }) samples[key].emplace(graph.node(node).lane_id, node);
+    }
     for (auto & donor : eviction_controls_) donor.position_lanes = lanes(donor.expansion, donor.pid, donor.tid);
     for (const auto & guard : capacity_guards_) {
         const bool existing = std::ranges::any_of(source.fact_nodes(), [&](const auto & fact) {
@@ -55,13 +62,7 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
     if (!work->rejected_candidates.empty()) {
         std::string reasons;
         for (const auto & rejected : work->rejected_candidates) {
-            if (rejected.reason == "locked_node" && locked_candidate_us_) continue;
-            if (rejected.reason == "locked_node")
-                throw MissingCostEvidence("execution_control/eviction_locked_candidate",
-                                          {
-                                              { "heap_size", rejected.heap_size }
-                },
-                                          "Target eviction needs heap-pop and locked-candidate check CPU cost");
+            if (rejected.reason == "locked_node") continue;
             reasons += " [" + rejected.reason + " node=" + std::to_string(rejected.node) + " before_victim=" + std::to_string(rejected.before_victim) + "]";
         }
         if (!reasons.empty())
@@ -70,117 +71,84 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
     }
     using Kind = HiCacheEvictionRegion::Kind;
     const auto queued = replay_.state().unacknowledged_device_writes(fact);
-    const auto control_samples = [&] {
-        std::vector<EvictionControlCostSample> samples;
-        for (const auto & donor : eviction_controls_) {
-            const auto & plan = donor.expansion;
-            if (donor.pid != call.pid || donor.tid != call.tid || donor.region.kind != Kind::Control || !plan.streams.empty() || !plan.waits.empty()
-                || !plan.event_waits.empty() || std::ranges::any_of(plan.nodes, [&](const auto & node) {
-                       return !node.work.is_cpu || node.submission.has_value() || node.work.lane_key != call.lane;
-                   }))
-                continue;
-            EvictionControlCostSample sample{ donor.region.control_phase };
-            sample.independent = donor.independent;
-            for (const auto & node : plan.nodes) {
-                sample.cpu_us += node.work.duration;
-                sample.residual_us += node.work.cpu_gap_after;
-            }
-            samples.push_back(sample);
-        }
-        return samples;
-    }();
+    const auto predict_control = [&](std::string operation, std::string implementation, std::string timing_scope) {
+        const structure::OperationWork work{
+            .component = "hicache_io_control",
+            .operation = std::move(operation),
+            .implementation = std::move(implementation),
+            .timing_scope = std::move(timing_scope),
+        };
+        return operator_provider_.estimate(work).duration_us;
+    };
     EvictionControl calibrated{};
+    std::vector<size_t> acknowledgement_slots;
+    auto release_buffer_pages = work->release_buffer_pages;
     const auto select_host = [&](const HiCacheEvictionStep & step) -> const EvictionControl & {
         if (step.kind == Kind::Control) {
-            const auto cost = estimate_eviction_control_cost(control_samples, step.control_phase);
-            if (!cost)
-                throw MissingCostEvidence("execution_control/eviction_control",
-                                          {
-                                              { "phase", static_cast<int>(step.control_phase) }
-                },
-                                          "Target eviction control has no base or independent CPU cost evidence");
+            calibrated.expansion = generate_cpu_control(call.lane, "target eviction control");
+            const auto implementation = eviction_control_name(step.control_phase);
+            const auto cpu_us = predict_control("eviction.control", implementation, "cpu_service");
+            // Residual intervals have separate observations and models. They
+            // are a measured approximation, not additional CPU execution.
+            const auto residual_us = predict_control("eviction.control", implementation, "residual_interval");
             auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
-            calibrated.expansion = generated_cpu_control(call.lane,
-                                                         cost->cpu_us,
-                                                         cost->residual_us,
-                                                         remainder,
-                                                         cost->independent          ? "target eviction control: shared estimate"
-                                                         : cost->phase_extrapolated ? "target eviction control: pooled base estimate"
-                                                                                    : "target eviction control: base phase estimate");
+            bind_cpu_control(calibrated.expansion, cpu_us, residual_us, remainder);
             calibrated.position_lanes.clear();
             ++generated_control_steps_;
-            phase_extrapolated_control_steps_ += cost->phase_extrapolated;
             return calibrated;
         }
         if (step.kind == Kind::BlockingCheck) {
-            const auto proxy = estimate_eviction_control_cost(control_samples, HiCacheEvictionRegion::ControlPhase::None);
-            if ((!queued.empty() && !proxy) || (!empty_write_check_us_ && !proxy))
-                throw MissingCostEvidence("execution_control/write_completion_check",
-                                          {
-                                              { "queued_writes", queued.size() }
-                },
-                                          "Target blocking check has no CPU cost evidence");
-            const auto entry = empty_write_check_us_ ? *empty_write_check_us_ : proxy->cpu_us;
-            auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
-            calibrated.expansion = generated_completion_check(call.lane,
-                                                              queued.size(),
-                                                              entry,
-                                                              empty_write_check_us_ ? 0 : proxy->residual_us,
-                                                              proxy ? proxy->cpu_us : 0,
-                                                              proxy ? proxy->residual_us : 0,
-                                                              remainder);
+            std::vector<structure::hicache::WriteConfirmationBatch> batches;
+            for (const auto & write : queued) {
+                // Publication work follows target radix splits, not the size
+                // or template of an observed source acknowledgement.
+                const auto tokens = core::checked_multiply_u64(write.header.pages.size(), page_size_, "Write acknowledgement token count overflow");
+                batches.push_back({ tokens, write.published_nodes });
+            }
+            const auto program = structure::hicache::write_confirmation_program(batches, true);
+            const auto & resources = write_resources_.at({ call.pid, call.tid });
+            auto generated = generate_write_confirmation(*graph_, call.entry_node, resources.worker, program);
+            bind_write_confirmation(generated, program, operator_provider_);
+            calibrated.expansion = std::move(generated.plan);
+            acknowledgement_slots = std::move(generated.acknowledgements);
             calibrated.position_lanes.clear();
             ++generated_blocking_checks_;
-            blocking_check_cost_extrapolations_ += !queued.empty() || !empty_write_check_us_;
-            if (queued.empty() && empty_write_check_us_) {
-                ++calibrated_empty_checks_;
-                calibrated_empty_check_cpu_us_ += calibrated.expansion.nodes.front().work.duration;
-            }
             return calibrated;
         }
         if (step.kind == Kind::SkipLocked) {
-            auto & remainder = locked_candidate_remainder_us_[{ call.pid, call.tid }];
-            const auto cost = locked_candidate_cost(step.heap_size, *locked_candidate_us_, locked_candidate_log2_heap_us_);
-            calibrated.expansion = calibrated_cpu_control(call.lane, cost, remainder, "locked eviction candidate");
+            calibrated.expansion = generate_cpu_control(call.lane, "target locked eviction candidate");
+            const structure::OperationWork primitive{
+                "hicache_io_control",
+                "eviction.locked_candidate",
+                "lru_heap",
+                "thread_cpu_service",
+                { { "pop_count", 1.0 }, { "sum_log2_heap", std::log2(static_cast<double>(step.heap_size)) } }
+            };
+            const auto cpu_us = operator_provider_.estimate(primitive).duration_us;
+            auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
+            // The isolated primitive measures thread CPU only. It is not a
+            // calibration of scheduler delay or an entire eviction envelope.
+            bind_cpu_control(calibrated.expansion, cpu_us, 0, remainder);
+            calibrated.position_lanes.clear();
             return calibrated;
         }
-        std::vector<const EvictionControl *> candidates;
-        uint64_t nearest = 0;
-        const bool release = step.kind == Kind::ReleaseBackup || step.kind == Kind::ReleaseRegular;
-        const auto tokens = release ? work->victims.at(*step.victim).page_count * page_size_ : 0;
-        for (const auto & donor : eviction_controls_) {
-            if (donor.pid != call.pid || donor.tid != call.tid || donor.region.kind != step.kind || donor.region.control_phase != step.control_phase) continue;
-            if (!donor.expansion.event_waits.empty()) continue;
-            if (release && !donor.region.released_tokens) continue;
-            const auto observed = donor.region.released_tokens;
-            const auto distance = release ? (tokens > observed ? tokens - observed : observed - tokens) : 0;
-            if (!candidates.empty() && !candidates.front()->independent && donor.independent) continue;
-            if (candidates.empty() || (candidates.front()->independent && !donor.independent) || distance < nearest) {
-                candidates.clear();
-                nearest = distance;
-            }
-            if (distance == nearest) candidates.push_back(&donor);
+        if (step.kind == Kind::ReleaseBackup || step.kind == Kind::ReleaseRegular) {
+            const auto pages = work->victims.at(*step.victim).page_count;
+            const auto & resources = write_resources_.at({ call.pid, call.tid });
+            auto generated = generate_paged_release(*graph_, call.entry_node, resources.worker, resources.compute, page_size_ > 1);
+            const auto costs = cost::estimate_paged_release(operator_provider_,
+                                                            pages,
+                                                            page_size_,
+                                                            release_buffer_pages,
+                                                            step.kind == Kind::ReleaseBackup,
+                                                            allocator_need_sort_);
+            bind_paged_release(generated, costs);
+            calibrated.expansion = std::move(generated.plan);
+            calibrated.position_lanes = calibrated.expansion.resource_lanes(*graph_);
+            release_buffer_pages = core::checked_add_u64(release_buffer_pages, pages, "Target release buffer overflow");
+            return calibrated;
         }
-        if (candidates.empty() && release)
-            throw MissingCostEvidence(step.kind == Kind::ReleaseRegular ? "execution_control/release_regular" : "execution_control/release_backup",
-                                      {
-                                          { "released_tokens",     tokens },
-                                          {       "page_size", page_size_ }
-            },
-                                      "Target release needs same-operation CPU/device work with allocator dependencies, from base or shared calibration");
-        if (candidates.empty())
-            throw std::runtime_error("Target capacity step lacks a same-thread base template: kind=" + std::to_string(static_cast<int>(step.kind))
-                                     + " phase=" + std::to_string(static_cast<int>(step.control_phase)) + " tokens=" + std::to_string(tokens)
-                                     + " queued_writes=" + std::to_string(queued.size())
-                                     + " preceding_kind=" + (step.preceding_kind ? std::to_string(static_cast<int>(*step.preceding_kind)) : "none"));
-        const auto service = [](const EvictionControl * donor) {
-            uint64_t total = 0;
-            for (const auto & node : donor->expansion.nodes)
-                if (node.work.is_cpu) total += node.work.duration + node.work.cpu_gap_after;
-            return total;
-        };
-        std::ranges::stable_sort(candidates, {}, service);
-        return *candidates[candidates.size() / 2];
+        throw std::logic_error("Unsupported target eviction step");
     };
     const auto check_positions = [&](std::span<const size_t> lanes) {
         for (const auto lane : lanes) {
@@ -205,7 +173,7 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             const auto operation =
                 std::ranges::find_if(queued, [&](const auto & write) { return write.node == victim && write.header.source_node_id == call.owner; });
             if (operation == queued.end()) throw std::runtime_error("Selected target victim has no queued write");
-            const auto & donor = select_write_template(call.pid, call.tid, operation->schedule.effective_byte_count);
+            const auto & donor = write_resources_.at({ call.pid, call.tid });
             check_positions(donor.position_lanes);
             const auto expanded = submit_target_write(donor, fact, *operation, sequence, future);
             last = expanded.host_return;
@@ -222,7 +190,8 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
                 }
             const auto expanded = sequence.append(donor.expansion, donor.position_lanes, events);
             last = expanded.host_return;
-            if (step.kind == Kind::BlockingCheck) capacity_ack_.emplace(*last, call.owner);
+            if (step.kind == Kind::BlockingCheck)
+                for (const auto slot : acknowledgement_slots) capacity_ack_.emplace(expanded.nodes.at(slot), call.owner);
         }
     }
     if (!last) throw std::logic_error("Capacity sequence has no return");

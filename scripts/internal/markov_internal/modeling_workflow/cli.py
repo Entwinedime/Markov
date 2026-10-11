@@ -6,10 +6,12 @@ import argparse
 from pathlib import Path
 
 from ..common.commands import positive_int
+from ..common.io import load_json
 from ..common.paths import require_repo_path
-from .context import DiagnosticLevel, WorkflowOptions, cpu_service_inputs
-from .io_model import HiCacheIoModel
-from .planning.target_configs import load_target_configs
+from ..modeling.cost.hicache import HiCacheIoModel
+from ..modeling.cost.package import cpu_service_inputs
+from .context import DiagnosticLevel, WorkflowOptions
+from .structure.target_configs import load_target_configs
 from .workflow import run_workflow
 
 
@@ -49,12 +51,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Same-base CPU service intervals; repeat for distinct source manifests.",
     )
     model_inputs.add_argument(
-        "--hicache-io-model",
+        "--cost-model",
         type=Path,
-        help="Explicit compact one-base HiCache model JSON.",
+        required=True,
+        help="Offline-trained database cost package; the current base is not fitted online.",
+    )
+    model_inputs.add_argument(
+        "--resource-environment",
+        type=Path,
+        help="explicit resource declaration for historical bases lacking recorded hardware/runtime metadata",
     )
 
     artifacts = parser.add_argument_group("artifacts and diagnostics")
+    artifacts.add_argument(
+        "--experiment-reports",
+        action="store_true",
+        help="Retain source replay and executed structure evidence for independent evaluation",
+    )
     artifacts.add_argument(
         "--diagnostics",
         default=DiagnosticLevel.OFF.value,
@@ -74,12 +87,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum model-run subprocesses to execute concurrently.",
     )
     args = parser.parse_args(argv)
+    trained = load_json(require_repo_path(args.cost_model))
     sources = tuple(require_repo_path(path).resolve() for path in args.source_manifest)
     output = (
         require_repo_path(args.output_dir)
         if args.output_dir
         else require_repo_path(args.source_manifest[0]).parent / "modeling" / "hicache_prediction"
     )
+    numerical = {**trained["hicache"], "operator_models": trained["operator_models"]}
+    io_model = HiCacheIoModel.from_raw(numerical)
+
     options = WorkflowOptions(
         source_manifests=sources,
         cpu_service_costs=cpu_service_inputs(args.cpu_service_cost, sources),
@@ -91,7 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         trace_threads=args.trace_threads,
         trace_file_threads=args.trace_file_threads,
         model_run_jobs=args.model_run_jobs,
-        hicache_io_model=HiCacheIoModel.load(args.hicache_io_model) if args.hicache_io_model else None,
+        hicache_io_model=io_model,
+        cost_deployment=trained["deployment"],
+        cost_sources=tuple(trained["training_sources"]),
+        cost_source_manifests=tuple(require_repo_path(path).resolve() for path in trained["training_source_manifests"]),
+        source_resources=load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
+        experiment_reports=args.experiment_reports,
     )
     return run_workflow(options)
 

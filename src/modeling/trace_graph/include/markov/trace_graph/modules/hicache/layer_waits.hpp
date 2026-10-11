@@ -32,7 +32,10 @@ struct HiCacheLayerWaitObservation {
     std::unordered_set<size_t> device_wait_node_ids;
 };
 
-/** Boundaries are observations only; this function never changes graph costs. */
+/** Boundaries are observations only; this function never changes graph costs.
+ * Opening-cut batch context is not admitted as a remodelable forward; its
+ * selected executable tail remains in the source DAG.
+ */
 HiCacheLayerWaitObservation observe_hicache_layer_waits(const patch::HiCacheSourceDagIndex & source);
 
 } // namespace markov::trace_graph::modules::hicache

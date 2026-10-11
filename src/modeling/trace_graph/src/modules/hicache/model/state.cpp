@@ -18,9 +18,14 @@
 namespace markov::trace_graph::modules::hicache::model {
 
 using core::DagGraph;
-using frontend::HiCacheConfig;
-
-HiCacheState::HiCacheState(HiCacheConfig config) : config_(std::move(config)), pager_(config_), policy_(config_) {}
+HiCacheState::HiCacheState(frontend::HiCacheRules rules, structure::hicache::IoCompletionProvider completion, uint64_t storage_batch_pages,
+                           frontend::HiCacheIoResourceLanesConfig resource_lanes)
+    : config_(std::move(rules)),
+      static_io_completion_(std::move(completion)),
+      storage_batch_pages_(storage_batch_pages),
+      resource_lanes_(resource_lanes),
+      pager_(config_),
+      policy_(config_) {}
 
 std::string HiCacheState::normalized_scope(const HiCacheFact & fact) const { return fact.cache_scope.empty() ? std::string("-1") : fact.cache_scope; }
 
@@ -54,14 +59,19 @@ void HiCacheState::register_prefetch_control_boundary(const HiCacheFact & fact) 
 
 void HiCacheState::begin_formal_window(bool execution_prefetch_control) {
     execution_prefetch_control_ = execution_prefetch_control;
-    prefetch_lane_queue_.clear();
+    storage_submissions_.clear();
+    // Only the retained static/prelude replay owns a projected I/O clock.
+    // Formal execution receives completion events from the DAG executor.
+    if (execution_prefetch_control) static_io_completion_ = {};
     formal_window_active_ = true;
     formal_boundary_seen_ = true;
     prefetch_control_boundaries_.clear();
     for (auto & scope : scopes_ | std::views::values) {
         scope.eviction_work.clear();
         scope.load_admission_work.clear();
-        scope.requests.clear();
+        // HTTP completion can precede the scheduler's final cache insertion.
+        // Keep request-owned KV across the measurement cut; the remaining
+        // lifecycle releases it. Finished requests have already erased themselves.
         scope.pending_write_through_backups.clear();
         scope.pending_loadbacks.clear();
         scope.load_ack_queue.clear();

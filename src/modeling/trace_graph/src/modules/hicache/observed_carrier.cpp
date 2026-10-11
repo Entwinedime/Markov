@@ -29,17 +29,10 @@ using patch::HiCacheIoOperationKind;
 using patch::HiCacheIoOperationLedger;
 using patch::HiCacheIoOperationRecord;
 
-model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationAudit & observed) {
+cost::StaticPhaseCosts observed_phase_costs(const core::DagGraph & graph, const HiCachePhaseObservationAudit & observed) {
     model::HiCachePhaseWorkLedger work;
     for (const auto & row : observed.observations) {
         if (row.request_ids.size() != 1) continue;
-        const auto cost = [](uint64_t duration, const std::vector<size_t> & nodes) {
-            return model::HiCachePhaseNodeCostPlan{
-                .source_duration_us = duration,
-                .predicted_duration_us = duration,
-                .source_node_ids = nodes,
-            };
-        };
         work.prefills.push_back(model::HiCachePrefillWorkItem{
             .logical_input = row.logical_input,
             .pid = row.pid,
@@ -47,12 +40,10 @@ model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationA
             .batch_size = row.batch_size,
             .prompt_token_count = row.prompt_token_count,
             .prefill_token_count = row.prefill_token_count,
-            .source_prefill_token_count = row.prefill_token_count,
-            .common_kernel_cost = cost(row.prefill_common_kernel_duration_us, row.prefill_common_kernel_node_ids),
-            .prefix_attention_cost = cost(row.prefill_prefix_attention_duration_us, row.prefill_prefix_attention_node_ids),
-            .collective_cost = cost(row.prefill.collective_duration_us, row.prefill.collective_node_ids),
-            .submit_cost = cost(row.prefill.submit_cpu_duration_us, row.prefill.submit_cpu_node_ids),
-            .feature_covered = true,
+            .common_kernel_nodes = row.prefill_common_kernel_node_ids,
+            .prefix_attention_nodes = row.prefill_prefix_attention_node_ids,
+            .collective_nodes = row.prefill.collective_node_ids,
+            .submit_nodes = row.prefill.submit_cpu_node_ids,
         });
         work.decodes.push_back(model::HiCacheDecodeWorkItem{
             .logical_input = row.logical_input,
@@ -61,19 +52,15 @@ model::HiCachePhaseWorkLedger observed_phase_work(const HiCachePhaseObservationA
             .prompt_token_count = row.prompt_token_count,
             .target_page_size = row.source_page_size,
             .iteration_count = row.decode_iteration_count,
-            .source_paged_attention_duration_us = hicache_paged_attention_duration(row.decode.kernel_families),
-            .predicted_paged_attention_duration_us = hicache_paged_attention_duration(row.decode.kernel_families),
-            .kernel_cost = cost(row.decode.kernel_duration_us, row.decode_kernel_node_ids),
-            .collective_cost = cost(row.decode.collective_duration_us, row.decode.collective_node_ids),
-            .submit_cost = cost(row.decode.submit_cpu_duration_us, row.decode.submit_cpu_node_ids),
-            .feature_covered = true,
+            .kernel_nodes = row.decode_kernel_node_ids,
+            .collective_nodes = row.decode.collective_node_ids,
+            .submit_nodes = row.decode.submit_cpu_node_ids,
         });
     }
     work.prefill_status = work.prefills.size() == observed.observations.size() ? "ready" : "not_ready";
     work.decode_status = work.decodes.size() == work.prefills.size() ? "ready" : "not_ready";
-    work.cost_status = work.prefill_status == "ready" && work.decode_status == "ready" ? "ready" : "not_ready";
-    work.status = observed.ready() && work.cost_status == "ready" ? "ready" : "not_ready";
-    return work;
+    work.status = observed.ready() && work.prefill_status == "ready" && work.decode_status == "ready" ? "ready" : "not_ready";
+    return cost::observed_static_phase_costs(graph, work);
 }
 
 void add_blocker(DirectAudit & audit, std::string blocker) {
@@ -204,8 +191,8 @@ bool append_prefetch(const core::DagGraph & graph, const HiCacheIoOperationRecor
     return true;
 }
 
-DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCacheIoOperationLedger & operations,
-                                        const model::HiCachePhaseWorkLedger & phase_work, core::DagMutationPlan & plan) {
+DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCacheIoOperationLedger & operations, const cost::StaticPhaseCosts & phase_work,
+                                        core::DagMutationPlan & plan) {
     DirectAudit audit;
     audit.observed_operation_count = operations.records.size();
     std::vector<CanonicalPrefetch> prefetched;
@@ -240,7 +227,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
     using RequestKey = std::pair<std::string, std::string>;
     std::map<RequestKey, const CanonicalPrefetch *> prefetch_by_request_rank;
     for (const auto & prefetch : prefetched) prefetch_by_request_rank.emplace(RequestKey{ prefetch.operation->pid, prefetch.operation->request_id }, &prefetch);
-    std::map<RequestKey, const model::HiCachePrefillWorkItem *> prefill_by_request_rank;
+    std::map<RequestKey, const cost::StaticPrefillCost *> prefill_by_request_rank;
     for (const auto & prefill : phase_work.prefills) prefill_by_request_rank.emplace(RequestKey{ prefill.pid, prefill.request_id }, &prefill);
     for (const auto & operation : operations.records) {
         if (operation.kind != HiCacheIoOperationKind::Load) continue;
@@ -282,7 +269,7 @@ DirectAudit append_observed_direct_plan(const core::DagGraph & graph, const HiCa
                         audit);
         }
     }
-    std::map<RequestKey, const model::HiCacheDecodeWorkItem *> decode_by_request_rank;
+    std::map<RequestKey, const cost::StaticDecodeCost *> decode_by_request_rank;
     for (const auto & decode : phase_work.decodes) decode_by_request_rank.emplace(RequestKey{ decode.pid, decode.request_id }, &decode);
     struct RequestBoundary {
         int logical_input = 0;
@@ -395,7 +382,7 @@ void HiCacheObservedPhaseCarrierModule::apply(core::DagGraph & graph) {
     result_.observed = observe_hicache_phases(graph);
     const patch::HiCacheSourceDagIndex source(graph);
     const auto operations = patch::build_hicache_io_operation_ledger(source);
-    auto work = observed_phase_work(result_.observed);
+    auto work = observed_phase_costs(graph, result_.observed);
     core::DagMutationPlan plan{
         .component = "hicache_observed_canonical_carrier",
         .reason = "score target-observed Direct and phase work with production semantic carriers",

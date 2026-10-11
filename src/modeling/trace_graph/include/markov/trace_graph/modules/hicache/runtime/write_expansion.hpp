@@ -2,6 +2,14 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
+#include <map>
+#include <optional>
+#include <span>
+#include <tuple>
+
+namespace markov::trace_graph::cost {
+struct HostOperationCost;
+}
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -16,20 +24,22 @@ public:
     void constrain_synchronizations(size_t lane, const HiCacheWriteStreamPosition & source, size_t tail, simulation::FutureDag & future) const;
 
 private:
-    struct Entry {
-        HiCacheWriteStreamPosition source;
-        size_t tail;
-    };
-    std::map<size_t, Entry> tails_;
+    // Nested callbacks insert inside a copied call while its outer stream cut
+    // still owns the call's last device node. Neither cut may erase the other.
+    using Cut = std::tuple<size_t, std::optional<size_t>, std::optional<size_t>>;
+    std::map<Cut, size_t> tails_;
     const core::DagGraph * graph_ = nullptr;
     std::map<size_t, std::vector<size_t>> synchronizations_;
 };
 
-/** A donor's small execution graph, with no donor arrival/completion times. */
+/** Local execution graph, generated from target work or copied from retained
+ * source work, without observed arrival/completion times. */
 struct HiCacheHostExpansion {
     struct Node {
         core::DagSyntheticNodeSpec work;
         std::optional<size_t> submission, queue_member;
+        // Local previous member of the same task; never a second FIFO job.
+        std::optional<size_t> task_predecessor;
     };
     struct Edge {
         size_t from, to;
@@ -48,6 +58,10 @@ struct HiCacheHostExpansion {
     // Specific event completions must be supplied explicitly by the caller;
     // unlike stream barriers they cannot use the current lane frontier.
     std::vector<Wait> event_waits;
+    // Existing collective completion nodes outside this replacement. These
+    // must remain active until expansion; unlike a stream frontier, a later
+    // operation on the same lane cannot substitute for this exact event.
+    std::vector<Wait> collective_completions;
     std::map<size_t, size_t> source_nodes;
     size_t host_return = 0;
 
@@ -63,33 +77,21 @@ struct HiCacheWriteExpansion : HiCacheHostExpansion {
     uint64_t payload_bytes = 0;
 };
 
-/** Generate pure CPU work and its return, with independently supplied cost.
- * Residual service remains distinct and must finish before the return node.
- * This constructor never requires a source execution template. */
-[[nodiscard]] HiCacheHostExpansion generated_cpu_control(std::string_view lane, double cpu_us, double residual_us, std::pair<double, double> & remainders,
-                                                         std::string_view name);
+/** Generate CPU work and its return without a source template or costs. */
+[[nodiscard]] HiCacheHostExpansion generate_cpu_control(std::string_view lane, std::string_view name);
 
-/** Ordered target event waits. Costs are independent inputs; event identities
- * are bound by expand_host, never copied from a source check. Per-event service
- * is aggregated after completion; this is not a measured latency upper bound. */
-[[nodiscard]] HiCacheHostExpansion generated_completion_check(std::string_view lane, size_t events, double entry_cpu_us, double entry_residual_us,
-                                                              double event_cpu_us, double event_residual_us, std::pair<double, double> & remainders);
-
-/** Generate target FAST2D K/V page count/bytes, retaining preparation and tail.
- * CPU per-page costs are a constant-cost extrapolation across page widths;
- * growth needs a measured steady page, not another target execution template. */
-[[nodiscard]] HiCacheWriteExpansion resize_write_pages(const HiCacheWriteExpansion & plan, uint64_t target_bytes, uint64_t page_bytes);
-/** Candidate geometry check; detailed dependency closure is checked on resize. */
-[[nodiscard]] bool write_page_geometry_matches(const HiCacheWriteExpansion & plan, uint64_t target_bytes, uint64_t page_bytes);
-
-/** Pure CPU call; retain fractional microseconds across calls on this thread. */
-[[nodiscard]] HiCacheHostExpansion calibrated_cpu_control(std::string_view lane, double cost_us, double & remainder_us, std::string_view name);
+/** Bind independent service to a generate_cpu_control result. Residual time
+ * stays distinct and completes before the return. Only cost/provenance change;
+ * fractional microseconds are carried by the caller across related calls. */
+void bind_cpu_control(HiCacheHostExpansion & plan, double cpu_us, double residual_us, std::pair<double, double> & remainders);
 
 /** Observe surviving worker lanes once after all source replacements.
  * Values are queue-member node IDs, not task costs or dispatch estimates. */
 [[nodiscard]] std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph);
 /** Refresh insertion endpoints disabled by another source-region replacement.
  * Empty positions describe target-only streams and remain empty. */
+void rebind_host_stream_position(const patch::HiCacheSourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
+                                 const std::string & tid, uint64_t at_us);
 void rebind_host_stream_positions(const patch::HiCacheSourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
                                   const std::string & pid, const std::string & tid, uint64_t at_us);
 /** Rebind copied tasks using the final source graph's exact worker lanes. */
@@ -108,8 +110,20 @@ void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size
 [[nodiscard]] std::optional<size_t> find_host_worker_resource(const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues, size_t main_node,
                                                               std::string_view submission_name);
 
+/** Copy retained source work, optionally including caller-owned zero-cost
+ * callback points inside the same interval. These points retain a source_nodes
+ * correspondence so the caller can move nested execution callbacks after
+ * expansion; they do not imply migration of the callback's modeled work.
+ * Worker members remain distinct so intermediate device launches retain their
+ * predecessors. A task has one dispatch delay and holds its queue until its tail.
+ * retain_collective_completions opts into exact external HCCL dependencies;
+ * its caller must hand them over during removal and preserve their source
+ * nodes through expansion, including when generating different tensor work.
+ */
 [[nodiscard]] HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                                          const HiCacheHostTemplate & host, std::string_view prefix = "target control: ");
+                                                          const HiCacheHostTemplate & host,
+                                                          std::string_view prefix = "target control: ", std::span<const size_t> callback_points = {},
+                                                          bool retain_collective_completions = false);
 [[nodiscard]] HiCacheWriteExpansion prepare_write_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                                             const patch::HiCacheIoOperationRecord & write, const HiCacheHostTemplate & host, size_t completion);
 
@@ -129,8 +143,15 @@ struct HiCacheExpandedHost {
                                               simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt,
                                               std::span<const size_t> event_completions = {});
 
-/** Caller resolves each stream at the new CPU insertion point before replay. */
-[[nodiscard]] HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, uint64_t service_us, std::span<const HiCacheWriteStreamPosition> positions,
+/** Distribute independent payload service across declared byte-weighted slots.
+ * Prefix rounding preserves total microseconds. Only duration/provenance are
+ * changed; resource selection, transfers and completion dependencies are fixed.
+ */
+void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us);
+
+/** Emit an already cost-bound plan. Caller resolves each stream at the new
+ * CPU insertion point; emission does not estimate or redistribute costs. */
+[[nodiscard]] HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions,
                                                 simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt);
 
 /** One CPU insertion callback can emit several calls on shared device streams.
@@ -140,7 +161,7 @@ public:
     HiCacheHostSequence(const std::map<size_t, HiCacheWriteStreamPosition> & positions, HiCacheWriteStreamInsertions & insertions,
                         simulation::FutureDag & future, std::optional<size_t> previous_host_return = std::nullopt);
     HiCacheExpandedHost append(const HiCacheHostExpansion & plan, std::span<const size_t> lanes, std::span<const size_t> event_completions = {});
-    HiCacheExpandedWrite append(const HiCacheWriteExpansion & plan, uint64_t service_us, std::span<const size_t> lanes);
+    HiCacheExpandedWrite append(const HiCacheWriteExpansion & plan, std::span<const size_t> lanes);
 
 private:
     std::vector<HiCacheWriteStreamPosition> resolve(std::span<const size_t> lanes) const;

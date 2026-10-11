@@ -73,12 +73,54 @@ target_sources(trace_graph_simulation
 )
 target_link_libraries(trace_graph_simulation PUBLIC trace_graph_core)
 
+add_library(trace_graph_source_dag STATIC)
+target_sources(trace_graph_source_dag
+    PRIVATE
+        src/source_dag/build.cpp
+        src/source_dag/replay.cpp
+)
+target_link_libraries(trace_graph_source_dag PUBLIC trace_graph_frontend trace_graph_io trace_graph_simulation)
+
 add_library(trace_graph_hicache STATIC)
 target_sources(trace_graph_hicache
     PRIVATE
         src/modules/hicache/fact.cpp
         src/modules/hicache/phase_observation.cpp
         src/modules/hicache/phase_carrier.cpp
+        src/cost/operator_model.cpp
+        src/cost/host_operation.cpp
+        src/cost/hicache_io.cpp
+        src/cost/hicache_submission.cpp
+        src/cost/hicache_release.cpp
+        src/cost/hicache_phase.cpp
+        src/cost/static_phase.cpp
+        src/structure/hicache/phase.cpp
+        src/structure/hicache/confirmation.cpp
+        src/structure/hicache/prefetch.cpp
+        src/structure/hicache/query.cpp
+        src/structure/phase_shape.cpp
+        src/structure/tensor_program.cpp
+        src/structure/cpu_collective.cpp
+        src/structure/hicache/allocator.cpp
+        src/structure/hicache/report.cpp
+        src/structure/hicache/resources.cpp
+        src/structure/hicache/attention.cpp
+        src/source_dag/observations.cpp
+        src/source_dag/confirmation.cpp
+        src/source_dag/operator_geometry.cpp
+        src/source_dag/device_collectives.cpp
+        src/source_dag/collective_cost.cpp
+        src/source_dag/phase_tensor_cost.cpp
+        src/source_dag/tensor_cost.cpp
+        src/source_dag/submission_cost.cpp
+        src/source_dag/allocator_observations.cpp
+        src/source_dag/prefetch.cpp
+        src/source_dag/prefetch_query.cpp
+        src/source_dag/call_regions.cpp
+        src/source_dag/attention_layout.cpp
+        src/source_dag/dense_regions.cpp
+        src/source_dag/load_admission.cpp
+        src/source_dag/decode_allocation.cpp
         src/modules/hicache/layer_waits.cpp
         src/modules/hicache/cpu_collectives.cpp
         src/modules/hicache/cpu_collective_timing.cpp
@@ -113,7 +155,6 @@ target_sources(trace_graph_hicache
         src/modules/hicache/model/prefetch_queue_execution.cpp
         src/modules/hicache/model/prefetch_scheduler_body.cpp
         src/modules/hicache/model/prefetch_wait_execution.cpp
-        src/modules/hicache/model/prefetch_wait_calibration.cpp
         src/modules/hicache/patch/prefetch_control_region.cpp
         src/modules/hicache/model/effect_decision.cpp
         src/modules/hicache/model/effect_ledger.cpp
@@ -134,7 +175,6 @@ target_sources(trace_graph_hicache
         src/modules/hicache/patch/attribution.cpp
         src/modules/hicache/model/request_model.cpp
         src/modules/hicache/model/decode_allocation_model.cpp
-        src/modules/hicache/model/decode_observation.cpp
         src/modules/hicache/model/prefetch_model.cpp
         src/modules/hicache/model/host_storage_model.cpp
         src/modules/hicache/model/writeback_model.cpp
@@ -145,17 +185,22 @@ target_sources(trace_graph_hicache
         src/modules/hicache/execution_boundaries.cpp
         src/modules/hicache/control_points.cpp
         src/modules/hicache/runtime/preparation.cpp
-        src/modules/hicache/runtime/preparation_execution.cpp
         src/modules/hicache/runtime/prefetch_queries.cpp
         src/modules/hicache/runtime/prefetch_waits.cpp
         src/modules/hicache/runtime/queue_confirmations.cpp
         src/modules/hicache/runtime/write_confirmations.cpp
         src/modules/hicache/runtime/loads.cpp
         src/modules/hicache/runtime/load_execution.cpp
+        src/modules/hicache/runtime/tensor_program.cpp
+        src/modules/hicache/runtime/allocator_calls.cpp
+        src/modules/hicache/runtime/phase_calls.cpp
+        src/modules/hicache/runtime/collective_services.cpp
+        src/modules/hicache/runtime/collective_callers.cpp
         src/modules/hicache/runtime/load_submission.cpp
         src/modules/hicache/runtime/load_insertion.cpp
         src/modules/hicache/runtime/inactive_layer_calls.cpp
         src/modules/hicache/runtime/writes.cpp
+        src/modules/hicache/runtime/storage_writes.cpp
         src/modules/hicache/runtime/write_calls.cpp
         src/modules/hicache/runtime/lifecycle_observation.cpp
         src/modules/hicache/runtime/lifecycle_calls.cpp
@@ -165,10 +210,10 @@ target_sources(trace_graph_hicache
         src/modules/hicache/runtime/write_frontier.cpp
         src/modules/hicache/runtime/write_host.cpp
         src/modules/hicache/runtime/write_expansion.cpp
-        src/modules/hicache/runtime/write_page_projection.cpp
         src/modules/hicache/runtime/host_removal.cpp
         src/modules/hicache/runtime/eviction_replacement.cpp
         src/modules/hicache/runtime/window.cpp
+        src/modules/hicache/runtime/static_replay.cpp
 )
 target_link_libraries(trace_graph_hicache PUBLIC trace_graph_core trace_graph_frontend crypto)
 
@@ -186,8 +231,8 @@ target_link_libraries(trace_graph_modules
 )
 
 add_library(trace_graph_cli_support STATIC)
-target_sources(trace_graph_cli_support PRIVATE src/cli/file_output.cpp src/cli/input_graph.cpp)
-target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_frontend trace_graph_io)
+target_sources(trace_graph_cli_support PRIVATE src/cli/file_output.cpp)
+target_link_libraries(trace_graph_cli_support PUBLIC trace_graph_source_dag)
 if(TRACE_GRAPH_DEBUG)
     target_sources(trace_graph_modules PRIVATE
         src/modules/hicache/dag_patch_module.cpp

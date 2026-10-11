@@ -18,6 +18,7 @@ from .shape_facts import (
     commit_request_events as _commit_request_events,
     completed_state_fact_phase as _completed_state_fact_phase,
     completed_transfer_tokens as _completed_transfer_tokens,
+    derive_decode_opportunities as _derive_decode_opportunities,
     event_sort_key as _event_sort_key,
     index_roles as _index_roles,
     nested_events as _nested_events,
@@ -48,6 +49,11 @@ _EFFECT_DESCRIPTORS = {
         ("commit_host_to_storage", "host_to_storage", "host_storage_lane"),
         ("commit_capacity_gate", "none", ""),
     ),
+    "cache_decode_allocation": (
+        ("commit_device_to_host", "device_to_host", "device_to_host_lane"),
+        ("commit_host_to_storage", "host_to_storage", "host_storage_lane"),
+        ("commit_capacity_gate", "none", ""),
+    ),
     "prefetch_candidate_anchor": (
         ("prefetch_io_operation", "storage_to_host", "host_storage_lane"),
         ("prefetch_visibility_dependency", "none", ""),
@@ -74,6 +80,7 @@ def extract_target_shape_oracle(
         window_start_us=window_start_us,
         window_end_us=window_end_us,
     )
+    events, decode_blockers = _derive_decode_opportunities(events)
     opportunities, opportunity_blockers = _build_opportunities(events)
     role_events = _index_roles(events)
     rows = [
@@ -90,6 +97,7 @@ def extract_target_shape_oracle(
 
     blockers = Counter(opportunity_blockers)
     blockers.update(parse_errors)
+    blockers.update(decode_blockers)
     if not patch_probe_contract_ready:
         blockers["patch_probe_contract_not_enabled"] += 1
     for row in rows:
@@ -103,6 +111,7 @@ def extract_target_shape_oracle(
         "ready": status == "ready",
         "lane_orders": lane_orders,
         "effects": rows,
+        "observation_blockers": dict(blockers),
     }
 
 
@@ -135,7 +144,11 @@ def _load_fact_events(
             except ValueError:
                 errors["malformed_hicache_fact"] += 1
                 continue
-            if fact is None:
+            runtime_role = {
+                "runtime.hicache.decode_allocation": "decode_allocation_observed",
+                "runtime.hicache.layer_waits": "decode_forward_observed" if args.get("phase") == "DECODE" else None,
+            }.get(event.get("name"))
+            if fact is None and runtime_role is None:
                 continue
             timestamp = _u64(event.get("ts"))
             duration = _u64(event.get("dur"))
@@ -147,8 +160,8 @@ def _load_fact_events(
                 window_position = "post"
             events.append(
                 {
-                    "fact_class": fact.fact_class,
-                    "role": fact.role,
+                    "fact_class": fact.fact_class if fact else "runtime_observation",
+                    "role": fact.role if fact else runtime_role,
                     "args": args,
                     "name": str(event.get("name") or ""),
                     "pid": str(event.get("pid") or ""),
@@ -315,7 +328,7 @@ def _classify_prefetch_io(
             "operation_count": 1,
             "effective_page_count": executed_pages,
             "completed_page_count": completed_pages,
-            "storage_batches": [(0, pages, 0, 0) for pages in batch_pages],
+            "storage_batches": [[0, pages, 0, 0] for pages in batch_pages],
         },
     )
 
@@ -355,11 +368,9 @@ def _classify_commit_d2h(opportunity: dict[str, Any], role_events: dict[str, lis
         role_events,
         role_events.get("commit_device_to_host_enqueue_observed", []),
     )
-    enqueues = [
-        event
-        for event in enqueues
-        if str(event["args"].get("phase") or "") == "end" and event["window_position"] == "formal"
-    ]
+    # The admitted lifecycle may finish after HTTP completion. Its owned
+    # transfers remain structural work; this does not extend the HTTP window.
+    enqueues = [event for event in enqueues if str(event["args"].get("phase") or "") == "end"]
     effective = sum(_u64(event["args"].get("effective_token_count")) for event in enqueues)
     if not enqueues or effective == 0:
         return _actual_row(opportunity, "not_required")
@@ -372,11 +383,24 @@ def _classify_commit_d2h(opportunity: dict[str, Any], role_events: dict[str, lis
     state = _transfer_state(effective, effective)
     page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
     pages = effective // page_size if page_size else 0
+    # start_writing only submits asynchronous DMA. The predictor counts host
+    # publication here, so require the matching completed acknowledgement.
+    releases = _commit_release_calls(opportunity, role_events)
+    published_tokens = sum(
+        _u64(event["args"].get("effective_token_count"))
+        for event in enqueues
+        if any(
+            _u64(event["args"].get("node_id")) in _u64_list(release["args"].get("operation_node_ids"))
+            and release["ts"] >= event["ts"]
+            for release in releases
+        )
+    )
+    published_pages = published_tokens // page_size if page_size else 0
     return _actual_row(
         opportunity,
         state,
         operation_sort_key=min((_event_sort_key(event) for event in timings)),
-        work={"operation_count": len(timings), "effective_page_count": pages, "completed_page_count": pages},
+        work={"operation_count": len(timings), "effective_page_count": pages, "completed_page_count": published_pages},
     )
 
 
@@ -412,7 +436,7 @@ def _classify_commit_h2s(opportunity: dict[str, Any], role_events: dict[str, lis
         timings.extend(matches)
     completed = sum(_completed_transfer_tokens(event["args"]) for event in timings)
     page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
-    batches: list[tuple[int, int, int, int]] = []
+    batches: list[list[int]] = []
     for operation_index, timing in enumerate(sorted(timings, key=_event_sort_key)):
         services = _nested_events(timing, role_events.get("storage_write_service_observed", []))
         for service in services:
@@ -422,7 +446,7 @@ def _classify_commit_h2s(opportunity: dict[str, Any], role_events: dict[str, lis
             new = _optional_u64(args.get("storage_new_page_count"))
             if pages == 0 or existing is None or new is None or existing + new != pages:
                 return _actual_row(opportunity, "unobservable", blocker="commit_h2s_service_batch_work_incomplete")
-            batches.append((operation_index, pages, existing, new))
+            batches.append([operation_index, pages, existing, new])
     if not batches:
         return _actual_row(opportunity, "unobservable", blocker="commit_h2s_service_batch_work_incomplete")
     executed_pages = sum(batch[1] for batch in batches)
@@ -458,7 +482,35 @@ def _classify_commit_capacity(
     releases = _commit_release_calls(opportunity, role_events)
     if not releases:
         return _actual_row(opportunity, "unobservable", blocker="commit_capacity_release_missing")
-    return _actual_row(opportunity, "not_required")
+
+    # write_back waits for acknowledgements before evict() releases device
+    # pages. Ordinary write-through acknowledgements only release their lock.
+    # Match actual node ownership; seeing any acknowledgement is insufficient.
+    released_nodes = {
+        node_id
+        for release in releases
+        if _optional_bool(release["args"].get("release_lock")) is False
+        for node_id in _u64_list(release["args"]["operation_node_ids"])
+    }
+    blocking_tokens = 0
+    for event in d2h:
+        write_back = _optional_bool(event["args"].get("write_back"))
+        if write_back is None:
+            return _actual_row(opportunity, "unobservable", blocker="commit_capacity_write_mode_missing")
+        if not write_back:
+            continue
+
+        nodes = set(_u64_list(event["args"].get("node_id")))
+        if not nodes or not nodes <= released_nodes:
+            return _actual_row(opportunity, "unobservable", blocker="commit_capacity_blocking_ack_missing")
+        blocking_tokens += _u64(event["args"]["effective_token_count"])
+
+    if not blocking_tokens:
+        return _actual_row(opportunity, "not_required")
+    page_size = _u64(opportunity["anchor"]["args"].get("source_page_size"))
+    if not page_size or blocking_tokens % page_size:
+        return _actual_row(opportunity, "unobservable", blocker="commit_capacity_page_geometry_missing")
+    return _actual_row(opportunity, "required", work={"effective_page_count": blocking_tokens // page_size})
 
 
 def _annotate_family_relations(rows: list[dict[str, Any]]) -> None:

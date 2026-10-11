@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 import time
 
@@ -11,34 +11,50 @@ from ...common.io import load_json, write_json
 from ...common.commands import nonnegative_int, positive_int
 from ...common.paths import require_repo_path
 from ...modeling.workload import discover_workload_window
-from ..planning.profile_runs import discover_profile_runs, parse_profile_run
-from ..prediction.hicache import execution_blockers
+from ...modeling.source_dag.profiles import ProfileRunRef, discover_profile_runs, parse_profile_run
+from ..execution.results import execution_blockers
+from ..context import DiagnosticLevel
 from ..validations.final_dag.shape_oracle import extract_target_shape_oracle, patch_probe_contract_enabled
 from ..validations.hicache.oracle_cost_replay.evidence import extract_target_phase_observation, prepare_replay_evidence
-from .http_metrics import score_cell, score_metrics
+from .http_metrics import cost_query_domain, score_cell, score_metrics
+from .structure import compare_structure, extract_target_structure
 
 
-def completed_predictions(directory: Path) -> list[tuple[dict, dict]]:
-    """Validate the selected execution before any evaluator target inputs are opened."""
+def _compare_structure_files(predicted: Path, observed: Path, details: bool) -> dict:
+    """Load one pair inside its worker; do not pickle full graphs between processes."""
+
+    return compare_structure(load_json(predicted), load_json(observed), details=details)
+
+
+def completed_predictions(directory: Path) -> tuple[list[tuple[dict, dict]], list[dict]]:
+    """Partition current attempts before reading targets or failed-run artifacts.
+
+    Historical static results retain their all-ready input contract. Current
+    execution summaries identify failures directly, including unstarted cells.
+    """
 
     summary = load_json(directory / "workflow_summary.json")
     outcome = summary["prediction"]
-    if outcome["status"] not in {"READY", "EXECUTED"} or summary["model_run_error_count"]:
-        raise ValueError(f"prediction execution is incomplete: {directory}")
-
     cells = outcome.get("cells", [])
     # Retained historical results split identity between a task index and each
     # run. New predictions keep it only in the workflow summary.
     retained = not cells or "source_manifest" not in cells[0]
     if retained:
+        if outcome["status"] not in {"READY", "EXECUTED"} or summary["model_run_error_count"]:
+            raise ValueError(f"prediction execution is incomplete: {directory}")
         plan = load_json(directory / "artifacts" / "model_run_plan.json")
         cells = plan["model_runs"]
         sources = {row["run_id"]: row for row in plan["runs"]}
 
-    if not cells or outcome.get("completed_count", outcome.get("ready_count")) != len(cells):
+    if not cells or (retained and outcome.get("completed_count", outcome.get("ready_count")) != len(cells)):
         raise ValueError(f"prediction execution is incomplete: {directory}")
     rows = []
+    unfinished = []
     for cell in cells:
+        if not retained and cell["status"] != "EXECUTED":
+            unfinished.append({"prediction_directory": str(directory), **cell})
+            continue
+
         run_id = cell["run_id"] if retained else cell["model_run_id"]
         output = require_repo_path(cell["output_dir"]) if retained else directory / "model_runs" / run_id
         if not output.resolve().is_relative_to(directory.resolve()):
@@ -82,7 +98,58 @@ def completed_predictions(directory: Path) -> list[tuple[dict, dict]]:
                 raise ValueError(f"prediction lacks scoring evidence: {run_id}")
 
         rows.append((evidence, run))
-    return rows
+    return rows, unfinished
+
+
+def select_prediction_attempts(
+    directories: list[Path], retries: list[Path]
+) -> tuple[list[tuple[Path, dict, dict]], list[dict], list[dict]]:
+    """Apply explicit retries only to incomplete cells, before opening targets.
+
+    Match source manifest and run identity, retaining the original target
+    configuration. A failed retry remains incomplete in the same denominator;
+    an already completed prediction cannot be replaced to select a better fit.
+    This selects recorded executions, not their costs or accuracy.
+    """
+
+    predictions = []
+    unfinished = []
+    for directory in directories:
+        completed, failed = completed_predictions(directory)
+        predictions.extend((directory, row, run) for row, run in completed)
+        unfinished.extend(failed)
+
+    pending = {(require_repo_path(row["source_manifest"]).resolve(), row["model_run_id"]): row for row in unfinished}
+    if len(pending) != len(unfinished):
+        raise ValueError("select one original attempt per incomplete prediction cell")
+
+    superseded = []
+    for directory in retries:
+        completed, failed = completed_predictions(directory)
+        attempts = completed + [(row, None) for row in failed]
+
+        for row, run in attempts:
+            key = require_repo_path(row["source_manifest"]).resolve(), row["model_run_id"]
+            previous = pending.pop(key)
+            if row["target_hicache"] != previous["target_hicache"]:
+                raise ValueError(f"retry changes the declared target configuration: {row['model_run_id']}")
+
+            superseded.append(
+                {
+                    "model_run_id": row["model_run_id"],
+                    "previous_directory": previous["prediction_directory"],
+                    "previous_status": previous["status"],
+                    "previous_blockers": previous["blockers"],
+                    "replacement_directory": str(directory),
+                    "replacement_status": row["status"],
+                }
+            )
+            if run is None:
+                pending[key] = row
+            else:
+                predictions.append((directory, row, run))
+
+    return predictions, list(pending.values()), superseded
 
 
 def recorded_costs(directory: Path) -> dict:
@@ -133,10 +200,13 @@ def evaluate(
     oracle_cost_replay: bool = False,
     oracle_max_runs: int = 0,
     normal_http: bool = False,
+    structure_manifests: list[Path] | None = None,
+    diagnostics: DiagnosticLevel = DiagnosticLevel.OFF,
+    retry_dirs: list[Path] | None = None,
 ) -> dict:
     if any(
         output.resolve().is_relative_to(path.resolve()) or path.resolve().is_relative_to(output.resolve())
-        for path in prediction_dirs
+        for path in [*prediction_dirs, *(retry_dirs or [])]
     ):
         raise ValueError("evaluation output must be separate from prediction inputs")
     write_json(output / "gate_summary.json", {"status": "SCORING", "new_predictions": 0, "new_acquisitions": 0})
@@ -152,6 +222,9 @@ def evaluate(
             oracle_cost_replay,
             oracle_max_runs,
             normal_http,
+            structure_manifests or [],
+            diagnostics,
+            retry_dirs or [],
         )
     except Exception as error:
         write_json(
@@ -172,12 +245,52 @@ def _evaluate(
     oracle_cost_replay: bool,
     oracle_max_runs: int,
     normal_http: bool,
+    structure_manifests: list[Path],
+    diagnostics: DiagnosticLevel,
+    retry_dirs: list[Path],
 ) -> dict:
     started = time.monotonic()
     # Complete every selected group before discovering even the first target.
-    predictions = [
-        (directory, row, run) for directory in prediction_dirs for row, run in completed_predictions(directory)
-    ]
+    predictions, unfinished, superseded = select_prediction_attempts(prediction_dirs, retry_dirs)
+    prediction_dirs = [*prediction_dirs, *retry_dirs]
+
+    if unfinished:
+        result = {
+            "status": "NOT_READY",
+            "reason": "Selected predictions are incomplete; no target inputs were opened and no accuracy metrics were calculated.",
+            "prediction_directories": [str(path) for path in prediction_dirs],
+            "predictions_selected": len(predictions) + len(unfinished),
+            "predictions_completed": len(predictions),
+            "predictions_incomplete": len(unfinished),
+            "incomplete_cells": unfinished,
+            "superseded_prediction_attempts": superseded,
+            "accuracy_scope": "not_scored",
+            "target_inputs_opened": False,
+            "new_predictions": 0,
+            "new_acquisitions": 0,
+        }
+        write_json(output / "gate_summary.json", result)
+        return result
+    training_captures, training_manifests = set(), set()
+    unrecorded_training = []
+    experiment_report_directories = set()
+    for directory in prediction_dirs:
+        provenance = load_json(directory / "workflow_summary.json")
+        if provenance.get("experiment_reports", False):
+            experiment_report_directories.add(directory)
+        if "cost_training_captures" not in provenance or "cost_training_manifests" not in provenance:
+            unrecorded_training.append(str(directory))
+            continue
+        training_captures.update(provenance["cost_training_captures"])
+        training_manifests.update(require_repo_path(path).resolve() for path in provenance["cost_training_manifests"])
+    if training_captures & {row["source_run_id"] for _, row, _ in predictions} or training_manifests & {
+        require_repo_path(row["source_manifest"]).resolve() for _, row, _ in predictions
+    }:
+        raise ValueError("independent training includes a base capture from this evaluation round")
+    if structure_manifests and set(prediction_dirs) - experiment_report_directories:
+        raise ValueError(
+            "structure comparison requires predictions run with --experiment-reports; existing files alone are not current evidence"
+        )
     if oracle_cost_replay and any("execution" in row for _, row, _ in predictions):
         raise ValueError("execution cost replay requires target operation mapping, which is not yet available")
     if normal_http and any("execution" not in row for _, row, _ in predictions):
@@ -195,6 +308,8 @@ def _evaluate(
         key = (target.config_id, target.input_id)
         if key not in expected:
             continue
+        if target.run_id in training_captures or target.manifest_path.resolve() in training_manifests:
+            raise ValueError(f"performance evaluation capture was used for cost training: {target.manifest_path}")
         if key in targets and not normal_http:
             raise ValueError(f"ambiguous target profiles for {key}; select explicit manifests")
         if normal_http:
@@ -249,6 +364,42 @@ def _evaluate(
             if any(actual.get(field) != value for field, value in configuration.items()):
                 raise ValueError(f"target profile configuration differs from predicted configuration: {target.label}")
 
+    structures = {}
+    if structure_manifests:
+        # This is a separate traced input set. Normal HTTP repetitions remain
+        # the performance truth, never a source of graph structure or costs.
+        required = {(row["target_config"], row["workload_id"]) for _, row, _ in predictions}
+        selected = {}
+        for target in discover_profile_runs(tuple(structure_manifests)):
+            key = (target.config_id, target.input_id)
+            if key not in required:
+                continue
+            if target.run_id in training_captures or target.manifest_path.resolve() in training_manifests:
+                raise ValueError(f"structure evaluation capture was used for cost training: {target.manifest_path}")
+            if key in selected:
+                raise ValueError(f"ambiguous target structure profiles for {key}; select one explicit capture")
+            actual = {"enabled": True, **(target.hicache_config or {})}
+            for selected_key, configuration in configurations:
+                if key == selected_key and any(actual.get(field) != value for field, value in configuration.items()):
+                    raise ValueError(f"target structure configuration differs from prediction: {target.label}")
+            selected[key] = target
+        if not selected:
+            raise ValueError("selected structure profiles do not match any prediction target")
+
+        def observe_structure(item: tuple[tuple[str, str], ProfileRunRef]) -> tuple[tuple[str, str], Path]:
+            key, target = item
+            target_output = output / "artifacts" / "target_structure" / target.run_id
+            extract_target_structure(
+                target,
+                target_output,
+                threads=threads,
+                file_threads=file_threads,
+            )
+            return key, target_output / "structure_observation.json"
+
+        with ThreadPoolExecutor(max_workers=jobs) as executor:
+            structures = dict(executor.map(observe_structure, selected.items()))
+
     phase_scores = output / "artifacts" / "target_phase_scores"
 
     def observe(target):
@@ -275,9 +426,28 @@ def _evaluate(
         with ThreadPoolExecutor(max_workers=jobs) as executor:
             observations = dict(executor.map(observe, targets.values()))
 
+    structure_scores = {}
+    if structures:
+        # Reachability is CPU-bound Python work. A bounded process pool uses
+        # the existing job budget without retaining every target graph in the
+        # parent or transferring those graphs through multiprocessing pipes.
+        with ProcessPoolExecutor(max_workers=jobs) as executor:
+            comparisons = {
+                (directory, prediction["model_run_id"]): executor.submit(
+                    _compare_structure_files,
+                    directory / "model_runs" / prediction["model_run_id"] / "structure_report.json",
+                    structures[(prediction["target_config"], prediction["workload_id"])],
+                    diagnostics.keep_debug_artifacts,
+                )
+                for directory, prediction, _ in predictions
+                if (prediction["target_config"], prediction["workload_id"]) in structures
+            }
+            structure_scores = {key: future.result() for key, future in comparisons.items()}
+
     rows = []
     source_windows = {}
-    for _, prediction, run in predictions:
+    source_replays = {}
+    for directory, prediction, run in predictions:
         key = (prediction["target_config"], prediction["workload_id"])
         source_manifest = prediction["source_manifest"]
         if normal_http:
@@ -303,32 +473,129 @@ def _evaluate(
         )
         if oracle_cost_replay:
             row.update(prepare_replay_evidence(prediction, run, *observations[key]))
+        model_output = directory / "model_runs" / prediction["model_run_id"]
+        if structures:
+            row["structure"] = structure_scores.get(
+                (directory, prediction["model_run_id"]),
+                {"status": "NOT_REQUESTED", "reason": "No target structure profile selected for this cell."},
+            )
+
+        source_report_path = model_output / "source_replay_report.json"
+        if directory in experiment_report_directories:
+            source_report = load_json(source_report_path)
+            row["source_replay"] = {
+                "status": source_report["status"],
+                "report": str(source_report_path),
+                "cost_basis": source_report["cost_basis"],
+                "timing_basis": source_report["timing_basis"],
+                "observed_e2e_us": source_report.get("observed_e2e_us"),
+                "replayed_e2e_us": source_report.get("replayed_e2e_us"),
+                "absolute_percentage_error": source_report.get("absolute_percentage_error"),
+                "request_latency_accuracy": source_report.get("request_latency_accuracy"),
+                "event_coverage": source_report["event_coverage"],
+                "dependency_audit": source_report["dependency_audit"],
+                "dependency_correctness_proven": source_report["dependency_correctness_proven"],
+            }
+            source_replays.setdefault(source_manifest, row["source_replay"])
         row["full_e2e"]["measurement_mode"] = "normal_http" if normal_http else "profiled_http"
         write_json(output / "cells" / f"{row['model_run_id']}.json", row)
         rows.append(row)
     cross, self_rows = [row for row in rows if not row["is_self"]], [row for row in rows if row["is_self"]]
+    source_manifests = {row["source_manifest"] for row in rows}
+    missing_source_reports = sorted(source_manifests - source_replays.keys())
+    unavailable_source_replays = sorted(
+        manifest for manifest, report in source_replays.items() if report["status"] != "reported"
+    )
+    source_report_status = "NOT_REQUESTED"
+    if experiment_report_directories:
+        source_report_status = (
+            "REPORTED" if not missing_source_reports and not unavailable_source_replays else "NOT_FULLY_RECORDED"
+        )
+
     by_source = {
         base: score_metrics([row for row in cross if row["source_config_id"] == base])
         for base in sorted({row["source_config_id"] for row in cross})
     }
+    by_workload = {
+        workload: score_metrics([row for row in cross if row["workload_id"] == workload])
+        for workload in sorted({row["workload_id"] for row in cross})
+    }
+    by_target = {
+        target: score_metrics([row for row in cross if row["target_config"] == target])
+        for target in sorted({row["target_config"] for row in cross})
+    }
+    query_groups: dict[str, list[dict]] = {}
+    for row in cross:
+        query_groups.setdefault(cost_query_domain(row), []).append(row)
+
     result = {
         **score_metrics(cross),
         "by_source": by_source,
+        "by_workload": by_workload,
+        "by_target": by_target,
+        "by_cost_query_domain": {
+            "scope": "Recorded independent operator queries only; I/O payload models, migrated costs and retained gaps are not classified here.",
+            "classification": "Any outside-range query takes precedence over an unseen combination within coordinate ranges; neither establishes whole-DAG cost coverage or confidence.",
+            "groups": {name: score_metrics(group) for name, group in sorted(query_groups.items())},
+        },
         "self_check": score_metrics(self_rows) if self_rows else None,
         "prediction_directories": [str(path) for path in prediction_dirs],
         "predictions_completed": len(rows),
+        "superseded_prediction_attempts": superseded,
         "new_predictions": 0,
         "new_acquisitions": 0,
         "target_profile_count": len(targets),
         "measurement_sample_count": sum(len(group) for group in samples.values()),
         "measurement_mode": "normal_http" if normal_http else "profiled_http",
         "evaluation_wall_seconds": time.monotonic() - started,
-        "new_target_extractions": new_extractions,
+        "new_target_extractions": new_extractions + len(structures),
+        "new_structure_extractions": len(structures),
+        "new_oracle_observation_extractions": new_extractions,
         "target_observations_reused": len(observations) - new_extractions,
         "http_only_target_count": len(targets) - len(observations),
         "costs": {str(path): recorded_costs(path) for path in prediction_dirs},
         "target_opened_after_all_selected_predictions": True,
         "parameters_or_capture_plan_changed": False,
+        "training_data_isolation": {
+            "status": "NOT_RECORDED" if unrecorded_training else "HELD_OUT",
+            "unrecorded_prediction_directories": unrecorded_training,
+            "scope": "all selected bases and actual performance/structure evaluation captures",
+            "limitations": "Checks declared training provenance, not hidden copied traces; historical predictions without provenance remain unverified.",
+        },
+        "structure_reports": {
+            "enabled": bool(structures),
+            "cell_count": len(structure_scores),
+            "selected_target_count": len(structures),
+            "unassessed_cell_count": len(rows) - len(structure_scores) if structures else None,
+            "full_structure_exact_proven": False,
+        },
+        "stages": {
+            "source_dag": {
+                "status": source_report_status,
+                "scope": "source replay with builder wait normalization against the same instrumented source; not normal HTTP accuracy or proof of all dependencies",
+                "sources": [{"source_manifest": manifest, **report} for manifest, report in source_replays.items()],
+                "missing_source_reports": missing_source_reports if experiment_report_directories else [],
+                "unavailable_source_replays": unavailable_source_replays,
+            },
+            "target_structure": {
+                "status": "PARTIAL_COVERAGE" if structures else "NOT_REQUESTED",
+                "compared_cells": len(structure_scores),
+                "full_structure_exact_proven": False,
+                "details_retained": diagnostics.keep_debug_artifacts,
+                "reports": [
+                    "cells/" + row["model_run_id"] + ".json"
+                    for row in rows
+                    if (row["target_config"], row["workload_id"]) in structures
+                ],
+            },
+            "performance": {
+                "scope": "full HTTP formal window; gap, unattributed costs and Prefill/Decode are not excluded",
+                "measurement_mode": "normal_http" if normal_http else "profiled_http",
+                "metrics_field": "full_e2e",
+                "accuracy_gates_field": "gates",
+                "execution_does_not_imply_accuracy": True,
+            },
+        },
         "formal_and_owner_scope": "full HTTP formal window without exclusions; optional static oracle replay is diagnostic only",
     }
     if any(group["status"] != "PASS" for group in by_source.values()):
@@ -371,6 +638,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Completed prediction output; repeat for multiple base groups.",
     )
     parser.add_argument(
+        "--retry-prediction-dir",
+        type=Path,
+        action="append",
+        default=[],
+        help="Explicit retry of incomplete cells in --prediction-dir; cannot replace completed cells or change targets.",
+    )
+    parser.add_argument(
         "--profile-run-dir", type=Path, action="append", default=[], help="Score-only target profile suite."
     )
     parser.add_argument(
@@ -382,6 +656,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Score execution predictions against uninstrumented repetitions; include normal base measurements too.",
     )
     parser.add_argument(
+        "--structure-profile-manifest",
+        type=Path,
+        action="append",
+        default=[],
+        help="Separate traced target for experimental structure comparison; repeat for each target/workload.",
+    )
+    parser.add_argument(
         "--output-dir", type=Path, required=True, help="Separate evaluation output, never the prediction directory."
     )
     parser.add_argument(
@@ -389,6 +670,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--trace-threads", type=positive_int, default=1)
     parser.add_argument("--trace-file-threads", type=positive_int, default=1)
+    parser.add_argument(
+        "--diagnostics",
+        choices=tuple(level.value for level in DiagnosticLevel),
+        default=DiagnosticLevel.OFF.value,
+        help="Full retains per-operator structure mismatches; default keeps coverage and difference counts.",
+    )
     parser.add_argument(
         "--oracle-cost-replay",
         action="store_true",
@@ -414,8 +701,18 @@ def main(argv: list[str] | None = None) -> int:
         oracle_cost_replay=args.oracle_cost_replay,
         oracle_max_runs=args.oracle_max_runs,
         normal_http=args.normal_http,
+        structure_manifests=[require_repo_path(path) for path in args.structure_profile_manifest],
+        diagnostics=DiagnosticLevel(args.diagnostics),
+        retry_dirs=[require_repo_path(path) for path in args.retry_prediction_dir],
     )
-    print(f"evaluation={result['status']} cross={result['cell_count']} new_predictions=0", flush=True)
+    if result["status"] == "NOT_READY":
+        print(
+            f"evaluation=NOT_READY completed={result['predictions_completed']}/{result['predictions_selected']} "
+            "accuracy=not_scored new_predictions=0",
+            flush=True,
+        )
+    else:
+        print(f"evaluation={result['status']} cross={result['cell_count']} new_predictions=0", flush=True)
     replay_ready = all(
         item["ready_count"] == item["selected_cell_count"] for item in result.get("oracle_cost_replay", {}).values()
     )

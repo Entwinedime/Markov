@@ -16,7 +16,7 @@
 
 namespace markov::trace_graph::modules::hicache {
 
-using frontend::HiCacheConfig;
+using frontend::HiCacheRules;
 
 namespace policy_detail {
 
@@ -51,7 +51,7 @@ uint64_t derived_prefetch_threshold_pages(const PrefetchThresholdInput & input) 
     return ceil_div(std::max(kSglangDefaultPrefetchThresholdTokens, input.page_size), input.page_size);
 }
 
-uint64_t derived_prefetch_capacity_limit_pages(const HiCacheConfig & config) {
+uint64_t derived_prefetch_capacity_limit_pages(const HiCacheRules & config) {
     /**
      * @brief Derives SGLang's host-side prefetch reservation limit.
      *
@@ -66,7 +66,7 @@ uint64_t derived_prefetch_capacity_limit_pages(const HiCacheConfig & config) {
            + ((available_pages % kCapacityRatioDenominator) * kCapacityRatioNumerator) / kCapacityRatioDenominator;
 }
 
-uint64_t derived_write_threshold(const HiCacheConfig & config, const std::string & write_policy) {
+uint64_t derived_write_threshold(const HiCacheRules & config, const std::string & write_policy) {
     if (config.write_through_threshold > 0) return config.write_through_threshold;
     if (write_policy == "write_through") return kSglangWriteThroughThreshold;
     if (write_policy == "write_through_selective") return kSglangWriteThroughSelectiveThreshold;
@@ -82,7 +82,7 @@ using policy_detail::in_set;
 using policy_detail::lower_copy;
 using policy_detail::PrefetchThresholdInput;
 
-HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) {
+HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheRules & config) {
     /**
      * @brief Resolves policy as a pure function of target configuration.
      *
@@ -122,7 +122,7 @@ HiCacheResolvedPolicyState resolve_hicache_policy(const HiCacheConfig & config) 
     };
 }
 
-HiCachePolicy::HiCachePolicy(const HiCacheConfig & config) : resolved_(resolve_hicache_policy(config)) {}
+HiCachePolicy::HiCachePolicy(const HiCacheRules & config) : resolved_(resolve_hicache_policy(config)) {}
 
 uint64_t HiCachePolicy::write_through_threshold() const { return resolved_.write_through_threshold; }
 

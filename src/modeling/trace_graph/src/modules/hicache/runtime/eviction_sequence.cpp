@@ -1,37 +1,30 @@
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
-#include <stdexcept>
-#include <cmath>
 #include <algorithm>
+#include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-std::optional<EvictionControlCost> estimate_eviction_control_cost(
-    std::span<const EvictionControlCostSample> samples, HiCacheEvictionRegion::ControlPhase phase) {
-    if (samples.empty()) return std::nullopt;
-    const bool has_base = std::ranges::any_of(samples, [](const auto& sample) { return !sample.independent; });
-    EvictionControlCost matched, pooled;
-    for (const auto & sample : samples) {
-        if (!std::isfinite(sample.cpu_us) || !std::isfinite(sample.residual_us) || sample.cpu_us < 0 || sample.residual_us < 0)
-            throw std::invalid_argument("Invalid base eviction control cost sample");
-        if (has_base && sample.independent) continue;
-        pooled.cpu_us += sample.cpu_us; pooled.residual_us += sample.residual_us; ++pooled.samples;
-        if (sample.phase == phase) {
-            matched.cpu_us += sample.cpu_us; matched.residual_us += sample.residual_us; ++matched.samples;
-        }
+std::string eviction_control_name(HiCacheEvictionRegion::ControlPhase phase) {
+    using Phase = HiCacheEvictionRegion::ControlPhase;
+    switch (phase) {
+    case Phase::Setup:
+        return "setup";
+    case Phase::Selection:
+        return "selection";
+    case Phase::SelectionEnd:
+        return "selection_end";
+    case Phase::ReleaseStart:
+        return "release_start";
+    case Phase::ReleaseNext:
+        return "release_next";
+    case Phase::Finish:
+        return "finish";
+    case Phase::Empty:
+        return "empty";
+    case Phase::None:
+        break;
     }
-    auto cost = matched.samples ? matched : pooled;
-    cost.phase_extrapolated = !matched.samples;
-    cost.independent = !has_base;
-    cost.cpu_us /= cost.samples; cost.residual_us /= cost.samples;
-    return cost;
-}
-
-double locked_candidate_cost(size_t heap_size, double fixed_us, double log2_heap_us) {
-    if (!std::isfinite(fixed_us) || fixed_us <= 0 || !std::isfinite(log2_heap_us) || log2_heap_us < 0)
-        throw std::invalid_argument("Invalid locked-candidate CPU coefficients");
-    if (log2_heap_us == 0) return fixed_us;
-    if (!heap_size) throw std::invalid_argument("Locked-candidate CPU cost requires the pre-pop heap size");
-    return fixed_us + log2_heap_us * std::log2(static_cast<double>(heap_size));
+    throw std::invalid_argument("Eviction control requires a semantic phase");
 }
 
 std::vector<HiCacheEvictionStep> eviction_sequence(const model::HiCacheEvictionWork & work, bool write_back) {
@@ -55,7 +48,7 @@ std::vector<HiCacheEvictionStep> eviction_sequence(const model::HiCacheEvictionW
     }
     const auto skips_before = [&](size_t victim) {
         while (skipped < work.rejected_candidates.size() && work.rejected_candidates[skipped].before_victim == victim) {
-            steps.push_back({Kind::SkipLocked});
+            steps.push_back({ Kind::SkipLocked });
             steps.back().heap_size = work.rejected_candidates[skipped].heap_size;
             ++skipped;
         }

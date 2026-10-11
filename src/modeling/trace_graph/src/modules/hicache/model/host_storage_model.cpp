@@ -4,10 +4,10 @@
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
 
-#include <string>
 #include <set>
-#include <tuple>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -40,9 +40,7 @@ uint64_t HiCacheState::release_device_residency(const HiCacheFact & fact, Scoped
     if (has_backup) { scope.tree.demote_device_to_host(node_id, false); }
     else {
         const auto removal = scope.tree.evict_unbacked_device_leaf(node_id);
-        if (!removal.evicted) {
-            return 0;
-        }
+        if (!removal.evicted) { return 0; }
         affected_nodes = removal.affected_nodes;
     }
     const auto allocator_released_pages = scope.device_allocator.release(released_pages);
@@ -82,7 +80,7 @@ const HiCacheEvictionWork * HiCacheState::eviction_work(const HiCacheFact & fact
 }
 
 void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState & scope, uint64_t requested_pages,
-                                         std::function<void(const HiCacheFact &)> continuation) {
+                                           std::function<void(const HiCacheFact &)> continuation) {
     if (!execution_prefetch_control_) {
         enforce_device_capacity(fact, scope, requested_pages);
         continuation(fact);
@@ -96,7 +94,9 @@ void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState
     }
     scope.allocation = PendingAllocation{ .fact_id = fact.source_node_id, .continuation = std::move(continuation) };
     auto & work = scope.eviction_work[fact.source_node_id];
-    work = HiCacheEvictionWork{ .requested_pages = requested_pages };
+    work = HiCacheEvictionWork{ .requested_pages = requested_pages,
+                                .release_buffer_pages =
+                                    scope.device_allocator.need_sort ? scope.device_allocator.release_pages : scope.device_allocator.free_pages };
     using Candidate = std::tuple<int64_t, uint64_t, HiCacheNodeId>;
     std::set<Candidate> candidates;
     std::set<HiCacheNodeId> selected, queued;
@@ -112,8 +112,12 @@ void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState
         candidates.erase(candidates.begin());
         const auto * node = scope.tree.node(id);
         if (!node || node->refs.lock_ref_total || !node->residency.device_present) {
-            work.rejected_candidates.push_back({id, work.victims.size(),
-                !node ? "missing_node" : node->refs.lock_ref_total ? "locked_node" : "not_device_resident", heap_size});
+            work.rejected_candidates.push_back({ id,
+                                                 work.victims.size(),
+                                                 !node                       ? "missing_node"
+                                                 : node->refs.lock_ref_total ? "locked_node"
+                                                                             : "not_device_resident",
+                                                 heap_size });
             continue;
         }
         const auto parent_id = node->parent;
@@ -126,8 +130,8 @@ void HiCacheState::allocate_after_capacity(const HiCacheFact & fact, ScopedState
             planned_pages = core::checked_add_u64(planned_pages, pages, "Eviction budget overflow");
         }
         else {
-            work.rejected_candidates.push_back({id, work.victims.size(),
-                release_after_write ? "host_backup_rejected" : "device_release_rejected", heap_size});
+            work.rejected_candidates.push_back(
+                { id, work.victims.size(), release_after_write ? "host_backup_rejected" : "device_release_rejected", heap_size });
         }
         // A failed host reservation does not prevent trying another victim.
         // Selected children still occupy GPU pages until the final wait ends.
@@ -167,8 +171,14 @@ void HiCacheState::resume_allocation(const HiCacheFact & fact) {
     const auto consumer_epoch = scope.clock.next_boundary_epoch();
     for (const auto & [id, operation] : scope.async_ops.storage_ops())
         if (operation.header.source_node_id == fact.source_node_id && !operation.capacity_gate_pages.empty() && !operation.header.consumer_epoch)
-            scope.async_ops.set_storage_consumer_boundary(id, consumer_epoch, fact.ts, fact.source_node_id, fact.execution_anchor_node_id,
-                                                        fact.source_event_index, fact.role, true);
+            scope.async_ops.set_storage_consumer_boundary(id,
+                                                          consumer_epoch,
+                                                          fact.ts,
+                                                          fact.source_node_id,
+                                                          fact.execution_anchor_node_id,
+                                                          fact.source_event_index,
+                                                          fact.role,
+                                                          true);
     pending.continuation(fact);
 }
 

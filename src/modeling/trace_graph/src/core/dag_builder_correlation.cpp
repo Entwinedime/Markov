@@ -47,7 +47,11 @@ void order_submission_roles(const DagGraph & graph, std::vector<size_t> & nodes)
     sort_nodes_by_event_ts_if_needed(graph, nodes);
     // Host submission causes device execution even when independently observed
     // intervals overlap. Device timestamps must not reverse that dependency.
-    std::stable_partition(nodes.begin(), nodes.end(), [&](size_t id) { return graph.node(id).is_cpu; });
+    const auto cpu_end = std::stable_partition(nodes.begin(), nodes.end(), [&](size_t id) { return graph.node(id).is_cpu; });
+    // A queued task's arrival causes its worker execution. Timestamp ties
+    // (including opening-cut arrival observations) must not reverse that
+    // cross-thread dependency just because a longer worker leaf sorts first.
+    std::stable_partition(nodes.begin(), cpu_end, [&](size_t id) { return graph.event_for_node(id).cat == "enqueue"; });
 }
 
 template <typename Result, typename Entry, typename Fn> std::vector<Result> map_entries_parallel(const std::vector<Entry> & entries, size_t threads, Fn fn) {

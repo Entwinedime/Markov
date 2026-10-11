@@ -3,8 +3,10 @@
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/source_dag/call_regions.hpp"
 #include <algorithm>
 #include <set>
+#include <span>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
@@ -43,14 +45,21 @@ std::map<std::pair<std::string, std::string>, std::string> observe_write_control
 const patch::HiCacheSourceFactNode & observe_write_envelope(const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid,
                                                             uint64_t begin, uint64_t end) {
     const patch::HiCacheSourceFactNode * outer = nullptr;
-    for (const auto & fact : source.fact_nodes()) {
-        if (fact.fact_role != "commit_device_to_host_enqueue_observed" || fact.phase != "end" || fact.pid != pid || fact.tid != tid || fact.timestamp_us > begin
-            || fact.timestamp_us + fact.duration_us < end)
-            continue;
-        if (outer) throw std::runtime_error("Write submission has multiple enclosing write_backup calls");
-        outer = &fact;
+    // An admitted request lifecycle may finish after the HTTP endpoint. Its
+    // write record and enclosing call live in the same preserved tail context;
+    // looking up that envelope must not extend the measured request window.
+    for (const auto facts : { std::span<const patch::HiCacheSourceFactNode>(source.fact_nodes()), source.tail_context_facts() }) {
+        for (const auto & fact : facts) {
+            if (fact.fact_role != "commit_device_to_host_enqueue_observed" || fact.phase != "end" || fact.pid != pid || fact.tid != tid
+                || fact.timestamp_us > begin || fact.timestamp_us + fact.duration_us < end)
+                continue;
+            if (outer) throw std::runtime_error("Write submission has multiple enclosing write_backup calls");
+            outer = &fact;
+        }
     }
-    if (!outer) throw std::runtime_error("Write submission lacks its enclosing write_backup call");
+    if (!outer)
+        throw std::runtime_error("Write submission lacks its enclosing write_backup call: pid=" + pid + " tid=" + tid + " begin_us=" + std::to_string(begin)
+                                 + " end_us=" + std::to_string(end));
     return *outer;
 }
 
@@ -65,7 +74,7 @@ HiCacheHostTemplate observe_write_host_template(const patch::HiCacheSourceDagInd
 HiCacheHostTemplate observe_host_template(const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid, uint64_t begin,
                                           uint64_t end) {
     if (end <= begin) throw std::invalid_argument("Host template requires a nonempty interval");
-    HiCacheHostTemplate result{ .main = source.timing_interval_ownership(pid, tid, begin, end - begin) };
+    HiCacheHostTemplate result{ .main = source.call_interval_ownership(pid, tid, begin, end - begin) };
     if (result.main.status != "ready" || (result.main.owned_node_ids.empty() && result.main.owned_gap_slices.empty()) || result.main.has_node_overlap)
         throw std::runtime_error("Host template lacks nonoverlapping main-thread leaves: pid=" + pid + " at_us=" + std::to_string(begin)
                                  + " reason=" + result.main.reason);
@@ -150,7 +159,8 @@ std::vector<HiCacheEvictionRegion> observe_eviction_regions(const patch::HiCache
 }
 
 HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                            const HiCacheHostTemplate & host, std::string_view prefix) {
+                                            const HiCacheHostTemplate & host, std::string_view prefix, std::span<const size_t> callback_points,
+                                            bool retain_collective_completions) {
     const auto & graph = source.graph();
     HiCacheHostExpansion plan;
     auto & mapped = plan.source_nodes;
@@ -168,15 +178,44 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
         uint64_t gap;
     };
     std::vector<Piece> pieces;
-    for (const auto id : host.main.owned_node_ids) pieces.push_back({ graph.event_for_node(id).ts, id, 0 });
+    auto main_nodes = host.main.owned_node_ids;
+    if (!callback_points.empty()) {
+        std::set<size_t> selected(main_nodes.begin(), main_nodes.end());
+        selected.insert(callback_points.begin(), callback_points.end());
+        const auto & sample = graph.event_for_node(callback_points.front());
+        const auto lane = source.cpu_nodes_on_lane(sample.pid, sample.tid);
+        const auto first = std::ranges::lower_bound(lane, host.main.interval_start_us, {}, [&](size_t id) { return graph.event_for_node(id).ts; });
+        main_nodes.clear();
+        for (auto at = first; at != lane.end() && graph.event_for_node(*at).ts < host.main.interval_end_us; ++at)
+            if (selected.erase(*at)) main_nodes.push_back(*at);
+
+        if (!selected.empty()) throw std::runtime_error("Retained callbacks must belong to the copied call's CPU interval");
+        for (const auto point : callback_points)
+            if (graph.node(point).duration || graph.node(point).cpu_gap_after || graph.scope_gap_duration(point))
+                throw std::runtime_error("Retained callback point must not duplicate separately owned service or gaps");
+    }
+    for (const auto id : main_nodes) pieces.push_back({ graph.event_for_node(id).ts, id, 0 });
     for (const auto & gap : host.main.owned_gap_slices) {
         const auto & event = graph.event_for_node(gap.owner_node_id);
-        const auto service = graph.cpu_service_cost().duration({ event.pid, event.tid }, gap.owned_start_us, gap.owned_end_us);
-        pieces.push_back({ gap.owned_start_us, std::nullopt, service });
+        const auto retained = graph.observed_cpu_gap_ranges(gap.owner_node_id);
+        if (!retained) throw std::runtime_error("Host expansion cannot migrate a remodeled gap without source coordinates");
+
+        // Nested replacements can remove only part of an observed gap. The
+        // old timestamps still enclose that time, but they do not authorize
+        // copying it again into the enclosing replacement.
+        for (const auto & [lo, hi] : *retained) {
+            const auto begin = std::max(lo, gap.owned_start_us), end = std::min(hi, gap.owned_end_us);
+            if (begin >= end) continue;
+
+            const auto service = graph.cpu_service_cost().duration({ event.pid, event.tid }, begin, end);
+            pieces.push_back({ begin, std::nullopt, service });
+        }
     }
-    std::ranges::sort(pieces, {}, &Piece::at);
+    // Equal-tick submissions retain the source lane's order. Sorting only by
+    // timestamp without stability can reverse zero-duration enqueue points.
+    std::ranges::stable_sort(pieces, {}, &Piece::at);
     if (pieces.empty()) throw std::runtime_error("Host expansion needs observed leaves or gaps");
-    const auto lane_node = host.main.owned_node_ids.empty() ? host.main.owned_gap_slices.front().owner_node_id : host.main.owned_node_ids.front();
+    const auto lane_node = main_nodes.empty() ? host.main.owned_gap_slices.front().owner_node_id : main_nodes.front();
     for (const auto & piece : pieces) {
         auto spec = piece.node ? copy(*piece.node)
                                : core::DagSyntheticNodeSpec{ .name = std::string(prefix) + "retained host gap",
@@ -195,14 +234,36 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
     });
     plan.edges.push_back({ plan.host_return - 1, plan.host_return, core::DagEdgeKind::Sequential });
 
+    // Correlation may identify only the first span of a submitted task. Keep
+    // its same-task continuations too, but never copy the next FIFO job. This
+    // is the same ownership boundary used when removing the original call.
+    auto worker_nodes = host.worker_nodes;
+    std::set<size_t> workers(worker_nodes.begin(), worker_nodes.end());
+    for (size_t i = 0; i < worker_nodes.size(); ++i) {
+        const auto task = queues.node_task.at(worker_nodes[i]);
+        if (task == core::DagNode::kNoNode) continue;
+
+        for (const auto edge_id : source.outgoing_edge_ids(worker_nodes[i])) {
+            const auto & edge = graph.edge(edge_id);
+            if (!edge.active || edge.kind != core::DagEdgeKind::Sequential || !graph.node(edge.dst).active || queues.node_task.at(edge.dst) != task) continue;
+
+            if (workers.insert(edge.dst).second) worker_nodes.push_back(edge.dst);
+        }
+    }
+
     std::map<size_t, std::vector<size_t>> jobs;
-    for (const auto node : host.worker_nodes) {
+    for (const auto node : worker_nodes) {
         const auto task = queues.node_task.at(node);
         if (task == core::DagNode::kNoNode) {
             const auto & event = graph.event_for_node(node);
-            throw std::runtime_error("Host worker is not a recognized queue task: template=" + std::string(prefix) + " node=" + std::to_string(node)
-                                     + " name=" + event.name + " pid=" + event.pid + " tid=" + event.tid + " at_us=" + std::to_string(event.ts)
-                                     + " correlation=" + event.arg("correlation_id"));
+            auto message = "Host worker is not a recognized queue task: template=" + std::string(prefix) + " node=" + std::to_string(node)
+                           + " name=" + event.name + " pid=" + event.pid + " tid=" + event.tid + " at_us=" + std::to_string(event.ts)
+                           + " correlation=" + event.arg("correlation_id");
+#ifdef DEBUG
+            if (const auto issue = queues.unavailable_lanes.find(graph.node(node).lane_id); issue != queues.unavailable_lanes.end())
+                message += " queue_reason=" + issue->second;
+#endif
+            throw std::runtime_error(message);
         }
         jobs[task].push_back(node);
     }
@@ -211,23 +272,25 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
         std::ranges::sort(nodes, {}, [&](size_t id) { return std::pair{ graph.event_for_node(id).ts, id }; });
         if (nodes.front() != task.first || nodes.back() != task.last || !mapped.contains(task.submission))
             throw std::runtime_error("Write template owns only part of a runtime queue job");
-        auto spec = copy(task.first);
-        spec.duration = 0;
         uint64_t previous_end = graph.event_for_node(task.first).ts;
+        std::optional<size_t> previous;
         for (const auto node : nodes) {
             const auto & event = graph.event_for_node(node);
             const auto gap = event.ts > previous_end ? graph.cpu_service_cost().duration({ event.pid, event.tid }, previous_end, event.ts) : 0;
-            const auto service = core::checked_add_u64(graph.cpu_service_node_duration(node), gap, "Write worker cost overflow");
-            spec.duration = core::checked_add_u64(spec.duration, service, "Write worker cost overflow");
+            auto spec = copy(node);
+            spec.duration = core::checked_add_u64(spec.duration, gap, "Write worker cost overflow");
+            if (!previous) spec.cpu_task_ready_delay_us = graph.cpu_service_ready_delay(task.first, task.ready_delay_us);
             previous_end = std::max(previous_end, event.ts + event.dur);
-            mapped.emplace(node, plan.nodes.size());
+            const auto local = plan.nodes.size();
+            mapped.emplace(node, local);
+            plan.nodes.push_back({ std::move(spec), mapped.at(task.submission), task.first, previous });
+            if (previous) plan.edges.push_back({ *previous, local, core::DagEdgeKind::Sequential });
+            previous = local;
         }
-        spec.cpu_task_ready_delay_us = graph.cpu_service_ready_delay(task.first, task.ready_delay_us);
-        plan.nodes.push_back({ std::move(spec), mapped.at(task.submission), task.first });
     }
 
     auto pending = host.main.owned_node_ids;
-    pending.insert(pending.end(), host.worker_nodes.begin(), host.worker_nodes.end());
+    pending.insert(pending.end(), worker_nodes.begin(), worker_nodes.end());
     std::set<size_t> devices;
     for (size_t i = 0; i < pending.size(); ++i)
         for (const auto id : source.outgoing_edge_ids(pending[i])) {
@@ -235,6 +298,8 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
             if (!edge.active || edge.kind != core::DagEdgeKind::Correlation || !graph.node(edge.dst).active || graph.node(edge.dst).is_cpu) continue;
             if (devices.insert(edge.dst).second) pending.push_back(edge.dst);
         }
+    const auto placeholders = source_dag::interior_stream_placeholders(source, devices);
+    devices.insert(placeholders.begin(), placeholders.end());
     for (const auto node : devices) {
         mapped.emplace(node, plan.nodes.size());
         plan.nodes.push_back({ copy(node) });
@@ -257,7 +322,28 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
             if (!has_before) first.push_back(node);
             if (!has_after) last.push_back(node);
         }
-        if (first.size() != 1 || last.size() != 1) throw std::runtime_error("Write template has a disconnected device stream");
+        if (first.size() != 1 || last.size() != 1) {
+            std::string details = " lane=" + std::to_string(lane) + " observed_begin_us=" + std::to_string(host.main.interval_start_us)
+                                  + " observed_end_us=" + std::to_string(host.main.interval_end_us) + " starts=" + std::to_string(first.size())
+                                  + " ends=" + std::to_string(last.size());
+            for (size_t i = 0; i < std::min(first.size(), size_t{ 4 }); ++i) {
+                const auto & event = graph.event_for_node(first[i]);
+                details += " start=" + std::to_string(first[i]) + ":" + event.name + "@" + std::to_string(event.ts);
+                for (const auto edge_id : source.incoming_edge_ids(first[i])) {
+                    const auto & edge = graph.edge(edge_id);
+                    if (!edge.active || edge.kind != core::DagEdgeKind::Stream) continue;
+                    const auto & predecessor = graph.event_for_node(edge.src);
+                    details +=
+                        " predecessor=" + std::to_string(edge.src) + ":" + predecessor.name + ":duration_us=" + std::to_string(graph.node(edge.src).duration);
+                    for (const auto predecessor_edge_id : source.incoming_edge_ids(edge.src)) {
+                        const auto & incoming = graph.edge(predecessor_edge_id);
+                        if (!incoming.active || incoming.kind == core::DagEdgeKind::Stream) continue;
+                        details += " predecessor_incoming=" + core::edge_kind_name(incoming.kind) + ":" + std::to_string(incoming.src);
+                    }
+                }
+            }
+            throw std::runtime_error("Write template has a disconnected device stream" + details);
+        }
         plan.streams.push_back({ first.front(), mapped.at(first.front()), mapped.at(last.front()) });
     }
     for (const auto & [node, local] : mapped)
@@ -270,6 +356,8 @@ HiCacheHostExpansion prepare_host_expansion(const patch::HiCacheSourceDagIndex &
                 plan.edges.push_back({ from->second, local, edge.kind == core::DagEdgeKind::Correlation ? core::DagEdgeKind::Mutation : edge.kind });
             }
             else if (edge.kind == core::DagEdgeKind::Sequential || edge.kind == core::DagEdgeKind::Stream) continue;
+            else if (retain_collective_completions && edge.kind == core::DagEdgeKind::HCCL && !graph.node(edge.src).is_cpu && !graph.node(node).is_cpu)
+                plan.collective_completions.push_back({ edge.src, local });
             else if (edge.kind == core::DagEdgeKind::Sync && !graph.node(edge.src).is_cpu && core::synchronizes_device_frontier(graph.event_for_node(node)))
                 plan.waits.push_back({ edge.src, local });
             else if (edge.kind == core::DagEdgeKind::Sync && graph.event_for_node(edge.src).name == "EVENT_RECORD" && !graph.node(edge.src).is_cpu

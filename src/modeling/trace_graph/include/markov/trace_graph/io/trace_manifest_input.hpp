@@ -4,8 +4,8 @@
  */
 #pragma once
 
-#include "markov/trace_graph/core/trace_event.hpp"
 #include "markov/trace_graph/core/client_requests.hpp"
+#include "markov/trace_graph/core/trace_event.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -51,6 +51,12 @@ struct ManifestTraceInputOptions {
 /** @brief One logical input after selected channels have been joined in memory. */
 struct ManifestTraceInput {
     std::vector<core::TraceEvent> events;
+    /** Selection accounting after parsing/joining, not raw JSON record counts.
+     * Synthetic window gates are excluded from retained duration records. */
+    size_t joined_record_count = 0;
+    size_t duration_record_count = 0;
+    size_t window_removed_record_count = 0;
+    size_t window_boundary_count = 0;
     /** @brief Pre-window side-table records needed to decode in-window event arguments. */
     std::vector<core::TraceEvent> context_events;
     /** @brief Pre-window semantic facts replayed only to reconstruct initial model state. */

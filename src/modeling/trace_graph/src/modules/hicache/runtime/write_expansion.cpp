@@ -1,21 +1,30 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include <algorithm>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
+namespace {
 
-HiCacheHostExpansion generated_cpu_control(std::string_view lane, double cpu_us, double residual_us, std::pair<double, double> & remainders,
-                                           std::string_view name) {
+void bind_cpu_service(core::DagSyntheticNodeSpec & work, double cpu_us, double residual_us, std::pair<double, double> & remainders) {
     const auto cpu = core::truncate_to_u64(cpu_us + remainders.first);
     const auto residual = core::truncate_to_u64(residual_us + remainders.second);
     if (cpu_us < 0 || residual_us < 0 || !cpu || !residual) throw std::invalid_argument("Generated CPU control requires finite nonnegative cost estimates");
+
     remainders.first += cpu_us - *cpu;
     remainders.second += residual_us - *residual;
+    work.duration = *cpu;
+    work.cpu_gap_after = *residual;
+}
+
+} // namespace
+
+HiCacheHostExpansion generate_cpu_control(std::string_view lane, std::string_view name) {
     HiCacheHostExpansion plan;
     plan.nodes.push_back({
-        { .name = std::string(name), .category = "hicache_patch", .lane_key = std::string(lane), .duration = *cpu, .cpu_gap_after = *residual }
+        { .name = std::string(name), .category = "hicache_patch", .lane_key = std::string(lane) }
     });
     plan.nodes.push_back({
         { .name = "target control return", .lane_key = std::string(lane) }
@@ -25,32 +34,9 @@ HiCacheHostExpansion generated_cpu_control(std::string_view lane, double cpu_us,
     return plan;
 }
 
-HiCacheHostExpansion generated_completion_check(std::string_view lane, size_t events, double entry_cpu_us, double entry_residual_us, double event_cpu_us,
-                                                double event_residual_us, std::pair<double, double> & remainders) {
-    auto plan = generated_cpu_control(lane, entry_cpu_us, entry_residual_us, remainders, "target write check entry");
-    for (size_t i = 0; i < events; ++i) {
-        auto body = generated_cpu_control(lane, event_cpu_us, event_residual_us, remainders, "target write acknowledgement: base control proxy");
-        const auto offset = plan.nodes.size();
-        plan.edges.push_back({ plan.host_return, offset, core::DagEdgeKind::Sequential });
-        plan.nodes.insert(plan.nodes.end(), body.nodes.begin(), body.nodes.end());
-        for (const auto & edge : body.edges) plan.edges.push_back({ offset + edge.from, offset + edge.to, edge.kind });
-        plan.event_waits.push_back({ core::DagNode::kNoNode, offset });
-        plan.host_return = offset + body.host_return;
-    }
-    return plan;
-}
-
-
-HiCacheHostExpansion calibrated_cpu_control(std::string_view lane, double cost_us, double & remainder_us, std::string_view name) {
-    const auto total = cost_us + remainder_us;
-    const auto duration = core::truncate_to_u64(total);
-    if (!(cost_us > 0.0) || !duration) throw std::invalid_argument("Calibrated control requires a finite positive CPU cost");
-    remainder_us = total - *duration;
-    HiCacheHostExpansion plan;
-    plan.nodes.push_back({
-        { .name = std::string(name), .category = "hicache_patch", .lane_key = std::string(lane), .duration = *duration }
-    });
-    return plan;
+void bind_cpu_control(HiCacheHostExpansion & plan, double cpu_us, double residual_us, std::pair<double, double> & remainders) {
+    bind_cpu_service(plan.nodes.front().work, cpu_us, residual_us, remainders);
+    plan.nodes.front().work.attrs["cost_binding_source"] = "hicache_control_independent_model";
 }
 
 std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & graph) {
@@ -60,14 +46,18 @@ std::map<size_t, size_t> observe_host_worker_members(const core::DagGraph & grap
     return members;
 }
 
+void rebind_host_stream_position(const patch::HiCacheSourceDagIndex & source, HiCacheWriteStreamPosition & position, const std::string & pid,
+                                 const std::string & tid, uint64_t at_us) {
+    const auto & graph = source.graph();
+    if ((!position.before || graph.node(*position.before).active) && (!position.after || graph.node(*position.after).active)) return;
+
+    const auto sample = position.before ? *position.before : *position.after;
+    position = observe_write_stream_position(source, sample, pid, tid, at_us);
+}
+
 void rebind_host_stream_positions(const patch::HiCacheSourceDagIndex & source, std::map<size_t, HiCacheWriteStreamPosition> & positions,
                                   const std::string & pid, const std::string & tid, uint64_t at_us) {
-    const auto & graph = source.graph();
-    for (auto & [lane, position] : positions) {
-        if ((!position.before || graph.node(*position.before).active) && (!position.after || graph.node(*position.after).active)) continue;
-        const auto sample = position.before ? *position.before : *position.after;
-        position = observe_write_stream_position(source, sample, pid, tid, at_us);
-    }
+    for (auto & [lane, position] : positions) rebind_host_stream_position(source, position, pid, tid, at_us);
 }
 
 void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size_t, size_t> & members, std::span<HiCacheHostExpansion *> plans) {
@@ -111,20 +101,20 @@ HiCacheExpandedHost HiCacheHostSequence::append(const HiCacheHostExpansion & pla
     return result;
 }
 
-HiCacheExpandedWrite HiCacheHostSequence::append(const HiCacheWriteExpansion & plan, uint64_t service_us, std::span<const size_t> lanes) {
-    auto result = expand_write(plan, service_us, resolve(lanes), future_, host_return_);
+HiCacheExpandedWrite HiCacheHostSequence::append(const HiCacheWriteExpansion & plan, std::span<const size_t> lanes) {
+    auto result = expand_write(plan, resolve(lanes), future_, host_return_);
     advance(lanes, result.stream_tails, result.host_return);
     return result;
 }
 
 HiCacheWriteStreamPosition HiCacheWriteStreamInsertions::position(size_t lane, HiCacheWriteStreamPosition source) const {
-    const auto found = tails_.find(lane);
-    if (found != tails_.end() && found->second.source.before == source.before && found->second.source.after == source.after) source.before = found->second.tail;
+    const auto found = tails_.find({ lane, source.before, source.after });
+    if (found != tails_.end()) source.before = found->second;
     return source;
 }
 
 void HiCacheWriteStreamInsertions::advance(size_t lane, HiCacheWriteStreamPosition source, size_t tail) {
-    tails_.insert_or_assign(lane, Entry{ source, tail });
+    tails_.insert_or_assign(Cut{ lane, source.before, source.after }, tail);
 }
 
 void HiCacheWriteStreamInsertions::bind_synchronizations(const core::DagGraph & graph) {
@@ -168,7 +158,9 @@ HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::spa
     std::vector<size_t> nodes(work.size(), core::DagNode::kNoNode);
     for (size_t i = 0; i < work.size(); ++i) {
         const auto & node = work[i];
-        nodes[i] = node.submission ? future.append_cpu_task(node.work, nodes.at(*node.submission), *node.queue_member) : future.append(node.work);
+        if (node.task_predecessor) nodes[i] = future.append_cpu_task_part(node.work, nodes.at(*node.task_predecessor));
+        else if (node.submission) nodes[i] = future.append_cpu_task(node.work, nodes.at(*node.submission), *node.queue_member);
+        else nodes[i] = future.append(node.work);
     }
 
     for (const auto & edge : plan.edges) future.depend(nodes.at(edge.from), nodes.at(edge.to), edge.kind);
@@ -182,6 +174,7 @@ HiCacheExpandedHost expand_host_work(const HiCacheHostExpansion & plan, std::spa
     for (size_t i = 0; i < plan.waits.size(); ++i)
         if (positions[plan.streams.size() + i].before) future.depend(*positions[plan.streams.size() + i].before, nodes.at(plan.waits[i].consumer));
     for (size_t i = 0; i < plan.event_waits.size(); ++i) future.depend(event_completions[i], nodes.at(plan.event_waits[i].consumer));
+    for (const auto & wait : plan.collective_completions) future.depend(wait.source_node, nodes.at(wait.consumer), core::DagEdgeKind::HCCL);
     result.nodes = std::move(nodes);
     return result;
 }
@@ -192,21 +185,24 @@ HiCacheExpandedHost expand_host(const HiCacheHostExpansion & plan, std::span<con
     return expand_host_work(plan, plan.nodes, positions, future, previous_host_return, event_completions);
 }
 
-HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, uint64_t service_us, std::span<const HiCacheWriteStreamPosition> positions,
-                                  simulation::FutureDag & future, std::optional<size_t> previous_host_return) {
+void bind_transfer_payload(HiCacheWriteExpansion & plan, uint64_t service_us) {
     if (!plan.payload_bytes) throw std::invalid_argument("Write expansion requires payload geometry");
-    // Only node costs vary per call; topology and source/resource bindings are
-    // borrowed unchanged. Prefix rounding preserves the total device service.
-    auto work = plan.nodes;
+
     uint64_t bytes = 0, assigned = 0;
     for (const auto & [node, count] : plan.payload) {
         bytes += count;
         const auto prefix = core::floor_multiply_divide_u64(service_us, bytes, plan.payload_bytes).value();
-        work.at(node).work.duration = prefix - assigned;
+
+        auto & work = plan.nodes.at(node).work;
+        work.duration = prefix - assigned;
+        work.attrs["cost_binding_source"] = "hicache_payload_model";
         assigned = prefix;
     }
+}
 
-    auto host = expand_host_work(plan, work, positions, future, previous_host_return, {});
+HiCacheExpandedWrite expand_write(const HiCacheWriteExpansion & plan, std::span<const HiCacheWriteStreamPosition> positions, simulation::FutureDag & future,
+                                  std::optional<size_t> previous_host_return) {
+    auto host = expand_host_work(plan, plan.nodes, positions, future, previous_host_return, {});
     return { host.host_return, host.nodes.at(plan.write_start), host.nodes.at(plan.completion), std::move(host.stream_tails), std::move(host.nodes) };
 }
 

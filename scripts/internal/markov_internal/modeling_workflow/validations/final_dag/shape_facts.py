@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
-from collections import defaultdict
+from bisect import bisect_left
+from collections import Counter, defaultdict
 from typing import Any
 
 
 _OPPORTUNITY_ROLES = (
     "cache_lookup_input",
     "cache_extend_input",
+    "cache_decode_allocation",
     "prefetch_candidate_anchor",
     "cache_lifecycle_commit",
 )
@@ -20,6 +22,98 @@ def index_roles(events: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     for event in events:
         result[str(event["role"])].append(event)
     return result
+
+
+def derive_decode_opportunities(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Join observed Decode allocation calls to prompt identity and their actual forward.
+
+    Only successful single-token calls with consecutive, observed request lengths
+    establish an opportunity. Missing joins remain report blockers, not zero work.
+    This reads target observations only; no predicted decisions or costs are used.
+    """
+
+    forwards: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        if event["role"] == "decode_forward_observed" and event["window_position"] == "formal":
+            forwards[(event["pid"], event["tid"])].append(event)
+    times = {lane: [event["ts"] for event in rows] for lane, rows in forwards.items()}
+    used: set[tuple[tuple[str, str], int]] = set()
+    origins: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
+    iterations: Counter[tuple[str, str]] = Counter()
+    blockers: Counter[str] = Counter()
+    derived = []
+
+    for event in events:
+        if event["window_position"] != "formal":
+            continue
+        if event["role"] == "cache_extend_input" and completed_state_fact_phase(event):
+            for request_id, span in opportunity_identities(event):
+                key = (event["pid"], request_id)
+                if key in origins:
+                    blockers["decode_ambiguous_prompt_origin"] += 1
+                origins[key] = (event, span)
+            continue
+        if event["role"] != "decode_allocation_observed":
+            continue
+
+        args = event["args"]
+        requests = array_arg(args.get("requests"))
+        ids = [str(request["request_id"]) for request in requests]
+        lane = (event["pid"], event["tid"])
+        position = bisect_left(times.get(lane, []), event["end"])
+        forward = forwards[lane][position] if position < len(forwards[lane]) else None
+        if (
+            args.get("status") != "returned"
+            or args.get("token_per_req") != 1
+            or not requests
+            or forward is None
+            or forward["args"].get("status") != "returned"
+            or array_arg(forward["args"].get("request_ids")) != ids
+            or (lane, position) in used
+        ):
+            blockers["decode_allocation_forward_join_incomplete"] += 1
+            continue
+
+        spans = []
+        for request_id, request in zip(ids, requests):
+            key = (event["pid"], request_id)
+            origin = origins.get(key)
+            if origin is None:
+                break
+            parent, span = origin
+            length = u64(span.get("end")) - u64(span.get("begin")) + iterations[key]
+            if (
+                parent["tid"] != event["tid"]
+                or parent["args"].get("cache_scope") != args.get("cache_scope")
+                or parent["ts"] >= event["ts"]
+                or request.get("decode_batch_idx") != iterations[key]
+                or request.get("kv_committed_len") != length
+                or request.get("kv_allocated_len") != length
+            ):
+                break
+            spans.append(span)
+        if len(spans) != len(requests):
+            blockers["decode_request_identity_incomplete"] += 1
+            continue
+
+        used.add((lane, position))
+        for request_id in ids:
+            iterations[(event["pid"], request_id)] += 1
+        derived.append(
+            dict(
+                event,
+                role="cache_decode_allocation",
+                fact_class="workload_identity",
+                args=dict(
+                    args, phase="end", request_ids=ids, full_path_spans=spans, source_page_size=args["page_size_tokens"]
+                ),
+            )
+        )
+
+    missing = sum(len(rows) for rows in forwards.values()) - len(used)
+    if missing:
+        blockers["decode_forward_without_allocation"] += missing
+    return sorted([*events, *derived], key=event_sort_key), blockers
 
 
 def request_events(opportunity: dict[str, Any], events: list[dict[str, Any]], window_end: int) -> list[dict[str, Any]]:
@@ -133,7 +227,9 @@ def commit_release_calls(
         and node_ids.intersection(u64_list(event["args"].get("operation_node_ids")))
     ]
     return [
-        end
+        # The acknowledgement removes its pending entry before the end probe.
+        # Keep node ownership observed at entry with the completed call.
+        dict(end, args={**end["args"], "operation_node_ids": start["args"]["operation_node_ids"]})
         for start in starts
         if (end := paired_end(start, role_events.get("commit_capacity_release_observed", []))) is not None
     ]
@@ -313,7 +409,7 @@ def request_ids(args: dict[str, Any]) -> set[str]:
 
 def opportunity_identities(event: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     args = event["args"]
-    if event["role"] != "cache_extend_input":
+    if event["role"] not in {"cache_extend_input", "cache_decode_allocation"}:
         span = object_arg(args.get("full_path_span"))
         return [(str(args.get("request_id") or ""), span)] if span else []
     request_values = array_arg(args.get("request_ids", args.get("batch_request_ids", [])))

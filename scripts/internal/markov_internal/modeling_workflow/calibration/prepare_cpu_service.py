@@ -9,7 +9,7 @@ from ...common.commands import positive_int
 from ...common.io import load_json, write_json
 from ...common.paths import require_repo_path
 from ...modeling.backend import execute_trace_graph, trace_graph_executable
-from ...modeling.workload import discover_workload_window
+from ...modeling.workload import controlled_request_window, discover_workload_window
 from .cpu_pair_preparation import prepare_forward_cpu_pair
 
 
@@ -20,14 +20,20 @@ def prepare_cpu_service(
     output_dir: Path,
     threads: int = 2,
     correct_recorder: bool = False,
+    include_setup_requests: bool = False,
 ) -> Path:
     """All targets sharing this source reuse the same measured service file."""
     light, profiled, output_dir = map(require_repo_path, (light, profiled, output_dir))
     window = discover_workload_window({}, profiled)
     if window is None or window.source != "workload_report.formal_window":
         raise ValueError("CPU service preparation requires the explicit formal workload window")
+    if include_setup_requests:
+        window = controlled_request_window(window)
     print("CPU service: reading and pairing the selected base captures", flush=True)
-    measurements = prepare_forward_cpu_pair(light, profiled, tp_size, correct_recorder=correct_recorder)
+    measurements = prepare_forward_cpu_pair(
+        light, profiled, tp_size, correct_recorder=correct_recorder, include_setup_requests=include_setup_requests
+    )
+    measurements["measurement_window"].update(start_us=window.start_ns // 1000, end_us=window.end_ns // 1000)
     output_dir.mkdir(parents=True, exist_ok=True)
     measurement_path = output_dir / "cpu_measurements.json"
     service_path = output_dir / "cpu_service.json"
@@ -63,7 +69,9 @@ def prepare_cpu_service(
         measurements["source_recorder_correction"] = correction
         if "hook_recorder_correction" in audit:
             measurements["hook_recorder_correction"] = audit["hook_recorder_correction"]
-    measurements["preparation"] = dict(tp_size=tp_size, correct_recorder=correct_recorder)
+    measurements["preparation"] = dict(
+        tp_size=tp_size, correct_recorder=correct_recorder, include_setup_requests=include_setup_requests
+    )
     write_json(measurement_path, measurements)
     return service_path
 
@@ -76,6 +84,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--threads", type=positive_int, default=2)
     parser.add_argument(
+        "--include-setup-requests",
+        action="store_true",
+        help="pair every controlled request for independent calibration",
+    )
+    parser.add_argument(
         "--correct-recorder", action="store_true", help="Apply measured light/source recorder corrections"
     )
     args = parser.parse_args(argv)
@@ -86,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output_dir,
         args.threads,
         args.correct_recorder,
+        args.include_setup_requests,
     )
     print(f"CPU service prepared: {path}")
     return 0

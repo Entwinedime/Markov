@@ -1,3 +1,4 @@
+#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
 #include <algorithm>
 #include <stdexcept>
@@ -12,15 +13,31 @@ const HiCacheLoadAdmissionWork * HiCacheState::load_admission_work(const HiCache
     return work == scope->second.load_admission_work.end() ? nullptr : &work->second;
 }
 
-bool HiCacheState::load_allocation_will_succeed(const HiCacheFact & fact) const {
+std::vector<HiCacheLoadAllocatorAttempt> HiCacheState::load_allocation_attempts(const HiCacheFact & fact) const {
     const auto * work = load_admission_work(fact);
     if (!work) throw std::logic_error("Load allocation projection needs target admission work");
-    if (!allocation_pending(fact)) return work->allocated;
+
     const auto & scope = scopes_.at(normalized_scope(fact));
+    const auto attempt = [&](uint64_t free_pages, uint64_t release_pages) {
+        const bool merge = scope.device_allocator.need_sort && work->requested_pages > free_pages && release_pages > 0;
+        const auto available = merge ? core::checked_add_u64(free_pages, release_pages, "Load merge page count overflow") : free_pages;
+        return HiCacheLoadAllocatorAttempt{ free_pages,
+                                            release_pages,
+                                            merge,
+                                            scope.device_allocator.capacity_pages == 0 || work->requested_pages <= available };
+    };
+    std::vector<HiCacheLoadAllocatorAttempt> attempts{ attempt(work->initial_free_pages, work->initial_release_pages) };
+    if (!allocation_pending(fact)) {
+        if (work->retry_attempt) attempts.push_back(*work->retry_attempt);
+        return attempts;
+    }
+
+    // The first attempt has already merged its release queue in state. Pending
+    // victims describe the exact additional releases before the second attempt.
     auto allocator = scope.device_allocator;
     for (const auto & victim : scope.allocation->victims) allocator.release(victim.pages.size());
-    allocator.merge_before_page_allocation(work->requested_pages);
-    return allocator.can_allocate(work->requested_pages);
+    attempts.push_back(attempt(allocator.free_pages, allocator.release_pages));
+    return attempts;
 }
 
 std::vector<std::string> HiCacheState::loadback_dependencies(const HiCacheFact & fact) const {
@@ -63,8 +80,10 @@ void HiCacheState::complete_loadback_batch(const HiCacheFact & fact, uint64_t ba
     if (!execution_prefetch_control_) throw std::logic_error("Explicit load completion requires execution-driven state");
     auto & scope = scope_state(fact);
     const auto batch = std::ranges::find(scope.load_ack_queue, batch_id, &HiCacheLoadbackBatch::id);
-    if (batch == scope.load_ack_queue.end() || batch->completed_at || fact.ts < batch->io_schedule.ready_ts)
+    if (batch == scope.load_ack_queue.end() || batch->completed_at || fact.ts < batch->io_schedule.start_ts)
         throw std::logic_error("Load completion requires a causal, uncompleted submitted batch");
+    batch->io_schedule.ready_ts = fact.ts;
+    batch->io_schedule.available = true;
     batch->completed_at = fact.ts;
     for (const auto & id : batch->operations) scope.async_ops.set_loadback_state(id, HiCacheOperationState::Completed, fact.ts);
 }

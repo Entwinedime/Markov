@@ -14,21 +14,22 @@ from typing import Any
 from ..common.io import load_json
 from ..common.manifest import profile_labels
 from ..common.paths import require_repo_path
+from ..modeling.deployment import environments_match, source_environment
 from ..contracts.forced_token.bundle import resolve_forced_token_bundle_plan
 from ..contracts.forced_token.plan import load_forced_token_plan
 from ..profiling.suite import expand_suite
 from ..workload_template.cli import parse_workload_command
 from .base_capture import captured_base_manifests
 from .capture import CAPTURE_CLEANUP_RESERVE_SEC
-from .control_calibrations import control_calibrations
+from ..modeling.cost.control import control_calibrations
 from .physical_capture import captured_physical_declaration, platform_inputs
-from .planning.profile_runs import (
+from ..modeling.source_dag.profiles import (
+    ProfileRunRef,
     discover_profile_runs,
     extract_hicache_from_server_command,
-    parse_server_command_flags,
 )
-from .planning.target_configs import load_target_config, parse_target_config
-from .types import ProfileRunRef, TargetHiCacheConfig
+from .structure.target_configs import load_target_config, parse_target_config
+from .types import TargetHiCacheConfig
 
 
 @dataclass(frozen=True)
@@ -115,6 +116,11 @@ class GroupRequest:
             "cpu_service_capture_budget",
             "cpu_service_costs",
             "control_calibrations",
+            "cost_model",
+            "cost_database",
+            "cost_training",
+            "automatic_cost_acquisition",
+            "resource_environment",
         }
         if set(raw) - allowed:
             raise ValueError(f"unknown group inputs (target observations are score-only): {sorted(set(raw) - allowed)}")
@@ -158,7 +164,7 @@ class GroupRequest:
             raise ValueError("provide one base manifest per workload; calibration repetitions are separate inputs")
         if len({json.dumps(run.hicache_config, sort_keys=True) for run in sources}) > 1:
             raise ValueError("base manifests must share one HiCache configuration")
-        environments = [source_environment(run) for run in sources]
+        environments = [source_environment(run, raw.get("resource_environment")) for run in sources]
         if environments and any(not environments_match(value, environments[0]) for value in environments[1:]):
             raise ValueError("base manifests must share model, TP and runtime resource settings")
 
@@ -299,7 +305,9 @@ def _control_sources(group: GroupRequest, base_environment: dict[str, Any] | Non
             raise ValueError("base measurements are not independent control calibration")
         if manifest not in admitted_manifests:
             (source,) = discover_profile_runs((manifest,))
-            if base_environment is not None and not environments_match(source_environment(source), base_environment):
+            if base_environment is not None and not environments_match(
+                source_environment(source, group.raw.get("resource_environment")), base_environment
+            ):
                 raise ValueError(f"control calibration changed model, TP or runtime resources: {path}")
             admitted_manifests.add(manifest)
         evidence[path] = {
@@ -307,53 +315,3 @@ def _control_sources(group: GroupRequest, base_environment: dict[str, Any] | Non
             "cost_basis": document.get("cost_basis", "source_profile_uncorrected"),
         }
     return evidence
-
-
-def environments_match(first: dict, second: dict) -> bool:
-    def comparable(value):
-        env = dict(value.get("env", {}))
-        if "SGLANG_STEP_TIMING_DIR" in env:
-            env["SGLANG_STEP_TIMING_DIR"] = bool(env["SGLANG_STEP_TIMING_DIR"])
-        return {**value, "env": env}
-
-    return comparable(first) == comparable(second)
-
-
-def source_environment(source: ProfileRunRef) -> dict[str, Any]:
-    """Runtime dimensions in which a group's observations may be shared."""
-
-    flags = parse_server_command_flags(source.run_dir / "server_cmd.txt")
-    flags.setdefault("tp_size", "1")
-    flags.setdefault("base_gpu_id", "0")
-    flags.setdefault("gpu_id_step", "1")
-    config = load_json(source.config_path)
-    names = (
-        "model_path",
-        "tp_size",
-        "dtype",
-        "kv_cache_dtype",
-        "attention_backend",
-        "sampling_backend",
-        "hicache_io_backend",
-        "hicache_mem_layout",
-        "hicache_storage_backend",
-        "numa_node",
-        "base_gpu_id",
-        "gpu_id_step",
-        "max_running_requests",
-        "chunked_prefill_size",
-        "disable_cuda_graph",
-    )
-    # Capture destinations and observer/export switches are provenance, not
-    # runtime resources. Correction remains bound to the actual source capture;
-    # ignoring these switches does not certify its completeness.
-    capture_options = {
-        "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR",
-        "HOOK_EMISSION_TIMING",
-        "SGLANG_NPU_PROFILER_SERIAL_EXPORT",
-        "SGLANG_HICACHE_IO_TIMING",
-    }
-    return {
-        "server": {name: flags.get(name) for name in names},
-        "env": {key: value for key, value in config.get("env", {}).items() if key not in capture_options},
-    }

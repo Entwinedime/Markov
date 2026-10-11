@@ -1,81 +1,92 @@
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
-#include "markov/trace_graph/modules/hicache/model/prefetch_wait_calibration.hpp"
+#include "markov/trace_graph/source_dag/prefetch.hpp"
+#include "markov/trace_graph/structure/cpu_collective.hpp"
+#include "markov/trace_graph/structure/hicache/query.hpp"
 #include <algorithm>
+#include <optional>
+#include <set>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 using Control = PrefetchControlObservation;
 using Action = model::PrefetchSchedulerAction;
 
+namespace {
+
+struct ReceiveGroup {
+    std::vector<int> members;
+    size_t root_index;
+    bool operator==(const ReceiveGroup &) const = default;
+};
+
+std::optional<ReceiveGroup> observe_receive_group(const core::DagGraph & graph, const CpuCollectiveObservation & collectives,
+                                                  const std::vector<int> & participants) {
+    std::optional<ReceiveGroup> result;
+    for (const auto & round : collectives.rounds) {
+        if (round.calls.empty()) continue;
+        const auto & event = graph.runtime_observations().at(round.calls.front().observation);
+        if (event.arg("role") != "request_receive" || event.arg("operation") != "broadcast") continue;
+
+        auto ordered = round.members;
+        std::ranges::sort(ordered);
+        if (ordered != participants) continue;
+
+        const auto root = event.arg("group_src").empty()
+                              ? static_cast<size_t>(std::ranges::find(round.members, std::stoi(event.arg("src"))) - round.members.begin())
+                              : std::stoul(event.arg("group_src"));
+        if (root >= round.members.size()) throw std::runtime_error("Source scheduler broadcast root is outside its group");
+
+        ReceiveGroup observed{ round.members, root };
+        if (result && *result != observed) throw std::runtime_error("Source scheduler has conflicting request-receive groups");
+        result = std::move(observed);
+    }
+    return result;
+}
+
+CpuCollectiveCallTiming collective_cost(cost::OperatorCostProvider & costs, structure::OperationWork work) {
+    const auto duration = [&](std::string_view scope) {
+        work.timing_scope = scope;
+        return costs.estimate(work).duration_us;
+    };
+    return { .before_submit = duration("before_submit_interval"),
+             .submission = duration("submission_service"),
+             .dispatch = duration("dispatch_interval"),
+             .worker_remainder = duration("worker_remainder"),
+             .after_join = duration("after_join_interval") };
+}
+
+} // namespace
+
 void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelReplay & replay, std::string_view source_policy, const std::string & target_policy,
-                                const core::ClientRequestChain & chain, const std::string & calibration_path,
-                                const std::vector<std::string> & cpu_calibrations) {
+                                const core::ClientRequestChain & chain, cost::OperatorCostProvider & costs) {
     if (state_) throw std::logic_error("Prefetch waits are already bound");
     state_ = &replay.state();
     clients_ = chain.requests;
     const patch::HiCacheSourceDagIndex source(graph);
     const auto rounds = observe_cpu_collectives(source);
-    const auto workers = observe_prefetch_workers(source, rounds);
     std::set<std::string> requests;
     for (const auto & request : clients_) requests.insert(request.request_id);
     const auto grouped = observe_prefetch_requests(source, rounds, source_policy, &requests);
 
-    // First complete active request in HTTP order; not a donor selected by
-    // prediction error. Only branch work becomes a template, never page counts.
-    model::PrefetchCheckTiming timing;
-    model::PrefetchSchedulerTiming body;
-    for (const auto & request : clients_) {
-        const auto at = grouped.find(request.request_id);
-        if (at == grouped.end()) throw std::runtime_error("Selected HTTP request has no progress observation");
-        const auto measured = target_policy == "best_effort" ? model::observe_prefetch_stop_timing(source, rounds, at->second)
-                                                             : model::observe_prefetch_wait_timing(source, rounds, workers, at->second);
-        if (!measured) continue;
-        timing = measured->check;
-        body = measured->scheduler;
-        template_ = { .request_id = request.request_id, .cpu = timing.cpu };
-        break;
-    }
-    if (template_.request_id.empty() && !calibration_path.empty()) {
-        const auto calibrated = model::read_prefetch_wait_calibration(calibration_path);
-        if ((target_policy == "best_effort") != (calibrated.source_policy == "best_effort"))
-            throw std::runtime_error("Independent prefetch template does not cover the target stop policy");
-        timing = calibrated.timing.check;
-        body = calibrated.timing.scheduler;
-        template_ = { .request_id = calibrated.request_id, .cpu = timing.cpu, .calibration_manifest = calibrated.source_manifest };
-    }
-    // An inactive target needs only its local-return cost. Keep active branch
-    // timings absent; the executed check requests them if a prefetch is ongoing.
-    if (timing.cpu.empty())
-        for (const auto & [request, ranks] : grouped)
-            for (const auto & [rank, calls] : ranks) timing.cpu.try_emplace(rank);
-    for (const auto & [request, ranks] : grouped)
-        if (ranks.size() != timing.cpu.size() || std::ranges::any_of(ranks, [&](const auto & item) { return !timing.cpu.contains(item.first); }))
-            throw std::runtime_error("Wait timing rank membership differs from base");
+    // Active checks and retry loops are generated work. Their costs come from
+    // independent evidence; source regions only identify replacement sites.
+    std::vector<int> participants;
+    if (!grouped.empty())
+        for (const auto & [rank, calls] : grouped.begin()->second) participants.push_back(rank);
+    const auto receive_group = target_policy == "best_effort" ? std::nullopt : observe_receive_group(graph, rounds, participants);
 
     std::vector<Control> selected;
     for (const auto & [request, ranks] : grouped)
         for (const auto & [rank, calls] : ranks) selected.insert(selected.end(), calls.begin(), calls.end());
-    const auto regions = patch::prepare_prefetch_wait_regions(graph, selected, rounds, workers);
-    // First observed local return per rank, in the same HTTP order used below.
-    // This evidence is shared by requests, not rescanned for every request.
-    std::map<int, uint64_t> base_local;
-    for (const auto & request : clients_)
-        for (const auto & [rank, calls] : grouped.at(request.request_id)) {
-            if (base_local.contains(rank)) continue;
-            for (const auto & call : calls)
-                if (call.local_return) {
-                    if (const auto cost = model::observe_prefetch_check_cpu(call, &source).no_operation_return) base_local.emplace(rank, *cost);
-                    break;
-                }
-        }
-    auto local_sources = cpu_calibrations;
-    if (!calibration_path.empty()) local_sources.insert(local_sources.begin(), calibration_path);
-    std::map<std::string, model::PrefetchWaitCalibration> shared_cpu;
+    const auto regions = patch::prepare_prefetch_wait_regions(graph, selected, rounds, observe_prefetch_workers(source, rounds));
     for (const auto & request : clients_) {
         const auto & ranks = grouped.at(request.request_id);
         auto wait = std::make_unique<Wait>();
         wait->request = request.request_id;
-        auto local_timing = timing;
+        std::map<int, uint64_t> migrated_returns;
+
         for (const auto & [rank, calls] : ranks) {
             const auto * first = source.fact_node(calls.front().progress_fact);
             const auto identity = std::ranges::find_if(replay.facts(), [&](const auto & item) {
@@ -88,22 +99,12 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
             fact.role = "prefetch_progress_observed";
             fact.source_ts = first->timestamp_us + first->duration_us;
             wait->facts[rank] = std::move(fact);
-            // Prefer this request's own local-return cost, then another
-            // observed local return from this base/rank. Missing is not zero.
+            // Only this request's unchanged local return can migrate directly.
+            // A donor from another source request would be an online cost fit.
             std::optional<uint64_t> local;
             for (const auto & call : calls)
-                if (call.local_return) local = model::observe_prefetch_check_cpu(call, &source).no_operation_return;
-            if (!local && base_local.contains(rank)) local = base_local.at(rank);
-            for (const auto & path : local_sources) {
-                if (local) break;
-                auto found = shared_cpu.find(path);
-                if (found == shared_cpu.end()) found = shared_cpu.emplace(path, model::read_prefetch_wait_calibration(path)).first;
-                const auto at = found->second.timing.check.cpu.find(rank);
-                if (at == found->second.timing.check.cpu.end()) continue;
-                local = at->second.no_operation_return;
-                if (local) template_.local_return_calibration_manifests[rank] = found->second.source_manifest;
-            }
-            local_timing.cpu.at(rank).no_operation_return = local;
+                if (call.local_return) local = source_dag::observe_prefetch_check_cpu(call, &source).no_operation_return;
+            if (local) migrated_returns.emplace(rank, *local);
             core::TraceEvent interval;
             interval.pid = first->pid;
             interval.tid = first->tid;
@@ -117,23 +118,62 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
         wait->execution = std::make_unique<model::HiCachePrefetchWaitExecution>(
             *state_,
             wait->facts,
-            local_timing,
-            body,
+            [&costs, participants, receive_group]() {
+                if (!receive_group) throw std::runtime_error("Source scheduler lacks request-receive group identity for generated retry work");
+                const auto broadcast =
+                    structure::cpu_collective_entries(structure::CpuCollectiveKind::Broadcast, receive_group->members, receive_group->root_index);
+                const auto all_reduce = structure::cpu_collective_entries(structure::CpuCollectiveKind::AllReduce, participants);
+                const auto local = [&](int rank, const std::string & role) {
+                    return model::PrefetchSchedulerLocalTiming{
+                        costs.estimate(structure::hicache::prefetch_scheduler_operation(role, "cpu_service", rank, participants.size())).duration_us,
+                        costs.estimate(structure::hicache::prefetch_scheduler_operation(role, "residual_interval", rank, participants.size())).duration_us
+                    };
+                };
+
+                model::PrefetchSchedulerTiming body;
+                for (const auto action : model::PREFETCH_SCHEDULER_SEQUENCE) {
+                    const std::string name(model::PREFETCH_SCHEDULER_NAMES.at(static_cast<size_t>(action)));
+                    auto & step = body.steps[action];
+                    for (const auto rank : participants) {
+                        step.before[rank] = local(rank, name + ".before");
+                        auto work = structure::hicache::prefetch_scheduler_operation(name + ".collective", "", rank, participants.size());
+                        if (action == Action::Receive) work.features["root_rank"] = receive_group->members.at(receive_group->root_index);
+                        auto communication = collective_cost(costs, std::move(work));
+                        communication.entry_ranks = (action == Action::Receive ? broadcast : all_reduce).at(rank);
+                        step.communication.calls.emplace(rank, std::move(communication));
+                        step.after[rank] = local(rank, name + ".after");
+                    }
+                }
+                for (const auto rank : participants) body.tail[rank] = local(rank, "tail");
+                return body;
+            },
             target_policy,
-            [this, stable](Action action, const model::PrefetchSchedulerBoundary & boundary, uint64_t time, simulation::FutureDag &) {
-                scheduler_action(*stable, action, boundary, time);
+            [&costs, migrated_returns = std::move(migrated_returns), count = ranks.size()](int rank, std::string_view role) {
+                if (role == "no_operation_return") {
+                    const auto found = migrated_returns.find(rank);
+                    if (found != migrated_returns.end()) return found->second;
+                }
+
+                return costs.estimate(structure::hicache::prefetch_check_interval(role, rank, count)).duration_us;
+            },
+            [&costs, count = ranks.size()](int rank, bool completion) {
+                return collective_cost(costs, structure::hicache::prefetch_check_collective(completion, rank, count, ""));
+            },
+            [this, stable](const model::PrefetchSchedulerBoundary & boundary, uint64_t time, simulation::FutureDag &) {
+                scheduler_action(*stable, boundary, time);
             });
         waits_.push_back(std::move(wait));
     }
 }
 
-void HiCachePrefetchWaits::scheduler_action(Wait & wait, Action action, const model::PrefetchSchedulerBoundary & boundary, uint64_t time) {
+void HiCachePrefetchWaits::scheduler_action(Wait & wait, const model::PrefetchSchedulerBoundary & boundary, uint64_t time) {
+    const auto action = boundary.action;
     if (!active_http_ || *active_http_ != wait.request) throw std::runtime_error("Scheduler wait is outside its active serial HTTP request");
     // The next serial HTTP request cannot arrive until this one completes.
     if (action == Action::Receive) return;
     auto fact = wait.facts.at(boundary.rank);
     fact.ts = time;
-    auto & samples = wait.samples[boundary.step];
+    auto & samples = wait.samples[boundary.action];
     if (!boundary.apply) {
         samples[boundary.rank] = action == Action::LoadCompletion ? state_->load_completion_count(fact) : state_->write_completion_count(fact);
         return;

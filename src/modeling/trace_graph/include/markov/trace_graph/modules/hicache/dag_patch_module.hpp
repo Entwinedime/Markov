@@ -7,6 +7,7 @@
 #ifdef DEBUG
 
 #include "markov/trace_graph/core/dag_mutation.hpp"
+#include "markov/trace_graph/frontend/model_config.hpp"
 #include "markov/trace_graph/modules/hicache/model/result.hpp"
 #include "markov/trace_graph/modules/hicache/patch/applied_validator.hpp"
 #include "markov/trace_graph/modules/hicache/patch/attribution.hpp"
@@ -78,7 +79,8 @@ struct HiCacheDagPatchResult {
  */
 class HiCacheDagPatchModule final : public SimulationModule {
 public:
-    explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config = false,
+    explicit HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, frontend::HiCacheIoCostConfig io_cost,
+                                   frontend::HiCachePhaseCostConfig phase_cost, bool source_target_same_config = false,
                                    std::string oracle_cost_replay_path = {}, std::string phase_oracle_cost_replay_path = {});
 
     [[nodiscard]] std::string_view name() const noexcept override;
@@ -89,6 +91,8 @@ public:
 
 private:
     std::shared_ptr<const model::HiCacheModelResult> model_result_;
+    frontend::HiCacheIoCostConfig io_cost_;
+    frontend::HiCachePhaseCostConfig phase_cost_;
     bool source_target_same_config_ = false;
     std::string oracle_cost_replay_path_;
     std::string phase_oracle_cost_replay_path_;

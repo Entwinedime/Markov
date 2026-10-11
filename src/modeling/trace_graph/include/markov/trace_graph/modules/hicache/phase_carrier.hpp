@@ -5,6 +5,7 @@
 #pragma once
 
 #include "markov/trace_graph/core/dag_mutation.hpp"
+#include "markov/trace_graph/cost/static_phase.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
@@ -20,10 +21,7 @@
 namespace markov::trace_graph::modules::hicache {
 
 /** Stable semantic identity used when Direct and phase work share a request boundary. */
-[[nodiscard]] std::string hicache_phase_carrier_synthetic_id(std::string_view request_id,
-                                                              int logical_input,
-                                                              std::string_view phase,
-                                                              std::string_view family);
+[[nodiscard]] std::string hicache_phase_carrier_synthetic_id(std::string_view request_id, int logical_input, std::string_view phase, std::string_view family);
 
 /** @brief Completeness and mutation counts for one canonical phase-carrier plan. */
 struct HiCachePhaseCarrierAudit {
@@ -38,14 +36,6 @@ struct HiCachePhaseCarrierAudit {
     std::map<std::string, uint64_t> blockers;
 };
 
-/** Project one already-admitted request/rank onto its source operators, without
- * adding topology or requiring other requests/ranks to have been admitted.
- * Live execution consumes the returned durations when those operators start;
- * the caller must reject updates to operators that have already started.
- */
-[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_operator_costs(const core::DagGraph & graph,
-    const model::HiCachePrefillWorkItem & prefill, const model::HiCacheDecodeWorkItem & decode, core::DagMutationPlan & plan);
-
 /**
  * @brief Appends one request/rank semantic phase graph to an existing atomic plan.
  *
@@ -53,9 +43,8 @@ struct HiCachePhaseCarrierAudit {
  * and synchronization dependencies. Zero-cost start/complete nodes connect phases
  * to I/O and requests. Unobserved operator families require a separate template.
  */
-[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph,
-                                                                          const model::HiCachePhaseWorkLedger & phase_work,
-                                                                          core::DagMutationPlan & plan);
+[[nodiscard]] HiCachePhaseCarrierAudit append_hicache_phase_carrier_plan(const core::DagGraph & graph, const cost::StaticPhaseCosts & phase_work,
+                                                                         core::DagMutationPlan & plan);
 
 #ifdef DEBUG
 /** @brief Debug score-side result for canonicalizing target-observed phase work. */

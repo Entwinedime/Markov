@@ -67,7 +67,7 @@ std::vector<std::string> HiCachePagePath::page_ids() const {
     return ids;
 }
 
-HiCacheTargetPager::HiCacheTargetPager(frontend::HiCacheConfig config) : config_(std::move(config)) {}
+HiCacheTargetPager::HiCacheTargetPager(frontend::HiCacheRules config) : config_(std::move(config)) {}
 
 uint64_t HiCacheTargetPager::page_size_for_fact(const HiCacheFact & fact) const {
     // Source page size is a contract-approved fallback value, not a source page identity.

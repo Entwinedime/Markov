@@ -11,7 +11,7 @@ from typing import Any
 
 from .....common.io import load_json
 from .....modeling.backend import append_option, execute_trace_graph, trace_graph_executable
-from ....types import ProfileRunRef
+from .....modeling.source_dag.profiles import ProfileRunRef
 from ...final_dag.shape_compare import shapes_match
 
 

@@ -36,7 +36,6 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
 
     const auto config = frontend::ModelConfig::from_file(filename);
     pipeline.modules_.reserve(3);
-    if (config.node_scale.enabled) { pipeline.modules_.push_back(std::make_unique<modules::node_scale::NodeScaleModule>(config.node_scale)); }
     if (config.hicache.enabled) {
         bool static_replay = false;
 #ifdef DEBUG
@@ -50,13 +49,17 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
                 throw std::invalid_argument("HiCache execution requires explicit source_prefetch_policy in the model config");
             pipeline.execution_config_ = config.hicache;
             pipeline.source_prefetch_policy_ = policy;
+            if (config.node_scale.enabled) pipeline.execution_node_scale_ = config.node_scale;
             return pipeline;
         }
+        if (config.node_scale.enabled) pipeline.modules_.push_back(std::make_unique<modules::node_scale::NodeScaleModule>(config.node_scale));
         auto result = std::make_shared<modules::hicache::model::HiCacheModelResult>();
         pipeline.modules_.push_back(std::make_unique<modules::hicache::HiCacheModule>(config.hicache, result));
 #ifdef DEBUG
         if (config.hicache.dag_patch_enabled) {
             auto patch = std::make_unique<modules::hicache::HiCacheDagPatchModule>(std::move(result),
+                                                                                   config.hicache.io_cost,
+                                                                                   config.hicache.phase_cost,
                                                                                    config.hicache.dag_patch_source_target_same_config,
                                                                                    hicache_oracle_cost_replay,
                                                                                    hicache_phase_oracle_cost_replay);
@@ -64,6 +67,7 @@ ModulePipeline ModulePipeline::from_config(const std::string & filename) {
         }
 #endif
     }
+    else if (config.node_scale.enabled) pipeline.modules_.push_back(std::make_unique<modules::node_scale::NodeScaleModule>(config.node_scale));
     return pipeline;
 }
 
@@ -77,14 +81,29 @@ bool ModulePipeline::needs_hicache_observations() const {
     });
 }
 
-void ModulePipeline::apply(core::DagGraph & graph, core::Logger & logger, const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us) {
+void ModulePipeline::apply(core::DagGraph & graph, const core::DagGraph & source_graph, core::Logger & logger, const core::ClientRequestChain & chain,
+                           uint64_t begin_us, uint64_t end_us) {
     for (const auto & module : modules_) {
         logger.info() << "Applying module: " << module->name();
         module->apply(graph);
     }
     if (execution_config_) {
         logger.info() << "Executing HiCache HTTP window";
-        execution_result_ = modules::hicache::runtime::execute_hicache_window(graph, *execution_config_, source_prefetch_policy_, chain, begin_us, end_us);
+        simulation::NodeCostAtStart final_cost;
+        if (execution_node_scale_) {
+            final_cost = [&](size_t node, uint64_t, uint64_t duration_us) {
+                return modules::node_scale::matched_node_duration(*execution_node_scale_, graph.event_for_node(node).name, duration_us).value_or(duration_us);
+            };
+        }
+
+        execution_result_ = modules::hicache::runtime::execute_hicache_window(graph,
+                                                                              source_graph,
+                                                                              *execution_config_,
+                                                                              source_prefetch_policy_,
+                                                                              chain,
+                                                                              begin_us,
+                                                                              end_us,
+                                                                              final_cost);
     }
 }
 

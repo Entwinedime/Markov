@@ -2,6 +2,7 @@
 #pragma once
 
 #include "markov/trace_graph/frontend/model_config.hpp"
+#include "markov/trace_graph/structure/hicache/prefetch.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -9,33 +10,6 @@
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache {
-
-/** An increment after physical page writes. A cancelled increment publishes
- * nothing, but its copy and return path still execute. The caller supplies that
- * branch's return time explicitly; successful observations do not measure it.
- */
-struct PrefetchPublication {
-    uint64_t page_count, at_us;
-    std::optional<uint64_t> cancelled_return_us;
-};
-
-struct PrefetchControlBatch {
-    uint64_t page_count, start_ts, ready_ts;
-    // Ordered increments: pagewise for generic file, grouped for atomic paths.
-    // No default that divides a whole service duration into guessed page costs.
-    std::vector<PrefetchPublication> publications;
-};
-
-struct PrefetchBatchExecution {
-    uint64_t copied_pages = 0, published_pages = 0, release_us = 0;
-    bool cancelled = false;
-};
-
-/** The worker reads the whole batch before testing cancellation at increment.
- * A rejected increment still pays its copy. Cancellation during cleanup after
- * all increments succeeded does not stop the next batch from being read.
- */
-[[nodiscard]] PrefetchBatchExecution execute_prefetch_batch(const PrefetchControlBatch & batch, std::optional<uint64_t> stop_us);
 
 struct HiCacheServiceCost {
     uint64_t duration_us = 0;
@@ -72,7 +46,5 @@ struct HiCacheServiceCost {
  */
 [[nodiscard]] std::optional<PrefetchControlBatch> hicache_prefetch_batch(const frontend::HiCacheIoServiceModelConfig & model, uint64_t page_bytes,
                                                                          uint64_t pages, uint64_t start_us);
-
-[[nodiscard]] std::string hicache_resource_lane(const frontend::HiCacheIoCostConfig & model, const std::string & kind, const std::string & scope);
 
 } // namespace markov::trace_graph::modules::hicache

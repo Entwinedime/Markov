@@ -17,6 +17,8 @@ namespace markov::trace_graph::cli {
 struct OutputPaths {
     std::string run_summary;
     std::string graph;
+    std::string source_replay_report;
+    std::string structure_report;
 #ifdef DEBUG
     std::string model_summary;
 #endif

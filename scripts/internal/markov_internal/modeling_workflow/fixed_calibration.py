@@ -16,7 +16,8 @@ from ..workload_template.expand import expand_template, request_token_budget
 from ..workload_template.cli import parse_workload_command
 from .capture import calibration_inputs, capture_usage, matching_calibration_profiles
 from .group import GroupRequest
-from .planning.profile_runs import parse_server_command_tokens
+from ..modeling.source_dag.profiles import parse_server_command_tokens
+from ..modeling.deployment import source_environment
 
 
 CALIBRATION_NAME = "fixed_calibration"
@@ -327,13 +328,24 @@ def _phase_workload(group: GroupRequest) -> tuple[dict[str, Any], dict[str, Any]
 
 
 def materialize_fixed_calibration(
-    group: GroupRequest, *, phase_only: bool = False, prefetch_policy: str = "wait_complete", release_only: bool = False
+    group: GroupRequest,
+    *,
+    phase_only: bool = False,
+    prefetch_policy: str = "wait_complete",
+    release_only: bool = False,
+    write_policy: str | None = None,
 ) -> dict[str, Any]:
     """Generate shared work from base inputs and the required execution program."""
 
     template, fields = _phase_workload(group) if phase_only else _workload(group, release_only=release_only)
     point = fields["point"]
-    if not release_only and prefetch_policy == "best_effort":
+    if write_policy is not None:
+        if write_policy not in {"write_back", "write_through", "write_through_selective"}:
+            raise ValueError("unsupported shared calibration write policy")
+        point["write_policy"] = write_policy
+        point["id"] += "_" + write_policy
+        template["id"] += "_" + write_policy
+    if not release_only and write_policy is None and prefetch_policy == "best_effort":
         template["id"] = "hicache_stop_calibration"
         point["id"] = f"stop_calibration_page_{point['page_size']}"
     output = group.output_dir / "generated" / template["id"]
@@ -346,6 +358,7 @@ def materialize_fixed_calibration(
     # The admitted capture, not a later-edited experiment suite, owns the base environment.
     # This freshly loaded object is owned by this builder; no caller data is mutated.
     config = load_json(group.sources[0].config_path)
+    resource_environment = source_environment(group.sources[0], group.raw.get("resource_environment"))["resources"]
     server = config.pop("server")
     base_command = command_tokens(server["command"])
     base_flags = parse_server_command_tokens(base_command)
@@ -356,6 +369,12 @@ def materialize_fixed_calibration(
     for key in ("matrix", "experiments", "metadata", "name", "bench", "id"):
         config.pop(key, None)
     config["run_root"] = relative(group.output_dir / "calibration_profiles")
+    if phase_only:
+        # Compute samples need operator geometry even when the base was
+        # captured without it. The paired light pass disables Torch profiling.
+        config["profiling"].update(enabled=True, channels=["torch", "ld_preload", "python_probe"])
+        config["profiling"].setdefault("torch", {}).update(enabled=True, record_shapes=True)
+
     if config.get("env", {}).get("SGLANG_STEP_TIMING_DIR"):
         config["env"]["SGLANG_STEP_TIMING_DIR"] = "{run_dir}/timing"
     files = {"template": relative(template_path), "config_specs": relative(specs_path)}
@@ -397,6 +416,7 @@ def materialize_fixed_calibration(
         name=f"{group.base_config}_{point['id']}_capture",
         continue_on_error=False,
         metadata={
+            "resource_environment": resource_environment,
             "purpose": "Shared calibration; target observations and scores are not inputs.",
             "profile_mode": "forced_token_capture",
             "calibration_base": group.base_config,

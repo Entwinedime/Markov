@@ -6,9 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from ..common.io import load_json
-from ..common.paths import require_repo_path
-from .io_model import HiCacheIoModel
+from ..modeling.cost.hicache import HiCacheIoModel
 from .types import TargetHiCacheConfig
 
 
@@ -46,18 +44,8 @@ class WorkflowOptions:
     model_run_jobs: int = 1
     hicache_io_model: HiCacheIoModel | None = None
     cpu_service_costs: dict[Path, Path] = field(default_factory=dict)
-
-
-def cpu_service_inputs(paths: list[Path], sources: tuple[Path, ...]) -> dict[Path, Path]:
-    """Bind explicit service files to selected sources, never prediction targets."""
-
-    inputs = {}
-    for path in paths:
-        path = require_repo_path(path)
-        source = require_repo_path(load_json(path)["source_manifest"]).resolve()
-        if source not in sources:
-            raise ValueError(f"CPU service input does not belong to a selected source: {path}")
-        if source in inputs:
-            raise ValueError(f"Multiple CPU service inputs for the same source: {source}")
-        inputs[source] = path
-    return inputs
+    cost_deployment: dict[str, object] | None = None
+    cost_sources: tuple[str, ...] = ()
+    cost_source_manifests: tuple[Path, ...] = ()
+    source_resources: dict[str, str] | None = None
+    experiment_reports: bool = False

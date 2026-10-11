@@ -81,6 +81,7 @@ nlohmann::json hicache_phase_observations(const modules::hicache::HiCachePhaseOb
         {               "paired_decode_count",                          phase.paired_decode_count },
         {    "unmatched_prefill_marker_count",               phase.unmatched_prefill_marker_count },
         {     "unmatched_decode_marker_count",                phase.unmatched_decode_marker_count },
+        {      "opening_context_marker_count",                 phase.opening_context_marker_count },
         {                "invalid_fact_count",                           phase.invalid_fact_count },
         {           "token_range_error_count",                      phase.token_range_error_count },
         {     "phase_owned_device_node_count",                phase.phase_owned_device_node_count },

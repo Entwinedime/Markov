@@ -5,6 +5,7 @@
 #include "markov/trace_graph/modules/hicache/patch/io_resource_cost.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/structure/hicache/resources.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -100,7 +101,7 @@ HiCacheIoCostRecord cost_record(const model::HiCacheEffectDecision & decision, c
             record.reason = "missing_prefetch_zero_payload_control";
             return record;
         }
-        record.resource_lane = hicache_resource_lane(model_fields, kind, decision.cache_scope);
+        record.resource_lane = structure::hicache::io_resource_lane(model_fields.resource_lanes, kind, decision.cache_scope);
         if (decision.control_host_available_pages.size() != record.operation_count) {
             record.status = HiCacheIoCostStatus::MissingHostControlModel;
             record.reason = "missing_prefetch_terminal_host_state";
@@ -179,7 +180,7 @@ HiCacheIoCostRecord cost_record(const model::HiCacheEffectDecision & decision, c
         return record;
     }
     record.duration_us = *duration;
-    record.resource_lane = hicache_resource_lane(model_fields, kind, decision.cache_scope);
+    record.resource_lane = structure::hicache::io_resource_lane(model_fields.resource_lanes, kind, decision.cache_scope);
 
     if (control == model_fields.control_models.end()) {
         record.status = HiCacheIoCostStatus::MissingHostControlModel;

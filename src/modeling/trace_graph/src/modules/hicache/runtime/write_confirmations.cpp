@@ -1,10 +1,12 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
+#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/structure/hicache/confirmation.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 #include <algorithm>
-#include <fstream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -18,87 +20,95 @@ core::TraceEvent boundary(const std::string & pid, const std::string & tid, uint
     point.ts = at;
     return point;
 }
+
 } // namespace
 
-void HiCacheWriteConfirmations::prepare(core::DagGraph & graph, const std::string & calibration, uint64_t begin, uint64_t end,
-                                        const std::vector<core::TraceEvent> & replaced, std::optional<uint64_t> idle_since_us) {
-    std::ifstream file(calibration);
-    if (!file) throw std::runtime_error("Cannot read independent write confirmation calibration");
-    const auto document = nlohmann::json::parse(file);
-    if (document.at("role") != "fixed_calibration" || document.at("source_manifest").get<std::string>().empty())
-        throw std::runtime_error("Write confirmations need independent calibration provenance");
-    const auto observations = graph.runtime_observations();
-    std::vector<Tail> calls;
-    std::vector<core::TraceEvent> points;
+ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, size_t anchor, std::optional<size_t> worker,
+                                                  std::span<const structure::hicache::WriteConfirmationStep> steps) {
+    ConfirmationExpansion generated;
+    auto & plan = generated.plan;
+    const auto lane = std::string(graph.node_lane_key(anchor));
+    std::optional<size_t> previous;
+    for (const auto & step : steps) {
+        const auto main = plan.nodes.size();
+        plan.nodes.push_back({
+            { .name = "target " + step.work.operation,
+             .category = "hicache_patch",
+             .lane_key = lane,
+             .attrs = { { "component", step.work.component },
+                         { "operation", step.work.operation },
+                         { "implementation", step.work.implementation },
+                         { "cost_operation", step.work.operation },
+                         { "cost_implementation", step.work.implementation },
+                         { "cost_timing_scope", "cpu_service" },
+                         { "work_features", nlohmann::json(step.work.features).dump() } } }
+        });
+        const auto returned = plan.nodes.size();
+        plan.nodes.push_back({
+            { .name = "after " + step.work.operation, .lane_key = lane }
+        });
+        plan.edges.push_back({ main, returned, core::DagEdgeKind::Sequential });
+        if (previous) plan.edges.push_back({ *previous, main, core::DagEdgeKind::Sequential });
+        if (step.completed_batch) {
+            plan.event_waits.push_back({ core::DagNode::kNoNode, main });
+            generated.acknowledgements.push_back(returned);
+        }
+        HostOperationSlots slots{ .main = main };
+        if (step.destroys_event) {
+            if (!worker)
+                throw structure::MissingWork("Write confirmation requires the scheduler's CPU worker queue",
+                                             {
+                                                 { "write_confirmation_worker", 1 }
+                });
+            slots.worker = plan.nodes.size();
+            const auto task = structure::hicache::event_destruction_work();
+            plan.nodes.push_back({
+                { .name = "target event destruction",
+                 .category = "hicache_patch",
+                 .lane_key = std::string(graph.node_lane_key(*worker)),
+                 .attrs = { { "component", task.component },
+                             { "operation", task.operation },
+                             { "implementation", task.implementation },
+                             { "cost_operation", task.operation },
+                             { "cost_implementation", task.implementation },
+                             { "cost_timing_scope", task.timing_scope } } },
+                returned,
+                *worker
+            });
+        }
+        generated.slots.push_back(slots);
+        previous = returned;
+        plan.host_return = returned;
+    }
+    return generated;
+}
+
+void HiCacheWriteConfirmations::prepare(core::DagGraph & graph, uint64_t begin, uint64_t end, const std::vector<core::TraceEvent> & replaced,
+                                        std::optional<uint64_t> idle_since_us) {
+    graph_ = &graph;
+    const auto & observations = graph.runtime_observations();
     for (const auto & event : observations) {
-        if (event.name != "runtime.hicache.write_completion" || event.arg("status") != "returned" || event.ts > end
+        if (event.name != "runtime.hicache.write_completion" || event.arg("status") != "returned" || event.arg("blocking") != "false" || event.ts > end
             || (event.ts < begin && (!idle_since_us || event.ts < *idle_since_us)))
             continue;
         if (std::ranges::any_of(replaced, [&](const auto & span) {
                 return event.pid == span.pid && event.tid == span.tid && span.ts <= event.ts && span.ts + span.dur >= event.ts + event.dur;
             }))
             continue;
-        const bool blocking = event.arg("blocking") == "true";
-        if (blocking && (event.ts < begin || event.ts + event.dur > end)) continue;
-        uint64_t start = event.ts;
-        if (!blocking) {
-            const core::TraceEvent * reduction = nullptr;
-            for (const auto & item : observations)
-                if (item.name == "runtime.cpu_collective" && item.arg("role") == "write_completion_check" && item.pid == event.pid && item.tid == event.tid
-                    && item.ts >= event.ts && item.ts + item.dur <= event.ts + event.dur) {
-                    if (reduction) throw std::runtime_error("Write confirmation has multiple MIN calls");
-                    reduction = &item;
-                }
-            if (!reduction) throw std::runtime_error("Write confirmation has no MIN return");
-            // Match queue confirmation admission: retain the full application
-            // tail of a complete in-window MIN, without moving the HTTP cut.
-            if (reduction->ts < begin || reduction->ts + reduction->dur > end) continue;
-            start = reduction->ts + reduction->dur;
-            tails_.push_back({ event.pid, event.tid, start, event.ts + event.dur });
-        }
-        calls.push_back({ event.pid, event.tid, start, event.ts + event.dur });
-        points.push_back(boundary(event.pid, event.tid, start));
-        points.push_back(boundary(event.pid, event.tid, event.ts + event.dur));
-    }
-    const auto bound = bind_hicache_control_points(graph, points);
-    const patch::HiCacheSourceDagIndex source(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    std::map<Lane, std::map<std::string, size_t>> resources;
-    for (size_t i = 0; i < calls.size(); ++i) {
-        const auto & call = calls[i];
-        if (!bound[2 * i] || !bound[2 * i + 1]) throw std::runtime_error("Write confirmation lacks exact boundaries");
-        const auto host = observe_host_template(source, call.pid, call.tid, call.begin, call.end);
-        const auto plan = prepare_host_expansion(source, queues, host);
-        auto & roles = resources[{ call.pid, call.tid }];
-        for (const auto & [role, node] : host_resource_roles(graph, plan, *bound[2 * i])) {
-            const auto [at, inserted] = roles.emplace(role, node);
-            if (!inserted && graph.node_lane_key(at->second) != graph.node_lane_key(node))
-                throw std::runtime_error("Confirmation role maps to different base resources");
-        }
-    }
-    for (auto & [lane, roles] : resources) {
-        const auto rank = graph.node(roles.at("main")).gpu_id;
-        std::map<uint64_t, std::vector<const nlohmann::json *>> groups;
-        for (const auto & row : document.at("rows")) {
-            if (row.at("status") != "ready" || row.at("rank").get<int>() != rank) continue;
-            const auto operations = row.at("confirmed_operations").get<uint64_t>();
-            if (row.at("confirmed_batches").get<uint64_t>() != operations || row.at("template").at("event_waits").size() != operations)
-                throw std::runtime_error("Confirmation calibration needs explicit one-operation batches");
-            groups[operations].push_back(&row);
-        }
-        for (auto & [operations, samples] : groups) {
-            std::ranges::stable_sort(samples, {}, [](const auto * row) {
-                return row->at("main_cpu_us").template get<uint64_t>() + row->at("main_gap_us").template get<uint64_t>();
-            });
-            const auto & selected = samples[samples.size() / 2]->at("template");
-            for (const auto & node : selected.at("nodes")) {
-                const auto role = node.at("resource").get<std::string>();
-                if (roles.contains(role) || !role.starts_with("worker|")) continue;
-                if (const auto worker = find_host_worker_resource(graph, queues, roles.at("main"), role.substr(7))) roles.emplace(role, *worker);
+
+        const core::TraceEvent * reduction = nullptr;
+        for (const auto & item : observations)
+            if (item.name == "runtime.cpu_collective" && item.arg("role") == "write_completion_check" && item.pid == event.pid && item.tid == event.tid
+                && item.ts >= event.ts && item.ts + item.dur <= event.ts + event.dur) {
+                if (reduction) throw std::runtime_error("Write confirmation has multiple MIN calls");
+                reduction = &item;
             }
-            templates_[lane].emplace(operations, import_host_template(selected, graph, queues, roles));
-        }
-        if (!templates_[lane].contains(0)) throw std::runtime_error("Confirmation calibration lacks an empty tail");
+        if (!reduction) throw std::runtime_error("Write confirmation has no MIN return");
+        // This outer check began by the HTTP endpoint. Keep its complete MIN
+        // and acknowledgement tail, including a MIN beginning in causal-tail
+        // context. Background work does not extend the scoring endpoint.
+        if (reduction->ts < begin) continue;
+        tails_.push_back({ event.pid, event.tid, reduction->ts + reduction->dur, event.ts + event.dur });
     }
 }
 
@@ -110,44 +120,93 @@ void HiCacheWriteConfirmations::replace_source_tails(core::DagGraph & graph) {
     }
     const auto bound = bind_hicache_control_points(graph, points);
     const patch::HiCacheSourceDagIndex source(graph);
+    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<HiCacheHostTemplate> hosts;
     hosts.reserve(tails_.size());
     for (const auto & tail : tails_) hosts.push_back(observe_host_template(source, tail.pid, tail.tid, tail.begin, tail.end));
+
     std::vector<HiCacheHostRegion> regions;
     for (size_t i = 0; i < hosts.size(); ++i) {
         if (!bound[2 * i] || !bound[2 * i + 1]) throw std::runtime_error("Confirmation replacement lost its boundaries");
         regions.push_back({ *bound[2 * i], *bound[2 * i + 1], &hosts[i] });
+        const auto key = Lane{ tails_[i].pid, tails_[i].tid };
+        const auto compute = compute_resources_.find(key);
+        if (!worker_members_.contains(key) && compute != compute_resources_.end()) {
+            if (const auto resource = observe_load_index_resources(source, queues, *bound[2 * i], compute->second))
+                worker_members_.emplace(key, resource->worker);
+        }
     }
     (void)core::apply_dag_mutation_plan(graph, plan_host_removal(source, regions));
 }
 
-void HiCacheWriteConfirmations::rebind_workers(const core::DagGraph & graph, const std::map<size_t, size_t> & members) {
-    std::vector<HiCacheHostExpansion *> plans;
-    for (auto & [lane, samples] : templates_)
-        for (auto & [count, plan] : samples) plans.push_back(&plan);
-    rebind_host_worker_queues(graph, members, plans);
-}
-
-size_t expand_write_confirmation_batches(const HiCacheHostExpansion & empty, const HiCacheHostExpansion & single, std::span<const size_t> completions,
-                                         std::optional<size_t> anchor, simulation::FutureDag & future) {
-    if (!empty.event_waits.empty() || !empty.streams.empty() || !empty.waits.empty())
-        throw std::invalid_argument("Empty write confirmation must not depend on a device event");
-    if (completions.empty()) return expand_host(empty, {}, future, anchor).host_return;
-    if (single.event_waits.size() != 1 || !single.streams.empty() || !single.waits.empty())
-        throw std::invalid_argument("Write confirmation primitive requires exactly one completed batch event");
-    auto last = anchor;
-    for (const auto event : completions) last = expand_host(single, {}, future, last, std::span(&event, 1)).host_return;
-    return *last;
+void HiCacheWriteConfirmations::rebind_resources(const std::map<size_t, size_t> & workers) {
+    for (auto & [lane, member] : worker_members_) member = workers.at(graph_->node(member).lane_id);
 }
 
 size_t HiCacheWriteConfirmations::expand(const WriteConfirmationWork & work, model::HiCacheState & state, const HiCacheWriteCalls & writes,
-                                         simulation::FutureDag & future) const {
-    const auto & samples = templates_.at({ work.fact.pid, work.fact.tid });
+                                         simulation::FutureDag & future) {
     const auto pending = state.unacknowledged_device_writes(work.fact);
     if (pending.size() < work.confirmed_writes) throw std::logic_error("Sampled confirmation prefix is no longer pending");
     std::vector<size_t> events;
-    for (size_t i = 0; i < work.confirmed_writes; ++i) events.push_back(writes.completion_for(pending[i]));
-    if (!events.empty() && !samples.contains(1)) throw std::runtime_error("Independent confirmation calibration lacks a single-batch CPU cost");
-    return expand_write_confirmation_batches(samples.at(0), samples.at(events.empty() ? 0 : 1), events, work.fact.execution_anchor_node_id, future);
+    std::vector<structure::hicache::WriteConfirmationBatch> batches;
+    for (size_t i = 0; i < work.confirmed_writes; ++i) {
+        events.push_back(writes.completion_for(pending[i]));
+        batches.push_back(
+            { core::checked_multiply_u64(pending[i].header.pages.size(), page_size_, "Confirmation token count overflow"), pending[i].published_nodes });
+    }
+
+    const auto anchor = *work.fact.execution_anchor_node_id;
+    const auto member = worker_members_.find({ work.fact.pid, work.fact.tid });
+    const auto worker = member == worker_members_.end() ? std::nullopt : std::optional{ member->second };
+    const auto program = structure::hicache::write_confirmation_program(batches);
+    auto generated = generate_write_confirmation(*graph_, anchor, worker, program);
+    bind_write_confirmation(generated, program, operator_provider_);
+    const auto expanded = expand_host(generated.plan, {}, future, anchor, events);
+    for (const auto returned : generated.acknowledgements) acknowledgements_.emplace(expanded.nodes.at(returned), work.fact);
+    return expanded.host_return;
 }
+
+void bind_write_confirmation(ConfirmationExpansion & generated, std::span<const structure::hicache::WriteConfirmationStep> program,
+                             cost::OperatorCostProvider & provider) {
+    // Structure and resource slots are complete before querying costs. Query
+    // every required scope together; no missing worker becomes a zero-cost job.
+    std::vector<structure::OperationWork> requests;
+    for (const auto & step : program) {
+        requests.push_back(step.work);
+        requests.back().timing_scope = "cpu_service";
+        requests.push_back(step.work);
+        requests.back().timing_scope = "residual_interval";
+        if (!step.destroys_event) continue;
+        for (const auto * scope : { "worker_service", "worker_residual_interval", "dispatch_interval" }) {
+            requests.push_back(structure::hicache::event_destruction_work());
+            requests.back().timing_scope = scope;
+        }
+    }
+    const auto estimates = provider.estimate_all(requests);
+    size_t next = 0;
+    for (size_t i = 0; i < program.size(); ++i) {
+        cost::HostOperationCost value;
+        value.main_us = estimates[next++].duration_us;
+        value.main_residual_us = estimates[next++].duration_us;
+        if (program[i].destroys_event) {
+            value.worker_us = estimates[next++].duration_us;
+            value.worker_residual_us = estimates[next++].duration_us;
+            value.dispatch_us = estimates[next++].duration_us;
+        }
+        bind_host_operation(generated.plan, generated.slots[i], value, "confirmation_independent_model");
+    }
+}
+
+void HiCacheWriteConfirmations::advance(size_t node, uint64_t time_us, model::HiCacheState & state) {
+    const auto found = acknowledgements_.find(node);
+    if (found == acknowledgements_.end()) return;
+
+    auto fact = found->second;
+    fact.ts = time_us;
+    fact.execution_anchor_node_id = node;
+    // Host publication and storage enqueue happen in the acknowledgement,
+    // before event destruction and before the whole confirmation returns.
+    state.acknowledge_writes(fact, 1);
+}
+
 } // namespace markov::trace_graph::modules::hicache::runtime

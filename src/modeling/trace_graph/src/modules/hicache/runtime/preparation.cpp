@@ -1,11 +1,12 @@
 #include "markov/trace_graph/modules/hicache/runtime/preparation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/fact.hpp"
+#include "markov/trace_graph/source_dag/call_regions.hpp"
 #include <algorithm>
-#include <bit>
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <string_view>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
@@ -13,6 +14,12 @@ using Event = core::TraceEvent;
 using Span = std::pair<uint64_t, uint64_t>;
 using Lane = std::pair<std::string, std::string>;
 using Json = nlohmann::json;
+using structure::hicache::AllocatorSpecialization;
+
+// The supported Ascend executor uses the inspected alloc_extend_kernel ABI
+// with BLOCK_SIZE=2048. Runtime type and buffer metadata identify that executor
+// even when this base only exercised its naive branch and never prepared JIT.
+constexpr std::string_view kNpuPagedAllocator = "sglang.srt.hardware_backend.npu.allocator_npu.NPUPagedTokenToKVPoolAllocator";
 
 uint64_t observed_service(const core::DagGraph & graph, const Event & event) {
     return graph.cpu_service_cost().duration({ event.pid, event.tid },
@@ -52,9 +59,7 @@ std::vector<Span> interval_union(std::vector<Span> intervals) {
     return result;
 }
 
-void observe_costs(const core::DagGraph & graph, AllocatorPreparationObservation & plan) {
-    std::map<std::string, std::map<std::string, std::vector<uint64_t>>> samples;
-    std::map<std::string, std::vector<const Event *>> loads;
+std::optional<bool> observe_compilation_context(const core::DagGraph & graph) {
     std::map<AllocatorSpecialization, std::vector<const Event *>> compiles;
     bool parallel = true;
     for (const auto & event : graph.runtime_observations()) {
@@ -64,11 +69,9 @@ void observe_costs(const core::DagGraph & graph, AllocatorPreparationObservation
             parallel = false;
             continue;
         }
-        if (event.name == "runtime.triton.load") loads[event.pid].push_back(&event);
         if (event.name != "runtime.triton.prepare") continue;
         const auto path = event.arg("path");
         const bool sync = event.arg("execution_mode") == "sync";
-        if (sync && (path == "compiled" || path == "disk_cache")) samples[event.pid][path].push_back(observed_service(graph, event));
         if (sync && path == "compiled") compiles[*specialization].push_back(&event);
         else parallel = false;
     }
@@ -80,50 +83,34 @@ void observe_costs(const core::DagGraph & graph, AllocatorPreparationObservation
             end = std::min(end, core::checked_add_u64(event->ts, event->dur, "preparation end overflow"));
             if (!ranks.insert(event->pid).second) parallel = false;
         }
-        if (begin >= end) parallel = false;
+        // One compiler interval cannot demonstrate cross-rank overlap.
+        if (ranks.size() < 2 || begin >= end) parallel = false;
     }
-    plan.source_parallel_compilation = parallel && !compiles.empty();
+    return compiles.empty() ? std::nullopt : std::optional<bool>{ parallel };
+}
+
+auto observe_static_cost_samples(const core::DagGraph & graph) {
+    std::map<std::string, std::map<std::string, std::vector<uint64_t>>> samples;
+    std::map<std::string, std::vector<const Event *>> loads;
+    for (const auto & event : graph.runtime_observations()) {
+        if (!allocator_event(event) || !observed_specialization(event) || event.arg("status") != "returned") continue;
+        if (event.name == "runtime.triton.load") loads[event.pid].push_back(&event);
+        const auto path = event.arg("path");
+        if (event.name == "runtime.triton.prepare" && event.arg("execution_mode") == "sync" && (path == "compiled" || path == "disk_cache"))
+            samples[event.pid][path].push_back(observed_service(graph, event));
+    }
     for (auto & [pid, events] : loads) {
         std::ranges::sort(events, {}, &Event::ts);
         for (size_t i = 0; i < events.size(); ++i) samples[pid][i == 0 ? "first_load" : "variant_load"].push_back(observed_service(graph, *events[i]));
     }
+    std::map<std::string, std::map<std::string, PreparationCostSamples>> result;
     for (auto & [pid, paths] : samples)
         for (auto & [path, values] : paths) {
             std::ranges::sort(values);
             const auto left = values[(values.size() - 1) / 2], right = values[values.size() / 2];
-            plan.cost_samples[pid][path] = { values.size(), values.front(), left + (right - left) / 2, values.back() };
+            result[pid][path] = { values.size(), values.front(), left + (right - left) / 2, values.back() };
         }
-}
-
-void assign_cache_paths(const std::vector<model::HiCacheAllocatorWorkItem> & calls, AllocatorPreparationPlan & plan) {
-    // A batch is shared across ranks, including repeated chunks of the same
-    // logical request. Publish its new disk entries only after the whole batch.
-    using Batch = std::pair<std::vector<std::string>, size_t>;
-    std::map<std::string, std::map<std::vector<std::string>, size_t>> occurrences;
-    std::map<Batch, size_t> indexes;
-    std::vector<std::vector<size_t>> batches;
-    for (size_t i = 0; i < calls.size(); ++i) {
-        if (calls[i].request_ids.empty()) continue;
-        const Batch key{ calls[i].request_ids, occurrences[calls[i].pid][calls[i].request_ids]++ };
-        const auto [entry, added] = indexes.emplace(key, batches.size());
-        if (added) batches.emplace_back();
-        batches[entry->second].push_back(i);
-    }
-    std::set<AllocatorSpecialization> disk;
-    bool uncertain = false;
-    for (const auto & batch : batches) {
-        for (const auto i : batch) {
-            auto & item = plan.calls[i];
-            if (item.status == "already_prepared") item.path = "memory_cache";
-            if (item.status == "required" && item.specialization)
-                item.path = disk.contains(*item.specialization) ? "disk_cache" : uncertain ? "unknown" : "compiled";
-        }
-        for (const auto i : batch) {
-            const auto & item = plan.calls[i];
-            if (item.status == "required" && item.specialization) disk.insert(*item.specialization);
-            if (item.status == "unknown" || item.status == "possibly_required" || item.status == "unsupported_signature") uncertain = true;
-        }
-    }
+    return result;
 }
 
 std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(const core::DagGraph & graph) {
@@ -165,19 +152,116 @@ std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> allocator_gap_anchors(c
 
 AllocatorPreparationObservation observe_allocator_preparations(const core::DagGraph & graph) {
     AllocatorPreparationObservation result;
-    observe_costs(graph, result);
     // Source batches bound observations even when target execution has not yet
     // reached them. Never infer an owner from the nearest arbitrary CPU event.
     std::map<Lane, std::vector<std::pair<uint64_t, size_t>>> batches;
+    std::vector<std::string> batch_requests;
     for (const auto & event : graph.hicache_fact_events()) {
         if (event.arg("fact").empty() || parse_hicache_fact_metadata(event).role != "cache_extend_input") continue;
         batches[{ event.pid, event.tid }].emplace_back(event.ts, result.calls.size());
+        batch_requests.push_back(event.arg("request_ids"));
         result.calls.push_back(
             { .source_fact_id = event.index, .pid = event.pid, .tid = event.tid, .begin_us = event.ts, .end_us = std::numeric_limits<uint64_t>::max() });
     }
     for (auto & [lane, boundaries] : batches) {
         std::ranges::sort(boundaries);
         for (size_t i = 1; i < boundaries.size(); ++i) result.calls[boundaries[i - 1].second].end_us = boundaries[i].first;
+    }
+    for (const auto & event : graph.runtime_observations()) {
+        if (event.name != "runtime.hicache.extend_allocation") continue;
+        const auto lane = batches.find({ event.pid, event.tid });
+        if (lane == batches.end()) continue;
+        const auto & boundaries = lane->second;
+        const auto after = std::ranges::upper_bound(boundaries, event.ts, {}, &std::pair<uint64_t, size_t>::first);
+        if (after == boundaries.begin()) continue;
+
+        const auto call_index = std::prev(after)->second;
+        auto & call = result.calls[call_index];
+        const auto end_us = core::checked_add_u64(event.ts, event.dur, "extend allocation observation end overflow");
+        if (event.arg("status") != "returned" || Json::parse(event.arg("request_ids")) != Json::parse(batch_requests[call_index]) || end_us > call.end_us) {
+            ++call.issues["allocator_observation_not_bound"];
+            continue;
+        }
+        // A measured call owns preparation only inside its exact envelope.
+        // Older captures without this diagnostic retain the batch boundary;
+        // no guessed envelope is manufactured from nearby kernel names.
+        call.begin_us = event.ts;
+        call.end_us = end_us;
+        if (event.has_arg_key_hint("prefix_lens_tokens") && event.has_arg_key_hint("sequence_lens_tokens")) {
+            const auto ids = Json::parse(event.arg("request_ids")).get<std::vector<std::string>>();
+            const auto prefixes = Json::parse(event.arg("prefix_lens_tokens")).get<std::vector<uint64_t>>();
+            const auto sequences = Json::parse(event.arg("sequence_lens_tokens")).get<std::vector<uint64_t>>();
+            if (ids.size() != prefixes.size() || ids.size() != sequences.size()) {
+                ++call.issues["allocator_lengths_incomplete"];
+                continue;
+            }
+            call.requests.clear();
+            for (size_t i = 0; i < ids.size(); ++i) {
+                if (prefixes[i] > sequences[i]) {
+                    ++call.issues["allocator_lengths_invalid"];
+                    call.requests.clear();
+                    break;
+                }
+                call.requests.push_back({ ids[i], sequences[i], prefixes[i] });
+            }
+        }
+        if (event.arg("allocator_implementation") == kNpuPagedAllocator && event.arg("free_page_dtype") == "torch.int64"
+            && event.arg("free_page_stride_elements") == "1") {
+            result.supported_pids.insert(event.pid);
+        }
+    }
+    // alloc_for_extend also constructs last_loc and writes the request table.
+    // Prefer the allocator's own envelope when it was captured, so preparation
+    // cannot acquire unrelated work from those surrounding operations.
+    std::set<size_t> refined_calls;
+    for (const auto & event : graph.runtime_observations()) {
+        if (event.name != "runtime.hicache.extend_allocator") continue;
+        const auto lane = batches.find({ event.pid, event.tid });
+        if (lane == batches.end()) continue;
+        const auto after = std::ranges::upper_bound(lane->second, event.ts, {}, &std::pair<uint64_t, size_t>::first);
+        if (after == lane->second.begin()) continue;
+
+        const auto call_index = std::prev(after)->second;
+        auto & call = result.calls[call_index];
+        const auto end_us = core::checked_add_u64(event.ts, event.dur, "allocator call observation end overflow");
+        if (event.arg("status") != "returned" || event.ts < call.begin_us || end_us > call.end_us) {
+            ++call.issues["allocator_call_observation_not_bound"];
+            continue;
+        }
+        // An unsuccessful attempt returns before preparing this kernel. Keep
+        // the raw attempt for structure ownership; do not invent JIT service.
+        if (event.arg("allocated") == "false") continue;
+        if (event.arg("allocated") != "true" || !refined_calls.insert(call_index).second) {
+            ++call.issues["allocator_call_observation_not_unique"];
+            continue;
+        }
+
+        call.begin_us = event.ts;
+        call.end_us = end_us;
+        call.allocator_observation = static_cast<size_t>(&event - graph.runtime_observations().data());
+        call.allocator_work = source_dag::observed_allocator_work(event);
+        if (event.has_arg_key_hint("prefix_dtype")) call.prefix_dtype = event.arg("prefix_dtype");
+        // TraceEvent normalizes JSON null to an empty string; zero remains "0"
+        // and means the caller did supply an exact (empty) page count.
+        if (const auto supplied = event.find_arg("supplied_new_pages")) call.page_count_supplied = !supplied->empty();
+        if (call.allocator_work) {
+            auto & work = *call.allocator_work;
+            work.source_fact_id = call.source_fact_id;
+            work.requests = call.requests;
+            uint64_t tokens = 0, pages = 0;
+            for (const auto & request : work.requests) {
+                const auto regions = structure::hicache::extend_page_regions(request.sequence_tokens, request.prefix_tokens, work.page_size);
+                tokens = core::checked_add_u64(tokens, request.sequence_tokens - request.prefix_tokens, "Observed extend tokens overflow");
+                pages = core::checked_add_u64(pages, regions.new_full_pages + (regions.new_tail_tokens != 0), "Observed extend pages overflow");
+            }
+            if (work.requests.size() != work.batch_size || tokens != work.extend_tokens || pages != work.allocated_pages) {
+                ++call.issues["allocator_work_observation_mismatch"];
+                call.allocator_work.reset();
+            }
+        }
+        if (event.arg("allocator_implementation") == kNpuPagedAllocator && event.arg("free_page_dtype") == "torch.int64"
+            && event.arg("free_page_stride_elements") == "1")
+            result.supported_pids.insert(event.pid);
     }
     std::map<std::string, uint64_t> first_load;
     for (const auto & event : graph.runtime_observations()) {
@@ -196,6 +280,7 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
         const auto after = std::ranges::upper_bound(boundaries, event.ts, {}, &std::pair<uint64_t, size_t>::first);
         if (after == boundaries.begin()) continue; // Prelude supplies samples, not a formal cost.
         auto & call = result.calls[std::prev(after)->second];
+        if (event.ts < call.begin_us) continue;
         const auto end = core::checked_add_u64(event.ts, event.dur, "preparation observation end overflow");
         const auto observed = observed_specialization(event);
         if (!observed || event.arg("status") != "returned" || end > call.end_us || (call.specialization && call.specialization != observed)) {
@@ -229,37 +314,16 @@ AllocatorPreparationObservation observe_allocator_preparations(const core::DagGr
     return result;
 }
 
-AllocatorPreparationPlan predict_allocator_preparations(const AllocatorPreparationObservation & source,
-                                                        const std::vector<model::HiCacheAllocatorWorkItem> & calls) {
-    AllocatorPreparationPlan result;
-    result.source_parallel_compilation = source.source_parallel_compilation;
-    result.cost_samples = source.cost_samples;
-    std::map<std::string, std::set<AllocatorSpecialization>> prepared;
-    std::set<std::string> uncertain;
-    for (const auto & call : calls) {
-        AllocatorPreparation item;
-        if (!source.supported_pids.contains(call.pid)) item.status = "unsupported_signature";
-        else if (call.allocated_pages >= 200) item.status = "naive_path";
-        else if (!call.free_index_offset || !call.extend_tokens || !call.batch_size || call.extend_tokens > (uint64_t{ 1 } << 63)
-                 || call.batch_size > (uint64_t{ 1 } << 63)) {
-            item.status = "unknown";
-            uncertain.insert(call.pid);
-        }
-        else {
-            item.specialization =
-                AllocatorSpecialization{ call.page_size, std::bit_ceil(call.batch_size), std::bit_ceil(call.extend_tokens), (*call.free_index_offset % 2) * 8 };
-            auto & cache = prepared[call.pid];
-            item.first_load = cache.empty();
-            item.status = cache.contains(*item.specialization) ? "already_prepared" : uncertain.contains(call.pid) ? "possibly_required" : "required";
-            cache.insert(*item.specialization);
-        }
-        if (call.formal && (item.status == "unknown" || item.status == "possibly_required" || item.status == "unsupported_signature"))
-            ++result.blockers[item.status];
-        result.calls.push_back(std::move(item));
-    }
-    assign_cache_paths(calls, result);
+namespace {
+
+AllocatorPreparationPlan predict_static_allocator_preparations(const core::DagGraph & graph, const AllocatorPreparationObservation & source,
+                                                               const std::vector<model::HiCacheAllocatorWorkItem> & calls) {
+    auto work = structure::hicache::plan_allocator_work(source.supported_pids, calls);
+    AllocatorPreparationPlan result{ .status = std::move(work.status), .calls = std::move(work.calls), .blockers = std::move(work.blockers) };
+    result.source_parallel_compilation = observe_compilation_context(graph);
+    result.cost_samples = observe_static_cost_samples(graph);
     for (size_t i = 0; i < calls.size(); ++i) {
-        if (!calls[i].formal) continue;
+        if (!calls[i].formal || calls[i].phase == model::HiCacheAllocatorPhase::Decode) continue;
         const auto found =
             std::ranges::find_if(source.calls, [&](const auto & call) { return call.source_fact_id == calls[i].source_fact_id && call.pid == calls[i].pid; });
         if (found == source.calls.end()) {
@@ -279,7 +343,7 @@ AllocatorPreparationPlan predict_allocator_preparations(const AllocatorPreparati
         }
         if (target.status == "required") {
             const auto costs = result.cost_samples.find(calls[i].pid);
-            if (!result.source_parallel_compilation) ++result.blockers["preparation_compilation_context_uncovered"];
+            if (result.source_parallel_compilation != true) ++result.blockers["preparation_compilation_context_uncovered"];
             else if (target.first_load) ++result.blockers["preparation_first_runtime_state_uncovered"];
             else if (costs == result.cost_samples.end() || !costs->second.contains(target.path) || !costs->second.contains("variant_load"))
                 ++result.blockers["new_preparation_cost_uncovered"];
@@ -299,9 +363,11 @@ AllocatorPreparationPlan predict_allocator_preparations(const AllocatorPreparati
     return result;
 }
 
+} // namespace
+
 AllocatorPreparationPlan plan_allocator_preparations(const core::DagGraph & graph, const std::vector<model::HiCacheAllocatorWorkItem> & calls) {
     const auto source = observe_allocator_preparations(graph);
-    auto result = predict_allocator_preparations(source, calls);
+    auto result = predict_static_allocator_preparations(graph, source, calls);
     std::map<Lane, std::vector<Span>> removed;
     std::map<size_t, uint64_t> added;
     for (const auto & cost : result.cpu_costs) {

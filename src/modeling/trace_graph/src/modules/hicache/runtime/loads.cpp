@@ -1,6 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include <algorithm>
@@ -104,24 +105,13 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
         if (!node) throw std::runtime_error("Forward consumer has no CPU boundary");
         forward_at_[*node].push_back(i);
     }
-    core::DagMutationPlan source_costs{ .component = "hicache_load_transfer" };
     for (size_t i = 0; i < loads_.size(); ++i) {
-        const auto & load = loads_[i];
         if (!submissions[i]) throw std::runtime_error("Load submission has no CPU boundary");
         if (!submit_at_.emplace(*submissions[i], i).second) throw std::runtime_error("Load submissions share an unresolved execution boundary");
-        if (!submission_calibration_.empty()) continue;
-        if (load.record.device_transfer_node_ids.empty()) continue;
-        const auto first = *std::ranges::min_element(load.record.device_transfer_node_ids, {}, [&](size_t id) { return graph.event_for_node(id).ts; });
-        const auto last = load.layers.back().source_record;
-        if (!start_at_.emplace(first, i).second || !complete_at_.emplace(last, i).second)
-            throw std::runtime_error("Source load batches share transfer or completion carriers");
-        if (graph.node(last).duration) throw std::runtime_error("Load completion needs a zero-cost final Record boundary");
-        for (const auto id : load.record.device_transfer_node_ids) source_costs.set_node_durations.push_back({ id, 0 });
     }
-    (void)core::apply_dag_mutation_plan(graph, source_costs);
 
-    prepare_generated_submissions(graph);
-    prepare_insertions(graph, boundaries);
+    prepare_generated_submissions(graph, begin_us);
+    replacement_boundaries_ = boundaries;
 }
 
 void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & future) {
@@ -132,47 +122,36 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
         if (const auto site = insertions_.find(at->second); site != insertions_.end()) {
             const auto & insertion = site->second;
             if (!load.batch) {
-                const auto empty = expand_host(insertion.empty, {}, future);
+                auto plan = insertion.empty;
+                if (plan.nodes.empty()) {
+                    plan = generate_cpu_control(graph_->node_lane_key(insertion.continuation), "target empty load queue");
+                    structure::OperationWork work{ "hicache_io_control", "load.submission.empty_return", "empty_queue", "cpu_service", {} };
+                    const auto cpu_us = operator_provider_.estimate(work).duration_us;
+                    work.timing_scope = "residual_interval";
+                    const auto residual_us = operator_provider_.estimate(work).duration_us;
+                    std::pair<double, double> remainder{};
+                    bind_cpu_control(plan, cpu_us, residual_us, remainder);
+                }
+                const auto empty = expand_host(plan, {}, future);
                 future.depend(empty.host_return, insertion.continuation);
             }
             else {
-                const Donor * donor = nullptr;
-                uint64_t best = UINT64_MAX;
                 const auto bytes = load.batch->io_schedule.effective_byte_count;
-                for (const auto & candidate : donors_) {
-                    // With independent operation costs, the target page count
-                    // must generate submissions even when a base donor exists.
-                    if (!submission_calibration_.empty()) break;
-                    if (candidate.pid != load.fact.pid || candidate.tid != load.fact.tid) continue;
-                    const auto size = candidate.plan.payload_bytes;
-                    const auto distance = size > bytes ? size - bytes : bytes - size;
-                    if (!donor || distance < best) {
-                        donor = &candidate;
-                        best = distance;
-                    }
-                }
-                std::optional<Donor> generated;
-                if (!donor) {
-                    const auto program = generated_submissions_.find({ load.fact.pid, load.fact.tid });
-                    if (program == generated_submissions_.end()) throw std::runtime_error("New load lacks independent submission costs or scheduler resources");
-                    if (!page_bytes_ || bytes % page_bytes_) throw std::runtime_error("Target load is not whole KV pages");
-                    const auto & p = program->second;
-                    if (p.base_cost) ++base_cost_batches_;
-                    else ++shared_cost_batches_;
-                    auto built = generate_load_submission(*graph_, p.main, p.worker, p.compute, p.stream, bytes / page_bytes_, page_bytes_, p.layers, p.cost);
-                    generated.emplace(Donor{
-                        load.fact.pid,
-                        load.fact.tid,
-                        std::move(built.plan),
-                        std::move(built.layer_records),
-                        { graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id }
-                    });
-                    donor = &*generated;
-                }
+                const auto program = generated_submissions_.find({ load.fact.pid, load.fact.tid });
+                if (program == generated_submissions_.end()) throw std::runtime_error("New load lacks proven scheduler resources");
+                if (!page_bytes_ || bytes % page_bytes_) throw std::runtime_error("Target load is not whole KV pages");
+                const auto & p = program->second;
+                auto built = generate_page_first_submission(*graph_, p.main, p.worker, p.compute, p.stream, bytes / page_bytes_, page_bytes_, p.layers, "load");
+                const auto costs = cost::estimate_load_submission(operator_provider_, bytes, page_bytes_, p.layers);
+                bind_page_first_submission(built, costs);
+                ++shared_cost_batches_;
+                const std::vector<size_t> lanes{ graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id };
                 HiCacheHostSequence sequence(insertion.positions, stream_insertions_, future);
-                const auto expanded = sequence.append(donor->plan, load.batch->io_schedule.duration_us, donor->lanes);
+                const auto service_us = io_completion_.duration("load", page_bytes_, bytes / page_bytes_, 0);
+                bind_transfer_payload(built.plan, service_us);
+                const auto expanded = sequence.append(built.plan, lanes);
                 future.depend(expanded.host_return, insertion.continuation);
-                for (const auto record : donor->records) load.layers.push_back({ load.layers.size(), 0, 0, expanded.nodes.at(record) });
+                for (const auto record : built.completion_records) load.layers.push_back({ load.layers.size(), 0, 0, expanded.nodes.at(record) });
                 complete_at_.emplace(expanded.completion, at->second);
             }
         }
@@ -184,18 +163,6 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
         if (load.batch)
             for (const auto & layer : load.layers) records.push_back(layer.source_record);
         consumers_.submitted(load.fact.pid, std::move(records));
-    }
-    if (const auto at = start_at_.find(node); at != start_at_.end()) {
-        auto & load = loads_[at->second];
-        if (load.batch) {
-            std::vector<uint64_t> bytes;
-            std::vector<size_t> records;
-            for (const auto & layer : load.layers) {
-                bytes.push_back(layer.bytes);
-                records.push_back(layer.source_record);
-            }
-            (void)generate_load_layer_transfers(future, node, load.batch->io_schedule.resource_lane, bytes, load.batch->io_schedule.duration_us, records);
-        }
     }
     if (const auto at = complete_at_.find(node); at != complete_at_.end()) {
         auto & load = loads_[at->second];

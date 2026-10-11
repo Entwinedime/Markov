@@ -1,38 +1,77 @@
 #pragma once
+#include "markov/trace_graph/core/dag_graph.hpp"
+#include "markov/trace_graph/cost/hicache_release.hpp"
+#include "markov/trace_graph/cost/hicache_submission.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
-#include <span>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-struct LoadIndexOperationCost {
-    uint64_t main_us = 0, main_residual_us = 0;
-    uint64_t worker_us = 0, dispatch_us = 0, device_us = 0;
-};
-
 struct LoadIndexResources {
     size_t worker, compute;
 };
-[[nodiscard]] HiCacheHostExpansion generate_layer_wait(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                                       const LoadIndexOperationCost & cost, uint64_t after_us, uint64_t after_residual_us);
-struct LoadSubmissionCost {
-    LoadIndexOperationCost before_sync, start_record, wait_event;
-    LoadIndexOperationCost first_copy, copy, first_layer_record, layer_record, tail;
+
+/** Local numeric slots for one declared host operation. These identities do
+ * not contain costs; binding may change durations, never topology or resources. */
+struct HostOperationSlots {
+    size_t main;
+    std::optional<size_t> worker, device;
+    std::optional<size_t> worker_return;
 };
-/** Partition a complete Ascend submission into per-operation costs. Unsupported
- * layouts return no observation; CPU residuals and dispatch remain separate. */
-[[nodiscard]] std::optional<LoadSubmissionCost> observe_load_submission_cost(const HiCacheWriteExpansion & plan, size_t layers);
-struct GeneratedLoadSubmission {
+
+/** Bind a worker segment's service/residual interval in microseconds.
+ * Dispatch is separate and belongs only to the task head. Keeps topology,
+ * queue identity and existing dispatch metadata unchanged. */
+void bind_worker_segment(core::DagSyntheticNodeSpec & worker, uint64_t service_us, uint64_t residual_us, std::string_view source);
+
+/** Bind microsecond service values to declared slots; absent worker/device
+ * roles stay absent. Does not add operations or change their dependencies. */
+void bind_host_operation(HiCacheHostExpansion & plan, const HostOperationSlots & slots, const cost::HostOperationCost & cost,
+                         std::string_view source = "hicache_host_independent_model");
+
+enum class ReleaseOperation { BeforeFirstSync, FirstSync, BeforeSecondSync, SecondSync, Concatenate, Tail };
+struct GeneratedPagedRelease {
+    HiCacheHostExpansion plan;
+    std::vector<std::pair<ReleaseOperation, HostOperationSlots>> operations;
+};
+/** Current Ascend paged immediate-free lowering: host fallback index work
+ * synchronizes compute twice, then asynchronously concatenates free pages.
+ * Counts and ordering belong to this lowering, not to a calibration sample.
+ */
+[[nodiscard]] GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_t main, size_t worker, size_t compute, bool paged = true);
+void bind_paged_release(GeneratedPagedRelease & generated, const cost::PagedReleaseCost & cost);
+/** A stream-wait program generated solely from resource identities. Semantic
+ * cost slots let the later cost stage bind values without changing topology.
+ */
+struct GeneratedLayerWait {
+    HiCacheHostExpansion plan;
+    size_t submit = 0, worker = 0, device = 0, tail = 0, worker_return = 0;
+};
+[[nodiscard]] GeneratedLayerWait generate_layer_wait(const core::DagGraph & graph, size_t main, size_t worker, size_t compute);
+enum class TransferOperation { PrepareSync, IndexSync, StartRecord, WaitEvent, FirstCopy, Copy, FirstCompletionRecord, CompletionRecord, Tail };
+struct GeneratedTransferSubmission {
     HiCacheWriteExpansion plan;
-    std::vector<size_t> layer_records;
+    std::vector<size_t> completion_records;
+    std::vector<std::pair<TransferOperation, HostOperationSlots>> operations;
 };
-/** Ascend page_first_direct: index D2H waits for compute, then K/V copies
- * transfer all layers before layer completion records. Structure depends only
- * on target pages/layers; costs and resource identities are separate inputs. */
-[[nodiscard]] GeneratedLoadSubmission generate_load_submission(const core::DagGraph & graph, size_t main, size_t worker, size_t compute, size_t load_stream,
-                                                               size_t pages, uint64_t page_bytes, size_t layers, const LoadSubmissionCost & cost);
+/** Ascend page_first_direct: index D2H waits for compute, then ordered K/V
+ * copies followed by completion records. Framework rules supply one global
+ * record for a write, or one per layer for a load; measurements cannot choose
+ * this count or the stream/event dependencies. Payload service is bound later.
+ */
+[[nodiscard]] GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
+                                                                         size_t transfer_stream, size_t pages, uint64_t page_bytes, size_t completion_count,
+                                                                         std::string_view operation);
+/** Fill control service slots only. Payload I/O remains bound separately;
+ * page count, completion count, waits and resource lanes are already fixed. */
+void bind_page_first_submission(GeneratedTransferSubmission & generated, const cost::PageFirstSubmissionCost & cost);
 /** Bind a worker FIFO to an explicitly identified compute stream using this
  * main lane's submission -> worker -> device evidence. The target operation
  * itself need not have occurred in base; the caller supplies the compute role. */
@@ -42,21 +81,13 @@ struct GeneratedLoadSubmission {
 
 /** One asynchronously submitted index operation, not a copied calibration DAG.
  * Resource nodes identify a proven main lane, existing worker FIFO and compute
- * stream. Cost includes main preparation/submission, worker service and device
- * service separately. The host return does not wait for device completion. */
-[[nodiscard]] HiCacheHostExpansion generate_load_index_operation(const core::DagGraph & graph, size_t main_node, size_t worker_node, size_t compute_node,
-                                                                 const LoadIndexOperationCost & cost, std::string_view operation);
-
-/** Generate the ordered device portion of a layer-first H2D batch. The caller
- * supplies target layer bytes and the independently estimated total service.
- * No source trace or transfer template is required. Optional existing records
- * retain their submission dependencies; otherwise new completion records are
- * emitted. Existing byte attribution may assign zero weight to an intermediate
- * record; that record and its ordering still remain. The total must be positive.
- * CPU launch work, initial stream ordering and downstream stream tails
- * remain the caller's responsibility, not an implicit device-wide barrier. */
-[[nodiscard]] std::vector<size_t> generate_load_layer_transfers(simulation::FutureDag & future, size_t ready, std::string_view lane,
-                                                                std::span<const uint64_t> layer_bytes, uint64_t service_us,
-                                                                std::span<const size_t> completion_records = {});
+ * stream. Numeric slots are bound later; the host return does not wait for
+ * device completion. Construction never queries or selects a cost model. */
+struct GeneratedDeviceOperation {
+    HiCacheHostExpansion plan;
+    size_t submit = 0, worker = 0, device = 0, worker_return = 0;
+};
+[[nodiscard]] GeneratedDeviceOperation generate_async_device_operation(const core::DagGraph & graph, size_t main_node, size_t worker_node, size_t compute_node,
+                                                                       std::string_view operation);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

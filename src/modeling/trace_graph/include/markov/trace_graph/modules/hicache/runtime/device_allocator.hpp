@@ -32,9 +32,6 @@ struct DeviceAllocatorLedger {
     /** @brief Merges pending releases back into the free-page count. */
     void merge_release_pages();
 
-    /** @brief Reconstructs release-queue visibility before an extend boundary. */
-    void merge_before_extend(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size);
-
     /** @brief Reconstructs release-queue visibility before page allocation. */
     void merge_before_page_allocation(uint64_t requested_pages);
 

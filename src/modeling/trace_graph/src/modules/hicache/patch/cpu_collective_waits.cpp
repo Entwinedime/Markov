@@ -20,9 +20,30 @@ struct Gap {
     std::vector<std::pair<uint64_t, uint64_t>> cuts;
 };
 
+using CallerOrderIssues = std::map<std::string, std::map<std::string, size_t>>;
+
+CallerOrderIssues observe_caller_order(const core::DagGraph & graph) {
+    std::map<std::pair<std::string, std::string>, std::vector<const core::TraceEvent *>> calls;
+    for (const auto & event : graph.runtime_observations())
+        if (event.name == "runtime.cpu_collective") calls[{ event.arg("group"), event.arg("rank") }].push_back(&event);
+
+    CallerOrderIssues issues;
+    for (auto & [key, events] : calls) {
+        std::ranges::sort(events, {}, [](const auto * event) { return event->ts; });
+        uint64_t end = 0;
+        for (const auto * event : events) {
+            if (event->pid != events.front()->pid || event->tid != events.front()->tid || event->ts < end || event->arg("async_op") != "false"
+                || event->arg("status") != "returned")
+                ++issues[key.first]["group_is_not_single_caller_synchronous"];
+            end = event->ts + event->dur;
+        }
+    }
+    return issues;
+}
+
 class Planner {
 public:
-    explicit Planner(const HiCacheSourceDagIndex & source) : source(source), graph(source.graph()) {}
+    Planner(const HiCacheSourceDagIndex & source, const CallerOrderIssues & caller_order) : source(source), graph(source.graph()), caller_order(caller_order) {}
     CpuCollectiveWaitPlan run(const std::vector<const CpuCollectiveRound *> & rounds) {
         check_call_order(rounds);
         for (const auto * round : rounds) add_round(*round);
@@ -36,6 +57,7 @@ public:
 private:
     const HiCacheSourceDagIndex & source;
     const core::DagGraph & graph;
+    const CallerOrderIssues & caller_order;
     CpuCollectiveWaitPlan result;
     std::map<size_t, Gap> gaps;
     std::map<size_t, uint64_t> cpu_gaps;
@@ -45,19 +67,11 @@ private:
     void check_call_order(const std::vector<const CpuCollectiveRound *> & rounds) {
         std::set<std::string> groups;
         for (const auto * round : rounds) groups.insert(round->group);
-        std::map<std::pair<std::string, std::string>, std::vector<const core::TraceEvent *>> calls;
-        for (const auto & event : graph.runtime_observations())
-            if (event.name == "runtime.cpu_collective" && groups.contains(event.arg("group")))
-                calls[{ event.arg("group"), event.arg("rank") }].push_back(&event);
-        for (auto & [key, events] : calls) {
-            std::ranges::sort(events, {}, [](const auto * event) { return event->ts; });
-            uint64_t end = 0;
-            for (const auto * event : events) {
-                if (event->pid != events.front()->pid || event->tid != events.front()->tid || event->ts < end || event->arg("async_op") != "false"
-                    || event->arg("status") != "returned")
-                    issue("group_is_not_single_caller_synchronous");
-                end = event->ts + event->dur;
-            }
+        for (const auto & group : groups) {
+            const auto found = caller_order.find(group);
+            if (found == caller_order.end()) continue;
+
+            for (const auto & [reason, count] : found->second) result.issues[reason] += count;
         }
     }
     Ref ref(size_t node) const { return Ref::synthetic(result.mutation.synthetic_nodes[node].synthetic_id); }
@@ -250,7 +264,15 @@ private:
 };
 } // namespace
 
+CpuCollectiveWaitPlanner::CpuCollectiveWaitPlanner(const HiCacheSourceDagIndex & source)
+    : source_(source),
+      caller_order_issues_(observe_caller_order(source.graph())) {}
+
+CpuCollectiveWaitPlan CpuCollectiveWaitPlanner::plan(const std::vector<const CpuCollectiveRound *> & rounds) const {
+    return Planner(source_, caller_order_issues_).run(rounds);
+}
+
 CpuCollectiveWaitPlan plan_cpu_collective_waits(const HiCacheSourceDagIndex & source, const std::vector<const CpuCollectiveRound *> & rounds) {
-    return Planner(source).run(rounds);
+    return CpuCollectiveWaitPlanner(source).plan(rounds);
 }
 } // namespace markov::trace_graph::modules::hicache::patch

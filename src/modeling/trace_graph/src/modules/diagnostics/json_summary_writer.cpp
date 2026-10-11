@@ -5,6 +5,7 @@
 #include "markov/trace_graph/modules/diagnostics/json_summary_writer.hpp"
 
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
+#include "markov/trace_graph/structure/hicache/report.hpp"
 
 #include <cstddef>
 #include <nlohmann/json.hpp>
@@ -14,45 +15,6 @@ namespace markov::trace_graph::modules::diagnostics {
 namespace {
 
 using Json = nlohmann::json;
-
-// Keep only the model-derived work needed for strict oracle admission. This
-// projection never reads target observations or recreates cache execution.
-Json target_effects(const hicache::model::HiCacheEffectDecisionLedger & ledger) {
-    Json effects = Json::array();
-    for (const auto & effect : ledger.decisions) {
-        Json batches = Json::array();
-        for (const auto & batch : effect.storage_service_batches)
-            batches.push_back({ batch.operation_index, batch.page_count, batch.existing_page_count, batch.new_page_count });
-
-        // Shape counts physical service calls. A zero-payload terminal control
-        // is still costed by io_resources, but is not a storage service batch.
-        using Direction = hicache::model::HiCacheTransferDirection;
-        std::size_t operations = 0;
-        if (effect.direction == Direction::StorageToHost || effect.direction == Direction::HostToStorage) operations = effect.storage_service_batches.size();
-        else if ((effect.direction == Direction::HostToDevice || effect.direction == Direction::DeviceToHost) && effect.effective_page_count > 0)
-            operations = effect.operation_ids.size();
-
-        effects.push_back({
-            {                  "effect_key",                                                              effect.effect_key },
-            {           "effect_family_key",                                                       effect.effect_family_key },
-            {                 "effect_type",                   hicache::model::hicache_effect_type_name(effect.effect_type) },
-            {                   "direction",              hicache::model::hicache_transfer_direction_name(effect.direction) },
-            {                 "cache_scope",                                                             effect.cache_scope },
-            {         "target_effect_state",   hicache::model::hicache_target_effect_state_name(effect.target_effect_state) },
-            {        "schedule_sensitivity", hicache::model::hicache_schedule_sensitivity_name(effect.schedule_sensitivity) },
-            {               "consumer_role",                                      effect.consumer_boundary.source_fact_role },
-            {               "resource_lane",                                                           effect.resource_lane },
-            {           "eligibility_epoch",                                              effect.eligibility_boundary.epoch },
-            {             "operation_count",                                                                     operations },
-            {        "effective_page_count",                                                    effect.effective_page_count },
-            {        "completed_page_count",                                                    effect.completed_page_count },
-            { "storage_existing_page_count",                                             effect.storage_existing_page_count },
-            {      "storage_new_page_count",                                                  effect.storage_new_page_count },
-            {             "storage_batches",                                                             std::move(batches) },
-        });
-    }
-    return effects;
-}
 
 Json io_resource_summary(const hicache::patch::HiCacheIoResourcePlan & resources) {
     Json costs = Json::array();
@@ -141,7 +103,7 @@ Json patch_summary(const hicache::HiCacheDagPatchModule & module) {
         { "hicache_dag_patch",
          {
          { "status", result.status },
-         { "target_effects", target_effects(module.effect_decisions()) },
+         { "target_effects", structure::hicache::effect_rows(module.effect_decisions()) },
          { "source_target_same_config", result.source_target_same_config },
          { "io_resources", io_resource_summary(result.io_resources) },
          { "source_attribution", source_attribution_summary(result.source_attribution) },

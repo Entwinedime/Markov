@@ -115,6 +115,8 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         }
         else if (argument == "--trace-channels") select_trace_channels(options.trace_input, next_value(index, argc, argv, argument));
         else if (argument == "--graph-output") options.outputs.graph = next_value(index, argc, argv, argument);
+        else if (argument == "--source-replay-report") options.outputs.source_replay_report = next_value(index, argc, argv, argument);
+        else if (argument == "--structure-report") options.outputs.structure_report = next_value(index, argc, argv, argument);
         else if (argument == "--model-config") options.model_config = next_value(index, argc, argv, argument);
         else if (argument == "--cpu-service-cost") options.cpu_service_cost = next_value(index, argc, argv, argument);
         else if (argument == "--prepare-cpu-service") options.prepare_cpu_service = next_value(index, argc, argv, argument);
@@ -152,7 +154,9 @@ void print_usage(const char * program) {
               << "  --cpu-service-cost FILE         Optional same-base CPU service intervals\n"
               << "  --prepare-cpu-service FILE      Generate service intervals from same-base measurements; no prediction\n"
               << "  --cpu-service-output FILE       Output for --prepare-cpu-service (replaces --run-summary)\n"
-              << "  --source-observations-only      Extract model inputs without client replay or simulation\n"
+              << "  --source-observations-only      Extract costs, or structure only with --structure-report; no simulation\n"
+              << "  --source-replay-report FILE     Experimental raw source DAG replay, before costs or transforms\n"
+              << "  --structure-report FILE         Experimental executed work; observed structure in source-only mode\n"
               << "  --graph-output FILE             Optional full DAG Chrome trace\n"
 #ifdef DEBUG
               << "  --actual-e2e-us N               Explicit workload E2E used by validation\n"

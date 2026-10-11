@@ -11,11 +11,12 @@ import random
 from statistics import median
 import time
 from types import SimpleNamespace
+from typing import Any
 
 from ...common.io import load_json, write_json
 from ...common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ...common.commands import positive_int
-from ..io_model_contract import nonnegative_finite_number, positive_finite_number
+from ...modeling.cost.io_contract import nonnegative_finite_number, positive_finite_number
 from .options import parse_cpu_sets, parse_positive_csv
 
 
@@ -147,10 +148,12 @@ def main(argv=None):
 def acquire_eviction_cpu(group, needs, *, dry_run=False):
     """Acquire one declared primitive domain for all affected targets, not per cell."""
     from ..physical_capture import physical_attempts, physical_usage, _completed, run_primitive_attempt
-    from ..group import source_environment
-    from ..planning.profile_runs import parse_server_command_flags
+    from ...modeling.deployment import source_environment
+    from ...modeling.source_dag.profiles import parse_server_command_flags
+    from ..control_acquisition import operator_requirements
 
-    required = [need for need in needs if need["component"] == "execution_control/eviction_locked_candidate"]
+    required = operator_requirements(needs, "eviction.locked_candidate")
+    required.extend(need for need in needs if need["component"] == "execution_control/eviction_locked_candidate")
     if not required:
         return dict(status="not_required")
     spec = group.raw.get("physical_capture", {})
@@ -162,7 +165,7 @@ def acquire_eviction_cpu(group, needs, *, dry_run=False):
     if flags.get("radix_eviction_policy", "lru") != "lru":
         return dict(plan, stop_reason="CPU primitive sampler supports LRU only")
     cpus = parse_cpu_sets(spec["cpu_sets"], len(spec["cpu_sets"].split("|")))
-    environment = source_environment(group.sources[0])
+    environment = source_environment(group.sources[0], group.raw.get("resource_environment"))
     if len(cpus) != int(environment["server"]["tp_size"]):
         raise ValueError("CPU primitive needs one CPU set per base TP rank")
     sizes = parse_positive_csv(",".join(str(size) for size in sampling["heap_sizes"]), "heap_sizes")
@@ -237,74 +240,44 @@ def acquire_eviction_cpu(group, needs, *, dry_run=False):
     )
 
 
-def estimate_locked_candidate_cost(report):
-    """A pop at heap size n costs a + b*log2(n); draining N sums that cost.
+def locked_candidate_observations(
+    report: dict[str, Any], source: str, deployment: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Keep drained-loop observations, not invented per-pop measurements.
 
-    N=1 identifies a; the largest heap identifies b through log2(N!). Interior
-    heaps are checks, never extra fitted parameters. Pool ranks by medians.
+    A drain performs N pops and sum(log2(n)) heap work. Offline linear training
+    can use these additive variables with a declared zero intercept, then query
+    one pop as (1, log2(heap_size)). This is an explicitly reported extrapolation
+    of primitive work, not a measurement of every individual pop.
     """
-    if report["clock"] != "thread_time_ns":
-        raise ValueError("Locked-candidate coefficients require thread CPU time")
-    by_rank = {}
-    for row in report["samples"]:
+
+    if report["clock"] != "thread_time_ns" or report["status"] != "measured":
+        raise ValueError("Locked-candidate observations require completed thread-CPU sampling")
+
+    rows = []
+    for sample in report["samples"]:
+        size = sample["heap_size"]
         differences = [
             nonnegative_finite_number(pair["active_us"], "active CPU")
             - nonnegative_finite_number(pair["baseline_us"], "baseline CPU")
-            for pair in row["pairs"]
+            for pair in sample["pairs"]
         ]
-        value = positive_finite_number(median(differences), "median loop CPU")
-        by_rank.setdefault(row["rank"], {})[row["heap_size"]] = (value, min(differences), max(differences))
-    intercepts, slopes = [], []
-    for values in by_rank.values():
-        if 1 not in values or len(values) < 3:
-            raise ValueError("Locked-candidate model needs heap 1, a larger anchor and an interior check")
-        largest = max(values)
-        fixed = values[1][0]
-        slope = (values[largest][0] - largest * fixed) / (math.lgamma(largest + 1) / math.log(2))
-        intercepts.append(fixed)
-        slopes.append(nonnegative_finite_number(slope, "heap growth coefficient"))
-    fixed, slope = median(intercepts), median(slopes)
-    checks = []
-    for rank, values in by_rank.items():
-        for size, (observed, low, high) in sorted(values.items()):
-            predicted = size * fixed + slope * math.lgamma(size + 1) / math.log(2)
-            checks.append(
-                dict(
-                    rank=rank,
-                    heap_size=size,
-                    observed_loop_us=observed,
-                    predicted_loop_us=predicted,
-                    relative_error=predicted / observed - 1,
-                    observed_range_us=[low, high],
-                    role="anchor" if size in (1, max(values)) else "check",
-                )
+        duration = positive_finite_number(median(differences), "median loop CPU")
+        rows.append(
+            dict(
+                capture="cpu_primitive:" + source,
+                manifest=source,
+                deployment=deployment,
+                position=f"rank:{sample['rank']}:drain:{size}",
+                operation="eviction.locked_candidate",
+                implementation="lru_heap",
+                timing_scope="thread_cpu_service",
+                features={"pop_count": float(size), "sum_log2_heap": math.lgamma(size + 1) / math.log(2)},
+                duration_us=duration,
             )
-    return dict(locked_candidate_us=fixed, locked_candidate_log2_heap_us=slope), dict(
-        formula="per pop: a + b*log2(n); drained heap: N*a + b*log2(N!)",
-        estimator="N=1 and largest heap per rank, then median rank coefficients; interior sizes held out",
-        heap_sizes=sorted({size for values in by_rank.values() for size in values}),
-        checks=checks,
-        interpretation="Shared CPU service estimate; not residual wait or whole eviction cost",
-        limitations=report["limitations"]
-        + [
-            "Logarithmic growth outside measured heap sizes is an unvalidated extrapolation.",
-            "Held-out errors and repeat ranges describe calibration approximation, not target E2E accuracy.",
-        ],
-    )
+        )
 
-
-def group_locked_candidate_cost(group):
-    """Read matching completed group evidence; model construction never collects."""
-    existing = acquire_eviction_cpu(
-        group,
-        [{"component": "execution_control/eviction_locked_candidate", "reason": "lookup_existing_measurement"}],
-        dry_run=True,
-    )
-    if existing["status"] != "cpu_primitive_measured":
-        return {}, {}
-    coefficients, evidence = estimate_locked_candidate_cost(load_json(require_repo_path(existing["report"])))
-    evidence.update(origin="independent_calibration", report=existing["report"], shared_across_group=True)
-    return coefficients, evidence
+    return rows
 
 
 if __name__ == "__main__":

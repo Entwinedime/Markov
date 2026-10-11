@@ -60,6 +60,10 @@ def build_trace_graph_command(run: ModelingRunConfig) -> list[str]:
         command.append("--hicache-static-replay")
     if run.outputs.dag_chrome_trace:
         command.extend(["--graph-output", str(run.output_dir / "dag_chrome_trace.json")])
+    if run.outputs.source_replay_report:
+        command.extend(["--source-replay-report", str(run.output_dir / "source_replay_report.json")])
+    if run.outputs.structure_report:
+        command.extend(["--structure-report", str(run.output_dir / "structure_report.json")])
     if run.outputs.module_summary:
         command.extend(["--model-summary", str(run.output_dir / "model_summary.json")])
     if run.model_config_path is not None:

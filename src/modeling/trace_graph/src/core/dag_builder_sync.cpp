@@ -448,10 +448,14 @@ void finalize_sync_nodes(DagGraph & graph, const DagBuildIndex & index) {
         if (edge.active && edge.kind == DagEdgeKind::Sync) has_wait_dependency[edge.dst] = true;
     }
     auto set_fixed_sync_duration = [&](const std::vector<size_t> & nodes) {
+        constexpr uint64_t source_sync_service_us = 10;
         for (const auto node_id : nodes) {
             // A submission or stream-order edge alone does not replace a wait.
             // Keep the observed blocking interval when its object is unknown.
-            if (has_wait_dependency[node_id]) graph.set_node_duration(node_id, 10);
+            // This legacy replay approximation is already a service cost, not
+            // the original blocking interval. CPU interval correction cannot
+            // be applied again; target cost providers may still replace it.
+            if (has_wait_dependency[node_id]) graph.bind_node_execution_duration(node_id, source_sync_service_us);
         }
     };
     set_fixed_sync_duration(index.stream_sync_nodes);

@@ -8,6 +8,8 @@
 #include "markov/trace_graph/cli/file_output.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/operator_model.hpp"
+#include "markov/trace_graph/structure/hicache/phase.hpp"
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
@@ -28,6 +30,35 @@ namespace {
 
 using Json = nlohmann::json;
 
+Json operator_query_result(const std::map<cost::OperatorCostProvider::QueryKey, cost::OperatorQuerySummary> & queries) {
+    Json rows = Json::array();
+    for (const auto & [key, summary] : queries) {
+        const auto & [component, operation, implementation, scope] = key;
+        rows.push_back({
+            {                  "component",                          component },
+            {                  "operation",                          operation },
+            {             "implementation",                     implementation },
+            {               "timing_scope",                              scope },
+            {                    "queries",                    summary.queries },
+            {      "outside_range_queries",      summary.outside_range_queries },
+            { "unseen_combination_queries", summary.unseen_combination_queries },
+            {    "queried_duration_sum_us",    summary.queried_duration_sum_us },
+        });
+        if (scope == "idle_stream_sync_interval")
+            rows.back()["limitations"] =
+                "Idle previously used stream; ordinary/infinite-timeout runtime APIs share one constant. Device waits are dependencies. "
+                "Blocking wake-up latency and inference contention are unmeasured, not proven zero.";
+    }
+    return {
+        {              "scope","independent HiCache control, phase and allocator operator model queries"                               },
+        {               "rows",                                                           std::move(rows) },
+        { "full_cost_coverage",                                                                     false },
+        {        "limitations",
+         "Query counts are not emitted operation counts; one queried primitive may be reused. Duration sums are not executed service totals or E2E. Source "
+         "migration, I/O payload models and retained gaps are outside this query report."                },
+    };
+}
+
 Json effect_decision_result(const modules::hicache::model::HiCacheEffectDecisionLedger & ledger) {
     Json result;
     result["status"] = ledger.status;
@@ -46,8 +77,8 @@ Json effect_decision_result(const modules::hicache::model::HiCacheEffectDecision
 }
 
 Json phase_work_result(const modules::hicache::model::HiCachePhaseWorkLedger & plan) {
-    // Keep target work identities for historical replay admission. Per-node
-    // costs remain in the model; retired component score tables are not emitted.
+    // Report structural work only. Live per-operator cost binding and retained
+    // static replay own their numerical evidence separately.
     Json prefills = Json::array();
     for (const auto & item : plan.prefills) {
         prefills.push_back({
@@ -69,17 +100,14 @@ Json phase_work_result(const modules::hicache::model::HiCachePhaseWorkLedger & p
     }
 
     return {
-        { "status", plan.status },
-        { "prefill_status", plan.prefill_status },
-        { "decode_status", plan.decode_status },
-        { "cost_status", plan.cost_status },
-        { "prefill_feature_covered_count", std::ranges::count_if(plan.prefills, [](const auto & item) { return item.feature_covered; }) },
-        { "decode_feature_covered_count", std::ranges::count_if(plan.decodes, [](const auto & item) { return item.feature_covered; }) },
-        { "prefill_count", plan.prefills.size() },
-        { "decode_count", plan.decodes.size() },
-        { "blockers", plan.blockers },
-        { "prefills", std::move(prefills) },
-        { "decodes", std::move(decodes) },
+        {         "status",          plan.status },
+        { "prefill_status",  plan.prefill_status },
+        {  "decode_status",   plan.decode_status },
+        {  "prefill_count", plan.prefills.size() },
+        {   "decode_count",  plan.decodes.size() },
+        {       "blockers",        plan.blockers },
+        {       "prefills",  std::move(prefills) },
+        {        "decodes",   std::move(decodes) },
     };
 }
 
@@ -184,7 +212,7 @@ Json dag_patch_result(const modules::hicache::HiCacheDagPatchModule & module) {
          { "removed_coverage_us", preparation.removed_coverage_us },
          { "added_cost_us", preparation.added_cost_us },
          { "required_path_counts", required_paths },
-         { "source_parallel_compilation", preparation.source_parallel_compilation },
+         { "source_parallel_compilation", preparation.source_parallel_compilation ? Json(*preparation.source_parallel_compilation) : Json(nullptr) },
          { "cost_samples", preparation_costs },
          { "estimate_assumption", "fresh shared disk cache; parallel first use within each batch" },
          { "cost_source", preparation.added_cost_us ? "selected_base_path_medians" : "source_prepare_load_interval_union" },
@@ -344,56 +372,118 @@ void write_run_summary(const std::string & filename, const core::DagGraph & grap
     summary["http_client"] = client_result;
     if (execution) {
         const auto & result = *execution;
+        Json executed_cost_sources = Json::object();
+        for (const auto & [source, totals] : result.executed_cost_sources) {
+            executed_cost_sources[source] = {
+                {             "nodes",             totals.nodes },
+                {  "node_duration_us",  totals.node_duration_us },
+                { "sequential_gap_us", totals.sequential_gap_us },
+                {    "ready_delay_us",    totals.ready_delay_us }
+            };
+        }
+
+        size_t phase_migration_candidates = 0, phase_generated_plans = 0;
+        std::map<std::string, size_t> phase_plan_issues;
+        size_t planned_collectives = 0;
+        std::map<std::string, size_t> collective_plan_issues;
+        for (const auto & call : result.collective_work) {
+            if (call.service) ++planned_collectives;
+            else ++collective_plan_issues[call.reason];
+        }
+        for (const auto & call : result.phase_tensor_work) {
+            using Action = structure::hicache::PhaseCallPlan::Action;
+            if (call.action == Action::RetainCompute) ++phase_migration_candidates;
+            else if (call.action == Action::Generate) ++phase_generated_plans;
+            else ++phase_plan_issues[call.reason];
+        }
         if (include_source_observations)
             summary["module_results"]["hicache"] = {
                 { "effect_decisions", effect_decision_result(result.model.effect_decisions) },
                 {       "phase_work",            phase_work_result(result.model.phase_work) }
             };
         summary["module_results"]["hicache_execution"] = {
-            {                              "status",                                "executed"                                                    },
-            {                       "cost_coverage",                                                                                     "partial" },
-            {                             "http_us",                                                                                result.http_us },
-            {                      "prepared_facts",                                                                         result.prepared_facts },
-            {                      "consumed_facts",                                                                         result.consumed_facts },
-            {               "wait_template_request",                                                                  result.wait_template_request },
-            {           "wait_calibration_manifest",                                                              result.wait_calibration_manifest },
-            {  "local_return_calibration_manifests",                                                     result.local_return_calibration_manifests },
-            {          "query_calibration_manifest",                                                             result.query_calibration_manifest },
-            {                  "decode_allocations",                                                                     result.decode_allocations },
-            {                    "phase_admissions",                                                                       result.phase_admissions },
-            {                   "changed_operators",                                                                      result.changed_operators },
-            {             "source_load_submissions",                                                                result.source_load_submissions },
-            {   "load_submission_base_cost_batches",                                                      result.load_submission_base_cost_batches },
-            { "load_submission_shared_cost_batches",                                                    result.load_submission_shared_cost_batches },
-            {              "completed_load_batches",                                                                 result.completed_load_batches },
+            {                              "status",                                      "executed"                                                    },
+            {                       "cost_coverage",                                                                                           "partial" },
+            {         "phase_tensor_structure_plan",
+             { { "status", "applied_calls_partial_structure_coverage" },
+             { "prepared_calls", result.prepared_phase_calls },
+             { "executed_calls", result.executed_phase_calls },
+             { "migration_candidates", phase_migration_candidates },
+             { "generated_plans", phase_generated_plans },
+             { "source_observation_issues", result.phase_observation_issues },
+             { "planning_issues", phase_plan_issues },
+             { "execution_granularity",
+             "Tensor operations with atomic runtime worker tasks and serial device service; native launches within a worker task are not separately "
+             "scheduled." } }                                                                                                                           },
+            {               "allocator_replacement",
+             { { "prepared_calls", result.prepared_allocator_calls },
+             { "executed_calls", result.executed_allocator_calls },
+             { "retained_calls", result.retained_allocator_calls },
+             { "generated_calls", result.executed_allocator_calls - result.retained_allocator_calls },
+             { "scope", "inner extend and eager Decode allocation, including preparation; excludes outer capacity guard and request-index update" } }   },
+            {              "device_collective_plan",
+             { { "status", "logical_service_and_segmented_submission_replacement" },
+             { "planned_calls", planned_collectives },
+             { "planning_issues", collective_plan_issues },
+             { "generated_service_nodes", result.prepared_collective_services },
+             { "executed_service_nodes", result.executed_collective_services },
+             { "generated_event_nodes", result.prepared_collective_events },
+             { "executed_event_nodes", result.executed_collective_events },
+             { "generated_worker_segments", result.prepared_collective_worker_segments },
+             { "executed_worker_segments", result.executed_collective_worker_segments },
+             { "generated_caller_segments", result.prepared_collective_caller_segments },
+             { "executed_caller_segments", result.executed_collective_caller_segments },
+             { "scope",
+             "All-rank-ready communication, per-enqueue caller work, reduction/event worker tasks and device event services use independent costs. Event "
+             "waiting is represented by dependencies. Ordinary queued eager protocol only; event dependency correspondence remains source-derived and "
+             "dispatch retains base corrected scheduler residual. Packet-level overlap and multi-launch protocols are not modeled." } }                 },
+            {        "independent_operator_queries",                                          operator_query_result(result.independent_operator_queries) },
+            {               "executed_cost_sources",
+             { { "sources", executed_cost_sources },
+             { "full_cost_coverage", false },
+             { "final_cost_transform_applied", result.final_cost_transform_enabled },
+             { "scope",
+             "All active executed nodes, including background work; durations are after final cost transform. Sums are not HTTP or critical-path time." },
+             { "limitations",
+             "Phase, generated tensor, page-first payload/submission, storage-write batches, paged-release, load-index and generated CPU-control bindings "
+             "are classified. Other retained/generated nodes, including boundaries, remain unclassified. Worker duration can include residual intervals. "
+             "Gap and ready-delay sums belong to the listed nodes, not necessarily the same cost source, and are not pure service." } }                 },
+            {                "phase_operator_costs",
+             { { "migrated_operations", result.phase_operator_costs.migrated_operations },
+             { "migrated_service_us", result.phase_operator_costs.migrated_service_us },
+             { "scope", "remaining unchanged phase operators only; generated tensor costs are reported separately; summed service is not E2E" } }       },
+            {                             "http_us",                                                                                      result.http_us },
+            {        "final_cost_transform_enabled",                                                                 result.final_cost_transform_enabled },
+            {                      "prepared_facts",                                                                               result.prepared_facts },
+            {                      "consumed_facts",                                                                               result.consumed_facts },
+            {                  "decode_allocations",                                                                           result.decode_allocations },
+            {                    "phase_admissions",                                                                             result.phase_admissions },
+            {                   "changed_operators",                                                                            result.changed_operators },
+            {             "source_load_submissions",                                                                      result.source_load_submissions },
+            { "load_submission_shared_cost_batches",                                                          result.load_submission_shared_cost_batches },
+            {              "completed_load_batches",                                                                       result.completed_load_batches },
             {                         "layer_calls",
-             { { "prepared", result.prepared_layer_calls }, { "active", result.active_layer_calls }, { "inactive", result.inactive_layer_calls } } },
-            {            "source_write_submissions",                                                               result.source_write_submissions },
-            {                    "completed_writes",                                                                       result.completed_writes },
-            {                 "resumed_allocations",                                                                    result.resumed_allocations },
-            {            "prepared_write_templates",                                                               result.prepared_write_templates },
-            {          "prepared_eviction_controls",                                                             result.prepared_eviction_controls },
-            {          "expanded_write_submissions",                                                             result.expanded_write_submissions },
-            {             "calibrated_empty_checks",                                                                result.calibrated_empty_checks },
-            {             "generated_control_steps",                                                                result.generated_control_steps },
-            {           "generated_blocking_checks",                                                              result.generated_blocking_checks },
-            {  "blocking_check_cost_extrapolations",                                                     result.blocking_check_cost_extrapolations },
-            {    "phase_extrapolated_control_steps",                                                       result.phase_extrapolated_control_steps },
-            {       "calibrated_empty_check_cpu_us",                                                          result.calibrated_empty_check_cpu_us },
-            {                   "preparation_slots",                                                                      result.preparation_slots },
-            {               "executed_preparations",                                                                  result.executed_preparations },
+             { { "prepared", result.prepared_layer_calls }, { "active", result.active_layer_calls }, { "inactive", result.inactive_layer_calls } }      },
+            {            "source_write_submissions",                                                                     result.source_write_submissions },
+            {                    "completed_writes",                                                                             result.completed_writes },
+            {                 "resumed_allocations",                                                                          result.resumed_allocations },
+            {            "prepared_write_templates",                                                                     result.prepared_write_templates },
+            {          "prepared_eviction_controls",                                                                   result.prepared_eviction_controls },
+            {          "expanded_write_submissions",                                                                   result.expanded_write_submissions },
+            {             "generated_control_steps",                                                                      result.generated_control_steps },
+            {           "generated_blocking_checks",                                                                    result.generated_blocking_checks },
             {                       "confirmations",
              { { "load_rounds", result.confirmations.load_rounds },
              { "write_rounds", result.confirmations.write_rounds },
              { "storage_rounds", result.confirmations.storage_rounds },
              { "replaced_rounds", result.confirmations.replaced_rounds },
-             { "partial_window_rounds", result.confirmations.partial_window_rounds } }                                                            },
+             { "partial_window_rounds", result.confirmations.partial_window_rounds } }                                                                  },
             {                     "cpu_collectives",
              { { "status", result.cpu_collectives.status },
              { "observed", result.cpu_collectives.observed_rounds },
              { "planned", result.cpu_collectives.planned_rounds },
-             { "retained", result.cpu_collectives.source_retained_rounds } }                                                                      },
-            {            "remaining_approximations",                  { "source_cpu_branch_costs", "writeback_blocking", "source_residual_waits" } }
+             { "retained", result.cpu_collectives.source_retained_rounds } }                                                                            },
+            {            "remaining_approximations",                        { "source_cpu_branch_costs", "writeback_blocking", "source_residual_waits" } }
         };
         // Full HTTP includes every retained cost. Target ownership projections
         // are not implemented yet; zero would falsely look like a valid score.

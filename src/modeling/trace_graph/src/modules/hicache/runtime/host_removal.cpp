@@ -1,6 +1,8 @@
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
+#include "markov/trace_graph/source_dag/call_regions.hpp"
+#include <algorithm>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -23,11 +25,23 @@ core::DagNodeRef append_host_entry_gate(const patch::HiCacheSourceDagIndex & sou
     return gate;
 }
 
-core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & source, std::span<const HiCacheHostRegion> regions) {
+core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & source, std::span<const HiCacheHostRegion> regions,
+                                        std::span<const size_t> collective_handoffs, std::span<const core::DagRedirectEdgeMutation> submission_handoffs) {
     using Kind = core::DagEdgeKind;
     const auto & graph = source.graph();
     core::DagMutationPlan plan{ .component = "hicache_host_replacement" };
-    std::set<size_t> removed, workers, gates;
+    std::set<size_t> removed, workers, gates, opening_submissions;
+    const std::set<size_t> transferred_collectives(collective_handoffs.begin(), collective_handoffs.end());
+    std::set<size_t> transferred_submissions;
+    std::set<size_t> transferred_submission_nodes;
+    for (const auto & handoff : submission_handoffs) {
+        const auto & edge = graph.edge(handoff.edge_index);
+        if (!edge.active || edge.kind != Kind::Correlation || !handoff.src || handoff.dst || !graph.node(edge.src).is_cpu || !graph.node(edge.dst).is_cpu)
+            throw std::runtime_error("Caller handoff must preserve a CPU task and replace only its submission endpoint");
+        transferred_submissions.insert(handoff.edge_index);
+        transferred_submission_nodes.insert(edge.src);
+        plan.redirect_edges.push_back(handoff);
+    }
     std::map<size_t, std::pair<size_t, size_t>> main;
     std::set<std::tuple<size_t, size_t, Kind>> additions;
     for (const auto & region : regions) {
@@ -67,11 +81,15 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
         for (const auto & gap : host.main.owned_gap_slices) {
             if (gap.owner_node_id != region.entry && !path.contains(gap.owner_node_id))
                 throw std::runtime_error("Host removal would consume an external CPU gap");
-            // A previously removed nested call leaves its original timestamps
-            // apart, but its entry carries no remaining gap. Do not resurrect
-            // that elapsed source interval as owned work of the outer call.
-            if (!graph.node(gap.owner_node_id).cpu_gap_after && !graph.scope_gap_duration(gap.owner_node_id)) continue;
-            gaps[gap.owner_node_id] += gap.owned_duration_us();
+            // Count only retained source pieces, exactly as host expansion
+            // does. Nested replacements may have removed all or part of the
+            // old timestamp gap before this enclosing call is replaced.
+            const auto retained = graph.observed_cpu_gap_ranges(gap.owner_node_id);
+            if (!retained) throw std::runtime_error("Host removal cannot own a remodeled gap without source coordinates");
+            for (const auto & [lo, hi] : *retained) {
+                const auto begin = std::max(lo, gap.owned_start_us), end = std::min(hi, gap.owned_end_us);
+                if (begin < end) gaps[gap.owner_node_id] += end - begin;
+            }
         }
         for (const auto id : path)
             if (gaps[id] != graph.node(id).cpu_gap_after || graph.scope_gap_duration(id))
@@ -82,21 +100,36 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
         if (gaps[region.entry] != graph.node(region.entry).cpu_gap_after || graph.scope_gap_duration(region.entry))
             throw std::runtime_error("Host entry gap is not wholly inside its call");
         removed.insert(path.begin(), path.end());
+        for (const auto node : region.opening_nodes) {
+            removed.insert(node);
+            if (graph.node(node).is_cpu) opening_submissions.insert(node);
+        }
         plan.set_cpu_gaps.push_back({ .node_id = region.entry, .duration = 0 });
         additions.emplace(region.entry, region.exit, Kind::Sequential);
     }
-    // Zero-duration enqueue leaves still submit real work. A cost template
-    // omits them, so discover removal ownership from the complete CPU chain.
+    // Discover removal ownership from the complete CPU chain, including
+    // zero-duration enqueue points and nested replacement gates.
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::vector<size_t> submitted(removed.begin(), removed.end());
     for (size_t i = 0; i < submitted.size(); ++i)
         for (const auto edge_id : source.outgoing_edge_ids(submitted[i])) {
+            if (transferred_submissions.contains(edge_id)) continue;
             const auto & edge = graph.edge(edge_id);
-            if (!edge.active || edge.kind != Kind::Correlation || removed.contains(edge.dst)) continue;
+            if (!edge.active || removed.contains(edge.dst)) continue;
+            const auto source_task = queues.node_task.at(edge.src);
+            const bool same_task = edge.kind == Kind::Sequential && source_task != core::DagNode::kNoNode && queues.node_task.at(edge.dst) == source_task
+                                   && removed.contains(queues.tasks.at(source_task).submission);
+            if (edge.kind != Kind::Correlation && !same_task) continue;
+
+            // A submitted CPU task can contain multiple runtime spans. Its
+            // continuation belongs to this call even without a second
+            // Correlation edge. Never follow the FIFO into the next task.
             const auto & node = graph.node(edge.dst);
             const auto task = node.is_cpu ? queues.node_task.at(edge.dst) : core::DagNode::kNoNode;
             if (!node.active || node.gpu_id != graph.node(submitted[i]).gpu_id
-                || (node.is_cpu && (task == core::DagNode::kNoNode || !main.contains(queues.tasks[task].submission))))
+                || (node.is_cpu
+                    && (task == core::DagNode::kNoNode
+                        || (!main.contains(queues.tasks[task].submission) && !opening_submissions.contains(queues.tasks[task].submission)))))
                 throw std::runtime_error("Host submission closure has no same-rank owned worker task: " + std::to_string(edge.src) + " "
                                          + graph.event_for_node(edge.src).name + " lane=" + std::string(graph.node_lane_key(edge.src))
                                          + " rank=" + std::to_string(graph.node(edge.src).gpu_id) + " -> " + std::to_string(edge.dst) + " "
@@ -106,19 +139,30 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
             if (node.is_cpu) workers.insert(edge.dst);
             submitted.push_back(edge.dst);
         }
+    const auto placeholders = source_dag::interior_stream_placeholders(source, removed);
+    removed.insert(placeholders.begin(), placeholders.end());
+
     for (const auto & region : regions)
         for (const auto id : region.host->worker_nodes)
             if (!workers.contains(id)) throw std::runtime_error("Host worker has no owned submission path");
     for (const auto id : gates)
         if (removed.contains(id)) throw std::runtime_error("Host removal contains another region's gate");
+    for (const auto id : transferred_submissions) {
+        const auto & edge = graph.edge(id);
+        if (!main.contains(edge.src) || removed.contains(edge.dst))
+            throw std::runtime_error("Caller handoff must leave its complete worker task outside removal");
+    }
     for (const auto id : workers) {
         const auto task = queues.node_task.at(id);
         if (task == core::DagNode::kNoNode || !removed.contains(queues.tasks.at(task).submission))
             throw std::runtime_error("Host removal worker lacks its owned submission");
+        if (transferred_submission_nodes.contains(queues.tasks.at(task).submission))
+            throw std::runtime_error("Caller handoff cannot remove part of its retained worker task");
     }
     for (size_t id = 0; id < queues.node_task.size(); ++id) {
         const auto task = queues.node_task[id];
-        if (task != core::DagNode::kNoNode && removed.contains(queues.tasks[task].submission) && !workers.contains(id))
+        if (task != core::DagNode::kNoNode && removed.contains(queues.tasks[task].submission)
+            && !transferred_submission_nodes.contains(queues.tasks[task].submission) && !workers.contains(id))
             throw std::runtime_error("Host removal owns only part of a worker task: " + std::to_string(id) + " " + graph.event_for_node(id).name);
     }
     // Only follow the resource's order, never an incoming event/record wait.
@@ -138,14 +182,21 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
             }
         }
     };
-    for (const auto & edge : graph.edges()) {
+    for (size_t edge_id = 0; edge_id < graph.edges().size(); ++edge_id) {
+        const auto & edge = graph.edge(edge_id);
         if (!edge.active || removed.contains(edge.src) == removed.contains(edge.dst)) continue;
         const bool outgoing = removed.contains(edge.src);
         const auto id = outgoing ? edge.src : edge.dst, peer = outgoing ? edge.dst : edge.src;
         if (const auto at = main.find(id); at != main.end()) {
+            if (outgoing && transferred_submissions.contains(edge_id)) continue;
             if (!outgoing && edge.kind == Kind::Sync && !graph.node(peer).is_cpu) continue;
             if (edge.kind != Kind::Sequential || peer != (outgoing ? at->second.second : at->second.first))
                 throw std::runtime_error("Host removal has an external main-thread dependency");
+        }
+        else if (opening_submissions.contains(id)) {
+            if (edge.kind != Kind::Sequential || graph.node(peer).lane_id != graph.node(id).lane_id)
+                throw std::runtime_error("Opening submission has an external nonqueue dependency");
+            if (outgoing) bypass(id, peer, Kind::Sequential, Kind::Sequential);
         }
         else if (workers.contains(id)) {
             if (edge.kind != Kind::Sequential || graph.node(peer).lane_id != graph.node(id).lane_id)
@@ -155,11 +206,16 @@ core::DagMutationPlan plan_host_removal(const patch::HiCacheSourceDagIndex & sou
         else if (outgoing) {
             if (edge.kind != Kind::Stream && (edge.kind != Kind::Sync || !core::synchronizes_device_frontier(graph.event_for_node(peer))))
                 throw std::runtime_error("Removed device event still has an external event consumer: " + std::to_string(id) + " "
-                                         + graph.event_for_node(id).name + " -> " + std::to_string(peer) + " " + graph.event_for_node(peer).name
-                                         + " kind=" + std::to_string(static_cast<int>(edge.kind)));
+                                         + graph.event_for_node(id).name + " -> " + std::to_string(peer) + " " + graph.event_for_node(peer).name + " kind="
+                                         + std::to_string(static_cast<int>(edge.kind)) + " source_ts_us=" + std::to_string(graph.event_for_node(id).ts)
+                                         + " consumer_ts_us=" + std::to_string(graph.event_for_node(peer).ts)
+                                         + " consumer_pid=" + graph.event_for_node(peer).pid + " consumer_tid=" + graph.event_for_node(peer).tid);
             bypass(id, peer, Kind::Stream, edge.kind);
         }
-        else if (edge.kind != Kind::Stream && edge.kind != Kind::Sync) { throw std::runtime_error("Removed device work has an external submission"); }
+        else if (edge.kind != Kind::Stream && edge.kind != Kind::Sync
+                 && (edge.kind != Kind::HCCL || graph.node(peer).is_cpu || !transferred_collectives.contains(edge_id))) {
+            throw std::runtime_error("Removed device work has an external submission");
+        }
     }
     plan.disable_nodes.assign(removed.begin(), removed.end());
     for (const auto & [from, to, kind] : additions) {

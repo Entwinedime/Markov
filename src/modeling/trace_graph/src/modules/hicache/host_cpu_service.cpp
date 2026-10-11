@@ -35,6 +35,7 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
     if (has_layers && layers.status != "ready") throw std::runtime_error("Layer CPU service requires aligned source call observations");
     using Lane = std::pair<std::string, std::string>;
     const auto identity = [](const nlohmann::json & value) { return value.is_string() ? value.get<std::string>() : std::to_string(value.get<uint64_t>()); };
+    std::map<Lane, std::vector<core::CpuServiceCost::Span>> corrections;
     for (const auto & call : measurements.at("rows")) {
         const Lane lane{ identity(call.at("pid")), identity(call.at("tid")) };
         auto ranges = call.at("exclusive_ranges_ns");
@@ -140,11 +141,16 @@ nlohmann::json attach_host_cpu_service(core::DagGraph & graph, const nlohmann::j
             if (numerator < 0 && numerator % total) --projected;
             const auto service = static_cast<__int128>(width) - (projected - assigned);
             if (service < 0 || service > std::numeric_limits<uint64_t>::max()) throw std::runtime_error("Host CPU service exceeds integer range");
-            graph.cpu_service_cost().add(lane, { piece.begin, piece.end, static_cast<uint64_t>(service) });
+            corrections[lane].push_back({ piece.begin, piece.end, static_cast<uint64_t>(service) });
             assigned = projected;
         }
         if (assigned != reduction) throw std::runtime_error("Host CPU allocation changed the measured budget");
     }
+
+    // Ownership and integer allocation use source geometry, not earlier host
+    // corrections. Keep that allocation order, then merge each lane once.
+    for (auto & [lane, spans] : corrections) graph.cpu_service_cost().add_spans(lane, std::move(spans));
+
     return retained;
 }
 

@@ -5,8 +5,8 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
-uint64_t start_ns(const core::TraceEvent & event) { return event.ts * 1000 + event.ts_submicro_ns; }
-uint64_t end_ns(const core::TraceEvent & event) { return start_ns(event) + event.dur * 1000 + event.dur_submicro_ns; }
+uint64_t start_ns(const core::TraceEvent & event) { return event.ts * 1'000 + event.ts_submicro_ns; }
+uint64_t end_ns(const core::TraceEvent & event) { return start_ns(event) + event.dur * 1'000 + event.dur_submicro_ns; }
 bool contains(const core::TraceEvent & outer, const core::TraceEvent & inner) {
     return outer.pid == inner.pid && outer.tid == inner.tid && start_ns(outer) <= start_ns(inner) && end_ns(inner) <= end_ns(outer);
 }
@@ -33,11 +33,11 @@ std::vector<HiCacheLifecycleStep> lifecycle_ready_steps(const HiCacheLifecycleIn
         }
         auto ready = event;
         const auto at = event.name == "runtime.hicache.write_policy_check" ? start_ns(event) : end_ns(event);
-        ready.ts = at / 1000;
-        ready.ts_submicro_ns = at % 1000;
+        ready.ts = at / 1'000;
+        ready.ts_submicro_ns = at % 1'000;
         ready.dur = ready.dur_submicro_ns = 0;
         ready.name += ".ready";
-        steps.push_back({first, last, std::move(ready)});
+        steps.push_back({ first, last, std::move(ready) });
     }
     std::ranges::sort(steps, {}, &HiCacheLifecycleStep::begin_tokens);
     uint64_t covered = 0, previous = start_ns(insert.envelope);
@@ -53,30 +53,32 @@ std::vector<HiCacheLifecycleStep> lifecycle_ready_steps(const HiCacheLifecycleIn
     return steps;
 }
 
-std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(
-    const core::DagGraph & graph, std::span<const model::HiCacheReplayFact> facts, uint64_t begin, uint64_t end) {
+std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(const core::DagGraph & graph, std::span<const model::HiCacheReplayFact> facts, uint64_t begin,
+                                                              uint64_t end) {
     std::vector<HiCacheLifecycleInsert> result;
     const auto in_window = [&](const core::TraceEvent & event) {
-        return start_ns(event) >= begin * 1000 && start_ns(event) <= end * 1000;
+        // The reader retains calls crossing the opening cut. Their unfinished
+        // lifecycle still owns target publication/write sites; a start before
+        // the first formal HTTP request does not make that work prelude-only.
+        return end_ns(event) >= begin * 1'000 && start_ns(event) <= end * 1'000;
     };
     for (const auto & event : graph.runtime_observations()) {
-        const bool retained_tail = event.arg("formal_window_context") == "causal_tail" && start_ns(event) > end * 1000;
+        const bool retained_tail = event.arg("formal_window_context") == "causal_tail" && start_ns(event) > end * 1'000;
         if (event.name != "runtime.hicache.radix_insert" || (!in_window(event) && !retained_tail)) continue;
         if (event.arg("status") != "returned") throw std::runtime_error("Radix insert observation did not return");
         const core::TraceEvent * enclosing = nullptr;
-        for (const auto * collection : {&graph.hicache_fact_events(), &graph.tail_context_events()})
-        for (const auto & raw : *collection) {
-            if (raw.arg("phase") != "end" || !contains(raw, event)
-                || parse_hicache_fact_metadata(raw).role != "cache_lifecycle_commit") continue;
-            if (enclosing) throw std::runtime_error("Radix insert has multiple enclosing lifecycles");
-            enclosing = &raw;
-        }
+        for (const auto * collection : { &graph.hicache_fact_events(), &graph.tail_context_events() })
+            for (const auto & raw : *collection) {
+                if (raw.arg("phase") != "end" || !contains(raw, event) || parse_hicache_fact_metadata(raw).role != "cache_lifecycle_commit") continue;
+                if (enclosing) throw std::runtime_error("Radix insert has multiple enclosing lifecycles");
+                enclosing = &raw;
+            }
         if (!enclosing) throw std::runtime_error("Radix insert has no enclosing lifecycle");
         const model::HiCacheReplayFact * owner = nullptr;
         for (const auto & item : facts) {
-            if (item.role != HiCacheFactRole::CacheLifecycleCommit || item.fact.source_event_index != enclosing->index
-                || item.fact.pid != enclosing->pid || item.fact.tid != enclosing->tid
-                || item.fact.source_ts != hicache_fact_boundary_timestamp(*enclosing)) continue;
+            if (item.role != HiCacheFactRole::CacheLifecycleCommit || item.fact.source_event_index != enclosing->index || item.fact.pid != enclosing->pid
+                || item.fact.tid != enclosing->tid || item.fact.source_ts != hicache_fact_boundary_timestamp(*enclosing))
+                continue;
             if (owner) throw std::runtime_error("Radix insert has multiple replay owners");
             owner = &item;
         }
@@ -89,7 +91,8 @@ std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(
     }
     for (const auto & event : graph.runtime_observations()) {
         if ((event.name != "runtime.hicache.write_policy_check" && event.name != "runtime.hicache.node_publish"
-             && event.name != "runtime.hicache.device_restore")) continue;
+             && event.name != "runtime.hicache.device_restore"))
+            continue;
         HiCacheLifecycleInsert * owner = nullptr;
         for (auto & insert : result) {
             if (!contains(insert.envelope, event)) continue;
@@ -112,8 +115,7 @@ std::vector<HiCacheLifecycleInsert> observe_lifecycle_inserts(
         if (event.arg("chunked") != owner->envelope.arg("chunked")) throw std::runtime_error("Node boundary and insert disagree on chunked state");
         owner->node_boundaries.push_back(event);
     }
-    for (auto & insert : result)
-        std::ranges::stable_sort(insert.node_boundaries, {}, start_ns);
+    for (auto & insert : result) std::ranges::stable_sort(insert.node_boundaries, {}, start_ns);
     return result;
 }
 

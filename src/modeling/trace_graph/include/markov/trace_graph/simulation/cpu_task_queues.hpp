@@ -3,6 +3,10 @@
 #pragma once
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include <vector>
+#ifdef DEBUG
+#include <map>
+#include <string>
+#endif
 
 namespace markov::trace_graph::simulation::detail {
 
@@ -16,11 +20,14 @@ struct CpuTaskQueues {
     std::vector<CpuTask> tasks;
     std::vector<size_t> node_task, submitted_task;
     size_t queue_count = 0;
+#ifdef DEBUG
+    std::map<size_t, std::string> unavailable_lanes;
+#endif
 
-    [[nodiscard]] bool replaces(const core::DagEdge& edge) const;
-    void materialize(core::DagGraph& graph, const std::vector<std::vector<size_t>>& order) const;
+    [[nodiscard]] bool replaces(const core::DagEdge & edge) const;
+    void materialize(core::DagGraph & graph, const std::vector<std::vector<size_t>> & order) const;
 };
 
-[[nodiscard]] CpuTaskQueues discover_cpu_task_queues(const core::DagGraph& graph);
+[[nodiscard]] CpuTaskQueues discover_cpu_task_queues(const core::DagGraph & graph);
 
 } // namespace markov::trace_graph::simulation::detail

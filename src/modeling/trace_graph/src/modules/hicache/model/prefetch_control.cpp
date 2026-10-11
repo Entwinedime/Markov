@@ -36,7 +36,6 @@ uint64_t HiCacheState::query_prefetch_storage(const HiCacheFact & fact) {
     auto * op = candidate ? &scope.async_ops.prefetch_ops().at(candidate->header.operation_id) : nullptr;
     if (!execution_prefetch_control_ || !op || op->query_sample_ts || fact.ts < op->header.enqueue_ts)
         throw std::logic_error("Prefetch query requires a new local storage sample at a causal time");
-    advance_storage_backups(fact, scope);
     op->hit_pages = scope.storage.contiguous_readable_prefix(op->planned_pages);
     op->query_sample_ts = fact.ts;
     return op->hit_pages.size();
@@ -62,7 +61,6 @@ void HiCacheState::complete_prefetch_query(const HiCacheFact & fact, uint64_t co
     op->payload_transfer_issued = true;
     op->io_schedule = schedule_target_io(normalized_scope(fact), "prefetch", fact.ts, op->hit_pages.size(), {}, op->execution_stop_ts);
     op->service_pages = prefix_to(op->hit_pages, op->io_schedule.effective_byte_count / config_.kv_bytes_per_page);
-    prefetch_lane_queue_[op->io_schedule.resource_lane].emplace_back(normalized_scope(fact), op->header.operation_id);
 }
 
 HiCachePrefetchCheck HiCacheState::sample_prefetch_check(const HiCacheFact & fact) const {
@@ -98,18 +96,8 @@ uint64_t HiCacheState::stop_prefetch(const HiCacheFact & fact) {
     op->policy_stop_ts = fact.ts;
     if (!op->payload_transfer_issued) return 0; // Query may still issue its first batch later.
 
-    // Shortening a running operation changes all later read starts. Recompute
-    // that queue suffix, including operations already cancelled while queued.
-    // Changed service cannot release before this stop's rejected increment.
-    const auto & queue = prefetch_lane_queue_.at(op->io_schedule.resource_lane);
-    const auto position = std::find(queue.begin(), queue.end(), std::pair{ normalized_scope(fact), op->header.operation_id });
-    if (position == queue.end()) throw std::logic_error("Issued prefetch has no resource queue entry");
-    io_lane_available_ts_[op->io_schedule.resource_lane] = op->io_schedule.start_ts;
-    for (auto entry = position; entry != queue.end(); ++entry) {
-        auto & queued = scopes_.at(entry->first).async_ops.prefetch_ops().at(entry->second);
-        queued.io_schedule = schedule_target_io(entry->first, "prefetch", *queued.query_return_ts, queued.hit_pages.size(), {}, queued.execution_stop_ts);
-        queued.service_pages = prefix_to(queued.hit_pages, queued.io_schedule.effective_byte_count / config_.kv_bytes_per_page);
-    }
+    // The worker observes termination after its next copy. Its DAG return
+    // releases the lane; neither this stop nor state recomputes queued costs.
     return locally_published_pages(*op);
 }
 
@@ -147,11 +135,33 @@ void HiCacheState::complete_prefetch_io(const HiCacheFact & fact) {
     complete_prefetch_io(op->header, fact.ts);
 }
 
+void HiCacheState::begin_prefetch_io(const HiCacheOperationHeader & operation, uint64_t timestamp_us) {
+    auto & op = scopes_.at(operation.cache_scope).async_ops.prefetch_ops().at(operation.operation_id);
+    op.io_schedule.start_ts = timestamp_us;
+    op.io_schedule.batches.clear();
+}
+
+void HiCacheState::record_prefetch_batch(const HiCacheOperationHeader & operation, size_t index, const runtime::HiCacheIoBatchSchedule & batch) {
+    auto & batches = scopes_.at(operation.cache_scope).async_ops.prefetch_ops().at(operation.operation_id).io_schedule.batches;
+    if (index == batches.size()) batches.push_back(batch);
+    else batches.at(index) = batch;
+}
+
 void HiCacheState::complete_prefetch_io(const HiCacheOperationHeader & operation, uint64_t timestamp_us) {
     auto & scope = scopes_.at(operation.cache_scope);
     auto & op = scope.async_ops.prefetch_ops().at(operation.operation_id);
-    if (!execution_prefetch_control_ || !op.payload_transfer_issued || op.io_return_ts || timestamp_us < op.io_schedule.ready_ts)
+    if (!execution_prefetch_control_ || !op.payload_transfer_issued || op.io_return_ts || timestamp_us < op.io_schedule.start_ts)
         throw std::logic_error("Prefetch I/O return requires completed physical work and a single return event");
+
+    // A cancelled batch still entered storage with all requested pages. Keep
+    // this issued volume separate from copied counts and published pages.
+    uint64_t issued_pages = 0;
+    for (const auto & batch : op.io_schedule.batches) issued_pages += batch.page_count;
+    op.service_pages = prefix_to(op.hit_pages, issued_pages);
+    op.io_schedule.effective_byte_count = core::checked_multiply_u64(issued_pages, config_.kv_bytes_per_page, "Prefetch executed bytes overflow");
+    op.io_schedule.ready_ts = timestamp_us;
+    op.io_schedule.duration_us = timestamp_us - op.io_schedule.start_ts;
+    op.io_schedule.available = true;
     op.io_return_ts = timestamp_us;
     queue_prefetch_host_release(scope, op, op.hit_pages.size() - locally_published_pages(op));
 }
@@ -160,9 +170,6 @@ HiCachePrefetchQueueSizes HiCacheState::prefetch_queue_sizes(const HiCacheFact &
     HiCachePrefetchQueueSizes sizes;
     const auto scope = scopes_.find(normalized_scope(fact));
     if (scope == scopes_.end()) return sizes;
-    // Until storage workers are execution-driven, their readiness still comes
-    // from the existing target service schedule, never a source ACK count.
-    if (execution_prefetch_control_) advance_storage_backups(fact, scope->second);
     sizes.revoked_operations = scope->second.prefetch_revoke_queue.size();
     sizes.backup_acks = scope->second.backup_ack_queue.size();
     // SGLang append_host_mem_release splits tensors into one queue entry per

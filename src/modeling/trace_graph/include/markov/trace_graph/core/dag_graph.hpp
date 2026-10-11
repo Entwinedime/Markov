@@ -27,6 +27,9 @@ namespace markov::trace_graph::core {
  */
 enum class DagEdgeKind : std::uint8_t { Sequential, Stream, Correlation, Sync, HCCL, HiCache, Mutation };
 
+/** Stable readable dependency name shared by summaries and semantic reports. */
+[[nodiscard]] std::string edge_kind_name(DagEdgeKind kind);
+
 /** @brief Distinguishes input trace events from model-created nodes. */
 enum class DagNodeKind : std::uint8_t { TraceEvent, Synthetic };
 
@@ -122,10 +125,14 @@ struct DagNode {
 
     /** @brief Whether this node may independently define the business E2E endpoint. */
     bool counts_toward_e2e = true;
-    /** Model-created single-leaf task, without fabricated source timestamps or correlation IDs. */
+    /** Member of a model-created CPU task. Members share one submission and a
+     * Sequential chain; only its head pays dispatch and its tail releases FIFO. */
     bool explicit_cpu_task = false;
     /** A synthetic observation fragment retains original CPU coordinates, not newly modeled service. */
     bool observed_cpu_coordinates = false;
+    /** Final execution cost, after source correction and the start-time cost
+     * provider. Replaying this graph must not correct this duration again. */
+    bool execution_cost_bound = false;
 
     /** @brief Index into the owning graph's event vector. */
     size_t event_index = 0;
@@ -213,6 +220,11 @@ public:
 
     /** @brief Creates a model node with an independent synthetic event identity. */
     size_t add_synthetic_node(const DagSyntheticNodeSpec & spec);
+    /** Register a device-lane identity, not an executable zero-cost operation.
+     * The inactive node may identify a resource for later generated work; it
+     * must not be used as a dependency endpoint. No source timestamp is implied.
+     */
+    size_t add_device_resource(std::string lane_key, int gpu_id);
 
     /** @brief Reserves compact storage before constructing a large graph. */
     void reserve(const DagGraphCapacity & capacity);
@@ -261,6 +273,9 @@ public:
 
     /** @brief Updates the sole authoritative execution duration for a node. */
     void set_node_duration(size_t node_id, uint64_t duration);
+    /** Bind a final start-time cost without changing raw event coordinates.
+     * CPU gaps and ready delays retain their separate correction contracts. */
+    void bind_node_execution_duration(size_t node_id, uint64_t duration);
 
     /** @brief Updates whether one node may independently define business E2E. */
     void set_node_counts_toward_e2e(size_t node_id, bool value);
@@ -269,6 +284,11 @@ public:
     using CpuGapRanges = std::vector<std::pair<uint64_t, uint64_t>>;
     void validate_cpu_gap_ranges(size_t node_id, uint64_t duration, const CpuGapRanges & ranges) const;
     void set_cpu_gap_after(size_t node_id, uint64_t duration, std::optional<CpuGapRanges> ranges = std::nullopt);
+    /** Original-coordinate pieces of the remaining sequential gap. Empty
+     * means no gap; nullopt means positive modeled work without exact source
+     * coordinates. Returned ranges are independent of later graph mutations.
+     */
+    [[nodiscard]] std::optional<CpuGapRanges> observed_cpu_gap_ranges(size_t node_id) const;
 
     CpuServiceCost & cpu_service_cost() { return cpu_service_cost_; }
     [[nodiscard]] const CpuServiceCost & cpu_service_cost() const { return cpu_service_cost_; }

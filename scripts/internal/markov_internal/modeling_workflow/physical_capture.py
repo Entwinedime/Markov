@@ -19,9 +19,9 @@ from .calibration.runtime_anchors import DMA_SERVICES, load_runtime_service_mode
 from .calibration.prefetch_service import prefetch_experiments, prefetch_io_bytes
 from .capture import pending_group_capture, recorded_capture, run_container_attempt
 from .physical_calibration import derive_kv_geometry
-from .planning.profile_runs import parse_server_command_flags
+from ..modeling.source_dag.profiles import parse_server_command_flags
 from .runtime_dma_calibration import build_operation_plan
-from .io_model_validation import required_prefetch_stages
+from ..modeling.cost.io_validation import required_prefetch_stages
 
 if TYPE_CHECKING:
     from .group import GroupRequest
@@ -53,12 +53,12 @@ def storage_batch_pages() -> int:
 
 def physical_context(group: GroupRequest) -> dict[str, Any]:
     """Admission uses workspace inputs; modeling need not mount model metadata/weights."""
-    from .group import source_environment
+    from ..modeling.deployment import source_environment
 
     return {
         "sampling": _io_sampling(group.raw.get("physical_capture") or {}),
         "existing_physical": group.raw.get("physical_calibration"),
-        "environment": source_environment(group.sources[0]),
+        "environment": source_environment(group.sources[0], group.raw.get("resource_environment")),
         "page_token_sizes": _declared_page_sizes(group),
     }
 
@@ -70,10 +70,10 @@ def _io_sampling(spec: dict[str, Any]) -> dict[str, Any]:
 
 def _platform_context(group: GroupRequest) -> dict[str, Any]:
     """Geometry and storage scopes depend on deployment, not measurement settings."""
-    from .group import source_environment
+    from ..modeling.deployment import source_environment
 
     return {
-        "environment": source_environment(group.sources[0]),
+        "environment": source_environment(group.sources[0], group.raw.get("resource_environment")),
         "devices": (group.raw.get("physical_capture") or {}).get("devices"),
     }
 

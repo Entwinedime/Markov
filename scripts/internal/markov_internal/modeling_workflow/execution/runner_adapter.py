@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ...modeling.run_config import ModelingOutputs, ModelingRunConfig
-from ..io_model import HiCacheIoModel
+from ...modeling.cost.hicache import HiCacheIoModel
 from ..types import ModelRunSpec, TargetHiCacheConfig
 
 if TYPE_CHECKING:
@@ -20,7 +20,11 @@ def runner_config(spec: ModelRunSpec, options: WorkflowOptions) -> ModelingRunCo
     return ModelingRunConfig(
         output_dir=spec.output_dir,
         profile_manifest=spec.source.manifest_path,
-        outputs=ModelingOutputs(module_summary=diagnostics),
+        outputs=ModelingOutputs(
+            module_summary=diagnostics,
+            source_replay_report=options.experiment_reports,
+            structure_report=options.experiment_reports,
+        ),
         threads=options.trace_threads,
         file_threads=options.trace_file_threads,
         trace_window_start_us=window.start_ns // 1000 if window else None,
@@ -43,16 +47,12 @@ def hicache_model_config(
     """Build the narrow C++ HiCache config."""
 
     # Target input has already excluded costs and patch internals. Only the
-    # shared model supplies costs. Prefetch policy was resolved at admission
-    # so requirement planning and cost selection use the same execution branch.
+    # shared model supplies costs. Prefetch policy drives execution; it does
+    # not select a measured waiting program.
     hicache_config = {
         "enabled": True,
         **target.fields,
-        **io_model.narrow_config(
-            target.fields["page_size"],
-            target.fields["prefetch_policy"],
-            target.fields.get("write_policy", "write_through"),
-        ),
+        **io_model.narrow_config(target.fields["page_size"]),
     }
     hicache_config["dag_patch"] = {
         "enabled": True,

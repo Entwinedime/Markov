@@ -1,145 +1,28 @@
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <string_view>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::split_load_tail(const core::DagGraph & graph, size_t main, LoadAdmissionProgram & program) {
-    const auto & source = program.tail.work;
-    if (source.streams.size() != 1 || !source.waits.empty() || !source.event_waits.empty()) return;
-
-    std::vector<size_t> submissions;
-    bool after_clones = false;
-    for (size_t i = 0; i < source.nodes.size(); ++i) {
-        const auto & node = source.nodes[i];
-        if (!node.work.is_cpu || node.queue_member) continue;
-        const auto & name = node.work.name;
-        if (name.find("Enqueue@") == std::string::npos) continue;
-        if (!name.ends_with("Enqueue@aclnnInplaceCopy")) {
-            if (submissions.empty()) return;
-            after_clones = true;
-            continue;
-        }
-        if (after_clones) return;
-        submissions.push_back(i);
-    }
-    if (submissions.empty()) return;
-
-    LoadIndexOperationCost total;
-    std::optional<size_t> worker;
-    std::set<size_t> devices;
-    std::set<size_t> removed;
-    size_t previous = 0;
-    const auto add = [](uint64_t & sum, uint64_t value) { sum = core::checked_add_u64(sum, value, "Load clone cost overflow"); };
-    for (const auto submission : submissions) {
-        std::optional<size_t> job, device;
-        for (size_t i = 0; i < source.nodes.size(); ++i)
-            if (source.nodes[i].submission == submission) {
-                if (job) return;
-                job = i;
-            }
-        if (!job || !source.nodes[*job].queue_member) return;
-        for (const auto & edge : source.edges)
-            if (edge.from == *job && !source.nodes[edge.to].work.is_cpu) {
-                if (device && *device != edge.to) return;
-                device = edge.to;
-            }
-        if (!device || !devices.insert(*device).second) return;
-
-        const auto member = *source.nodes[*job].queue_member;
-        if (worker && graph.node(*worker).lane_id != graph.node(member).lane_id) return;
-        worker = member;
-        for (size_t i = previous; i <= submission; ++i) {
-            if (!source.nodes[i].work.is_cpu || source.nodes[i].queue_member) return;
-            add(total.main_us, source.nodes[i].work.duration);
-            add(total.main_residual_us, source.nodes[i].work.cpu_gap_after);
-        }
-        add(total.worker_us, source.nodes[*job].work.duration);
-        add(total.dispatch_us, source.nodes[*job].work.cpu_task_ready_delay_us.value());
-        add(total.device_us, source.nodes[*device].work.duration);
-        for (size_t i = previous; i <= submission; ++i) removed.insert(i);
-        removed.insert(*job);
-        removed.insert(*device);
-        previous = submission + 1;
-    }
-
-    // The enclosing host-load branch can concatenate the promoted prefix after
-    // load_back returns. Repeat only its clone prefix; preserve the remaining
-    // CPU, worker and device work once, including that concatenation.
-    HiCacheHostExpansion tail;
-    std::map<size_t, size_t> retained;
-    for (size_t i = 0; i < source.nodes.size(); ++i) {
-        if (removed.contains(i)) continue;
-        retained.emplace(i, tail.nodes.size());
-        tail.nodes.push_back(source.nodes[i]);
-    }
-    for (auto & node : tail.nodes) {
-        if (!node.submission) continue;
-        const auto at = retained.find(*node.submission);
-        if (at == retained.end()) return;
-        node.submission = at->second;
-    }
-    for (const auto & edge : source.edges) {
-        const bool from = retained.contains(edge.from), to = retained.contains(edge.to);
-        if (from && to) tail.edges.push_back({ retained.at(edge.from), retained.at(edge.to), edge.kind });
-        else if (from) return;
-        else if (to && edge.kind != core::DagEdgeKind::Sequential && edge.kind != core::DagEdgeKind::Stream) return;
-    }
-    for (const auto & [original, local] : source.source_nodes)
-        if (retained.contains(local)) tail.source_nodes.emplace(original, retained.at(local));
-    tail.host_return = retained.at(source.host_return);
-    std::vector<size_t> first, last;
-    for (size_t i = 0; i < tail.nodes.size(); ++i) {
-        if (tail.nodes[i].work.is_cpu) continue;
-        bool before = false, after = false;
-        for (const auto & edge : tail.edges) {
-            if (edge.kind != core::DagEdgeKind::Stream) continue;
-            before |= edge.to == i;
-            after |= edge.from == i;
-        }
-        if (!before) first.push_back(i);
-        if (!after) last.push_back(i);
-    }
-    if (!first.empty()) {
-        if (first.size() != 1 || last.size() != 1) return;
-        tail.streams.push_back({ source.streams.front().source_node, first.front(), last.front() });
-    }
-    // A source-only per-call mean, not a target fit. Keep worker dispatch and
-    // residual CPU separate; size-dependent clone costs remain an extrapolation.
-    const auto count = submissions.size();
-    for (const auto field : { &LoadIndexOperationCost::main_us,
-                              &LoadIndexOperationCost::main_residual_us,
-                              &LoadIndexOperationCost::worker_us,
-                              &LoadIndexOperationCost::dispatch_us,
-                              &LoadIndexOperationCost::device_us }) {
-        auto & value = total.*field;
-        value = value / count + (value % count >= (count + 1) / 2);
-    }
-    const auto compute = source.streams.front().source_node;
-    program.clone =
-        LoadStep{ generate_load_index_operation(graph, main, *worker, compute, total, "clone: base per-call cost"), { graph.node(compute).lane_id } };
-    auto lanes = tail.resource_lanes(graph);
-    program.tail = LoadStep{ std::move(tail), std::move(lanes) };
-}
 
 void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
-    if (load_index_calibration_.empty()) return;
-    const auto document = read_control_calibration(load_index_calibration_, "load_index");
     const auto & graph = source.graph();
     for (const auto & branch : load_branches_) {
         const auto key = std::pair{ branch.envelope.pid, branch.envelope.tid };
-        if (std::ranges::any_of(load_admissions_, [&](const auto & sample) { return sample.pid == key.first && sample.tid == key.second && !sample.tokens; }))
-            continue;
+        if (std::ranges::any_of(load_admissions_, [&](const auto & sample) { return sample.pid == key.first && sample.tid == key.second; })) continue;
         std::optional<size_t> compute;
         const auto witness = [&](size_t node) {
             if (compute && graph.node(*compute).lane_id != graph.node(node).lane_id)
                 throw std::runtime_error("Scheduler load admission has conflicting compute roles");
             compute = node;
         };
+        if (const auto found = compute_resources_.find(key); found != compute_resources_.end()) witness(found->second);
         for (const auto & [id, donor] : templates_)
             if (donor.pid == key.first && donor.tid == key.second) witness(donor.compute_record);
         for (const auto & donor : eviction_controls_)
@@ -150,134 +33,107 @@ void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSo
         if (!compute) continue; // Required only if this target needs a new branch.
         const auto resources = observe_load_index_resources(source, queues, branch.entry_node, *compute);
         if (!resources) continue;
-        const auto rank = graph.node(branch.entry_node).gpu_id;
-        const nlohmann::json * row = nullptr;
-        for (const auto & sample : document.at("ranks"))
-            if (sample.at("rank").get<int>() == rank) {
-                if (row) throw std::invalid_argument("Duplicate load index calibration rank");
-                row = &sample;
-            }
-        if (!row) continue;
         const auto operation = [&](const char * name) {
-            const auto & cost = row->at("operations").at(name);
             return LoadStep{
-                generate_load_index_operation(graph, branch.entry_node, resources->worker, resources->compute, read_load_operation_cost(cost), name),
+                generate_async_device_operation(graph, branch.entry_node, resources->worker, resources->compute, std::string("load index ") + name),
+                name,
                 { graph.node(*compute).lane_id }
             };
         };
-        LoadAdmissionProgram program{ .pid = key.first, .tid = key.second };
+        LoadAdmissionProgram program{ .pid = key.first, .tid = key.second, .main_lane = std::string(graph.node_lane_key(branch.entry_node)) };
         for (const auto * name : { "multiply", "range", "add" }) program.allocation.push_back(operation(name));
         program.clone = operation("clone");
-        std::pair<double, double> remainder{};
-        program.tail.work = generated_cpu_control(graph.node_lane_key(branch.entry_node),
-                                                  read_control_duration(row->at("tail_us")),
-                                                  read_control_duration(row->at("tail_residual_us")),
-                                                  remainder,
-                                                  "target load admission bookkeeping");
+        program.merge_concat = operation("merge_concat");
+        program.merge_sort = operation("merge_sort");
+        program.prefix_concat = operation("prefix_concat");
         load_admissions_.push_back(std::move(program));
     }
 }
 
-void HiCacheWriteCalls::prepare_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
-    // Page geometry belongs to source request inputs, not load-return facts.
-    // A process uses one allocator geometry throughout the admitted capture.
-    std::map<std::string, uint64_t> source_pages;
-    for (const auto & fact : source.fact_nodes())
-        if (fact.fact_role == "cache_extend_input" && fact.phase == "start") source_pages.try_emplace(fact.pid, fact.source_page_size);
+size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const std::string & tid) const {
+    for (size_t i = 0; i < load_admissions_.size(); ++i)
+        if (load_admissions_[i].pid == pid && load_admissions_[i].tid == tid) return i;
 
-    for (const auto & branch : load_branches_) {
-        if (branch.condition.arg("needed") != "true") continue;
-        std::vector<const LoadAttempt *> attempts;
-        for (const auto & attempt : load_attempts_)
-            if (attempt.owner == branch.owner) attempts.push_back(&attempt);
-        std::ranges::sort(attempts, {}, [](const auto * attempt) { return attempt->event.ts; });
-        if (attempts.empty() || attempts.back()->event.arg("allocated") != "true") continue;
-        const auto & first = attempts.front()->event;
-        const auto & last = attempts.back()->event;
-        const patch::HiCacheSourceFactNode * admission = nullptr;
-        for (const auto & fact : source.fact_nodes())
-            if (fact.fact_role == "loadback_decision_observed" && fact.phase == "end" && fact.pid == first.pid && fact.tid == first.tid
-                && fact.request_id == branch.condition.arg("request_id") && fact.timestamp_us <= first.ts
-                && fact.timestamp_us + fact.duration_us >= last.ts + last.dur) {
-                if (admission) throw std::runtime_error("Load template has ambiguous source admission geometry");
-                admission = &fact;
-            }
-        if (!admission || !admission->effective_token_count) throw std::runtime_error("Successful load template lacks its source token count");
-        const auto end_us = [](const auto & e) { return (e.ts * 1'000 + e.ts_submicro_ns + e.dur * 1'000 + e.dur_submicro_ns) / 1'000; };
-        const auto region = [&](uint64_t begin, uint64_t end) {
-            auto work = prepare_host_expansion(source, queues, observe_host_template(source, first.pid, first.tid, begin, end), "host load: ");
-            auto lanes = work.resource_lanes(source.graph());
-            return LoadStep{ std::move(work), std::move(lanes) };
-        };
-        LoadAdmissionProgram donor{ .pid = first.pid,
-                                    .tid = first.tid,
-                                    .tokens = admission->effective_token_count,
-                                    .source_page_size = source_pages.at(first.pid),
-                                    .direct_allocation = attempts.size() == 1,
-                                    .prefix = region(end_us(branch.condition), first.ts),
-                                    .allocation = { region(last.ts, last.ts + last.dur) },
-                                    .tail = region(last.ts + last.dur, end_us(branch.envelope)) };
-        split_load_tail(source.graph(), branch.entry_node, donor);
-        if (first.arg("allocated") == "false") {
-            const patch::HiCacheSourceFactNode * eviction = nullptr;
-            for (const auto & fact : source.fact_nodes())
-                if (fact.fact_role == "capacity_result_observed" && fact.phase == "end" && fact.pid == first.pid && fact.tid == first.tid
-                    && fact.timestamp_us >= first.ts + first.dur && fact.timestamp_us + fact.duration_us <= last.ts) {
-                    if (eviction) throw std::runtime_error("Load retry has multiple source capacity envelopes");
-                    eviction = &fact;
-                }
-            if (!eviction) throw std::runtime_error("Load retry lacks its source capacity envelope");
-            auto failure = region(first.ts, eviction->timestamp_us).work;
-            if (failure.streams.empty() && failure.waits.empty() && failure.event_waits.empty()) donor.failure = std::move(failure);
-            if (eviction->timestamp_us + eviction->duration_us < last.ts) { donor.retry = region(eviction->timestamp_us + eviction->duration_us, last.ts); }
-        }
-        load_admissions_.push_back(std::move(donor));
-    }
-
-    // Independent primitives supplement source evidence; declaring them must
-    // not prevent collecting an applicable same-base operation.
-    prepare_generated_load_admissions(source, queues);
-}
-
-size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens, bool direct_allocation) const {
-    if (direct_allocation) {
-        for (size_t i = 0; i < load_admissions_.size(); ++i) {
-            const auto & sample = load_admissions_[i];
-            // Equal allocation work with a separately repeatable clone has
-            // direct source evidence. Do not reuse an eviction/retry envelope
-            // for a branch that succeeds immediately.
-            if (sample.pid == pid && sample.tid == tid && sample.tokens == tokens && sample.source_page_size == page_size_ && sample.clone
-                && sample.direct_allocation)
-                return i;
-        }
-    }
-
-    size_t selected = load_admissions_.size();
-    uint64_t nearest = UINT64_MAX;
-    for (size_t i = 0; i < load_admissions_.size(); ++i) {
-        const auto & sample = load_admissions_[i];
-        if (sample.pid != pid || sample.tid != tid) continue;
-        if (!sample.tokens) return i;
-
-        // A decomposed sample describes target clone cardinality. An opaque
-        // aggregate remains usable only when no such source evidence exists.
-        if (selected != load_admissions_.size() && load_admissions_[selected].clone && !sample.clone) continue;
-
-        const auto distance = *sample.tokens > tokens ? *sample.tokens - tokens : tokens - *sample.tokens;
-        if (selected == load_admissions_.size() || (!load_admissions_[selected].clone && sample.clone) || distance < nearest) {
-            selected = i;
-            nearest = distance;
-        }
-    }
-    if (selected == load_admissions_.size()) throw std::runtime_error("Load admission lacks base or independent costs on its scheduler resources");
-    return selected;
+    throw std::runtime_error("Generated allocation lacks proven scheduler compute/worker resources");
 }
 
 void HiCacheWriteCalls::bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program) {
-    for (const auto * step : { &program.prefix, &program.retry, &program.clone })
-        if (*step) bind_call_resources(source, call, (*step)->work, true);
-    for (const auto & step : program.allocation) bind_call_resources(source, call, step.work, true);
-    bind_call_resources(source, call, program.tail.work, true);
+    if (program.clone) bind_call_resources(source, call, program.clone->program.plan, true);
+    for (const auto & step : program.allocation) bind_call_resources(source, call, step.program.plan, true);
+    if (allocator_need_sort_) {
+        bind_call_resources(source, call, program.merge_concat.program.plan, true);
+        bind_call_resources(source, call, program.merge_sort.program.plan, true);
+    }
+    bind_call_resources(source, call, program.prefix_concat.program.plan, true);
+}
+
+HiCacheHostExpansion HiCacheWriteCalls::cost_load_step(const LoadStep & step, uint64_t pages, bool first_clone) const {
+    structure::OperationWork work{
+        "hicache_io_control",
+        "load.index." + step.operation,
+        "ascend.paged_unsorted",
+        "",
+        { { "pages", static_cast<double>(pages) },
+          { "page_size_tokens", static_cast<double>(page_size_) },
+          { "requested_tokens", static_cast<double>(core::checked_multiply_u64(pages, page_size_, "Load token count overflow")) } }
+    };
+    if (step.operation == "clone") work.features["first_clone"] = first_clone ? 1.0 : 0.0;
+    return bind_load_operation(step, std::move(work));
+}
+
+HiCacheHostExpansion HiCacheWriteCalls::bind_load_operation(const LoadStep & step, structure::OperationWork work) const {
+    auto plan = step.program.plan;
+    const auto costs = cost::estimate_host_operation(operator_provider_, std::move(work), true);
+    bind_host_operation(plan, { step.program.submit, step.program.worker, step.program.device, step.program.worker_return }, costs);
+    return plan;
+}
+
+HiCacheHostExpansion HiCacheWriteCalls::load_prefix_concat(const LoadAdmissionProgram & program, const model::HiCacheLoadAdmissionWork & work) const {
+    const auto prefix_tokens = core::checked_multiply_u64(work.existing_prefix_pages, page_size_, "Prefix token count overflow");
+    const auto new_tokens = work.allocated ? core::checked_multiply_u64(work.requested_pages, page_size_, "Load token count overflow") : 0;
+    const auto output_tokens = core::checked_add_u64(prefix_tokens, new_tokens, "Concatenated prefix overflow");
+    structure::OperationWork operation{
+        "hicache_io_control",
+        "load.admission.prefix_concat",
+        "ascend.aclnn_cat",
+        "cpu_service",
+        { { "prefix_tokens", static_cast<double>(prefix_tokens) },
+          { "new_tokens", static_cast<double>(new_tokens) },
+          { "output_tokens", static_cast<double>(output_tokens) },
+          { "nonempty_inputs", static_cast<double>((prefix_tokens > 0) + (new_tokens > 0)) } }
+    };
+    if (output_tokens) {
+        auto plan = bind_load_operation(program.prefix_concat, operation);
+        operation.operation = "load.admission.prefix_tail";
+        const auto tail = cost::estimate_host_operation(operator_provider_, operation, false);
+        bind_host_operation(plan, { .main = plan.host_return }, tail);
+        return plan;
+    }
+
+    // The supported op-api cat filters empty 1-D inputs and returns an empty
+    // tensor without dispatch. This branch is chosen by shape, never by cost.
+    auto plan = generate_cpu_control(program.main_lane, "target empty prefix concatenation");
+    const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
+    std::pair<double, double> remainder{};
+    bind_cpu_control(plan, costs.main_us, costs.main_residual_us, remainder);
+    return plan;
+}
+
+HiCacheHostExpansion HiCacheWriteCalls::load_admission_tail(const LoadAdmissionProgram & program, uint64_t pages, bool allocated) const {
+    auto plan = generate_cpu_control(program.main_lane, "target load admission bookkeeping");
+    structure::OperationWork work{
+        "hicache_io_control",
+        allocated ? "load.index.tail" : "load.index.failure_tail",
+        "ascend.paged_unsorted",
+        "cpu_service",
+        { { "pages", static_cast<double>(pages) },
+          { "page_size_tokens", static_cast<double>(page_size_) },
+          { "requested_tokens", static_cast<double>(core::checked_multiply_u64(pages, page_size_, "Load token count overflow")) } }
+    };
+    const auto costs = cost::estimate_host_operation(operator_provider_, work, false);
+    std::pair<double, double> remainder{};
+    bind_cpu_control(plan, costs.main_us, costs.main_residual_us, remainder);
+    return plan;
 }
 
 void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation::FutureDag & future) {
@@ -286,7 +142,21 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
     if (!item.started) throw std::runtime_error("Host-load branch precedes its lookup input");
     const auto * work = replay_.state().load_admission_work(item.fact);
     if (!work) {
-        const auto restored = expand_host(branch.original, {}, future);
+        auto inactive = branch.original;
+        if (inactive.nodes.empty()) {
+            const auto & call = capacity_calls_.at(branch.owner);
+            inactive = generate_cpu_control(call.lane, "target no-load return");
+            const structure::OperationWork operation{
+                .component = "execution_control",
+                .operation = "load.noop_return",
+                .implementation = "no_host_hit",
+                .timing_scope = "cpu_service",
+            };
+            const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
+            std::pair<double, double> remainder{};
+            bind_cpu_control(inactive, costs.main_us, costs.main_residual_us, remainder);
+        }
+        const auto restored = expand_host(inactive, {}, future);
         future.depend(restored.host_return, branch.continuation);
         return;
     }
@@ -295,62 +165,123 @@ void HiCacheWriteCalls::start_load_branch(size_t node, uint64_t time, simulation
     fact.ts = time;
     fact.execution_anchor_node_id = node;
 
-    const bool allocated = replay_.state().load_allocation_will_succeed(fact);
+    if (work->skipped_below_threshold) {
+        const auto & program = load_admissions_[select_load_admission(fact.pid, fact.tid)];
+        auto skipped = generate_cpu_control(call.lane, "target threshold skip: no allocator or DMA");
+        structure::OperationWork operation{
+            "hicache_io_control",
+            "load.admission.skip",
+            "below_token_threshold",
+            "cpu_service",
+            { { "pages", static_cast<double>(work->requested_pages) },
+              { "page_size_tokens", static_cast<double>(page_size_) },
+              { "requested_tokens", static_cast<double>(core::checked_multiply_u64(work->requested_pages, page_size_, "Load token count overflow")) },
+              { "promoted_nodes", static_cast<double>(work->node_pages.size()) } }
+        };
+        const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
+        std::pair<double, double> remainder{};
+        bind_cpu_control(skipped, costs.main_us, costs.main_residual_us, remainder);
+        HiCacheHostSequence sequence(call.positions, stream_insertions_, future, node);
+        (void)sequence.append(skipped, {});
+        const auto prefix = sequence.append(load_prefix_concat(program, *work),
+                                            work->existing_prefix_pages ? std::span<const size_t>{ program.prefix_concat.lanes } : std::span<const size_t>{});
+        future.depend(prefix.host_return, branch.continuation);
+        return;
+    }
+
+    const auto attempts = replay_.state().load_allocation_attempts(fact);
+    const bool allocated = attempts.back().succeeds;
     const bool evict = replay_.state().eviction_work(fact) != nullptr;
-    const auto selected = select_load_admission(fact.pid, fact.tid, work->requested_pages * page_size_, allocated && !evict && !allocator_need_sort_);
+    const auto selected = select_load_admission(fact.pid, fact.tid);
     const auto & program = load_admissions_[selected];
 
-    // Aggregate source evidence only describes a successful allocation. Keep
-    // that limitation explicit; it does not supply a failed-return cost.
-    if (!allocated && program.tokens) throw std::runtime_error("Aggregate base load cost does not cover allocation failure");
-    const LoadAdmissionProgram * retry_cost = nullptr;
-    if (evict || !allocated) {
-        if (program.tokens) {
-            retry_cost = program.failure ? &program : nullptr;
-            for (const auto & sample : load_admissions_)
-                if (!retry_cost && sample.pid == fact.pid && sample.tid == fact.tid && sample.failure) retry_cost = &sample;
-            if (!retry_cost) throw std::runtime_error("New load capacity path lacks a base failed allocation");
-            load_failure_templates_.insert_or_assign(branch.owner, *retry_cost->failure);
-        }
-        else {
-            // No-sort failure does no device work. Retain the existing,
-            // explicitly uncertain no-load CPU proxy; it is not a measurement.
-            double cpu = 0, residual = 0;
-            for (const auto & part : branch.original.nodes) {
-                cpu += part.work.duration;
-                residual += part.work.cpu_gap_after;
-            }
-            std::pair<double, double> remainder{};
-            load_failure_templates_.insert_or_assign(
-                branch.owner,
-                generated_cpu_control(call.lane, cpu, residual, remainder, "target failed allocation: base no-load control cost proxy"));
-        }
-    }
+    auto preparation_plan = generate_cpu_control(call.lane, "target host load preparation");
+    structure::OperationWork preparation{
+        "hicache_io_control",
+        "load.admission.prepare",
+        "host_indices_cpu",
+        "cpu_service",
+        { { "pages", static_cast<double>(work->requested_pages) },
+          { "page_size_tokens", static_cast<double>(page_size_) },
+          { "requested_tokens", static_cast<double>(core::checked_multiply_u64(work->requested_pages, page_size_, "Load token count overflow")) },
+          { "promoted_nodes", static_cast<double>(work->node_pages.size()) } }
+    };
+    const auto preparation_cost = cost::estimate_host_operation(operator_provider_, preparation, false);
+    std::pair<double, double> preparation_remainder{};
+    bind_cpu_control(preparation_plan, preparation_cost.main_us, preparation_cost.main_residual_us, preparation_remainder);
+    HiCacheHostSequence entry(call.positions, stream_insertions_, future, node);
+    const auto prepared = entry.append(preparation_plan, {}).host_return;
+    std::optional<size_t> previous = prepared;
 
-    std::optional<size_t> previous;
-    if (program.prefix) {
-        HiCacheHostSequence prefix(call.positions, stream_insertions_, future);
-        previous = prefix.append(program.prefix->work, program.prefix->lanes).host_return;
+    const auto merge = [&](const model::HiCacheLoadAllocatorAttempt & attempt) {
+        if (!attempt.merge_release) return;
+
+        const auto pages = core::checked_add_u64(attempt.free_pages, attempt.release_pages, "Load merge work overflow");
+        structure::OperationWork operation{
+            "hicache_io_control",
+            "",
+            "ascend.paged_sorted",
+            "cpu_service",
+            { { "free_pages", static_cast<double>(attempt.free_pages) },
+              { "release_pages", static_cast<double>(attempt.release_pages) },
+              { "pages", static_cast<double>(pages) },
+              { "page_size_tokens", static_cast<double>(page_size_) } }
+        };
+        HiCacheHostSequence sequence(call.positions, stream_insertions_, future, previous);
+        for (const auto * step : { &program.merge_concat, &program.merge_sort }) {
+            operation.operation = "load.index." + step->operation;
+            previous = sequence.append(bind_load_operation(*step, operation), step->lanes).host_return;
+        }
+
+        // Clearing the release queue allocates an empty tensor; it is CPU
+        // bookkeeping, not another device sort or a wait for sort completion.
+        auto cleared = generate_cpu_control(call.lane, "target clear merged release queue");
+        operation.operation = "load.index.merge_tail";
+        const auto costs = cost::estimate_host_operation(operator_provider_, operation, false);
+        std::pair<double, double> remainder{};
+        bind_cpu_control(cleared, costs.main_us, costs.main_residual_us, remainder);
+        previous = sequence.append(cleared, {}).host_return;
+    };
+    merge(attempts.front());
+
+    if (evict || !allocated) {
+        auto failed = generate_cpu_control(call.lane, "target failed allocation");
+        const structure::OperationWork failure{
+            .component = "execution_control",
+            .operation = "load.allocation_failure",
+            .implementation = allocator_need_sort_ ? "paged_sorted" : "paged_unsorted",
+            .timing_scope = "thread_cpu_service",
+            .features = {
+                {"requested_tokens", static_cast<double>(core::checked_multiply_u64(work->requested_pages, page_size_, "Load token count overflow"))},
+                {"page_size_tokens", static_cast<double>(page_size_)},
+            },
+        };
+        const auto duration = operator_provider_.estimate(failure).duration_us;
+        std::pair<double, double> remainder{};
+        bind_cpu_control(failed, duration, 0, remainder);
+        load_failure_templates_.insert_or_assign(branch.owner, std::move(failed));
     }
     if (evict) {
-        if (!program.tokens && allocator_need_sort_) throw std::runtime_error("Generated load allocation does not yet model free-page merge/sort work");
         previous = expand_capacity(call, fact, future, previous);
         if (!previous) throw std::logic_error("Target load retry has no capacity return");
-        // Release completion is not allocation completion: publish only after
-        // the allocator below returns, for every source of operation costs.
+
+        // Eviction completion precedes the retry; it does not publish a
+        // successful allocation before its actual allocator return.
         allocation_returns_.erase(*previous);
-        if (retry_cost && retry_cost->retry) {
-            HiCacheHostSequence retry(call.positions, stream_insertions_, future, previous);
-            previous = retry.append(retry_cost->retry->work, retry_cost->retry->lanes).host_return;
-        }
+        merge(attempts.back());
     }
 
     HiCacheHostSequence allocation(call.positions, stream_insertions_, future, previous);
     auto returned = node;
     if (allocated) {
-        for (const auto & step : program.allocation) returned = allocation.append(step.work, step.lanes).host_return;
+        for (const auto & step : program.allocation) returned = allocation.append(cost_load_step(step, work->requested_pages), step.lanes).host_return;
     }
-    else returned = allocation.append(load_failure_templates_.at(branch.owner), {}).host_return;
+    else {
+        // SGLang retries controller.load after eviction even when capacity
+        // remains insufficient. expand_capacity charged the first failure;
+        // this is the second attempt, not post-return bookkeeping.
+        returned = allocation.append(load_failure_templates_.at(branch.owner), {}).host_return;
+    }
 
     future.depend(returned, branch.continuation);
     allocation_returns_[returned].push_back(branch.owner);

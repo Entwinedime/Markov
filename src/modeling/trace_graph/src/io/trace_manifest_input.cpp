@@ -6,6 +6,7 @@
 
 #include "markov/trace_graph/io/trace_channel_join.hpp"
 
+#include "markov/trace_graph/core/dag_builder_normalization.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/io/chrome_trace_io.hpp"
 
@@ -20,7 +21,9 @@
 #include <map>
 #include <ranges>
 #include <regex>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -185,7 +188,8 @@ bool semantic_tail_context_event(const TraceEvent & event) { return event.source
 
 bool semantic_prelude_context_event(const TraceEvent & event) {
     return event.source_channel == TraceSourceChannel::PythonProbe
-           && (event.has_arg_key_hint("fact")
+           && (event.has_arg_key_hint("fact") || event.name == "runtime.hicache.host_load_check"
+               || (event.name == "runtime.phase.attention" && event.arg("descriptor_present") != "false")
                || (event.name == "runtime.hicache.layer_waits" && event.arg("consumer_index") == "-1" && event.arg("status") == "returned"));
 }
 
@@ -233,24 +237,48 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     if (!options.window_start_us || !options.window_end_us) return;
     const auto start = *options.window_start_us;
     const auto end = *options.window_end_us;
-    // Tail children may be retained through a device connection before CPU
-    // leaf selection inherits their submission identity. Preserve that identity
-    // now, so filtering cannot orphan a child from its observed queue task.
+    // Boundary children may survive through a device connection after their
+    // native submission was clipped. Preserve the containing queue identity
+    // now, before CPU-leaf selection and window filtering lose that relation.
     using Lane = std::pair<std::string, std::string>;
     using Time = unsigned __int128;
     const auto start_ns = [](const TraceEvent & event) -> Time { return Time(event.ts) * 1'000 + event.ts_submicro_ns; };
     const auto end_ns = [&](const TraceEvent & event) { return start_ns(event) + Time(event.dur) * 1'000 + event.dur_submicro_ns; };
-    std::map<Lane, std::vector<size_t>> tail_tasks;
+    // Clipping a nested child must not promote its crossing Torch envelope
+    // into an executable CPU leaf. Preserve that observed parent role, not the
+    // clipped child's service; the envelope's uninstrumented tail remains gap.
+    std::map<Lane, std::vector<size_t>> opening_cpu_parents;
     for (size_t i = 0; i < input.events.size(); ++i) {
         const auto & event = input.events[i];
-        if (event.cat == "dequeue" && end_ns(event) > Time(end) * 1'000 && !event.arg("correlation_id").empty())
-            tail_tasks[{ event.pid, event.tid }].push_back(i);
+        if (event.source_channel == TraceSourceChannel::Torch && event.cat == "cpu_op" && start_ns(event) < Time(start) * 1'000
+            && end_ns(event) >= Time(start) * 1'000 && !core::dag_builder_detail::is_submit_anchor_event(event))
+            opening_cpu_parents[{ event.pid, event.tid }].push_back(i);
     }
-    for (auto & [lane, tasks] : tail_tasks) std::ranges::sort(tasks, {}, [&](size_t i) { return start_ns(input.events[i]); });
+    for (const auto & event : input.events) {
+        if (event.source_channel != TraceSourceChannel::Torch || (event.cat != "cpu_op" && event.cat != "enqueue") || !event.dur
+            || end_ns(event) >= Time(start) * 1'000)
+            continue;
+        const auto lane = opening_cpu_parents.find({ event.pid, event.tid });
+        if (lane == opening_cpu_parents.end()) continue;
+
+        for (const auto i : lane->second) {
+            auto & parent = input.events[i];
+            if (start_ns(parent) <= start_ns(event) && end_ns(event) <= end_ns(parent)) parent.set_arg("formal_window_cpu_parent", "true");
+        }
+    }
+
+    std::map<Lane, std::vector<size_t>> boundary_tasks;
+    for (size_t i = 0; i < input.events.size(); ++i) {
+        const auto & event = input.events[i];
+        const bool crosses_opening = start_ns(event) < Time(start) * 1'000 && end_ns(event) >= Time(start) * 1'000;
+        if (event.cat == "dequeue" && (crosses_opening || end_ns(event) > Time(end) * 1'000) && !event.arg("correlation_id").empty())
+            boundary_tasks[{ event.pid, event.tid }].push_back(i);
+    }
+    for (auto & [lane, tasks] : boundary_tasks) std::ranges::sort(tasks, {}, [&](size_t i) { return start_ns(input.events[i]); });
     for (auto & event : input.events) {
-        if (event.ts <= end || !event.arg("correlation_id").empty()) continue;
-        const auto lane = tail_tasks.find({ event.pid, event.tid });
-        if (lane == tail_tasks.end()) continue;
+        if ((event.ts >= start && event.ts <= end) || !event.arg("correlation_id").empty()) continue;
+        const auto lane = boundary_tasks.find({ event.pid, event.tid });
+        if (lane == boundary_tasks.end()) continue;
         auto parent = std::ranges::upper_bound(lane->second, start_ns(event), {}, [&](size_t i) { return start_ns(input.events[i]); });
         if (parent == lane->second.begin()) continue;
         const auto & task = input.events[*--parent];
@@ -259,36 +287,78 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
     std::unordered_set<std::string> in_window_connection_ids;
     std::unordered_set<std::string> in_window_correlation_ids;
     std::vector<TimeInterval> semantic_tail_intervals;
-    std::vector<const TraceEvent *> lifecycle_tail_calls;
+    std::vector<const TraceEvent *> semantic_tail_calls;
     std::vector<ThreadCallInterval> cross_boundary_semantic_calls;
     for (const auto & event : input.events) {
         const auto event_end = event.dur > std::numeric_limits<uint64_t>::max() - event.ts ? std::numeric_limits<uint64_t>::max() : event.ts + event.dur;
         if (event_end < start && token_dictionary_context_event(event)) input.context_events.push_back(event);
         if (event_end < start && semantic_prelude_context_event(event)) input.prelude_context_events.push_back(event);
-        if (event.source_channel == TraceSourceChannel::PythonProbe && semantic_tail_context_event(event) && event.dur > 0 && event.ts <= end && event_end > end
-            && !event.tid.empty() && event.tid != "-1") {
+        // A rank may finish its last forward/sample after the client's HTTP
+        // response. Preserve the rest of that already-started batch as causal
+        // context, without extending the measured HTTP window or adding a new
+        // request. Otherwise its logits/sampling descriptors disappear even
+        // though the same batch's forward marker is retained.
+        const bool generation_batch = event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.hicache.layer_waits"
+                                      && event.arg("status") == "returned" && (event.arg("phase") == "EXTEND" || event.arg("phase") == "DECODE");
+        const bool completion_check = event.source_channel == TraceSourceChannel::PythonProbe && event.arg("status") == "returned"
+                                      && (event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.load_completion");
+        // A started nonblocking check owns its MIN and acknowledgement tail,
+        // even when those children begin after the client response. Retain the
+        // observed call, not subsequent polling rounds or a time margin.
+        if (event.source_channel == TraceSourceChannel::PythonProbe && (semantic_tail_context_event(event) || generation_batch || completion_check)
+            && event.dur > 0 && event.ts <= end && event_end > end && !event.tid.empty() && event.tid != "-1") {
             cross_boundary_semantic_calls.push_back(ThreadCallInterval{
                 .start_us = event.ts,
                 .end_us = event_end,
                 .tid = event.tid,
             });
+            if (generation_batch || completion_check) semantic_tail_calls.push_back(&event);
         }
         if (event.ts > end && semantic_tail_context_event(event)) {
             input.tail_context_events.push_back(event);
             if (event.dur > 0) semantic_tail_intervals.emplace_back(event.ts, event_end);
             if (event.arg("phase") == "end" && Json::parse(event.arg("fact")).value("role", "") == "cache_lifecycle_commit")
-                lifecycle_tail_calls.push_back(&event);
+                semantic_tail_calls.push_back(&event);
         }
         if (event_end < start || event.ts > end) continue;
         append_causality_identity(event, "connection_id", in_window_connection_ids);
         append_causality_identity(event, "correlation_id", in_window_correlation_ids);
     }
+    // Device work submitted before the opening cut can execute inside the window.
+    // Preserve its unique native submission as metadata before removing that CPU
+    // work. It proves stream placement, not an extra executable submission.
+    std::unordered_map<std::string, const TraceEvent *> pre_window_launches;
+    for (const auto & event : input.events) {
+        if (!core::dag_builder_detail::is_submit_anchor_event(event) || end_ns(event) >= Time(start) * 1'000) continue;
+        const auto connection = event.arg("connection_id");
+        if (connection.empty()) continue;
+
+        const auto [found, inserted] = pre_window_launches.emplace(connection, &event);
+        if (inserted || !found->second) continue;
+
+        const auto & previous = *found->second;
+        if (previous.pid != event.pid || previous.tid != event.tid) found->second = nullptr;
+        else if (start_ns(previous) <= start_ns(event) && end_ns(event) <= end_ns(previous)) found->second = &event;
+        else if (start_ns(event) > start_ns(previous) || end_ns(previous) > end_ns(event)) found->second = nullptr;
+    }
+    for (auto & event : input.events) {
+        if (end_ns(event) < Time(start) * 1'000 || event.ts > end) continue;
+        const auto found = pre_window_launches.find(event.arg("connection_id"));
+        if (found == pre_window_launches.end() || !found->second || !core::dag_builder_detail::resolve_event_lane(event, false).is_device) continue;
+
+        const auto & launch = *found->second;
+        event.set_arg("pre_window_submit_pid", launch.pid);
+        event.set_arg("pre_window_submit_tid", launch.tid);
+        event.set_arg("pre_window_submit_start_us", std::to_string(launch.ts));
+        event.set_arg("pre_window_submit_end_us", std::to_string(static_cast<uint64_t>(end_ns(launch) / 1'000)));
+        if (event.arg("correlation_id").empty() && !launch.arg("correlation_id").empty()) event.set_arg("correlation_id", launch.arg("correlation_id"));
+    }
     for (auto & event : input.events) {
         if (event.ts <= end) continue;
-        // A retained lifecycle still executes after the HTTP endpoint. Keep
+        // A retained lifecycle or batch still executes after the HTTP endpoint. Keep
         // its nested semantic boundaries too, without admitting new endpoints.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
-            && std::ranges::any_of(lifecycle_tail_calls, [&](const auto * call) {
+            && std::ranges::any_of(semantic_tail_calls, [&](const auto * call) {
                    return event.pid == call->pid && event.tid == call->tid && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
                }))
             mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
@@ -296,6 +366,37 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
             && (overlaps_tail_context(event, semantic_tail_intervals) || strictly_nested_in_cross_boundary_call(event, cross_boundary_semantic_calls)))
             mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
     }
+    // Synchronous CPU collectives execute their Gloo work on another thread.
+    // These traces have no submit/worker correlation id, so retain the native
+    // worker only within the same-process, completed collective envelope.
+    // The collective observer still rejects missing or nonunique workers.
+    std::vector<const TraceEvent *> tail_collectives;
+    for (const auto & event : input.events)
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.name == "runtime.cpu_collective" && event.arg("status") == "returned"
+            && event.arg("async_op") == "false" && event.ts >= start && end_ns(event) > Time(end) * 1'000
+            && (event.ts <= end || event.arg("formal_window_context") == "causal_tail"))
+            tail_collectives.push_back(&event);
+
+    std::vector<ThreadCallInterval> collective_worker_calls;
+    for (auto & event : input.events) {
+        if (event.ts <= end || event.source_channel != TraceSourceChannel::Torch || event.cat != "cpu_op"
+            || (event.name != "gloo:all_reduce" && event.name != "gloo:broadcast"))
+            continue;
+
+        const bool belongs_to_call = std::ranges::any_of(tail_collectives, [&](const auto * call) {
+            const bool same_operation = (event.name == "gloo:all_reduce" && call->arg("operation") == "all_reduce")
+                                        || (event.name == "gloo:broadcast" && call->arg("operation") == "broadcast");
+            return same_operation && event.pid == call->pid && event.tid != call->tid && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
+        });
+        if (!belongs_to_call) continue;
+
+        mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+        collective_worker_calls.push_back({ event.ts, event.ts + event.dur, event.tid });
+    }
+    for (auto & event : input.events)
+        if (event.ts > end && event.source_channel != TraceSourceChannel::PythonProbe && strictly_nested_in_cross_boundary_call(event, collective_worker_calls))
+            mark_causal_tail(event, in_window_connection_ids, in_window_correlation_ids);
+
     // A collective can return after its last CPU leaf but before the window
     // ends. Its return gap needs the next same-lane call as an observed boundary.
     // Retain that call (including nested leaves), not an arbitrary time margin.
@@ -372,7 +473,113 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         const auto found = head_context.find({ event.pid, event.tid });
         if (found != head_context.end() && end_ns(event) < Time(start) * 1'000) found->second = true;
     }
-    std::erase_if(input.events, [&](const TraceEvent & event) {
+    // A diagnostic envelope can straddle the opening cut while its nested
+    // collective already returned before it. Keep those descriptors together
+    // so consumers can distinguish a partial-window call from missing probes.
+    // They describe context only: the pre-window CPU/device work stays excluded.
+    std::vector<const TraceEvent *> head_calls;
+    for (auto & event : input.events) {
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic" && start_ns(event) < Time(start) * 1'000
+            && end_ns(event) >= Time(start) * 1'000) {
+            head_calls.push_back(&event);
+            // The already-running batch is context, not a formal forward to
+            // remodel. Its executable tail remains selected by the window.
+            if (event.name == "runtime.hicache.layer_waits") event.set_arg("formal_window_context", "causal_head");
+        }
+    }
+
+    // A forward already in progress at the cut owns its nested descriptors
+    // and Torch marker too. Keep its executable tail in the source graph, but
+    // do not demand a complete target replacement for this partial batch.
+    for (auto & event : input.events) {
+        const bool descriptor = event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic";
+        const bool marker =
+            event.source_channel == TraceSourceChannel::Torch && (event.name.starts_with("step[EXTEND") || event.name.starts_with("step[DECODE"));
+        if (!descriptor && !marker) continue;
+
+        if (std::ranges::any_of(head_calls, [&](const auto * call) {
+                return call->name == "runtime.hicache.layer_waits" && event.pid == call->pid && event.tid == call->tid && start_ns(event) >= start_ns(*call)
+                       && end_ns(event) <= end_ns(*call);
+            }))
+            event.set_arg("formal_window_context", "causal_head");
+    }
+
+    // Decide before erase_if moves records referenced by head_calls.
+    std::unordered_set<size_t> head_descriptors;
+    for (const auto & event : input.events)
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic" && end_ns(event) < Time(start) * 1'000
+            && std::ranges::any_of(head_calls, [&](const auto * call) {
+                   return event.pid == call->pid && event.tid == call->tid && start_ns(event) >= start_ns(*call) && end_ns(event) <= end_ns(*call);
+               }))
+            head_descriptors.insert(event.index);
+
+    // Probe return records carry their entry timestamp, while payload fields
+    // may live only in the corresponding zero-duration start record. Retain
+    // that exact descriptor for crossing calls; it is not executable work.
+    using FactCall = std::tuple<std::string, std::string, std::string, uint64_t, uint16_t>;
+    std::set<FactCall> crossing_fact_calls;
+    for (const auto & event : input.events)
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact") && event.arg("phase") == "end"
+            && start_ns(event) < Time(start) * 1'000 && end_ns(event) >= Time(start) * 1'000)
+            crossing_fact_calls.emplace(event.pid, event.tid, event.arg("target_id"), event.ts, event.ts_submicro_ns);
+    for (const auto & event : input.events)
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact") && event.arg("phase") == "start"
+            && crossing_fact_calls.contains({ event.pid, event.tid, event.arg("target_id"), event.ts, event.ts_submicro_ns }))
+            head_descriptors.insert(event.index);
+
+    // Worker jobs can already be queued at the opening cut. Their original
+    // enqueue is context, not CPU service inside the window. Give those jobs
+    // zero-service arrival points on a separate observation lane, preserving
+    // their observed FIFO order ahead of newly submitted formal work.
+    using QueueIdentity = std::pair<std::string, std::string>;
+    std::map<QueueIdentity, const TraceEvent *> opening_enqueues;
+    for (const auto & event : input.events) {
+        if (event.cat != "enqueue" || end_ns(event) >= Time(start) * 1'000) continue;
+        const auto correlation = event.arg("correlation_id");
+        if (correlation.empty()) continue;
+
+        const auto [found, inserted] = opening_enqueues.emplace(QueueIdentity{ event.pid, correlation }, &event);
+        if (!inserted) found->second = nullptr;
+    }
+    struct OpeningTask {
+        const TraceEvent * enqueue;
+        Lane worker;
+    };
+    std::vector<OpeningTask> opening_tasks;
+    std::map<Lane, uint64_t> opening_queue_times;
+    for (const auto & event : input.events) {
+        if (event.cat != "dequeue" || end_ns(event) < Time(start) * 1'000 || (event.ts > end && event.arg("formal_window_context") != "causal_tail")) continue;
+
+        const auto found = opening_enqueues.find({ event.pid, event.arg("correlation_id") });
+        if (found == opening_enqueues.end() || !found->second || found->second->tid == event.tid) continue;
+
+        const Lane worker{ event.pid, event.tid };
+        opening_tasks.push_back({ found->second, worker });
+        const auto at = std::min(start, event.ts);
+        const auto [queue, inserted] = opening_queue_times.emplace(worker, at);
+        if (!inserted) queue->second = std::min(queue->second, at);
+    }
+    std::ranges::sort(opening_tasks, {}, [&](const OpeningTask & task) { return std::pair{ start_ns(*task.enqueue), task.enqueue->index }; });
+    std::vector<TraceEvent> opening_arrivals;
+    for (const auto & task : opening_tasks) {
+        TraceEvent arrival;
+        arrival.name = "formal_window.queued_task";
+        arrival.cat = "enqueue";
+        arrival.pid = task.worker.first;
+        arrival.tid = "formal_window.queue:" + task.worker.second;
+        arrival.ts = opening_queue_times.at(task.worker);
+        arrival.source_channel = TraceSourceChannel::Synthetic;
+        arrival.set_arg("correlation_id", task.enqueue->arg("correlation_id"));
+        arrival.set_arg("counts_toward_e2e", "false");
+        arrival.set_arg("formal_window_context", "causal_head");
+        arrival.set_arg("pre_window_enqueue_tid", task.enqueue->tid);
+        arrival.set_arg("pre_window_enqueue_start_us", std::to_string(task.enqueue->ts));
+        arrival.set_arg("pre_window_enqueue_end_us", std::to_string(static_cast<uint64_t>(end_ns(*task.enqueue) / 1'000)));
+        opening_arrivals.push_back(std::move(arrival));
+    }
+
+    input.window_removed_record_count = std::erase_if(input.events, [&](const TraceEvent & event) {
+        if (head_descriptors.contains(event.index)) return false;
         // Pre-window preparation is model context, not pre-window execution.
         // DagBuilder retains these envelopes only as non-executable metadata.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic"
@@ -382,6 +589,11 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         const bool retained_causal_tail = event.arg("formal_window_context") == "causal_tail";
         return event_end < start || (event.ts > end && !retained_causal_tail);
     });
+    for (auto & arrival : opening_arrivals) {
+        input.events.push_back(std::move(arrival));
+        ++input.window_boundary_count;
+    }
+
     for (const auto & [lane, has_predecessor] : head_context) {
         if (!has_predecessor) continue;
         // Eligibility against executable work is checked after CPU-leaf
@@ -396,22 +608,37 @@ void retain_trace_window(ManifestTraceInput & input, const ManifestTraceInputOpt
         boundary.source_channel = TraceSourceChannel::Synthetic;
         boundary.set_arg("counts_toward_e2e", "false");
         input.events.push_back(std::move(boundary));
+        ++input.window_boundary_count;
     }
     for (size_t index = 0; index < input.events.size(); ++index) input.events[index].index = index;
 }
 
-ManifestTraceInput load_torch_group(const std::string & torch_path, const std::string & custom_path, const std::vector<std::string> & sidecar_paths,
-                                    const std::vector<std::string> & input_contracts, const ManifestTraceInputOptions & options) {
-    ManifestTraceInput input;
-    input.input_contracts = input_contracts;
-    input.events = read_channel_trace(torch_path, profiler_read_options(options), TraceSourceChannel::Torch);
-    if (!custom_path.empty()) {
-        detail::join_custom_trace(input.events, read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload), options);
-    }
-    append_trace_files(input, sidecar_paths, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
+void select_input_events(ManifestTraceInput & input, const ManifestTraceInputOptions & options) {
+    input.joined_record_count = input.events.size();
     detail::retain_duration_events(input.events);
+    input.duration_record_count = input.events.size();
     retain_trace_window(input, options);
-    return input;
+}
+
+void normalize_profiler_clock(std::vector<TraceEvent> & events, const Json & clock) {
+    if (!clock.contains("unix_origin_ns")) return;
+
+    const auto offset = clock.at("unix_origin_ns").get<int64_t>() - clock.at("origin_ns").get<int64_t>();
+    for (auto & event : events) {
+        if (event.ph == 'M') continue;
+
+        auto timestamp = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "profiler timestamp overflow"),
+                                               event.ts_submicro_ns,
+                                               "profiler timestamp overflow");
+        if (offset >= 0) timestamp = core::checked_add_u64(timestamp, static_cast<uint64_t>(offset), "aligned profiler timestamp overflow");
+        else {
+            const auto magnitude = static_cast<uint64_t>(-(offset + 1)) + 1;
+            if (timestamp < magnitude) throw std::runtime_error("profiler clock maps a timestamp before the Unix epoch");
+            timestamp -= magnitude;
+        }
+        event.ts = timestamp / 1'000;
+        event.ts_submicro_ns = timestamp % 1'000;
+    }
 }
 
 ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std::vector<std::string> & input_contracts,
@@ -420,8 +647,7 @@ ManifestTraceInput load_state_only_group(const ManifestPaths & paths, const std:
     input.input_contracts = input_contracts;
     append_trace_files(input, paths.ld_preload, sidecar_read_options(options), TraceSourceChannel::LdPreload);
     append_trace_files(input, paths.python_probe, sidecar_read_options(options), TraceSourceChannel::PythonProbe);
-    detail::retain_duration_events(input.events);
-    retain_trace_window(input, options);
+    select_input_events(input, options);
     return input;
 }
 
@@ -431,7 +657,8 @@ void normalize_wait_clock(std::vector<TraceEvent> & events, const Json & clock) 
             continue;
         if (clock.value("clock", "") != "npu_syscnt") throw std::runtime_error("NPU layer-wait counters require the matching Torch trace host_clock");
         const auto origin_tick = clock.at("origin_tick").get<int64_t>();
-        const auto origin_ns = clock.at("origin_ns").get<int64_t>();
+        const bool unix_aligned = clock.contains("unix_origin_ns");
+        const auto origin_ns = clock.at(unix_aligned ? "unix_origin_ns" : "origin_ns").get<int64_t>();
         const auto scale = clock.at("ns_per_tick").get<double>();
         if (!std::isfinite(scale) || scale <= 0) throw std::runtime_error("invalid profiler counter scale");
         auto intervals = Json::parse(event.arg("wait_intervals"));
@@ -444,21 +671,28 @@ void normalize_wait_clock(std::vector<TraceEvent> & events, const Json & clock) 
             }
         }
         event.set_arg("wait_intervals", intervals.dump());
-        event.set_arg("wait_clock", "profiler_ns");
+        event.set_arg("wait_clock", unix_aligned ? "aligned_unix_ns" : "profiler_ns");
     }
 }
 
 ManifestTraceInput load_logical_input(const ManifestPaths & paths, const std::vector<std::string> & input_contracts, size_t index,
                                       const ManifestTraceInputOptions & options) {
     const auto pid = pid_from_path(paths.torch[index]);
-    auto input = load_torch_group(paths.torch[index],
-                                  select_by_pid(paths.ld_preload, pid, "LD_PRELOAD"),
-                                  select_sidecars(paths.python_probe, pid),
-                                  input_contracts,
-                                  options);
-    const auto clock = paths.host_clocks.find(paths.torch[index]);
-    normalize_wait_clock(input.events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
-    normalize_wait_clock(input.prelude_context_events, clock == paths.host_clocks.end() ? Json::object() : clock->second);
+    const auto found = paths.host_clocks.find(paths.torch[index]);
+    const auto clock = found == paths.host_clocks.end() ? Json::object() : found->second;
+    ManifestTraceInput input;
+    input.input_contracts = input_contracts;
+    input.events = read_channel_trace(paths.torch[index], profiler_read_options(options), TraceSourceChannel::Torch);
+    // Join containment and formal-window selection must see one clock. Raw
+    // trace files and their original manifest transform remain unchanged.
+    normalize_profiler_clock(input.events, clock);
+    const auto custom_path = select_by_pid(paths.ld_preload, pid, "LD_PRELOAD");
+    if (!custom_path.empty()) {
+        detail::join_custom_trace(input.events, read_channel_trace(custom_path, sidecar_read_options(options), TraceSourceChannel::LdPreload), options);
+    }
+    append_trace_files(input, select_sidecars(paths.python_probe, pid), sidecar_read_options(options), TraceSourceChannel::PythonProbe);
+    normalize_wait_clock(input.events, clock);
+    select_input_events(input, options);
     return input;
 }
 

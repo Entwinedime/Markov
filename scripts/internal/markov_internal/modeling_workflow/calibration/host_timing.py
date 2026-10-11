@@ -35,7 +35,7 @@ def observe_host_cpu(steps: dict, report: dict, records: list[dict], syncs: list
         containers = [j for j, candidate in enumerate(hosts) if i != j and contains(candidate, row)]
         if containers:
             parents[i] = min(containers, key=lambda j: hosts[j]["end_ns"] - hosts[j]["start_ns"])
-    rows, unbound, partial, outside_http = [], [], [], []
+    rows, unbound, partial, outside_http, outside_selected_requests = [], [], [], [], []
     for i, row in enumerate(hosts):
         if not row["returned"]:
             raise ValueError("Host method did not return")
@@ -59,6 +59,15 @@ def observe_host_cpu(steps: dict, report: dict, records: list[dict], syncs: list
             parent = min(containers, key=lambda r: r["end_ns"] - r["start_ns"])
             result["outer_scope"] = parent["name"]
             result["identity"] = parent["identity"]
+
+            # Profiling can move setup calls across the HTTP window boundary.
+            # Request selection, not wall-clock overlap, determines whether
+            # their CPU budgets belong to this pair. Source execution stays intact.
+            request_ids = set(parent["identity"]["request_ids"])
+            if request_ids and request_ids.isdisjoint(formal_requests):
+                outside_selected_requests.append(result)
+                continue
+
         if row["end_ns"] <= lo or row["start_ns"] >= hi:
             outside_http.append(result)
             continue
@@ -77,6 +86,7 @@ def observe_host_cpu(steps: dict, report: dict, records: list[dict], syncs: list
         unbound=unbound,
         partial=partial,
         outside_http=outside_http,
+        outside_selected_requests=outside_selected_requests,
     )
 
 

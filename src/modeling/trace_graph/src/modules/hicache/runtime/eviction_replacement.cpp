@@ -1,3 +1,4 @@
+#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
@@ -5,6 +6,67 @@
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
+
+void HiCacheWriteCalls::replace_source_write_calls(core::DagGraph & graph) {
+    // Eviction envelopes have already been replaced as a whole. Remaining
+    // source submissions retain only their entry/return sites: target state
+    // determines whether they write and how many pages/calls are necessary.
+    std::vector<size_t> submissions;
+    for (const auto & [node, actions] : actions_)
+        for (const auto & [action, call] : actions)
+            if (action == Action::Submit) submissions.push_back(call);
+    if (submissions.empty()) return;
+
+    const patch::HiCacheSourceDagIndex observed(graph);
+    std::vector<HiCacheHostTemplate> hosts;
+    std::vector<std::vector<size_t>> opening_nodes;
+    hosts.reserve(submissions.size());
+    opening_nodes.reserve(submissions.size());
+    for (const auto id : submissions) {
+        const auto & call = calls_[id];
+        const auto begin_us = graph.event_for_node(call.entry_node).ts;
+        const auto end_us = graph.event_for_node(call.return_node).ts;
+        hosts.push_back(observe_host_template(observed, call.pid, call.tid, begin_us, end_us));
+        opening_nodes.emplace_back();
+        if (call.at_us >= begin_us) continue;
+
+        // The suffix cannot own CPU leaves that were already clipped. It can
+        // still own their queued work through exact original caller metadata.
+        auto & initial = opening_nodes.back();
+        initial = writes_.source_retained_nodes(call.source.value());
+        for (const auto & node : graph.nodes()) {
+            if (!node.active || !node.is_cpu) continue;
+            const auto & event = graph.event_for_node(node.id);
+            if (event.cat != "enqueue" || event.pid != call.pid || event.arg("pre_window_enqueue_tid") != call.tid) continue;
+
+            const auto first = core::parse_u64(event.arg("pre_window_enqueue_start_us")).value();
+            const auto last = core::parse_u64(event.arg("pre_window_enqueue_end_us")).value();
+            if (first >= call.at_us && first < end_us && last <= end_us) initial.push_back(node.id);
+        }
+    }
+
+    std::vector<HiCacheHostRegion> regions;
+    for (size_t i = 0; i < submissions.size(); ++i) {
+        const auto & call = calls_[submissions[i]];
+        regions.push_back({ call.entry_node, call.return_node, &hosts[i], opening_nodes[i] });
+    }
+    (void)core::apply_dag_mutation_plan(graph, plan_host_removal(observed, regions));
+
+    // Resolve against the surviving stream order, not the removed payload's
+    // observed GPU timestamps. Generated host returns delay the original
+    // continuation; asynchronous completion does not block it unnecessarily.
+    const patch::HiCacheSourceDagIndex surviving(graph);
+    for (const auto id : submissions) {
+        auto & call = calls_[id];
+        call.successors = { call.return_node };
+        if (const auto resources = write_resources_.find({ call.pid, call.tid }); resources != write_resources_.end()) {
+            for (const auto resource : { resources->second.compute, resources->second.transfer }) {
+                const auto lane = graph.node(resource).lane_id;
+                call.positions.emplace(lane, observe_write_stream_position(surviving, resource, call.pid, call.tid, call.at_us));
+            }
+        }
+    }
+}
 
 void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end) {
     // Replace both policy directions as complete envelopes. The target state
@@ -16,10 +78,9 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
         if (fact.fact_role != "capacity_result_observed" || fact.phase != "end" || !fact.duration_us || fact.timestamp_us < begin
             || fact.timestamp_us + fact.duration_us > end)
             continue;
-        const auto regions = observe_eviction_regions(observed, fact);
-        const bool source_write_back =
-            std::ranges::any_of(regions, [](const auto & region) { return region.kind == HiCacheEvictionRegion::Kind::BlockingCheck; });
-        if (source_write_back == write_back_) continue;
+        // Even an unchanged policy can select different victims, pages and
+        // releases. The observed envelope locates execution; it does not
+        // supply the target's operation count or host program.
         evictions.push_back(fact);
         for (const auto at : { fact.timestamp_us, fact.timestamp_us + fact.duration_us }) {
             core::TraceEvent point;

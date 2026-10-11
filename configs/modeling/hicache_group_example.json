@@ -1,5 +1,12 @@
 {
   "base_manifests": ["<base-profile>/profile_manifest.json"],
   "target_configs": ["configs/modeling/hicache_target_example.json"],
+  "cost_model": "<independently-trained-cost-package>.json",
+  "resource_environment": {
+    "device": "<device model and allocation>",
+    "host": "<CPU model and process affinity>",
+    "storage": "<storage medium and filesystem>",
+    "implementation": "<framework runtime and operator implementation>"
+  },
   "output_dir": "data/modeling_runs/my_hicache_group"
 }

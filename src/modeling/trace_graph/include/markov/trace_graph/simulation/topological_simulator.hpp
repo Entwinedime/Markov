@@ -45,7 +45,9 @@ struct SimulationResult {
 /** Compute the current node's duration at its actual start, after dependencies
  * and CPU queue admission. Calls follow nondecreasing simulated time (ties use
  * node id after ready dependencies). Return the complete duration, not a delta.
- * The result is stored on the node and immediately affects its successors.
+ * duration_us is already corrected for source profiling overhead. The result
+ * is stored as a final execution cost and immediately affects successors;
+ * a later static replay must not apply source CPU correction a second time.
  * The callback must not mutate graph topology or other node costs. Reusing a
  * stateful model requires a fresh state and the intended input graph per run.
  * A decision about future visibility is pending until its completion boundary;
@@ -75,6 +77,11 @@ public:
      * cross-thread submission must not have completed. queue_member proves
      * the worker identity; no observed task or queue order is overwritten. */
     virtual size_t append_cpu_task(const core::DagSyntheticNodeSpec & node, size_t submission, size_t queue_member) = 0;
+    /** Extend an unstarted generated task after its current last member.
+     * Keeps the same submission/FIFO ownership; only the first member carries
+     * dispatch delay. The queue is released after the new last member, allowing
+     * device launches from earlier members without releasing the worker. */
+    virtual size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & node, size_t previous) = 0;
     virtual void depend(size_t predecessor, size_t successor, core::DagEdgeKind kind = core::DagEdgeKind::Mutation) = 0;
 };
 using ExpandAtStart = std::function<void(size_t node_id, uint64_t start_us, FutureDag & future)>;

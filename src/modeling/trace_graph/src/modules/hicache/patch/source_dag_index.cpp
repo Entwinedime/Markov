@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <unordered_set>
 
 namespace markov::trace_graph::modules::hicache::patch {
@@ -251,15 +252,17 @@ HiCacheSourceDagIndex::HiCacheSourceDagIndex(const core::DagGraph & graph) : gra
     }
 
     for (auto & [lane_key, nodes] : cpu_nodes_by_lane_) {
-        std::ranges::sort(nodes, [&](size_t left_node_id, size_t right_node_id) {
-            const auto & left = graph_.event_for_node(left_node_id);
-            const auto & right = graph_.event_for_node(right_node_id);
-            if (left.ts != right.ts) return left.ts < right.ts;
-            // An inserted point at a leaf's entry precedes that leaf. Putting
-            // it after the leaf would count the leaf again as the point's gap.
-            if ((left.dur == 0) != (right.dur == 0)) return left.dur == 0;
-            return left_node_id < right_node_id;
-        });
+        // Sort compact coordinates instead of repeatedly visiting large trace
+        // storage. Entry points still precede nonempty leaves at the same tick.
+        std::vector<std::tuple<uint64_t, bool, size_t>> order;
+        order.reserve(nodes.size());
+        for (const auto id : nodes) {
+            const auto & event = graph_.event_for_node(id);
+            order.emplace_back(event.ts, event.dur != 0, id);
+        }
+        std::ranges::sort(order);
+        for (size_t i = 0; i < nodes.size(); ++i) nodes[i] = std::get<2>(order[i]);
+
         auto & prefix_ends = cpu_prefix_end_us_by_lane_[lane_key];
         prefix_ends.reserve(nodes.size());
         uint64_t frontier_end = 0;
@@ -452,6 +455,28 @@ HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::timing_interval_ownership(
     return output;
 }
 
+HiCacheTimingIntervalOwnership HiCacheSourceDagIndex::call_interval_ownership(std::string_view pid, std::string_view tid, uint64_t start_us,
+                                                                              uint64_t duration_us) const {
+    auto ownership = timing_interval_ownership(pid, tid, start_us, duration_us);
+    if (!duration_us) return ownership;
+
+    const std::set<size_t> timed(ownership.owned_node_ids.begin(), ownership.owned_node_ids.end());
+    ownership.owned_node_ids.clear();
+    const auto lane = cpu_nodes_on_lane(pid, tid);
+    const auto first = std::ranges::lower_bound(lane, start_us, {}, [&](size_t id) { return graph_.event_for_node(id).ts; });
+    for (auto at = first; at != lane.end(); ++at) {
+        const auto & event = graph_.event_for_node(*at);
+        if (event.ts >= ownership.interval_end_us) break;
+
+        const bool submits = !event.dur && std::ranges::any_of(outgoing_edge_ids(*at), [&](size_t id) {
+            const auto & edge = graph_.edge(id);
+            return edge.active && edge.kind == core::DagEdgeKind::Correlation && graph_.node(edge.dst).active;
+        });
+        if (submits || timed.contains(*at)) ownership.owned_node_ids.push_back(*at);
+    }
+    return ownership;
+}
+
 std::optional<HiCacheTimingIntervalOwnership> HiCacheSourceDagIndex::enclosing_control_interval_ownership(const HiCacheSourceFactNode & fact,
                                                                                                           std::string_view control_event_name) const {
     const auto found = control_intervals_by_name_.find(control_event_name);
@@ -501,8 +526,7 @@ HiCacheDeviceTransferClosure HiCacheSourceDagIndex::device_transfer_closure(cons
         if (!node.active || node.is_cpu || node.gpu_id != logical_input) continue;
         const auto & event = graph_.event_for_node(node.id);
         if (event.arg("operation") != direction) continue;
-        const auto submit_ts = node.submit_ts > 0 ? node.submit_ts : event.ts;
-        if (submit_ts < submission.timestamp_us || submit_ts > interval_end) continue;
+        if (!device_submitted_in_call(id, submission.pid, submission.tid, submission.timestamp_us, interval_end)) continue;
         output.transfer_node_ids.push_back(node.id);
         output.transfer_duration_us =
             core::checked_add_u64(output.transfer_duration_us, node.duration, "HiCache source device-transfer duration exceeds uint64 range");
@@ -515,7 +539,7 @@ HiCacheDeviceTransferClosure HiCacheSourceDagIndex::device_transfer_closure(cons
     });
     if (output.transfer_node_ids.empty()) {
         output.status = "no_device_transfer";
-        output.reason = "host submission emitted no direction-matched device transfer";
+        output.reason = "no direction-matched device transfer could be attributed to the host caller";
         return output;
     }
 
@@ -549,11 +573,7 @@ HiCacheDeviceTransferClosure HiCacheSourceDagIndex::device_transfer_closure(cons
             const auto & edge = graph_.edge(edge_index);
             if (!edge.active || edge.dst >= graph_.node_count() || !graph_.node(edge.dst).active) continue;
             if (edge.kind != core::DagEdgeKind::Stream || graph_.node(edge.dst).lane_id != graph_.node(current).lane_id) continue;
-            const auto & successor = graph_.node(edge.dst);
-            const auto & successor_event = graph_.event_for_node(edge.dst);
-            const auto successor_submit_ts = successor.submit_ts > 0 ? successor.submit_ts : successor_event.ts;
-            const bool contiguous_record_tail = successor_event.name == "EVENT_RECORD";
-            if ((successor_submit_ts < submission.timestamp_us || successor_submit_ts > interval_end) && !contiguous_record_tail) continue;
+            if (!device_submitted_in_call(edge.dst, submission.pid, submission.tid, submission.timestamp_us, interval_end)) continue;
             frontier.push_back(edge.dst);
         }
     }

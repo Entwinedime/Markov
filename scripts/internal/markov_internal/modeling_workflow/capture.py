@@ -168,6 +168,18 @@ def capture_calibration(group: GroupRequest, definition: dict[str, Any], *, stag
     inputs = {key: definition["files"][key] for key in ("template", "config_specs")}
     current_inputs = calibration_inputs(inputs)
     profiles = matching_calibration_profiles(attempts, current_inputs, stage=stage)
+    suite = load_json(require_repo_path(point["files"]["capture_suite"]))
+    if stage in {"capture", "profiled_replay"} and suite["profiling"].get("torch", {}).get("record_shapes", False):
+        # Equal workload tokens do not imply equal observation coverage. Read
+        # the completed capture's actual config, not its regenerated template.
+        shape_profiles = []
+        for row in profiles:
+            manifest = load_json(require_repo_path(row["profile_manifest"]))
+            captured = load_json(require_repo_path(manifest["config_path"]))
+            if captured["profiling"].get("torch", {}).get("record_shapes", False):
+                shape_profiles.append(row)
+        profiles = shape_profiles
+
     mode = "capture" if stage in {"capture", "token_plan_capture"} else "replay"
     bundle = None
     replay_inputs = None
@@ -205,7 +217,6 @@ def capture_calibration(group: GroupRequest, definition: dict[str, Any], *, stag
     work_root = group.output_dir / "captures"
     work_root.mkdir(parents=True, exist_ok=True)
     output = Path(tempfile.mkdtemp(prefix=f"{point_id}_{mode}_", dir=work_root))
-    suite = load_json(require_repo_path(point["files"]["capture_suite"]))
     suite.setdefault("metadata", {})["profile_mode"] = "forced_token_" + mode
     argv = suite["bench"]["command"]
     if mode == "replay":

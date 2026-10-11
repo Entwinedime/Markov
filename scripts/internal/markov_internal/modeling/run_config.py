@@ -17,6 +17,8 @@ class ModelingOutputs:
     dag_chrome_trace: bool = False
     module_summary: bool = False
     debug_logging: bool = False
+    source_replay_report: bool = False
+    structure_report: bool = False
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,8 @@ class ModelingRunConfig:
                 "emit_dag_chrome_trace": self.outputs.dag_chrome_trace,
                 "emit_module_summary": self.outputs.module_summary,
                 "debug": self.outputs.debug_logging,
+                "source_replay_report": self.outputs.source_replay_report,
+                "structure_report": self.outputs.structure_report,
             },
         }
         if self.model_config_path is not None:
@@ -99,6 +103,8 @@ class ModelingRunConfig:
             dag_chrome_trace=bool(output_flags.get("emit_dag_chrome_trace", False)),
             module_summary=bool(output_flags.get("emit_module_summary", False)),
             debug_logging=bool(output_flags.get("debug", False)),
+            source_replay_report=bool(output_flags.get("source_replay_report", False)),
+            structure_report=bool(output_flags.get("structure_report", False)),
         )
         backend_kind = str(cpp_config.get("backend_kind") or "release").strip().lower()
         static_replay = bool(cpp_config.get("hicache_static_replay", False))

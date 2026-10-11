@@ -3,7 +3,8 @@
  * @brief Models the target-derived HiCache storage-prefetch lifecycle.
  */
 #include "markov/trace_graph/modules/hicache/model/detail/state_model_helpers.hpp"
-#include "markov/trace_graph/modules/hicache/service_model.hpp"
+#include "markov/trace_graph/structure/hicache/prefetch.hpp"
+#include "markov/trace_graph/structure/hicache/resources.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,17 +22,20 @@ HiCacheIoSchedule HiCacheState::schedule_target_io(const std::string & scope, co
     HiCacheIoSchedule schedule;
     if (page_count == 0) return schedule;
     const bool storage = kind == "prefetch" || kind == "write_host_to_storage";
-    const auto batch_limit = storage ? config_.io_cost.storage_batch_pages : page_count;
+    const auto batch_limit = storage ? storage_batch_pages_ : page_count;
     if (batch_limit == 0) throw std::logic_error("Storage service requires a positive batch limit");
     const auto batch_count = page_count / batch_limit + static_cast<uint64_t>(page_count % batch_limit != 0);
     if (!existing_batch_pages.empty() && (kind != "write_host_to_storage" || existing_batch_pages.size() != batch_count))
         throw std::logic_error("H2S existing-page work must describe every executed service batch");
-    const auto & service = require_hicache_service(config_.io_cost,
-                                                   kind,
-                                                   config_.kv_bytes_per_page,
-                                                   std::min(batch_limit, page_count),
-                                                   existing_batch_pages.empty() ? 0 : existing_batch_pages.front());
-    schedule.resource_lane = hicache_resource_lane(config_.io_cost, kind, scope);
+    schedule.resource_lane = structure::hicache::io_resource_lane(resource_lanes_, kind, scope);
+    if (execution_prefetch_control_) {
+        schedule.start_ts = eligibility_ts;
+        schedule.effective_byte_count = core::checked_multiply_u64(page_count, config_.kv_bytes_per_page, "Target I/O byte count overflow");
+        for (uint64_t start = 0; start < page_count; start += std::min(batch_limit, page_count - start))
+            schedule.batches.push_back({ std::min(batch_limit, page_count - start) });
+        return schedule; // Cost and finish time remain unbound, not zero-cost work.
+    }
+
     auto & lane_available = io_lane_available_ts_[schedule.resource_lane];
     schedule.start_ts = std::max(eligibility_ts, lane_available);
     schedule.ready_ts = schedule.start_ts;
@@ -43,20 +47,18 @@ HiCacheIoSchedule HiCacheState::schedule_target_io(const std::string & scope, co
         if (!staged_prefetch && start > 0 && stop_ts && schedule.ready_ts >= *stop_ts) break;
         const auto count = std::min(batch_limit, page_count - start);
         const auto existing = existing_batch_pages.empty() ? 0 : existing_batch_pages[schedule.batches.size()];
-        const auto cost = hicache_service_cost(service, config_.kv_bytes_per_page, count, 1, existing);
-        if (!cost) throw std::logic_error("Target I/O service projection is invalid");
-        const auto ready = core::checked_add_u64(schedule.ready_ts, cost->duration_us, "Target I/O completion overflow");
+        const auto duration_us = static_io_completion_.duration(kind, config_.kv_bytes_per_page, count, existing);
+        const auto ready = core::checked_add_u64(schedule.ready_ts, duration_us, "Target I/O completion overflow");
         schedule.batches.push_back({ count, schedule.ready_ts, ready });
         bool cancelled = false;
         if (staged_prefetch) {
-            const auto staged = hicache_prefetch_batch(service, config_.kv_bytes_per_page, count, schedule.ready_ts);
-            if (!staged) throw std::logic_error("Target prefetch stages are invalid");
-            const auto execution = execute_prefetch_batch(*staged, stop_ts);
+            const auto staged = static_io_completion_.prefetch_batch(config_.kv_bytes_per_page, count, schedule.ready_ts);
+            const auto execution = structure::hicache::execute_prefetch_batch(staged, stop_ts);
             auto & batch = schedule.batches.back();
             batch.copied_page_count = execution.copied_pages;
             batch.ready_ts = execution.release_us;
             cancelled = execution.cancelled;
-            for (size_t page = 0; page < execution.published_pages; ++page) batch.page_ready_ts.push_back(staged->publications[page].at_us);
+            for (size_t page = 0; page < execution.published_pages; ++page) batch.page_ready_ts.push_back(staged.publications[page].at_us);
         }
         schedule.ready_ts = schedule.batches.back().ready_ts;
         executed_pages += count;
@@ -257,7 +259,6 @@ void HiCacheState::apply_prefetch_candidate_anchor(const HiCacheFact & fact) {
     if (pages.empty()) return;
     auto & scope = scope_state(fact);
     const auto request_key = scoped_request_key(fact);
-    if (!request_key.empty()) scope.requests[request_key].prefetch_candidate_seen = true;
     scope.storage.observe_path(page_path);
     auto lookup = scope.tree.lookup(pages);
     sync_capacity(scope, normalized_scope(fact), lookup.topology_chain);

@@ -55,7 +55,7 @@ struct HiCachePagePath {
  */
 class HiCacheTargetPager {
 public:
-    explicit HiCacheTargetPager(frontend::HiCacheConfig config = frontend::HiCacheConfig{});
+    explicit HiCacheTargetPager(frontend::HiCacheRules config = frontend::HiCacheRules{});
 
     /** @brief Resolves target page size, using the fact's source size only when config omits it. */
     [[nodiscard]] uint64_t page_size_for_fact(const HiCacheFact & fact) const;
@@ -67,7 +67,7 @@ public:
     [[nodiscard]] HiCachePagePath project(const HiCacheFact & fact, const HiCacheTokenPath & tokens) const;
 
 private:
-    frontend::HiCacheConfig config_;
+    frontend::HiCacheRules config_;
 };
 
 } // namespace markov::trace_graph::modules::hicache::runtime

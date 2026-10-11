@@ -19,6 +19,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/target_pager.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/token_store.hpp"
 #include "markov/trace_graph/modules/hicache/storage/storage_directory.hpp"
+#include "markov/trace_graph/structure/hicache/io_completion.hpp"
 
 #include <cstdint>
 #include <deque>
@@ -29,6 +30,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::model {
@@ -74,6 +77,7 @@ struct HiCacheEvictionWork {
         bool backed_up;
     };
     uint64_t requested_pages = 0;
+    uint64_t release_buffer_pages = 0;
     struct RejectedCandidate {
         HiCacheNodeId node;
         size_t before_victim;
@@ -84,11 +88,23 @@ struct HiCacheEvictionWork {
     std::vector<Victim> victims;
 };
 
+/** One allocator attempt. A merge is selected from queue counts, not costs. */
+struct HiCacheLoadAllocatorAttempt {
+    uint64_t free_pages = 0, release_pages = 0;
+    bool merge_release = false;
+    bool succeeds = false;
+};
+
 /** Geometry at this lookup, before later requests can split the radix nodes.
- * Each entry is one predicted slice/clone, not a source timing sample. */
+ * Each node_pages entry is one predicted slice/clone, not a timing sample.
+ * Initial queue counts survive allocation; retry records its own pre-merge state. */
 struct HiCacheLoadAdmissionWork {
     uint64_t requested_pages = 0;
+    uint64_t existing_prefix_pages = 0;
+    uint64_t initial_free_pages = 0, initial_release_pages = 0;
+    std::optional<HiCacheLoadAllocatorAttempt> retry_attempt;
     std::vector<uint64_t> node_pages;
+    bool skipped_below_threshold = false;
     bool allocated = false;
 };
 
@@ -118,7 +134,16 @@ struct HiCacheLoadbackBatch {
 struct HiCacheDeviceWrite {
     HiCacheOperationHeader header;
     HiCacheIoSchedule schedule;
-    HiCacheNodeId node = 0; // Target radix identity; equal payload sizes are not identities.
+    HiCacheNodeId node = 0;       // Target radix identity; equal payload sizes are not identities.
+    uint64_t published_nodes = 0; // Current split radix nodes covered by this pending backup.
+};
+
+/** Background storage work emitted at actual host publication. No cost or
+ * predicted finish time is stored in this execution request. */
+struct HiCacheStorageWrite {
+    HiCacheOperationHeader header;
+    std::string resource_lane;
+    std::vector<std::pair<uint64_t, uint64_t>> batches; // Total/existing pages.
 };
 
 enum class HiCacheLifecycleExecution { Immediate, DeferReturn, Stepped };
@@ -127,7 +152,15 @@ enum class HiCacheLifecycleExecution { Immediate, DeferReturn, Stepped };
 class HiCacheState {
 public:
     /** @brief Initializes the state machine from an explicit target configuration. */
-    explicit HiCacheState(frontend::HiCacheConfig config = frontend::HiCacheConfig{});
+    explicit HiCacheState(frontend::HiCacheRules rules = {}, structure::hicache::IoCompletionProvider completion = {}, uint64_t storage_batch_pages = 0,
+                          frontend::HiCacheIoResourceLanesConfig resource_lanes = {});
+    /** Transfer newly submitted storage work to the DAG executor exactly once. */
+    [[nodiscard]] std::vector<HiCacheStorageWrite> take_storage_submissions();
+    void begin_storage_batch(const std::string & scope, const std::string & operation, size_t batch, uint64_t time_us);
+    void complete_storage_batch(const std::string & scope, const std::string & operation, size_t batch, uint64_t time_us);
+    void complete_storage_write(const std::string & scope, const std::string & operation, uint64_t time_us);
+    [[nodiscard]] uint64_t storage_batch_pages() const { return storage_batch_pages_; }
+    [[nodiscard]] uint64_t page_bytes() const { return config_.kv_bytes_per_page; }
     // Pending continuations refer to this canonical state and its cache scopes.
     HiCacheState(const HiCacheState &) = delete;
     HiCacheState & operator=(const HiCacheState &) = delete;
@@ -138,13 +171,26 @@ public:
     /** Fix source identity before target execution may reorder facts. */
     void register_effect_identity(const HiCacheFact & fact);
 
+    /** A source branch proves an admission opportunity, never a target hit.
+     * Formal lookup loading is eligible only at these approved fact identities.
+     */
+    void register_load_admission_lookup(size_t fact_id) { load_admission_lookups_.insert(fact_id); }
+
+    [[nodiscard]] bool has_load_admission(size_t fact_id) const { return load_admission_lookups_.contains(fact_id); }
+
+    /** Execute a registered host-load opportunity after its lookup, on the
+     * common execution clock. The fact retains its source identity but carries
+     * the admission time and anchor. May leave an allocation continuation.
+     */
+    void admit_load(const HiCacheFact & fact);
+
     /** Retain cache residency and reset request-local state. Execution-driven
      * prefetch requires explicit query, stop, visibility and scheduler events;
      * it does not infer them from future cache-extend facts or end of trace.
      */
     void begin_formal_window(bool execution_prefetch_control = false);
 
-    /** Execution-driven prefetch: inspect the full queued service, stop at the
+    /** Execution-driven prefetch: inspect actual worker publications, stop at the
      * actual stop call, then publish the cross-rank MIN at its visible boundary.
      * Times share the state's absolute clock. These APIs never read target data.
      * Host release is separate; publication does not free outstanding buffers.
@@ -158,11 +204,15 @@ public:
     [[nodiscard]] HiCachePrefetchCheck sample_prefetch_check(const HiCacheFact & fact) const;
     uint64_t stop_prefetch(const HiCacheFact & fact);
     void publish_prefetch(const HiCacheFact & fact, uint64_t visible_pages);
+    // Physical worker observations, in the DAG executor's absolute microseconds.
+    // Batch index is submission order; a publication replaces that batch's snapshot.
+    void begin_prefetch_io(const HiCacheOperationHeader & operation, uint64_t timestamp_us);
+    void record_prefetch_batch(const HiCacheOperationHeader & operation, size_t index, const runtime::HiCacheIoBatchSchedule & batch);
     void complete_prefetch_io(const HiCacheFact & fact);
     // Background return belongs to an operation, even if its request was replaced.
     void complete_prefetch_io(const HiCacheOperationHeader & operation, uint64_t timestamp_us);
     // Sample revoke/backup-ACK/page-release queues before MIN, drain returned
-    // counts later. Refresh storage completion from its current target schedule;
+    // counts later. Storage completion arrives from its DAG execution event;
     // new arrivals during MIN stay queued. Sampling never releases host pins.
     [[nodiscard]] HiCachePrefetchQueueSizes prefetch_queue_sizes(const HiCacheFact & fact);
     void drain_prefetch_queues(const HiCacheFact & fact, HiCachePrefetchQueueSizes counts);
@@ -180,7 +230,7 @@ public:
     [[nodiscard]] const HiCacheLoadAdmissionWork * load_admission_work(const HiCacheFact & fact) const;
     /** Read-only outcome after the already selected capacity releases. Does
      * not acknowledge writes, release pages or publish a load operation. */
-    [[nodiscard]] bool load_allocation_will_succeed(const HiCacheFact & fact) const;
+    [[nodiscard]] std::vector<HiCacheLoadAllocatorAttempt> load_allocation_attempts(const HiCacheFact & fact) const;
     /** Acknowledge completed DMA without publishing the waiting allocation. */
     void confirm_allocation_writes(const HiCacheFact & fact);
     void resume_allocation(const HiCacheFact & fact);
@@ -235,7 +285,6 @@ private:
         std::vector<HiCacheNodeId> device_chain;
         std::vector<HiCacheNodeId> host_chain;
         std::string lifecycle_state;
-        bool prefetch_candidate_seen = false;
     };
 
     /** @brief One immediate write()/start_writing() DMA batch awaiting scheduler acknowledgement. */
@@ -378,12 +427,18 @@ private:
         std::vector<CacheExtendRequestIntent> requests;
     };
 
-    frontend::HiCacheConfig config_;
+    frontend::HiCacheRules config_;
+    // Used only for static/prelude replay; formal execution clears this provider.
+    structure::hicache::IoCompletionProvider static_io_completion_;
+    uint64_t storage_batch_pages_ = 0;
+    frontend::HiCacheIoResourceLanesConfig resource_lanes_;
     HiCacheTargetPager pager_;
     HiCachePolicy policy_;
     std::unordered_map<std::string, ScopedState> scopes_;
     std::unordered_map<std::string, uint64_t> io_lane_available_ts_;
-    std::unordered_map<std::string, std::vector<std::pair<std::string, std::string>>> prefetch_lane_queue_;
+    std::vector<HiCacheStorageWrite> storage_submissions_;
+    std::unordered_set<size_t> load_admission_lookups_;
+    std::unordered_map<size_t, size_t> load_admission_prefix_limits_;
     std::unordered_map<std::string, std::vector<HiCacheFact>> prefetch_control_boundaries_;
     std::vector<HiCacheEffectOpportunity> effect_opportunities_;
     std::vector<HiCachePrefillWorkItem> prefill_work_items_;
@@ -451,7 +506,7 @@ private:
 
 
     /** @brief Protects the reusable request prefix described by a cache lookup. */
-    void apply_cache_lookup_input(const HiCacheFact & fact);
+    void apply_cache_lookup_input(const HiCacheFact & fact, bool admission = false);
 
     /** @brief Allocates batch KV pages and updates request ownership at cache extend. */
     void apply_cache_extend_input(const HiCacheFact & fact);
@@ -548,12 +603,5 @@ private:
  * must not substitute source time for a missing target boundary.
  */
 using HiCacheFactClock = std::function<uint64_t(const HiCacheFact &)>;
-
-/** Runs the one state model without mutating the DAG. An empty clock retains
- * the existing source-timed replay; supplying a clock does not by itself solve
- * the state/DAG scheduling loop or replace prefetch control semantics.
- */
-[[nodiscard]] HiCacheModelResult apply_hicache_model(core::DagGraph & graph, const frontend::HiCacheConfig & config,
-                                                     const HiCacheFactClock & execution_clock = {});
 
 } // namespace markov::trace_graph::modules::hicache::model

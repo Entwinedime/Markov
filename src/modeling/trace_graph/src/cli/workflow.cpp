@@ -11,10 +11,14 @@
 #include "markov/trace_graph/cli/cpu_service_preparation.hpp"
 #include "markov/trace_graph/cli/file_output.hpp"
 #include "markov/trace_graph/cli/hicache_observations.hpp"
-#include "markov/trace_graph/cli/input_graph.hpp"
 #include "markov/trace_graph/cli/module_pipeline.hpp"
 #include "markov/trace_graph/cli/options.hpp"
 #include "markov/trace_graph/cli/run_summary.hpp"
+#include "markov/trace_graph/source_dag/build.hpp"
+#include "markov/trace_graph/source_dag/observations.hpp"
+#include "markov/trace_graph/source_dag/replay.hpp"
+#include "markov/trace_graph/structure/hicache/report.hpp"
+#include "markov/trace_graph/structure/missing_work.hpp"
 #include <nlohmann/json.hpp>
 
 #include "markov/trace_graph/cli/debug_support.hpp"
@@ -26,16 +30,20 @@
 #ifdef DEBUG
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
 #endif
-#include "markov/trace_graph/modules/hicache/missing_cost.hpp"
+#include "markov/trace_graph/cost/missing_evidence.hpp"
 #include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/scope_observation.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <algorithm>
 #include <fstream>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace markov::trace_graph::cli {
 
@@ -98,16 +106,28 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     auto modules = ModulePipeline::from_config(options.model_config);
 #endif
     auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
+    const auto source_input_selection = options.outputs.source_replay_report.empty() ? nlohmann::json(nullptr) : source_dag::input_selection_report(inputs);
     const auto client_input = options.trace_input.include_python_probe && !options.source_observations_only
                                   ? io::load_client_requests_from_manifest(options.profile_manifest)
                                   : io::ManifestClientInput{ "python_probe_channel_disabled", {} };
-    auto graph = build_input_graph(std::move(inputs), options.trace_input.threads);
+    auto graph = source_dag::build(std::move(inputs), options.trace_input.threads);
+    const auto source_execution_event_count = graph.events().size();
     if (!options.prepare_cpu_service.empty()) {
         if (client_input.status != "ready") throw std::runtime_error("CPU service preparation needs complete client requests");
         const auto chain = core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us);
         if (chain.status != "connected") throw std::runtime_error("CPU service preparation could not bind the client chain");
         prepare_cpu_service(graph, options.profile_manifest, options.prepare_cpu_service, options.cpu_service_output);
         return 0;
+    }
+    // Request availability belongs to the observed source as well as target
+    // execution. Bind once; the experimental replay must precede cost views
+    // and any mutation, including optional NodeScale.
+    const auto client_chain = client_input.status == "ready" ? core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us)
+                                                             : core::ClientRequestChain{ client_input.status, {} };
+    if (!options.outputs.source_replay_report.empty()) {
+        auto report = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
+        report["event_coverage"]["input_selection"] = source_input_selection;
+        write_json_file(options.outputs.source_replay_report, report);
     }
     if (!options.cpu_service_cost.empty()) {
         std::ifstream input(options.cpu_service_cost);
@@ -119,13 +139,48 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #endif
 
     if (options.source_observations_only) {
+        const auto phases = modules::hicache::observe_hicache_phases(graph);
+        if (!options.outputs.structure_report.empty()) {
+            // The evaluator asks for structural evidence, not training data.
+            // Cost extraction has additional attribution requirements and
+            // must not gate comparison of independently observable structure.
+            write_json_file(options.outputs.structure_report, structure::hicache::observed_phase_structure_report(graph, phases));
+            write_json_file(options.outputs.run_summary,
+                            {
+                                {         "observation_scope",                        "structure" },
+                                { "source_phase_observations", hicache_phase_observations(phases) }
+            });
+            return 0;
+        }
+
         const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
         const auto operations = modules::hicache::patch::build_hicache_io_operation_ledger(source);
         auto io = hicache_io_observations(graph, operations, !options.cpu_service_cost.empty());
+        nlohmann::json collective_diagnostics;
+        auto operator_observations = source_dag::phase_operator_observations(graph, phases, !options.cpu_service_cost.empty(), &collective_diagnostics);
+        if (!options.cpu_service_cost.empty()) {
+            // Submission attribution splits a working graph at control points.
+            // Keep the original observations intact and use the same paired
+            // measurements as the independent write exporter. Other control
+            // families are already collected by phase_operator_observations.
+            auto write_graph = graph;
+            auto write = modules::hicache::runtime::export_write_calibration(write_graph,
+                                                                             options.trace_input.window_start_us.value_or(0),
+                                                                             options.trace_input.window_end_us.value_or(std::numeric_limits<uint64_t>::max()));
+            for (auto & observation : write["operator_observations"]) {
+                if (observation["operation"].get_ref<const std::string &>().starts_with("write.submission."))
+                    operator_observations.push_back(std::move(observation));
+            }
+        }
+
         write_json_file(options.outputs.run_summary,
                         {
-                            {    "source_io_observations",                                                                          io },
-                            { "source_phase_observations", hicache_phase_observations(modules::hicache::observe_hicache_phases(graph)) }
+                            { "observation_scope", "cost" },
+                            { "source_io_observations", io },
+                            { "source_phase_observations", hicache_phase_observations(phases) },
+                            { "operator_geometry", source_dag::operator_geometry_observations(graph, phases) },
+                            { "device_collective_observations", std::move(collective_diagnostics) },
+                            { "operator_observations", std::move(operator_observations) }
         });
         return 0;
     }
@@ -145,20 +200,34 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     }
     // Request availability is an input dependency, not a scoring-only adjustment.
     // Keep the same anchors throughout modeling, execution and HTTP reporting.
-    const auto client_chain = client_input.status == "ready" ? core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us)
-                                                             : core::ClientRequestChain{ client_input.status, {} };
     const auto begin = client_input.requests.empty() ? 0 : client_input.requests.front().start_us;
     const auto end = client_input.requests.empty() ? 0 : client_input.requests.back().end_us;
+    // A transformation gets one independent working graph. Preserve source
+    // topology, observation coordinates and measured costs for migration; no
+    // target module can overwrite them. Shared trace buffers remain shared.
+    // Plain build/replay has no target mutation and needs no duplicate graph.
+    std::unique_ptr<const DagGraph> source_graph;
+    if (modules.uses_hicache_execution() || !modules.modules().empty()) source_graph = std::make_unique<const DagGraph>(graph);
     try {
-        modules.apply(graph, logger, client_chain, begin, end);
+        modules.apply(graph, source_graph ? *source_graph : graph, logger, client_chain, begin, end);
     }
-    catch (const modules::hicache::MissingCostEvidence & error) {
+    catch (const structure::MissingWork & error) {
         if (!options.outputs.run_summary.empty())
             write_json_file(options.outputs.run_summary,
                             {
-                                {                "status",                            "data_limitation" },
-                                {         "missing_costs", nlohmann::json::array({ error.requirement }) },
-                                { "requirements_complete",                                        false }
+                                {                "status",                                                                  "structure_limitation" },
+                                {        "structure_gaps", nlohmann::json::array({ { { "reason", error.what() }, { "details", error.details } } }) },
+                                { "requirements_complete",                                                                                   false }
+            });
+        throw;
+    }
+    catch (const cost::MissingCostEvidence & error) {
+        if (!options.outputs.run_summary.empty())
+            write_json_file(options.outputs.run_summary,
+                            {
+                                {                "status",  "data_limitation" },
+                                {         "missing_costs", error.requirements },
+                                { "requirements_complete",              false }
             });
         throw;
     }
@@ -177,6 +246,12 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
     if (!options.outputs.model_summary.empty()) write_module_summary(options.outputs.model_summary, modules.modules());
 #endif
     write_run_summary(options.outputs.run_summary, graph, modules.modules(), source_io, source_phase, client_result, execution, include_source_observations);
+    if (!options.outputs.structure_report.empty()) {
+        if (!execution) throw std::invalid_argument("Executed structure report requires HiCache execution prediction");
+        write_json_file(
+            options.outputs.structure_report,
+            structure::hicache::execution_structure_report(graph, execution->model.effect_decisions, execution->model.phase_work, execution->collective_work));
+    }
     return 0;
 }
 

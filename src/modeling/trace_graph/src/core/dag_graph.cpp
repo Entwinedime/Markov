@@ -14,8 +14,6 @@
 
 namespace markov::trace_graph::core {
 
-namespace dag_graph_detail {
-
 /**
  * @brief Returns the stable user-visible name for an edge kind.
  *
@@ -41,12 +39,13 @@ std::string edge_kind_name(DagEdgeKind kind) {
     return "unknown";
 }
 
+namespace dag_graph_detail {
+
 bool contains_hccl_name(const std::string & name) { return name.contains("hcom") || name.contains("HCCL") || name.contains("hccl"); }
 
 } // namespace dag_graph_detail
 
 using dag_graph_detail::contains_hccl_name;
-using dag_graph_detail::edge_kind_name;
 
 DagEdge::DagEdge(size_t src_value, size_t dst_value, DagEdgeKind kind_value, std::string_view effect_id_value, std::string_view reason_value)
     : src(src_value),
@@ -119,6 +118,13 @@ size_t DagGraph::add_node(size_t event_index, bool is_cpu, std::string_view lane
     scope_node_owned_.push_back(0);
     scope_gap_durations_.push_back(0);
     return node_id;
+}
+
+size_t DagGraph::add_device_resource(std::string lane_key, int gpu_id) {
+    const auto node = add_synthetic_node({ .name = "device resource", .is_cpu = false, .lane_key = std::move(lane_key) });
+    nodes_[node].active = false;
+    nodes_[node].gpu_id = gpu_id;
+    return node;
 }
 
 size_t DagGraph::add_synthetic_node(const DagSyntheticNodeSpec & spec) {
@@ -207,13 +213,24 @@ DagNode & DagGraph::mutable_node(size_t node_id) {
 
 void DagGraph::set_node_duration(size_t node_id, uint64_t duration) { mutable_node(node_id).duration = duration; }
 
+void DagGraph::bind_node_execution_duration(size_t node_id, uint64_t duration) {
+    auto & target = mutable_node(node_id);
+    target.duration = duration;
+    target.execution_cost_bound = true;
+}
+
 uint64_t DagGraph::cpu_service_node_duration(size_t id) const {
     const auto & n = node(id);
-    if (cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates) || n.duration == 0) return n.duration;
+    if (n.execution_cost_bound || cpu_service_cost_.empty() || !n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates)
+        || n.duration == 0)
+        return n.duration;
     const auto & e = event_for_node(id);
     const auto service = cpu_service_cost_.duration({ e.pid, e.tid }, e.ts, checked_add_u64(e.ts, e.dur, "CPU service event end overflow"));
     if (service == e.dur) return n.duration;
-    if (n.duration != e.dur) throw std::runtime_error("CPU service overlaps an already remodeled node");
+    if (n.duration != e.dur)
+        throw std::runtime_error("CPU service overlaps an already remodeled node: node=" + std::to_string(id) + " event=" + e.name
+                                 + " duration_us=" + std::to_string(n.duration) + " observed_us=" + std::to_string(e.dur)
+                                 + " corrected_us=" + std::to_string(service) + " timestamp_us=" + std::to_string(e.ts));
     return service;
 }
 
@@ -275,6 +292,19 @@ void DagGraph::set_cpu_gap_after(size_t node_id, uint64_t duration, std::optiona
     }
     else retained_cpu_gap_ranges_.erase(node_id);
     target.cpu_gap_after = duration;
+}
+
+std::optional<DagGraph::CpuGapRanges> DagGraph::observed_cpu_gap_ranges(size_t id) const {
+    const auto & n = node(id);
+    if (!n.cpu_gap_after) return CpuGapRanges{};
+    if (const auto found = retained_cpu_gap_ranges_.find(id); found != retained_cpu_gap_ranges_.end()) return found->second;
+    if (!n.is_cpu || (n.kind == DagNodeKind::Synthetic && !n.observed_cpu_coordinates) || n.cpu_gap_after != n.original_cpu_gap_after) return std::nullopt;
+
+    const auto & event = event_for_node(id);
+    const auto begin = checked_add_u64(event.ts, event.dur, "Observed CPU gap begin overflow");
+    return CpuGapRanges{
+        { begin, checked_add_u64(begin, n.cpu_gap_after, "Observed CPU gap end overflow") }
+    };
 }
 
 void DagGraph::clear_scope_ownership() {
@@ -562,7 +592,7 @@ private:
         for (const auto & [graph_index, node_id] : nodes) {
             (void)graph_index;
             const auto duration = merged_.nodes_[node_id].duration;
-            if (minimum == 0 || duration < minimum) minimum = duration;
+            if (duration > 0 && (minimum == 0 || duration < minimum)) minimum = duration;
         }
         return minimum;
     }
@@ -582,7 +612,9 @@ private:
         /**
          * Kernel name and occurrence index are the strongest identities present in
          * every supported trace. Peer nodes constrain each rank-local continuation;
-         * the minimum nonzero duration avoids duplicating collective wait time.
+         * the minimum nonzero duration is a wait-reduction heuristic, not
+         * an independently measured transport service. Do not use this
+         * normalized duration as a cost-database training observation.
          * Repeated same-name collectives with divergent rank order remain ambiguous.
          */
         for (const auto & [name, ranks] : hccl_groups_) {

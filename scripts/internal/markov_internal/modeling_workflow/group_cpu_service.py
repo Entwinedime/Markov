@@ -7,9 +7,9 @@ import subprocess
 
 from ..common.paths import ROOT_DIR, require_repo_path, repo_relative_path
 from ..common.io import load_json
-from .context import cpu_service_inputs
+from ..modeling.cost.package import cpu_service_inputs
 from .cpu_capture import capture_light_base
-from .planning.profile_runs import parse_server_command_flags
+from ..modeling.source_dag.profiles import parse_server_command_flags
 
 
 def cpu_service_plan(group) -> dict:
@@ -77,6 +77,7 @@ def prepare_group_cpu_service(plan: dict, *, dry_run: bool = False) -> list[Path
         measurements = output.parent / "cpu_measurements.json"
         if output.is_file() and measurements.is_file():
             previous = load_json(measurements)
+            service = load_json(output)
             prepared = previous.get("preparation", {})
             if (
                 require_repo_path(previous["source_manifest"]).resolve()
@@ -85,6 +86,10 @@ def prepare_group_cpu_service(plan: dict, *, dry_run: bool = False) -> list[Path
                 == require_repo_path(pair["light_manifest"]).resolve()
                 and prepared.get("tp_size") == pair["tp_size"]
                 and prepared.get("correct_recorder") is True
+                and prepared.get("include_setup_requests", False) == pair.get("include_setup_requests", False)
+                and service.get("light_manifest") is not None
+                and require_repo_path(service["light_manifest"]).resolve()
+                == require_repo_path(pair["light_manifest"]).resolve()
             ):
                 cpu_service_inputs([output], (require_repo_path(pair["profile_manifest"]).resolve(),))
                 outputs.append(output)
@@ -92,6 +97,8 @@ def prepare_group_cpu_service(plan: dict, *, dry_run: bool = False) -> list[Path
         if dry_run:
             continue
         command = [str(ROOT_DIR / "scripts/model.sh"), "prepare-cpu-service", "--correct-recorder"]
+        if pair.get("include_setup_requests", False):
+            command.append("--include-setup-requests")
         for key in ("light_manifest", "profile_manifest", "tp_size", "output_dir"):
             command.extend(("--" + key.replace("_", "-"), str(pair[key])))
         subprocess.run(command, cwd=ROOT_DIR, check=True)

@@ -4,7 +4,7 @@
  */
 #include "markov/trace_graph/modules/hicache/service_model.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/modules/hicache/missing_cost.hpp"
+#include "markov/trace_graph/cost/missing_evidence.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -71,12 +71,12 @@ const frontend::HiCacheIoServiceModelConfig & require_hicache_service(const fron
         std::string component = "physical/" + kind;
         if (kind == "prefetch") component = "physical/prefetch_stages";
         if (kind == "write_host_to_storage") component = existing_pages ? "physical/write_host_to_storage_existing" : "service/write_host_to_storage_new";
-        throw MissingCostEvidence(component,
-                                  {
-                                      { "page_bytes", page_bytes },
-                                      { "page_count",      pages }
+        throw cost::MissingCostEvidence(component,
+                                        {
+                                            { "page_bytes", page_bytes },
+                                            { "page_count",      pages }
         },
-                                  "Target transfer requires a measured or base-derived " + kind + " service model");
+                                        "Target transfer requires an applicable independent " + kind + " service model");
     }
     return found->second;
 }
@@ -91,13 +91,13 @@ std::optional<HiCacheServiceCost> hicache_service_cost(const frontend::HiCacheIo
     if (model.direction == "host_to_storage") {
         if (existing_pages > 0) {
             if (model.existing_key_bandwidth_points.empty())
-                throw MissingCostEvidence("physical/write_host_to_storage_existing",
-                                          {
-                                              {     "page_bytes",     page_bytes },
-                                              {     "page_count",          pages },
-                                              { "existing_pages", existing_pages }
+                throw cost::MissingCostEvidence("physical/write_host_to_storage_existing",
+                                                {
+                                                    {     "page_bytes",     page_bytes },
+                                                    {     "page_count",          pages },
+                                                    { "existing_pages", existing_pages }
                 },
-                                          "Storage batch requires existing-key materialization costs");
+                                                "Storage batch requires existing-key materialization costs");
             const auto bandwidth = interpolated_existing_key_bandwidth(model, page_bytes, pages);
             if (bandwidth <= 0.0) return std::nullopt;
             cost.transfer_us = static_cast<double>(existing_pages) * page_bytes * 1'000'000.0 / bandwidth;
@@ -105,13 +105,13 @@ std::optional<HiCacheServiceCost> hicache_service_cost(const frontend::HiCacheIo
         }
         if (pages > existing_pages) {
             if (model.new_operation_points.empty())
-                throw MissingCostEvidence("service/write_host_to_storage_new",
-                                          {
-                                              { "page_bytes",             page_bytes },
-                                              { "page_count",                  pages },
-                                              {  "new_pages", pages - existing_pages }
+                throw cost::MissingCostEvidence("service/write_host_to_storage_new",
+                                                {
+                                                    { "page_bytes",             page_bytes },
+                                                    { "page_count",                  pages },
+                                                    {  "new_pages", pages - existing_pages }
                 },
-                                          "Storage batch requires new-key setup and transfer costs");
+                                                "Storage batch requires new-key setup and transfer costs");
             const auto [setup, bandwidth] = interpolated_transfer(model.new_operation_points, page_bytes);
             if (bandwidth <= 0.0) return std::nullopt;
             cost.setup_us = setup * static_cast<double>(calls);
@@ -168,31 +168,6 @@ std::optional<PrefetchControlBatch> hicache_prefetch_batch(const frontend::HiCac
         batch.publications.push_back({ 1, at(publication), core::checked_add_u64(start_us, cancelled_cost->duration_us, "prefetch service time overflow") });
     }
     return batch;
-}
-
-PrefetchBatchExecution execute_prefetch_batch(const PrefetchControlBatch & batch, std::optional<uint64_t> stop_us) {
-    PrefetchBatchExecution result{ .release_us = batch.ready_ts };
-    for (const auto & publication : batch.publications) {
-        result.copied_pages = core::checked_add_u64(result.copied_pages, publication.page_count, "prefetch copied pages overflow");
-        if (stop_us && publication.at_us >= *stop_us) {
-            if (!publication.cancelled_return_us) throw std::invalid_argument("cancelled prefetch requires a measured return-path timing");
-            result.release_us = *publication.cancelled_return_us;
-            result.cancelled = true;
-            break;
-        }
-        result.published_pages = result.copied_pages;
-    }
-    return result;
-}
-
-std::string hicache_resource_lane(const frontend::HiCacheIoCostConfig & model, const std::string & kind, const std::string & scope) {
-    const auto local = kind == "prefetch"                ? "host_storage_read_lane"
-                       : kind == "write_host_to_storage" ? "host_storage_write_lane"
-                       : kind == "load"                  ? "host_to_device_lane"
-                                                         : "device_to_host_lane";
-    const bool shared =
-        (kind == "prefetch" && model.resource_lanes.shared_storage_read) || (kind == "write_host_to_storage" && model.resource_lanes.shared_storage_write);
-    return shared ? local : scope + "/" + local;
 }
 
 } // namespace markov::trace_graph::modules::hicache

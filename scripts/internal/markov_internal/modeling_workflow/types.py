@@ -3,41 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import cached_property
 from pathlib import Path
 from typing import Any
 
-from ..modeling.workload import WorkloadWindow, discover_workload_window
-
-
-@dataclass(frozen=True)
-class ProfileRunRef:
-    """One concrete profiling run selected as workflow input."""
-
-    manifest_path: Path
-    run_dir: Path
-    config_path: Path
-    run_id: str
-    config_id: str
-    input_id: str
-    python_probe_files: tuple[Path, ...]
-    hicache_config: dict[str, Any] | None = None
-
-    @cached_property
-    def workload_window(self) -> WorkloadWindow | None:
-        """Read this immutable capture's window lazily, shared by its targets.
-
-        A new workflow creates new source objects; nothing is cached on disk.
-        Failed reads propagate without caching a fabricated window.
-        """
-
-        return discover_workload_window({}, self.manifest_path)
-
-    @property
-    def label(self) -> str:
-        """Return the compact input/config label used in progress and artifacts."""
-
-        return f"{self.input_id}/{self.config_id}"
+from ..modeling.source_dag.profiles import ProfileRunRef
 
 
 @dataclass(frozen=True)
@@ -81,6 +50,7 @@ class ModelRunResult:
     return_code: int
     skip_reason: str = ""
     missing_costs: tuple[dict[str, Any], ...] = ()
+    structure_gaps: tuple[dict[str, Any], ...] = ()
 
     @property
     def ok(self) -> bool:

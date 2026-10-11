@@ -8,9 +8,16 @@
 #include "markov/trace_graph/modules/module.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <string_view>
 
 namespace markov::trace_graph::modules::node_scale {
+
+/** Apply the first matching rule to an already bound duration in microseconds.
+ * No match returns nullopt; a matched zero duration remains a valid zero.
+ * This does not read or mutate graph structure or source observations.
+ */
+[[nodiscard]] std::optional<uint64_t> matched_node_duration(const frontend::NodeScaleConfig & config, std::string_view name, uint64_t duration_us);
 
 /**
  * @brief Applies the first matching substring rule to every existing DAG node.

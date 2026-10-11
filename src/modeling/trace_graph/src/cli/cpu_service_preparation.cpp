@@ -28,7 +28,12 @@ void prepare_cpu_service(core::DagGraph & graph, const std::string & manifest, c
     if (data.contains("hook_recorder_writes")) hook_recorder = modules::hicache::attach_hook_recorder_cpu_service(graph, data.at("hook_recorder_writes"));
     std::ofstream file(output);
     if (!file) throw std::runtime_error("Cannot open CPU service output");
-    io::write_cpu_service_cost(file, manifest, graph.cpu_service_cost(), data.value("reference_io", nlohmann::json{}));
+    io::write_cpu_service_cost(file,
+                               manifest,
+                               graph.cpu_service_cost(),
+                               data.at("light_manifest").get<std::string>(),
+                               data.value("reference_io", nlohmann::json{}),
+                               data.at("measurement_window"));
 
     int64_t retained_cpu = 0;
     for (const auto & row : retained) retained_cpu += row.at("retained_reduction_us").get<int64_t>();

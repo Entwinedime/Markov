@@ -113,8 +113,11 @@ def _run_one(options: WorkflowOptions, spec: ModelRunSpec) -> ModelRunResult:
         # The report belongs to this attempt. Do not use file timestamps to
         # distinguish fresh failures from leftovers of an earlier command.
         report = spec.output_dir / "run_summary.json"
-        report.unlink(missing_ok=True)
-        (spec.output_dir / "model_summary.json").unlink(missing_ok=True)
+        # An application rerun may turn experimental outputs off. Remove the
+        # previous attempt's reports too, so disabled reports cannot appear
+        # to describe this execution. Raw profiles and other runs are untouched.
+        for name in ("run_summary.json", "model_summary.json", "source_replay_report.json", "structure_report.json"):
+            (spec.output_dir / name).unlink(missing_ok=True)
         return_code = run_command(build_trace_graph_command(config), log_path=log_path).returncode
         if return_code == 0:
             if not options.diagnostics.keep_debug_artifacts:
@@ -125,11 +128,14 @@ def _run_one(options: WorkflowOptions, spec: ModelRunSpec) -> ModelRunResult:
                 options.diagnostics.failure_log_max_bytes,
             )
         missing_costs = ()
+        structure_gaps = ()
         if return_code != 0 and report.is_file():
             failure = load_json(report)
             if failure.get("status") == "data_limitation":
                 missing_costs = tuple(failure["missing_costs"])
-        return ModelRunResult(spec, return_code, missing_costs=missing_costs)
+            elif failure.get("status") == "structure_limitation":
+                structure_gaps = tuple(failure["structure_gaps"])
+        return ModelRunResult(spec, return_code, missing_costs=missing_costs, structure_gaps=structure_gaps)
     except Exception as error:
         # Keep subprocess diagnostics if reading its report failed.
         with log_path.open("a", encoding="utf-8") as log_file:

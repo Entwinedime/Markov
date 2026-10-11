@@ -47,8 +47,19 @@ struct TraceEvent {
     TraceEvent(TraceEvent &&) noexcept = default;
     TraceEvent & operator=(TraceEvent &&) noexcept = default;
 
-    /** @brief Stable input order, retained as the final same-timestamp tie breaker. */
+    /** @brief Current input order, used as the same-timestamp tie breaker.
+     * Joins and normalization can renumber it; it is not measurement identity.
+     */
     size_t index = 0;
+
+    /** Original JSON record byte offset, preserved across filtering, joins,
+     * normalization and graph merges. Generated records have no source offset.
+     */
+    std::optional<size_t> source_record_offset;
+    /** File name shared by the records of one trace. Capture identity is
+     * supplied by the importer; repository/alias directory paths are excluded.
+     */
+    std::shared_ptr<const std::string> source_record_file;
 
     /** @brief Typed source provenance retained without allocating an argument per event. */
     TraceSourceChannel source_channel = TraceSourceChannel::Unknown;

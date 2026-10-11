@@ -46,7 +46,7 @@ struct HiCachePrefetchTimeoutInput {
  */
 class HiCachePolicy {
 public:
-    explicit HiCachePolicy(const frontend::HiCacheConfig & config = frontend::HiCacheConfig{});
+    explicit HiCachePolicy(const frontend::HiCacheRules & config = frontend::HiCacheRules{});
 
     /** @brief Returns the request-hit threshold for write-through backup. */
     [[nodiscard]] uint64_t write_through_threshold() const;

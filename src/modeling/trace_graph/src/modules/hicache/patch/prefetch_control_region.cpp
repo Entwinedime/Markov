@@ -1,8 +1,8 @@
 #include "markov/trace_graph/modules/hicache/patch/prefetch_control_region.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
-#include "markov/trace_graph/modules/hicache/model/prefetch_scheduler_body.hpp"
 #include "markov/trace_graph/modules/hicache/patch/cpu_collective_waits.hpp"
+#include "markov/trace_graph/source_dag/prefetch.hpp"
 
 #include <algorithm>
 #include <set>
@@ -248,7 +248,7 @@ std::vector<PrefetchControlRegion> prepare_prefetch_wait_regions(core::DagGraph 
                 previous.push_back(calls[i - 1]);
                 next.push_back(calls[i]);
             }
-            const auto body = model::observe_prefetch_scheduler_body(source, collectives, workers, previous, next);
+            const auto body = source_dag::observe_prefetch_scheduler_body(source, collectives, workers, previous, next);
             if (!body.issue.empty()) throw std::invalid_argument("Incomplete source wait body: " + body.issue);
             for (size_t j = first_span; j < spans.size(); ++j)
                 for (const auto & step : body.steps) spans[j].rounds.push_back(step.source_round);

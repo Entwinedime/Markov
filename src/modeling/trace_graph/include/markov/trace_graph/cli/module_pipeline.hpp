@@ -35,7 +35,8 @@ public:
 #endif
 
     /** @brief Applies every owned module exactly once in configuration order. */
-    void apply(core::DagGraph & graph, core::Logger & logger, const core::ClientRequestChain & chain, uint64_t begin_us, uint64_t end_us);
+    void apply(core::DagGraph & graph, const core::DagGraph & source_graph, core::Logger & logger, const core::ClientRequestChain & chain, uint64_t begin_us,
+               uint64_t end_us);
 
     [[nodiscard]] bool uses_hicache_execution() const { return execution_config_.has_value(); }
     /** @brief Static HiCache models and score-only carriers need source component observations. */
@@ -48,6 +49,7 @@ public:
 private:
     std::vector<std::unique_ptr<modules::SimulationModule>> modules_;
     std::optional<frontend::HiCacheConfig> execution_config_;
+    std::optional<frontend::NodeScaleConfig> execution_node_scale_;
     std::string source_prefetch_policy_;
     std::optional<modules::hicache::runtime::HiCacheWindowResult> execution_result_;
 };

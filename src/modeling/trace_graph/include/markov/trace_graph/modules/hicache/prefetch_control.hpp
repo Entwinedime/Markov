@@ -1,6 +1,6 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
-#include "markov/trace_graph/modules/hicache/service_model.hpp"
+#include "markov/trace_graph/structure/hicache/prefetch.hpp"
 #include <set>
 
 namespace markov::trace_graph::modules::hicache {

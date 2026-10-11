@@ -5,52 +5,8 @@
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-
-std::vector<HiCacheLoadBranch> observe_load_branches(std::span<const core::TraceEvent> observations, std::span<const model::HiCacheReplayFact> facts,
-                                                     uint64_t begin, uint64_t end) {
-    const auto start = [](const auto & event) { return event.ts * 1'000 + event.ts_submicro_ns; };
-    const auto stop = [&](const auto & event) { return start(event) + event.dur * 1'000 + event.dur_submicro_ns; };
-    std::vector<const core::TraceEvent *> branches, checks;
-    for (const auto & event : observations) {
-        if (event.ts < begin || stop(event) > end * 1'000) continue;
-        if (event.name == "hicache.control.host_load_branch") branches.push_back(&event);
-        if (event.name == "runtime.hicache.host_load_check") checks.push_back(&event);
-    }
-    std::vector<HiCacheLoadBranch> result;
-    std::set<const core::TraceEvent *> used;
-    for (const auto * branch : branches) {
-        const core::TraceEvent * condition = nullptr;
-        for (const auto * check : checks) {
-            if (check->pid != branch->pid || check->tid != branch->tid || start(*check) < start(*branch) || stop(*check) > stop(*branch)) continue;
-            if (condition) throw std::runtime_error("Load branch has multiple conditions");
-            condition = check;
-        }
-        if (!condition || !used.insert(condition).second || condition->arg("request_id").empty() || condition->arg("status") != "returned"
-            || (condition->arg("needed") != "true" && condition->arg("needed") != "false"))
-            throw std::runtime_error("Load branch lacks a unique completed condition");
-        const model::HiCacheReplayFact * owner = nullptr;
-        bool ambiguous = false;
-        for (const auto & item : facts) {
-            const auto & fact = item.fact;
-            if (item.role != HiCacheFactRole::CacheLookupInput || fact.pid != branch->pid || fact.tid != branch->tid
-                || fact.request_id != condition->arg("request_id") || fact.source_ts * 1'000 > start(*branch))
-                continue;
-            if (!owner || owner->fact.source_ts < fact.source_ts) {
-                owner = &item;
-                ambiguous = false;
-            }
-            else if (owner->fact.source_ts == fact.source_ts) ambiguous = true;
-        }
-        if (ambiguous) throw std::runtime_error("Load branch has ambiguous lookup inputs");
-        if (!owner) throw std::runtime_error("Load branch lacks a preceding lookup of the same request and thread");
-        result.push_back({ owner->fact.source_node_id, *branch, *condition });
-    }
-    if (used.size() != checks.size()) throw std::runtime_error("Load condition lacks its complete outer branch");
-    return result;
-}
-
 void HiCacheWriteCalls::bind_load_branches(core::DagGraph & graph, uint64_t begin, uint64_t end) {
-    load_branches_ = observe_load_branches(graph.runtime_observations(), replay_.facts(), begin, end);
+    load_branches_ = source_dag::observe_load_branches(graph.runtime_observations(), replay_.facts(), begin, end);
     std::vector<core::TraceEvent> points;
     for (const auto & branch : load_branches_) {
         for (const auto * event : { &branch.condition, &branch.envelope }) {
@@ -178,13 +134,9 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     std::set<size_t> owners;
     for (const auto & branch : load_branches_) {
         if (branch.condition.arg("needed") != "true") continue;
-        // Base-derived clone primitives and independent primitives use the
-        // same target branch replacement. Unsupported aggregate evidence does
-        // not silently claim a new operation-count model.
-        if (load_index_calibration_.empty() && !std::ranges::any_of(load_admissions_, [&](const auto & program) {
-                return program.pid == branch.envelope.pid && program.tid == branch.envelope.tid && program.clone.has_value();
-            }))
-            continue;
+        // Every observed active branch is replaced by target rules. Missing
+        // primitive costs are reported when that work executes, never used to
+        // retain the source branch as a hidden prediction fallback.
         branches.push_back(&branch);
         owners.insert(branch.owner);
         const auto & first = graph.event_for_node(branch.entry_node);
@@ -211,27 +163,10 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
     const patch::HiCacheSourceDagIndex retained(graph);
     for (const auto * branch : branches) {
         const auto key = std::pair{ branch->envelope.pid, branch->envelope.tid };
-        const auto & program = load_admissions_.at(select_load_admission(key.first, key.second, 0));
         HiCacheHostExpansion empty;
-        for (const auto & [node, candidate] : empty_load_branches_) {
-            const auto & fact = replay_.fact(candidate.owner).fact;
-            if (fact.pid == key.first && fact.tid == key.second) {
-                empty = candidate.original;
-                break;
-            }
-        }
-        if (empty.nodes.empty()) {
-            // No inactive source branch was measured. The existing proxy is
-            // CPU bookkeeping only, not the successful branch's concatenation.
-            double cpu = 0, residual = 0;
-            for (const auto & part : program.tail.work.nodes) {
-                if (!part.work.is_cpu || part.queue_member) continue;
-                cpu += part.work.duration;
-                residual += part.work.cpu_gap_after;
-            }
-            std::pair<double, double> remainder{};
-            empty = generated_cpu_control(graph.node_lane_key(branch->entry_node), cpu, residual, remainder, "target no-load branch: bookkeeping cost proxy");
-        }
+        // This request did not observe the inactive branch. Keep its cost
+        // unbound until target state selects it; another request is not a
+        // corresponding source operation and cannot donate its envelope.
         empty_load_branches_.emplace(branch->entry_node, EmptyLoadBranch{ branch->owner, branch->return_node, std::move(empty) });
         const auto & event = graph.event_for_node(branch->entry_node);
         Call call{ .owner = branch->owner,
@@ -255,57 +190,53 @@ void HiCacheWriteCalls::rebind_retained_resources(const patch::HiCacheSourceDagI
     // Bind after all source regions have been replaced, including load
     // submissions whose compute Records can be the next stream endpoint.
     const auto & graph = retained.graph();
-    const auto refresh = [&](Call & call) { rebind_host_stream_positions(retained, call.positions, call.pid, call.tid, call.at_us); };
+    const auto refresh = [&](Call & call) {
+        rebind_host_stream_positions(retained, call.positions, call.pid, call.tid, call.at_us);
+
+        // Synthetic insertion sites captured their outgoing continuation
+        // before phase/allocator replacement. Reconnect to the surviving
+        // boundary now, not to an inactive payload node saved during bind.
+        // Replaced source calls and eviction envelopes instead keep their
+        // explicit return gates; those are not immediate-successor snapshots.
+        if (call.source || call.retained_allocation_return) return;
+        call.successors.clear();
+        for (const auto edge_id : retained.outgoing_edge_ids(call.entry_node)) {
+            const auto & edge = graph.edge(edge_id);
+            if (edge.active && graph.node(edge.dst).active) call.successors.push_back(edge.dst);
+        }
+    };
     for (auto & call : calls_)
         if (graph.node(call.entry_node).active) refresh(call);
-    for (auto & [owner, call] : capacity_calls_) refresh(call);
+    for (auto & [owner, call] : capacity_calls_) {
+        // A target eviction may write even when the source only released
+        // pages. Bind the generated transfer resource too, after all source
+        // removals; observed eviction fragments cannot enumerate that lane.
+        if (const auto resources = write_resources_.find({ call.pid, call.tid }); resources != write_resources_.end()) {
+            for (const auto resource : { resources->second.compute, resources->second.transfer }) {
+                const auto lane = graph.node(resource).lane_id;
+                if (call.positions.contains(lane)) continue;
+
+                try {
+                    call.positions.emplace(lane, observe_write_stream_position(retained, resource, call.pid, call.tid, call.at_us));
+                }
+                catch (const std::runtime_error & error) {
+                    // Unused resources need not have an observable cut. Keep
+                    // the failure for the target branch that actually needs it.
+                    capacity_position_errors_[owner].insert_or_assign(lane, error.what());
+                }
+            }
+        }
+        refresh(call);
+    }
     for (auto & [node, calls] : lifecycle_writes_at_)
         for (auto & call : calls) refresh(call);
     auto plans = host_plans();
     rebind_host_worker_queues(graph, members, plans);
-    writes_.rebind_consumers(retained);
+    for (auto & [key, resources] : write_resources_) {
+        const auto lane = graph.node(resources.worker).lane_id;
+        resources.worker = members.at(lane);
+    }
 }
 
-void HiCacheWriteCalls::prepare_load_capacity(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues) {
-    struct Failure {
-        uint64_t duration;
-        HiCacheHostExpansion expansion;
-    };
-    std::map<std::pair<std::string, std::string>, std::vector<Failure>> failures;
-    std::map<size_t, std::vector<const LoadAttempt *>> grouped;
-    for (const auto & attempt : load_attempts_) {
-        grouped[attempt.owner].push_back(&attempt);
-        const auto & event = attempt.event;
-        if (event.arg("allocated") != "false") continue;
-        const auto host = observe_host_template(source, event.pid, event.tid, event.ts, event.ts + event.dur);
-        auto expansion = prepare_host_expansion(source, queues, host, "failed load allocation: ");
-        // A failed allocation can sort free pages on other allocator paths.
-        // Such a donor needs device-lane binding; do not treat it as pure CPU.
-        if (!host.worker_nodes.empty() || !expansion.streams.empty() || !expansion.waits.empty() || !expansion.event_waits.empty()) continue;
-        failures[{ event.pid, event.tid }].push_back({ event.dur, std::move(expansion) });
-    }
-    for (auto & [lane, samples] : failures) std::ranges::stable_sort(samples, {}, &Failure::duration);
-    for (auto & [owner, attempts] : grouped) {
-        std::ranges::sort(attempts, {}, [](const auto * item) { return item->event.ts; });
-        if (attempts.size() > 2
-            || (attempts.size() == 2
-                && (attempts[0]->event.arg("allocated") != "false" || attempts[0]->event.ts + attempts[0]->event.dur > attempts[1]->event.ts
-                    || attempts[0]->event.arg("node_id") != attempts[1]->event.arg("node_id"))))
-            throw std::runtime_error("Load admission has an unsupported attempt sequence");
-        // Existing source eviction is still owned by its observed write calls.
-        if (attempts.size() != 1 || attempts.front()->event.arg("allocated") != "true") continue;
-        const auto & attempt = *attempts.front();
-        const auto & event = attempt.event;
-        const auto samples = failures.find({ event.pid, event.tid });
-        if (samples == failures.end()) continue;
-        if (guarded_owners_.contains(owner)) throw std::runtime_error("Lookup has multiple capacity opportunities");
-        load_failure_templates_.emplace(owner, samples->second[samples->second.size() / 2].expansion);
-        // Insert before the original successful allocation, never after it.
-        // On the target branch this original call becomes the successful retry.
-        capacity_guards_.push_back({ owner, event.pid, event.tid, event.ts, event.ts, attempt.entry_node, attempt.entry_node });
-        guarded_owners_.insert(owner);
-        allocation_returns_[attempt.entry_node].push_back(owner);
-    }
-}
 
 } // namespace markov::trace_graph::modules::hicache::runtime

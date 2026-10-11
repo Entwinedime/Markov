@@ -1,26 +1,15 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
-#include "markov/trace_graph/modules/hicache/prefetch_control.hpp"
+#include <functional>
 
 namespace markov::trace_graph::modules::hicache::model {
 
-struct PrefetchCheckCpuTiming {
-    std::optional<uint64_t> check_to_max, max_to_false_return, max_to_stop, best_effort_to_stop, stop_to_min, min_to_visible;
-    std::optional<uint64_t> no_operation_return;
-    // Zero when the caller already accounts for the outer progress prefix.
-    uint64_t entry_to_check = 0;
-};
-// Extract only the branch actually observed. Counterfactual branch costs remain
-// absent until another base/calibration call supplies them; zero is a measurement.
-// Supplying the source reads service costs on unchanged observation coordinates.
-// Without it, this remains a raw calibration export.
-[[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed,
-                                                              const patch::HiCacheSourceDagIndex * source = nullptr);
-struct PrefetchCheckTiming {
-    std::map<int, PrefetchCheckCpuTiming> cpu;
-    CpuCollectiveTiming state_max, completion_min;
-};
+// Resolve only the interval reached by target execution. Durations are in us;
+// an unavailable independent cost propagates as MissingCostEvidence.
+using PrefetchCheckLocalCost = std::function<uint64_t(int, std::string_view)>;
+// Numerical fields only; the executor supplies participant dependencies.
+using PrefetchCheckCollectiveCost = std::function<CpuCollectiveCallTiming(int, bool)>;
 
 /** One progress call over a complete TP group. Absent operations return locally;
  * active operations sample at the actual check, MAX, then stop and MIN pages.
@@ -29,7 +18,8 @@ struct PrefetchCheckTiming {
  */
 class HiCachePrefetchCheckExecution {
 public:
-    HiCachePrefetchCheckExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, PrefetchCheckTiming timing, std::string policy);
+    HiCachePrefetchCheckExecution(HiCacheState & state, std::map<int, HiCacheFact> facts, std::string policy, PrefetchCheckLocalCost local_cost,
+                                  PrefetchCheckCollectiveCost collective_cost);
     // Invoke no later than the earliest zero-cost entry. Returned nodes are
     // completion gates; callers may attach their unstarted continuations.
     CpuRankNodes start(const CpuRankNodes & entries, simulation::FutureDag & future);
@@ -49,7 +39,9 @@ private:
     void terminal(const CpuRankNodes & predecessors, bool immediate, simulation::FutureDag & future);
     HiCacheState & state_;
     std::map<int, HiCacheFact> facts_;
-    PrefetchCheckTiming timing_;
+    CpuCollectiveTiming collective(bool completion) const;
+    PrefetchCheckLocalCost local_cost_;
+    PrefetchCheckCollectiveCost collective_cost_;
     bool immediate_;
     CpuRankNodes owners_, entries_, returned_, max_returned_;
     std::optional<CpuCollectiveExecution> first_collective_;

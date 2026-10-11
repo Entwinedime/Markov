@@ -13,6 +13,7 @@
 #include "markov/trace_graph/core/numeric.hpp"
 
 #include <algorithm>
+#include <map>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -26,7 +27,8 @@ uint64_t node_end_ts(const TraceEvent & event) { return checked_add_u64(event.ts
 
 bool is_submit_anchor_event(const TraceEvent & event) {
     if (event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue") return true;
-    if (event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync")) return true;
+    if (event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync") || event.name == "AscendCL@aclrtMemcpy2dAsync")
+        return true;
     return event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
 }
 
@@ -44,6 +46,56 @@ struct ExecutionAndFactEvents {
     std::vector<TraceEvent> request_observations;
     std::vector<TraceEvent> runtime_observations;
 };
+
+void retain_modeled_operator_envelopes(ExecutionAndFactEvents & split) {
+    using Interval = std::pair<uint64_t, uint64_t>;
+    std::map<std::pair<std::string, std::string>, std::vector<Interval>> lanes;
+    const auto interval = [](const TraceEvent & event) {
+        const auto begin =
+            checked_add_u64(checked_multiply_u64(event.ts, 1'000, "operator timestamp overflow"), event.ts_submicro_ns, "operator timestamp overflow");
+        const auto duration =
+            checked_add_u64(checked_multiply_u64(event.dur, 1'000, "operator duration overflow"), event.dur_submicro_ns, "operator duration overflow");
+        return Interval{ begin, checked_add_u64(begin, duration, "operator end timestamp overflow") };
+    };
+    for (const auto & event : split.runtime_observations) {
+        // Phase probes carry source geometry, not execution nodes. Retain
+        // nested Torch envelopes for every such descriptor; individual
+        // operation readers decide which implementations they understand.
+        if (event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.extend_allocator" || event.name == "runtime.hicache.decode_allocator")
+            lanes[{ event.pid, event.tid }].push_back(interval(event));
+    }
+    for (auto & [lane, calls] : lanes) {
+        std::ranges::sort(calls);
+        std::vector<Interval> merged;
+        for (const auto & call : calls) {
+            if (merged.empty() || merged.back().second < call.first) merged.push_back(call);
+            else merged.back().second = std::max(merged.back().second, call.second);
+        }
+        calls = std::move(merged);
+    }
+
+    // Normalization keeps CPU leaves, not their Torch operator envelopes.
+    // Retain the latter as source-only observations so later cost extraction
+    // can recover submission ownership without counting the envelope again.
+    // Shape-bearing envelopes also preserve ordinary compute geometry, even
+    // outside HiCache-specific probes. They remain observations, not extra
+    // execution nodes. Shape-free traces retain only the modeled regions.
+    for (const auto & event : split.executable_events) {
+        if (event.source_channel != TraceSourceChannel::Torch || event.ph != 'X' || event.cat != "cpu_op") continue;
+        if (event.has_arg("Input Dims")) {
+            split.runtime_observations.push_back(event);
+            continue;
+        }
+        const auto lane = lanes.find({ event.pid, event.tid });
+        if (lane == lanes.end()) continue;
+
+        const auto span = interval(event);
+        auto call = std::ranges::upper_bound(lane->second, span.first, {}, &Interval::first);
+        if (call == lane->second.begin()) continue;
+        --call;
+        if (span.second <= call->second) split.runtime_observations.push_back(event);
+    }
+}
 
 std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, const std::vector<DagPhaseMarkerEvent> & markers,
                                                                      int gpu_id) {
@@ -111,17 +163,20 @@ ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events)
             split.runtime_observations.push_back(event);
         // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
         if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
-            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.cpu_collective"
-                || event.name == "runtime.hicache.layer_waits" || event.name == "runtime.hicache.prefetch_check"
-                || event.name == "runtime.hicache.prefetch_progress" || event.name == "runtime.hicache.write_policy_check"
-                || event.name == "runtime.hicache.radix_insert" || event.name == "runtime.hicache.node_publish"
-                || event.name == "runtime.hicache.device_restore" || event.name == "runtime.hicache.prefetch_stop"
-                || event.name == "runtime.hicache.prefetch_publish" || event.name == "runtime.hicache.prefetch_read"
-                || event.name == "runtime.hicache.prefetch_query" || event.name == "runtime.hicache.host_release"
-                || event.name == "runtime.hicache.storage_drain" || event.name == "runtime.hicache.prefetch_enqueue"
-                || event.name == "runtime.hicache.load_completion" || event.name == "runtime.hicache.write_completion"
-                || event.name == "runtime.hicache.decode_allocation" || event.name == "runtime.hicache.capacity_guard"
-                || event.name == "runtime.hicache.load_allocation" || event.name == "runtime.hicache.host_load_check"
+            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.allocator.kernel"
+                || event.name == "runtime.cpu_collective" || event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.layer_waits"
+                || event.name == "runtime.hicache.prefetch_check" || event.name == "runtime.hicache.prefetch_progress"
+                || event.name == "runtime.hicache.write_policy_check" || event.name == "runtime.hicache.radix_insert"
+                || event.name == "runtime.hicache.node_publish" || event.name == "runtime.hicache.device_restore"
+                || event.name == "runtime.hicache.prefetch_stop" || event.name == "runtime.hicache.prefetch_publish"
+                || event.name == "runtime.hicache.prefetch_read" || event.name == "runtime.hicache.prefetch_query"
+                || event.name == "runtime.hicache.host_release" || event.name == "runtime.hicache.storage_drain"
+                || event.name == "runtime.hicache.prefetch_enqueue" || event.name == "runtime.hicache.load_completion"
+                || event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.write_ack"
+                || event.name == "runtime.hicache.decode_allocation" || event.name == "runtime.hicache.extend_allocation"
+                || event.name == "runtime.hicache.decode_allocator" || event.name == "runtime.hicache.extend_allocator"
+                || event.name == "runtime.hicache.capacity_guard" || event.name == "runtime.hicache.load_allocation"
+                || event.name == "runtime.hicache.load_admission" || event.name == "runtime.hicache.host_load_check"
                 || event.name == "runtime.hicache.device_release_backup" || event.name == "runtime.hicache.allocator_free"
                 || event.name == "runtime.hicache.device_release_regular") {
                 split.runtime_observations.push_back(std::move(event));
@@ -190,6 +245,7 @@ DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
     auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
     auto exclusions = dag_builder_detail::control_exclusion_intervals(events, phase_markers, gpu_id);
     auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
+    dag_builder_detail::retain_modeled_operator_envelopes(split);
     auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
     DagGraph graph(std::move(normalized), gpu_id);
     graph.set_parsed_record_count(parsed_count);

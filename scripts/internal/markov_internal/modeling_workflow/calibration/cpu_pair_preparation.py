@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 from ...common.io import load_json
 from ...common.manifest import workload_report_path
 from ...common.paths import require_repo_path, repo_relative_path
 from ...common.trace import load_chrome_trace_events
-from ..planning.profile_runs import parse_server_command_flags
+from ...modeling.source_dag.profiles import parse_server_command_flags
 from .base_pair import validate_base_pair, validate_forward_work
 from .step_timing import bind_forward_steps, compare_forward_cpu, observe_forward_cpu
 from .host_timing import observe_host_cpu, pair_host_cpu
@@ -34,11 +35,18 @@ def _capture(manifest_path: Path, tp_size: int) -> dict:
     return dict(manifest=manifest, config=config, report=report, plan=plan, timing_dir=timing_dir)
 
 
-def _timer_events(directory: Path):
+def _timer_events(directory: Path, started_at_sec: float, ended_at_sec: float) -> Iterator[dict]:
+    # Timing sinks may be reused across container restarts, including reused
+    # process IDs. Select the capture lifetime before binding request names;
+    # the formal workload and complete-call checks still apply afterwards.
+    begin_ns, end_ns = round(started_at_sec * 1_000_000_000), round(ended_at_sec * 1_000_000_000)
     for path in sorted(directory.glob("*.jsonl")):
         with path.open(encoding="utf-8") as stream:
             for line in stream:
-                yield json.loads(line)
+                event = json.loads(line)
+                if event["end_ns"] <= begin_ns or event["start_ns"] >= end_ns:
+                    continue
+                yield event
 
 
 def _trace_events(manifest: dict, channel: str = "ld_preload"):
@@ -88,6 +96,7 @@ def prepare_forward_cpu_pair(
     tp_size: int,
     *,
     correct_recorder: bool = False,
+    include_setup_requests: bool = False,
 ) -> dict:
     """Read only the two base captures; do not select targets or fit corrections."""
     manifests = tuple(require_repo_path(path).resolve() for path in (light_manifest, profiled_manifest))
@@ -95,9 +104,28 @@ def prepare_forward_cpu_pair(
         raise ValueError("CPU pair requires distinct light and profiled captures")
     captures = tuple(_capture(path, tp_size) for path in manifests)
     validate_base_pair(*(tuple(capture[key] for capture in captures) for key in ("config", "report", "plan")))
+    if include_setup_requests:
+        for capture in captures:
+            report = capture["report"]
+            requests = [row for row in report["requests"] if row.get("kind") == "request"]
+            begin_ms = min(row["start_time_ms"] for row in requests)
+            end_ms = max(row["end_time_ms"] for row in requests)
+
+            # Timing binders consume a request-selection view. Do not edit the
+            # captured report or redefine its E2E scoring window on disk.
+            capture["report"] = dict(
+                report,
+                requests=[dict(row, measure=True) for row in requests],
+                formal_window={
+                    "formal_begin_ms": begin_ms,
+                    "formal_end_ms": end_ms,
+                    "e2e_ms": end_ms - begin_ms,
+                },
+            )
     steps, timers = [], []
     for manifest, capture in zip(manifests, captures):
-        records = list(_timer_events(capture["timing_dir"]))
+        manifest_data = capture["manifest"]
+        records = list(_timer_events(capture["timing_dir"], manifest_data["started_at"], manifest_data["ended_at"]))
         if correct_recorder and not timers:
             from .recorder_correction import clean_reference
 
@@ -135,6 +163,11 @@ def prepare_forward_cpu_pair(
     measurements = {
         "light_manifest": str(repo_relative_path(manifests[0])),
         "source_manifest": str(repo_relative_path(manifests[1])),
+        "measurement_window": {
+            "scope": "all_controlled_requests" if include_setup_requests else "formal_workload",
+            "start_us": round(captures[1]["report"]["formal_window"]["formal_begin_ms"] * 1_000_000) // 1000,
+            "end_us": round(captures[1]["report"]["formal_window"]["formal_end_ms"] * 1_000_000) // 1000,
+        },
         "profiled_steps": steps[1],
         "comparison": comparison,
         "pairing": {

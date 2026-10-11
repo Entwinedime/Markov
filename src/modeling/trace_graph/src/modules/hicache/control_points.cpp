@@ -1,4 +1,5 @@
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
+#include "markov/trace_graph/core/dag_mutation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
 #include <algorithm>
@@ -32,11 +33,12 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
     for (size_t i = 0; i < gaps.size(); ++i) result[positions[i]] = gaps[i];
     const patch::HiCacheSourceDagIndex source(graph);
     std::map<size_t, std::map<uint64_t, std::vector<size_t>>> splits;
+    std::map<Coordinate, std::vector<size_t>> entries;
     for (const auto i : positions) {
         if (result[i]) continue;
         const auto & point = points[i];
-        if (const auto entry = source.cpu_node_starting_at(point.pid, point.tid, point.ts)) {
-            result[i] = entry;
+        if (source.cpu_node_starting_at(point.pid, point.tid, point.ts)) {
+            entries[{ point.pid, point.tid, point.ts }].push_back(i);
             continue;
         }
         std::vector<size_t> covering;
@@ -97,6 +99,38 @@ std::vector<std::optional<size_t>> bind_hicache_control_points(core::DagGraph & 
         tail.dur = event.ts + event.dur - cursor;
         graph.mutable_node(id).duration = graph.mutable_node(id).original_duration = tail.dur;
         graph.add_edge(*previous, id, core::DagEdgeKind::Sequential);
+    }
+    // A native entry is a coordinate, not an empty replacement gate. Resolve
+    // it after self-time splitting, which may have moved the original node to
+    // the suffix. Preserve all arrival dependencies at the new zero-cost gate
+    // and leave the actual CPU work and its outgoing dependencies untouched.
+    if (entries.empty()) return result;
+
+    const patch::HiCacheSourceDagIndex split_source(graph);
+    core::DagMutationPlan entry_plan{ .component = "hicache_control_boundaries" };
+    std::map<std::string, std::vector<size_t>> entry_results;
+    for (const auto & [coordinate, indices] : entries) {
+        const auto & [pid, tid, at] = coordinate;
+        const auto node = split_source.cpu_node_starting_at(pid, tid, at);
+        if (!node) continue;
+
+        const auto gate = core::DagNodeRef::synthetic("control_entry_" + std::to_string(*node));
+        entry_plan.synthetic_nodes.push_back({
+            gate.synthetic_id,
+            { .name = points[indices.front()].name + ".point",
+                           .category = "observed_boundary",
+                           .lane_key = std::string(graph.node_lane_key(*node)),
+                           .observed_point = core::DagObservedPoint{ pid, tid, at, graph.node(*node).gpu_id } }
+        });
+        for (const auto edge : split_source.incoming_edge_ids(*node))
+            if (graph.edge(edge).active) entry_plan.redirect_edges.push_back({ .edge_index = edge, .dst = gate });
+        entry_plan.add_edges.push_back({ gate, core::DagNodeRef::existing(*node), core::DagEdgeKind::Sequential });
+        entry_results.emplace(gate.synthetic_id, indices);
+    }
+    if (!entry_results.empty()) {
+        const auto applied = core::apply_dag_mutation_plan(graph, entry_plan);
+        for (const auto & [identity, indices] : entry_results)
+            for (const auto i : indices) result[i] = applied.synthetic_node_ids.at(identity);
     }
     return result;
 }

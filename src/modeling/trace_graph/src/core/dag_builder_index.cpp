@@ -5,7 +5,10 @@
 #include "markov/trace_graph/core/dag_builder_stages.hpp"
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
+#include <limits>
 #include <ranges>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -18,6 +21,13 @@ using dag_builder_detail::is_event_sync_event;
 using dag_builder_detail::is_stream_sync_event;
 using dag_builder_detail::is_usable_lane_value;
 using dag_builder_detail::resolve_event_lane;
+
+bool has_connection_identity(std::string_view value) {
+    // CANN's missing connection is -1, also exported as unsigned uint64.
+    // Keep that raw observation, but never join unrelated events by it.
+    static const auto unsigned_missing_connection = std::to_string(std::numeric_limits<uint64_t>::max());
+    return !value.empty() && value != "-1" && value != unsigned_missing_connection;
+}
 
 class NodeIndexer {
 public:
@@ -46,8 +56,10 @@ private:
         if (identity.is_device) register_device_aliases(event, identity, lane_id);
         index_causality_identity(event, node_id, "connection_id", index_.connection_to_nodes);
         if (event.has_arg_key_hint("enclosing_copy_connections"))
-            for (const auto & connection : nlohmann::json::parse(event.arg("enclosing_copy_connections")))
-                index_.connection_to_nodes[connection.get<std::string>()].push_back(node_id);
+            for (const auto & connection : nlohmann::json::parse(event.arg("enclosing_copy_connections"))) {
+                auto value = connection.get<std::string>();
+                if (has_connection_identity(value)) index_.connection_to_nodes[std::move(value)].push_back(node_id);
+            }
         index_causality_identity(event, node_id, "correlation_id", index_.correlation_to_nodes);
         classify_special_event(event, node_id);
     }
@@ -67,7 +79,10 @@ private:
                                          std::unordered_map<std::string, std::vector<size_t>> & groups) {
         if (!event.has_arg_key_hint(key)) return;
         auto value = event.find_arg(key);
-        if (value && !value->empty()) groups[std::move(*value)].push_back(node_id);
+        if (!value || value->empty()) return;
+        if (key == "connection_id" && !has_connection_identity(*value)) return;
+
+        groups[std::move(*value)].push_back(node_id);
     }
 
     /** @brief Classifies synchronization anchors without changing observed time. */

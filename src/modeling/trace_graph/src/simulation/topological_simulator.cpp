@@ -273,9 +273,13 @@ private:
         }
         // Expansion can reallocate node storage; acquire this reference afterwards.
         auto & node = graph_.mutable_node(node_id);
-        if (cost_at_start_) node.duration = cost_at_start_(node_id, start_time_[node_id], node.duration);
+        auto duration = effective_node_duration(node);
+        if (cost_at_start_) {
+            duration = cost_at_start_(node_id, start_time_[node_id], duration);
+            graph_.bind_node_execution_duration(node_id, duration);
+        }
         if (deferred_boundaries_.contains(node_id) && node.duration) throw std::logic_error("Deferred observation cannot acquire a service cost");
-        const auto completion_time = core::checked_add_u64(start_time_[node_id], effective_node_duration(node), "DAG simulation timestamp overflow");
+        const auto completion_time = core::checked_add_u64(start_time_[node_id], duration, "DAG simulation timestamp overflow");
         completion_time_[node_id] = completion_time;
         if (mode_ == ReplayMode::Full) {
             node.simulation_start = start_time_[node_id];
@@ -341,6 +345,24 @@ private:
         queues_.submitted_task[submission] = task;
         task_ready_.push_back(false);
         connect(submission, id, core::DagEdgeKind::Correlation);
+        return id;
+    }
+
+    size_t append_cpu_task_part(const core::DagSyntheticNodeSpec & spec, size_t previous) override {
+        if (previous >= nodes_.size() || !nodes_[previous].explicit_cpu_task || execution_[previous] != Execution::Pending || !spec.is_cpu || spec.cpu_gap_after
+            || spec.cpu_task_ready_delay_us || graph_.node_lane_key(previous) != spec.lane_key)
+            throw std::invalid_argument("CPU task continuation requires an unstarted generated member on the same worker");
+        const auto task_id = queues_.node_task[previous];
+        if (task_id == kInvalidNode || queues_.tasks[task_id].last != previous)
+            throw std::invalid_argument("CPU task continuation must extend the current last member");
+
+        const auto submission = queues_.tasks[task_id].submission;
+        const auto id = append(spec, BoundaryOrder::Ordinary, submission);
+        graph_.mutable_node(id).explicit_cpu_task = true;
+        queues_.node_task[id] = task_id;
+        queues_.tasks[task_id].last = id;
+        connect(submission, id, core::DagEdgeKind::Correlation);
+        connect(previous, id, core::DagEdgeKind::Sequential);
         return id;
     }
 

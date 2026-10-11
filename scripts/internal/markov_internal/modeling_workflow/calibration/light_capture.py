@@ -56,7 +56,9 @@ def light_capture_config(profile_manifest: Path, output_dir: Path, bundle: Path 
     )
     metadata.setdefault("workload_id", input_id)
     timing = config.get("env", {}).get("SGLANG_STEP_TIMING_DIR")
-    if not timing or not any(require_repo_path(timing).glob("*.jsonl")):
+    if not timing or not any(
+        require_repo_path(timing.replace("{run_dir}", str(profile_manifest.parent))).glob("*.jsonl")
+    ):
         raise ValueError("Base has no step CPU timings; collect a timed base before its light replay")
     if str(config.get("env", {}).get("HOOK_SYNC_THREAD_CPU")) != "1":
         raise ValueError("Base synchronization CPU timing was not enabled")

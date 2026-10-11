@@ -1,13 +1,19 @@
 """Bind forward scopes and compare same-base CPU service outside synchronization."""
 
 from collections import defaultdict
+from collections.abc import Iterable
 import math
 
 
-def bind_forward_steps(report: dict, events, expected_ranks) -> list[dict]:
+def bind_forward_steps(report: dict, events: Iterable[dict], expected_ranks: Iterable[int]) -> list[dict]:
     """Keep measured scopes intact; never infer request identity from timestamps."""
     requests = [row for row in report["requests"] if row.get("measure") and row.get("kind") == "request"]
     by_id = {row["logical_request_id"]: row for row in requests}
+    setup_ids = {
+        row["logical_request_id"]
+        for row in report["requests"]
+        if row.get("kind") == "request" and not row.get("measure")
+    }
     ranks = set(expected_ranks)
     if not requests or len(by_id) != len(requests) or not ranks:
         raise ValueError("forward binding requires unique formal requests and declared ranks")
@@ -26,6 +32,11 @@ def bind_forward_steps(report: dict, events, expected_ranks) -> list[dict]:
         identity = event.get("identity") or {}
         ids = identity.get("request_ids", [])
         rank = identity.get("tp_rank")
+        # A setup forward may return after formal HTTP measurement starts.
+        # It remains source work, but is not a formal-request CPU measurement.
+        if len(ids) == 1 and ids[0] in setup_ids:
+            continue
+
         if len(ids) != 1 or ids[0] not in by_id or rank not in ranks:
             raise ValueError("forward step lacks a declared request/rank identity")
         if not event["returned"] or event["end_ns"] <= event["start_ns"]:

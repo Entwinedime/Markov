@@ -1,10 +1,11 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
-#include "markov/trace_graph/modules/hicache/service_model.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
+#include "markov/trace_graph/structure/hicache/prefetch.hpp"
 
 #include <deque>
 #include <unordered_set>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache::model {
 
@@ -16,7 +17,7 @@ namespace markov::trace_graph::modules::hicache::model {
  */
 class HiCachePrefetchExecution {
 public:
-    HiCachePrefetchExecution(HiCacheState & state, const frontend::HiCacheConfig & config) : state_(state), config_(config) {}
+    HiCachePrefetchExecution(HiCacheState & state, structure::hicache::IoCompletionProvider completion) : state_(state), completion_(std::move(completion)) {}
     // Suppressed/revoked queries add no work. Worker completion remains a
     // private resource boundary, not a foreground dependency or HTTP endpoint.
     void enqueue(const HiCacheFact & candidate, simulation::FutureDag & future);
@@ -40,7 +41,7 @@ private:
     void begin_batch(size_t index, uint64_t time, simulation::FutureDag & future);
     void schedule(size_t index, Step step, uint64_t duration, simulation::FutureDag & future);
     HiCacheState & state_;
-    const frontend::HiCacheConfig & config_;
+    structure::hicache::IoCompletionProvider completion_;
     std::deque<Execution> executions_;
     std::unordered_map<size_t, Event> events_;
     std::unordered_map<std::string, size_t> lane_tail_;

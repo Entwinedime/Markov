@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..common.io import write_json
 from .progress import StageProgress, count_text
-from .types import ProfileRunRef
+from ..modeling.source_dag.profiles import ProfileRunRef
 from .validations.hicache.preflight.profile import audit_hicache_profile
 
 if TYPE_CHECKING:

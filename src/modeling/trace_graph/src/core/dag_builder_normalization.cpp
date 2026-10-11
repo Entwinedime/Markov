@@ -202,7 +202,7 @@ private:
         std::vector<TraceEvent> result;
         result.reserve(events.size());
         for (const auto index : std::views::iota(size_t{ 0 }, events.size())) {
-            if (is_hicache_control_event(events[index])) selection.is_leaf[index] = false;
+            if (is_hicache_control_event(events[index]) || events[index].arg("formal_window_cpu_parent") == "true") selection.is_leaf[index] = false;
         }
         append_hicache_control_self_time(events, lanes, selection, result);
         partition_control_self_time(result, observations);
@@ -274,8 +274,13 @@ private:
     static void partition_control_self_time(std::vector<TraceEvent> & remainders, std::span<const TraceEvent> observations) {
         std::map<std::pair<std::string, std::string>, std::vector<uint64_t>> boundaries;
         for (const auto & call : observations) {
-            if (call.name != "runtime.cpu_collective" && call.name != "runtime.hicache.prefetch_check" && call.name != "runtime.hicache.prefetch_stop"
-                && call.name != "runtime.hicache.prefetch_enqueue")
+            // Retained Torch envelopes also delimit modeled operations inside
+            // a control marker (for example a scalar readback). Splitting its
+            // generated self-time preserves cost while making ownership exact;
+            // real measured leaves are appended only after this partition.
+            const bool operator_envelope = call.source_channel == TraceSourceChannel::Torch && call.cat == "cpu_op" && call.ph == 'X';
+            if (!operator_envelope && call.name != "runtime.cpu_collective" && call.name != "runtime.hicache.prefetch_check"
+                && call.name != "runtime.hicache.prefetch_stop" && call.name != "runtime.hicache.prefetch_enqueue")
                 continue;
             auto & times = boundaries[{ call.pid, call.tid }];
             times.push_back(call.ts);

@@ -18,7 +18,7 @@ void DeviceAllocatorLedger::configure(uint64_t pages, bool sort_required) {
     capacity_pages = pages;
     free_pages = pages;
     release_pages = 0;
-    free_index_offset = pages > 0 ? std::optional<uint64_t>{0} : std::nullopt;
+    free_index_offset = pages > 0 ? std::optional<uint64_t>{ 0 } : std::nullopt;
 }
 
 uint64_t DeviceAllocatorLedger::available_pages() const {
@@ -35,23 +35,6 @@ void DeviceAllocatorLedger::merge_release_pages() {
     if (release_pages > 0) free_index_offset = 0;
     free_pages = core::checked_add_u64(free_pages, release_pages, "HiCache device allocator free page count exceeds uint64 range");
     release_pages = 0;
-}
-
-/**
- * @brief Reconstructs conditional release-queue synchronization before extend.
- *
- * The paged allocator includes batch overhead in its pressure gate. This count-level
- * projection preserves that timing so cleanup is not driven only by final occupancy.
- */
-void DeviceAllocatorLedger::merge_before_extend(uint64_t extend_tokens, uint64_t batch_size, uint64_t page_size) {
-    if (!need_sort || page_size == 0) return;
-    const auto needed_pages =
-        page_size == 1
-            ? extend_tokens
-            : core::checked_add_u64(core::checked_add_u64(extend_tokens / page_size, batch_size, "HiCache extend allocator gate exceeds uint64 range"),
-                                    1,
-                                    "HiCache extend allocator gate exceeds uint64 range");
-    if (needed_pages > free_pages) merge_release_pages();
 }
 
 /** @brief Makes pending releases visible when required by the page request. */

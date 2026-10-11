@@ -3,8 +3,10 @@
 
 namespace markov::trace_graph::io {
 void write_cpu_service_cost(std::ostream & output, const std::filesystem::path & source_manifest, const core::CpuServiceCost & cost,
-                            const nlohmann::json & reference_io) {
+                            const std::filesystem::path & light_manifest, const nlohmann::json & reference_io, const nlohmann::json & measurement_window) {
     output << "{\n  \"source_manifest\": " << nlohmann::json(source_manifest.generic_string()).dump();
+    output << ",\n  \"light_manifest\": " << nlohmann::json(light_manifest.generic_string()).dump();
+    output << ",\n  \"measurement_window\": " << measurement_window.dump();
     // Paired service evidence is provenance for model preparation, not a second
     // correction applied by the CPU simulator.
     if (!reference_io.is_null()) output << ",\n  \"reference_io\": " << reference_io.dump();

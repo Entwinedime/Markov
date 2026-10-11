@@ -6,7 +6,7 @@ from collections import defaultdict
 from typing import Any
 
 from .evidence import observed_direct_cost
-from ....io_model_contract import io_observation_ready
+from .....modeling.cost.io_contract import io_observation_ready
 
 
 SHAPE_FIELDS = ("operation_count", "page_count", "byte_count")

@@ -54,10 +54,17 @@ struct HiCachePhaseObservation {
     uint64_t prefill_prefix_attention_duration_us = 0;
     std::vector<size_t> prefill_common_kernel_node_ids;
     std::vector<size_t> prefill_prefix_attention_node_ids;
+    // Exact framework calls enclosed by the joined forward marker. A view
+    // can have a semantic owner without submitting an executable node.
+    std::vector<size_t> prefill_call_observations;
     uint64_t decode_iteration_count = 0;
     uint64_t decode_duration_us = 0;
     HiCachePhaseNodeObservation decode;
     std::vector<size_t> decode_kernel_node_ids;
+    // Operator -> zero-based single-token decode round, from its producer
+    // marker/correlation owner. Not inferred from device completion ordering.
+    std::map<size_t, uint64_t> decode_node_iterations;
+    std::map<size_t, uint64_t> decode_call_iterations;
 };
 
 /** @brief Compact completeness audit and request-level phase observations. */
@@ -71,6 +78,9 @@ struct HiCachePhaseObservationAudit {
     size_t paired_decode_count = 0;
     size_t unmatched_prefill_marker_count = 0;
     size_t unmatched_decode_marker_count = 0;
+    // Already-running opening-cut batches remain source execution, not
+    // complete formal phases to replace under the target configuration.
+    size_t opening_context_marker_count = 0;
     size_t invalid_fact_count = 0;
     size_t token_range_error_count = 0;
     size_t phase_owned_device_node_count = 0;
@@ -96,6 +106,8 @@ struct HiCachePhaseObservationAudit {
  * The join is based on rank-local semantic order. It has no config/cell table and
  * does not use a fixed time tolerance. Marker intervals remain observations, not
  * ownership windows for Direct I/O or residual CPU gaps.
+ * Post-forward greedy sampling uses its exact call envelope and a unique
+ * enclosing request batch containing that forward, not timestamp proximity.
  */
 [[nodiscard]] HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits = nullptr);
 

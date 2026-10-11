@@ -5,6 +5,7 @@
 #include "markov/trace_graph/modules/hicache/dag_patch_module.hpp"
 
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/static_phase.hpp"
 #include "markov/trace_graph/modules/hicache/phase_carrier.hpp"
 
 #include <algorithm>
@@ -26,9 +27,12 @@
 
 namespace markov::trace_graph::modules::hicache {
 
-HiCacheDagPatchModule::HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, bool source_target_same_config,
-                                             std::string oracle_cost_replay_path, std::string phase_oracle_cost_replay_path)
+HiCacheDagPatchModule::HiCacheDagPatchModule(std::shared_ptr<const model::HiCacheModelResult> model_result, frontend::HiCacheIoCostConfig io_cost,
+                                             frontend::HiCachePhaseCostConfig phase_cost, bool source_target_same_config, std::string oracle_cost_replay_path,
+                                             std::string phase_oracle_cost_replay_path)
     : model_result_(std::move(model_result)),
+      io_cost_(std::move(io_cost)),
+      phase_cost_(std::move(phase_cost)),
       source_target_same_config_(source_target_same_config),
       oracle_cost_replay_path_(std::move(oracle_cost_replay_path)),
       phase_oracle_cost_replay_path_(std::move(phase_oracle_cost_replay_path)) {
@@ -99,10 +103,9 @@ bool append_sequential_request_prefetch_boundaries(const core::DagGraph & graph,
     std::vector<Boundary> boundaries;
     for (const auto & prefill : phase_work.prefills) {
         const auto prefetch = prefetch_by_request_rank.find(RequestKey{ prefill.logical_input, prefill.request_id });
-        if (prefill.submit_cost.source_node_ids.empty()) return false;
-        const auto first_submit = std::ranges::min_element(prefill.submit_cost.source_node_ids, {}, [&](size_t node_id) {
-            return std::pair{ graph.event_for_node(node_id).ts, node_id };
-        });
+        if (prefill.submit_nodes.empty()) return false;
+        const auto first_submit =
+            std::ranges::min_element(prefill.submit_nodes, {}, [&](size_t node_id) { return std::pair{ graph.event_for_node(node_id).ts, node_id }; });
         boundaries.push_back(Boundary{
             .logical_input = prefill.logical_input,
             .order_ts = graph.event_for_node(*first_submit).ts,
@@ -190,7 +193,7 @@ std::string decode_phase_effect(const model::HiCacheDecodeWorkItem & item, std::
     return "hicache_phase:" + item.request_id + ":decode:" + std::to_string(item.logical_input) + ":" + std::string(family);
 }
 
-void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work, const std::string & filename, HiCachePhaseOracleCostReplayAudit & audit) {
+void apply_phase_oracle_cost_replay(cost::StaticPhaseCosts & phase_work, const std::string & filename, HiCachePhaseOracleCostReplayAudit & audit) {
     if (filename.empty()) return;
     std::ifstream stream(filename);
     if (!stream) throw std::invalid_argument("cannot open HiCache phase oracle-cost replay input: " + filename);
@@ -228,7 +231,7 @@ void apply_phase_oracle_cost_replay(model::HiCachePhaseWorkLedger & phase_work, 
     audit.status = "validating";
     audit.supplied_cost_count = supplied.size();
     std::unordered_set<std::string> consumed;
-    const auto apply = [&](model::HiCachePhaseNodeCostPlan & cost, const std::string & effect) {
+    const auto apply = [&](cost::StaticPhaseNodeCost & cost, const std::string & effect) {
         ++audit.required_cost_count;
         const auto found = supplied.find(effect);
         if (found == supplied.end()) throw std::invalid_argument("missing HiCache phase oracle cost for effect: " + effect);
@@ -265,12 +268,13 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
     if (!model_result_->replay_complete) throw std::logic_error("HiCacheDagPatchModule must run after HiCacheModule");
 
     result_.source_target_same_config = source_target_same_config_;
-    auto phase_work = model_result_->phase_work;
-    apply_phase_oracle_cost_replay(phase_work, phase_oracle_cost_replay_path_, result_.phase_oracle_cost_replay);
+    const auto & phase_work = model_result_->phase_work;
+    auto phase_costs = cost::bind_static_phase_costs(graph, phase_work, phase_cost_);
+    apply_phase_oracle_cost_replay(phase_costs, phase_oracle_cost_replay_path_, result_.phase_oracle_cost_replay);
     const auto source_index = patch::HiCacheSourceDagIndex(graph);
     result_.io_operation_ledger = patch::build_hicache_io_operation_ledger(source_index);
     result_.source_attribution = patch::build_hicache_source_attribution(source_index, model_result_->effect_decisions, result_.io_operation_ledger);
-    result_.io_resources = patch::build_hicache_io_resource_plan(model_result_->effect_decisions, model_result_->io_cost_model);
+    result_.io_resources = patch::build_hicache_io_resource_plan(model_result_->effect_decisions, io_cost_);
     patch::apply_hicache_oracle_cost_replay(result_.io_resources, oracle_cost_replay_path_);
     result_.shadow_rewrite = patch::build_hicache_shadow_rewrite_transaction(graph,
                                                                              model_result_->effect_decisions,
@@ -280,14 +284,14 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
     result_.boundary_validation = patch::validate_hicache_shadow_boundaries(graph, result_.shadow_rewrite);
     build_apply_gate(result_, *model_result_);
     result_.plan = result_.apply_blockers.empty() ? executable_plan(result_.shadow_rewrite) : blocked_plan();
-    if (!model_result_->phase_cost_model.enabled) result_.phase_patch_status = "disabled";
-    else if (phase_work.status != "ready" || phase_work.cost_status != "ready") {
+    if (!phase_cost_.enabled) result_.phase_patch_status = "disabled";
+    else if (phase_work.status != "ready" || phase_costs.cost_status != "ready") {
         result_.phase_patch_status = "blocked";
         add_apply_blocker(result_, "phase_work_or_cost_not_ready");
     }
     else {
         const auto before = result_.plan.set_node_durations.size();
-        if (result_.apply_blockers.empty()) result_.phase_carrier = append_hicache_phase_carrier_plan(graph, phase_work, result_.plan);
+        if (result_.apply_blockers.empty()) result_.phase_carrier = append_hicache_phase_carrier_plan(graph, phase_costs, result_.plan);
         result_.phase_duration_update_count = result_.plan.set_node_durations.size() - before;
         result_.phase_owner_conflict_count = result_.phase_carrier.owner_conflict_count;
         if (result_.phase_carrier.status == "ready" && append_hicache_reused_loadback_dependencies(phase_work, result_.shadow_rewrite, result_.plan)
@@ -301,7 +305,7 @@ void HiCacheDagPatchModule::apply(core::DagGraph & graph) {
             add_apply_blocker(result_, result_.phase_owner_conflict_count ? "phase_owner_conflict" : "phase_carrier_or_request_boundary_not_ready");
         }
     }
-    if (result_.apply_blockers.empty() && model_result_->phase_cost_model.enabled) {
+    if (result_.apply_blockers.empty() && phase_cost_.enabled) {
         auto & preparation = result_.runtime_preparation;
         preparation = runtime::plan_allocator_preparations(graph, phase_work.allocator_calls);
         for (const auto & change : preparation.mutation.set_cpu_gaps) {

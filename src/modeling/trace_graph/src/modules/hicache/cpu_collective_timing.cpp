@@ -1,6 +1,6 @@
 #include "markov/trace_graph/modules/hicache/cpu_collective_timing.hpp"
+#include "markov/trace_graph/structure/cpu_collective.hpp"
 #include <algorithm>
-#include <bit>
 #include <set>
 #include <stdexcept>
 
@@ -30,23 +30,13 @@ CpuCollectiveTiming observe_cpu_collective_timing(const core::DagGraph & graph, 
     }
     CpuRankTimes entries;
     for (const auto & call : round.calls) entries[call.rank] = graph.event_for_node(*call.worker).ts;
+    const auto dependencies =
+        structure::cpu_collective_entries(operation == "all_reduce" ? structure::CpuCollectiveKind::AllReduce : structure::CpuCollectiveKind::Broadcast,
+                                          round.members,
+                                          root);
     for (const auto & call : round.calls) {
         auto & timing = result.calls[call.rank];
-        if (operation == "all_reduce") timing.entry_ranks = round.members;
-        else {
-            const auto member = std::ranges::find(round.members, call.rank) - round.members.begin();
-            const size_t rank = (member + size - root) % size;
-            const auto actual = [&](size_t v) { return round.members[(v + root) % size]; };
-            timing.entry_ranks.push_back(call.rank);
-            // Gloo binomial tree: receive before forwarding, TCP send waits
-            // for direct-child entry. These are not parent-return edges.
-            for (size_t ancestor = rank; ancestor != 0;) {
-                ancestor ^= std::bit_floor(ancestor);
-                timing.entry_ranks.push_back(actual(ancestor));
-            }
-            for (size_t bit = 1; bit < size; bit <<= 1)
-                if (rank < bit && rank + bit < size) timing.entry_ranks.push_back(actual(rank + bit));
-        }
+        timing.entry_ranks = dependencies.at(call.rank);
         uint64_t latest = 0;
         for (const auto rank : timing.entry_ranks) latest = std::max(latest, entries.at(rank));
         const auto & event = graph.runtime_observations()[call.observation];
@@ -95,6 +85,7 @@ CpuCollectiveTiming observe_cpu_all_reduce_envelope(const core::DagGraph & graph
             }
         latest = std::max(latest, e.ts);
     }
+    const auto dependencies = structure::cpu_collective_entries(structure::CpuCollectiveKind::AllReduce, round.members);
     for (const auto & call : round.calls) {
         const auto & e = graph.runtime_observations().at(call.observation);
         if (e.ts + e.dur < e.ts || e.ts + e.dur < latest) {
@@ -102,7 +93,7 @@ CpuCollectiveTiming observe_cpu_all_reduce_envelope(const core::DagGraph & graph
             timing.issue = "envelope_return_before_peer_entry";
             return timing;
         }
-        timing.calls[call.rank] = { .entry_ranks = round.members, .envelope_remainder_us = e.ts + e.dur - latest };
+        timing.calls[call.rank] = { .entry_ranks = dependencies.at(call.rank), .envelope_remainder_us = e.ts + e.dur - latest };
     }
     return timing;
 }

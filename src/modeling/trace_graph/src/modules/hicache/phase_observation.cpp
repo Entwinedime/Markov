@@ -46,12 +46,15 @@ struct ExtendFact {
 enum class PhaseKind : uint8_t { Prefill, Decode };
 
 struct PhaseInterval {
+    const TraceEvent * envelope = nullptr;
     int logical_input = 0;
     std::string_view pid;
+    std::string_view tid;
     uint64_t start_us = 0;
     uint64_t end_us = 0;
     size_t observation_index = 0;
     PhaseKind kind = PhaseKind::Prefill;
+    uint64_t decode_iteration = 0;
 };
 
 Json array_arg(const TraceEvent & event, std::string_view key) {
@@ -117,19 +120,15 @@ uint64_t sum_tokens(const std::vector<uint64_t> & values) {
 }
 
 bool is_device_control_anchor(std::string_view name) {
-    return name == "EVENT_WAIT" || name == "EVENT_RECORD" || name == "NOTIFY_WAIT" || name == "NOTIFY_RECORD"
-           || name == "MODEL_EXECUTE";
+    return name == "EVENT_WAIT" || name == "EVENT_RECORD" || name == "NOTIFY_WAIT" || name == "NOTIFY_RECORD" || name == "MODEL_EXECUTE";
 }
 
 bool is_phase_cpu_control(const TraceEvent & event) {
-    return event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue"
-           || event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync")
-           || event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
+    return event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue" || event.name.starts_with("AscendCL@aclrtLaunch")
+           || event.name.starts_with("AscendCL@aclrtMemcpyAsync") || event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
 }
 
 bool is_collective_node(std::string_view name) { return name.starts_with("hcom"); }
-
-bool is_attention_node(std::string_view name) { return name.contains("Attention"); }
 
 std::string phase_family_name(std::string_view name) {
     const auto instance_suffix = name.find("__");
@@ -183,7 +182,8 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
             ++audit.cache_extend_fact_count;
             if (!fact.request_ids.empty()) ++audit.request_bound_fact_count;
             const auto expected_batch = fact.batch_size ? fact.batch_size : fact.request_ids.size();
-            if (fact.request_ids.empty() || fact.request_ids.size() != expected_batch || fact.token_counts.size() != expected_batch) {
+            if (fact.request_ids.empty() || fact.request_ids.size() != expected_batch || fact.token_counts.size() != expected_batch
+                || fact.source_page_size == 0) {
                 ++audit.invalid_fact_count;
             }
             facts_by_pid[event.pid].push_back(std::move(fact));
@@ -197,6 +197,11 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     std::unordered_map<std::string, std::vector<Marker>> decodes_by_pid;
     for (const auto & marker_event : graph.phase_marker_events()) {
         const auto & event = marker_event.event;
+        if (event.arg("formal_window_context") == "causal_head") {
+            ++audit.opening_context_marker_count;
+            continue;
+        }
+
         if (event.name.starts_with("step[EXTEND")) {
             const auto tokens = marker_value(event.name, "toks=");
             if (!tokens) {
@@ -253,7 +258,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 .logical_input = prefill.logical_input,
                 .pid = pid,
                 .request_ids = fact.request_ids,
-                .batch_size = fact.batch_size,
+                .batch_size = fact.batch_size ? fact.batch_size : fact.request_ids.size(),
                 .source_page_size = fact.source_page_size,
                 .prompt_token_count = prompt_tokens,
                 .prefill_token_count = prefill.token_count,
@@ -263,24 +268,98 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 .decode_duration_us = decode_duration,
             });
             phase_intervals.push_back(PhaseInterval{
+                .envelope = prefill.event,
                 .logical_input = prefill.logical_input,
                 .pid = pid,
+                .tid = prefill.event->tid,
                 .start_us = prefill.event->ts,
                 .end_us = core::checked_add_u64(prefill.event->ts, prefill.event->dur, "HiCache prefill interval exceeds uint64 range"),
                 .observation_index = observation_index,
                 .kind = PhaseKind::Prefill,
             });
+            uint64_t iteration = 0;
             for (const auto * decode : owned_decodes) {
                 phase_intervals.push_back(PhaseInterval{
+                    .envelope = decode->event,
                     .logical_input = decode->logical_input,
                     .pid = pid,
+                    .tid = decode->event->tid,
                     .start_us = decode->event->ts,
                     .end_us = core::checked_add_u64(decode->event->ts, decode->event->dur, "HiCache decode interval exceeds uint64 range"),
                     .observation_index = observation_index,
                     .kind = PhaseKind::Decode,
+                    .decode_iteration = iteration++,
                 });
             }
         }
+    }
+
+    // ModelRunner.sample runs after the Torch forward marker, but within the
+    // same request-bearing TpModelWorker batch. Attribute its exact envelope
+    // through that enclosing call, not the nearest forward or kernel launch.
+    // Keep original marker durations and unrelated post-forward work intact.
+    std::vector<const TraceEvent *> batches;
+    for (const auto & event : graph.runtime_observations())
+        if (event.name == "runtime.hicache.layer_waits" && event.arg("status") == "returned") batches.push_back(&event);
+
+    std::vector<PhaseInterval> sampling_intervals;
+    for (const auto & sample : graph.runtime_observations()) {
+        if (sample.name != "runtime.phase.greedy_sampling" || sample.arg("status") != "returned") continue;
+        const auto sample_end = core::checked_add_u64(sample.ts, sample.dur, "Sampling interval end overflow");
+        const PhaseInterval * owner = nullptr;
+        size_t matches = 0;
+        for (const auto * batch : batches) {
+            const auto batch_end = core::checked_add_u64(batch->ts, batch->dur, "Batch interval end overflow");
+            if (batch->pid != sample.pid || batch->tid != sample.tid || batch->ts > sample.ts || batch_end < sample_end) continue;
+            const auto requests = string_array_arg(*batch, "request_ids");
+            for (const auto & interval : phase_intervals) {
+                if (interval.pid != batch->pid || interval.tid != batch->tid || interval.start_us < batch->ts || interval.end_us > batch_end
+                    || audit.observations[interval.observation_index].request_ids != requests
+                    || batch->arg("phase") != (interval.kind == PhaseKind::Prefill ? "EXTEND" : "DECODE"))
+                    continue;
+                owner = &interval;
+                ++matches;
+            }
+        }
+        if (matches != 1) continue;
+        // Already marker-owned or intersecting boundaries require no second
+        // ownership interval. Partial overlap remains unresolved downstream.
+        if (sample.ts < owner->end_us) continue;
+
+        auto sampling = *owner;
+        sampling.envelope = &sample;
+        sampling.start_us = sample.ts;
+        sampling.end_us = sample_end;
+        sampling_intervals.push_back(sampling);
+    }
+    phase_intervals.insert(phase_intervals.end(), sampling_intervals.begin(), sampling_intervals.end());
+
+    // CPU-only views have no worker/device submission. Their
+    // exact framework envelope still belongs to a unique, joined forward on
+    // the same OS thread. This records call identity, not additional work.
+    using FineTime = unsigned __int128;
+    const auto fine_start = [](const TraceEvent & event) { return FineTime(event.ts) * 1'000 + event.ts_submicro_ns; };
+    const auto fine_end = [&](const TraceEvent & event) { return fine_start(event) + FineTime(event.dur) * 1'000 + event.dur_submicro_ns; };
+    for (size_t i = 0; i < graph.runtime_observations().size(); ++i) {
+        const auto & call = graph.runtime_observations()[i];
+        if (!call.name.starts_with("runtime.phase.") || call.arg("status") != "returned" || call.arg("formal_window_context") == "causal_head") continue;
+
+        const PhaseInterval * owner = nullptr;
+        size_t matches = 0;
+        for (const auto & interval : phase_intervals) {
+            if (interval.pid != call.pid || interval.tid != call.tid || fine_start(*interval.envelope) > fine_start(call)
+                || fine_end(*interval.envelope) < fine_end(call))
+                continue;
+
+            owner = &interval;
+            ++matches;
+        }
+        if (matches > 1) ++audit.phase_owner_conflict_count;
+        if (matches != 1) continue;
+
+        auto & observation = audit.observations[owner->observation_index];
+        if (owner->kind == PhaseKind::Prefill) observation.prefill_call_observations.push_back(i);
+        else observation.decode_call_iterations.emplace(i, owner->decode_iteration);
     }
 
     const auto find_owner = [&](const core::DagNode & node, uint64_t anchor_us) {
@@ -298,16 +377,12 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
 
     std::unordered_map<size_t, std::vector<size_t>> correlation_predecessors;
     for (const auto & edge : graph.edges()) {
-        if (edge.active && edge.kind == core::DagEdgeKind::Correlation)
-            correlation_predecessors[edge.dst].push_back(edge.src);
+        if (edge.active && edge.kind == core::DagEdgeKind::Correlation) correlation_predecessors[edge.dst].push_back(edge.src);
     }
     // CANN gives Node@launch a synthetic activity PID, whereas torch Dequeue
     // uses the real process PID. They still identify the same OS worker thread.
     // Retain containment only as an ownership link: adding a hard DAG edge from
     // the enclosing Dequeue's END to its nested launch would be incorrect.
-    using FineTime = unsigned __int128;
-    const auto fine_start = [](const TraceEvent & event) { return FineTime(event.ts) * 1000 + event.ts_submicro_ns; };
-    const auto fine_end = [&](const TraceEvent & event) { return fine_start(event) + FineTime(event.dur) * 1000 + event.dur_submicro_ns; };
     std::map<std::pair<int, std::string>, std::vector<size_t>> worker_dequeues;
     for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || node.kind != core::DagNodeKind::TraceEvent) continue;
@@ -329,8 +404,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
     for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || node.kind != core::DagNodeKind::TraceEvent) continue;
         const auto & event = graph.event_for_node(node.id);
-        if (event.source_channel != core::TraceSourceChannel::Torch || event.name != "Node@launch"
-            || event.arg("Thread Id") != event.tid) continue;
+        if (event.source_channel != core::TraceSourceChannel::Torch || event.name != "Node@launch" || event.arg("Thread Id") != event.tid) continue;
         const auto found = worker_dequeues.find({ node.gpu_id, event.tid });
         if (found == worker_dequeues.end()) continue;
         const auto & lane = found->second;
@@ -362,7 +436,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                 if (predecessor.is_cpu && event.source_channel == core::TraceSourceChannel::Torch
                     && (event.name.starts_with("Enqueue@") || event.cat == "enqueue")) {
                     const auto * owner = find_owner(predecessor, event.ts);
-                    if (owner != nullptr && event.pid != owner->pid) owner = nullptr;
+                    if (owner != nullptr && (event.pid != owner->pid || event.tid != owner->tid)) owner = nullptr;
                     if (producer && *producer != owner) {
                         ++audit.phase_owner_conflict_count;
                         return nullptr;
@@ -382,6 +456,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         device_owners.emplace(node.id, owner);
         const auto & event = graph.event_for_node(node.id);
         auto & observation = audit.observations[owner->observation_index];
+        if (owner->kind == PhaseKind::Decode) observation.decode_node_iterations.emplace(node.id, owner->decode_iteration);
         ++audit.phase_owned_device_node_count;
         auto & family = owner->kind == PhaseKind::Prefill ? audit.prefill_device_families[phase_family_name(event.name)]
                                                           : audit.decode_device_families[phase_family_name(event.name)];
@@ -406,7 +481,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         kernel_family.duration_us = core::checked_add_u64(kernel_family.duration_us, node.duration, "HiCache kernel family duration exceeds uint64 range");
         phase.kernel_duration_us = core::checked_add_u64(phase.kernel_duration_us, node.duration, "HiCache phase kernel duration exceeds uint64 range");
         if (owner->kind == PhaseKind::Decode) { observation.decode_kernel_node_ids.push_back(node.id); }
-        else if (is_attention_node(event.name)) {
+        else if (is_hicache_paged_attention(event.name)) {
             observation.prefill_prefix_attention_node_ids.push_back(node.id);
             observation.prefill_prefix_attention_duration_us = core::checked_add_u64(observation.prefill_prefix_attention_duration_us,
                                                                                      node.duration,
@@ -420,10 +495,10 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         }
     }
 
-    // Only CPU nodes on a proven correlation chain into owned phase device work
-    // are active phase control.  A Torch leaf merely occurring inside the broad
-    // EXTEND/DECODE marker is not sufficient ownership evidence and remains in
-    // the zero-cost dependency skeleton for gap-excluded replay.
+    // Direct submissions belong to the marker's caller thread. Background
+    // cleanup in the same process is not phase work merely because it overlaps
+    // EXTEND/DECODE. Worker ownership is added below through correlation chains;
+    // unowned work remains in the graph, with its cost and dependencies intact.
     std::map<size_t, const PhaseInterval *> cpu_owners;
     for (const auto & node : graph.nodes()) {
         if (!node.active || !node.is_cpu || node.kind != core::DagNodeKind::TraceEvent) continue;
@@ -433,7 +508,7 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         const auto * owner = find_owner(node, event.ts);
         if (owner == nullptr) continue;
         const auto end_us = core::checked_add_u64(event.ts, event.dur, "HiCache phase CPU control end exceeds uint64 range");
-        if (event.pid == owner->pid && end_us <= owner->end_us) cpu_owners.emplace(node.id, owner);
+        if (event.pid == owner->pid && event.tid == owner->tid && end_us <= owner->end_us) cpu_owners.emplace(node.id, owner);
     }
     std::unordered_set<size_t> proven_cpu_owners;
     for (const auto & [device_id, owner] : device_owners) {
@@ -453,21 +528,21 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
                     continue;
                 }
                 const auto & event = graph.event_for_node(predecessor_id);
-                if (event.source_channel != core::TraceSourceChannel::Torch || predecessor.gpu_id != owner->logical_input
-                    || event.pid != owner->pid || layer_waits->cpu_node_ids.contains(predecessor_id))
+                if (event.source_channel != core::TraceSourceChannel::Torch || predecessor.gpu_id != owner->logical_input || event.pid != owner->pid
+                    || layer_waits->cpu_node_ids.contains(predecessor_id))
                     continue;
                 // A delayed worker anchor follows its producer, not whichever
                 // marker happens to overlap its launch. Conflicting device
                 // consumers remain an error rather than picking one owner.
                 if (proven_cpu_owners.insert(predecessor_id).second) cpu_owners[predecessor_id] = owner;
-                else if (cpu_owners.at(predecessor_id) != owner)
-                    ++audit.phase_owner_conflict_count;
+                else if (cpu_owners.at(predecessor_id) != owner) ++audit.phase_owner_conflict_count;
             }
         }
     }
     for (const auto & [node_id, owner] : cpu_owners) {
         const auto & node = graph.node(node_id);
         auto & observation = audit.observations[owner->observation_index];
+        if (owner->kind == PhaseKind::Decode) observation.decode_node_iterations.emplace(node_id, owner->decode_iteration);
         ++audit.phase_owned_submit_cpu_node_count;
         auto & phase = owner->kind == PhaseKind::Prefill ? observation.prefill : observation.decode;
         phase.submit_cpu_node_ids.push_back(node_id);
@@ -486,9 +561,8 @@ HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph
         return left.pid < right.pid;
     });
     const bool complete = audit.cache_extend_fact_count > 0 && audit.cache_extend_fact_count == audit.request_bound_fact_count
-                          && audit.cache_extend_fact_count == audit.paired_prefill_count && audit.invalid_fact_count == 0
-                          && audit.token_range_error_count == 0 && audit.unmatched_prefill_marker_count == 0
-                          && audit.unmatched_decode_marker_count == 0 && audit.phase_owner_conflict_count == 0;
+                          && audit.cache_extend_fact_count == audit.paired_prefill_count && audit.invalid_fact_count == 0 && audit.token_range_error_count == 0
+                          && audit.unmatched_prefill_marker_count == 0 && audit.unmatched_decode_marker_count == 0 && audit.phase_owner_conflict_count == 0;
     audit.status = complete ? "ready" : "not_ready";
     return audit;
 }

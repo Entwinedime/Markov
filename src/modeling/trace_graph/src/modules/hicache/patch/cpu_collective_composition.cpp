@@ -50,13 +50,14 @@ CpuCollectivePatch append_retained_cpu_collectives(const HiCacheSourceDagIndex &
     if (observation.rounds.empty()) return result;
     const auto & graph = source.graph();
     const auto occupied = touched_nodes(graph, plan);
+    const CpuCollectiveWaitPlanner planner(source);
     std::vector<const CpuCollectiveRound *> selected;
     for (const auto & round : observation.rounds) {
         if (!round.issue.empty() || std::ranges::any_of(round.calls, [](const auto & call) { return !call.issue.empty(); })) {
             ++result.source_retained_rounds["incomplete_observation"];
             continue;
         }
-        const auto candidate = plan_cpu_collective_waits(source, { &round });
+        const auto candidate = planner.plan({ &round });
         if (!candidate.issues.empty()) {
             ++result.source_retained_rounds[candidate.issues.begin()->first];
             continue;
@@ -79,7 +80,7 @@ CpuCollectivePatch append_retained_cpu_collectives(const HiCacheSourceDagIndex &
         return result;
     }
     // Generate once: adjacent calls can split different parts of the same gap.
-    const auto combined = plan_cpu_collective_waits(source, selected);
+    const auto combined = planner.plan(selected);
     if (!combined.issues.empty()) {
         result.status = "blocked";
         result.blockers = combined.issues;

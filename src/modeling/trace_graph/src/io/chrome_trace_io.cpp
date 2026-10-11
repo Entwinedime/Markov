@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <future>
 #include <limits>
@@ -275,10 +276,12 @@ private:
             skip_ws();
             if (p_ >= end_ || *p_ == ']') break;
             if (*p_ == '{') {
+                const auto record_offset = static_cast<size_t>(p_ - buffer_->data());
                 bool valid = false;
                 auto event = parse_event(valid);
                 if (valid) {
                     event.index = events.size();
+                    event.source_record_offset = record_offset;
                     events.push_back(std::move(event));
                 }
             }
@@ -579,7 +582,11 @@ std::vector<TraceEvent> read_chrome_trace_impl(const std::string & filename, con
     }
 
     auto events = parse_trace_buffer(shared_buffer, options, partitions);
-    for (size_t index = 0; index < events.size(); ++index) events[index].index = index;
+    const auto record_file = std::make_shared<const std::string>(std::filesystem::path(filename).filename().string());
+    for (size_t index = 0; index < events.size(); ++index) {
+        events[index].index = index;
+        events[index].source_record_file = record_file;
+    }
     auto & logger = Logger::instance();
     if (logger.enabled(Logger::Info)) logger.info() << "Read " << events.size() << " Chrome trace events from " << filename;
     return events;
@@ -638,8 +645,16 @@ void write_chrome_trace_dag(const std::string & filename, const DagGraph & graph
             << "      \"args\": {\"node_id\":" << node.id << ",\"event_index\":" << node.event_index << ",\"node_kind\":\""
             << (node.kind == core::DagNodeKind::Synthetic ? "synthetic" : "trace_event") << "\",\"is_cpu\":" << (node.is_cpu ? "true" : "false")
             << ",\"lane_id\":" << node.lane_id << ",\"cpu_gap_after_us\":" << simulation::topological_edge_delay_us(graph, node, core::DagEdgeKind::Sequential)
-            << ",\"cpu_ready_delay_before_us\":" << graph.cpu_service_ready_delay(node.id, node.cpu_ready_delay_before) << "}\n"
-            << "    }";
+            << ",\"cpu_ready_delay_before_us\":" << graph.cpu_service_ready_delay(node.id, node.cpu_ready_delay_before);
+        // Chrome's ts/dur above are simulated coordinates. Keep source
+        // coordinates separate so an explicit DAG export can diagnose call
+        // ownership without mistaking replay time for an observed boundary.
+        if (node.kind != core::DagNodeKind::Synthetic) {
+            ofs << ",\"observed_pid\":" << json_scalar_literal(event.pid) << ",\"observed_tid\":" << json_scalar_literal(event.tid)
+                << ",\"observed_start_us\":" << event.ts << ",\"observed_start_submicro_ns\":" << event.ts_submicro_ns
+                << ",\"observed_duration_us\":" << event.dur << ",\"observed_duration_submicro_ns\":" << event.dur_submicro_ns;
+        }
+        ofs << "}\n    }";
     }
 
     for (size_t edge_index = 0; edge_index < graph.edges().size(); ++edge_index) {

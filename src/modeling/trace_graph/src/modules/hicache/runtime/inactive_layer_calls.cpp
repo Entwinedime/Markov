@@ -1,49 +1,23 @@
 #include "markov/trace_graph/modules/hicache/patch/layer_wait_insertion.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/layer_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include <algorithm>
-#include <nlohmann/json.hpp>
 #include <stdexcept>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
 void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayerWaitObservation & waits, uint64_t begin, uint64_t end) {
-    using Key = std::pair<std::string, std::string>;
-    std::map<Key, std::vector<const Call *>> donors;
-    for (const auto & [node, call] : calls_) donors[{ call.pid, call.phase }].push_back(&call);
-    const auto work = [](const Call * call) {
-        uint64_t total = 0;
-        for (const auto & node : call->plan.nodes) total += node.work.duration + node.work.cpu_gap_after;
-        return total;
-    };
-    for (auto & [key, samples] : donors) std::ranges::stable_sort(samples, {}, work);
     std::vector<const HiCacheLayerWaitCall *> inactive;
     std::map<std::pair<size_t, size_t>, std::vector<const HiCacheLayerWaitCall *>> groups;
     for (const auto & call : waits.calls) {
-        if (call.enabled || call.start_ns / 1'000 < begin || call.end_ns / 1'000 > end) continue;
+        // Match active checks: a retained forward owns all of its checks,
+        // including those returning beyond the measured HTTP endpoint.
+        if (call.enabled || call.batch_start_ns / 1'000 < begin || call.batch_start_ns / 1'000 > end) continue;
         inactive.push_back(&call);
         groups[{ *call.before, *call.after }].push_back(&call);
     }
     const patch::HiCacheSourceDagIndex source(graph);
     const auto positions = patch::observe_inactive_layer_positions(source, waits, inactive);
-    struct Cost {
-        LoadIndexOperationCost submit;
-        uint64_t after, after_residual;
-    };
-    std::map<std::pair<int, std::string>, Cost> costs;
-    if (!calibration_.empty()) {
-        const auto doc = read_control_calibration(calibration_, "layer_wait");
-        for (const auto & row : doc.at("rows")) {
-            const auto key = std::pair{ row.at("rank").get<int>(), row.at("phase").get<std::string>() };
-            if (!costs
-                     .emplace(
-                         key,
-                         Cost{ read_load_operation_cost(row), read_control_duration(row.at("after_us")), read_control_duration(row.at("after_residual_us")) })
-                     .second)
-                throw std::runtime_error("Duplicate layer wait cost rank/phase");
-        }
-    }
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<std::pair<size_t, size_t>, std::optional<LoadIndexResources>> resources;
     core::DagMutationPlan insertion{ .component = "hicache_layer_wait" };
@@ -71,7 +45,6 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
             const auto & call = *observed[i];
             if (call.start_ns < previous_end || call.end_ns > gap_end * 1'000) throw std::runtime_error("Inactive layer calls overlap or escape their CPU gap");
             previous_end = call.end_ns;
-            const auto samples = donors.find({ event.pid, call.phase });
             const auto & position = positions.at(&call);
             if (position.before.size() > 1) throw std::runtime_error("Inactive layer call has multiple stream predecessors");
             const auto gate = core::DagNodeRef::synthetic("layer_entry:" + std::to_string(before) + ":" + std::to_string(i));
@@ -89,31 +62,24 @@ void HiCacheLayerCalls::bind_inactive(core::DagGraph & graph, const HiCacheLayer
                 .lane = lane,
                 .batch_start_ns = call.batch_start_ns,
                 .layer = call.layer,
+                .source_start_ns = call.start_ns,
+                .source_end_ns = call.end_ns,
+                .source_position = call.position,
                 .outside_gap_us = service(call.end_ns / 1'000, next),
+                .following_gap_ranges = core::DagGraph::CpuGapRanges{ { call.end_ns / 1'000, next } },
                 .source_inactive_us = service(call.start_ns / 1'000, call.end_ns / 1'000),
-                .plan = samples == donors.end() ? HiCacheHostExpansion{}
-                      : samples->second[samples->second.size() / 2]->plan,
                 .position = { position.before.empty() ? std::nullopt : std::optional{ position.before.front() }, position.after },
                 .device_lane = position.device_lane,
                 .successors = {},
                 .synchronizations = position.synchronizations,
-                .insertion_issue = samples == donors.end() ? "active_call_sample_missing" : position.issue
+                .insertion_issue = position.issue
             };
-            if (samples == donors.end() && position.issue.empty()) {
-                const auto cost = costs.find({ graph.node(before).gpu_id, call.phase });
+            if (position.issue.empty()) {
                 const auto key = std::pair{ graph.node(before).lane_id, position.device_lane };
-                if (cost != costs.end()) {
-                    if (!resources.contains(key)) resources.emplace(key, observe_load_index_resources(source, queues, before, position.after));
-                    if (const auto & r = resources.at(key)) {
-                        target.plan =
-                            generate_layer_wait(graph, before, r->worker, r->compute, cost->second.submit, cost->second.after, cost->second.after_residual);
-                        target.insertion_issue.clear();
-                    }
-                    else target.insertion_issue = "forward_worker_resource_missing";
-                }
-                else target.insertion_issue = "independent_layer_wait_cost_missing";
+                if (!resources.contains(key)) resources.emplace(key, observe_load_index_resources(source, queues, before, position.after));
+                if (const auto & r = resources.at(key)) target.program = generate_layer_wait(graph, before, r->worker, r->compute);
+                else target.insertion_issue = "forward_worker_resource_missing";
             }
-            else if (samples == donors.end() && !position.issue.empty()) target.insertion_issue = position.issue;
             pending.emplace(gate.synthetic_id, PlannedCall{ std::move(target), {} });
             gates.push_back(gate);
         }

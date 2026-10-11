@@ -1,9 +1,14 @@
 #pragma once
+#include "markov/trace_graph/cost/hicache_io.hpp"
+#include "markov/trace_graph/cost/operator_model.hpp"
 #include "markov/trace_graph/modules/hicache/model/replay.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/lifecycle_observation.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
+#include "markov/trace_graph/source_dag/load_admission.hpp"
+#include "markov/trace_graph/structure/hicache/resources.hpp"
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -18,13 +23,7 @@ struct HiCacheCapacityGuard {
     size_t entry_node = 0, return_node = 0;
 };
 
-struct HiCacheLoadBranch {
-    size_t owner;
-    core::TraceEvent envelope, condition;
-    size_t entry_node = 0, return_node = 0;
-};
-[[nodiscard]] std::vector<HiCacheLoadBranch> observe_load_branches(std::span<const core::TraceEvent> observations,
-                                                                   std::span<const model::HiCacheReplayFact> facts, uint64_t begin, uint64_t end);
+using source_dag::HiCacheLoadBranch;
 [[nodiscard]] std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSourceDagIndex & source,
                                                                         std::span<const model::HiCacheReplayFact> facts,
                                                                         std::span<const core::TraceEvent> observations, uint64_t begin, uint64_t end);
@@ -37,40 +36,36 @@ public:
     [[nodiscard]] size_t completion_for(const model::HiCacheDeviceWrite & write) const {
         return completions_.at({ write.header.cache_scope, write.header.operation_id });
     }
-    HiCacheWriteCalls(model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, HiCacheWriteStreamInsertions & insertions)
+    HiCacheWriteCalls(model::HiCacheModelReplay & replay, const frontend::HiCacheConfig & config, HiCacheWriteStreamInsertions & insertions,
+                      const structure::hicache::SchedulerComputeResources & compute_resources, cost::OperatorCostProvider & provider)
         : replay_(replay),
           writes_(replay.state()),
           stream_insertions_(insertions),
           page_size_(config.page_size),
           page_bytes_(config.kv_bytes_per_page),
           write_back_(config.write_policy == "write_back"),
-          empty_write_check_us_(config.io_cost.empty_write_check_us),
-          locked_candidate_us_(config.io_cost.locked_candidate_us),
-          locked_candidate_log2_heap_us_(config.io_cost.locked_candidate_log2_heap_us),
-          write_host_calibration_(config.write_host_calibration),
-          release_host_calibration_(config.release_host_calibration),
-          load_index_calibration_(config.load_index_calibration),
-          allocator_need_sort_(config.device_allocator_need_sort) {}
-    void bind(core::DagGraph & graph, uint64_t begin, uint64_t end);
+          allocator_need_sort_(config.device_allocator_need_sort),
+          operator_provider_(provider),
+          io_completion_(cost::io_completion_provider(config.io_cost)),
+          compute_resources_(compute_resources) {}
+    // A crossing source call keeps only its exact retained CPU suffix. Its
+    // entry follows initial lifecycle state at the HTTP availability gate;
+    // clipped submissions identify removal ownership, never reusable costs.
+    void bind(core::DagGraph & graph, uint64_t begin, uint64_t end, size_t opening_node);
     void replace_active_load_branches(core::DagGraph & graph);
     // Finalize resource and consumer bindings after all source replacements.
     void rebind_retained_resources(const patch::HiCacheSourceDagIndex & source, const std::map<size_t, size_t> & members);
     void applied(const model::HiCacheReplayFact & input) const;
     /** Returns facts whose allocations completed at this boundary. */
     std::vector<size_t> advance(size_t node, uint64_t time, simulation::FutureDag & future);
-    [[nodiscard]] uint64_t duration(size_t node, uint64_t original) const { return writes_.duration(node, original); }
     [[nodiscard]] size_t source_submissions() const { return submissions_; }
     [[nodiscard]] size_t completed_writes() const { return writes_.completed(); }
     [[nodiscard]] size_t resumed_allocations() const { return resumed_; }
     [[nodiscard]] size_t prepared_templates() const { return templates_.size(); }
     [[nodiscard]] size_t prepared_eviction_controls() const { return eviction_controls_.size(); }
     [[nodiscard]] size_t expanded_submissions() const { return expanded_; }
-    [[nodiscard]] size_t calibrated_empty_checks() const { return calibrated_empty_checks_; }
-    [[nodiscard]] uint64_t calibrated_empty_check_cpu_us() const { return calibrated_empty_check_cpu_us_; }
     [[nodiscard]] size_t generated_control_steps() const { return generated_control_steps_; }
     [[nodiscard]] size_t generated_blocking_checks() const { return generated_blocking_checks_; }
-    [[nodiscard]] size_t blocking_check_cost_extrapolations() const { return blocking_check_cost_extrapolations_; }
-    [[nodiscard]] size_t phase_extrapolated_control_steps() const { return phase_extrapolated_control_steps_; }
 
 private:
     enum class Action { Submit, Wait, Return };
@@ -93,19 +88,18 @@ private:
     [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
     void bind_capacity_calls(const patch::HiCacheSourceDagIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
-    void bind_lifecycle_writes(core::DagGraph & graph);
-    void load_write_calibration(core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues);
-    void load_release_calibration(const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues);
+    void replace_source_write_calls(core::DagGraph & graph);
+    void bind_lifecycle_writes(core::DagGraph & graph, uint64_t begin_us);
+    void prepare_write_resources(core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues);
     void submit_lifecycle_writes(size_t node, uint64_t time, simulation::FutureDag & future);
     void bind_load_attempts(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void bind_load_branches(core::DagGraph & graph, uint64_t begin, uint64_t end);
     void prepare_empty_load_branches(core::DagGraph & graph);
-    void prepare_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
     void prepare_generated_load_admissions(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
     void start_load_branch(size_t node, uint64_t time, simulation::FutureDag & future);
-    void prepare_load_capacity(const patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues);
     std::optional<size_t> expand_capacity(Call & call, const HiCacheFact & fact, simulation::FutureDag & future, std::optional<size_t> previous = std::nullopt);
     model::HiCacheModelReplay & replay_;
+    const core::DagGraph * graph_ = nullptr;
     HiCacheWrites writes_;
     HiCacheWriteStreamInsertions & stream_insertions_;
     struct WriteTemplate {
@@ -117,10 +111,14 @@ private:
         bool independent = false;
     };
     std::map<size_t, WriteTemplate> templates_;
-    const WriteTemplate & select_write_template(const std::string & pid, const std::string & tid, uint64_t bytes) const;
+    struct WriteResources {
+        size_t compute, worker, transfer;
+        std::vector<size_t> position_lanes;
+    };
+    std::map<std::pair<std::string, std::string>, WriteResources> write_resources_;
     // Submit one target write and register its completion. Callers retain
     // ownership of their host continuation and allocation return boundaries.
-    HiCacheExpandedWrite submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
+    HiCacheExpandedWrite submit_target_write(const WriteResources & resources, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
                                              HiCacheHostSequence & sequence, simulation::FutureDag & future);
     struct EvictionControl {
         std::string pid, tid;
@@ -147,27 +145,27 @@ private:
     };
     std::map<size_t, EmptyLoadBranch> empty_load_branches_;
     struct LoadStep {
-        HiCacheHostExpansion work;
+        GeneratedDeviceOperation program;
+        std::string operation;
         std::vector<size_t> lanes;
     };
     struct LoadAdmissionProgram {
         std::string pid, tid;
-        // Observed aggregate costs have a sampled token count. Primitive costs
-        // instead provide a clone operation repeated for target promoted nodes.
-        std::optional<uint64_t> tokens;
-        uint64_t source_page_size = 0;
-        bool direct_allocation = false;
-        std::optional<LoadStep> prefix, retry, clone;
+        // Cost-free resource programs; target state owns sizes/cardinality.
+        std::optional<LoadStep> clone;
         std::vector<LoadStep> allocation;
-        LoadStep tail;
-        std::optional<HiCacheHostExpansion> failure;
+        LoadStep merge_concat, merge_sort;
+        LoadStep prefix_concat;
+        std::string main_lane;
     };
     std::vector<LoadAdmissionProgram> load_admissions_;
-    // Recognized asynchronous clone samples become a per-node operation and
-    // a once-per-admission CPU tail; unsupported source geometry stays explicit.
-    void split_load_tail(const core::DagGraph & graph, size_t main, LoadAdmissionProgram & program);
-    [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid, uint64_t tokens, bool direct_allocation = false) const;
+    // Cost selection never changes allocation or clone execution rules.
+    [[nodiscard]] size_t select_load_admission(const std::string & pid, const std::string & tid) const;
     void bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program);
+    [[nodiscard]] HiCacheHostExpansion cost_load_step(const LoadStep & step, uint64_t pages, bool first_clone = false) const;
+    [[nodiscard]] HiCacheHostExpansion bind_load_operation(const LoadStep & step, structure::OperationWork work) const;
+    [[nodiscard]] HiCacheHostExpansion load_prefix_concat(const LoadAdmissionProgram & program, const model::HiCacheLoadAdmissionWork & work) const;
+    [[nodiscard]] HiCacheHostExpansion load_admission_tail(const LoadAdmissionProgram & program, uint64_t pages, bool allocated) const;
     struct LoadBranchReturn {
         size_t owner, program, continuation;
         bool expected_allocation;
@@ -182,19 +180,13 @@ private:
     uint64_t page_size_;
     uint64_t page_bytes_;
     bool write_back_;
-    std::optional<double> empty_write_check_us_;
-    std::optional<double> locked_candidate_us_;
-    double locked_candidate_log2_heap_us_ = 0.0;
-    std::string write_host_calibration_;
-    std::string release_host_calibration_;
-    std::string load_index_calibration_;
     bool allocator_need_sort_ = false;
-    std::map<std::pair<std::string, std::string>, double> locked_candidate_remainder_us_;
-    size_t calibrated_empty_checks_ = 0;
-    size_t generated_control_steps_ = 0, phase_extrapolated_control_steps_ = 0;
-    size_t generated_blocking_checks_ = 0, blocking_check_cost_extrapolations_ = 0;
+    cost::OperatorCostProvider & operator_provider_;
+    structure::hicache::IoCompletionProvider io_completion_;
+    const structure::hicache::SchedulerComputeResources & compute_resources_;
+    size_t generated_control_steps_ = 0;
+    size_t generated_blocking_checks_ = 0;
     std::map<std::pair<std::string, std::string>, std::pair<double, double>> control_cost_remainders_;
-    uint64_t calibrated_empty_check_cpu_us_ = 0;
     std::vector<Call> calls_;
     std::map<size_t, std::vector<std::pair<Action, size_t>>> actions_;
     std::set<size_t> source_owners_, wait_owners_;

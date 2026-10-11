@@ -15,7 +15,9 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::patch {
@@ -107,6 +109,13 @@ struct HiCacheDeviceStreamOrder {
     [[nodiscard]] std::optional<size_t> next(size_t node) const;
 };
 
+/** Stream ordinals around one caller-time cut. Unanchored ordinals are only
+ * those between the two proven sides; their legality remains the caller's job. */
+struct HiCacheDeviceSubmissionCut {
+    std::optional<size_t> last_before, first_after;
+    std::span<const size_t> unanchored_ordinals;
+};
+
 class HiCacheSourceDagIndex {
 public:
     explicit HiCacheSourceDagIndex(const core::DagGraph & graph);
@@ -120,12 +129,36 @@ public:
      * identifies rank/lane even after removal; an empty resource has no nodes.
      * Transitive shortcuts are allowed; disconnected, branching or cyclic work is not. */
     [[nodiscard]] const HiCacheDeviceStreamOrder & device_stream_order(size_t sample) const;
+    /** CPU submission anchors in device_stream_order order, following only
+     * active Correlation edges back to the requested caller thread. Empty
+     * entries mean no proven anchor, not an inferred timestamp. Like the
+     * stream index, this cache requires an unchanged graph for its lifetime. */
+    [[nodiscard]] const std::vector<std::vector<size_t>> & device_submission_anchors(size_t sample, const std::string & pid, const std::string & tid) const;
+    /** Resolve a cut from ALL correlated caller anchors, without scanning the
+     * whole stream for every call. Overlapping submissions and disagreement
+     * with Stream order remain errors. Time is in source microseconds; this
+     * query shares the index's immutable-graph lifetime contract. A unique
+     * native launch clipped before the formal window proves that its retained
+     * device operation was already queued, without restoring CPU execution. */
+    [[nodiscard]] HiCacheDeviceSubmissionCut device_submission_cut(size_t sample, const std::string & pid, const std::string & tid, uint64_t at_us) const;
+    /** All proven caller anchors must be contained in [begin_us, end_us).
+     * Worker submission timestamps may occur after the caller returned. */
+    [[nodiscard]] bool device_submitted_in_call(size_t node, const std::string & pid, const std::string & tid, uint64_t begin_us, uint64_t end_us) const;
 
     [[nodiscard]] const HiCacheSourceFactNode * fact_node(size_t node_id) const;
     [[nodiscard]] std::span<const HiCacheSourceFactNode> tail_context_facts() const { return tail_context_facts_; }
     [[nodiscard]] std::span<const size_t> nodes_for_fact_role(std::string_view role) const;
     [[nodiscard]] std::span<const size_t> nodes_for_request(std::string_view request_id) const;
     [[nodiscard]] std::span<const size_t> cpu_nodes_on_lane(std::string_view pid, std::string_view tid) const;
+    /** Timing ownership plus zero-duration submissions inside [start, end).
+     * Correlation edges establish submitted work; retain those identities for
+     * structural replacement without changing duration/gap totals or readiness.
+     * Bare boundary gates are not submissions. Node order follows the source
+     * CPU lane. A zero-width interval owns no points because its call ordering
+     * cannot be established from ticks alone.
+     */
+    [[nodiscard]] HiCacheTimingIntervalOwnership call_interval_ownership(std::string_view pid, std::string_view tid, uint64_t start_us,
+                                                                         uint64_t duration_us) const;
     /** Borrow the time-ordered candidate slice for [begin_us, end_us).
      * Prefix maxima retain long enclosing leaves; callers filter individual
      * ends because shorter leaves in the slice may have already finished. */
@@ -180,6 +213,15 @@ private:
     std::unordered_map<std::string, std::vector<uint64_t>, core::TraceArgHash, std::equal_to<>> cpu_prefix_end_us_by_lane_;
     ControlIntervalMap control_intervals_by_name_;
     mutable std::map<std::pair<int, size_t>, HiCacheDeviceStreamOrder> device_stream_orders_;
+    mutable std::map<std::tuple<int, size_t, std::string, std::string>, std::vector<std::vector<size_t>>> device_submission_anchors_;
+    struct DeviceSubmissionTimeline {
+        // The bool marks a strict end: a zero-duration anchor starting at the
+        // cut belongs after it, including groups with earlier anchors.
+        std::vector<std::pair<std::pair<uint64_t, bool>, size_t>> finishes;
+        std::vector<std::pair<uint64_t, size_t>> starts;
+        std::vector<size_t> last_before_prefix, first_after_suffix, unanchored;
+    };
+    mutable std::map<std::tuple<int, size_t, std::string, std::string>, DeviceSubmissionTimeline> device_submission_timelines_;
 
     [[nodiscard]] static std::span<const size_t> find_nodes(const NodeMap & index, std::string_view key);
     [[nodiscard]] static std::string cpu_lane_key(std::string_view pid, std::string_view tid);

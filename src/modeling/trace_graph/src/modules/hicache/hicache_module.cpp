@@ -3,6 +3,7 @@
  * @brief HiCache SimulationModule adapter implementation.
  */
 #include "markov/trace_graph/modules/hicache/hicache_module.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/static_replay.hpp"
 
 #include <stdexcept>
 #include <string_view>
@@ -35,8 +36,6 @@ std::string_view HiCacheModule::name() const noexcept { return kModuleName; }
  * the immutable replay result, while Debug summaries are serialized only at the CLI
  * diagnostics boundary.
  */
-void HiCacheModule::apply(core::DagGraph & graph) {
-    *result_ = model::apply_hicache_model(graph, config_);
-}
+void HiCacheModule::apply(core::DagGraph & graph) { *result_ = runtime::replay_hicache_static(graph, config_); }
 
 } // namespace markov::trace_graph::modules::hicache

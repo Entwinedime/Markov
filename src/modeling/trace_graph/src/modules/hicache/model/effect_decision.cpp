@@ -417,7 +417,8 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
                 .header = &operation.header,
                 .effective_pages = &operation.header.pages,
                 .completed_pages = operation.header.state == HiCacheOperationState::Completed || operation.header.state == HiCacheOperationState::Committed
-                    ? &operation.header.pages : nullptr,
+                                       ? &operation.header.pages
+                                       : nullptr,
                 .state = operation_state_name(operation.header.state),
                 .dependency_required = true,
             };
@@ -461,8 +462,9 @@ std::vector<OperationEvidence> operation_evidence(const HiCacheEffectOpportunity
                     .completed_pages = operation.host_materialized ? &operation.device_to_host_pages : nullptr,
                     .state = operation_state_name(operation.header.state),
                     .service_completion_ts = operation.device_completed_at ? operation.device_completed_at
-                        : operation.host_materialized && operation.device_to_host_schedule.available
-                            ? std::optional<uint64_t>{ operation.device_to_host_schedule.ready_ts } : std::nullopt,
+                                             : operation.host_materialized && operation.device_to_host_schedule.available
+                                                 ? std::optional<uint64_t>{ operation.device_to_host_schedule.ready_ts }
+                                                 : std::nullopt,
                 };
             });
         break;
@@ -741,7 +743,7 @@ void HiCacheState::observe_effect_opportunities(const HiCacheFact & fact, HiCach
 HiCacheEffectDecisionLedger HiCacheState::effect_decision_ledger() const {
     HiCacheEffectDecisionLedger ledger;
     ledger.kv_bytes_per_page = config_.kv_bytes_per_page;
-    ledger.storage_batch_pages = config_.io_cost.storage_batch_pages;
+    ledger.storage_batch_pages = storage_batch_pages_;
     ledger.l2_capacity_pages = config_.l2_capacity_pages;
     ledger.l2_capacity_bytes =
         core::checked_multiply_u64(config_.l2_capacity_pages, config_.kv_bytes_per_page, "HiCache target L2 capacity bytes exceed uint64 range");

@@ -59,6 +59,13 @@ def observe_scheduler_cpu(
             "scheduler.process_batch_result",
         ):
             continue
+
+        # A setup result may finish after the first formal HTTP request starts.
+        # Pair only selected request work; its uncorrected source graph stays intact.
+        request_ids = set(scope["identity"]["request_ids"])
+        if request_ids and not request_ids & formal_requests:
+            continue
+
         boundary = begin < lo or end > hi or end <= lo or begin >= hi
         if end <= lo or begin >= hi:
             if set(scope.get("identity", {}).get("request_ids", [])) & formal_requests:

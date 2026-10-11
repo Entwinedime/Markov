@@ -1,5 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
+#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -29,52 +31,105 @@ void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex &
     }
 }
 
+void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues) {
+    const patch::HiCacheSourceDagIndex source(graph);
+    const auto bind = [&](const std::string & pid, const std::string & tid, size_t main, size_t compute, std::optional<size_t> transfer) {
+        const auto key = std::pair{ pid, tid };
+        if (write_resources_.contains(key)) return;
+        const auto resources = observe_load_index_resources(source, queues, main, compute);
+        if (!resources) return;
+
+        // A legal target write can introduce its controller transfer stream
+        // even when this source only freed device pages. Cost evidence does
+        // not decide whether the resource or execution branch exists.
+        const auto payload = transfer ? *transfer : graph.add_device_resource("hicache.write:" + pid + ":" + tid, graph.node(main).gpu_id);
+        const auto compute_lane = graph.node(compute).lane_id;
+        const auto payload_lane = graph.node(payload).lane_id;
+        write_resources_.emplace(key,
+                                 WriteResources{
+                                     compute,
+                                     resources->worker,
+                                     payload,
+                                     { compute_lane, payload_lane, compute_lane }
+        });
+    };
+    for (const auto & [id, sample] : templates_) {
+        const auto roles = write_resource_roles(graph, sample.expansion, sample.compute_record);
+        bind(sample.pid, sample.tid, roles.at("main"), roles.at("compute_ready"), roles.at("payload"));
+    }
+    for (const auto & sample : eviction_controls_) {
+        using Kind = HiCacheEvictionRegion::Kind;
+        if ((sample.region.kind != Kind::ReleaseRegular && sample.region.kind != Kind::ReleaseBackup) || sample.expansion.streams.size() != 1) continue;
+        const auto & main_lane = sample.expansion.nodes.at(sample.expansion.host_return).work.lane_key;
+        for (const auto & [original, local] : sample.expansion.source_nodes) {
+            if (!graph.node(original).is_cpu || graph.node_lane_key(original) != main_lane) continue;
+            bind(sample.pid, sample.tid, original, sample.expansion.streams.front().source_node, std::nullopt);
+            break;
+        }
+    }
+    for (auto & call : calls_) {
+        if (call.source) continue;
+        const auto compute = compute_resources_.find({ call.pid, call.tid });
+        if (compute != compute_resources_.end()) {
+            if (const auto main = source.cpu_boundary_at_or_before(call.pid, call.tid, call.at_us))
+                bind(call.pid, call.tid, *main, compute->second, std::nullopt);
+        }
+
+        const auto resources = write_resources_.find({ call.pid, call.tid });
+        if (resources == write_resources_.end()) continue;
+        for (const auto node : { resources->second.compute, resources->second.transfer }) {
+            const auto lane = graph.node(node).lane_id;
+            if (!call.positions.contains(lane)) call.positions.emplace(lane, observe_write_stream_position(source, node, call.pid, call.tid, call.at_us));
+        }
+    }
+}
+
 std::vector<HiCacheHostExpansion *> HiCacheWriteCalls::host_plans() {
     std::vector<HiCacheHostExpansion *> plans;
-    for (auto & [id, donor] : templates_) plans.push_back(&donor.expansion);
-    for (auto & donor : eviction_controls_) plans.push_back(&donor.expansion);
+    // Observed write/eviction fragments now serve only removal and resource
+    // identification. Only programs that will actually execute need worker
+    // rebinding; an obsolete source worker is not a target cost requirement.
 
     for (auto & donor : load_admissions_) {
-        for (auto * step : { &donor.prefix, &donor.retry, &donor.clone })
-            if (*step) plans.push_back(&(*step)->work);
-        for (auto & step : donor.allocation) plans.push_back(&step.work);
-        plans.push_back(&donor.tail.work);
-        if (donor.failure) plans.push_back(&*donor.failure);
+        if (donor.clone) plans.push_back(&donor.clone->program.plan);
+        for (auto & step : donor.allocation) plans.push_back(&step.program.plan);
+        plans.push_back(&donor.prefix_concat.program.plan);
+        if (allocator_need_sort_) {
+            plans.push_back(&donor.merge_concat.program.plan);
+            plans.push_back(&donor.merge_sort.program.plan);
+        }
     }
 
     for (auto & [id, plan] : load_failure_templates_) plans.push_back(&plan);
     return plans;
 }
 
-HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteTemplate & sample, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
-                                                            HiCacheHostSequence & sequence, simulation::FutureDag & future) {
-    const auto projected = resize_write_pages(sample.expansion, operation.schedule.effective_byte_count, page_bytes_);
-    auto expanded = sequence.append(projected, operation.schedule.duration_us, sample.position_lanes);
+HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources & resources, const HiCacheFact & fact,
+                                                            const model::HiCacheDeviceWrite & operation, HiCacheHostSequence & sequence,
+                                                            simulation::FutureDag & future) {
+    const auto bytes = operation.schedule.effective_byte_count;
+    if (!page_bytes_ || !bytes || bytes % page_bytes_) throw std::runtime_error("Target write requires a positive whole-page payload");
+
+    auto generated = generate_page_first_submission(*graph_,
+                                                    fact.execution_anchor_node_id.value(),
+                                                    resources.worker,
+                                                    resources.compute,
+                                                    resources.transfer,
+                                                    bytes / page_bytes_,
+                                                    page_bytes_,
+                                                    1,
+                                                    "write");
+    const auto costs = cost::estimate_write_submission(operator_provider_, bytes, page_bytes_, write_back_);
+    bind_page_first_submission(generated, costs);
+    const auto lanes = generated.plan.resource_lanes(*graph_);
+    const auto service_us = io_completion_.duration("write_device_to_host", page_bytes_, bytes / page_bytes_, 0);
+    bind_transfer_payload(generated.plan, service_us);
+    auto expanded = sequence.append(generated.plan, lanes);
     const auto completion = writes_.submit_expanded(fact, operation, expanded.write_start, expanded.completion, future);
 
     completions_.emplace(std::pair{ operation.header.cache_scope, operation.header.operation_id }, completion);
     ++expanded_;
     return expanded;
-}
-
-const HiCacheWriteCalls::WriteTemplate & HiCacheWriteCalls::select_write_template(const std::string & pid, const std::string & tid, uint64_t bytes) const {
-    const WriteTemplate * selected = nullptr;
-    uint64_t nearest = 0;
-    for (const auto & [id, candidate] : templates_) {
-        if (candidate.pid != pid || candidate.tid != tid || candidate.write_back != std::optional<bool>{ write_back_ }
-            || !write_page_geometry_matches(candidate.expansion, bytes, page_bytes_))
-            continue;
-        const auto source_bytes = candidate.expansion.payload_bytes;
-        const auto distance = source_bytes > bytes ? source_bytes - bytes : bytes - source_bytes;
-        // Compatible base geometry can be extrapolated before consulting an
-        // independent measurement, even when that measurement is closer in size.
-        if (!selected || (selected->independent && !candidate.independent) || (selected->independent == candidate.independent && distance < nearest)) {
-            selected = &candidate;
-            nearest = distance;
-        }
-    }
-    if (!selected) throw std::runtime_error("Target write lacks a same-thread, same-policy template with projectable page geometry");
-    return *selected;
 }
 
 size_t observe_write_call_owner(const patch::HiCacheSourceDagIndex & source, std::span<const model::HiCacheReplayFact> facts, const std::string & pid,
@@ -145,7 +200,8 @@ std::vector<HiCacheCapacityGuard> observe_capacity_guards(const patch::HiCacheSo
     return guards;
 }
 
-void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t end) {
+void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t end, size_t opening_node) {
+    graph_ = &graph;
     lifecycle_inserts_ = observe_lifecycle_inserts(graph, replay_.facts(), begin, end);
     for (const auto & insert : lifecycle_inserts_) (void)lifecycle_ready_steps(insert);
     const auto in_scope = [&](const std::string & pid, const std::string & tid, uint64_t first, uint64_t last) {
@@ -180,7 +236,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
     std::vector<core::TraceEvent> host_boundaries;
     const auto add_host_boundaries = [&](const core::TraceEvent & event) {
         if (!in_scope(event.pid, event.tid, event.ts, event.ts + event.dur) || !event.dur) return;
-        for (const auto at : { event.ts, event.ts + event.dur }) {
+        for (const auto at : { std::max(event.ts, begin), event.ts + event.dur }) {
             core::TraceEvent point;
             point.name = "hicache.host_region";
             point.pid = event.pid;
@@ -218,9 +274,11 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         if (record.kind != patch::HiCacheIoOperationKind::WriteDeviceToHost || !in_scope(record.pid, record.tid, record.source_start_us, record.source_end_us))
             continue;
         const auto owner = observe_write_call_owner(source, replay_.facts(), record.pid, record.tid, record.source_start_us, record.source_end_us);
+        const auto & envelope = observe_write_envelope(source, record.pid, record.tid, record.source_start_us, record.source_end_us);
         writes_.add_source(source, record);
-        point(record.pid, record.tid, record.source_start_us, Action::Submit, calls_.size());
-        calls_.push_back({ .owner = owner, .source = record.timing_fact_node_id });
+        point(record.pid, record.tid, std::max(envelope.timestamp_us, begin), Action::Submit, calls_.size());
+        calls_.push_back({ .owner = owner, .source = record.timing_fact_node_id, .pid = record.pid, .tid = record.tid, .at_us = envelope.timestamp_us });
+        point(record.pid, record.tid, envelope.timestamp_us + envelope.duration_us, Action::Return, calls_.size() - 1);
         source_owners_.insert(owner);
         ++submissions_;
     }
@@ -234,7 +292,10 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         wait_owners_.insert(owner);
     }
     const auto nodes = bind_hicache_control_points(graph, points);
+    core::DagMutationPlan opening{ .component = "hicache_write_opening" };
     for (size_t i = 0; i < points.size(); ++i) {
+        // Keep partial-call entry on its real CPU lane. The initial lifecycle
+        // state is applied first, without reconstructing pre-window service.
         const auto bound = nodes[i];
         if (!bound) {
             auto message = "Write call has no exact CPU boundary: pid=" + points[i].pid + " at_us=" + std::to_string(points[i].ts);
@@ -251,8 +312,11 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         const auto [action, call] = actions[i];
         actions_[*bound].push_back({ action, call });
         if (action == Action::Return) calls_[call].return_node = *bound;
-        if (action == Action::Wait) calls_[call].entry_node = *bound;
+        if (action == Action::Wait || action == Action::Submit) calls_[call].entry_node = *bound;
+        if (action == Action::Submit && calls_[call].at_us < begin)
+            opening.add_edges.push_back({ core::DagNodeRef::existing(opening_node), core::DagNodeRef::existing(*bound), core::DagEdgeKind::Mutation });
     }
+    if (!opening.add_edges.empty()) (void)core::apply_dag_mutation_plan(graph, opening);
     // Call boundaries may split host self/gap pieces. Observe templates only
     // after those edits so their leaf ownership matches the execution graph.
     const patch::HiCacheSourceDagIndex bound_source(graph);
@@ -305,14 +369,13 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             }
         }
     }
-    load_write_calibration(graph, queues);
-    load_release_calibration(graph, queues);
-    prepare_load_capacity(bound_source, queues);
-    prepare_load_admissions(bound_source, queues);
+    prepare_write_resources(graph, queues);
+    prepare_generated_load_admissions(bound_source, queues);
     replace_source_evictions(graph, begin, end);
+    replace_source_write_calls(graph);
     bind_capacity_calls(patch::HiCacheSourceDagIndex(graph));
     prepare_empty_load_branches(graph);
-    bind_lifecycle_writes(graph);
+    bind_lifecycle_writes(graph, begin);
 }
 
 void HiCacheWriteCalls::applied(const model::HiCacheReplayFact & item) const {
@@ -338,16 +401,22 @@ void HiCacheWriteCalls::applied(const model::HiCacheReplayFact & item) const {
     for (const auto & write : replay_.state().pending_device_writes(fact))
         if (write.header.source_node_id == fact.source_node_id && !source_owners_.contains(fact.source_node_id)
             && !lifecycle_write_owners_.contains(fact.source_node_id) && !capacity_calls_.contains(fact.source_node_id)
-            && !(wait_owners_.contains(fact.source_node_id)
-                 && std::ranges::any_of(templates_, [&](const auto & entry) { return entry.second.pid == fact.pid && entry.second.tid == fact.tid; })))
-            throw std::runtime_error("Target adds a write without a host submission template" + location());
+            && !(wait_owners_.contains(fact.source_node_id) && write_resources_.contains({ fact.pid, fact.tid })))
+            throw std::runtime_error("Target adds a write without a host execution site or resource binding" + location());
 }
 
 std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simulation::FutureDag & future) {
     writes_.advance(node, time);
     submit_lifecycle_writes(node, time, future);
-    if (empty_load_branches_.contains(node)) start_load_branch(node, time, future);
     std::vector<size_t> resumed;
+    if (const auto branch = empty_load_branches_.find(node); branch != empty_load_branches_.end()) {
+        const auto owner = branch->second.owner;
+        replay_.admit_load(owner, time, node);
+        applied(replay_.fact(owner));
+        start_load_branch(node, time, future);
+        if (replay_.fact(owner).consumed) resumed.push_back(owner);
+    }
+
     const auto at_capacity = [&](size_t owner) {
         const auto & item = replay_.fact(owner);
         if (!item.started) throw std::runtime_error("Capacity call precedes its allocation input");
@@ -358,7 +427,10 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
     };
     if (const auto ack = capacity_ack_.find(node); ack != capacity_ack_.end()) {
         const auto fact = at_capacity(ack->second);
-        if (replay_.state().allocation_pending(fact)) replay_.state().confirm_allocation_writes(fact);
+        // Each generated return follows one event wait and its acknowledgement
+        // body. Publish host residency and enqueue H2S at this FIFO boundary;
+        // allocation release still waits for the whole blocking check.
+        replay_.state().acknowledge_writes(fact, 1);
     }
     if (const auto capacity = capacity_at_.find(node); capacity != capacity_at_.end())
         expand_capacity(capacity_calls_.at(capacity->second), at_capacity(capacity->second), future);
@@ -372,14 +444,15 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
             fact.ts = time;
             fact.execution_anchor_node_id = node;
             if (action == Action::Submit) {
-                std::optional<model::HiCacheDeviceWrite> operation;
-                for (const auto & pending : replay_.state().pending_device_writes(fact))
-                    if (pending.header.source_node_id == call.owner && !completions_.contains({ pending.header.cache_scope, pending.header.operation_id })) {
-                        operation = pending;
-                        break;
-                    }
-                const auto completion = writes_.submit_source(*call.source, fact, operation, future);
-                if (completion) completions_.emplace(std::pair{ operation->header.cache_scope, operation->header.operation_id }, *completion);
+                HiCacheHostSequence sequence(call.positions, stream_insertions_, future);
+                for (const auto & pending : replay_.state().pending_device_writes(fact)) {
+                    const auto key = std::pair{ pending.header.cache_scope, pending.header.operation_id };
+                    if (pending.header.source_node_id != call.owner || completions_.contains(key)) continue;
+
+                    const auto & resources = write_resources_.at({ call.pid, call.tid });
+                    const auto expanded = submit_target_write(resources, fact, pending, sequence, future);
+                    for (const auto successor : call.successors) future.depend(expanded.host_return, successor);
+                }
             }
             else if (action == Action::Wait) {
                 call.waiting = replay_.state().allocation_pending(fact);
@@ -389,7 +462,7 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
                     auto complete = completions_.find(key);
                     if (complete == completions_.end()) {
                         if (pending.header.source_node_id != call.owner) throw std::runtime_error("Unsubmitted target write belongs to another host action");
-                        const auto & donor = select_write_template(call.pid, call.tid, pending.schedule.effective_byte_count);
+                        const auto & donor = write_resources_.at({ call.pid, call.tid });
                         const auto expanded = submit_target_write(donor, fact, pending, sequence, future);
                         for (const auto successor : call.successors) future.depend(expanded.host_return, successor);
                         complete = completions_.find(key);
@@ -424,21 +497,28 @@ std::vector<size_t> HiCacheWriteCalls::advance(size_t node, uint64_t time, simul
         if (work->allocated != branch.expected_allocation)
             throw std::logic_error("Load allocation return disagrees with the projected target capacity outcome");
         const auto & program = load_admissions_.at(branch.program);
-        HiCacheHostSequence suffix(capacity_calls_.at(branch.owner).positions, stream_insertions_, future);
+        HiCacheHostSequence suffix(capacity_calls_.at(branch.owner).positions, stream_insertions_, future, node);
         size_t returned;
         if (work->allocated) {
-            if (program.clone)
+            if (program.clone) {
+                bool first_clone = true;
                 for (const auto pages : work->node_pages) {
                     if (!pages) throw std::logic_error("Target load contains an empty promoted node");
-                    (void)suffix.append(program.clone->work, program.clone->lanes);
+                    (void)suffix.append(cost_load_step(*program.clone, pages, first_clone), program.clone->lanes);
+                    first_clone = false;
                 }
-            returned = suffix.append(program.tail.work, program.tail.lanes).host_return;
+            }
+            returned = suffix.append(load_admission_tail(program, work->requested_pages, true), {}).host_return;
         }
         else {
-            auto cleanup = load_failure_templates_.at(branch.owner);
-            for (auto & part : cleanup.nodes) part.work.name = "target failed load cleanup: base control cost proxy";
-            returned = suffix.append(cleanup, {}).host_return;
+            // Allocation failure and the caller's bookkeeping are different
+            // operations. Never charge the failed allocator a second time
+            // as a proxy for the post-return cleanup.
+            returned = suffix.append(load_admission_tail(program, work->requested_pages, false), {}).host_return;
         }
+        const auto prefix = load_prefix_concat(program, *work);
+        const bool device_prefix = work->allocated || work->existing_prefix_pages > 0;
+        returned = suffix.append(prefix, device_prefix ? std::span<const size_t>{ program.prefix_concat.lanes } : std::span<const size_t>{}).host_return;
         future.depend(returned, branch.continuation);
     }
     return resumed;

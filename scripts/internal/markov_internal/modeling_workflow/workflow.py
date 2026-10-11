@@ -6,11 +6,12 @@ from ..common.io import write_json
 from ..common.paths import repo_relative_path
 from .context import WorkflowOptions
 from .execution.model_executor import run_model_runs
-from .planning.profile_runs import discover_profile_runs
-from .planning.specs import plan_model_runs
+from ..modeling.source_dag.profiles import discover_profile_runs
+from .structure.specs import plan_model_runs
 from .preflight import preflight_sources
-from .prediction.hicache import build_row, read_row, summarize
+from .execution.results import build_row, read_row, summarize
 from .types import ModelRunResult
+from ..modeling.deployment import environments_match, require_cost_environment, source_environment
 
 
 def run_workflow(options: WorkflowOptions) -> int:
@@ -18,6 +19,17 @@ def run_workflow(options: WorkflowOptions) -> int:
 
     options.output_dir.mkdir(parents=True, exist_ok=True)
     runs = discover_profile_runs(options.source_manifests)
+    if set(options.cost_sources) & {source.run_id for source in runs} or set(options.cost_source_manifests) & {
+        source.manifest_path.resolve() for source in runs
+    }:
+        raise ValueError("current base captures must be excluded from independently trained prediction costs")
+    if options.cost_deployment is not None:
+        require_cost_environment(options.cost_deployment)
+        if any(
+            not environments_match(source_environment(source, options.source_resources), options.cost_deployment)
+            for source in runs
+        ):
+            raise ValueError("database cost model does not apply to the selected source deployment")
 
     preflight_report = preflight_sources(options, runs)
     specs = plan_model_runs(options, runs, preflight_report)
@@ -29,10 +41,13 @@ def run_workflow(options: WorkflowOptions) -> int:
     # leaves an incomplete current attempt, never a previous successful report.
     summary = {
         "diagnostics": options.diagnostics.value,
+        "experiment_reports": options.experiment_reports,
         "profile_run_count": len(runs),
         "model_run_count": len(specs),
         "model_run_error_count": 0,
         "preflight_ready": preflight_report["ready"],
+        "cost_training_captures": list(options.cost_sources),
+        "cost_training_manifests": [str(repo_relative_path(path)) for path in options.cost_source_manifests],
         "prediction": summarize(list(rows.values())),
     }
     report_path = options.output_dir / "workflow_summary.json"
@@ -55,7 +70,11 @@ def run_workflow(options: WorkflowOptions) -> int:
     for row in rows.values():
         duration = row["http_e2e_us"]
         detail = f"{duration / 1_000_000:.6f} s" if duration is not None else "not predicted"
-        reasons = [need["component"] for need in row["missing_costs"]] or row["blockers"]
+        reasons = (
+            [gap["reason"] for gap in row["structure_gaps"]]
+            or [need["component"] for need in row["missing_costs"]]
+            or row["blockers"]
+        )
         if reasons:
             detail += " | " + ", ".join(reasons)
         print(f"  {row['source_config_id']} -> {row['target_config']} | {row['workload_id']} | {detail}")

@@ -4,6 +4,8 @@
  */
 #pragma once
 
+#include "markov/trace_graph/cost/operator_model.hpp"
+
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -77,10 +79,6 @@ struct HiCacheIoCostConfig {
     std::map<std::string, HiCacheIoServiceModelConfig> service_models{};
     std::map<std::string, HiCacheIoControlModelConfig> control_models{};
     HiCacheIoResourceLanesConfig resource_lanes{};
-    /** Independent CPU-envelope calibration, per empty blocking write check. */
-    std::optional<double> empty_write_check_us;
-    std::optional<double> locked_candidate_us;
-    double locked_candidate_log2_heap_us = 0.0;
 };
 
 /** @brief Monotone cost response for one source-owned phase node family. */
@@ -135,7 +133,7 @@ struct HiCachePhaseCostConfig {
  * These fields describe target policy, capacity, and byte projection. Source-observed policy
  * outcomes are not accepted here; replay derives target behavior from approved facts.
  */
-struct HiCacheConfig {
+struct HiCacheRules {
     bool enabled = false;
     uint64_t page_size = 0;
     uint64_t kv_bytes_per_page = 0;
@@ -144,15 +142,6 @@ struct HiCacheConfig {
     std::string write_policy = "write_through";
     uint64_t write_through_threshold = 0;
     std::string prefetch_policy = "timeout";
-    std::string prefetch_wait_calibration;              // Independent branch timing, used only when base has no active wait.
-    std::string prefetch_query_calibration;             // Independent query CPU/communication costs, not a source DAG.
-    std::string load_index_calibration;                 // Independent index-operation costs; no target topology.
-    std::string load_submission_calibration;            // Independent Ascend submission costs, not a target DAG.
-    std::string layer_wait_calibration;                 // Independent event-wait submission costs.
-    std::vector<std::string> prefetch_cpu_calibrations; // Policy-independent local return costs only.
-    std::string write_host_calibration;                 // Independent host-call templates for write policies absent from the base.
-    std::string release_host_calibration;               // Independent ordinary release work, rebound to base allocator resources.
-    std::string write_confirmation_calibration;         // Independent nonblocking ACK tails, including empty checks.
     uint64_t prefetch_threshold_pages = 0;
     uint64_t prefetch_capacity_limit_pages = 0;
     bool prefetch_timeout_configured = false;
@@ -160,8 +149,13 @@ struct HiCacheConfig {
     double prefetch_timeout_per_ki_token_sec = 0.0;
     double prefetch_timeout_max_sec = 0.0;
     bool device_allocator_need_sort = false;
+};
+
+/** Cost inputs and execution switches never enter the policy/page projector. */
+struct HiCacheConfig : HiCacheRules {
     HiCacheIoCostConfig io_cost;
     HiCachePhaseCostConfig phase_cost;
+    std::vector<cost::OperatorModel> operator_models;
     bool dag_patch_enabled = false;
     bool dag_patch_source_target_same_config = false;
 };
