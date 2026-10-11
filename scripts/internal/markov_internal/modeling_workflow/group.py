@@ -6,7 +6,8 @@ The host prepare workflow and container requirement scanner share this input.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from functools import cached_property
 import json
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,6 @@ from ..workload_template.cli import parse_workload_command
 from .base_capture import captured_base_manifests
 from .capture import CAPTURE_CLEANUP_RESERVE_SEC
 from ..modeling.cost.control import control_calibrations
-from .physical_capture import captured_physical_declaration, platform_inputs
 from ..modeling.source_dag.profiles import (
     ProfileRunRef,
     discover_profile_runs,
@@ -87,11 +87,8 @@ class GroupRequest:
     workload_ids: tuple[str, ...]
     sources: tuple[ProfileRunRef, ...]
     targets: tuple[TargetHiCacheConfig, ...]
-    physical: dict[str, Any] | None
-    fixed_calibration_manifests: tuple[Path, ...]
     budget: ProfileBudget
     output_dir: Path
-    control_sources: dict[str, dict[str, str]]
     base_budget: ProfileBudget | None
     physical_budget: PhysicalBudget | None
 
@@ -106,7 +103,6 @@ class GroupRequest:
             "base_manifests",
             "target_configs",
             "physical_calibration",
-            "fixed_calibration_manifests",
             "budget",
             "output_dir",
             "forced_token_bundle",
@@ -193,43 +189,48 @@ class GroupRequest:
                 raise ValueError("target configuration must be a policy object or path/name")
         if len({target.label for target in targets}) != len(targets):
             raise ValueError("target names must be unique within a group")
-        physical = admitted_physical_calibration(raw.get("physical_calibration"))
-        fixed_manifests = tuple(require_repo_path(value) for value in raw.get("fixed_calibration_manifests", []))
-        if len(set(fixed_manifests)) != len(fixed_manifests) or any(not value.is_file() for value in fixed_manifests):
-            raise ValueError("fixed calibration manifests must be distinct existing files")
         raw = {**raw, "base_config": base, "workload_ids": list(workload_ids)}
-        generated_controls = require_repo_path(raw["output_dir"]) / "control_calibrations.json"
-        raw["control_calibrations"] = control_calibrations(
-            load_json(generated_controls) if generated_controls.exists() else {},
-            raw.get("control_calibrations", {}),
+        return cls(
+            path=path,
+            raw=raw,
+            profile_suite=suite_path,
+            base_config=base,
+            workload_ids=workload_ids,
+            sources=sources,
+            targets=tuple(targets),
+            budget=ProfileBudget.parse(raw.get("budget", dict(wall_seconds=0, server_starts=0, requests=0, tokens=0))),
+            output_dir=require_repo_path(raw["output_dir"]),
+            base_budget=base_budget,
+            physical_budget=physical_budget,
         )
-        group = cls(
-            path,
-            raw,
-            suite_path,
-            base,
-            workload_ids,
-            sources,
-            tuple(targets),
-            physical,
-            fixed_manifests,
-            ProfileBudget.parse(raw.get("budget", dict(wall_seconds=0, server_starts=0, requests=0, tokens=0))),
-            require_repo_path(raw["output_dir"]),
-            {},
-            base_budget,
-            physical_budget,
+
+    @cached_property
+    def physical(self) -> dict[str, Any] | None:
+        """Admit physical evidence only when acquisition needs its geometry or costs."""
+
+        # Physical samplers are optional; default prediction only loads sources.
+        from .physical_capture import captured_physical_declaration, platform_inputs
+
+        declared = admitted_physical_calibration(self.raw.get("physical_calibration"))
+        if self.missing_base_workloads:
+            return declared
+
+        return admitted_physical_calibration(captured_physical_declaration(self)) or declared or platform_inputs(self)
+
+    @cached_property
+    def controls(self) -> dict[str, Any]:
+        """Resolve independent control inputs for acquisition, not normal prediction.
+
+        A fresh group after capture resolves the updated collection. Admission
+        still rejects base evidence and incompatible runtime environments.
+        """
+
+        generated = self.output_dir / "control_calibrations.json"
+        collection = control_calibrations(
+            load_json(generated) if generated.exists() else {}, self.raw.get("control_calibrations", {})
         )
-        if not group.missing_base_workloads:
-            physical = (
-                admitted_physical_calibration(captured_physical_declaration(group))
-                or physical
-                or platform_inputs(group)
-            )
-        return replace(
-            group,
-            physical=physical,
-            control_sources=_control_sources(group, environments[0] if environments else None),
-        )
+        _admit_controls(self, collection)
+        return collection
 
     @property
     def missing_base_workloads(self) -> tuple[str, ...]:
@@ -280,18 +281,19 @@ def admitted_physical_calibration(declaration: dict[str, Any] | None) -> dict[st
     return admitted
 
 
-def _control_sources(group: GroupRequest, base_environment: dict[str, Any] | None) -> dict[str, dict[str, str]]:
+def _admit_controls(group: GroupRequest, collection: dict[str, Any]) -> None:
     """Reuse explicitly shared measurements, not per-target costs or old models.
 
     C++ validates operation semantics when consuming these measurements. This
     boundary checks the measurement sources and the same environment contract
     used for supplementary profiles; it does not certify execution coverage.
     """
-    collection = group.raw["control_calibrations"]
+    base_environment = (
+        source_environment(group.sources[0], group.raw.get("resource_environment")) if group.sources else None
+    )
     paths = set(collection["prefetch_wait"].values())
     paths.update(path for policies in collection["write_host"].values() for path in policies.values())
     paths.update(value for key, value in collection.items() if key not in {"prefetch_wait", "write_host"})
-    evidence: dict[str, dict[str, str]] = {}
     base_manifests = {source.manifest_path for source in group.sources}
     admitted_manifests: set[Path] = set()
     for path in sorted(paths):
@@ -310,8 +312,3 @@ def _control_sources(group: GroupRequest, base_environment: dict[str, Any] | Non
             ):
                 raise ValueError(f"control calibration changed model, TP or runtime resources: {path}")
             admitted_manifests.add(manifest)
-        evidence[path] = {
-            "source_manifest": document["source_manifest"],
-            "cost_basis": document.get("cost_basis", "source_profile_uncorrected"),
-        }
-    return evidence

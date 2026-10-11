@@ -14,7 +14,6 @@ from ..contracts.forced_token.plan import int_list, load_forced_token_plan
 from ..workload_template.schema import load_template
 from ..workload_template.expand import expand_template, request_token_budget
 from ..workload_template.cli import parse_workload_command
-from .capture import calibration_inputs, capture_usage, matching_calibration_profiles
 from .group import GroupRequest
 from ..modeling.source_dag.profiles import parse_server_command_tokens
 from ..modeling.deployment import source_environment
@@ -432,32 +431,3 @@ def materialize_fixed_calibration(
     write_json(path, config)
     point["files"] = {"capture_suite": relative(path)}
     return {"name": template["id"], "files": files, "counts": counts, **fields}
-
-
-def plan_fixed_calibration(group: GroupRequest, model_inputs: dict[str, Any]) -> dict[str, Any]:
-    if model_inputs.get("status") == "ready":
-        return {"status": "not_required", "reason": "ready_for_execution_checks"}
-    missing = model_inputs.get("missing", [])
-    components = {item["component"] for item in missing}
-    if components != {"phase"}:
-        return dict(
-            status="no_suitable_experiment",
-            missing=missing,
-            remaining_profile_count=0,
-            reason="No workload experiment is justified for these input gaps.",
-        )
-    definition = materialize_fixed_calibration(group, phase_only=True)
-    ledger_path = group.output_dir / "capture_ledger.json"
-    attempts = load_json(ledger_path)["attempts"] if ledger_path.exists() else []
-    expected = calibration_inputs(definition["files"])
-    successful = matching_calibration_profiles(attempts, expected)
-    # More repeats cannot supply an absent branch or another work coordinate.
-    return {
-        "status": "experiment_exhausted" if successful else "needs_calibration",
-        "missing": missing,
-        "experiment_scope": "phase",
-        "definition": definition,
-        "completed_profile_count": len(successful),
-        "remaining_profile_count": int(not successful),
-        "usage": capture_usage(attempts),
-    }

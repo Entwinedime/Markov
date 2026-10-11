@@ -232,7 +232,7 @@ def prepare_control_calibration(group: GroupRequest, demand: str, needs: Sequenc
     if operation == "prefetch_query":
         # Group admission already checks these independent manifests and their
         # environment. Re-export with current code; do not reuse old parameters.
-        for path in sorted(set(group.raw["control_calibrations"]["prefetch_wait"].values())):
+        for path in sorted(set(group.controls["prefetch_wait"].values())):
             existing = load_json(require_repo_path(path))
             if existing.get("cost_basis") != "paired_cpu_service" or not existing.get("cpu_service_file"):
                 continue
