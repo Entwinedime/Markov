@@ -85,10 +85,10 @@ void resolve_attention_cache_layouts(const modules::hicache::patch::HiCacheSourc
         auto & write = call.cache_write;
         // Older descriptors can still be explained by recorded producers,
         // joined by actual phase ownership and layer, not nearest timestamps.
-        const auto found = producers.find({ call.phase_index, call.decode_iteration, layer });
+        const auto found = producers.find({ call.position.phase_index, call.position.decode_iteration, layer });
         if (found == producers.end()) continue;
         const auto & consumer = events.at(call.region.work.observation);
-        if (call.decode_iteration) {
+        if (call.position.decode_iteration) {
             const auto * fused = unique_producer(found->second, "runtime.phase.qkv_norm_rope", consumer);
             if (!fused || fused->arg("callsite") != "forward_prepare_npu" || fused->arg("key_dtype") != write.key_dtype
                 || fused->arg("value_dtype") != write.value_dtype)

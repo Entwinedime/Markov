@@ -19,23 +19,6 @@ std::vector<size_t> HiCacheHostExpansion::resource_lanes(const core::DagGraph & 
     return result;
 }
 
-std::optional<size_t> find_host_worker_resource(const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues, size_t main_node,
-                                                std::string_view submission_name) {
-    const auto & main = graph.node(main_node);
-    std::optional<size_t> found;
-    for (const auto & task : queues.tasks) {
-        const auto & submission = graph.node(task.submission);
-        const auto & worker = graph.node(task.first);
-        if (!submission.active || !worker.active || submission.lane_id != main.lane_id || submission.gpu_id != main.gpu_id || worker.gpu_id != main.gpu_id
-            || graph.event_for_node(task.submission).name != submission_name)
-            continue;
-        if (found && graph.node(*found).lane_id != worker.lane_id)
-            throw std::runtime_error("Host submission identifies multiple worker lanes: " + std::string(submission_name));
-        found = task.first;
-    }
-    return found;
-}
-
 std::map<std::string, size_t> host_resource_roles(const core::DagGraph & graph, const HiCacheHostExpansion & plan, size_t main_node,
                                                   std::optional<size_t> compute_node) {
     const auto main_lane = graph.node_lane_key(main_node);

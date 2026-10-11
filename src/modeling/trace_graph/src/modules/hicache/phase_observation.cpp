@@ -147,15 +147,6 @@ bool is_hicache_paged_attention(std::string_view name) {
     return normalized.contains("attention");
 }
 
-uint64_t hicache_paged_attention_duration(const std::map<std::string, HiCachePhaseCostFamily> & families) {
-    uint64_t duration = 0;
-    for (const auto & [name, family] : families) {
-        if (!is_hicache_paged_attention(name)) continue;
-        duration = core::checked_add_u64(duration, family.duration_us, "HiCache paged-attention duration exceeds uint64 range");
-    }
-    return duration;
-}
-
 HiCachePhaseObservationAudit observe_hicache_phases(const core::DagGraph & graph, const HiCacheLayerWaitObservation * layer_waits) {
     HiCachePhaseObservationAudit audit;
     HiCacheLayerWaitObservation local_waits;

@@ -82,16 +82,16 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
                           .request_id = prefill.request_id,
-                          .decode_iteration = source.decode_iteration,
+                          .decode_iteration = source.position.decode_iteration,
                           .layer_index = source.conditions.cache_layer_index };
     if (prefill.batch_size != 1 || source.batch.requests.size() != 1) {
         result.reason = "target_attention_batch_rule_not_implemented";
         return result;
     }
-    const AttentionRequestShape request = source.decode_iteration
-                                              ? AttentionRequestShape{ 1, decode_context_tokens(decode.prompt_token_count, *source.decode_iteration) }
+    const AttentionRequestShape request = source.position.decode_iteration
+                                              ? AttentionRequestShape{ 1, decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) }
                                               : AttentionRequestShape{ prefill.prefill_token_count, prefill.prompt_token_count };
-    const auto page_tokens = source.decode_iteration ? decode.target_page_size : prefill.target_page_size;
+    const auto page_tokens = source.position.decode_iteration ? decode.target_page_size : prefill.target_page_size;
     const auto & original = source.batch.requests.front();
     if (request.query_tokens == original.query_tokens && request.context_tokens == original.context_tokens && page_tokens == source.batch.page_tokens) {
         result.action = PhaseCallPlan::Action::RetainCompute;
@@ -100,7 +100,7 @@ PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, cons
     }
 
     std::optional<AttentionInputs> inputs;
-    if (source.decode_iteration && source.conditions.graph && request.context_tokens == original.context_tokens) {
+    if (source.position.decode_iteration && source.conditions.graph && request.context_tokens == original.context_tokens) {
         // Only the cache page geometry changed. The same request/round retains
         // graph eligibility and captured query batch; do not infer a new graph
         // bucket for changed batching or context lengths from a source sample.
@@ -138,16 +138,16 @@ PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCa
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
                           .request_id = prefill.request_id,
-                          .decode_iteration = source.decode_iteration,
+                          .decode_iteration = source.position.decode_iteration,
                           .kind = PhaseCallPlan::Kind::Metadata };
-    if (prefill.batch_size != 1 || (!source.decode_iteration && !source.complete_prefill_context)) {
+    if (prefill.batch_size != 1 || (!source.position.decode_iteration && !source.complete_prefill_context)) {
         result.reason = "target_metadata_batch_or_prefill_chunk_rule_unavailable";
         return result;
     }
 
     auto target = source.inputs;
-    target.context_tokens = source.decode_iteration ? decode_context_tokens(decode.prompt_token_count, *source.decode_iteration) : prefill.prompt_token_count;
-    target.page_tokens = source.decode_iteration ? decode.target_page_size : prefill.target_page_size;
+    target.context_tokens = source.position.decode_iteration ? decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) : prefill.prompt_token_count;
+    target.page_tokens = source.position.decode_iteration ? decode.target_page_size : prefill.target_page_size;
     if (target.context_tokens > target.max_context_tokens) {
         result.reason = "target_metadata_context_exceeds_deployment_capacity";
         return result;
@@ -163,7 +163,7 @@ PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCa
         result.reason = "target_metadata_graph_dispatch_not_established";
         return result;
     }
-    auto program = ascend_attention_metadata_program(source.decode_iteration ? "decode" : "prefill", target);
+    auto program = ascend_attention_metadata_program(source.position.decode_iteration ? "decode" : "prefill", target);
     if (!program) {
         result.reason = "target_metadata_backend_lowering_unavailable";
         return result;
@@ -178,7 +178,7 @@ PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
                           .logical_input = prefill.logical_input,
                           .request_id = prefill.request_id,
-                          .decode_iteration = source.decode_iteration,
+                          .decode_iteration = source.position.decode_iteration,
                           .layer_index = source.layer_index,
                           .kind = PhaseCallPlan::Kind::Dense,
                           .dense_role = source.role };
@@ -200,7 +200,7 @@ PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source
         result.reason = "source_dense_rows_disagree_with_declared_dense_token_layout";
         return result;
     }
-    auto target_tokens = source.decode_iteration ? attention.batch.padded_query_tokens : prefill.prefill_token_count;
+    auto target_tokens = source.position.decode_iteration ? attention.batch.padded_query_tokens : prefill.prefill_token_count;
     if (logits) target_tokens = 1;
     const auto rows = core::checked_multiply_u64(target_tokens, source.rows_per_token, "Dense target rows overflow");
     if (rows == 0) {
@@ -223,7 +223,7 @@ PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source
         return result;
     }
     result.action = PhaseCallPlan::Action::Generate;
-    result.operations = dense_tensor_program(source.decode_iteration ? "decode" : "prefill", source.region.implementation, *shape);
+    result.operations = dense_tensor_program(source.position.decode_iteration ? "decode" : "prefill", source.region.implementation, *shape);
     return result;
 }
 
@@ -232,8 +232,7 @@ DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollect
     DeviceCollectivePlan result{ source.region.observation, source.peer_observations, std::nullopt, {} };
     const source_dag::AttentionCall * attention = nullptr;
     for (const auto & call : attention_calls) {
-        if (call.phase_index != source.position.phase_index || call.decode_iteration != source.position.decode_iteration
-            || call.conditions.cache_layer_index != source.layer_index)
+        if (call.position != source.position || call.conditions.cache_layer_index != source.layer_index)
             continue;
         if (attention) {
             result.reason = "collective_forward_layout_ambiguous";
@@ -282,13 +281,9 @@ std::map<size_t, CostMigration> phase_migration_candidates(const core::DagGraph 
                                                            const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                                            const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     std::map<size_t, CostMigration> operations;
-    const auto append = [&](const auto & nodes, const std::string & operation, bool unchanged, std::string_view migration_basis) {
+    const auto append = [&](const auto & nodes, const std::string & operation, bool unchanged) {
         for (const auto id : nodes) {
-            operations.emplace(id,
-                               CostMigration{ operation,
-                                              graph.event_for_node(id).name,
-                                              unchanged ? std::optional<size_t>{ id } : std::nullopt,
-                                              unchanged ? std::string(migration_basis) : std::string{} });
+            operations.emplace(id, CostMigration{ operation, graph.event_for_node(id).name, unchanged });
         }
     };
 
@@ -297,11 +292,10 @@ std::map<size_t, CostMigration> phase_migration_candidates(const core::DagGraph 
     const bool same_prefill = prefill.prefill_token_count == source.prefill_token_count
                               && prefill.reusable_prefix_token_count == source.prompt_token_count - source.prefill_token_count
                               && prefill.batch_size == source.batch_size && prefill.target_page_size == source.source_page_size;
-    const std::string_view prefill_basis = "same corresponding operator, deployment, new tokens, context, batch and cache geometry";
-    append(prefill.common_kernel_nodes, "prefill.common", same_prefill, prefill_basis);
-    append(prefill.prefix_attention_nodes, "prefill.attention", same_prefill, prefill_basis);
-    append(prefill.collective_nodes, "prefill.collective", same_prefill, prefill_basis);
-    append(prefill.submit_nodes, "prefill.submit", same_prefill, prefill_basis);
+    append(prefill.common_kernel_nodes, "prefill.common", same_prefill);
+    append(prefill.prefix_attention_nodes, "prefill.attention", same_prefill);
+    append(prefill.collective_nodes, "prefill.collective", same_prefill);
+    append(prefill.submit_nodes, "prefill.submit", same_prefill);
 
     const bool same_context = decode.prompt_token_count == source.prompt_token_count && prefill.batch_size == source.batch_size;
     const bool same_pages = decode.target_page_size == source.source_page_size;
@@ -311,23 +305,19 @@ std::map<size_t, CostMigration> phase_migration_candidates(const core::DagGraph 
         // metadata also submits indexing, casts and page-table division here.
         // Until semantic ownership proves otherwise, require the same cache
         // geometry for migration just as for the rest of this phase.
-        append(std::vector<size_t>{ id },
-               attention ? "decode.attention" : "decode.common",
-               same_context && same_pages,
-               attention ? "same corresponding round, deployment, batch, context and attention cache geometry"
-                         : "same corresponding round, deployment, batch, context and cache geometry");
+        append(std::vector<size_t>{ id }, attention ? "decode.attention" : "decode.common", same_context && same_pages);
     }
     // These operators retain their own corresponding round, not another
     // round's average. Cache pages are not the kernel's internal tile size.
-    append(decode.collective_nodes, "decode.collective", same_context, "same corresponding round, deployment, batch and collective work");
-    append(decode.submit_nodes, "decode.submit", same_context && same_pages, "same corresponding round, deployment, batch, context and submission geometry");
+    append(decode.collective_nodes, "decode.collective", same_context);
+    append(decode.submit_nodes, "decode.submit", same_context && same_pages);
     return operations;
 }
 
 void require_complete_phase_migrations(const std::map<size_t, CostMigration> & operations) {
     std::map<std::string, size_t> unresolved;
     for (const auto & [node, binding] : operations)
-        if (!binding.source_node) ++unresolved[binding.operation + ":" + binding.implementation];
+        if (!binding.unchanged) ++unresolved[binding.operation + ":" + binding.implementation];
 
     if (!unresolved.empty()) throw MissingWork("Changed phase operations lack structural work rules", unresolved);
 }

@@ -811,7 +811,7 @@ DenseCallAudit observe_dense_calls(const modules::hicache::patch::HiCacheSourceD
         const auto & descriptor =
             location.prelude ? graph.prelude_context_events().at(location.observation) : graph.runtime_observations().at(location.observation);
         if (!descriptor.has_arg("layer_id")) continue;
-        attention_by_layer[{ call.phase_index, call.decode_iteration, descriptor.arg_u64("layer_id") }].push_back(i);
+        attention_by_layer[{ call.position.phase_index, call.position.decode_iteration, descriptor.arg_u64("layer_id") }].push_back(i);
     }
 
     for (auto & region : observe_dense_regions(source, queues, result.issues)) {
@@ -872,13 +872,13 @@ DenseCallAudit observe_dense_calls(const modules::hicache::patch::HiCacheSourceD
             ++result.issues["dense_call_token_layout_unresolved"];
             continue;
         }
-        result.calls.push_back({ std::move(region), owner->phase_index, match->second.front(), owner->decode_iteration, role, layer, rows_per_token });
+        result.calls.push_back({ std::move(region), *owner, match->second.front(), role, layer, rows_per_token });
     }
     std::map<std::pair<Identity, std::string>, size_t> counts;
     std::set<size_t> sampling_descriptors;
     for (const auto & call : result.calls) {
         const auto count = ++counts[{
-            { call.phase_index, call.decode_iteration, call.layer_index },
+            { call.position.phase_index, call.position.decode_iteration, call.layer_index },
             call.role
         }];
         if (call.role == "greedy_sampling") {
@@ -979,7 +979,7 @@ AttentionMetadataAudit observe_attention_metadata_calls(const modules::hicache::
 
         const auto & phase = phases.observations.at(owner->phase_index);
         ++call_counts[{ owner->phase_index, owner->decode_iteration }];
-        result.calls.push_back({ std::move(region), owner->phase_index, owner->decode_iteration, *inputs, inputs->context_tokens == phase.prompt_token_count });
+        result.calls.push_back({ std::move(region), *owner, *inputs, inputs->context_tokens == phase.prompt_token_count });
     }
     // One ordinary metadata preparation per forward round. Missing probe
     // coverage cannot leave unclaimed metadata kernels in generic phase cost;
@@ -1043,7 +1043,7 @@ AttentionCallAudit observe_attention_calls(const modules::hicache::patch::HiCach
 
         covered_nodes.insert(region.work.submitted_nodes.begin(), region.work.submitted_nodes.end());
         result.calls.push_back(
-            { std::move(region), owner->phase_index, owner->decode_iteration, *conditions, *batch, *write, attention_eager_padding(descriptor) });
+            { std::move(region), *owner, *conditions, *batch, *write, attention_eager_padding(descriptor) });
     }
     for (const auto node : required_attention_nodes)
         if (!covered_nodes.contains(node)) ++result.issues["attention_device_work_without_call"];

@@ -27,7 +27,7 @@ struct PhaseOperatorCost {
 
 /** Migrate remaining unchanged phase work after semantic owners have removed
  * their generated/replaced regions. The structure layer has established a
- * source reference for every remaining binding before this call; changed
+ * unchanged work for every remaining source-node key before this call; changed
  * unowned nodes must not enter cost inference with proxy phase geometry.
  */
 [[nodiscard]] std::vector<PhaseOperatorCost> bind_phase_cost_migrations(const core::DagGraph & source_graph,

@@ -97,9 +97,6 @@ struct HiCachePhaseObservationAudit {
 /** @brief Share Decode attention classification between observation and patch. */
 [[nodiscard]] bool is_hicache_paged_attention(std::string_view name);
 
-/** @brief Sum the semantic paged-attention family in one Decode observation. */
-[[nodiscard]] uint64_t hicache_paged_attention_duration(const std::map<std::string, HiCachePhaseCostFamily> & families);
-
 /**
  * @brief Joins request-bearing cache-extend facts to Torch phase markers.
  *

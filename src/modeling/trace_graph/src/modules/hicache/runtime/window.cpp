@@ -128,7 +128,7 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
         write_confirmations.rebind_resources(workers);
     }
     std::map<size_t, uint64_t> operator_costs;
-    std::map<size_t, bool> phase_cost_migrations;
+    std::set<size_t> phase_cost_migrations;
     std::set<size_t> started;
     std::set<std::pair<std::string, std::string>> projected;
     size_t admitted_prefills = 0;
@@ -181,21 +181,21 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
             const auto & decode = phase_work.decodes[admitted_prefills];
             const auto & source_phase = replay.source_phase(prefill.pid, prefill.request_id);
             for (const auto & call : replay.source_attention_calls().calls) {
-                const auto & origin = replay.source_phase(call.phase_index);
+                const auto & origin = replay.source_phase(call.position.phase_index);
                 if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
 
                 output.phase_tensor_work.push_back(structure::hicache::plan_attention_call(call, prefill, decode));
                 phase_calls.set_work(output.phase_tensor_work.back());
             }
             for (const auto & call : replay.source_metadata_calls().calls) {
-                const auto & origin = replay.source_phase(call.phase_index);
+                const auto & origin = replay.source_phase(call.position.phase_index);
                 if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
 
                 output.phase_tensor_work.push_back(structure::hicache::plan_attention_metadata_call(call, prefill, decode));
                 phase_calls.set_work(output.phase_tensor_work.back());
             }
             for (const auto & call : replay.source_dense_calls().calls) {
-                const auto & origin = replay.source_phase(call.phase_index);
+                const auto & origin = replay.source_phase(call.position.phase_index);
                 if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
 
                 const auto & attention = replay.source_attention_calls().calls.at(call.attention_call_index);
@@ -216,7 +216,7 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
             structure::hicache::require_complete_phase_migrations(operations);
             const auto costs = cost::bind_phase_cost_migrations(source_graph, operations, output.phase_operator_costs);
             for (const auto & cost : costs) {
-                phase_cost_migrations.emplace(cost.node_id, operations.at(cost.node_id).source_node.has_value());
+                phase_cost_migrations.insert(cost.node_id);
 
                 // Unchanged CPU work may already have executed. A no-op is
                 // not a retroactive update; actual changes are.
@@ -320,8 +320,7 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
         if (!node.active) continue;
 
         std::string origin = "unclassified";
-        if (const auto phase = phase_cost_migrations.find(id); phase != phase_cost_migrations.end())
-            origin = phase->second ? "phase_source_migration" : "phase_independent_model";
+        if (phase_cost_migrations.contains(id)) origin = "phase_source_migration";
         else if (node.kind == core::DagNodeKind::Synthetic) origin = graph.event_for_node(id).arg("cost_binding_source", "unclassified");
         if (origin == "device_collective_independent_model") ++output.executed_collective_services;
         if (origin == "collective_event_independent_model") ++output.executed_collective_events;

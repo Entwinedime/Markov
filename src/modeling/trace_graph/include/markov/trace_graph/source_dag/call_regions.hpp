@@ -192,8 +192,7 @@ struct DeviceChain {
  */
 struct AttentionCall {
     AttentionRegion region;
-    size_t phase_index;
-    std::optional<uint64_t> decode_iteration;
+    PhaseCallPosition position;
     structure::hicache::AscendAttentionConditions conditions;
     structure::hicache::AttentionBatchShape batch;
     structure::hicache::AttentionCacheWrite cache_write;
@@ -212,8 +211,8 @@ void resolve_attention_cache_layouts(const modules::hicache::patch::HiCacheSourc
 
 struct DenseCall {
     DenseRegion region;
-    size_t phase_index, attention_call_index;
-    std::optional<uint64_t> decode_iteration;
+    PhaseCallPosition position;
+    size_t attention_call_index;
     std::string role;
     uint64_t layer_index;
     uint64_t rows_per_token;
@@ -233,8 +232,7 @@ struct DenseCallAudit {
 
 struct AttentionMetadataCall {
     AttentionMetadataRegion region;
-    size_t phase_index;
-    std::optional<uint64_t> decode_iteration;
+    PhaseCallPosition position;
     structure::hicache::AttentionMetadataInputs inputs;
     bool complete_prefill_context;
 };

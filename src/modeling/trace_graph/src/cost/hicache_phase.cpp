@@ -7,7 +7,7 @@ std::vector<PhaseOperatorCost> bind_phase_cost_migrations(const core::DagGraph &
     std::vector<PhaseOperatorCost> costs;
     costs.reserve(operations.size());
     for (const auto & [node, binding] : operations) {
-        const auto duration = source_graph.cpu_service_node_duration(*binding.source_node);
+        const auto duration = source_graph.cpu_service_node_duration(node);
         ++coverage.migrated_operations;
         coverage.migrated_service_us += duration;
 

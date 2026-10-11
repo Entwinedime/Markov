@@ -106,10 +106,6 @@ void rebind_host_worker_queues(const core::DagGraph & graph, const std::map<size
 [[nodiscard]] std::map<std::string, size_t> host_resource_roles(const core::DagGraph & graph, const HiCacheHostExpansion & plan, size_t main_node,
                                                                 std::optional<size_t> compute_node = {});
 
-/** Resource identity only, witnessed by the same main lane's real submissions. */
-[[nodiscard]] std::optional<size_t> find_host_worker_resource(const core::DagGraph & graph, const simulation::detail::CpuTaskQueues & queues, size_t main_node,
-                                                              std::string_view submission_name);
-
 /** Copy retained source work, optionally including caller-owned zero-cost
  * callback points inside the same interval. These points retain a source_nodes
  * correspondence so the caller can move nested execution callbacks after

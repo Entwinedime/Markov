@@ -1,8 +1,6 @@
 #pragma once
 
-#include <cstddef>
 #include <map>
-#include <optional>
 #include <string>
 
 namespace markov::trace_graph::structure {
@@ -19,15 +17,14 @@ struct OperationWork {
     std::map<std::string, double> features;
 };
 
-/** A migration candidate is not a cost prediction request. A source reference
- * proves unchanged work; missing reference requires a structural owner to
- * replace the operation before costs can be bound. No proxy work features.
+/** A migration candidate is keyed by its corresponding source node. Unchanged
+ * work may retain that node's cost; changed work requires a structural owner
+ * to replace it before binding. This is not a model request or proxy geometry.
  */
 struct CostMigration {
     std::string operation;
     std::string implementation;
-    std::optional<size_t> source_node;
-    std::string migration_basis;
+    bool unchanged;
 };
 
 } // namespace markov::trace_graph::structure

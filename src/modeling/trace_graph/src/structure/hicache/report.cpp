@@ -443,7 +443,7 @@ Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSour
     const auto dense_audit = source_dag::observe_dense_calls(source, queues, phases, audit);
     ObservedTensorOperations result;
     const auto append_call = [&](const source_dag::SubmittedCallRegion & work, std::span<const size_t> operator_observations,
-                                 size_t phase_index, std::optional<uint64_t> decode_iteration, std::optional<uint64_t> cache_layer,
+                                 const source_dag::PhaseCallPosition & position, std::optional<uint64_t> cache_layer,
                                  const std::string & kind, const std::optional<std::vector<TensorOperation>> & program) {
         for (const auto node : work.submitted_nodes)
             if (!graph.node(node).is_cpu) result.call_devices.insert(node);
@@ -453,11 +453,11 @@ Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSour
         }
 
         const auto matched = source_dag::match_tensor_operators(source, queues, operator_observations, *program);
-        const auto & phase = phases.observations.at(phase_index);
-        const auto iteration = decode_iteration ? Json(*decode_iteration) : Json(nullptr);
+        const auto & phase = phases.observations.at(position.phase_index);
+        const auto iteration = position.decode_iteration ? Json(*position.decode_iteration) : Json(nullptr);
         const auto layer = cache_layer ? Json(*cache_layer) : Json(nullptr);
         const auto call_identity =
-            Json::array({ phase.logical_input, phase.request_ids.front(), decode_iteration ? "decode" : "prefill", iteration, layer, kind });
+            Json::array({ phase.logical_input, phase.request_ids.front(), position.decode_iteration ? "decode" : "prefill", iteration, layer, kind });
         const auto call_key = call_identity.dump();
         for (const auto * nodes : { &work.caller.owned_node_ids, &work.submitted_nodes }) {
             for (const auto node : *nodes) {
@@ -469,14 +469,14 @@ Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSour
         result.append(source, queues, *program, matched, call_identity);
     };
     for (const auto & call : audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, call.conditions.cache_layer_index,
+        append_call(call.region.work, call.region.operator_observations, call.position, call.conditions.cache_layer_index,
                     "layer", ascend_attention_tensor_program(call.conditions, call.batch, call.cache_write));
     for (const auto & call : metadata_audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, std::nullopt,
-                    "metadata", ascend_attention_metadata_program(call.decode_iteration ? "decode" : "prefill", call.inputs));
+        append_call(call.region.work, call.region.operator_observations, call.position, std::nullopt,
+                    "metadata", ascend_attention_metadata_program(call.position.decode_iteration ? "decode" : "prefill", call.inputs));
     for (const auto & call : dense_audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, call.layer_index,
-                    "dense." + call.role, dense_tensor_program(call.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
+        append_call(call.region.work, call.region.operator_observations, call.position, call.layer_index,
+                    "dense." + call.role, dense_tensor_program(call.position.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
 
     auto issues = audit.issues;
     for (const auto & [issue, count] : metadata_audit.issues) issues[issue] += count;
