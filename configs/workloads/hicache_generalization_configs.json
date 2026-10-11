@@ -1,0 +1,47 @@
+{
+  "description": "Six declared target configurations for the real-workload generalization panel; not cost-model features.",
+  "configs": [
+    {
+      "id": "wide_device_wait",
+      "purpose": "More device capacity under an existing write-through/wait-complete path.",
+      "resolved": {"page_size": 64, "device_pages": 96, "host_pages": 192},
+      "policy": {"write_policy": "write_through", "prefetch_threshold": 256, "prefetch_stop_policy": "wait_complete", "prefetch_capacity_limit_tokens": 4915, "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}},
+      "launcher": {"max_total_tokens": 6144, "hicache_ratio": 1.99}
+    },
+    {
+      "id": "tight_host_writeback",
+      "purpose": "Write-back with a smaller host/device ratio than the existing write-back configurations.",
+      "resolved": {"page_size": 128, "device_pages": 28, "host_pages": 43},
+      "policy": {"write_policy": "write_back", "prefetch_threshold": 512, "prefetch_stop_policy": "wait_complete", "prefetch_capacity_limit_tokens": 1536, "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}},
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 1.5}
+    },
+    {
+      "id": "middle_threshold_selective",
+      "purpose": "A new intermediate admission threshold with existing page geometry.",
+      "resolved": {"page_size": 64, "device_pages": 48, "host_pages": 64},
+      "policy": {"write_policy": "write_through_selective", "prefetch_threshold": 384, "prefetch_stop_policy": "wait_complete", "prefetch_capacity_limit_tokens": 819, "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}},
+      "launcher": {"max_total_tokens": 3072, "hicache_ratio": 1.32}
+    },
+    {
+      "id": "short_timeout_writeback",
+      "purpose": "A predeclared short wait, without choosing its value from target latency.",
+      "resolved": {"page_size": 128, "device_pages": 28, "host_pages": 126},
+      "policy": {"write_policy": "write_back", "prefetch_threshold": 512, "prefetch_stop_policy": "timeout", "prefetch_capacity_limit_tokens": 10035, "timeout": {"base_sec": 0.01, "per_ki_token_sec": 0.0, "max_sec": 0.01}},
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 4.49}
+    },
+    {
+      "id": "page32_selective_best_effort",
+      "purpose": "Previously unseen combination of existing page size, write policy and stop policy.",
+      "resolved": {"page_size": 32, "device_pages": 112, "host_pages": 225},
+      "policy": {"write_policy": "write_through_selective", "prefetch_threshold": 256, "prefetch_stop_policy": "best_effort", "prefetch_capacity_limit_tokens": 2892, "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}},
+      "launcher": {"max_total_tokens": 3584, "hicache_ratio": 2.0}
+    },
+    {
+      "id": "large_working_set_wait",
+      "purpose": "Larger cache working set for explicit cost-range and unseen-combination inspection.",
+      "resolved": {"page_size": 128, "device_pages": 64, "host_pages": 257},
+      "policy": {"write_policy": "write_back", "prefetch_threshold": 512, "prefetch_stop_policy": "wait_complete", "prefetch_capacity_limit_tokens": 19763, "timeout": {"base_sec": null, "per_ki_token_sec": null, "max_sec": null}},
+      "launcher": {"max_total_tokens": 8192, "hicache_ratio": 4.0}
+    }
+  ]
+}

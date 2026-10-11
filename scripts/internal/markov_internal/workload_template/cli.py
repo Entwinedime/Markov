@@ -32,9 +32,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     """Build the reusable command parser for runner preflight and execution."""
 
     parser = argparse.ArgumentParser(
-        description="Compile and strictly serially execute a JSON HiCache manual workload.", allow_abbrev=False
+        description="Prepare or strictly serially execute a JSON HiCache workload.", allow_abbrev=False
     )
-    parser.add_argument("--template", required=True, help="Path to one JSON workload template.")
+    inputs = parser.add_mutually_exclusive_group(required=True)
+    inputs.add_argument("--template", help="Path to one JSON workload template.")
+    inputs.add_argument("--sharegpt-dataset", help="Prepare serial workload inputs from a local ShareGPT JSON corpus.")
+    parser.add_argument("--sharegpt-policy", help="Declared sampling and token-range policy for corpus preparation.")
     parser.add_argument(
         "--config-specs",
         default=str(DEFAULT_CONFIG_SPECS),
@@ -47,6 +50,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-sec", type=float, default=600.0)
     parser.add_argument("--forced-token-mode", choices=("none", "capture", "replay"), default="none")
     parser.add_argument("--forced-token-plan")
+    parser.add_argument(
+        "--checkpoint-mode",
+        choices=("verify", "observe"),
+        default="verify",
+        help="Observe setup cache state without enforcing a manual workload's old-config assertions.",
+    )
     parser.add_argument(
         "--require-hicache-state",
         action="store_true",
@@ -76,6 +85,17 @@ def main() -> int:
 
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.sharegpt_dataset:
+        if not args.sharegpt_policy:
+            parser.error("ShareGPT preparation requires --sharegpt-policy")
+        from .sharegpt import prepare_sharegpt
+
+        report = prepare_sharegpt(
+            Path(args.sharegpt_dataset), Path(args.sharegpt_policy), args.tokenizer_path, Path(args.output_dir)
+        )
+        print(json.dumps({"prepared_workloads": list(report["workloads"]), "output_dir": args.output_dir}), flush=True)
+        return 0
+
     template_path = Path(args.template)
     config_specs_path = Path(args.config_specs)
     output_dir = Path(args.output_dir)
@@ -111,7 +131,9 @@ def main() -> int:
         config = configs.get(str(args.config_id))
         if config is None:
             parser.error(f"unknown config id: {args.config_id}")
-    require_diagnostic = args.forced_token_mode == "replay" or args.require_hicache_state
+    require_diagnostic = (
+        args.forced_token_mode == "replay" and template.state_checks_required
+    ) or args.require_hicache_state
     if require_diagnostic and config is None:
         parser.error("HiCache state checks require --config-id")
     forced_plan_path = Path(args.forced_token_plan) if args.forced_token_plan else None
@@ -126,6 +148,7 @@ def main() -> int:
             timeout_sec=float(args.timeout_sec),
             diagnostic_api_key=args.diagnostic_api_key,
             require_diagnostic=require_diagnostic,
+            checkpoint_mode=args.checkpoint_mode,
         )
     except (OSError, TemplateValidationError, WorkloadExecutionError) as error:
         print(f"workload_failed:{error}", file=sys.stderr, flush=True)

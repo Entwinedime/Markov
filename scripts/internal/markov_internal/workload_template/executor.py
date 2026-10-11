@@ -39,6 +39,7 @@ def execute_workload(
     timeout_sec: float,
     diagnostic_api_key: str | None,
     require_diagnostic: bool,
+    checkpoint_mode: str,
 ) -> bool:
     """Execute one fixed plan; any gate error stops instead of changing request order."""
 
@@ -136,6 +137,7 @@ def execute_workload(
                         diagnostic_url=diagnostic_url,
                         timeout_sec=timeout_sec,
                         api_key=diagnostic_api_key,
+                        checkpoint_mode=checkpoint_mode,
                     )
             else:
                 row = _gate_not_available_row(step, f"unsupported_step_kind:{step.kind}")
@@ -177,6 +179,7 @@ def execute_workload(
         "workload_id": plan.template.workload_id,
         "config_id": config.config_id if config is not None else None,
         "mode": mode,
+        "checkpoint_mode": checkpoint_mode,
         "forced_token": forced_summary,
         "formal_window": formal_window,
         "total": latency_summary(rows),
@@ -404,6 +407,7 @@ def _execute_checkpoint(
     diagnostic_url: str,
     timeout_sec: float,
     api_key: str | None,
+    checkpoint_mode: str,
 ) -> dict[str, Any]:
     """Evaluate fixed witness assertions against one read-only diagnostic snapshot."""
 
@@ -424,7 +428,7 @@ def _execute_checkpoint(
             continue
         observed = evaluate_assertion(snapshot, request, str(assertion["range"]), config)
         expected = assertion["expect"]
-        passed = assertion_matches(observed, expected)
+        passed = assertion_matches(observed, expected) if checkpoint_mode == "verify" else None
         assertion_rows.append(
             {
                 "id": assertion["id"],
@@ -435,7 +439,8 @@ def _execute_checkpoint(
                 "passed": passed,
             }
         )
-        all_passed &= passed
+        if passed is False:
+            all_passed = False
     return {
         "kind": "checkpoint",
         "step_id": step.step_id,
@@ -447,6 +452,7 @@ def _execute_checkpoint(
         "start_time_ms": start_wall,
         "end_time_ms": time.time() * 1000.0,
         "assertions": assertion_rows,
+        "verification": "performed" if checkpoint_mode == "verify" else "not_requested",
     }
 
 

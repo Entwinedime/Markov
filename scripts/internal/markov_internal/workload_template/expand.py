@@ -27,8 +27,8 @@ class RequestPlan:
     phase: str
     measure: bool
     prompt_token_ids: tuple[int, ...]
-    anchor_tokens: int
-    tail_tokens: int
+    anchor_tokens: int | None
+    tail_tokens: int | None
     max_new_tokens: int
 
 
@@ -142,8 +142,13 @@ def request_token_budget(template: Template) -> dict[str, int]:
         for step in _expand_step(raw):
             if step["kind"] == "request":
                 definition, _ = resolve_request_definition(template.data["request_defs"], step["request"])
-                contract = definition["token_contract"]
-                counts.append(contract["anchor_tokens"] + contract["tail_tokens"] + output)
+                contract = definition.get("token_contract")
+                input_count = (
+                    contract["anchor_tokens"] + contract["tail_tokens"]
+                    if contract is not None
+                    else len(definition["prompt_token_ids"])
+                )
+                counts.append(input_count + output)
     return {"requests": len(counts), "tokens": sum(counts), "output_tokens_per_request": output}
 
 
@@ -199,14 +204,17 @@ def _build_request_plan(
         token_ids = tuple(int(token_id) for token_id in tokenizer.encode(prompt, add_special_tokens=False))
     if not token_ids:
         raise TemplateValidationError(f"request {request_name} rendered an empty token sequence")
-    token_contract = request_definition["token_contract"]
-    anchor_tokens = token_contract["anchor_tokens"]
-    expected_tail_tokens = token_contract["tail_tokens"]
-    actual_tail_tokens = len(token_ids) - anchor_tokens
-    if actual_tail_tokens != expected_tail_tokens:
-        raise TemplateValidationError(
-            f"request {request_name}: tail token contract expected {expected_tail_tokens}, got {actual_tail_tokens}"
-        )
+    token_contract = request_definition.get("token_contract")
+    anchor_tokens = actual_tail_tokens = None
+    if token_contract is not None:
+        anchor_tokens = token_contract["anchor_tokens"]
+        expected_tail_tokens = token_contract["tail_tokens"]
+        actual_tail_tokens = len(token_ids) - anchor_tokens
+        if actual_tail_tokens != expected_tail_tokens:
+            raise TemplateValidationError(
+                f"request {request_name}: tail token contract expected {expected_tail_tokens}, got {actual_tail_tokens}"
+            )
+
     return RequestPlan(
         step_id=raw_step["id"],
         sequence_id=sequence_id,

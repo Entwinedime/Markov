@@ -42,6 +42,12 @@ class Template:
 
         return str(self.data["id"])
 
+    @property
+    def state_checks_required(self) -> bool:
+        """State gates belong to the workload, not to forced-token replay."""
+
+        return any(step["kind"] in {"barrier", "checkpoint"} for step in self.data["steps"])
+
 
 def load_template(path: Path) -> Template:
     """Load and validate one JSON template before any tokenizer/server use."""
@@ -186,9 +192,12 @@ def _validate_template_shape(data: Mapping[str, Any]) -> None:
                 raise TemplateValidationError(
                     f"request definition {request_name}.prompt_parts[{part_index}].text must be a string"
                 )
-        token_contract = _required_object(request_def, "token_contract", f"request definition {request_name}")
-        _required_positive_int(token_contract, "anchor_tokens", f"request definition {request_name}.token_contract")
-        _required_positive_int(token_contract, "tail_tokens", f"request definition {request_name}.token_contract")
+        if "token_contract" in request_def:
+            token_contract = _required_object(request_def, "token_contract", f"request definition {request_name}")
+            _required_positive_int(token_contract, "anchor_tokens", f"request definition {request_name}.token_contract")
+            _required_positive_int(token_contract, "tail_tokens", f"request definition {request_name}.token_contract")
+        elif tokens is None:
+            raise TemplateValidationError(f"request definition {request_name}: text prompts need a token contract")
         branch_markers = request_def.get("branch_markers")
         branch_marker = request_def.get("branch_marker")
         if branch_marker is not None and (not isinstance(branch_marker, str) or not branch_marker):
@@ -227,6 +236,9 @@ def _validate_template_shape(data: Mapping[str, Any]) -> None:
     if start_step not in known_step_ids or end_step not in known_step_ids:
         raise TemplateValidationError("formal_window must reference declared step ids")
     _validate_two_stage_layout(steps, start_step=start_step, end_step=end_step)
+    if any(step["kind"] in {"barrier", "checkpoint"} for step in steps):
+        for name, definition in request_defs.items():
+            _required_object(definition, "token_contract", f"stateful request definition {name}")
 
 
 def _validate_two_stage_layout(
@@ -239,6 +251,17 @@ def _validate_two_stage_layout(
 
     barrier_positions = [index for index, step in enumerate(steps) if step.get("kind") == "barrier"]
     checkpoint_positions = [index for index, step in enumerate(steps) if step.get("kind") == "checkpoint"]
+    if not barrier_positions and not checkpoint_positions:
+        formal_positions = [index for index, step in enumerate(steps) if step["measure"]]
+        if not formal_positions:
+            raise TemplateValidationError("serial workload needs a measured request sequence")
+        first = formal_positions[0]
+        if formal_positions != list(range(first, len(steps))):
+            raise TemplateValidationError("serial workload formal requests must form the complete final sequence")
+        if start_step != steps[first]["id"] or end_step != steps[-1]["id"]:
+            raise TemplateValidationError("formal_window must cover all measured serial requests")
+        return
+
     if not barrier_positions:
         raise TemplateValidationError("two-stage workload requires a settling barrier before its checkpoint")
     if len(checkpoint_positions) != 1:
