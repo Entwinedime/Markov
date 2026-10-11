@@ -205,9 +205,6 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
         set(result["training_source_manifests"]) | database.manifests_for_captures(set(result["training_sources"]))
     )
 
-    # Select all evidence before publishing parameters. An invalid I/O
-    # selection must not store models from a failed training call.
-    database.replace_models(request["deployment"], result["operator_models"])
     return result
 
 

@@ -194,7 +194,7 @@ class CostDatabase:
             if replace_captures
             else []
         )
-        removed = dict(observations=0, evidence=0, models=0)
+        removed = dict(observations=0, evidence=0)
         with closing(sqlite3.connect(self.path)) as connection, connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS capture_sources (capture TEXT NOT NULL, manifest TEXT NOT NULL, is_capture INTEGER NOT NULL, "
@@ -213,26 +213,10 @@ class CostDatabase:
                 "PRIMARY KEY (capture, position, timing_scope))"
             )
             if replaced:
-                affected_deployments: set[str] = set()
                 for capture in replaced:
                     for table in ("observations", "evidence"):
-                        affected_deployments.update(
-                            row[0]
-                            for row in connection.execute(
-                                f"SELECT DISTINCT deployment FROM {table} WHERE capture=?", (capture,)
-                            )
-                        )
                         removed[table] += connection.execute(
                             f"DELETE FROM {table} WHERE capture=?", (capture,)
-                        ).rowcount
-
-                # Database models are derived from these measurements. Exported
-                # packages are separate files: report that they need retraining,
-                # never rewrite them or introduce a version handshake.
-                if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='models'").fetchone():
-                    for deployment in affected_deployments:
-                        removed["models"] += connection.execute(
-                            "DELETE FROM models WHERE deployment=?", (deployment,)
                         ).rowcount
 
             for row in evidence:
@@ -427,24 +411,3 @@ class CostDatabase:
                 for environment, operation, implementation, scope, count, captures in groups
             ],
         }
-
-    def replace_models(self, deployment: dict[str, Any], models: list[dict[str, Any]]) -> None:
-        """Keep one current trained response per operator in a selected deployment.
-
-        Training replaces this deployment's responses atomically. Missing models
-        do not silently retain older coefficients as a prediction fallback.
-        """
-
-        with closing(sqlite3.connect(self.path)) as connection, connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS models (deployment TEXT NOT NULL, operation TEXT NOT NULL, "
-                "implementation TEXT NOT NULL, timing_scope TEXT NOT NULL, parameters TEXT NOT NULL, "
-                "PRIMARY KEY (deployment, operation, implementation, timing_scope))"
-            )
-            environment = _json(deployment)
-            connection.execute("DELETE FROM models WHERE deployment=?", (environment,))
-            for model in models:
-                connection.execute(
-                    "INSERT INTO models VALUES (?, ?, ?, ?, ?)",
-                    (environment, model["operation"], model["implementation"], model["timing_scope"], _json(model)),
-                )
