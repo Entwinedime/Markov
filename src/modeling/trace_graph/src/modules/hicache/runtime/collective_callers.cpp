@@ -1,9 +1,9 @@
 #include "markov/trace_graph/core/numeric.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/collective_services.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 
-#include <array>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -116,18 +116,16 @@ std::optional<uint64_t> HiCacheCollectiveServices::caller_cost(core::DagGraph & 
     const auto & segment = found->second;
     const auto steps = structure::hicache::ordinary_collective_caller_steps(segment.transfer);
     const auto work = structure::hicache::collective_caller_work(work_.at(segment.observation), steps[segment.step]);
-    auto residual = work;
-    residual.timing_scope = "residual_interval";
-    const std::array requests{ work, residual };
-    const auto estimates = provider.estimate_all(requests);
+    const auto estimate = cost::estimate_host_operation(provider, work, false);
+
     auto & event = graph.mutable_event_for_node(node);
     event.set_arg("cost_binding_source", "collective_caller_independent_model");
     event.set_arg("cost_operation", work.operation);
     event.set_arg("cost_implementation", work.implementation);
     event.set_arg("cost_timing_scope", work.timing_scope);
-    event.set_arg("cpu_service_us", std::to_string(estimates[0].duration_us));
-    event.set_arg("residual_interval_us", std::to_string(estimates[1].duration_us));
-    return core::checked_add_u64(estimates[0].duration_us, estimates[1].duration_us, "Collective caller interval overflow");
+    event.set_arg("cpu_service_us", std::to_string(estimate.main_us));
+    event.set_arg("residual_interval_us", std::to_string(estimate.main_residual_us));
+    return core::checked_add_u64(estimate.main_us, estimate.main_residual_us, "Collective caller interval overflow");
 }
 
 } // namespace markov::trace_graph::modules::hicache::runtime

@@ -19,7 +19,11 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
     for (const auto & operation : operations) {
         using Kind = structure::TensorExecutionKind;
         HiCacheHostExpansion segment;
+        const auto main_lane = graph.node_lane_key(main);
+        std::optional<size_t> previous_main;
+        const auto cpu = [&](std::string name) { return segment.append_main(main_lane, std::move(name), previous_main, ""); };
         TensorOperationSlots slots{ .submit = 0, .host_return = 0, .work = operation.work };
+
         if (operation.execution == Kind::DirectBlockingDevice) slots.tail_scope = "blocking_return_interval";
         if (operation.execution == Kind::BlockingContextReadback) slots.tail_scope = "blocking_readback_interval";
         if (operation.execution == Kind::LayerReady && has_layer_load) {
@@ -37,89 +41,50 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
             result.event_layers.push_back(operation.layer_index.value());
         }
         else if (operation.execution == Kind::LayerReady || operation.execution == Kind::CpuService) {
-            const auto lane = std::string(graph.node_lane_key(main));
-            segment.nodes.push_back({
-                { .name = "target " + operation.work.operation, .lane_key = lane }
-            });
-            segment.nodes.push_back({
-                { .name = "after " + operation.work.operation, .lane_key = lane }
-            });
-            segment.edges.push_back({ 0, 1, core::DagEdgeKind::Sequential });
-            segment.host_return = 1;
+            slots.submit = cpu("target " + operation.work.operation);
+            segment.host_return = cpu("after " + operation.work.operation);
             if (operation.execution == Kind::LayerReady) {
                 slots.work.operation = "layer_wait.inactive_return";
                 slots.work.implementation = "inactive";
             }
         }
         else if (operation.execution == Kind::BlockingContextReadback) {
-            const auto lane = std::string(graph.node_lane_key(main));
-            slots.tail = 1;
             slots.tail_operation = operation.work.operation + ".return";
-            segment.nodes.push_back({
-                { .name = "target " + operation.work.operation + " prepare", .lane_key = lane }
-            });
-            segment.nodes.push_back({
-                { .name = "target " + operation.work.operation + " synchronous readback", .lane_key = lane }
-            });
-            segment.nodes.push_back({
-                { .name = "after " + operation.work.operation, .lane_key = lane }
-            });
-            segment.edges = {
-                { 0, 1, core::DagEdgeKind::Sequential },
-                { 1, 2, core::DagEdgeKind::Sequential }
-            };
-            segment.host_return = 2;
+            slots.submit = cpu("target " + operation.work.operation + " prepare");
+            slots.tail = cpu("target " + operation.work.operation + " synchronous readback");
+            segment.host_return = cpu("after " + operation.work.operation);
             // Torch-NPU waits for compute first, then performs aclrtMemcpy
             // on the caller. There is no submitted worker/copy task. Bind the
             // complete post-wait interval, not fictitious device/worker costs.
         }
         else if (operation.execution == Kind::DirectBlockingDevice) {
-            const auto lane = std::string(graph.node_lane_key(main));
-            slots.device = 1;
-            slots.tail = 2;
+            slots.submit = cpu("target " + operation.work.operation + " submit");
+            slots.device = segment.nodes.size();
             slots.tail_operation = operation.work.operation + ".return";
             segment.nodes.push_back({
-                { .name = "target " + operation.work.operation + " submit", .lane_key = lane }
-            });
-            segment.nodes.push_back({
                 { .name = "target " + operation.work.operation + " device", .is_cpu = false, .lane_key = std::string(graph.node_lane_key(compute)) }
-            });
-            segment.nodes.push_back({
-                { .name = "target " + slots.tail_operation, .lane_key = lane }
-            });
-            segment.nodes.push_back({
-                { .name = "after " + operation.work.operation, .lane_key = lane }
             });
             // The launcher runs on the caller: no queue task or dispatch
             // delay exists. Stream completion releases its synchronous tail.
             // Correlation is reserved for registering worker FIFO tasks in
             // FutureDag. This direct launch has no worker; its causal edge
             // uses the same mutation relation as other generated device work.
-            segment.edges = {
-                { 0, 1,   core::DagEdgeKind::Mutation },
-                { 0, 2, core::DagEdgeKind::Sequential },
-                { 1, 2,       core::DagEdgeKind::Sync },
-                { 2, 3, core::DagEdgeKind::Sequential }
-            };
-            segment.host_return = 3;
+            segment.edges.push_back({ slots.submit, *slots.device, core::DagEdgeKind::Mutation });
+            slots.tail = cpu("target " + slots.tail_operation);
+            segment.edges.push_back({ *slots.device, *slots.tail, core::DagEdgeKind::Sync });
+            segment.host_return = cpu("after " + operation.work.operation);
         }
         else if (!operation.device_launches.empty()) {
-            const auto main_lane = std::string(graph.node_lane_key(main));
             const auto worker_lane = std::string(graph.node_lane_key(worker));
             const auto device_lane = std::string(graph.node_lane_key(compute));
-            segment.nodes.push_back({
-                { .name = "target " + operation.work.operation + " submit", .lane_key = main_lane }
-            });
-            segment.nodes.push_back({
-                { .name = "target queued", .lane_key = main_lane }
-            });
-            segment.edges.push_back({ 0, 1, core::DagEdgeKind::Sequential });
+            slots.submit = cpu("target " + operation.work.operation + " submit");
+            const auto submitted = cpu("target queued");
             std::optional<size_t> previous_worker, previous_kernel;
             for (const auto & launch : operation.device_launches) {
                 const auto launch_worker = segment.nodes.size();
                 segment.nodes.push_back({
                     { .name = "target " + launch.operation + " launch", .lane_key = worker_lane },
-                    1,
+                    submitted,
                     worker,
                     previous_worker
                 });
@@ -139,22 +104,14 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
             slots.worker_return = segment.nodes.size();
             segment.nodes.push_back({
                 { .name = "target worker return", .lane_key = worker_lane },
-                1,
+                submitted,
                 worker,
                 previous_worker
             });
             segment.edges.push_back({ *previous_worker, *slots.worker_return, core::DagEdgeKind::Sequential });
-            slots.tail = segment.nodes.size();
             slots.tail_operation = operation.work.operation + ".return";
-            segment.nodes.push_back({
-                { .name = "target " + slots.tail_operation, .lane_key = main_lane }
-            });
-            segment.edges.push_back({ 1, *slots.tail, core::DagEdgeKind::Sequential });
-            segment.host_return = segment.nodes.size();
-            segment.nodes.push_back({
-                { .name = "after " + operation.work.operation, .lane_key = main_lane }
-            });
-            segment.edges.push_back({ *slots.tail, segment.host_return, core::DagEdgeKind::Sequential });
+            slots.tail = cpu("target " + slots.tail_operation);
+            segment.host_return = cpu("after " + operation.work.operation);
         }
         else {
             auto generated = generate_async_device_operation(graph, main, worker, compute, operation.work.operation);
@@ -168,13 +125,10 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
             slots.tail = segment.host_return;
             slots.tail_operation = operation.work.operation + ".return";
             segment.nodes[*slots.tail].work.name = "target " + slots.tail_operation;
-            const auto returned = segment.nodes.size();
-            segment.nodes.push_back({
-                { .name = "after " + operation.work.operation, .lane_key = std::string(graph.node_lane_key(main)) }
-            });
-            segment.edges.push_back({ *slots.tail, returned, core::DagEdgeKind::Sequential });
-            segment.host_return = returned;
+            previous_main = slots.tail;
+            segment.host_return = cpu("after " + operation.work.operation);
         }
+
         const auto offset = plan.nodes.size();
         slots.submit += offset;
         if (slots.worker) *slots.worker += offset;

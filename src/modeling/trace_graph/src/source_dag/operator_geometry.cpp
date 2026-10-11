@@ -1,4 +1,3 @@
-#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
@@ -63,13 +62,8 @@ nlohmann::json operator_geometry_observations(const core::DagGraph & graph, cons
         const auto position = measurement_position(event);
         if (!position) continue;
 
-        const auto begin_ns = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "operator timestamp overflow"),
-                                                    event.ts_submicro_ns,
-                                                    "operator timestamp overflow");
-        const auto duration_ns = core::checked_add_u64(core::checked_multiply_u64(event.dur, 1'000, "operator duration overflow"),
-                                                       event.dur_submicro_ns,
-                                                       "operator duration overflow");
-        const auto end_ns = core::checked_add_u64(begin_ns, duration_ns, "operator end overflow");
+        const auto begin_ns = event.start_ns();
+        const auto end_ns = event.end_ns();
         const auto region = metadata ? metadata_by_observation.at(i)->work : observe_submitted_call_region(source, queues, i);
         auto devices = nlohmann::json::array();
         if (!region.caller.has_node_overlap) {

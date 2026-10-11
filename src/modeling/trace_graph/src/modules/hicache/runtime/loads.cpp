@@ -2,6 +2,7 @@
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/cost/hicache_submission.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include <algorithm>
@@ -126,11 +127,9 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                 if (plan.nodes.empty()) {
                     plan = generate_cpu_control(graph_->node_lane_key(insertion.continuation), "target empty load queue");
                     structure::OperationWork work{ "hicache_io_control", "load.submission.empty_return", "empty_queue", "cpu_service", {} };
-                    const auto cpu_us = operator_provider_.estimate(work).duration_us;
-                    work.timing_scope = "residual_interval";
-                    const auto residual_us = operator_provider_.estimate(work).duration_us;
+                    const auto estimate = cost::estimate_host_operation(operator_provider_, work, false);
                     std::pair<double, double> remainder{};
-                    bind_cpu_control(plan, cpu_us, residual_us, remainder);
+                    bind_cpu_control(plan, estimate.main_us, estimate.main_residual_us, remainder);
                 }
                 const auto empty = expand_host(plan, {}, future);
                 future.depend(empty.host_return, insertion.continuation);

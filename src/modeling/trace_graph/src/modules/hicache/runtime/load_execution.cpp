@@ -6,17 +6,6 @@
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
 
-size_t append_main_work(HiCacheHostExpansion & plan, std::string_view lane, std::string name, std::optional<size_t> & previous,
-                        std::string category = "hicache_patch") {
-    const auto node = plan.nodes.size();
-    plan.nodes.push_back({
-        { .name = std::move(name), .category = std::move(category), .lane_key = std::string(lane) }
-    });
-    if (previous) plan.edges.push_back({ *previous, node, core::DagEdgeKind::Sequential });
-    previous = node;
-    return node;
-}
-
 struct SubmittedDevice {
     size_t worker, device, returned;
 };
@@ -82,7 +71,7 @@ GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_
     std::optional<size_t> previous;
     const auto lane = graph.node_lane_key(main);
     const auto cpu = [&](ReleaseOperation role, const char * name) {
-        const auto node = append_main_work(plan, lane, name, previous);
+        const auto node = plan.append_main(lane, name, previous);
         result.operations.push_back({ role, { .main = node } });
         return node;
     };
@@ -97,7 +86,7 @@ GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_
     }
 
     (void)cpu(ReleaseOperation::Concatenate, "target release concatenate submit");
-    const auto queued = append_main_work(plan, lane, "target release concatenate queued", previous);
+    const auto queued = plan.append_main(lane, "target release concatenate queued", previous);
     const auto task = append_submitted_device(plan, graph, worker, queued, graph.node_lane_key(compute), "target release concatenate");
     result.operations.back().second.worker = task.worker;
     result.operations.back().second.device = task.device;
@@ -106,7 +95,7 @@ GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_
     plan.streams.push_back({ compute, task.device, task.device });
 
     (void)cpu(ReleaseOperation::Tail, "target release bookkeeping");
-    plan.host_return = append_main_work(plan, lane, "target release host return", previous);
+    plan.host_return = plan.append_main(lane, "target release host return", previous);
     return result;
 }
 
@@ -123,8 +112,8 @@ GeneratedLayerWait generate_layer_wait(const core::DagGraph & graph, size_t main
     auto & plan = result.plan;
     const auto lane = graph.node_lane_key(main);
     std::optional<size_t> previous;
-    result.submit = append_main_work(plan, lane, "target layer event wait submit", previous);
-    const auto queued = append_main_work(plan, lane, "target layer event wait queued", previous);
+    result.submit = plan.append_main(lane, "target layer event wait submit", previous);
+    const auto queued = plan.append_main(lane, "target layer event wait queued", previous);
     const auto task = append_submitted_device(plan, graph, worker, queued, graph.node_lane_key(compute), "target layer event wait");
     result.worker = task.worker;
     result.device = task.device;
@@ -135,8 +124,8 @@ GeneratedLayerWait generate_layer_wait(const core::DagGraph & graph, size_t main
     // Only the device stream waits. Its event is the target layer completion,
     // supplied at execution; the CPU returns after submitting the wait.
     plan.event_waits.push_back({ core::DagNode::kNoNode, plan.streams.front().last });
-    result.tail = append_main_work(plan, lane, "target layer wait bookkeeping", previous);
-    plan.host_return = append_main_work(plan, lane, "target layer wait host return", previous);
+    result.tail = plan.append_main(lane, "target layer wait bookkeeping", previous);
+    plan.host_return = plan.append_main(lane, "target layer wait host return", previous);
     return result;
 }
 
@@ -154,7 +143,7 @@ GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph 
     const auto transfer_lane = std::string(graph.node_lane_key(transfer_stream));
     const auto prefix = "target " + std::string(operation);
     std::optional<size_t> previous_main, previous_device;
-    const auto cpu = [&](const std::string & name) { return append_main_work(plan, main_lane, name, previous_main); };
+    const auto cpu = [&](const std::string & name) { return plan.append_main(main_lane, name, previous_main); };
     const auto operation_cpu = [&](TransferOperation role, const std::string & name) {
         const auto node = cpu(name);
         result.operations.push_back({ role, { .main = node } });
@@ -230,12 +219,12 @@ GeneratedDeviceOperation generate_async_device_operation(const core::DagGraph & 
     GeneratedDeviceOperation result;
     auto & plan = result.plan;
     std::optional<size_t> previous;
-    result.submit = append_main_work(plan, main_lane, name + " prepare/submit", previous);
-    const auto submitted = append_main_work(plan, main_lane, name + " queued", previous, "");
+    result.submit = plan.append_main(main_lane, name + " prepare/submit", previous);
+    const auto submitted = plan.append_main(main_lane, name + " queued", previous, "");
     const auto task = append_submitted_device(plan, graph, worker_node, submitted, graph.node_lane_key(compute_node), name, " device");
     result.worker = task.worker;
     result.device = task.device;
-    plan.host_return = append_main_work(plan, main_lane, name + " host return", previous, "");
+    plan.host_return = plan.append_main(main_lane, name + " host return", previous, "");
     result.worker_return = task.returned;
     plan.edges.push_back({ task.worker, task.device, core::DagEdgeKind::Mutation });
     plan.streams.push_back({ compute_node, task.device, task.device });

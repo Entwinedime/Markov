@@ -2,10 +2,16 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::cost {
 struct HostOperationCost;
@@ -64,6 +70,11 @@ struct HiCacheHostExpansion {
     std::vector<Wait> collective_completions;
     std::map<size_t, size_t> source_nodes;
     size_t host_return = 0;
+
+    /** Append zero-cost caller work on the supplied lane, chain it after the
+     * local previous node and update that cursor. Returns a local slot ID;
+     * no worker task, device wait or graph mutation is implied. */
+    size_t append_main(std::string_view lane, std::string name, std::optional<size_t> & previous, std::string category = "hicache_patch");
 
     /** In expand_host position order: emitted streams, then stream barriers.
      * Repeated resources remain repeated; event waits are bound separately. */

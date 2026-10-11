@@ -4,6 +4,7 @@
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include <algorithm>
 #include <stdexcept>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
@@ -21,16 +22,22 @@ void bind_cpu_service(core::DagSyntheticNodeSpec & work, double cpu_us, double r
 
 } // namespace
 
+size_t HiCacheHostExpansion::append_main(std::string_view lane, std::string name, std::optional<size_t> & previous, std::string category) {
+    const auto node = nodes.size();
+    nodes.push_back({
+        { .name = std::move(name), .category = std::move(category), .lane_key = std::string(lane) }
+    });
+    if (previous) edges.push_back({ *previous, node, core::DagEdgeKind::Sequential });
+
+    previous = node;
+    return node;
+}
+
 HiCacheHostExpansion generate_cpu_control(std::string_view lane, std::string_view name) {
     HiCacheHostExpansion plan;
-    plan.nodes.push_back({
-        { .name = std::string(name), .category = "hicache_patch", .lane_key = std::string(lane) }
-    });
-    plan.nodes.push_back({
-        { .name = "target control return", .lane_key = std::string(lane) }
-    });
-    plan.edges.push_back({ 0, 1, core::DagEdgeKind::Sequential });
-    plan.host_return = 1;
+    std::optional<size_t> previous;
+    (void)plan.append_main(lane, std::string(name), previous);
+    plan.host_return = plan.append_main(lane, "target control return", previous, "");
     return plan;
 }
 

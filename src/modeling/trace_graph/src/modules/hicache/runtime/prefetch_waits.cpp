@@ -1,4 +1,5 @@
 #include "markov/trace_graph/modules/hicache/runtime/prefetch_waits.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/source_dag/prefetch.hpp"
 #include "markov/trace_graph/structure/cpu_collective.hpp"
 #include "markov/trace_graph/structure/hicache/query.hpp"
@@ -124,10 +125,9 @@ void HiCachePrefetchWaits::bind(core::DagGraph & graph, model::HiCacheModelRepla
                     structure::cpu_collective_entries(structure::CpuCollectiveKind::Broadcast, receive_group->members, receive_group->root_index);
                 const auto all_reduce = structure::cpu_collective_entries(structure::CpuCollectiveKind::AllReduce, participants);
                 const auto local = [&](int rank, const std::string & role) {
-                    return model::PrefetchSchedulerLocalTiming{
-                        costs.estimate(structure::hicache::prefetch_scheduler_operation(role, "cpu_service", rank, participants.size())).duration_us,
-                        costs.estimate(structure::hicache::prefetch_scheduler_operation(role, "residual_interval", rank, participants.size())).duration_us
-                    };
+                    const auto work = structure::hicache::prefetch_scheduler_operation(role, "cpu_service", rank, participants.size());
+                    const auto estimate = cost::estimate_host_operation(costs, work, false);
+                    return model::PrefetchSchedulerLocalTiming{ estimate.main_us, estimate.main_residual_us };
                 };
 
                 model::PrefetchSchedulerTiming body;

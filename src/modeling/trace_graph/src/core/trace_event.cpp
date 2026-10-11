@@ -201,6 +201,15 @@ TraceEvent & TraceEvent::operator=(const TraceEvent & other) {
     return *this;
 }
 
+uint64_t TraceEvent::start_ns() const {
+    return checked_add_u64(checked_multiply_u64(ts, 1'000, "Trace timestamp overflow"), ts_submicro_ns, "Trace timestamp overflow");
+}
+
+uint64_t TraceEvent::end_ns() const {
+    const auto duration_ns = checked_add_u64(checked_multiply_u64(dur, 1'000, "Trace duration overflow"), dur_submicro_ns, "Trace duration overflow");
+    return checked_add_u64(start_ns(), duration_ns, "Trace event end timestamp overflow");
+}
+
 void TraceEvent::set_args_json_slice(std::shared_ptr<const std::string> buffer, const TraceByteRange & range) {
     args_buffer_ = std::move(buffer);
     args_offset_ = range.offset;

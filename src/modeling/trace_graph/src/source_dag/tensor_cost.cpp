@@ -31,14 +31,7 @@ std::optional<double> observe_device_event_wait_service(const modules::hicache::
     if (recorded.is_cpu || recorded.kind != core::DagNodeKind::TraceEvent) return std::nullopt;
 
     const auto & completion = graph.event_for_node(*producer);
-    const auto end_us = core::checked_add_u64(completion.ts, completion.dur, "Event record completion overflow");
-    const auto end_ns = core::checked_add_u64(core::checked_multiply_u64(end_us, 1'000, "Event record completion overflow"),
-                                              static_cast<uint64_t>(completion.ts_submicro_ns) + completion.dur_submicro_ns,
-                                              "Event record completion overflow");
-    const auto begin_ns = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "Event wait timestamp overflow"),
-                                                event.ts_submicro_ns,
-                                                "Event wait timestamp overflow");
-    if (end_ns > begin_ns) return std::nullopt;
+    if (completion.end_ns() > event.start_ns()) return std::nullopt;
 
     return static_cast<double>(event.dur) + static_cast<double>(event.dur_submicro_ns) / 1000.0;
 }
@@ -68,14 +61,7 @@ std::optional<uint64_t> observe_nonblocking_cpu_service(const modules::hicache::
     const auto producer = waits.front();
     if (graph.node(producer).is_cpu || graph.node(producer).kind != core::DagNodeKind::TraceEvent) return std::nullopt;
     const auto & completed = graph.event_for_node(producer);
-    const auto begin_ns = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "CPU observation timestamp overflow"),
-                                                event.ts_submicro_ns,
-                                                "CPU observation timestamp overflow");
-    const auto completion_us = core::checked_add_u64(completed.ts, completed.dur, "Device completion timestamp overflow");
-    const auto completion_ns = core::checked_add_u64(core::checked_multiply_u64(completion_us, 1'000, "Device completion timestamp overflow"),
-                                                     static_cast<uint64_t>(completed.ts_submicro_ns) + completed.dur_submicro_ns,
-                                                     "Device completion timestamp overflow");
-    if (completion_ns > begin_ns) return std::nullopt;
+    if (completed.end_ns() > event.start_ns()) return std::nullopt;
 
     // Use the preserved trace interval, never the graph's fixed sync-return
     // value. Corrected and profiled observations retain distinct scopes.
@@ -87,19 +73,10 @@ namespace {
 std::optional<uint64_t> readback_ready_us(const core::DagGraph & graph, const SynchronousReadback & readback) {
     const auto & wait = graph.event_for_node(readback.synchronization);
     const auto & device = graph.event_for_node(readback.device_completion);
-    const auto end_ns = [](const core::TraceEvent & event) {
-        const auto end_us = core::checked_add_u64(event.ts, event.dur, "Readback end overflow");
-        return core::checked_add_u64(core::checked_multiply_u64(end_us, 1'000, "Readback end timestamp overflow"),
-                                     static_cast<uint64_t>(event.ts_submicro_ns) + event.dur_submicro_ns,
-                                     "Readback end timestamp overflow");
-    };
-    const auto start_ns = core::checked_add_u64(core::checked_multiply_u64(wait.ts, 1'000, "Readback start timestamp overflow"),
-                                                wait.ts_submicro_ns,
-                                                "Readback start timestamp overflow");
-    const auto ready_ns = std::max(start_ns, end_ns(device));
+    const auto ready_ns = std::max(wait.start_ns(), device.end_ns());
     // The dependency establishes a readback even when profiler clocks disagree.
     // Such a sample cannot establish its non-waiting return cost.
-    if (ready_ns > end_ns(wait)) return std::nullopt;
+    if (ready_ns > wait.end_ns()) return std::nullopt;
     return ready_ns / 1'000 + static_cast<uint64_t>(ready_ns % 1'000 != 0);
 }
 
@@ -142,15 +119,8 @@ std::optional<uint64_t> blocking_return_begin(const modules::hicache::patch::HiC
         const auto & producer = graph.node(waits.front());
         if (producer.kind != core::DagNodeKind::TraceEvent || producer.is_cpu) return std::nullopt;
         const auto & completion = graph.event_for_node(producer.id);
-        const auto completed_us = core::checked_add_u64(completion.ts, completion.dur, "Blocking completion overflow");
-        const auto completed_ns = core::checked_add_u64(core::checked_multiply_u64(completed_us, 1'000, "Blocking completion overflow"),
-                                                        static_cast<uint64_t>(completion.ts_submicro_ns) + completion.dur_submicro_ns,
-                                                        "Blocking completion overflow");
-        const auto returned_us = core::checked_add_u64(event.ts, event.dur, "Blocking sync return overflow");
-        const auto returned_ns = core::checked_add_u64(core::checked_multiply_u64(returned_us, 1'000, "Blocking sync return overflow"),
-                                                       static_cast<uint64_t>(event.ts_submicro_ns) + event.dur_submicro_ns,
-                                                       "Blocking sync return overflow");
-        if (completed_ns > returned_ns) return std::nullopt;
+        const auto completed_ns = completion.end_ns();
+        if (completed_ns > event.end_ns()) return std::nullopt;
 
         // Round the device completion up: never include its fractional last
         // microsecond in the CPU-side post-completion interval.

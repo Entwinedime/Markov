@@ -79,6 +79,12 @@ struct TraceEvent {
     std::string pid = "-1";
     std::string tid = "-1";
 
+    /** Exact stored trace coordinates, including sub-microsecond fractions.
+     * These are not simulation times or CPU service costs. Conversion throws
+     * on uint64_t overflow; end_ns includes both start and duration fractions. */
+    [[nodiscard]] uint64_t start_ns() const;
+    [[nodiscard]] uint64_t end_ns() const;
+
     /** @brief Points args at a reader-owned buffer slice instead of copying the source text. */
     void set_args_json_slice(std::shared_ptr<const std::string> buffer, const TraceByteRange & range);
 

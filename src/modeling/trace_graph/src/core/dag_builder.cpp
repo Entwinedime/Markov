@@ -50,13 +50,7 @@ struct ExecutionAndFactEvents {
 void retain_modeled_operator_envelopes(ExecutionAndFactEvents & split) {
     using Interval = std::pair<uint64_t, uint64_t>;
     std::map<std::pair<std::string, std::string>, std::vector<Interval>> lanes;
-    const auto interval = [](const TraceEvent & event) {
-        const auto begin =
-            checked_add_u64(checked_multiply_u64(event.ts, 1'000, "operator timestamp overflow"), event.ts_submicro_ns, "operator timestamp overflow");
-        const auto duration =
-            checked_add_u64(checked_multiply_u64(event.dur, 1'000, "operator duration overflow"), event.dur_submicro_ns, "operator duration overflow");
-        return Interval{ begin, checked_add_u64(begin, duration, "operator end timestamp overflow") };
-    };
+    const auto interval = [](const TraceEvent & event) { return Interval{ event.start_ns(), event.end_ns() }; };
     for (const auto & event : split.runtime_observations) {
         // Phase probes carry source geometry, not execution nodes. Retain
         // nested Torch envelopes for every such descriptor; individual

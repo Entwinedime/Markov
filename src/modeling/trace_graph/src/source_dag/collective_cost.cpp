@@ -19,13 +19,7 @@ namespace {
 std::optional<std::pair<uint64_t, uint64_t>> raw_interval_ns(const core::DagGraph & graph, size_t node) {
     const auto & event = graph.event_for_node(node);
     if (graph.node(node).kind != core::DagNodeKind::TraceEvent || !measurement_position(event)) return std::nullopt;
-    const auto begin = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "collective timestamp overflow"),
-                                             event.ts_submicro_ns,
-                                             "collective timestamp overflow");
-    const auto duration = core::checked_add_u64(core::checked_multiply_u64(event.dur, 1'000, "collective duration overflow"),
-                                                event.dur_submicro_ns,
-                                                "collective duration overflow");
-    return std::pair{ begin, core::checked_add_u64(begin, duration, "collective end overflow") };
+    return std::pair{ event.start_ns(), event.end_ns() };
 }
 
 } // namespace

@@ -2,7 +2,6 @@
 
 #include "markov/trace_graph/core/dag_builder.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
-#include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 
 #include <algorithm>
@@ -28,12 +27,6 @@ nlohmann::json synchronization_clock_report(const core::DagGraph & graph) {
         Json example = nullptr;
     };
     std::map<int, RankAudit> ranks;
-    const auto end_ns = [](const core::TraceEvent & event) {
-        const auto end_us = core::checked_add_u64(event.ts, event.dur, "Observed synchronization end overflow");
-        return core::checked_add_u64(core::checked_multiply_u64(end_us, 1'000, "Observed synchronization timestamp overflow"),
-                                     static_cast<uint64_t>(event.ts_submicro_ns) + event.dur_submicro_ns,
-                                     "Observed synchronization timestamp overflow");
-    };
     for (const auto & edge : graph.edges()) {
         if (!edge.active || edge.kind != core::DagEdgeKind::Sync) continue;
         const auto & producer = graph.node(edge.src);
@@ -49,7 +42,7 @@ nlohmann::json synchronization_clock_report(const core::DagGraph & graph) {
         }
         ++rank.checked;
         const auto & device = graph.event_for_node(edge.src);
-        const auto completed = end_ns(device), returned = end_ns(wait);
+        const auto completed = device.end_ns(), returned = wait.end_ns();
         if (completed <= returned) continue;
 
         ++rank.violations;

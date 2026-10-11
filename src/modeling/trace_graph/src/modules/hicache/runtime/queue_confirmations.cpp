@@ -1,6 +1,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/queue_confirmations.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/dag_mutation.hpp"
+#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/prefetch_worker_observation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
@@ -263,13 +264,11 @@ void HiCacheQueueConfirmations::advance(size_t node, uint64_t time, simulation::
                                                "nonblocking",
                                                "cpu_service",
                                                { { "confirmed_operations", static_cast<double>(common.loads) } } };
-                const auto cpu_us = operator_provider_.estimate(work).duration_us;
-                work.timing_scope = "residual_interval";
-                const auto residual_us = operator_provider_.estimate(work).duration_us;
+                const auto estimate = cost::estimate_host_operation(operator_provider_, work, false);
                 auto & remainder = load_tail_remainders_[{ fact.pid, fact.tid }];
                 // The sampled prefix is already complete. Estimate the whole
                 // bookkeeping tail, not an invented per-batch source average.
-                bind_cpu_control(plan, cpu_us, residual_us, remainder);
+                bind_cpu_control(plan, estimate.main_us, estimate.main_residual_us, remainder);
                 const auto last = expand_host(plan, {}, future, node).host_return;
                 future.depend(last, check.return_nodes.at(action.rank));
             }

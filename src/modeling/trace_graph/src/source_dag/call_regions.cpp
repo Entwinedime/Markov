@@ -169,13 +169,7 @@ std::map<size_t, size_t> match_submitted_operator_envelopes(const modules::hicac
         if (!readback && devices.empty()) continue;
 
         const auto & event = graph.runtime_observations().at(observation);
-        const auto begin_ns = core::checked_add_u64(core::checked_multiply_u64(event.ts, 1'000, "Operator timestamp overflow"),
-                                                    event.ts_submicro_ns,
-                                                    "Operator timestamp overflow");
-        const auto duration_ns = core::checked_add_u64(core::checked_multiply_u64(event.dur, 1'000, "Operator duration overflow"),
-                                                       event.dur_submicro_ns,
-                                                       "Operator duration overflow");
-        candidates.push_back({ observation, begin_ns, core::checked_add_u64(begin_ns, duration_ns, "Operator end overflow"), std::move(devices) });
+        candidates.push_back({ observation, event.start_ns(), event.end_ns(), std::move(devices) });
     }
 
     std::vector<size_t> submitted;

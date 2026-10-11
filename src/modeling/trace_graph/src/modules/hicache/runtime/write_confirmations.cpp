@@ -30,24 +30,16 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
     const auto lane = std::string(graph.node_lane_key(anchor));
     std::optional<size_t> previous;
     for (const auto & step : steps) {
-        const auto main = plan.nodes.size();
-        plan.nodes.push_back({
-            { .name = "target " + step.work.operation,
-             .category = "hicache_patch",
-             .lane_key = lane,
-             .attrs = { { "component", step.work.component },
-                         { "operation", step.work.operation },
-                         { "implementation", step.work.implementation },
-                         { "cost_operation", step.work.operation },
-                         { "cost_implementation", step.work.implementation },
-                         { "cost_timing_scope", "cpu_service" },
-                         { "work_features", nlohmann::json(step.work.features).dump() } } }
-        });
-        const auto returned = plan.nodes.size();
-        plan.nodes.push_back({
-            { .name = "after " + step.work.operation, .lane_key = lane }
-        });
-        plan.edges.push_back({ main, returned, core::DagEdgeKind::Sequential });
+        std::optional<size_t> call_previous;
+        const auto main = plan.append_main(lane, "target " + step.work.operation, call_previous);
+        plan.nodes[main].work.attrs = { { "component", step.work.component },
+                                       { "operation", step.work.operation },
+                                       { "implementation", step.work.implementation },
+                                       { "cost_operation", step.work.operation },
+                                       { "cost_implementation", step.work.implementation },
+                                       { "cost_timing_scope", "cpu_service" },
+                                       { "work_features", nlohmann::json(step.work.features).dump() } };
+        const auto returned = plan.append_main(lane, "after " + step.work.operation, call_previous, "");
         if (previous) plan.edges.push_back({ *previous, main, core::DagEdgeKind::Sequential });
         if (step.completed_batch) {
             plan.event_waits.push_back({ core::DagNode::kNoNode, main });
