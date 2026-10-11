@@ -83,9 +83,7 @@ def declared_cost_demands(needs: Sequence[dict], models: Sequence[dict]) -> tupl
             # its missing features. The explicit training definition already
             # tells us whether this target descriptor could ever query it.
             model = definitions[0]
-            missing = sorted(
-                {feature for feature in (*model.features, *model.coverage_features) if feature not in work["features"]}
-            )
+            missing = sorted(set(model.required_features) - work["features"].keys())
             if missing:
                 incomplete_work.append(dict(work, missing_features=missing))
             else:

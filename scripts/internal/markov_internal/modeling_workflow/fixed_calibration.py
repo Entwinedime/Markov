@@ -15,6 +15,7 @@ from ..workload_template.schema import load_template
 from ..workload_template.expand import expand_template, request_token_budget
 from ..workload_template.cli import parse_workload_command
 from .group import GroupRequest
+from .physical_capture import storage_batch_pages
 from ..modeling.source_dag.profiles import parse_server_command_tokens
 from ..modeling.deployment import source_environment
 
@@ -63,14 +64,12 @@ def _base_tokens(group: GroupRequest) -> tuple[list[int], list[int], list[str]]:
 def _workload(group: GroupRequest, *, release_only: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """Exercise cache transitions at the base page size, shared by all targets."""
 
-    if group.physical is None:
-        raise ValueError("fixed calibration requires platform physical calibration")
     page = int(group.sources[0].hicache_config["page_size"])
     pool, prompt_lengths, token_sources = _base_tokens(group)
-    storage_batch_pages = int(group.physical["storage_batch_pages"])
+    batch_pages = storage_batch_pages()
     alignment = page
     payload_tokens = math.ceil(max(prompt_lengths) / alignment) * alignment
-    payload_tokens = max(4 * page, min(payload_tokens, storage_batch_pages * page))
+    payload_tokens = max(4 * page, min(payload_tokens, batch_pages * page))
     short_tokens = 2 * alignment
     payload_pages = payload_tokens // page
     device_pages = payload_pages + 2
@@ -201,7 +200,7 @@ def _workload(group: GroupRequest, *, release_only: bool = False) -> tuple[dict[
             "median": median(prompt_lengths),
             "maximum": max(prompt_lengths),
         },
-        "storage_batch_pages": storage_batch_pages,
+        "storage_batch_pages": batch_pages,
         "alignment_tokens": alignment,
         "short_tokens": short_tokens,
         "payload_tokens": payload_tokens,

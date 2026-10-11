@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from statistics import median
 from typing import Any
@@ -35,6 +35,14 @@ class ModelSpec:
     observation_operations: tuple[str, ...] = ()
     extrapolation_features: tuple[str, ...] = ()
 
+    @property
+    def source_operations(self) -> tuple[str, ...]:
+        return self.observation_operations or (self.operation,)
+
+    @property
+    def required_features(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys((*self.features, *self.coverage_features)))
+
     @classmethod
     def from_raw(cls, raw: dict[str, Any]) -> ModelSpec:
         values = dict(raw)
@@ -57,6 +65,74 @@ class ModelSpec:
             raise ValueError("zero-intercept fitting requires a linear model with variable work")
 
         return spec
+
+
+def train_models(
+    specifications: list[ModelSpec], observations: list[OperationObservation]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Expand declared implementations and fit them from admitted measurements.
+
+    Wildcards select only implementations measured in the requested scope.
+    Return fitted/missing responses and separately report other implementations;
+    neither outcome changes work generation or starts acquisition.
+    """
+
+    observations_by_operation: dict[str, list[OperationObservation]] = defaultdict(list)
+    for row in observations:
+        observations_by_operation[row.operation].append(row)
+
+    models = []
+    unmeasured_implementations = []
+    for spec in specifications:
+        operation_rows = [
+            row
+            for operation in spec.source_operations
+            for row in observations_by_operation[operation]
+        ]
+        if spec.implementation != "*":
+            models.append(_train_model(spec, [row for row in operation_rows if row.implementation == spec.implementation]))
+            continue
+
+        implementations = sorted(
+            {row.implementation for row in operation_rows if row.timing_scope == spec.timing_scope}
+        )
+        for implementation in sorted({row.implementation for row in operation_rows} - set(implementations)):
+            unmeasured_implementations.append(
+                {
+                    "operation": spec.operation,
+                    "implementation": implementation,
+                    "timing_scope": spec.timing_scope,
+                    "reason": "missing_timing_scope",
+                    "available_timing_scopes": sorted(
+                        {row.timing_scope for row in operation_rows if row.implementation == implementation}
+                    ),
+                }
+            )
+        # A direct call need not have queued-worker measurements. Wildcards
+        # select implementations measured in this scope, not every backend
+        # ever seen under the same operation name.
+        models.extend(
+            _train_model(replace(spec, implementation=name), [row for row in operation_rows if row.implementation == name])
+            for name in implementations
+        )
+        if not implementations:
+            models.append(
+                {
+                    "operation": spec.operation,
+                    "implementation": "*",
+                    "timing_scope": spec.timing_scope,
+                    "status": "missing_data",
+                    "reason": "missing_timing_scope" if operation_rows else "missing_operation",
+                    "available_timing_scopes": sorted({row.timing_scope for row in operation_rows}),
+                    "features": list(spec.required_features),
+                    "ineligible_measurements": 0,
+                }
+            )
+    keys = [(model["operation"], model["implementation"], model["timing_scope"]) for model in models]
+    if len(set(keys)) != len(keys):
+        raise ValueError("provide one cost model per operation, implementation and timing scope")
+
+    return models, unmeasured_implementations
 
 
 def _solve(matrix: list[list[float]], response: list[float]) -> list[float] | None:
@@ -126,18 +202,12 @@ def _with_training_fit(
     return model
 
 
-def train_model(spec: ModelSpec, observations: list[OperationObservation]) -> dict[str, Any]:
-    """Train one declared form; report gaps instead of fitting a target-specific fix."""
+def _train_model(spec: ModelSpec, operation_rows: list[OperationObservation]) -> dict[str, Any]:
+    """Fit one concrete implementation selected by train_models, preserving gaps."""
 
-    # Context labels can describe the same backend work (for example logits
-    # all-gather in Prefill and Decode). Pool only explicitly declared sources;
-    # implementation, deployment, geometry and timing scopes still apply.
-    source_operations = spec.observation_operations or (spec.operation,)
-    operation_rows = [
-        row for row in observations if row.operation in source_operations and row.implementation == spec.implementation
-    ]
+    source_operations = spec.source_operations
     candidates = [row for row in operation_rows if row.timing_scope == spec.timing_scope]
-    required = tuple(dict.fromkeys((*spec.features, *spec.coverage_features)))
+    required = spec.required_features
     rows = [row for row in candidates if all(name in row.features for name in required)]
     missing_features = sorted({name for row in candidates for name in required if name not in row.features})
     identity = {"operation": spec.operation, "implementation": spec.implementation, "timing_scope": spec.timing_scope}

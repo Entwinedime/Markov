@@ -68,52 +68,31 @@ def _io_sampling(spec: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in spec.items() if key not in {"budget", "eviction_cpu"}}
 
 
-def _platform_context(group: GroupRequest) -> dict[str, Any]:
-    """Geometry and storage scopes depend on deployment, not measurement settings."""
-    from ..modeling.deployment import source_environment
-
-    return {
-        "environment": source_environment(group.sources[0], group.raw.get("resource_environment")),
-        "devices": (group.raw.get("physical_capture") or {}).get("devices"),
-    }
-
-
 def platform_inputs(group: GroupRequest) -> dict[str, Any] | None:
-    """Read deployment metadata prepared on the host, never measured coefficients."""
+    """Derive deployment metadata when needed; no saved state or timing samples.
 
-    path = group.output_dir / "platform_inputs.json"
-    if not path.is_file():
-        return None
-    document = load_json(path)
-    return document if document["input_context"] == _platform_context(group) else None
-
-
-def prepare_platform(group: GroupRequest) -> dict[str, Any]:
-    """Expose model geometry to modeling without starting any measurement worker."""
+    Unsupported or unavailable model metadata returns None. Sampling placement
+    and measured service coefficients are deliberately not prerequisites.
+    """
 
     definition = physical_definition(group, service="metadata")
     if definition["limitations"]:
-        return dict(status="needs_physical_calibration", limitations=definition["limitations"])
+        return None
 
-    write_json(
-        group.output_dir / "platform_inputs.json",
-        dict(
-            input_context=definition["input_context"],
-            kv_geometry=definition["geometry"],
-            storage_batch_pages=definition["storage_batch_pages"],
-            resource_lanes={"storage_read": "scope", "storage_write": "scope"},
-            service_models={},
-            measurement_sources=[],
-            measurement_description="Deployment metadata only; no service cost has been measured",
-            measurement_scope=dict(
-                storage_scope_devices=definition["devices"],
-                storage_scope_numa_nodes=definition["numa_nodes"] or [None] * len(definition["devices"]),
-            ),
-            target_workload_trace_used=False,
-            target_e2e_used=False,
+    return dict(
+        kv_geometry=definition["geometry"],
+        storage_batch_pages=definition["storage_batch_pages"],
+        resource_lanes={"storage_read": "scope", "storage_write": "scope"},
+        service_models={},
+        measurement_sources=[],
+        measurement_description="Deployment metadata only; no service cost has been measured",
+        measurement_scope=dict(
+            storage_scope_devices=definition["devices"],
+            storage_scope_numa_nodes=definition["numa_nodes"] or [None] * len(definition["devices"]),
         ),
+        target_workload_trace_used=False,
+        target_e2e_used=False,
     )
-    return dict(status="platform_ready")
 
 
 def _declared_page_sizes(group: GroupRequest) -> list[int]:
@@ -204,7 +183,6 @@ def physical_definition(
     numa_nodes = [nodes[device] for device in devices] if nodes else None
     batch_pages = storage_batch_pages()
     definition = {
-        "input_context": _platform_context(group),
         "geometry": geometry,
         "devices": devices,
         "numa_nodes": numa_nodes,
@@ -347,8 +325,8 @@ def _completed(attempts: list[dict[str, Any]], definition: dict[str, Any], stage
 
 
 def captured_physical_declaration(group: GroupRequest) -> dict[str, Any] | None:
-    # Metadata-only preparation declares no sampling domain to match against
-    # previous I/O attempts. Explicit physical_calibration remains independent.
+    # Without a sampling declaration, only explicitly supplied measurements
+    # apply. Deployment metadata is derived separately and is not evidence.
     if not (group.raw.get("physical_capture") or {}).get("page_token_sizes"):
         return None
 
@@ -511,11 +489,12 @@ def _capture_physical_service(
         plan["stop_reason"] = "physical_sampler_limitations"
         return plan
     declaration = captured_physical_declaration(group) or group.raw.get("physical_calibration")
-    if declaration is None and platform_inputs(group) is not None:
-        declaration = {"report": str(repo_relative_path(group.output_dir / "platform_inputs.json"))}
     if declaration is None:
-        plan["stop_reason"] = "existing_physical_report_required"
-        return plan
+        # The sampler accepts a file input. Write the current metadata here,
+        # only for an actual I/O demand; never recover it as reusable state.
+        path = group.output_dir / "platform_inputs.json"
+        write_json(path, group.physical)
+        declaration = {"report": str(repo_relative_path(path))}
     definition["base_report"] = declaration["report"]
     dimensions = (
         "num_hidden_layers",

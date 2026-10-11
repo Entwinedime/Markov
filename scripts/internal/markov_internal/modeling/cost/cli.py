@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +10,7 @@ from ...common.io import load_json, write_json
 from ...common.paths import repo_relative_path, require_repo_path
 from ..deployment import require_cost_environment, source_environment
 from .database import CostDatabase, OperationObservation, evidence_manifests
-from .models import ModelSpec, estimate, train_model
+from .models import ModelSpec, estimate, train_models
 from .io import service_cost_evidence
 from .package import control_observations, cpu_service_inputs, embed_control_measurements
 
@@ -79,58 +77,8 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
     if not specs:
         raise ValueError("training must declare at least one operation model")
 
-    observations_by_operation: dict[str, list[OperationObservation]] = defaultdict(list)
-    for row in rows:
-        observations_by_operation[row.operation].append(row)
-
-    models = []
-    unmeasured_implementations = []
-    for raw in specs:
-        spec = ModelSpec.from_raw(raw)
-        operation_rows = [
-            row
-            for operation in (spec.observation_operations or (spec.operation,))
-            for row in observations_by_operation[operation]
-        ]
-        if spec.implementation != "*":
-            models.append(train_model(spec, operation_rows))
-            continue
-
-        implementations = sorted(
-            {row.implementation for row in operation_rows if row.timing_scope == spec.timing_scope}
-        )
-        for implementation in sorted({row.implementation for row in operation_rows} - set(implementations)):
-            unmeasured_implementations.append(
-                {
-                    "operation": spec.operation,
-                    "implementation": implementation,
-                    "timing_scope": spec.timing_scope,
-                    "reason": "missing_timing_scope",
-                    "available_timing_scopes": sorted(
-                        {row.timing_scope for row in operation_rows if row.implementation == implementation}
-                    ),
-                }
-            )
-        # A direct call need not have queued-worker measurements. Wildcards
-        # select implementations measured in this scope, not every backend
-        # ever seen under the same operation name.
-        models.extend(train_model(replace(spec, implementation=name), operation_rows) for name in implementations)
-        if not implementations:
-            models.append(
-                {
-                    "operation": spec.operation,
-                    "implementation": "*",
-                    "timing_scope": spec.timing_scope,
-                    "status": "missing_data",
-                    "reason": "missing_timing_scope" if operation_rows else "missing_operation",
-                    "available_timing_scopes": sorted({row.timing_scope for row in operation_rows}),
-                    "features": list(dict.fromkeys((*spec.features, *spec.coverage_features))),
-                    "ineligible_measurements": 0,
-                }
-            )
-    keys = [(model["operation"], model["implementation"], model["timing_scope"]) for model in models]
-    if len(set(keys)) != len(keys):
-        raise ValueError("provide one cost model per operation, implementation and timing scope")
+    specifications = [ModelSpec.from_raw(raw) for raw in specs]
+    models, unmeasured_implementations = train_models(specifications, rows)
 
     ready_models = [model for model in models if model["status"] == "ready"]
     operator_captures = {capture for model in ready_models for capture in model["source_captures"]}
