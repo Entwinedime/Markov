@@ -16,7 +16,7 @@ enum class TensorExecutionKind { AsyncDevice, CpuService, BlockingContextReadbac
 
 [[nodiscard]] std::string_view tensor_execution_name(TensorExecutionKind kind);
 
-/** Cost-free tensor/control work shared by phase submodules. Predecessors
+/** Cost-free tensor/control work shared by phase and allocator submodules. Predecessors
  * address earlier operations in the same program and require their device
  * completion (or host return for host-only operations). For an asynchronous
  * consumer they constrain device execution, not CPU submission. For a host
@@ -26,6 +26,7 @@ enum class TensorExecutionKind { AsyncDevice, CpuService, BlockingContextReadbac
 struct TensorOperation {
     OperationWork work;
     std::vector<size_t> predecessors;
+    // Identifies a request within a multi-request program for reporting only.
     std::optional<size_t> request_index;
     TensorExecutionKind execution = TensorExecutionKind::AsyncDevice;
     std::optional<uint64_t> layer_index;

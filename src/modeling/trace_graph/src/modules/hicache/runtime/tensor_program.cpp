@@ -10,18 +10,9 @@
 #include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-namespace {
-
-struct OperationView {
-    const structure::OperationWork & work;
-    std::span<const size_t> predecessors;
-    structure::TensorExecutionKind execution;
-    std::optional<uint64_t> layer_index;
-    std::span<const structure::OperationWork> device_launches;
-};
 
 GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                               std::span<const OperationView> operations, const std::string & identity_prefix, bool has_layer_load) {
+                                               std::span<const structure::TensorOperation> operations, const std::string & identity_prefix, bool has_layer_load) {
     GeneratedTensorProgram result;
     auto & plan = result.plan;
     std::optional<size_t> previous_host, previous_device, first_device;
@@ -206,6 +197,7 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
             node.work.attrs["implementation"] = operation.work.implementation;
             node.work.attrs[identity_prefix + "_operation_index"] = std::to_string(result.operations.size());
             node.work.attrs[identity_prefix + "_execution"] = structure::tensor_execution_name(operation.execution);
+            if (operation.request_index) node.work.attrs[identity_prefix + "_request_index"] = std::to_string(*operation.request_index);
             const auto local = offset + i;
             std::string scope;
             if (local == slots.submit || (slots.tail && local == *slots.tail)) scope = "cpu_service";
@@ -274,52 +266,6 @@ GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, siz
 
     if (first_device) plan.streams.push_back({ compute, *first_device, *previous_device });
     return result;
-}
-
-} // namespace
-
-GeneratedTensorProgram generate_phase_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                                     std::span<const structure::TensorOperation> operations, bool has_layer_load) {
-    std::vector<OperationView> views;
-    views.reserve(operations.size());
-    for (const auto & operation : operations) {
-        views.push_back({ operation.work, operation.predecessors, operation.execution, operation.layer_index, operation.device_launches });
-    }
-    return generate_tensor_program(graph, main, worker, compute, views, "phase_tensor", has_layer_load);
-}
-
-GeneratedTensorProgram generate_allocator_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                                  std::span<const structure::hicache::AllocatorTensorOperation> operations) {
-    std::vector<OperationView> views;
-    views.reserve(operations.size());
-    for (const auto & operation : operations) {
-        using Execution = structure::TensorExecutionKind;
-        Execution execution = Execution::AsyncDevice;
-        using Kind = structure::hicache::AllocatorExecutionKind;
-        switch (operation.execution) {
-        case Kind::CpuService:
-            execution = Execution::CpuService;
-            break;
-        case Kind::AsyncDevice:
-            execution = Execution::AsyncDevice;
-            break;
-        case Kind::BlockingReadback:
-            execution = Execution::BlockingContextReadback;
-            break;
-        case Kind::DirectBlockingDevice:
-            execution = Execution::DirectBlockingDevice;
-            break;
-        }
-        views.push_back({ operation.work, operation.predecessors, execution, std::nullopt, operation.device_launches });
-    }
-    auto generated = generate_tensor_program(graph, main, worker, compute, views, "allocator", false);
-    for (size_t i = 0; i < operations.size(); ++i) {
-        if (!operations[i].request_index) continue;
-        const auto end = i + 1 < operations.size() ? generated.operations[i + 1].submit : generated.plan.nodes.size();
-        for (size_t node = generated.operations[i].submit; node < end; ++node)
-            generated.plan.nodes[node].work.attrs["allocator_request_index"] = std::to_string(*operations[i].request_index);
-    }
-    return generated;
 }
 
 std::vector<cost::TensorCostRequest> tensor_cost_requests(std::span<const TensorOperationSlots> operations) {

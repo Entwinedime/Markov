@@ -1,7 +1,7 @@
 #pragma once
 
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
-#include "markov/trace_graph/structure/operation.hpp"
+#include "markov/trace_graph/structure/tensor_program.hpp"
 
 #include <array>
 #include <cstddef>
@@ -26,20 +26,6 @@ struct ExtendPageRegions {
 
 [[nodiscard]] ExtendPageRegions extend_page_regions(uint64_t sequence_tokens, uint64_t prefix_tokens, uint64_t page_size_tokens);
 
-enum class AllocatorExecutionKind { CpuService, AsyncDevice, BlockingReadback, DirectBlockingDevice };
-
-struct AllocatorTensorOperation {
-    OperationWork work;
-    std::vector<size_t> predecessors;
-    // CPU preparation/return does not wait for device completion. Device work
-    // uses the allocator's compute stream; host submission order is separate.
-    AllocatorExecutionKind execution = AllocatorExecutionKind::AsyncDevice;
-    std::optional<size_t> request_index;
-    // Ordered launches inside one queued tensor call, not separate Python calls.
-    // Empty retains the ordinary single-launch abstraction.
-    std::vector<OperationWork> device_launches;
-};
-
 struct AscendAllocatorInputs {
     std::string sequence_dtype, last_location_dtype, free_page_dtype;
     bool debug_memory_pool;
@@ -63,7 +49,7 @@ struct AscendAllocatorInputs {
  * the final .int() is a host-only no-op. Views/slicing free_pages create no
  * device work. The input dtype is observed deployment/call metadata.
  */
-[[nodiscard]] std::optional<std::vector<AllocatorTensorOperation>>
+[[nodiscard]] std::optional<std::vector<TensorOperation>>
     ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs);
 
 /** Common extend prefix before either fused or naive allocation: optional
@@ -72,7 +58,7 @@ struct AscendAllocatorInputs {
  * caller supplies whether it already computed num_new_pages; current ordinary
  * alloc_for_extend does not. No kernel-preparation cost belongs to this prefix.
  */
-[[nodiscard]] std::optional<std::vector<AllocatorTensorOperation>>
+[[nodiscard]] std::optional<std::vector<TensorOperation>>
     ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
                                    const std::string & prefix_dtype, bool page_count_supplied);
 
@@ -102,7 +88,7 @@ struct AllocatorPreparation {
  * here. A required preparation is inside this program; callers replacing the
  * whole region must not additionally bind its old standalone preparation slot.
  */
-[[nodiscard]] std::optional<std::vector<AllocatorTensorOperation>>
+[[nodiscard]] std::optional<std::vector<TensorOperation>>
     ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
                                           const std::string & prefix_dtype, bool page_count_supplied, const AllocatorPreparation & preparation);
 
@@ -111,7 +97,7 @@ struct AllocatorPreparation {
  * Branch predicates use target lengths, never measured costs or source hits.
  * Views are host preparation, while tensor arithmetic/copy and scalar device
  * readbacks remain separate operations. No Triton preparation is required. */
-[[nodiscard]] std::optional<std::vector<AllocatorTensorOperation>>
+[[nodiscard]] std::optional<std::vector<TensorOperation>>
     ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
                                           const std::string & prefix_dtype, bool page_count_supplied);
 

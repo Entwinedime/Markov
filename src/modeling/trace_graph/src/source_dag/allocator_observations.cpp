@@ -36,7 +36,7 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const modules::
         const auto deployment = observed_allocator_inputs(event);
         if (!deployment) continue;
 
-        std::optional<std::vector<structure::hicache::AllocatorTensorOperation>> program;
+        std::optional<std::vector<structure::TensorOperation>> program;
         bool has_preparation = false;
         if (region.phase == modules::hicache::model::HiCacheAllocatorPhase::Decode) {
             const auto work = observed_allocator_work(event);
@@ -76,7 +76,7 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const modules::
         std::optional<size_t> fused_position;
         for (size_t i = 0; i < program->size(); ++i) {
             const auto & operation = program->at(i);
-            if (operation.execution == structure::hicache::AllocatorExecutionKind::CpuService) continue;
+            if (operation.execution == structure::TensorExecutionKind::CpuService) continue;
             const auto & implementation = operation.work.implementation;
             if (implementation == "sgl_kernel_npu.alloc_extend_kernel:int64") {
                 fused_position = i;

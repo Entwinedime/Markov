@@ -19,18 +19,18 @@ public:
           component_(std::move(phase)),
           prefix_("allocator." + (component_ == "prefill" ? std::string("extend") : component_)) {}
 
-    void adopt_prefix(std::vector<AllocatorTensorOperation> prefix) {
+    void adopt_prefix(std::vector<TensorOperation> prefix) {
         program = std::move(prefix);
         for (size_t i = 0; i < program.size(); ++i) {
             const auto kind = program[i].execution;
-            if (kind != AllocatorExecutionKind::CpuService) previous_device_ = i;
-            if (kind != AllocatorExecutionKind::AsyncDevice) previous_host_ = i;
+            if (kind != TensorExecutionKind::CpuService) previous_device_ = i;
+            if (kind != TensorExecutionKind::AsyncDevice) previous_host_ = i;
         }
     }
 
     size_t append(const std::string & operation, const std::string & implementation, uint64_t elements, std::vector<size_t> dependencies,
-                  AllocatorExecutionKind execution = AllocatorExecutionKind::AsyncDevice) {
-        const bool device = execution != AllocatorExecutionKind::CpuService;
+                  TensorExecutionKind execution = TensorExecutionKind::AsyncDevice) {
+        const bool device = execution != TensorExecutionKind::CpuService;
         const std::map<std::string, double> features{
             {         "elements",         static_cast<double>(elements) },
             {       "batch_size", static_cast<double>(call_.batch_size) },
@@ -41,12 +41,12 @@ public:
             std::vector<size_t> host_dependencies;
             if (previous_host_) host_dependencies.push_back(*previous_host_);
             program.push_back({
-                { component_,
+                .work = { component_,
                  preparation == 0 ? prefix_ + ".entry" : prefix_ + "." + operation + ".prepare",
                  "sglang.NPUPagedTokenToKVPoolAllocator", "cpu_service",
                  features },
-                std::move(host_dependencies),
-                AllocatorExecutionKind::CpuService
+                .predecessors = std::move(host_dependencies),
+                .execution = TensorExecutionKind::CpuService
             });
             previous_host_ = preparation;
             dependencies.push_back(preparation);
@@ -55,9 +55,9 @@ public:
         else if (previous_host_) dependencies.push_back(*previous_host_);
 
         program.push_back({
-            { component_, prefix_ + "." + operation, implementation, device ? "device_service" : "cpu_service", features },
-            std::move(dependencies),
-            execution
+            .work = { component_, prefix_ + "." + operation, implementation, device ? "device_service" : "cpu_service", features },
+            .predecessors = std::move(dependencies),
+            .execution = execution
         });
         if (implementation == "aten.cumsum:int32_to_int64" || implementation == "aten.cumsum:int64") {
             // The inspected contiguous integer CANN path casts to the output
@@ -104,12 +104,12 @@ public:
         }
         if (device) previous_device_ = program.size() - 1;
         else previous_host_ = program.size() - 1;
-        if (execution == AllocatorExecutionKind::BlockingReadback || execution == AllocatorExecutionKind::DirectBlockingDevice)
+        if (execution == TensorExecutionKind::BlockingContextReadback || execution == TensorExecutionKind::DirectBlockingDevice)
             previous_host_ = program.size() - 1;
         return program.size() - 1;
     }
 
-    std::vector<AllocatorTensorOperation> program;
+    std::vector<TensorOperation> program;
 
 private:
     const modules::hicache::model::HiCacheAllocatorWorkItem & call_;
@@ -166,7 +166,7 @@ ExtendPageRegions extend_page_regions(uint64_t sequence_tokens, uint64_t prefix_
     return { existing_tail, remaining / page_size_tokens, remaining % page_size_tokens };
 }
 
-std::optional<std::vector<AllocatorTensorOperation>> ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+std::optional<std::vector<TensorOperation>> ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
                                                                                      const AscendAllocatorInputs & inputs) {
     // Request-to-token tables store int32 locations in the ordinary Decode
     // path; other callers may supply int64. Preserve the resulting promotion
@@ -207,11 +207,11 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_decode_allocator_pro
     // No new pages + int32 last_loc already returns int32; .int() is then a
     // host-only no-op, not an extra device cast or a missing cost sample.
     if (call.allocated_pages > 0 || !last_int32) builder.append("output_int", "aten._to_copy:int64_to_int32", call.batch_size, { output });
-    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, AllocatorExecutionKind::CpuService);
+    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, TensorExecutionKind::CpuService);
     return std::move(builder.program);
 }
 
-std::optional<std::vector<AllocatorTensorOperation>> ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+std::optional<std::vector<TensorOperation>> ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
                                                                                     const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
                                                                                     bool page_count_supplied) {
     if (!inputs.device_name.starts_with("Ascend910B") || call.phase != modules::hicache::model::HiCacheAllocatorPhase::Extend || !call.queue_state_known
@@ -226,7 +226,7 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_extend_allocator_pre
         const auto pre_pages = builder.append("prefix_pages", "aten.floor_divide:int64", call.batch_size, { pre_round });
         const auto counts = builder.append("new_pages", "aten.sub:int64", call.batch_size, { seq_pages, pre_pages });
         const auto total = builder.append("sum_pages", "aten.sum:int64", call.batch_size, { counts });
-        builder.append("page_count_readback", "aten._local_scalar_dense:int64", 1, { total }, AllocatorExecutionKind::BlockingReadback);
+        builder.append("page_count_readback", "aten._local_scalar_dense:int64", 1, { total }, TensorExecutionKind::BlockingContextReadback);
     }
     if (call.merge_release_queue) {
         const auto pages = core::checked_add_u64(call.free_pages_before, call.release_pages_before, "Allocator merge page count overflow");
@@ -249,7 +249,7 @@ OperationWork allocator_preparation_operation(const AllocatorPreparation & prepa
     };
 }
 
-std::optional<std::vector<AllocatorTensorOperation>> ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+std::optional<std::vector<TensorOperation>> ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
                                                                                            const AscendAllocatorInputs & inputs,
                                                                                            const std::string & prefix_dtype, bool page_count_supplied,
                                                                                            const AllocatorPreparation & preparation) {
@@ -262,10 +262,10 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_fused_extend_allocat
     AllocatorProgram builder(call, "prefill");
     builder.adopt_prefix(std::move(*prefix));
     if (preparation.status == "required") {
-        const auto slot = builder.append("preparation", preparation.path, 0, {}, AllocatorExecutionKind::CpuService);
+        const auto slot = builder.append("preparation", preparation.path, 0, {}, TensorExecutionKind::CpuService);
         builder.program[slot].work = allocator_preparation_operation(preparation);
     }
-    const auto execution = *inputs.triton_task_queue_enabled ? AllocatorExecutionKind::AsyncDevice : AllocatorExecutionKind::DirectBlockingDevice;
+    const auto execution = *inputs.triton_task_queue_enabled ? TensorExecutionKind::AsyncDevice : TensorExecutionKind::DirectBlockingDevice;
     const auto kernel = builder.append("fused_indices", "sgl_kernel_npu.alloc_extend_kernel:int64", call.extend_tokens, {}, execution);
     const auto & shape = *preparation.specialization;
     auto & features = builder.program[kernel].work.features;
@@ -274,11 +274,11 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_fused_extend_allocat
     features.emplace("extend_upper_bound_tokens", static_cast<double>(shape[2]));
     features.emplace("free_pointer_mod16_bytes", static_cast<double>(shape[3]));
     builder.append("output_int", "aten._to_copy:int64_to_int32", call.extend_tokens, { kernel });
-    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, AllocatorExecutionKind::CpuService);
+    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, TensorExecutionKind::CpuService);
     return std::move(builder.program);
 }
 
-std::optional<std::vector<AllocatorTensorOperation>> ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+std::optional<std::vector<TensorOperation>> ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
                                                                                            const AscendAllocatorInputs & inputs,
                                                                                            const std::string & prefix_dtype, bool page_count_supplied) {
     if (call.allocated_pages < kNpuNaiveAllocationMinimumPages || inputs.last_location_dtype != "torch.int64" || call.requests.size() != call.batch_size)
@@ -299,7 +299,7 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_naive_extend_allocat
                               boolean ? "aten._local_scalar_dense:bool" : "aten._local_scalar_dense:int64",
                               1,
                               { value },
-                              AllocatorExecutionKind::BlockingReadback);
+                              TensorExecutionKind::BlockingContextReadback);
     };
     const auto rounded_pages = [&](const std::string & name, uint64_t elements) {
         // The Python expression is x + page_size - 1, not x + roundup.
@@ -404,7 +404,7 @@ std::optional<std::vector<AllocatorTensorOperation>> ascend_naive_extend_allocat
         mark_request(first, i);
     }
     // Naive output was allocated int32, so the enclosing .int() emits no cast.
-    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, AllocatorExecutionKind::CpuService);
+    builder.append("return", "sglang.NPUPagedTokenToKVPoolAllocator", call.batch_size, {}, TensorExecutionKind::CpuService);
     return std::move(builder.program);
 }
 

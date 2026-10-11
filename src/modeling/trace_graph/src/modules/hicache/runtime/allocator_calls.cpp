@@ -198,7 +198,7 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
         // Retaining proven unchanged source work does not require a native
         // lowering rule. New work does: an unknown device must not silently
         // inherit the inspected 910B implementation.
-        std::optional<std::vector<structure::hicache::AllocatorTensorOperation>> program;
+        std::optional<std::vector<structure::TensorOperation>> program;
         if (decode) { program = structure::hicache::ascend_decode_allocator_program(work, call.inputs); }
         else if (call.preparation.status == "naive_path") {
             program = structure::hicache::ascend_naive_extend_allocator_program(work, call.inputs, call.prefix_dtype.value(), call.page_count_supplied.value());
@@ -214,7 +214,7 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
             throw std::runtime_error("Target allocator has no implemented program for its device/dtype/execution inputs; device_name="
                                      + (call.inputs.device_name.empty() ? std::string("unknown") : call.inputs.device_name));
 
-        auto generated = generate_allocator_program(graph, node, call.resources.worker, call.resources.compute, *program);
+        auto generated = generate_tensor_program(graph, node, call.resources.worker, call.resources.compute, *program, "allocator");
         const auto requests = tensor_cost_requests(generated.operations);
         const auto estimates = cost::estimate_tensor_costs(requests, provider_);
         bind_tensor_program(generated, estimates);

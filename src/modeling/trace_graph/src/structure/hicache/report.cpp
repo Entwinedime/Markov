@@ -353,33 +353,105 @@ Json executed_tensor_operations(const core::DagGraph & graph, const std::string 
     };
 }
 
+/** Shared correspondence accounting for phase and allocator programs.
+ * Call identities and framework-specific matching stay with their callers.
+ * This records only independently corroborated work, never cost inference.
+ */
+struct ObservedTensorOperations {
+    Json operators = Json::array();
+    std::map<size_t, std::string> completions;
+    std::set<size_t> call_devices, assigned_devices;
+    size_t unavailable_programs = 0, unmatched_program = 0, overlapping_ownership = 0;
+    std::map<std::string, std::map<std::string, size_t>> unmatched_operations;
+
+    void append(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                std::span<const TensorOperation> program, const std::map<size_t, size_t> & matched, const Json & call_identity) {
+        const auto & graph = source.graph();
+        for (size_t index = 0; index < program.size(); ++index) {
+            const auto & operation = program[index];
+            if (operation.execution == TensorExecutionKind::CpuService || operation.execution == TensorExecutionKind::LayerReady) continue;
+
+            const auto found = matched.find(index);
+            if (found == matched.end()) {
+                ++unmatched_program;
+                ++unmatched_operations[operation.work.operation]["operator_correspondence"];
+                continue;
+            }
+
+            const auto region = source_dag::observe_submitted_call_region(source, queues, found->second);
+            const auto readback =
+                operation.execution == TensorExecutionKind::BlockingContextReadback ? source_dag::observe_synchronous_readback(source, region) : std::nullopt;
+            std::set<size_t> devices;
+            for (const auto node : region.submitted_nodes)
+                if (!graph.node(node).is_cpu) devices.insert(node);
+
+            if (region.caller.status != "ready" || region.caller.has_node_overlap || (devices.empty() && !readback)
+                || (operation.execution == TensorExecutionKind::BlockingContextReadback && !readback)) {
+                ++unmatched_program;
+                ++unmatched_operations[operation.work.operation]["incomplete_submission_or_readback"];
+                continue;
+            }
+            if (std::ranges::any_of(devices, [&](size_t node) { return assigned_devices.contains(node); })) {
+                ++overlapping_ownership;
+                continue;
+            }
+
+            assigned_devices.insert(devices.begin(), devices.end());
+            auto identity = call_identity;
+            identity.push_back(index);
+            if (readback) completions.emplace(readback->completion, identity.dump());
+            else if (const auto chain = source_dag::observe_serial_device_chain(source, devices)) completions.emplace(chain->last, identity.dump());
+
+            operators.push_back({
+                { "operator_identity", identity.dump() },
+                { "call_identity", call_identity.dump() },
+                { "operation", operation.work.operation },
+                { "implementation", operation.work.implementation },
+                { "features", operation.work.features },
+                { "native_device_nodes", devices.size() },
+                { "native_device_topology", native_device_topology(source, devices) },
+                { "observed_kernel_names", observed_kernel_names(graph, devices) },
+                { "native_serial_sequence", serial_native_sequence(source, devices, false) },
+            });
+        }
+    }
+
+    Json report(const core::DagGraph & graph) && {
+        auto precedence = phase_precedence(graph, completions);
+        Json result{
+            { "operators", std::move(operators) },
+            { "unmatched_program_operators", unmatched_program },
+            { "unmatched_operations", std::move(unmatched_operations) },
+            { "resource_groups", operator_resource_groups(graph, completions) },
+            { "completion_identities", precedence["identities"] },
+            { "precedence_identities", std::move(precedence["identities"]) },
+            { "precedence_successors", std::move(precedence["successors"]) },
+            { "precedence_unprocessed_nodes", precedence["unprocessed_active_nodes"] },
+            { "unavailable_call_programs", unavailable_programs },
+            { "overlapping_ownership", overlapping_ownership },
+        };
+        result.update(unassigned_device_work(graph, call_devices, assigned_devices));
+        return result;
+    }
+};
+
 Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
                                       const modules::hicache::HiCachePhaseObservationAudit & phases, std::map<size_t, std::string> & call_owners) {
     const auto & graph = source.graph();
     const auto audit = source_dag::observe_attention_calls(source, queues, phases);
     const auto metadata_audit = source_dag::observe_attention_metadata_calls(source, queues, phases);
     const auto dense_audit = source_dag::observe_dense_calls(source, queues, phases, audit);
-    Json operations = Json::array();
-    std::map<size_t, std::string> completions;
-    size_t unmatched_program = 0, unavailable_programs = 0, overlapping_ownership = 0;
-    std::map<std::string, std::map<std::string, size_t>> unmatched_operations;
-    std::set<size_t> call_devices, assigned_devices;
-    const auto append_call = [&](const source_dag::SubmittedCallRegion & work,
-                                 std::span<const size_t>
-                                     operator_observations,
-                                 size_t phase_index,
-                                 std::optional<uint64_t>
-                                     decode_iteration,
-                                 std::optional<uint64_t>
-                                     cache_layer,
-                                 const std::string & kind,
-                                 const std::optional<std::vector<TensorOperation>> & program) {
+    ObservedTensorOperations result;
+    const auto append_call = [&](const source_dag::SubmittedCallRegion & work, std::span<const size_t> operator_observations,
+                                 size_t phase_index, std::optional<uint64_t> decode_iteration, std::optional<uint64_t> cache_layer,
+                                 const std::string & kind, const std::optional<std::vector<TensorOperation>> & program) {
         for (const auto node : work.submitted_nodes)
-            if (!graph.node(node).is_cpu) call_devices.insert(node);
+            if (!graph.node(node).is_cpu) result.call_devices.insert(node);
         if (!program) {
-            ++unavailable_programs;
+            ++result.unavailable_programs;
             return;
         }
+
         const auto matched = source_dag::match_tensor_operators(source, queues, operator_observations, *program);
         const auto & phase = phases.observations.at(phase_index);
         const auto iteration = decode_iteration ? Json(*decode_iteration) : Json(nullptr);
@@ -393,99 +465,26 @@ Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSour
                 if (!added && owner->second != call_key) owner->second.clear();
             }
         }
-        for (size_t index = 0; index < program->size(); ++index) {
-            const auto & operation = program->at(index);
-            if (operation.execution != TensorExecutionKind::AsyncDevice && operation.execution != TensorExecutionKind::DirectBlockingDevice
-                && operation.execution != TensorExecutionKind::BlockingContextReadback)
-                continue;
-            const auto found = matched.find(index);
-            if (found == matched.end()) {
-                ++unmatched_program;
-                ++unmatched_operations[operation.work.operation]["operator_correspondence"];
-                continue;
-            }
-            const auto region = source_dag::observe_submitted_call_region(source, queues, found->second);
-            const auto readback =
-                operation.execution == TensorExecutionKind::BlockingContextReadback ? source_dag::observe_synchronous_readback(source, region) : std::nullopt;
-            std::set<size_t> devices;
-            for (const auto node : region.submitted_nodes)
-                if (!graph.node(node).is_cpu) devices.insert(node);
-            if (region.caller.status != "ready" || region.caller.has_node_overlap || (devices.empty() && !readback)
-                || (operation.execution == TensorExecutionKind::BlockingContextReadback && !readback)) {
-                ++unmatched_program;
-                ++unmatched_operations[operation.work.operation]["incomplete_submission_or_readback"];
-                continue;
-            }
-            if (std::ranges::any_of(devices, [&](size_t node) { return assigned_devices.contains(node); })) {
-                ++overlapping_ownership;
-                continue;
-            }
-            assigned_devices.insert(devices.begin(), devices.end());
-            auto identity = call_identity;
-            identity.push_back(index);
-            if (readback) completions.emplace(readback->completion, identity.dump());
-            else if (const auto chain = source_dag::observe_serial_device_chain(source, devices)) completions.emplace(chain->last, identity.dump());
-            operations.push_back({
-                { "operator_identity", identity.dump() },
-                { "call_identity", call_identity.dump() },
-                { "operation", operation.work.operation },
-                { "implementation", operation.work.implementation },
-                { "features", operation.work.features },
-                { "native_device_nodes", devices.size() },
-                { "native_device_topology", native_device_topology(source, devices) },
-                { "observed_kernel_names", observed_kernel_names(graph, devices) },
-                { "native_serial_sequence", serial_native_sequence(source, devices, false) },
-            });
-        }
+
+        result.append(source, queues, *program, matched, call_identity);
     };
     for (const auto & call : audit.calls)
-        append_call(call.region.work,
-                    call.region.operator_observations,
-                    call.phase_index,
-                    call.decode_iteration,
-                    call.conditions.cache_layer_index,
-                    "layer",
-                    ascend_attention_tensor_program(call.conditions, call.batch, call.cache_write));
+        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, call.conditions.cache_layer_index,
+                    "layer", ascend_attention_tensor_program(call.conditions, call.batch, call.cache_write));
     for (const auto & call : metadata_audit.calls)
-        append_call(call.region.work,
-                    call.region.operator_observations,
-                    call.phase_index,
-                    call.decode_iteration,
-                    std::nullopt,
-                    "metadata",
-                    ascend_attention_metadata_program(call.decode_iteration ? "decode" : "prefill", call.inputs));
+        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, std::nullopt,
+                    "metadata", ascend_attention_metadata_program(call.decode_iteration ? "decode" : "prefill", call.inputs));
     for (const auto & call : dense_audit.calls)
-        append_call(call.region.work,
-                    call.region.operator_observations,
-                    call.phase_index,
-                    call.decode_iteration,
-                    call.layer_index,
-                    "dense." + call.role,
-                    dense_tensor_program(call.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
+        append_call(call.region.work, call.region.operator_observations, call.phase_index, call.decode_iteration, call.layer_index,
+                    "dense." + call.role, dense_tensor_program(call.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
 
     auto issues = audit.issues;
     for (const auto & [issue, count] : metadata_audit.issues) issues[issue] += count;
     for (const auto & [issue, count] : dense_audit.issues) issues[issue] += count;
-    auto precedence = phase_precedence(graph, completions);
-    std::vector<std::string> completion_identities;
-    for (const auto & [node, identity] : completions) completion_identities.push_back(identity);
-    Json report{
-        { "operators", std::move(operations) },
-        { "unmatched_program_operators", unmatched_program },
-        { "unmatched_operations", unmatched_operations },
-        { "resource_groups", operator_resource_groups(graph, completions) },
-        { "completion_identities", completion_identities },
-        { "precedence_identities", std::move(precedence["identities"]) },
-        { "precedence_successors", std::move(precedence["successors"]) },
-        { "precedence_unprocessed_nodes", precedence["unprocessed_active_nodes"] },
-        { "unavailable_call_programs", unavailable_programs },
-        { "overlapping_ownership", overlapping_ownership },
-        { "source_observation_issues", issues },
-        { "scope",
-         "tensor work corroborated by Torch envelopes and submitted device work; CPU, layer checks and native dependency correspondence remain outside this "
-          "comparison" }
-    };
-    report.update(unassigned_device_work(graph, call_devices, assigned_devices));
+    auto report = std::move(result).report(graph);
+    report["source_observation_issues"] = std::move(issues);
+    report["scope"] =
+        "tensor work corroborated by Torch envelopes and submitted device work; CPU, layer checks and native dependency correspondence remain outside this comparison";
     return report;
 }
 
@@ -871,89 +870,34 @@ Json observed_allocator_operations(const modules::hicache::patch::HiCacheSourceD
         Json requests = Json::array();
         for (const auto & request : call.at("requests"))
             requests.push_back({
-                { "request_id",       request.at("request_id") },
-                {  "iteration", request.at("decode_iteration") }
+                { "request_id", request.at("request_id") },
+                { "iteration", request.at("decode_iteration") }
             });
         const auto identity = Json::array({ call.at("logical_input"), requests, call.at("phase") == "prefill" ? "extend" : "decode" });
         if (!identities.emplace(index, identity).second) ambiguous.insert(index);
     }
     for (const auto index : ambiguous) identities.erase(index);
 
-    Json operators = Json::array();
-    std::map<size_t, std::string> completions;
-    std::set<size_t> call_devices, assigned_devices;
-    size_t unavailable = 0, unmatched = 0, overlap = 0;
-    std::map<std::string, std::map<std::string, size_t>> unmatched_operations;
+    ObservedTensorOperations result;
     for (const auto & call : source_dag::observe_allocator_programs(source, queues)) {
         for (const auto node : call.region.work.submitted_nodes)
-            if (!graph.node(node).is_cpu) call_devices.insert(node);
+            if (!graph.node(node).is_cpu) result.call_devices.insert(node);
         const auto identity = identities.find(call.region.work.observation);
         if (!call.program || identity == identities.end()) {
-            ++unavailable;
+            ++result.unavailable_programs;
             continue;
         }
-        for (size_t i = 0; i < call.program->size(); ++i) {
-            const auto & operation = call.program->at(i);
-            if (operation.execution == AllocatorExecutionKind::CpuService) continue;
-            const auto matched = call.matched_operators.find(i);
-            if (matched == call.matched_operators.end()) {
-                ++unmatched;
-                ++unmatched_operations[operation.work.operation]["operator_correspondence"];
-                continue;
-            }
-            const auto region = source_dag::observe_submitted_call_region(source, queues, matched->second);
-            const auto readback =
-                operation.execution == AllocatorExecutionKind::BlockingReadback ? source_dag::observe_synchronous_readback(source, region) : std::nullopt;
-            std::set<size_t> devices;
-            for (const auto node : region.submitted_nodes)
-                if (!graph.node(node).is_cpu) devices.insert(node);
-            if (region.caller.status != "ready" || region.caller.has_node_overlap || (devices.empty() && !readback)
-                || (operation.execution == AllocatorExecutionKind::BlockingReadback && !readback)) {
-                ++unmatched;
-                ++unmatched_operations[operation.work.operation]["incomplete_submission_or_readback"];
-                continue;
-            }
-            if (std::ranges::any_of(devices, [&](size_t node) { return assigned_devices.contains(node); })) {
-                ++overlap;
-                continue;
-            }
-            assigned_devices.insert(devices.begin(), devices.end());
-            auto key = identity->second;
-            key.push_back(i);
-            if (readback) completions.emplace(readback->completion, key.dump());
-            else if (const auto chain = source_dag::observe_serial_device_chain(source, devices)) completions.emplace(chain->last, key.dump());
-            operators.push_back({
-                { "operator_identity", key.dump() },
-                { "call_identity", identity->second.dump() },
-                { "operation", operation.work.operation },
-                { "implementation", operation.work.implementation },
-                { "features", operation.work.features },
-                { "native_device_nodes", devices.size() },
-                { "native_device_topology", native_device_topology(source, devices) },
-                { "observed_kernel_names", observed_kernel_names(graph, devices) },
-                { "native_serial_sequence", serial_native_sequence(source, devices, false) }
-            });
-        }
+
+        result.append(source, queues, *call.program, call.matched_operators, identity->second);
     }
-    auto precedence = phase_precedence(graph, completions);
-    Json report{
-        { "operators", std::move(operators) },
-        { "completion_identities", precedence["identities"] },
-        { "resource_groups", operator_resource_groups(graph, completions) },
-        { "precedence_identities", std::move(precedence["identities"]) },
-        { "precedence_successors", std::move(precedence["successors"]) },
-        { "precedence_unprocessed_nodes", precedence["unprocessed_active_nodes"] },
-        { "unavailable_call_programs", unavailable },
-        { "unmatched_program_operators", unmatched },
-        { "unmatched_operations", unmatched_operations },
-        { "overlapping_ownership", overlap },
-        { "source_observation_issues",
-         { { "unobservable_outer_calls", observed_work.at("unobservable_calls") }, { "ambiguous_inner_calls", ambiguous.size() } } },
-        { "scope",
-         "allocator tensor work corroborated by independent call envelopes and device submissions; CPU/control and internal launch dependencies are not fully "
-          "compared" }
+
+    auto report = std::move(result).report(graph);
+    report["source_observation_issues"] = {
+        { "unobservable_outer_calls", observed_work.at("unobservable_calls") },
+        { "ambiguous_inner_calls", ambiguous.size() }
     };
-    report.update(unassigned_device_work(graph, call_devices, assigned_devices));
+    report["scope"] =
+        "allocator tensor work corroborated by independent call envelopes and device submissions; CPU/control and internal launch dependencies are not fully compared";
     return report;
 }
 
@@ -1266,11 +1210,7 @@ Json execution_structure_report(const core::DagGraph & graph, const model::HiCac
                         { "implementation",                                            operation.work.implementation },
                         {       "features",                                                  operation.work.features },
                         {   "predecessors",                                                   operation.predecessors },
-                        {      "execution",
-                         operation.execution == AllocatorExecutionKind::CpuService             ? "cpu_service"
-                         : operation.execution == AllocatorExecutionKind::BlockingReadback     ? "blocking_readback"
-                         : operation.execution == AllocatorExecutionKind::DirectBlockingDevice ? "direct_blocking_device"
-                         : "async_device"                                                                           },
+                        {      "execution",                                          tensor_execution_name(operation.execution) },
                         {  "request_index", operation.request_index ? Json(*operation.request_index) : Json(nullptr) },
                     });
             }

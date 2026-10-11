@@ -201,7 +201,7 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
         if (!call.resources) throw std::runtime_error("Target phase work lacks a proven compute stream and worker resource");
         const std::vector<size_t> no_load;
         const auto & records = call.layers.empty() ? no_load : consumer(call.pid, call.layers.front().batch_start_ns);
-        auto generated = generate_phase_tensor_program(graph, node, call.resources->worker, call.resources->compute, work.operations, !records.empty());
+        auto generated = generate_tensor_program(graph, node, call.resources->worker, call.resources->compute, work.operations, "phase_tensor", !records.empty());
         inherit_collective_completions(graph, call.retained, generated.plan);
         const auto requests = tensor_cost_requests(generated.operations);
         const auto estimates = cost::estimate_tensor_costs(requests, provider_);

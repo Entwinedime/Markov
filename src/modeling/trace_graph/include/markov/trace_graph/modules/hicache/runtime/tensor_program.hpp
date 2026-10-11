@@ -3,7 +3,6 @@
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
-#include "markov/trace_graph/structure/hicache/allocator.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
 
 #include <cstddef>
@@ -60,14 +59,14 @@ struct GeneratedTensorProgram {
     std::vector<uint64_t> event_layers;
 };
 
-[[nodiscard]] GeneratedTensorProgram generate_phase_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                                                   std::span<const structure::TensorOperation> operations, bool has_layer_load);
-
-/** Allocator tensor calls share queued submission and synchronous readback lowering. A direct blocking
- * launch has no worker slot and releases host return only after device service.
- * No HiCache layer waits are inserted in this program. */
-[[nodiscard]] GeneratedTensorProgram generate_allocator_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
-                                                                std::span<const structure::hicache::AllocatorTensorOperation> operations);
+/** Lower the shared work description without translating operation types.
+ * identity_prefix names report attributes, not a cost or execution policy.
+ * Allocator callers leave has_layer_load false; phase callers provide the
+ * target readiness condition. Optional request_index remains report metadata.
+ */
+[[nodiscard]] GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
+                                                             std::span<const structure::TensorOperation> operations, const std::string & identity_prefix,
+                                                             bool has_layer_load = false);
 
 /** Describe only the service scopes selected by the structural slots. Active
  * waits use the same submit/tail families as standalone HiCache layer calls;

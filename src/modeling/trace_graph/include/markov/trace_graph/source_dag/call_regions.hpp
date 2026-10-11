@@ -7,6 +7,7 @@
 #include "markov/trace_graph/structure/hicache/allocator.hpp"
 #include "markov/trace_graph/structure/hicache/attention.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
+#include "markov/trace_graph/structure/tensor_program.hpp"
 
 #include <map>
 #include <optional>
@@ -106,7 +107,7 @@ struct AllocatorRegion {
  * submissions or a proven synchronous readback. Shared by cost export and reporting. */
 struct ObservedAllocatorProgram {
     AllocatorRegion region;
-    std::optional<std::vector<structure::hicache::AllocatorTensorOperation>> program;
+    std::optional<std::vector<structure::TensorOperation>> program;
     std::map<size_t, size_t> matched_operators;
     std::optional<size_t> fused_position;
     bool has_preparation = false;
