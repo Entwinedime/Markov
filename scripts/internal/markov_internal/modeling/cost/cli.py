@@ -4,156 +4,12 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any
 
 from ...common.io import load_json, write_json
-from ...common.paths import repo_relative_path, require_repo_path
-from ..deployment import require_cost_environment, source_environment
-from .database import CostDatabase, OperationObservation, evidence_manifests
-from .models import ModelSpec, estimate, train_models
-from .io import service_cost_evidence
-from .package import control_observations, cpu_service_inputs, embed_control_measurements
-
-
-def import_profiles(
-    database: CostDatabase,
-    manifests: list[Path],
-    scratch: Path,
-    services: list[Path],
-    aliases: dict[str, str],
-    resources: dict[str, str] | None = None,
-    *,
-    include_setup_requests: bool = False,
-    replace_captures: bool = False,
-) -> dict[str, Any]:
-    """Extract explicitly selected historical captures, never the prediction base."""
-
-    # Import is a boundary workflow. Prediction and operator inference do not
-    # depend on framework acquisition, profile discovery or raw trace readers.
-    from ..source_dag.observations import scan_observations
-    from ..source_dag.profiles import discover_profile_runs
-
-    sources = discover_profile_runs(tuple(path.resolve() for path in manifests))
-    correction = cpu_service_inputs(services, tuple(source.manifest_path.resolve() for source in sources))
-    rows = []
-    evidence = []
-    for source in sources:
-        observation = scan_observations(
-            source,
-            scratch,
-            role="history",
-            cpu_service=correction.get(source.manifest_path.resolve()),
-            include_setup_requests=include_setup_requests,
-        )
-        manifest = str(repo_relative_path(source.manifest_path))
-        # Preserve capture identity across explicit asset aliases. A run's
-        # timestamp/identity is provenance; it is never a model feature.
-        capture = aliases.get(manifest, source.run_id)
-        deployment = source_environment(source, resources)
-        observation["resource_environment_basis"] = (
-            "explicit_import_declaration" if resources is not None else "capture_metadata_or_unknown"
-        )
-        for row in observation["operator_observations"]:
-            rows.append(
-                OperationObservation.from_raw(dict(row, capture=capture, manifest=manifest, deployment=deployment))
-            )
-        evidence.append(
-            dict(capture=capture, manifest=manifest, deployment=deployment, kind="runtime_io", payload=observation)
-        )
-
-    return database.import_measurements(rows, evidence, replace_captures=replace_captures)
-
-
-def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
-    """Select one deployment and fit declared operators without reading target data."""
-
-    excluded = set(request.get("excluded_captures", []))
-    excluded_manifests = request.get("excluded_manifests", [])
-    excluded = database.excluded_captures(excluded, excluded_manifests)
-    require_cost_environment(request["deployment"])
-    rows = database.observations(request["deployment"], excluded_captures=excluded)
-    available_evidence = database.evidence(request["deployment"], excluded_captures=excluded)
-    specs = request["models"]
-    if not specs:
-        raise ValueError("training must declare at least one operation model")
-
-    specifications = [ModelSpec.from_raw(raw) for raw in specs]
-    models, unmeasured_implementations = train_models(specifications, rows)
-
-    ready_models = [model for model in models if model["status"] == "ready"]
-    operator_captures = {capture for model in ready_models for capture in model["source_captures"]}
-    operator_manifests = {manifest for model in ready_models for manifest in model["source_manifests"]}
-    operator_manifests.update(
-        path for row in available_evidence if row["capture"] in operator_captures for path in evidence_manifests(row)
-    )
-
-    result = {
-        "status": "ready" if all(model["status"] == "ready" for model in models) else "missing_data",
-        "deployment": request["deployment"],
-        "excluded_captures": sorted(excluded),
-        "excluded_manifests": sorted(str(repo_relative_path(path)) for path in excluded_manifests),
-        "operator_models": ready_models,
-        "missing_models": [model for model in models if model["status"] != "ready"],
-        "wildcard_unmeasured_implementations": unmeasured_implementations,
-        "training_sources": sorted(operator_captures),
-        "training_source_manifests": sorted(operator_manifests),
-        "measurement_count": sum(model["measurement_count"] for model in ready_models),
-        "candidate_measurement_count": len(rows),
-        "prediction_reads_database": False,
-        "base_used_for_online_fit": False,
-        "readiness_scope": "declared operator model specifications; target execution and full cost coverage are not implied",
-    }
-    if "io_evidence" in request:
-        wanted = set(request["io_evidence"])
-        evidence = [
-            row
-            for row in available_evidence
-            if row["kind"] == "runtime_io" or (row["kind"] == "physical_io" and row["capture"] in wanted)
-        ]
-        physical = [row for row in evidence if row["kind"] == "physical_io"]
-        if len(physical) != 1:
-            raise ValueError("select exactly one applicable physical I/O measurement document")
-        captures = [dict(row["payload"], role="history") for row in evidence if row["kind"] == "runtime_io"]
-        io = service_cost_evidence(physical[0]["payload"], captures)
-        if io["missing"]:
-            result["status"] = "missing_data"
-        result["readiness_scope"] = (
-            "declared operator specifications and requested I/O families; target execution and full cost coverage are not implied"
-        )
-        primitives = physical[0]["payload"]
-        result["hicache"] = {
-            "storage_batch_pages": primitives["storage_batch_pages"],
-            "kv_bytes_per_token_per_rank": primitives["kv_geometry"]["kv_bytes_per_token_per_rank"],
-            "resource_lanes": primitives["resource_lanes"],
-            "service_models": io["models"],
-        }
-        used_runtime_manifests = {row["source_manifest"] for row in io["rows"]}
-        used_evidence = [
-            row for row in evidence if row["kind"] != "runtime_io" or row["manifest"] in used_runtime_manifests
-        ]
-        result["io_training"] = {
-            "missing": io["missing"],
-            "sources": io["sources"],
-            "measurement_support": io["measurement_support"],
-            "captures": sorted({row["capture"] for row in used_evidence}),
-            "considered_runtime_captures": sorted({row["capture"] for row in evidence if row["kind"] == "runtime_io"}),
-            "source_scope": "I/O parameter contributors; considered captures also affect evidence availability and fallback selection",
-        }
-        # Keep the package's isolation boundary conservative: failed fits can
-        # influence the choice of a physical fallback even without producing
-        # coefficients. Per-family provenance above separates those cases.
-        result["training_sources"] = sorted(set(result["training_sources"]) | {row["capture"] for row in evidence})
-        result["training_source_manifests"] = sorted(
-            set(result["training_source_manifests"]) | {path for row in evidence for path in evidence_manifests(row)}
-        )
-
-    # Aliases admitted by deduplicating imports are still training provenance.
-    # Carry them into the package because prediction never opens the database.
-    result["training_source_manifests"] = sorted(
-        set(result["training_source_manifests"]) | database.manifests_for_captures(set(result["training_sources"]))
-    )
-
-    return result
+from ...common.paths import require_repo_path
+from .database import CostDatabase, OperationObservation
+from .models import estimate
+from .package import import_evidence, import_profiles, train
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -209,36 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         output = require_repo_path(args.output_dir)
         if args.evidence:
             rows = load_json(require_repo_path(args.evidence))["evidence"]
-            for row in rows:
-                if row["kind"] == "control_costs" and "control_calibrations" in row["payload"]:
-                    payload = row["payload"]
-                    payload["control_measurements"] = embed_control_measurements(payload.pop("control_calibrations"))
-                elif row["kind"] == "control_costs":
-                    row["payload"]["control_measurements"] = embed_control_measurements(
-                        row["payload"]["control_measurements"]
-                    )
-
-            measurements = [
-                observation
-                for row in rows
-                if row["kind"] == "control_costs"
-                for observation in control_observations(row)
-            ]
-            for row in rows:
-                if row["kind"] != "cpu_primitive":
-                    continue
-                measurements.extend(
-                    OperationObservation.from_raw(
-                        dict(
-                            observation,
-                            capture=row["capture"],
-                            manifest=row["manifest"],
-                            deployment=row["deployment"],
-                        )
-                    )
-                    for observation in row["payload"]["operator_observations"]
-                )
-            result = database.import_measurements(measurements, rows, replace_captures=args.replace_captures)
+            result = import_evidence(database, rows, replace_captures=args.replace_captures)
         elif args.observations:
             rows = [
                 OperationObservation.from_raw(row)
