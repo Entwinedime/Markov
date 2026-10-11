@@ -344,6 +344,7 @@ scripts/model.sh prepare-hicache --group <group.json>
 
 最小配置使用已有独立成本包，不启动自动成本补采。成本包仍须满足部署条件和目标操作的实际需求，
 缺少模型或测量覆盖时明确报告缺口，不能保证任意成本包都能完成预测。
+普通预测不恢复物理或控制校准文件；这些输入只在显式共享补采需要使用时才解析与准入。
 
 `--dry-run` 不启动设备采集、CPU 配对准备或 target 预测，但会写准备摘要，不是完全无写入的语法检查。
 `--calibration-only` 只准备 source 输入及其同源 CPU 校正，可不提供成本包；成功状态为
@@ -376,7 +377,6 @@ scripts/model.sh prepare-hicache --group <group.json>
     "measurement_sources": ["<original-measurement.json>"],
     "measurement_description": "Target-independent platform measurements."
   },
-  "fixed_calibration_manifests": ["<independent-profile>/profile_manifest.json"],
   "budget": {
     "wall_seconds": 1200,
     "server_starts": 3,
@@ -387,7 +387,8 @@ scripts/model.sh prepare-hicache --group <group.json>
 ~~~
 
 这只是字段补充示例，须与 base、targets 和 output_dir 放在同一组配置中；预算值由实际可接受开销决定。
-`fixed_calibration_manifests` 可为空，这个沿用的字段名不要求固定端点或固定重复套餐。
+已有独立 profile 使用 `cost-db import --profile-manifest` 入库，再离线训练成本包；
+组配置不维护一份没有消费方的校准 manifest 清单。
 
 各类采集的预算分开声明：
 
@@ -758,8 +759,9 @@ CPU 服务、残余间隔、worker、派发和设备事件分别保留，传输�
 完整观测。它在同一个事务中替换这些 capture 的观测和证据，删除此次提取已不再接纳的旧样本；
 中途失败则回滚。原始 trace 不删除，已登记的来源别名仍保留，避免替换后绕过数据隔离。
 该选项不适合增量导入某一个控制原语：必须提供该 capture 希望保留的全部派生数据。
-受影响部署的数据库模型会被移除，随后需显式重新训练并导出成本包；已经导出的包不被自动改写，
-导入摘要会提醒重新训练。默认导入和自动补库均不隐式执行替换；本轮已验证真实重导及失败事务回滚。
+数据库只维护测量和来源，训练参数只保存在导出的成本包，不再写一份数据库模型副本。
+替换测量后需显式重新训练并导出成本包；已有包不被自动改写，导入摘要会提醒重新训练。
+默认导入和自动补库均不隐式执行替换。
 
 训练请求明确 `deployment`、`models` 以及 `excluded_captures`/`excluded_manifests`。
 每个模型声明 `operation`、`implementation`、`timing_scope`、`features` 和 `form`；
