@@ -2,14 +2,13 @@
 
 import os
 import sys
-import time
 from contextvars import ContextVar
 from types import ModuleType
 from typing import Any, Callable
 from weakref import WeakKeyDictionary
 
 from trace_sim_probe.patching import install_wrapper
-from trace_sim_probe.writer import get_writer
+from trace_sim_probe.probes.thread_timing import invoke_runtime_call
 
 
 TARGET_MODULES = (
@@ -154,7 +153,6 @@ def _lm_head_call(original: Callable[..., Any], module: ModuleType) -> Callable[
             "bias_shape": None,
             "bias_dtype": None,
             "last_token_projection": _LOGITS_LAST_TOKEN.get(),
-            "status": "raised",
         }
         fields.update(_DENSE_ROLES.get(processor, {}))
         return _invoke(original, (processor, hidden, head, embedding_bias), fields, "runtime.phase.logits_projection")
@@ -177,7 +175,6 @@ def _logits_output(original: Callable[..., Any]) -> Callable[..., Any]:
             "input_dtype": str(logits.dtype),
             "vocab_size": processor.vocab_size,
             "output_buffer_present": metadata.next_token_logits_buffer is not None,
-            "status": "raised",
         }
         return _invoke(original, (processor, logits, metadata), fields, "runtime.phase.logits_output")
 
@@ -242,7 +239,6 @@ def _eager_inputs(original: Callable[..., Any], module: ModuleType) -> Callable[
             "copy_enabled": not module.envs.SGLANG_EAGER_INPUT_NO_COPY.get(),
             "pipeline_inputs_present": pp_proxy_tensors is not None,
             "slots": slots,
-            "status": "raised",
         }
 
         def invoke() -> Any:
@@ -280,7 +276,6 @@ def _logits_pruning(original: Callable[..., Any]) -> Callable[..., Any]:
             "last_token_selection": last_token and not passthrough,
             "before_norm_present": hidden_states_before_norm is not None,
             "auxiliary_count": 0 if aux_hidden_states is None else len(aux_hidden_states),
-            "status": "raised",
         }
         if last_token and not passthrough:
             lengths = logits_metadata.extend_seq_lens
@@ -315,7 +310,6 @@ def _greedy_sampling(original: Callable[..., Any]) -> Callable[..., Any]:
             "input_shape": list(logits.shape),
             "input_stride": list(logits.stride()),
             "input_dtype": str(logits.dtype),
-            "status": "raised",
         }
 
         def invoke() -> Any:
@@ -334,16 +328,7 @@ def _invoke(
     output_names: tuple[str, ...] = ("output", "residual_output"),
     output_getter: Callable[[Any], tuple[Any, ...]] | None = None,
 ) -> Any:
-    writer = get_writer()
-    start_us = writer.now_us()
-    cpu_start_ns = time.thread_time_ns()
-    cpu_end_ns = None
-    end_us = start_us
-    try:
-        result = original(*args)
-        cpu_end_ns = time.thread_time_ns()
-        end_us = writer.now_us()
-        fields["status"] = "returned"
+    def describe(result: Any) -> None:
         if output_getter is not None:
             outputs = output_getter(result)
         elif isinstance(result, tuple):
@@ -355,14 +340,8 @@ def _invoke(
             fields[name + "_shape"] = list(output.shape)
             fields[name + "_stride"] = list(output.stride())
             fields[name + "_dtype"] = str(output.dtype)
-        return result
-    finally:
-        if cpu_end_ns is None:
-            cpu_end_ns = time.thread_time_ns()
-            end_us = writer.now_us()
 
-        fields["thread_cpu_ns"] = cpu_end_ns - cpu_start_ns
-        writer.duration_event(event_name, start_us, end_us, "runtime_diagnostic", fields)
+    return invoke_runtime_call(original, args, {}, fields, event_name, describe)
 
 
 def _embedding_forward(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -374,7 +353,6 @@ def _embedding_forward(original: Callable[..., Any]) -> Callable[..., Any]:
         fields = {
             **owner,
             "implementation": "sglang.VocabParallelEmbedding.forward",
-            "status": "raised",
             "input_shape": list(input_.shape),
             "tp_size": layer.tp_size,
             "quant_implementation": f"{type(layer.quant_method).__module__}.{type(layer.quant_method).__qualname__}",
@@ -410,7 +388,6 @@ def _embedding_mask_call(original: Callable[..., Any]) -> Callable[..., Any]:
 
         fields = {
             "implementation": "sglang.get_masked_input_and_mask.npu_eager",
-            "status": "raised",
             "input_shape": list(input_.shape),
             "input_stride": list(input_.stride()),
             "input_dtype": str(input_.dtype),
@@ -428,7 +405,7 @@ def _embedding_call(original: Callable[..., Any]) -> Callable[..., Any]:
         if indices.device.type != "npu":
             return original(method, layer, indices)
 
-        fields = {"implementation": "torch.nn.functional.embedding", "status": "raised"}
+        fields = {"implementation": "torch.nn.functional.embedding"}
         for name, tensor in (("indices", indices), ("weight", layer.weight)):
             fields[name + "_shape"] = list(tensor.shape)
             fields[name + "_stride"] = list(tensor.stride())
@@ -459,7 +436,6 @@ def _linear_call(original: Callable[..., Any]) -> Callable[..., Any]:
             "weight_dtype": str(weight.dtype),
             "bias_shape": None if bias is None else list(bias.shape),
             "bias_dtype": None if bias is None else str(bias.dtype),
-            "status": "raised",
         }
         fields.update(_DENSE_ROLES.get(layer, {}))
         return _invoke(original, (method, layer, x, bias), fields, "runtime.phase.linear")
@@ -476,7 +452,6 @@ def _gated_activation_call(original: Callable[..., Any]) -> Callable[..., Any]:
             "input_shape": list(x.shape),
             "input_stride": list(x.stride()),
             "input_dtype": str(x.dtype),
-            "status": "raised",
         }
         fields.update(_DENSE_ROLES.get(layer, {}))
         return _invoke(original, (layer, x), fields, "runtime.phase.gated_activation")
@@ -509,7 +484,6 @@ def _normalization_call(original: Callable[..., Any]) -> Callable[..., Any]:
             "residual_stride": None if residual is None else list(residual.stride()),
             "residual_dtype": None if residual is None else str(residual.dtype),
             "post_residual_addition": post_residual_addition is not None,
-            "status": "raised",
         }
         fields.update(_DENSE_ROLES.get(layer, {}))
         return _invoke(original, (layer, x, residual, post_residual_addition), fields, "runtime.phase.normalization")
@@ -555,7 +529,6 @@ def _qkv_norm_rope_call(original: Callable[..., Any]) -> Callable[..., Any]:
             "epsilon": eps,
             "is_neox_style": is_neox_style,
             "triton_task_queue_enabled": os.getenv("TRITON_ENABLE_TASKQUEUE", "true").lower() in {"true", "1"},
-            "status": "raised",
         }
         for name, tensor in (
             ("input", x),
@@ -596,7 +569,6 @@ def _rotary_table_call(original: Callable[..., Any]) -> Callable[..., Any]:
     def observed(layer: Any, positions: Any) -> Any:
         fields = {
             "implementation": "sglang.RotaryEmbedding.get_cos_sin_with_position",
-            "status": "raised",
         }
         for name, tensor in (("positions", positions), ("table", layer.cos_sin_cache)):
             fields[name + "_shape"] = list(tensor.shape)
@@ -641,7 +613,6 @@ def _rotary_call(original: Callable[..., Any], module: ModuleType) -> Callable[.
             "native_rotary_uncompiled": layer._apply_rotary_emb_wrapped is module.apply_rotary_emb,
             "offsets_present": offsets is not None,
             "fused_kv_write": fused_set_kv_buffer_arg is not None,
-            "status": "raised",
         }
         for name, tensor in (
             ("positions", positions),
@@ -704,7 +675,6 @@ def _qk_reshape(original: Callable[..., Any]) -> Callable[..., Any]:
             "input_stride": list(x.stride()),
             "input_dtype": str(x.dtype),
             "head_dim": head_dim,
-            "status": "raised",
         }
         owners = _QK_INPUTS.get()
         owner = None if owners is None else owners.get(id(x))
@@ -748,7 +718,6 @@ def _device_collective(original: Callable[..., Any], module: ModuleType, kind: s
             "element_bytes": x.element_size(),
             "world_size": communicator.world_size,
             "group_rank": group.rank(),
-            "status": "raised",
         }
         # Counts this observed entry, including failures, not all native HCCL
         # work. Quantized or unobserved collectives are not implied covered.

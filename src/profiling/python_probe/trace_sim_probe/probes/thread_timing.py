@@ -1,10 +1,50 @@
-"""Diagnostic-only thread clocks and scheduling counters."""
+"""Runtime call clocks and optional per-thread scheduling diagnostics."""
 
 from __future__ import annotations
 
 import resource
 import time
-from typing import Any
+from typing import Any, Callable
+
+from trace_sim_probe.writer import get_writer
+
+
+def invoke_runtime_call(
+    original: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    fields: dict[str, Any],
+    event_name: str,
+    on_return: Callable[[Any], None] | None = None,
+) -> Any:
+    """Time a call, then describe its result and emit one event, including failures.
+
+    Mutates fields with status and thread_cpu_ns. Metadata callbacks run after
+    both end clocks, outside the measured interval. Original results and errors
+    propagate; this helper performs no tensor reads or scheduling diagnostics.
+    """
+
+    writer = get_writer()
+    fields["status"] = "raised"
+    start_us = writer.now_us()
+    cpu_start_ns = time.thread_time_ns()
+    cpu_end_ns = None
+    end_us = start_us
+    try:
+        result = original(*args, **kwargs)
+        cpu_end_ns = time.thread_time_ns()
+        end_us = writer.now_us()
+        fields["status"] = "returned"
+        if on_return is not None:
+            on_return(result)
+        return result
+    finally:
+        if cpu_end_ns is None:
+            cpu_end_ns = time.thread_time_ns()
+            end_us = writer.now_us()
+
+        fields["thread_cpu_ns"] = cpu_end_ns - cpu_start_ns
+        writer.duration_event(event_name, start_us, end_us, "runtime_diagnostic", fields)
 
 
 def _thread_schedstat_snapshot() -> dict[str, int] | None:
@@ -35,7 +75,7 @@ def _thread_schedstat_snapshot() -> dict[str, int] | None:
         return None
 
 
-def _thread_timing_snapshot(*, boundary: str = "start") -> dict[str, int]:
+def _thread_timing_snapshot(*, at_end: bool = False) -> dict[str, int]:
     """Capture bounded per-thread clocks close to a measured call boundary.
 
     The CPU clock is sampled last at the start boundary and first at the end
@@ -43,9 +83,7 @@ def _thread_timing_snapshot(*, boundary: str = "start") -> dict[str, int]:
     work outside the CPU interval used for the wrapped call.
     """
 
-    if boundary not in {"start", "end"}:
-        raise ValueError(f"unsupported thread-timing boundary: {boundary!r}")
-    if boundary == "end":
+    if at_end:
         thread_cpu_ns = time.thread_time_ns()
         usage = resource.getrusage(resource.RUSAGE_THREAD)
         schedstat = _thread_schedstat_snapshot()

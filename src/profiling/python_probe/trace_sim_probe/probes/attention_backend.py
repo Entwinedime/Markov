@@ -4,14 +4,13 @@ from functools import lru_cache, partial
 from itertools import count
 import os
 import sys
-import time
 from types import ModuleType
 from typing import Any, Callable
 from weakref import WeakKeyDictionary
 
 from trace_sim_probe.patching import install_wrapper
 from trace_sim_probe.schema import HICACHE_CONSUMER_DAG_PATCH
-from trace_sim_probe.writer import get_writer
+from trace_sim_probe.probes.thread_timing import invoke_runtime_call
 
 
 TARGET_MODULES = ("sglang.srt.hardware_backend.npu.attention.ascend_backend",)
@@ -204,28 +203,15 @@ def _attention_call(original: Callable[..., Any], phase: str) -> Callable[..., A
                 "descriptor_id": descriptor_id,
                 "descriptor_present": not known,
                 "sampling": "every_call" if every_call else "first_successful_call_per_layer_shape_path",
-                "status": "raised",
             }
         )
-        writer = get_writer()
-        start_us = writer.now_us()
-        cpu_start_ns = time.thread_time_ns()
-        cpu_end_ns = None
-        end_us = start_us
-        try:
-            result = original(backend, q, k, v, layer, forward_batch, *args, **kwargs)
-            cpu_end_ns = time.thread_time_ns()
-            end_us = writer.now_us()
-            fields["status"] = "returned"
-            seen[key] = descriptor_id
-            return result
-        finally:
-            if cpu_end_ns is None:
-                cpu_end_ns = time.thread_time_ns()
-                end_us = writer.now_us()
 
-            fields["thread_cpu_ns"] = cpu_end_ns - cpu_start_ns
-            writer.duration_event("runtime.phase.attention", start_us, end_us, "runtime_diagnostic", fields)
+        def remember(result: Any) -> None:
+            seen[key] = descriptor_id
+
+        return invoke_runtime_call(
+            original, (backend, q, k, v, layer, forward_batch, *args), kwargs, fields, "runtime.phase.attention", remember
+        )
 
     return observed
 
@@ -279,22 +265,12 @@ def _metadata_call(original: Callable[..., Any], route: str, device_name: Callab
             "sliding_window_kv_pool": backend.use_sliding_window_kv_pool,
             "use_mla": backend.use_mla,
             "sampling": "every_call",
-            "status": "raised",
         }
         if extend_seq_lens is not None:
             fields["extend_dtype"] = str(extend_seq_lens.dtype)
             fields["extend_device_type"] = extend_seq_lens.device.type
 
-        writer = get_writer()
-        start_us = writer.now_us()
-        cpu_start_ns = time.thread_time_ns()
-        cpu_end_ns = None
-        end_us = start_us
-        try:
-            result = original(backend, forward_batch, *args, **kwargs)
-            cpu_end_ns = time.thread_time_ns()
-            end_us = writer.now_us()
-            fields["status"] = "returned"
+        def describe(result: Any) -> None:
             output = backend.forward_metadata.block_tables
             fields["block_table_shape"] = list(output.shape)
             fields["block_table_stride"] = list(output.stride())
@@ -309,14 +285,10 @@ def _metadata_call(original: Callable[..., Any], route: str, device_name: Callab
                     and source_sequence.stride() == destination_sequence.stride()
                     and source_sequence.data_ptr() == destination_sequence.data_ptr()
                 )
-            return result
-        finally:
-            if cpu_end_ns is None:
-                cpu_end_ns = time.thread_time_ns()
-                end_us = writer.now_us()
 
-            fields["thread_cpu_ns"] = cpu_end_ns - cpu_start_ns
-            writer.duration_event("runtime.phase.attention_metadata", start_us, end_us, "runtime_diagnostic", fields)
+        return invoke_runtime_call(
+            original, (backend, forward_batch, *args), kwargs, fields, "runtime.phase.attention_metadata", describe
+        )
 
     return observed
 

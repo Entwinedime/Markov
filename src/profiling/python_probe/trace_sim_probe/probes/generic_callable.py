@@ -280,12 +280,12 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
 
         @functools.wraps(fn)
         async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
-            timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
+            timing_started = _thread_timing_snapshot() if capture_thread_timing else None
             started = get_writer().now_us()
             _emit_targets(targets, argument_spec, args, kwargs, None, "start", started, started, None)
             result = await fn(*args, **kwargs)
             ended = get_writer().now_us()
-            timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
+            timing_ended = _thread_timing_snapshot(at_end=True) if capture_thread_timing else None
             timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
             _emit_targets(targets, argument_spec, args, kwargs, result, "end", started, ended, timing)
             return result
@@ -294,12 +294,12 @@ def _wrap_callable(targets: tuple[TargetSpec, ...], fn: Callable[..., Any]) -> C
 
     @functools.wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
-        timing_started = _thread_timing_snapshot(boundary="start") if capture_thread_timing else None
+        timing_started = _thread_timing_snapshot() if capture_thread_timing else None
         started = get_writer().now_us()
         _emit_targets(targets, argument_spec, args, kwargs, None, "start", started, started, None)
         result = fn(*args, **kwargs)
         ended = get_writer().now_us()
-        timing_ended = _thread_timing_snapshot(boundary="end") if capture_thread_timing else None
+        timing_ended = _thread_timing_snapshot(at_end=True) if capture_thread_timing else None
         timing = _thread_timing_delta(timing_started, timing_ended, started, ended)
         _emit_targets(targets, argument_spec, args, kwargs, result, "end", started, ended, timing)
         return result
