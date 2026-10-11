@@ -16,12 +16,12 @@
 - profile manifest 是 profiling 与 modeling 的唯一交接点；
 - source DAG 只来自 source profile；
 - target config 可以影响 effect plan；
-- calibration 与 selected base 可以影响 cost parameter；
+- selected base 只提供对应且未变化的可迁移成本；变化或新增操作使用独立测量与离线模型，不以当前 base 在线拟合参数；
 - target observation 只能用于 score-only structure/cost/oracle；
 - target E2E、target cell ID 和 workload ID 不能进入模型参数。
 
-正式 predictor 与 observed-target evaluator 是两条物理隔离的路径。`predict-hicache` 不打开 target profile/score root，
-也不导入 target oracle；`evaluate-hicache` 必须先确认选中的 predictor 全部完成，再读取 target score。
+正式 predictor 与 observed-target evaluator 是两条物理隔离的路径。`predict` 不打开 target profile/score root，
+也不导入 target oracle；`evaluate` 必须先确认选中的 predictor 全部完成，再读取 target score。
 已有预测使用 `--prediction-dir` 独立评分，不为评分启动补采、构模或重复预测。评分结果不能回写模型、改变
 readiness 或触发自动 refit。
 预测入口不接收矩阵评分、跨base模型映射或oracle参数。评估默认只评分；显式 `--oracle-cost-replay` 才在评分后做成本替换诊断，
@@ -77,9 +77,11 @@ oracle-cost replay 只诊断预测 operation/effect 的 cost binding 和 sensiti
 ## 5. Calibration
 
 - 平台 physical calibration 不运行任何 target workload，并显式声明 `physical_capture.page_token_sizes`；该物理域不能从 target 列表反推；
-- 优先使用 selected base 的实测成本，其次使用有依据的成本外推；两者不足才补充独立测量，不强制双端点或固定重复配额；
+- 只有操作工作及实现确实未变化时才迁移 selected base 的对应成本；变化或新增操作的预测使用独立数据库测量与离线模型；
+- 当前 base 不自动入库，也不在预测中用于拟合。历史采集需要显式导入；独立数据不足才执行显式开启、有累计预算的共享补采；
 - 同一模型、TP、I/O backend 和资源环境可共享适用的独立校准；环境不匹配时不能沿用参数；
-- base profiles 提供 source DAG、工作量及可辨识的 HiCache I/O/control、Prefill/Decode 成本依据，不能把其他 base 或 target 真值伪装成独立校准；
+- base profiles 提供 source DAG、原始工作观测及可直接迁移的对应成本，不能把当前实验的其他 base 或 target 真值伪装成独立校准；
+- 成本部署域明确框架、模型/TP、后端和资源环境；未知环境的观测可保留，但不得据此训练或应用共享成本模型。历史资源声明不改写原采集，也不等于实测证明；
 - 补采面向整组需求并由全部 target 共享。target 配置可以用于分析所需操作，配置名称、target profile、评分和逐格误差不能进入参数拟合或决定补采；
 - 60-cross 仅在预测全部结束后评分。精度不足报告 `MODEL_LIMITATION`，不触发 refit 或新候选。
 

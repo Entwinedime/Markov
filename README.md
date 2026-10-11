@@ -5,10 +5,9 @@
 当前建模主线是 SGLang HiCache 的 I/O/control 与 Prefill/Decode 变化：
 
 ```text
-base profile + target config + workload
-  -> source DAG 与 base 成本依据
-  -> 按执行规则生成 target 操作和依赖，估计成本
-  -> DAG 执行与完整 HTTP 时间预测
+base profile -> 原始 DAG 与源观测
+原始 DAG + target config + workload -> 目标操作、依赖和条件执行规则
+目标工作 + 可迁移的 base 成本 + 独立成本模型 -> 执行与完整 HTTP E2E
 ```
 
 HiCache I/O/control（内部 scope ID 为 `hicache_direct`）、Prefill 和 Decode 分别建模。默认预测不排除 gap 或未归属成本；仍沿用 base 的残余等待等近似，会随结果说明。执行完成不等于精度达标，当前执行式预测的分项归属评分尚不完整。
@@ -80,7 +79,7 @@ scripts/model.sh build-dag \
 该入口不要求 HiCache。以下 HiCache 预测流程只适用于 SGLang。
 
 从 [最小组配置](configs/modeling/hicache_group_example.json) 开始：复制为自己的配置文件，
-将 `base_manifests` 中的占位路径换成实际 manifest，按需修改 target 配置及输出目录。然后先运行：
+将 `base_manifests` 和 `cost_model` 中的占位路径换成实际输入，声明实际资源环境，按需修改 target 配置及输出目录。然后先运行：
 
 ```bash
 scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
@@ -94,12 +93,18 @@ scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
 scripts/model.sh prepare-hicache --group <group_request.json>
 ```
 
-prepare 统一完成成本检查、必要的共享补采、构模和组预测，不需要手工串联内部阶段。
-成本优先来自 base 实测及有依据的外推，不足才使用共享独立校准。首次准备自动读取 base 部署的模型配置信息，
-不必声明物理采样或先采完整参数包；宿主机缺少模型配置时，会提示提供配置文件或适用的已有校准报告。
-未具备的 I/O 服务成本单独报告，目标执行确实用到时才触发共享补采。
-CPU 控制和计算参数仍有构模前置要求，自动补采尚未覆盖全部控制分支。
-不能保证任意组只靠 base 就能预测。
+本轮[三阶段重构](docs/tmp/three_stage_modeling_refactor_plan_20261002.md)已完成，
+[泛化扩展](docs/tmp/hicache_generalization_expansion_plan_20261010.md)的 186 格预测也已全部执行。
+54 格新留出确认已独立评分，全部低于 6%，完整 HTTP WAPE 为 1.640%、最大 APE 为 5.587%；
+总体及三个 base 的性能分组通过原有门槛，但部分负载和 target 分组仍未通过，不能代表每次运行都准。
+原 60 格最终代码回归已完成，全部低于 10%，WAPE 为 3.001%、最大 APE 为 9.370%，严格状态仍为 MODEL_LIMITATION。
+扩展 72 格最终评分已完成，全部低于 10%，WAPE 为 2.348%、最大 APE 为 8.429%，严格状态仍为 MODEL_LIMITATION。
+七份 target 的九格结构比较已完成但仍为 partial，完整 target DAG 一致性未证明；成本覆盖也仍为 partial。
+适用范围、分组结果与证据见[当前进展](docs/work_progress.md)，不宣称任意配置均受支持。
+prepare 使用已经离线训练的独立成本包组织组预测。base 提供原始图和工作确实未变化的对应成本，
+不自动入库或在线拟合；变化或新增操作查询独立模型。历史测量通过 `cost-db import/train` 显式准备。
+共享补采默认关闭，显式开启并提供累计预算后才执行；合法分支缺少成本时报告缺口，不填零或删掉操作。
+新流程不保证任意组只靠 base 或现有数据库就能完成预测，部署适用性与数据覆盖须分别检查。
 
 先看输出目录的 `group_summary.json` 了解准备状态与停止原因，再按其中的预测结果路径查看
 `workflow_summary.json`：`prediction.cells` 包含各格完整 HTTP 时间、执行状态和成本局限。
@@ -108,7 +113,7 @@ CPU 控制和计算参数仍有构模前置要求，自动补采尚未覆盖全�
 有 target 实测时，再对已完成的预测独立评分：
 
 ```bash
-scripts/model.sh evaluate-hicache \
+scripts/model.sh evaluate \
   --prediction-dir <prediction-output> \
   --profile-run-dir <target-profile-suite> \
   --output-dir <separate-score-output>
@@ -120,6 +125,9 @@ scripts/model.sh evaluate-hicache \
 ## 可选 DAG 变换
 
 NodeScale 是框架无关的可选 DAG 变换。它按顺序匹配节点名称子串，并缩放节点耗时；没有配置时默认关闭。
+在三阶段 HiCache 执行路径中，缩放作用于已绑定的最终节点耗时，也包含目标新生成的节点，
+不修改原始 DAG 或回归参数。独立构图入口同样先使用校正后的有效成本，再缩放并绑定最终耗时，
+不会把已经拆成依赖的同步阻塞墙钟重新放回节点。独立构图入口已用真实输入验证此衔接，完整目标预测仍待验收。
 将以下内容保存为模型配置，并在 `build-dag` 命令中追加 `--model-config <model.json>`：
 
 ```json

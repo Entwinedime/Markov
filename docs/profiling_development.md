@@ -23,7 +23,97 @@ scripts/profile.sh <experiment.json>
 
 `--server/--input/--experiment` 用于选择少量 cell；`--channels` 覆盖采集 channel；SGLang forced replay 使用
 `--forced-token-bundle` 选择矩阵回放计划，普通单次回放也可在 workload 命令中直接指定 `--forced-token-plan`。
+采集输入由文件与参数声明，入口不读取 stdin；在逐行读取配置的 Shell 循环中调用，不会消耗后续配置行。
 profiling cell 严格串行，避免设备、host 和 storage 状态跨 cell 干扰。
+HiCache DAG 采集增加 `runtime.hicache.write_ack`：记录等待事件之后的确认处理边界，以及已有状态中的
+备份 token 数、发布节点数、存储开关和释放锁标志。只读取标量与列表长度，不采 snapshot、不查询或同步设备事件。
+该探针已用于本轮独立 full/light 配对与成本提取；探针本身的额外开销仍按同源轻量配对处理。
+注意力探针另记录 `runtime.phase.attention_metadata`，区分每轮页表准备与逐层 attention、缓存分配。
+逐层 `runtime.phase.attention` 的缓存写入描述另保留 K/V 的 shape 和 stride，并将布局纳入描述复用条件。
+相同元素数的连续张量和切片视图不再共用同一个描述；这些字段仅读取张量元数据，不读取内容或触发同步。
+旧采集没有这些直接布局字段，不能自动视为连续；后续建模须使用可追溯的生产者布局或报告缺少依据。
+它只读取 shape、stride、dtype、设备类型与现有分支标志，不读取设备张量内容、不增加同步。
+单请求的当前上下文使用框架已有的 `seq_lens_sum` Python 标量；缺失时不补做张量读回，
+也不以整个请求长度代替当前 Prefill 分块长度。普通
+`init_forward_metadata` 和 graph 的 `init_forward_metadata_out_graph` 每次调用各记录一个边界，
+并区分普通执行、graph capture 与 replay。记录边界不等于已经生成这些路径的目标结构。
+graph replay 使用缓冲区视图而非完整 `ForwardBatch`，不读取不存在的扩展字段；通过已有地址与布局
+记录序列拷贝是否为完全相同的视图，不读张量内容，以免把自拷贝误建为设备工作。
+这些包络是源观测，不新增 DAG 执行节点，也不把包络耗时叠加到内部算子成本上。
+同一 DAG 采集模式新增 `runtime.phase.linear`，只观测 NPU 非量化 Linear 的张量元数据及调用边界，
+CPU AMX、ROCm 和量化路径不冒充相同实现。不采参数或激活值；调用开销仍须在统一采集时评估。
+Qwen3 decoder 初始化时通过实际子模块登记四类 dense 投影的角色/层号，仅用于语义对应，不作为成本系数。
+其他模型的 Linear 仍可提供实际几何测量，但不会因此自动获得 Qwen3 的目标 token 布局规则。
+
+输入 Embedding 的观测分为外层角色/输出几何、索引掩码及实际查表。外层
+`runtime.phase.embedding_forward` 不作为整段成本；内部 Torch 清零包络提供执行区间，
+外层仅补充该算子的语义。首层归一化观测同时声明输入 Embedding 是否存在及 TP 大小，
+用于发现某轮缺失查表或掩码观测，不通过补造事件掩盖漏采。上述探针只读取元数据，尚待统一实采验证。
+
+普通投影与门控激活共用 `dense_backend` 观测模块和计时逻辑。`runtime.phase.gated_activation`
+只包裹实际执行的 `SiluAndMul.forward_npu`（`torch_npu.npu_swiglu`），记录输入形状、步长、
+dtype、输出形状和调用时钟；不读取张量内容或增加同步。Qwen3 的 `mlp_activation` 与四类投影
+通过实际模块对象记录 `dense_role` 和模型层号，不依靠维度相等猜测角色。采用 native SiLU 加乘法
+的路径不冒充融合激活。DAG 构建保留该观测及内部 Torch 包络，但不把包络作为额外执行成本。
+门控激活已用于本轮源几何提取、独立成本训练与目标阶段替换；这不证明其他布局或后端已覆盖。
+
+`runtime.phase.logits_pruning` 单独记录输出投影之前的隐藏状态选择，区分 Decode 直接沿用与
+Prefill 选取每个请求最后一行的分支，保留输入/输出形状、长度数组形状与 dtype、静态 padding
+以及额外隐藏状态是否存在。只读取元数据，不读取长度或索引张量内容，不增加设备同步。
+该包络用于归属 Cumsum/Sub/Index 等辅助操作，不把它们混入 MatMul 或注意力，也不额外计费。
+当前已真实采到 Prefill 选择及 Decode 直接沿用，普通单请求 Prefill 的结构/成本提取已接入共用
+dense 链，独立 full/light 配对与正式提取入库通过；尚无跨页大小目标预测结果。
+已有旧 trace 不因新增探针自动获得这些信息。
+
+`runtime.phase.input_buffers` 记录 eager `load_batch` 的真实边界及缓冲区注册信息，
+包括 token/请求轴、源/目标形状、步长、dtype 和复制分组所需属性。只读取元数据，
+不调用自定义取值/切片函数、不读取张量内容或增加同步，也不采缓存 snapshot。
+自定义回调只标记其存在；未知布局不能冒充支持。现已完成独立 full/light 实采及提取，
+新 base 也已重采，旧 trace 不自动补造缺失的输入准备描述。
+
+`runtime.phase.normalization` 记录实际 `RMSNorm.forward_npu`，区分普通归一化与融合残差相加，
+保留输入/残差/权重的形状、步长、dtype、epsilon 和输出元数据。Qwen3 输入归一化和 Attention 后
+归一化按实际模块登记角色；未经过此入口的通信融合或 native 路径不会伪造相同观测。
+额外 `post_residual_addition` 会被标明，当前不把它并入单个 RMSNorm 的成本样本。
+`split_residual_norm` 记录实际加载的 batch-invariant 残差归一化替代函数，区分融合操作和
+“相加后归一化”的两操作路径；不读取张量内容，也不通过环境变量猜测替换是否真正生效。
+Q/K 模块另外登记 `rows_per_token`，值来自模型声明的本地头数；仅在真实 RMSNorm 调用发生时输出，
+不为 Decode 的融合 QKV/RoPE 路径补造独立事件。
+
+Decode 的 `runtime.phase.qkv_norm_rope` 单独包裹真实融合函数，记录输入、sin/cos、权重与 bias 的
+形状/步长/dtype 和 Q/K/V 输出几何；外层准备函数只传递层号上下文，不增加整段计费包络。
+已识别的融合 Triton 启动另记录 `runtime.phase.kernel`，共用现有 allocator 的启动观测逻辑，
+排除 warmup；它和外层包络用于区分准备与实际提交，不可把两者墙钟相加。已用于本轮独立成本提取和阶段替换。
+融合描述另记录 `triton_task_queue_enabled`，按安装 driver 的环境变量解析规则读取；关闭队列意味着
+直接启动并等待流完成，不是与异步路径相同的结构。没有新增同步或 tensor 内容读回。
+
+`runtime.phase.rotary_table` 观测真实的 `get_cos_sin_with_position`，记录位置索引、缓存表和输出的
+形状/布局/dtype，不读取位置数值。通过当前调用上下文关联起始层，不把共享 RotaryEmbedding 对象
+最后登记的层号当作所有者；不修改原函数返回值或缓存内容。此边界与融合 QKV、Linear 分开，
+已用于查表、repeat 及必要拷贝的目标工作描述和逐操作成本提取；其他缓存布局仍需独立核对。
+
+Prefill 的 `runtime.phase.rotary` 包裹实际 NPU RoPE 入口，记录 Q/K、位置索引、缓存表和输出几何，
+以及旋转模式、可选融合实现是否存在、offsets 与缓存状态。上下文来自当前 Attention 调用，
+不会将共享 rotary 对象归到最后一个模型层。普通 `npu_mrope` 已有源几何与成本对应；
+float 表配合 bfloat16 输入等会切换执行规则的路径仍需独立展开，不按普通 mrope 处理。
+
+`runtime.phase.qk_reshape` 记录 Q/K 头展平前后的形状/步长及是否共享数据地址，只输出共享布尔值，
+不保存地址或张量内容。Q/K 身份来自当前 `apply_qk_norm` 的真实输入对象与 norm 模块关联，
+不依赖两个张量大小不同；调用退出即恢复上下文。该观测用于区分无设备操作的视图与实际复制。
+
+`runtime.phase.device_collective` 单独观测普通 NPU all-reduce，记录张量形状/步长/dtype、元素字节数、
+参与者数和组内 rank。Qwen3 通信准备入口只传递层与调用位置，不把外层包络再次计费。
+不新增 collective 或同步，不把 quant-all-reduce、all-gather 或通信融合冒充同一路径。
+此观测及内部 Torch 包络用于目标通信工作描述和跨 rank 就绪关系；完整底层协议仍未建模。
+观测还保留进程组名称、成员表、全局/组内 rank 和该组的已观测 all-reduce 次序；组信息首次查询后缓存，
+不发起新通信。次序包含失败入口，只统计这条已观测路径，不代表全部 HCCL 的原生序列号，
+也不能仅凭次序相同就宣布跨 rank 语义对应。成员相同但名称不同的组不自动合并。
+普通 `NpuCommunicator.all_gather` 共用该轻量观测，另记录拼接维度、输出几何及独立的
+`observed_all_gather_index`；logits 调用上下文提供归属与末 token 分支信息。
+all-gather 与 all-reduce 次序不能混用。源侧按通信种类分别对应参与者，并核对实际输出形状。
+单请求末 token 的 logits 汇聚已接入公共通信链，多行重排和其他未知实现仍不算已支持；
+`unmodeled_calls` 保留未知实现的描述。本轮已有独立成本样本与统一预测，具体结构覆盖见实验报告。
+
 字符串命令的引号必须完整；解析错误直接报告，不按空命令或缺失 server 参数继续。参数数组形式可避免 shell 引号歧义。
 模型引用在准备运行时选定，workload 环境和临时模型配置覆盖共用它：顶层 `model_path` 优先，
 其次 `server.model_path`，否则取命令中最后一个 `--model-path` / `--model_path` 值（也支持等号形式）。
@@ -47,6 +137,8 @@ profiling、modeling 和 hook 构建共用 `run.sh` 启动一次性容器；prof
 
 suite 先展开并预检查全部选中实验，再串行执行。
 单次运行和 suite 都在创建运行对象时完成输入预检查，不需要调用方另行开启。
+对于模板负载，启动服务前复用负载自身的格式校验，包括 token 范围声明和准备/正式阶段边界；
+`--dry-run` 也执行该检查。它不证明缓存状态断言成立，实际状态仍由运行时检查。
 矩阵按公共配置、server、input、实验覆盖的顺序合并，
 每层覆盖后应用 `$unset`；选择子集不改变原编号。命令与环境变量先展开运行目录，再解析配置字段，未知字段报错。
 三种通道的选项、probe 目录、尾部等待及刷新参数在准备时确定，执行和 manifest 共用，不能由旧环境变量暗中改写。
@@ -154,6 +246,15 @@ capture 的真实输出必须达到请求的 `max_new_tokens`，replay 会重新
 裁短不能作为合法 bundle。
 
 有状态 capture 还要通过 startup gate、barrier 和 checkpoint。token-only capture 不提供建模 trace；随后的 replay 才是 base DAG 数据。
+普通真实请求可以直接使用 `prompt_token_ids`，不要求人工 anchor/tail 或准备 checkpoint；
+没有状态步骤时，token replay 不自动要求诊断接口。显式 `--require-hicache-state` 仍核对启动配置。
+有状态模板默认 `--checkpoint-mode verify`；用相同人工负载实验新配置时，可以显式选择 `observe`，
+保留 barrier、启动配置核对和实际缓存观测，只不强求新配置满足旧配置的状态断言。
+报告标注 `verification: not_requested`、断言 `passed: null`，不能把完成采集当作断言通过。
+ShareGPT 的本地语料转化复用同一 workload 入口：`--sharegpt-dataset <json> --sharegpt-policy <policy.json>
+--tokenizer-path <model> --output-dir <inputs>`。输入按实际 tokenizer 选样，不裁切文本；
+语料及 token 数组留在 data，选样规则在 configs。预热对话、正式对话、独立校准和最终确认会话分别声明，
+预热不计入正式窗口，但其缓存状态不会被隐式清空。
 workload 只保留请求、重复请求、barrier 和 checkpoint；旧显式 wait 分支已删除，它原本也无法通过两阶段布局校验。
 checkpoint 用于与服务端核对 token 路径的摘要仍保留，按前缀增量计算并在各 rank 间复用；这不是产物版本控制。
 报告中缺失的 forced-token 检查计数不再补零，损坏报告也不视为“未开启检查”。
@@ -267,6 +368,12 @@ prepare 的 `execution_mode` 区分同步、异步与未知；`path` 仅在实�
 其他情况为 `unknown`；不按耗时阈值分类，旧记录缺少字段也不能反推成编译样本。
 记录保存在 Python probe trace 的 `runtime_diagnostic` 类别中，供准备成本归因与建模使用，不作为 HiCache fact。
 source 已有准备时间仍由原 CPU gap 承载，消费这些观测时不能再重复加入一份成本。
+NPU 分配器的 `alloc_extend_kernel` 另记录 `runtime.allocator.kernel` 调用边界，
+仅限对应 kernel 的非 warmup 调用，不读取 tensor、缓存键或 snapshot。
+冷调用边界包含嵌套的准备/装载；独立成本导出暂不将这种整段区间用作 kernel 启动成本，避免重复计费。
+该观测只进入原始图的旁路记录，不新增一层执行节点；新增探针尚待统一采集与开销核对。
+extend 内层同时记录 Ascend Triton 的 `TRITON_ENABLE_TASKQUEUE` 实际开关语义。
+容器实现默认启用 worker 队列；关闭后直接提交并同步等待，不能按同一异步结构处理。
 不采 tensor 内容、snapshot 或缓存摘要；重复的已装载内核不发事件。不改缓存与预热策略，冷启动和已有缓存的结果必须分开解释。
 
 DAG consumer 或显式 timing 会记录终止请求的 `runtime.response.*` 边界：scheduler_send、tokenizer_dispatch、serialize、http_body_sent。
@@ -336,9 +443,14 @@ HiCache 控制观测沿用上述 consumer/诊断选择规则。以下事件统�
 不逐次写 JSON、不增加设备同步、不采集 snapshot。未启用 consumer 时也保留快速返回的调用区间，失败调用标记为 raised。
 建图只保存观测；HiCache图变换阶段据此调整目标配置的等待，不把包络再加成一份成本。该探针的真实模型采集开销仍需测量。
 NPU 的逐层区间使用 Torch 原始计数器（`wait_clock=npu_syscnt`），不与 Python 墙钟直接比较。
-采集结束后，manifest 的每份 Torch trace 保存自己的 `host_clock` 换算；建图读入时将区间转换为
-`profiler_ns` 纳秒边界。没有 NPU 计数器时显式记录 `unix_ns`，不初始化设备；batch 外层仍为墙钟区间。
-旧采集没有原始计数器，保持原样，不通过固定偏移修补。换算只解释时间来源，不是额外成本或模型系数。
+采集结束后，manifest 的每份 Torch trace 保存自己的 `host_clock` 换算。原有 `origin_tick/origin_ns/ns_per_tick`
+描述 vendor 导出的坐标；`unix_origin_ns` 和 `unix_reference` 另保存 framework 自身的计数器、单调时钟和墙钟锚点。
+两者可能不同，不能默认 Torch 的 epoch 数值已和 Python `time.time_ns()` 一致。建图在合并 hook 和裁剪窗口之前，
+将 Torch 坐标转换到该墙钟参考；原始 trace 文件保持不变。逐层 syscnt 区间用同一参考转换为 `aligned_unix_ns`。
+锚点换算不是拟合操作边界，也不消除采样误差或证明不存在时钟漂移；后续仍检查调用包含关系及依赖时间矛盾。
+旧 manifest 没有墙钟参考时保留原有 `profiler_ns` 解释，不能将它计作跨通道已对齐；已有原始 profiler 元数据可以
+按同一采集函数补充参考，不凭 cell 身份或观测残差指定偏移。没有 NPU 计数器时仍显式记录 `unix_ns`，不初始化设备。
+缺失原始时钟证据的旧采集保持缺口。换算只解释时间来源，不是额外成本或模型系数。
 采集直接按模块启动，不使用名为 `profile.py` 的转发脚本，避免遮蔽标准库 `profile`。
 旧采集中 consumer 未启用时的空列表仅表示探针未记录调用，不表示框架没有调用；不能据此推断新增等待的位置或零成本。
 
@@ -347,6 +459,44 @@ NPU 的逐层区间使用 Torch 原始计数器（`wait_clock=npu_syscnt`），�
 不读取tensor、分配结果或snapshot，不查询设备事件；定义及scheduler导入别名只包装一次。
 该入口早于forward和请求长度递增，不能用forward marker替代。建图仅保留观测，不重复增加CPU成本。
 审计迭代数时需考虑overlap调度先启动下一轮再处理上轮结束结果，输出token数不一定等于decode轮数加一。
+
+三阶段重构另记录 `runtime.hicache.extend_allocation`：从已存在的 Python 请求字段和 batch 列表读取
+prefix/sequence/extend token 长度、页大小、新页数及 allocator 实现，保存 `alloc_for_extend` 的实际调用区间。
+另记录 free-page buffer 的 dtype 和 stride 元数据，用于辨识当前 Ascend 分配规则，不读取其索引值。
+不读取 CPU/GPU tensor 内容、输出索引或 snapshot，也不新增同步。该区间仅解释已有工作，不作为额外 DAG 节点收费。
+建模侧用请求身份和同线程批次归属校验区间，将准备观测限定到实际调用内；旧采集未记录此区间时，
+仍保留原批次边界及其较宽的归属限制，不从最近的 kernel 名称猜补。新增观测尚待本轮统一运行验证。
+
+NPU paged allocator 方法自身另发出 `runtime.hicache.extend_allocator` / `runtime.hicache.decode_allocator`，
+只记录 batch 形状、页大小、实现、free/release 长度、返回状态和线程 CPU 时间；extend 的显式新页数未传入时为 null。
+同时记录 `device_name`：首次实际分配时读取 Torch-NPU 设备名称并缓存，安装探针时不初始化设备。
+该字段用于结构规则的硬件适用性判断，不是内部版本号；没有型号的历史观测不能默认采用 910B 专属展开。
+不读取 tensor 值或输出索引，仅记录返回 tensor 的 dtype 元数据，不新增同步或改变分支。
+外层调用保留请求身份，内层区间区分真正分配与外围位置查询、请求表写入，不能把嵌套包络相加计费。
+建模只把这些区间作为旁路观测；准备归属优先采用完整且唯一的成功内层边界。
+线程 CPU 时间不等于墙钟等待或完整 GPU 成本；新增探针仍有采集扰动，尚待配对采集与统一验证。
+
+三阶段重构增加 `runtime.phase.attention`，只针对 Ascend 的 Prefill/Decode 后端入口。
+记录头数和维度、FIA/MLA/graph/compile 等执行条件、shape/dtype 以及可选输入是否存在，
+不读取 tensor 内容、不复制缓存、不新增设备同步。每个后端对象、层、shape 和已记录路径组合的完整描述，
+仅在首次成功调用时写出；失败调用保留 raised，后续成功仍可记录。
+声明 `hicache_dag_patch` consumer 后，即使 `diagnostics: "off"`，每次调用也记录边界和线程 CPU 时间：
+这些边界是替换源计算区域所需的输入，不是可选诊断。没有该 consumer 时，显式 `diagnostics: "timing"`
+同样记录逐次边界；其他直接安装该探针的场景只记录首次成功的描述。
+重复调用只保存描述引用和计时；完整执行条件按首次出现写一次，用 pid、phase、descriptor_id 对应，
+该编号只是同一采集内的引用，不是版本或内容校验。前序上下文仅保留完整描述，不保留初始化阶段的重复边界。
+历史稀疏记录不能证明每轮区域完整；逐调用墙钟也不等于 GPU 服务，不能相加作为计算耗时。
+原始结构报告注明来源集合、观测位置与采样方式；旧资产缺失时报告 unavailable。
+分支输入还包括明确的 verify/draft/context-parallel 模式标志、因果/SWA 条件，以及未填充 token 数和各请求的新 token、缓存前缀长度。
+这些长度是框架已有的 Python 数据，不读 tensor；完整长度列表不截断。相同 padded shape 但有效长度不同会产生不同描述，
+避免把有输出补零、逐请求 FIA 调用等差异的路径误当作同一个工作。
+注意力描述还记录缓存池实现、FIA 设置、K/V 与索引 dtype 及元素数量，用于区分 KV 写入和类型转换。
+这些仍是 tensor 元数据；未知缓存池不强行套用 NPUMHA 的写入规则。
+另记录 MLP 同步、input-scattered 能力、TP 大小和当前 TBO 条件。TP 大小本身不代表每个 Prefill 都要补齐；
+这些字段提供形状规则的依据，不允许按源 tensor 长度与 token 数的比例外推目标 padding。
+源结构报告可按完整 Prefill 长度和缓存元数据展开普通路径的 KV-write/score/output 程序；这不是设备 kernel 实测清单，
+也不是正式目标 DAG。缺少逐请求长度时保持未知，不从 batch 总量反推或把缺失前缀记为零。
+还未执行本轮真实采集，不能声称这些信息已足以生成完整 target 算子布局，探针扰动仍需统一验证。
 
 HiCache probe target 声明位于：
 
@@ -446,7 +596,7 @@ DMA 校准使用 `scripts/model.sh calibrate-hicache runtime-dma`，只输出设
 Python probe 出现大 gap：先确认使用当前 snapshot-free catalog，再做同配置的 timing/off 对照。
 可识别的部分同步等待已改为依赖；剩余未知时间仍保留，不能因为尚未归属就直接删除。当前覆盖与限制见工作进展。
 
-设备缓存释放的观测分两层：原有 `device_release_backup/regular` 标记整段调用，新增 `runtime.hicache.allocator_free` 只在这两种调用内部记录 paged/token allocator 的 free 区间。字段包括所属释放分支、token 数、页大小、是否立即回收及 need_sort；只读取 tensor.numel 和 Python 标量，不读取索引内容、不做 snapshot 或设备同步。释放之外的 allocator.free 不输出事件，异常仍原样抛出。
+设备缓存释放的观测分两层：`device_release_backup/regular` 标记整段调用，`runtime.hicache.allocator_free` 只在这两种调用内部记录 paged/token allocator 的 free 区间。Ascend 的 allocator 重写了父类方法，因此也在其实际实现上挂接，不依赖父类调用。字段包括所属释放分支、token 数、页大小、拼接前缓冲区页数、是否立即回收及 need_sort；只读取 tensor.numel 和 Python 标量，不读取索引内容、不做 snapshot 或设备同步。释放之外的 allocator.free 不输出事件，异常仍原样抛出。
 
 这个内层区间用于后续分离共有的内存池回收与分支特有的缓存元数据操作；C++ 将它保留为旁路观测，不另建可执行节点。旧 trace 不会自动获得这个边界，现有整段模板路径仍保留；区间拆分与成本消费尚待接入。轻量记录也有开销，新采数据仍须走同源 CPU 开销校正，不能把 probe 的成本当成目标操作成本。
 
