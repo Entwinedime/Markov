@@ -93,18 +93,12 @@ scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
 scripts/model.sh prepare-hicache --group <group_request.json>
 ```
 
-本轮[三阶段重构](docs/tmp/three_stage_modeling_refactor_plan_20261002.md)已完成，
-[泛化扩展](docs/tmp/hicache_generalization_expansion_plan_20261010.md)的 186 格预测也已全部执行。
-54 格新留出确认已独立评分，全部低于 6%，完整 HTTP WAPE 为 1.640%、最大 APE 为 5.587%；
-总体及三个 base 的性能分组通过原有门槛，但部分负载和 target 分组仍未通过，不能代表每次运行都准。
-原 60 格最终代码回归已完成，全部低于 10%，WAPE 为 3.001%、最大 APE 为 9.370%，严格状态仍为 MODEL_LIMITATION。
-扩展 72 格最终评分已完成，全部低于 10%，WAPE 为 2.348%、最大 APE 为 8.429%，严格状态仍为 MODEL_LIMITATION。
-七份 target 的九格结构比较已完成但仍为 partial，完整 target DAG 一致性未证明；成本覆盖也仍为 partial。
-适用范围、分组结果与证据见[当前进展](docs/work_progress.md)，不宣称任意配置均受支持。
 prepare 使用已经离线训练的独立成本包组织组预测。base 提供原始图和工作确实未变化的对应成本，
 不自动入库或在线拟合；变化或新增操作查询独立模型。历史测量通过 `cost-db import/train` 显式准备。
 共享补采默认关闭，显式开启并提供累计预算后才执行；合法分支缺少成本时报告缺口，不填零或删掉操作。
 新流程不保证任意组只靠 base 或现有数据库就能完成预测，部署适用性与数据覆盖须分别检查。
+当前实验证据限定于已声明的框架、模型、TP、后端和请求条件，不宣称任意配置均受支持。
+最新精度、结构覆盖及这轮精简的验证状态统一见[当前进展](docs/work_progress.md)。
 
 先看输出目录的 `group_summary.json` 了解准备状态与停止原因，再按其中的预测结果路径查看
 `workflow_summary.json`：`prediction.cells` 包含各格完整 HTTP 时间、执行状态和成本局限。
