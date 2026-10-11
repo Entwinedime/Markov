@@ -128,7 +128,11 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         if (!corrected) throw std::runtime_error("Shared write/release costs require paired CPU correction");
         const bool release_only = operation == "release-host";
         auto document = hc::runtime::export_write_calibration(graph, begin_us, end_us, release_only);
-        for (const auto & observation : source_dag::confirmation_operator_observations(graph, corrected))
+        // Write extraction splits boundaries. Its consumers need indices of
+        // that graph, not the source snapshot taken before the split.
+        const hc::patch::HiCacheSourceDagIndex calibrated(graph);
+        const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+        for (const auto & observation : source_dag::confirmation_operator_observations(calibrated, queues, corrected))
             document["operator_observations"].push_back(observation);
         document.update({
             {        "role",                                                "fixed_calibration"                     },
@@ -381,7 +385,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         publish({
             { "role", "independent_layer_wait_audit" },
             { "rows", std::move(rows) },
-            { "operator_observations", source_dag::layer_wait_operator_observations(graph, corrected) }
+            { "operator_observations", source_dag::layer_wait_operator_observations(source, queues, corrected) }
         });
         return 0;
     }
@@ -626,7 +630,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             rows.push_back(std::move(row));
         }
         auto operator_observations = source_dag::load_admission_operator_observations(graph, corrected);
-        for (const auto & observation : source_dag::prefix_concat_operator_observations(graph, corrected)) operator_observations.push_back(observation);
+        for (const auto & observation : source_dag::prefix_concat_operator_observations(bounded, queues, corrected)) operator_observations.push_back(observation);
 
         publish({
             {                  "role",         "independent_cost_audit" },

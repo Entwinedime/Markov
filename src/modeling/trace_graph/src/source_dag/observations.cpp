@@ -41,6 +41,7 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
                                            bool cpu_service_applied, nlohmann::json * collective_diagnostics) {
     nlohmann::json rows = nlohmann::json::array();
     const modules::hicache::patch::HiCacheSourceDagIndex source_index(graph);
+    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     // Device event instructions have one physical identity, independent of
     // whether HiCache or a collective submitted them. Export each raw event
     // once, retaining only waits whose producer was already complete.
@@ -147,20 +148,20 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
             {   "timing_scope",                                         "thread_cpu_service" },
         });
     }
-    for (const auto & row : confirmation_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
+    for (const auto & row : confirmation_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
     for (const auto & row : load_admission_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : prefix_concat_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : layer_wait_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : phase_tensor_operator_observations(graph, phases, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : allocator_operator_observations(graph, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : collective_operator_observations(graph, phases, cpu_service_applied, collective_diagnostics)) rows.push_back(row);
+    for (const auto & row : prefix_concat_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
+    for (const auto & row : layer_wait_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
+    for (const auto & row : phase_tensor_operator_observations(source_index, queues, phases, cpu_service_applied)) rows.push_back(row);
+    for (const auto & row : allocator_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
+    for (const auto & row : collective_operator_observations(source_index, queues, phases, cpu_service_applied, collective_diagnostics)) rows.push_back(row);
     return rows;
 }
 
-nlohmann::json layer_wait_operator_observations(const core::DagGraph & graph, bool cpu_service_applied) {
+nlohmann::json layer_wait_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
+                                               const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+    const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
-    const modules::hicache::patch::HiCacheSourceDagIndex source_index(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::map<std::pair<std::string, uint64_t>, std::string> layer_positions;
     for (const auto & event : graph.runtime_observations()) {
         if (event.name != "runtime.hicache.layer_waits") continue;
@@ -294,14 +295,14 @@ void append_blocking_write_observations(const modules::hicache::patch::HiCacheSo
 
 } // namespace
 
-nlohmann::json confirmation_operator_observations(const core::DagGraph & graph, bool cpu_service_applied) {
+nlohmann::json confirmation_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
+                                                 const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+    const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
     // Nonblocking confirmation costs are observed after the MIN returns;
     // empty blocking calls separately measure fixed entry/return work.
     // Queue deltas describe actual work; neither the old tail's local node
     // count nor its event-wait layout becomes the target's execution program.
-    const modules::hicache::patch::HiCacheSourceDagIndex source_index(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     for (const auto & event : graph.runtime_observations()) {
         if (event.name == "runtime.hicache.write_ack" && event.arg("status") == "returned") {
             const auto tokens = core::parse_u64(event.arg("backup_tokens"));
@@ -528,10 +529,10 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
     return rows;
 }
 
-nlohmann::json prefix_concat_operator_observations(const core::DagGraph & graph, bool cpu_service_applied) {
+nlohmann::json prefix_concat_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                  const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+    const auto & graph = source.graph();
     nlohmann::json rows = nlohmann::json::array();
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     for (const auto & admission : graph.runtime_observations()) {
         if (admission.name != "runtime.hicache.load_admission" || admission.arg("status") != "returned") continue;
         const auto position = measurement_position(admission);

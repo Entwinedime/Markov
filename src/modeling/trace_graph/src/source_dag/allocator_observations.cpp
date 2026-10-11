@@ -118,51 +118,24 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const modules::
     return calls;
 }
 
-nlohmann::json allocator_operator_observations(const core::DagGraph & graph, bool cpu_service_applied) {
+nlohmann::json allocator_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                               const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
     using Json = nlohmann::json;
     Json rows = Json::array();
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
     std::set<size_t> measured_devices;
     for (const auto & call : observe_allocator_programs(source, queues)) {
         if (!call.program) continue;
         const auto & program = *call.program;
-        const auto & event = graph.runtime_observations().at(call.region.work.observation);
         const auto & matched = call.matched_operators;
-        for (const auto & [position, observation] : matched) {
-            // Cold launch CPU includes the separately measured JIT service.
-            // Until those nested intervals are split, omit caller CPU scopes;
-            // independently attributed device/worker service remains usable.
-            const bool include_caller = !call.has_preparation || position != call.fused_position;
-            for (const auto & row : tensor_operator_observations(source,
-                                                                 queues,
-                                                                 program.at(position).work,
-                                                                 observation,
-                                                                 measured_devices,
-                                                                 cpu_service_applied,
-                                                                 include_caller,
-                                                                 program.at(position).device_launches))
-                rows.push_back(row);
-        }
+        // Cold launch CPU includes separately measured JIT service. Omit only
+        // that caller's scopes; attributed device/worker service remains usable.
+        append_tensor_program_observations(source, queues, program, matched, measured_devices, cpu_service_applied, rows, true,
+                                             call.has_preparation ? call.fused_position : std::nullopt);
 
         // Admit outer CPU samples only when every tensor boundary is paired.
         // Otherwise missing tensor work could leak into a preparation sample.
         if (call.has_preparation || !call.complete_tensor_mapping) continue;
-        Json outer = Json::array();
-        uint64_t previous = event.ts;
-        const auto finish = core::checked_add_u64(event.ts, event.dur, "Allocator call end overflow");
-        bool owned = true;
-        for (size_t i = 0; i + 1 < program.size(); i += 2) {
-            const auto & tensor = graph.runtime_observations().at(matched.at(i + 1));
-            const auto end = core::checked_add_u64(tensor.ts, tensor.dur, "Allocator tensor end overflow");
-            if (end > finish || !append_cpu_interval_observations(source, event, program.at(i).work, previous, tensor.ts, cpu_service_applied, outer)) {
-                owned = false;
-                break;
-            }
-            previous = end;
-        }
-        if (owned && append_cpu_interval_observations(source, event, program.back().work, previous, finish, cpu_service_applied, outer))
-            for (const auto & row : outer) rows.push_back(row);
+        for (const auto & row : tensor_program_outer_observations(source, call.region.work, program, matched, cpu_service_applied)) rows.push_back(row);
     }
     return rows;
 }

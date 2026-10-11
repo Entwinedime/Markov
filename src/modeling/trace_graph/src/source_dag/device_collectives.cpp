@@ -206,9 +206,10 @@ struct CollectedDeviceCollectives {
     nlohmann::json report;
 };
 
-CollectedDeviceCollectives collect_device_collectives(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases) {
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+CollectedDeviceCollectives collect_device_collectives(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                       const simulation::detail::CpuTaskQueues & queues,
+                                                       const modules::hicache::HiCachePhaseObservationAudit & phases) {
+    const auto & graph = source.graph();
     const auto positions = phase_call_positions(phases);
     auto calls = nlohmann::json::array();
     auto unmodeled_calls = nlohmann::json::array();
@@ -483,9 +484,10 @@ CollectedDeviceCollectives collect_device_collectives(const core::DagGraph & gra
 
 } // namespace
 
-DeviceCollectiveAudit observe_device_collectives(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
+DeviceCollectiveAudit observe_device_collectives(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                 const simulation::detail::CpuTaskQueues & queues, const modules::hicache::HiCachePhaseObservationAudit & phases,
                                                  nlohmann::json * diagnostics) {
-    auto observed = collect_device_collectives(graph, phases);
+    auto observed = collect_device_collectives(source, queues, phases);
     if (diagnostics) *diagnostics = std::move(observed.report);
     return std::move(observed.audit);
 }

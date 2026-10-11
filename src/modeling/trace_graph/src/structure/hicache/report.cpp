@@ -934,11 +934,11 @@ Json observed_phase_structure_report(const core::DagGraph & graph, const modules
     auto report = operator_structure(graph, std::move(work));
     report["unsupported_batches"] = unsupported_batches;
     report["observation_status"] = phases.status;
-    const auto collectives = source_dag::observe_device_collectives(graph, phases, &report["device_collective_observations"]);
-    report["collective_operations"] = observed_collective_structure(graph, phases, collectives);
-    report["allocator_work"] = observed_allocator_work(graph, phases);
     const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+    const auto collectives = source_dag::observe_device_collectives(source, queues, phases, &report["device_collective_observations"]);
+    report["collective_operations"] = observed_collective_structure(graph, phases, collectives);
+    report["allocator_work"] = observed_allocator_work(graph, phases);
     Json allocator_regions = Json::array();
     for (const auto & region : source_dag::observe_allocator_regions(source, queues)) {
         auto row = submitted_region_row(graph, region.work);

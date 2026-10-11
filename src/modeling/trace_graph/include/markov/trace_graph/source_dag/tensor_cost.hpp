@@ -1,9 +1,13 @@
 #pragma once
 
+#include "markov/trace_graph/modules/hicache/layer_waits.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
+#include "markov/trace_graph/structure/tensor_program.hpp"
 
+#include <cstddef>
 #include <cstdint>
+#include <map>
 #include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <set>
@@ -84,6 +88,28 @@ struct WorkerLaunchObservation {
                                                           const simulation::detail::CpuTaskQueues & queues, const structure::OperationWork & work,
                                                           size_t observation, std::set<size_t> & measured_devices, bool cpu_service_applied,
                                                           bool include_caller_scopes = true, std::span<const structure::OperationWork> device_launches = {});
+
+/** Append samples for the matched operators of an already-described program.
+ * Program indices and observation indices remain source-local. Device ownership
+ * accumulates in measured_devices across calls; source and program are unchanged.
+ * Cold preparation can exclude all caller scopes or just one program index,
+ * without discarding independently measurable device/worker scopes. */
+void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                         const simulation::detail::CpuTaskQueues & queues, std::span<const structure::TensorOperation> program,
+                                         const std::map<size_t, size_t> & matched, std::set<size_t> & measured_devices, bool cpu_service_applied,
+                                         nlohmann::json & rows, bool include_caller_scopes = true,
+                                         std::optional<size_t> omitted_caller_operation = std::nullopt);
+
+/** Measure preparation/return intervals between an outer program's consumers.
+ * Such programs alternate CPU preparation and a tensor/layer-wait consumer,
+ * followed by a CPU tail. All boundaries must match before any rows are returned;
+ * ambiguous, overlapping or unmeasured intervals return an empty array, not zeros.
+ * Layer waits are source boundaries only, never extra costs of the outer call.
+ * The caller separately excludes cold preparation and incomplete native mappings. */
+[[nodiscard]] nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                               const SubmittedCallRegion & region, std::span<const structure::TensorOperation> program,
+                                                               const std::map<size_t, size_t> & matched, bool cpu_service_applied,
+                                                               std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits = {});
 
 /** Append CPU and residual scopes only if the complete interval is owned and
  * contains no unaccounted submission or unmeasured synchronization. An optional

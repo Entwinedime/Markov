@@ -33,7 +33,7 @@ HiCacheModelReplay::HiCacheModelReplay(const core::DagGraph & graph, const front
         source_attention_calls_ = source_dag::observe_attention_calls(source, queues, source_phases_);
         source_metadata_calls_ = source_dag::observe_attention_metadata_calls(source, queues, source_phases_);
         source_dense_calls_ = source_dag::observe_dense_calls(source, queues, source_phases_, source_attention_calls_);
-        source_device_collectives_ = source_dag::observe_device_collectives(graph, source_phases_);
+        source_device_collectives_ = source_dag::observe_device_collectives(source, queues, source_phases_);
     }
     for (size_t i = 0; i < source_phases_.observations.size(); ++i) {
         const auto & observation = source_phases_.observations[i];

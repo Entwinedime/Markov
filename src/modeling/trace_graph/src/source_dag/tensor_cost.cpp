@@ -562,4 +562,70 @@ nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCac
     return rows;
 }
 
+void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                         const simulation::detail::CpuTaskQueues & queues, std::span<const structure::TensorOperation> program,
+                                         const std::map<size_t, size_t> & matched, std::set<size_t> & measured_devices, bool cpu_service_applied,
+                                         nlohmann::json & rows, bool include_caller_scopes, std::optional<size_t> omitted_caller_operation) {
+    for (const auto & [position, observation] : matched) {
+        const auto & operation = program[position];
+        const bool include_caller = include_caller_scopes && position != omitted_caller_operation;
+        for (auto & row : tensor_operator_observations(source, queues, operation.work, observation, measured_devices, cpu_service_applied,
+                                                       include_caller, operation.device_launches))
+            rows.push_back(std::move(row));
+    }
+}
+
+nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                 const SubmittedCallRegion & region, std::span<const structure::TensorOperation> program,
+                                                 const std::map<size_t, size_t> & matched, bool cpu_service_applied,
+                                                 std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits) {
+    const auto & graph = source.graph();
+    const auto & outer = graph.runtime_observations().at(region.observation);
+    nlohmann::json rows = nlohmann::json::array();
+    // A program rooted at its own Torch envelope already exports caller
+    // scopes. Only an explicit CPU tail establishes additional outer work.
+    if (!measurement_position(outer) || program.empty() || program.back().execution != structure::TensorExecutionKind::CpuService) return rows;
+
+    const auto outer_end = core::checked_add_u64(outer.ts, outer.dur, "Tensor program end overflow");
+    std::vector<const modules::hicache::HiCacheLayerWaitCall *> nested;
+    for (const auto & wait : layer_waits) {
+        if (!wait.issue.empty() || !wait.before) continue;
+        const auto & event = graph.event_for_node(*wait.before);
+        if (event.pid == outer.pid && event.tid == outer.tid && wait.start_ns / 1'000 >= outer.ts && wait.end_ns / 1'000 <= outer_end) nested.push_back(&wait);
+    }
+    std::ranges::stable_sort(nested, [](const auto * left, const auto * right) {
+        return std::pair{ left->start_ns, left->position } < std::pair{ right->start_ns, right->position };
+    });
+
+    // Preparation alternates with its consumer, followed by the outer return.
+    // Partial matching must not charge an omitted consumer as preparation.
+    uint64_t previous = outer.ts;
+    size_t layer = 0;
+    for (size_t i = 0; i + 1 < program.size(); i += 2) {
+        const auto & operation = program[i + 1];
+        uint64_t begin, end;
+        if (operation.execution == structure::TensorExecutionKind::LayerReady) {
+            if (layer == nested.size() || nested[layer]->layer != operation.layer_index) return nlohmann::json::array();
+            begin = nested[layer]->start_ns / 1'000;
+            end = nested[layer++]->end_ns / 1'000;
+        }
+        else {
+            const auto found = matched.find(i + 1);
+            if (found == matched.end()) return nlohmann::json::array();
+            const auto & event = graph.runtime_observations().at(found->second);
+            begin = event.ts;
+            end = core::checked_add_u64(begin, event.dur, "Tensor operator end overflow");
+        }
+        if (begin < previous || end > outer_end
+            || !append_cpu_interval_observations(source, outer, program[i].work, previous, begin, cpu_service_applied, rows))
+            return nlohmann::json::array();
+        previous = end;
+    }
+
+    if (layer != nested.size()
+        || !append_cpu_interval_observations(source, outer, program.back().work, previous, outer_end, cpu_service_applied, rows))
+        return nlohmann::json::array();
+    return rows;
+}
+
 } // namespace markov::trace_graph::source_dag

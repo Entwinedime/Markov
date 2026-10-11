@@ -30,11 +30,12 @@ std::optional<std::pair<uint64_t, uint64_t>> raw_interval_ns(const core::DagGrap
 
 } // namespace
 
-nlohmann::json collective_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                                bool cpu_service_applied, nlohmann::json * collective_diagnostics) {
-    const auto observed = observe_device_collectives(graph, phases, collective_diagnostics);
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
-    const auto queues = simulation::detail::discover_cpu_task_queues(graph);
+nlohmann::json collective_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                const simulation::detail::CpuTaskQueues & queues,
+                                                const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied,
+                                                nlohmann::json * collective_diagnostics) {
+    const auto & graph = source.graph();
+    const auto observed = observe_device_collectives(source, queues, phases, collective_diagnostics);
     std::map<size_t, const DeviceCollectiveCall *> calls;
     for (const auto & call : observed.calls) calls.emplace(call.region.observation, &call);
     auto rows = nlohmann::json::array();
