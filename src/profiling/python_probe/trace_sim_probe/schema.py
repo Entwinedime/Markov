@@ -18,7 +18,15 @@ HICACHE_FACT_CONSUMERS = frozenset(
 def runtime_probe_names(consumers: tuple[str, ...], diagnostics: str) -> tuple[str, ...]:
     """DAG consumers need causal observations even without optional diagnostics."""
     if HICACHE_CONSUMER_DAG_PATCH in consumers or diagnostics == "timing":
-        return ("runtime_preparation", "response_boundaries", "cpu_collectives", "layer_waits", "decode_allocation")
+        return (
+            "runtime_preparation",
+            "response_boundaries",
+            "cpu_collectives",
+            "layer_waits",
+            "decode_allocation",
+            "attention_backend",
+            "dense_backend",
+        )
     return ()
 
 

@@ -166,6 +166,8 @@ def _allocator_free(original):
             page_size=allocator.page_size,
             immediate=allocator.is_not_in_free_group,
             need_sort=allocator.need_sort,
+            # Tensor lengths are host metadata, not snapshots of page values.
+            release_buffer_pages=(allocator.release_pages if allocator.need_sort else allocator.free_pages).numel(),
         )
         return _record_call(original, "runtime.hicache.allocator_free", fields, allocator, free_index)
 
@@ -388,6 +390,23 @@ def _completion_check(original, stage):
     return observed
 
 
+def _write_ack(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Observe CPU acknowledgement work after the caller's device wait."""
+
+    def observed(owner: Any, ack_id: int, *, release_lock: bool) -> None:
+        _, backup_tokens, publish_nodes = owner.ongoing_write_through[ack_id]
+        fields = {
+            "ack_id": ack_id,
+            "backup_tokens": backup_tokens,
+            "published_nodes": len(publish_nodes),
+            "storage_enabled": bool(owner.enable_storage),
+            "release_lock": release_lock,
+        }
+        return _record_call(original, "runtime.hicache.write_ack", fields, owner, ack_id, release_lock=release_lock)
+
+    return observed
+
+
 def _prefetch_publication(original):
     def observed(operation, num_tokens):
         fields = {"request_id": operation.request_id, "num_tokens": num_tokens, "status": "raised"}
@@ -430,6 +449,7 @@ _PREFETCH_TIMINGS = {
         ("HiRadixCache", "_drain_storage_control_queues_impl", _storage_drain),
         ("HiRadixCache", "loading_check", partial(_completion_check, stage="load_completion")),
         ("HiRadixCache", "writing_check", partial(_completion_check, stage="write_completion")),
+        ("HiRadixCache", "_finish_write_through_ack", _write_ack),
         ("HiRadixCache", "_evict_backuped", partial(_device_release, stage="device_release_backup")),
         ("HiRadixCache", "_evict_regular", partial(_device_release, stage="device_release_regular")),
     ),
@@ -442,6 +462,9 @@ _PREFETCH_TIMINGS = {
     ),
     "sglang.srt.mem_cache.hicache_storage": (("HiCacheFile", "batch_get", _prefetch_read),),
     "sglang.srt.mem_cache.allocator.paged": (("PagedTokenToKVPoolAllocator", "free", _allocator_free),),
+    # The Ascend allocator overrides free() without calling its paged parent.
+    # Observe that implementation too; tensor metadata remains host-only.
+    "sglang.srt.hardware_backend.npu.allocator_npu": (("NPUPagedTokenToKVPoolAllocator", "free", _allocator_free),),
     "sglang.srt.mem_cache.allocator.token": (("TokenToKVPoolAllocator", "free", _allocator_free),),
 }
 TARGET_MODULES = tuple(

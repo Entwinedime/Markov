@@ -2,7 +2,8 @@
 
 Triton preparation may load a disk cache entry or compile a new variant. With
 async compilation the interval ends at submission return, not kernel readiness.
-No tensor contents, cache keys, snapshots or per-launch records are collected.
+No tensor contents, cache keys or snapshots are collected. The modeled NPU
+allocator additionally records its kernel-call envelope for cost attribution.
 """
 
 from __future__ import annotations
@@ -24,6 +25,47 @@ _TARGETS = {
 }
 TARGET_MODULES = tuple(_TARGETS)
 _PREPARATION = ContextVar("triton_preparation", default=None)
+
+
+def _modeled_launch(original: Callable[..., Any]) -> Callable[..., Any]:
+    def measured(instance: Any, *args: Any, **kwargs: Any) -> Any:
+        function = instance.fn
+        allocator = function.__module__ == "sgl_kernel_npu.mem_cache.allocator" and function.__name__ in {
+            "alloc_extend_kernel",
+            "alloc_extend_kernel_aiv",
+        }
+        qkv = (
+            function.__module__ == "sgl_kernel_npu.norm.split_qkv_rmsnorm_rope"
+            and function.__name__ == "split_qkv_rmsnorm_rope_kernel"
+        )
+        if (not allocator and not qkv) or kwargs.get("warmup", False):
+            return original(instance, *args, **kwargs)
+
+        # This includes preparation on a cold call. Nested prepare/load
+        # observations identify that work; consumers must not count it twice.
+        writer = get_writer()
+        start_us = writer.now_us()
+        status = "raised"
+        try:
+            result = original(instance, *args, **kwargs)
+            status = "returned"
+            return result
+        finally:
+            end_us = writer.now_us()
+            writer.duration_event(
+                "runtime.allocator.kernel" if allocator else "runtime.phase.kernel",
+                start_us,
+                end_us,
+                "runtime_diagnostic",
+                {
+                    "implementation": "sgl_kernel_npu.alloc_extend_kernel:int64"
+                    if allocator
+                    else "sgl_kernel_npu.split_qkv_rmsnorm_rope",
+                    "status": status,
+                },
+            )
+
+    return measured
 
 
 def _ir_entry(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -92,6 +134,8 @@ def install(module: ModuleType) -> None:
 
     if module.__name__ == "triton.compiler.compiler":
         install_wrapper(getattr(module, "ASTSource", None), "make_ir", _ir_entry)
+    elif module.__name__ == "triton.runtime.jit":
+        install_wrapper(getattr(module, "JITFunction", None), "run", _modeled_launch)
 
     class_name, method, event = _TARGETS[module.__name__]
     install_wrapper(

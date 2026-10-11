@@ -24,6 +24,8 @@ _FULL_LIST_KEYS = {
     "requests",
     "members",
     "wait_intervals",
+    "extend_query_lengths",
+    "extend_prefix_lengths",
 }
 
 

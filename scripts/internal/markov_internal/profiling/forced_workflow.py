@@ -23,6 +23,7 @@ from ..contracts.forced_token.plan import (
     validate_plan_contract,
 )
 from ..contracts.forced_token.quality import forced_token_quality_from_report
+from ..workload_template import load_template
 from ..workload_template.cli import parse_workload_command
 
 
@@ -31,7 +32,7 @@ def preflight_forced_token_contract(
     *,
     experiment_id: str,
 ) -> None:
-    """Reject invalid replay plans or capture overwrite before starting inference."""
+    """Validate workload syntax and token inputs before starting inference."""
 
     template = parse_workload_command(bench_command)
     if template is None:
@@ -41,11 +42,8 @@ def preflight_forced_token_contract(
     plan_path = resolve_repo_path(template.forced_token_plan)
     if plan_path is None and mode == "capture":
         plan_path = Path(template.output_dir) / "forced_token_plan.json"
-    template_path = resolve_repo_path(template.template)
-    raw = load_json(template_path) if template_path else None
-    if not isinstance(raw, dict) or not raw.get("id"):
-        raise ValueError(f"invalid workload template: {template_path}")
-    workload_id = str(raw["id"])
+    workload = load_template(require_repo_path(template.template))
+    workload_id = workload.workload_id
     if mode == "none":
         return
 

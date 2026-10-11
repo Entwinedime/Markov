@@ -17,6 +17,7 @@ from trace_sim_probe.schema import runtime_probe_names
 _INSTALLED = False
 _LOCK = threading.Lock()
 _ORIGINAL_IMPORT = builtins.__import__
+_ORIGINAL_IMPORT_MODULE = importlib.import_module
 _IMPORT_GUARD = threading.local()
 _PROBES: tuple[ModuleType, ...] | None = None
 
@@ -87,6 +88,25 @@ def _import_hook(name, globals=None, locals=None, fromlist=(), level=0):
     return module
 
 
+def _import_module_hook(name: str, package: str | None = None) -> ModuleType:
+    """Observe completed dynamic imports used by the framework model registry.
+
+    importlib.import_module bypasses builtins.__import__ for the requested
+    module. Its nested imports can expose a partially defined model, so the
+    final installation must also run after the dynamic import returns.
+    """
+    was_active = getattr(_IMPORT_GUARD, "active", False)
+    _IMPORT_GUARD.active = True
+    try:
+        module = _ORIGINAL_IMPORT_MODULE(name, package)
+        # Model registries also load modules inside an ordinary import. Do
+        # not skip that completed module merely because its parent is loading.
+        _post_import_apply(module.__name__)
+        return module
+    finally:
+        _IMPORT_GUARD.active = was_active
+
+
 def bootstrap() -> None:
     """安装 import hook 并对已加载模块应用 probe。"""
 
@@ -100,6 +120,7 @@ def bootstrap() -> None:
         probes = _probes()
         _INSTALLED = True
         builtins.__import__ = _import_hook
+        importlib.import_module = _import_module_hook
 
     for probe in probes:
         _apply_probe_to_loaded_modules(probe)
