@@ -703,6 +703,12 @@ Attention、metadata、dense 和通信共用 `PhaseCallPosition` 表达源请求
 不得将切分前的索引用于切分后的图。入库前的证据展开与准入由 Python `cost/package` 组织，
 数据库负责原子去重和持久化，CLI 只选择输入与输出。
 
+Python 的 target 声明由 `modeling_workflow/types.py` 中的 `TargetHiCacheConfig` 一次准入；
+源 CPU 校正的对应关系由 `modeling/source_dag/profiles.py` 处理，不依赖离线训练模块。
+`execution/model_executor.py` 只排列并执行 source/target 任务，不负责 DAG 结构变换。
+预测选项中的独立成本包及其部署、来源是必需输入；合法操作的具体缺口仍由执行结果报告，
+不是在任务规划时以“没有模型”为由跳过目标结构。
+
 ### 三个阶段怎样合作
 
 | 阶段 | 负责的事情 | 不能做的事情 |
