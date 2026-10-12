@@ -1,0 +1,49 @@
+{
+  "requests": [
+    {
+      "id": "request-1",
+      "arrival_offset_us": 0,
+      "input_tokens": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "output_tokens": 8
+    },
+    {
+      "id": "request-2",
+      "arrival_offset_us": 1000,
+      "input_tokens": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9
+      ],
+      "output_tokens": 4
+    },
+    {
+      "id": "request-3",
+      "arrival_offset_us": 2000,
+      "input_tokens": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        10
+      ],
+      "output_tokens": 6
+    }
+  ]
+}

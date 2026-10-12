@@ -1,0 +1,18 @@
+{
+  "parameters": {
+    "device": "npu",
+    "tp_size": 2,
+    "attention_backend": "ascend",
+    "max_running_requests": 1,
+    "max_total_tokens": 16384,
+    "chunked_prefill_size": -1,
+    "max_prefill_tokens": 16384,
+    "schedule_policy": "fcfs",
+    "disable_radix_cache": true,
+    "disable_overlap_schedule": true,
+    "disable_cuda_graph": true,
+    "enable_mixed_chunk": false,
+    "enable_hierarchical_cache": false
+  },
+  "model_assets": {}
+}

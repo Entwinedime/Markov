@@ -1,13 +1,14 @@
-FROM markov-trace-sim-ktransformers-env:ubuntu22.04
+ARG BASE_IMAGE=markov-next-ktransformers-env:ubuntu22.04
+FROM ${BASE_IMAGE}
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-COPY scripts/internal/frameworks/ktransformers/install_from_source.sh /opt/trace-sim/scripts/internal/frameworks/ktransformers/install_from_source.sh
+COPY docker/install/ktransformers.sh /opt/trace-sim/install/ktransformers.sh
+COPY src/collection/adapters/frameworks/ktransformers/ascend /opt/trace-sim/src/collection/adapters/frameworks/ktransformers/ascend
 COPY third_party/ktransformers /opt/trace-sim/third_party/ktransformers
-COPY third_party/sglang /opt/trace-sim/third_party/sglang
 
-RUN chmod +x /opt/trace-sim/scripts/internal/frameworks/ktransformers/install_from_source.sh \
-    && /opt/trace-sim/scripts/internal/frameworks/ktransformers/install_from_source.sh /opt/trace-sim
+RUN chmod +x /opt/trace-sim/install/ktransformers.sh \
+    && /opt/trace-sim/install/ktransformers.sh /opt/trace-sim
 
 WORKDIR /workspace/trace-sim
 

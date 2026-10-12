@@ -1,21 +1,26 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
 [project]
-name = "ktransformers-sglang-trace-sim"
-version = "0.1.0"
-description = "Trace-driven profiling, DAG modeling, and what-if simulation for ktransformers and sglang."
+name = "markov-collection"
+version = "0.0.0"
 requires-python = ">=3.10"
-dependencies = []
+description = "Native inference observations for Markov"
+
+[project.entry-points."sglang.srt.plugins"]
+markov = "markov_collection.adapters.frameworks.sglang.observer:install"
+
+[tool.setuptools.packages.find]
+where = ["src/collection"]
+include = ["markov_collection*"]
 
 [tool.ruff]
-target-version = "py310"
 line-length = 120
-extend-exclude = [
-    "build",
-    "data",
-    "docs/tmp",
-    "third_party",
-]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
 
 [tool.ruff.format]
 quote-style = "double"
-indent-style = "space"
-line-ending = "lf"

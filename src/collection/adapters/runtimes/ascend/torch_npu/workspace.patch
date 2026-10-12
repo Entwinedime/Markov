@@ -1,0 +1,73 @@
+--- a/torch_npu/csrc/core/npu/NPUWorkspaceAllocator.cpp
++++ b/torch_npu/csrc/core/npu/NPUWorkspaceAllocator.cpp
+@@ -1,3 +1,5 @@
++#include "markov_workspace_observation.hpp"
++
+ #include <memory>
+ #include <vector>
+ 
+@@ -85,6 +87,8 @@
+         }
+ 
+         WorkspaceBlock* block = blocks[stream];
++        markov::collection::WorkspaceObservation observation(device, stream, size, block->size, block->data_ptr, true, false);
++
+         if (block->size < alloc_size) {
+             if (block->data_ptr != nullptr) {
+                 ASCEND_LOGI("NPUWorkspaceAllocator free by aclrtFree: size=%zu", block->size);
+@@ -191,6 +195,7 @@
+         this->last_block = block;
+         this->last_stream = stream;
+ #endif
++        observation.finish(block->size, block->data_ptr);
+         return block->data_ptr;
+     }
+ 
+@@ -228,6 +233,9 @@
+ 
+         std::lock_guard<std::recursive_mutex> lock(mutex);
+         for (const auto& block_pair : blocks) {
++            markov::collection::WorkspaceObservation observation(
++                device, block_pair.first, 0, block_pair.second->size, block_pair.second->data_ptr, true, true);
++
+             if (block_pair.second->data_ptr != nullptr) {
+                 ASCEND_LOGI("NPUWorkspaceAllocator free by aclrtFree: size=%zu", block_pair.second->size);
+                 NPU_CHECK_ERROR(aclrtFree(block_pair.second->data_ptr));
+@@ -260,6 +268,7 @@
+                 );
+ #endif
+             }
++            observation.finish(0, nullptr);
+             delete block_pair.second;
+         }
+ 
+@@ -492,11 +501,14 @@
+ 
+         if (c10_npu::option::OptionsManager::CheckForceUncached()) {
+             delete_func = &uncached_delete;
++            markov::collection::WorkspaceObservation observation(device, stream, size, 0, nullptr, false, false);
++
+             if (size != 0) {
+                 size_t alloc_size = size + 32;
+                 NPU_CHECK_ERROR(
+                     c10_npu::acl::AclrtMallocAlign32(&dev_ptr, alloc_size, aclrtMemMallocPolicy::ACL_MEM_MALLOC_HUGE_ONLY));
+             }
++            observation.finish(size != 0 ? size + 32 : 0, dev_ptr);
+         } else {
+             if (size != 0) {
+                 this->malloc(&dev_ptr, device, size, stream);
+--- a/torch_npu/profiler/analysis/prof_parse/_fwk_file_parser.py
++++ b/torch_npu/profiler/analysis/prof_parse/_fwk_file_parser.py
+@@ -36,6 +36,12 @@
+         if not file_path:
+             return []
+         all_bytes = FileManager.file_read_all(file_path, "rb")
++        # Worker workspace ranges have one dedicated writer. Merge only after
++        # profiler shutdown, retaining the native TLV decoder and clock mapping.
++        workspace_file = os.path.join(self._fwk_path, "markov.workspace")
++        if file_tag == FileTag.TORCH_OP and os.path.isfile(workspace_file):
++            all_bytes += FileManager.file_read_all(workspace_file, "rb")
++
+         file_bean = FwkFileParserConfig.FILE_BEAN_MAP.get(file_tag, {}).get("bean")
+         is_tlv = FwkFileParserConfig.FILE_BEAN_MAP.get(file_tag, {}).get("is_tlv")
+         struct_size = FwkFileParserConfig.FILE_BEAN_MAP.get(file_tag, {}).get("struct_size")

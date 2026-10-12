@@ -1,3 +1,11 @@
+name: markov-next
+
+x-build-proxy: &build-proxy
+  http_proxy: ${http_proxy:-${HTTP_PROXY:-}}
+  https_proxy: ${https_proxy:-${HTTPS_PROXY:-}}
+  HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+  HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+
 x-profile-common: &profile-common
   working_dir: /workspace/trace-sim
   network_mode: host
@@ -23,11 +31,15 @@ services:
     build:
       context: ../..
       dockerfile: docker/images/sglang/Dockerfile
-    image: markov-trace-sim-sglang:ubuntu22.04
+      network: ${MARKOV_BUILD_NETWORK:-default}
+      args:
+        <<: *build-proxy
+        BASE_IMAGE: ${MARKOV_IMAGE_PREFIX:-markov-next}-sglang-env:ubuntu22.04
+    image: ${MARKOV_IMAGE_PREFIX:-markov-next}-sglang:ubuntu22.04
+    pull_policy: never
     environment:
       <<: *common-env
       ASCEND_CUSTOM_OPP_PATH: /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/batch_invariant
-      PYTHONPATH: /workspace/trace-sim/third_party/sglang/python
     command: bash
 
   ktransformers-profile:
@@ -35,7 +47,12 @@ services:
     build:
       context: ../..
       dockerfile: docker/images/ktransformers/Dockerfile
-    image: markov-trace-sim-ktransformers:ubuntu22.04
+      network: ${MARKOV_BUILD_NETWORK:-default}
+      args:
+        <<: *build-proxy
+        BASE_IMAGE: ${MARKOV_IMAGE_PREFIX:-markov-next}-ktransformers-env:ubuntu22.04
+    image: ${MARKOV_IMAGE_PREFIX:-markov-next}-ktransformers:ubuntu22.04
+    pull_policy: never
     environment:
       <<: *common-env
     command: bash
@@ -45,7 +62,11 @@ services:
     build:
       context: ../..
       dockerfile: docker/images/modeling/Dockerfile
-    image: markov-trace-sim-modeling:ubuntu24.04
+      network: ${MARKOV_BUILD_NETWORK:-default}
+      args:
+        <<: *build-proxy
+    image: ${MARKOV_IMAGE_PREFIX:-markov-next}-modeling:ubuntu24.04
+    pull_policy: never
     volumes:
       - ../..:/workspace/trace-sim
     command: bash

@@ -42,8 +42,8 @@ RUN locale-gen en_US.UTF-8
 ENV LANG=en_US.UTF-8
 ENV LANGUAGE=en_US:en
 ENV LC_ALL=en_US.UTF-8
-ENV CC=clang
-ENV CXX=clang++
+ENV CC=gcc
+ENV CXX=g++
 ENV CMAKE_GENERATOR=Ninja
 
 WORKDIR /workspace/trace-sim
