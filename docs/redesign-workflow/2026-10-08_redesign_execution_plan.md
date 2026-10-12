@@ -35,7 +35,7 @@
 
 s4-decode-capacity-domain复用同一原生观测，保存16384-token共享容量，Decode候选上限改为容量减1；128输入/7输出已完整展开，两个既有配置回归保持。该开发诊断不是整个范围的独立验收。该轮编译资产142077673字节、编译阶段约59秒；当前资产的开销见执行记录，轻量建库仍未通过。
 
-所有complete均指给定耗时下的条件执行，不是正式性能预测。累计原生采集尝试为73次（57次管线、16次独立诊断）；用户已授权自主安排后续额度，具体新增预算和停止条件仍须按工程约束先记录。历史运行、后处理和存储开销集中于[执行记录](2026-10-08_redesign_execution_log.md)，不在此重复逐轮统计。
+所有complete均指给定耗时下的条件执行，不是正式性能预测。累计原生采集尝试为75次（57次管线、18次独立诊断）；用户已授权自主安排后续额度，具体新增预算和停止条件仍须按工程约束先记录。历史运行、后处理和存储开销集中于[执行记录](2026-10-08_redesign_execution_log.md)，不在此重复逐轮统计。
 
 ## 3. 下一步与阶段门槛
 
@@ -174,9 +174,13 @@ s4-fixed-assets-acceptance的100ns输入完成6业务批次/25动作，检查依
 
 现有67供体1+2合并已通过生产端有限行数资格，复用公共区域替换及MergeLeft/Right/Total布局，不增加采集。修正后1000ns路径完成6批/24动作；实际14个Concat为2+2→4、14个Index为4→2，同rank各合并完成点均可达全部过滤入口，全图依赖时间有序，100ns基线摘要/端口/资源保持。证据merge_structure_verification.json、merge_baseline_verification.json。规则范围见[模板关系](../redesign/sglang_template_relations.md)，不能推广到可选字段或pending分支变化。
 
-修正后固定资产/规则的新留出输入已完成首次独立原生明细对照，目录s4-independent-structure：4业务批次/16动作、两rank32个阶段调用请求状态一致；6768个kernel的类型/shape/dtype/format多重集合、34个传输方向/字节数、512次workspace需求序列及8次发布状态一致。两rank各一次扩容，最终容量197132288。该输入未用于改规则，validation资产未进入生成器；事实见native_kernel_comparison.json、native_transfer_comparison.json、native_workspace_comparison.json、native_publication_comparison.json。
+修正后固定资产/规则的新留出输入已完成首次独立原生明细对照，目录s4-independent-structure：4业务批次/16动作、两rank32个阶段调用请求状态一致；6768个kernel的类型/shape/dtype/format多重集合、34个传输方向/字节数、512次workspace需求序列及8次发布状态一致。两rank各一次扩容，最终容量197132288。当时该输入未用于改规则，后续事件归一化修正已使其转为开发证据；validation资产始终未进入模板生成器。事实见native_kernel_comparison.json、native_transfer_comparison.json、native_workspace_comparison.json、native_publication_comparison.json。
 
-**下一步复用这份独立观测核对等待前沿、跨阶段端口和内部关键依赖，不追加采集**。明细集合一致不证明拓扑或完整CPU工作等价，不能勾选整个S4。S3轻量机制覆盖及S4同配置/允许配置变化、多组请求、时间反馈和拒绝域的原定要求不变。
+同份独立观测的计算顺序与完成路径已进一步核对：6768个kernel逐阶段有序描述一致，6744对阶段内相邻kernel存在真实依赖路径；6606个模型kernel均可达各自device_done，8条device_done→published端口路径成立。94次主机同步的流级/设备级数量一致，按阶段、rank和scope分组的同rank计算前沿分布一致；原生前沿由CANN提交关联与同步调用序列确定，未发现重叠计算提交。证据native_order_and_port_comparison.json、native_wait_compute_frontiers.json；前沿分布检查不等于跨线程每个等待一一对应，也未验证DMA/通信前沿。
+
+CPU核对已定位共享提交队列上的后台事件清理缺口：669个未归属销毁任务均夹在已归属工作之间，411个可追溯到本窗口模型event record，258个无窗口内record。当前线程投影仅保留顺序，没有恢复其服务与目标触发；详见[后台事件清理约束](../redesign/sglang_template_relations.md)及native_background_event_audit.json。已有base核对确认同类清理和窗口边界差异；运行时归一化已补齐唯一包含关系的销毁API来源绑定，未改目标模板或后台控制。入口event历史的生产/归一化已接通，第75次三event SDK观察验证保留、销毁和未record查询的区分，真实serving交接尚未验证。沿用既有modeled合同：模板外后台服务明确排除，不把完整watchdog调度新增为S3/S4门槛；此处待核对的是顺序投影之外是否仍有跨边界因果，不按观测清理次数复制任务或拟合其耗时。第73次输入已用于归一化修正，转为开发证据，修改后的完整实现仍须新的独立验收。 rtEventQueryStatus标量观察已接入；第74次不加载模型的SDK观察取得3次查询，handle/状态与journal一致且无虚构提交。未覆盖pending状态、watchdog轮询、入口快照或后台目标展开，不能据此关闭该缺口。
+
+**下一步继续复用该观测核对DMA/通信等待前沿、跨rank关键依赖和完整CPU工作，不追加采集**。已有计算顺序及端口路径不证明全局拓扑等价，不能勾选整个S4。S3轻量机制覆盖及S4同配置/允许配置变化、多组请求、时间反馈和拒绝域的原定要求不变。
 
 ## 7. S3：统一流程复核、语义插桩与 base 模板
 

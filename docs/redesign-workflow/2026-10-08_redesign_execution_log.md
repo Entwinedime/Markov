@@ -4143,3 +4143,74 @@ Docker构建、三来源compile-templates、公开predict及git diff检查均通
 预测图341335节点、789431边，所有依赖时间有序且service均为假设100ns，KV最后一轮对independent-0发生第二页分配。该图内一致性不等于原生依赖等价。内核比较保留集合粒度限制，尚未核对全部等待前沿、端口、CPU服务及全局拓扑；validation未归属诊断仍在。本轮没有因结果调整输入、规则或资产，独立资格保留，验证来源未进入模板/成本。下一步复用本次事实继续依赖与端口核对，不另开采集或把本次输入用于拟合。
 
 原始173448187字节、validation派生132881393字节、后处理发布20166603810ns，均在预估内；预测图137350792及明细30258123字节。累计原生1462310259490ns/1740秒、原始1710121284字节/2GiB、派生约5443847980字节/5.25GiB。ledger新增validation派生文件排除项，未将observation_facts重复计入raw，保留既有消耗。未重试、未改产品代码、未新增test；代码批次仍1。计划与功能现状同步，git diff检查通过，S3–S6未完成，goal保持active，不写完成总日志。
+
+
+## 2026-10-12：恢复后复用独立观测核对计算顺序与同步前沿
+
+上一次goal工作取得第73次独立观测及结构明细，属于有效进展；随后提交与推送已完成，用户现恢复goal。重新读取计划、工程约束及当前产物，未启动新采集、未改模板/变换规则，保留该输入的独立资格。
+
+在既有341335节点/789431边的目标图上，按原生阶段调用与rank对齐32个实例。6768个计算kernel的有序名称/类型/输入输出shape、dtype、format一致，每个原生阶段/rank的compute仅在一个物理流。逐对检查6744条阶段内相邻kernel的end→begin可达路径，全部成立；模型阶段6606个kernel的end均可达本rank的device_done，8条device_done→published路径成立。没有用100ns下的时间先后替代图可达性。证据s4-independent-structure/native_order_and_port_comparison.json。
+
+94次主机同步（含pageable H2D中的内部同步）数量及流级/设备级范围一致。原生端通过CANN connection_id定位计算提交，以同线程同API完整序列对应同步，内部copy同步用包含关系关联；预测端以图的拓扑传播取得等待点的同rank计算祖先末端。按阶段/rank/scope比较前沿分布，全部一致，未发现计算提交与同步区间重叠。证据native_wait_compute_frontiers.json。这是计算前沿分布的检查，不是跨线程逐wait身份等价、DMA/通信前沿或全部CPU拓扑的证明。
+
+本轮没有产品代码修改、构建、test、重采或成本拟合；只执行既有真实产物的一次性分析并保存结论，代码批次仍1，采集累计73次不变。两份小型审计结果纳入现有存储ledger；计划更新已验证范围与下一步。后续继续核对DMA/通信前沿、跨rank关键依赖与CPU工作，不因本轮通过而提前进入S5。S3–S6未完成，goal保持active，不写完成总日志。
+
+CPU剩余范围初查：本次facts中3578个CPU interval未归属，6个已标记profiler_control，业务未归属3572与manifest一致。其中query event status为690条，destroy event的enqueue/dequeue/ACL/runtime各669条，另有recv/process_input等。此为按名称清点，不能直接删除或按计数加成本；下一步须区分事件生命周期、阶段间服务及明确scope外工作，并保留异步依赖证据。
+
+
+## 2026-10-12：未归属CPU事件清理的来源与共享队列核对
+
+上一轮计算顺序/端口/同步计算前沿取得新证据，属于有效进展。本轮复用同份独立观测，检查未归属CPU的实际机制；没有启动设备任务或更改模板规则。
+
+读取当前SGLang容器保留的torch_npu构建源码：NPUEvent.cpp的析构和query、AsyncTaskQueueInterface.cpp的LaunchLazyDestroyTask、ProcessGroupHCCL.cpp的WorkHCCL事件共享及Watchdog::runLoop。源码目录是导出树，没有.git；安装提交依据沿用实际workspace_states中的安装来源记录，不把该目录冒充独立git检出。源码表明销毁进入提交队列，后台完成检查可触发对象清理；具体每个query的event身份和唤醒条件仍无逐次观察。
+
+原生rtEventDestroy记录本身均没有owner，不能直接将1709条API计作未归属业务。按rank/thread完整序列与拦截区间包含的Runtime@EventDestroy对应后，实际669条CPU销毁未归属，与原始诊断相符。按(pid,event handle)关联此前成功record，并在destroy时清除身份，411条对应本窗口已归属event（prefill260/decode151），258条没有窗口内record；后者不能凭数量断定属于预热。
+
+669个未归属Dequeue均有唯一未归属Enqueue的async_task_queue flow，且全部夹在相同提交worker的已归属任务之间。因此不能把后台线程工作一概认为不影响模型提交。当前BlockExtractor仅提取有owner的span，TemplateAssembly的cpu_thread_projection保留穿过未建模区间的线程顺序，却不恢复清理服务和目标触发。证据s4-independent-structure/native_background_event_audit.json，保留全部关联索引，不据此拟合时间。
+
+该发现使下一步具体化：先核对已有base中的同类事实与入口未决event，再在生产适配端明确生命周期/异步工作边界；不得直接把清理塞回原同步block、按后台计数复制目标任务、缩小CPU支持声明或交由S5补偿。尚未修改产品规则，留出输入仍是独立发现缺口的证据；若用它修正实现，撤销后续独立验收资格。计划与模板关系文档同步，新增小型审计产物计入既有派生额度。采集仍73次，代码批次仍1，S3–S6未完成，goal保持active。
+
+
+## 2026-10-12：base窗口差异与销毁API事实关联修正
+
+上一轮定位共享提交worker上的缺失清理服务，属于有效进展。本轮先检查既有69/70的base事实。主来源每rank的原生销毁比profiler多129条，均在首条profiler销毁之前；窗口内1181/1179条逐一包含吻合。故不能用全窗口API序号硬配，也不能把缺记录解释为入口空状态。第二来源有13条未满足精确包含，保留不确定性。初始审计base_event_lifecycle_audit.json记录全序列失败，不把该失败误报为采集失败或重试理由。
+
+仅修改Ascend归一化：复用已有trace_interval时钟、rank/thread和profiler Runtime@EventDestroy身份，按开始点有序索引查找原生API内部唯一完整区间。关联source_interval和原执行scope，不继承event producer的block，不修改hardware_intervals或event生命周期。没有新增采集、模板、核心控制器分支、兼容格式或test文件。未找到/多候选/包含不成立保持null，后续仍须处理具体结构缺口。
+
+用生产关联方法处理两个既有base事实（内存中，不覆盖原始来源/编译资产）：主来源2618条中2360条关联、1300条恢复执行归属；清理来源1040条中1027条关联、519条恢复执行归属；均无新增hardware关联。证据base_event_attribution_verification.json。这是局部事实关联资格，不是旧采集全链重提取。
+
+第73次真实原始捕获在modeling容器Python3.12下重新执行生产capture及workspace归一化读取流程，未覆盖原事实或manifest。1709条销毁全部关联，其中1040条恢复执行范围、669条仍未归属，hardware关联为0；其余native_api字段及intervals/flows/calls/workspace_states/profile_controls/devices/supplementary_work全部不变，未预期变化0。证据event_attribution_verification.json。首次宿主Python3.9低于项目要求而失败，转到现有容器；初次比较漏调用workspace资格化步骤，出现512条缺派生字段，补齐生产读取步骤后已核对恢复，不修改workspace代码。
+
+由于第73次输入用于本次事实关联实现及验证，现转为开发证据；历史固定规则计算顺序/端口对照结论保留，但不能用于修改后完整独立验收。后台工作仿真本身尚未完成，不能把新增owner关联视为服务、触发或入口状态已解决。下一步围绕事件入口状态、查询完成和队列投递确定最小runtime事实，并让核心消费统一异步工作关系，不嵌入watchdog名称或按目标观测次数展开。
+
+Ruff检查、修改文件format检查及git diff检查通过；未改C++、.clang-format或third_party，未运行模型、无新增采集，累计仍73次。三份审计结果纳入存储ledger；本次为最近整体审查后的第2批实质代码修改。S3–S6未完成，goal保持active，不写完成总日志。
+
+
+## 2026-10-12：补充event查询状态的最小运行时事实
+
+上一轮已修正销毁API关联，属于有效进展。本轮确认NativeJournal只在Recorder启动时开启，不能恢复此前未记录的入口event；现有拦截还缺query返回状态。先补rtEventQueryStatus的event handle、返回状态及原生API区间，保持原调用和无新增同步，不提前建立后台调度器。对应CPU范围复用既有Ascend API序列关联，不借query推造设备提交。
+
+原生观察库在现有SGLang SDK容器构建通过（仅SDK头文件既有pedantic警告），C++格式使用modeling容器，.clang-format不变。安排第74次（57管线+17隔离）单设备SDK观察，不加载模型：创建event、查询、记录、显式同步后查询及销毁，用于核对拦截透明性和journal字段。限60秒，原始/派生各≤1MiB，额度计入现有1740秒、2GiB及5.25GiB，不增额度；设备4已检查空闲。取得查询返回值与journal一致即结束，失败不自动重试；不据此资格化完整watchdog触发、初始event状态或成本。
+
+
+第74次观察91548已终结，SDK调用全部返回0、journal flush成功，进程内初始化至清理计720973560ns，未重试。journal包含3次rtEventQueryStatus、1次record、1次显式stream synchronize、1次destroy；查询handle及状态逐项与ACL返回一致，query没有task/stream提交身份。观察到的新建未record event状态也为1，故不能用“query完成”补造producer；本次未触发pending，不以此宣称两状态及watchdog调度已验证。证据s4-event-query/{result,verification,collection_accounting}.json，原始/派生均远低于1MiB，计入原ledger且未增额度。
+
+代码改动限原生观察器的查询字段/拦截及Ascend归一化API名称映射，未改核心、模板定义或第三方源码。查询失败保留状态null，CPU采样模式保持原调用，不把query当同步wait计数；旧事实无query不能假定没有后台轮询。query对应profiler CPU区间的完整链路尚未由本次无profiler SDK观察验证，后续仍需按真实用途核对。计划、模板关系及运行说明更新，Ruff、原生构建与diff检查通过；本次是最近整体审查后的第3批实质代码修改。
+
+下一步继续处理窗口入口event状态和后台完成检查的工作身份；查询状态观察只是必要事实，尚未形成目标后台任务触发。统一预热不自动保证后台清理为空，不向控制器加入本次调用数或轮询常量。S3–S6未完成，goal保持active，不写完成总日志。
+
+
+## 2026-10-12：业务窗口入口event历史的生产与消费
+
+上一轮新增query状态并取得真实SDK证据，属于有效进展。本轮NativeJournal在显式MARKOV_NATIVE_OBSERVATIONS环境下先只观察record/query/destroy，业务窗口开始后切换原journal。入口历史单独写native_api/initial_events，保存唯一单调时钟入口标记；不采预热计算、不增加同步、不用sleep清空后台。正在跨越入口的调用由事实时间保留歧义，不能提前当作完成。没有为此建立常驻event注册表或多套内部版本。
+
+生产清单显式增加event_history；ServingNormalizer组合runtime EventHistory重建已观察record且尚未destroy的入口集合，query不能创建producer，record重置旧查询状态。跨入口、重叠及失败调用保留具体缺口；无历史文件报告entry_history_not_observed。该集合不等于未完成设备任务或watchdog队列。历史capture需明确声明已有文件或空引用列表，不补造入口历史，正式解析不增加旧字段fallback。
+
+原生构建、Ruff与格式检查通过。安排第75次（57管线+18隔离）三event SDK观察，设备4已检查空闲，限60秒、raw/derived各≤1MiB，使用现有累计额度：A已record保留至窗口内销毁，B在窗口前record并销毁，C从未record但查询。以入口A存在/B和C不存在、窗口record分离及原返回值保持为停止条件；失败先诊断，不自动重试，不因通过就资格化真实watchdog。
+
+
+第75次79456已终结，SDK初始化至清理1271496360ns，全部调用返回0、flush成功。入口历史包含两次record、两次query及一次destroy；EventHistory只保留A及其原record/query来源，B销毁后消失，C查询完成没有制造producer。业务journal仅query/destroy/destroy三条，无预热record。证据s4-event-entry/result.json；原始约数KiB，计入同一ledger，未重试或加载模型。只有SDK层入口历史及解释得到验证，真实serving清单交接、跨入口并发分支仍未资格化。
+
+本轮复核已有控制/性能合同及workspace功能审查，纠正前几轮把“完整后台清理服务/触发”当成S3/S4必需项的扩大解释：05_controller_semantics.md的模板外CPU顺序投影、06_performance_execution.md的scope要求及已有unassigned_port_audit均明确允许排除模板外CPU服务，不要求清空全局未归属计数。shared worker上的清理服务存在本身不足以推翻这一合同；需核对的是跨边界必要因果，而非复制原生watchdog。新增观察用于event身份/入口因果取证，不推进完整后台控制器，不将排除服务成本硬拟合进入节点。这是恢复已有范围，不是缩减原目标；真实HTTP/后台成本仍不授资格。
+
+计划、模板关系及开发说明已统一当前边界。接下来回到DMA/通信等待前沿、跨rank关键依赖与实际模板出口核对，复用已有事实；只有证明新的因果缺口才扩展共同表达。原生构建（仅SDK头既有警告）、Python lint/格式和diff检查通过；未改仿真核心、.clang-format、第三方源码或新增test。本次为最近整体审查后的第4批实质代码修改，下一批实质修改后触发周期审查。S3–S6仍未完成，goal保持active。

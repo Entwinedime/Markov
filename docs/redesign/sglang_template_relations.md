@@ -315,6 +315,19 @@ SGLang 环境记录实际 fresh_process、warmup 输入长度、调用共用的 
 
 设备等待由 SourceStreamWait/TemplateStreamWait 区分 stream/device：stream 要求原生流身份，device 不伪造单流身份，两者均须绑定有效资源域。设备同步等待同设备、入口前已提交的各流前沿；未知工作和重叠提交不能被默认为已覆盖，也不能将等待收费为 CPU 服务。观测活动与未归属业务必须依证据区分，不能只根据没有 owner 删除节点。
 
+**后台事件清理仍待资格化。** 第73次独立观测中，669个未归属destroy_event队列任务均通过async_task_queue flow连接到唯一的后台enqueue，且全部处于同一提交worker的已归属任务之间。通过同线程完整API序列、包含关系及进程内event handle生命周期，其中411个销毁可追溯到本窗口的模型event record，258个没有窗口内record，不能推定其来自预热或给它们补造owner。证据为s4-independent-structure/native_background_event_audit.json。
+
+当前torch_npu源码中，NPUEvent析构通过LaunchLazyDestroyEventTask向提交队列投递销毁；ProcessGroupHCCL的Watchdog查询完成事件并移除已完成Work，也会触发相关对象生命周期。源码与后台线程观察相符，但现有记录不足以逐次证明query对应的event及watchdog唤醒条件。TemplateAssembly的CPU线程投影只保留被建模端点的顺序，不会恢复被投影掉的清理服务；因此已有计算/端口检查不证明这些后台工作已被模拟。
+
+运行时归一化现通过同rank/thread的Runtime@EventDestroy唯一完整包含关系绑定rtEventDestroy，保留原执行scope，不继承event创建者scope或SDK残留task ID。窗口外、时钟不满足包含或多候选均保持source_interval为空。主base的2618条销毁中2360条绑定、1300条有执行归属，剩余258条在profiler首条销毁之前；另一个base的1040条中1027条满足包含、519条有执行归属，13条时钟不满足条件仍不绑定。窗口内外事实不能简单按完整API序号配对。现有base仍没有完整入口event状态，且记录了尚无窗口内destroy的event record；这不等于这些设备event未完成，也不等于其后台清理可以忽略。
+
+Ascend原生观察器现记录rtEventQueryStatus的event handle、原生API起止、返回码和event_status；成功时保留SDK枚举整数，失败时状态为null，不增加查询、等待或设备提交。CPU范围关联复用同线程同API的完整序列；具体watchdog来源仍需事实，不依线程名猜测。第74次单event SDK观察证据在s4-event-query/verification.json：三次状态均为1，和ACL调用结果一致；新建但未record的event也返回完成，因此状态值不能证明producer存在或替代record/destroy生命周期。pending状态、真实后台轮询及窗口入口快照尚未验证，历史无query记录不能解释为没有轮询。
+
+入口观察现单独保留预热前后的event生命周期历史，并由runtime EventHistory重建入口已record未destroy集合；源时间只判断入口边界，不作为目标时延。第75次SDK观察确认已record并保留的A出现在入口集合，已destroy的B及从未record的C不出现，业务journal不混入窗口前记录。跨入口及重叠调用保持歧义；本次尚非真实serving入口交接，也未证明watchdog队列为空。
+
+**沿用既有modeled边界。** [模板外CPU顺序投影](05_controller_semantics.md#模板外-cpu-观测之间的顺序投影)已明确模板外服务不计入目标成本。后台清理占用同一worker本身不构成必须实现完整watchdog的要求；此前“遗漏服务需要后台目标展开”的表述过宽，应区分已声明排除的服务和仍须保留的跨边界因果。新增event事实用于核对生命周期身份及外部依赖，不能把主线扩张成完整运行时仿真，也不能将模板外耗时拟合进节点。现有投影只覆盖已证明的同线程顺序；若存在跨线程/设备/状态端口的新因果，仍须共同表达或明确具体缺口。未归属数量不作为阻塞S3/S4的门槛，完整HTTP/后台成本继续不授资格。第73次输入已用于事实归一化修正，是开发证据；历史计算顺序结果保留，修改后的完整实现另行独立验收。
+
+
 现有正式 grow 来源见 `data/redesign/s4-workspace-growth/serving_growth_verification.json`：640个使用点、两 rank 各一次 grow、1280个 CPU 切口无跨界；需求和观察容量保留为证据，不写成目标常量。其两条 device wait 曾因 profiler 开关任务没有 CANN 提交而清空 lanes（device_wait_audit.json）。提取器现仅按明确的 PROFILING_ENABLE/DISABLE task type 将观测控制排除在目标同步域外，原始节点仍保留并记录 scope 原因；正式重提取恢复各 rank 两条业务流，节点、边和其他等待不变，证据为同目录 device_wait_reextract_verification.json。此修复不替代目标容量与分支装配资格。开发来源不能兼作固定规则的独立验收。后续先关闭同步域、初始化资格和状态/分支装配，再进行独立目标结构验收；不按长度或人数重复采集。
 
 ### CPU 服务的内层语义归属
