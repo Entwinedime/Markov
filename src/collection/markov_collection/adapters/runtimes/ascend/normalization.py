@@ -7,13 +7,14 @@ import csv
 import json
 import re
 import sqlite3
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from markov_collection.adapters.runtimes.ascend.event_history import EventHistory
 from markov_collection.adapters.runtimes.ascend.torch_npu.allocator import WorkspaceAllocation
 from markov_collection.artifacts.json_file import write_json
 
@@ -382,6 +383,45 @@ class ObservationNormalizer:
             )
 
         self._associate_cpu_api_calls()
+        self._associate_event_destruction()
+
+    def _associate_event_destruction(self) -> None:
+        observed: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for interval in self.intervals:
+            if interval["process"] == "CANN" and interval["name"] == "Runtime@EventDestroy":
+                observed[(interval["rank"], interval["tid"])].append(interval)
+
+        starts = {}
+        for thread, intervals in observed.items():
+            intervals.sort(key=lambda interval: interval["start_ns"])
+            starts[thread] = [interval["start_ns"] for interval in intervals]
+
+        for record in self.native_api:
+            if record["api"] != "rtEventDestroy":
+                continue
+
+            # The intercepted runtime call encloses its profiler interval. Native
+            # recording can start before profiling, so ordinal pairing is unsafe.
+            thread = (record["rank"], record["tid"])
+            intervals = observed[thread]
+            if not intervals:
+                continue
+
+            begin = record["trace_interval"]["begin_ns"]
+            end = record["trace_interval"]["end_ns"]
+            first = bisect_left(starts[thread], begin)
+            last = bisect_right(starts[thread], end)
+            if last - first != 1 or intervals[first]["end_ns"] > end:
+                continue
+
+            interval = intervals[first]
+            if record["owner_call"] not in (None, interval["owner_call"]):
+                continue
+
+            # Preserve the execution scope, not the event producer's scope.
+            # Destruction submits no hardware task and cannot inherit a last task ID.
+            record["source_interval"] = interval["id"]
+            record["owner_call"] = interval["owner_call"]
 
     def _associate_cpu_api_calls(self) -> None:
         # Both device-sync entry points emit the same runtime profiler name.
@@ -389,6 +429,7 @@ class ObservationNormalizer:
         names = {
             "rtMemcpyAsync": "AscendCL@aclrtMemcpyAsync",
             "rtStreamWaitEvent": "AscendCL@aclrtStreamWaitEvent",
+            "rtEventQueryStatus": "AscendCL@aclrtQueryEventStatus",
             "rtDeviceSynchronize": "Runtime@DeviceSynchronize",
             "rtDeviceSynchronizeWithTimeout": "Runtime@DeviceSynchronize",
             "workspace_allocate": "MarkovWorkspaceAllocate",
@@ -775,6 +816,23 @@ class ServingNormalizer(ObservationNormalizer):
             raise ValueError("serving observation role must match the native capture")
         self.role = role
 
+    def _read_event_states(self) -> list[dict[str, Any]]:
+        ranks = {call["pid"]: call["rank"] for call in self.calls.values()}
+        states = []
+        observed = set()
+        for reference in self.capture["event_history"]:
+            state = EventHistory(self.directory, reference).initial_state()
+            state["rank"] = ranks[state["pid"]]
+            if state["pid"] in observed:
+                raise ValueError(f"duplicate event entry history for worker: {state['pid']}")
+            observed.add(state["pid"])
+            self.gaps.extend({"kind": "event_state", "rank": state["rank"], **gap} for gap in state["gaps"])
+            states.append(state)
+
+        for pid in ranks.keys() - observed:
+            self.gaps.append({"kind": "event_state", "reason": "entry_history_not_observed", "rank": ranks[pid]})
+        return states
+
     def _read_workspace_states(self) -> list[dict[str, Any]]:
         states = []
         workers = {(call["rank"], call["pid"]) for call in self.calls.values()}
@@ -860,6 +918,7 @@ class ServingNormalizer(ObservationNormalizer):
     def extract(self) -> Path:
         self._read_capture()
         workspace_states = self._read_workspace_states()
+        event_states = self._read_event_states()
         facts_path = self.directory / ("source_facts.json" if self.role == "base" else "observation_facts.json")
         write_json(
             facts_path,
@@ -870,6 +929,7 @@ class ServingNormalizer(ObservationNormalizer):
                 "native_api": self.native_api,
                 "supplementary_work": self.supplementary_work,
                 "workspace_states": workspace_states,
+                "event_states": event_states,
                 "profile_controls": self.profile_controls,
                 "devices": self.devices,
             },

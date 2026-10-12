@@ -6,6 +6,7 @@
 #include <runtime/rt_stars.h>
 #include <runtime/stream.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -194,6 +195,8 @@ struct ApiRecord {
     std::optional<FftsSubmission> ffts;
     std::vector<DriverCopy> driver_copies;
     std::optional<WorkspaceTransition> workspace;
+    std::optional<rtEventStatus_t> event_status;
+    bool initial_event;
 };
 
 struct CpuCounters {
@@ -207,10 +210,10 @@ struct CpuCounters {
     std::int64_t last_sync_result = 0;
 };
 
-enum class ObservationMode { Off, Journal, CpuSampling };
+enum class ObservationMode { Off, EventHistory, Journal, CpuSampling };
 
-// Base enables the journal at its serving window; device sampling explicitly
-// includes declared warmups. CPU counter mode does not write API records.
+// Before the serving window, retain only event lifecycle history. Device
+// sampling includes its declared warmups; CPU counter mode writes no journal.
 // Buffering keeps file I/O out of each API; explicit scope/profile flushes persist
 // records before multiprocessing shutdown can bypass destructors.
 class NativeJournal {
@@ -222,10 +225,16 @@ public:
 
     void begin_window(const char * directory) {
         directory_ = directory;
+        window_begin_ns_ = clock_ns(CLOCK_MONOTONIC);
         mode_.store(ObservationMode::Journal);
     }
 
     bool enabled() const { return mode_.load() == ObservationMode::Journal; }
+    bool initial_events() const { return mode_.load() == ObservationMode::EventHistory; }
+    bool observes_events() const {
+        const auto mode = mode_.load();
+        return mode == ObservationMode::EventHistory || mode == ObservationMode::Journal;
+    }
     bool cpu_sampling() const { return mode_.load() == ObservationMode::CpuSampling; }
 
     void begin_cpu_sampling() { mode_.store(ObservationMode::CpuSampling); }
@@ -257,13 +266,24 @@ public:
             records.swap(records_);
         }
 
-        if (records.empty()) return;
+        if (records.empty() && !window_begin_ns_) return;
 
         std::filesystem::create_directories(directory_);
-        const auto path = directory_ / ("pid-" + std::to_string(getpid()) + ".jsonl");
-        std::ofstream stream(path, std::ios::app);
-        stream.exceptions(std::ios::failbit | std::ios::badbit);
+        const auto filename = "pid-" + std::to_string(getpid()) + ".jsonl";
+        std::ofstream journal(directory_ / filename, std::ios::app);
+        journal.exceptions(std::ios::failbit | std::ios::badbit);
+        std::ofstream history;
+        history.exceptions(std::ios::failbit | std::ios::badbit);
+        if (window_begin_ns_ || std::any_of(records.begin(), records.end(), [](const auto & record) { return record.initial_event; })) {
+            std::filesystem::create_directories(directory_ / "initial_events");
+            history.open(directory_ / "initial_events" / filename, std::ios::app);
+        }
+        if (window_begin_ns_) {
+            history << "{\"pid\":" << getpid() << ",\"window_begin_ns\":" << *window_begin_ns_ << "}\n";
+            window_begin_ns_.reset();
+        }
         for (const auto & record : records) {
+            auto & stream = record.initial_event ? history : journal;
             // API names are fixed symbols; every other value is numeric/null.
             stream << "{\"api\":\"" << record.api << "\",\"call_id\":" << record.call_id << ",\"pid\":" << getpid() << ",\"tid\":" << record.tid
                    << ",\"scope_call_id\":";
@@ -307,6 +327,11 @@ public:
 
             stream << ",\"wall_time_ns\":" << record.wall_time_ns << ",\"start_ns\":" << record.start_ns << ",\"end_ns\":" << record.end_ns
                    << ",\"thread_cpu_ns\":" << record.thread_cpu_ns << ",\"result\":" << record.result;
+            if (std::strcmp(record.api, "rtEventQueryStatus") == 0) {
+                stream << ",\"event_status\":";
+                if (record.event_status) stream << static_cast<std::int32_t>(*record.event_status);
+                else stream << "null";
+            }
             if (record.ffts) {
                 stream << ",\"ffts\":";
                 record.ffts->write(stream);
@@ -329,10 +354,20 @@ public:
     }
 
 private:
+    NativeJournal() {
+        // Only capture processes request this journal. Retain event lifecycle
+        // facts before warmup finishes, without recording the warmup workload.
+        if (const auto * directory = std::getenv("MARKOV_NATIVE_OBSERVATIONS")) {
+            directory_ = directory;
+            mode_.store(ObservationMode::EventHistory);
+        }
+    }
+
     std::atomic<ObservationMode> mode_{ ObservationMode::Off };
     std::atomic_uint64_t sequence_{ 1 };
 
     std::filesystem::path directory_;
+    std::optional<std::int64_t> window_begin_ns_;
     std::mutex mutex_;
     std::vector<ApiRecord> records_;
 };
@@ -394,7 +429,9 @@ public:
                    0,
                    std::nullopt,
                    {},
-                   std::nullopt },
+                   std::nullopt,
+                   std::nullopt,
+                   NativeJournal::instance().initial_events() },
           submits_task_(submits_task) {
         if (stream != nullptr) {
             static const auto get_id = resolve<decltype(&rtGetStreamId)>("rtGetStreamId");
@@ -421,13 +458,14 @@ public:
         finish(result);
     }
 
-    void finish(rtError_t result, std::optional<FftsSubmission> ffts = std::nullopt) {
+    void finish(rtError_t result, std::optional<FftsSubmission> ffts = std::nullopt, std::optional<rtEventStatus_t> event_status = std::nullopt) {
         // Keep CPU-clock reads outside the wall interval used to split waits.
         // CPU observations still include probe overhead and are not service costs.
         record_.end_ns = clock_ns(CLOCK_MONOTONIC);
         record_.thread_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - thread_start_ns_;
         record_.result = result;
         record_.ffts = std::move(ffts);
+        record_.event_status = event_status;
 
         if (submits_task_ && result == RT_ERROR_NONE) {
             // The SDK reports the calling thread's last submitted task. Query
@@ -491,11 +529,23 @@ extern "C" int markov_native_flush(int close_window) {
 
 extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
     static const auto original = resolve<decltype(&rtEventRecord)>("rtEventRecord");
-    if (!NativeJournal::instance().enabled()) return original(event, stream);
+    if (!NativeJournal::instance().observes_events()) return original(event, stream);
 
-    ApiObservation observation("rtEventRecord", stream, event, true);
+    ApiObservation observation("rtEventRecord", stream, event, NativeJournal::instance().enabled());
     const auto result = original(event, stream);
     observation.finish(result);
+    return result;
+}
+
+extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * status) {
+    static const auto original = resolve<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
+    if (!NativeJournal::instance().observes_events()) return original(event, status);
+
+    // Preserve the native query and returned state; observing completion must
+    // neither synchronize the event nor manufacture a device submission.
+    ApiObservation observation("rtEventQueryStatus", nullptr, event);
+    const auto result = original(event, status);
+    observation.finish(result, std::nullopt, result == RT_ERROR_NONE ? std::optional(*status) : std::nullopt);
     return result;
 }
 
@@ -597,7 +647,7 @@ extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
 extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
     static const auto original = resolve<decltype(&rtEventDestroy)>("rtEventDestroy");
 
-    if (!NativeJournal::instance().enabled()) return original(event);
+    if (!NativeJournal::instance().observes_events()) return original(event);
 
     ApiObservation observation("rtEventDestroy", nullptr, event);
     const auto result = original(event);

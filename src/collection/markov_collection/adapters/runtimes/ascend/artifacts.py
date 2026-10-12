@@ -78,6 +78,10 @@ class AscendCaptureArtifacts:
                 str(path.relative_to(self.directory))
                 for path in sorted((self.directory / "native_api").glob("*.jsonl"))
             ],
+            "event_history": [
+                str(path.relative_to(self.directory))
+                for path in sorted((self.directory / "native_api" / "initial_events").glob("*.jsonl"))
+            ],
             "profile_controls": [
                 str(path.relative_to(self.directory))
                 for path in sorted((self.directory / "profile_controls").glob("*.json"))
