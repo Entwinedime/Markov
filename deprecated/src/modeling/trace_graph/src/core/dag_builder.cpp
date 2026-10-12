@@ -1,0 +1,313 @@
+/**
+ * @file
+ * @brief Builds a TraceGraph DAG from Chrome trace duration events.
+ *
+ * Construction extracts only trace-supported execution order, submission chains,
+ * and synchronization. What-if modules and HiCache policy run after the base DAG.
+ */
+#include "markov/trace_graph/core/dag_builder.hpp"
+#include "markov/trace_graph/core/cpu_gap_observation.hpp"
+
+#include "markov/trace_graph/core/dag_builder_stages.hpp"
+
+#include "markov/trace_graph/core/numeric.hpp"
+
+#include <algorithm>
+#include <map>
+#include <optional>
+#include <ranges>
+#include <string>
+#include <utility>
+
+namespace markov::trace_graph::core {
+
+namespace dag_builder_detail {
+
+uint64_t node_end_ts(const TraceEvent & event) { return checked_add_u64(event.ts, event.dur, "trace event end timestamp overflow"); }
+
+bool is_submit_anchor_event(const TraceEvent & event) {
+    if (event.name.starts_with("Enqueue@") || event.name == "Node@launch" || event.cat == "enqueue") return true;
+    if (event.name.starts_with("AscendCL@aclrtLaunch") || event.name.starts_with("AscendCL@aclrtMemcpyAsync")) return true;
+    return event.name == "AscendCL@aclrtRecordEvent" || event.name == "AscendCL@aclrtWaitEvent";
+}
+
+bool is_usable_lane_value(const std::string & value) { return !value.empty() && value != "-1"; }
+
+bool is_hicache_fact_event(const TraceEvent & event) { return event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("fact"); }
+
+bool is_hicache_control_event(const TraceEvent & event) {
+    return event.name.starts_with("hicache.control.") && !event.name.ends_with(".self") && event.ph == 'X';
+}
+
+struct ExecutionAndFactEvents {
+    std::vector<TraceEvent> executable_events;
+    std::vector<TraceEvent> hicache_fact_events;
+    std::vector<TraceEvent> request_observations;
+    std::vector<TraceEvent> runtime_observations;
+};
+
+void retain_modeled_operator_envelopes(ExecutionAndFactEvents & split) {
+    using Interval = std::pair<uint64_t, uint64_t>;
+    std::map<std::pair<std::string, std::string>, std::vector<Interval>> lanes;
+    const auto interval = [](const TraceEvent & event) {
+        const auto begin =
+            checked_add_u64(checked_multiply_u64(event.ts, 1'000, "operator timestamp overflow"), event.ts_submicro_ns, "operator timestamp overflow");
+        const auto duration =
+            checked_add_u64(checked_multiply_u64(event.dur, 1'000, "operator duration overflow"), event.dur_submicro_ns, "operator duration overflow");
+        return Interval{ begin, checked_add_u64(begin, duration, "operator end timestamp overflow") };
+    };
+    for (const auto & event : split.runtime_observations) {
+        // Phase probes carry source geometry, not execution nodes. Retain
+        // nested Torch envelopes for every such descriptor; individual
+        // operation readers decide which implementations they understand.
+        if (event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.extend_allocator" || event.name == "runtime.hicache.decode_allocator")
+            lanes[{ event.pid, event.tid }].push_back(interval(event));
+    }
+    for (auto & [lane, calls] : lanes) {
+        std::ranges::sort(calls);
+        std::vector<Interval> merged;
+        for (const auto & call : calls) {
+            if (merged.empty() || merged.back().second < call.first) merged.push_back(call);
+            else merged.back().second = std::max(merged.back().second, call.second);
+        }
+        calls = std::move(merged);
+    }
+
+    // Normalization keeps CPU leaves, not their Torch operator envelopes.
+    // Retain the latter as source-only observations so later cost extraction
+    // can recover submission ownership without counting the envelope again.
+    // Shape-bearing envelopes also preserve ordinary compute geometry, even
+    // outside HiCache-specific probes. They remain observations, not extra
+    // execution nodes. Shape-free traces retain only the modeled regions.
+    for (const auto & event : split.executable_events) {
+        if (event.source_channel != TraceSourceChannel::Torch || event.ph != 'X' || event.cat != "cpu_op") continue;
+        if (event.has_arg("Input Dims")) {
+            split.runtime_observations.push_back(event);
+            continue;
+        }
+        const auto lane = lanes.find({ event.pid, event.tid });
+        if (lane == lanes.end()) continue;
+
+        const auto span = interval(event);
+        auto call = std::ranges::upper_bound(lane->second, span.first, {}, &Interval::first);
+        if (call == lane->second.begin()) continue;
+        --call;
+        if (span.second <= call->second) split.runtime_observations.push_back(event);
+    }
+}
+
+std::vector<DagControlExclusionInterval> control_exclusion_intervals(const std::vector<TraceEvent> & events, const std::vector<DagPhaseMarkerEvent> & markers,
+                                                                     int gpu_id) {
+    std::vector<DagControlExclusionInterval> intervals;
+    for (const auto & event : events) {
+        const bool profiling_snapshot =
+            event.name.ends_with(":state_snapshot") || (event.source_channel == TraceSourceChannel::PythonProbe && event.has_arg_key_hint("state_snapshot"));
+        if (event.ph == 'X' && profiling_snapshot && event.dur > 0) {
+            intervals.push_back(DagControlExclusionInterval{
+                .gpu_id = gpu_id,
+                .start_us = event.ts,
+                .end_us = node_end_ts(event),
+                .kind = DagControlExclusionKind::ProfilingSnapshot,
+            });
+        }
+    }
+
+    // The phase side table already owns source-order marker selection. Reuse it
+    // for the control metric instead of independently selecting and sorting phases.
+    std::vector<const TraceEvent *> decodes;
+    for (const auto & marker : markers) {
+        if (marker.event.name.starts_with("step[DECODE")) decodes.push_back(&marker.event);
+    }
+
+    size_t decode_index = 0;
+    for (const auto & marker : markers) {
+        const auto & extend = marker.event;
+        if (!extend.name.starts_with("step[EXTEND")) continue;
+
+        while (decode_index < decodes.size() && node_end_ts(*decodes[decode_index]) <= extend.ts) ++decode_index;
+        if (decode_index >= decodes.size()) break;
+        const auto end_us = node_end_ts(*decodes[decode_index++]);
+        if (end_us <= extend.ts) continue;
+        intervals.push_back(DagControlExclusionInterval{
+            .gpu_id = gpu_id,
+            .start_us = extend.ts,
+            .end_us = end_us,
+            .kind = DagControlExclusionKind::PrefillDecode,
+        });
+    }
+    return intervals;
+}
+
+std::vector<DagPhaseMarkerEvent> phase_marker_events(const std::vector<TraceEvent> & events, int gpu_id) {
+    std::vector<DagPhaseMarkerEvent> markers;
+    for (const auto & event : events) {
+        if (event.source_channel != TraceSourceChannel::Torch || event.ph != 'X' || event.pid != event.tid) continue;
+        if (!event.name.starts_with("step[EXTEND") && !event.name.starts_with("step[DECODE")) continue;
+        markers.push_back(DagPhaseMarkerEvent{ .gpu_id = gpu_id, .event = event });
+    }
+    std::ranges::sort(markers, [](const auto & left, const auto & right) {
+        if (left.event.ts != right.event.ts) return left.event.ts < right.event.ts;
+        return left.event.index < right.event.index;
+    });
+    return markers;
+}
+
+ExecutionAndFactEvents split_hicache_fact_events(std::vector<TraceEvent> events) {
+    ExecutionAndFactEvents split;
+    split.executable_events.reserve(events.size());
+    for (auto & event : events) {
+        // Keep the admission envelope even when child work covers all of its
+        // self time. The original still participates in CPU normalization.
+        if (event.source_channel == TraceSourceChannel::Torch && event.ph == 'X' && event.name == "hicache.control.host_load_branch")
+            split.runtime_observations.push_back(event);
+        // Diagnostic envelopes explain existing CPU gaps; they are not extra work.
+        if (event.source_channel == TraceSourceChannel::PythonProbe && event.cat == "runtime_diagnostic") {
+            if (event.name == "runtime.triton.prepare" || event.name == "runtime.triton.load" || event.name == "runtime.allocator.kernel"
+                || event.name == "runtime.cpu_collective" || event.name.starts_with("runtime.phase.") || event.name == "runtime.hicache.layer_waits"
+                || event.name == "runtime.hicache.prefetch_check" || event.name == "runtime.hicache.prefetch_progress"
+                || event.name == "runtime.hicache.write_policy_check" || event.name == "runtime.hicache.radix_insert"
+                || event.name == "runtime.hicache.node_publish" || event.name == "runtime.hicache.device_restore"
+                || event.name == "runtime.hicache.prefetch_stop" || event.name == "runtime.hicache.prefetch_publish"
+                || event.name == "runtime.hicache.prefetch_read" || event.name == "runtime.hicache.prefetch_query"
+                || event.name == "runtime.hicache.host_release" || event.name == "runtime.hicache.storage_drain"
+                || event.name == "runtime.hicache.prefetch_enqueue" || event.name == "runtime.hicache.load_completion"
+                || event.name == "runtime.hicache.write_completion" || event.name == "runtime.hicache.write_ack"
+                || event.name == "runtime.hicache.decode_allocation" || event.name == "runtime.hicache.extend_allocation"
+                || event.name == "runtime.hicache.decode_allocator" || event.name == "runtime.hicache.extend_allocator"
+                || event.name == "runtime.hicache.capacity_guard" || event.name == "runtime.hicache.load_allocation"
+                || event.name == "runtime.hicache.load_admission" || event.name == "runtime.hicache.host_load_check"
+                || event.name == "runtime.hicache.device_release_backup" || event.name == "runtime.hicache.allocator_free"
+                || event.name == "runtime.hicache.device_release_regular") {
+                split.runtime_observations.push_back(std::move(event));
+                continue;
+            }
+            if (event.name == "runtime.request.receive") {
+                // The envelope contains existing work and waits. Only expose
+                // its start; dispatch_ready already supplies the end point.
+                event.name += ".begin";
+                event.dur = 0;
+                event.dur_submicro_ns = 0;
+                split.request_observations.push_back(std::move(event));
+            }
+            else if (event.name == "runtime.response.scheduler_send" || event.name == "runtime.request.socket_received"
+                     || event.name == "runtime.request.dispatch_ready")
+                split.request_observations.push_back(std::move(event));
+            continue;
+        }
+        if (is_hicache_fact_event(event)) split.hicache_fact_events.push_back(std::move(event));
+        else split.executable_events.push_back(std::move(event));
+    }
+    return split;
+}
+
+std::optional<std::string> hinted_arg(const TraceEvent & event, std::string_view key) {
+    if (!event.has_arg_key_hint(key)) return std::nullopt;
+    return event.find_arg(key);
+}
+
+/**
+ * @brief Resolves device classification, ordering lane, and optional sync aliases once.
+ *
+ * `Physic Stream Id` is the strongest device evidence. Kernel and cpu_op events may
+ * instead use `streamId`. Device ordering prefers top-level `tid`, then `streamId`,
+ * alternate `stream id`, and finally the physical stream ID.
+ */
+EventLaneIdentity resolve_event_lane(const TraceEvent & event, bool collect_aliases) {
+    EventLaneIdentity identity;
+    identity.physical_stream_id = hinted_arg(event, "Physic Stream Id");
+    const bool stream_identifies_device = event.cat == "Kernel" || event.cat == "cpu_op";
+    if (stream_identifies_device) identity.stream_id = hinted_arg(event, "streamId");
+    identity.is_device = identity.physical_stream_id.has_value() || (stream_identifies_device && identity.stream_id.has_value());
+    if (!identity.is_device) {
+        identity.lane = "CPU:" + event.pid + ":" + event.tid;
+        return identity;
+    }
+
+    if (collect_aliases || !is_usable_lane_value(event.tid)) {
+        if (!identity.stream_id) identity.stream_id = hinted_arg(event, "streamId");
+        identity.alternate_stream_id = hinted_arg(event, "stream id");
+    }
+    if (is_usable_lane_value(event.tid)) identity.lane = event.tid;
+    else if (identity.stream_id && is_usable_lane_value(*identity.stream_id)) identity.lane = *identity.stream_id;
+    else if (identity.alternate_stream_id && is_usable_lane_value(*identity.alternate_stream_id)) identity.lane = *identity.alternate_stream_id;
+    else if (identity.physical_stream_id && is_usable_lane_value(*identity.physical_stream_id)) identity.lane = *identity.physical_stream_id;
+    else identity.lane = "NPU_UNKNOWN";
+    return identity;
+}
+
+} // namespace dag_builder_detail
+
+DagBuilder::DagBuilder(size_t threads) : threads_(std::max<size_t>(1, threads)) {}
+
+DagGraph DagBuilder::build(std::vector<TraceEvent> events, int gpu_id) const {
+    auto parsed_count = events.size();
+    auto phase_markers = dag_builder_detail::phase_marker_events(events, gpu_id);
+    auto exclusions = dag_builder_detail::control_exclusion_intervals(events, phase_markers, gpu_id);
+    auto split = dag_builder_detail::split_hicache_fact_events(std::move(events));
+    dag_builder_detail::retain_modeled_operator_envelopes(split);
+    auto normalized = normalize_events(std::move(split.executable_events), split.runtime_observations);
+    DagGraph graph(std::move(normalized), gpu_id);
+    graph.set_parsed_record_count(parsed_count);
+    graph.set_hicache_fact_events(std::move(split.hicache_fact_events));
+    graph.set_runtime_observations(std::move(split.runtime_observations));
+    graph.set_control_exclusion_intervals(std::move(exclusions));
+    graph.set_phase_marker_events(std::move(phase_markers));
+    graph.reserve(DagGraphCapacity{ .nodes = graph.events().size(), .edges = 0 });
+
+    auto index = create_node_index(graph);
+    graph.reserve(DagGraphCapacity{ .nodes = graph.node_count(), .edges = estimate_edge_capacity(graph, index) });
+    add_correlation_edges(graph, index, threads_);
+    add_sequential_edges(graph, index);
+    add_event_wait_edges(graph, index);
+    add_notify_wait_edges(graph, index);
+    add_model_execute_edges(graph, index);
+    add_sync_edges(graph, index);
+    finalize_sync_nodes(graph, index);
+    normalize_cpu_queue_waits(graph);
+    std::ranges::sort(split.request_observations, {}, &TraceEvent::ts);
+    for (const auto & observation : split.request_observations) {
+        // These points carry no extra cost or E2E eligibility. A future response
+        // path must separately prove complete request binding before using them.
+        (void)insert_cpu_gap_observation(graph, observation);
+    }
+    return graph;
+}
+
+size_t estimate_edge_capacity(const DagGraph & graph, const DagBuildIndex & index) {
+    size_t capacity = 0;
+    auto add = [&](size_t value) {
+        if (value > std::numeric_limits<size_t>::max() - capacity) throw std::length_error("base DAG edge-capacity overflow");
+        capacity += value;
+    };
+    auto add_group_edges = [&](const auto & groups) {
+        for (const auto & [key, nodes] : groups) {
+            (void)key;
+            if (nodes.size() > 1) add(nodes.size() - 1);
+        }
+    };
+
+    size_t device_lane_count = 0;
+    for (const auto & [lane_id, nodes] : index.lane_to_nodes) {
+        (void)lane_id;
+        if (nodes.empty()) continue;
+        add(nodes.size() - 1);
+        if (!graph.node(nodes.front()).is_cpu) device_lane_count++;
+    }
+    add_group_edges(index.correlation_to_nodes);
+    add_group_edges(index.connection_to_nodes);
+    add(index.event_wait_nodes.size());
+    add(index.notify_wait_candidate_count);
+    add(index.event_sync_nodes.size());
+
+    const auto lane_fanout_nodes = checked_add_u64(checked_add_u64(static_cast<uint64_t>(index.stream_sync_nodes.size()),
+                                                                   static_cast<uint64_t>(index.device_sync_nodes.size()),
+                                                                   "base DAG sync-node count overflow"),
+                                                   static_cast<uint64_t>(index.model_execute_nodes.size()),
+                                                   "base DAG sync-node count overflow");
+    const auto lane_fanout_edges = checked_multiply_u64(lane_fanout_nodes, static_cast<uint64_t>(device_lane_count), "base DAG lane-fanout overflow");
+    if (lane_fanout_edges > std::numeric_limits<size_t>::max()) throw std::length_error("base DAG edge-capacity overflow");
+    add(static_cast<size_t>(lane_fanout_edges));
+    return capacity;
+}
+
+} // namespace markov::trace_graph::core
