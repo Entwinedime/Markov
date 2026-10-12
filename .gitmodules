@@ -1,6 +1,12 @@
 [submodule "third_party/sglang"]
 	path = third_party/sglang
-	url = git@github.com:Entwinedime/sglang.git
+	url = https://github.com/sgl-project/sglang.git
 [submodule "third_party/ktransformers"]
 	path = third_party/ktransformers
-	url = git@github.com:Entwinedime/ktransformers.git
+	url = https://github.com/kvcache-ai/ktransformers.git
+[submodule "reference/doolyprof"]
+	path = reference/doolyprof
+	url = https://github.com/dooly-project/doolyprof.git
+[submodule "reference/doolysim"]
+	path = reference/doolysim
+	url = https://github.com/dooly-project/doolysim.git
