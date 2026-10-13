@@ -80,7 +80,7 @@ base 配置 + model + workload → base 采集 → 原始 DAG → 目标工作�
 共用入口规划，先通过完整 mutation 应用改边及成本替换，再登记执行回调。
 非活跃层等待也先规划整组插入再应用；allocator preparation 的源坐标在创建时提供，不再事后修补。
 候选分支的资源不足仍在目标实际需要时报告；已确定执行的调用则立即要求可用资源。
-当前检查安排见[人工维护计划](tmp/human_maintenance_tightening_plan_20261011.md)。
+当前验证范围及尚未解决的问题见[工作进展](work_progress.md)。
 
 ### 输入来源
 
