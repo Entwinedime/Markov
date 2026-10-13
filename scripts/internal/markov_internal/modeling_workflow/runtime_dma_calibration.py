@@ -23,11 +23,10 @@ from typing import Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import require_repo_path
-from .calibration.runtime_anchors import (
+from ..modeling.cost.io_contract import (
     DMA_SERVICES,
     RUNTIME_DMA_INDEX_RESIDENCY,
     RUNTIME_DMA_OPERATOR_NAME,
-    load_runtime_service_models,
 )
 from .calibration.options import (
     apply_numa_preference,
@@ -500,16 +499,8 @@ def main(argv: list[str] | None = None) -> int:
 
     plan = parse_args(argv)
     report = capture_runtime_dma(plan)
-    geometry = plan.base_report["kv_geometry"]["kv_bytes_per_token_per_rank"]
     dma_path = plan.output_dir / "runtime_dma_calibration.json"
-    runtime = load_runtime_service_models(
-        dma_path,
-        expected_kv_bytes_per_token_per_rank=geometry,
-        expected_page_bytes=[page * geometry for page in plan.page_token_sizes],
-        expected_concurrent_scope_count=len(plan.devices),
-        directions=plan.directions,
-    )
-    complete_dma_bundle(plan.base_report, plan.base_path, dma_path, runtime)
+    complete_dma_bundle(plan.base_report, plan.base_path, dma_path)
     print(f"runtime_dma_report={plan.output_dir / 'runtime_dma_calibration.json'}")
     print(f"samples={len(report['samples'])}")
     return 0

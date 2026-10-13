@@ -11,13 +11,16 @@ import random
 from statistics import median
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from ...common.io import load_json, write_json
 from ...common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ...common.commands import positive_int
 from ...modeling.cost.io_contract import nonnegative_finite_number, positive_finite_number
 from .options import parse_cpu_sets, parse_positive_csv
+
+if TYPE_CHECKING:
+    from ..physical_capture import PhysicalCaptureInputs
 
 
 def measure_locked_candidates(evict, cache, params, *, batch: int, repeats: int) -> list[dict]:
@@ -145,7 +148,9 @@ def main(argv=None):
     )
 
 
-def acquire_eviction_cpu(group, needs, *, dry_run=False):
+def acquire_eviction_cpu(
+    group: PhysicalCaptureInputs, needs: list[dict[str, Any]], *, dry_run: bool = False
+) -> dict[str, Any]:
     """Acquire one declared primitive domain for all affected targets, not per cell."""
     from ..physical_capture import physical_attempts, physical_usage, _completed, run_primitive_attempt
     from ...modeling.deployment import source_environment
@@ -156,7 +161,7 @@ def acquire_eviction_cpu(group, needs, *, dry_run=False):
     required.extend(need for need in needs if need["component"] == "execution_control/eviction_locked_candidate")
     if not required:
         return dict(status="not_required")
-    spec = group.raw.get("physical_capture", {})
+    spec = group.capture
     sampling = spec.get("eviction_cpu")
     plan = dict(status="needs_cpu_primitive", requirements=required, usage=physical_usage(physical_attempts(group)))
     if not sampling or not spec.get("cpu_sets"):
@@ -165,7 +170,7 @@ def acquire_eviction_cpu(group, needs, *, dry_run=False):
     if flags.get("radix_eviction_policy", "lru") != "lru":
         return dict(plan, stop_reason="CPU primitive sampler supports LRU only")
     cpus = parse_cpu_sets(spec["cpu_sets"], len(spec["cpu_sets"].split("|")))
-    environment = source_environment(group.sources[0], group.raw.get("resource_environment"))
+    environment = source_environment(group.sources[0], group.resources)
     if len(cpus) != int(environment["server"]["tp_size"]):
         raise ValueError("CPU primitive needs one CPU set per base TP rank")
     sizes = parse_positive_csv(",".join(str(size) for size in sampling["heap_sizes"]), "heap_sizes")

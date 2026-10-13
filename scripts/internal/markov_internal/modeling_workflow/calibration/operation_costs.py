@@ -13,52 +13,26 @@ from ...common.paths import require_repo_path, repo_relative_path
 from ...modeling.source_dag.profiles import discover_profile_runs
 from ...modeling.workload import controlled_request_window, discover_workload_window
 from ..context import DiagnosticLevel
-from .operation_sampling import index_costs, index_observations
 
 
 def summarize(audit: dict[str, Any], operation: str, page_size: int) -> dict[str, Any]:
-    if audit.get("cost_basis") != "paired_cpu_service" or not audit.get("cpu_service_file"):
-        raise ValueError("Formal operation calibration requires paired CPU service correction")
+    """Publish measured scopes; Python does not interpret nodes or dependencies."""
 
-    observations = list(audit.get("operator_observations", []))
-    unavailable = []
-    measured_calls = 0
-    for row in audit["rows"]:
-        if row["status"] != "observed":
-            unavailable.append({key: value for key, value in row.items() if key not in ("nodes", "edges")})
-            continue
-        if operation == "load_index":
-            try:
-                observations.extend(index_observations(row, index_costs(row), page_size))
-            except ValueError as error:
-                unavailable.append(dict(pid=row["pid"], tid=row["tid"], begin_us=row["begin_us"], reason=str(error)))
-                continue
-        measured_calls += 1
-
-    if not observations:
+    if not audit["operator_observations"]:
         raise ValueError("Independent calibration contains no usable operation observations")
 
-    result = dict(
-        role="fixed_calibration",
-        operation=operation,
-        source_manifest=audit["source_manifest"],
-        cpu_service_file=audit["cpu_service_file"],
-        cost_basis=audit["cost_basis"],
-        estimator="Individual operation measurements after paired CPU correction; no per-rank or per-phase mean parameters.",
-        limitations="Unmeasured residuals, worker dispatch and device costs retained. CPU reductions are allocated within measured intervals, not identified per instruction. Extrapolation beyond sampled sizes is unvalidated.",
-        measured_calls=measured_calls,
-        operator_observations=observations,
-        unavailable_samples=unavailable,
-    )
-    if operation == "layer_wait":
-        return result
-    result["measured_page_size"] = page_size
+    result = dict(audit, role="fixed_calibration", operation=operation)
+    rows = result.pop("rows", [])
+    result["unavailable_samples"] = [row for row in rows if row["status"] not in {"observed", "ready"}]
+    if operation != "layer_wait":
+        result["measured_page_size"] = page_size
     if operation == "load_submission":
         result.update(backend="kernel_ascend", layout="page_first_direct")
+
     return result
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile-manifest", type=Path, required=True)
     parser.add_argument("--cpu-service-cost", type=Path, required=True)
@@ -128,11 +102,10 @@ def main():
             audit = scratch / (operation + ".json")
             if result.returncode != 0 and not audit.exists():
                 break
-            direct_export = operation in ("prefetch_wait", "prefetch_query", "write_host", "release_host")
             observed = load_json(audit)
-            if args.diagnostics == DiagnosticLevel.FULL.value and not direct_export:
+            if args.diagnostics == DiagnosticLevel.FULL.value:
                 write_json(output / (operation + "_audit.json"), observed)
-            costs = observed if direct_export else summarize(observed, operation, args.page_size)
+            costs = summarize(observed, operation, args.page_size)
             costs["source_manifest"] = str(repo_relative_path(source))
             costs["cpu_service_file"] = str(repo_relative_path(service))
             costs["measurement_manifests"] = [str(repo_relative_path(source)), correction["light_manifest"]]

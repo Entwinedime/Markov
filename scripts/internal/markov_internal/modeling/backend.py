@@ -32,16 +32,18 @@ def trace_graph_executable(backend_kind: str = "release") -> Path:
     raise FileNotFoundError(f"missing {backend_kind} trace_graph executable at {directory}/trace_graph; run {command}")
 
 
-def build_trace_graph_command(run: ModelingRunConfig) -> list[str]:
+def build_trace_graph_command(run: ModelingRunConfig, *, target_plan: Path | None = None) -> list[str]:
     """Translate a normalized runner config into the narrow C++ CLI."""
 
     command = [
         str(trace_graph_executable(run.backend_kind)),
         "--profile-manifest",
         str(run.profile_manifest),
-        "--run-summary",
-        str(run.output_dir / "run_summary.json"),
     ]
+    if target_plan is None:
+        command.extend(["--run-summary", str(run.output_dir / "run_summary.json")])
+    else:
+        command.extend(["--target-plan", str(target_plan)])
     for field, option in (
         ("threads", "--threads"),
         ("file_threads", "--file-threads"),
@@ -66,7 +68,7 @@ def build_trace_graph_command(run: ModelingRunConfig) -> list[str]:
         command.extend(["--structure-report", str(run.output_dir / "structure_report.json")])
     if run.outputs.module_summary:
         command.extend(["--model-summary", str(run.output_dir / "model_summary.json")])
-    if run.model_config_path is not None:
+    if target_plan is None and run.model_config_path is not None:
         command.extend(["--model-config", str(run.model_config_path)])
     return command
 

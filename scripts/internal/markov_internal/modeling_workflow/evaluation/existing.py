@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import time
 
 from ...common.io import load_json, write_json
@@ -211,21 +213,31 @@ def evaluate(
         raise ValueError("evaluation output must be separate from prediction inputs")
     write_json(output / "gate_summary.json", {"status": "SCORING", "new_predictions": 0, "new_acquisitions": 0})
     try:
-        return _evaluate(
-            prediction_dirs,
-            profile_dirs,
-            manifests,
-            output,
-            jobs,
-            threads,
-            file_threads,
-            oracle_cost_replay,
-            oracle_max_runs,
-            normal_http,
-            structure_manifests or [],
-            diagnostics,
-            retry_dirs or [],
+        # Structure extraction is working storage, not another result copy.
+        # Retain it only on an explicit detailed-diagnostics request; a failure
+        # must also release this attempt's temporary files, never input assets.
+        storage = (
+            nullcontext(output / "artifacts" / "target_structure")
+            if not structure_manifests or diagnostics.keep_debug_artifacts
+            else TemporaryDirectory(prefix="target_structure_", dir=output)
         )
+        with storage as structure_root:
+            return _evaluate(
+                prediction_dirs,
+                profile_dirs,
+                manifests,
+                output,
+                jobs,
+                threads,
+                file_threads,
+                oracle_cost_replay,
+                oracle_max_runs,
+                normal_http,
+                structure_manifests or [],
+                diagnostics,
+                retry_dirs or [],
+                Path(structure_root),
+            )
     except Exception as error:
         write_json(
             output / "gate_summary.json",
@@ -248,6 +260,7 @@ def _evaluate(
     structure_manifests: list[Path],
     diagnostics: DiagnosticLevel,
     retry_dirs: list[Path],
+    structure_root: Path,
 ) -> dict:
     started = time.monotonic()
     # Complete every selected group before discovering even the first target.
@@ -271,21 +284,18 @@ def _evaluate(
         }
         write_json(output / "gate_summary.json", result)
         return result
-    training_captures, training_manifests = set(), set()
+    training_manifests = set()
     unrecorded_training = []
     experiment_report_directories = set()
     for directory in prediction_dirs:
         provenance = load_json(directory / "workflow_summary.json")
         if provenance.get("experiment_reports", False):
             experiment_report_directories.add(directory)
-        if "cost_training_captures" not in provenance or "cost_training_manifests" not in provenance:
+        if "cost_training_manifests" not in provenance:
             unrecorded_training.append(str(directory))
             continue
-        training_captures.update(provenance["cost_training_captures"])
         training_manifests.update(require_repo_path(path).resolve() for path in provenance["cost_training_manifests"])
-    if training_captures & {row["source_run_id"] for _, row, _ in predictions} or training_manifests & {
-        require_repo_path(row["source_manifest"]).resolve() for _, row, _ in predictions
-    }:
+    if training_manifests & {require_repo_path(row["source_manifest"]).resolve() for _, row, _ in predictions}:
         raise ValueError("independent training includes a base capture from this evaluation round")
     if structure_manifests and set(prediction_dirs) - experiment_report_directories:
         raise ValueError(
@@ -308,7 +318,7 @@ def _evaluate(
         key = (target.config_id, target.input_id)
         if key not in expected:
             continue
-        if target.run_id in training_captures or target.manifest_path.resolve() in training_manifests:
+        if target.manifest_path.resolve() in training_manifests:
             raise ValueError(f"performance evaluation capture was used for cost training: {target.manifest_path}")
         if key in targets and not normal_http:
             raise ValueError(f"ambiguous target profiles for {key}; select explicit manifests")
@@ -374,7 +384,7 @@ def _evaluate(
             key = (target.config_id, target.input_id)
             if key not in required:
                 continue
-            if target.run_id in training_captures or target.manifest_path.resolve() in training_manifests:
+            if target.manifest_path.resolve() in training_manifests:
                 raise ValueError(f"structure evaluation capture was used for cost training: {target.manifest_path}")
             if key in selected:
                 raise ValueError(f"ambiguous target structure profiles for {key}; select one explicit capture")
@@ -388,7 +398,7 @@ def _evaluate(
 
         def observe_structure(item: tuple[tuple[str, str], ProfileRunRef]) -> tuple[tuple[str, str], Path]:
             key, target = item
-            target_output = output / "artifacts" / "target_structure" / target.run_id
+            target_output = structure_root / target.run_id
             extract_target_structure(
                 target,
                 target_output,

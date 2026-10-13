@@ -370,72 +370,10 @@ def _compare_tensor_operations(predicted: dict[str, Any], target: dict[str, Any]
             "operator_identity": identity,
             "predicted_device_nodes": matched["predicted"][identity]["native_device_nodes"],
             "observed_device_nodes": matched["actual"][identity]["native_device_nodes"],
-            "predicted_operations": matched["predicted"][identity]["native_operations"],
-            "observed_kernel_names": matched["actual"][identity]["observed_kernel_names"],
         }
         for identity in native_common
         if matched["predicted"][identity]["native_device_nodes"] != matched["actual"][identity]["native_device_nodes"]
     ]
-    topology_differences = [
-        {
-            "operator_identity": identity,
-            "predicted": matched["predicted"][identity]["native_device_topology"],
-            "observed": matched["actual"][identity]["native_device_topology"],
-        }
-        for identity in native_common
-        if matched["predicted"][identity]["native_device_topology"]
-        != matched["actual"][identity]["native_device_topology"]
-    ]
-
-    native_identity_differences = []
-    native_identity_compared = 0
-    for identity in native_common:
-        operations = matched["predicted"][identity]["native_operations"]
-        labels = [operation["expected_task_label"] for operation in operations]
-        if not labels or any(label is None for label in labels):
-            continue
-
-        native_identity_compared += 1
-        expected_labels = Counter(labels)
-        observed_labels: Counter[str] = Counter()
-        unmatched_names = []
-        for name in matched["actual"][identity]["observed_kernel_names"]:
-            candidates = [label for label in expected_labels if name.endswith(label)]
-            if len(candidates) == 1:
-                observed_labels[candidates[0]] += 1
-            else:
-                unmatched_names.append(name)
-
-        if unmatched_names or expected_labels != observed_labels:
-            native_identity_differences.append(
-                {
-                    "operator_identity": identity,
-                    "expected_labels": dict(expected_labels),
-                    "observed_labels": dict(observed_labels),
-                    "unmatched_kernel_names": unmatched_names,
-                }
-            )
-
-    sequence_differences = []
-    sequence_compared = 0
-    for identity in native_common:
-        expected_sequence = matched["predicted"][identity]["native_serial_sequence"]
-        observed_sequence = matched["actual"][identity]["native_serial_sequence"]
-        if expected_sequence is None or observed_sequence is None:
-            continue
-
-        sequence_compared += 1
-        if len(expected_sequence) != len(observed_sequence) or any(
-            not name.endswith(label) for label, name in zip(expected_sequence, observed_sequence)
-        ):
-            sequence_differences.append(
-                {
-                    "operator_identity": identity,
-                    "expected_labels": expected_sequence,
-                    "observed_kernel_names": observed_sequence,
-                }
-            )
-
     completion_common = (
         set(matched["common"]) & set(predicted["completion_identities"]) & set(target["completion_identities"])
     )
@@ -453,26 +391,6 @@ def _compare_tensor_operations(predicted: dict[str, Any], target: dict[str, Any]
             "differences": native_differences,
             "exact_counts": bool(native_common) and not native_differences,
             "scope": "device-node multiplicity within matched async/direct calls; not native operation identity or dependency equivalence",
-        },
-        "native_device_topology": {
-            "compared_operators": len(native_common),
-            "differences": topology_differences,
-            "matching_invariants": bool(native_common) and not topology_differences,
-            "scope": "internal edge kinds, degree distribution and lane sharing; not graph isomorphism or operation identity",
-        },
-        "native_operation_labels": {
-            "compared_operators": native_identity_compared,
-            "operators_without_label_rules": len(native_common) - native_identity_compared,
-            "differences": native_identity_differences,
-            "matching_inventories": bool(native_identity_compared) and not native_identity_differences,
-            "scope": "known native operator/engine label multiplicity only; not order, dtype, shape or full dependency equivalence",
-        },
-        "native_serial_order": {
-            "compared_operators": sequence_compared,
-            "operators_without_serial_proof_or_labels": len(native_common) - sequence_compared,
-            "differences": sequence_differences,
-            "matching_sequences": bool(sequence_compared) and not sequence_differences,
-            "scope": "known operator labels along proven single-stream chains; not CPU/control dependency equivalence",
         },
         **{
             field: matched[field]
@@ -611,14 +529,8 @@ def _compact_comparison(report: dict[str, Any]) -> None:
 
     identities(report["phase_operators"])
     for tensor in (report["phase_tensor_operations"], report["allocator_tensor_operations"]):
-        for field in (
-            "native_device_counts",
-            "native_device_topology",
-            "native_operation_labels",
-            "native_serial_order",
-        ):
-            comparison = tensor[field]
-            comparison["difference_count"] = len(comparison.pop("differences"))
+        comparison = tensor["native_device_counts"]
+        comparison["difference_count"] = len(comparison.pop("differences"))
 
     dependencies = report["dependencies"]
     for field in ("missing_edge_labels", "extra_edge_labels"):

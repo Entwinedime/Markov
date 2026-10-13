@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from ..modeling.cost.hicache import HiCacheIoModel
+from ..modeling.cost.hicache import HiCacheCostModels
 from .types import TargetHiCacheConfig
 
 
@@ -37,10 +37,7 @@ class WorkflowOptions:
     target_configs: tuple[TargetHiCacheConfig, ...]
     output_dir: Path
     diagnostics: DiagnosticLevel
-    hicache_io_model: HiCacheIoModel
-    cost_deployment: dict[str, object]
-    cost_sources: tuple[str, ...]
-    cost_source_manifests: tuple[Path, ...]
+    cost_models: HiCacheCostModels
     dry_run: bool = False
     continue_on_error: bool = False
     trace_threads: int = 1

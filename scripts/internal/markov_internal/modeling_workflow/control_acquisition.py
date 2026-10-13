@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, require_repo_path, repo_relative_path
+from ..common.process import run_command
 from .capture import CONTROL_CAPTURE_STAGES, capture_calibration
 from ..modeling.cost.control import control_calibrations
-from .group_cpu_service import prepare_group_cpu_service
+from .cpu_service import prepare_cpu_services
 from ..modeling.source_dag.profiles import ProfileRunRef, discover_profile_runs, parse_server_command_flags
 
 if TYPE_CHECKING:
@@ -24,6 +25,109 @@ PREFETCH_CAPTURE_POLICIES = {
     "best_effort": "best_effort",
     "wait_complete": "wait_complete",
 }
+
+_CONTROL_EXPORTS = {
+    "eviction_locked_candidate": (),
+    "release_regular": ("release_host",),
+    "write_back": ("write_host",),
+    "write_through": ("write_host",),
+    "best_effort": ("prefetch_wait",),
+    "wait_complete": ("prefetch_wait",),
+    "prefetch_query": ("prefetch_query",),
+}
+
+
+@dataclass(frozen=True)
+class ControlCapture:
+    """A shared execution experiment and the observations to export from it.
+
+    This plan contains no target identity, costs or fitted parameters. An
+    eviction CPU primitive has no runtime exporter and uses its own sampler.
+    """
+
+    experiment: str
+    exports: tuple[str, ...]
+
+
+def _control_operation(operation: str, implementation: str) -> tuple[str | None, str | None]:
+    """Return the supported capture and any extra waiting-capture export.
+
+    Unknown implementations cannot select an experiment. A capture selected
+    for another demand can still attempt that family's actual observations.
+    These are sampler rules, not model selection or target execution rules.
+    """
+
+    experiment, export = None, None
+    if operation.startswith(("load.index.", "load.admission.")):
+        export = "load_index"
+        if (
+            (operation.startswith("load.index.") and implementation == "ascend.paged_unsorted")
+            or (operation == "load.admission.prepare" and implementation == "host_indices_cpu")
+            or (
+                operation in {"load.admission.prefix_concat", "load.admission.prefix_tail"}
+                and implementation == "ascend.aclnn_cat"
+            )
+        ):
+            experiment = "wait_complete"
+    elif operation.startswith("load.submission."):
+        export = "load_submission"
+        if implementation in {"kernel_ascend.page_first_direct.load", "empty_queue"}:
+            experiment = "wait_complete"
+    elif operation.startswith("layer_wait."):
+        export = "layer_wait"
+        if (operation == "layer_wait.inactive_return" and implementation == "inactive") or (
+            operation in {"layer_wait.submit", "layer_wait.tail"} and implementation == "ascend.stream_wait_event"
+        ):
+            experiment = "wait_complete"
+    if export is not None:
+        return experiment, export
+
+    if operation.startswith("write.submission."):
+        if implementation == "kernel_ascend.page_first_direct.write_back":
+            experiment = "write_back"
+        elif implementation == "kernel_ascend.page_first_direct.write_through":
+            experiment = "write_through"
+    elif operation.startswith("write.confirmation.") or operation == "runtime.event_destroy":
+        experiment = "write_through"
+    elif (
+        (operation == "write.completion_entry" and implementation in {"blocking", "blocking_empty"})
+        or (
+            (operation == "write.completion_advance" or operation.startswith("write.completion."))
+            and implementation == "blocking"
+        )
+        or (operation == "write.completion_poll" and implementation == "blocking_storage")
+    ):
+        experiment = "write_back"
+    elif operation.startswith("release."):
+        if implementation in {"ascend.paged_immediate.backup", "ascend.token_immediate.backup"}:
+            experiment = "write_back"
+        elif implementation in {"ascend.paged_immediate.regular", "ascend.token_immediate.regular"}:
+            experiment = "release_regular"
+    elif implementation == "nonblocking":
+        if operation == "write.confirmation_tail":
+            experiment = "write_through"
+        elif operation == "load.confirmation_tail":
+            experiment = "wait_complete"
+    elif (operation, implementation) in {
+        ("device.event.wait", "ascend.EVENT_WAIT"),
+        ("device.event.record", "ascend.EVENT_RECORD"),
+    }:
+        # Raw device events are shared across callers, while the experiment
+        # still measures each caller's CPU separately.
+        experiment = "wait_complete"
+    elif operation.startswith("prefetch.check.") and implementation == "sglang.prefetch_check":
+        role = operation.removeprefix("prefetch.check.")
+        experiment = "best_effort" if role in {"no_operation_return", "best_effort_to_stop"} else "wait_complete"
+    elif operation.startswith("prefetch.collective.") and implementation == "gloo.all_reduce.int32":
+        experiment = "wait_complete"
+    elif operation.startswith("prefetch.scheduler.") and implementation in {
+        "sglang.serial_scheduler",
+        "gloo.broadcast.int64",
+        "gloo.all_reduce.int32",
+    }:
+        experiment = "wait_complete"
+
+    return experiment, export
 
 
 def operator_requirements(needs: Sequence[dict], operation: str) -> list[dict]:
@@ -109,92 +213,33 @@ def declared_cost_demands(
     return collectable, undeclared, corrections
 
 
-def pending_control_experiments(needs: Sequence[dict], attempted: set[str]) -> list[str]:
-    """Map execution demands to shared experiments, with queries exported last.
+def plan_control_captures(needs: Sequence[dict[str, Any]], attempted: set[str]) -> list[ControlCapture]:
+    """Select shared experiments and their exports together; queries run last.
 
     The caller owns the attempt lifecycle. Unknown programs stay unresolved;
     they are not redirected to a different measurement.
     """
     components = {need["component"] for need in needs}
-    operations = [
+    experiments = [
         name
         for name in ("eviction_locked_candidate", "release_regular")
         if "execution_control/" + name in components and name not in attempted
     ]
     if operator_requirements(needs, "eviction.locked_candidate") and "eviction_locked_candidate" not in attempted:
-        if "eviction_locked_candidate" not in operations:
-            operations.append("eviction_locked_candidate")
+        if "eviction_locked_candidate" not in experiments:
+            experiments.append("eviction_locked_candidate")
+    wait_exports: set[str] = set()
     # Describe experiments by execution policy, not by the target cell. One
     # write-back pressure capture measures both submission and backup release.
     for need in needs:
         for coordinate in need["coordinates"]:
             operation = coordinate.get("operation", "")
             implementation = coordinate.get("implementation", "")
-            experiment = None
-            if operation.startswith("write.submission."):
-                if implementation == "kernel_ascend.page_first_direct.write_back":
-                    experiment = "write_back"
-                elif implementation == "kernel_ascend.page_first_direct.write_through":
-                    experiment = "write_through"
-            elif operation.startswith("load.submission."):
-                if implementation in {"kernel_ascend.page_first_direct.load", "empty_queue"}:
-                    experiment = "wait_complete"
-            elif operation.startswith("write.confirmation.") or operation == "runtime.event_destroy":
-                experiment = "write_through"
-            elif (
-                (operation == "write.completion_entry" and implementation in {"blocking", "blocking_empty"})
-                or (
-                    (operation == "write.completion_advance" or operation.startswith("write.completion."))
-                    and implementation == "blocking"
-                )
-                or (operation == "write.completion_poll" and implementation == "blocking_storage")
-            ):
-                experiment = "write_back"
-            elif operation.startswith("load.index.") and implementation == "ascend.paged_unsorted":
-                experiment = "wait_complete"
-            elif operation == "load.admission.prepare" and implementation == "host_indices_cpu":
-                experiment = "wait_complete"
-            elif (
-                operation in {"load.admission.prefix_concat", "load.admission.prefix_tail"}
-                and implementation == "ascend.aclnn_cat"
-            ):
-                experiment = "wait_complete"
-            elif operation.startswith("release."):
-                if implementation in {"ascend.paged_immediate.backup", "ascend.token_immediate.backup"}:
-                    experiment = "write_back"
-                elif implementation in {"ascend.paged_immediate.regular", "ascend.token_immediate.regular"}:
-                    experiment = "release_regular"
-            elif implementation == "nonblocking":
-                if operation == "write.confirmation_tail":
-                    experiment = "write_through"
-                elif operation == "load.confirmation_tail":
-                    experiment = "wait_complete"
-            elif operation == "layer_wait.inactive_return" and implementation == "inactive":
-                experiment = "wait_complete"
-            elif operation in {"layer_wait.submit", "layer_wait.tail"} and implementation == "ascend.stream_wait_event":
-                experiment = "wait_complete"
-            elif (operation, implementation) in {
-                ("device.event.wait", "ascend.EVENT_WAIT"),
-                ("device.event.record", "ascend.EVENT_RECORD"),
-            }:
-                # Runtime extraction shares raw device events across callers;
-                # this experiment still measures each caller's CPU separately.
-                experiment = "wait_complete"
-            elif operation.startswith("prefetch.check.") and implementation == "sglang.prefetch_check":
-                role = operation.removeprefix("prefetch.check.")
-                experiment = (
-                    "best_effort" if role in {"no_operation_return", "best_effort_to_stop"} else "wait_complete"
-                )
-            elif operation.startswith("prefetch.collective.") and implementation == "gloo.all_reduce.int32":
-                experiment = "wait_complete"
-            elif operation.startswith("prefetch.scheduler.") and implementation in {
-                "sglang.serial_scheduler",
-                "gloo.broadcast.int64",
-                "gloo.all_reduce.int32",
-            }:
-                experiment = "wait_complete"
-            if experiment is not None and experiment not in attempted and experiment not in operations:
-                operations.append(experiment)
+            experiment, export = _control_operation(operation, implementation)
+            if export is not None:
+                wait_exports.add(export)
+            if experiment is not None and experiment not in attempted and experiment not in experiments:
+                experiments.append(experiment)
     waits = {
         PREFETCH_CAPTURE_POLICIES[coordinate["program"]]
         for need in needs
@@ -202,30 +247,32 @@ def pending_control_experiments(needs: Sequence[dict], attempted: set[str]) -> l
         for coordinate in need["coordinates"]
         if coordinate["program"] in PREFETCH_CAPTURE_POLICIES
     }
-    operations.extend(sorted(waits - attempted - set(operations)))
+    experiments.extend(sorted(waits - attempted - set(experiments)))
 
     # The wait experiment may publish a paired trace that also supplies queries.
     query_needed = "execution_control/prefetch_query" in components or bool(
         operator_requirements(needs, "prefetch.query")
     )
     if query_needed and "prefetch_query" not in attempted:
-        operations.append("prefetch_query")
-    return operations
+        experiments.append("prefetch_query")
+
+    # Preserve exporter order: load index, submission, then layer checks.
+    ordered_wait_exports = tuple(
+        name for name in ("load_index", "load_submission", "layer_wait") if name in wait_exports
+    )
+    return [
+        ControlCapture(name, _CONTROL_EXPORTS[name] + (ordered_wait_exports if name == "wait_complete" else ()))
+        for name in experiments
+    ]
 
 
-def prepare_control_calibration(group: GroupRequest, demand: str, needs: Sequence[dict]) -> dict:
+def prepare_control_calibration(group: GroupRequest, capture: ControlCapture) -> dict[str, Any]:
     """Resolve a shared control demand, then capture and export its normal CPU costs."""
     # Materialization imports group definitions; keep that dependency local.
     from .fixed_calibration import materialize_fixed_calibration
 
-    if demand == "prefetch_query":
-        operation = "prefetch_query"
-    elif demand == "release_regular":
-        operation = "release_host"
-    elif demand in {"write_back", "write_through"}:
-        operation = "write_host"
-    else:
-        operation = "prefetch_wait"
+    demand = capture.experiment
+    operation = capture.exports[0]
     if operation == "prefetch_query":
         # Group admission already checks these independent manifests and their
         # environment. Re-export with current code; do not reuse old parameters.
@@ -261,19 +308,7 @@ def prepare_control_calibration(group: GroupRequest, demand: str, needs: Sequenc
     (profile,) = discover_profile_runs((require_repo_path(paired["profile_manifest"]),))
     service = require_repo_path(paired["cpu_service_cost"])
     output = require_repo_path(paired["output_dir"])
-    exports = [operation]
-    if demand == "wait_complete":
-        # Several cost families use the same paired waiting experiment. Export
-        # the needed observations once; do not schedule another capture for
-        # each primitive or assume raw-profile import extracts these audits.
-        requested = {coordinate.get("operation", "") for need in needs for coordinate in need["coordinates"]}
-        if any(name.startswith(("load.index.", "load.admission.")) for name in requested):
-            exports.append("load_index")
-        if any(name.startswith("load.submission.") for name in requested):
-            exports.append("load_submission")
-        if any(name.startswith("layer_wait.") for name in requested):
-            exports.append("layer_wait")
-    return _export_control(group, profile, service, output, operation, extra_operations=exports[1:])
+    return _export_control(group, profile, service, output, operation, extra_operations=capture.exports[1:])
 
 
 def capture_paired_calibration(group: GroupRequest, definition: dict[str, Any]) -> dict[str, Any]:
@@ -306,7 +341,7 @@ def capture_paired_calibration(group: GroupRequest, definition: dict[str, Any]) 
         output_dir=str(repo_relative_path(output / "cpu")),
         include_setup_requests=True,
     )
-    services = prepare_group_cpu_service(dict(pairs=[pair], existing_services=[]))
+    services = prepare_cpu_services(dict(pairs=[pair], existing_services=[]))
     full["cpu_service_cost"] = str(repo_relative_path(services[0]))
     write_json(ledger_path, ledger)
 
@@ -326,7 +361,7 @@ def _export_control(
     operation: str,
     *,
     extra_operations: Sequence[str] = (),
-) -> dict:
+) -> dict[str, Any]:
     # Export only the required operation, not every operation this workload
     # happens to contain. The paired capture is shared by the whole group.
     operations = [operation, *extra_operations]
@@ -344,7 +379,7 @@ def _export_control(
     ]
     for name in operations:
         command.extend(("--operation", name))
-    subprocess.run(command, cwd=ROOT_DIR, check=True)
+    run_command(command).check_returncode()
 
     value = str(repo_relative_path(output / (operation + ".json")))
     if operation == "prefetch_wait":

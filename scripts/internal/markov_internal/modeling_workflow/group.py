@@ -10,18 +10,14 @@ from dataclasses import dataclass
 from functools import cached_property
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from ..common.io import load_json
 from ..common.manifest import profile_labels
 from ..common.paths import require_repo_path
 from ..modeling.deployment import source_environment
-from ..contracts.forced_token.bundle import resolve_forced_token_bundle_plan
-from ..contracts.forced_token.plan import load_forced_token_plan
-from ..profiling.suite import expand_suite
-from ..workload_template.cli import parse_workload_command
-from .base_capture import captured_base_manifests
-from .capture import CAPTURE_CLEANUP_RESERVE_SEC
+from ..profiling.suite import profile_experiments
+from .capture import PhysicalBudget, ProfileBudget
 from ..modeling.cost.control import ControlMeasurement, control_calibrations, read_control_measurements
 from ..modeling.source_dag.profiles import (
     ProfileRunRef,
@@ -31,50 +27,8 @@ from ..modeling.source_dag.profiles import (
 from .types import TargetHiCacheConfig
 
 
-@dataclass(frozen=True)
-class AcquisitionBudget:
-    """Complete acquisition limits, including startup and failed attempts."""
-
-    wall_seconds: float
-
-    def available_for(self, usage: dict[str, Any], **increments: int) -> tuple[float, list[str]]:
-        """Return remaining wall seconds and exceeded limits for one planned attempt.
-
-        Usage includes previous failures. Wall time retains the container cleanup
-        reserve; other limits permit an attempt that exactly uses the remaining budget.
-        """
-
-        remaining = self.wall_seconds - usage["wall_seconds"]
-        limits = [key for key, count in increments.items() if usage[key] + count > getattr(self, key)]
-        if remaining <= CAPTURE_CLEANUP_RESERVE_SEC:
-            limits.append("wall_seconds")
-        return remaining, limits
-
-    @classmethod
-    def parse(cls, raw: dict[str, Any]) -> AcquisitionBudget:
-        budget = cls(**raw)
-        if any(not isinstance(value, (int, float)) or not 0 <= value < float("inf") for value in vars(budget).values()):
-            raise ValueError("calibration budgets must be finite and non-negative")
-        if any(
-            not isinstance(value, int) or isinstance(value, bool)
-            for key, value in vars(budget).items()
-            if key != "wall_seconds"
-        ):
-            raise ValueError("calibration counts must be integers")
-        return budget
-
-
-@dataclass(frozen=True)
-class ProfileBudget(AcquisitionBudget):
-    server_starts: int
-    requests: int
-    tokens: int
-
-
-@dataclass(frozen=True)
-class PhysicalBudget(AcquisitionBudget):
-    container_starts: int
-    logical_io_bytes: int
+if TYPE_CHECKING:
+    from .physical_capture import PhysicalCaptureInputs
 
 
 @dataclass(frozen=True)
@@ -129,16 +83,30 @@ class GroupRequest:
             if suite["framework"] != "sglang":
                 raise ValueError("HiCache group preparation requires SGLang; other frameworks retain build-dag")
             declared = set()
-            for experiment in expand_suite(suite):
+            for experiment in profile_experiments(suite):
                 config_id, input_id = profile_labels(experiment)
                 declared.add((config_id, input_id))
                 servers.setdefault(config_id, []).append(experiment["server"]["command"])
+
+            # A single base declaration already selects its workloads. Matrix
+            # inputs still require an explicit base; never choose the first row.
+            if not base and len(servers) == 1:
+                base = next(iter(servers))
+            if "workload_ids" not in raw and not workload_ids:
+                workload_ids = tuple(sorted(workload for config, workload in declared if config == base and workload))
+
             if not base or not workload_ids or any((base, workload) not in declared for workload in workload_ids):
-                raise ValueError("each base/workload must identify a declared profiling experiment")
-            recovered = captured_base_manifests(
-                {**raw, "base_config": base}, suite, set(workload_ids) - {source.input_id for source in sources}
-            )
-            sources += tuple(discover_profile_runs(tuple(recovered)))
+                raise ValueError(
+                    "select one declared base and its workloads; "
+                    "a profiling input with one base can supply the selection directly"
+                )
+            missing = set(workload_ids) - {source.input_id for source in sources}
+            if missing:
+                # Only missing bases need the capture ledger and planners.
+                from .profile_capture import captured_base_manifests
+
+                recovered = captured_base_manifests({**raw, "base_config": base}, suite, missing)
+                sources += tuple(discover_profile_runs(tuple(recovered)))
         elif not sources or set(workload_ids) != {source.input_id for source in sources}:
             raise ValueError("without profile_suite, provide a base manifest for every requested workload")
         if any(source.hicache_config is None for source in sources):
@@ -204,17 +172,28 @@ class GroupRequest:
         )
 
     @cached_property
+    def sampling(self) -> PhysicalCaptureInputs:
+        """Only deployment/domain inputs cross into the shared physical sampler."""
+        from .physical_capture import PhysicalCaptureInputs
+
+        return PhysicalCaptureInputs(
+            capture=self.raw.get("physical_capture") or {},
+            calibration=self.raw.get("physical_calibration"),
+            resources=self.raw.get("resource_environment"),
+            forced_token_bundle=self.raw.get("forced_token_bundle"),
+            sources=self.sources,
+            output_dir=self.output_dir,
+            physical_budget=self.physical_budget,
+        )
+
+    @property
     def physical(self) -> dict[str, Any] | None:
-        """Admit physical evidence only when acquisition needs its geometry or costs."""
+        from .physical_capture import admitted_physical_calibration
 
-        # Physical samplers are optional; default prediction only loads sources.
-        from .physical_capture import captured_physical_declaration, platform_inputs
-
-        declared = admitted_physical_calibration(self.raw.get("physical_calibration"))
         if self.missing_base_workloads:
-            return declared
+            return admitted_physical_calibration(self.raw.get("physical_calibration"))
 
-        return admitted_physical_calibration(captured_physical_declaration(self)) or declared or platform_inputs(self)
+        return self.sampling.physical
 
     @cached_property
     def controls(self) -> tuple[ControlMeasurement, ...]:
@@ -239,46 +218,14 @@ class GroupRequest:
     def token_plan(self, workload: str) -> Path | None:
         """Use an explicit bundle or the selected base's actual replay input."""
 
-        bundle = self.raw.get("forced_token_bundle")
-        if bundle:
-            return resolve_forced_token_bundle_plan(require_repo_path(bundle), workload)
-
         source = next((source for source in self.sources if source.input_id == workload), None)
         if source is None:
             return None
-        args = parse_workload_command(load_json(source.config_path).get("bench", {}).get("command"))
-        if args is None or args.forced_token_mode != "replay":
-            return None
 
-        path = require_repo_path(args.forced_token_plan)
-        if load_forced_token_plan(path).get("workload_id") != workload:
-            raise ValueError(f"base token plan belongs to another workload: {workload}")
-        return path
+        # Token replay inputs are needed by optional acquisition, not prediction.
+        from .profile_capture import profile_token_plan
 
-
-def admitted_physical_calibration(declaration: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Admit explicitly sourced hardware curves, never embedded runtime/control."""
-
-    if declaration is None:
-        return None
-    if not declaration.get("measurement_sources") or not declaration.get("measurement_description"):
-        raise ValueError("physical calibration requires original measurement sources and their scope")
-    for source in declaration["measurement_sources"]:
-        if not require_repo_path(source).is_file():
-            raise ValueError(f"physical calibration source is unavailable: {source}")
-    report = load_json(require_repo_path(declaration["report"]))
-    for field in ("target_workload_trace_used", "target_e2e_used"):
-        if report.get(field) is not False:
-            raise ValueError(f"physical calibration must declare {field}=false before any cost projection")
-    # Presence of control/phase in an old bundle cannot silently grant permission
-    # to consume those labels. They are rebuilt from this group's observations.
-    admitted = {key: report[key] for key in ("kv_geometry", "service_models", "resource_lanes", "storage_batch_pages")}
-    admitted["measurement_scope"] = report.get("measurement_scope") or {}
-    admitted["measurement_sources"] = list(declaration["measurement_sources"])
-    admitted["measurement_description"] = str(declaration["measurement_description"])
-    for field in ("target_workload_trace_used", "target_e2e_used"):
-        admitted[field] = report[field]
-    return admitted
+        return profile_token_plan(source, self.raw.get("forced_token_bundle"))
 
 
 def _admit_controls(group: GroupRequest, measurements: tuple[ControlMeasurement, ...]) -> None:

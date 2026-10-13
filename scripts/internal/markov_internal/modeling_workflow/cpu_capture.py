@@ -10,12 +10,12 @@ from ..common.manifest import workload_report_path
 from ..common.paths import ROOT_DIR, require_repo_path, repo_relative_path
 from .calibration.light_capture import light_capture_config
 from .capture import (
+    ProfileBudget,
     pending_capture_reason,
     profile_usage,
     recorded_capture,
     run_profile_attempt,
 )
-from .group import ProfileBudget
 
 
 def capture_light_base(pair: dict, plan: dict, *, dry_run: bool = False) -> Path | None:

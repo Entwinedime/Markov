@@ -18,11 +18,12 @@ def run_workflow(options: WorkflowOptions) -> int:
 
     options.output_dir.mkdir(parents=True, exist_ok=True)
     runs = discover_profile_runs(options.source_manifests)
-    if set(options.cost_sources) & {source.run_id for source in runs} or set(options.cost_source_manifests) & {
-        source.manifest_path.resolve() for source in runs
-    }:
+    costs = options.cost_models
+    # Suite-local run labels are not database identities. Complete manifest
+    # provenance carries original captures, known aliases and paired inputs.
+    if set(costs.source_manifests) & {source.manifest_path.resolve() for source in runs}:
         raise ValueError("current base captures must be excluded from independently trained prediction costs")
-    if any(source_environment(source, options.source_resources) != options.cost_deployment for source in runs):
+    if any(source_environment(source, options.source_resources) != costs.deployment for source in runs):
         raise ValueError("database cost model does not apply to the selected source deployment")
 
     preflight_report = preflight_sources(options, runs)
@@ -40,8 +41,8 @@ def run_workflow(options: WorkflowOptions) -> int:
         "model_run_count": len(specs),
         "model_run_error_count": 0,
         "preflight_ready": preflight_report["ready"],
-        "cost_training_captures": list(options.cost_sources),
-        "cost_training_manifests": [str(repo_relative_path(path)) for path in options.cost_source_manifests],
+        "cost_training_captures": list(costs.source_captures),
+        "cost_training_manifests": [str(repo_relative_path(path)) for path in costs.source_manifests],
         "prediction": summarize(list(rows.values())),
     }
     report_path = options.output_dir / "workflow_summary.json"

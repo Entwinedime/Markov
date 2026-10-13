@@ -12,11 +12,10 @@ from ..common.io import load_json, write_json
 from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path, running_in_modeling_container
 from ..common.process import run_command
 from ..modeling.deployment import source_environment
-from .base_capture import capture_base
 from .capture import pending_group_capture
 from .context import DiagnosticLevel
 from .group import GroupRequest
-from .group_cpu_service import cpu_service_plan, prepare_group_cpu_service
+from .cpu_service import cpu_service_plan, prepare_cpu_services
 
 
 def _relative(path: Path) -> str:
@@ -24,8 +23,10 @@ def _relative(path: Path) -> str:
 
 
 def _predict(
-    group: GroupRequest, summary: dict[str, Any], *, jobs: int, diagnostics: str, experiment_reports: bool
-) -> None:
+    group: GroupRequest, cpu_service_files: list[str], *, jobs: int, diagnostics: str, experiment_reports: bool
+) -> dict[str, Any]:
+    """Run one attempt and return its outcome; never mutate preparation state."""
+
     output = group.output_dir / "predictions"
     command = [
         "--cost-model",
@@ -47,7 +48,7 @@ def _predict(
         command.extend(("--resource-environment", _relative(resource_path)))
     for source in group.sources:
         command.extend(("--source-manifest", _relative(source.manifest_path)))
-    for service in summary["cpu_service_files"]:
+    for service in cpu_service_files:
         command.extend(("--cpu-service-cost", service))
     for index, target in enumerate(group.targets):
         path = group.output_dir / "targets" / f"target_{index + 1}.json"
@@ -58,23 +59,46 @@ def _predict(
     report.unlink(missing_ok=True)
     # Each attempt replaces the previous result. A launch failure must not
     # reuse stale missing costs to trigger another round of acquisition.
-    summary.pop("prediction", None)
-    summary.pop("prediction_summary", None)
-    summary["predictions_completed"] = 0
-    summary["status"] = "predicting"
     started = time.monotonic()
     code = run_command([str(ROOT_DIR / "scripts/model.sh"), "predict", *command]).returncode
-    summary["prediction_return_code"] = code
-    summary["prediction_wall_seconds"] = time.monotonic() - started
+    outcome: dict[str, Any] = {
+        "status": "prediction_failed",
+        "prediction_return_code": code,
+        "prediction_wall_seconds": time.monotonic() - started,
+        "cost_model": group.raw["cost_model"],
+        "prediction": None,
+        "prediction_summary": None,
+        "predictions_completed": 0,
+    }
     if not report.is_file():
-        summary["status"] = "prediction_failed"
-        return
+        return outcome
 
-    result = load_json(report)["prediction"]
-    summary["prediction"] = {key: value for key, value in result.items() if key != "cells"}
-    summary["prediction_summary"] = _relative(report)
-    summary["predictions_completed"] = result["completed_count"]
-    summary["status"] = "predicted" if code == 0 and result["status"] == "EXECUTED" else "prediction_incomplete"
+    prediction = load_json(report)["prediction"]
+    # One readable group report contains the results and limitations. Detailed
+    # query provenance stays in the workflow report, not another full copy.
+    prediction["cells"] = [
+        {
+            key: row[key]
+            for key in (
+                "source_config_id",
+                "target_config",
+                "workload_id",
+                "status",
+                "http_e2e_us",
+                "cost_coverage",
+                "approximations",
+                "blockers",
+            )
+        }
+        for row in prediction["cells"]
+    ]
+    outcome.update(
+        prediction=prediction,
+        prediction_summary=_relative(report),
+        predictions_completed=prediction["completed_count"],
+        status="predicted" if code == 0 and prediction["status"] == "EXECUTED" else "prediction_incomplete",
+    )
+    return outcome
 
 
 def predict_group(
@@ -84,6 +108,7 @@ def predict_group(
     model_run_jobs: int,
     diagnostics: str,
     experiment_reports: bool = False,
+    database_refreshed: bool = False,
 ) -> None:
     """Predict directly; enter optional shared recovery only after a cost gap."""
 
@@ -91,12 +116,22 @@ def predict_group(
     while True:
         summary.pop("undeclared_operator_models", None)
         summary.pop("cost_corrections_required", None)
-        _predict(group, summary, jobs=model_run_jobs, diagnostics=diagnostics, experiment_reports=experiment_reports)
-        if summary.get("prediction", {}).get("structure_gaps"):
+        attempt = _predict(
+            group,
+            summary["cpu_service_files"],
+            jobs=model_run_jobs,
+            diagnostics=diagnostics,
+            experiment_reports=experiment_reports,
+        )
+        summary.update(attempt)
+        prediction = attempt["prediction"]
+        if prediction is None:
+            return
+        if prediction["structure_gaps"]:
             summary["status"] = "structure_corrections_required"
             return
 
-        needs = summary.get("prediction", {}).get("missing_costs", [])
+        needs = prediction["missing_costs"]
         if not needs or not group.raw.get("automatic_cost_acquisition", False):
             return
 
@@ -104,7 +139,7 @@ def predict_group(
             # Default prediction does not import capture planners or trainers.
             from .acquisition import CostAcquisition
 
-            acquisition = CostAcquisition(group)
+            acquisition = CostAcquisition(group, database_refreshed=database_refreshed)
 
         outcome = acquisition.advance(needs)
         summary["captures"].extend(outcome.pop("captures", []))
@@ -138,19 +173,24 @@ def prepare(
     path = group.output_dir / "group_summary.json"
     try:
         if group.missing_base_workloads:
+            # Existing sources do not need the capture planners.
+            from .profile_capture import capture_base
+
             result = capture_base(group, dry_run=dry_run)
             summary["base_plan"] = result
             if result["status"] != "base_captured":
-                summary["status"] = result["status"]
+                summary["status"] = "planned" if dry_run else result["status"]
                 return summary
             group = GroupRequest.load(group.path)
 
-        if not group.raw.get("cost_model") and not calibration_only:
+        database_inputs = bool(group.raw.get("cost_database") and group.raw.get("cost_training"))
+        if not group.raw.get("cost_model") and not database_inputs and not calibration_only:
             summary["status"] = "needs_independent_cost_model"
+            summary["stop_reason"] = "Provide cost_model, or cost_database and cost_training for offline preparation."
             return summary
         summary["base_manifests"] = [_relative(source.manifest_path) for source in group.sources]
-        summary["cpu_service"] = cpu_service_plan(group)
-        services = prepare_group_cpu_service(summary["cpu_service"], dry_run=dry_run)
+        summary["cpu_service"] = cpu_service_plan(group.sources, group.raw, group.output_dir)
+        services = prepare_cpu_services(summary["cpu_service"], dry_run=dry_run)
         summary["cpu_service_files"] = [_relative(value) for value in services]
         if summary["cpu_service"]["status"] not in {"prepared", "not_requested"}:
             summary["status"] = summary["cpu_service"]["status"]
@@ -160,12 +200,26 @@ def prepare(
             summary["status"] = "planned" if dry_run else "source_inputs_prepared"
             return summary
 
+        database_refreshed = not group.raw.get("cost_model")
+        if database_refreshed:
+            # Only an explicit database/training declaration selects this path.
+            # Existing packages stay the normal path and are never refitted.
+            from .cost_preparation import train_group_cost_model
+
+            trained = train_group_cost_model(group, load_json(require_repo_path(group.raw["cost_training"])))
+            if trained is None:
+                summary["status"] = "shared_training_incomplete"
+                return summary
+
+            group = trained
+
         predict_group(
             group,
             summary,
             model_run_jobs=model_run_jobs,
             diagnostics=diagnostics,
             experiment_reports=experiment_reports,
+            database_refreshed=database_refreshed,
         )
         return summary
     except BaseException as error:
@@ -206,6 +260,8 @@ def main(argv: list[str] | None = None) -> int:
         f"group={result['base_config']} status={result['status']} "
         f"predictions={result['predictions_completed']}/{result['prediction_count']}"
     )
+    if result.get("stop_reason"):
+        print(result["stop_reason"])
     print(f"report={_relative(group.output_dir / 'group_summary.json')}")
     return 0 if result["status"] in {"planned", "source_inputs_prepared", "predicted"} else 2
 

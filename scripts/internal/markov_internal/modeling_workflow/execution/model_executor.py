@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import concurrent.futures
+import json
+import subprocess
 from collections.abc import Iterator
 from itertools import product
 from pathlib import Path
@@ -10,7 +11,8 @@ from typing import TYPE_CHECKING, Any
 
 from ...common.io import load_json, write_json
 from ...common.naming import safe_slug
-from ...common.process import run_command
+from ...common.paths import ROOT_DIR
+from ...common.process import stop_process
 from ...modeling.backend import build_trace_graph_command
 from ...modeling.source_dag.profiles import ProfileRunRef
 from ..progress import StageProgress
@@ -86,99 +88,153 @@ def run_model_runs(options: WorkflowOptions, specs: list[ModelRunSpec]) -> Itera
 
 
 def _result_stream(options: WorkflowOptions, specs: list[ModelRunSpec]) -> Iterator[tuple[ModelRunResult, int]]:
-    """Use the same bounded scheduling and failure policy at any worker count."""
+    """Prepare each source once; native targets keep the bounded job policy.
 
-    max_workers = min(options.model_run_jobs, max(1, len(specs)))
-    remaining = iter(specs)
-    stop_scheduling = False
+    Sources are processed in plan order, not concurrently. Trace buffers and
+    lazy caches live only in this invocation; nothing is cached on disk.
+    """
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures: set[concurrent.futures.Future[ModelRunResult]] = set()
+    sources: dict[tuple[Path, Path | None], list[ModelRunSpec]] = {}
+    for spec in specs:
+        sources.setdefault((spec.source.manifest_path, spec.cpu_service_cost), []).append(spec)
 
-        def submit_next() -> bool:
-            try:
-                spec = next(remaining)
-            except StopIteration:
-                return False
-            futures.add(executor.submit(_run_one, options, spec))
-            return True
-
-        while len(futures) < max_workers and submit_next():
-            pass
-
-        while futures:
-            done, _ = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
-            futures.difference_update(done)
-            completed = [future.result() for future in done]
-            # Inspect the entire completed batch before replacing workers;
-            # set iteration order must not decide whether failures stop work.
-            if not options.continue_on_error and any(result.return_code != 0 for result in completed):
-                stop_scheduling = True
-
-            while not stop_scheduling and len(futures) < max_workers and submit_next():
-                pass
-
-            for result in completed:
-                yield result, len(futures)
+    for batch in sources.values():
+        failed = False
+        for result, inflight in _run_source(options, batch):
+            failed |= result.return_code != 0
+            yield result, inflight
+        if failed and not options.continue_on_error:
+            return
 
 
-def _run_one(options: WorkflowOptions, spec: ModelRunSpec) -> ModelRunResult:
-    log_path = spec.output_dir / "model.log"
-    if spec.skip_reason:
-        return ModelRunResult(spec, 0, skip_reason=spec.skip_reason)
+def _run_source(options: WorkflowOptions, specs: list[ModelRunSpec]) -> Iterator[tuple[ModelRunResult, int]]:
+    """Publish live per-target outcomes from one prepared-source process.
 
-    try:
+    Popen is needed here because the native backend streams completion records;
+    one-shot run_command cannot report progress while a batch is executing.
+    stop_process owns interruption cleanup for the entire process group.
+    """
+
+    ready = []
+    configs = []
+    for spec in specs:
+        if spec.skip_reason:
+            yield ModelRunResult(spec, 0, skip_reason=spec.skip_reason), 0
+            continue
+
         spec.output_dir.mkdir(parents=True, exist_ok=True)
-        if not options.dry_run:
-            log_path.unlink(missing_ok=True)
-
-        config = runner_config(spec, options)
-        model = hicache_model_config(
-            spec.target,
-            source_prefetch_policy=spec.source.hicache_config["prefetch_policy"],
-            source_target_same_config=spec.target.matches_source(spec.source),
-            io_model=options.hicache_io_model,
-        )
-        write_json(spec.output_dir / "cpp_model_config.json", model)
-        write_json(spec.output_dir / "runner_config.json", config.to_raw())
-        if options.dry_run:
-            return ModelRunResult(spec, 0, skip_reason="dry_run")
-
-        # The report belongs to this attempt. Do not use file timestamps to
-        # distinguish fresh failures from leftovers of an earlier command.
-        report = spec.output_dir / "run_summary.json"
-        # An application rerun may turn experimental outputs off. Remove the
-        # previous attempt's reports too, so disabled reports cannot appear
-        # to describe this execution. Raw profiles and other runs are untouched.
-        for name in ("run_summary.json", "model_summary.json", "source_replay_report.json", "structure_report.json"):
-            (spec.output_dir / name).unlink(missing_ok=True)
-        return_code = run_command(build_trace_graph_command(config), log_path=log_path).returncode
-        if return_code == 0:
-            if not options.diagnostics.keep_debug_artifacts:
-                log_path.unlink(missing_ok=True)
-        else:
-            truncate_log_tail(
-                log_path,
-                options.diagnostics.failure_log_max_bytes,
+        try:
+            config = runner_config(spec, options)
+            model = hicache_model_config(
+                spec.target,
+                source_prefetch_policy=spec.source.hicache_config["prefetch_policy"],
+                source_target_same_config=spec.target.matches_source(spec.source),
+                cost_models=options.cost_models,
             )
-        missing_costs = ()
-        structure_gaps = ()
-        if return_code != 0 and report.is_file():
+            write_json(spec.output_dir / "cpp_model_config.json", model)
+            write_json(spec.output_dir / "runner_config.json", config.to_raw())
+        except Exception as error:
+            (spec.output_dir / "model.log").write_text(f"model input preparation failed: {error}\n", encoding="utf-8")
+            yield ModelRunResult(spec, 1), 0
+            if not options.continue_on_error:
+                return
+            continue
+        if options.dry_run:
+            yield ModelRunResult(spec, 0, skip_reason="dry_run"), 0
+            continue
+
+        # Every output belongs to this attempt, including previously enabled
+        # experimental reports. No old file can turn failure into success.
+        for name in (
+            "model.log",
+            "run_summary.json",
+            "model_summary.json",
+            "source_replay_report.json",
+            "structure_report.json",
+        ):
+            (spec.output_dir / name).unlink(missing_ok=True)
+        ready.append(spec)
+        configs.append(config)
+
+    if not ready:
+        return
+
+    plan_path = ready[0].output_dir / "target_plan.json"
+    write_json(
+        plan_path,
+        {
+            "jobs": options.model_run_jobs,
+            "continue_on_error": options.continue_on_error,
+            "runs": [
+                {"output_dir": str(config.output_dir), "model_config": str(config.model_config_path)}
+                for config in configs
+            ],
+        },
+    )
+    batch_log = ready[0].output_dir / "source_preparation.log"
+    completed = set()
+    process = None
+    return_code = 1
+    try:
+        with batch_log.open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                build_trace_graph_command(configs[0], target_plan=plan_path),
+                cwd=ROOT_DIR,
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+                start_new_session=True,
+            )
+            for line in process.stdout:
+                outcome = json.loads(line)
+                index = outcome["index"]
+                result = _finish_result(options, ready[index], outcome["return_code"], outcome["skip_reason"])
+                completed.add(index)
+                yield result, outcome["inflight"]
+            return_code = process.wait()
+    except Exception as error:
+        with batch_log.open("a", encoding="utf-8") as log:
+            log.write(f"\nnative prediction batch failed: {error}\n")
+    finally:
+        stop_process(process)
+        if process is not None and process.stdout is not None:
+            process.stdout.close()
+
+    # Source preparation/process failure has no target result. Preserve its
+    # cause for all affected cells rather than reading leftovers or filling 0.
+    truncate_log_tail(batch_log, options.diagnostics.failure_log_max_bytes)
+    for index, spec in enumerate(ready):
+        if index not in completed:
+            detail = batch_log.read_text(encoding="utf-8") or "native target completion record missing"
+            (spec.output_dir / "model.log").write_text(detail, encoding="utf-8")
+            yield _finish_result(options, spec, return_code or 1), 0
+    if not options.diagnostics.keep_debug_artifacts and return_code == 0:
+        batch_log.unlink(missing_ok=True)
+    else:
+        truncate_log_tail(batch_log, options.diagnostics.failure_log_max_bytes)
+
+
+def _finish_result(
+    options: WorkflowOptions, spec: ModelRunSpec, return_code: int, skip_reason: str = ""
+) -> ModelRunResult:
+    """Read only failed current reports; successful summaries belong to read_row."""
+
+    log = spec.output_dir / "model.log"
+    missing_costs = ()
+    structure_gaps = ()
+    if return_code != 0:
+        truncate_log_tail(log, options.diagnostics.failure_log_max_bytes)
+        report = spec.output_dir / "run_summary.json"
+        if report.is_file():
             failure = load_json(report)
             if failure.get("status") == "data_limitation":
                 missing_costs = tuple(failure["missing_costs"])
             elif failure.get("status") == "structure_limitation":
                 structure_gaps = tuple(failure["structure_gaps"])
-        return ModelRunResult(spec, return_code, missing_costs=missing_costs, structure_gaps=structure_gaps)
-    except Exception as error:
-        # Keep subprocess diagnostics if reading its report failed.
-        with log_path.open("a", encoding="utf-8") as log_file:
-            log_file.write(f"\ninternal model runner error: {error}\n")
-        truncate_log_tail(
-            log_path,
-            options.diagnostics.failure_log_max_bytes,
-        )
-        return ModelRunResult(spec, 1)
+    elif not options.diagnostics.keep_debug_artifacts:
+        log.unlink(missing_ok=True)
+
+    return ModelRunResult(spec, return_code, skip_reason, missing_costs, structure_gaps)
 
 
 def truncate_log_tail(path: Path, limit: int) -> None:

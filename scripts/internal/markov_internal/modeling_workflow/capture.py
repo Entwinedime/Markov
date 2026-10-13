@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
@@ -24,6 +25,48 @@ if TYPE_CHECKING:
 # Leave time for the named container and its host client to stop after timeout.
 CAPTURE_CLEANUP_RESERVE_SEC = 30
 CONTROL_CAPTURE_STAGES = ("token_plan_capture", "profiled_replay", "light_replay")
+
+
+@dataclass(frozen=True)
+class AcquisitionBudget:
+    """Cumulative limits, including startup, failed attempts and cleanup time."""
+
+    wall_seconds: float
+
+    def available_for(self, usage: dict[str, Any], **increments: int) -> tuple[float, list[str]]:
+        remaining = self.wall_seconds - usage["wall_seconds"]
+        limits = [key for key, count in increments.items() if usage[key] + count > getattr(self, key)]
+        if remaining <= CAPTURE_CLEANUP_RESERVE_SEC:
+            limits.append("wall_seconds")
+
+        return remaining, limits
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> AcquisitionBudget:
+        budget = cls(**raw)
+        if any(not isinstance(value, (int, float)) or not 0 <= value < float("inf") for value in vars(budget).values()):
+            raise ValueError("calibration budgets must be finite and non-negative")
+        if any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for key, value in vars(budget).items()
+            if key != "wall_seconds"
+        ):
+            raise ValueError("calibration counts must be integers")
+
+        return budget
+
+
+@dataclass(frozen=True)
+class ProfileBudget(AcquisitionBudget):
+    server_starts: int
+    requests: int
+    tokens: int
+
+
+@dataclass(frozen=True)
+class PhysicalBudget(AcquisitionBudget):
+    container_starts: int
+    logical_io_bytes: int
 
 
 @contextmanager
@@ -133,6 +176,7 @@ def pending_capture_reason(attempts: list[dict[str, Any]], ledger_path: Path) ->
 def pending_group_capture(output_dir: Path) -> str | None:
     for name in (
         "base_capture_ledger.json",
+        "performance_capture_ledger.json",
         "capture_ledger.json",
         "physical_capture_ledger.json",
         "cpu_captures/capture_ledger.json",

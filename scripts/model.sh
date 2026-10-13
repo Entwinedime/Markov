@@ -12,18 +12,27 @@ cd "$ROOT_DIR"
 usage() {
     cat >&2 <<'EOF'
 Main workflow:
+  scripts/model.sh prepare-costs --request <performance_request.json> [--dry-run]
   scripts/model.sh prepare-hicache --group <group_request.json> [--dry-run]
   scripts/model.sh build-dag (--profile-manifest <manifest> --output-dir <dir> | --config <runner_config.json>)
   scripts/model.sh evaluate --prediction-dir <completed-output> --profile-run-dir <target-suite> --output-dir <score-output>
 
 Start with prepare-hicache for one base and a group of targets. It coordinates
-base inputs, an independently trained cost package and prediction. Evaluation
-is separate: target measurements are not required to make predictions.
+base acquisition, independent costs and prediction. A profile_suite can be an
+ordinary config declaring the model, base and workload; no matrix is required.
+Existing base_manifests are a reuse option. Provide an existing cost_model,
+or cost_database and cost_training to prepare one offline from existing data.
+New packages stay in the group's output; shared input packages are not replaced.
+Evaluation is separate: target measurements are not required for prediction.
+prepare-costs maintains independent measurements and models without a target
+group. It captures declared sampling workloads, imports facts and trains a
+reusable package; all new captures remain explicitly budgeted and serial.
 Use --dry-run to inspect the plan without starting an inference server.
 
 Individual stages and diagnostics:
   scripts/model.sh cost-db import --database <database.sqlite> --profile-manifest <history-manifest> --output-dir <import-output>
   scripts/model.sh cost-db train --database <database.sqlite> --request <training-request.json> --output <cost-package.json>
+  scripts/model.sh cost-db migrate --database <previous-database.sqlite> --output <new-database.sqlite> --summary <migration.json>
   scripts/model.sh predict --source-manifest <manifest> --target-config <config> --cost-model <cost-package.json> --output-dir <prediction-output>
   scripts/model.sh evaluate --prediction-dir <prediction-output> --target-profile-manifest <score-manifest> --output-dir <score-output>
   scripts/model.sh prepare-cpu-service --light-manifest <manifest> --profile-manifest <manifest> --tp-size <n> --output-dir <dir>
@@ -33,7 +42,9 @@ Individual stages and diagnostics:
 Missing base captures need base_capture_budget. Missing physical measurements
 need a budgeted physical_capture request with explicit page_token_sizes.
 Without the required budget/input, preparation reports the missing work instead
-of starting an unbounded capture. --calibration-only stops before prediction.
+of starting an unbounded capture. An empty database does not provide all costs;
+independent measurements and model definitions remain necessary.
+--calibration-only stops before prediction.
 
 prepare-hicache coordinates containers from the host. Device calibration uses
 SGLang; DAG construction and prediction use modeling. Prediction cells share
@@ -81,6 +92,9 @@ case "$action:$calibration_kind" in
         ;;
     prepare-hicache:)
         exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.prepare "$@"
+        ;;
+    prepare-costs:)
+        exec env PYTHONPATH=scripts/internal python3 -m markov_internal.modeling_workflow.performance "$@"
         ;;
     build-dag:)
         module=modeling.source_dag.cli

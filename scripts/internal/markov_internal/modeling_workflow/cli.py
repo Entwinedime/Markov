@@ -8,8 +8,7 @@ from pathlib import Path
 from ..common.commands import positive_int
 from ..common.io import load_json
 from ..common.paths import require_repo_path
-from ..modeling.cost.hicache import HiCacheIoModel
-from ..modeling.deployment import require_cost_environment
+from ..modeling.cost.hicache import HiCacheCostModels
 from ..modeling.source_dag.profiles import cpu_service_inputs
 from .context import DiagnosticLevel, WorkflowOptions
 from .types import TargetHiCacheConfig
@@ -85,19 +84,16 @@ def main(argv: list[str] | None = None) -> int:
         "--model-run-jobs",
         type=positive_int,
         default=1,
-        help="Maximum model-run subprocesses to execute concurrently.",
+        help="Maximum concurrent target executions per prepared source; source groups run in sequence.",
     )
     args = parser.parse_args(argv)
-    trained = load_json(require_repo_path(args.cost_model))
-    require_cost_environment(trained["deployment"])
+    cost_models = HiCacheCostModels.from_raw(load_json(require_repo_path(args.cost_model)))
     sources = tuple(require_repo_path(path).resolve() for path in args.source_manifest)
     output = (
         require_repo_path(args.output_dir)
         if args.output_dir
         else require_repo_path(args.source_manifest[0]).parent / "modeling" / "hicache_prediction"
     )
-    numerical = {**trained["hicache"], "operator_models": trained["operator_models"]}
-    io_model = HiCacheIoModel.from_raw(numerical)
     targets = tuple(TargetHiCacheConfig.load(path) for path in args.target_config)
     if len({target.label for target in targets}) != len(targets):
         raise ValueError("target config names must be unique within one prediction request")
@@ -113,10 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         trace_threads=args.trace_threads,
         trace_file_threads=args.trace_file_threads,
         model_run_jobs=args.model_run_jobs,
-        hicache_io_model=io_model,
-        cost_deployment=trained["deployment"],
-        cost_sources=tuple(trained["training_sources"]),
-        cost_source_manifests=tuple(require_repo_path(path).resolve() for path in trained["training_source_manifests"]),
+        cost_models=cost_models,
         source_resources=load_json(require_repo_path(args.resource_environment)) if args.resource_environment else None,
         experiment_reports=args.experiment_reports,
     )

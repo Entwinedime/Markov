@@ -123,7 +123,7 @@ def parse_args(argv: list[str] | None = None) -> CalibrationOptions:
         "--base-report",
         type=Path,
         required=True,
-        help="retain unrelated services from this independent physical report",
+        help="retain geometry and measurement sources from this independent physical report",
     )
     parser.add_argument("--service", choices=("prefetch", "existing_write", "new_write"), required=True)
     return CalibrationOptions(**vars(parser.parse_args(argv)))

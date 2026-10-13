@@ -1,33 +1,76 @@
-"""Group physical bootstrap: deployed-TP DMA and storage, with a separate budget."""
+"""Target-independent deployed-TP DMA and storage sampling with a separate budget."""
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 import ast
+from functools import cached_property
 import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable
 
 from ..common.io import load_json, write_json
 from ..common.commands import nonnegative_int, positive_int
 from ..common.paths import ROOT_DIR, repo_relative_path, require_repo_path
 from ..contracts.forced_token.plan import load_forced_token_plan
 from .calibration.options import format_cpu_set, parse_cpu_sets, parse_integer_csv
-from .calibration.runtime_anchors import DMA_SERVICES, load_runtime_service_models
+from ..modeling.cost.io_contract import DMA_SERVICES
+from ..modeling.cost.physical import read_physical_measurements
 from .calibration.prefetch_service import prefetch_experiments, prefetch_io_bytes
-from .capture import pending_group_capture, recorded_capture, run_container_attempt
+from .profile_capture import profile_token_plan
+from .capture import PhysicalBudget, pending_group_capture, recorded_capture, run_container_attempt
 from .physical_calibration import derive_kv_geometry
-from ..modeling.source_dag.profiles import parse_server_command_flags
+from ..modeling.source_dag.profiles import ProfileRunRef, parse_server_command_flags
 from .runtime_dma_calibration import build_operation_plan
-from ..modeling.cost.io_validation import required_prefetch_stages
-
-if TYPE_CHECKING:
-    from .group import GroupRequest
 
 
-def physical_attempts(group: GroupRequest) -> list[dict[str, Any]]:
+@dataclass(frozen=True)
+class PhysicalCaptureInputs:
+    """Sampling deployment and domain; contains no targets or prediction state."""
+
+    capture: dict[str, Any]
+    calibration: dict[str, Any] | None
+    resources: dict[str, str] | None
+    forced_token_bundle: str | None
+    sources: tuple[ProfileRunRef, ...]
+    output_dir: Path
+    physical_budget: PhysicalBudget | None
+
+    @cached_property
+    def physical(self) -> dict[str, Any] | None:
+        declared = admitted_physical_calibration(self.calibration)
+        return admitted_physical_calibration(captured_physical_declaration(self)) or declared or platform_inputs(self)
+
+
+def admitted_physical_calibration(declaration: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Admit raw measurement sources and geometry; fitting belongs to the cost layer."""
+
+    if declaration is None:
+        return None
+    if not declaration.get("measurement_sources") or not declaration.get("measurement_description"):
+        raise ValueError("physical calibration requires original measurement sources and their scope")
+    for source in declaration["measurement_sources"]:
+        if not require_repo_path(source).is_file():
+            raise ValueError(f"physical calibration source is unavailable: {source}")
+
+    report = load_json(require_repo_path(declaration["report"]))
+    for field in ("target_workload_trace_used", "target_e2e_used"):
+        if report.get(field) is not False:
+            raise ValueError(f"physical calibration must declare {field}=false before any cost projection")
+
+    admitted = {key: report[key] for key in ("kv_geometry", "resource_lanes", "storage_batch_pages")}
+    admitted["measurement_scope"] = report.get("measurement_scope") or {}
+    admitted["measurement_sources"] = list(declaration["measurement_sources"])
+    admitted["measurement_description"] = str(declaration["measurement_description"])
+    for field in ("target_workload_trace_used", "target_e2e_used"):
+        admitted[field] = report[field]
+
+    return admitted
+
+
+def physical_attempts(group: PhysicalCaptureInputs) -> list[dict[str, Any]]:
     path = group.output_dir / "physical_capture_ledger.json"
     return load_json(path)["attempts"] if path.exists() else []
 
@@ -51,14 +94,14 @@ def storage_batch_pages() -> int:
     raise ValueError("SGLang storage batch size is not statically declared; cannot reserve prefetch bytes")
 
 
-def physical_context(group: GroupRequest) -> dict[str, Any]:
+def physical_context(group: PhysicalCaptureInputs) -> dict[str, Any]:
     """Admission uses workspace inputs; modeling need not mount model metadata/weights."""
     from ..modeling.deployment import source_environment
 
     return {
-        "sampling": _io_sampling(group.raw.get("physical_capture") or {}),
-        "existing_physical": group.raw.get("physical_calibration"),
-        "environment": source_environment(group.sources[0], group.raw.get("resource_environment")),
+        "sampling": _io_sampling(group.capture),
+        "existing_physical": group.calibration,
+        "environment": source_environment(group.sources[0], group.resources),
         "page_token_sizes": _declared_page_sizes(group),
     }
 
@@ -68,7 +111,7 @@ def _io_sampling(spec: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in spec.items() if key not in {"budget", "eviction_cpu"}}
 
 
-def platform_inputs(group: GroupRequest) -> dict[str, Any] | None:
+def platform_inputs(group: PhysicalCaptureInputs) -> dict[str, Any] | None:
     """Derive deployment metadata when needed; no saved state or timing samples.
 
     Unsupported or unavailable model metadata returns None. Sampling placement
@@ -83,7 +126,6 @@ def platform_inputs(group: GroupRequest) -> dict[str, Any] | None:
         kv_geometry=definition["geometry"],
         storage_batch_pages=definition["storage_batch_pages"],
         resource_lanes={"storage_read": "scope", "storage_write": "scope"},
-        service_models={},
         measurement_sources=[],
         measurement_description="Deployment metadata only; no service cost has been measured",
         measurement_scope=dict(
@@ -95,10 +137,10 @@ def platform_inputs(group: GroupRequest) -> dict[str, Any] | None:
     )
 
 
-def _declared_page_sizes(group: GroupRequest) -> list[int]:
+def _declared_page_sizes(group: PhysicalCaptureInputs) -> list[int]:
     """Return the platform sampling domain without consulting prediction targets."""
 
-    value = (group.raw.get("physical_capture") or {}).get("page_token_sizes")
+    value = group.capture.get("page_token_sizes")
     if not isinstance(value, list) or not value:
         raise ValueError("physical_capture.page_token_sizes must declare a target-independent platform domain")
     pages = sorted({positive_int(str(page)) for page in value})
@@ -131,10 +173,10 @@ def deployment_cpu_sets(flags: dict[str, str], devices: list[int], explicit: str
 
 
 def physical_definition(
-    group: GroupRequest, *, service: str, directions: tuple[str, ...] = tuple(DMA_SERVICES)
+    group: PhysicalCaptureInputs, *, service: str, directions: tuple[str, ...] = tuple(DMA_SERVICES)
 ) -> dict[str, Any]:
     """Use deployment geometry, declared page paths and base inputs, never target labels."""
-    spec = group.raw.get("physical_capture") or {}
+    spec = group.capture
     if set(spec) - {
         "budget",
         "devices",
@@ -227,7 +269,7 @@ def physical_definition(
         return definition
 
     quantum = math.lcm(*page_bytes)
-    token_plans = [group.token_plan(workload) for workload in group.workload_ids]
+    token_plans = [profile_token_plan(source, group.forced_token_bundle) for source in group.sources]
     max_tokens = max(
         [
             len(row["origin_input_ids"])
@@ -324,10 +366,10 @@ def _completed(attempts: list[dict[str, Any]], definition: dict[str, Any], stage
     )
 
 
-def captured_physical_declaration(group: GroupRequest) -> dict[str, Any] | None:
+def captured_physical_declaration(group: PhysicalCaptureInputs) -> dict[str, Any] | None:
     # Without a sampling declaration, only explicitly supplied measurements
     # apply. Deployment metadata is derived separately and is not evidence.
-    if not (group.raw.get("physical_capture") or {}).get("page_token_sizes"):
+    if not group.capture.get("page_token_sizes"):
         return None
 
     context = None
@@ -412,11 +454,8 @@ SERVICE_SAMPLERS = {
 }
 
 
-def capture_physical(group: GroupRequest, *, dry_run: bool, required_components: set[str]) -> dict[str, Any]:
+def capture_physical(group: PhysicalCaptureInputs, *, dry_run: bool, required_components: set[str]) -> dict[str, Any]:
     """Acquire requested services serially, preserving each completed supplement."""
-    # Group loading reads capture declarations; import only on the execution path.
-    from .group import GroupRequest
-
     attempts = physical_attempts(group)
     plan = {
         "status": "needs_physical_calibration",
@@ -434,7 +473,7 @@ def capture_physical(group: GroupRequest, *, dry_run: bool, required_components:
     if unsupported:
         return dict(plan, stop_reason="service_sampler_unavailable", requirements=sorted(unsupported))
 
-    if "page_token_sizes" not in (group.raw.get("physical_capture") or {}):
+    if "page_token_sizes" not in group.capture:
         return dict(
             plan,
             stop_reason="physical_capture_declaration_required",
@@ -471,7 +510,7 @@ def capture_physical(group: GroupRequest, *, dry_run: bool, required_components:
         )
         # Each sampler extends the preceding report, never the original snapshot.
         if len(completed_components) < len(required_components):
-            group = GroupRequest.load(group.path)
+            group = replace(group)
 
     if budget_denied is not None:
         budget_denied["physical_capture_usage"] = result["physical_capture_usage"]
@@ -480,7 +519,7 @@ def capture_physical(group: GroupRequest, *, dry_run: bool, required_components:
 
 
 def _capture_physical_service(
-    group: GroupRequest, supplement: str, *, directions: tuple[str, ...], dry_run: bool
+    group: PhysicalCaptureInputs, supplement: str, *, directions: tuple[str, ...], dry_run: bool
 ) -> dict[str, Any]:
     attempts = physical_attempts(group)
     definition = physical_definition(group, service=supplement, directions=directions)
@@ -488,7 +527,7 @@ def _capture_physical_service(
     if definition["limitations"]:
         plan["stop_reason"] = "physical_sampler_limitations"
         return plan
-    declaration = captured_physical_declaration(group) or group.raw.get("physical_calibration")
+    declaration = captured_physical_declaration(group) or group.calibration
     if declaration is None:
         # The sampler accepts a file input. Write the current metadata here,
         # only for an actual I/O demand; never recover it as reusable state.
@@ -529,30 +568,11 @@ def _capture_physical_service(
         if observed.get("target_workload_trace_used") is not False or observed.get("target_e2e_used") is not False:
             raise ValueError("physical capture did not produce an independent primitive report")
 
+        # Admission checks measurements, not whether they fit a chosen model.
+        # Reports retain earlier sources; this attempt owns only its new file.
+        read_physical_measurements(observed, definition["input_context"]["environment"])
         if supplement == "dma":
-            dma_path = report.parent / "runtime_dma_calibration.json"
-            load_runtime_service_models(
-                dma_path,
-                expected_kv_bytes_per_token_per_rank=definition["geometry"]["kv_bytes_per_token_per_rank"],
-                expected_page_bytes=[
-                    page * definition["geometry"]["kv_bytes_per_token_per_rank"]
-                    for page in definition["page_token_sizes"]
-                ],
-                expected_concurrent_scope_count=len(definition["devices"]),
-                directions=tuple(definition["directions"]),
-            )
-            return len(load_json(dma_path)["samples"])
-
-        if supplement == "prefetch":
-            required_prefetch_stages(observed["service_models"]["prefetch"]["stages"])
-        changed = "prefetch" if supplement == "prefetch" else "write_host_to_storage"
-        if any(
-            observed["service_models"][kind] != value
-            for kind, value in group.physical["service_models"].items()
-            if kind != changed
-        ):
-            raise ValueError("Partial service capture changed unrelated service costs")
-
+            return len(load_json(report.parent / "runtime_dma_calibration.json")["samples"])
         samples = load_json(report.parent / "physical_observations.json")
         return len(
             samples["prefetch_service_observations"] if supplement == "prefetch" else samples["host_storage"]["samples"]
@@ -573,7 +593,16 @@ def _capture_physical_service(
     return plan
 
 
-def run_primitive_attempt(group, definition, stage, command_for_output, report_name, validate, *, environment=None):
+def run_primitive_attempt(
+    group: PhysicalCaptureInputs,
+    definition: dict[str, Any],
+    stage: str,
+    command_for_output: Callable[[Path], list[str]],
+    report_name: str,
+    validate: Callable[[Path], int],
+    *,
+    environment: dict[str, str] | None = None,
+) -> dict[str, Any]:
     """One budget and durable ledger for physical and CPU primitive measurements."""
     attempts = physical_attempts(group)
     if reason := pending_group_capture(group.output_dir):

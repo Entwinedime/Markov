@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ...modeling.run_config import ModelingOutputs, ModelingRunConfig
-from ...modeling.cost.hicache import HiCacheIoModel
+from ...modeling.cost.hicache import HiCacheCostModels
 from ..types import ModelRunSpec, TargetHiCacheConfig
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ def hicache_model_config(
     *,
     source_prefetch_policy: str,
     source_target_same_config: bool,
-    io_model: HiCacheIoModel,
+    cost_models: HiCacheCostModels,
 ) -> dict[str, Any]:
     """Build the narrow C++ HiCache config."""
 
@@ -52,7 +52,7 @@ def hicache_model_config(
     hicache_config = {
         "enabled": True,
         **target.fields,
-        **io_model.narrow_config(target.fields["page_size"]),
+        **cost_models.execution_costs(target.fields["page_size"]),
     }
     hicache_config["dag_patch"] = {
         "enabled": True,
