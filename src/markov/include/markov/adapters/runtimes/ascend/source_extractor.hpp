@@ -53,6 +53,7 @@ private:
 
     void extract_cpu_control();
     void extract_worker_cpu();
+    void bind_worker_cpu(const nlohmann::json & intervals, const nlohmann::json & flows);
     void observe_cpu_control(std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::size_t owner, std::optional<std::size_t> source_interval,
                              SourceCpuPart part, std::optional<std::size_t> recorded_scope = std::nullopt);
 

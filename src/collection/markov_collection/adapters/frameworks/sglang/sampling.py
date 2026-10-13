@@ -14,6 +14,7 @@ from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
+from markov_collection.adapters.runtimes.ascend.worker_units import CpuWorkerUnits
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.artifacts.sampling_domain import SamplingDomain
 from markov_collection.instrumentation.session import CaptureSession
@@ -92,6 +93,9 @@ class NativeSampling(CaptureSession):
             return
 
         samples = sorted((self.directory / "cpu_samples").glob("*.jsonl"))
+        workers = sorted((self.directory / "cpu_workers").glob("*.jsonl"))
+        worker_units = self.directory / "cpu_worker_units.json"
+        worker_coverage = CpuWorkerUnits(samples, workers).publish(worker_units)
         warmup_coverage, completion_coverage = self._cpu_coverage(samples)
         gaps = [
             {"kind": "cost", "reason": "non_runtime_wait_cpu_not_classified"},
@@ -113,6 +117,25 @@ class NativeSampling(CaptureSession):
                 "environment": "native_environment.json",
                 "completions": "measurement_completions.json",
                 "cpu_samples": [str(path.relative_to(self.directory)) for path in samples],
+                "cpu_units": [
+                    str(path.relative_to(self.directory))
+                    for path in sorted((self.directory / "cpu_units").glob("*.jsonl"))
+                ],
+                "cpu_workers": [str(path.relative_to(self.directory)) for path in workers],
+                "cpu_worker_units": worker_units.name,
+                "cpu_worker_coverage": worker_coverage,
+                "cpu_worker_readiness": "needs_data",
+                "cpu_worker_gaps": [
+                    "runtime_submission_semantics_not_qualified",
+                    "unmeasured_observation_boundary_overhead",
+                    "target_operation_matching_not_implemented",
+                ],
+                "cpu_unit_boundary": "complete native call; phase samples remain inclusive of this work",
+                "cpu_unit_readiness": "needs_data",
+                "cpu_unit_gaps": [
+                    "call_and_clock_boundary_overhead_not_qualified",
+                    "independent_cost_validation_missing",
+                ],
                 "worker_environments": [
                     str(path.relative_to(self.directory))
                     for path in sorted((self.directory / "cpu_samples").glob("*-environment.json"))

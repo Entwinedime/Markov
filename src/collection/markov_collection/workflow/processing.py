@@ -33,39 +33,51 @@ class CaptureProcessing:
             except FileNotFoundError:
                 pass  # A stopped processor has not published a completed result.
 
-            if self.role in {"base", "validation"}:
-                manifest = ServingNormalizer(self.capture, self.role).extract()
-                with manifest.open(encoding="utf-8") as stream:
-                    information = json.load(stream)
-                if self.role == "validation":
-                    result = {"validation_manifest": str(manifest), "readiness": information["readiness"]}
-                elif information["framework"] == "sglang":
-                    extraction = subprocess.run(
-                        [str(self.root / "build/markov/markov"), "extract", "--base-manifest", str(manifest)],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    result = json.loads(extraction.stdout)
-                else:
-                    result = {"base_manifest": str(manifest), "readiness": information["readiness"]}
-            else:
-                with (self.directory / "prepared_input.json").open(encoding="utf-8") as stream:
-                    prepared = json.load(stream)
+            failure = self.directory / "processing_failure.json"
+            failure.unlink(missing_ok=True)
+            try:
+                result = self._process()
+            except Exception as error:
+                # Only the processor can declare its work terminal. Host command
+                # failures and interrupts do not manufacture this record.
+                write_json(failure, {"role": self.role, "error_type": type(error).__name__, "message": str(error)})
+                raise
 
-                normalizer = (
-                    CollectiveCostNormalizer(self.capture)
-                    if prepared["measurement_kind"] == "communication"
-                    else DeviceCostNormalizer(self.capture)
-                )
-                manifest = normalizer.extract()
-                with manifest.open(encoding="utf-8") as stream:
-                    information = json.load(stream)
-                result = {"performance_manifest": str(manifest), "readiness": information["readiness"]}
-
-            # Publish the resumable result only after normalization and extraction finish.
             write_json(self.directory / "processing_result.json", result)
             return result
+
+    def _process(self) -> dict[str, Any]:
+        if self.role in {"base", "validation"}:
+            manifest = ServingNormalizer(self.capture, self.role).extract()
+            with manifest.open(encoding="utf-8") as stream:
+                information = json.load(stream)
+            if self.role == "validation":
+                result = {"validation_manifest": str(manifest), "readiness": information["readiness"]}
+            elif information["framework"] == "sglang":
+                extraction = subprocess.run(
+                    [str(self.root / "build/markov/markov"), "extract", "--base-manifest", str(manifest)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                result = json.loads(extraction.stdout)
+            else:
+                result = {"base_manifest": str(manifest), "readiness": information["readiness"]}
+        else:
+            with (self.directory / "prepared_input.json").open(encoding="utf-8") as stream:
+                prepared = json.load(stream)
+
+            normalizer = (
+                CollectiveCostNormalizer(self.capture)
+                if prepared["measurement_kind"] == "communication"
+                else DeviceCostNormalizer(self.capture)
+            )
+            manifest = normalizer.extract()
+            with manifest.open(encoding="utf-8") as stream:
+                information = json.load(stream)
+            result = {"performance_manifest": str(manifest), "readiness": information["readiness"]}
+
+        return result
 
 
 def main() -> None:

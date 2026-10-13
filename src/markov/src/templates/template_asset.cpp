@@ -414,7 +414,13 @@ private:
     }
 
     Json write(const BatchOperationVariant & value) const {
-        return record(value.role, value.source_requests, value.minimum_requests, value.maximum_requests, value.page_table, value.page_size_tokens);
+        return record(value.role,
+                      value.source_requests,
+                      value.minimum_requests,
+                      value.maximum_requests,
+                      value.page_table,
+                      value.page_size_tokens,
+                      value.request_pool_rebindable);
     }
     BatchOperationVariant read(const Json & data, std::type_identity<BatchOperationVariant>) const {
         return { read<BatchOperationRole>(data.at(0)),
@@ -422,7 +428,8 @@ private:
                  read<std::uint64_t>(data.at(2)),
                  read<std::uint64_t>(data.at(3)),
                  read<std::optional<PageTableMaterialization>>(data.at(4)),
-                 read<std::uint32_t>(data.at(5)) };
+                 read<std::uint32_t>(data.at(5)),
+                 read<bool>(data.at(6)) };
     }
 
     Json write(const BatchRowParameter & value) const { return record(value.output, value.slot, value.extent); }
@@ -794,15 +801,22 @@ private:
                  read<std::vector<std::optional<std::size_t>>>(data.at(3)) };
     }
 
+    Json write(const SourceCpuWork & value) const { return record(value.operation, value.part, value.submission); }
+    SourceCpuWork read(const Json & data, std::type_identity<SourceCpuWork>) const {
+        return { read<std::string>(data.at(0)), read<CpuSubmissionPart>(data.at(1)), read<SourceSpanId>(data.at(2)) };
+    }
+
     Json write(const TemplateNodeObservation & value) const {
-        return record(value.source_span, value.kernel, value.source_scope, value.communication, value.transfer);
+        return record(value.source_span, value.kernel, value.source_scope, value.communication, value.transfer, value.control_part, value.cpu_work);
     }
     TemplateNodeObservation read(const Json & data, std::type_identity<TemplateNodeObservation>) const {
         return { read<SourceSpanId>(data.at(0)),
                  read<const SourceKernel *>(data.at(1)),
                  read<std::optional<std::size_t>>(data.at(2)),
                  read<const SourceCommunicationTask *>(data.at(3)),
-                 read<const SourceTransfer *>(data.at(4)) };
+                 read<const SourceTransfer *>(data.at(4)),
+                 read<std::optional<SourceCpuPart>>(data.at(5)),
+                 read<std::optional<SourceCpuWork>>(data.at(6)) };
     }
 
     Json write(const TemplateGraph & value) const {
@@ -1012,32 +1026,33 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
         for (const auto & member : members) definitions.push_back(write(member));
 
     return {
-        {            "manifest_path",          source.manifest_path.string() },
-        {           "templates_path",         source.templates_path.string() },
-        {               "model_path",                      source.model_path },
-        {            "configuration",                   source.configuration },
-        {                    "ranks",                           source.ranks },
-        {         "page_size_tokens",                source.page_size_tokens },
-        {               "deployment",               write(source.deployment) },
-        {               "resolution",                      source.resolution },
-        {               "source_gap",               write(source.source_gap) },
-        {       "initialization_gap",       write(source.initialization_gap) },
-        {          "workspace_pools",          write(source.workspace_pools) },
-        {    "workspace_binding_gap",    write(source.workspace_binding_gap) },
-        {         "admission_policy",         write(source.admission_policy) },
-        {                  "kernels",                  write(source.kernels) },
-        {                "transfers",                write(source.transfers) },
-        {              "model_rules",                 std::move(model_rules) },
-        {          "workspace_rules",             std::move(workspace_rules) },
-        {          "attention_rules",             std::move(attention_rules) },
-        {         "collective_rules",            std::move(collective_rules) },
-        {        "region_structures",                  std::move(structures) },
-        {              "definitions",                 std::move(definitions) },
-        {                     "gaps",                            source.gaps },
-        {      "request_pool_domain",      write(source.request_pool_domain) },
-        { "sequence_capacity_tokens", write(source.sequence_capacity_tokens) },
-        {               "transforms",                      source.transforms },
-        {                   "limits",                          source.limits }
+        {              "manifest_path",            source.manifest_path.string() },
+        {             "templates_path",           source.templates_path.string() },
+        {                 "model_path",                        source.model_path },
+        {              "configuration",                     source.configuration },
+        {                      "ranks",                             source.ranks },
+        {           "page_size_tokens",                  source.page_size_tokens },
+        {                 "deployment",                 write(source.deployment) },
+        {                 "resolution",                        source.resolution },
+        {                 "source_gap",                 write(source.source_gap) },
+        {         "initialization_gap",         write(source.initialization_gap) },
+        {            "workspace_pools",            write(source.workspace_pools) },
+        {      "workspace_binding_gap",      write(source.workspace_binding_gap) },
+        {           "admission_policy",           write(source.admission_policy) },
+        {                    "kernels",                    write(source.kernels) },
+        {                  "transfers",                  write(source.transfers) },
+        {                "model_rules",                   std::move(model_rules) },
+        {            "workspace_rules",               std::move(workspace_rules) },
+        {            "attention_rules",               std::move(attention_rules) },
+        {           "collective_rules",              std::move(collective_rules) },
+        {          "region_structures",                    std::move(structures) },
+        {                "definitions",                   std::move(definitions) },
+        {                       "gaps",                              source.gaps },
+        {        "request_pool_domain",        write(source.request_pool_domain) },
+        { "initialization_pool_domain", write(source.initialization_pool_domain) },
+        {   "sequence_capacity_tokens",   write(source.sequence_capacity_tokens) },
+        {                 "transforms",                        source.transforms },
+        {                     "limits",                            source.limits }
     };
 }
 
@@ -1089,6 +1104,7 @@ TemplateSource TemplateAssetCodec::decode(const Json & data) {
     result.workspace_binding_gap = read<std::optional<std::string>>(data.at("workspace_binding_gap"));
     result.gaps = data.at("gaps");
     result.request_pool_domain = read<RequestPoolCapacityDomain>(data.at("request_pool_domain"));
+    result.initialization_pool_domain = read<RequestPoolCapacityDomain>(data.at("initialization_pool_domain"));
     result.sequence_capacity_tokens = read<std::optional<std::uint32_t>>(data.at("sequence_capacity_tokens"));
     result.transforms = read<std::vector<std::string>>(data.at("transforms"));
     result.limits = read<std::vector<std::string>>(data.at("limits"));

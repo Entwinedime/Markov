@@ -16,6 +16,10 @@ from uuid import uuid4
 from markov_collection.artifacts.json_file import write_json
 
 
+class CaptureProcessingFailed(RuntimeError):
+    """A processor published a terminal failure for the recorded attempt."""
+
+
 class CollectionWorkflow:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -29,10 +33,17 @@ class CollectionWorkflow:
         ]
 
     def _host_path(self, path: str) -> Path:
-        return self.root / Path(path).relative_to("/workspace/trace-sim")
+        declared = Path(path)
+        if declared.is_relative_to("/workspace/trace-sim"):
+            return self.root / declared.relative_to("/workspace/trace-sim")
+        return declared
 
     def _container_path(self, path: Path) -> str:
-        return str(Path("/workspace/trace-sim") / path.relative_to(self.root))
+        if path.is_relative_to(self.root):
+            return str(Path("/workspace/trace-sim") / path.relative_to(self.root))
+        # External declared inputs retain their absolute path. The consuming
+        # operation mounts each required file explicitly, with its own access mode.
+        return str(path)
 
     def _save(self, path: Path, value: Any) -> None:
         write_json(path, value)
@@ -246,8 +257,20 @@ class CollectionWorkflow:
             self._save(directory / "run.json", state)
             try:
                 code = process.wait(timeout=remaining_ns / 1_000_000_000)
-                if code != 0 and self._container_state(container) is None:
-                    self._finish_attempt(state, "failed", code, time.perf_counter_ns() - started_ns, time.time_ns())
+                launch_result = {
+                    "return_code": code,
+                    "elapsed_wall_time_ns": time.perf_counter_ns() - started_ns,
+                    "ended_at_ns": time.time_ns(),
+                }
+                self._save(attempt_directory / "launch_result.json", launch_result)
+                container_state = self._container_state(container)
+                failed_start = container_state is None or (
+                    container_state["Status"] == "created" and bool(container_state["Error"])
+                )
+                if code != 0 and failed_start:
+                    self._finish_attempt(
+                        state, "failed", code, launch_result["elapsed_wall_time_ns"], launch_result["ended_at_ns"]
+                    )
                 else:
                     subprocess.run(["docker", "wait", container], check=True, stdout=log, stderr=subprocess.STDOUT)
                     self._reconcile(state)
@@ -275,6 +298,8 @@ class CollectionWorkflow:
         if self._completed_processing(state):
             self._save(directory / "run.json", state)
             return
+
+        self._raise_processing_failure(directory, state)
 
         if state["role"] == "performance":
             with (directory / "prepared_input.json").open(encoding="utf-8") as stream:
@@ -312,12 +337,30 @@ class CollectionWorkflow:
                 )
             if not self._completed_processing(state):
                 raise RuntimeError("capture processor exited without publishing its result")
+        except subprocess.CalledProcessError:
+            self._raise_processing_failure(directory, state)
+            state.update(task_status="interrupted", reason=f"{state['role']}_processing_interrupted")
+            self._save(directory / "run.json", state)
+            raise
         except (Exception, KeyboardInterrupt):
             state.update(task_status="interrupted", reason=f"{state['role']}_processing_interrupted")
             self._save(directory / "run.json", state)
             raise
 
         self._save(directory / "run.json", state)
+
+    def _raise_processing_failure(self, directory: Path, state: dict[str, Any]) -> None:
+        attempt = state["attempts"][-1]
+        try:
+            with (Path(attempt["directory"]) / "processing_failure.json").open(encoding="utf-8") as stream:
+                failure = json.load(stream)
+        except FileNotFoundError:
+            return
+
+        attempt["processing_failure"] = failure
+        state.update(task_status="finished", reason=f"{state['role']}_processing_failed")
+        self._save(directory / "run.json", state)
+        raise CaptureProcessingFailed(failure["message"])
 
     def _completed_processing(self, state: dict[str, Any]) -> bool:
         role = state["role"]
@@ -457,6 +500,22 @@ class CollectionWorkflow:
         if container is None or container["Status"] == "created":
             if self._live_launcher(attempt):
                 return True, time.time_ns() - attempt["created_at_ns"]
+            try:
+                with (Path(attempt["directory"]) / "launch_result.json").open(encoding="utf-8") as stream:
+                    launch = json.load(stream)
+            except FileNotFoundError:
+                launch = None
+
+            # A failed launcher plus an absent/failed-created container proves
+            # no monitor ran. Charge the recorded launch interval, never time
+            # accumulated while the task waited for a later resume.
+            failed_start = container is None or bool(container["Error"])
+            if launch is not None and launch["return_code"] != 0 and failed_start:
+                self._finish_attempt(
+                    state, "failed", launch["return_code"], launch["elapsed_wall_time_ns"], launch["ended_at_ns"]
+                )
+                return False, 0
+
             raise RuntimeError(
                 "native attempt has no running handle or terminal record; its budget cannot be recovered"
             )
@@ -528,6 +587,9 @@ def main() -> None:
     inputs.add_argument("--run", type=Path)
     parser.add_argument("--template-assets", type=Path, help="replace prediction template imports with a JSON array")
     parser.add_argument(
+        "--cost-model", type=Path, action="append", help="replace fitted cost inputs on prediction resume"
+    )
+    parser.add_argument(
         "--performance-manifest",
         type=Path,
         action="append",
@@ -572,6 +634,7 @@ def main() -> None:
         for value in [
             arguments.template_assets,
             arguments.performance_manifest,
+            arguments.cost_model,
             arguments.base_budget_sec,
             arguments.performance_budget_sec,
             arguments.validation_budget_sec,
@@ -641,10 +704,17 @@ def main() -> None:
                         if arguments.performance_manifest is not None
                         else None
                     ),
+                    cost_models=[path.resolve() for path in arguments.cost_model]
+                    if arguments.cost_model is not None
+                    else None,
                 )
             )
         else:
-            if arguments.template_assets is not None or arguments.performance_manifest is not None:
+            if (
+                arguments.template_assets is not None
+                or arguments.performance_manifest is not None
+                or arguments.cost_model is not None
+            ):
                 parser.error("asset revisions require a prediction task")
             result = (
                 workflow.status(directory)

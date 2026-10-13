@@ -23,12 +23,15 @@ class SGLangCapture(CaptureSession):
         requests = self.prepared["requests"]
         os.environ["SGLANG_PLUGINS"] = "markov"
 
+        # Host wall times describe collection overhead, never target node costs.
+        engine_started_ns = time.perf_counter_ns()
         engine = Engine(
             model_path=self.prepared["model_path"],
             tokenizer_path=self.prepared["tokenizer_path"],
             skip_tokenizer_init=True,
             **self.prepared["configuration"],
         )
+        engine_ready_ns = time.perf_counter_ns()
         signal.signal(signal.SIGQUIT, self._handle_worker_failure)
         try:
             if "representative_recipe" in self.prepared:
@@ -44,11 +47,13 @@ class SGLangCapture(CaptureSession):
 
             warmup_input = [1]
             warmup_sampling = {"max_new_tokens": 2, "ignore_eos": True, "temperature": 0}
+            warmup_started_ns = time.perf_counter_ns()
             engine.generate(
                 input_ids=warmup_input,
                 sampling_params=warmup_sampling,
                 rid=warmup_id,
             )
+            warmup_finished_ns = time.perf_counter_ns()
 
             # Native tokenizer setup installs an asyncio SIGQUIT handler during warmup.
             # A failed worker must unwind this capture instead of leaving stop_profile
@@ -56,20 +61,24 @@ class SGLangCapture(CaptureSession):
             engine.loop.remove_signal_handler(signal.SIGQUIT)
             signal.signal(signal.SIGQUIT, self._handle_worker_failure)
 
+            profile_start_ns = time.perf_counter_ns()
             engine.start_profile(
                 output_dir=str(self.directory / "native_profile"),
                 activities=["CPU", "GPU"],
                 record_shapes=True,
                 with_stack=False,
             )
+            observation_started_ns = time.perf_counter_ns()
             try:
                 responses = engine.loop.run_until_complete(self._execute(engine))
                 cleanup = []
                 if self.prepared["role"] == "base":
                     cleanup = engine.loop.run_until_complete(self._await_cleanup(request_ids))
             finally:
+                observation_finished_ns = time.perf_counter_ns()
                 if not self._worker_failed:
                     engine.stop_profile()
+            profile_finished_ns = time.perf_counter_ns()
 
             write_json(self.directory / "responses.json", responses)
             write_json(
@@ -82,6 +91,15 @@ class SGLangCapture(CaptureSession):
                     "model_configuration": self._model_configuration(),
                     "effective_server_args": dataclasses.asdict(engine.tokenizer_manager.server_args),
                     "collection_completion": cleanup,
+                    "collection_wall_time_ns": {
+                        "engine_initialization": engine_ready_ns - engine_started_ns,
+                        "request_preparation": warmup_started_ns - engine_ready_ns,
+                        "warmup": warmup_finished_ns - warmup_started_ns,
+                        "post_warmup_setup": profile_start_ns - warmup_finished_ns,
+                        "profile_start": observation_started_ns - profile_start_ns,
+                        "observation_and_cleanup": observation_finished_ns - observation_started_ns,
+                        "profile_stop_and_export": profile_finished_ns - observation_finished_ns,
+                    },
                     "initialization": {
                         "engine": "fresh_process",
                         "warmup": {

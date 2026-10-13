@@ -14,14 +14,16 @@ Usage: scripts/markov.sh plan --project project.json
        scripts/markov.sh sample --project project.json --configuration ID --workload ID --kind cpu|device --measurement-requests work-domains.json [--repetitions N]
        scripts/markov.sh sample --project project.json --configuration ID --kind communication [--repetitions N]
        scripts/markov.sh status --run run-directory
-       scripts/markov.sh resume --run run-directory
+       scripts/markov.sh resume --run run-directory [--cost-model FILE ...]
        scripts/markov.sh extract --base-manifest profile_manifest.json
        scripts/markov.sh compile-templates --base-manifest profile_manifest.json
+       scripts/markov.sh fit-costs --performance-manifest performance_manifest.json [--unit admission|worker|kernel|communication]
+       scripts/markov.sh evaluate-costs --model-candidate candidate.json --performance-manifest held-out-manifest.json
 
 plan describes configuration/workload combinations without collecting. predict
 uses declared compiled templates and source-bound node durations. Representative
-collection reports candidate mechanisms; automatic collection and real node cost
-models remain unimplemented.
+collection runs once per missing-source group when its base budget permits.
+Rule/cost gaps never trigger structure capture; complete measured-cost coverage is pending.
 profile --representative executes the candidate recipe within the base budget.
 profile and sample are explicit diagnostic acquisition commands; observe-target
 produces validation-only facts. extract rebuilds compiled templates from observations.
@@ -29,6 +31,10 @@ compile-templates reuses existing source graphs and instances for binding change
 status/resume share the task's cumulative budgets. resume --template-assets FILE
 replaces the explicit template list; paths in that JSON array are relative to FILE.
 CPU/device samples require explicit nonempty measurement requests.
+fit-costs produces admission (default), worker CPU, kernel or physical communication task candidates.
+Explicit cost candidates can enter conditional prediction under their declared query policies.
+All candidates preserve measurement gaps and do not establish cost qualification.
+evaluate-costs compares a fixed candidate with separate unit samples without fitting.
 
 HELP
     exit 0

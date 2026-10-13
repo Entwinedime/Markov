@@ -1,41 +1,23 @@
 #include "markov/workflow/plan.hpp"
 
-#include "markov/adapters/frameworks/sglang/bindings.hpp"
-#include "markov/adapters/frameworks/sglang/collection_planner.hpp"
-#include "markov/adapters/frameworks/sglang/sampling_recipes.hpp"
+#include "markov/adapters/collection_adapter.hpp"
+#include "markov/adapters/template_adapter.hpp"
 #include "markov/contracts/control.hpp"
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace markov {
 namespace {
 
 using Json = nlohmann::json;
-
-// Serialization is the external report boundary; algorithms use typed configuration.
-Json parameters(const FrameworkConfiguration & configuration) {
-    if (const auto * p = std::get_if<SGLangConfiguration>(&configuration)) { return p->parameters(); }
-
-    const auto & p = std::get<KTransformersConfiguration>(configuration);
-    return {
-        {         "backend_type",                  p.backend_type },
-        {                   "tp",                            p.tp },
-        {       "max_batch_size",                p.max_batch_size },
-        {           "chunk_size",                    p.chunk_size },
-        {            "cpu_infer",                     p.cpu_infer },
-        {           "cache_lens",                    p.cache_lens },
-        {       "sched_strategy",                p.sched_strategy },
-        {       "use_cuda_graph",                p.use_cuda_graph },
-        {            "gguf_path",            p.gguf_path.string() },
-        { "optimize_config_path", p.optimize_config_path.string() }
-    };
-}
 
 Json permission(const CollectionPermission & value) {
     return {
@@ -70,20 +52,27 @@ Json requests(std::span<const Request> input, bool native) {
 
 } // namespace
 
+const CollectionAdapter & Planner::collection_adapter(Framework framework) const {
+    const auto adapter = std::ranges::find_if(collection_adapters_, [&](const CollectionAdapter * item) { return item->framework() == framework; });
+    if (adapter == collection_adapters_.end()) throw std::invalid_argument("framework collection preparation not implemented");
+    return **adapter;
+}
+
 nlohmann::json Planner::describe(const Project & project) const {
     auto combinations = Json::array();
     for (const auto & candidate : project.configurations) {
         for (const auto & workload : project.request_workloads) {
             auto gaps = Json::array();
             bool supported = true;
-            if (candidate.framework != Framework::SGLang) {
+            const auto adapter = std::ranges::find_if(adapters_, [&](const TemplateAdapter * item) { return item->framework() == candidate.framework; });
+            if (adapter == adapters_.end()) {
                 supported = false;
                 gaps.push_back({
                     {   "kind",                       "implementation" },
                     { "reason", "framework_prediction_not_implemented" }
                 });
             }
-            else if (!SGLangBindings{}.control_limits(std::get<SGLangConfiguration>(candidate.configuration))) {
+            else if (!(*adapter)->control_limits(candidate.configuration)) {
                 supported = false;
                 gaps.push_back({
                     {   "kind",               "implementation" },
@@ -143,28 +132,68 @@ nlohmann::json Planner::collection_plan(const Project & project) const {
             { "reason", "only_lightweight_cold_modeled_scope_implemented" }
         };
     }
-    return SGLangCollectionPlanner{}.configurations(project.configurations);
+    auto groups = Json::array();
+    std::map<std::string, Json> exclusions;
+    std::vector<std::string> selection_bases;
+    for (const auto * adapter : adapters_) {
+        std::vector<const Candidate *> candidates;
+        for (const auto & candidate : project.configurations)
+            if (candidate.framework == adapter->framework()) candidates.push_back(&candidate);
+
+        const auto plan = adapter->configurations(candidates);
+        for (const auto & group : plan.at("groups")) groups.push_back(group);
+        for (const auto & excluded : plan.at("excluded_configurations")) exclusions.emplace(excluded.at("configuration_id").get<std::string>(), excluded);
+        const auto basis = plan.at("selection_basis").get<std::string>();
+        if (std::ranges::find(selection_bases, basis) == selection_bases.end()) selection_bases.push_back(basis);
+    }
+
+    // Keep exclusions in user declaration order across adapter boundaries.
+    auto excluded = Json::array();
+    for (const auto & candidate : project.configurations) {
+        const auto adapter = std::ranges::find_if(adapters_, [&](const TemplateAdapter * item) { return item->framework() == candidate.framework; });
+        if (adapter == adapters_.end()) {
+            excluded.push_back({
+                { "configuration_id",                                    candidate.id },
+                {           "reason", "framework_collection_planning_not_implemented" }
+            });
+        }
+        else if (const auto found = exclusions.find(candidate.id); found != exclusions.end()) excluded.push_back(found->second);
+    }
+
+    std::string basis;
+    for (const auto & description : selection_bases) {
+        if (!basis.empty()) basis += "; ";
+        basis += description;
+    }
+    return {
+        {                  "status", groups.empty() ? "unsupported" : "requires_mechanism_coverage" },
+        {                  "groups",                                              std::move(groups) },
+        { "excluded_configurations",                                            std::move(excluded) },
+        {         "selection_basis",                                               std::move(basis) }
+    };
 }
 
 nlohmann::json Planner::prepare_collection(const Project & project, const Candidate & candidate, std::span<const Request> input) const {
-    const bool sglang = candidate.framework == Framework::SGLang;
-    return {
-        { "block_bindings", sglang ? SGLangBindings{}.describe() : Json::array() },
-        { "native_regions", sglang ? SGLangBindings{}.describe_regions() : Json(nullptr) },
-        { "blocks", sglang ? ServingContract{}.describe() : Json::array() },
+    const auto & adapter = collection_adapter(candidate.framework);
+    const auto snapshot = adapter.configuration(candidate.configuration);
+    auto values = snapshot.at("parameters");
+    values.update(snapshot.at("model_assets"));
+    auto result = adapter.instrumentation();
+    result.update({
         { "role", "base" },
-        { "framework", sglang ? "sglang" : "ktransformers" },
+        { "framework", adapter.name() },
         { "configuration_id", candidate.id },
         { "model_path", project.model_path.string() },
         { "tokenizer_path", project.tokenizer_path.string() },
-        { "configuration", parameters(candidate.configuration) },
+        { "configuration", std::move(values) },
         { "requests", requests(input, true) },
         { "environment", environment(candidate.environment) },
         { "permission", permission(project.base_collection) },
         { "permissions", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
         { "diagnostics", project.diagnostics },
         { "output_directory", project.output_directory.string() }
-    };
+    });
+    return result;
 }
 
 nlohmann::json Planner::prepare_representative(const Project & project, const Candidate & candidate) const {
@@ -198,7 +227,8 @@ nlohmann::json Planner::prepare_representative(const Project & project, const Ca
 }
 
 nlohmann::json Planner::prepare_target(const Project & project, const Candidate & candidate, const RequestWorkload & workload, std::int64_t budget_sec) const {
-    if (candidate.framework != Framework::SGLang) throw std::invalid_argument("target observation currently requires SGLang");
+    if (!collection_adapter(candidate.framework).supports_target_observation())
+        throw std::invalid_argument("target observation not implemented for this framework");
     if (budget_sec <= 0 || budget_sec > std::numeric_limits<std::int64_t>::max() / 1'000'000'000)
         throw std::invalid_argument("target observation requires a positive nanosecond-representable budget");
 
@@ -220,25 +250,13 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
     for (std::size_t index = 0; index < project.configurations.size(); ++index) {
         const auto & candidate = project.configurations[index];
         const auto filename = "configuration-" + std::to_string(index) + ".json";
-        auto values = parameters(candidate.configuration);
-        auto assets = Json::object();
-        if (const auto * native = std::get_if<KTransformersConfiguration>(&candidate.configuration)) {
-            assets = {
-                {            "gguf_path",            native->gguf_path.string() },
-                { "optimize_config_path", native->optimize_config_path.string() }
-            };
-            values.erase("gguf_path");
-            values.erase("optimize_config_path");
-        }
-        configuration_files[filename] = {
-            {   "parameters", values },
-            { "model_assets", assets }
-        };
+        const auto & adapter = collection_adapter(candidate.framework);
+        configuration_files[filename] = adapter.configuration(candidate.configuration);
         configurations.push_back({
-            {          "id",                                                          candidate.id },
-            {   "framework", candidate.framework == Framework::SGLang ? "sglang" : "ktransformers" },
-            { "environment",                                    environment(candidate.environment) },
-            {      "config",                                                              filename }
+            {          "id",                       candidate.id },
+            {   "framework",                     adapter.name() },
+            { "environment", environment(candidate.environment) },
+            {      "config",                           filename }
         });
     }
 
@@ -265,6 +283,8 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
     }
     auto performances = Json::array();
     for (const auto & path : project.performance_manifests) performances.push_back(path.string());
+    auto models = Json::array();
+    for (const auto & path : project.cost_models) models.push_back(path.string());
     Json input{
         {             "model",                 { { "path", project.model_path.string() }, { "tokenizer_path", project.tokenizer_path.string() } } },
         {    "configurations",                                                                                                     configurations },
@@ -272,7 +292,7 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
         {        "simulation",    { { "controller", project.controller }, { "scope", project.scope == Scope::Modeled ? "modeled" : "http_e2e" } } },
         {     "initial_state",                                       { { "cache", project.initial_cache == CacheState::Cold ? "cold" : "warm" } } },
         {        "collection", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
-        {            "assets",                                          { { "templates", templates }, { "performance_manifests", performances } } },
+        {            "assets",               { { "templates", templates }, { "performance_manifests", performances }, { "cost_models", models } } },
         {            "output",                     { { "directory", project.output_directory.string() }, { "diagnostics", project.diagnostics } } }
     };
     return {
@@ -284,9 +304,8 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
 
 nlohmann::json Planner::prepare_sampling(const Project & project, const Candidate & candidate, const RequestWorkload & prompts,
                                          const Json & measurement_requests) const {
-    if (candidate.framework != Framework::SGLang) throw std::invalid_argument("independent sampling currently implements SGLang");
     if (project.controller != "lightweight") throw std::invalid_argument("sampling requires lightweight control");
-    auto grid = SGLangSamplingRecipes{}.workloads(std::get<SGLangConfiguration>(candidate.configuration), prompts.requests, measurement_requests);
+    auto grid = collection_adapter(candidate.framework).workloads(candidate, prompts.requests, measurement_requests);
     auto prepared = prepare_collection(project, candidate, {});
     prepared["role"] = "performance";
     prepared["permission"] = permission(project.performance_collection);
@@ -297,9 +316,7 @@ nlohmann::json Planner::prepare_sampling(const Project & project, const Candidat
 }
 
 nlohmann::json Planner::prepare_communication(const Project & project, const Candidate & candidate) const {
-    if (candidate.framework != Framework::SGLang) throw std::invalid_argument("communication sampling currently implements SGLang");
-    auto grid =
-        SGLangSamplingRecipes{}.collectives(std::get<SGLangConfiguration>(candidate.configuration), candidate.environment, project.performance_manifests);
+    auto grid = collection_adapter(candidate.framework).collectives(candidate, project.performance_manifests);
     if (grid.empty() && project.performance_collection.allow_run)
         throw std::invalid_argument("communication sampling needs independent device measurements with collective work domains");
 

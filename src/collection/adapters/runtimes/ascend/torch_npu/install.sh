@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the pinned wheel's native libraries with the shared allocator probe.
+# Rebuild the pinned wheel's native libraries with allocator and queue probes.
 set -euo pipefail
 
 MARKOV_ADAPTER_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +41,9 @@ fetch_source fmtlib/fmt "$FMT_COMMIT" "$BUILD_ROOT/third_party/fmt"
 fetch_source nlohmann/json "$JSON_COMMIT" "$BUILD_ROOT/third_party/nlohmann"
 
 patch --batch --forward -d "$BUILD_ROOT" -p1 < "$MARKOV_ADAPTER_ROOT/workspace.patch"
+patch --batch --forward -d "$BUILD_ROOT" -p1 < "$MARKOV_ADAPTER_ROOT/queue.patch"
+cp "$MARKOV_ADAPTER_ROOT/queue_observation.hpp" \
+    "$BUILD_ROOT/torch_npu/csrc/core/npu/markov_queue_observation.hpp"
 cp "$MARKOV_ADAPTER_ROOT/workspace_observation.hpp" \
     "$BUILD_ROOT/torch_npu/csrc/core/npu/markov_workspace_observation.hpp"
 
@@ -71,10 +74,12 @@ provenance = {
     "torch_npu_source_commit": sys.argv[2],
     "dependencies": {"op-plugin": sys.argv[3], "fmt": sys.argv[4], "nlohmann": sys.argv[5]},
     "source_patch": "src/collection/adapters/runtimes/ascend/torch_npu/workspace.patch",
+    "queue_patch": "src/collection/adapters/runtimes/ascend/torch_npu/queue.patch",
+    "queue_probe_header": "src/collection/adapters/runtimes/ascend/torch_npu/queue_observation.hpp",
     "probe_header": "src/collection/adapters/runtimes/ascend/torch_npu/workspace_observation.hpp",
     "libraries": ["libtorch_npu.so", "libop_plugin_atb.so", "libnpu_profiler.so"],
     "profiler_reader": "profiler/analysis/prof_parse/_fwk_file_parser.py",
-    "scope": "shared workspace allocation and cached release; uncached release is not observed",
+    "scope": "shared workspace allocation and cached release; scoped enqueue and worker calls; uncached release is not observed",
 }
 (Path(sys.argv[1]) / "markov_workspace_build.json").write_text(json.dumps(provenance, indent=2) + "\n")
 PY

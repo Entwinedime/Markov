@@ -12,7 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from markov_collection.artifacts.json_file import write_json
-from markov_collection.workflow.collection import CollectionWorkflow
+from markov_collection.workflow.collection import CaptureProcessingFailed, CollectionWorkflow
 
 
 class PredictionProcessing:
@@ -72,7 +72,9 @@ class PredictionWorkflow:
                 role: {"consumed_wall_time_ns": 0, **permission} for role, permission in inputs["collection"].items()
             },
             "attempts": [],
-            "prediction": {"rounds": [], "result": None},
+            "prediction": {"rounds": [], "result": None, "recompute_configurations": None},
+            "representatives": {},
+            "active_representative": None,
         }
 
         write_json(directory / "run.json", state)
@@ -126,6 +128,7 @@ class PredictionWorkflow:
         budgets: dict[str, int] | None = None,
         template_assets: Path | None = None,
         performance_manifests: list[Path] | None = None,
+        cost_models: list[Path] | None = None,
     ) -> dict[str, Any]:
         with (directory / "run.lock").open("a", encoding="utf-8") as lock:
             try:
@@ -139,16 +142,24 @@ class PredictionWorkflow:
             write_json(directory / "run.json", state)
             prediction_container = self._prediction_container(directory, state)
             prediction_live = prediction_container is not None and prediction_container["Running"]
+            revisions = (
+                bool(budgets)
+                or template_assets is not None
+                or performance_manifests is not None
+                or cost_models is not None
+            )
             if live or prediction_live:
                 result = self._result(directory, state)
-                if budgets or template_assets is not None or performance_manifests is not None:
+                if revisions:
                     result["requested_changes_applied"] = False
                 return result
 
             # Reconcile active work before changing the inputs used by a resumed round.
-            if budgets or template_assets is not None or performance_manifests is not None:
-                self._revise_assets(directory, state, budgets or {}, template_assets, performance_manifests)
-            if state["task_status"] == "finished":
+            if revisions:
+                self._revise_assets(
+                    directory, state, budgets or {}, template_assets, performance_manifests, cost_models
+                )
+            if state["task_status"] == "finished" and state["active_representative"] is None:
                 return self._result(directory, state)
 
             try:
@@ -172,6 +183,7 @@ class PredictionWorkflow:
         budgets: dict[str, int],
         template_assets: Path | None,
         performance_manifests: list[Path] | None,
+        cost_models: list[Path] | None,
     ) -> None:
         for role, seconds in budgets.items():
             if seconds <= 0 or seconds * 1_000_000_000 < state["collection"][role]["consumed_wall_time_ns"]:
@@ -214,7 +226,13 @@ class PredictionWorkflow:
                 self.collection._container_path(path) for path in performance_manifests
             ]
 
+        if cost_models is not None:
+            project["assets"]["cost_models"] = [self.collection._container_path(path) for path in cost_models]
+
         write_json(project_path, project)
+        # Explicit asset replacement can affect any source selection. Only the
+        # automatic representative path has a producer-qualified group scope.
+        state["prediction"]["recompute_configurations"] = None
         state.update(task_status="planned", status="needs_data")
         state.pop("reason", None)
 
@@ -231,6 +249,9 @@ class PredictionWorkflow:
             round_directory.mkdir(parents=True, exist_ok=True)
             with (directory / "input/project.json").open(encoding="utf-8") as stream:
                 inputs = json.load(stream)
+            affected = state["prediction"]["recompute_configurations"]
+            if affected is not None:
+                inputs["configurations"] = [item for item in inputs["configurations"] if item["id"] in affected]
             for workload in inputs["request_workloads"]:
                 workload["path"] = self.collection._container_path(directory / "input" / workload["path"])
             # Graph diagnostics belong to this round's writable mount and survive resume.
@@ -269,6 +290,9 @@ class PredictionWorkflow:
             directory / "input",
         }
 
+        # Fitted models contain all query values. Raw sample references are
+        # provenance and are not opened by the prediction consumer.
+        mounts.update(self.collection._host_path(path) for path in inputs["assets"]["cost_models"])
         declared = [(path, "performance") for path in inputs["assets"]["performance_manifests"]]
         for asset in inputs["assets"]["templates"]:
             declared.append((asset["manifest"], "base"))
@@ -312,7 +336,26 @@ class PredictionWorkflow:
                 raise RuntimeError(f"prediction container exited {container['ExitCode']}; see {round_directory}")
 
         with (round_directory / "result.json").open(encoding="utf-8") as stream:
-            return json.load(stream)
+            result = json.load(stream)
+        if state["prediction"]["recompute_configurations"] is None:
+            return result
+
+        # Keep the raw round limited to its actual inputs. The published task
+        # result combines replacements with immutable prior combination reports.
+        with (directory / state["prediction"]["result"]).open(encoding="utf-8") as stream:
+            previous = json.load(stream)
+        replacements = {
+            (item["configuration_id"], item["request_workload_id"]): item for item in result["combinations"]
+        }
+        result["combinations"] = [
+            replacements.get((item["configuration_id"], item["request_workload_id"]), item)
+            for item in previous["combinations"]
+        ]
+        coverage = {item["configuration_id"]: item for item in result["representative_collection"]["source_coverage"]}
+        plan = previous["representative_collection"]
+        plan["source_coverage"] = [coverage.get(item["configuration_id"], item) for item in plan["source_coverage"]]
+        result["representative_collection"] = plan
+        return result
 
     def _publish(self, directory: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
         result["collection_performed"] = bool(state["attempts"])
@@ -322,15 +365,24 @@ class PredictionWorkflow:
         }
 
         result["collection_usage"] = usage
+        collection_failures = {}
+        for group in result["representative_collection"].get("groups", []):
+            reason = state["representatives"].get(group["representative_configuration_id"])
+            if reason is not None:
+                for configuration in group["configuration_ids"]:
+                    collection_failures[configuration] = reason
+
         for candidate in result["combinations"]:
             missing_source = any(gap["reason"] == "compatible_template_missing" for gap in candidate["gaps"])
-            if candidate["status"] == "needs_data" and missing_source and "reason" in state:
-                collection_gap = {"kind": "collection", "reason": state["reason"]}
+            reason = collection_failures.get(candidate["configuration_id"], state.get("reason"))
+            if candidate["status"] == "needs_data" and missing_source and reason is not None:
+                collection_gap = {"kind": "collection", "reason": reason}
                 if collection_gap not in candidate["gaps"]:
                     candidate["gaps"].append(collection_gap)
         relative = Path(state["prediction"]["rounds"][-1]) / "prediction.json"
         write_json(directory / relative, result)
         state["prediction"]["result"] = str(relative)
+        state["prediction"]["recompute_configurations"] = None
 
         write_json(directory / "run.json", state)
 
@@ -351,22 +403,120 @@ class PredictionWorkflow:
 
         self._publish(directory, state, result)
 
-    def _continue(self, directory: Path, state: dict[str, Any]) -> None:
-        result = self._simulate(directory, state)
-        missing_source = any(
-            gap["reason"] == "compatible_template_missing"
-            for combination in result["combinations"]
-            for gap in combination["gaps"]
-        )
-        reason = None
-        if missing_source:
-            permission = state["collection"]["base"]
-            reason = (
-                "representative_collection_planning_not_implemented"
-                if permission["allow_run"]
-                else "base_collection_disabled"
+    def _collect_representative(self, directory: Path, state: dict[str, Any]) -> None:
+        active = state["active_representative"]
+        try:
+            if len(state["attempts"]) == active["attempt_index"]:
+                with (directory / "prepared_input.json").open(encoding="utf-8") as stream:
+                    prepared = json.load(stream)
+                self.collection._collect(prepared, directory, state)
+            elif state["attempts"][-1]["status"] == "completed" and state["base_manifest"] is None:
+                # Resume processing the recorded attempt, never launch a replacement.
+                state["status"] = "captured"
+                self.collection._finalize(directory, state)
+        except CaptureProcessingFailed:
+            # The attempt retains the processor's error and captured inputs.
+            # Isolate this group; never turn a host interruption into a failure.
+            pass
+
+        if state["base_manifest"] is None:
+            state["representatives"][active["configuration_id"]] = state.get(
+                "reason", "representative_collection_incomplete"
             )
-        self._finish(directory, state, result, reason)
+        else:
+            project_path = directory / "input/project.json"
+            with project_path.open(encoding="utf-8") as stream:
+                project = json.load(stream)
+            manifest = self.collection._container_path(Path(state["base_manifest"]))
+            # Publishing the input can precede the state write on interruption.
+            if not any(asset["manifest"] == manifest for asset in project["assets"]["templates"]):
+                project["assets"]["templates"].append({"manifest": manifest, "node_durations": None})
+                write_json(project_path, project)
+            state["prediction"]["recompute_configurations"] = active["configuration_ids"]
+
+        # Failed collection changes only the group's outcome, not simulation
+        # inputs. Persist the reusable-result phase across a host interruption.
+        phase = "planned" if state["base_manifest"] is not None else "selecting"
+        state.update(active_representative=None, task_status=phase, status="needs_data")
+        state.pop("reason", None)
+        write_json(directory / "run.json", state)
+
+    def _continue(self, directory: Path, state: dict[str, Any]) -> None:
+        if state["active_representative"] is not None:
+            self._collect_representative(directory, state)
+
+        if state["task_status"] == "selecting":
+            with (directory / state["prediction"]["result"]).open(encoding="utf-8") as stream:
+                result = json.load(stream)
+        else:
+            result = self._simulate(directory, state)
+
+        while True:
+            missing = {
+                combination["configuration_id"]
+                for combination in result["combinations"]
+                if combination["status"] == "needs_data"
+                and any(gap["reason"] == "compatible_template_missing" for gap in combination["gaps"])
+            }
+            if not missing:
+                self._finish(directory, state, result)
+                return
+
+            # A declared but unreadable/uncompiled asset needs repair, not a
+            # replacement native run that conceals the import failure.
+            if any(asset["status"] != "loaded" for asset in result["assets"]):
+                self._finish(directory, state, result, "template_asset_repair_required")
+                return
+
+            permission = state["collection"]["base"]
+            if not permission["allow_run"]:
+                self._finish(directory, state, result, "base_collection_disabled")
+                return
+            if permission["consumed_wall_time_ns"] >= permission["max_wall_time_sec"] * 1_000_000_000:
+                self._finish(directory, state, result, "base_collection_budget_exhausted")
+                return
+
+            # Only absent compatible sources need a candidate. Rule and cost gaps
+            # do not request another capture; every declared group gets one try.
+            selected = None
+            for group in result["representative_collection"].get("groups", []):
+                representative = group["representative_configuration_id"]
+                if not missing.intersection(group["configuration_ids"]) or representative in state["representatives"]:
+                    continue
+                if group["candidate_recipe"]["status"] == "not_ready":
+                    state["representatives"][representative] = group["candidate_recipe"]["reason"]
+                    continue
+                selected = group
+                break
+            if selected is None:
+                self._finish(directory, state, result, "representative_source_unavailable")
+                return
+
+            representative = selected["representative_configuration_id"]
+            prepared = self.collection._prepare(
+                directory / "input/project.json",
+                "base",
+                "cpu",
+                configuration_id=representative,
+                representative=True,
+            )
+            write_json(directory / "prepared_input.json", prepared)
+            state["representatives"][representative] = None
+            state.update(
+                role="base",
+                base_manifest=None,
+                active_representative={
+                    "configuration_id": representative,
+                    "configuration_ids": selected["configuration_ids"],
+                    "attempt_index": len(state["attempts"]),
+                },
+                task_status="planned",
+            )
+            self._publish(directory, state, result)
+
+            self._collect_representative(directory, state)
+            if state["task_status"] != "selecting":
+                result = self._simulate(directory, state)
 
 
 def main() -> None:

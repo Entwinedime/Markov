@@ -69,6 +69,9 @@ class AscendProfileWindow:
 
             # Level2 exposes runtime copy waits absent from the default Level1 trace.
             kwargs["profiler_level"] = ProfilerLevel.Level2
+            # Keep published exports and clock/device metadata, but let the vendor
+            # remove duplicate analysis intermediates after export has completed.
+            kwargs["data_simplification"] = True
 
         return original(config, *args, **kwargs)
 

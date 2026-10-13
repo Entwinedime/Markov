@@ -177,6 +177,7 @@ struct SourceKernel {
     std::optional<std::vector<std::uint32_t>> request_pool_slots = std::nullopt;
     std::optional<AttentionWorkload> attention = std::nullopt; // Target semantic parameters, absent in raw kernel observations.
 
+    bool has_semantic_work() const;
     nlohmann::json describe() const;
 };
 
@@ -188,6 +189,21 @@ struct SourceOperation {
     std::optional<std::string> input_shapes = std::nullopt;
     std::optional<std::string> input_types = std::nullopt;
     std::vector<SourceSpanId> collective_spans = {};
+};
+
+enum class CpuSubmissionPart { Before, Call, After };
+
+// A complete measured interval around one submission. These identities locate
+// the operation; target device descriptors must come from the expanded graph.
+struct SourceCpuWork {
+    std::string operation;
+    CpuSubmissionPart part;
+    SourceSpanId submission;
+
+    nlohmann::json describe() const;
+    static SourceCpuWork read(const nlohmann::json & record);
+    static std::string_view part_name(CpuSubmissionPart part);
+    static CpuSubmissionPart parse_part(std::string_view name);
 };
 
 // Collective envelopes describe logical work; physical services retain their own
@@ -266,6 +282,8 @@ class SourceGraph {
 public:
     static std::string_view span_name(SourceSpanKind kind);
     static std::string_view relation_name(SourceRelation relation);
+    static std::string_view cpu_part_name(SourceCpuPart part);
+    static SourceCpuPart parse_cpu_part(std::string_view name);
     static SourceRelation parse_relation(std::string_view name);
     static SourceDomain parse_domain(std::string_view name);
     std::size_t lane(SourceDomain domain, std::uint32_t rank, std::uint64_t native_id);
@@ -276,6 +294,7 @@ public:
     void observe_transfer(SourceSpanId span, SourceTransfer transfer);
     void observe_stream_wait(SourceSpanId span, SourceStreamWait wait);
     void observe_operation(SourceOperation operation);
+    void observe_cpu_work(SourceSpanId span, SourceCpuWork work);
     void observe_collective(SourceCollective collective);
     void connect(BoundaryId source, BoundaryId target, SourceRelation relation, std::optional<std::size_t> source_reference = std::nullopt);
 
@@ -303,6 +322,7 @@ private:
     std::vector<SourceSpan> spans_;
     std::map<SourceSpanId, SourceKernel> kernels_;
     std::map<SourceSpanId, SourceTransfer> transfers_;
+    std::map<SourceSpanId, SourceCpuWork> cpu_work_;
     std::map<SourceSpanId, SourceStreamWait> stream_waits_;
     std::vector<SourceOperation> operations_;
     std::vector<SourceCollective> collectives_;

@@ -4,7 +4,7 @@
 #include "markov/contracts/project.hpp"
 #include "markov/execution/execution_graph.hpp"
 #include "markov/execution/workspace_state.hpp"
-#include "markov/performance/node_durations.hpp"
+#include "markov/performance/node_costs.hpp"
 #include "markov/templates/templates.hpp"
 
 #include <nlohmann/json.hpp>
@@ -22,7 +22,7 @@ namespace markov {
 
 class SimulationRuntime {
 public:
-    SimulationRuntime(std::span<const Request> requests, Controller & controller, const TemplateBank & templates, const NodeDurations & durations,
+    SimulationRuntime(std::span<const Request> requests, Controller & controller, const TemplateBank & templates, const NodeCosts & costs,
                       std::optional<std::filesystem::path> graph_path);
 
     nlohmann::json run(ServingLimits limits);
@@ -56,7 +56,7 @@ private:
     std::span<const Request> requests_; // Borrowed from the selected workload for this simulation.
     Controller & controller_;
     const TemplateBank & templates_;
-    const NodeDurations & durations_;
+    const NodeCosts & costs_;
     TemplateAssembly assembly_;
     WorkspaceState workspace_;
     ExecutionGraph execution_graph_;

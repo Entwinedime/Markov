@@ -25,6 +25,8 @@ class AttentionParameterRule;
 // construction. Consumers receive layouts, dependencies and operation identity.
 class SGLangTemplateBindings {
 public:
+    // Qualified contiguous INT64 scalar-list branch of ACLNN ConcatD.
+    static constexpr std::uint64_t last_location_concat_limit = 32;
     static TemplateSource produce(const std::filesystem::path & manifest_path);
 
     SGLangTemplateBindings(TemplateDefinition & definition, std::set<ModelParameterRule> & rules, std::set<CollectiveParameterRule> & collectives,

@@ -1,0 +1,28 @@
+--- a/torch_npu/csrc/core/npu/NPUQueue.cpp
++++ b/torch_npu/csrc/core/npu/NPUQueue.cpp
+@@ -1 +1,3 @@
++#include "markov_queue_observation.hpp"
++
+ #include "torch_npu/csrc/core/npu/NPUQueue.h"
+@@ -446,6 +448,9 @@
+     at_npu::native::NpuUtils::ProfReportMarkDataToNpuProfiler(2, datas, read_idx.idx);
++#endif
++    auto *queue_param = static_cast<c10_npu::queue::QueueParas *>(manager().getCurrentParams(datas, read_idx.idx));
++    markov::collection::QueueObservation observation(*queue_param, true);
+     auto ret = manager().Call(datas, read_idx.idx);
++    observation.finish(ret);
++#ifndef BUILD_LIBTORCH
+     at_npu::native::NpuUtils::ProfReportMarkDataToNpuProfiler(3, datas, read_idx.idx);
+-#else
+-    auto ret = manager().Call(datas, read_idx.idx);
+ #endif
+@@ -529,2 +534,5 @@
+ {
++    auto *queue_param = static_cast<c10_npu::queue::QueueParas *>(cur_paras);
++    markov::collection::QueueObservation observation(*queue_param, false);
++
+     if (initialized == false) {
+@@ -650,2 +658,3 @@
+     SetWriteWorking(false);
++    observation.finish(0);
+ }

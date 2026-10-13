@@ -4,6 +4,7 @@
 #include "markov/production/source_bindings.hpp"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -159,6 +160,26 @@ nlohmann::json BlockExtractor::extract() const {
         });
     }
 
+    // Project only recorded thread paths whose intermediate points have no
+    // modeled owner. Stop at the next owned point, even if it is another block.
+    // This preserves ordering without importing excluded CPU work or its cost.
+    const auto absent = graph_.boundaries().size();
+    std::vector<BoundaryId> thread_next(absent, absent);
+    for (const auto & edge : graph_.edges())
+        if (edge.relation == SourceRelation::ThreadOrder) thread_next[edge.source] = edge.target;
+
+    std::vector<std::vector<std::array<BoundaryId, 2>>> internal_thread_paths(calls_.size());
+    for (BoundaryId begin = 0; begin < absent; ++begin) {
+        if (users[begin].empty()) continue;
+        auto end = thread_next[begin];
+        if (end == absent || !users[end].empty()) continue;
+
+        while (end != absent && users[end].empty()) end = thread_next[end];
+        if (end == absent) continue;
+        for (const auto owner : users[begin])
+            if (std::binary_search(users[end].begin(), users[end].end(), owner)) internal_thread_paths[owner].push_back({ begin, end });
+    }
+
     auto gaps = nlohmann::json::array();
     auto result = nlohmann::json::array();
     for (std::size_t index = 0; index < calls_.size(); ++index) {
@@ -246,6 +267,7 @@ nlohmann::json BlockExtractor::extract() const {
             {           "source_state",                                                                                                     source_state },
             {           "input_layout",                                                                                                           layout },
             {                  "spans",                                                                                                   members[index] },
+            {  "internal_thread_paths",                                                                                     internal_thread_paths[index] },
             {         "internal_edges",                                                                                            internal_edges[index] },
             {             "native_api",                                                                                       native_api_members_[index] },
             {     "logical_boundaries",                                                                                           logical_members[index] },

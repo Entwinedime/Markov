@@ -267,6 +267,9 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     }
 
 
+    std::map<SourceSpanId, SourceCpuWork> cpu_work;
+    for (const auto & work : graph.at("cpu_work")) cpu_work.emplace(work.at("source_span").get<SourceSpanId>(), SourceCpuWork::read(work));
+
     for (const auto & transfer : graph.at("transfers"))
         result.transfers.emplace(transfer.at("source_span").get<SourceSpanId>(), SourceTransfer::read(transfer));
 
@@ -419,6 +422,8 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
         for (const auto & node : definition.graph) {
             const auto transfer = result.transfers.find(definition.observation(node).source_span);
             if (transfer != result.transfers.end()) definition.observation(node).transfer = &transfer->second;
+            const auto cpu = cpu_work.find(definition.observation(node).source_span);
+            if (cpu != cpu_work.end()) definition.observation(node).cpu_work = cpu->second;
         }
 
         bindings.bind(graph, data.at("regions"), calls, copies, result.page_size_tokens);
@@ -451,15 +456,26 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     if (!result.workspace_binding_gap) AscendWorkspaceBindings{}.bind(result, facts, graph);
     if (supported && !result.workspace_binding_gap) AscendWorkspaceBindings{}.bind_demands(result, facts, environment);
 
-    result.transforms = { "request_identity", "request_pool_rows", "kv_free_pages", "fixed_membership_prefill_lengths" };
-    result.limits = { "fixed Qwen3 dense model, TP, backend, dtype and native deployment",
-                      "separate unchunked prefill/decode without prefix cache or graph",
-                      "observed variants, cold multi-token prefill within one page per member at observed batch size, and the guarded request-pool row "
-                      "decrease are implemented",
-                      "request-pool row rewriting preserves node topology; native kernel-variant equivalence still requires qualification",
-                      "source token-shape matches do not prove identical control branches, publication effects or internal kernel variants",
-                      "source dependency coverage remains partial; initial modeled resources have no in-flight work; given node durations do not establish "
-                      "performance qualification" };
+    result.initialization_pool_domain = { result.request_pool_domain.maximum, "workspace_initial_capacity_migration_not_qualified" };
+    if (supported && !result.initialization_gap && !result.workspace_binding_gap) {
+        // On the eager dense path, shrinking the request table changes backing
+        // rows, not the single-request warmup's model shapes. Token capacity,
+        // model, TP and runtime stay fixed in the configuration-change binding.
+        // Reuse is bounded by the producer's existing row-shrink domain.
+        result.initialization_pool_domain = result.request_pool_domain;
+    }
+
+
+    result.transforms = { "request_identity", "request_pool_rows", "kv_free_pages", "qualified_prefill_lengths", "qualified_batch_membership" };
+    result.limits = {
+        "fixed Qwen3 dense model, TP, backend, dtype and native deployment",
+        "separate unchunked prefill/decode without prefix cache or graph",
+        "cold multi-token prefill within one page per member; request membership, filter/merge and shape changes require qualified template bindings",
+        "request-pool row rewriting preserves node topology; native kernel-variant equivalence still requires qualification",
+        "source token-shape matches do not prove identical control branches, publication effects or internal kernel variants",
+        "source dependency coverage remains partial; initial modeled resources have no in-flight work; given node durations do not establish "
+        "performance qualification"
+    };
     return result;
 }
 

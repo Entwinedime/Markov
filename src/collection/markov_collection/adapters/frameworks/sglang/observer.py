@@ -478,6 +478,9 @@ def install() -> None:
         HookRegistry.register(f"{batch}.prepare_for_decode", observer.prepare_decode, HookType.AROUND)
         HookRegistry.register(f"{scheduler}.run_batch", observer.execute, HookType.AROUND)
         HookRegistry.register(f"{scheduler}.process_batch_result", observer.publish, HookType.AROUND)
+        for binding in prepared["native_regions"]["bindings"]:
+            if binding["semantic"] == "admission_budget":
+                HookRegistry.register(binding["hook"], observer.admission_budget, HookType.AROUND)
     else:
         definitions = {definition["step"]: definition for definition in prepared["blocks"]}
         wrappers = {

@@ -281,17 +281,30 @@ void SGLangTemplateBindings::bind_length_domain(std::uint32_t page_size_tokens, 
 }
 
 void SGLangTemplateBindings::bind_request_pool(const RequestPoolLayout & pool) {
-    for (const auto & operation : definition_.operations) {
-        const auto * binding = pool.indexed_write(operation.host.source_span);
-        if (binding) definition_.batch_operations.emplace(operation.host.source_span, binding->variant);
-    }
-
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
         if (!node_observation.kernel) continue;
         auto layout = pool.bind(node_observation.source_span, *node_observation.kernel, definition_.source_requests);
         if (!layout) definition_.request_pool_layouts.emplace(node_observation.source_span, std::unexpected(layout.error()));
         else if (*layout) definition_.request_pool_layouts.emplace(node_observation.source_span, std::move(**layout));
+    }
+
+    for (const auto & operation : definition_.operations) {
+        const auto * binding = pool.indexed_write(operation.host.source_span);
+        if (!binding) continue;
+
+        // Import the write branch, never the donor's pool contents. Every device
+        // member must rebind its capacity, batch axes and indexed target slots.
+        auto variant = binding->variant;
+        variant.request_pool_rebindable = true;
+        for (const auto span : operation.device_spans) {
+            const auto layout = definition_.request_pool_layouts.find(span);
+            if (layout == definition_.request_pool_layouts.end() || !layout->second) {
+                variant.request_pool_rebindable = false;
+                break;
+            }
+        }
+        definition_.batch_operations.emplace(operation.host.source_span, variant);
     }
 }
 
@@ -892,9 +905,8 @@ void SGLangTemplateBindings::bind_last_locations(std::uint32_t page_size_tokens)
 
     // ACLNN groups this contiguous INT64 scalar-list path into at most 32
     // operands per ConcatD. Larger lists require a multi-operation template.
-    constexpr std::uint64_t concat_input_limit = 32;
     const auto requests = definition_.source_requests.size();
-    if (requests > concat_input_limit) return;
+    if (requests > last_location_concat_limit) return;
     if (requests == 1) {
         // Singleton Cat still copies one INT64 value. Its bytes do not depend
         // on prompt length, page count or the numeric last-location value.
@@ -932,9 +944,14 @@ void SGLangTemplateBindings::bind_last_locations(std::uint32_t page_size_tokens)
 
     // Singleton Cat is a copy; the multi-input branch remains one ConcatD
     // only inside the native grouping limit. Other batch work qualifies separately.
-    definition_.batch_operations.emplace(
-        selected->host.source_span,
-        BatchOperationVariant{ BatchOperationRole::LastLocationConcat, requests, requests == 1 ? 1U : 2U, requests == 1 ? 1U : concat_input_limit });
+    definition_.batch_operations.emplace(selected->host.source_span,
+                                         BatchOperationVariant{ BatchOperationRole::LastLocationConcat,
+                                                                requests,
+                                                                requests == 1 ? 1U : 2U,
+                                                                requests == 1 ? 1U : last_location_concat_limit,
+                                                                std::nullopt,
+                                                                0,
+                                                                true });
 }
 
 void SGLangTemplateBindings::bind_decode_locations() {
@@ -1051,6 +1068,8 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
 
     // Bind the entire native divide call, including its materialization, casts
     // and worker. A shape-only edit cannot remove a now-unnecessary copy.
+    // This call consumes the selected batch rows; backing pool capacity does
+    // not change its operands or state. The materialization variant still must match.
     for (const auto & operation : definition_.operations) {
         if (operation.name != "aten::floor_divide") continue;
         std::multiset<ModelKernelRole> roles;
@@ -1073,7 +1092,8 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
                                                                     1,
                                                                     std::numeric_limits<std::uint64_t>::max(),
                                                                     materialization,
-                                                                    page_size_tokens });
+                                                                    page_size_tokens,
+                                                                    true });
     }
 
     // Sampling belongs to model_forward but consumes its logits child's rows.
@@ -1206,12 +1226,16 @@ void SGLangTemplateBindings::bind_logits_reshape() {
     }
 
     // The fixed TP>1 permuted [B, TP, Vrank] view is contiguous only at B=1.
+    // Its operands depend on the active batch, not backing request-pool capacity.
     // This selects the native branch; operation ports still qualify its rewrite.
     definition_.batch_operations.emplace(operation.host.source_span,
                                          BatchOperationVariant{ BatchOperationRole::LogitsReshape,
                                                                 requests,
                                                                 requests == 1 ? 1U : 2U,
-                                                                requests == 1 ? 1U : std::numeric_limits<std::uint64_t>::max() });
+                                                                requests == 1 ? 1U : std::numeric_limits<std::uint64_t>::max(),
+                                                                std::nullopt,
+                                                                0,
+                                                                true });
 }
 
 std::optional<std::size_t> SGLangTemplateBindings::logits_gather_reshape() const {

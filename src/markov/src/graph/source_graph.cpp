@@ -15,6 +15,8 @@
 namespace markov {
 namespace {
 
+constexpr std::array cpu_parts{ "schedule_prefix", "prepare_body", "prepare_suffix", "execute", "publish", "dispatch" };
+
 constexpr std::array transfer_directions{ "host_to_host", "host_to_device", "device_to_host", "device_to_device" };
 
 std::string_view domain_name(SourceDomain domain) {
@@ -34,26 +36,16 @@ std::string_view domain_name(SourceDomain domain) {
     std::unreachable();
 }
 
-std::string_view control_part_name(SourceCpuPart part) {
-    switch (part) {
-    case SourceCpuPart::SchedulePrefix:
-        return "schedule_prefix";
-    case SourceCpuPart::PrepareBody:
-        return "prepare_body";
-    case SourceCpuPart::PrepareSuffix:
-        return "prepare_suffix";
-    case SourceCpuPart::Execute:
-        return "execute";
-    case SourceCpuPart::Publish:
-        return "publish";
-    case SourceCpuPart::Dispatch:
-        return "dispatch";
-    }
-
-    std::unreachable();
-}
-
 } // namespace
+
+std::string_view SourceGraph::cpu_part_name(SourceCpuPart part) { return cpu_parts[static_cast<std::size_t>(part)]; }
+
+SourceCpuPart SourceGraph::parse_cpu_part(std::string_view name) {
+    const auto found = std::find(cpu_parts.begin(), cpu_parts.end(), name);
+    if (found == cpu_parts.end()) throw std::invalid_argument("unknown CPU service part: " + std::string(name));
+
+    return static_cast<SourceCpuPart>(found - cpu_parts.begin());
+}
 
 nlohmann::json SourceTransfer::describe() const {
     return {
@@ -304,6 +296,11 @@ nlohmann::json PositionWorkload::describe() const {
     };
 }
 
+bool SourceKernel::has_semantic_work() const {
+    return positions || kv_allocation || kv_release || batch_filter || batch_merge || page_table || sequence_lengths || sequence_length_max || kv_new_pages
+           || request_pool_slots || attention || logits_token_indices;
+}
+
 nlohmann::json SourceKernel::describe() const {
     nlohmann::json result{
         {           "name",           name },
@@ -465,6 +462,31 @@ void SourceGraph::observe_stream_wait(SourceSpanId span, SourceStreamWait wait) 
 
 void SourceGraph::observe_operation(SourceOperation operation) { operations_.push_back(std::move(operation)); }
 
+void SourceGraph::observe_cpu_work(SourceSpanId span, SourceCpuWork work) { cpu_work_.emplace(span, std::move(work)); }
+
+std::string_view SourceCpuWork::part_name(CpuSubmissionPart part) {
+    return part == CpuSubmissionPart::Before ? "before" : part == CpuSubmissionPart::Call ? "call" : "after";
+}
+
+CpuSubmissionPart SourceCpuWork::parse_part(std::string_view name) {
+    if (name == "before") return CpuSubmissionPart::Before;
+    if (name == "call") return CpuSubmissionPart::Call;
+    if (name == "after") return CpuSubmissionPart::After;
+    throw std::invalid_argument("unknown CPU submission part: " + std::string(name));
+}
+
+nlohmann::json SourceCpuWork::describe() const {
+    return {
+        {  "operation",       operation },
+        {       "part", part_name(part) },
+        { "submission",      submission }
+    };
+}
+
+SourceCpuWork SourceCpuWork::read(const nlohmann::json & record) {
+    return { record.at("operation").get<std::string>(), parse_part(record.at("part").get<std::string>()), record.at("submission").get<SourceSpanId>() };
+}
+
 std::size_t SourceGraph::lane(SourceDomain domain, std::uint32_t rank, std::uint64_t native_id) {
     const auto key = std::tuple(domain, rank, native_id);
     const auto [position, inserted] = lane_ids_.try_emplace(key, lanes_.size());
@@ -603,6 +625,16 @@ void SourceGraph::write(const std::filesystem::path & path) const {
         stream << record;
     }
 
+    stream << "],\"cpu_work\":[";
+    bool first_cpu = true;
+    for (const auto & [span, work] : cpu_work_) {
+        if (!first_cpu) stream << ',';
+        first_cpu = false;
+        auto record = work.describe();
+        record["source_span"] = span;
+        stream << record;
+    }
+
     stream << "],\"transfers\":[";
     bool first_transfer = true;
     for (const auto & [span, transfer] : transfers_) {
@@ -683,7 +715,7 @@ void SourceGraph::write(const std::filesystem::path & path) const {
             {           "begin",                                                                             span.begin },
             {             "end",                                                                               span.end }
         });
-        if (span.control_part) record["control_part"] = control_part_name(*span.control_part);
+        if (span.control_part) record["control_part"] = cpu_part_name(*span.control_part);
         stream << record;
     }
 

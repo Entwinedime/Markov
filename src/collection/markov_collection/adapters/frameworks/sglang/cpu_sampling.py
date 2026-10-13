@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import atexit
-import ctypes
 import json
 import os
 import threading
@@ -14,24 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.observer import SGLangObserver
+from markov_collection.adapters.runtimes.ascend.cpu_sampling import CpuCounters, CpuSampling
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.artifacts.json_file import write_json
-
-
-class RuntimeCpuCounters(ctypes.Structure):
-    _fields_ = [
-        (name, ctypes.c_int64)
-        for name in (
-            "wait_ns",
-            "probe_ns",
-            "wait_wall_ns",
-            "last_sync_start_ns",
-            "last_sync_end_ns",
-            "last_sync_cpu_end_ns",
-            "last_sync_probe_cpu_ns",
-            "last_sync_result",
-        )
-    ]
 
 
 @dataclass
@@ -45,8 +29,9 @@ class CpuPart:
 @dataclass
 class ScheduleSample:
     cpu_start_ns: int
-    counters_start: RuntimeCpuCounters
+    counters_start: CpuCounters
     prefix: CpuPart | None = None
+    unit_wrapper_cpu_ns: int = 0
     preparation_wrapper_cpu_ns: int = 0
     preparation_wait_ns: int = 0
     preparation_probe_ns: int = 0
@@ -59,23 +44,13 @@ class CpuSamplingObserver(SGLangObserver):
         self._warmup_ids = warmup_ids
         self._schedule_sample: ScheduleSample | None = None
         self._records: list[dict[str, Any]] = []
+        self._unit_records: list[dict[str, Any]] = []
         self._execution_start_ns = 0
         self._submission_ns = 0
         self._rank: int | None = None
 
-        self._native = ctypes.CDLL(None)
-        self._native.markov_native_begin_cpu_sampling.argtypes = []
-        self._native.markov_native_begin_cpu_sampling.restype = None
-        self._native.markov_native_read_cpu_counters.argtypes = [ctypes.POINTER(RuntimeCpuCounters)]
-        self._native.markov_native_read_cpu_counters.restype = None
-        self._native.markov_native_begin_cpu_sampling()
-
+        self._cpu_sampling = CpuSampling(directory.parent / "cpu_workers")
         atexit.register(self.close)
-
-    def _counters(self) -> RuntimeCpuCounters:
-        counters = RuntimeCpuCounters()
-        self._native.markov_native_read_cpu_counters(ctypes.byref(counters))
-        return counters
 
     def _write(
         self,
@@ -110,7 +85,8 @@ class CpuSamplingObserver(SGLangObserver):
         )
 
     def close(self) -> None:
-        if not self._records:
+        self._cpu_sampling.flush_workers()
+        if not self._records and not self._unit_records:
             return
 
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -129,6 +105,13 @@ class CpuSamplingObserver(SGLangObserver):
 
         self._records.clear()
 
+        unit_directory = self.directory.parent / "cpu_units"
+        unit_directory.mkdir(exist_ok=True)
+        with (unit_directory / f"rank-{self._rank}-pid-{os.getpid()}.jsonl").open("a", encoding="utf-8") as stream:
+            for record in self._unit_records:
+                stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+        self._unit_records.clear()
+
     def schedule(self, original: Callable[..., Any], scheduler: Any, *args: Any, **kwargs: Any) -> Any:
         visible = scheduler.waiting_queue + scheduler.running_batch.reqs
         if scheduler.last_batch is not None:
@@ -144,16 +127,17 @@ class CpuSamplingObserver(SGLangObserver):
         }
 
         start_ns = time.perf_counter_ns()
-        sample = ScheduleSample(0, self._counters())
+        sample = ScheduleSample(0, self._cpu_sampling.read())
         self._schedule_sample = sample
-        sample.cpu_start_ns = time.thread_time_ns()
-        try:
-            batch = original(scheduler, *args, **kwargs)
-        finally:
-            cpu_end_ns = time.thread_time_ns()
-            end_ns = time.perf_counter_ns()
-            counters_end = self._counters()
-            self._schedule_sample = None
+        with self._cpu_sampling:
+            sample.cpu_start_ns = time.thread_time_ns()
+            try:
+                batch = original(scheduler, *args, **kwargs)
+            finally:
+                cpu_end_ns = time.thread_time_ns()
+                end_ns = time.perf_counter_ns()
+                counters_end = self._cpu_sampling.read()
+                self._schedule_sample = None
 
         if sample.prefix is None:
             raise RuntimeError("CPU sampling observed a tracked schedule without native preparation")
@@ -162,7 +146,11 @@ class CpuSamplingObserver(SGLangObserver):
 
         # Preparation is nested inside schedule; subtract it before recording the suffix.
         suffix = CpuPart(
-            cpu_end_ns - sample.cpu_start_ns - prefix.active_ns - sample.preparation_wrapper_cpu_ns,
+            cpu_end_ns
+            - sample.cpu_start_ns
+            - prefix.active_ns
+            - sample.preparation_wrapper_cpu_ns
+            - sample.unit_wrapper_cpu_ns,
             counters_end.wait_ns - sample.counters_start.wait_ns - prefix.wait_ns - sample.preparation_wait_ns,
             counters_end.probe_ns - sample.counters_start.probe_ns - prefix.probe_ns - sample.preparation_probe_ns,
             counters_end.wait_wall_ns
@@ -185,6 +173,53 @@ class CpuSamplingObserver(SGLangObserver):
 
         return batch
 
+    def admission_budget(self, original: Callable[..., Any], adder: Any, req: Any, *args: Any, **kwargs: Any) -> Any:
+        wrapper_start_ns = time.thread_time_ns()
+        if req.rid not in self.request_ids:
+            return original(adder, req, *args, **kwargs)
+
+        parameters = {
+            "accepted_requests": len(adder.can_run_list),
+            "running_requests": len(adder.running_batch.reqs) if adder.running_batch is not None else 0,
+            "input_tokens": req.extend_input_len,
+        }
+        initialized = adder.req_states is not None
+        probe_start_ns = time.thread_time_ns()
+        probe_end_ns = time.thread_time_ns()
+        counters_start = self._cpu_sampling.read()
+        cpu_start_ns = time.thread_time_ns()
+        result = original(adder, req, *args, **kwargs)
+        cpu_end_ns = time.thread_time_ns()
+        counters_end = self._cpu_sampling.read()
+
+        accepted = bool(adder.can_run_list and adder.can_run_list[-1] is req)
+        # In this native method, acceptance on the non-SWA path follows a full
+        # horizon traversal. Rejected calls do not reveal their iteration count.
+        parameters["horizon_checks"] = len(adder.req_states) if accepted and not adder.is_hybrid_swa else None
+        self._unit_records.append(
+            {
+                "unit": "admission_budget",
+                "stage": "warmup" if req.rid in self._warmup_ids else "measurement",
+                "rank": self._rank,
+                "pid": os.getpid(),
+                "tid": threading.get_native_id(),
+                "request_id": req.rid,
+                "parameters": parameters,
+                "request_states_initialized": initialized,
+                "native_result": result.name,
+                "candidate_accepted": accepted,
+                "native_call_cpu_ns": cpu_end_ns - cpu_start_ns,
+                "clock_pair_ns": probe_end_ns - probe_start_ns,
+                "runtime_wait_cpu_ns": counters_end.wait_ns - counters_start.wait_ns,
+                "native_probe_cpu_ns": counters_end.probe_ns - counters_start.probe_ns,
+            }
+        )
+        # Keep added observation work out of the enclosing phase. The native
+        # call itself remains in that inclusive phase and must not be billed twice.
+        wrapper_cpu_ns = time.thread_time_ns() - wrapper_start_ns - (cpu_end_ns - cpu_start_ns)
+        self._schedule_sample.unit_wrapper_cpu_ns += wrapper_cpu_ns
+        return result
+
     def prepare_prefill(self, original: Callable[..., Any], batch: Any, *args: Any, **kwargs: Any) -> Any:
         return self._prepare(original, batch, "prefill", *args, **kwargs)
 
@@ -193,13 +228,13 @@ class CpuSamplingObserver(SGLangObserver):
 
     def _prepare(self, original: Callable[..., Any], batch: Any, phase: str, *args: Any, **kwargs: Any) -> Any:
         wrapper_cpu_start_ns = time.thread_time_ns()
-        wrapper_counters = self._counters()
+        wrapper_counters = self._cpu_sampling.read()
         if not self._tracked(batch.reqs):
             return original(batch, *args, **kwargs)
 
         sample = self._schedule_sample
         sample.prefix = CpuPart(
-            wrapper_cpu_start_ns - sample.cpu_start_ns,
+            wrapper_cpu_start_ns - sample.cpu_start_ns - sample.unit_wrapper_cpu_ns,
             wrapper_counters.wait_ns - sample.counters_start.wait_ns,
             wrapper_counters.probe_ns - sample.counters_start.probe_ns,
             wrapper_counters.wait_wall_ns - sample.counters_start.wait_wall_ns,
@@ -210,12 +245,13 @@ class CpuSamplingObserver(SGLangObserver):
         metadata = self._batch(batch, phase)
 
         start_ns = time.perf_counter_ns()
-        counters_start = self._counters()
-        cpu_start_ns = time.thread_time_ns()
-        result = original(batch, *args, **kwargs)
-        cpu_end_ns = time.thread_time_ns()
+        counters_start = self._cpu_sampling.read()
+        with self._cpu_sampling:
+            cpu_start_ns = time.thread_time_ns()
+            result = original(batch, *args, **kwargs)
+            cpu_end_ns = time.thread_time_ns()
         end_ns = time.perf_counter_ns()
-        counters_end = self._counters()
+        counters_end = self._cpu_sampling.read()
 
         sample.preparation_wait_ns = counters_end.wait_ns - wrapper_counters.wait_ns
         sample.preparation_probe_ns = counters_end.probe_ns - wrapper_counters.probe_ns
@@ -248,12 +284,13 @@ class CpuSamplingObserver(SGLangObserver):
         metadata = self._batch(batch, phase)
 
         start_ns = time.perf_counter_ns()
-        counters_start = self._counters()
-        cpu_start_ns = time.thread_time_ns()
-        result = original(scheduler, batch, *args, **kwargs)
-        cpu_end_ns = time.thread_time_ns()
+        counters_start = self._cpu_sampling.read()
+        with self._cpu_sampling:
+            cpu_start_ns = time.thread_time_ns()
+            result = original(scheduler, batch, *args, **kwargs)
+            cpu_end_ns = time.thread_time_ns()
         end_ns = time.perf_counter_ns()
-        counters_end = self._counters()
+        counters_end = self._cpu_sampling.read()
 
         self._execution_start_ns = start_ns
         self._submission_ns = end_ns
@@ -283,12 +320,13 @@ class CpuSamplingObserver(SGLangObserver):
         metadata = self._batch(batch, phase)
 
         start_ns = time.perf_counter_ns()
-        counters_start = self._counters()
-        cpu_start_ns = time.thread_time_ns()
-        result = original(scheduler, batch, *args, **kwargs)
-        cpu_end_ns = time.thread_time_ns()
+        counters_start = self._cpu_sampling.read()
+        with self._cpu_sampling:
+            cpu_start_ns = time.thread_time_ns()
+            result = original(scheduler, batch, *args, **kwargs)
+            cpu_end_ns = time.thread_time_ns()
         end_ns = time.perf_counter_ns()
-        counters_end = self._counters()
+        counters_end = self._cpu_sampling.read()
 
         finished = [req for req in batch.reqs if req.finished()]
         metadata["finished_request_count"] = len(finished)

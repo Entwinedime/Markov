@@ -1,8 +1,14 @@
+#include "markov/adapters/frameworks/ktransformers/collection_adapter.hpp"
+#include "markov/adapters/frameworks/sglang/collection_adapter.hpp"
+#include "markov/adapters/frameworks/sglang/template_adapter.hpp"
 #include "markov/contracts/project.hpp"
+#include "markov/workflow/cost_fitting_workflow.hpp"
 #include "markov/workflow/extraction_workflow.hpp"
 #include "markov/workflow/plan.hpp"
 #include "markov/workflow/prediction_workflow.hpp"
+#include "markov/workflow/project_reader.hpp"
 
+#include <array>
 #include <exception>
 #include <fstream>
 #include <iostream>
@@ -14,6 +20,8 @@
 
 namespace {
 constexpr std::string_view usage = "Usage: markov {plan|predict|prepare-prediction} --project project.json\n"
+                                   "       markov fit-costs --performance-manifest performance_manifest.json [--unit admission|worker|kernel|communication]\n"
+                                   "       markov evaluate-costs --model-candidate candidate.json --performance-manifest performance_manifest.json\n"
                                    "       markov prepare --project project.json --configuration ID --workload ID\n"
                                    "       markov prepare-representative --project project.json --configuration ID\n"
                                    "       markov prepare-target --project project.json --configuration ID --workload ID --budget-sec N\n"
@@ -30,13 +38,15 @@ int main(int argc, char ** argv) {
     try {
         if (argc < 4 || argc % 2 != 0) throw std::invalid_argument(std::string(usage));
         const std::string_view command = argv[1];
-        const std::set<std::string_view> commands{ "plan",    "predict",          "prepare-prediction", "prepare-representative",
-                                                   "prepare", "prepare-target",   "prepare-sampling",   "prepare-communication",
-                                                   "extract", "compile-templates" };
+        const std::set<std::string_view> commands{ "plan",    "predict",           "prepare-prediction", "prepare-representative",
+                                                   "prepare", "prepare-target",    "prepare-sampling",   "prepare-communication",
+                                                   "extract", "compile-templates", "fit-costs",          "evaluate-costs" };
         if (!commands.contains(command)) throw std::invalid_argument(std::string(usage));
 
         const bool source_command = command == "extract" || command == "compile-templates";
         std::set<std::string_view> required{ source_command ? "--base-manifest" : "--project" };
+        if (command == "fit-costs") required = { "--performance-manifest" };
+        if (command == "evaluate-costs") required = { "--model-candidate", "--performance-manifest" };
         if (command == "prepare" || command == "prepare-representative" || command == "prepare-target" || command == "prepare-sampling"
             || command == "prepare-communication")
             required.insert("--configuration");
@@ -45,24 +55,42 @@ int main(int argc, char ** argv) {
         if (command == "prepare-sampling") required.insert("--measurement-requests");
         std::map<std::string_view, std::string> options;
         for (int index = 2; index < argc; index += 2) {
-            if (!required.contains(argv[index]) || !options.emplace(argv[index], argv[index + 1]).second)
+            const bool optional_unit = command == "fit-costs" && std::string_view(argv[index]) == "--unit";
+            if ((!required.contains(argv[index]) && !optional_unit) || !options.emplace(argv[index], argv[index + 1]).second)
                 throw std::invalid_argument("unknown or duplicate argument: " + std::string(argv[index]));
         }
         for (const auto key : required) {
             if (!options.contains(key)) throw std::invalid_argument("missing argument: " + std::string(key));
         }
 
+        if (command == "fit-costs") {
+            std::cout << markov::CostFittingWorkflow{}
+                             .run(options.at("--performance-manifest"), options.contains("--unit") ? options.at("--unit") : "admission")
+                             .dump(2)
+                      << '\n';
+            return 0;
+        }
+        if (command == "evaluate-costs") {
+            std::cout << markov::CostFittingWorkflow{}.evaluate(options.at("--model-candidate"), options.at("--performance-manifest")).dump(2) << '\n';
+            return 0;
+        }
+
+        const markov::SGLangTemplateAdapter sglang;
+        const std::array<const markov::TemplateAdapter *, 1> adapters{ &sglang };
         if (source_command) {
-            const markov::ExtractionWorkflow workflow;
+            const markov::ExtractionWorkflow workflow(adapters);
             const auto & manifest = options.at("--base-manifest");
             const auto result = command == "extract" ? workflow.run(manifest) : workflow.compile(manifest);
             std::cout << result.dump(2) << '\n';
             return 0;
         }
-        const auto project = markov::ProjectReader{}.read(options.at("--project"));
-        const markov::Planner planner;
+        const markov::SGLangCollectionAdapter sglang_collection;
+        const markov::KTransformersCollectionAdapter kt_collection;
+        const std::array<const markov::CollectionAdapter *, 2> collection_adapters{ &sglang_collection, &kt_collection };
+        const auto project = markov::ProjectReader(collection_adapters).read(options.at("--project"));
+        const markov::Planner planner(adapters, collection_adapters);
         nlohmann::json result;
-        if (command == "predict") result = markov::PredictionWorkflow{}.run(project);
+        if (command == "predict") { result = markov::PredictionWorkflow(adapters).run(project, planner.collection_plan(project)); }
         else if (command == "plan") result = planner.describe(project);
         else if (command == "prepare-prediction") result = planner.prepare_prediction(project);
         else {

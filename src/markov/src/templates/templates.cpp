@@ -105,9 +105,13 @@ void TemplateDefinition::read_structure(const Json & source, const Json & source
                           span_kind(span.at("kind").get<std::string>()),
                           local_ids.at(span.at("begin").get<BoundaryId>()),
                           local_ids.at(span.at("end").get<BoundaryId>()) });
-        node_observations.push_back({ source_span,
-                                      kernel == kernels.end() ? nullptr : &kernel->second,
-                                      span.at("scope_call").is_null() ? std::nullopt : std::optional(span.at("scope_call").get<std::size_t>()) });
+        node_observations.push_back(
+            { source_span,
+              kernel == kernels.end() ? nullptr : &kernel->second,
+              span.at("scope_call").is_null() ? std::nullopt : std::optional(span.at("scope_call").get<std::size_t>()),
+              nullptr,
+              nullptr,
+              span.contains("control_part") ? std::optional(SourceGraph::parse_cpu_part(span.at("control_part").get<std::string>())) : std::nullopt });
     }
 
     for (const auto & identity : source.at("internal_edges")) {
@@ -117,6 +121,11 @@ void TemplateDefinition::read_structure(const Json & source, const Json & source
                                local_ids.at(edge.at("source").get<BoundaryId>()),
                                local_ids.at(edge.at("target").get<BoundaryId>()) });
     }
+
+    // Keep native CPU paths across excluded observations inside the template,
+    // so state qualification and later rewrites see the same dependencies.
+    for (const auto & path : source.at("internal_thread_paths"))
+        graph.add_dependency({ SourceRelation::ThreadOrder, local_ids.at(path.at(0).get<BoundaryId>()), local_ids.at(path.at(1).get<BoundaryId>()) });
 
     // A region is a view of existing work. Rebinding its cuts to the same local
     // boundary space keeps asynchronous dependencies without a region-wide barrier.
@@ -1321,7 +1330,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_op
     return replacement;
 }
 
-void TemplateBank::bind_sources(std::span<const TemplateBank * const> banks) {
+void TemplateBank::bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources) {
+    operation_sources_.assign(operation_sources.begin(), operation_sources.end());
     donors_.clear();
     banks_ = { this };
     for (const auto & [key, definitions] : source_.definitions)
@@ -1365,7 +1375,11 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
         if (observed->second.accepts(target)) continue;
         if (target.requests.empty()) return std::unexpected("batch_operation_empty_target_not_supported");
 
-        std::vector<const TemplateDefinition *> candidates;
+        struct OperationSource {
+            const TemplateDefinition * definition;
+            bool rebindable_only;
+        };
+        std::vector<OperationSource> candidates;
         for (const auto & [key, definitions] : donors_) {
             const auto & [step, phase, rank] = key;
             if (rank != source.rank) continue;
@@ -1375,16 +1389,25 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
                 if (step != StepKind::Prefill && step != StepKind::Decode) continue;
             }
             else if (step != source.step || phase != target.phase) continue;
-            for (const auto & definition : definitions) candidates.push_back(definition);
+            for (const auto & definition : definitions) candidates.push_back({ definition, false });
         }
+
+        // Fragment sources never enter the whole-template or state-donor banks.
+        for (const auto * definition : operation_sources_) {
+            if (definition->rank != source.rank || definition->step != source.step || definition->phase != target.phase) continue;
+            if (std::ranges::find(candidates, definition, &OperationSource::definition) != candidates.end()) continue;
+            candidates.push_back({ definition, true });
+        }
+
         std::optional<TemplateOperationRewrite> selected;
         std::string gap = "batch_operation_variant_not_observed";
-        for (const auto * candidate : candidates) {
-            const auto & donor = *candidate;
+        for (const auto & candidate : candidates) {
+            const auto & donor = *candidate.definition;
             for (const auto & variant : donor.operations) {
                 const auto replacement = donor.batch_operations.find(variant.host.source_span);
                 if (replacement == donor.batch_operations.end() || replacement->second.role != observed->second.role
-                    || replacement->second.source_requests != donor.source_requests.size() || !replacement->second.accepts(target))
+                    || replacement->second.source_requests != donor.source_requests.size() || !replacement->second.accepts(target)
+                    || (candidate.rebindable_only && !replacement->second.request_pool_rebindable))
                     continue;
                 auto plan = source.plan_operation_replacement(operation, donor, variant);
                 if (!plan) {
@@ -1449,6 +1472,27 @@ bool TemplateDefinition::is_cpu_region(const TemplateRegion & region) const {
     return cpu_lane.has_value();
 }
 
+std::optional<std::size_t> TemplateDefinition::admission_member_slot(SourceSpanId span) const {
+    for (std::size_t slot = 0; slot < admission_regions.size(); ++slot) {
+        const auto & region = regions[admission_regions[slot]];
+        if (region.inputs.size() != 1 || region.outputs.size() != 1) continue;
+
+        // Admission regions are producer-qualified CPU-only work. A complete
+        // unit can use one node's cost only when that service spans both ports.
+        std::optional<TemplateNode> service;
+        std::size_t services = 0;
+        for (const auto index : region.nodes) {
+            const auto & node = graph[index];
+            if (node.kind != SourceSpanKind::CpuControl) continue;
+            ++services;
+            service = node;
+        }
+        if (services == 1 && observation(*service).source_span == span && service->begin == region.inputs.front() && service->end == region.outputs.front())
+            return slot;
+    }
+    return std::nullopt;
+}
+
 bool TemplateDefinition::matches_transition(const BatchInput & target) const {
     const auto count = target.transition.pending_prefill_requests ? 1U : 0U;
     auto entry = target.transition;
@@ -1460,12 +1504,13 @@ bool TemplateDefinition::matches_transition(const BatchInput & target) const {
         if (std::ranges::equal(std::span(filters).first(count), std::span(target.filters).first(count))) return true;
     }
 
-    // Keep the observed pending filter and nonempty branches. Only the left
-    // row count changes here; the following running filter is planned separately.
-    if (transition_merge_parameters && target.merge && target.merge->left_count > 0 && target.transition.running_requests == target.merge->left_count
-        && transition->pending_prefill_requests == target.transition.pending_prefill_requests && merge->right_count == target.merge->right_count
-        && filters.front() == target.filters.front())
-        return true;
+    // Both row counts are parameters of the qualified nonempty merge. The
+    // pending filter must still keep every member; the running filter is separate.
+    if (transition_merge_parameters && target.merge && target.merge->left_count > 0 && target.merge->right_count > 0
+        && target.transition.running_requests == target.merge->left_count && target.transition.pending_prefill_requests == target.merge->right_count) {
+        const auto & pending = target.filters.front();
+        if (pending.input_count == target.merge->right_count && pending.retained_indices.size() == pending.input_count) return true;
+    }
 
     // Empty/all-kept CPU filters scan target members without creating device
     // indices. Preserve whether the prefix runs, not its observed loop count.
@@ -2228,9 +2273,8 @@ std::expected<void, TemplateGap> TemplateBank::qualify_initialization(std::uint3
         return std::unexpected(TemplateGap{ TemplateGapKind::Observation, *source_.initialization_gap, StepKind::Schedule, BatchPhase::Idle, 0 });
     if (source_.workspace_binding_gap)
         return std::unexpected(TemplateGap{ TemplateGapKind::Observation, *source_.workspace_binding_gap, StepKind::Schedule, BatchPhase::Idle, 0 });
-    if (request_capacity != source_.request_pool_domain.maximum)
-        return std::unexpected(
-            TemplateGap{ TemplateGapKind::Rule, "workspace_initial_capacity_migration_not_qualified", StepKind::Schedule, BatchPhase::Idle, 0 });
+    if (const auto gap = source_.initialization_pool_domain.unsupported(request_capacity))
+        return std::unexpected(TemplateGap{ TemplateGapKind::Rule, *gap, StepKind::Schedule, BatchPhase::Idle, 0 });
     return {};
 }
 

@@ -25,6 +25,8 @@ struct BatchOperationVariant {
     std::uint64_t maximum_requests;
     std::optional<PageTableMaterialization> page_table = std::nullopt;
     std::uint32_t page_size_tokens = 0;
+    // The operation can use the target pool without importing source pool state.
+    bool request_pool_rebindable = false;
 
     bool accepts(const BatchInput & input) const;
 };

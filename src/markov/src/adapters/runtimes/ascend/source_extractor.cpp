@@ -1349,6 +1349,46 @@ void AscendSourceExtractor::extract_cpu_control() {
     }
 }
 
+void AscendSourceExtractor::bind_worker_cpu(const nlohmann::json & intervals, const nlohmann::json & flows) {
+    std::map<std::pair<BoundaryId, BoundaryId>, SourceSpanId> submissions;
+    for (const auto & flow : flows) {
+        if (flow.value("source_binding", "") != "native_flow_runtime_submission") continue;
+        const auto identity = flow.at("source_intervals").at(0).get<SourceSpanId>();
+        const auto & span = graph_.spans()[identity];
+        submissions.emplace(std::pair{ span.begin, span.end }, identity);
+    }
+
+    std::map<std::size_t, std::vector<SourceSpanId>> services;
+    for (SourceSpanId identity = 0; identity < graph_.spans().size(); ++identity) {
+        const auto & span = graph_.spans()[identity];
+        if (span.kind == SourceSpanKind::CpuControl && span.control_part == SourceCpuPart::Dispatch && span.source_interval)
+            services[*span.source_interval].push_back(identity);
+    }
+
+    for (auto & [worker, members] : services) {
+        const auto name = intervals.at(worker).at("name").get<std::string>();
+        if (!name.starts_with("Dequeue@") || members.size() != 3) continue;
+        std::ranges::sort(members, [&](SourceSpanId left, SourceSpanId right) {
+            return graph_.boundaries()[graph_.spans()[left].begin].observed_time_ns < graph_.boundaries()[graph_.spans()[right].begin].observed_time_ns;
+        });
+
+        const auto & before = graph_.spans()[members[0]];
+        const auto & call = graph_.spans()[members[1]];
+        const auto & after = graph_.spans()[members[2]];
+        const auto & window = graph_.spans()[worker];
+        if (before.begin != window.begin || before.end != call.begin || call.end != after.begin || after.end != window.end) continue;
+        const auto submission = submissions.find({ call.begin, call.end });
+        if (submission == submissions.end()) continue;
+
+        // Bind existing complete services only. Extra waits or cuts are neither
+        // removed nor assigned a fraction of a whole-worker measurement.
+        const auto operation = name.substr(std::string_view("Dequeue@").size());
+        graph_.observe_cpu_work(members[0], { operation, CpuSubmissionPart::Before, submission->second });
+        graph_.observe_cpu_work(members[1], { operation, CpuSubmissionPart::Call, submission->second });
+        graph_.observe_cpu_work(members[2], { operation, CpuSubmissionPart::After, submission->second });
+    }
+}
+
 void AscendSourceExtractor::extract_worker_cpu() {
     std::set<std::size_t> control_lanes;
 
@@ -1512,6 +1552,7 @@ nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & mani
     // CPU segmentation needs the flow endpoints and explicit waits collected above.
     extract_cpu_control();
     extract_worker_cpu();
+    bind_worker_cpu(facts.at("intervals"), facts.at("flows"));
     if (const auto unresolved = bindings_.bind_transfers(graph_, facts.at("intervals"), facts.at("native_api"), calls_))
         gaps_.push_back({
             {      "kind",                    "observation" },

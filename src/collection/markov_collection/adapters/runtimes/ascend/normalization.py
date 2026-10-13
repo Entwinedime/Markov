@@ -42,6 +42,70 @@ class ObservationNormalizer:
         self.devices: list[dict[str, Any]] = []
         self.profile_controls: list[dict[str, Any]] = []
 
+    def _task_samples(
+        self, collectives: dict[tuple[int, int], list[dict[str, Any]]], unresolved: Counter
+    ) -> list[dict[str, Any]]:
+        hardware: dict[tuple[int, int, int, int], list[dict[str, Any]]] = defaultdict(list)
+        for interval in self.intervals:
+            if interval["process"] != "Ascend Hardware":
+                continue
+
+            args = interval["arguments"]
+            key = (interval["rank"], args["Physic Stream Id"], args["Task Id"], args["Subtask Id"])
+            hardware[key].append(interval)
+
+        samples = []
+        for detail in self.intervals:
+            args = detail["arguments"]
+            if detail["process"] != "Communication" or "context id" not in args:
+                continue
+
+            rank = detail["rank"]
+            key = (rank, args["stream id"], args["task id"], args["context id"])
+            matches = hardware[key]
+            if len(matches) != 1 or args["src rank"] != rank:
+                unresolved["collective_physical_task_identity_ambiguous"] += 1
+                continue
+
+            physical = matches[0]
+            owners = collectives.get((rank, physical["arguments"]["connection_id"]), [])
+            if not owners:
+                owner = physical["owner_call"]
+                if owner is None or self.calls[owner]["step"] != "setup":
+                    unresolved["collective_task_owner_missing"] += 1
+                continue  # Only a known setup scope can be excluded without a gap.
+            if len(owners) != 1:
+                unresolved["collective_task_owner_ambiguous"] += 1
+                continue
+
+            collective = owners[0]
+
+            # Keep the physical task boundary and classification. Waits and
+            # markers retain their physical classification, not a collective envelope cost.
+            samples.append(
+                {
+                    "rank": rank,
+                    "stage": collective["stage"],
+                    **{key: collective[key] for key in ("grid", "repetition", "step") if key in collective},
+                    "kind": physical["kind"],
+                    "operation": detail["name"],
+                    "bytes": args["size(Byte)"],
+                    "data_type": args["data type"],
+                    "transport": args["transport type"],
+                    "source_rank": args["src rank"],
+                    "destination_rank": args["dst rank"],
+                    "stream": args["stream id"],
+                    "task": args["task id"],
+                    "context": args["context id"],
+                    "device_start_ns": physical["start_ns"],
+                    "device_end_ns": physical["end_ns"],
+                    "observed_wall_ns": physical["observed_wall_ns"],
+                    "source": physical["source"],
+                    "detail_source": detail["source"],
+                }
+            )
+        return samples
+
     def _read_capture(self) -> None:
         for reference in self.capture["observations"]:
             with (self.directory / reference).open(encoding="utf-8") as stream:
@@ -722,6 +786,43 @@ class ObservationNormalizer:
                 if begin <= interval["start_ns"] and interval["end_ns"] <= end:
                     interval["owner_call"] = identity
 
+        # Native connection IDs locate the actual launch; queue correlation IDs
+        # connect its worker to the originating host enqueue. Vendor torch flows
+        # can instead name an unrelated nested record_function probe.
+        submissions: dict[int, list[int]] = defaultdict(list)
+        enqueues: dict[int, list[int]] = defaultdict(list)
+        worker_windows: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        runtime_submissions: dict[int, list[dict[str, Any]]] = defaultdict(list)
+
+        # These profiler modes denote actual task submission, not preparation or
+        # a high-level operator envelope. Keep backend spelling in this adapter.
+        submission_modes = {
+            "LaunchKernelV2",
+            "KernelLaunch",
+            "KernelLaunchWithHandle",
+            "KernelLaunchWithHandle_Big",
+            "FftsPlusTaskLaunch",
+            "EventRecord",
+            "StreamWaitEvent",
+            "MemcpyAsync",
+        }
+
+        for interval in local_intervals:
+            arguments = interval["arguments"]
+            if interval["process"] == "CANN":
+                submissions[arguments["connection_id"]].append(interval["id"])
+                if arguments.get("level") == "runtime" and arguments.get("Mode") in submission_modes:
+                    runtime_submissions[interval["tid"]].append(interval)
+            elif interval["name"].startswith("Enqueue@"):
+                enqueues[arguments["correlation_id"]].append(interval["id"])
+            elif interval["name"].startswith("Dequeue@"):
+                worker_windows[interval["tid"]].append(interval)
+
+        for sequence in worker_windows.values():
+            sequence.sort(key=lambda interval: interval["start_ns"])
+        for sequence in runtime_submissions.values():
+            sequence.sort(key=lambda interval: interval["start_ns"])
+
         for (category, identity), endpoints in flow_events.items():
             if "s" not in endpoints or "f" not in endpoints:
                 self.gaps.append(
@@ -738,6 +839,30 @@ class ObservationNormalizer:
             source, target = endpoints["s"], endpoints["f"]
             source_ids = starts[(source["pid"], source["tid"], timestamp_ns(source["ts"]))]
             target_ids = starts[(target["pid"], target["tid"], timestamp_ns(target["ts"]))]
+            profiler_source_ids = source_ids
+            source_binding = None
+            if category == "HostToDevice":
+                submission = self._flow_submission(source_ids, target_ids, runtime_submissions)
+                if submission is not None:
+                    source_ids = [submission]
+                    source_binding = "native_flow_runtime_submission"
+            if category == "async_npu" and len(target_ids) == 1:
+                enqueue = self._flow_enqueue(self.intervals[target_ids[0]], submissions, worker_windows, enqueues)
+                if enqueue is not None:
+                    host = self.intervals[enqueue]
+                    # Containment validates an already identity-linked enqueue;
+                    # it never chooses a device producer by temporal proximity.
+                    valid = any(
+                        self.intervals[index]["pid"] == host["pid"]
+                        and self.intervals[index]["tid"] == host["tid"]
+                        and self.intervals[index]["start_ns"] <= host["start_ns"]
+                        and host["end_ns"] <= self.intervals[index]["end_ns"]
+                        for index in source_ids
+                    )
+                    if not valid:
+                        source_ids = [enqueue]
+                        source_binding = "native_connection_queue"
+
             owners = {self.intervals[index]["owner_call"] for index in source_ids} - {None}
             if len(owners) == 1:
                 owner = owners.pop()
@@ -761,6 +886,10 @@ class ObservationNormalizer:
                     "target_time_ns": timestamp_ns(target["ts"]),
                 }
             )
+            if source_ids != profiler_source_ids:
+                self.flows[-1]["profiler_source_intervals"] = profiler_source_ids
+                self.flows[-1]["source_binding"] = source_binding
+                self.flows[-1]["source_time_ns"] = self.intervals[source_ids[0]]["start_ns"]
 
         # CANN, hardware tasks and HCCL summaries share explicit connection IDs.
         # The collective root receives its owner through the native flow; propagate
@@ -807,6 +936,63 @@ class ObservationNormalizer:
             self.gaps.append(
                 {"kind": "scope", "reason": "vendor_analysis_channels_excluded", "rank": rank, "counts": dict(ignored)}
             )
+
+    def _flow_submission(
+        self,
+        sources: list[int],
+        targets: list[int],
+        submissions: dict[int, list[dict[str, Any]]],
+    ) -> int | None:
+        if not sources or not targets:
+            return None
+
+        parents = [self.intervals[index] for index in sources]
+        first = parents[0]
+        if any(parent["process"] != "CANN" or parent["tid"] != first["tid"] for parent in parents):
+            return None
+
+        # The native flow establishes device identity first. Containment only
+        # refines that known producer; never choose a nearby launch by time.
+        connections = {parent["arguments"]["connection_id"] for parent in parents}
+        if any(self.intervals[index]["arguments"].get("connection_id") not in connections for index in targets):
+            return None
+
+        begin = max(parent["start_ns"] for parent in parents)
+        end = min(parent["end_ns"] for parent in parents)
+        sequence = submissions.get(first["tid"], [])
+        position = bisect_left(sequence, begin, key=lambda interval: interval["start_ns"])
+        stop = bisect_left(sequence, end, key=lambda interval: interval["start_ns"])
+        matches = []
+        for interval in sequence[position:stop]:
+            if interval["end_ns"] <= end:
+                matches.append(interval["id"])
+
+        return matches[0] if len(matches) == 1 else None
+
+    def _flow_enqueue(
+        self,
+        target: dict[str, Any],
+        submissions: dict[int, list[int]],
+        worker_windows: dict[int, list[dict[str, Any]]],
+        enqueues: dict[int, list[int]],
+    ) -> int | None:
+        matches = submissions.get(target["arguments"].get("connection_id"), [])
+        if len(matches) != 1:
+            return None
+
+        submission = self.intervals[matches[0]]
+        sequence = worker_windows.get(submission["tid"], [])
+        position = bisect_right(sequence, submission["start_ns"], key=lambda interval: interval["start_ns"]) - 1
+        if position < 0:
+            return None
+        worker = sequence[position]
+        if submission["end_ns"] > worker["end_ns"]:
+            return None
+
+        hosts = enqueues.get(worker["arguments"]["correlation_id"], [])
+        if len(hosts) != 1:
+            return None
+        return hosts[0]
 
 
 class ServingNormalizer(ObservationNormalizer):
@@ -991,6 +1177,27 @@ class DeviceCostNormalizer(ObservationNormalizer):
         if self.capture["role"] != "performance":
             raise ValueError("independent device costs must come from a performance capture")
 
+    @staticmethod
+    def kernel_cost_work(interval: dict[str, Any]) -> dict[str, Any] | None:
+        kernel = interval.get("kernel")
+        if interval["kind"] != "compute" or kernel is None:
+            return None
+
+        # Vendor column names stop at this adapter. Capacity, rank and trace
+        # identities are not substitutes for the actual launch dimensions.
+        return {
+            "name": interval["name"],
+            "operation": kernel["Type"],
+            "input_shapes": kernel["Input Shapes"],
+            "output_shapes": kernel["Output Shapes"],
+            "input_dtypes": kernel["Input Data Types"],
+            "output_dtypes": kernel["Output Data Types"],
+            "input_formats": kernel["Input Formats"],
+            "output_formats": kernel["Output Formats"],
+            "task_type": interval["arguments"]["Task Type"],
+            "launch_blocks": int(kernel["Block Dim" if "Block Dim" in kernel else "Block Num"]),
+        }
+
     def extract(self) -> Path:
         from markov_collection.artifacts.sampling_domain import SamplingDomain
 
@@ -1005,6 +1212,7 @@ class DeviceCostNormalizer(ObservationNormalizer):
 
         samples = []
         collectives = []
+        collective_owners: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         unresolved = Counter()
         for interval in self.intervals:
             arguments = interval["arguments"]
@@ -1032,6 +1240,8 @@ class DeviceCostNormalizer(ObservationNormalizer):
                     "source": interval["source"],
                 }
             )
+            collective_owners[(interval["rank"], arguments["connection_id"])].append(collectives[-1])
+
         for interval in self.intervals:
             if interval["kind"] not in ("compute", "dma"):
                 continue
@@ -1063,17 +1273,20 @@ class DeviceCostNormalizer(ObservationNormalizer):
                     "duration_ns": interval["observed_wall_ns"],
                     "arguments": interval["arguments"],
                     "kernel": interval.get("kernel"),
+                    "kernel_work": self.kernel_cost_work(interval),
                     "transfer": transfer,
                     "source": interval["source"],
                 }
             )
 
+        task_samples = self._task_samples(collective_owners, unresolved)
         sample_path = self.directory / "device_measurements.json"
         write_json(
             sample_path,
             {
                 "samples": samples,
                 "collective_descriptors": collectives,
+                "task_samples": task_samples,
                 "collective_observations": self.supplementary_work,
                 "devices": self.devices,
             },
@@ -1106,6 +1319,8 @@ class DeviceCostNormalizer(ObservationNormalizer):
                     "stage_kind": dict(Counter(f"{sample['stage']}/{sample['kind']}" for sample in samples)),
                     "collective_observations": len(self.supplementary_work),
                     "collective_descriptors": len(collectives),
+                    "task_samples": len(task_samples),
+                    "task_kinds": dict(Counter(sample["kind"] for sample in task_samples)),
                 },
                 "clock": {"duration_ns": "physical hardware span; compound transport is not service cost"},
                 "readiness": "needs_data",
@@ -1130,6 +1345,7 @@ class CollectiveCostNormalizer(ObservationNormalizer):
         world_size = prepared["configuration"]["tp_size"]
         samples = []
         grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        collectives: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         unresolved = Counter()
         for interval in self.intervals:
             args = interval["arguments"]
@@ -1172,6 +1388,7 @@ class CollectiveCostNormalizer(ObservationNormalizer):
             }
 
             samples.append(sample)
+            collectives[(interval["rank"], args["connection_id"])].append(sample)
             grouped[(metadata["grid"], metadata["repetition"])].append(sample)
 
         # A collective sample requires all ranks from the same grid point and repetition.
@@ -1201,7 +1418,12 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                 )
 
         measurements = self.directory / "collective_measurements.json"
-        write_json(measurements, {"rank_samples": samples, "groups": groups, "devices": self.devices}, compact=True)
+        task_samples = self._task_samples(collectives, unresolved)
+        write_json(
+            measurements,
+            {"rank_samples": samples, "groups": groups, "task_samples": task_samples, "devices": self.devices},
+            compact=True,
+        )
         if unresolved:
             self.gaps.append(
                 {"kind": "cost", "reason": "collective_measurement_incomplete", "counts": dict(unresolved)}
@@ -1225,6 +1447,8 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                     "rank_samples": len(samples),
                     "groups": len(groups),
                     "stage_groups": dict(Counter(group["stage"] for group in groups)),
+                    "task_samples": len(task_samples),
+                    "task_kinds": dict(Counter(sample["kind"] for sample in task_samples)),
                 },
                 "clock": {
                     "device_start_ns/device_end_ns": "wall_epoch_ns; native per-rank collective spans",

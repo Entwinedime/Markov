@@ -9,8 +9,15 @@
 
 namespace markov {
 
+class TemplateAdapter;
+class CollectionAdapter;
+
 class Planner {
 public:
+    Planner(std::span<const TemplateAdapter * const> adapters, std::span<const CollectionAdapter * const> collection_adapters)
+        : adapters_(adapters),
+          collection_adapters_(collection_adapters) {}
+
     nlohmann::json describe(const Project & project) const;
     nlohmann::json collection_plan(const Project & project) const;
     nlohmann::json prepare_prediction(const Project & project) const;
@@ -23,6 +30,13 @@ public:
     nlohmann::json prepare_sampling(const Project & project, const Candidate & configuration, const RequestWorkload & prompts,
                                     const nlohmann::json & measurement_requests) const;
     nlohmann::json prepare_communication(const Project & project, const Candidate & configuration) const;
+
+private:
+    const CollectionAdapter & collection_adapter(Framework framework) const;
+
+    // Both adapter lists are owned by the entry point throughout preparation.
+    std::span<const TemplateAdapter * const> adapters_;
+    std::span<const CollectionAdapter * const> collection_adapters_;
 };
 
 } // namespace markov

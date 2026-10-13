@@ -329,6 +329,8 @@ struct TemplateNodeObservation {
     std::optional<std::size_t> source_scope;
     const SourceCommunicationTask * communication = nullptr; // Borrowed from this source definition's collective tasks.
     const SourceTransfer * transfer = nullptr;               // Borrowed from TemplateSource::transfers.
+    std::optional<SourceCpuPart> control_part = std::nullopt;
+    std::optional<SourceCpuWork> cpu_work = std::nullopt;
 };
 
 // Each insertion owns its target descriptor. Donor observations and definition
@@ -535,6 +537,7 @@ struct TemplateDefinition {
     TemplateSubgraphRegion workspace_region(const TemplateWorkspaceUse & use) const;
     TemplateSubgraphRegion semantic_region(const TemplateRegion & source) const;
     bool is_cpu_region(const TemplateRegion & region) const;
+    std::optional<std::size_t> admission_member_slot(SourceSpanId span) const;
     bool has_resource_roles() const;
     bool matches_running_filter(const BatchInput & target) const;
     std::expected<std::vector<TemplateRegionPort>, std::string> region_ports(const TemplateSubgraphRegion & region) const;
@@ -804,6 +807,7 @@ struct TemplateSource {
     std::vector<TemplateWorkspacePool> workspace_pools;
     std::optional<std::string> workspace_binding_gap;
     RequestPoolCapacityDomain request_pool_domain;
+    RequestPoolCapacityDomain initialization_pool_domain;  // Producer-qualified reuse of the post-warmup capacities.
     std::optional<std::uint32_t> sequence_capacity_tokens; // Processed tokens, including the current query.
     std::vector<std::string> transforms;
     std::vector<std::string> limits;
@@ -821,7 +825,9 @@ public:
 
     // Borrowed sources are qualified by the caller; all owners remain alive during prediction.
     // Each batch still selects one complete native cohort before local rewrites.
-    void bind_sources(std::span<const TemplateBank * const> banks);
+    void bind_sources(std::span<const TemplateBank * const> banks, std::span<const TemplateDefinition * const> operation_sources = {});
+
+    const TemplateSource & source() const { return source_; }
 
     // One nonempty controller batch; returned rows follow invocation order.
     std::expected<std::vector<std::vector<TemplateInstance>>, TemplateGap> instantiate(std::span<const InvokeStep> invocations,
@@ -870,7 +876,8 @@ private:
                                                                              std::optional<std::size_t> request_slot = std::nullopt) const;
 
     TemplateSource source_;
-    std::vector<const TemplateBank *> banks_; // Qualified local donors may lack an initialization contract.
+    std::vector<const TemplateDefinition *> operation_sources_; // Borrowed from workflow-owned banks; only declared independent operations.
+    std::vector<const TemplateBank *> banks_;                   // Qualified local donors may lack an initialization contract.
     std::map<std::tuple<StepKind, BatchPhase, std::uint32_t>, std::vector<const TemplateDefinition *>> donors_;
 };
 

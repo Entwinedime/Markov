@@ -107,6 +107,7 @@ struct Project {
     CollectionPermission base_collection;
     CollectionPermission performance_collection;
     std::vector<std::filesystem::path> performance_manifests;
+    std::vector<std::filesystem::path> cost_models;
 
     std::filesystem::path output_directory;
     bool diagnostics = false;
@@ -115,9 +116,5 @@ struct Project {
     const RequestWorkload & workload(std::string_view id) const;
 };
 
-class ProjectReader {
-public:
-    Project read(const std::filesystem::path & path) const;
-};
 
 } // namespace markov

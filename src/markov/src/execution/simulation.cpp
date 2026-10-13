@@ -36,12 +36,12 @@ std::string_view connection_rule_name(TemplateConnectionRule rule) {
 
 } // namespace
 
-SimulationRuntime::SimulationRuntime(std::span<const Request> requests, Controller & controller, const TemplateBank & templates,
-                                     const NodeDurations & durations, std::optional<std::filesystem::path> graph_path)
+SimulationRuntime::SimulationRuntime(std::span<const Request> requests, Controller & controller, const TemplateBank & templates, const NodeCosts & costs,
+                                     std::optional<std::filesystem::path> graph_path)
     : requests_(requests),
       controller_(controller),
       templates_(templates),
-      durations_(durations),
+      costs_(costs),
       workspace_(templates.workspace_pools()),
       graph_path_(std::move(graph_path)),
       request_timings_(requests.size()) {}
@@ -156,19 +156,25 @@ std::optional<nlohmann::json> SimulationRuntime::accept(std::span<const ControlA
         if (!work_.emplace(id, std::move(work)).second) throw std::logic_error("duplicate dynamic work identity");
     }
     if (invocations.front().input.phase != BatchPhase::Idle) ++batches_;
-    auto completions = execution_graph_.schedule(durations_);
+
+    // Work owns the immutable invocation; the cost query borrows it only for
+    // this scheduling pass, after staged work has reached its stable owner.
+    std::map<WorkId, const InvokeStep *> cost_contexts;
+    for (const auto & [id, work] : work_) cost_contexts.emplace(id, &work.invocation);
+    auto completions = execution_graph_.schedule(costs_, cost_contexts);
     if (!completions) {
         const auto & gap = completions.error();
-        return report("needs_data",
-                      Json::array({
-                          { { "kind", gap.source_span ? "input" : "observation" },
-                           { "reason", gap.reason },
-                           { "work_id", gap.work },
-                           { "rank", gap.rank },
-                           { "source_span", gap.source_span ? Json(*gap.source_span) : Json(nullptr) },
-                           { "source_manifest", gap.source_manifest ? Json(gap.source_manifest->string()) : Json(nullptr) },
-                           { "time_ns", time_ns_ } }
-        }));
+        Json description{
+            {            "kind",                                 gap.source_span ? "input" : "observation" },
+            {          "reason",                                                                gap.reason },
+            {         "work_id",                                                                  gap.work },
+            {            "rank",                                                                  gap.rank },
+            {     "source_span",                  gap.source_span ? Json(*gap.source_span) : Json(nullptr) },
+            { "source_manifest", gap.source_manifest ? Json(gap.source_manifest->string()) : Json(nullptr) },
+            {         "time_ns",                                                                  time_ns_ }
+        };
+        if (!gap.service_work.is_null()) description["service_work"] = gap.service_work;
+        return report("needs_data", Json::array({ std::move(description) }));
     }
     for (auto & event : *completions) enqueue(std::move(event));
     return std::nullopt;
@@ -697,9 +703,9 @@ nlohmann::json SimulationRuntime::report(std::string_view status, const nlohmann
         {             "scope",                                                                                                 "modeled" },
         {           "metrics",                                                                                                   metrics },
         {              "gaps",                                                                                                      gaps },
-        {      "timing_basis",                                                                                    "given_node_durations" },
+        {      "timing_basis",             costs_.has_models() ? "empirical_candidates_with_conditional_inputs" : "given_node_durations" },
         {       "assumptions",
-         { "explicit service-node durations; conditional execution, not a qualified performance prediction",
+         { "explicit givens and/or empirical candidates; conditional execution, not a qualified performance prediction",
          "waits follow dependencies; annotations carry no service charge",
          "initial modeled resources contain no in-flight work",
          "HTTP, tokenizer, initialization, warmup and idle polling are outside scope" }                                                 },

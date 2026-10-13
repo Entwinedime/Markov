@@ -1,9 +1,13 @@
+#include "worker_sampling.hpp"
+
 #include <driver/ascend_hal_base.h>
 #include <runtime/dev.h>
 #include <runtime/event.h>
+#include <runtime/kernel.h>
 #include <runtime/mem.h>
 #include <runtime/rt_ffts_plus.h>
 #include <runtime/rt_stars.h>
+#include <runtime/rts/rts_kernel.h>
 #include <runtime/stream.h>
 
 #include <algorithm>
@@ -197,17 +201,6 @@ struct ApiRecord {
     std::optional<WorkspaceTransition> workspace;
     std::optional<rtEventStatus_t> event_status;
     bool initial_event;
-};
-
-struct CpuCounters {
-    std::int64_t wait_cpu_ns = 0;
-    std::int64_t probe_cpu_ns = 0;
-    std::int64_t wait_wall_ns = 0;
-    std::int64_t last_sync_start_ns = 0;
-    std::int64_t last_sync_end_ns = 0;
-    std::int64_t last_sync_cpu_end_ns = 0;
-    std::int64_t last_sync_probe_cpu_ns = 0;
-    std::int64_t last_sync_result = 0;
 };
 
 enum class ObservationMode { Off, EventHistory, Journal, CpuSampling };
@@ -514,7 +507,9 @@ extern "C" void markov_native_set_scope(std::uint64_t call_id) { NativeJournal::
 
 extern "C" void markov_native_begin_cpu_sampling() { NativeJournal::instance().begin_cpu_sampling(); }
 
-extern "C" void markov_native_read_cpu_counters(CpuCounters * counters) { *counters = NativeJournal::instance().cpu_counters(); }
+CpuCounters & markov_native_cpu_counters() { return NativeJournal::instance().cpu_counters(); }
+
+extern "C" void markov_native_read_cpu_counters(CpuCounters * counters) { *counters = markov_native_cpu_counters(); }
 
 extern "C" int markov_native_flush(int close_window) {
     try {
@@ -528,6 +523,7 @@ extern "C" int markov_native_flush(int close_window) {
 }
 
 extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
+    WorkerSubmission worker_point("rtEventRecord");
     static const auto original = resolve<decltype(&rtEventRecord)>("rtEventRecord");
     if (!NativeJournal::instance().observes_events()) return original(event, stream);
 
@@ -538,6 +534,7 @@ extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
 }
 
 extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * status) {
+    WorkerSubmission worker_point("rtEventQueryStatus");
     static const auto original = resolve<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
     if (!NativeJournal::instance().observes_events()) return original(event, status);
 
@@ -550,6 +547,7 @@ extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * statu
 }
 
 extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
+    WorkerSubmission worker_point("rtStreamWaitEvent");
     static const auto original = resolve<decltype(&rtStreamWaitEvent)>("rtStreamWaitEvent");
     if (!NativeJournal::instance().enabled()) return original(stream, event);
 
@@ -560,6 +558,7 @@ extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
 }
 
 extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
+    WorkerSubmission worker_point("rtStreamSynchronize");
     static const auto original = resolve<decltype(&rtStreamSynchronize)>("rtStreamSynchronize");
     if (NativeJournal::instance().cpu_sampling()) {
         CpuWaitObservation observation;
@@ -577,6 +576,7 @@ extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
 }
 
 extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int32_t timeout) {
+    WorkerSubmission worker_point("rtStreamSynchronizeWithTimeout");
     static const auto original = resolve<decltype(&rtStreamSynchronizeWithTimeout)>("rtStreamSynchronizeWithTimeout");
     if (NativeJournal::instance().cpu_sampling()) {
         CpuWaitObservation observation;
@@ -594,6 +594,7 @@ extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int3
 }
 
 extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
+    WorkerSubmission worker_point("rtEventSynchronize");
     static const auto original = resolve<decltype(&rtEventSynchronize)>("rtEventSynchronize");
     if (NativeJournal::instance().cpu_sampling()) {
         CpuWaitObservation observation;
@@ -611,6 +612,7 @@ extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
 }
 
 extern "C" rtError_t rtDeviceSynchronize() {
+    WorkerSubmission worker_point("rtDeviceSynchronize");
     static const auto original = resolve<decltype(&rtDeviceSynchronize)>("rtDeviceSynchronize");
     if (NativeJournal::instance().cpu_sampling()) {
         CpuWaitObservation observation;
@@ -628,6 +630,7 @@ extern "C" rtError_t rtDeviceSynchronize() {
 }
 
 extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
+    WorkerSubmission worker_point("rtDeviceSynchronizeWithTimeout");
     static const auto original = resolve<decltype(&rtDeviceSynchronizeWithTimeout)>("rtDeviceSynchronizeWithTimeout");
     if (NativeJournal::instance().cpu_sampling()) {
         CpuWaitObservation observation;
@@ -645,6 +648,7 @@ extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
 }
 
 extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
+    WorkerSubmission worker_point("rtEventDestroy");
     static const auto original = resolve<decltype(&rtEventDestroy)>("rtEventDestroy");
 
     if (!NativeJournal::instance().observes_events()) return original(event);
@@ -657,6 +661,7 @@ extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
 
 extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_bytes, const void * source, std::uint64_t bytes, rtMemcpyKind_t kind,
                                    rtStream_t stream) {
+    WorkerSubmission worker_point("rtMemcpyAsync");
     static const auto original = resolve<decltype(&rtMemcpyAsync)>("rtMemcpyAsync");
     if (!NativeJournal::instance().enabled()) return original(destination, maximum_bytes, source, bytes, kind, stream);
 
@@ -698,6 +703,7 @@ extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes
 }
 
 extern "C" rtError_t rtGeneralCtrl(std::uintptr_t * control, std::uint32_t count, std::uint32_t type) {
+    WorkerSubmission worker_point("rtGeneralCtrl");
     static const auto original = resolve<decltype(&rtGeneralCtrl)>("rtGeneralCtrl");
     if (!NativeJournal::instance().enabled() || type != RT_GNL_CTRL_TYPE_FFTS_PLUS || count != 2) return original(control, count, type);
 
@@ -710,4 +716,34 @@ extern "C" rtError_t rtGeneralCtrl(std::uintptr_t * control, std::uint32_t count
     const auto result = original(control, count, type);
     observation.finish(result, std::move(submission));
     return result;
+}
+
+// Compute submission boundaries observed in the current Ascend mainline.
+// Forward arguments unchanged; do not inspect tensor memory or synchronize.
+extern "C" rtError_t rtKernelLaunch(const void * stub, std::uint32_t blocks, void * args, std::uint32_t args_size, rtSmDesc_t * shared_memory,
+                                    rtStream_t stream) {
+    static const auto original = resolve<decltype(&rtKernelLaunch)>("rtKernelLaunch");
+    WorkerSubmission worker_point("rtKernelLaunch");
+    return original(stub, blocks, args, args_size, shared_memory, stream);
+}
+
+extern "C" rtError_t rtKernelLaunchWithHandle(void * handle, const std::uint64_t tiling_key, std::uint32_t blocks, rtArgsEx_t * args,
+                                              rtSmDesc_t * shared_memory, rtStream_t stream, const void * kernel_info) {
+    static const auto original = resolve<decltype(&rtKernelLaunchWithHandle)>("rtKernelLaunchWithHandle");
+    WorkerSubmission worker_point("rtKernelLaunchWithHandle");
+    return original(handle, tiling_key, blocks, args, shared_memory, stream, kernel_info);
+}
+
+extern "C" rtError_t rtKernelLaunchWithHandleV2(void * handle, const std::uint64_t tiling_key, std::uint32_t blocks, rtArgsEx_t * args,
+                                                rtSmDesc_t * shared_memory, rtStream_t stream, const rtTaskCfgInfo_t * configuration) {
+    static const auto original = resolve<decltype(&rtKernelLaunchWithHandleV2)>("rtKernelLaunchWithHandleV2");
+    WorkerSubmission worker_point("rtKernelLaunchWithHandleV2");
+    return original(handle, tiling_key, blocks, args, shared_memory, stream, configuration);
+}
+
+extern "C" rtError_t rtsLaunchKernelWithHostArgs(rtFuncHandle handle, std::uint32_t blocks, rtStream_t stream, rtKernelLaunchCfg_t * configuration, void * args,
+                                                 std::uint32_t args_size, rtPlaceHolderInfo_t * placeholders, std::uint32_t placeholder_count) {
+    static const auto original = resolve<decltype(&rtsLaunchKernelWithHostArgs)>("rtsLaunchKernelWithHostArgs");
+    WorkerSubmission worker_point("rtsLaunchKernelWithHostArgs");
+    return original(handle, blocks, stream, configuration, args, args_size, placeholders, placeholder_count);
 }

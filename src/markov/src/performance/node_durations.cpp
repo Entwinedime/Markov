@@ -46,10 +46,12 @@ void NodeDurations::load(const std::filesystem::path & path, const std::filesyst
 
 bool NodeDurations::contains(const std::filesystem::path & manifest) const { return sources_.contains(manifest); }
 
-std::optional<std::int64_t> NodeDurations::duration(const std::filesystem::path & manifest, SourceSpanId source) const {
-    const auto asset = sources_.find(manifest);
+std::optional<std::int64_t> NodeDurations::duration(const ServiceWork & work) const {
+    // Given durations deliberately preserve the caller's structural assumption.
+    // Measured costs must instead use the target descriptors in work.
+    const auto asset = sources_.find(work.source_manifest);
     if (asset == sources_.end()) return std::nullopt;
-    const auto found = asset->second.values.find(source);
+    const auto found = asset->second.values.find(work.source_span);
     if (found == asset->second.values.end()) return std::nullopt;
     return found->second;
 }
