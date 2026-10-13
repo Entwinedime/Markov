@@ -1,50 +1,70 @@
-"""Project offline I/O and operator models into target execution inputs."""
+"""Admit one independent cost package and project its execution inputs."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-import math
+from pathlib import Path
 from typing import Any
 
+from ...common.paths import require_repo_path
+from ..deployment import require_cost_environment
+from .curves import interpolate_cost_curve
 from .io_contract import MAX_U64, positive_u64
 from .io_validation import required_resource_lanes, required_service_models
 
 
 @dataclass(frozen=True)
-class HiCacheIoModel:
-    """Admitted I/O and operator models projected into target execution."""
+class HiCacheCostModels:
+    """One package's responses, deployment and independent measurement sources.
 
-    fields: dict[str, Any]
+    Admission resolves paths and validates the I/O domain once. Nested model
+    data is shared read-only across targets; execution cannot mutate coefficients
+    or interpret these sources as traces to read. A partial package remains
+    usable until an actual operation requires a missing response.
+    Capture names are database provenance, not suite-local profiling run IDs;
+    isolation uses the complete manifest lineage, including paired sources.
+    """
+
+    deployment: dict[str, Any]
+    source_captures: tuple[str, ...]
+    source_manifests: tuple[Path, ...]
+    storage_batch_pages: int
+    kv_bytes_per_token_per_rank: int
+    resource_lanes: dict[str, str]
+    service_models: dict[str, dict[str, Any]]
+    operator_models: list[dict[str, Any]]
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> HiCacheIoModel:
-        if raw.get("control_models") or raw.get("phase_cost") is not None or "empty_write_check_us" in raw:
+    def from_raw(cls, raw: dict[str, Any]) -> HiCacheCostModels:
+        require_cost_environment(raw["deployment"])
+        io = raw["hicache"]
+        if io.get("control_models") or io.get("phase_cost") is not None or "empty_write_check_us" in io:
             raise ValueError(
                 "Execution requires operator models, not aggregate phase/control costs or an empty-check override"
             )
-        service_models = required_service_models(raw.get("service_models"))
-        resource_lanes = required_resource_lanes(raw.get("resource_lanes"))
-        fields = {
-            "storage_batch_pages": positive_u64(raw.get("storage_batch_pages"), "storage_batch_pages"),
-            "kv_bytes_per_token_per_rank": positive_u64(
-                raw.get("kv_bytes_per_token_per_rank"),
+        return cls(
+            deployment=raw["deployment"],
+            source_captures=tuple(raw["training_sources"]),
+            source_manifests=tuple(require_repo_path(path).resolve() for path in raw["training_source_manifests"]),
+            storage_batch_pages=positive_u64(io["storage_batch_pages"], "storage_batch_pages"),
+            kv_bytes_per_token_per_rank=positive_u64(
+                io["kv_bytes_per_token_per_rank"],
                 "kv_bytes_per_token_per_rank",
             ),
-            "service_models": service_models,
-            "resource_lanes": resource_lanes,
-            "operator_models": raw["operator_models"],
-        }
-        return cls(fields=fields)
+            resource_lanes=required_resource_lanes(io["resource_lanes"]),
+            service_models=required_service_models(io["service_models"]),
+            operator_models=raw["operator_models"],
+        )
 
-    def narrow_config(self, page_size: int) -> dict[str, Any]:
+    def execution_costs(self, page_size: int) -> dict[str, Any]:
         """Project a target into execution fields; nested coefficients remain read-only."""
 
-        page_bytes = page_size * self.fields["kv_bytes_per_token_per_rank"]
+        page_bytes = page_size * self.kv_bytes_per_token_per_rank
         if page_bytes > MAX_U64:
             raise OverflowError("target page_size * kv_bytes_per_token_per_rank exceeds uint64")
 
         service_models = {}
-        for kind, values in self.fields["service_models"].items():
+        for kind, values in self.service_models.items():
             # Only top-level curve fields are replaced. Coefficients and point
             # tables are shared read-only, like operator models and resource lanes.
             narrowed = dict(values)
@@ -61,36 +81,10 @@ class HiCacheIoModel:
         result = {
             "kv_bytes_per_page": page_bytes,
             "io_cost": {
-                "storage_batch_pages": self.fields["storage_batch_pages"],
+                "storage_batch_pages": self.storage_batch_pages,
                 "service_models": service_models,
-                "resource_lanes": self.fields["resource_lanes"],
+                "resource_lanes": self.resource_lanes,
             },
-            "operator_models": self.fields["operator_models"],
+            "operator_models": self.operator_models,
         }
         return result
-
-
-def interpolate_cost_curve(
-    points: list[dict[str, Any]], coordinate: float, coordinate_field: str, value_field: str, *, log_value: bool = True
-) -> float:
-    """Shared model-build/prediction curve; clamp endpoints on a log coordinate.
-
-    Positive rates/scales use log values; setup costs use linear values, including zero.
-    Callers admit measurement units and domains before constructing these curves.
-    """
-    ordered = sorted(points, key=lambda point: float(point[coordinate_field]))
-    if coordinate <= float(ordered[0][coordinate_field]):
-        return float(ordered[0][value_field])
-    if coordinate >= float(ordered[-1][coordinate_field]):
-        return float(ordered[-1][value_field])
-    for left, right in zip(ordered, ordered[1:]):
-        if coordinate > float(right[coordinate_field]):
-            continue
-        position = math.log(coordinate / float(left[coordinate_field])) / math.log(
-            float(right[coordinate_field]) / float(left[coordinate_field])
-        )
-        left_value, right_value = float(left[value_field]), float(right[value_field])
-        if log_value:
-            return math.exp(math.log(left_value) + position * math.log(right_value / left_value))
-        return left_value + position * (right_value - left_value)
-    raise RuntimeError("cost curve interpolation failed")

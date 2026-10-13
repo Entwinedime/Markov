@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -11,9 +12,10 @@ from ...common.paths import repo_relative_path, require_repo_path
 from ..deployment import require_cost_environment, source_environment
 from ..source_dag.profiles import cpu_service_inputs, discover_profile_runs
 from .control import ControlMeasurement, control_entries
-from .database import CostDatabase, OperationObservation, merge_control_measurements
+from .database import CostDatabase, OperationObservation
 from .io import service_cost_evidence
-from .models import ModelSpec, train_models
+from .models import ModelSpec, parse_model_specs, train_models
+from .physical import read_physical_measurements
 
 
 def import_profiles(
@@ -46,9 +48,10 @@ def import_profiles(
             include_setup_requests=include_setup_requests,
         )
         manifest = str(repo_relative_path(source.manifest_path))
-        # Preserve capture identity across explicit asset aliases. A run's
-        # timestamp/identity is provenance; it is never a model feature.
-        capture = aliases.get(manifest, source.run_id)
+        # A suite-local run_id can repeat across independent captures. Keep
+        # existing provenance on reimport; new identity follows its manifest.
+        # Explicit aliases handle renamed copies, never fitting variables.
+        capture = aliases[manifest] if manifest in aliases else database.capture_identity(manifest)
         deployment = source_environment(source, resources)
         observation["resource_environment_basis"] = (
             "explicit_import_declaration" if resources is not None else "capture_metadata_or_unknown"
@@ -71,14 +74,38 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
     excluded_manifests = request.get("excluded_manifests", [])
     excluded = database.excluded_captures(excluded, excluded_manifests)
     require_cost_environment(request["deployment"])
-    rows = database.observations(request["deployment"], excluded_captures=excluded)
-    available_evidence = database.evidence(request["deployment"], excluded_captures=excluded)
-    specs = request["models"]
-    if not specs:
-        raise ValueError("training must declare at least one operation model")
+    specs = request.get("models", [])
+    if not specs and "io_evidence" not in request:
+        raise ValueError("training must declare operation models or physical I/O evidence")
 
-    specifications = [ModelSpec.from_raw(raw) for raw in specs]
-    models, unmeasured_implementations = train_models(specifications, rows)
+    specifications = parse_model_specs(specs)
+    families: dict[tuple[str, ...], list[ModelSpec]] = defaultdict(list)
+    for specification in specifications:
+        families[tuple(sorted(specification.source_operations))].append(specification)
+
+    models, unmeasured_implementations = [], []
+    for operations, family_specs in families.items():
+        rows = database.observations(request["deployment"], operations=operations, excluded_captures=excluded)
+        fitted, missing = train_models(family_specs, rows)
+        models.extend(fitted)
+        unmeasured_implementations.extend(missing)
+        del rows
+
+    order = {
+        (spec.operation, spec.implementation, spec.timing_scope): index for index, spec in enumerate(specifications)
+    }
+
+    def model_order(model: dict[str, Any]) -> int:
+        identity = model["operation"], model["implementation"], model["timing_scope"]
+        if identity in order:
+            return order[identity]
+        return order[model["operation"], "*", model["timing_scope"]]
+
+    models.sort(key=model_order)
+    unmeasured_implementations.sort(key=model_order)
+    keys = [(model["operation"], model["implementation"], model["timing_scope"]) for model in models]
+    if len(set(keys)) != len(keys):
+        raise ValueError("provide one cost model per operation, implementation and timing scope")
 
     ready_models = [model for model in models if model["status"] == "ready"]
     training_captures = {capture for model in ready_models for capture in model["source_captures"]}
@@ -92,12 +119,11 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
         "missing_models": [model for model in models if model["status"] != "ready"],
         "wildcard_unmeasured_implementations": unmeasured_implementations,
         "measurement_count": sum(model["measurement_count"] for model in ready_models),
-        "candidate_measurement_count": len(rows),
-        "prediction_reads_database": False,
-        "base_used_for_online_fit": False,
+        "candidate_measurement_count": database.measurement_count(request["deployment"], excluded_captures=excluded),
         "readiness_scope": "declared operator model specifications; target execution and full cost coverage are not implied",
     }
     if "io_evidence" in request:
+        available_evidence = database.evidence(request["deployment"], excluded_captures=excluded)
         wanted = set(request["io_evidence"])
         evidence = [
             row
@@ -105,8 +131,19 @@ def train(database: CostDatabase, request: dict[str, Any]) -> dict[str, Any]:
             if row["kind"] == "runtime_io" or (row["kind"] == "physical_io" and row["capture"] in wanted)
         ]
         physical = [row for row in evidence if row["kind"] == "physical_io"]
-        if len(physical) != 1:
+        if len(physical) > 1:
             raise ValueError("select exactly one applicable physical I/O measurement document")
+        if not physical:
+            result.update(
+                status="missing_data",
+                io_training={
+                    "missing": [{"component": "physical", "reason": "missing_selected_physical_evidence"}],
+                    "captures": [],
+                },
+                training_sources=sorted(training_captures),
+                training_source_manifests=sorted(database.manifests_for_captures(training_captures)),
+            )
+            return result
         captures = [dict(row["payload"], role="history") for row in evidence if row["kind"] == "runtime_io"]
         io = service_cost_evidence(physical[0]["payload"], captures)
         if io["missing"]:
@@ -161,7 +198,9 @@ def import_evidence(
     measurements = []
     for row in evidence:
         payload = row["payload"]
-        if row["kind"] == "control_costs":
+        if row["kind"] == "physical_io":
+            payload["physical_measurements"] = read_physical_measurements(payload, row["deployment"])
+        elif row["kind"] == "control_costs":
             if "control_calibrations" in payload:
                 payload["control_measurements"] = payload.pop("control_calibrations")
             payload["control_measurements"] = embed_control_measurements(payload["control_measurements"])
@@ -175,6 +214,19 @@ def import_evidence(
             )
 
     return database.import_measurements(measurements, evidence, replace_captures=replace_captures)
+
+
+def physical_evidence(physical: dict[str, Any], deployment: dict[str, Any]) -> dict[str, Any]:
+    """Identify a physical measurement collection by its explicit original inputs."""
+
+    sources = sorted(physical["measurement_sources"])
+    return dict(
+        capture="physical:" + ",".join(sources),
+        kind="physical_io",
+        manifest=sources[0],
+        deployment=deployment,
+        payload=physical,
+    )
 
 
 def control_observations(evidence: dict[str, Any]) -> list[OperationObservation]:
@@ -258,33 +310,33 @@ def embed_control_measurements(collection: dict[str, Any]) -> dict[str, Any]:
     return {key: embed(value) for key, value in collection.items()}
 
 
-def control_evidence(measurements: Sequence[ControlMeasurement], deployment: dict[str, Any]) -> list[dict[str, Any]]:
-    """Group explicit control documents by their actual source capture.
+def control_evidence(
+    measurements: Sequence[ControlMeasurement], deployment: dict[str, Any], database: CostDatabase
+) -> list[dict[str, Any]]:
+    """Declare explicit control documents under their actual source capture.
 
     A group configuration and a stringified path collection are not capture
-    identities. This uses only the manifests named by measurement documents.
-    Selection keys remain intact in database evidence, not runtime inputs.
+    identities. Selection paths are import inputs, not a second stored copy of
+    operator measurements. The database deduplicates repeated source positions.
     """
 
-    captures: dict[str, dict[str, Any]] = {}
-
+    evidence = []
     for measurement in measurements:
         source = measurement.source
-        evidence = captures.setdefault(
-            source.run_id,
-            dict(
-                capture=source.run_id,
-                manifest=str(repo_relative_path(source.manifest_path)),
-                deployment=deployment,
-                kind="control_costs",
-                payload={"control_measurements": {}},
-            ),
-        )
-        selected = evidence["payload"]["control_measurements"]
+        manifest = str(repo_relative_path(source.manifest_path))
+        collection: dict[str, Any] = {}
+        selected = collection
         for key in measurement.selection[:-1]:
             selected = selected.setdefault(key, {})
+        selected[measurement.selection[-1]] = _with_measurement_sources(measurement.document)
+        evidence.append(
+            dict(
+                capture=database.capture_identity(manifest),
+                manifest=manifest,
+                deployment=deployment,
+                kind="control_costs",
+                payload={"control_measurements": collection},
+            )
+        )
 
-        value = _with_measurement_sources(measurement.document)
-        merge_control_measurements(selected, {measurement.selection[-1]: value})
-
-    return list(captures.values())
+    return evidence

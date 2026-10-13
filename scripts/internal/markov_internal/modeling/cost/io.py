@@ -7,20 +7,18 @@ from collections import defaultdict
 from statistics import median
 from typing import Any
 
-from .hicache import interpolate_cost_curve
+from .curves import interpolate_cost_curve
 from .io_contract import (
     OPERATION_KINDS,
     KIND_DIRECTIONS,
+    MissingCostEvidence,
     io_observation_ready,
     positive_u64,
     positive_finite_number,
     nonnegative_finite_number,
 )
 from .io_validation import _points, required_prefetch_stages
-
-
-class MissingCostEvidence(ValueError):
-    """A supported cost form lacks measurements that identify its parameters."""
+from .physical import fit_physical_services
 
 
 def _existing_bandwidth(points: list[dict[str, Any]], page_bytes: float, operation_pages: float) -> float:
@@ -280,33 +278,34 @@ def _call_cost_curve(
         by_page.setdefault(row["page_size"], []).append(row)
     fits, rejected, selected = [], [], []
     for page, values in sorted(by_page.items()):
-        samples: dict[float, list[dict]] = {}
-        for row in values:
-            calls = len(
-                row["storage_new_batch_pages"]
-                if row["family"] == "write_host_to_storage"
-                else row["service_call_bytes"]
+        # Normalize each measured operation once. Capture medians remain
+        # separate so repeated calls do not reweight independent captures.
+        calls_by_row = [
+            (
+                row,
+                len(
+                    row["storage_new_batch_pages"]
+                    if row["family"] == "write_host_to_storage"
+                    else row["service_call_bytes"]
+                ),
             )
+            for row in values
+        ]
+        samples: dict[float, dict[str, list[float]]] = {}
+        for row, calls in calls_by_row:
             if calls == 0:
                 continue
-            samples.setdefault(row["byte_count"] / calls, []).append(
-                dict(
-                    source=row["source_manifest"],
-                    role=row.get("role", "calibration"),
-                    duration=row["observed_service_us"] / calls,
-                )
-            )
+
+            per_source = samples.setdefault(row["byte_count"] / calls, {})
+            per_source.setdefault(row["source_manifest"], []).append(row["observed_service_us"] / calls)
+
         anchors = []
-        for size, observations in sorted(samples.items()):
-            chosen = observations
-            per_source = {}
-            for row in chosen:
-                per_source.setdefault(row["source"], []).append(row["duration"])
+        for size, per_source in sorted(samples.items()):
             anchors.append(
                 dict(
                     bytes_per_call=size,
                     duration_us_per_call=median(median(times) for times in per_source.values()),
-                    sample_count=len(chosen),
+                    sample_count=sum(len(times) for times in per_source.values()),
                     source_manifests=sorted(per_source),
                 )
             )
@@ -326,12 +325,7 @@ def _call_cost_curve(
         # Intermediate anchors describe observations but do not estimate the
         # endpoint formula. Failed page fits likewise supply no coefficients.
         sizes = {short["bytes_per_call"], long["bytes_per_call"]}
-        for row in values:
-            calls = len(
-                row["storage_new_batch_pages"]
-                if row["family"] == "write_host_to_storage"
-                else row["service_call_bytes"]
-            )
+        for row, calls in calls_by_row:
             if calls and row["byte_count"] / calls in sizes:
                 selected.append(row)
 
@@ -411,14 +405,18 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
             rows=[],
             measurement_support=_io_coverage([]),
         )
-    services = dict(physical["service_models"])
+    fitted, physical_gaps = fit_physical_services(physical["physical_measurements"])
+    physical = dict(physical, service_models=fitted)
+    services = physical["service_models"]
     stages = services.get("prefetch", {}).get("stages")
     missing = []
     if stages is None:
         missing.append(
             dict(
                 component="physical/prefetch_stages",
-                reason="read_copy_return_measurements_missing; total service time cannot identify stage costs",
+                reason=physical_gaps.get(
+                    "prefetch", "read_copy_return_measurements_missing; total service time cannot identify stage costs"
+                ),
             )
         )
     else:
@@ -453,7 +451,9 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
         if family != "prefetch" and state != "new":
             parameter = "existing_key_bandwidth_points" if state == "existing" else "page_bandwidth_points"
             if not services.get(family, {}).get(parameter):
-                missing.append(dict(component="physical/" + component, reason=parameter + "_missing"))
+                missing.append(
+                    dict(component="physical/" + component, reason=physical_gaps.get(component, parameter + "_missing"))
+                )
                 continue
 
         eligible = [
@@ -472,7 +472,9 @@ def service_cost_evidence(physical: dict | None, captures: list[dict]) -> dict:
         if curve is None:
             independent = _independent_service_curve(physical, family, state)
             if independent is None:
-                missing.append(dict(component="service/" + component, reason=detail["profile_gap"]))
+                missing.append(
+                    dict(component="service/" + component, reason=physical_gaps.get(component, detail["profile_gap"]))
+                )
                 continue
             curve = independent
             sources[component] = dict(

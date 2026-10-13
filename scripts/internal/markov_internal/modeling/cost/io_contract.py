@@ -19,9 +19,16 @@ KIND_DIRECTIONS = {
     "write_device_to_host": "device_to_host",
     "write_host_to_storage": "host_to_storage",
 }
+DMA_SERVICES = {KIND_DIRECTIONS[kind]: kind for kind in ("load", "write_device_to_host")}
+RUNTIME_DMA_OPERATOR_NAME = "npu::transfer_kv_dim_exchange"
+RUNTIME_DMA_INDEX_RESIDENCY = {"host_indices": "cpu", "device_indices": "cpu"}
 READY_IO_OBSERVATION_STATUSES = frozenset(
     {"ready", "ready_background_unmaterialized", "ready_background_transfer_only"}
 )
+
+
+class MissingCostEvidence(ValueError):
+    """A supported cost form lacks measurements that identify its parameters."""
 
 
 def io_observation_ready(observed: dict[str, Any]) -> bool:

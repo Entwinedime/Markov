@@ -67,6 +67,34 @@ class ModelSpec:
         return spec
 
 
+def parse_model_specs(declarations: list[dict[str, Any]]) -> list[ModelSpec]:
+    """Expand explicit operation/scope lists at the training-input boundary.
+
+    A name is shorthand for a singleton list. Each operation/scope pair keeps
+    its own samples and coefficients; only the declared fitting policy is
+    shared. Implementation wildcards and explicit observation pooling retain
+    their existing meanings. An empty selector is not a successful no-op.
+    """
+
+    specifications = []
+    for declaration in declarations:
+        operation = declaration["operation"]
+        scope = declaration["timing_scope"]
+        operations = [operation] if isinstance(operation, str) else operation
+        scopes = [scope] if isinstance(scope, str) else scope
+        if not operations or not scopes:
+            raise ValueError("model operation and timing_scope selectors must not be empty")
+
+        specification = ModelSpec.from_raw(dict(declaration, operation=operations[0], timing_scope=scopes[0]))
+        specifications.extend(
+            replace(specification, operation=name, timing_scope=timing_scope)
+            for name in operations
+            for timing_scope in scopes
+        )
+
+    return specifications
+
+
 def train_models(
     specifications: list[ModelSpec], observations: list[OperationObservation]
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -83,23 +111,23 @@ def train_models(
 
     models = []
     unmeasured_implementations = []
+    measurement_pools: dict[tuple[str, ...], dict[str, list[OperationObservation]]] = {}
     for spec in specifications:
-        implementation_rows: dict[str, list[OperationObservation]] = defaultdict(list)
-        for operation in spec.source_operations:
-            for row in observations_by_operation[operation]:
-                implementation_rows[row.implementation].append(row)
+        if spec.source_operations not in measurement_pools:
+            by_implementation: dict[str, list[OperationObservation]] = defaultdict(list)
+            for operation in spec.source_operations:
+                for row in observations_by_operation[operation]:
+                    by_implementation[row.implementation].append(row)
+            measurement_pools[spec.source_operations] = by_implementation
+
+        implementation_rows = measurement_pools[spec.source_operations]
 
         if spec.implementation != "*":
-            models.append(_train_model(spec, implementation_rows[spec.implementation]))
+            models.append(_train_model(spec, implementation_rows.get(spec.implementation, [])))
             continue
 
-        scopes = {
-            name: {row.timing_scope for row in rows}
-            for name, rows in implementation_rows.items()
-        }
-        implementations = sorted(
-            name for name, available in scopes.items() if spec.timing_scope in available
-        )
+        scopes = {name: {row.timing_scope for row in rows} for name, rows in implementation_rows.items()}
+        implementations = sorted(name for name, available in scopes.items() if spec.timing_scope in available)
         for implementation in sorted(scopes.keys() - set(implementations)):
             unmeasured_implementations.append(
                 {
@@ -114,8 +142,7 @@ def train_models(
         # select implementations measured in this scope, not every backend
         # ever seen under the same operation name.
         models.extend(
-            _train_model(replace(spec, implementation=name), implementation_rows[name])
-            for name in implementations
+            _train_model(replace(spec, implementation=name), implementation_rows[name]) for name in implementations
         )
         if not implementations:
             models.append(
@@ -130,10 +157,6 @@ def train_models(
                     "ineligible_measurements": 0,
                 }
             )
-    keys = [(model["operation"], model["implementation"], model["timing_scope"]) for model in models]
-    if len(set(keys)) != len(keys):
-        raise ValueError("provide one cost model per operation, implementation and timing scope")
-
     return models, unmeasured_implementations
 
 

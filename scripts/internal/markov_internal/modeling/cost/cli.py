@@ -8,6 +8,7 @@ from pathlib import Path
 from ...common.io import load_json, write_json
 from ...common.paths import require_repo_path
 from .database import CostDatabase, OperationObservation
+from .migration import migrate_database
 from .models import estimate
 from .package import import_evidence, import_profiles, train
 
@@ -46,6 +47,15 @@ def main(argv: list[str] | None = None) -> int:
     trainer.add_argument("--database", type=Path, required=True)
     trainer.add_argument("--request", type=Path, required=True)
     trainer.add_argument("--output", type=Path, required=True)
+
+    migration = actions.add_parser(
+        "migrate", help="convert the previous database layout to a new path; source stays read-only"
+    )
+    migration.add_argument("--database", type=Path, required=True)
+    migration.add_argument(
+        "--output", type=Path, required=True, help="new database path; never replaces an existing file"
+    )
+    migration.add_argument("--summary", type=Path, required=True)
 
     inspector = actions.add_parser(
         "inspect", help="read stored coverage or estimate declared work using a trained model"
@@ -87,6 +97,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.action == "train":
         result = train(CostDatabase(require_repo_path(args.database)), load_json(require_repo_path(args.request)))
         write_json(require_repo_path(args.output), result)
+    elif args.action == "migrate":
+        result = migrate_database(require_repo_path(args.database), require_repo_path(args.output))
+        write_json(require_repo_path(args.summary), result)
     else:
         if args.database:
             result = CostDatabase(require_repo_path(args.database)).summary()
