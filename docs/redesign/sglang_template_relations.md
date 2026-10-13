@@ -287,9 +287,9 @@ Slice/AsStrided 的存在随视图连续性变化：当前观察到 C=1、B>1 �
 
 RoPE 分支审阅还表明：已有 position_gather/tile/slice 位于首层 qkv_preparation，而非独立的 get_cos_sin_with_position 观测区域。T=2 时直属工作有 MatMul、Gather、Tile、两次 Slice 和融合 QKV/RMSNorm/RoPE；T=1 时少两次 Slice。初次边界审阅时，该 scope 下没有 CPU 服务 span，CPU 服务仅按外层 serving 身份提取；后续已按下节显式调用栈补齐控制线程内层归属。故不能直接把整个区域视作两次连续化操作，也不能只删设备 Slice 就声明完成分支变换。下一步须明确相关 CPU 提交、数据输入/输出和共享位置结果的跨区域关系，才可选择替换子区域或改写节点；此次逻辑边界修正不解除精确输入门槛。
 
-### Workspace 容量状态与设备级同步（待实现）
+### Workspace 容量状态与设备级同步
 
-workspace 是按 device/stream 共享的原生缓冲区，与 KV 页池分开。目标结构取决于初始化后的容量、目标操作需求和之前的分配效果，不能按“首次 Decode”或某个人数直接选择扩容分支。当前来源绑定、有限需求计算、allocator CPU 切口以及同配置容量推进已接入；目标分支替换、跨配置初值资格及完整设备同步域尚未完成。当前缺口与整改顺序见[整体审查](../redesign-workflow/2026-10-12_workspace_state_pipeline_review.md)。
+workspace 是按 device/stream 共享的原生缓冲区，与 KV 页池分开。目标结构取决于初始化后的容量、目标操作需求和之前的分配效果，不能按“首次 Decode”或某个人数直接选择扩容分支。当前来源绑定、有限需求计算、allocator CPU 切口以及同配置容量推进已接入；同配置扩容分支替换已有开发验证，跨配置初值及声明范围的独立验收未完成。职责与限制见[整体审查](../redesign-workflow/2026-10-12_workspace_state_pipeline_review.md)。
 
 **原生机制与观测边界。** 安装 torch_npu 2.10.0 提交 `94f8a8e6b523d7ba553e1b80d5b5248478391526` 的 [WorkspaceAllocator](https://github.com/Ascend/pytorch/blob/94f8a8e6b523d7ba553e1b80d5b5248478391526/torch_npu/csrc/core/npu/NPUWorkspaceAllocator.cpp#L69) 对 cached 请求加32字节，新容量按2MiB对齐；旧分配非空且不足时先同步设备，再释放和重分配。首次分配、复用和清空不因此产生该显式同步。地址可能在扩容前后相同，分支须根据需求与容量判断。这些常量来自原生机制，不是拟合。
 
@@ -297,7 +297,9 @@ op-plugin 提交 `dedc316708372c9a8bfde4527abd2a94b74840f5` 的 [OperationSetup]
 
 **采集合同。** WorkspaceCapture 在 warmup 后、profiler 前读取初值，停止后读取终值；短暂 state-only history 必须恢复原设置。使用 memory._snapshot 中明确的 workspace_snapshot，不按普通 segments 大小猜测。每次记录 device、stream handle、请求字节、前后容量与地址、策略、API 和语义身份；最终容量须与窗口快照一致。MarkovWorkspaceAllocate/Release 使用原生时钟和线程身份，写独立 markov.workspace 事件文件并在停止后合并，避免两个写入器共用 torch.op_range 导致 TLV 损坏。worker 归属复用已有队列 flow。失败、缺窗口、未知安装来源和未资格化 uncached 生命周期保留缺口；历史数据不补造空缓存。隔离四分支、安装加载及 serving 窗口证据分别在 s4-workspace-probe-runtime、s4-workspace-serving；隔离 mm 未触发分配，不能据此宣布 ACLNN 正向覆盖，完整 Dockerfile 重建也尚未验收。
 
-SGLang 环境记录实际 fresh_process、warmup 输入长度、调用共用的 sampling_parameters 和 after_warmup_before_profile 快照位置。统一预热起点及当前固定配方见[输入合同](02_user_contract.md#仿真起点统一预热后开始)。历史采集按各自实际记录判断，不能视为已采用新配方；C++ 生产端现消费该记录核对固定配方，编译资产保存 initialization_gap 并在来源选择时拒绝不合格记录；尚未由此计算或推进目标初始容量。KV=cold 不代表 workspace 为空；目标不能无条件继承来源容量。初始化本身可在预测时延范围外，但其产生的状态必须作为有资格的入口条件。
+SGLang 环境记录实际 fresh_process、warmup 输入长度、调用共用的 sampling_parameters 和 after_warmup_before_profile 快照位置。统一预热起点及当前固定配方见[输入合同](02_user_contract.md#仿真起点统一预热后开始)。历史采集按各自实际记录判断，不能视为已采用新配方；C++ 生产端现消费该记录核对固定配方，编译资产保存 initialization_gap 并在来源选择时拒绝不合格记录；这只资格化入口记录；同配置目标容量推进已接入，跨配置初始容量不能据此直接迁移。KV=cold 不代表 workspace 为空；目标不能无条件继承来源容量。初始化本身可在预测时延范围外，但其产生的状态必须作为有资格的入口条件。
+
+初值迁移的代码合同采用独立 `initialization_pool_domain`，由生产端发布并随编译模板保存，核心仅查询其适用条件。当前规则沿用已声明的请求池行数缩小域：eager dense 路径关闭 graph、prefix cache 与重叠，模型、TP、运行环境、token 容量保持固定；单请求预热的模型 shape 不随请求池上限缩小而改变。原生请求表及 eager registry 的 backing rows 随上限变化，与预热的实际 batch 分开解释。固定预热记录或 workspace 绑定缺失时仍不可初始化；容量增大不在此规则范围。pool-four→pool-three 的原生开发证据见 `data/redesign/s4-initialization-transfer/verification.json`，它不等于所有目标配置的独立验收；执行验证结果统一记录在实施日志。规则不含样本名称、采集编号或观测容量常量。
 
 **来源与模板合同。** WorkspaceAllocation 先按固定原生提交校验分配分支，派生 workspace_allocation 与原始记录分开。AscendWorkspaceBindings 再按 source_interval → marker → 同 scope/lane 的包含 worker → 已由 flow 关联的 host operation 绑定。stream handle 关联快照，物理 stream ID 关联模板资源，不互代。TemplateSource 按资源保存初值；TemplateWorkspaceUse 保存操作/worker、API/marker、局部边界、需求与来源分支。歧义或缺失产生 workspace_binding_gap。编译资产只维护当前合同，变化后重新 compile-templates，无旧格式回退。
 
@@ -319,7 +321,7 @@ SGLang 环境记录实际 fresh_process、warmup 输入长度、调用共用的 
 
 当前torch_npu源码中，NPUEvent析构通过LaunchLazyDestroyEventTask向提交队列投递销毁；ProcessGroupHCCL的Watchdog查询完成事件并移除已完成Work，也会触发相关对象生命周期。源码与后台线程观察相符，但现有记录不足以逐次证明query对应的event及watchdog唤醒条件。TemplateAssembly的CPU线程投影只保留被建模端点的顺序，不会恢复被投影掉的清理服务；因此已有计算/端口检查不证明这些后台工作已被模拟。
 
-运行时归一化现通过同rank/thread的Runtime@EventDestroy唯一完整包含关系绑定rtEventDestroy，保留原执行scope，不继承event创建者scope或SDK残留task ID。窗口外、时钟不满足包含或多候选均保持source_interval为空。主base的2618条销毁中2360条绑定、1300条有执行归属，剩余258条在profiler首条销毁之前；另一个base的1040条中1027条满足包含、519条有执行归属，13条时钟不满足条件仍不绑定。窗口内外事实不能简单按完整API序号配对。现有base仍没有完整入口event状态，且记录了尚无窗口内destroy的event record；这不等于这些设备event未完成，也不等于其后台清理可以忽略。
+运行时归一化现通过同rank/thread的Runtime@EventDestroy唯一完整包含关系绑定rtEventDestroy，保留原执行scope，不继承event创建者scope或SDK残留task ID。窗口外、时钟不满足包含或多候选均保持source_interval为空。主base的2618条销毁中2360条绑定、1300条有执行归属，剩余258条在profiler首条销毁之前；另一个base的1040条中1027条满足包含、519条有执行归属，13条时钟不满足条件仍不绑定。窗口内外事实不能简单按完整API序号配对。现有base仍没有完整入口event状态，且记录了尚无窗口内destroy的event record；这不等于这些设备event未完成；后台服务仍按既定范围排除，仅核对对流程内端口的必要因果。
 
 Ascend原生观察器现记录rtEventQueryStatus的event handle、原生API起止、返回码和event_status；成功时保留SDK枚举整数，失败时状态为null，不增加查询、等待或设备提交。CPU范围关联复用同线程同API的完整序列；具体watchdog来源仍需事实，不依线程名猜测。第74次单event SDK观察证据在s4-event-query/verification.json：三次状态均为1，和ACL调用结果一致；新建但未record的event也返回完成，因此状态值不能证明producer存在或替代record/destroy生命周期。pending状态、真实后台轮询及窗口入口快照尚未验证，历史无query记录不能解释为没有轮询。
 
@@ -328,7 +330,7 @@ Ascend原生观察器现记录rtEventQueryStatus的event handle、原生API起�
 **沿用既有modeled边界。** [模板外CPU顺序投影](05_controller_semantics.md#模板外-cpu-观测之间的顺序投影)已明确模板外服务不计入目标成本。后台清理占用同一worker本身不构成必须实现完整watchdog的要求；此前“遗漏服务需要后台目标展开”的表述过宽，应区分已声明排除的服务和仍须保留的跨边界因果。新增event事实用于核对生命周期身份及外部依赖，不能把主线扩张成完整运行时仿真，也不能将模板外耗时拟合进节点。现有投影只覆盖已证明的同线程顺序；若存在跨线程/设备/状态端口的新因果，仍须共同表达或明确具体缺口。未归属数量不作为阻塞S3/S4的门槛，完整HTTP/后台成本继续不授资格。第73次输入已用于事实归一化修正，是开发证据；历史计算顺序结果保留，修改后的完整实现另行独立验收。
 
 
-现有正式 grow 来源见 `data/redesign/s4-workspace-growth/serving_growth_verification.json`：640个使用点、两 rank 各一次 grow、1280个 CPU 切口无跨界；需求和观察容量保留为证据，不写成目标常量。其两条 device wait 曾因 profiler 开关任务没有 CANN 提交而清空 lanes（device_wait_audit.json）。提取器现仅按明确的 PROFILING_ENABLE/DISABLE task type 将观测控制排除在目标同步域外，原始节点仍保留并记录 scope 原因；正式重提取恢复各 rank 两条业务流，节点、边和其他等待不变，证据为同目录 device_wait_reextract_verification.json。此修复不替代目标容量与分支装配资格。开发来源不能兼作固定规则的独立验收。后续先关闭同步域、初始化资格和状态/分支装配，再进行独立目标结构验收；不按长度或人数重复采集。
+现有正式 grow 来源见 `data/redesign/s4-workspace-growth/serving_growth_verification.json`：640个使用点、两 rank 各一次 grow、1280个 CPU 切口无跨界；需求和观察容量保留为证据，不写成目标常量。其两条 device wait 曾因 profiler 开关任务没有 CANN 提交而清空 lanes（device_wait_audit.json）。提取器现仅按明确的 PROFILING_ENABLE/DISABLE task type 将观测控制排除在目标同步域外，原始节点仍保留并记录 scope 原因；正式重提取恢复各 rank 两条业务流，节点、边和其他等待不变，证据为同目录 device_wait_reextract_verification.json。此修复不替代目标容量与分支装配资格。开发来源不能兼作固定规则的独立验收。后续任务以当前计划为准；不把本节历史来源问题全部作为新门槛，也不按长度或人数重复采集。
 
 ### CPU 服务的内层语义归属
 
@@ -726,7 +728,7 @@ Schedule 合并不能只按 Concat 数量处理：get_next_batch_to_run 先过�
 
 显式 merge scope 仅使用 BatchLayout::bind_merge，外围节点不再借用该合并关系；filter scope 仍只使用指定过滤规则。公开 prepare 到共同 wrapper 的交接、实际安装方法签名和捕获范围外跳过已核对（data/redesign/s3-merge-region-contract/contract_audit.json）。真实 merge 切口与 filter/接管/merge 的整段序列变换仍未验收，旧资产没有这些 scope，不能将记录三个参数视作完成调度变换。Prepare last_loc 与共享 CPU 边界仍按联合观测准入表推进，不单独补采。
 
-合并前缀的有限行数资格：生产端要求pending过滤全保留、整个transition只含CPU观察/服务与已绑定MergeLeft/Right/Total的Concat，复制、等待、通信和其他计算不满足该资格。目标保持pending人数、其过滤选择和merge右侧人数，左侧须非空且等于进入transition的running人数；后续running过滤仍独立规划。此规则复用当前固定非overlap/non-spec及采样域对可选字段的限定，不能扩展到任意导入来源、可选字段变化或其他合并分支。CPU节点和端口全部保留，目标行数改变不表示CPU耗时已可预测。该资格保存于编译资产的transition_merge_parameters，旧资产需用已有事实重编译，无兼容回退；开发回归已验证2+2→4的14个Concat及随后4→2的14个Index、同rank合并到过滤的因果可达性，证据s4-fixed-assets-acceptance/merge_structure_verification.json；新的独立输入及原生结构对照仍待完成，不认定完整变换验收。
+合并前缀的有限行数资格：生产端要求pending过滤全保留、整个transition只含CPU观察/服务与已绑定MergeLeft/Right/Total的Concat，复制、等待、通信和其他计算不满足该资格。目标仍须全保留pending成员，两侧均非空；左侧等于进入transition的running人数，右侧等于pending人数及前缀过滤输入人数。两侧行数共同通过已有MergeLeft/Right/Total绑定求值，不要求右侧等于来源人数；后续running过滤仍独立规划。此规则复用当前固定非overlap/non-spec及采样域对可选字段的限定，不能扩展到任意导入来源、可选字段变化或其他合并分支。CPU节点和端口全部保留，目标行数改变不表示CPU耗时已可预测。该资格保存于编译资产的transition_merge_parameters，旧资产需用已有事实重编译，无兼容回退；开发回归已验证2+2→4的14个Concat及随后4→2的14个Index、同rank合并到过滤的因果可达性，证据s4-fixed-assets-acceptance/merge_structure_verification.json；新的独立输入及原生结构对照仍待完成，不认定完整变换验收。
 
 过滤区域的分支资格还需独立于人数变换。安装版 filter_batch 先处理空保留集（清空 reqs、保留不再使用的旧张量），再处理全保留（直接返回），其余路径才构造设备索引、选择批次张量并调用 sampling_info.filter_batch。空输入同样先走清空分支；两个提前返回路径仍包含按输入成员构造 keep_indices 的 CPU 工作，不能当作无工作。部分过滤中的 input_ids、seq_lens_cpu、采样张量、bias 和 penalty 等条件会改变内部工作，必须由已声明范围固定或由观测事实解释，不能只用输入/输出人数资格化整个区域。
 
@@ -945,7 +947,11 @@ CPU 区域的节点种类、非空性和单线程检查统一由 TemplateDefinit
 
 **有限 CPU 参数域。** 最新真实来源的 30 个准入/预算/统计区域均只有 CPU observation/control。四个单请求前缀在容量停止与队列耗尽下，操作身份（含 aten::empty）、端点别名和内部依赖一致；八个预算区域在不同 horizon 次数下保持同一观测结构。节点归属使用 scope_call 和父链，不能用 serving owner_call 代替。
 
-生产端仅为单 CPU 执行线程、区域内无设备/等待、全部预算调用成功接纳的 prefix/statistics 授予 admission_cpu_request_count。核心 parameterized_cpu_path 对非空接纳限制为队列耗尽或接纳后容量停止，核对候选/请求/horizon 与等待数关系，并要求目标接纳数及预算调用数保持来源值。运行成员遍历、horizon、队列整理和尾部扫描的变化保存在目标工作参数中，不按等待数增加模板。内存/输入预算拒绝、调用数变化及额外原生机制不包含在该域。 预算退出不能仅按外层枚举分类：add_one_req_ignore_eos 可在接纳前返回 NO_TOKEN，也可先 append 并扣减预算，再由 budget_state 返回 NO_TOKEN/OTHER；OTHER 还包括延迟、chunk 等其他原因。后续资格化须记录原生退出位置及当前候选是否已接纳，不重复执行预算判断。最新来源的 32 个 prefix 仅包含 22 次 early_return、8 次容量停止、2 次队列耗尽，12 个 budget 区域只记录 horizon 次数，不能证明预算退出分支。证据 s4-admission-exit-audit/source_inventory.json。 现有预算区域已补充 return_site（原生函数源码内相对行号）、native_result 与 candidate_accepted：返回表达式只执行一次，接纳事实读取 can_run_list 末成员身份，嵌套辅助函数保持原样。该记录是来源诊断，不是核心按行号分支的规则；当前历史资产没有这些字段，7 个返回位置通过 Docker AST 改写/编译检查。随后一次有界真实采集验证了末端 budget_state 返回 OTHER 且 candidate_accepted=true：两 rank 各两次，两个输入分别为 127/65 token，按 128-token 页扣减同一输入预算；下一次入口 batch_is_full 仍为 false。证据 s4-admission-exit-capture/verification.json。尚需完整 CPU 区域/依赖比较与目标展开验收，NO_TOKEN 和其他 OTHER 原因未由此覆盖，提取器限制不变。 最新结构对照中，4 个输入预算停止前缀与4个已支持单候选前缀均为相同的 8 节点、13 内部边、4 切边；尾部统计的4个新区域与6个旧区域也保持节点/内部边/切边关系一致。对照覆盖嵌套预算区域和端点别名；切边仅比较本地端点、关系与外部 lane 类型，尚非完整外部工作身份或目标装配证明。证据 s4-admission-exit-audit/{topology_comparison,statistics_topology_comparison}.json，后续优先扩展公共 CPU 参数域，不增加逐长度模板。
+生产端仅为单 CPU 执行线程、区域内无设备/等待、预算调用成功接纳的 prefix/statistics 授予 admission_cpu_request_count。核心 AdmissionWork::parameterized_cpu_path 支持队列耗尽、容量停止及接纳当前请求后的 InputBudget 停止；后者不关闭持续准入。目标候选/请求/horizon 数与等待人数必须满足对应关系；人数变化由已有 admission_budget 区域重组，不枚举批次模板。内存不足、接纳前拒绝及未知原生退出仍不在该参数域。
+
+原生 OTHER/NO_TOKEN 返回值本身不足以判断路径：预算返回记录 return_site、native_result、candidate_accepted；返回表达式只执行一次，相对源码行号用于取证，不进入核心规则。生产端当前仍只直接资格化已识别的来源退出，目标 InputBudget 可由已资格化的成功接纳模板参数化表达，二者不能混为“必须采到同一种退出”。依据为 s4-admission-exit-capture/verification.json 与 s4-admission-exit-audit/{topology_comparison,statistics_topology_comparison}.json：接纳后的输入预算停止与已支持前缀/统计的节点、内部边及局部切边一致。这不是完整外部身份或独立目标装配证明。
+
+运行成员遍历、horizon、队列整理和尾部扫描保存在目标工作参数中；来源调用数不等于模板族数。当前预算轴公开展开结果只维护在[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)，不由配方机制报告的缺项自动触发补采。
 
 零接纳使用同一个 CPU 参数域：候选、请求和 horizon 检查均为零，按入口状态区分 Closed、NoWaitingRequests 与创建 adder 前的 RequestCapacity。原生容量判断只读取配置及请求槽列表大小，非推测路径不进入 DFlash 延迟；这些早退均无 Prepare/statistics 或设备工作，batch_is_full 的目标变化由控制器维护。生产端仍要求区域仅含同线程 CPU 节点，核心按接纳的 Prefill 人数匹配；Decode 的运行人数不能被当作接纳数。请求预算失败和已进入候选循环的零接纳不在此域。
 

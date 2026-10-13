@@ -1,10 +1,12 @@
 # 当前构建与运行
 
-当前预测要求模板 source_state 中有真实 worker 准入策略。旧资产缺少该观测时，predict 返回 needs_data / admission_policy_not_observed，且不自动重采；此前完整输出预约路径已删除。不要手填原生默认值绕过缺口。新策略正向执行及完整 S3/S4 仍待验收，机制见[准入策略](sglang_template_relations.md#准入策略与内存压力)。
+本页维护可执行入口及其实际限制，主线为 SGLang + Qwen3-32B。阶段状态和开发是否暂停只见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)。README 按约定保持为空。
 
-本页说明当前实现，开发主线为 SGLang + Qwen3-32B。plan、输入准备、SGLang base 采集、独立 CPU/设备/通信采样及部分 source 结构提取已接入；predict 已接通限定范围的自动采集、有限域补采、重算和任务恢复。主线的完整控制/成本资格与独立评价尚未完成。KT 原生采集已有成功结果，保留入口和资产，其预测闭环在后续扩展。README 按既有要求保持为空。
+预测组合入口由 CLI 注入 `TemplateAdapter`；适配器解释来源配置、选择合格模板并提供公共控制限制，PredictionWorkflow 负责资产/成本隔离和组合执行。采集计划仅作为报告传入。Planner 的控制路径判断与配置分组已共用该接口；采集准备与配置序列化通过独立的 `CollectionAdapter` 注入 SGLang/KT 实现，保留 KT 仅采集的能力边界。提取/编译装配复用 TemplateAdapter；workflow 中的 ProjectReader 负责公共集合输入，具体框架参数解析通过 CollectionAdapter 注入。公共 JSON 输入工具集中在 contracts/json_input，框架配置值类型保留在输入合同中。
 
-2026-10-09 修订的[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)要求结构先行：统一流程与插桩 → 参数化 base 模板 → 给定节点耗时下的动态展开 → 节点 cost model。本页命令仍描述实际已有实现，现有整批精确查表与联合延迟不是最终节点模型；统一记录已开始落实原生 API 的显式阶段身份，给定节点耗时入口已接入，完整端口/结构资格尚未通过，不在此列出伪运行命令。用户已恢复实施，继续推进参数化、分支和共同消费接口；结构验收通过前不进入节点成本模型。集合输入、快照与组合执行已切换，代表性建库规划和节点成本仍未实现；当前范围以本页和输入合同为准。
+公开入口已接通集合输入、显式模板资产、给定节点耗时下的动态执行、报告和 status/resume。代表短请求可通过显式 profile 执行；predict 的代表性自动建库、受影响组合重算及正式节点成本闭环尚未完成，不能把历史自动补采入口描述当作当前能力。KT 原生采集保留，预测闭环为后续扩展。
+
+模板 source_state 需要真实 worker 准入策略；缺少观测时返回 needs_data / admission_policy_not_observed，不手填原生默认值绕过。原完整输出预约及整批联合成本后端已删除。当前执行始终结构先行、成本后置；给定耗时结果不代表真实性能精度，机制见[准入策略](sglang_template_relations.md#准入策略与内存压力)。
 
 现有独立采样的原生 workload/HCCL 条件由 adapters/frameworks/sglang/SGLangSamplingRecipes 准备；Planner 负责分派与公共权限、输出封装。prepare-sampling/prepare-communication 只准备输入，不执行设备任务；设施保留不代表 S5 节点成本模型已实现。
 
@@ -27,19 +29,20 @@ scripts/build.sh
 
 ```text
 src/markov/{include/markov,src}/
-├── contracts/                         # 统一流程、控制输入、观测值及用户输入
+├── contracts/                         # 公共值合同及共用 JSON 输入校验
 ├── graph/                             # 来源图、节点和依赖表达
 ├── production/                        # SourceBindings、SourceCall、公共 BlockExtractor
 ├── adapters/
 │   ├── frameworks/sglang/             # serving 绑定、子图提取、模板生产及采集配方
 │   │   └── models/                    # Qwen3 模块声明、模型/attention 原生布局解释
+│   ├── frameworks/ktransformers/      # 已有采集的配置与准备；不提供模板预测
 │   └── runtimes/ascend/               # CANN 事件关联、AscendSourceExtractor、HCCL 布局
 ├── templates/                         # 统一模板、参数化、实例化及有限变换
 ├── controller/                        # 轻量控制器及业务状态
 ├── execution/                         # 目标执行图、资源、完成事件及唯一模拟时钟
-├── performance/                       # 给定节点耗时；后续成本模型
-├── workflow/                          # 输入规划、适配器选择、生产与预测装配
-└── cli/                               # 命令解析
+├── performance/                       # 给定耗时、CPU 经验模型、统一节点成本查询
+├── workflow/                          # ProjectReader、输入规划、生产与预测编排
+└── cli/                               # 命令解析及适配器具体实现的组合
 ```
 
 | 抽象步骤 | 实现与交接 |
@@ -117,7 +120,7 @@ scripts/markov.sh resume --run data/path/to/run --template-assets template-asset
 
 项目使用固定模型、configurations、request_workloads和assets.templates；完整字段见[输入合同](02_user_contract.md)。plan不采集、不加载编译资产，逐组合说明声明范围；predict共享已有编译资产，逐组合动态执行，结果无隐含base比较。示例资产为空，因此返回缺数据；不是可用性能预测结果。
 
-代表性建库已报告配置分组、最大请求池候选和短请求配方，并提供显式配方采集；已有资产覆盖、自动建库和节点cost model尚未实现。允许采集但缺来源时明确返回representative_collection_planning_not_implemented，不把目标workload自动重采当作代表性规划。显式采集入口见下文。
+代表性建库按同部署配置组选择最大请求池、同池最大Prefill预算候选，运行固定短请求配方。predict先尝试显式资产，只为缺兼容来源的组在base授权及累计预算内采集一次，随后导入生成库重新预测；不采集目标workload，不因规则或成本缺口补采。节点cost model尚未实现，详细恢复行为见[集合流程](07_integration_workflow.md)。显式采集入口见下文。
 
 ## 3. 修改后的必要检查
 
@@ -138,14 +141,11 @@ JSON 用 jq empty 检查正式示例。输入行为通过公开 plan/predict 检
 
 Docker 镜像本机曾被其他来源 untag/delete，发起者未知；缺镜像时按上述命令恢复。不自动清理 Docker 系统、历史资产或原仓库。
 
-### 恢复实施后的优先工作
+当前本机 workspace 观测使用已安装探针的 `markov-workspace-20261012-sglang:ubuntu22.04`，公开采集命令须显式设置 `MARKOV_IMAGE_PREFIX=markov-workspace-20261012`（同前缀 modeling 镜像也已存在）。默认 `markov-next-sglang:ubuntu22.04` 尚无该探针安装记录，不能用于要求完整 workspace 分配证据的采集。源码更新不会更新已构建镜像；更换环境时先读取实际镜像内 torch_npu 包的 `markov_workspace_build.json`，核对安装提交和探针覆盖范围。旧安装记录保留安装时的源路径，不改写历史来源。
 
-1. 按[动作合同](01_system_framework.md)复核完整主线迭代，补齐原生位置、状态效果与异步端口。
-2. 落实[统一语义记录与模板](04_collection_templates.md)，把真实节点/依赖、参数映射和合法变体提供给核心。
-3. 按[动态展开设计](05_controller_semantics.md)接入显式给定节点耗时，以同一执行核验证同配置、准入 2→1 和时间反馈；报告条件，不调用成本补采。
-4. 结构完成条件满足后，再按内部性能单元复核样本和实现模型，集成正式预测与恢复。
+### 恢复实施
 
-输入/产物和公开入口变更同步更新；旧项目字段和旧恢复任务不提供兼容执行路径，历史资产按当前输入合同显式引用。
+当前任务、顺序与阶段门槛统一见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)，此处只维护运行与部署方法。
 
 ## 4. 显式诊断采集
 
@@ -157,7 +157,7 @@ scripts/markov.sh observe-target --project path/to/project.json --configuration 
 
 profile读取选定配置和请求文件，使用collection.base的显式授权及累计预算；禁采时零attempt。SGLang普通profile/observe-target按相同arrival_time_ns批量提交预分词请求，不同到达组并发按计划提交；响应标记batch_response，不将组返回时刻当作逐请求完成。此命令是诊断采集，不是普通用户必须选择base的产品流程。KT使用同样的选取参数，服务部署取自所选配置，已有采集能力保留。
 
-profile --representative仅接受plan选出的代表配置，不能同时传--workload。按实际页大小生成短请求，每组批量提交，等真实返回后再提交下一组；沿用collection.base预算，禁采时零attempt。配方及尚未覆盖机制见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md#代表短请求候选与执行前门槛)。这仍是显式诊断入口，predict尚不会自动发起建库。
+profile --representative仅接受plan选出的代表配置，不能同时传--workload。按实际页大小生成短请求，每组批量提交，等真实返回后再提交下一组；沿用collection.base预算，禁采时零attempt。配方及尚未覆盖机制见[实施计划](04_collection_templates.md#代表短请求候选与执行前门槛)。这仍是显式诊断入口，predict尚不会自动发起建库。
 
 observe-target使用独立预算生成role=validation的观测，不能作为预测模板或成本。status/resume恢复已有任务不重置预算，原生容器存活时不能启动第二次采集或修改预算。首次部署与采集前的原生路径条件见[框架路径](framework_paths.md)。
 
@@ -165,7 +165,7 @@ observe-target使用独立预算生成role=validation的观测，不能作为预
 
 ## 5. 已有 base 的 source 提取
 
-CPU API归一化也关联设备同步：`rtDeviceSynchronize`和`rtDeviceSynchronizeWithTimeout`按完整同线程序列对应`Runtime@DeviceSynchronize`，数量或已知scope不一致时保持未关联。关联只恢复调用归属，不生成硬件任务。提取器现按显式stream/device范围恢复提交前沿，CPU服务沿既有路径切除等待；模板存储、资源绑定和执行明细共用该范围。设备域存在未映射活动或重叠提交时保留未解析等待，不能宣称设备级动态展开已验收；workspace分支触发及完整资源域仍待落实。内部资产需从原始事实重提取，不兼容旧的无scope存储。 workspace需求探针已完成隔离构建和ATB分配/扩容/复用/清空运行验证，证据与边界见[workspace合同](sglang_template_relations.md#workspace-容量状态与设备级同步待实现)。SGLang Dockerfile经`docker/install/torch_npu_workspace.sh`调用runtime适配器的`install.sh`，构建固定提交的带探针原生库，保留匹配wheel的Python扩展；安装脚本和独立验证镜像的实际库加载检查已通过，当前cached/non-overlap代表请求的serving窗口链已通过验证；完整Dockerfile重建仍未验收。`MAX_JOBS`构建参数控制并行度，默认16。采集环境的`workspace_probe`记录包内构建来源，未安装时为null；现有镜像不会因源码修改自动获得探针，诊断scope也不构成完整serving模板。
+CPU API归一化也关联设备同步：`rtDeviceSynchronize`和`rtDeviceSynchronizeWithTimeout`按完整同线程序列对应`Runtime@DeviceSynchronize`，数量或已知scope不一致时保持未关联。关联只恢复调用归属，不生成硬件任务。提取器现按显式stream/device范围恢复提交前沿，CPU服务沿既有路径切除等待；模板存储、资源绑定和执行明细共用该范围。设备域存在未映射活动或重叠提交时保留未解析等待，不能宣称设备级动态展开已验收；workspace分支触发及完整资源域仍待落实。内部资产需从原始事实重提取，不兼容旧的无scope存储。 workspace需求探针已完成隔离构建和ATB分配/扩容/复用/清空运行验证，证据与边界见[workspace合同](sglang_template_relations.md#workspace-容量状态与设备级同步)。SGLang Dockerfile经`docker/install/torch_npu_workspace.sh`调用runtime适配器的`install.sh`，构建固定提交的带探针原生库，保留匹配wheel的Python扩展；安装脚本和独立验证镜像的实际库加载检查已通过，当前cached/non-overlap代表请求的serving窗口链已通过验证；完整Dockerfile重建仍未验收。`MAX_JOBS`构建参数控制并行度，默认16。采集环境的`workspace_probe`记录包内构建来源，未安装时为null；现有镜像不会因源码修改自动获得探针，诊断scope也不构成完整serving模板。
 
 Ascend native journal同时保留 `rtEventQueryStatus` 的event handle、返回码和 `event_status`（失败为null）。这是原生查询的观测，不发起额外查询或同步；没有device提交身份。查询完成不能代替event record关联或证明预热后的后台清理为空。当前仅完成单event SDK拦截验证，后台调度与入口状态尚待资格化，见[模板关系](sglang_template_relations.md)。
 
@@ -193,7 +193,15 @@ scripts/markov.sh compile-templates --base-manifest data/path/to/profile_manifes
 
 来源记录/提取规则变化时仍必须先归一化或extract：source_facts须保留scope_call与owner_call，模板须有internal_edges；源图需要stream_waits、collectives及独立于物理device_spans的collective_spans。缺少原始语义的事实不能靠重编译恢复，缺字段不能解释为空通信。保留原生trace时可重做归一化，无须重新运行模型。成功解析与无环只证明已记录关系合法；身份、复合任务依赖或CPU服务边界未闭合时仍为needs_data，不能把模块级实例化当成完整物理依赖。
 
+预测任务的`selecting`表示已有预测结果可复用、正在处理代表组选择。失败未产生新资产时，resume读取同轮prediction.json继续选组；成功导入资产或显式修改输入才安排新轮次。自动建库成功后，`prediction.recompute_configurations`记录原代表组的configuration_ids，下一轮project.json只包含该组；合并后的prediction.json保留其他组合。显式资产替换仍完整重算。新增持久字段要求新建当前格式任务，不兼容猜测旧未完成任务的重算范围。
+
+原生启动命令退出后写入`launch_result.json`，保存退出码、单调时钟耗时和结束时间。Docker留下Created/Error且启动命令失败时，据此结束该attempt；resume不把恢复等待时间计入预算。旧任务若没有终态或启动记录，继续明确报告无法恢复计量，不猜测耗时或自动再采。
+
+采集后处理的确定失败由处理进程写入`processing_failure.json`，预测任务按组隔离并保留原attempt；`resume`不会把这一失败变成自动重采或自动重处理。修复原因后，可对该attempt显式重跑原后处理入口（`PYTHONPATH=src/collection python3 -m markov_collection.workflow.processing --capture <原native_capture.json> --role base`，在modeling容器内执行），它在持有处理锁时清除上一失败记录并重用原输入。成功后通过已有`resume --template-assets`导入生成资产。没有失败记录的宿主异常仍需核对真实运行状态，不能据此重启。
+
 编译模板保存lane、外部连接和等待的资源角色，来源报告resource_bindings列出原生编号及可选的control/submission/model/collective角色。未绑定角色不代表可跨来源迁移。此字段变更须从已有事实执行compile-templates；不支持旧资产格式兼容。
+
+编译模板保留源图CPU服务的`control_part`，供目标成本查询使用。此字段加入后，已有源图只需执行`compile-templates`重建当前资产；无需重新采集或构图，不兼容读取缺该字段的旧编译记录。
 
 编译模板同时保存来源共享的sequence_capacity_tokens，表示包含本次query的最大已处理序列长度；原生模型/表/缓存解释只在生产端发生。缺此字段的历史编译资产须从满足当前合同的来源重新compile-templates，不提供旧格式兼容；无需重新采集。Decode候选长度使用共享容量，Prefill候选仍限一页；整组结构和分支资格继续单独检查。
 
@@ -203,6 +211,8 @@ predict只挂载assets.templates中各manifest和compiled_templates所指资产�
 
 ## 6. 独立性能采样
 
+当前 CPU/device 入口启动一次原生 Engine，在同一引擎内按条件调用 `generate()`/`async_generate()`；并非每个数据点重启 serving，也未改用 `bench_one_batch.py` 或直接驱动 `ModelRunner`。语义与性能观测独立、统一适配及自动特征域规划的设计见[采样合同](04_collection_templates.md#独立性能采样合同)；这些后续能力尚未完整实现，下面的命令仍要求显式测量工作域。
+
 ```bash
 scripts/markov.sh sample --project path/to/project.json --configuration CONFIG_ID --workload WORKLOAD_ID --measurement-requests work-domains.json --repetitions 3
 scripts/markov.sh sample --project path/to/project.json --configuration CONFIG_ID --workload WORKLOAD_ID --kind device --measurement-requests work-domains.json --repetitions 3
@@ -211,9 +221,9 @@ scripts/markov.sh sample --project path/to/project.json --configuration CONFIG_I
 
 sample 使用 collection.performance 的 allow_run 和累计 max_wall_time_sec，关闭时返回 needs_data/performance_collection_disabled、零 attempts、零用量。kind 默认为 cpu，可选 device、communication；重复次数必须为正，默认每个测量条件三次。status/resume 与 base 共用原生容器预算、资源锁和恢复机制，base/performance 分开记账。
 
-当前仅实现 SGLang lightweight 范围的 Ascend 路径，需要已给出的 token 输入；不支持文本解析、radix、overlap、graph、mixed prefill/decode、HiCache 或 chunked prefill。CPU/device 必须用 measurement-requests 显式指定非空测量工作域；不再按目标输入长度、输出长度与批大小自动展开采样网格。缺少该参数时在创建采集任务前报错，空数组也不接受。通信采样仍从显式独立设备资产提取通信工作域。输入是用户明确提供的工作域数组（当前节点执行报告不再生成整批 measurement_requests），每项含 phase、requests 的 input_tokens/context_tokens/prompt_tokens，以及 finished_request_count。原生输入配方由 C++ Planner 生成，使用选定 workload 中同长度的真实 token 输入和新的测量身份，不运行其业务到达序列，不读取 target 实测或评分。
+当前仅实现 SGLang lightweight 范围的 Ascend 路径，需要已给出的 token 输入；不支持文本解析、radix、overlap、graph、mixed prefill/decode、HiCache 或 chunked prefill。CPU模式同时按既有admission_budget hook记录完整原生调用到cpu_units目录，manifest显式列出文件、边界和未资格化原因；这些记录不同于cpu_samples中的包含式阶段测量。clock_pair_ns仅为探针量级观测，不是自动修正系数，禁止把两类样本同时收费。安装当前queue适配后，CPU模式还输出`cpu_workers`，manifest显式列出原生入队/worker记录及其needs_data原因。记录含原生任务名称/类型、pid/correlation_id、各线程时钟和已观测runtime点；不能跨线程相减CPU时钟，也不能按时间接近猜worker所属业务。采样结束后生成`cpu_worker_units.json`，manifest通过`cpu_worker_units`引用，并在`cpu_worker_coverage`报告关联覆盖与缺口。该资产共享阶段上下文，为enqueue和worker分别保存不重叠的相邻边界测量、等待/探针计数及原始行号；覆盖通过也不提升needs_data。目标工作匹配和服务/等待解释仍未完成，不能直接作为正式成本。模板资产新增按节点保存的CPU提交工作描述，旧编译资产需使用当前归一化生成的source_facts执行`extract`重建，仅重新`compile-templates`不能给旧源图补CPU工作描述；不读取旧字段默认值。CPU/device 必须用 measurement-requests 显式指定非空测量工作域；不再按目标输入长度、输出长度与批大小自动展开采样网格。缺少该参数时在创建采集任务前报错，空数组也不接受。通信采样仍从显式独立设备资产提取通信工作域。输入是用户明确提供的工作域数组（当前节点执行报告不再生成整批 measurement_requests），每项含 phase、requests 的 input_tokens/context_tokens/prompt_tokens，以及 finished_request_count。原生输入配方由 C++ Planner 生成，使用选定 workload 中同长度的真实 token 输入和新的测量身份，不运行其业务到达序列，不读取 target 实测或评分。
 
-这是当前联合批次测量合同，尚未按最终节点/局部子图粒度定义；请求完成数也不足以区分具体结束成员。已有入口与资产保留，后续在 S5 依据已验收结构确定正式单元及特征，当前不继续靠补齐 9/8、10/9 等整批组合推进结构验收。
+这是驱动原生请求的采样输入合同，不是以整批为成本粒度：已有 CPU 单元和设备节点记录可供拟合，整批条件仍不能表达所有单元特征，请求完成数也不足以区分具体结束成员。已有入口与资产保留，后续依据公共工作描述规划采样并核对实际覆盖，不恢复按 9/8、10/9 等整批组合逐项补采。
 
 不同 decode 上下文通过独立请求的真实 token 进度分批释放形成；同组请求一起提交。生成 token、原生 scheduler 和 KV 更新保持原生行为，既不覆盖 token 也不暂停 scheduler。配方是请求的工作域，实际原生 batch 与 shape 才是测量证据；客户端释放时刻不能保证所有域都会到达。预热、完成覆盖和实际成本查询继续决定资产是否可用。
 
@@ -225,17 +235,53 @@ device 采样复用相同测量条件和预热规则，启用框架 profiler 及
 
 communication 需要 assets.performance_manifests 显式引用同一 SGLang TP/设备部署的独立 device 测量。准备阶段从原生 collective_descriptors 提取操作、元素数、dtype、算法和来源；当前实现 BFP16 allReduce/allGather、Ascend HCCL、每 rank 一个设备且 TP≥2。采样不加载模型权重，每项先预热再重复测量；同步仅用于独立 benchmark 的完成隔离，未插入 serving 捕获。collective_measurements.json 保留逐 rank 原始时刻、配对包络、启动错峰及所有 rank 启动后的尾部观测。首轮六项条件得到 48 条 rank 记录、24 组配对观测，其中正式测量 18 组；启动错峰与尾部耗时相近，尚未确认可迁移的通信服务。profiler 本身未启用 warmup 的提示及开销资格问题保留，操作预热不等于 profiler 预热。
 
-三种产物均为 performance_manifest.json，明确引用实际输入、环境、完成计数和样本，不可用于 extract 或填补 base 语义。当前保持 readiness=needs_data：CPU 非 SDK 等待、观测开销，以及设备/通信成本适用性仍需处理。cpu 当前还记录原生准备、提交、完成代理及发布边界，生成 native_serving_timing；限定模块预测可以显式接受其联合延迟近似，不能称为纯设备服务。
+三种产物均为 performance_manifest.json，明确引用实际输入、环境、完成计数和样本，不可用于 extract 或填补 base 语义。当前保持 readiness=needs_data：CPU 非 SDK 等待、观测开销，以及设备/通信成本适用性仍需处理。cpu 当前还记录原生准备、提交、完成代理及发布边界，生成 native_serving_timing；节点预测不消费旧联合延迟，不能将其当作纯设备服务。
+
+独立通信采样的 `collective_measurements.json` 另含 `task_samples`：按原生任务身份关联的物理工作、等待与标记，以及字节量和来源引用。该数据仍保留 manifest 的成本资格限制，不应直接将所有任务的观测时长求和作为通信成本。
+
+### 从独立单元样本拟合候选
+
+```bash
+scripts/markov.sh fit-costs --performance-manifest path/to/performance_manifest.json > candidate-model.json
+```
+
+该命令在modeling Docker内执行C++拟合，默认处理`native_serving_timing`中的完整准入预算单元。它只读取显式manifest引用的cpu_units，不扫描目录或采集；排除预热、未确认完整接纳路径和含runtime等待/探针的记录，并报告排除原因。以初始化路径、成员数量与horizon工作规模分组，合并rank取中位数，保留数量和原始范围，不去掉高值、不按输入长度拟合或外推。
+
+使用 `--unit worker` 则读取 manifest 引用的 `cpu_worker_units`。只纳入完整单次提交、无已观测等待的 worker；从各段线程 CPU 时间中扣除已记录的成对探针开销，再按操作名称与 before/call/after 分组取中位数。探针计数不得超过所属线程区间，不截断为零。原生队列事件名称由 runtime 适配器提供，拟合器不解释队列类型。该候选假设固定模型和部署下可暂不按 shape、rank、阶段细分，须用独立数据检验；未测出的观测开销没有被扣除。worker 的独立性检查同时追溯原始记录，不能通过重新归一化同一份数据作为留出样本。
+
+使用 `--unit kernel` 则读取 `native_device_work` 的 `device_measurements`。Ascend 生产端为每条计算记录提供 `kernel_work`，统一表达 kernel 名称、操作、输入/输出 shape、dtype、format、任务类型与实际启动块数；原始 vendor 字段和来源继续保留。C++ 按完整描述分组取中位数，排除预热、非计算工作与缺少描述的记录，不按 source span、request 身份或整批 decode 长度拟合。启动块数不同则属于不同工作键，设备核心容量不能替代启动规模。
+
+kernel 候选目前是物理设备 span 的经验基线，未扣 profiler 开销或隐藏停顿，尚未纳入数据相关的序列/KV 工作特征，通过 `assets.cost_models` 可进入条件预测。目标按完整张量描述匹配，只有单一观测启动变体且不含额外语义工作时才使用候选；目标启动规模沿用该观测变体属于显式假设。未匹配 shape/启动描述不外推；原生 trace 参与训练/评价重叠检查。历史数据只能在明确导入任务中转换，缺少的 runtime 条件须显式保留为未知与缺口，不增加旧格式回退或伪造观测。
+
+输出为`candidate`，没有可用样本时为`needs_data`；原测量资格与缺口保留，并随候选输出声明的配置、部署、runtime及相应 CPU/设备条件（observed_context），不据此自动授权成本迁移。该命令不修改源资产、独立留出数据或预测输入；准入/worker/kernel 候选可通过 `assets.cost_models` 显式导入条件预测。拟合成功不意味着探针边界、部署迁移或精度验收通过。
+
+评价当前fit-costs生成的固定候选：
+
+```bash
+scripts/markov.sh evaluate-costs --model-candidate candidate-model.json \
+  --performance-manifest path/to/held-out-performance-manifest.json
+```
+
+评价复用同一单元读取合同，只读取候选数值，不调用拟合。候选保存显式sample_sources；直接重用任一拟合样本文件会报错。输出匹配/未匹配工作、分组及总体MAE、带符号误差、最大绝对误差和WAPE（比例值），同时报告观测上下文是否相同、排除记录及双方测量缺口。零样本或零观测总时长的相关比率为null，不伪造零误差。文件分离及上下文相同都不是完整独立性或迁移资格证明；结果保持not_established，不回写候选、补采或提高预测资格。
+
+拟合候选的显式消费：在项目 `assets.cost_models` 中填写候选路径，运行原有 `predict`。预测只读模型文件，不重拟合或加载源样本；独立测量 manifest 仍不是成本模型。当前匹配模型、框架和部署，由适配器判断配置关系，再按实际目标工作查询。SGLang 请求池容量、Prefill 预算可在已支持路径内变化，仍须满足模板与成本键；这只是候选消费条件，未建立真实性能或硬件迁移资格。未匹配模型不会触发采集。需要修订已保存任务时：
+
+```bash
+scripts/markov.sh resume --run path/to/run --cost-model path/to/admission-candidate.json \
+  --cost-model path/to/worker-candidate.json
+```
+
+该列表替换全部成本模型，重算组合；重复无修订恢复不增加轮次。实际基准、来源和限制见[经验成本合同](02_user_contract.md#显式经验成本输入)。
 
 ## 7. 条件预测与恢复
 
-每份assets.templates包含manifest和可选node_durations，给定耗时必须引用同一来源。预测容器仅挂载明确的manifest、编译资产和耗时，不读取原始trace/source_facts；关闭diagnostics时跳过逐实例详细报告构造，仅汇总连接规则和执行结果；打开时按combination_N_graph.json输出物理图，按combination_N_graph.details.json保存逐工作/模板明细。主结果通过structure.graph.artifact和execution_details.artifact引用这两个文件，execution_details.work_count记录工作数；不再内嵌execution_graph数组，predict/status/resume不读取明细文件。语义区域与操作切口在一次报告中按不可变来源定义计算一次，目标参数和连接仍逐实例描述；明细文件仍含按实例重复的来源描述，尚未完成内容去重。
+每份assets.templates包含manifest和可选node_durations，给定耗时必须引用同一来源。预测容器仅挂载明确的 manifest、编译资产、给定耗时和拟合模型，不读取原始trace/source_facts；关闭diagnostics时跳过逐实例详细报告构造，仅汇总连接规则和执行结果；打开时按combination_N_graph.json输出物理图，按combination_N_graph.details.json保存逐工作/模板明细。主结果通过structure.graph.artifact和execution_details.artifact引用这两个文件，execution_details.work_count记录工作数；不再内嵌execution_graph数组，predict/status/resume不读取明细文件。语义区域与操作切口在一次报告中按不可变来源定义计算一次，目标参数和连接仍逐实例描述；明细文件仍含按实例重复的来源描述，尚未完成内容去重。
 
 模板按模型、配置变换和部署筛选后共享；控制器、KV及执行状态按配置×workload组合隔离。来源缺失、控制范围外和节点耗时缺失分别报告，部分组合失败不阻断其他组合。当前支持共同原生条件下的多来源候选、整批来源切换及有限局部donor替换；完整代表性建库规划仍未完成。provenance.source是首选来源，实际使用集合见structure.graph.sources；工作明细的source_manifest限定source_call/source_batch，耗时说明统一见assets[].node_durations。
 
-恢复输入用--template-assets FILE显式替换完整来源列表，数组项与项目assets.templates一致，路径相对FILE。资产修订后的当前实现重算全部组合；完成任务无修订的resume只读已有结果。改变模型、配置集合或请求序列建立新任务，不修改持久快照冒充恢复。真实节点成本、自动代表性建库、组合依赖重算及独立evaluate仍待完成。
+恢复输入用--template-assets FILE显式替换完整来源列表，数组项与项目assets.templates一致，路径相对FILE。资产修订后的当前实现重算全部组合；完成任务无修订的resume只读已有结果。改变模型、配置集合或请求序列建立新任务，不修改持久快照冒充恢复。缺兼容来源且base授权/预算允许时，predict为每个配置组自动运行一次代表配方并导入生成库；已有资产优先，加载失败先修复，规则/成本缺口不触发结构采集。失败及恢复不自动重试已尝试组。当前持久任务保存representatives（代表到组失败原因的映射，空原因表示尚无失败）与active_representative，旧任务快照需重新创建，不提供旧格式兼容。自动导入资产后按受影响配置组重算，保留其他组合结果；显式替换资产仍完整重算。真实节点成本与独立evaluate的当前交付状态见执行计划。
 
 
 SGLang `native_environment.initialization` 记录实际 warmup token、长度、sampling_parameters 和窗口位置。生产端按[固定预热合同](02_user_contract.md#仿真起点统一预热后开始)检查并保存 initialization_gap，TemplateBank::qualify_initialization 消费该结果；缺失记录返回 initialization_not_observed，不匹配返回 fixed_warmup_not_observed。来源的共同资格与初始化资格分别报告：缺初始化证据的来源不能提供起点；后续整批候选须有完整workspace绑定、共同原生条件及整组接口资格，局部候选须满足区域合同，两者均消费唯一目标容量状态，不导入供体初始容量。旧编译资产必须从实际来源重编译，不能补造元数据或用默认值绕过缺口；通过配方检查不等于目标容量状态已资格化。allocator marker 现在也切分 worker CPU 服务，使用该可替换边界须从事实重新 `extract`，只 `compile-templates` 不能给旧图补 CPU 切口。
 
-Workspace窗口状态由采集器写入`workspace_states/rank-*-pid-*.json`，manifest显式引用；ServingNormalizer保留初始/结束状态并核对原生分配记录的连续性。此入口已通过当前cached/non-overlap代表请求的真实serving验证，证据见`data/redesign/s4-workspace-serving/serving_verification.json`；目标容量推进已接入同配置、保留原分支路径，分支替换仍未接通。旧manifest缺少该字段不做兼容解析，也不能把未观测状态填为空缓存；现有缺状态资产不具备workspace生命周期资格。该检查不提供目标需求公式或节点耗时。
+Workspace窗口状态由采集器写入`workspace_states/rank-*-pid-*.json`，manifest显式引用；ServingNormalizer保留初始/结束状态并核对原生分配记录的连续性。此入口已通过当前cached/non-overlap代表请求的真实serving验证，证据见`data/redesign/s4-workspace-serving/serving_verification.json`；目标容量推进与分支变换按现有workspace规则资格处理，当前验证范围见执行计划。旧manifest缺少该字段不做兼容解析，也不能把未观测状态填为空缓存；现有缺状态资产不具备workspace生命周期资格。该检查不提供目标需求公式或节点耗时。

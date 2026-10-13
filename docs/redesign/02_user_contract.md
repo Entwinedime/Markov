@@ -25,7 +25,8 @@ adapter 是我们理解原生实现的代码，不是用户负载。实际支持
 | initial_state.cache | 默认cold；warm当前unsupported |
 | collection.base / performance | 默认禁止；allow_run及累计max_wall_time_sec。启用时预算须为正，恢复不重置。base在此表示结构资产采集角色，不是用户指定比较基准 |
 | assets.templates | 默认空数组，每项manifest及可选node_durations，来源manifest不重复。缺耗时不填零 |
-| assets.performance_manifests | 显式独立性能资产列表，默认空；当前节点cost model尚未消费它们 |
+| assets.performance_manifests | 显式独立测量资产列表，默认空；不直接作为拟合模型消费 |
+| assets.cost_models | 默认空；显式拟合成本候选文件列表，声明顺序用于重叠工作选择；当前输出保留条件性质与测量资格 |
 | output.directory / diagnostics | 必填输出目录；完整图诊断默认false |
 
 路径相对声明它的文件解析。模型路径可为部署容器路径；CLI项目路径使用仓库路径。prepare-prediction生成全部配置和workload的独立文件，持久任务按数组位置命名快照，不把用户id拼入文件路径。
@@ -50,17 +51,27 @@ combinations按配置声明顺序 × workload声明顺序输出，每项包含co
 
 ## 采集边界与恢复
 
-常规predict只需探索集、显式资产和采集条件。代表配置及代表request必须由有界建库规划选出，不能直接枚举目标workload重采；预算到限不等于覆盖完成。当前只完成同机制/部署配置分组和最大请求池代表选择，plan/predict在representative_collection报告候选组与排除原因，状态requires_mechanism_coverage。短请求和机制覆盖规划尚未实现：缺可用来源时，禁采返回base_collection_disabled；允许采集仍返回representative_collection_planning_not_implemented，不启动目标request的冒充建库循环。这是待补齐能力，不是最终产品完成状态。
+常规predict只需探索集、可选显式资产和采集条件。代表配置及代表request由有界建库规划选出，不直接枚举目标workload重采；预算到限不等于覆盖完成。plan/predict在representative_collection报告候选组与排除原因，requires_mechanism_coverage不代表每组都必须采集。predict先消费已有资产，缺兼容来源且允许采集时才在累计base预算内执行每组一次的固定短请求配方；禁采返回base_collection_disabled。生成库导入后重新预测，失败不自动重试；资产加载失败先修复，规则及成本缺口不触发结构采集。恢复合同见[集合流程](07_integration_workflow.md)，当前完成程度只在实施计划维护。
 
 profile、sample、observe-target是显式诊断采集命令，使用--configuration/--workload定位其输入；不代表用户必须为普通predict指定base。observe-target产物只用于独立评价，不作为预测模板或成本。CPU/device sample必须提供非空--measurement-requests，不自动展开长度/批大小网格。
 
 status/resume保留任务预算及来源；活跃预测不接受资产/预算修改，返回requested_changes_applied=false。宿主中断后保留处理阶段，依据真实容器状态恢复同轮结果，完成任务的重复resume不新开轮次。
 
-`resume --run DIR --template-assets FILE`使用JSON数组替换完整模板输入列表，字段同assets.templates，路径相对FILE解析；可同时更新各来源的node_durations。`--performance-manifest FILE`可重复，替换独立性能输入。预算仍使用--base-budget-sec/--performance-budget-sec追加总额。显式资产修订后当前从初始状态重算全部组合；按依赖只重算受影响组合尚待实现，不恢复模拟器内部checkpoint。
+`resume --run DIR --template-assets FILE`使用JSON数组替换完整模板输入列表，字段同assets.templates，路径相对FILE解析；可同时更新各来源的node_durations。`--performance-manifest FILE`可重复，替换独立测量输入；`--cost-model FILE`可重复，替换完整拟合候选列表。预算仍使用--base-budget-sec/--performance-budget-sec追加总额。显式资产修订后当前从初始状态重算全部组合；自动建库按代表配置组重算；显式资产修订完整重算，不恢复模拟器内部 checkpoint。
+
+## 显式经验成本输入
+
+`assets.cost_models` 接受 `fit-costs` 的准入、worker 或 kernel 候选。模型先匹配声明的模型、框架及 Docker 服务/设备；配置关系由框架适配器判断。当前 SGLang 仅容许在已支持控制路径内改变请求池容量与 Prefill 预算，其余实现参数保持一致。该关系只允许查询候选：实际目标成员工作或提交位置仍须命中成本键，未知不填零。worker 基线仍省略 shape，不能以配置关系成立证明该省略始终准确，也不证明 runtime、硬件、CPU 亲和性或迁移资格。未匹配原因见组合的 `cost_model_context_gaps`，不触发结构采集；原测量缺口、假设和 `not_established` 保留在根结果的 `cost_models`。
+
+执行核通过目标 `ServiceWork` 查询：完整准入成员按 accepted/running/horizon 工作量匹配，完整 worker 按操作与提交位置匹配，并要求目标提交根已解析。模型按声明顺序取首个可用值；没有匹配时只使用用户显式提供的节点耗时，二者均缺则返回具体成本缺口，不补零。实际使用数量见图摘要 `cost_usage`；诊断节点的 `service_cost` 给出 ns、basis 及组合 `cost_models` 的索引。模型文件自含值，预测不读取它引用的原始样本或重新拟合；声明文件只读挂载，workspace 外模型保留绝对路径。
+
+kernel 候选只在完整名称/操作/输入输出 shape、dtype、format 精确匹配且训练中仅有一个启动变体时提供条件耗时。目标尚无独立启动规模时，采用该唯一观测变体是一项明确假设；若存在多个变体则不选择或平均。带注意力、KV、位置等额外语义工作的节点不由这类基础候选计费。查询政策在模型报告的 `query_policy` 中说明，实际基准为 `empirical_kernel_candidate`。
+
+混合运行保持 `empirical_candidates_with_conditional_inputs` 和条件假设；`complete` 表示该条件运行结束，不代表真实性能资格或整个成本覆盖完成。计算、通信/传输、设备命令及其余 CPU 成本仍按计划交付。
 
 ## 显式给定耗时
 
-每份模板资产可指定node_durations路径，文件包含base_manifest来源引用、unit="ns"、非空assumptions数组及values数组。每项为source_span和非负整数duration_ns。base_manifest是文件内的资产身份，必须匹配该条模板来源；不能跨来源复用span编号。当前predict需要所用服务节点的值；缺失返回needs_data，不回退到观测时间差或原联合模块成本。
+每份模板资产可指定node_durations路径，文件包含base_manifest来源引用、unit="ns"、非空assumptions数组及values数组。每项为source_span和非负整数duration_ns。base_manifest是文件内的资产身份，必须匹配该条模板来源；不能跨来源复用span编号。未被显式模型匹配的服务仍需给定值；缺失返回 needs_data，不回退到观测时间差或原联合模块成本。
 
 等待与注解只贡献依赖，服务节点才计费；不能以父模块包络代替内部节点耗时。给定假设仅支持结构分析，真实预测的节点成本由后续S5提供。
 

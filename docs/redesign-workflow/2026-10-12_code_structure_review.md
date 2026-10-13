@@ -1,5 +1,7 @@
 # 2026-10-12：代码层次、风格与逻辑整理
 
+本文各节为对应批次的历史代码审查，当前阶段状态只见实施计划；2026-10-13 补充纠偏见文末。
+
 本次落实用户明确的周期审查方向，检查活动代码的职责、依赖、状态所有权、可读性与重复实现；workspace 功能缺口另见同日 workspace_state_pipeline_review。本报告不把代码整理计作 S3/S4 结构验收。
 
 ## 检查范围与结论
@@ -26,7 +28,7 @@ Python 全包 Ruff 通过，修改的 C++ 文件 clang-format 检查及 git diff
 
 TemplateDefinition/TemplateBank 仍承担较多结构选择与报告工作。此次只分离已有独立类职责，没有按行数继续拆方法或引入额外架构；后续修改应优先消除实际重复，而非不断加新文件。workspace 后续修改已将使用点绑定到目标拓扑；继续要求初始化、目标使用点、容量与分支保持一条数据流，避免按功能缺口增加独立诊断包装。
 
-本次代码质量周期检查结束，计数归零。功能进度和完整 S3–S6 门槛仍由执行计划维护，goal 保持 active。
+本次代码质量周期检查结束，计数归零。功能进度和完整 S3–S6 门槛仍由执行计划维护，当时 goal 为 active（历史状态）。
 
 
 ## 随后五批修改的复查
@@ -65,3 +67,35 @@ Docker构建通过；三份活动资产从实际来源重编译，公开延迟�
 - 修改方法按读取、归属、报告分组，补必要生命周期注释；不新增管理类、registry、版本回退或test。大型normalization/source_extractor仍承担较多适配职责，本轮新增方法只分离实际启停记录读取与归属，不按行数继续拆层。
 
 全包Ruff、容器Python AST、Docker C++构建及diff检查通过；第71次事实重提取的源图、模板及编译资产逐字节保持，见s4-group-cleanup/lifecycle_reextract_verification.json。随后补齐的内部等待条件仅针对新增profiler_control归属，已有未标记事实分支不变，最终构建另行确认。未对新启停归属做真实采集，不以该回归或审查关闭功能缺口。审查批次归零，S3–S6退出条件不变。
+
+## 2026-10-13：合并变换至来源选择的五批复查
+
+本次检查活动入口、CMake依赖、workflow资产生命周期、模板只读来源与装配、controller/execution状态边界、NodeDurations，以及Python Recorder→SGLang observer→Ascend产物/归一化和原生event journal。重点是职责、所有权、错误隔离与代码收紧；以下结论不是全仓逐行正确性或功能验收证明。
+
+- **层次**：公共C++ contracts/graph/controller/execution/performance/templates未发现反向adapters/workflow include；公共Python instrumentation/artifacts没有具体适配导入，runtime没有框架导入。CMake仍为workflow→adapters→core。来源配置解释和配置变化关系集中在SGLangCollectionPlanner；TemplateBank只提供只读来源，不增加框架判断。
+- **重复判断收紧**：删除PredictionWorkflow中独立维护的部署、配置、供体和初始化筛选循环，实际预测与source_coverage消费同一SGLangSourceSelection。供体与初始来源分别有真实用途，不把二者合并成一个available布尔值；缺成本仍由NodeDurations路径处理，不转成结构补采。
+- **所有权和错误边界**：workflow完成资产加载后才创建SGLangSourceCandidate只读视图，持有bank与解析后的配置直至所有组合结束；selection仅保存借用指针。审阅中保留配置在加载try块内一次解析，避免把坏资产的异常移到组合循环外；没有新增吞错、默认值或逐层解析。资产身份、准入与初始化继续复用现有qualify方法。
+- **状态与采集职责**：controller仍消费Published更新请求/KV，runtime拥有模拟时间，来源选择不写这些状态。NativeJournal只在显式观察环境保留入口event记录；EventHistory解释record/query/destroy并保留歧义，未加入目标控制或后台服务计费。Recorder的外层动作flush与SGLang profile启停分工保持；跨窗口并发及完整serving交接仍是已记录的待验证风险，不用SDK局部观察关闭。
+- **风格和规模**：新逻辑按资格、初始化、报告分段，注释解释借用生命周期及成本/结构边界；没有新注册器、缓存、兼容入口、测试工程或重复状态。plan仍只做配置分组，predict才消费已加载资产，此边界已写清；完整机制覆盖判断仍缺，不用报告字段掩盖未实现的自动建库。
+
+Docker C++构建和修改文件格式检查、Python全包Ruff及diff检查通过。四条公开CLI路径复用真实编译资产：原完整组合摘要保持，缺成本保持来源资格，缺资产明确报缺口，池缩容保留供体但拒绝未资格化初始化；见s3-source-eligibility/verification.json。无新增原生采集、test、.clang-format或第三方改动。本次周期检查收口，代码批次归零；S3–S6阶段资格不变。
+
+
+## 2026-10-13：审查方法纠偏
+
+此前多次确认核心无反向 include，但 PredictionWorkflow 仍直接持有 SGLang 配置和选择逻辑。因此目录/CMake方向正确不能等同于换框架只改适配端，后续审查必须沿实际业务调用和改动落点判断。
+
+审查继续以代码层次、风格、逻辑整理和收紧为主；不把所有原生事件差异转成实现任务，不按文件行数、拒绝条件数量或检查通过数作质量结论。MechanismEvidence 是现有来源诊断，不能把它逐步扩成独立于实际变换器的资格系统。约定直接应用于开发，不创建额外检查平台。外围解耦等代码任务在实施计划维护，本次未执行代码整改或新采集。
+
+
+## 2026-10-13：机制报告至模板生产装配的五批复查
+
+覆盖 CLI→规划/采集准备/预测/提取编译→适配器→模板/控制/执行的实际调用和拥有关系，复核 CMake 依赖；未将本轮不变的底层事件重新作为验收任务。
+
+- **分层与职责**：workflow源码及头文件不再引用具体framework/runtime；CLI显式组装TemplateAdapter与CollectionAdapter，后者允许KT真实采集而不伪造预测实现。SGLang模板适配器组合原生提取和生产，编译资产发布仍属于共同workflow。ProjectReader及配置值解析仍有具体框架逻辑，是剩余实际耦合，不以扫描零命中关闭全部外围任务。
+- **所有权**：入口持有适配器直至命令结束，workflow仅借用span；来源bank和已解析配置由预测workflow持有，加载结束后才构建借用视图。提取方法中的SGLangBindings覆盖AscendSourceExtractor整个调用；编译source拥有规则，编码完成后销毁，无跨调用借用。
+- **状态与错误**：Controller和SimulationRuntime的请求/KV、时钟及workspace状态职责未改变，NodeDurations仍独立于结构来源。公共编译在实际生产前撤销旧资产引用，成功写入后再发布；不支持的框架在进入生产前报错。无共享可变注册器、第二控制器、缓存或兼容解析。
+- **代码收紧与范围**：已有预测接口扩为模板生产/选择接口并同步更名，删除旧文件及名称，没有叠加新的生产接口。配置/原生观测元数据从Planner迁到有实际消费者的采集适配器；JSON仅用于现有外部输入和报告交接。接口不新增实例化特判，机制报告未扩为第二验证器。
+- **跨语言和风格**：公共Python instrumentation/artifacts导入扫描未发现反向适配依赖，本轮未改Python。修改的C++方法按解析、选择、执行及发布分段；容器格式和diff检查通过，未改.clang-format、third_party或增加test工程。
+
+Docker正式构建通过，五批公开回归及其范围集中于执行日志。此次现有base完整extract包含编译，图/模板/编译字节保持；没有原生采集或独立目标验证，不新增支持域。周期审查结束，计数归零。

@@ -1,6 +1,6 @@
 # 阶段四 采集与子图模板提取
 
-状态：S3 实施中，当前主线为 SGLang + Qwen3-32B。已有原生采集、部分 source DAG、模块实例化和独立采样入口；统一流程边界、三类语义记录、内部依赖和可参数化模板仍待验收。当前优先为给定节点耗时下的动态展开提供真实结构，独立性能采样在结构资格满足后用于 S5。依赖[流程合同](01_system_framework.md)与[控制接口](03_control_interface.md)，KT 预测和原生控制器均为后续能力。
+本文件维护采集与模板合同；阶段交付状态及支持证据见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)。
 
 KTransformers 的 Ascend BalanceServe TP=1 原生采集与后处理已有成功结果，复用采集权限、累计预算、设备串行锁、Recorder、Ascend runtime journal 和 ServingNormalizer。原生 wrapper 单列调度 lookahead、prepare、execute、sync、sample、update 和 token 队列 publish，保存 mini batch 与上一批/下一批的实际身份。现有 source facts 与采集代码保留；标准步骤、DAG/模板、专家路由及成本模型在主线稳定后扩展，不作为当前 S3 验收门槛。
 
@@ -19,19 +19,43 @@ KTransformers 的 Ascend BalanceServe TP=1 原生采集与后处理已有成功�
 
 ### 当前来源配置分组
 
-plan与predict的representative_collection报告已经接入SGLangCollectionPlanner。只对当前lightweight/cold/modeled路径做配置分组：框架、控制路径和设备数不符的配置明确列入excluded_configurations；部署相同且仅在现有配置关系允许的准入/Prefill预算轴上变化时属于同组。每组选max_running_requests最大的配置，相同容量按声明顺序选择。依据是RequestPoolCapacityDomain只支持保持容量或有条件缩小，不能从小池增加容量；不是按性能评分搜索最优base。
+plan与predict的representative_collection报告经入口注入的TemplateAdapter分派；当前由SGLangTemplateAdapter提供配置分组与配方。公共Planner只汇总结果，不直接解释框架控制参数。只对当前lightweight/cold/modeled路径做配置分组：框架、控制路径和设备数不符的配置明确列入excluded_configurations；部署相同且仅在现有配置关系允许的准入/Prefill预算轴上变化时属于同组。每组选max_running_requests最大的配置，相同容量优先选择max_prefill_tokens更大的配置，两项都相同时保留声明顺序。依据是RequestPoolCapacityDomain只支持保持容量或有条件缩小，不能从小池增加容量；同容量下保留更充足的配方Prefill预算，不是按性能评分搜索最优base。
 
-分组只读取配置，不读取目标request序列。增加workload不增加组；TP、部署或尚无变换的参数差异不被并入同组。groups中的configuration_ids只是共同来源的候选集合，尚未证明实际模板、内部参数及分支覆盖。状态requires_mechanism_coverage表示还须完成已有资产覆盖及累计开销判断。报告现有candidate_recipe列出短请求关系、预期机制、停止条件和未覆盖项，plan/predict报告本身不启动任务；显式profile --representative已能准备并执行分组配方，复用公共预算和恢复。不能把组数解释为所需原生运行次数。配方唯一正文见[代表短请求候选](../redesign-workflow/2026-10-08_redesign_execution_plan.md#代表短请求候选与执行前门槛)。已有资产的语义覆盖复用决策同样待接入。 s4-representative-capacity已通过集合入口验证最大池选择与实际资产复用衔接：声明顺序为容量3、4时仍选择4，同一容量4/双请求来源在两配置下展开三请求冷Prefill；仅已绑定请求表行轴变化，槽位与物理依赖保持。该证据不覆盖自动采集、Decode增长或其他未观测机制。
+分组只读取配置，不读取目标request序列。增加workload不增加组；TP、部署或尚无变换的参数差异不被并入同组。groups中的configuration_ids只是共同来源的候选集合，尚未证明实际模板、内部参数及分支覆盖。状态requires_mechanism_coverage表示还须完成已有资产覆盖及累计开销判断。报告现有candidate_recipe列出短请求关系、预期机制、停止条件和未覆盖项，plan/predict报告本身不启动任务；显式profile --representative已能准备并执行分组配方，复用公共预算和恢复。不能把组数解释为所需原生运行次数。配方唯一正文见[代表短请求候选](#代表短请求候选与执行前门槛)。预测首先消费已有资产；仅缺兼容来源时才进入每组一次的自动代表采集，规则/成本缺口不触发采集。实际交付与证据只在实施计划维护。 s4-representative-capacity已通过集合入口验证最大池选择与实际资产复用衔接：声明顺序为容量3、4时仍选择4，同一容量4/双请求来源在两配置下展开三请求冷Prefill；仅已绑定请求表行轴变化，槽位与物理依赖保持。该证据不覆盖自动采集、Decode增长或其他未观测机制。
 
 Dooly的本地run-tracer使用短generate窗口并记录动态维度，resolver再合并重复操作；这些代码不提供Markov的serving过滤/退出/等待分支覆盖保证。这里只复用轻量发现与去重原则，不照搬其默认batch/token数作为本项目采集规则。
 
+### 代表短请求候选与执行前门槛
+
+plan/predict的candidate_recipe是生产端给出的机制候选，可以通过显式profile --representative执行，但尚不是完成覆盖判断的自动建库方案。P取真实worker的effective_server_args.page_size；prompt_page_offsets表示P加偏移，不能从探索request取长度或硬填本机128。令N为代表配置的请求池容量。当前候选要求2≤N≤32、P≥4、Prefill预算至少NP，并预留4NP token容量。预算考虑原生按页对齐输入及输出余量；4NP是本配方的保守充足条件，不是目标KV分配公式。上限32复用生产端已资格化的last-location Concat分支边界，避免为填满任意大池无界增加请求。容量1及超过该分支的候选报告配方未定义；这不等于禁止已有模板预测这些配置。
+
+| 顺序 | 输入长度 / 输出数 | 预期机制及理由 |
+| --- | --- | --- |
+| 1 | P−2、P−1 / 1、1 | 两成员准入与last_loc、冷Prefill立即完成、逐请求直接释放、共享输出 |
+| 2 | P−1、P / 4、2 | 首次Decode中第二成员跨页并结束；后续第一成员跨页、继续、结束，覆盖部分过滤、单成员Decode、零/非零新增页、空/单成员释放组 |
+| 3 | P−2、P−1 / 2、2 | 双成员Decode同时结束的拼接释放；入口同时核对上一组完成后的清理 |
+| 4 | N+1个P−1 / 前N−1个输出5，第N个输出3，排队者输出2 | 先占满请求池，较早结束一个成员后准入排队的单请求，再与仍运行的成员合批；不修改原生调度状态 |
+
+四组共N+7请求、5N+12输出token，与目标workload数量或长度无关；在当前候选域内最多39请求、172输出token。每组一起提交，等前组完成才提交下一组，不使用猜测的毫秒间隔；批次形成本身仍以原生记录为准。profile --representative已使用批量input_ids、逐请求sampling_params和真实返回屏障；普通workload采集保持原到达序列。页大小与配方预算在Engine初始化后从实际配置解析，批量返回时刻不作为逐请求完成时刻或节点成本。历史三组配方的s3-representative-execution一次运行取得P=128下7个完整批次、两rank共58份实例（含2份Idle Schedule），仍须逐机制核对资格。当前组间还等待各rank原生清理确认，详见下文采集生命周期；历史仅等待客户端返回的证据不能证明该屏障。四组配方现已通过一次原生触发验证，单成员Prefill与3+1合批在两rank均出现；这仍不等于所有目标变换或单来源初始化已合格，当前状态见实施计划。
+
+执行前先对照已有同配置资产删除已覆盖观测需求，再落实真实页大小、配置预算及公共采集生命周期。当前s3-representative-execution/mechanism_coverage.json已核对7个完整批次，两个rank均有分配页/无新增页、空/单/多成员释放及请求级绑定。此为事实与区域资格清点，不是完整建库证书；无需为这些已存在分支重采。各预期机制必须在全部rank上实际出现且模板参数/端口合格，否则停止并报告，不能换workload自动重试。当前候选明确未覆盖周期性非最终输出、准入预算停止、内存压力和域外后端变体；这些项需结合既有规则/事实确定复用或缺口，不能凭配方或预期机制标记完整建库。未完成这项覆盖判定前，不把predict的缺模板转成自动profile。
+
+
 ### 来源事实与规则覆盖分开判断
+
+建库需求不能直接由“缺少同形状来源调用”产生。来源清点回答观测过什么，实际模板实例化回答能否从已有结构生成目标；二者不是同一覆盖表。已有变换和独立结构证据能够覆盖的目标，不要求再采同人数、同长度的原生模板。新配方用于从零建立必要证据，其全部触发组不应在已有资产可复用时机械重跑；仍须按真实规则资格决定复用，不能只按机制名称消除缺口。
 
 编译资产已有准入入口/检查工作、批次转换、过滤、合并及发布事实。预测在assets[].source.observations中集中报告，并分别暴露准入CPU、转换CPU和运行批更新的参数绑定资格。现还报告publication_regions、running_update_cpu_only及kv_region：KV记录直接来自生产端已有分支绑定，区分allocation/release_group、是否改变页以及释放成员域；null表示没有该区域资格，不等于没有原生操作。不改变资产格式，不要求重采。TemplateBank.qualify由来源选择和实例化共用，只检查来源身份缺口、准入策略及请求池，不能作为全部机制的覆盖证书。
 
+predict经入口注入的TemplateAdapter将已加载资产交给具体适配实现统一选择；当前实现为SGLangTemplateAdapter，在representative_collection.source_coverage按configuration_id报告供体清单、可提供初始状态的清单及具体缺口；与groups.configuration_ids关联查看。实际预测消费同一选择结果，成本输入只在合格初始来源中决定优先项，不改变结构资格。配置只解析一次，bank及其配置由workflow持有，适配器借用只读视图；不重新读取原始采集。该报告的scope仅为来源身份、准入、容量及初始化，mechanism_coverage仍为not_qualified。独立plan命令只分组配置，不加载资产，不宣称完成这项检查。下一步仍须完成机制与目标条件的联合资格，不能把source_coverage.available作为自动采集或完整支持的依据。
+
+source_coverage.mechanisms现报告候选配方的14项机制，配方与报告共用机制清单。逐项保存合格供体中的manifest/rank/source_call/source_batch、缺失rank和已有producer_binding；同一调用的多个成员只记一个引用，不当作多个模板。KV跨页与释放成员域直接读取生产端已有有限分支，未增加页数推导或新变换；Prefill直接释放与Decode组末调用free分别解释。producer_binding为null只表示没有报告独立绑定标志，不等于没有原生工作或变换实现。
+
+no_compiled_evidence要求先检查既有观测或规则，不能直接触发采集；有证据仍为requires_target_qualification。各rank分别有某个机制，不证明它们组成同一个完整cohort，也不证明跨来源拼接、参数域和目标状态联合成立。公开核对见s3-mechanism-coverage/verification.json，当前结果与下一步集中于实施计划。完整cohort及目标变换条件未联合通过前，保持总体not_qualified。
+
 是否需要采集，须同时核对原生分支条件、已有观测和已实现变换。例如AdmissionWork允许已提交请求后的InputBudget结束通过参数化路径表达，不要求每个来源直接观测该停止原因；MemoryBudget拒绝涉及不同的候选检查和持续准入状态，当前这条参数化规则不支持它。不能因停止原因未出现在来源中就自动补采，也不能因另一个分支已有样本而宣称等价。已有规则的目标适用条件仍由实例化检查。
 
-当前来源的机制清点及数量见data/redesign/s3-mechanism-facts/mechanism_inventory.json：两rank均有请求容量/队列耗尽/准入关闭/无等待请求、部分过滤/全保留/清空、合批及无人/部分/全部完成发布。清点只证明这些来源事实与绑定存在。cohort_coverage.json进一步核对15个完整批次，每批schedule/prepare/模型执行/publish覆盖全部两rank且请求签名一致；另有两rank的idle schedule。Prefill与Decode均已有1、2请求的来源。请求池可缩容不代表批人数可变换：当前instantiate_step已允许具有完整参数和成员切口的跨人数候选，仍联合检查全部阶段/rank、操作分支和资源端口；Prefill与一个Decode场景的2→1已通过公开执行，支持边界及证据统一见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md#3-下一步与阶段门槛)。不能为更大请求池自动枚举1到容量的所有批大小采集；先实现批人数变换或明确其支持域。 跨人数需要同时处理请求级CPU循环、共享输出/释放及模型连续性分支；单改Requests张量轴或截断请求不能取得完整资格。原single_request_topology诊断绕过这项限制，现已删除，底层规划仅由正式实例化调用。短请求配方已提供显式执行；分组到已有机制资格及自动建库仍待接通。
+当前来源的机制清点及数量见data/redesign/s3-mechanism-facts/mechanism_inventory.json：两rank均有请求容量/队列耗尽/准入关闭/无等待请求、部分过滤/全保留/清空、合批及无人/部分/全部完成发布。清点只证明这些来源事实与绑定存在。cohort_coverage.json进一步核对15个完整批次，每批schedule/prepare/模型执行/publish覆盖全部两rank且请求签名一致；另有两rank的idle schedule。Prefill与Decode均已有1、2请求的来源。请求池可缩容不代表批人数可变换：当前instantiate_step已允许具有完整参数和成员切口的跨人数候选，仍联合检查全部阶段/rank、操作分支和资源端口；Prefill与一个Decode场景的2→1已通过公开执行，支持边界及证据统一见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md#3-下一步与阶段门槛)。不能为更大请求池自动枚举1到容量的所有批大小采集；先实现批人数变换或明确其支持域。 跨人数需要同时处理请求级CPU循环、共享输出/释放及模型连续性分支；单改Requests张量轴或截断请求不能取得完整资格。原single_request_topology诊断绕过这项限制，现已删除，底层规划仅由正式实例化调用。短请求配方提供显式执行，自动建库先消费实际来源资格；当前交付见实施计划。
 
 容量4短配方的当前清点见data/redesign/s3-representative-execution/mechanism_coverage.json。7个批次均覆盖四阶段和两个rank，输入/context/generated请求签名一致；每rank具备新增页/不新增页分配、空/单成员/多成员释放区域域，以及准入、初始化和发布成员绑定。该清点只证明已有来源事实及区域绑定，尚不证明所有内部节点、局部替换端口或任意目标都合格；实际目标资格仍由共同实例化路径判断，不因清点齐备自动标记建库完成。
 
@@ -42,6 +66,18 @@ Dooly 通过短 prompt、小 batch、短输出、限定 generate 采集窗口，
 固定模型和已覆盖机制下，新请求应增加实例而非模板定义。每个真实结构分支先解释条件、参数、依赖和端口，再获取最少证据；完整目标序列只作独立评价。
 
 profiler启停属于运行环境观察范围，不增加serving block。AscendProfileWindow记录start/stop调用的rank、进程、原生线程、monotonic起止及完成状态，由产物清单显式引用profile_controls文件。归一化仅在同rank/线程、完整时间包含且不与serving归属冲突时附加profiler_control来源；CANN时间使用已记录导出原点，native API使用自身monotonic坐标。源图保留这些活动，已确认的控制同步报告为scope，不能混入目标等待。失败、无证据、范围冲突和未覆盖线程不自动排除；两rank真实启停及停止同步归属已验证，证据为data/redesign/s4-profile-lifecycle/lifecycle_verification.json；历史无范围记录的尾部同步缺口不因此关闭，其他线程及异步活动不因该结果自动获归属。
+
+### 建库开销的分段口径
+
+SGLang成功采集的`native_environment.json.collection_wall_time_ns`记录宿主单调时钟差值：engine_initialization、request_preparation、warmup、post_warmup_setup、profile_start、observation_and_cleanup、profile_stop_and_export。阶段相邻、不重叠；统一预热的generate耗时单独记录，观测段包含代表请求组间及最终清理握手。profiler停止包含vendor导出，不能把整段当成模型运行时间。
+
+这些字段只描述采集开销，不是目标CPU/NPU节点成本，也不进入成本拟合。范围从Engine构造前到stop_profile返回，排除模块导入、结果文件写出、engine shutdown及独立后处理；外层attempt总量和后处理发布时间继续单独记账，不能把两种口径相加造成重复计量。失败仍依赖已有attempt监控记录，未完成阶段不伪造分段值；历史产物不补写估计时间。字段的实际验证状态只在执行计划维护。
+
+### 采集产物保留
+
+Ascend运行环境适配层在项目的profiling窗口中设置Level2并启用torch-npu的 `data_simplification`。由vendor在导出完成后清理重复的summary/timeline及分析中间文件；公开trace、kernel CSV、通信数据库、profiler配置、host时钟起点和device信息仍由native_capture显式引用。原生观察、API journal、workspace记录不在这一清理范围。该配置目前由SGLang的profiling hook使用，不推广为所有采集后端都已启用。
+
+历史资产保持原样，不追溯删除或重分类来降低累计用量。估计的节省量与新采集实测分开，单次文件规模不外推为任意workload的常量预算；预算和当前验证结果见执行计划及执行记录。
 
 ### 建库方案与结束条件
 
@@ -112,6 +148,59 @@ profiler启停属于运行环境观察范围，不增加serving block。AscendPr
 
 采集公共合同不重复列出每个原生 kernel。当前 SGLang 的通信、KV 分配/释放、采样/metadata、CPU 操作切口和索引写入等条件集中在[原生关系参考](sglang_template_relations.md)。修改相关机制时读取对应小节；开发顺序和尚缺条件见实施计划。
 
+### 独立性能采样合同
+
+这里的“独立”指性能数据的用途、测量边界和采集生命周期独立于结构建库，不要求每个算子脱离 serving 单独执行。一次原生推理可以同时产生多个性能单元的样本；性能粒度不等于整批或整段请求时延。以下为设计合同，当前实现与后续任务以[实施计划 S5](../redesign-workflow/2026-10-08_redesign_execution_plan.md#s5性能单元与节点成本)为准。
+
+#### 采样方法的四项约束
+
+| 约束 | 具体要求 |
+| --- | --- |
+| 与子图对象一致 | 样本对应模板中的节点或明确的局部子图，复用公共工作描述、单位和计费边界；相同名称或 shape 不足以证明实现与成本相同 |
+| 适配简洁 | 我们组织请求、设置观测窗口和转换样本；原生请求、组批、KV、执行更新及回收由框架管理，不自行编排或复制这套状态机 |
+| 跨框架有共同实现途径 | 公共抽象依赖“提交推理请求、原生执行、取得观测”等共同能力，不假定每个框架都有 SGLang 的 batch 类型、ModelRunner 或单批次 benchmark |
+| 易构造特征范围 | 用少量参数化请求形成建模所需的可达特征范围，复用已有参数关系；不能为每个节点手写请求配方，或靠无界试运行命中每个 shape |
+
+#### 统一接口与两类插桩
+
+采样接口统一表达三项内容：输入为性能单元工作描述、需要覆盖的特征域、声明的模型/配置/部署与累计预算；执行由框架适配器将需求转换为采样请求并调用原生入口；输出为实际工作特征、测量值与边界、运行条件、原始来源及覆盖缺口。这是职责合同，不是已经存在的 API 或新用户必填字段，也不预建逐性能单元的执行器体系。
+
+公共编排复用预算、预热、失败和资产生命周期；框架适配负责请求构造与必要观测位置，运行环境适配负责 CPU/设备/传输/通信测量及规范化。Python 运行原生采集，C++ 消费公共工作描述与样本，拟合和预测不接收原生 Python 对象。跨框架通用性先审查职责和数据边界，不把立即实现第二框架作为主线门槛。
+
+语义插桩回答工作属于哪个流程区域、如何形成模板及依赖；性能插桩回答实际工作特征及服务测量。两者独立启停，性能采样不要求重跑整套语义插桩或重新生成 source DAG；可以共享必要的归属标识、工作描述、底层观测和异步关联能力，避免复制一套解释。当前 device 采样仍复用 SGLangObserver 的语义 scope，独立性能观测边界尚待收紧，不能据此合同宣称已解耦。
+
+一致性落实在被测性能单元：对应工作复用原生执行实现，并核对必要的 backend、dtype/layout、批次/KV、workspace、stream 和并发条件。两次采集不要求同一请求或全部外围流程相同；共用某个 forward 入口也不能自动证明所有服务可迁移。无须为这条约定复制状态管理或建立逐事件等价检查平台。
+
+#### 从请求构造到特征覆盖
+
+```text
+子图工作描述与探索范围 → 固定参数、动态参数及已知实现分支
+    → 少量参数化采样请求 → 原生组批和执行
+    → 实际节点/局部子图特征与耗时 → 覆盖与留出评价
+```
+
+已有模板关系主要表达“配置 + 实际批次状态 → 节点特征”，不是任意请求到所有节点的完整映射，也不是已实现的反向求解器。采样规划据此选择候选请求；原生调度、资源和执行分支仍决定实际工作。参数分为模型/部署固定量、请求可影响的动态量和需要观测的运行状态，不能把各轴的笛卡尔积都当作可达输入。
+
+| 需要覆盖的工作特征 | 优先使用的请求构造方式 | 必须保留的边界 |
+| --- | --- | --- |
+| Prefill token 维度 | 请求数量与输入长度分布 | 相同总 token 数的不同分组，attention 和 CPU 工作仍可能不同 |
+| Decode token 维度 | 一组请求、少量输出，形成活跃成员 | 提交数量不保证实际批次大小，成员完成会改变后续组批 |
+| Attention 上下文 | 长 prompt 建立真实 KV，再少量 Decode | 长 prompt 与长时间生成只对条件相符的性能单元等价，不推导输出历史相关 CPU 或缓存状态相同 |
+| CPU 接纳、准备和发布 | 请求数量、长度、投放与完成方式 | 采样原生控制工作，不另写控制器模拟这些调用 |
+| 搬运及通信工作量 | 使用实际批次和配置产生的数据量 | 拓扑、rank 数、实现与内存类型等不能仅靠请求长度任意改变 |
+
+严格固定批次只是可能的采样手段，不是接口要求。优先在原生空闲、资源允许的条件下使用简单请求组；不修改 scheduler/KV、不伪造页表，也不为了命中 shape 静默切换目标部署的 backend、分块或 graph 设置。框架正常管理运行状态，我们只记录必要状态与条件。
+
+采样前声明特征范围、候选请求、重复测量、留出方案及运行/处理/存储预算。模型常驻、短输出和一次执行收集多类单元用于降低开销；初始化、统一预热、KV 准备与失败仍计入累计开销。实际样本如实标注，未按预期组批不自动作废，未覆盖也不因已有大量记录而消失；重复层和重复测量不能冒充不同特征点。范围内覆盖不足先解释参数关系、可达性或观测缺失，在既定预算内决定调整或保留限制，不自动循环补采。留出按独立运行或特征点划分，不能把同次运行的重复层随机拆成独立验证。
+
+#### 原生入口的选择边界
+
+当前 SGLang CPU/device 采样使用常驻 Engine 的 `generate()`/`async_generate()`，多次调用无需重启引擎或 HTTP 服务；已有请求配方与实际批次记录不等于自动特征域规划。近期优先在这条原生请求路径上验证上述合同，独立通信设施按性能单元适用条件保留。不同类别的测量载体可以不同，CPU、I/O 与通信的成本边界见[性能设计](06_performance_execution.md#性能样本与子图工作的对应)。
+
+SGLang serving 内部经 `Scheduler.run_batch → TpModelWorker → ForwardBatch → ModelRunner` 执行；`bench_one_batch.py` 是官方静态批次 benchmark，由脚本构造批次并调用较低层方法，不是与 Engine 对等的通用固定批次 API。该脚本也管理状态，只是复用官方代码；其输入衔接、结果处理和资源重置与 serving 不同。`ModelRunner.forward()` 接收已准备的执行状态，不承担完整请求生命周期。直接使用这些入口不自动满足或违反合同，必须同时满足四项约束；本轮没有验证 benchmark 的 Ascend 采样适用性，也不引入需要我们管理原生状态的驱动。
+
+参考 Dooly 的参数来源、等价测量复用和有界采样思想，不把其逐算子/模块独立执行与元数据重建作为默认路线；回归模型（包括随机森林）的选择不能替代工作描述、特征覆盖及独立评价。
+
 ## 2. 插桩先定义语义，再收集事件
 
 为每个框架维护“标准步骤 → 原生位置”映射，明确函数/调用边界、上下文来源、提交与完成关联方式。优先使用官方接口、Python wrapper 或必要的原生 hook，避免每个算子单独手写一套采集器。
@@ -139,6 +228,10 @@ SGLang base 及现有独立采样的环境记录共用 RuntimeEnvironment，保�
 异步工作必须保留从提交到设备执行、event 和结果消费的关联。线程局部 scope 只解释当前线程；跨线程、进程或 rank 时由适配器传播/记录必要上下文，不能因为发生时间接近就认定同一阶段。无法关联的必要工作保留语义缺口。
 
 运行时返回的线程最近任务 ID 不自动代表本次 API 新提交的任务。实际框架诊断已出现普通 CPU 内存 H2D 成功后仍返回前一计算任务身份的情况；关联仍须核对任务类型、连接、线程和作用域，不能将复制绑定成计算、因无独立任务身份而填零，或推断耗时全是 CPU 服务。Ascend 已观测的 PCIE_DMA_SQE 与 SDMA/SDMA_SQE 均归为传输，按各自实际来源保留；没有通信观测的 trace 不要求存在通信数据库表。
+
+Ascend的vendor派生torch_to_npu连线需要与原生提交身份一致。适配端通过目标connection ID的唯一CANN提交、同线程包含该提交的Dequeue以及唯一correlation ID对应Enqueue核对来源；原来源不能包含这个已关联Enqueue时，使用该Enqueue作为来源并保留profiler原来源。包含关系只核对同步窗口，不以时间接近推测跨线程或设备归属；证据不足时不猜测改绑。
+
+模板的`internal_thread_paths`保存同一block两端之间、仅经过无归属边界的原生ThreadOrder路径。提取时遇到任何有归属边界即停止延伸，不能跨越其他block；模板编译将该路径变成普通内部线程依赖，供状态资格、子图切分和执行共同消费。被跨过的CPU事件及其耗时仍排除。该字段来自重新extract；既有未编译模板需从原始事实重新提取，不维护缺字段兼容解析。
 
 CPU 调用归属与设备任务绑定分别成立。复制与事件等待共用按 rank/thread/API 类型分组的完整序列核对；数量、已有作用域及既有关联的 CPU 包含关系必须一致。缺失的 source_interval 可恢复为该 CPU 调用，但不能据此生成硬件边或清除设备身份缺口。hardware_intervals 才声明已关联的设备工作，空列表不表示复制或等待无工作。
 
@@ -244,9 +337,28 @@ Prepare 的定义声明输入参数和 prepared 端口含义。SGLang wrapper �
 
 需要区分三个层次：block 类型规定流程职责；采集实例保存某次调用的真实子图；模板变体规定可以复用的结构及其适用条件。采集实例数量不等于提取算法或模板变体数量。当前 TemplateBank 按 step/phase/rank 组织实例，再按请求 token 条件、发布分支、过滤状态和同批来源选择，已共享部分模型区域的局部图，完整参数与接口归并仍未完成。 attention/MLP共同共享路径的现有三来源回归中，完整目标图及明细保持一致，编译资产合计减少8.67%；证据为data/redesign/s4-native-cleanup/attention_structure_sharing.json，不作为独立目标资格。
 
+#### 模板族、变体和参数关系的维护清单
+
+模板族按同一语义职责与参数合同理解，真实执行分支才形成变体；它不是step/phase/rank分桶，也不是每次原生调用。下表整理现有生产绑定和消费者，不新增核心枚举或另一套支持判断。所有行最终都须通过节点参数、资源、端口及目标状态的联合资格。
+
+| 语义职责 | 需要区分的真实变体 | 目标参数与现有实现落点 |
+| --- | --- | --- |
+| Schedule状态迁移 | pending Prefill接续、running过滤、非空批合并、空批 | transition/filter/merge区域；保留成员、左右成员及入口准入状态由BatchParameterLayout等消费，不能仅按人数选择 |
+| 准入与请求初始化 | 零接纳早退、成功接纳循环、队列/容量/接纳后输入预算停止 | AdmissionWork记录候选、horizon、队列及统计工作；成员区域重组。内存拒绝与回退不因已有成功分支而支持 |
+| Prepare输入与KV | Prefill扩展、Decode新增页或页内追加；页表布局分支 | KvParameterLayout绑定请求、token、空闲/新增页；BatchOperationVariant区分页表连续、单列和带步长物化 |
+| Prepare局部操作 | relay写入、请求表写入、last-location Cat、页表除法、logits reshape | BatchOperationVariant按已绑定人数/布局条件选供体；BatchParameterLayout重绑行轴与操作数。原生分支条件留在生产绑定，不按请求长度枚举模板 |
+| Prefill/Decode模型主体 | 两种phase；原生QKV准备及attention实现路径 | ModelParameterRule、AttentionParameterRule消费token/context、shape/layout与模型固定量；decoder层是语义容器，不能与内部物理工作重复计数 |
+| 模型区域复用 | attention与feed_forward中实际不同的局部结构、资源和接口 | TemplateGraph共享严格相等的局部定义；attention_core嵌在attention内，不再重复持有节点。相同模块名不保证同结构 |
+| Publish及KV释放 | 无/部分/全部完成，Prefill/Decode发布，空/单/多成员释放组 | PublicationParameterLayout与KvParameterLayout消费完成成员、释放页及输出工作；Published端口不等于所有后台清理完成 |
+| 通信、复制与workspace | 原生通信算法/任务、传输方向/布局、workspace分配或复用 | 独立参数与资源绑定保留真实依赖；workspace由目标状态推进。改变TP、后端或通信实现不由这张表授予资格 |
+
+源码落点为生产端`adapters/frameworks/sglang/template_bindings.cpp`及runtime绑定，共同消费位于`templates`与`execution`。表中变体是规则维护单元，不是新建独立类或全部物理变体的数量承诺。
+
+数量口径分别是：来源manifest；流程调用实例；内部区域调用；共享局部结构定义；参数规则定义及其观测引用。`TemplateBank::describe`已有这些独立字段，当前不输出一个无法定义等价关系的“总模板族数”。共享定义保留来源映射；未共享的serving区域仍按来源实例保留，不能把区域共享说成整批模板已经完全去重。当前资产实测与剩余验收只在执行计划/日志维护。
+
 模板族归并必须保留节点角色、内部依赖、端口、跨模板连接及参数来源。只有这些结构在明确的身份重绑定和有限参数规则下等价，才能共享定义；相同 block 名、节点数或输入 shape 均不足以证明等价。采集调用、源 span 及实测数据的来源仍需保留，不能因共享结构而丢失成本依据。首先明确当前实例的有效选择条件和结构差异，再决定有实际收益的归并；不预建通用图同构框架，不把逐个 decode 长度建立模板作为泛化方案。
 
-共享结构的CPU路径比较不能简单去掉关系标签。若两执行端点之间的额外路径只经过同一CPU线程上的注释区间，且已有不穿过其他执行端点的纯thread_order路径，则该额外路径不增加执行顺序约束，可在结构比较中归一化。原始注释及来源边继续保存；这一规则不授权删除CPU服务、等待、跨区域端口或父层服务extent，也不证明CPU工作量或成本相同。当前MLP来源的逐路径证据见[架构审查](../redesign-workflow/2026-10-10_architecture_review.md#MLP重复区域复用核对)；其拓扑、接口及已有模型/通信规则已进入共享图，其余参数合同和独立目标资格仍未收口。
+共享结构的CPU路径比较不能简单去掉关系标签。若两执行端点之间的额外路径只经过同一CPU线程上的注释区间，且已有不穿过其他执行端点的纯thread_order路径，则该额外路径不增加执行顺序约束，可在结构比较中归一化。原始注释及来源边继续保存；这一规则不授权删除CPU服务、等待、跨区域端口或父层服务extent，也不证明CPU工作量或成本相同。当前MLP来源的逐路径证据见[架构审查](../redesign-workflow/2026-10-10_architecture_review.md#mlp重复区域复用核对)；其拓扑、接口及已有模型/通信规则已进入共享图，其余参数合同和独立目标资格仍未收口。
 
 共享定义与来源绑定必须一起拆分。TemplateBank 按 source_batch 联合选择同批各阶段和各 rank；TemplateAssembly 根据 source_boundary、remote_source_calls 和源 CPU lane 顺序连接端点。不能把多个 TemplateDefinition 直接换成一个代表实例。可共享的是局部节点角色、依赖、参数关系和端口定义；每次观测保留局部槽位到源 call/span/boundary、资源及同批关联的映射，目标装配和成本追溯读取所选来源。
 
@@ -286,10 +398,11 @@ attention 参数同样分离规则与来源：`AttentionParameterRule` 按完整
 
 #### 多来源组合的身份与资源边界
 
-TemplateBank持有一个首选来源，并借用其他合格bank的不可变定义；PredictionWorkflow持有全部bank直到组合运行结束。首选来源不是整张目标图必须唯一使用的来源。共同来源资格与初始化资格分开：首选来源必须满足统一预热及目标容量条件；后续整批候选要求workspace绑定完整，按共同条件、整组接口与实际目标状态消费，局部供体另按区域合同消费，均不导入它的初始容量。缺预热记录的历史来源不能单独启动仿真，也不补造初始化字段。共同候选要求模型、原生配置、部署、rank数、页大小、序列容量、语义解析方式和准入策略一致；跨原生配置共享不是当前规则。
+TemplateBank持有一个首选来源，并借用其他合格bank的不可变定义；PredictionWorkflow持有全部bank直到组合运行结束。首选来源不是整张目标图必须唯一使用的来源。共同来源资格与初始化资格分开：首选来源必须满足统一预热及目标容量条件；后续整批候选要求workspace绑定完整，按共同条件、整组接口与实际目标状态消费，局部供体另按区域合同消费，均不导入它的初始容量。缺预热记录的历史来源不能单独启动仿真，也不补造初始化字段。整批及带状态的共同候选要求模型、原生配置、部署、rank数、页大小、序列容量、语义解析方式和准入策略一致。另设受限的操作片段输入：在适配器已允许的准入配置变化内，仅消费生产端声明可按目标请求池重新绑定的操作。LastLocationConcat、选中批次页表的 PageTableDivide 和 logits 的 LogitsReshape 不依赖池总容量；RelayWrite、RequestTableWrite 则要求全部设备成员已有目标容量、批次轴和槽位的参数关系。局部写入消费目标池，不导入来源池内容；不据此放行该来源的整份模板、初始状态或任意其他操作。
 
 - **完整批次与局部替换**：每个目标批次先选一个来源内的原生batch，联合验证全部阶段和rank，再提交装配；后续批次可以换来源。局部操作/区域从既有语义分组的候选中选择，组内本来源优先，继续执行参数、端口、分支及拓扑资格检查。整批缺失与变换规则缺失保持不同结果，不以同形状或资产可加载代替覆盖。
 - **设备完成端口**：从区域内部因果关系确定设备资源的唯一末端工作，不以来源是否存在外部 host wait 决定是否暴露完成点。已有完成导出必须对应此末端；实际完成点与流出口不同，只接受唯一前驱的 CompletionJoin。供体末端没有流出口别名时，复用目标已资格化的别名及零工作连接，不添加服务节点。反向别名合并仍明确拒绝。
+- **片段适用条件**：`BatchOperationVariant.request_pool_rebindable` 随编译模板保存，默认不声明；适配器只接入自身来源资格成立且配置差异在既有规则内的候选。`operation_sources` 是工作流所持来源定义的只读视图；核心只在对应阶段/rank的批次操作替换中消费，并再次要求实际所选操作带有该声明。后续端口、依赖、资源角色与成本查询沿用原路径。这些来源不进入整批、KV、workspace或初始化供体集合。
 - **来源身份**：节点、边界、调用及耗时用manifest加局部编号限定；Assembly的边界匹配与CPU顺序投影也按来源限定，不拼接不同采集的时间戳。插入工作保留实际donor来源，目标端点独立创建，不能因复用同一donor而共享执行身份。
 - **资源角色**：TemplateResource保留原生编号与可选角色，有角色时按domain/rank/role匹配。lane、外部连接、等待、区域替换和资源前沿共用该身份；未赋角色的资源只能保留来源内身份。跨来源局部替换要求参与定义的资源角色完整，整批来源切换还要求首选来源与候选来源全部定义的资源角色完整。这是当前保守支持域，不声称未参与目标的未知资源必然影响执行。任务完成边界不合并为执行资源。
 - **状态与成本**：请求、KV、控制状态和模拟时钟保持唯一，来源切换只改变所实例化的工作。服务节点按实际来源查询给定耗时；缺值报告该manifest与span，不借用另一资产的同号值。来源图、原生编号及原始资源别名保留，目标执行不读取原生框架对象。
@@ -322,7 +435,7 @@ SGLangResourceBindings从serving入口绑定control，从原生CPU flow绑定sub
 
 模板参数区分模型固定量、配置相关量、request 变量与运行状态。记录来源到节点 shape/layout、工作次数、分支和端口的映射；先落实主线需要的显式映射，再按维护收益采用维度来源传播，不预建全自动污点框架。用不同代表输入核对变化规律和未覆盖分支，不仅凭名称或维度数值推断来源。
 
-五类顶层 block 内部提供必要的 attention、KV、通信等语义锚点，支持局部替换和复用；不要求每个算子单独插桩。kernel 因 shape 或 autotuner 改变时，性能签名可复用不等于物理 DAG 等价。270 个实例是原始证据，需识别重复结构与真正变体，不以枚举 decode 长度替代参数化。
+五类顶层 block 内部提供必要的 attention、KV、通信等语义锚点，支持局部替换和复用；不要求每个算子单独插桩。kernel 因 shape 或 autotuner 改变时，性能签名可复用不等于物理 DAG 等价。实例数量是来源证据，不能代替结构族及变体划分，也不以枚举decode长度替代参数化。
 
 Prefill/Decode 内部采用“模型结构 → 原生模块/调用绑定 → 实际执行子图”的语义映射。先读取当前模型及框架实现中的层/子模块组织，再为确有复用或变换需要的区域设置 wrapper/hook；记录模型模块路径、层实例、phase 与调用身份，并沿既有提交身份传播到执行节点。避免只凭 kernel 名称反推模型结构，也不为每个模型层复制提取算法。
 
@@ -430,7 +543,7 @@ ServingNormalizer 在 base 角色下的初始 manifest 引用规范化输入、�
 
 原生 CPU 包络保留为非叠加注解。额外提取 schedule 前段、prepare 本体、schedule 后段、execute 与 publish 的控制片段；schedule 后段归入 prepare，prepared 才能对应原生开始执行模型前的就绪点。片段记录真实来源，但墙钟仍可能包含等待或观测开销，不作为已测服务。model_forward 为嵌套观测，物理工作归外层 prefill/decode。
 
-原生 rtStreamSynchronize/WithTimeout 另形成 host_wait span，source_api 指向原生 API 记录，source_interval 为 null；其 CPU 线程、阶段身份及配对时钟来自该记录。成功返回只连接同一进程、stream 句柄及 stream ID 上、调用前已成功提交且能关联硬件的工作结束点，关系为 native_host_wait。它表示已知的必要依赖子集，不证明整个等待前沿完整；并发提交、未观测 kernel 提交以及 stream 生命周期变化仍需另有证据。失败返回保留观测，不生成成功完成依赖。CPU control 片段在同一原生线程的 host_wait 边界处分段，保留等待前后的工作；重叠/嵌套等待按区间并集扣除，原始 CPU 注解和阶段端口仍保留。此处时间区间用于同一线程上的片段切分，不用于猜设备因果或工作归属。 在非等待片段内，已有 native_flow 的 CPU 源/目标边界也作为切分点，保留排队、跨线程交接与设备提交发生的位置；不把每个注解端点都扩展为服务节点，也不将提交改接到 API 返回来制造屏障。给定耗时的执行需要沿这些片段推进后再释放对应关联点，当前模块执行核尚未实现这一步。剩余片段仍可能含未观测等待和探针开销，不能直接将墙钟差当 CPU 服务，也不能按墙钟比例分摊整段 thread_cpu_ns。 原生阶段主线程以外，已归属 CPU 注解的覆盖区间另提取为 dispatch 控制片段：按同线程区间并集处理嵌套，同一时段只保留一份工作及可追溯注解来源，再沿已知等待/flow 边界分段。不同阶段的归属若同时覆盖同一片段，报告 cpu_dispatch_scope_conflict，不任选一个阶段。未归属注解和无观测的线程空隙不补成服务；dispatch 的主动服务成本仍需独立资格。host_wait 不纳入 device_done 汇合，也不能按观测墙钟当作服务成本；原有同步缺口继续保留。若关联设备结束晚于原生同步返回，另外报告 native_host_wait_clock_order_disagrees，保留设备 interval、CANN 提交 interval、原生等待 API 引用及差值；不改时间戳，也不因图无环忽略该矛盾。
+原生 rtStreamSynchronize/WithTimeout 另形成 host_wait span，source_api 指向原生 API 记录，source_interval 为 null；其 CPU 线程、阶段身份及配对时钟来自该记录。成功返回只连接同一进程、stream 句柄及 stream ID 上、调用前已成功提交且能关联硬件的工作结束点，关系为 native_host_wait。它表示已知的必要依赖子集，不证明整个等待前沿完整；并发提交、未观测 kernel 提交以及 stream 生命周期变化仍需另有证据。失败返回保留观测，不生成成功完成依赖。CPU control 片段在同一原生线程的 host_wait 边界处分段，保留等待前后的工作；重叠/嵌套等待按区间并集扣除，原始 CPU 注解和阶段端口仍保留。此处时间区间用于同一线程上的片段切分，不用于猜设备因果或工作归属。 在非等待片段内，已有 native_flow 的 CPU 源/目标边界也作为切分点，保留排队、跨线程交接与设备提交发生的位置；不把每个注解端点都扩展为服务节点，也不将提交改接到 API 返回来制造屏障。给定耗时的执行需要沿这些片段推进后再释放对应关联点，这属于统一执行核的端点推进职责，当前完整验收状态见实施计划。剩余片段仍可能含未观测等待和探针开销，不能直接将墙钟差当 CPU 服务，也不能按墙钟比例分摊整段 thread_cpu_ns。 原生阶段主线程以外，已归属 CPU 注解的覆盖区间另提取为 dispatch 控制片段：按同线程区间并集处理嵌套，同一时段只保留一份工作及可追溯注解来源，再沿已知等待/flow 边界分段。不同阶段的归属若同时覆盖同一片段，报告 cpu_dispatch_scope_conflict，不任选一个阶段。未归属注解和无观测的线程空隙不补成服务；dispatch 的主动服务成本仍需独立资格。host_wait 不纳入 device_done 汇合，也不能按观测墙钟当作服务成本；原有同步缺口继续保留。若关联设备结束晚于原生同步返回，另外报告 native_host_wait_clock_order_disagrees，保留设备 interval、CANN 提交 interval、原生等待 API 引用及差值；不改时间戳，也不因图无环忽略该矛盾。
 
 不同原生 task 按各自物理 stream 的 FIFO 关系连接；同一 task 的子任务不因时间顺序而全串行化。实机记录存在同一 task 内重叠的 SDMA。compound task 的完整内部依赖仍是缺口。SDMA_SQE/MEMCPY_ASYNC 属于传输观测；当前 18 个任务已关联原生字节量和方向，剩余任务仍需补齐来源，不能默认复制参数。
 
