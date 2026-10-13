@@ -1,12 +1,14 @@
 # Modeling 开发与使用
 
 本项目从一个 base 的真实采集构建 source DAG，根据 target 配置推演缓存行为、工作量和耗时。
-用户的正式路径是：
+用户提供平台/框架、model、base config、workload 和 target config 集合，流程负责采集、构图和预测；
+已有 profile 是复用方式，不是首次使用必须手工制作的输入。
 
 ~~~text
-base profile + 一组 target 配置
-  → prepare-hicache：使用独立成本包，显式开启后才共享补采，生成目标图并预测
-  → evaluate：有 target 实测时独立评分
+base 配置 + model + workload → base 采集 → 原始 DAG → 目标工作与依赖规则
+独立性能采集 → 性能数据库 → 各类成本模型
+两者汇合：prepare-hicache 填入迁移/预测成本，仿真并报告完整 HTTP
+有 target 实测时：evaluate 独立评分，不参与应用预测
 ~~~
 
 预测不需要 target trace。参数原理见 [HiCache 数值模型](hicache_io_cost_model.md)，
@@ -15,10 +17,8 @@ base profile + 一组 target 配置
 10-10 已清理不再使用的历史实验资产。本页旧证据路径仅描述当时验证，不保证仍可运行；
 现存采集、校准、静态回放输入及最新稳定对照以工作进展的[数据资产](work_progress.md#数据资产)为准。
 
-本轮三阶段重构已交付，完成设备流嵌套插入修正后的 60/60 格预测，使用同一份独立成本包；
-完整 HTTP、结构比较及源回放已报告。完整结果以本轮报告为准，不拼接旧格；剩余近似与未知范围明确保留。
-执行完成不等于成本覆盖充分或精度达标。最新结果和资产以[工作进展](work_progress.md)为准，
-实施过程保留在[计划](tmp/three_stage_modeling_refactor_plan_20261002.md)和[日志](tmp/three_stage_modeling_refactor_log_20261002.md)，不在本页重复逐轮状态。
+10-10 的稳定对照已完成完整 HTTP、源回放及代表目标的结构比较。本轮职责精简已完成 60 格回归、普通首次采集
+及结构报告修正后的代表验证；具体范围和限制以[工作进展](work_progress.md)为准，不用旧成绩代替新验证。
 
 ## 1. 当前能做什么
 
@@ -41,35 +41,46 @@ base profile + 一组 target 配置
 
 ## 2. 输入与职责
 
+### 正式使用的输入
+
+应用用户提供平台/框架、model、base config、workload 和 target config 集合，另指定输出位置与允许的采集开销。
+现行配置中，框架、模型及 base 启动参数由 `profile_suite` 指向的采集配置声明，workload 由其中的 `bench` 声明；
+平台资源可由采集记录或 `resource_environment` 指定。已有 `base_manifests` 是复用入口，不代替这一首次使用合同。
+
+平台性能维护负责独立采集、数据库和模型定义。测量可以来自其他独立 runtime trace 或物理采集，
+但复用须满足实际平台、实现、工作变量和计时口径。应用流程消费适用模型，不让用户逐 target 挑参数或连接内部模块。
+数据库保存测量事实，成本模型将目标 DAG 的工作描述转换为耗时；base 则保留结构依据与确实未变工作的迁移成本。
+
+两条主线在成本填充与仿真时汇合，不要求先完成 target profiling，也不表示设备采集并行。
+应用仍需引用已有成本包，或数据库与训练声明；独立性能准备有自己的入口，不要求先建立 target 组。
+采样域和模型定义须明确，不保证从任意空库自动辨识全部操作，详见独立性能准备。
+
 ### 代码分工
 
 同一份信息尽量只有一个所有者；观察到的源执行与预测出的目标执行不是两份需要互相同步的状态。
 
 | 信息 | 所有者 | 不负责什么 |
 | --- | --- | --- |
-| 原始事实、源节点和观测区间 | source DAG、fact、source_dag_index | 不决定 target 采用哪个分支 |
-| 源 I/O 操作、工作量及其归属 | io_operation_ledger、attribution | 不把源耗时当成目标完成时刻 |
-| 目标缓存状态、操作数量与生命周期 | model 状态机与 runtime | 不按有没有源模板决定合法分支是否存在 |
-| 源 host 调用的区域与依赖归属 | runtime/write_host | 不提供聚合目标成本或决定目标工作量 |
-| 独立操作成本的查询与分段数值 | cost/operator_model、cost/host_operation | 不决定结构或绑定资源，原始测量不直接进入运行时 |
-| 执行资源的观察与绑定 | structure/hicache/resources、runtime/write_resources | 不拟合成本或读取 target trace |
-| 目标提交、等待与传输计划 | runtime/load_execution 等操作生成器 | 不在生成时重新解析校准文件 |
-| 共享资源顺序、操作展开和依赖连接 | runtime/write_expansion、FutureDag | 不重新推导缓存策略 |
-| 成本需求与共享实验的对应 | Python control_acquisition、物理采样器 | 不看 target 分数，也不维护另一份组状态 |
-| 源准备与组预测 | Python prepare | 不实现补采和离线训练 |
-| 缺口恢复与独立数据导入 | Python acquisition | 不执行预测或使用评分，累计用量由采集账本维护 |
+| 用户流程及缺数据恢复 | Python prepare、cost_preparation、acquisition | 组织阶段，不实现图算法或成本公式；默认不启动补采 |
+| 源节点、调用、请求和原始依赖 | source_dag 与 trace 适配 | 不决定 target 分支，不把源耗时当目标完成时刻 |
+| 目标工作、缓存状态与条件规则 | structure 与 HiCache model | 不查询成本，不因缺样本省略合法分支 |
+| 独立模型与未变成本迁移 | Python modeling/cost、C++ cost | 只返回成本、来源和范围，不选择资源或改变结构 |
+| 资源绑定与时间推进 | HiCache runtime、FutureDag、simulation | 执行既定规则，不重新解释 trace 或拟合参数 |
+| 源回放、结构比较、性能评分 | 实验报告与独立 evaluate | 不成为应用预测输入，也不回写模型或触发补采 |
+
+输入、阶段衔接及仿真粒度的原则见第 9 节；具体文件只在修改相应职责时阅读。
 
 源样本与独立测量仍有不同的读取方式，但得到的 host 操作计划通过同一个落图入口执行。
 资源顺序由操作计划统一给出：先是执行的 stream，再是等待的 stream；同一资源重复出现时不能去重，
 显式 event completion 则另外绑定。main、worker、设备服务与 residual gap 也不能合并为一个成本。
 
-当前全流程重构已完成统一验收：源片段替换结束后，再统一观察保留下来的 worker 队列，
+源片段替换结束后，再统一观察保留下来的 worker 队列，
 加载、层等待、写完成确认与写入共用这份资源依据。各组件不在删除中间片段后分别认定最终队列。
 加载和写入的 stream 插入端点也在此时按同一份最终源图刷新。加载提交、分配入口与空加载分支
 共用入口规划，先通过完整 mutation 应用改边及成本替换，再登记执行回调。
 非活跃层等待也先规划整组插入再应用；allocator preparation 的源坐标在创建时提供，不再事后修补。
 候选分支的资源不足仍在目标实际需要时报告；已确定执行的调用则立即要求可用资源。
-本轮进展与统一检查安排见 [重构计划](tmp/end_to_end_refactor_plan_20260927.md)。
+当前检查安排见[人工维护计划](tmp/human_maintenance_tightening_plan_20261011.md)。
 
 ### 输入来源
 
@@ -88,7 +99,7 @@ target 文件只含 `{name?, hicache}`，示例见
 [hicache_target_example.json](../configs/modeling/hicache_target_example.json)。
 target 不得携带成本、观测或评分字段。页大小及策略在输入边界校验。
 当前调度器加载遵循 HiRadixCache 的 10-token 最小 host 命中规则：更短的命中不发出分配或 H2D，
-但提前返回和已有 prefix 拼接仍须计费。这条源码分支及新 probe 元数据尚待统一运行验证。
+但提前返回和已有 prefix 拼接仍须计费。统一验证范围见工作进展，不将未观测分支当作已验证。
 当前 schedule_policy 未传 `mem_quota`；其他调用方的 quota 限制不属于已经实现的执行路径。
 省略预取策略时，输入解析统一补为 `timeout`，不继承 base 的策略；成本需求检查与执行使用同一个值。
 
@@ -102,6 +113,7 @@ target 不得携带成本、观测或评分字段。页大小及策略在输入�
 | 需求 | 命令 |
 | --- | --- |
 | 一个 base 预测一组 target | `scripts/model.sh prepare-hicache --group <group.json>` |
+| 独立采样、入库与模型准备 | `scripts/model.sh prepare-costs --request <performance.json>` |
 | 通用 source DAG 构建、仿真 | `scripts/model.sh build-dag` |
 | 已完成预测的独立评分 | `scripts/model.sh evaluate` |
 | 导入独立测量并离线训练 | `scripts/model.sh cost-db import/train` |
@@ -112,6 +124,18 @@ target 不得携带成本、观测或评分字段。页大小及策略在输入�
 
 `prepare-hicache` 在宿主机协调容器；设备采集进入框架容器，构模与预测进入 modeling 容器。
 一次批量预测共用一个 modeling 容器，但整个 prepare 不保证只启动一次容器。
+
+同一 manifest 和 CPU 校正的目标在一次调用内共用源准备：trace 读取、原始 DAG、客户端锚点、
+可选的原始回放，以及 CPU 校正只准备一次。源组顺序执行；`--model-run-jobs` 限制该组的并发目标数，
+不再跨不同源组同时构图。Linux modeling 容器在源准备的读取/构图线程退出后派生各目标进程，
+每个目标独占可变图、懒加载参数缓存、执行时钟和成本查询统计，不在磁盘上保存可复用的源图缓存。
+改变 manifest、窗口、校正或通道须重新准备；单格的 `runner_config.json` 仍可通过公开入口单独复现。
+
+源准备失败影响整组；某个目标缺工作或成本时，只写该目标的失败报告。默认不再启动后续目标，
+已经启动的目标正常收尾；独立 `predict` 可用 `--continue-on-error` 继续。
+`prepare-hicache` 会执行整组目标以汇总共享缺口，不接受这个开关。批次逐目标返回结果，不等整组结束才显示进度。
+普通运行清除成功日志；失败保留目标日志和必要的 `source_preparation.log`，详细诊断才保留成功日志。
+生成的 `target_plan.json` 只是当次调度输入，不是版本、有效性凭据或冻结副本。
 
 ## 4. 构建普通 DAG
 
@@ -154,7 +178,51 @@ scripts/model.sh build-dag --config <runner_config.json>
 
 ## 5. 一个 base 组
 
-### 最小起点
+### 首次准备
+
+先准备一个普通采集配置：`server` 声明模型与 base 推理参数，`bench` 声明 workload，
+`metadata.config_id/workload_id` 用于选择和展示。不要求 matrix，也不要求包含 target 采集。
+模型路径沿用 profiling 的声明规则，不在组输入里再保存一份。
+
+组输入用 `profile_suite` 引用该配置，流程负责记录所需 tokens、采集 base、接收 manifest 并构图。
+只有一个 base 时可直接采用所声明的 workloads；多个 base 的实验文件仍须用 `base_config` 明确选择，
+按需用 `workload_ids` 缩小范围。显式空列表不是“全部 workloads”。
+
+例如使用已有独立性能库、尚未采集 base：
+
+~~~json
+{
+  "profile_suite": "<base-experiment.json>",
+  "target_configs": ["configs/modeling/hicache_target_example.json"],
+  "cost_database": "<platform-cost-database.sqlite>",
+  "cost_training": "<deployment-model-definitions.json>",
+  "base_capture_budget": {
+    "wall_seconds": 1200,
+    "server_starts": 2,
+    "requests": 100,
+    "tokens": 100000
+  },
+  "output_dir": "data/modeling_runs/my_hicache_group"
+}
+~~~
+
+预算数字只是例子，应按实际允许的采集规模填写。已有成本包时可用 `cost_model` 代替数据库与训练声明。
+CPU 配对和新的独立成本补采另行声明，不从 base 预算借用。运行方式与下面的复用例子相同。
+模板 workload 不必预写 token 回放参数；没有已有计划时，入口先记录 tokens，再采集受控 base trace。
+显式 replay 计划或组的 token bundle 可跳过记录。两次运行使用各自的新报告目录，不覆盖原 workload 输出；
+不需要 HiCache 状态检查的普通 token 模板也不要求配置矩阵文件。
+当前仍要求固定输出长度与串行模板请求，不等于已经支持任意自然结束或并发请求的自动准备。
+
+性能数据库独立于这一组长期维护；训练声明负责选择适用部署和各类模型，整组共用一个结果包。
+空库、新后端或不适用的模型仍需独立性能采集，现行入口不能仅凭空库自动采齐全部计算、I/O 和控制成本。
+数据不足与结构不支持分别报告，不启动 target 实测来补洞。
+
+这里有两种使用职责，而不是要求每个预测用户维护一套模型：
+用户提供本次平台、模型、base、workload 和 target 集合；性能维护者为平台准备可复用的数据库与模型定义。
+库中有适用数据时直接复用，没有时进行独立性能采集。实际查询由目标工作描述选定操作、实现、口径与变量，
+不是由用户为每个 target 手工挑模型。现行配置仍要引用成本包或数据库/训练声明，尚未实现只填平台名就自动发现这些资产。
+
+### 已有采集的最小起点
 
 复制 [hicache_group_example.json](../configs/modeling/hicache_group_example.json)，替换实际路径：
 
@@ -176,6 +244,8 @@ scripts/model.sh build-dag --config <runner_config.json>
 target 也可以直接写成 `{"name": "...", "hicache": {...}}`。已有 base 时不需要矩阵 suite，
 base/workload 身份可从 manifest 推导；没有显式 metadata 名称时使用配置名称或 run 身份。
 多个 workload 应显式使用相同 config_id 和不同 workload_id，评分时与 target 身份对应。
+普通单配置没有这些标签时，准备入口按配置的 name/id 识别 base，从所引用模板的 id 识别 workload；生成采集配置会保留这些身份，
+不会因运行名称变化而把新 manifest 当成另一份 base。
 
 先检查输入，再执行：
 
@@ -187,6 +257,20 @@ scripts/model.sh prepare-hicache --group <group.json>
 最小配置使用已有独立成本包，不启动自动成本补采。成本包仍须满足部署条件和目标操作的实际需求，
 缺少模型或测量覆盖时明确报告缺口，不能保证任意成本包都能完成预测。
 普通预测不恢复物理或控制校准文件；这些输入只在显式共享补采需要使用时才解析与准入。
+
+只有数据库而没有成本包时，删除 `cost_model`，改为声明：
+
+~~~json
+{
+  "cost_database": "<independent-cost-database.sqlite>",
+  "cost_training": "<training-request.json>"
+}
+~~~
+
+其余 base、target 和输出字段不变。同一入口先离线训练，再用生成包预测全部 target；
+不要求用户先执行另一条训练命令。训练请求仍要明确部署、模型定义和 HiCache 所需 I/O 依据，
+不是仅提供任意数据库就能预测。新包写入组输出的 `cost_model.json`，自动排除当前 base 的采集身份与 manifest。
+用户提供的共享输入包不会被恢复流程覆盖；同时声明成本包和数据库时优先使用已有包。
 
 `--dry-run` 不启动设备采集、CPU 配对准备或 target 预测，但会写准备摘要，不是完全无写入的语法检查。
 `--calibration-only` 只准备 source 输入及其同源 CPU 校正，可不提供成本包；成功状态为
@@ -239,7 +323,7 @@ scripts/model.sh prepare-hicache --group <group.json>
 
 | 情况 | 组字段 | 必要输入 |
 | --- | --- | --- |
-| 缺 base profile | `base_capture_budget` | `profile_suite`、base/workload 选择、`forced_token_bundle` |
+| 缺 base profile | `base_capture_budget` | 普通 `profile_suite` 配置；多 base 时明确选择；已有 token plan/bundle 可复用 |
 | 缺 base 的轻量 CPU 回放 | `cpu_service_capture_budget` | 可从已选 base 自动规划；默认复用 base 报告记录的 token plan |
 | 缺共享 workload 依据 | `budget` | base 的合法 token 输入 |
 | 缺物理服务或 CPU 原语测量 | `physical_capture.budget` | 对应物理采样域、设备与 CPU 绑定 |
@@ -262,7 +346,8 @@ wall_seconds、container_starts、logical_io_bytes。省略 workload budget 等�
 base 补采按 profiling 的正式展开规则选择实验，保留 experiment 覆盖与 `$unset`；
 每个 base/workload 必须唯一匹配一个已声明实验，不从两个矩阵轴重新拼出被排除的组合。
 `profile_suite` 也可指向普通单实验或显式 experiments 文件，不要求 matrix；使用
-`metadata.config_id/workload_id` 标明要采集的 base 与 workload。已有显式 token plan 时只回放一次；
+`metadata.config_id/workload_id` 标明要采集的 base 与 workload。只有一个 base 时无需重复选择；
+已有显式 token plan 时只回放一次；
 使用 `{forced_token_plan}` 时，才从所给 bundle 取计划，或先捕获 tokens 再回放。
 target 若用实验配置名简写，读取展开后的实际 server 命令；同名实验的 HiCache 配置不一致时，
 改用明确的 target 对象或文件，不任取其中一个。标签仍不进入成本拟合。
@@ -285,7 +370,7 @@ target 若用实验配置名简写，读取展开后的实际 server 命令；�
 ~~~
 
 页域是平台的显式采样域，不从 target 列表反推。设备与绑核须匹配 base 环境。
-首次准备会自动从 base 部署读取 KV 几何和存储范围，不要求声明 `physical_capture`；这不启动测量，
+真正需要补采时才从 base 部署读取 KV 几何和存储范围，不要求普通预测声明 `physical_capture`；这不启动测量，
 也不提供任何测得的成本。宿主机无法读取 base 模型的 config.json 时，报告具体路径及已有校准替代方式。
 修改采样次数、页域或采样绑核不会使这份部署信息失效。
 实际 I/O 补采仍须声明页域、适用放置和预算；没有页域时不会自动沿用账本中的旧 I/O 测量。
@@ -376,6 +461,8 @@ forward、HiCache host 和 scheduler 的观测与配对分别放在 `calibration
 
 组级 `control_calibrations` 声明已有操作成本文件：prefetch_wait 按策略、write_host 按页大小和写策略索引，
 load_index、load_submission、layer_wait 等按操作名声明。导出用法见[共享 CPU 操作校准](hicache_io_cost_model.md#共享-cpu-操作校准的采集开销)。
+独立导出直接产生操作级测量，不携带用于生成目标结构的局部图模板；
+Python 编排不按节点名称二次分解计时，预测只消费离线成本模型。
 正式查询不读取 `prefetch_query_calibration`：结构模块按执行组生成本地采样、MIN 和应用结果的顺序，
 再查询独立模型 `prefetch.query` / `sglang.storage_hit_min`。缺少模型报告带工作描述的成本缺口，
 不要求 base 出现过查询，也不从成本文件读取通信参与者。
@@ -396,23 +483,30 @@ load_index、load_submission、layer_wait 等按操作名声明。导出用法�
 
 ## 6. 准备流程与失败处理
 
-正常使用时，prepare 只做三件事：取得声明的 base，准备同源 CPU 修正，使用所选独立成本包预测整组 target。
-它不打开成本数据库，也不提前恢复控制或物理校准文件。已有成本包仍须满足部署、来源隔离和实际操作需求；
+正常使用时，prepare 取得或采集声明的 base，准备已选择的同源 CPU 修正，再使用适用的独立模型预测整组 target。
+已有成本包时，不训练、不打开成本数据库，也不提前恢复控制或物理校准文件；
+只有显式以数据库和训练请求代替成本包时，才先做离线成本准备。已有成本包仍须满足部署、来源隔离和实际操作需求；
 合法分支缺少成本时，失败格 HTTP 时间为 null，需求保存在 `prediction.missing_costs`，不删操作或填零。
 
 只有显式开启 `automatic_cost_acquisition` 并声明数据库、训练请求与累计预算，才在真实成本缺口后进入补采：
 
 1. 先核对缺口是否有训练定义、目标工作是否提供了所需变量；缺结构或缺变量不靠采集补洞。
-2. 用已有独立数据库刷新一次成本包，补充排除本组 base，再重跑整组。没有新设备采集，也不消耗采集预算。
+2. 尚未在本次准备中训练时，用已有独立数据库刷新一次成本包，排除本组 base，再重跑整组；已经训练则不重复此步。
+   没有新设备采集，也不消耗采集预算。
 3. 仍缺数据时，按操作需求选择一批共享实验并严格串行采集；完成后统一入库、离线训练和重新预测整组。
 4. 同次准备不重复尝试同一实验。已做实验仍未解决的缺口保留并停止，不按 target 分数重训或扩大实验。
 
-`prepare.py` 负责源准备与预测，`acquisition.py` 负责可选恢复；具体实验由控制、计算与物理采样模块完成。
+`prepare.py` 负责源准备与预测，`cost_preparation.py` 负责组级离线训练，`acquisition.py` 负责可选恢复；
+首次训练与缺口恢复共用成本准备，不各自维护训练命令、排除规则和发布逻辑。
+具体实验由控制、计算与物理采样模块完成。
 一次恢复会话只读取和解析一次训练请求，缺口分析与后续训练使用同一组模型定义。
+控制补采先生成包含实验与导出项的 `ControlCapture`；执行只消费该计划，不再次按需求匹配导出类型。
+等待实验可以同时提供加载索引、提交和层等待观测，query 保持最后处理以复用同组配对。
+这些匹配只描述当前采样器的覆盖，不决定 target 分支或模型适用性；未知实现不能单独触发一个假定可用的实验。
 需要修改定义时重新运行 prepare；采集后的组输入和累计预算仍按实际状态更新，不冻结文件。
 补采得到的成本包由整组 target 共享，不读取 target trace 或逐格误差。更新成本包后，不沿用旧包下已经完成的预测格。
 离线训练可发布本次有依据的部分模型；未用模型缺数据不提前阻断执行，实际缺口继续明确报告。
-训练失败时保留原包并停止，不能把原文件当成本次训练成果。
+所有新包写入组输出，用户提供的共享输入包不被覆盖。训练失败时停止，不能把旧文件当成本次训练成果。
 
 ### 补采选择与输入
 
@@ -440,13 +534,13 @@ I/O 补采要求显式 `physical_capture.page_token_sizes`，不从 target 列�
 
 ### 摘要、预算与恢复
 
-先看 `group_summary.json`，再按其中路径查看预测和采集日志：
+`group_summary.json` 直接包含各目标的耗时、执行状态与限制；需要详细来源或故障日志时再按其中路径查看：
 
 | 状态 | 含义与下一步 |
 | --- | --- |
 | `predicted` | 本次组预测全部执行；成本覆盖与独立精度验收仍需另外检查 |
 | `planned` / `source_inputs_prepared` | dry-run 或 calibration-only 已结束，没有执行 target，也没有训练 |
-| `needs_independent_cost_model` | 普通预测尚未指定独立成本包 |
+| `needs_independent_cost_model` | 缺成本输入；提供成本包，或已有数据库和训练请求 |
 | `structure_corrections_required` | 目标工作或依赖规则不完整，不能用补采代替结构实现 |
 | `cost_model_definitions_required` / `cost_corrections_required` | 缺训练定义、工作变量或存在不适用的数值响应；先查看修正说明 |
 | `acquisition_requires_database_and_training_request` | 已开启自动补采，但未声明数据库或离线训练请求 |
@@ -474,9 +568,69 @@ dry-run 不启动采集和预测；calibration-only 只准备源输入。两者�
 
 ## 7. 独立成本库、预测与结果
 
+### 独立性能准备
+
+平台维护者用一个入口组织独立性能主线，不需要构造 base/target 预测组：
+
+~~~bash
+scripts/model.sh prepare-costs --request <performance.json> --dry-run
+scripts/model.sh prepare-costs --request <performance.json>
+~~~
+
+最小输入是数据库位置、训练声明和输出目录。有适用数据时只做离线训练；
+需要采样时，在同一个请求里声明普通 profiling 配置和允许的累计开销：
+
+~~~json
+{
+  "database": "<platform-library.sqlite>",
+  "training": "<deployment-model-definitions.json>",
+  "output_dir": "data/modeling_runs/platform_performance",
+  "profile_suite": "<independent-sampling-config.json>",
+  "capture_budget": {
+    "wall_seconds": 1200,
+    "server_starts": 2,
+    "requests": 100,
+    "tokens": 100000
+  }
+}
+~~~
+
+预算只是示例。采样配置声明模型、运行参数和独立 workload，不放 target trace 或评分输入。
+入口严格串行处理配置中明确列出的实验；普通单实验即可，不要求矩阵。自动回放目前限于 SGLang 模板负载，
+未知执行分支或采样器不由新成本样本自动获得支持。
+采集、实际启动和失败复用现有预算/进程规则；没有 token 计划时先记录，再完成 profiler 回放。
+独立采集开启 Torch shape 记录以提取实际工作变量，不改变 base 默认采集；CPU 服务必须另有同源轻量依据。
+同一输出目录重复运行只复用相同输入的完成采集，不清空账本；新采样定义应保留累计用量。
+
+已有独立 profile 使用 `profile_manifests`，已有测量行或证据使用 `observations`、`evidence` 文件。
+runtime profile 测量提取目前限于 SGLang；这不限制 KTransformers 的共享构图入口，也不表示其算子测量已接通。
+`cpu_service_costs`、`cpu_service_pairs`、`cpu_service_capture_budget` 与应用准备共用同一校正规则，
+允许 CPU pair 显式声明 `include_setup_requests`。库维护的 `include_setup_requests` 单独选择导入的测量窗口。
+`resource_environment` 是实际资源的显式声明，不能覆盖采集记录的冲突设置。
+已有 `control_calibrations` 可直接准入；新增控制分支需有覆盖其工作的独立采样与测量，不从拟合缺口臆造观测。
+
+I/O 维护可声明已有 `physical_calibration`，或用 `physical_capture` 的页域、设备、CPU 放置及物理预算安排采样。
+`physical_services` 明确选择 `physical/prefetch_stages`、`physical/load`、`physical/write_device_to_host`、
+`physical/write_host_to_storage_existing`、`service/write_host_to_storage_new` 中需要的服务，默认不启动物理采样。
+新物理采样从本请求的独立 profile 取得部署信息，必须与训练部署一致；不读取预测组或 target。
+采样器仍限于当前 Ascend/page-first/file 路径，不能把执行入口齐备称为任意平台的全部成本就绪。
+
+默认导入去重，不提供隐式覆盖旧观测的开关。修正提取规则需要下面的显式完整采集替换动作。
+输出的 `performance_summary.json` 给出当前采集、校正、导入与训练结果；`cost_model.json` 是可复用包。
+缺数据库/测量、缺变量或模型缺数据均明确报告；部分包只包含有依据的响应，缺项不记零。
+ready 只对应本次声明的模型，不证明所有 target 或完整 E2E 可预测。dry-run 不采集、导入或训练。
+库维护不读取评分，不触发应用预测，也不覆盖请求引用的共享成本包。
+
 ### 导入与离线训练
 
-数据库保存测量和来源，参数只保存在导出的成本包。当前 base 不自动入库，也不在线拟合：
+数据库保存测量和来源，参数只保存在导出的成本包。当前 base 不自动入库，也不在线拟合。
+
+这条性能主线可以在某次预测之前准备，后续继续积累适用的独立数据，不按 target 创建专用数据库。
+同一库可以保存多个平台或模型的观测，训练时仍按部署、实现和计时口径选择；
+跨模型/平台的共享须有明确适用依据，不能因操作同名就混合拟合。模型包供一组 target 使用，
+新增测量不自动修改已导出的包。应用用户可以消费已有包，维护者才需要管理采集与训练定义。
+
+显式导入及离线训练：
 
 ~~~bash
 scripts/model.sh cost-db import \
@@ -494,23 +648,81 @@ scripts/model.sh cost-db train \
 
 没有同源 CPU 校正时省略相应参数，CPU 样本仍保留 profiled 口径，不能作为正常服务模型的依据。
 物理 I/O 或已导出的控制/原语测量通过 `--evidence` 导入，不能把其文档路径当成另一份 runtime profile。
+物理声明提供几何、测量条件和原始文件来源。导入读取这些明确来源，保存存储工作点、DMA 设备时间及
+预取阶段测量；历史报告中的 `service_models` 不入库，也不从系数反造样本。原始文件缺失就停止。
+物理采集报告只发布来源和条件，离线成本层才从库内测量拟合服务响应。训练不回读外部测量文件。
 导入和训练不启动设备采集，不读取评分结果；所选部署和来源必须独立于本轮 base 及评分采集。
 部署比较排除纯观测开关，但 CPU 亲和性、设备及实际执行开关仍参与适用性判断。
 
 重复导入按原采集与测量位置去重，不合并不同真实采集中的同一工作点。
+新 runtime/control 采集默认以原 manifest 路径建立身份，重导入沿用库中已登记的身份；
+suite 内的局部 run 名可以在不同采集中重复，不能据此合并。重命名副本通过 `--capture-aliases` 明确原身份。
+普通 runtime 入库不要求测到完整 HiCache 写入，只导入实际可归属的操作；显式写入/释放导出仍要求相应测量。
 修正提取规则时，显式使用 `--replace-captures` 重新导入该采集的完整派生观测：
 在同一事务中替换，失败回滚，保留来源别名及原始 trace。它不是追加某个控制原语的开关；
 只提交部分数据会移除该采集未提交的旧派生样本。默认导入和自动补库不隐式替换。
 替换后须显式重训，已有成本包不会自动改变。
 
+### 性能库的事实归属
+
+数据库长期维护独立测量，不随某个 base 或 target 新建一套。部署、采集身份和来源分别保存；
+操作测量只记录原位置、实现、工作变量、计时口径和微秒数，通过引用关联其部署与 manifest。
+控制导出和 CPU 原语中的操作行不再作为整份 JSON 重复存储；库内额外证据只保存 I/O 训练需要的
+运行时服务测量及物理依据。图模板、诊断布局和临时报告字段不决定一次测量是否重复。
+
+普通重导入不能改写同一采集的环境；同一位置/口径的真实工作或耗时变化仍是冲突。
+需要更正历史环境声明时，可通过 `--replace-captures` 完整替换库内派生观测和声明，
+但同一批输入仍须一致。这不修改原始采集，不等于实测证明，也不会更新已发布成本包。
+别名和完整/轻量依赖随事务保存，训练留出不打开历史 trace。原始测量文件不由入库流程删除。
+`import_summary.json` 中 `operators` 计操作行，`evidence` 只计额外的 I/O 聚合，不计控制报告副本。
+
+之前使用整段部署和来源字符串的数据库，需要显式转换一次；普通导入或训练不暗中转换旧库：
+
+~~~bash
+scripts/model.sh cost-db migrate \
+  --database <previous-database.sqlite> \
+  --output <new-database.sqlite> \
+  --summary <migration.json>
+~~~
+
+转换只读旧库，完成后才发布新文件；输出已存在就报错，绝不覆盖。更改组配置中的 `cost_database`
+引用后，导入、训练与覆盖查看只使用当前表示。已发布的成本包仍可直接预测，不必为转换重训。
+转换不读原 trace、不重新提取成本、不证明模型覆盖或 E2E 精度，也不恢复已经清理的原始文件。
+物理证据例外：显式转换会读取声明的原始物理文件，将旧参数表示改为测量事实；文件缺失时整个转换失败，旧库不变。
+已经完成表结构转换、但物理证据仍保存参数的库，使用 `cost-db import --evidence ... --replace-captures`
+重新导入其完整物理声明。普通训练不兼容读取旧物理参数；已发布成本包仍可直接消费，重导入不会自动改包。
+同一库的维护与训练顺序执行，训练期间不改写所选数据库；当前分操作族读取不提供跨进程在线更新协议。
+
 ### 训练请求与缺口
 
 训练请求声明 `deployment`、`models` 和 `excluded_captures`/`excluded_manifests`。
+仅维护 I/O 时可省略 `models`，声明 `io_evidence` 选择一个物理测量集合；不必附带无关算子。
+同一集合可以引用多份独立原始测量。未测服务和不能辨识的参数列为缺口，不因采集成功就算模型就绪。
 留出覆盖本轮全部 base、结构评价、正常 HTTP 评价及相应轻量配对，不能仅排除完整侧。
+
+共同的公式、变量和范围规则只需声明一次：`operation` 和 `timing_scope` 可分别写一个名字或明确的名字列表。
+列表按操作与口径的组合展开；不是按前缀匹配，不从已有 trace 自动猜模型形式。
+每个组合仍独立选样本、训练和记录适用域，不共享系数。不同规则分开声明，不能用列表覆盖差异。
+例如 Decode 中 K/V 写入采用相同的常数模型和工作范围，但 CPU 服务与残余区间仍分别建模时，可以写成：
+
+~~~json
+{
+  "operation": ["decode.attention.key_write", "decode.attention.value_write"],
+  "implementation": "ascend.scatter_nd_update_",
+  "timing_scope": ["cpu_service", "residual_interval"],
+  "features": [],
+  "coverage_features": ["elements", "locations"],
+  "form": "constant"
+}
+~~~
+
+以上声明对应四个独立响应，不是把四种成本合成一项；实际操作和口径必须有相应观测。
+只有底层工作确实等价时，才另用 `observation_operations` 显式共享测量。
+离线训练和共享补采使用同一套声明展开，I/O-only 请求不必补一个空的算子清单。
 
 | 模型字段 | 含义 |
 | --- | --- |
-| `operation`、`implementation`、`timing_scope` | 确定一个操作、后端实现和测量口径；同一三元组只声明一个模型 |
+| `operation`、`implementation`、`timing_scope` | 选定操作、实现和口径；操作/口径可用明确列表，同一展开后的三元组只声明一个模型 |
 | `form`、`features` | 常数、线性或单变量分段线性，以及实际进入公式的变量 |
 | `coverage_features` | 只限定已测工作条件，不增加系数；默认空 |
 | `observation_operations` | 显式选择有机制依据的等价观测名；默认只使用自身操作，不改写或复制原始样本 |
@@ -519,6 +731,10 @@ scripts/model.sh cost-db train \
 `implementation="*"` 仅为所请求口径下已有样本的实现分别训练，不合并不同后端。
 其他实现的缺失口径在 `wildcard_unmeasured_implementations` 中说明；查询这些口径时仍会失败。
 若要求某个实现必须齐备，应使用具体名称。CPU、worker、派发、残余和设备口径也不能互作替代。
+
+训练按声明的操作族分批读取，保留其他口径以区分“缺操作”和“缺口径”；不会为小模型集合
+加载整个平台的全部观测。响应按声明展开顺序输出：先操作、再口径；同采集同工作点的聚合与拟合方式不变。
+一次非常大的操作族仍需要对应的内存，这不是恒定内存训练或任意规模的保证。
 
 缺数据时，训练分别报告 `missing_operation`、`missing_timing_scope`、`missing_features`，
 并列出已有口径。不自动删变量、换公式或补零；工作点不足、秩亏和无效响应也需离线审查。
@@ -541,6 +757,8 @@ scripts/model.sh cost-db train \
 所有来源与完整/轻量依赖随成本包保存，参数只由离线训练产生。
 
 `training_sources`/`training_source_manifests` 保守记录算子训练及 I/O 选择接触的来源。
+数据库采集身份不等于 manifest 中可重复的 suite-local `run_id`。自动留出 base 和预测准入按实际 manifest 来源关系判断，
+已登记的原采集别名及完整/轻量依赖也随包传递；不因两个独立采集的 run 名称相同而排除其中一个。
 I/O 中失败的拟合也可能影响物理公式选择，不能从隔离名单删除；
 `io_training.captures` 与方向来源记录实际贡献者，`considered_runtime_captures` 和
 `considered_source_manifests` 记录被考察数据。两端点估计不把中间点当成系数来源，
@@ -569,7 +787,7 @@ scripts/model.sh predict \
 
 | 文件/字段 | 用途 |
 | --- | --- |
-| `group_summary.json` | 准备状态、预算、停止原因与逐格结果路径 |
+| `group_summary.json` | 准备状态、停止原因、实际成本包及逐目标结果；预算与诊断路径另附 |
 | `cost-package.json` | 离线参数、训练来源、缺失模型及部署范围 |
 | `import_summary.json` | 本次导入和去重结果 |
 | `preflight_summary.json` | source trace/事实错误 |
@@ -577,7 +795,8 @@ scripts/model.sh predict \
 | `model_runs/<model_run_id>/run_summary.json` | C++ 执行结果 |
 | `model_runs/<model_run_id>/runner_config.json` | 单格复现输入 |
 
-组摘要只保留组级结果和成本缺口，逐格结果在 `prediction_summary` 指向的 workflow 摘要中。
+组摘要的 `prediction.cells` 直接保存逐目标耗时、状态、成本覆盖及保留近似；
+完整查询来源和复现身份在 `prediction_summary` 指向的 workflow 摘要中，不复制完整诊断。
 每格保存 source manifest、source 配置、target 配置与字段、workload 和 `model_run_id`；
 不额外维护一份任务索引，也不将 Python 身份回写 C++ 摘要。
 开始时保存未完成任务，每完成一格更新同一摘要；中断后可以查看已完成结果，但它不是预测缓存。
@@ -694,32 +913,24 @@ manifest、窗口和源 CPU 校正，不能漏掉 CPU 校正后再声称“只�
 5. 扩展实验报告的语义对应与覆盖说明，再用公开入口的真实输入验证。
    源回放、目标结构与完整 HTTP 各自回答不同问题；评分不能回写结构或模型。
 
-Attention、metadata、dense 和通信共用 `PhaseCallPosition` 表达源请求阶段与 Decode 轮次。
-这种身份只在当前源图内解释归属；跨 trace 对应仍使用逻辑输入和请求，不比较局部索引。
-张量成本导出与结构报告共用已证明的算子对应，但计时测量还需要额外检查，
-不能把“找到操作”当作“获得有效成本”。
+沿职责修改以下合同，不必同步维护一套逐算子工作流：
 
-源成本导出共用 `source_dag/tensor_cost` 的程序采样和外层区间提取：
-各操作族只提供自己的源程序、对应关系与冷启动限制，不再各写一套分段循环。
-一次只读导出共享同一源索引和 CPU 队列；需要切分边界的导出使用私有图并重新建立索引，
-不得将切分前的索引用于切分后的图。入库前的证据展开与准入由 Python `cost/package` 组织，
-数据库负责原子去重和持久化，CLI 只选择输入与输出。
+| 衔接 | 合同与实现位置 |
+| --- | --- |
+| 源调用 → 目标工作 | `source_dag/phase_calls` 建立调用与 `PhaseCallPosition`；`structure/hicache/phase` 规划计算和通信。身份属于源图，跨 trace 使用逻辑请求，不比较局部编号 |
+| 结构 → 成本 | `TensorOperation` 表达工作和前驱；生成器声明 `OperationCostRequest` 与 `HostOperationSlots`。计算、分配、释放、传输及写确认共用 `bind_host_operations`，不另建成本操作清单 |
+| 成本 → 数值绑定 | C++ `cost/host_operation` 一次估计程序的全部口径，缺口一起报告；运行时只填槽位。多启动各自计费，CPU-only worker 不虚构设备或启动/返回成本 |
+| 独立输入 → 预测 | Python `TargetHiCacheConfig` 与 `HiCacheCostModels` 分别准入策略和成本包；包共同持有响应、部署、来源，预测不读数据库或训练 trace |
+| 测量 → 数据库 | `ControlMeasurement` 保存原采集与选择；`cost/package` 准入和分组，`CostDatabase` 原子去重与持久化。CLI 只选输入输出，不实现提取或拟合 |
+| 程序 → 执行 | `HiCacheHostExpansion` 保存局部节点、worker、流与等待；`FutureDag` 沿同一时钟展开。Python `model_executor` 只安排任务，不变换 DAG |
 
-共享控制输入在使用时由组解析为 `ControlMeasurement`，保留 policy/page 选择、测量文档和源采集身份；
-准入、query 重新导出和证据分组复用这个对象，不各自重读同一文件。数据库证据与观测提取共用
-`control_entries` 遍历嵌入文档，遍历本身不读文件；公开配置与入库格式没有改变。
-
-运行时用 `HiCacheHostExpansion::append_main` 拼接局部 CPU 顺序链，返回实际生成的槽位，
-不靠固定编号连接。各执行分支仍自己声明 worker、设备流及同步等待；这个入口不查询成本。
-纯 CPU 操作共用 `cost::estimate_host_operation(..., false)` 请求 service 和 residual 两个口径，
-不把 worker 或阻塞读回成本并入其中。源构图、对应和成本提取通过 `TraceEvent::start_ns/end_ns`
-读取保留小数精度的 trace 坐标，不与预测时钟或校正后的 CPU service 混用。
-
-Python 的 target 声明由 `modeling_workflow/types.py` 中的 `TargetHiCacheConfig` 一次准入；
-源 CPU 校正的对应关系由 `modeling/source_dag/profiles.py` 处理，不依赖离线训练模块。
-`execution/model_executor.py` 只排列并执行 source/target 任务，不负责 DAG 结构变换。
-预测选项中的独立成本包及其部署、来源是必需输入；合法操作的具体缺口仍由执行结果报告，
-不是在任务规划时以“没有模型”为由跳过目标结构。
+源成本提取共用 `source_dag/tensor_cost`，各族提供自己的程序、对应和冷启动限制。
+找到算子不等于获得有效计时；只读导出共用索引，需要切分的导出用私有图并重建索引。
+性能导入只导出实际操作的工作变量、计时和 I/O 依据，不另建无人使用的 Torch 几何目录。
+通信描述在源观测边界准入为调用与参与者工作，执行与测量共用它；不经诊断 JSON 还原调用。
+结构报告比较实际工作、独立观测及必要依赖，不再重复生成 Attention/allocator 的假设程序或原始调用清单。
+HiCache replay 保存缓存状态及请求/轮次观测，不持有算子调用目录。纯 I/O 曲线数学由训练和目标投影共用，
+不反向依赖预测编排。trace 坐标保留纳秒精度，不能与校正后的 service 或预测时钟混用。
 
 ### 三个阶段怎样合作
 
@@ -752,6 +963,25 @@ Attention 的两次逐层缓存检查也只在 K/V 主机提交之后发生：�
 提交 load event wait。它们都不要求 CPU 先等 K/V 写入完成；设备侧先后关系由 stream 和事件依赖保留。
 阻塞读回可以先准备参数，到复制入口才等待设备，不能把整个调用都放到等待之后。
 声明了多个子启动时分别计费，不能再叠加父操作的设备总时长。
+
+### 仿真需要多细
+
+判断标准是能否改变后续工作、并发或完成顺序，不是 trace 中有多少条记录。
+缓存状态与执行时间是两个尺度：状态按必要的请求、页范围及批次更新，服务成本可按有明确工作量的逻辑操作估计。
+
+| 保留边界 | 可以使用粗粒度的内部工作 |
+| --- | --- |
+| 缓存命中、容量分配/释放、提交、完成与发布 | 同一状态结果的连续页用范围表达，不逐 byte 模拟 |
+| CPU 提交、worker 排队、设备流、同步及通信参与者到齐 | 无外部消费者或资源切换的内部计算，用张量调用或逻辑服务的响应表达 |
+| timeout、取消、重试和其他会改变后续工作的条件 | 已确认分支的固定管理工作用典型成本，不为每条 Python 语句增加回归 |
+
+一个 Attention 调用的耗时可以用 shape 模型估计，但不能连同前后回载、同步和缓存发布一起压成一个数。
+一个 I/O 批次可以按页数与字节数估计服务，但若逐批发布会让前台提前继续，就必须保留发布边界。
+同样，worker 返回与设备完成可能重叠，不能合并成串行总耗时。
+
+当前后端有明确子启动及交错依赖时仍展开这些启动，不因成本包齐全或代码量目标而直接折叠。
+合并前检查区域是否有外部依赖、资源切换、状态变化及条件分支；证据不够时保留现行粒度。
+父成本拆成子成本后不能再收费一次。CPU 服务、残余区间及无法解释的 gap 仍分别管理。
 
 ### 当前结构规则的范围
 
@@ -843,6 +1073,10 @@ CANN 的 `connection_id` 为 `-1` 或其 uint64 表示时，代表没有有效�
 
 ### HiCache 控制与成本边界
 
+源写入和淘汰片段在完成归属检查后，只保留资源角色及插入位置的观测身份，不再长期存放一份源拓扑和成本副本。
+目标容量步骤另由状态和执行规则生成，不能借源片段的页数或分支决定目标工作。
+执行摘要中的 `observed_write_fragments`、`observed_eviction_fragments` 是源资源依据的数量，不是目标模板数或执行次数。
+
 写回确认按 FIFO 批次生成：每批确认后即可发布 host 状态并提交 H2S，容量释放仍等整个阻塞检查结束。
 阻塞与非阻塞路径的队列、局部事件生命周期不同，不能共用整段墙钟或从源模板决定释放次数。
 加载使用持久事件池，不套用写回的事件销毁规则；多批次间推进也必须有独立成本依据。
@@ -855,7 +1089,8 @@ host 加载在 lookup 保存目标命中范围，到 admission 才判断容量�
 allocator 准备依据特化、缓存路径及首次加载情况，不把源编译重叠作为目标特征；
 跨 rank 编译竞争仍是未解释的成本变化。
 
-加载索引、提交、释放和控制段分别查询 CPU、worker、dispatch、设备及 residual 口径。
+生成器同时给出工作描述与数值槽位，计算、分配、释放、传输和写确认共用数值绑定，
+分别查询 CPU、worker、dispatch、设备及 residual。相同重复工作可共用响应，不合并执行节点或依赖。
 同步前准备与等待后的同步服务分开，无法从真实等待中分离的成本不入库；已可测的其他片段可独立保留。
 模型缺失时返回明确缺口，不用整段墙钟或零值补齐。各类公式及近似见成本模型文档。
 
@@ -863,31 +1098,24 @@ allocator 准备依据特化、缓存路径及首次加载情况，不把源编�
 
 base 仅提供对应且未变化的成本，变化或新增操作使用独立数据库离线训练的成本包。
 预测不打开数据库、不自动导入 base、不读取 target；共享补采默认关闭。
-同一部署共用的成本包必须提前留出整轮 base 和实际评分采集，完整/轻量配对任一侧被留出时，
-整份测量不得参与训练。别名与来源用原始采集身份表达，不用摘要或内部版本号充当有效性证明。
+成本包须留出整轮 base 与评分采集；完整/轻量任一侧被留出时，整份测量不能入训练。
+别名用原采集身份表达，不用摘要或内部版本号证明有效。部署与测量口径的要求见第 7 节及成本文档。
 
 独立测量可用 `--include-setup-requests` 扩展到全部有时间戳的受控请求，但配对校正必须覆盖同一范围。
 它不改变预测或评分窗口，也不授权将窗口外未经校正的区间标为正常 CPU 成本。
 部署声明包含框架、模型/TP、dtype/量化、graph/编译与资源环境；未知或冲突条件不能假定兼容。
 
-实验显式开启 `--experiment-reports`，独立 `evaluate` 读取结构 trace 和正常 HTTP 测量，产生三阶段报告。
-目标结构提取使用评分命令的 `--model-run-jobs` 上限并行；默认仍为一，各目标输出独立。
-可显式提供少量代表 target 的结构 profile；只比较这些输入对应的预测，其他格标为未请求，
-报告分别列出结构实测数、已比较格数与未评价格数。完整 HTTP 评分仍要求所有选中格及正常真值齐备，
-不能把代表格检查称为全矩阵结构验证。
-这一步只在 modeling 环境构图，不启动推理或设备采集，不能据此放宽 profiling 串行要求。
-源回放对照同次 profile；完整性能对照预选的正常 HTTP 样本；结构比较使用实际展开图，不先填 target 成本。
-结构报告分开列出对应覆盖、工作量、资源分组和可达性差异，不合成万能相似度，也不把未观测项算作通过。
+实验用 `--experiment-reports` 保留源回放和实际展开结构，再独立 `evaluate`；三份报告的含义见[验证说明](validation/hicache_validation.md#三份报告分别证明什么)。
+结构构图可按 `--model-run-jobs` 并行，默认一、各输出独立，不启动设备采集或放宽 profiling 串行规则。
+代表 target 只证明已比较范围，其他格明确未请求；完整 HTTP 仍须全部选中格的正常真值。
+操作、工作量、资源与完成点可达性分别比较，不先填 target 成本，也不合成整图相似度。
 HiCache effect 包括“不需要执行”的决策；Decode 机会由目标侧分配调用、prompt 身份和后续 forward 独立关联，
 不是复制预测结果。缺关联单列 target_observation_blockers，不能当作没有工作。
 
-原生算子和重建调用分区比较，未对应的工作、逻辑等待及其他合成节点分别计数。
-比较可穿过中间节点，但这不证明中间 CPU/control、物理资源身份或所有底层操作已经对应。
-同族重复调用重排、未知标签、内部连接及完整原生结构仍有覆盖限制，计数或连接特征一致不等于全图同构。
+原生和重建调用分区比较，未对应工作、逻辑等待及其他合成节点另计。
+可达性可以穿过中间节点，不证明中间工作或物理身份已对应，也不证明全图同构。
 默认保留紧凑摘要；显式 diagnostics full 才保留详细问题清单。重新运行同一目录时清理旧报告，
 防止关掉报告后误读旧文件；dry-run 不执行这种清理，原始采集不受影响。
-可达性差异始终完整计数；详细报告的 missing/extra 关系各保留至多 64 个示例，
-并注明示例是否截断。这只是限制报告大小，不减少比较范围，也不把差异当作通过。
 
 ### 核心存储与执行约束
 

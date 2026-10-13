@@ -5,10 +5,15 @@
 当前建模主线是 SGLang HiCache 的 I/O/control 与 Prefill/Decode 变化：
 
 ```text
-base profile -> 原始 DAG 与源观测
-原始 DAG + target config + workload -> 目标操作、依赖和条件执行规则
-目标工作 + 可迁移的 base 成本 + 独立成本模型 -> 执行与完整 HTTP E2E
+用户提供平台、model、base config、workload 和 target config 集合
+  ├─ 采集 base → 原始 DAG → 目标工作与依赖规则 ─┐
+  └─ 独立性能采集 → 性能数据库 → 成本模型 ──────┴─ 填成本、仿真 → HTTP E2E
 ```
+
+base 主线解释执行结构，并迁移明确未变化的操作成本；性能主线长期积累独立测量，
+分别维护计算、I/O 和控制等成本模型。模型消费目标 DAG 的工作描述，供整组 target 及后续预测复用，
+不依附于某次 base 采集，也不要求采集每个 target。预测本身不读取 target trace。
+两条主线是职责分工，不是并行占用设备。超时等条件由同一执行时钟展开，不另做一套时间推算。
 
 HiCache I/O/control（内部 scope ID 为 `hicache_direct`）、Prefill 和 Decode 分别建模。默认预测不排除 gap 或未归属成本；仍沿用 base 的残余等待等近似，会随结果说明。执行完成不等于精度达标，当前执行式预测的分项归属评分尚不完整。
 
@@ -78,14 +83,18 @@ scripts/model.sh build-dag \
 
 该入口不要求 HiCache。以下 HiCache 预测流程只适用于 SGLang。
 
-从 [最小组配置](configs/modeling/hicache_group_example.json) 开始：复制为自己的配置文件，
-将 `base_manifests` 和 `cost_model` 中的占位路径换成实际输入，声明实际资源环境，按需修改 target 配置及输出目录。然后先运行：
+首次使用时，在普通采集配置中声明模型、base 启动参数及 workload，用组配置的 `profile_suite` 引用它，
+再提供 `target_configs`、成本依据、输出目录及采集预算。只有一个 base 的配置不必重复填写 base/workload 选择，
+不要求构造矩阵，也不要求先手工生成 manifest。完整例子见[首次准备](docs/modeling_development.md#首次准备)。
+
+已有采集可从 [复用组配置](configs/modeling/hicache_group_example.json) 开始：替换 `base_manifests` 和 `cost_model`
+路径，声明实际资源环境，修改 target 及输出目录。两种方式使用同一入口：
 
 ```bash
 scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
 ```
 
-最小配置没有补采预算，不启动额外设备采集；检查可能从 base trace 构图并写出报告。
+复用示例没有补采预算，不启动额外设备采集；检查可能从 base trace 构图并写出报告。
 缺少依据时，按[组准备说明](docs/modeling_development.md#5-一个-base-组)声明已有校准或补采预算。
 输入齐备后执行：
 
@@ -93,15 +102,22 @@ scripts/model.sh prepare-hicache --group <group_request.json> --dry-run
 scripts/model.sh prepare-hicache --group <group_request.json>
 ```
 
-prepare 使用已经离线训练的独立成本包组织组预测。base 提供原始图和工作确实未变化的对应成本，
-不自动入库或在线拟合；变化或新增操作查询独立模型。历史测量通过 `cost-db import/train` 显式准备。
+prepare 使用独立成本包组织组预测；也可用 `cost_database` 和 `cost_training` 代替 `cost_model`，
+由入口先从已有独立数据离线生成组成本包。已有成本包优先，不自动重训；恢复产生的新包留在组输出，不覆盖共享输入包。
+base 提供原始图和工作确实未变化的对应成本，不自动入库或在线拟合；变化或新增操作查询独立模型。
+历史测量通过 `cost-db import` 显式入库，模型定义和适用范围仍须明确声明。
+平台性能维护使用 `scripts/model.sh prepare-costs --request <performance_request.json>`：
+声明独立采样配置或已有测量，入口负责串行采集、同源 CPU 校正、去重入库和离线训练，不需要 target 组。
+具体输入见[独立性能准备](docs/modeling_development.md#独立性能准备)。已有适用包可直接交给应用预测。
+物理采集只发布测量与来源，成本库不保存其旧拟合参数；服务响应在离线训练时生成。
+新平台没有适用成本数据时，须声明独立采样域和模型定义；入口不凭空推断未知框架、操作或所有变量组合。
 共享补采默认关闭，显式开启并提供累计预算后才执行；合法分支缺少成本时报告缺口，不填零或删掉操作。
 新流程不保证任意组只靠 base 或现有数据库就能完成预测，部署适用性与数据覆盖须分别检查。
 当前实验证据限定于已声明的框架、模型、TP、后端和请求条件，不宣称任意配置均受支持。
 最新精度、结构覆盖及这轮精简的验证状态统一见[当前进展](docs/work_progress.md)。
 
-先看输出目录的 `group_summary.json` 了解准备状态与停止原因，再按其中的预测结果路径查看
-`workflow_summary.json`：`prediction.cells` 包含各格完整 HTTP 时间、执行状态和成本局限。
+输出目录的 `group_summary.json` 直接给出准备状态、停止原因及 `prediction.cells` 中的各目标完整 HTTP 时间和成本局限；
+需要查询来源或单格复现时，再打开其中引用的 `workflow_summary.json` 和运行配置。
 失败格时间为 null，不算作零。结果文件、补采预算及失败处理详见[建模使用说明](docs/modeling_development.md)。
 
 有 target 实测时，再对已完成的预测独立评分：

@@ -11,6 +11,15 @@
 
 业务流程不能要求用户串联内部 bundle builder、score runner 或多套模型入口。
 
+正式使用从平台/框架、model、base config、workload 和 target config 集合开始；
+流程负责采集 base、接收 manifest、构建原始 DAG 和推演目标结构。已有 manifest 是复用方式，不是唯一入口。
+独立性能采集、数据库和成本模型是长期维护的另一条主线，在成本填充与仿真阶段汇合；
+不按 target 建专用库，不要求应用用户手工连接内部阶段。两条主线不意味着并行设备采集。
+性能测量和训练属于平台性能维护；已有适用模型直接复用，不在每次 target 预测时重新采集、训练。
+`prepare-costs` 独立组织显式采样、去重入库与离线训练；其输入不接收 target 组或评分，
+与应用准备共用采集和成本接口，不另建一套采样/拟合规则。
+新平台的库和模型尚未准备好时，应报告性能准备的缺口，不能把实验矩阵或 target 实测变成应用前提。
+
 ## 2. 数据边界
 
 - profile manifest 是 profiling 与 modeling 的唯一交接点；
