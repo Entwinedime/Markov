@@ -210,7 +210,12 @@ def _attention_call(original: Callable[..., Any], phase: str) -> Callable[..., A
             seen[key] = descriptor_id
 
         return invoke_runtime_call(
-            original, (backend, q, k, v, layer, forward_batch, *args), kwargs, fields, "runtime.phase.attention", remember
+            original,
+            (backend, q, k, v, layer, forward_batch, *args),
+            kwargs,
+            fields,
+            "runtime.phase.attention",
+            remember,
         )
 
     return observed

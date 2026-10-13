@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from ..common.io import load_json
 from ..common.naming import sanitize
 from ..common.manifest import profile_labels
+from ..common.paths import require_repo_path
 
 
 INTERNAL_SUITE_KEYS = {"experiments", "matrix", "continue_on_error", "$unset"}
@@ -241,6 +243,31 @@ def expand_suite(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         merged["metadata"] = metadata
         expanded.append(merged)
     return expanded
+
+
+def profile_experiments(suite: dict[str, Any]) -> list[dict[str, Any]]:
+    """Resolve ordinary template identities for selection and token recording.
+
+    A config's name identifies its base, not the workload inside its template.
+    Explicit input labels remain unchanged; neither the input config nor its
+    workload is modified. Other drivers keep the normal profiling labels.
+    """
+
+    # Template command parsing is needed here, not for general suite expansion.
+    from ..workload_template.cli import parse_workload_command
+
+    experiments = expand_suite(suite)
+    for index, experiment in enumerate(experiments):
+        metadata = experiment.get("metadata", {})
+        if metadata.get("suite_input_id") or metadata.get("workload_id"):
+            continue
+
+        args = parse_workload_command(experiment["bench"]["command"])
+        if args is not None and args.template:
+            workload_id = load_json(require_repo_path(args.template))["id"]
+            experiments[index] = {**experiment, "metadata": {**metadata, "workload_id": workload_id}}
+
+    return experiments
 
 
 def filter_suite_experiments(

@@ -241,7 +241,9 @@ def _parse_events(raw: Any, target_id: str) -> dict[str, str]:
         if phase not in {"start", "end"}:
             raise ValueError(f"python_probe target {target_id!r} events contains unsupported phase {phase!r}")
         if not isinstance(event_name, str) or not event_name:
-            raise ValueError(f"python_probe target {target_id!r} event name for phase {phase!r} must be a non-empty string")
+            raise ValueError(
+                f"python_probe target {target_id!r} event name for phase {phase!r} must be a non-empty string"
+            )
         events[phase] = event_name
     if not events:
         raise ValueError(f"python_probe target {target_id!r} events must not be empty")

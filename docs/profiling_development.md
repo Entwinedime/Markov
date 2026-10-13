@@ -19,6 +19,8 @@ scripts/profile.sh <experiment.json>
 
 普通采集不要求矩阵。suite 先展开、预检查全部选中实验，再严格串行执行，
 避免 NPU、host 和 storage 状态跨 cell 干扰。配置与参数来自文件和命令行，不读取 stdin。
+配置展开及普通模板的 workload 身份解析归 `profiling/suite.py`；base 准备和独立性能采集共用，
+不在各自工作流维护另一套解析。已有源与 CPU 配对的预测路径不加载采集规划，只有缺输入时才进入采集。
 dry-run 检查配置、命令及 workload 格式并写出计划，不启动服务、不清理存储、不生成 token capture bundle，
 也不证明运行时缓存状态或设备语义正确。
 
@@ -112,6 +114,8 @@ scripts/profile.sh configs/experiments/hicache_manual_workload/profiling_full_da
 
 受控 token 是复现实验选项，不是普通预测必须人工串联的第二套流程。
 它固定真实请求顺序、输入和输出 token，使不同配置看到相同 workload。
+组的首次准备可从普通模板命令自动安排记录与回放，不要求手工补 replay 参数；
+下述命令用于单独采集与复用，具体选择由[组准备入口](modeling_development.md#首次准备)组织。
 
 ```bash
 scripts/profile.sh configs/experiments/hicache_manual_workload/no_profile_capture.json
@@ -162,7 +166,9 @@ suite、token 和 profile 均写入当次组目录；失败、超时、无效输
 
 物理采样不运行 target workload，页宽域由采样声明，不从 target 列表倒推。
 DMA 的 `runtime-dma` 入口需要 base-report 提供模型几何、设备和 NUMA 信息，
-当前只支持两字节 KV；原始 DMA 样本保留，新服务合入报告，不覆盖其他服务。
+当前只支持两字节 KV；原始 DMA 样本保留，报告合入原始测量来源，不拟合或保存服务系数。
+存储报告保留采样域、所选工作点及测量条件，预取保留阶段计时；原服务的来源继续保留，
+补采成功只表示完成测量。成本参数及辨识缺口由独立数据库的离线训练处理，不由采集报告决定。
 固定 device-capacity-tokens 可保持真实缓存池的 shape/stride；缺省按最大操作分配，不等价于实际布局。
 文件预取 sampler 记录实际框架分段时钟，不再在 worker 内启动 Torch profiler。
 空闲同步及各类计时原语的适用范围见成本文档，采样成功不表示整组成本已齐备。
@@ -176,6 +182,9 @@ Python probe 默认 snapshot-free，只读现有 Python 标量、容器长度与
 不读取 tensor 内容、不复制缓存、不增加设备同步。DAG consumer 即使 diagnostics=off，
 也需要请求响应、CPU 通信、层等待、分配及 phase 边界；只做 state/input-contract 时不安装这些 DAG 观测。
 manifest 的 python_runtime_probes 记录选择，实际覆盖仍由建模检查。
+
+缓存查询同时记录缓存树与控制器的对象关系，不需要 snapshot 或实际写回/回载来建立身份。
+建模只接受这类直接关系或明确的调用/请求对应，不按最近时间或“只有一棵树”猜测。
 
 ### 正式观测分别说明什么
 

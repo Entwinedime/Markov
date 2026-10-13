@@ -11,13 +11,16 @@ from .paths import map_repo_path, require_repo_path
 def profile_labels(config: dict[str, Any], fallback: str = "") -> tuple[str, str]:
     """Return config/workload labels; matrix labels precede ordinary metadata.
 
-    Labels select and display inputs, not model parameters. Callers reading an
-    existing manifest may supply its run name when neither label was declared.
+    Labels select and display inputs, not model parameters. Ordinary configs
+    use their name or id without requiring matrix metadata. A manifest reader
+    can supply its run identity for a config that declares neither.
     """
     metadata = config.get("metadata", {})
+    identity = str(config.get("name") or config.get("id") or fallback)
+
     return (
-        str(metadata.get("suite_server_id") or metadata.get("config_id") or fallback),
-        str(metadata.get("suite_input_id") or metadata.get("workload_id") or fallback),
+        str(metadata.get("suite_server_id") or metadata.get("config_id") or identity),
+        str(metadata.get("suite_input_id") or metadata.get("workload_id") or identity),
     )
 
 

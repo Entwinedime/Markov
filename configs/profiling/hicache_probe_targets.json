@@ -19,6 +19,10 @@
         "source": "hicache_cache_scope:self"
       },
       {
+        "name": "controller_scope",
+        "source": "hicache_cache_scope:self.cache_controller"
+      },
+      {
         "name": "seq_no",
         "source": "hicache_seq:self"
       },
