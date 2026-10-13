@@ -1,6 +1,4 @@
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/hicache_release.hpp"
-#include "markov/trace_graph/cost/missing_evidence.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
@@ -14,20 +12,12 @@ namespace markov::trace_graph::modules::hicache::runtime {
 void HiCacheWriteCalls::bind_capacity_calls(const patch::HiCacheSourceDagIndex & source) {
     const auto & graph = source.graph();
     std::map<std::pair<std::string, std::string>, std::map<size_t, size_t>> samples;
-    const auto lanes = [&](const HiCacheHostExpansion & plan, const std::string & pid, const std::string & tid) {
-        std::vector<size_t> result;
-        const auto add = [&](size_t node) {
-            const auto lane = graph.node(node).lane_id;
-            result.push_back(lane);
-            samples[{ pid, tid }].emplace(lane, node);
-        };
-        for (const auto node : plan.resource_nodes()) add(node);
-        return result;
-    };
     for (const auto & [key, resources] : write_resources_) {
         for (const auto node : { resources.compute, resources.transfer }) samples[key].emplace(graph.node(node).lane_id, node);
     }
-    for (auto & donor : eviction_controls_) donor.position_lanes = lanes(donor.expansion, donor.pid, donor.tid);
+    for (const auto & fragment : observed_eviction_fragments_)
+        for (const auto node : fragment.resources) samples[{ fragment.pid, fragment.tid }].emplace(graph.node(node).lane_id, node);
+
     for (const auto & guard : capacity_guards_) {
         const bool existing = std::ranges::any_of(source.fact_nodes(), [&](const auto & fact) {
             return fact.fact_role == "capacity_result_observed" && fact.phase == "end" && fact.pid == guard.pid && fact.tid == guard.tid
@@ -80,22 +70,23 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
         };
         return operator_provider_.estimate(work).duration_us;
     };
-    EvictionControl calibrated{};
+    HiCacheHostExpansion step_plan;
+    std::vector<size_t> step_lanes;
     std::vector<size_t> acknowledgement_slots;
     auto release_buffer_pages = work->release_buffer_pages;
-    const auto select_host = [&](const HiCacheEvictionStep & step) -> const EvictionControl & {
+    const auto select_host = [&](const HiCacheEvictionStep & step) -> const HiCacheHostExpansion & {
         if (step.kind == Kind::Control) {
-            calibrated.expansion = generate_cpu_control(call.lane, "target eviction control");
+            step_plan = generate_cpu_control(call.lane, "target eviction control");
             const auto implementation = eviction_control_name(step.control_phase);
             const auto cpu_us = predict_control("eviction.control", implementation, "cpu_service");
             // Residual intervals have separate observations and models. They
             // are a measured approximation, not additional CPU execution.
             const auto residual_us = predict_control("eviction.control", implementation, "residual_interval");
             auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
-            bind_cpu_control(calibrated.expansion, cpu_us, residual_us, remainder);
-            calibrated.position_lanes.clear();
+            bind_cpu_control(step_plan, cpu_us, residual_us, remainder);
+            step_lanes.clear();
             ++generated_control_steps_;
-            return calibrated;
+            return step_plan;
         }
         if (step.kind == Kind::BlockingCheck) {
             std::vector<structure::hicache::WriteConfirmationBatch> batches;
@@ -108,15 +99,15 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             const auto program = structure::hicache::write_confirmation_program(batches, true);
             const auto & resources = write_resources_.at({ call.pid, call.tid });
             auto generated = generate_write_confirmation(*graph_, call.entry_node, resources.worker, program);
-            bind_write_confirmation(generated, program, operator_provider_);
-            calibrated.expansion = std::move(generated.plan);
+            bind_host_operations(generated.plan, generated.operations, operator_provider_, "confirmation_independent_model");
+            step_plan = std::move(generated.plan);
             acknowledgement_slots = std::move(generated.acknowledgements);
-            calibrated.position_lanes.clear();
+            step_lanes.clear();
             ++generated_blocking_checks_;
-            return calibrated;
+            return step_plan;
         }
         if (step.kind == Kind::SkipLocked) {
-            calibrated.expansion = generate_cpu_control(call.lane, "target locked eviction candidate");
+            step_plan = generate_cpu_control(call.lane, "target locked eviction candidate");
             const structure::OperationWork primitive{
                 "hicache_io_control",
                 "eviction.locked_candidate",
@@ -128,25 +119,27 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             auto & remainder = control_cost_remainders_[{ call.pid, call.tid }];
             // The isolated primitive measures thread CPU only. It is not a
             // calibration of scheduler delay or an entire eviction envelope.
-            bind_cpu_control(calibrated.expansion, cpu_us, 0, remainder);
-            calibrated.position_lanes.clear();
-            return calibrated;
+            bind_cpu_control(step_plan, cpu_us, 0, remainder);
+            step_lanes.clear();
+            return step_plan;
         }
         if (step.kind == Kind::ReleaseBackup || step.kind == Kind::ReleaseRegular) {
             const auto pages = work->victims.at(*step.victim).page_count;
             const auto & resources = write_resources_.at({ call.pid, call.tid });
-            auto generated = generate_paged_release(*graph_, call.entry_node, resources.worker, resources.compute, page_size_ > 1);
-            const auto costs = cost::estimate_paged_release(operator_provider_,
-                                                            pages,
-                                                            page_size_,
-                                                            release_buffer_pages,
-                                                            step.kind == Kind::ReleaseBackup,
-                                                            allocator_need_sort_);
-            bind_paged_release(generated, costs);
-            calibrated.expansion = std::move(generated.plan);
-            calibrated.position_lanes = calibrated.expansion.resource_lanes(*graph_);
+            auto generated = generate_paged_release(*graph_,
+                                                    call.entry_node,
+                                                    resources.worker,
+                                                    resources.compute,
+                                                    pages,
+                                                    page_size_,
+                                                    release_buffer_pages,
+                                                    step.kind == Kind::ReleaseBackup,
+                                                    allocator_need_sort_);
+            bind_host_operations(generated.plan, generated.operations, operator_provider_);
+            step_plan = std::move(generated.plan);
+            step_lanes = step_plan.resource_lanes(*graph_);
             release_buffer_pages = core::checked_add_u64(release_buffer_pages, pages, "Target release buffer overflow");
-            return calibrated;
+            return step_plan;
         }
         throw std::logic_error("Unsupported target eviction step");
     };
@@ -179,8 +172,8 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
             last = expanded.host_return;
         }
         else {
-            const auto & donor = select_host(step);
-            check_positions(donor.position_lanes);
+            const auto & plan = select_host(step);
+            check_positions(step_lanes);
             std::vector<size_t> events;
             if (step.kind == Kind::BlockingCheck)
                 for (const auto & write : queued) {
@@ -188,7 +181,7 @@ std::optional<size_t> HiCacheWriteCalls::expand_capacity(Call & call, const HiCa
                     if (completion == completions_.end()) throw std::runtime_error("Capacity check refers to an unsubmitted target write");
                     events.push_back(completion->second);
                 }
-            const auto expanded = sequence.append(donor.expansion, donor.position_lanes, events);
+            const auto expanded = sequence.append(plan, step_lanes, events);
             last = expanded.host_return;
             if (step.kind == Kind::BlockingCheck)
                 for (const auto slot : acknowledgement_slots) capacity_ack_.emplace(expanded.nodes.at(slot), call.owner);

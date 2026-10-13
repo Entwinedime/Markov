@@ -9,6 +9,15 @@
 #include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/source_dag/load_admission.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
@@ -61,8 +70,8 @@ public:
     [[nodiscard]] size_t source_submissions() const { return submissions_; }
     [[nodiscard]] size_t completed_writes() const { return writes_.completed(); }
     [[nodiscard]] size_t resumed_allocations() const { return resumed_; }
-    [[nodiscard]] size_t prepared_templates() const { return templates_.size(); }
-    [[nodiscard]] size_t prepared_eviction_controls() const { return eviction_controls_.size(); }
+    [[nodiscard]] size_t observed_write_fragments() const { return observed_write_fragments_.size(); }
+    [[nodiscard]] size_t observed_eviction_fragments() const { return observed_eviction_fragments_.size(); }
     [[nodiscard]] size_t expanded_submissions() const { return expanded_; }
     [[nodiscard]] size_t generated_control_steps() const { return generated_control_steps_; }
     [[nodiscard]] size_t generated_blocking_checks() const { return generated_blocking_checks_; }
@@ -84,7 +93,7 @@ private:
     };
     // Candidate load/capacity resources are required only when target work uses
     // them. Other calls fail immediately if their observed resource is unbound.
-    void bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const HiCacheHostExpansion & plan, bool candidate = false);
+    void bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate = false);
     [[nodiscard]] std::vector<HiCacheHostExpansion *> host_plans();
     void bind_capacity_calls(const patch::HiCacheSourceDagIndex & source);
     void replace_source_evictions(core::DagGraph & graph, uint64_t begin, uint64_t end);
@@ -102,15 +111,14 @@ private:
     const core::DagGraph * graph_ = nullptr;
     HiCacheWrites writes_;
     HiCacheWriteStreamInsertions & stream_insertions_;
-    struct WriteTemplate {
-        std::optional<bool> write_back;
-        size_t compute_record = 0;
-        HiCacheWriteExpansion expansion;
+    // Resource witnesses admitted from source fragments. Retain only role
+    // and insertion identities, not a second copy of source topology/costs.
+    struct ObservedWriteFragment {
         std::string pid, tid;
-        std::vector<size_t> position_lanes;
-        bool independent = false;
+        size_t main, compute_record, payload;
+        std::vector<size_t> resources;
     };
-    std::map<size_t, WriteTemplate> templates_;
+    std::map<size_t, ObservedWriteFragment> observed_write_fragments_;
     struct WriteResources {
         size_t compute, worker, transfer;
         std::vector<size_t> position_lanes;
@@ -120,14 +128,14 @@ private:
     // ownership of their host continuation and allocation return boundaries.
     HiCacheExpandedWrite submit_target_write(const WriteResources & resources, const HiCacheFact & fact, const model::HiCacheDeviceWrite & operation,
                                              HiCacheHostSequence & sequence, simulation::FutureDag & future);
-    struct EvictionControl {
+    struct ObservedEvictionFragment {
         std::string pid, tid;
-        HiCacheEvictionRegion region;
-        HiCacheHostExpansion expansion;
-        std::vector<size_t> position_lanes;
-        bool independent = false;
+        std::vector<size_t> resources;
+        // A release can prove compute without owning a retained main node.
+        // Loads may use that stream; a write binding requires both identities.
+        std::optional<size_t> main, compute;
     };
-    std::vector<EvictionControl> eviction_controls_;
+    std::vector<ObservedEvictionFragment> observed_eviction_fragments_;
     std::vector<HiCacheCapacityGuard> capacity_guards_;
     std::vector<HiCacheLifecycleInsert> lifecycle_inserts_;
     std::map<size_t, std::vector<Call>> lifecycle_writes_at_;

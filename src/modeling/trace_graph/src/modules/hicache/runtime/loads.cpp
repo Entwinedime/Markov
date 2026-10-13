@@ -1,7 +1,6 @@
 #include "markov/trace_graph/modules/hicache/runtime/loads.hpp"
 #include "markov/trace_graph/core/cpu_gap_observation.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
@@ -18,12 +17,10 @@ void HiCacheLoads::bind(core::DagGraph & graph, model::HiCacheModelReplay & repl
     const patch::HiCacheSourceDagIndex source(graph);
     const auto ledger = patch::build_hicache_io_operation_ledger(source);
     const auto waits = observe_hicache_layer_waits(source);
-    // Timing probes name the controller object; state facts name its radix
-    // tree. Nonempty loads prove the association through node/request identity.
-    // A nested write_backup/start_writing call proves the same object relation
-    // without requiring this base to contain a nonempty load. Empty calls reuse
-    // either explicit association, never a nearest-request or single-tree guess.
-    auto tree_scopes = observe_write_controller_scopes(source);
+    // Query facts name the radix tree and its controller directly. Nested
+    // writes or nonempty loads also prove the relation in source observations.
+    // Empty calls reuse proven identity, never a nearest-request/single-tree guess.
+    auto tree_scopes = observe_controller_scopes(source);
     for (const auto & record : ledger.records) {
         if (record.kind != patch::HiCacheIoOperationKind::Load || record.request_id.empty() || record.cache_scope.empty()) continue;
         for (const auto & item : replay.facts()) {
@@ -141,8 +138,7 @@ void HiCacheLoads::advance(size_t node, uint64_t time, simulation::FutureDag & f
                 if (!page_bytes_ || bytes % page_bytes_) throw std::runtime_error("Target load is not whole KV pages");
                 const auto & p = program->second;
                 auto built = generate_page_first_submission(*graph_, p.main, p.worker, p.compute, p.stream, bytes / page_bytes_, page_bytes_, p.layers, "load");
-                const auto costs = cost::estimate_load_submission(operator_provider_, bytes, page_bytes_, p.layers);
-                bind_page_first_submission(built, costs);
+                bind_host_operations(built.plan, built.operations, operator_provider_);
                 ++shared_cost_batches_;
                 const std::vector<size_t> lanes{ graph_->node(p.compute).lane_id, graph_->node(p.stream).lane_id, graph_->node(p.compute).lane_id };
                 HiCacheHostSequence sequence(insertion.positions, stream_insertions_, future);

@@ -43,7 +43,7 @@ const core::TraceEvent * unique_producer(const Producers & producers, const std:
 } // namespace
 
 void resolve_attention_cache_layouts(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                     const modules::hicache::HiCachePhaseObservationAudit & phases, AttentionCallAudit & attention) {
+                                     const PhaseCallPositions & positions, AttentionCallAudit & attention) {
     const auto & graph = source.graph();
     const auto & events = graph.runtime_observations();
     std::vector<std::pair<size_t, uint64_t>> unresolved;
@@ -64,7 +64,6 @@ void resolve_attention_cache_layouts(const modules::hicache::patch::HiCacheSourc
     }
     if (unresolved.empty()) return;
 
-    const auto positions = phase_call_positions(phases);
     std::map<Identity, Producers> producers;
     for (size_t index = 0; index < events.size(); ++index) {
         const auto & event = events[index];

@@ -11,7 +11,23 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-std::map<std::pair<std::string, std::string>, std::string> observe_write_controller_scopes(const patch::HiCacheSourceDagIndex & source) {
+std::map<std::pair<std::string, std::string>, std::string> observe_controller_scopes(const patch::HiCacheSourceDagIndex & source) {
+    std::map<std::pair<std::string, std::string>, std::string> scopes;
+    const auto associate = [&](const std::string & pid, const std::string & controller, const std::string & tree) {
+        const auto [at, inserted] = scopes.emplace(std::pair{ pid, controller }, tree);
+        if (!inserted && at->second != tree) throw std::runtime_error("Controller maps to multiple cache trees");
+    };
+    for (const auto events : { std::span<const core::TraceEvent>(source.graph().hicache_fact_events()),
+                               std::span<const core::TraceEvent>(source.graph().prelude_context_events()) }) {
+        for (const auto & event : events) {
+            const auto controller = event.arg("controller_scope");
+            if (controller.empty()) continue;
+
+            const auto metadata = parse_hicache_fact_metadata(event);
+            if (metadata.fact_class == "workload_identity" && metadata.role == "cache_lookup_input") associate(event.pid, controller, event.arg("cache_scope"));
+        }
+    }
+
     // Prelude facts already survive window trimming for state reconstruction.
     // Read only identity/enclosure here; never import their CPU/device work.
     struct Call {
@@ -28,15 +44,13 @@ std::map<std::pair<std::string, std::string>, std::string> observe_write_control
         const auto role = parse_hicache_fact_metadata(event).role;
         if (relevant(role)) calls.push_back({ role, event.pid, event.tid, event.arg("cache_scope"), event.ts, event.ts + event.dur });
     }
-    std::map<std::pair<std::string, std::string>, std::string> scopes;
     for (const auto & call : calls) {
         if (call.role != "commit_device_to_host_io_observed" || call.scope.empty()) continue;
         for (const auto & tree : calls) {
             if (tree.role != "commit_device_to_host_enqueue_observed" || tree.scope.empty() || tree.pid != call.pid || tree.tid != call.tid
                 || tree.begin > call.begin || tree.end < call.end)
                 continue;
-            const auto [at, inserted] = scopes.emplace(std::pair{ call.pid, call.scope }, tree.scope);
-            if (!inserted && at->second != tree.scope) throw std::runtime_error("Write controller maps to multiple cache trees");
+            associate(call.pid, call.scope, tree.scope);
         }
     }
     return scopes;

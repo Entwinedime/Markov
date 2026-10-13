@@ -1,15 +1,13 @@
 #pragma once
 #include "markov/trace_graph/core/dag_graph.hpp"
-#include "markov/trace_graph/cost/hicache_release.hpp"
-#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/simulation/topological_simulator.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string_view>
-#include <utility>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
@@ -19,11 +17,19 @@ struct LoadIndexResources {
 };
 
 /** Local numeric slots for one declared host operation. These identities do
- * not contain costs; binding may change durations, never topology or resources. */
+ * not contain costs; binding may change durations, never topology or resources.
+ * A CPU-only task uses worker without device/worker_return. Multiple device
+ * launches each have their own worker segment; they replace the parent device
+ * charge, not the caller, task-return or optional caller-tail scopes. */
 struct HostOperationSlots {
+    struct DeviceLaunch {
+        size_t worker, device;
+    };
     size_t main;
     std::optional<size_t> worker, device;
     std::optional<size_t> worker_return;
+    std::optional<size_t> tail;
+    std::vector<DeviceLaunch> device_launches;
 };
 
 /** Bind a worker segment's service/residual interval in microseconds.
@@ -36,17 +42,31 @@ void bind_worker_segment(core::DagSyntheticNodeSpec & worker, uint64_t service_u
 void bind_host_operation(HiCacheHostExpansion & plan, const HostOperationSlots & slots, const cost::HostOperationCost & cost,
                          std::string_view source = "hicache_host_independent_model");
 
-enum class ReleaseOperation { BeforeFirstSync, FirstSync, BeforeSecondSync, SecondSync, Concatenate, Tail };
+/** Work declared by a generator and its numeric binding positions. Repeated
+ * copies/records share one request only when their entire work is identical.
+ * Cost evaluation consumes this declaration; it does not reconstruct roles. */
+struct HostOperationBinding {
+    cost::OperationCostRequest request;
+    std::vector<HostOperationSlots> slots;
+};
+
+/** Resolve all scopes before binding. Does not change the generated plan,
+ * except numeric durations and their provenance; payload I/O stays separate.
+ * Each request and its slots are generated together. Repeated slots receive
+ * the same resolved response, but remain separate execution operations. */
+void bind_host_operations(HiCacheHostExpansion & plan, std::span<const HostOperationBinding> operations, cost::OperatorCostProvider & provider,
+                          std::string_view source = "hicache_host_independent_model");
+
 struct GeneratedPagedRelease {
     HiCacheHostExpansion plan;
-    std::vector<std::pair<ReleaseOperation, HostOperationSlots>> operations;
+    std::vector<HostOperationBinding> operations;
 };
 /** Current Ascend paged immediate-free lowering: host fallback index work
  * synchronizes compute twice, then asynchronously concatenates free pages.
  * Counts and ordering belong to this lowering, not to a calibration sample.
  */
-[[nodiscard]] GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_t main, size_t worker, size_t compute, bool paged = true);
-void bind_paged_release(GeneratedPagedRelease & generated, const cost::PagedReleaseCost & cost);
+[[nodiscard]] GeneratedPagedRelease generate_paged_release(const core::DagGraph & graph, size_t main, size_t worker, size_t compute, uint64_t released_pages,
+                                                           uint64_t page_size, uint64_t buffer_pages, bool backed_up, bool need_sort);
 /** A stream-wait program generated solely from resource identities. Semantic
  * cost slots let the later cost stage bind values without changing topology.
  */
@@ -55,11 +75,10 @@ struct GeneratedLayerWait {
     size_t submit = 0, worker = 0, device = 0, tail = 0, worker_return = 0;
 };
 [[nodiscard]] GeneratedLayerWait generate_layer_wait(const core::DagGraph & graph, size_t main, size_t worker, size_t compute);
-enum class TransferOperation { PrepareSync, IndexSync, StartRecord, WaitEvent, FirstCopy, Copy, FirstCompletionRecord, CompletionRecord, Tail };
 struct GeneratedTransferSubmission {
     HiCacheWriteExpansion plan;
     std::vector<size_t> completion_records;
-    std::vector<std::pair<TransferOperation, HostOperationSlots>> operations;
+    std::vector<HostOperationBinding> operations;
 };
 /** Ascend page_first_direct: index D2H waits for compute, then ordered K/V
  * copies followed by completion records. Framework rules supply one global
@@ -68,10 +87,7 @@ struct GeneratedTransferSubmission {
  */
 [[nodiscard]] GeneratedTransferSubmission generate_page_first_submission(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
                                                                          size_t transfer_stream, size_t pages, uint64_t page_bytes, size_t completion_count,
-                                                                         std::string_view operation);
-/** Fill control service slots only. Payload I/O remains bound separately;
- * page count, completion count, waits and resource lanes are already fixed. */
-void bind_page_first_submission(GeneratedTransferSubmission & generated, const cost::PageFirstSubmissionCost & cost);
+                                                                         std::string_view operation, bool write_back = false);
 /** Bind a worker FIFO to an explicitly identified compute stream using this
  * main lane's submission -> worker -> device evidence. The target operation
  * itself need not have occurred in base; the caller supplies the compute role. */

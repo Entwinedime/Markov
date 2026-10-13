@@ -25,7 +25,8 @@ namespace markov::trace_graph::structure::hicache {
  * operations; later slots are anonymous junctions. Unowned single-successor
  * chains are contracted without expanding all reachable operation pairs.
  * Lane-sharing partitions contain semantic operators,
- * not cross-trace lane ids or proof of physical/internal-path correspondence. */
+ * not cross-trace lane ids or proof of physical/internal-path correspondence.
+ * Reports do not reconstruct unused hypothetical programs or raw envelope inventories. */
 [[nodiscard]] nlohmann::json observed_phase_structure_report(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases);
 
 } // namespace markov::trace_graph::structure::hicache

@@ -779,9 +779,8 @@ std::optional<structure::hicache::AttentionMetadataInputs> observed_attention_me
 }
 
 DenseCallAudit observe_dense_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                   const modules::hicache::HiCachePhaseObservationAudit & phases, const AttentionCallAudit & attention) {
+                                   const PhaseCallPositions & positions, const AttentionCallAudit & attention) {
     DenseCallAudit result;
-    const auto positions = phase_call_positions(phases);
     using Identity = std::tuple<size_t, std::optional<uint64_t>, uint64_t>;
     std::map<Identity, std::vector<size_t>> attention_by_layer;
     const auto & graph = source.graph();
@@ -948,9 +947,8 @@ DenseCallAudit observe_dense_calls(const modules::hicache::patch::HiCacheSourceD
 
 AttentionMetadataAudit observe_attention_metadata_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                         const simulation::detail::CpuTaskQueues & queues,
-                                                        const modules::hicache::HiCachePhaseObservationAudit & phases) {
+                                                        const modules::hicache::HiCachePhaseObservationAudit & phases, const PhaseCallPositions & positions) {
     AttentionMetadataAudit result;
-    const auto positions = phase_call_positions(phases);
     using Round = std::pair<size_t, std::optional<uint64_t>>;
     std::map<Round, size_t> call_counts;
     for (const auto & [node, position] : positions.nodes)
@@ -987,14 +985,13 @@ AttentionMetadataAudit observe_attention_metadata_calls(const modules::hicache::
 }
 
 AttentionCallAudit observe_attention_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                           const modules::hicache::HiCachePhaseObservationAudit & phases) {
+                                           const modules::hicache::HiCachePhaseObservationAudit & phases, const PhaseCallPositions & positions) {
     AttentionCallAudit result;
     if (!phases.ready()) {
         ++result.issues["source_phase_observations_incomplete"];
         return result;
     }
 
-    const auto owners = phase_call_positions(phases);
     std::set<size_t> required_attention_nodes;
     const auto & graph = source.graph();
     for (size_t i = 0; i < phases.observations.size(); ++i) {
@@ -1018,7 +1015,7 @@ AttentionCallAudit observe_attention_calls(const modules::hicache::patch::HiCach
             continue;
         }
 
-        const auto owner = call_phase_position(region.work, owners);
+        const auto owner = call_phase_position(region.work, positions);
         if (!owner || (region.phase == "decode") != owner->decode_iteration.has_value()) {
             ++result.issues["attention_call_phase_ownership_unresolved"];
             continue;
@@ -1036,13 +1033,12 @@ AttentionCallAudit observe_attention_calls(const modules::hicache::patch::HiCach
         }
 
         covered_nodes.insert(region.work.submitted_nodes.begin(), region.work.submitted_nodes.end());
-        result.calls.push_back(
-            { std::move(region), *owner, *conditions, *batch, *write, attention_eager_padding(descriptor) });
+        result.calls.push_back({ std::move(region), *owner, *conditions, *batch, *write, attention_eager_padding(descriptor) });
     }
     for (const auto node : required_attention_nodes)
         if (!covered_nodes.contains(node)) ++result.issues["attention_device_work_without_call"];
     if (result.calls.empty()) ++result.issues["no_complete_attention_calls"];
-    resolve_attention_cache_layouts(source, queues, phases, result);
+    resolve_attention_cache_layouts(source, queues, positions, result);
     return result;
 }
 

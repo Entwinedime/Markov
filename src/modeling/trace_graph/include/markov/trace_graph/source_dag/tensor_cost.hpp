@@ -94,11 +94,10 @@ struct WorkerLaunchObservation {
  * accumulates in measured_devices across calls; source and program are unchanged.
  * Cold preparation can exclude all caller scopes or just one program index,
  * without discarding independently measurable device/worker scopes. */
-void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                         const simulation::detail::CpuTaskQueues & queues, std::span<const structure::TensorOperation> program,
-                                         const std::map<size_t, size_t> & matched, std::set<size_t> & measured_devices, bool cpu_service_applied,
-                                         nlohmann::json & rows, bool include_caller_scopes = true,
-                                         std::optional<size_t> omitted_caller_operation = std::nullopt);
+void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
+                                        std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes = true,
+                                        std::optional<size_t> omitted_caller_operation = std::nullopt);
 
 /** Measure preparation/return intervals between an outer program's consumers.
  * Such programs alternate CPU preparation and a tensor/layer-wait consumer,

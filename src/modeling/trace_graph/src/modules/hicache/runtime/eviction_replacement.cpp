@@ -166,10 +166,10 @@ void HiCacheWriteCalls::replace_source_evictions(core::DagGraph & graph, uint64_
         }
     const patch::HiCacheSourceDagIndex surviving(graph);
     for (auto & call : replacements) {
-        for (const auto & [id, donor] : templates_)
-            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.expansion);
-        for (const auto & donor : eviction_controls_)
-            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.expansion);
+        for (const auto & [id, donor] : observed_write_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.resources);
+        for (const auto & donor : observed_eviction_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(surviving, call, donor.resources);
         if (!graph.node(call.return_node).active) throw std::runtime_error("Eviction replacement removed its allocation return");
         allocation_returns_[call.return_node].push_back(call.owner);
         capacity_at_.emplace(call.entry_node, call.owner);

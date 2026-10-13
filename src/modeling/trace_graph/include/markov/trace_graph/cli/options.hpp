@@ -28,6 +28,7 @@ struct OutputPaths {
 struct CliOptions {
     std::string profile_manifest;
     std::string model_config;
+    std::string target_plan;
     std::string cpu_service_cost;
     std::string prepare_cpu_service;
     std::string cpu_service_output;

@@ -12,14 +12,14 @@ namespace markov::trace_graph::cost {
 
 HostOperationCost estimate_host_operation(OperatorCostProvider & provider, structure::OperationWork work, bool submitted,
                                           std::optional<structure::OperationWork> device_work) {
-    const TensorCostRequest request{ .work = std::move(work), .worker = submitted, .device = submitted, .device_work = std::move(device_work) };
-    return estimate_tensor_costs(std::span<const TensorCostRequest>{ &request, 1 }, provider).front().call;
+    const OperationCostRequest request{ .work = std::move(work), .worker = submitted, .device = submitted, .device_work = std::move(device_work) };
+    return estimate_operation_costs(std::span<const OperationCostRequest>{ &request, 1 }, provider).front().call;
 }
 
-std::vector<TensorOperationCost> estimate_tensor_costs(std::span<const TensorCostRequest> requests, OperatorCostProvider & provider) {
+std::vector<OperationCost> estimate_operation_costs(std::span<const OperationCostRequest> requests, OperatorCostProvider & provider) {
     // Allocate destinations before taking references. No vector holding these
     // values grows after its references are recorded, and none escapes here.
-    std::vector<TensorOperationCost> result(requests.size());
+    std::vector<OperationCost> result(requests.size());
     std::vector<uint64_t> readback_sync_us(requests.size());
     std::vector<structure::OperationWork> work;
     std::vector<uint64_t *> destinations;
@@ -36,8 +36,20 @@ std::vector<TensorOperationCost> estimate_tensor_costs(std::span<const TensorCos
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto & request = requests[i];
         auto & estimate = result[i];
-        host(request.work, estimate.call);
-        if (request.worker) {
+        if (request.main_service_work) {
+            const auto & service = *request.main_service_work;
+            append(service, service.timing_scope, estimate.call.main_us);
+            append(request.work, "residual_interval", estimate.call.main_residual_us);
+        }
+        else { host(request.work, estimate.call); }
+
+        if (request.worker_work) {
+            const auto & task = *request.worker_work;
+            append(task, "worker_service", estimate.call.worker_us);
+            append(task, "worker_residual_interval", estimate.call.worker_residual_us);
+            append(task, "dispatch_interval", estimate.call.dispatch_us);
+        }
+        else if (request.worker) {
             append(request.work, "dispatch_interval", estimate.call.dispatch_us);
             append(request.work, "worker_return_service", estimate.call.worker_return_us);
             append(request.work, "worker_return_residual_interval", estimate.call.worker_return_residual_us);

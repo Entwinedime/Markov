@@ -49,8 +49,8 @@ struct AscendAllocatorInputs {
  * the final .int() is a host-only no-op. Views/slicing free_pages create no
  * device work. The input dtype is observed deployment/call metadata.
  */
-[[nodiscard]] std::optional<std::vector<TensorOperation>>
-    ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs);
+[[nodiscard]] std::optional<std::vector<TensorOperation>> ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+                                                                                          const AscendAllocatorInputs & inputs);
 
 /** Common extend prefix before either fused or naive allocation: optional
  * device page counting/readback and the target queue merge. This is explicitly
@@ -58,9 +58,9 @@ struct AscendAllocatorInputs {
  * caller supplies whether it already computed num_new_pages; current ordinary
  * alloc_for_extend does not. No kernel-preparation cost belongs to this prefix.
  */
-[[nodiscard]] std::optional<std::vector<TensorOperation>>
-    ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
-                                   const std::string & prefix_dtype, bool page_count_supplied);
+[[nodiscard]] std::optional<std::vector<TensorOperation>> ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+                                                                                         const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
+                                                                                         bool page_count_supplied);
 
 /** Conservative whole-call migration within the same declared allocator ABI
  * and resource deployment. Unknown queue/pointer metadata cannot prove reuse.
@@ -88,18 +88,19 @@ struct AllocatorPreparation {
  * here. A required preparation is inside this program; callers replacing the
  * whole region must not additionally bind its old standalone preparation slot.
  */
-[[nodiscard]] std::optional<std::vector<TensorOperation>>
-    ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
-                                          const std::string & prefix_dtype, bool page_count_supplied, const AllocatorPreparation & preparation);
+[[nodiscard]] std::optional<std::vector<TensorOperation>> ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+                                                                                                const AscendAllocatorInputs & inputs,
+                                                                                                const std::string & prefix_dtype, bool page_count_supplied,
+                                                                                                const AllocatorPreparation & preparation);
 
 /** Naive large-page extend: retain the framework's scalar readbacks and
  * Python branch order, including computation whose result is not consumed.
  * Branch predicates use target lengths, never measured costs or source hits.
  * Views are host preparation, while tensor arithmetic/copy and scalar device
  * readbacks remain separate operations. No Triton preparation is required. */
-[[nodiscard]] std::optional<std::vector<TensorOperation>>
-    ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call, const AscendAllocatorInputs & inputs,
-                                          const std::string & prefix_dtype, bool page_count_supplied);
+[[nodiscard]] std::optional<std::vector<TensorOperation>> ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
+                                                                                                const AscendAllocatorInputs & inputs,
+                                                                                                const std::string & prefix_dtype, bool page_count_supplied);
 
 struct AllocatorPreparationWorkPlan {
     std::string status = "unavailable";

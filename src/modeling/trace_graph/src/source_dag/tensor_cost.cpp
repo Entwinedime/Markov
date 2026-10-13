@@ -532,23 +532,28 @@ nlohmann::json tensor_operator_observations(const modules::hicache::patch::HiCac
     return rows;
 }
 
-void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                         const simulation::detail::CpuTaskQueues & queues, std::span<const structure::TensorOperation> program,
-                                         const std::map<size_t, size_t> & matched, std::set<size_t> & measured_devices, bool cpu_service_applied,
-                                         nlohmann::json & rows, bool include_caller_scopes, std::optional<size_t> omitted_caller_operation) {
+void append_tensor_program_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                        std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
+                                        std::set<size_t> & measured_devices, bool cpu_service_applied, nlohmann::json & rows, bool include_caller_scopes,
+                                        std::optional<size_t> omitted_caller_operation) {
     for (const auto & [position, observation] : matched) {
         const auto & operation = program[position];
         const bool include_caller = include_caller_scopes && position != omitted_caller_operation;
-        for (auto & row : tensor_operator_observations(source, queues, operation.work, observation, measured_devices, cpu_service_applied,
-                                                       include_caller, operation.device_launches))
+        for (auto & row : tensor_operator_observations(source,
+                                                       queues,
+                                                       operation.work,
+                                                       observation,
+                                                       measured_devices,
+                                                       cpu_service_applied,
+                                                       include_caller,
+                                                       operation.device_launches))
             rows.push_back(std::move(row));
     }
 }
 
-nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                 const SubmittedCallRegion & region, std::span<const structure::TensorOperation> program,
-                                                 const std::map<size_t, size_t> & matched, bool cpu_service_applied,
-                                                 std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits) {
+nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const SubmittedCallRegion & region,
+                                                 std::span<const structure::TensorOperation> program, const std::map<size_t, size_t> & matched,
+                                                 bool cpu_service_applied, std::span<const modules::hicache::HiCacheLayerWaitCall> layer_waits) {
     const auto & graph = source.graph();
     const auto & outer = graph.runtime_observations().at(region.observation);
     nlohmann::json rows = nlohmann::json::array();
@@ -592,8 +597,7 @@ nlohmann::json tensor_program_outer_observations(const modules::hicache::patch::
         previous = end;
     }
 
-    if (layer != nested.size()
-        || !append_cpu_interval_observations(source, outer, program.back().work, previous, outer_end, cpu_service_applied, rows))
+    if (layer != nested.size() || !append_cpu_interval_observations(source, outer, program.back().work, previous, outer_end, cpu_service_applied, rows))
         return nlohmann::json::array();
     return rows;
 }

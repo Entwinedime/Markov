@@ -80,8 +80,4 @@ const HiCachePhaseWorkLedger & HiCacheModelReplay::current_phase_work() {
     return work;
 }
 
-const HiCachePhaseObservation & HiCacheModelReplay::source_phase(const std::string & pid, const std::string & request_id) const {
-    return source_phases_.observations.at(source_phase_positions_.at({ pid, request_id }));
-}
-
 } // namespace markov::trace_graph::modules::hicache::model

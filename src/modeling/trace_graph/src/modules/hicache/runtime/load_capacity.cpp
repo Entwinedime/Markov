@@ -95,13 +95,12 @@ void HiCacheWriteCalls::prepare_empty_load_branches(core::DagGraph & graph) {
                                                  replacement);
         Call call{ .owner = branch->owner, .pid = event.pid, .tid = event.tid, .at_us = event.ts };
         call.lane = std::string(graph.node_lane_key(first));
-        const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(source, call, plan, true); };
         for (const auto & donor : load_admissions_)
             if (donor.pid == call.pid && donor.tid == call.tid) bind_load_resources(source, call, donor);
-        for (const auto & [id, donor] : templates_)
-            if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
-        for (const auto & donor : eviction_controls_)
-            if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
+        for (const auto & [id, donor] : observed_write_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(source, call, donor.resources, true);
+        for (const auto & donor : observed_eviction_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(source, call, donor.resources, true);
         pending.emplace(gate.synthetic_id,
                         std::pair{
                             EmptyLoadBranch{ branch->owner, first, std::move(original) },
@@ -175,13 +174,12 @@ void HiCacheWriteCalls::replace_active_load_branches(core::DagGraph & graph) {
                    .at_us = event.ts,
                    .entry_node = branch->entry_node,
                    .lane = std::string(graph.node_lane_key(branch->entry_node)) };
-        const auto positions = [&](const HiCacheHostExpansion & plan) { bind_call_resources(retained, call, plan, true); };
         for (const auto & donor : load_admissions_)
             if (donor.pid == call.pid && donor.tid == call.tid) bind_load_resources(retained, call, donor);
-        for (const auto & [id, donor] : templates_)
-            if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
-        for (const auto & donor : eviction_controls_)
-            if (donor.pid == call.pid && donor.tid == call.tid) positions(donor.expansion);
+        for (const auto & [id, donor] : observed_write_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(retained, call, donor.resources, true);
+        for (const auto & donor : observed_eviction_fragments_)
+            if (donor.pid == call.pid && donor.tid == call.tid) bind_call_resources(retained, call, donor.resources, true);
         capacity_calls_.emplace(branch->owner, std::move(call));
     }
 }

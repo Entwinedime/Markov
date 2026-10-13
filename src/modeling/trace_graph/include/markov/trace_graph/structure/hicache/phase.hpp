@@ -3,8 +3,7 @@
 #include "markov/trace_graph/core/dag_graph.hpp"
 #include "markov/trace_graph/modules/hicache/model/phase_work.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
-#include "markov/trace_graph/source_dag/call_regions.hpp"
-#include "markov/trace_graph/source_dag/device_collectives.hpp"
+#include "markov/trace_graph/source_dag/phase_calls.hpp"
 #include "markov/trace_graph/structure/hicache/collective.hpp"
 #include "markov/trace_graph/structure/operation.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
@@ -23,7 +22,6 @@ struct PhaseCallPlan {
     // Retaining unchanged compute never retains an observed HiCache wait:
     // layer readiness remains owned by the target HiCache execution rules.
     enum class Action { RetainCompute, Generate, Unavailable };
-    enum class Kind { Attention, Metadata, Dense };
     size_t source_observation;
     // Semantic correspondence for experiment reports, never cost features.
     int logical_input;
@@ -32,22 +30,9 @@ struct PhaseCallPlan {
     Action action = Action::Unavailable;
     std::vector<TensorOperation> operations;
     std::string reason;
-    Kind kind = Kind::Attention;
-    std::string dense_role;
+    // Semantic report label, not an execution or cost dispatch key.
+    std::string call_kind = "layer";
 };
-
-/** Plan one source-corresponding call after target admission has fixed its
- * token/cache work. No graph modification, cost query or target trace access.
- */
-[[nodiscard]] PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
-                                                const modules::hicache::model::HiCacheDecodeWorkItem & decode);
-
-[[nodiscard]] PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCall & source,
-                                                         const modules::hicache::model::HiCachePrefillWorkItem & prefill,
-                                                         const modules::hicache::model::HiCacheDecodeWorkItem & decode);
-
-[[nodiscard]] PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source_dag::AttentionCall & attention,
-                                            const modules::hicache::model::HiCachePrefillWorkItem & prefill);
 
 /** One rank's logical all-reduce service demand. Peer observations locate
  * the corresponding call boundaries; they are not cost features or source
@@ -61,9 +46,20 @@ struct DeviceCollectivePlan {
     std::string reason;
 };
 
-[[nodiscard]] DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollectiveCall & source,
-                                                               std::span<const source_dag::AttentionCall> attention,
-                                                               const modules::hicache::model::HiCachePrefillWorkItem & prefill);
+struct PhaseCallWork {
+    std::vector<PhaseCallPlan> tensors;
+    std::vector<DeviceCollectivePlan> collectives;
+};
+
+/** Plan all calls for one admitted request/rank. source_phase is the exact
+ * index established by request identity, not an execution-time guess.
+ * Attention, metadata and dense retain their source order within each family;
+ * collectives retain peer identities. Unavailable rules remain explicit plans.
+ * No graph mutation, cost query or target trace access takes place here.
+ */
+[[nodiscard]] PhaseCallWork plan_phase_calls(const source_dag::PhaseCallAudit & source, size_t source_phase,
+                                             const modules::hicache::model::HiCachePrefillWorkItem & prefill,
+                                             const modules::hicache::model::HiCacheDecodeWorkItem & decode);
 
 /** Establish migration candidates from immutable source identities for an
  * admitted request/rank. This is not work geometry for fitting a model.

@@ -1,10 +1,10 @@
 #include "markov/trace_graph/modules/hicache/runtime/control_calibration.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/hicache_release.hpp"
-#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/eviction_sequence.hpp"
-#include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/write_host.hpp"
+#include "markov/trace_graph/modules/hicache/runtime/writes.hpp"
 #include "markov/trace_graph/source_dag/submission_cost.hpp"
 #include <algorithm>
 #include <nlohmann/json.hpp>
@@ -130,49 +130,21 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                 }) {
                     const auto & primitive = *costs.*member;
                     const auto position = "write_submission:" + record.pid + ":" + record.tid + ":" + std::to_string(record.source_start_us) + ":" + name;
-                    const auto emit = [&](std::string_view scope, std::optional<double> duration_us) {
-                        if (!duration_us) return;
-                        result["operator_observations"].push_back({
-                            {       "position",                                              position                                               },
-                            {      "operation",                                                                           "write.submission." + name },
-                            { "implementation",                                                                                       implementation },
-                            {       "features",
-                             { { "payload_bytes", plan.payload_bytes }, { "page_bytes", page_bytes }, { "pages", plan.payload_bytes / page_bytes } } },
-                            {    "duration_us",                                                                                         *duration_us },
-                            {   "timing_scope",                                                                                                scope }
-                        });
+                    const structure::OperationWork work{
+                        .operation = "write.submission." + name,
+                        .implementation = implementation,
+                        .features = { { "payload_bytes", static_cast<double>(plan.payload_bytes) },
+                                     { "page_bytes", static_cast<double>(page_bytes) },
+                                     { "pages", static_cast<double>(plan.payload_bytes / page_bytes) } },
                     };
-                    emit("cpu_service", primitive.main_us);
-                    emit("residual_interval", primitive.main_residual_us);
-
-                    if (submitted) {
-                        emit("worker_launch_service", primitive.worker_us);
-                        emit("worker_launch_residual_interval", primitive.worker_residual_us);
-                        emit("worker_return_service", primitive.worker_return_us);
-                        emit("worker_return_residual_interval", primitive.worker_return_residual_us);
-                        emit("dispatch_interval", primitive.dispatch_us);
-                        emit("device_service", primitive.device_us);
-                    }
+                    source_dag::append_host_operation_observations(result["operator_observations"], work, position, primitive, true, submitted);
                 }
-            }
-            Json submissions = Json::object();
-            for (const auto & [role, node] : roles) {
-                if (!role.starts_with("worker")) continue;
-                std::set<std::string> names;
-                for (const auto & work : plan.nodes) {
-                    if (!work.queue_member || !work.submission || graph.node(*work.queue_member).lane_id != graph.node(node).lane_id) continue;
-                    for (const auto & [original, local] : plan.source_nodes)
-                        if (local == *work.submission) names.insert(graph.event_for_node(original).name);
-                }
-                if (names.empty()) throw std::runtime_error("Independent write worker has no submission identity");
-                submissions[role] = names;
             }
             result["rows"].push_back({
-                { "status", "ready" },
-                { "rank", graph.node(roles.at("main")).gpu_id },
-                { "write_back", *host.write_back },
-                { "template", export_write_template(graph, plan, roles) },
-                { "worker_submissions", submissions }
+                {     "status",                             "ready" },
+                {       "rank", graph.node(roles.at("main")).gpu_id },
+                { "write_back",                    *host.write_back },
+                {   "begin_us",              record.source_start_us }
             });
         }
     }
@@ -182,15 +154,13 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
         if (release_only && !plan.event_waits.empty()) throw std::runtime_error("Ordinary release cannot wait for backup completion");
         const auto main = host.main.owned_node_ids.empty() ? host.main.owned_gap_slices.front().owner_node_id : host.main.owned_node_ids.front();
         if (plan.streams.size() > 1) throw std::runtime_error("Independent eviction has multiple compute resources");
-        const auto roles =
-            host_resource_roles(graph, plan, main, plan.streams.empty() ? std::nullopt : std::optional<size_t>{ plan.streams.front().source_node });
         Json row{
-            { "status", "ready" },
-            { "rank", graph.node(main).gpu_id },
-            { "kind", static_cast<int>(region.kind) },
-            { "phase", static_cast<int>(region.control_phase) },
-            { "released_tokens", region.released_tokens },
-            { "template", export_host_template(graph, plan, roles) }
+            {          "status",                                "ready" },
+            {            "rank",                graph.node(main).gpu_id },
+            {            "kind",          static_cast<int>(region.kind) },
+            {           "phase", static_cast<int>(region.control_phase) },
+            { "released_tokens",                 region.released_tokens },
+            {        "begin_us",                           region.begin }
         };
         if (region.kind == HiCacheEvictionRegion::Kind::Control) row["control_operation"] = eviction_control_name(region.control_phase);
         if (region.kind == HiCacheEvictionRegion::Kind::ReleaseRegular || region.kind == HiCacheEvictionRegion::Kind::ReleaseBackup) {
@@ -225,31 +195,15 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
                         const auto & primitive = *measured.*member;
                         if (page_size == 1 && name != "concatenate" && name != "tail") continue;
                         const auto position = "release:" + fact.pid + ":" + fact.tid + ":" + std::to_string(region.begin) + ":" + name;
-                        const auto emit = [&](std::string_view scope, std::optional<double> duration_us) {
-                            if (!duration_us) return;
-                            result["operator_observations"].push_back({
-                                {       "position",position                                                   },
-                                {      "operation",                                 "release." + name },
-                                { "implementation",                                    implementation },
-                                {       "features",
-                                 { { "released_pages", tokens / page_size },
-                                 { "page_size", page_size },
-                                 { "release_buffer_pages", buffer },
-                                 { "need_sort", allocation->arg("need_sort") == "true" ? 1 : 0 } }   },
-                                {    "duration_us",                                      *duration_us },
-                                {   "timing_scope",                                             scope }
-                            });
+                        const structure::OperationWork work{
+                            .operation = "release." + name,
+                            .implementation = implementation,
+                            .features = { { "released_pages", static_cast<double>(tokens / page_size) },
+                                         { "page_size", static_cast<double>(page_size) },
+                                         { "release_buffer_pages", static_cast<double>(buffer) },
+                                         { "need_sort", allocation->arg("need_sort") == "true" ? 1.0 : 0.0 } },
                         };
-                        emit("cpu_service", primitive.main_us);
-                        emit("residual_interval", primitive.main_residual_us);
-                        if (submitted) {
-                            emit("worker_launch_service", primitive.worker_us);
-                            emit("worker_launch_residual_interval", primitive.worker_residual_us);
-                            emit("worker_return_service", primitive.worker_return_us);
-                            emit("worker_return_residual_interval", primitive.worker_return_residual_us);
-                            emit("dispatch_interval", primitive.dispatch_us);
-                            emit("device_service", primitive.device_us);
-                        }
+                        source_dag::append_host_operation_observations(result["operator_observations"], work, position, primitive, true, submitted);
                     }
                 }
             }
@@ -287,8 +241,6 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
             };
         result[release_only ? "rows" : "eviction_controls"].push_back(std::move(row));
     }
-    if (result["rows"].empty())
-        throw std::runtime_error(release_only ? "Independent capture has no complete ordinary release" : "Independent capture has no complete write operation");
     if (release_only) {
         result["scope"] = "ordinary release resource evidence";
         result.erase("eviction_controls");
@@ -296,55 +248,5 @@ Json export_write_calibration(core::DagGraph & graph, uint64_t begin, uint64_t e
     return result;
 }
 
-Json export_host_template(const core::DagGraph & graph, const HiCacheHostExpansion & plan, const std::map<std::string, size_t> & roles) {
-    std::map<std::string, std::string> lane_roles;
-    for (const auto & [role, node] : roles) {
-        const auto [at, inserted] = lane_roles.emplace(std::string(graph.node_lane_key(node)), role);
-        if (!inserted && at->second != role) throw std::runtime_error("Portable write template needs unique resource roles");
-    }
-    const auto role_for = [&](size_t node) { return lane_roles.at(std::string(graph.node_lane_key(node))); };
-    Json output{
-        {       "nodes",    Json::array() },
-        {       "edges",    Json::array() },
-        {     "streams",    Json::array() },
-        {       "waits",    Json::array() },
-        { "event_waits",    Json::array() },
-        { "host_return", plan.host_return }
-    };
-    for (const auto & node : plan.nodes) {
-        const auto & work = node.work;
-        if (!work.attrs.empty() || work.observed_point) throw std::runtime_error("Portable write work must not retain source coordinates or opaque attributes");
-        Json row{
-            {              "name",                    work.name },
-            {          "category",                work.category },
-            {            "is_cpu",                  work.is_cpu },
-            {          "resource", lane_roles.at(work.lane_key) },
-            {          "duration",                work.duration },
-            {     "cpu_gap_after",           work.cpu_gap_after },
-            { "counts_toward_e2e",       work.counts_toward_e2e }
-        };
-        if (node.submission) row["submission"] = *node.submission;
-        if (node.task_predecessor) row["task_predecessor"] = *node.task_predecessor;
-        if (node.queue_member) row["queue_resource"] = role_for(*node.queue_member);
-        if (work.cpu_task_ready_delay_us) row["ready_delay_us"] = *work.cpu_task_ready_delay_us;
-        output["nodes"].push_back(std::move(row));
-    }
-    for (const auto & edge : plan.edges) output["edges"].push_back({ edge.from, edge.to, static_cast<int>(edge.kind) });
-    for (const auto & stream : plan.streams) output["streams"].push_back({ role_for(stream.source_node), stream.first, stream.last });
-    for (const auto & wait : plan.waits) output["waits"].push_back({ role_for(wait.source_node), wait.consumer });
-    for (const auto & wait : plan.event_waits) output["event_waits"].push_back(wait.consumer);
-    return output;
-}
-
-Json export_write_template(const core::DagGraph & graph, const HiCacheWriteExpansion & plan, const std::map<std::string, size_t> & roles) {
-    auto output = export_host_template(graph, plan, roles);
-    output.update({
-        {       "payload",       plan.payload },
-        { "payload_bytes", plan.payload_bytes },
-        {   "write_start",   plan.write_start },
-        {    "completion",    plan.completion }
-    });
-    return output;
-}
 
 } // namespace markov::trace_graph::modules::hicache::runtime

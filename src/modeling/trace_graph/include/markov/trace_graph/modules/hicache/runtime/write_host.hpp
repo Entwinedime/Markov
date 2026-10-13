@@ -15,13 +15,13 @@ struct HiCacheHostTemplate {
 
 /** Structural ownership of a controller submission, independent of whether
  * the enclosing call can supply a reusable CPU/device cost template. */
-[[nodiscard]] const patch::HiCacheSourceFactNode & observe_write_envelope(
-    const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid, uint64_t begin, uint64_t end);
+[[nodiscard]] const patch::HiCacheSourceFactNode & observe_write_envelope(const patch::HiCacheSourceDagIndex & source, const std::string & pid,
+                                                                          const std::string & tid, uint64_t begin, uint64_t end);
 
-/** An explicitly nested tree.write_backup -> controller.start_writing pair
- * proves resource identity even when this base never performs a host load. */
-[[nodiscard]] std::map<std::pair<std::string, std::string>, std::string> observe_write_controller_scopes(
-    const patch::HiCacheSourceDagIndex & source);
+/** Query facts directly name the tree's controller. An explicitly nested
+ * tree.write_backup -> controller.start_writing pair supplies the same
+ * association when the source records only call identities. */
+[[nodiscard]] std::map<std::pair<std::string, std::string>, std::string> observe_controller_scopes(const patch::HiCacheSourceDagIndex & source);
 
 [[nodiscard]] HiCacheHostTemplate observe_host_template(const patch::HiCacheSourceDagIndex & source, const std::string & pid, const std::string & tid,
                                                         uint64_t begin, uint64_t end);

@@ -95,16 +95,7 @@ void write_graph_output(const CliOptions & options, const DagGraph & graph) {
 
 } // namespace
 
-int run_workflow(const CliOptions & options, core::Logger & logger) {
-#ifdef DEBUG
-    auto modules = ModulePipeline::from_config(options.model_config,
-                                               options.hicache_oracle_cost_replay,
-                                               options.hicache_phase_oracle_cost_replay,
-                                               options.hicache_canonical_observed_phase_scope,
-                                               options.hicache_static_replay);
-#else
-    auto modules = ModulePipeline::from_config(options.model_config);
-#endif
+PreparedSource prepare_source(const CliOptions & options) {
     auto inputs = io::load_trace_inputs_from_manifest(options.profile_manifest, options.trace_input);
     const auto source_input_selection = options.outputs.source_replay_report.empty() ? nlohmann::json(nullptr) : source_dag::input_selection_report(inputs);
     const auto client_input = options.trace_input.include_python_probe && !options.source_observations_only
@@ -112,22 +103,15 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
                                   : io::ManifestClientInput{ "python_probe_channel_disabled", {} };
     auto graph = source_dag::build(std::move(inputs), options.trace_input.threads);
     const auto source_execution_event_count = graph.events().size();
-    if (!options.prepare_cpu_service.empty()) {
-        if (client_input.status != "ready") throw std::runtime_error("CPU service preparation needs complete client requests");
-        const auto chain = core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us);
-        if (chain.status != "connected") throw std::runtime_error("CPU service preparation could not bind the client chain");
-        prepare_cpu_service(graph, options.profile_manifest, options.prepare_cpu_service, options.cpu_service_output);
-        return 0;
-    }
     // Request availability belongs to the observed source as well as target
     // execution. Bind once; the experimental replay must precede cost views
     // and any mutation, including optional NodeScale.
     const auto client_chain = client_input.status == "ready" ? core::connect_client_requests(graph, client_input.requests, client_input.hicache_idle_since_us)
                                                              : core::ClientRequestChain{ client_input.status, {} };
+    nlohmann::json replay;
     if (!options.outputs.source_replay_report.empty()) {
-        auto report = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
-        report["event_coverage"]["input_selection"] = source_input_selection;
-        write_json_file(options.outputs.source_replay_report, report);
+        replay = source_dag::replay_report(graph, client_chain, client_input.requests, source_execution_event_count, options.profile_manifest);
+        replay["event_coverage"]["input_selection"] = source_input_selection;
     }
     if (!options.cpu_service_cost.empty()) {
         std::ifstream input(options.cpu_service_cost);
@@ -137,6 +121,15 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 #ifdef DEBUG
     if (options.actual_e2e_us) graph.set_real_e2e_time(*options.actual_e2e_us);
 #endif
+
+    return { std::move(graph), client_input, client_chain, std::move(replay) };
+}
+
+int run_prepared_workflow(const CliOptions & options, ModulePipeline & modules, PreparedSource source, core::Logger & logger) {
+    auto & graph = source.graph;
+    const auto & client_input = source.client_input;
+    const auto & client_chain = source.client_chain;
+    if (!options.outputs.source_replay_report.empty()) write_json_file(options.outputs.source_replay_report, source.replay_report);
 
     if (options.source_observations_only) {
         const auto phases = modules::hicache::observe_hicache_phases(graph);
@@ -156,8 +149,7 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
         const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
         const auto operations = modules::hicache::patch::build_hicache_io_operation_ledger(source);
         auto io = hicache_io_observations(graph, operations, !options.cpu_service_cost.empty());
-        nlohmann::json collective_diagnostics;
-        auto operator_observations = source_dag::phase_operator_observations(graph, phases, !options.cpu_service_cost.empty(), &collective_diagnostics);
+        auto operator_observations = source_dag::phase_operator_observations(graph, phases, !options.cpu_service_cost.empty());
         if (!options.cpu_service_cost.empty()) {
             // Submission attribution splits a working graph at control points.
             // Keep the original observations intact and use the same paired
@@ -175,12 +167,9 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
 
         write_json_file(options.outputs.run_summary,
                         {
-                            { "observation_scope", "cost" },
-                            { "source_io_observations", io },
-                            { "source_phase_observations", hicache_phase_observations(phases) },
-                            { "operator_geometry", source_dag::operator_geometry_observations(graph, phases) },
-                            { "device_collective_observations", std::move(collective_diagnostics) },
-                            { "operator_observations", std::move(operator_observations) }
+                            {      "observation_scope",                           "cost" },
+                            { "source_io_observations",                               io },
+                            {  "operator_observations", std::move(operator_observations) }
         });
         return 0;
     }
@@ -253,6 +242,29 @@ int run_workflow(const CliOptions & options, core::Logger & logger) {
             structure::hicache::execution_structure_report(graph, execution->model.effect_decisions, execution->model.phase_work, execution->collective_work));
     }
     return 0;
+}
+
+int run_workflow(const CliOptions & options, core::Logger & logger) {
+    if (!options.target_plan.empty()) return run_prediction_batch(options, logger);
+
+#ifdef DEBUG
+    auto modules = ModulePipeline::from_config(options.model_config,
+                                               options.hicache_oracle_cost_replay,
+                                               options.hicache_phase_oracle_cost_replay,
+                                               options.hicache_canonical_observed_phase_scope,
+                                               options.hicache_static_replay);
+#else
+    auto modules = ModulePipeline::from_config(options.model_config);
+#endif
+    auto source = prepare_source(options);
+    if (!options.prepare_cpu_service.empty()) {
+        if (source.client_input.status != "ready") throw std::runtime_error("CPU service preparation needs complete client requests");
+        if (source.client_chain.status != "connected") throw std::runtime_error("CPU service preparation could not bind the client chain");
+        prepare_cpu_service(source.graph, options.profile_manifest, options.prepare_cpu_service, options.cpu_service_output);
+        return 0;
+    }
+
+    return run_prepared_workflow(options, modules, std::move(source), logger);
 }
 
 } // namespace markov::trace_graph::cli

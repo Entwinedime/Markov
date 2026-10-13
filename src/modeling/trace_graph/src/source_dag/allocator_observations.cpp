@@ -118,8 +118,8 @@ std::vector<ObservedAllocatorProgram> observe_allocator_programs(const modules::
     return calls;
 }
 
-nlohmann::json allocator_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                               const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+nlohmann::json allocator_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
+                                               bool cpu_service_applied) {
     using Json = nlohmann::json;
     Json rows = Json::array();
     std::set<size_t> measured_devices;
@@ -129,8 +129,15 @@ nlohmann::json allocator_operator_observations(const modules::hicache::patch::Hi
         const auto & matched = call.matched_operators;
         // Cold launch CPU includes separately measured JIT service. Omit only
         // that caller's scopes; attributed device/worker service remains usable.
-        append_tensor_program_observations(source, queues, program, matched, measured_devices, cpu_service_applied, rows, true,
-                                             call.has_preparation ? call.fused_position : std::nullopt);
+        append_tensor_program_observations(source,
+                                           queues,
+                                           program,
+                                           matched,
+                                           measured_devices,
+                                           cpu_service_applied,
+                                           rows,
+                                           true,
+                                           call.has_preparation ? call.fused_position : std::nullopt);
 
         // Admit outer CPU samples only when every tensor boundary is paired.
         // Otherwise missing tensor work could leak into a preparation sample.

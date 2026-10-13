@@ -47,8 +47,8 @@ struct HiCacheWindowResult {
     size_t load_submission_shared_cost_batches = 0;
     size_t prepared_layer_calls = 0, active_layer_calls = 0, inactive_layer_calls = 0;
     size_t source_write_submissions = 0, completed_writes = 0, resumed_allocations = 0;
-    size_t prepared_write_templates = 0;
-    size_t prepared_eviction_controls = 0;
+    size_t observed_write_fragments = 0;
+    size_t observed_eviction_fragments = 0;
     size_t expanded_write_submissions = 0;
     size_t generated_control_steps = 0;
     size_t generated_blocking_checks = 0;

@@ -1,8 +1,14 @@
 #pragma once
 #include "markov/trace_graph/modules/hicache/model/state.hpp"
 #include "markov/trace_graph/modules/hicache/phase_observation.hpp"
-#include "markov/trace_graph/source_dag/call_regions.hpp"
-#include "markov/trace_graph/source_dag/device_collectives.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::model {
 
@@ -53,29 +59,22 @@ public:
      * With no blockers, prefills and decodes have matching positions. Does not
      * finalize state or build I/O effects; finish() produces the complete result. */
     [[nodiscard]] const HiCachePhaseWorkLedger & current_phase_work();
-    /** Borrow the already joined immutable observation for a request/rank.
-     * Call only for admitted phases without input blockers. The reference
-     * belongs to this replay; target work never overwrites its geometry.
+    /** Immutable request/round observations. Detailed operator calls belong
+     * to source_dag, not the cache state replay. Borrowed until replay ends.
      */
-    [[nodiscard]] const HiCachePhaseObservation & source_phase(const std::string & pid, const std::string & request_id) const;
-    /** Prepared from the immutable source before any target mutation. Missing
-     * metadata remains in the audit; these are not generated target calls.
+    [[nodiscard]] const HiCachePhaseObservationAudit & source_phases() const { return source_phases_; }
+    /** Index into source_phases().observations for an admitted request/rank.
+     * Missing or ambiguous identities remain input blockers; no nearest match.
      */
-    [[nodiscard]] const source_dag::AttentionCallAudit & source_attention_calls() const { return source_attention_calls_; }
-    [[nodiscard]] const source_dag::AttentionMetadataAudit & source_metadata_calls() const { return source_metadata_calls_; }
-    [[nodiscard]] const source_dag::DenseCallAudit & source_dense_calls() const { return source_dense_calls_; }
-    [[nodiscard]] const source_dag::DeviceCollectiveAudit & source_device_collectives() const { return source_device_collectives_; }
-    [[nodiscard]] const HiCachePhaseObservation & source_phase(size_t index) const { return source_phases_.observations.at(index); }
+    [[nodiscard]] size_t source_phase_index(const std::string & pid, const std::string & request_id) const {
+        return source_phase_positions_.at({ pid, request_id });
+    }
     [[nodiscard]] HiCacheModelResult finish();
 
 private:
     HiCacheReplayFact & continue_lifecycle(size_t fact_id, uint64_t timestamp_us, size_t execution_node);
     HiCacheState state_;
     HiCachePhaseObservationAudit source_phases_;
-    source_dag::AttentionCallAudit source_attention_calls_;
-    source_dag::AttentionMetadataAudit source_metadata_calls_;
-    source_dag::DenseCallAudit source_dense_calls_;
-    source_dag::DeviceCollectiveAudit source_device_collectives_;
     std::map<std::pair<std::string, std::string>, size_t> source_phase_positions_;
     HiCacheModelResult result_;
     std::vector<HiCacheReplayFact> facts_;

@@ -74,7 +74,8 @@ struct PhaseCallPositions {
  * contradictory assignments are unavailable, never resolved by proximity.
  * Calls without submitted work, including CPU-only views, use exact
  * same-thread forward containment instead;
- * this establishes semantics, not zero execution cost. */
+ * this establishes semantics, not zero execution cost. Prepare once from the
+ * immutable audit and pass the same positions to every call family. */
 [[nodiscard]] PhaseCallPositions phase_call_positions(const modules::hicache::HiCachePhaseObservationAudit & phases);
 [[nodiscard]] std::optional<PhaseCallPosition> call_phase_position(const SubmittedCallRegion & region, const PhaseCallPositions & positions);
 
@@ -207,7 +208,7 @@ struct AttentionCallAudit {
 /** Resolve packed-row K/V layouts from direct metadata or the same source
  * forward/layer's proven Qwen3 producers. Does not inspect device durations. */
 void resolve_attention_cache_layouts(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                     const modules::hicache::HiCachePhaseObservationAudit & phases, AttentionCallAudit & attention);
+                                     const PhaseCallPositions & positions, AttentionCallAudit & attention);
 
 struct DenseCall {
     DenseRegion region;
@@ -227,8 +228,8 @@ struct DenseCallAudit {
  * Join to the same source forward/layer's attention descriptor to establish
  * token layout, not by dimension coincidence or timestamp proximity. */
 [[nodiscard]] DenseCallAudit observe_dense_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                 const simulation::detail::CpuTaskQueues & queues,
-                                                 const modules::hicache::HiCachePhaseObservationAudit & phases, const AttentionCallAudit & attention);
+                                                 const simulation::detail::CpuTaskQueues & queues, const PhaseCallPositions & positions,
+                                                 const AttentionCallAudit & attention);
 
 struct AttentionMetadataCall {
     AttentionMetadataRegion region;
@@ -244,11 +245,12 @@ struct AttentionMetadataAudit {
 
 [[nodiscard]] AttentionMetadataAudit observe_attention_metadata_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                                       const simulation::detail::CpuTaskQueues & queues,
-                                                                      const modules::hicache::HiCachePhaseObservationAudit & phases);
+                                                                      const modules::hicache::HiCachePhaseObservationAudit & phases,
+                                                                      const PhaseCallPositions & positions);
 
 [[nodiscard]] AttentionCallAudit observe_attention_calls(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                          const simulation::detail::CpuTaskQueues & queues,
-                                                         const modules::hicache::HiCachePhaseObservationAudit & phases);
+                                                         const modules::hicache::HiCachePhaseObservationAudit & phases, const PhaseCallPositions & positions);
 
 [[nodiscard]] std::vector<AllocatorRegion> observe_allocator_regions(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                                      const simulation::detail::CpuTaskQueues & queues);

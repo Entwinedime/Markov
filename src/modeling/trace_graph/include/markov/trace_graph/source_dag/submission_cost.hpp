@@ -1,10 +1,14 @@
 #pragma once
 
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
+#include "markov/trace_graph/structure/operation.hpp"
 
 #include <cstddef>
 #include <cstdint>
+#include <nlohmann/json_fwd.hpp>
 #include <optional>
+#include <span>
+#include <string_view>
 
 namespace markov::trace_graph::source_dag {
 
@@ -18,6 +22,26 @@ struct HostOperationMeasurement {
     // Preserve raw device precision before model fitting or simulation rounding.
     std::optional<double> device_us;
 };
+
+/** Append the measured scopes of one operation. Absent measurements remain
+ * absent rows, not zeros. Source position plus timing scope is the import
+ * identity; work describes variables, not an executable calibration template.
+ * CPU scopes are labeled profiled unless this capture has paired correction.
+ * submitted=false emits caller scopes only. */
+void append_host_operation_observations(nlohmann::json & rows, const structure::OperationWork & work, std::string_view position,
+                                        const HostOperationMeasurement & measured, bool corrected, bool submitted);
+
+/** Measure the supported unsorted allocation followed by promoted-node clones.
+ * Work lengths come from the source admission, never equal division by clone
+ * count. Requires one complete asynchronous task/device per submission and no
+ * unowned device work. Unsupported/incomplete layouts return no measurements.
+ * An empty clone_lengths is admissible only for a single full-length clone.
+ * Durations retain corrected CPU/residual scopes and fractional device time. */
+[[nodiscard]] std::optional<nlohmann::json> load_index_operator_observations(const modules::hicache::runtime::HiCacheHostExpansion & plan,
+                                                                             const modules::hicache::patch::HiCacheSourceDagIndex & source,
+                                                                             const simulation::detail::CpuTaskQueues & queues, uint64_t tokens,
+                                                                             uint64_t page_size, std::span<const uint64_t> clone_lengths,
+                                                                             std::string_view position, bool corrected);
 
 struct PagedReleaseMeasurement {
     HostOperationMeasurement before_first_sync, first_sync, before_second_sync, second_sync, concatenate, tail;

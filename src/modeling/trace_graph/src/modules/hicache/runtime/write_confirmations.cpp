@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <utility>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
@@ -32,13 +33,15 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
     for (const auto & step : steps) {
         std::optional<size_t> call_previous;
         const auto main = plan.append_main(lane, "target " + step.work.operation, call_previous);
-        plan.nodes[main].work.attrs = { { "component", step.work.component },
-                                       { "operation", step.work.operation },
-                                       { "implementation", step.work.implementation },
-                                       { "cost_operation", step.work.operation },
-                                       { "cost_implementation", step.work.implementation },
-                                       { "cost_timing_scope", "cpu_service" },
-                                       { "work_features", nlohmann::json(step.work.features).dump() } };
+        plan.nodes[main].work.attrs = {
+            {           "component",                       step.work.component },
+            {           "operation",                       step.work.operation },
+            {      "implementation",                  step.work.implementation },
+            {      "cost_operation",                       step.work.operation },
+            { "cost_implementation",                  step.work.implementation },
+            {   "cost_timing_scope",                             "cpu_service" },
+            {       "work_features", nlohmann::json(step.work.features).dump() }
+        };
         const auto returned = plan.append_main(lane, "after " + step.work.operation, call_previous, "");
         if (previous) plan.edges.push_back({ *previous, main, core::DagEdgeKind::Sequential });
         if (step.completed_batch) {
@@ -46,6 +49,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
             generated.acknowledgements.push_back(returned);
         }
         HostOperationSlots slots{ .main = main };
+        cost::OperationCostRequest request{ .work = step.work };
         if (step.destroys_event) {
             if (!worker)
                 throw structure::MissingWork("Write confirmation requires the scheduler's CPU worker queue",
@@ -54,6 +58,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
                 });
             slots.worker = plan.nodes.size();
             const auto task = structure::hicache::event_destruction_work();
+            request.worker_work = task;
             plan.nodes.push_back({
                 { .name = "target event destruction",
                  .category = "hicache_patch",
@@ -68,7 +73,7 @@ ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, 
                 *worker
             });
         }
-        generated.slots.push_back(slots);
+        generated.operations.push_back({ std::move(request), { std::move(slots) } });
         previous = returned;
         plan.host_return = returned;
     }
@@ -152,41 +157,10 @@ size_t HiCacheWriteConfirmations::expand(const WriteConfirmationWork & work, mod
     const auto worker = member == worker_members_.end() ? std::nullopt : std::optional{ member->second };
     const auto program = structure::hicache::write_confirmation_program(batches);
     auto generated = generate_write_confirmation(*graph_, anchor, worker, program);
-    bind_write_confirmation(generated, program, operator_provider_);
+    bind_host_operations(generated.plan, generated.operations, operator_provider_, "confirmation_independent_model");
     const auto expanded = expand_host(generated.plan, {}, future, anchor, events);
     for (const auto returned : generated.acknowledgements) acknowledgements_.emplace(expanded.nodes.at(returned), work.fact);
     return expanded.host_return;
-}
-
-void bind_write_confirmation(ConfirmationExpansion & generated, std::span<const structure::hicache::WriteConfirmationStep> program,
-                             cost::OperatorCostProvider & provider) {
-    // Structure and resource slots are complete before querying costs. Query
-    // every required scope together; no missing worker becomes a zero-cost job.
-    std::vector<structure::OperationWork> requests;
-    for (const auto & step : program) {
-        requests.push_back(step.work);
-        requests.back().timing_scope = "cpu_service";
-        requests.push_back(step.work);
-        requests.back().timing_scope = "residual_interval";
-        if (!step.destroys_event) continue;
-        for (const auto * scope : { "worker_service", "worker_residual_interval", "dispatch_interval" }) {
-            requests.push_back(structure::hicache::event_destruction_work());
-            requests.back().timing_scope = scope;
-        }
-    }
-    const auto estimates = provider.estimate_all(requests);
-    size_t next = 0;
-    for (size_t i = 0; i < program.size(); ++i) {
-        cost::HostOperationCost value;
-        value.main_us = estimates[next++].duration_us;
-        value.main_residual_us = estimates[next++].duration_us;
-        if (program[i].destroys_event) {
-            value.worker_us = estimates[next++].duration_us;
-            value.worker_residual_us = estimates[next++].duration_us;
-            value.dispatch_us = estimates[next++].duration_us;
-        }
-        bind_host_operation(generated.plan, generated.slots[i], value, "confirmation_independent_model");
-    }
 }
 
 void HiCacheWriteConfirmations::advance(size_t node, uint64_t time_us, model::HiCacheState & state) {

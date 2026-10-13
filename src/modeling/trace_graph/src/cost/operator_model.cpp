@@ -5,8 +5,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <set>
-#include <stdexcept>
 #include <utility>
 
 namespace markov::trace_graph::cost {
@@ -57,25 +57,19 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
 
     const auto & model = *found->second;
     bool outside = false;
-    double value = model.intercept_us;
-    for (const auto & [name, coefficient] : model.coefficients) {
-        const auto feature = work.features.find(name);
-        if (feature == work.features.end()) {
-            auto coordinates = describe();
-            coordinates["missing_feature"] = name;
-            throw cost::MissingCostEvidence(work.component + "/feature", coordinates, "Missing operator feature: " + name);
-        }
-
-        value += coefficient * feature->second;
-    }
+    // Input admission proves that regression/curve coordinates are included
+    // in feature_ranges. Establish this query's work point once, then evaluate
+    // the response and joint coverage from that same description.
+    std::map<std::string, double> point;
     for (const auto & [name, range] : model.feature_ranges) {
         const auto feature = work.features.find(name);
         if (feature == work.features.end()) {
             auto coordinates = describe();
             coordinates["missing_feature"] = name;
-            throw cost::MissingCostEvidence(work.component + "/feature", coordinates, "Missing coverage feature: " + name);
+            throw cost::MissingCostEvidence(work.component + "/feature", coordinates, "Missing declared operator feature: " + name);
         }
 
+        point.emplace(name, feature->second);
         const bool feature_outside = feature->second < range.first || feature->second > range.second;
         outside |= feature_outside;
         if (feature_outside && !model.allow_extrapolation && std::ranges::find(model.extrapolation_features, name) == model.extrapolation_features.end()) {
@@ -85,8 +79,11 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
         }
     }
 
+    double value = model.intercept_us;
+    for (const auto & [name, coefficient] : model.coefficients) value += coefficient * point.at(name);
+
     if (model.form == "piecewise_linear") {
-        const auto coordinate = work.features.at(model.coordinate);
+        const auto coordinate = point.at(model.coordinate);
         auto right = std::ranges::lower_bound(model.points, coordinate, {}, [](const auto & point) { return point.first; });
         if (right == model.points.begin()) ++right;
         else if (right == model.points.end()) right = std::prev(model.points.end());
@@ -98,8 +95,6 @@ OperatorEstimate OperatorCostProvider::estimate(const structure::OperationWork &
     if (!std::isfinite(value) || value < 0.0 || !rounded)
         throw cost::MissingCostEvidence(work.component + "/model", describe(), "Database operator cost is not a finite non-negative duration");
 
-    std::map<std::string, double> point;
-    for (const auto & [feature, range] : model.feature_ranges) point.emplace(feature, work.features.at(feature));
     const bool unseen = std::ranges::find(model.measured_feature_points, point) == model.measured_feature_points.end();
     const OperatorEstimate result{ *rounded, outside, unseen };
     auto & summary = queries_[{ work.component, work.operation, work.implementation, work.timing_scope }];

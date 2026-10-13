@@ -1,5 +1,4 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
-#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/host_removal.hpp"
 #include <algorithm>
@@ -7,8 +6,8 @@
 
 namespace markov::trace_graph::modules::hicache::runtime {
 
-void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const HiCacheHostExpansion & plan, bool candidate) {
-    for (const auto node : plan.resource_nodes()) {
+void HiCacheWriteCalls::bind_call_resources(const patch::HiCacheSourceDagIndex & source, Call & call, std::span<const size_t> resources, bool candidate) {
+    for (const auto node : resources) {
         const auto lane = source.graph().node(node).lane_id;
         if (call.positions.contains(lane)) continue;
 
@@ -53,19 +52,11 @@ void HiCacheWriteCalls::prepare_write_resources(core::DagGraph & graph, const si
                                      { compute_lane, payload_lane, compute_lane }
         });
     };
-    for (const auto & [id, sample] : templates_) {
-        const auto roles = write_resource_roles(graph, sample.expansion, sample.compute_record);
-        bind(sample.pid, sample.tid, roles.at("main"), roles.at("compute_ready"), roles.at("payload"));
-    }
-    for (const auto & sample : eviction_controls_) {
-        using Kind = HiCacheEvictionRegion::Kind;
-        if ((sample.region.kind != Kind::ReleaseRegular && sample.region.kind != Kind::ReleaseBackup) || sample.expansion.streams.size() != 1) continue;
-        const auto & main_lane = sample.expansion.nodes.at(sample.expansion.host_return).work.lane_key;
-        for (const auto & [original, local] : sample.expansion.source_nodes) {
-            if (!graph.node(original).is_cpu || graph.node_lane_key(original) != main_lane) continue;
-            bind(sample.pid, sample.tid, original, sample.expansion.streams.front().source_node, std::nullopt);
-            break;
-        }
+    for (const auto & [id, sample] : observed_write_fragments_) { bind(sample.pid, sample.tid, sample.main, sample.compute_record, sample.payload); }
+    for (const auto & sample : observed_eviction_fragments_) {
+        if (!sample.main) continue;
+
+        bind(sample.pid, sample.tid, *sample.main, *sample.compute, std::nullopt);
     }
     for (auto & call : calls_) {
         if (call.source) continue;
@@ -118,9 +109,9 @@ HiCacheExpandedWrite HiCacheWriteCalls::submit_target_write(const WriteResources
                                                     bytes / page_bytes_,
                                                     page_bytes_,
                                                     1,
-                                                    "write");
-    const auto costs = cost::estimate_write_submission(operator_provider_, bytes, page_bytes_, write_back_);
-    bind_page_first_submission(generated, costs);
+                                                    "write",
+                                                    write_back_);
+    bind_host_operations(generated.plan, generated.operations, operator_provider_);
     const auto lanes = generated.plan.resource_lanes(*graph_);
     const auto service_us = io_completion_.duration("write_device_to_host", page_bytes_, bytes / page_bytes_, 0);
     bind_transfer_payload(generated.plan, service_us);
@@ -317,7 +308,7 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             opening.add_edges.push_back({ core::DagNodeRef::existing(opening_node), core::DagNodeRef::existing(*bound), core::DagEdgeKind::Mutation });
     }
     if (!opening.add_edges.empty()) (void)core::apply_dag_mutation_plan(graph, opening);
-    // Call boundaries may split host self/gap pieces. Observe templates only
+    // Call boundaries may split host self/gap pieces. Observe fragments only
     // after those edits so their leaf ownership matches the execution graph.
     const patch::HiCacheSourceDagIndex bound_source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
@@ -326,17 +317,15 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
         const auto host = observe_write_host_template(bound_source, record);
         try {
             auto expansion = prepare_write_expansion(bound_source, queues, record, host, writes_.source_completion(record.timing_fact_node_id));
-            auto lanes = expansion.resource_lanes(graph);
-            templates_.emplace(record.timing_fact_node_id,
-                               WriteTemplate{ host.write_back,
-                                              writes_.source_start_record(bound_source, record.timing_fact_node_id),
-                                              std::move(expansion),
-                                              record.pid,
-                                              record.tid,
-                                              std::move(lanes) });
+            const auto compute_record = writes_.source_start_record(bound_source, record.timing_fact_node_id);
+            const auto roles = write_resource_roles(graph, expansion, compute_record);
+
+            observed_write_fragments_.emplace(
+                record.timing_fact_node_id,
+                ObservedWriteFragment{ record.pid, record.tid, roles.at("main"), compute_record, roles.at("payload"), expansion.resource_nodes() });
         }
         catch (const std::exception & error) {
-            throw std::runtime_error("Write template pid=" + record.pid + " at_us=" + std::to_string(record.source_start_us) + ": " + error.what());
+            throw std::runtime_error("Observed write pid=" + record.pid + " at_us=" + std::to_string(record.source_start_us) + ": " + error.what());
         }
     }
     for (auto & call : calls_) {
@@ -345,9 +334,9 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             const auto & edge = graph.edge(edge_id);
             if (edge.active && graph.node(edge.dst).active) call.successors.push_back(edge.dst);
         }
-        for (const auto & [id, donor] : templates_) {
+        for (const auto & [id, donor] : observed_write_fragments_) {
             if (donor.pid != call.pid || donor.tid != call.tid) continue;
-            bind_call_resources(bound_source, call, donor.expansion);
+            bind_call_resources(bound_source, call, donor.resources);
         }
     }
     // Prepare the work outside complete write calls. These source regions are
@@ -361,7 +350,21 @@ void HiCacheWriteCalls::bind(core::DagGraph & graph, uint64_t begin, uint64_t en
             if (region.kind == HiCacheEvictionRegion::Kind::WriteBackup) continue;
             try {
                 const auto host = observe_host_template(bound_source, eviction.pid, eviction.tid, region.begin, region.end);
-                eviction_controls_.push_back({ eviction.pid, eviction.tid, region, prepare_host_expansion(bound_source, queues, host) });
+                const auto expansion = prepare_host_expansion(bound_source, queues, host);
+                std::optional<size_t> main, compute;
+                using Kind = HiCacheEvictionRegion::Kind;
+                if ((region.kind == Kind::ReleaseRegular || region.kind == Kind::ReleaseBackup) && expansion.streams.size() == 1) {
+                    compute = expansion.streams.front().source_node;
+                    const auto & main_lane = expansion.nodes.at(expansion.host_return).work.lane_key;
+                    for (const auto & [original, local] : expansion.source_nodes) {
+                        if (!graph.node(original).is_cpu || graph.node_lane_key(original) != main_lane) continue;
+
+                        main = original;
+                        break;
+                    }
+                }
+
+                observed_eviction_fragments_.push_back({ eviction.pid, eviction.tid, expansion.resource_nodes(), main, compute });
             }
             catch (const std::exception & error) {
                 throw std::runtime_error("Eviction control pid=" + eviction.pid + " at_us=" + std::to_string(region.begin)

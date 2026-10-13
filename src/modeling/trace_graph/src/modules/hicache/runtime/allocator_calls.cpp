@@ -215,9 +215,7 @@ void HiCacheAllocatorCalls::advance(core::DagGraph & graph, size_t node, simulat
                                      + (call.inputs.device_name.empty() ? std::string("unknown") : call.inputs.device_name));
 
         auto generated = generate_tensor_program(graph, node, call.resources.worker, call.resources.compute, *program, "allocator");
-        const auto requests = tensor_cost_requests(generated.operations);
-        const auto estimates = cost::estimate_tensor_costs(requests, provider_);
-        bind_tensor_program(generated, estimates);
+        bind_host_operations(generated.plan, generated.operations, provider_, "tensor_independent_model");
         plan = std::move(generated.plan);
     }
     nlohmann::json requests = nlohmann::json::array();

@@ -39,8 +39,7 @@ struct PrefetchCheckCpuTiming {
 // absent in this observation; independent samples train their cost models.
 // A measured zero remains distinct from an unobserved branch.
 // Reads service costs on unchanged observation coordinates from the same graph.
-[[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed,
-                                                                const patch::HiCacheSourceDagIndex & source);
+[[nodiscard]] PrefetchCheckCpuTiming observe_prefetch_check_cpu(const PrefetchControlObservation & observed, const patch::HiCacheSourceDagIndex & source);
 struct PrefetchSchedulerStep {
     PrefetchSchedulerAction action;
     size_t source_round;

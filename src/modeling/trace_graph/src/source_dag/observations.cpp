@@ -38,7 +38,7 @@ std::optional<std::string> measurement_position(const core::TraceEvent & event) 
 }
 
 nlohmann::json phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                           bool cpu_service_applied, nlohmann::json * collective_diagnostics) {
+                                           bool cpu_service_applied) {
     nlohmann::json rows = nlohmann::json::array();
     const modules::hicache::patch::HiCacheSourceDagIndex source_index(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
@@ -154,12 +154,12 @@ nlohmann::json phase_operator_observations(const core::DagGraph & graph, const m
     for (const auto & row : layer_wait_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
     for (const auto & row : phase_tensor_operator_observations(source_index, queues, phases, cpu_service_applied)) rows.push_back(row);
     for (const auto & row : allocator_operator_observations(source_index, queues, cpu_service_applied)) rows.push_back(row);
-    for (const auto & row : collective_operator_observations(source_index, queues, phases, cpu_service_applied, collective_diagnostics)) rows.push_back(row);
+    for (const auto & row : collective_operator_observations(source_index, queues, phases, cpu_service_applied)) rows.push_back(row);
     return rows;
 }
 
 nlohmann::json layer_wait_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
-                                               const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+                                                const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
     const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
     std::map<std::pair<std::string, uint64_t>, std::string> layer_positions;
@@ -296,7 +296,7 @@ void append_blocking_write_observations(const modules::hicache::patch::HiCacheSo
 } // namespace
 
 nlohmann::json confirmation_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source_index,
-                                                 const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+                                                  const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
     const auto & graph = source_index.graph();
     nlohmann::json rows = nlohmann::json::array();
     // Nonblocking confirmation costs are observed after the MIN returns;
@@ -530,7 +530,7 @@ nlohmann::json load_admission_operator_observations(const core::DagGraph & input
 }
 
 nlohmann::json prefix_concat_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
-                                                  const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
+                                                   const simulation::detail::CpuTaskQueues & queues, bool cpu_service_applied) {
     const auto & graph = source.graph();
     nlohmann::json rows = nlohmann::json::array();
     for (const auto & admission : graph.runtime_observations()) {

@@ -6,7 +6,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
-#include <nlohmann/json_fwd.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -60,12 +59,12 @@ struct CollectiveCallerInterval {
 /** Source-only attribution for the current ordinary Qwen3 TP path. Unknown
  * layouts, missing peers and ambiguous submission ownership are issues, not
  * zero work or inferred peer calls. This does not prove target dispatch.
- * When requested, diagnostics receives the same extraction's detailed report;
- * neither output mutates the graph or changes attribution policy. The source
- * index and queues describe the same immutable graph throughout this call. */
+ * Descriptor agreement is checked as typed work, not by serializing a report.
+ * The source index and queues describe the same immutable graph throughout this call;
+ * positions must have been prepared from the accompanying phase audit. */
 [[nodiscard]] DeviceCollectiveAudit observe_device_collectives(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                                const simulation::detail::CpuTaskQueues & queues,
                                                                const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                                               nlohmann::json * diagnostics = nullptr);
+                                                               const PhaseCallPositions & positions);
 
 } // namespace markov::trace_graph::source_dag

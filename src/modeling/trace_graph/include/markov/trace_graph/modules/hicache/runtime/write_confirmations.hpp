@@ -5,13 +5,21 @@
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/structure/hicache/confirmation.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <span>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
 class HiCacheWriteCalls;
 
 struct ConfirmationExpansion {
     HiCacheHostExpansion plan;
-    std::vector<HostOperationSlots> slots;
+    std::vector<HostOperationBinding> operations;
     std::vector<size_t> acknowledgements;
 };
 
@@ -19,8 +27,6 @@ struct ConfirmationExpansion {
  * FIFO tasks. Cost binding is separate and cannot change these dependencies. */
 [[nodiscard]] ConfirmationExpansion generate_write_confirmation(const core::DagGraph & graph, size_t anchor, std::optional<size_t> worker,
                                                                 std::span<const structure::hicache::WriteConfirmationStep> steps);
-void bind_write_confirmation(ConfirmationExpansion & generated, std::span<const structure::hicache::WriteConfirmationStep> program,
-                             cost::OperatorCostProvider & provider);
 
 /** Independent nonblocking ACK host work. Source observations locate resources
  * and the old tail; target state supplies operations and their completion nodes. */

@@ -3,9 +3,12 @@
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 
 #include <algorithm>
+#include <array>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -108,6 +111,129 @@ void observe_worker_cost(const HiCacheHostExpansion & plan, const patch::HiCache
 }
 
 } // namespace
+
+void append_host_operation_observations(nlohmann::json & rows, const structure::OperationWork & work, std::string_view position,
+                                        const HostOperationMeasurement & measured, bool corrected, bool submitted) {
+    const auto append = [&](std::string_view scope, std::optional<double> duration_us) {
+        if (!duration_us) return;
+
+        rows.push_back({
+            {       "position",            position },
+            {      "operation",      work.operation },
+            { "implementation", work.implementation },
+            {       "features",       work.features },
+            {    "duration_us",        *duration_us },
+            {   "timing_scope",               scope }
+        });
+    };
+    using Measurement = HostOperationMeasurement;
+    const std::array fields{
+        std::pair{                     "cpu_service",                   &Measurement::main_us },
+        std::pair{               "residual_interval",          &Measurement::main_residual_us },
+        std::pair{           "worker_launch_service",                 &Measurement::worker_us },
+        std::pair{ "worker_launch_residual_interval",        &Measurement::worker_residual_us },
+        std::pair{           "worker_return_service",          &Measurement::worker_return_us },
+        std::pair{ "worker_return_residual_interval", &Measurement::worker_return_residual_us },
+        std::pair{               "dispatch_interval",               &Measurement::dispatch_us },
+    };
+    for (size_t index = 0; index < (submitted ? fields.size() : 2); ++index) {
+        const auto & [scope, member] = fields[index];
+        std::string label = scope;
+        if (!corrected && index != fields.size() - 1) {
+            label = "profiled_" + label;
+            if (index == 0) label = "profiled_cpu";
+        }
+
+        append(label, measured.*member);
+    }
+    if (submitted) append("device_service", measured.device_us);
+}
+
+std::optional<nlohmann::json> load_index_operator_observations(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source,
+                                                               const simulation::detail::CpuTaskQueues & queues, uint64_t tokens, uint64_t page_size,
+                                                               std::span<const uint64_t> clone_lengths, std::string_view position, bool corrected) {
+    if (!page_size || !tokens || tokens % page_size || plan.streams.size() != 1 || !plan.waits.empty() || !plan.event_waits.empty()) return std::nullopt;
+
+    const auto & nodes = plan.nodes;
+    std::vector<size_t> submissions;
+    for (size_t index = 0; index < nodes.size(); ++index)
+        if (nodes[index].work.is_cpu && !nodes[index].queue_member && nodes[index].work.name.starts_with("Enqueue@")) submissions.push_back(index);
+
+    const std::array allocation_calls{ "Enqueue@aclnnMuls", "Enqueue@aclnnArange", "Enqueue@aclnnAdd" };
+    if (submissions.size() <= allocation_calls.size()) return std::nullopt;
+    for (size_t index = 0; index < allocation_calls.size(); ++index)
+        if (nodes[submissions[index]].work.name != allocation_calls[index]) return std::nullopt;
+    for (size_t index = allocation_calls.size(); index < submissions.size(); ++index)
+        if (nodes[submissions[index]].work.name != "Enqueue@aclnnInplaceCopy") return std::nullopt;
+
+    std::vector<uint64_t> lengths(clone_lengths.begin(), clone_lengths.end());
+    if (lengths.empty() && submissions.size() == allocation_calls.size() + 1) lengths.push_back(tokens);
+    if (lengths.size() != submissions.size() - allocation_calls.size()) return std::nullopt;
+    uint64_t total = 0;
+    for (const auto length : lengths) {
+        if (!length || length % page_size) return std::nullopt;
+        total = core::checked_add_u64(total, length, "Measured clone lengths overflow");
+    }
+    if (total != tokens) return std::nullopt;
+
+    auto rows = nlohmann::json::array();
+    std::set<size_t> assigned;
+    size_t previous = 0;
+    const auto segment = [&](size_t last) {
+        HostOperationMeasurement measured{ .main_us = 0, .main_residual_us = 0 };
+        for (size_t index = previous; index <= last; ++index) {
+            const auto & node = nodes[index];
+            if (!node.work.is_cpu || node.queue_member) continue;
+            add_measurement(measured.main_us, node.work.duration);
+            add_measurement(measured.main_residual_us, node.work.cpu_gap_after);
+        }
+        previous = last + 1;
+        return measured;
+    };
+    const std::array names{ "multiply", "range", "add" };
+    for (size_t index = 0; index < submissions.size(); ++index) {
+        const auto submission = submissions[index];
+        std::set<size_t> devices;
+        size_t heads = 0;
+        for (size_t local = 0; local < nodes.size(); ++local) {
+            if (nodes[local].submission != submission) continue;
+            heads += !nodes[local].task_predecessor;
+            for (const auto & edge : plan.edges)
+                if (edge.from == local && !nodes[edge.to].work.is_cpu) devices.insert(edge.to);
+        }
+        if (heads != 1 || devices.size() != 1 || !assigned.insert(*devices.begin()).second) return std::nullopt;
+
+        auto measured = segment(submission);
+        observe_worker_cost(plan, source, queues, submission, measured);
+        if (!measured.worker_us || !measured.worker_residual_us || !measured.worker_return_us || !measured.worker_return_residual_us || !measured.dispatch_us
+            || !measured.device_us)
+            return std::nullopt;
+
+        const std::string name = index < names.size() ? names[index] : "clone";
+        const auto length = index < names.size() ? tokens : lengths[index - names.size()];
+        structure::OperationWork work{
+            .operation = "load.index." + name,
+            .implementation = "ascend.paged_unsorted",
+            .features = { { "requested_tokens", static_cast<double>(length) },
+                         { "page_size_tokens", static_cast<double>(page_size) },
+                         { "pages", static_cast<double>(length / page_size) } }
+        };
+        if (name == "clone") work.features["first_clone"] = index == names.size() ? 1.0 : 0.0;
+        append_host_operation_observations(rows, work, std::string(position) + ":" + name + ":" + std::to_string(index), measured, corrected, true);
+    }
+    for (size_t index = 0; index < nodes.size(); ++index)
+        if (!nodes[index].work.is_cpu && !assigned.contains(index)) return std::nullopt;
+
+    const structure::OperationWork tail{
+        .operation = "load.index.tail",
+        .implementation = "ascend.paged_unsorted",
+        .features = { { "requested_tokens", static_cast<double>(tokens) },
+                     { "page_size_tokens", static_cast<double>(page_size) },
+                     { "pages", static_cast<double>(tokens / page_size) } }
+    };
+    append_host_operation_observations(rows, tail, std::string(position) + ":tail", segment(nodes.size() - 1), corrected, false);
+    return rows;
+}
 
 std::optional<PagedReleaseMeasurement> observe_paged_release_cost(const HiCacheHostExpansion & plan, const patch::HiCacheSourceDagIndex & source,
                                                                   const simulation::detail::CpuTaskQueues & queues, bool paged) {

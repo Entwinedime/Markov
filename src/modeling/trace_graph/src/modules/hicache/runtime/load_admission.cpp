@@ -23,13 +23,10 @@ void HiCacheWriteCalls::prepare_generated_load_admissions(const patch::HiCacheSo
             compute = node;
         };
         if (const auto found = compute_resources_.find(key); found != compute_resources_.end()) witness(found->second);
-        for (const auto & [id, donor] : templates_)
+        for (const auto & [id, donor] : observed_write_fragments_)
             if (donor.pid == key.first && donor.tid == key.second) witness(donor.compute_record);
-        for (const auto & donor : eviction_controls_)
-            if (donor.pid == key.first && donor.tid == key.second
-                && (donor.region.kind == HiCacheEvictionRegion::Kind::ReleaseRegular || donor.region.kind == HiCacheEvictionRegion::Kind::ReleaseBackup)
-                && donor.expansion.streams.size() == 1)
-                witness(donor.expansion.streams.front().source_node);
+        for (const auto & donor : observed_eviction_fragments_)
+            if (donor.pid == key.first && donor.tid == key.second && donor.compute) witness(*donor.compute);
         if (!compute) continue; // Required only if this target needs a new branch.
         const auto resources = observe_load_index_resources(source, queues, branch.entry_node, *compute);
         if (!resources) continue;
@@ -58,13 +55,13 @@ size_t HiCacheWriteCalls::select_load_admission(const std::string & pid, const s
 }
 
 void HiCacheWriteCalls::bind_load_resources(const patch::HiCacheSourceDagIndex & source, Call & call, const LoadAdmissionProgram & program) {
-    if (program.clone) bind_call_resources(source, call, program.clone->program.plan, true);
-    for (const auto & step : program.allocation) bind_call_resources(source, call, step.program.plan, true);
+    if (program.clone) bind_call_resources(source, call, program.clone->program.plan.resource_nodes(), true);
+    for (const auto & step : program.allocation) bind_call_resources(source, call, step.program.plan.resource_nodes(), true);
     if (allocator_need_sort_) {
-        bind_call_resources(source, call, program.merge_concat.program.plan, true);
-        bind_call_resources(source, call, program.merge_sort.program.plan, true);
+        bind_call_resources(source, call, program.merge_concat.program.plan.resource_nodes(), true);
+        bind_call_resources(source, call, program.merge_sort.program.plan.resource_nodes(), true);
     }
-    bind_call_resources(source, call, program.prefix_concat.program.plan, true);
+    bind_call_resources(source, call, program.prefix_concat.program.plan.resource_nodes(), true);
 }
 
 HiCacheHostExpansion HiCacheWriteCalls::cost_load_step(const LoadStep & step, uint64_t pages, bool first_clone) const {

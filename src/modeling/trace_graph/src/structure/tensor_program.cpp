@@ -4,6 +4,26 @@
 #include <utility>
 
 namespace markov::trace_graph::structure {
+namespace {
+
+/** One eager sequence step: caller preparation, then a queued tensor call.
+ * Earlier tensor completion constrains the device, not CPU preparation.
+ * The program consists of these alternating steps until its caller return.
+ */
+void append_eager_tensor_operation(std::vector<TensorOperation> & program, OperationWork work, const std::string & caller) {
+    auto preparation = work;
+    preparation.operation += ".prepare";
+    preparation.implementation = caller;
+    preparation.timing_scope = "cpu_service";
+    program.push_back({ std::move(preparation), {}, std::nullopt, TensorExecutionKind::CpuService });
+
+    std::vector<size_t> predecessors{ program.size() - 1 };
+    if (program.size() > 1) predecessors.push_back(program.size() - 2);
+
+    program.push_back({ std::move(work), std::move(predecessors) });
+}
+
+} // namespace
 
 std::string_view tensor_execution_name(TensorExecutionKind kind) {
     switch (kind) {
@@ -175,18 +195,9 @@ std::vector<TensorOperation> dense_tensor_program(const std::string & component,
                  {    "invalid_mask", "aten.bitwise_not" }
         }) {
             const auto operation = component + ".embedding_mask." + role;
-            program.push_back({
-                { component, operation + ".prepare", "sglang.get_masked_input_and_mask.npu_eager", "cpu_service", features },
-                {},
-                std::nullopt,
-                TensorExecutionKind::CpuService
-            });
-            std::vector<size_t> predecessors{ program.size() - 1 };
-            if (program.size() > 1) predecessors.push_back(program.size() - 2);
-            program.push_back({
-                { component, operation, std::string(backend) + ":" + implementation, "device_service", features },
-                predecessors
-            });
+            append_eager_tensor_operation(program,
+                                          { component, operation, std::string(backend) + ":" + implementation, "device_service", features },
+                                          "sglang.get_masked_input_and_mask.npu_eager");
             if (std::string_view(backend) == "aten.mul") {
                 // Eager NPU embedding offsets/remapping multiply a bool mask
                 // by an int64 scalar or tensor. The mask promotion and the
@@ -212,18 +223,9 @@ std::vector<TensorOperation> dense_tensor_program(const std::string & component,
             work["output_width"] = static_cast<double>(width);
             work["output_elements"] = static_cast<double>(rotary->rows) * static_cast<double>(width);
             const auto operation = component + ".rotary.native." + role;
-            program.push_back({
-                { component, operation + ".prepare", "sglang.RotaryEmbedding.forward_npu", "cpu_service", work },
-                {},
-                std::nullopt,
-                TensorExecutionKind::CpuService
-            });
-            std::vector<size_t> predecessors{ program.size() - 1 };
-            if (program.size() > 1) predecessors.push_back(program.size() - 2);
-            program.push_back({
-                { component, operation, backend + ":" + implementation, "device_service", work },
-                predecessors
-            });
+            append_eager_tensor_operation(program,
+                                          { component, operation, backend + ":" + implementation, "device_service", std::move(work) },
+                                          "sglang.RotaryEmbedding.forward_npu");
         };
 
         // forward_npu eagerly gathers before selecting forward_native; the
@@ -258,18 +260,9 @@ std::vector<TensorOperation> dense_tensor_program(const std::string & component,
         std::vector<TensorOperation> program;
         const auto append = [&](const std::string & role, const std::string & backend) {
             const auto operation = component + ".rotary_table." + role;
-            program.push_back({
-                { component, operation + ".prepare", "sglang.RotaryEmbedding.get_cos_sin_with_position", "cpu_service", features },
-                {},
-                std::nullopt,
-                TensorExecutionKind::CpuService
-            });
-            std::vector<size_t> predecessors{ program.size() - 1 };
-            if (program.size() > 1) predecessors.push_back(program.size() - 2);
-            program.push_back({
-                { component, operation, backend + ":" + implementation, "device_service", features },
-                predecessors
-            });
+            append_eager_tensor_operation(program,
+                                          { component, operation, backend + ":" + implementation, "device_service", features },
+                                          "sglang.RotaryEmbedding.get_cos_sin_with_position");
         };
         append("gather", "aten.index_select");
         append("repeat", "aten.repeat");

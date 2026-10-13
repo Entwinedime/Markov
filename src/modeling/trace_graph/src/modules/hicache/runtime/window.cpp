@@ -15,6 +15,7 @@
 #include "markov/trace_graph/modules/hicache/runtime/storage_writes.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_calls.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_confirmations.hpp"
+#include "markov/trace_graph/source_dag/phase_calls.hpp"
 #include "markov/trace_graph/structure/hicache/phase.hpp"
 #include "markov/trace_graph/structure/hicache/resources.hpp"
 #include "markov/trace_graph/structure/missing_work.hpp"
@@ -40,12 +41,15 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
                                      config.io_cost.resource_lanes,
                                      true);
     replay.prepare_decode_allocations(source_graph, begin, end);
-    output.phase_observation_issues = replay.source_attention_calls().issues;
-    for (const auto & [issue, count] : replay.source_metadata_calls().issues) output.phase_observation_issues[issue] += count;
-    for (const auto & [issue, count] : replay.source_dense_calls().issues) output.phase_observation_issues[issue] += count;
-    for (const auto & [issue, count] : replay.source_device_collectives().issues) output.phase_observation_issues[issue] += count;
+    const auto source_calls = [&] {
+        const patch::HiCacheSourceDagIndex source(source_graph);
+        const auto queues = simulation::detail::discover_cpu_task_queues(source_graph);
+        return source_dag::observe_phase_calls(source, queues, replay.source_phases());
+    }();
+    output.phase_observation_issues = source_calls.issues();
     if (!output.phase_observation_issues.empty())
         throw structure::MissingWork("Phase replacement needs complete per-call source observations", output.phase_observation_issues);
+
     output.prepared_facts = replay.facts().size();
     const auto bound = bind_hicache_execution_boundaries(graph, replay.facts());
     if (!bound.issues.empty()) {
@@ -110,9 +114,8 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
         if (!mutation.topology.ok()) throw std::runtime_error("CPU collective topology invalid");
 #endif
     }
-    collective_services.bind(graph, source_graph, replay.source_device_collectives().calls, begin, end);
-    phase_calls
-        .bind(graph, source_graph, replay.source_attention_calls().calls, replay.source_metadata_calls().calls, replay.source_dense_calls().calls, begin, end);
+    collective_services.bind(graph, source_graph, source_calls.collectives.calls, begin, end);
+    phase_calls.bind(graph, source_graph, source_calls.attention.calls, source_calls.metadata.calls, source_calls.dense.calls, begin, end);
     const auto preparation_source = observe_allocator_preparations(source_graph);
     allocator_calls.bind(graph, source_graph, replay.facts(), compute_resources.schedule, preparation_source, begin, end);
     // No source regions are replaced after this point. Every generated host
@@ -130,7 +133,6 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
     std::map<size_t, uint64_t> operator_costs;
     std::set<size_t> phase_cost_migrations;
     std::set<size_t> started;
-    std::set<std::pair<std::string, std::string>> projected;
     size_t admitted_prefills = 0;
     size_t admitted_allocations = 0;
     const HiCacheLayerCalls::Consumer layer_consumer = [&](const std::string & pid, uint64_t batch) -> const std::vector<size_t> & {
@@ -174,40 +176,23 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
         }
         if (!phase_work.blockers.empty()) throw structure::MissingWork("Phase input incomplete", phase_work.blockers);
 
+        // The source join admits one phase per request/rank. This cursor
+        // consumes each appended work item once; no second identity set is needed.
         for (; admitted_prefills < phase_work.prefills.size(); ++admitted_prefills) {
             const auto & prefill = phase_work.prefills[admitted_prefills];
-            const auto key = std::pair{ prefill.pid, prefill.request_id };
-            if (projected.contains(key)) continue;
             const auto & decode = phase_work.decodes[admitted_prefills];
-            const auto & source_phase = replay.source_phase(prefill.pid, prefill.request_id);
-            for (const auto & call : replay.source_attention_calls().calls) {
-                const auto & origin = replay.source_phase(call.position.phase_index);
-                if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
-
-                output.phase_tensor_work.push_back(structure::hicache::plan_attention_call(call, prefill, decode));
+            const auto source_phase_index = replay.source_phase_index(prefill.pid, prefill.request_id);
+            const auto & source_phase = replay.source_phases().observations.at(source_phase_index);
+            auto work = structure::hicache::plan_phase_calls(source_calls, source_phase_index, prefill, decode);
+            for (auto & call : work.tensors) {
+                output.phase_tensor_work.push_back(std::move(call));
                 phase_calls.set_work(output.phase_tensor_work.back());
             }
-            for (const auto & call : replay.source_metadata_calls().calls) {
-                const auto & origin = replay.source_phase(call.position.phase_index);
-                if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
-
-                output.phase_tensor_work.push_back(structure::hicache::plan_attention_metadata_call(call, prefill, decode));
-                phase_calls.set_work(output.phase_tensor_work.back());
-            }
-            for (const auto & call : replay.source_dense_calls().calls) {
-                const auto & origin = replay.source_phase(call.position.phase_index);
-                if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
-
-                const auto & attention = replay.source_attention_calls().calls.at(call.attention_call_index);
-                output.phase_tensor_work.push_back(structure::hicache::plan_dense_call(call, attention, prefill));
-                phase_calls.set_work(output.phase_tensor_work.back());
-            }
-            for (const auto & call : replay.source_device_collectives().calls) {
-                const auto & origin = replay.source_phase(call.position.phase_index);
-                if (origin.pid != prefill.pid || origin.request_ids.size() != 1 || origin.request_ids.front() != prefill.request_id) continue;
-                output.collective_work.push_back(structure::hicache::plan_device_collective_call(call, replay.source_attention_calls().calls, prefill));
+            for (auto & call : work.collectives) {
+                output.collective_work.push_back(std::move(call));
                 collective_services.set_work(output.collective_work.back());
             }
+
             auto operations = structure::hicache::phase_migration_candidates(source_graph, source_phase, prefill, decode);
             std::erase_if(operations, [&](const auto & item) {
                 return phase_calls.owns(item.first) || allocator_calls.owns(item.first) || collective_services.owns(item.first);
@@ -227,7 +212,6 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
                 if (started.contains(cost.node_id)) throw std::runtime_error("Phase admitted after an operator already started");
                 if (!operator_costs.emplace(cost.node_id, cost.duration_us).second) throw std::runtime_error("Duplicate phase ownership");
             }
-            projected.insert(key);
         }
     };
     output.simulation = simulation::run_topological_simulation(
@@ -292,7 +276,7 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
     output.retained_allocator_calls = allocator_calls.retained();
     if (output.executed_allocator_calls != output.prepared_allocator_calls) throw std::runtime_error("Execution did not expand every prepared allocator call");
     if (!output.model.effect_decisions.missing_facts.empty()) throw std::runtime_error("HiCache execution finished with missing model facts");
-    output.phase_admissions = projected.size();
+    output.phase_admissions = admitted_prefills;
     output.changed_operators = operator_costs.size();
     output.source_load_submissions = loads.source_submissions();
     output.load_submission_shared_cost_batches = loads.shared_cost_batches();
@@ -303,8 +287,8 @@ HiCacheWindowResult execute_hicache_window(core::DagGraph & graph, const core::D
     output.source_write_submissions = writes.source_submissions();
     output.completed_writes = writes.completed_writes();
     output.resumed_allocations = writes.resumed_allocations();
-    output.prepared_write_templates = writes.prepared_templates();
-    output.prepared_eviction_controls = writes.prepared_eviction_controls();
+    output.observed_write_fragments = writes.observed_write_fragments();
+    output.observed_eviction_fragments = writes.observed_eviction_fragments();
     output.expanded_write_submissions = writes.expanded_submissions();
     output.generated_control_steps = writes.generated_control_steps();
     output.generated_blocking_checks = writes.generated_blocking_checks();

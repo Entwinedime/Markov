@@ -1,6 +1,5 @@
 // Offline extraction from an explicitly selected independent calibration only.
 #include "markov/trace_graph/core/numeric.hpp"
-#include "markov/trace_graph/cost/hicache_submission.hpp"
 #include "markov/trace_graph/io/cpu_service_input.hpp"
 #include "markov/trace_graph/io/trace_manifest_input.hpp"
 #include "markov/trace_graph/modules/hicache/execution_boundaries.hpp"
@@ -17,83 +16,21 @@
 #include "markov/trace_graph/source_dag/tensor_cost.hpp"
 #include "markov/trace_graph/structure/hicache/query.hpp"
 #include <algorithm>
+#include <exception>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <vector>
 using namespace markov::trace_graph;
 namespace hc = modules::hicache;
 
 namespace {
 
-// Local node ids are array offsets. CPU and device service share the same unit;
-// residual CPU gaps and worker dispatch delays remain separate observations.
-nlohmann::json expansion_observation(const hc::runtime::HiCacheHostExpansion & plan, const hc::patch::HiCacheSourceDagIndex & source,
-                                     const simulation::detail::CpuTaskQueues & queues) {
-    auto nodes = nlohmann::json::array();
-    for (size_t i = 0; i < plan.nodes.size(); ++i) {
-        const auto & node = plan.nodes[i];
-        nlohmann::json item{
-            {          "id",                             i },
-            {        "name",                node.work.name },
-            {         "cpu",              node.work.is_cpu },
-            {        "lane",            node.work.lane_key },
-            {  "service_us",            node.work.duration },
-            { "residual_us",       node.work.cpu_gap_after },
-            {      "worker", node.queue_member.has_value() }
-        };
-        if (node.submission) item["submission"] = *node.submission;
-        if (node.task_predecessor) item["task_predecessor"] = *node.task_predecessor;
-        if (node.work.cpu_task_ready_delay_us) item["dispatch_us"] = *node.work.cpu_task_ready_delay_us;
-        nodes.push_back(std::move(item));
-    }
-
-    // Expansion durations use integer simulation ticks. Calibration retains
-    // the original fractional device measurement, not the rounded replay cost.
-    // Event waits are measured separately with their synchronization proof.
-    for (const auto & [original, local] : plan.source_nodes) {
-        const auto & value = source.graph().node(original);
-        if (value.is_cpu || value.kind != core::DagNodeKind::TraceEvent) continue;
-
-        const auto & event = source.graph().event_for_node(original);
-        if (event.name == "EVENT_WAIT" || value.duration != event.dur) continue;
-        nodes[local]["service_us"] = static_cast<double>(event.dur) + static_cast<double>(event.dur_submicro_ns) / 1000.0;
-    }
-
-    auto edges = nlohmann::json::array();
-    for (const auto & edge : plan.edges) edges.push_back({ edge.from, edge.to, static_cast<int>(edge.kind) });
-
-    std::map<size_t, std::vector<size_t>> jobs;
-    for (const auto & [original, local] : plan.source_nodes)
-        if (plan.nodes[local].submission) jobs[*plan.nodes[local].submission].push_back(original);
-    auto worker_costs = nlohmann::json::object();
-    for (const auto & [submission, members] : jobs) {
-        std::set<size_t> devices;
-        for (const auto member : members)
-            for (const auto edge_id : source.outgoing_edge_ids(member)) {
-                const auto & edge = source.graph().edge(edge_id);
-                if (edge.active && edge.kind == core::DagEdgeKind::Correlation && !source.graph().node(edge.dst).is_cpu) devices.insert(edge.dst);
-            }
-        if (const auto costs = source_dag::observe_worker_launch(source, queues, members, devices)) {
-            worker_costs[std::to_string(submission)] = {
-                {                 "worker_us",          costs->launch_us },
-                {        "worker_residual_us", costs->launch_residual_us },
-                {          "worker_return_us",          costs->return_us },
-                { "worker_return_residual_us", costs->return_residual_us }
-            };
-        }
-    }
-
-    return {
-        {        "nodes",        std::move(nodes) },
-        {        "edges",        std::move(edges) },
-        { "worker_costs", std::move(worker_costs) },
-        {  "event_waits", plan.event_waits.size() }
-    };
-}
 
 int export_operation(core::DagGraph graph, const std::string & manifest, uint64_t begin_us, uint64_t end_us, const std::string & output_path,
                      const std::string & operation, const std::string & cpu_service) {
@@ -104,6 +41,9 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             { "cpu_service_file",                  corrected ? cpu_service : "" },
             {       "cost_basis", corrected ? "paired_cpu_service" : "profiled" }
         });
+        if (!document.contains("limitations"))
+            document["limitations"] = "Only attributable measured scopes are exported; absent scopes remain missing. CPU correction uses this capture's paired "
+                                      "intervals; worker, device and residual timing are separate.";
         std::ofstream output(output_path);
         output << document.dump(2) << '\n';
         if (!output) throw std::runtime_error("Failed to persist operation calibration");
@@ -128,6 +68,9 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
         if (!corrected) throw std::runtime_error("Shared write/release costs require paired CPU correction");
         const bool release_only = operation == "release-host";
         auto document = hc::runtime::export_write_calibration(graph, begin_us, end_us, release_only);
+        if (document["rows"].empty())
+            throw std::runtime_error(release_only ? "Independent capture has no complete ordinary release"
+                                                  : "Independent capture has no complete write operation");
         // Write extraction splits boundaries. Its consumers need indices of
         // that graph, not the source snapshot taken before the split.
         const hc::patch::HiCacheSourceDagIndex calibrated(graph);
@@ -310,81 +253,9 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
     }
     if (operation == "audit-layer-wait") {
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-        auto rows = nlohmann::json::array();
-        for (const auto & call : hc::observe_hicache_layer_waits(source).calls) {
-            if (!call.enabled) continue;
-            nlohmann::json row{
-                { "phase", call.phase },
-                { "layer", call.layer }
-            };
-            try {
-                if (!call.submission || !call.worker || !call.device_wait || !call.issue.empty())
-                    throw std::runtime_error("Independent layer wait lacks complete submission evidence");
-                hc::runtime::HiCacheHostTemplate host{ .main = call.cpu, .worker_nodes = { *call.worker } };
-                const auto plan = hc::runtime::prepare_host_expansion(source, queues, host);
-                if (plan.streams.size() != 1 || plan.event_waits.size() != 1 || !plan.waits.empty())
-                    throw std::runtime_error("Independent layer wait has unsupported dependencies");
-                const auto submission = plan.source_nodes.at(*call.submission);
-                std::vector<size_t> worker_nodes;
-                for (const auto & [original, local] : plan.source_nodes)
-                    if (plan.nodes[local].submission) worker_nodes.push_back(original);
-                const auto parts = source_dag::observe_worker_launch(source, queues, std::move(worker_nodes), { *call.device_wait });
-                uint64_t before = 0, before_gap = 0, after = 0, after_gap = 0, worker = 0, dispatch = 0;
-                size_t jobs = 0;
-                for (size_t i = 0; i < plan.nodes.size(); ++i) {
-                    const auto & node = plan.nodes[i];
-                    if (!node.work.is_cpu) continue;
-                    if (node.submission) {
-                        worker += node.work.duration;
-                        if (!node.task_predecessor) {
-                            ++jobs;
-                            if (!node.work.cpu_task_ready_delay_us) throw std::runtime_error("Layer wait worker has no observed dispatch interval");
-                            dispatch += *node.work.cpu_task_ready_delay_us;
-                        }
-                    }
-                    else if (i <= submission) {
-                        before += node.work.duration;
-                        before_gap += node.work.cpu_gap_after;
-                    }
-                    else {
-                        after += node.work.duration;
-                        after_gap += node.work.cpu_gap_after;
-                    }
-                }
-                if (jobs != 1) throw std::runtime_error("Layer wait must have one background task");
-                row.update({
-                    {            "status",                          "observed" },
-                    {              "rank", graph.node(*call.submission).gpu_id },
-                    {           "main_us",                              before },
-                    {  "main_residual_us",                          before_gap },
-                    {          "after_us",                               after },
-                    { "after_residual_us",                           after_gap },
-                    {         "worker_us",                              worker },
-                    {       "dispatch_us",                            dispatch },
-                    {         "device_us",                             nullptr }
-                });
-                if (const auto device = source_dag::observe_device_event_wait_service(source, *call.device_wait)) row["device_us"] = *device;
-                else
-                    row["device_service_issue"] = "No raw device event wait proven free of dependency waiting; normalized replay duration is not a measurement";
-                if (parts) {
-                    row["worker_launch_service_us"] = parts->launch_us;
-                    row["worker_launch_residual_us"] = parts->launch_residual_us;
-                    row["worker_return_service_us"] = parts->return_us;
-                    row["worker_return_residual_us"] = parts->return_residual_us;
-                }
-                else { row["worker_split_issue"] = "No complete measurable single-launch task; aggregate is audit-only"; }
-            }
-            catch (const std::exception & error) {
-                row.update({
-                    { "status", "incomplete" },
-                    { "reason", error.what() }
-                });
-            }
-            rows.push_back(std::move(row));
-        }
         publish({
-            { "role", "independent_layer_wait_audit" },
-            { "rows", std::move(rows) },
+            { "role", "fixed_calibration" },
+            { "operation", "layer_wait" },
             { "operator_observations", source_dag::layer_wait_operator_observations(source, queues, corrected) }
         });
         return 0;
@@ -470,66 +341,26 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                          {               "tail",                    &Cost::tail }
                 }) {
                     const auto & cost = *costs.*member;
-                    for (const auto & [scope, duration] : std::vector<std::pair<std::string, std::optional<double>>>{
-                             {                   "main_us",                   cost.main_us },
-                             {          "main_residual_us",          cost.main_residual_us },
-                             {                 "worker_us",                 cost.worker_us },
-                             {        "worker_residual_us",        cost.worker_residual_us },
-                             {          "worker_return_us",          cost.worker_return_us },
-                             { "worker_return_residual_us", cost.worker_return_residual_us },
-                             {               "dispatch_us",               cost.dispatch_us },
-                             {                 "device_us",                 cost.device_us }
-                    })
-                        row["costs"][name][scope] = duration ? nlohmann::json(*duration) : nlohmann::json(nullptr);
                     if (std::string_view(name) == "layer_record" && layers.size() == 1) continue;
-                    const auto emit = [&](std::string_view scope, std::optional<double> duration) {
-                        if (!duration) return;
-                        operator_rows.push_back({
-                            {       "position", "load_submission:" + record.pid + ":" + record.tid + ":" + std::to_string(record.source_start_us) + ":" + name },
-                            {      "operation",                                                                         "load.submission." + std::string(name) },
-                            { "implementation",                                                                         "kernel_ascend.page_first_direct.load" },
-                            {       "features",                                                                                                       features },
-                            {    "duration_us",                                                                                                      *duration },
-                            {   "timing_scope",                                                                                                          scope },
-                        });
+                    const bool submitted = std::string_view(name) == "start_record" || std::string_view(name) == "wait_event"
+                                           || std::string_view(name) == "first_layer_record" || std::string_view(name) == "layer_record";
+                    const structure::OperationWork work{
+                        .operation = "load.submission." + std::string(name),
+                        .implementation = "kernel_ascend.page_first_direct.load",
+                        .features = features.get<std::map<std::string, double>>(),
                     };
-                    emit(corrected ? "cpu_service" : "profiled_cpu", cost.main_us);
-                    emit(corrected ? "residual_interval" : "profiled_residual_interval", cost.main_residual_us);
-                    if (std::string_view(name) == "start_record" || std::string_view(name) == "wait_event" || std::string_view(name) == "first_layer_record"
-                        || std::string_view(name) == "layer_record") {
-                        emit(corrected ? "worker_launch_service" : "profiled_worker_launch_service", cost.worker_us);
-                        emit(corrected ? "worker_launch_residual_interval" : "profiled_worker_launch_residual_interval", cost.worker_residual_us);
-                        emit(corrected ? "worker_return_service" : "profiled_worker_return_service", cost.worker_return_us);
-                        emit(corrected ? "worker_return_residual_interval" : "profiled_worker_return_residual_interval", cost.worker_return_residual_us);
-                        emit("dispatch_interval", cost.dispatch_us);
-                        emit("device_service", cost.device_us);
-                    }
+                    source_dag::append_host_operation_observations(operator_rows,
+                                                                   work,
+                                                                   "load_submission:" + record.pid + ":" + record.tid + ":"
+                                                                       + std::to_string(record.source_start_us) + ":" + name,
+                                                                   cost,
+                                                                   corrected,
+                                                                   submitted);
                 }
-                row.update(expansion_observation(plan, bounded, queues));
-                for (const auto & [node, bytes] : plan.payload) row["nodes"][node]["payload_bytes"] = bytes;
-
-                auto streams = nlohmann::json::array(), barriers = nlohmann::json::array();
-                for (const auto & stream : plan.streams)
-                    streams.push_back({
-                        {  "lane", graph.node_lane_key(stream.source_node) },
-                        { "first",                            stream.first },
-                        {  "last",                             stream.last }
-                    });
-                for (const auto & wait : plan.waits)
-                    barriers.push_back({
-                        {     "lane", graph.node_lane_key(wait.source_node) },
-                        { "consumer",                         wait.consumer }
-                    });
-                std::vector<size_t> records;
-                for (const auto & layer : layers) records.push_back(plan.source_nodes.at(layer.source_record));
                 row.update({
-                    {      "status",                                          "observed" },
-                    {        "rank", graph.node(host.main.owned_node_ids.front()).gpu_id },
-                    {     "streams",                                             streams },
-                    {       "waits",                                            barriers },
-                    {     "records",                                             records },
-                    { "host_return",                                    plan.host_return },
-                    {       "bytes",                                  plan.payload_bytes }
+                    { "status",         "observed" },
+                    {  "bytes", plan.payload_bytes },
+                    { "layers",      layers.size() }
                 });
             }
             catch (const std::exception & error) {
@@ -572,10 +403,11 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                 points.push_back(std::move(point));
             }
         }
-        const auto boundaries = hc::bind_hicache_control_points(graph, points);
+        (void)hc::bind_hicache_control_points(graph, points);
         const hc::patch::HiCacheSourceDagIndex bounded(graph);
         const auto queues = simulation::detail::discover_cpu_task_queues(graph);
         nlohmann::json rows = nlohmann::json::array();
+        auto operator_rows = nlohmann::json::array();
         for (const auto & fact : bounded.fact_nodes()) {
             if (fact.fact_role != "loadback_decision_observed" || fact.phase != "end" || !fact.effective_token_count) continue;
             nlohmann::json row{
@@ -606,20 +438,24 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
                     row["clone_tokens"] = nlohmann::json::parse(admission.arg("host_node_tokens"));
                 }
 
-                // Measure only the successful attempt and subsequent clones.
-                // Earlier failed allocation/eviction work and host-index
-                // preparation precede this boundary and have separate costs.
+                // Earlier failures and host-index preparation have separate
+                // measurements; this interval starts at the successful attempt.
                 const auto host = hc::runtime::observe_host_template(bounded, fact.pid, fact.tid, allocation->ts, fact.timestamp_us + fact.duration_us);
                 const auto plan = hc::runtime::prepare_host_expansion(bounded, queues, host, "");
-                const auto main_node = host.main.owned_node_ids.empty() ? host.main.owned_gap_slices.front().owner_node_id : host.main.owned_node_ids.front();
-                row["rank"] = graph.node(main_node).gpu_id;
-                row.update(expansion_observation(plan, bounded, queues));
-                row.update({
-                    {              "status",          "observed" },
-                    { "allocation_begin_us",      allocation->ts },
-                    {      "device_streams", plan.streams.size() },
-                    {        "stream_waits",   plan.waits.size() }
-                });
+                const auto clones = row.contains("clone_tokens") ? row["clone_tokens"].get<std::vector<uint64_t>>() : std::vector<uint64_t>{};
+                const auto position = "load_index:" + fact.pid + ":" + fact.tid + ":" + std::to_string(fact.timestamp_us);
+                const auto measured = source_dag::load_index_operator_observations(plan,
+                                                                                   bounded,
+                                                                                   queues,
+                                                                                   fact.effective_token_count,
+                                                                                   allocation->arg_u64("page_size"),
+                                                                                   clones,
+                                                                                   position,
+                                                                                   corrected);
+                if (!measured) throw std::runtime_error("Unsorted index work lacks complete asynchronous allocation/clone measurements");
+
+                for (const auto & observation : *measured) operator_rows.push_back(observation);
+                row["status"] = "observed";
             }
             catch (const std::exception & error) {
                 row.update({
@@ -630,7 +466,9 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
             rows.push_back(std::move(row));
         }
         auto operator_observations = source_dag::load_admission_operator_observations(graph, corrected);
-        for (const auto & observation : source_dag::prefix_concat_operator_observations(bounded, queues, corrected)) operator_observations.push_back(observation);
+        for (const auto & observation : source_dag::prefix_concat_operator_observations(bounded, queues, corrected))
+            operator_observations.push_back(observation);
+        for (const auto & observation : operator_rows) operator_observations.push_back(observation);
 
         publish({
             {                  "role",         "independent_cost_audit" },
@@ -644,7 +482,7 @@ int export_operation(core::DagGraph graph, const std::string & manifest, uint64_
 
 } // namespace
 
-int main(int argc, char ** argv) {
+int main(int argc, char ** argv) try {
     // manifest begin end output operation cpu-service [output operation ...]
     if (argc < 7 || argc % 2 == 0) return 2;
     std::vector<std::pair<std::string, std::string>> exports{
@@ -680,4 +518,8 @@ int main(int argc, char ** argv) {
         if (status != 0) return status;
     }
     return 0;
+}
+catch (const std::exception & error) {
+    std::cerr << error.what() << '\n';
+    return 1;
 }

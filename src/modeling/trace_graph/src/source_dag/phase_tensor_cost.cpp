@@ -18,7 +18,8 @@ nlohmann::json phase_tensor_operator_observations(const modules::hicache::patch:
                                                   const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied) {
     const auto & graph = source.graph();
     nlohmann::json rows = nlohmann::json::array();
-    const auto calls = observe_attention_calls(source, queues, phases);
+    const auto positions = phase_call_positions(phases);
+    const auto calls = observe_attention_calls(source, queues, phases, positions);
     const auto layer_waits = modules::hicache::observe_hicache_layer_waits(source);
     std::set<size_t> measured_devices;
 
@@ -35,7 +36,6 @@ nlohmann::json phase_tensor_operator_observations(const modules::hicache::patch:
     // Metadata is outside per-layer attention. Match each enclosed operator
     // and the intervening CPU intervals, never count the outer wall time as
     // an additional service or attach layer costs a second time.
-    const auto positions = phase_call_positions(phases);
     for (const auto & region : observe_attention_metadata_regions(source, queues)) {
         if (region.work.caller.status != "ready" || region.work.caller.has_node_overlap) continue;
         const auto owner = call_phase_position(region.work, positions);

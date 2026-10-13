@@ -77,6 +77,8 @@ OperationWork collective_caller_work(const OperationWork & collective, const Col
     return work;
 }
 
+namespace {
+
 PhaseCallPlan plan_attention_call(const source_dag::AttentionCall & source, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                   const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     PhaseCallPlan result{ .source_observation = source.region.work.observation,
@@ -139,14 +141,15 @@ PhaseCallPlan plan_attention_metadata_call(const source_dag::AttentionMetadataCa
                           .logical_input = prefill.logical_input,
                           .request_id = prefill.request_id,
                           .decode_iteration = source.position.decode_iteration,
-                          .kind = PhaseCallPlan::Kind::Metadata };
+                          .call_kind = "metadata" };
     if (prefill.batch_size != 1 || (!source.position.decode_iteration && !source.complete_prefill_context)) {
         result.reason = "target_metadata_batch_or_prefill_chunk_rule_unavailable";
         return result;
     }
 
     auto target = source.inputs;
-    target.context_tokens = source.position.decode_iteration ? decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) : prefill.prompt_token_count;
+    target.context_tokens =
+        source.position.decode_iteration ? decode_context_tokens(decode.prompt_token_count, *source.position.decode_iteration) : prefill.prompt_token_count;
     target.page_tokens = source.position.decode_iteration ? decode.target_page_size : prefill.target_page_size;
     if (target.context_tokens > target.max_context_tokens) {
         result.reason = "target_metadata_context_exceeds_deployment_capacity";
@@ -180,8 +183,7 @@ PhaseCallPlan plan_dense_call(const source_dag::DenseCall & source, const source
                           .request_id = prefill.request_id,
                           .decode_iteration = source.position.decode_iteration,
                           .layer_index = source.layer_index,
-                          .kind = PhaseCallPlan::Kind::Dense,
-                          .dense_role = source.role };
+                          .call_kind = "dense." + source.role };
     if (prefill.batch_size != 1 || attention.batch.requests.size() != 1 || !attention.padding || attention.padding->mlp_sync
         || attention.padding->allow_input_scattered || attention.conditions.context_parallel) {
         result.reason = "target_dense_distributed_token_layout_unavailable";
@@ -232,8 +234,7 @@ DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollect
     DeviceCollectivePlan result{ source.region.observation, source.peer_observations, std::nullopt, {} };
     const source_dag::AttentionCall * attention = nullptr;
     for (const auto & call : attention_calls) {
-        if (call.position != source.position || call.conditions.cache_layer_index != source.layer_index)
-            continue;
+        if (call.position != source.position || call.conditions.cache_layer_index != source.layer_index) continue;
         if (attention) {
             result.reason = "collective_forward_layout_ambiguous";
             return result;
@@ -277,14 +278,35 @@ DeviceCollectivePlan plan_device_collective_call(const source_dag::DeviceCollect
     return result;
 }
 
+} // namespace
+
+PhaseCallWork plan_phase_calls(const source_dag::PhaseCallAudit & source, size_t source_phase, const modules::hicache::model::HiCachePrefillWorkItem & prefill,
+                               const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
+    PhaseCallWork result;
+    for (const auto & call : source.attention.calls)
+        if (call.position.phase_index == source_phase) result.tensors.push_back(plan_attention_call(call, prefill, decode));
+
+    for (const auto & call : source.metadata.calls)
+        if (call.position.phase_index == source_phase) result.tensors.push_back(plan_attention_metadata_call(call, prefill, decode));
+
+    for (const auto & call : source.dense.calls) {
+        if (call.position.phase_index != source_phase) continue;
+
+        result.tensors.push_back(plan_dense_call(call, source.attention.calls.at(call.attention_call_index), prefill));
+    }
+
+    for (const auto & call : source.collectives.calls)
+        if (call.position.phase_index == source_phase) result.collectives.push_back(plan_device_collective_call(call, source.attention.calls, prefill));
+
+    return result;
+}
+
 std::map<size_t, CostMigration> phase_migration_candidates(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservation & source,
                                                            const modules::hicache::model::HiCachePrefillWorkItem & prefill,
                                                            const modules::hicache::model::HiCacheDecodeWorkItem & decode) {
     std::map<size_t, CostMigration> operations;
     const auto append = [&](const auto & nodes, const std::string & operation, bool unchanged) {
-        for (const auto id : nodes) {
-            operations.emplace(id, CostMigration{ operation, graph.event_for_node(id).name, unchanged });
-        }
+        for (const auto id : nodes) { operations.emplace(id, CostMigration{ operation, graph.event_for_node(id).name, unchanged }); }
     };
 
     // Same model/TP/backend is established by the prediction input boundary.

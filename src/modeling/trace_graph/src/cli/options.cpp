@@ -75,6 +75,8 @@ void select_trace_channels(io::ManifestTraceInputOptions & options, const std::s
 }
 
 void validate_options(const CliOptions & options) {
+    if (!options.target_plan.empty() && (options.source_observations_only || !options.prepare_cpu_service.empty() || !options.model_config.empty()))
+        throw CliUsageError("--target-plan supplies target models and cannot be combined with single-run model, observation or CPU preparation");
     if (options.source_observations_only && (!options.model_config.empty() || !options.prepare_cpu_service.empty() || !options.outputs.graph.empty()))
         throw CliUsageError("Source observation extraction cannot be combined with model, CPU preparation or graph output");
     if (options.profile_manifest.empty()) throw CliUsageError("--profile-manifest is required");
@@ -82,7 +84,8 @@ void validate_options(const CliOptions & options) {
         throw CliUsageError("--prepare-cpu-service and --cpu-service-output must be supplied together");
     if (!options.prepare_cpu_service.empty() && (!options.model_config.empty() || !options.cpu_service_cost.empty()))
         throw CliUsageError("CPU service preparation uses source measurements, not target models or existing service costs");
-    if (options.prepare_cpu_service.empty() && options.outputs.run_summary.empty()) throw CliUsageError("--run-summary is required");
+    if (options.prepare_cpu_service.empty() && options.target_plan.empty() && options.outputs.run_summary.empty())
+        throw CliUsageError("--run-summary is required");
     if (options.trace_input.window_start_us.has_value() != options.trace_input.window_end_us.has_value()) {
         throw CliUsageError("--trace-window-start-us and --trace-window-end-us must be provided together");
     }
@@ -118,6 +121,7 @@ std::optional<CliOptions> parse_cli_options(int argc, char ** argv) {
         else if (argument == "--source-replay-report") options.outputs.source_replay_report = next_value(index, argc, argv, argument);
         else if (argument == "--structure-report") options.outputs.structure_report = next_value(index, argc, argv, argument);
         else if (argument == "--model-config") options.model_config = next_value(index, argc, argv, argument);
+        else if (argument == "--target-plan") options.target_plan = next_value(index, argc, argv, argument);
         else if (argument == "--cpu-service-cost") options.cpu_service_cost = next_value(index, argc, argv, argument);
         else if (argument == "--prepare-cpu-service") options.prepare_cpu_service = next_value(index, argc, argv, argument);
         else if (argument == "--cpu-service-output") options.cpu_service_output = next_value(index, argc, argv, argument);
@@ -151,6 +155,7 @@ void print_usage(const char * program) {
               << "  --trace-window-end-us N         Inclusive workload-window end timestamp\n\n"
               << "Model and output:\n"
               << "  --model-config FILE             Optional SimulationModule config\n"
+              << "  --target-plan FILE              Internal same-source batch; private target executions\n"
               << "  --cpu-service-cost FILE         Optional same-base CPU service intervals\n"
               << "  --prepare-cpu-service FILE      Generate service intervals from same-base measurements; no prediction\n"
               << "  --cpu-service-output FILE       Output for --prepare-cpu-service (replaces --run-summary)\n"

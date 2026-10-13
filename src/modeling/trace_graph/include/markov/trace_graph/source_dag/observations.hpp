@@ -1,8 +1,8 @@
 #pragma once
 
 #include "markov/trace_graph/core/dag_graph.hpp"
-#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/modules/hicache/patch/source_dag_index.hpp"
+#include "markov/trace_graph/modules/hicache/phase_observation.hpp"
 #include "markov/trace_graph/simulation/cpu_task_queues.hpp"
 
 #include <nlohmann/json_fwd.hpp>
@@ -14,13 +14,6 @@ namespace markov::trace_graph::source_dag {
 /** Stable original record and interval identity; synthetic work has no measurement. */
 [[nodiscard]] std::optional<std::string> measurement_position(const core::TraceEvent & event);
 
-/** Preserve observed Torch input dimensions and source submission links.
- * Unsupported encodings retain raw text with null parsed dimensions.
- * Strict innermost envelopes establish source-local ownership; ties and
- * non-nested candidates remain ambiguous, never resolved by kernel name.
- * This source evidence neither emits costs nor generates target geometry. */
-[[nodiscard]] nlohmann::json operator_geometry_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases);
-
 /** One group observation after the last measured input frontier, ending at
  * the last rank's communication completion. This is a completion interval,
  * not pure transport service. Requires raw, complete predecessor intervals
@@ -29,8 +22,7 @@ namespace markov::trace_graph::source_dag {
  * this capture's correction; raw HCCL duration is never a device sample. */
 [[nodiscard]] nlohmann::json collective_operator_observations(const modules::hicache::patch::HiCacheSourceDagIndex & source,
                                                               const simulation::detail::CpuTaskQueues & queues,
-                                                              const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied,
-                                                              nlohmann::json * collective_diagnostics = nullptr);
+                                                              const modules::hicache::HiCachePhaseObservationAudit & phases, bool cpu_service_applied);
 
 /** Attention, metadata and Linear samples with observed operator/submission ownership.
  * Missing or ambiguous native lowering is omitted, not filled from call wall time.
@@ -53,10 +45,9 @@ namespace markov::trace_graph::source_dag {
  * Build one source index and queue observation for all immutable exporters.
  * Both refer to this graph only and must not survive a graph mutation.
  * Exporters that need boundary splitting own a private graph and fresh indices.
- * Optional collective diagnostics reuse the same source attribution as samples.
  */
 [[nodiscard]] nlohmann::json phase_operator_observations(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases,
-                                                         bool cpu_service_applied, nlohmann::json * collective_diagnostics = nullptr);
+                                                         bool cpu_service_applied);
 
 /** Whole nonblocking CPU tails after MIN, indexed by the observed queue delta,
  * plus empty blocking write entry/return and separately observed ack bodies.

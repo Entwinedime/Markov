@@ -92,11 +92,8 @@ def scan_observations(
             "start_us": window.start_ns // 1000,
             "end_us": window.end_ns // 1000,
         },
-        "source_prefetch_policy": source.hicache_config["prefetch_policy"],
         "source_io_observations": summary["source_io_observations"],
-        "source_phase_observations": summary["source_phase_observations"],
         "operator_observations": summary["operator_observations"],
-        "operator_geometry": summary["operator_geometry"],
     }
     if correction is not None:
         observation["measurement_manifests"] = [observation["source_manifest"], correction["light_manifest"]]

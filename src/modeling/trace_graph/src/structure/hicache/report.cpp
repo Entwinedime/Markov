@@ -1,8 +1,8 @@
 #include "markov/trace_graph/structure/hicache/report.hpp"
 #include "markov/trace_graph/core/numeric.hpp"
 #include "markov/trace_graph/source_dag/call_regions.hpp"
-#include "markov/trace_graph/source_dag/device_collectives.hpp"
 #include "markov/trace_graph/source_dag/observations.hpp"
+#include "markov/trace_graph/source_dag/phase_calls.hpp"
 #include "markov/trace_graph/structure/hicache/allocator.hpp"
 #include "markov/trace_graph/structure/phase_shape.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
@@ -120,13 +120,9 @@ Json phase_precedence(const core::DagGraph & graph, const std::map<size_t, std::
 }
 
 Json generated_work_inventory(const core::DagGraph & graph) {
-    std::map<std::string, size_t> categories, operations, edge_groups;
+    std::map<std::string, size_t> categories;
     std::set<std::pair<int, size_t>> resources;
     size_t generated = 0, observation_fragments = 0;
-    const auto generated_node = [&](size_t id) {
-        const auto & node = graph.node(id);
-        return node.kind == core::DagNodeKind::Synthetic && !node.observed_cpu_coordinates;
-    };
     for (const auto & node : graph.nodes()) {
         if (!node.active || node.kind != core::DagNodeKind::Synthetic) continue;
         if (node.observed_cpu_coordinates) {
@@ -136,41 +132,23 @@ Json generated_work_inventory(const core::DagGraph & graph) {
         ++generated;
         const auto & event = graph.event_for_node(node.id);
         ++categories[event.cat];
-        ++operations[event.name];
         resources.emplace(node.gpu_id, node.lane_id);
-    }
-    for (const auto & edge : graph.edges()) {
-        if (!edge.active || !graph.node(edge.src).active || !graph.node(edge.dst).active) continue;
-        const auto from = generated_node(edge.src) ? "generated" : "retained";
-        const auto to = generated_node(edge.dst) ? "generated" : "retained";
-        ++edge_groups[std::string(from) + "->" + to];
     }
     return {
         {                "generated_nodes",                                                                                                       generated },
         { "retained_observation_fragments",                                                                                           observation_fragments },
         {                     "categories",                                                                                                      categories },
-        {                "operation_names",                                                                                                      operations },
         {            "resource_lane_count",                                                                                                resources.size() },
-        {           "edge_endpoint_groups",                                                                                                     edge_groups },
         {                          "scope", "active synthetic operations and boundaries, excluding source observation fragments; not target correspondence" },
         {   "target_correspondence_proven",                                                                                                           false },
     };
 }
 
-std::vector<std::string> observed_kernel_names(const core::DagGraph & graph, const std::set<size_t> & devices) {
-    std::vector<std::string> names;
-    for (const auto device : devices) names.push_back(graph.event_for_node(device).name);
-    // Source ids order this inventory, not cross-trace execution order.
-    return names;
-}
-
 Json unassigned_device_work(const core::DagGraph & graph, const std::set<size_t> & devices, const std::set<size_t> & assigned) {
     size_t observed = 0, logical_waits = 0, other_synthetic = 0;
-    std::map<std::string, size_t> names;
     for (const auto node : devices) {
         if (assigned.contains(node)) continue;
         const auto & event = graph.event_for_node(node);
-        ++names[event.name];
 
         // A builder-created wait is not a missing measured kernel. It still
         // belongs to uncovered work until its target correspondence is proven.
@@ -180,91 +158,23 @@ Json unassigned_device_work(const core::DagGraph & graph, const std::set<size_t>
     }
     return {
         { "unassigned_call_device_nodes",          observed + logical_waits + other_synthetic                                         },
-        {      "unassigned_kernel_names",                                                                             std::move(names) },
         { "unassigned_device_node_kinds",
          { { "observed_device_work", observed }, { "synthetic_logical_wait", logical_waits }, { "other_synthetic", other_synthetic } } }
     };
 }
 
-Json serial_native_sequence(const modules::hicache::patch::HiCacheSourceDagIndex & source, const std::set<size_t> & devices, bool predicted) {
-    const auto chain = source_dag::observe_serial_device_chain(source, devices);
-    if (!chain) return nullptr;
-
-    const auto & graph = source.graph();
-    Json sequence = Json::array();
-    auto current = chain->first;
-    while (true) {
-        const auto & event = graph.event_for_node(current);
-        if (predicted) {
-            const auto label = source_dag::native_launch_label(event.arg("cost_implementation"));
-            if (!label) return nullptr;
-            sequence.push_back(std::string(*label));
-        }
-        else { sequence.push_back(event.name); }
-        if (current == chain->last) break;
-
-        // The chain proof establishes exactly one successor here. Traverse
-        // actual stream edges; node ids and timestamps are not execution order.
-        for (const auto id : source.outgoing_edge_ids(current)) {
-            const auto & edge = graph.edge(id);
-            if (edge.active && edge.kind == core::DagEdgeKind::Stream && devices.contains(edge.dst)) {
-                current = edge.dst;
-                break;
-            }
-        }
-    }
-    return sequence;
-}
-
-Json native_device_topology(const modules::hicache::patch::HiCacheSourceDagIndex & source, const std::set<size_t> & devices) {
-    const auto & graph = source.graph();
-    std::map<std::pair<int, size_t>, size_t> lanes;
-    std::map<std::string, size_t> edges;
-    std::vector<std::pair<size_t, size_t>> degrees;
-    for (const auto node : devices) {
-        const auto & value = graph.node(node);
-        ++lanes[{ value.gpu_id, value.lane_id }];
-        size_t incoming = 0, outgoing = 0;
-        for (const auto id : source.incoming_edge_ids(node)) {
-            const auto & edge = graph.edge(id);
-            if (edge.active && devices.contains(edge.src)) ++incoming;
-        }
-        for (const auto id : source.outgoing_edge_ids(node)) {
-            const auto & edge = graph.edge(id);
-            if (!edge.active || !devices.contains(edge.dst)) continue;
-            ++outgoing;
-            ++edges[std::string(core::edge_kind_name(edge.kind))];
-        }
-        degrees.emplace_back(incoming, outgoing);
-    }
-
-    // Local node/lane ids are never cross-trace identities. These invariants
-    // expose parallelism or missing links, but do not prove graph isomorphism
-    // or native-operation identity when they happen to agree.
-    std::vector<size_t> lane_sizes;
-    for (const auto & [lane, count] : lanes) lane_sizes.push_back(count);
-    std::ranges::sort(lane_sizes);
-    std::ranges::sort(degrees);
-    return {
-        {          "lane_sizes", lane_sizes },
-        { "internal_edge_kinds",      edges },
-        {    "internal_degrees",    degrees }
-    };
-}
-
 Json executed_tensor_operations(const core::DagGraph & graph, const std::string & family, const std::map<std::string, int> & ranks = {}) {
-    const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
     Json operations = Json::array();
     std::map<size_t, std::string> completions;
-    std::map<std::string, Json> device_operations;
-    std::map<std::string, std::set<size_t>> device_nodes;
+    std::map<std::string, size_t> device_counts;
     for (const auto & node : graph.nodes()) {
         if (!node.active) continue;
         const auto & event = graph.event_for_node(node.id);
         // Geometry is recorded once, on the actual emitted operation's
         // submission node. A saved/unexecuted work plan is not evidence here.
-        if (event.arg(family + "_action") != "generated") continue;
         const auto execution = event.arg(family + "_execution");
+        if (execution.empty()) continue;
+
         const bool tensor_device = !node.is_cpu && (execution == "async_device" || execution == "direct_blocking_device");
         const bool tensor_completion = (tensor_device && event.arg("tensor_intermediate_device") != "true")
                                        || (execution == "blocking_readback" && event.arg("tensor_completion") == "true");
@@ -303,16 +213,7 @@ Json executed_tensor_operations(const core::DagGraph & graph, const std::string 
         }
         auto identity = call_identity;
         identity.push_back(index);
-        if (tensor_device) {
-            device_nodes[identity.dump()].insert(node.id);
-            auto & native = device_operations.try_emplace(identity.dump(), Json::array()).first->second;
-            const auto label = source_dag::native_launch_label(event.arg("cost_implementation"));
-            native.push_back({
-                {           "operation",                       event.arg("cost_operation") },
-                {      "implementation",                  event.arg("cost_implementation") },
-                { "expected_task_label", label ? Json(std::string(*label)) : Json(nullptr) }
-            });
-        }
+        if (tensor_device) ++device_counts[identity.dump()];
         if (tensor_completion) {
             completions.emplace(node.id, identity.dump());
             continue;
@@ -331,11 +232,7 @@ Json executed_tensor_operations(const core::DagGraph & graph, const std::string 
     }
     for (auto & operation : operations) {
         const auto identity = operation.at("operator_identity").get<std::string>();
-        const auto native = device_operations.find(identity);
-        operation["native_operations"] = native == device_operations.end() ? Json::array() : std::move(native->second);
-        operation["native_device_nodes"] = operation["native_operations"].size();
-        operation["native_device_topology"] = native_device_topology(source, device_nodes[identity]);
-        operation["native_serial_sequence"] = serial_native_sequence(source, device_nodes[identity], true);
+        operation["native_device_nodes"] = device_counts[identity];
     }
 
     auto precedence = phase_precedence(graph, completions);
@@ -403,15 +300,12 @@ struct ObservedTensorOperations {
             else if (const auto chain = source_dag::observe_serial_device_chain(source, devices)) completions.emplace(chain->last, identity.dump());
 
             operators.push_back({
-                { "operator_identity", identity.dump() },
-                { "call_identity", call_identity.dump() },
-                { "operation", operation.work.operation },
-                { "implementation", operation.work.implementation },
-                { "features", operation.work.features },
-                { "native_device_nodes", devices.size() },
-                { "native_device_topology", native_device_topology(source, devices) },
-                { "observed_kernel_names", observed_kernel_names(graph, devices) },
-                { "native_serial_sequence", serial_native_sequence(source, devices, false) },
+                {   "operator_identity",               identity.dump() },
+                {       "call_identity",          call_identity.dump() },
+                {           "operation",      operation.work.operation },
+                {      "implementation", operation.work.implementation },
+                {            "features",       operation.work.features },
+                { "native_device_nodes",                devices.size() },
             });
         }
     }
@@ -436,15 +330,18 @@ struct ObservedTensorOperations {
 };
 
 Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSourceDagIndex & source, const simulation::detail::CpuTaskQueues & queues,
-                                      const modules::hicache::HiCachePhaseObservationAudit & phases, std::map<size_t, std::string> & call_owners) {
+                                      const modules::hicache::HiCachePhaseObservationAudit & phases, const source_dag::PhaseCallAudit & calls,
+                                      std::map<size_t, std::string> & call_owners) {
     const auto & graph = source.graph();
-    const auto audit = source_dag::observe_attention_calls(source, queues, phases);
-    const auto metadata_audit = source_dag::observe_attention_metadata_calls(source, queues, phases);
-    const auto dense_audit = source_dag::observe_dense_calls(source, queues, phases, audit);
     ObservedTensorOperations result;
-    const auto append_call = [&](const source_dag::SubmittedCallRegion & work, std::span<const size_t> operator_observations,
-                                 const source_dag::PhaseCallPosition & position, std::optional<uint64_t> cache_layer,
-                                 const std::string & kind, const std::optional<std::vector<TensorOperation>> & program) {
+    const auto append_call = [&](const source_dag::SubmittedCallRegion & work,
+                                 std::span<const size_t>
+                                     operator_observations,
+                                 const source_dag::PhaseCallPosition & position,
+                                 std::optional<uint64_t>
+                                     cache_layer,
+                                 const std::string & kind,
+                                 const std::optional<std::vector<TensorOperation>> & program) {
         for (const auto node : work.submitted_nodes)
             if (!graph.node(node).is_cpu) result.call_devices.insert(node);
         if (!program) {
@@ -468,23 +365,35 @@ Json observed_phase_tensor_operations(const modules::hicache::patch::HiCacheSour
 
         result.append(source, queues, *program, matched, call_identity);
     };
-    for (const auto & call : audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.position, call.conditions.cache_layer_index,
-                    "layer", ascend_attention_tensor_program(call.conditions, call.batch, call.cache_write));
-    for (const auto & call : metadata_audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.position, std::nullopt,
-                    "metadata", ascend_attention_metadata_program(call.position.decode_iteration ? "decode" : "prefill", call.inputs));
-    for (const auto & call : dense_audit.calls)
-        append_call(call.region.work, call.region.operator_observations, call.position, call.layer_index,
-                    "dense." + call.role, dense_tensor_program(call.position.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
+    for (const auto & call : calls.attention.calls)
+        append_call(call.region.work,
+                    call.region.operator_observations,
+                    call.position,
+                    call.conditions.cache_layer_index,
+                    "layer",
+                    ascend_attention_tensor_program(call.conditions, call.batch, call.cache_write));
+    for (const auto & call : calls.metadata.calls)
+        append_call(call.region.work,
+                    call.region.operator_observations,
+                    call.position,
+                    std::nullopt,
+                    "metadata",
+                    ascend_attention_metadata_program(call.position.decode_iteration ? "decode" : "prefill", call.inputs));
+    for (const auto & call : calls.dense.calls)
+        append_call(call.region.work,
+                    call.region.operator_observations,
+                    call.position,
+                    call.layer_index,
+                    "dense." + call.role,
+                    dense_tensor_program(call.position.decode_iteration ? "decode" : "prefill", call.region.implementation, call.region.shape));
 
-    auto issues = audit.issues;
-    for (const auto & [issue, count] : metadata_audit.issues) issues[issue] += count;
-    for (const auto & [issue, count] : dense_audit.issues) issues[issue] += count;
+    auto issues = calls.attention.issues;
+    for (const auto & [issue, count] : calls.metadata.issues) issues[issue] += count;
+    for (const auto & [issue, count] : calls.dense.issues) issues[issue] += count;
     auto report = std::move(result).report(graph);
     report["source_observation_issues"] = std::move(issues);
-    report["scope"] =
-        "tensor work corroborated by Torch envelopes and submitted device work; CPU, layer checks and native dependency correspondence remain outside this comparison";
+    report["scope"] = "tensor work corroborated by Torch envelopes and submitted device work; CPU, layer checks and native dependency correspondence remain "
+                      "outside this comparison";
     return report;
 }
 
@@ -700,48 +609,6 @@ Json allocator_request_row(const model::HiCacheAllocatorRequest & request, uint6
     };
 }
 
-Json submitted_region_row(const core::DagGraph & graph, const source_dag::SubmittedCallRegion & region) {
-    const auto & event = graph.runtime_observations().at(region.observation);
-    const auto boundary = [&](const std::vector<size_t> & edges) {
-        Json rows = Json::array();
-        for (const auto id : edges) {
-            const auto & edge = graph.edge(id);
-            rows.push_back({
-                { "source_edge",                          id },
-                {        "from",                    edge.src },
-                {          "to",                    edge.dst },
-                {        "kind", static_cast<int>(edge.kind) }
-            });
-        }
-        return rows;
-    };
-    return {
-        {    "source_observation",                  region.observation },
-        {                   "pid",                           event.pid },
-        {                   "tid",                           event.tid },
-        {       "source_begin_us",                            event.ts },
-        {  "observed_interval_us",                           event.dur },
-        {      "caller_ownership",                region.caller.status },
-        {          "caller_nodes",        region.caller.owned_node_ids },
-        {      "ownership_reason",                region.caller.reason },
-        {          "uncovered_us", region.caller.uncovered_duration_us },
-        {       "submitted_nodes",              region.submitted_nodes },
-        { "incoming_dependencies",     boundary(region.incoming_edges) },
-        { "outgoing_dependencies",     boundary(region.outgoing_edges) }
-    };
-}
-
-Json operator_envelope_counts(const core::DagGraph & graph, std::span<const size_t> observations) {
-    std::map<std::string, size_t> counts;
-    for (const auto observation : observations) ++counts[graph.runtime_observations().at(observation).name];
-
-    return {
-        { "status",                                                  counts.empty() ? "unavailable" : "observed" },
-        { "counts",                                                                                       counts },
-        {  "scope", "original nested CPU operator envelopes; not additive service costs or native kernel counts" },
-    };
-}
-
 Json observed_allocator_work(const core::DagGraph & graph, const modules::hicache::HiCachePhaseObservationAudit & phases) {
     std::map<std::string, int> ranks;
     for (const auto & phase : phases.observations) ranks.emplace(phase.pid, phase.logical_input);
@@ -870,8 +737,8 @@ Json observed_allocator_operations(const modules::hicache::patch::HiCacheSourceD
         Json requests = Json::array();
         for (const auto & request : call.at("requests"))
             requests.push_back({
-                { "request_id", request.at("request_id") },
-                { "iteration", request.at("decode_iteration") }
+                { "request_id",       request.at("request_id") },
+                {  "iteration", request.at("decode_iteration") }
             });
         const auto identity = Json::array({ call.at("logical_input"), requests, call.at("phase") == "prefill" ? "extend" : "decode" });
         if (!identities.emplace(index, identity).second) ambiguous.insert(index);
@@ -894,10 +761,10 @@ Json observed_allocator_operations(const modules::hicache::patch::HiCacheSourceD
     auto report = std::move(result).report(graph);
     report["source_observation_issues"] = {
         { "unobservable_outer_calls", observed_work.at("unobservable_calls") },
-        { "ambiguous_inner_calls", ambiguous.size() }
+        {    "ambiguous_inner_calls",                       ambiguous.size() }
     };
-    report["scope"] =
-        "allocator tensor work corroborated by independent call envelopes and device submissions; CPU/control and internal launch dependencies are not fully compared";
+    report["scope"] = "allocator tensor work corroborated by independent call envelopes and device submissions; CPU/control and internal launch dependencies "
+                      "are not fully compared";
     return report;
 }
 
@@ -936,142 +803,11 @@ Json observed_phase_structure_report(const core::DagGraph & graph, const modules
     report["observation_status"] = phases.status;
     const modules::hicache::patch::HiCacheSourceDagIndex source(graph);
     const auto queues = simulation::detail::discover_cpu_task_queues(graph);
-    const auto collectives = source_dag::observe_device_collectives(source, queues, phases, &report["device_collective_observations"]);
-    report["collective_operations"] = observed_collective_structure(graph, phases, collectives);
+    const auto calls = source_dag::observe_phase_calls(source, queues, phases);
+    report["collective_operations"] = observed_collective_structure(graph, phases, calls.collectives);
     report["allocator_work"] = observed_allocator_work(graph, phases);
-    Json allocator_regions = Json::array();
-    for (const auto & region : source_dag::observe_allocator_regions(source, queues)) {
-        auto row = submitted_region_row(graph, region.work);
-        row["phase"] = region.phase == model::HiCacheAllocatorPhase::Extend ? "prefill" : "decode";
-        row["allocated"] = region.allocated ? Json(*region.allocated) : Json(nullptr);
-        row["torch_operator_envelopes"] = operator_envelope_counts(graph, region.operator_observations);
-        allocator_regions.push_back(std::move(row));
-    }
-    report["allocator_regions"] = {
-        { "status",                                                                             allocator_regions.empty() ? "unavailable" : "observed" },
-        {  "calls",                                                                                                       std::move(allocator_regions) },
-        {  "scope", "source allocator envelopes, submission/task closure and boundary dependencies; not target generation or replacement safety proof" }
-    };
-    Json attention = Json::array();
-    const auto tensor_operations = [](const std::vector<TensorOperation> & program) {
-        Json operations = Json::array();
-        for (const auto & operation : program)
-            operations.push_back({
-                {      "operation",                                                 operation.work.operation },
-                { "implementation",                                            operation.work.implementation },
-                {      "execution",                               tensor_execution_name(operation.execution) },
-                {    "layer_index",     operation.layer_index ? Json(*operation.layer_index) : Json(nullptr) },
-                {       "features",                                                  operation.work.features },
-                {   "predecessors",                                                   operation.predecessors },
-                {  "request_index", operation.request_index ? Json(*operation.request_index) : Json(nullptr) }
-            });
-        return operations;
-    };
-    const auto append_attention = [&](const auto & events, const char * collection) {
-        for (size_t i = 0; i < events.size(); ++i) {
-            const auto & event = events[i];
-            if (event.name != "runtime.phase.attention") continue;
-
-            Json dispatch = nullptr;
-            Json tensor_program = nullptr;
-            Json shape_rule = nullptr;
-            if (const auto conditions = source_dag::attention_conditions(event)) {
-                if (const auto selected = ascend_attention_dispatch(*conditions))
-                    dispatch = {
-                        {      "branch",                                                         selected->branch },
-                        {      "layout",                                                         selected->layout },
-                        { "per_request",                                                    selected->per_request },
-                        {       "scope", "framework dispatch only; tensor program and native nodes not generated" }
-                    };
-
-                const auto batch = source_dag::attention_batch_shape(event);
-                const auto write = source_dag::attention_cache_write(event);
-                if (batch && write) {
-                    if (const auto padding = source_dag::attention_eager_padding(event))
-                        if (const auto reconstructed =
-                                target_eager_attention_inputs(*conditions, *batch, *write, *padding, batch->requests, batch->page_tokens))
-                            shape_rule = {
-                                {      "padded_query_tokens",                                         reconstructed->batch.padded_query_tokens },
-                                { "matches_observed_padding",           reconstructed->batch.padded_query_tokens == batch->padded_query_tokens },
-                                {                    "scope", "framework eager padding rule on observed inputs; not target execution evidence" }
-                            };
-
-                    if (const auto program = ascend_attention_tensor_program(*conditions, *batch, *write)) {
-                        tensor_program = {
-                            { "operations",tensor_operations(*program)             },
-                            {      "scope",
-                             "framework cache-write/score/output program derived from observed metadata; excludes caller CPU work, not a native DAG or target "
-                             "prediction" }
-                        };
-                    }
-                }
-            }
-
-            // Descriptor references are process/phase scoped, not graph node
-            // ids. Timing mode retains every formal call; sparse mode does not
-            // establish complete region coverage. Neither measures GPU service.
-            attention.push_back({
-                {        "source_collection",                          collection },
-                {       "source_observation",                                   i },
-                {                      "pid",                           event.pid },
-                {                      "tid",                           event.tid },
-                {          "source_begin_us",                            event.ts },
-                {     "observed_interval_us",                           event.dur },
-                {               "descriptor", Json::parse(event.args_json_view()) },
-                {       "framework_dispatch",                 std::move(dispatch) },
-                { "framework_tensor_program",           std::move(tensor_program) },
-                {         "eager_shape_rule",               std::move(shape_rule) }
-            });
-        }
-    };
-    append_attention(graph.prelude_context_events(), "prelude");
-    append_attention(graph.runtime_observations(), "formal");
-    Json attention_regions = Json::array();
-    const auto decode_contexts = source_dag::decode_operator_contexts(phases, source_dag::observe_decode_contexts(graph, phases));
-    for (const auto & region : source_dag::observe_attention_regions(source, queues)) {
-        auto row = submitted_region_row(graph, region.work);
-        row["phase"] = region.phase;
-        row["sampling"] = region.sampling;
-        row["status"] = region.status;
-        row["torch_operator_envelopes"] = operator_envelope_counts(graph, region.operator_observations);
-        row["descriptor_position"] = region.descriptor
-            ? Json{{"source_collection", region.descriptor->prelude ? "prelude" : "formal"},
-                   {"source_observation", region.descriptor->observation}} : Json(nullptr);
-        row["decode_context"] = nullptr;
-        row["framework_tensor_program"] = nullptr;
-        if (const auto context = source_dag::attention_decode_context(region, decode_contexts)) {
-            row["decode_context"] = {
-                {            "pid",            context->pid },
-                {        "request",        context->request },
-                {      "iteration",      context->iteration },
-                { "context_tokens", context->context_tokens }
-            };
-            if (region.descriptor) {
-                const auto & descriptor = region.descriptor->prelude ? graph.prelude_context_events().at(region.descriptor->observation)
-                                                                     : graph.runtime_observations().at(region.descriptor->observation);
-                const auto conditions = source_dag::attention_conditions(descriptor);
-                const auto batch = source_dag::attention_batch_shape(descriptor, context->context_tokens);
-                const auto write = source_dag::attention_cache_write(descriptor);
-                if (conditions && batch && write)
-                    if (const auto program = ascend_attention_tensor_program(*conditions, *batch, *write))
-                        row["framework_tensor_program"] = {
-                            { "operations",                                                                                      tensor_operations(*program) },
-                            {      "scope", "framework program from the observed call's own scalar-confirmed decode round; not native target DAG generation" }
-                        };
-            }
-        }
-        attention_regions.push_back(std::move(row));
-    }
-    report["attention_backend_observations"] = {
-        {  "status",attention.empty() ? "unavailable" : "observed"                    },
-        {   "calls",                           std::move(attention) },
-        { "regions",                   std::move(attention_regions) },
-        {   "scope",
-         "source backend descriptors and optional timing-mode call boundaries; references use pid/phase/descriptor_id, not generated target operators or "
-         "device service"                                          }
-    };
     std::map<size_t, std::string> call_owners;
-    report["phase_tensor_operations"] = observed_phase_tensor_operations(source, queues, phases, call_owners);
+    report["phase_tensor_operations"] = observed_phase_tensor_operations(source, queues, phases, calls, call_owners);
     for (auto & operation : report["operators"]) {
         const auto owner = call_owners.find(operation.at("graph_node").get<size_t>());
         operation["tensor_call_identity"] = owner == call_owners.end() ? "" : owner->second;
@@ -1190,7 +926,6 @@ Json execution_structure_report(const core::DagGraph & graph, const model::HiCac
         });
 
     std::map<std::string, int> allocation_ranks;
-    const auto allocator_inputs = source_dag::observe_allocator_inputs(graph);
     for (const auto & prefill : phases.prefills) allocation_ranks.emplace(prefill.pid, prefill.logical_input);
     for (const auto & decode : phases.decodes) allocation_ranks.emplace(decode.pid, decode.logical_input);
     for (const auto & call : phases.allocator_calls) {
@@ -1199,22 +934,6 @@ Json execution_structure_report(const core::DagGraph & graph, const model::HiCac
         Json requests = Json::array();
         for (const auto & request : call.requests) requests.push_back(allocator_request_row(request, call.page_size));
         const auto rank = allocation_ranks.find(call.pid);
-        Json tensor_program = nullptr;
-        const auto inputs = allocator_inputs.find(call.pid);
-        if (inputs != allocator_inputs.end()) {
-            if (const auto planned = ascend_decode_allocator_program(call, inputs->second)) {
-                tensor_program = Json::array();
-                for (const auto & operation : *planned)
-                    tensor_program.push_back({
-                        {      "operation",      operation.work.operation                                           },
-                        { "implementation",                                            operation.work.implementation },
-                        {       "features",                                                  operation.work.features },
-                        {   "predecessors",                                                   operation.predecessors },
-                        {      "execution",                                          tensor_execution_name(operation.execution) },
-                        {  "request_index", operation.request_index ? Json(*operation.request_index) : Json(nullptr) },
-                    });
-            }
-        }
         Json queue = nullptr;
         if (call.queue_state_known) {
             // State admission already established sufficient capacity. An
@@ -1230,18 +949,17 @@ Json execution_structure_report(const core::DagGraph & graph, const model::HiCac
             };
         }
         allocations.push_back({
-            {          "logical_input",                        rank == allocation_ranks.end() ? -1 : rank->second },
-            {                  "phase", call.phase == model::HiCacheAllocatorPhase::Decode ? "decode" : "prefill" },
-            {       "page_size_tokens",                                                            call.page_size },
-            {             "batch_size",                                                           call.batch_size },
-            {          "extend_tokens",                                                        call.extend_tokens },
-            {              "new_pages",                                                      call.allocated_pages },
-            {      "free_pages_before",                                                    call.free_pages_before },
-            {   "release_pages_before",                                                 call.release_pages_before },
-            {    "merge_release_queue",                                                  call.merge_release_queue },
-            {               "requests",                                                       std::move(requests) },
-            {            "queue_state",                                                          std::move(queue) },
-            { "planned_tensor_program",                                                 std::move(tensor_program) },
+            {        "logical_input",                        rank == allocation_ranks.end() ? -1 : rank->second },
+            {                "phase", call.phase == model::HiCacheAllocatorPhase::Decode ? "decode" : "prefill" },
+            {     "page_size_tokens",                                                            call.page_size },
+            {           "batch_size",                                                           call.batch_size },
+            {        "extend_tokens",                                                        call.extend_tokens },
+            {            "new_pages",                                                      call.allocated_pages },
+            {    "free_pages_before",                                                    call.free_pages_before },
+            { "release_pages_before",                                                 call.release_pages_before },
+            {  "merge_release_queue",                                                  call.merge_release_queue },
+            {             "requests",                                                       std::move(requests) },
+            {          "queue_state",                                                          std::move(queue) },
         });
     }
     const auto stats = graph.summary_stats();

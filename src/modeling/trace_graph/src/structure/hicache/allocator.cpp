@@ -42,9 +42,9 @@ public:
             if (previous_host_) host_dependencies.push_back(*previous_host_);
             program.push_back({
                 .work = { component_,
-                 preparation == 0 ? prefix_ + ".entry" : prefix_ + "." + operation + ".prepare",
-                 "sglang.NPUPagedTokenToKVPoolAllocator", "cpu_service",
-                 features },
+                         preparation == 0 ? prefix_ + ".entry" : prefix_ + "." + operation + ".prepare",
+                         "sglang.NPUPagedTokenToKVPoolAllocator", "cpu_service",
+                         features },
                 .predecessors = std::move(host_dependencies),
                 .execution = TensorExecutionKind::CpuService
             });
@@ -167,7 +167,7 @@ ExtendPageRegions extend_page_regions(uint64_t sequence_tokens, uint64_t prefix_
 }
 
 std::optional<std::vector<TensorOperation>> ascend_decode_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
-                                                                                     const AscendAllocatorInputs & inputs) {
+                                                                            const AscendAllocatorInputs & inputs) {
     // Request-to-token tables store int32 locations in the ordinary Decode
     // path; other callers may supply int64. Preserve the resulting promotion
     // and no-op-cast rules rather than borrowing the extend Triton signature.
@@ -212,8 +212,8 @@ std::optional<std::vector<TensorOperation>> ascend_decode_allocator_program(cons
 }
 
 std::optional<std::vector<TensorOperation>> ascend_extend_allocator_prefix(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
-                                                                                    const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
-                                                                                    bool page_count_supplied) {
+                                                                           const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
+                                                                           bool page_count_supplied) {
     if (!inputs.device_name.starts_with("Ascend910B") || call.phase != modules::hicache::model::HiCacheAllocatorPhase::Extend || !call.queue_state_known
         || inputs.debug_memory_pool || prefix_dtype != "torch.int64" || inputs.sequence_dtype != "torch.int64" || inputs.free_page_dtype != "torch.int64")
         return std::nullopt;
@@ -250,9 +250,8 @@ OperationWork allocator_preparation_operation(const AllocatorPreparation & prepa
 }
 
 std::optional<std::vector<TensorOperation>> ascend_fused_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
-                                                                                           const AscendAllocatorInputs & inputs,
-                                                                                           const std::string & prefix_dtype, bool page_count_supplied,
-                                                                                           const AllocatorPreparation & preparation) {
+                                                                                  const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
+                                                                                  bool page_count_supplied, const AllocatorPreparation & preparation) {
     if (call.allocated_pages >= kNpuNaiveAllocationMinimumPages || inputs.last_location_dtype != "torch.int64" || !inputs.triton_task_queue_enabled.has_value()
         || !preparation.specialization || (preparation.status != "required" && preparation.status != "already_prepared"))
         return std::nullopt;
@@ -279,8 +278,8 @@ std::optional<std::vector<TensorOperation>> ascend_fused_extend_allocator_progra
 }
 
 std::optional<std::vector<TensorOperation>> ascend_naive_extend_allocator_program(const modules::hicache::model::HiCacheAllocatorWorkItem & call,
-                                                                                           const AscendAllocatorInputs & inputs,
-                                                                                           const std::string & prefix_dtype, bool page_count_supplied) {
+                                                                                  const AscendAllocatorInputs & inputs, const std::string & prefix_dtype,
+                                                                                  bool page_count_supplied) {
     if (call.allocated_pages < kNpuNaiveAllocationMinimumPages || inputs.last_location_dtype != "torch.int64" || call.requests.size() != call.batch_size)
         return std::nullopt;
     auto prefix = ascend_extend_allocator_prefix(call, inputs, prefix_dtype, page_count_supplied);

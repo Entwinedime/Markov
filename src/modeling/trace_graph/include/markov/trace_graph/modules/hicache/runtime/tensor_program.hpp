@@ -1,33 +1,16 @@
 #pragma once
 
-#include "markov/trace_graph/cost/host_operation.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/load_execution.hpp"
 #include "markov/trace_graph/modules/hicache/runtime/write_expansion.hpp"
 #include "markov/trace_graph/structure/tensor_program.hpp"
 
 #include <cstddef>
-#include <optional>
+#include <cstdint>
 #include <span>
 #include <string>
 #include <vector>
 
 namespace markov::trace_graph::modules::hicache::runtime {
-
-struct TensorOperationSlots {
-    struct DeviceLaunch {
-        size_t worker, device;
-        structure::OperationWork work;
-    };
-    size_t submit;
-    std::optional<size_t> worker, device, tail;
-    std::optional<size_t> worker_return;
-    size_t host_return;
-    structure::OperationWork work;
-    std::string tail_operation;
-    std::string tail_scope = "cpu_service";
-    std::vector<DeviceLaunch> device_launches;
-    std::optional<structure::OperationWork> device_work;
-};
 
 /** Cost-free lowering on one compute stream and worker FIFO, with target
  * HiCache layer checks. has_layer_load comes from target cache execution, not
@@ -53,7 +36,7 @@ struct TensorOperationSlots {
  */
 struct GeneratedTensorProgram {
     HiCacheHostExpansion plan;
-    std::vector<TensorOperationSlots> operations;
+    std::vector<HostOperationBinding> operations;
     // In plan.event_waits order. The caller supplies each target layer's
     // completion node to expand_host; no source event is copied here.
     std::vector<uint64_t> event_layers;
@@ -67,19 +50,5 @@ struct GeneratedTensorProgram {
 [[nodiscard]] GeneratedTensorProgram generate_tensor_program(const core::DagGraph & graph, size_t main, size_t worker, size_t compute,
                                                              std::span<const structure::TensorOperation> operations, const std::string & identity_prefix,
                                                              bool has_layer_load = false);
-
-/** Describe only the service scopes selected by the structural slots. Active
- * waits use the same submit/tail families as standalone HiCache layer calls;
- * inactive returns do not require worker/device evidence.
- * Blocking returns request a single post-completion interval. This projection
- * removes all graph identities; it makes no model queries or numeric choices.
- */
-[[nodiscard]] std::vector<cost::TensorCostRequest> tensor_cost_requests(std::span<const TensorOperationSlots> operations);
-
-/** Bind one already-estimated numeric record per operation, in program order.
- * Modifies only numeric slots in the supplied program; retains event_layers.
- * No model queries, topology choices, source cost projection or graph writes.
- */
-void bind_tensor_program(GeneratedTensorProgram & generated, std::span<const cost::TensorOperationCost> costs);
 
 } // namespace markov::trace_graph::modules::hicache::runtime

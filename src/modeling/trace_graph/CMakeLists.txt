@@ -90,8 +90,6 @@ target_sources(trace_graph_hicache
         src/cost/operator_model.cpp
         src/cost/host_operation.cpp
         src/cost/hicache_io.cpp
-        src/cost/hicache_submission.cpp
-        src/cost/hicache_release.cpp
         src/cost/hicache_phase.cpp
         src/cost/static_phase.cpp
         src/structure/hicache/phase.cpp
@@ -107,10 +105,10 @@ target_sources(trace_graph_hicache
         src/structure/hicache/attention.cpp
         src/source_dag/observations.cpp
         src/source_dag/confirmation.cpp
-        src/source_dag/operator_geometry.cpp
         src/source_dag/device_collectives.cpp
         src/source_dag/collective_cost.cpp
         src/source_dag/phase_tensor_cost.cpp
+        src/source_dag/phase_calls.cpp
         src/source_dag/tensor_cost.cpp
         src/source_dag/submission_cost.cpp
         src/source_dag/allocator_observations.cpp
@@ -276,6 +274,7 @@ target_sources(trace_graph
         src/cli/hicache_observations.cpp
         src/cli/run_summary.cpp
         src/cli/workflow.cpp
+        src/cli/prediction_batch.cpp
         src/cli/main.cpp
 )
 target_link_libraries(trace_graph

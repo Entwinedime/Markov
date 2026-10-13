@@ -15,29 +15,14 @@ namespace markov::trace_graph::modules::hicache::runtime {
 namespace {
 
 void describe_phase_call(HiCacheHostExpansion & plan, const structure::hicache::PhaseCallPlan & work) {
-    using Kind = structure::hicache::PhaseCallPlan::Kind;
-    std::string kind;
-    switch (work.kind) {
-    case Kind::Attention:
-        kind = "layer";
-        break;
-    case Kind::Metadata:
-        kind = "metadata";
-        break;
-    case Kind::Dense:
-        kind = "dense." + work.dense_role;
-        break;
-    }
-
     for (auto & node : plan.nodes) {
         auto & attributes = node.work.attrs;
         attributes["phase_tensor_request_id"] = work.request_id;
         attributes["phase_tensor_logical_input"] = std::to_string(work.logical_input);
         attributes["phase_tensor_phase"] = work.decode_iteration ? "decode" : "prefill";
-        attributes["phase_tensor_call_kind"] = kind;
+        attributes["phase_tensor_call_kind"] = work.call_kind;
         if (work.decode_iteration) attributes["phase_tensor_iteration"] = std::to_string(*work.decode_iteration);
         if (work.layer_index) attributes["phase_tensor_layer"] = std::to_string(*work.layer_index);
-        attributes["phase_tensor_action"] = work.action == structure::hicache::PhaseCallPlan::Action::RetainCompute ? "retained" : "generated";
     }
 }
 
@@ -201,11 +186,10 @@ void HiCachePhaseCalls::advance(core::DagGraph & graph, size_t node, const HiCac
         if (!call.resources) throw std::runtime_error("Target phase work lacks a proven compute stream and worker resource");
         const std::vector<size_t> no_load;
         const auto & records = call.layers.empty() ? no_load : consumer(call.pid, call.layers.front().batch_start_ns);
-        auto generated = generate_tensor_program(graph, node, call.resources->worker, call.resources->compute, work.operations, "phase_tensor", !records.empty());
+        auto generated =
+            generate_tensor_program(graph, node, call.resources->worker, call.resources->compute, work.operations, "phase_tensor", !records.empty());
         inherit_collective_completions(graph, call.retained, generated.plan);
-        const auto requests = tensor_cost_requests(generated.operations);
-        const auto estimates = cost::estimate_tensor_costs(requests, provider_);
-        bind_tensor_program(generated, estimates);
+        bind_host_operations(generated.plan, generated.operations, provider_, "tensor_independent_model");
         describe_phase_call(generated.plan, work);
 
         size_t check = 0;
