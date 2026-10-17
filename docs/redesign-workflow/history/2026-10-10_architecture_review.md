@@ -1,6 +1,8 @@
 # 整体架构审查：历史证据与遗留边界
 
-2026-10-13 整理。本文保留 10 月 10–12 日审查的关键结构证据，不维护当前进度或下一步。原逐批检查合并；[当前实施计划](2026-10-08_redesign_execution_plan.md)决定任务，[代码质量审查](2026-10-12_code_structure_review.md)记录职责/风格整改。以下数据均限定于当时资产，不据其推导最新实现资格。
+> 历史审查/观测记录：结论限定于文中日期与当时实现。2026-10-16 清空数据后，旧 `data/redesign` 地址不再可复核；本文的“当前”“待完成”不作为现在的任务或授权状态。实时状态见[主计划](../2026-10-08_redesign_execution_plan.md)。
+
+2026-10-13 整理。本文保留 10 月 10–12 日审查的关键结构证据，不维护当前进度或下一步。原逐批检查合并；[当前实施计划](../2026-10-08_redesign_execution_plan.md)决定任务，[代码质量审查](2026-10-12_code_structure_review.md)记录职责/风格整改。以下数据均限定于当时资产，不据其推导最新实现资格。
 
 ## 主要发现及处理
 
@@ -36,7 +38,7 @@
 | 外部端点职责 | 33024条完成导出全部到所属serving的device_done；3840条跨界extent引用父层CPU服务，不能当注解删除；15360条线程/设备流连接按实际模块父子与层位置逐项匹配 | mlp_external_endpoint_inventory.json、mlp_external_position_verification.json |
 | 局部接口槽与外部别名 | 1920个区域按局部端点、方向、关系及远端资源域形成13种接口；加入远端端点别名、资源别名及同rank关系后仍为13种，与未含参数规则的13种局部结构一一对应；无重复端口描述造成的编号歧义 | mlp_interface_slot_inventory.json |
 
-当时正式消费：SGLang生产端选择feed_forward区域，通用TemplateGraph共享节点、内部依赖、模型/通信参数规则、资源槽和接口。1920个MLP区域使用13份局部图，保留注释及未归一化连接，不等于诊断中的三组执行连通投影；全来源21566处模型参数绑定共用44条规则，3900次通信观测共用4条计数/字节规则。来源span、kernel描述、CPU观测时间、调用及实际资源独立保存，插入按供体定义和固定槽读取来源，目标描述符独立持有。稳定合同见[采集设计](../redesign/04_collection_templates.md#31-从源实例到可展开模板)。
+当时正式消费：SGLang生产端选择feed_forward区域，通用TemplateGraph共享节点、内部依赖、模型/通信参数规则、资源槽和接口。1920个MLP区域使用13份局部图，保留注释及未归一化连接，不等于诊断中的三组执行连通投影；全来源21566处模型参数绑定共用44条规则，3900次通信观测共用4条计数/字节规则。来源span、kernel描述、CPU观测时间、调用及实际资源独立保存，插入按供体定义和固定槽读取来源，目标描述符独立持有。稳定合同见[采集设计](../../redesign/04_collection_templates.md#41-从源实例到可展开模板)。
 
 接口已统一：TemplateInterface同时供serving内切口和跨定义连接使用，共用远端表；共享定义保存端点/资源别名、相对rank及远端与局部端点重合关系，调用绑定实际编号。TemplateGraph的依赖与连接读取均消费该表，远端编号不再重复存于逐连接观测。两侧切口只解析一次原边槽，父层服务extent及跨rank通知仍保留，不新增屏障或服务成本。旧TemplateDependencyPort及单侧连接读取接口已删除，无兼容实现。
 
@@ -60,7 +62,7 @@ TemplateAssetCodec显式保存合同字段，将共享规则/结构、kernel/传
 
 本次同时沿脚本→Python编排/恢复→Project→提取/编译→加载→控制与执行核完成接入审查：归一化/提取仍属于CPU后处理，已完成任务的resume复用原结果，旧资产由用户显式extract迁移；仅缺整个base_manifest可启动初次采集。发现并修正公开extract相对路径与Project绝对路径不一致的问题，生产端按Project同一方式统一保存绝对规范路径；本次正式验收使用绝对路径。控制器/执行/性能层未增加框架分支，Service独占耗时计费，Wait/Annotation仅贡献约束。完整字段读写属于资产维护职责，不新增调度或变换规则。Docker新Release及默认构建通过，无警告；Python语法和脚本检查通过，未新增test工程。
 
-交付边界见[采集设计](../redesign/04_collection_templates.md#编译资产与预测加载)。本项通过不授予独立目标结构、CPU/来源时钟或成本资格；其余参数合同、最终配置×workload集合入口与S5/S6仍未完成。
+交付边界见[采集设计](../../redesign/04_collection_templates.md#编译资产与预测加载)。本项通过不授予独立目标结构、CPU/来源时钟或成本资格；其余参数合同、最终配置×workload集合入口与S5/S6仍未完成。
 
 ### 共享区域与替换接口的边界
 
@@ -106,7 +108,7 @@ MLP现有来源包含4608条跨rank通知和33024条到所属serving的完成导
 
 worker内部Runtime记录并非逐项相同。差异仅涉及二进制加载/函数查找和零时长同步结束点：原生差异记录不是flow端点或已记录API的父区间；同步结束点均位于已经匹配的等待内。目标多出的Binary记录均为annotation，不承担已检查的提交/等待/事件端点。预算配置的两次FloorDivides还存在相同数量Binary查找在kernel提交前后的位置变化，完整Runtime序列不能宣称等价。进一步检查全部Binary记录：原生1348/1732条均无已记录flow/API父端点职责，目标1342/1718条均为无已检查因果端点的annotation。显式排除这些记录及已分类的额外零时长结束点后，其余Runtime进入/返回和派发边界的必要依赖路径全部通过。该结果不要求按Binary注释增补等待/模板，也不授予其CPU开销、缓存状态或额外依赖等价资格。
 
-其余同步复制已清点为具体缺口：当时来源134次中仅10次输入上传已绑定；两份留出观测56/82次中仅4/6次已绑定，其余52/76次分为Prefill准备40/60次、前向元数据8/12次、过滤4/4次。方向/地址/驱动区间记录均已存在，缺的是逐复制语义与参数关系，不以再次采集代替绑定。前向元数据没有命名binding，但保留实际scope_call及serving归属；不能将binding为空误读为scope为空。原生候选及绑定约束见[同步复制说明](../redesign/sglang_template_relations.md#输入解析与cpu上传的显式区域)，逐项事实为`source/base/budget_synchronous_copy_inventory.json`。 来源134次复制的唯一worker/队列/aten::copy_关联已核对，全部同形同类型张量的计算字节等于驱动字节；证据`source_copy_provenance`及`source_copy_tensor_provenance`。观测分组不等于逐项身份资格，也不授予相同人数下所有字节固定的通用规则。
+其余同步复制已清点为具体缺口：当时来源134次中仅10次输入上传已绑定；两份留出观测56/82次中仅4/6次已绑定，其余52/76次分为Prefill准备40/60次、前向元数据8/12次、过滤4/4次。方向/地址/驱动区间记录均已存在，缺的是逐复制语义与参数关系，不以再次采集代替绑定。前向元数据没有命名binding，但保留实际scope_call及serving归属；不能将binding为空误读为scope为空。原生候选及绑定约束见[同步复制说明](../../redesign/sglang_template_relations.md#输入解析与cpu上传的显式区域)，逐项事实为`source/base/budget_synchronous_copy_inventory.json`。 来源134次复制的唯一worker/队列/aten::copy_关联已核对，全部同形同类型张量的计算字节等于驱动字节；证据`source_copy_provenance`及`source_copy_tensor_provenance`。观测分组不等于逐项身份资格，也不授予相同人数下所有字节固定的通用规则。
 
 后续来源整改`s3-synchronous-copy-work`已接入全部同步driver工作的描述：134项与原生驱动区间/方向/字节完全一致，新增124项；原有42项保留，现共166项。kernel、等待、通信、操作、资源、边界、span及边逐字段不变，Docker构建与公开extract完成，编译资产142076054字节。来源绑定证据为该目录verification.json及extraction_report.json。后续生产端已沿原生队列/张量链加入120项请求数组和4项过滤索引参数；重建资产中166项transfer均有显式layout（transfer_parameter_bindings.json）。公开predict使用新资产完整展开24/28阶段，72/102项复制在逐serving调用的次数、方向、字节上与已有原生观测一致；与原预测比较，除transfer描述外目标图全部字段相同。证据为parameter_expansion_verification.json及base/budget_parameter_copy_comparison.json。此次是参数整改后的开发验证，上表仍对应原固定资产，不能替代全部关系固定后的最终独立验收。
 
@@ -120,7 +122,7 @@ worker内部Runtime记录并非逐项相同。差异仅涉及二进制加载/函
 
 **仍未授予的资格**：通信直接stream后继、所属device_done导出和跨流事件信号已核对；worker派发名称/顺序、片段归属和服务/等待区间覆盖已匹配，必要提交/返回顺序投影也通过，但完整运行时序列、逐区域身份及上述范围外的设备/CPU依赖仍未完整对应；当时数据的主线程联合端点次序已补齐；完整支持域的独立验收、未记录/非flow依赖和来源设备时间资格仍须分别处理。已核对的直接复制服务边界不重复列为缺失节点；CPU成本与跨时钟时长不能由上述结构通过推导。源/目标区间覆盖也不是纯CPU服务耗时或成本模型。后续复用现有事实检查这些关系，不按名称、请求长度或供体标签补模板。
 
-旧 `s4-independent-joint-native` 已是开发证据：第58层缺独立EVENT_WAIT但依赖路径保留，历史通信payload多重集匹配，输入上传工作与内部等待后来已通过当时记录合同接通。旧API wall_time与profiler直接比较的判断已撤回；原始时钟可恢复，但缺driver copy/地址记录，不能补空字段迁移。workspace/tiling差异被包围于单一CPU覆盖候选且无额外切口，只能排除按注释数补模板的理由，不能证明executor缓存行为或成本相等。历史细节、取证文件及范围见[执行记录](2026-10-08_redesign_execution_log.md)，不重复列为当时缺陷。
+旧 `s4-independent-joint-native` 已是开发证据：第58层缺独立EVENT_WAIT但依赖路径保留，历史通信payload多重集匹配，输入上传工作与内部等待后来已通过当时记录合同接通。旧API wall_time与profiler直接比较的判断已撤回；原始时钟可恢复，但缺driver copy/地址记录，不能补空字段迁移。workspace/tiling差异被包围于单一CPU覆盖候选且无额外切口，只能排除按注释数补模板的理由，不能证明executor缓存行为或成本相等。历史细节、取证文件及范围见[执行记录](../2026-10-08_redesign_execution_log.md)，不重复列为当时缺陷。
 
 ## 2026-10-12：资源、等待与成员序列的周期审查
 

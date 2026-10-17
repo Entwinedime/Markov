@@ -2,6 +2,8 @@
 
 当前主线为 SGLang + Qwen3-32B，KT 预测在主线稳定后扩展。SGLang 已有真实采集和限定模块预测，KT 已有原生采集及 source facts；完整资格与阶段状态见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)。本页保留源码、资产来源与待补充的事实。
 
+本阶段排除host控制类CPU服务耗时，按[性能范围](06_performance_execution.md)保留行为与因果，实现与验收状态见[实施计划](../redesign-workflow/2026-10-08_redesign_execution_plan.md)。该取舍不覆盖未来KT的CPU专家实际计算，不能据此删除专家负载或将其无条件视为瞬时完成。下述历史观测及原生机制继续作为事实参考。
+
 ## 适配组合与源码归属
 
 适配器支持的是实际实现组合；下面的目录不能自由排列组合成支持承诺。框架和环境的真实版本由子模块/安装脚本和采集环境记录确定，不维护项目内部 v1/v2。
@@ -13,7 +15,7 @@
 | torch_npu workspace 观察 | [runtime 适配目录](../../src/collection/adapters/runtimes/ascend/torch_npu/README.md) | 固定 wheel/源码组合的采集插桩；当前由 SGLang Dockerfile 安装，不因 KT 同用 Ascend 而默认适用 |
 | CANN SDK 观察 | `src/collection/adapters/runtimes/ascend/native` | 两框架现有采集入口加载标量观察库，SDK 符号/事件解释仍受实际 CANN 环境约束 |
 
-`docker/install/{sglang,ktransformers,torch_npu_workspace}.sh` 仅调用这些实现；镜像选择和 COPY 在 Dockerfile。框架版本改变可能影响模块和方法位置，torch_npu/CANN 改变可能影响分配器、ABI 和 profiler 格式，须在对应适配器调整并重验。单个组件安装成功不能证明组合的模型路径、语义记录或模板复用正确。
+Dockerfile 直接复制并调用这些适配器的安装实现，不再保留只转发调用的脚本。框架版本改变可能影响模块和方法位置，torch_npu/CANN 改变可能影响分配器、ABI 和 profiler 格式，须在对应适配器调整并重验。单个组件安装成功不能证明组合的模型路径、语义记录或模板复用正确。
 
 ## 1. S0/S1 环境核对记录
 

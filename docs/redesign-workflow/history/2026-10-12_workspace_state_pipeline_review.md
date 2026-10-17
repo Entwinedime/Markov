@@ -1,6 +1,8 @@
 # 2026-10-12：workspace 生产、变换与执行链审阅
 
-本文件保留 workspace 专项交接证据和接口限制（2026-10-13 校正），不代替[代码质量整体检查](2026-10-12_code_structure_review.md)。历史修复过程留在执行日志，阶段门槛以[实施计划](2026-10-08_redesign_execution_plan.md)为准。以下开发证据均使用显式假设耗时，不能作为真实成本预测或独立结构验收。
+> 历史审查/观测记录：结论限定于文中日期与当时实现。2026-10-16 清空数据后，旧 `data/redesign` 地址不再可复核；本文的“当前”“待完成”不作为现在的任务或授权状态。实时状态见[主计划](../2026-10-08_redesign_execution_plan.md)。
+
+本文件保留 workspace 专项交接证据和接口限制（2026-10-13 校正），不代替[代码质量整体检查](2026-10-12_code_structure_review.md)。历史修复过程留在执行日志，阶段门槛以[实施计划](../2026-10-08_redesign_execution_plan.md)为准。以下开发证据均使用显式假设耗时，不能作为真实成本预测或独立结构验收。
 
 ## 当前职责与证据
 
@@ -13,7 +15,7 @@
 | 扩容等待 | 插入的设备等待按实际worker提交及目标依赖可达性绑定当前动作前沿，并保留跨动作前驱；不搬用供体的来源前驱或按时间选最后节点 | s4-fixed-warmup/submission_frontier_verification.json、target_wait_binding_verification.json |
 | 尾部清理及延迟到达 | base在两rank原生空Schedule记录后结束窗口，validation仍到最后Publish。已完成两请求结束→Idle清空→四请求到达→扩容→全部完成，4业务批次/17动作 | s4-native-cleanup/cleanup_observation_verification.json、dynamic_expansion_verification.json、full_graph_verification.json |
 
-需求、初始容量、allocator规则和控制状态是不同事实。只有初始容量来自预热快照；目标分支由当前需求及唯一容量状态计算。KV cold不意味着workspace为空。稳定机制与有限域见[模板关系](../redesign/sglang_template_relations.md#workspace-容量状态与设备级同步)。
+需求、初始容量、allocator规则和控制状态是不同事实。只有初始容量来自预热快照；目标分支由当前需求及唯一容量状态计算。KV cold不意味着workspace为空。稳定机制与有限域见[模板关系](../../redesign/sglang_template_relations.md#workspace-容量状态与设备级同步)。
 
 ## 插入区域再次替换的接口核对
 

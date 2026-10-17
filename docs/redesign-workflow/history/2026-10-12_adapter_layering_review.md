@@ -1,6 +1,8 @@
 # 采集与模板生产分层检查
 
-本轮落实用户要求的代码/目录分层，不推进已暂停的 S3–S6 goal，不新增原生采集。当前结构及扩展规则统一维护在[开发说明](../redesign/development.md#c-目录与职责)，本页只记录检查结果。
+> 历史审查/观测记录：结论限定于文中日期与当时实现。2026-10-16 清空数据后，旧 `data/redesign` 地址不再可复核；本文的“当前”“待完成”不作为现在的任务或授权状态。实时状态见[主计划](../2026-10-08_redesign_execution_plan.md)。
+
+本轮落实用户要求的代码/目录分层，不推进已暂停的 S3–S6 goal，不新增原生采集。当前结构及扩展规则统一维护在[开发说明](../../redesign/development.md#c-目录与职责)，本页只记录检查结果。
 
 ## 发现与修正
 
@@ -30,4 +32,4 @@
 
 torch_npu 的 workspace patch、观察头文件、固定源码构建脚本及适用说明归入 `src/collection/adapters/runtimes/ascend/torch_npu`；Python workspace/profiling 同步归入运行包的对应子目录。SGLang 与 KT 的 Ascend 安装适配归入 `src/collection/adapters/frameworks/<框架>/ascend`，KT 原有 runtime.py 随安装实现一并归位。`docker/install` 三个入口仅调用适配器，两个 Dockerfile 复制实际组合所需目录。来源元数据使用新路径，历史观测记录保持原样。
 
-本次调整未改变补丁、观察头文件或原生算法。Docker 内原始源码 patch dry-run、头文件格式、Python 编译及 23 个模块导入/插件入口检查通过；shell 语法、Docker COPY 路径、当前设计链接、旧路径残留及 diff 检查通过。未进行完整镜像重建或新设备采集；现有已安装镜像不会因源码移动自动更新。具体适用边界统一见[框架与环境组合](../redesign/framework_paths.md#适配组合与源码归属)。
+本次调整未改变补丁、观察头文件或原生算法。Docker 内原始源码 patch dry-run、头文件格式、Python 编译及 23 个模块导入/插件入口检查通过；shell 语法、Docker COPY 路径、当前设计链接、旧路径残留及 diff 检查通过。未进行完整镜像重建或新设备采集；现有已安装镜像不会因源码移动自动更新。具体适用边界统一见[框架与环境组合](../../redesign/framework_paths.md#适配组合与源码归属)。
