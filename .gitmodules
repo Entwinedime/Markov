@@ -10,3 +10,6 @@
 [submodule "reference/doolysim"]
 	path = reference/doolysim
 	url = https://github.com/dooly-project/doolysim.git
+[submodule "reference/llmservingsim"]
+	path = reference/llmservingsim
+	url = https://github.com/casys-kaist/LLMServingSim.git
