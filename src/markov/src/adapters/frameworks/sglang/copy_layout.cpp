@@ -47,6 +47,24 @@ SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann:
         const auto & api = facts.at("native_api").at(transfer.at("source_api").get<std::size_t>());
         if (api.at("copy_execution") != "synchronous_driver" || transfer.at("direction") != "host_to_device") continue;
         const auto span = transfer.at("source_span").get<SourceSpanId>();
+
+        // Input upload identity comes from the recorded wrapper result. Bytes
+        // alone cannot distinguish this tensor from another copy in the scope.
+        if (!api.at("scope_call").is_null()) {
+            const auto & call = facts.at("calls").at(api.at("scope_call").get<std::string>());
+            if (call.at("binding") == "sglang.inputs.resolve") {
+                const auto & copy = call.at("result").at("input_copy");
+                if (!copy.is_null()) {
+                    const auto matches = [&](const nlohmann::json & candidate) {
+                        const auto & addresses = candidate.at("copy_addresses");
+                        return candidate.at("api") == "rtMemcpyAsync" && candidate.at("scope_call") == api.at("scope_call") && !addresses.is_null()
+                               && addresses.at("source") == copy.at("source_address") && addresses.at("destination") == copy.at("destination_address")
+                               && candidate.at("transfer_bytes") == copy.at("bytes");
+                    };
+                    if (matches(api) && std::ranges::count_if(facts.at("native_api"), matches) == 1) input_transfers_.insert(span);
+                }
+            }
+        }
         const auto & source_interval = graph.at("spans").at(span).at("source_interval");
         if (source_interval.is_null()) continue;
         const auto worker_id = source_interval.get<std::size_t>();
@@ -91,6 +109,8 @@ SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann:
 }
 
 void SGLangCopyLayout::bind(TemplateDefinition & definition, const nlohmann::json & calls, const std::map<std::size_t, NativeFilterSelection> & filters) const {
+    bind_input_transfers(definition);
+
     const bool cold_prefill = definition.phase == BatchPhase::Prefill
                               && std::ranges::all_of(definition.source_requests, [](const auto & request) { return request.context_tokens == 0; });
     for (const auto & node : definition.graph) {
@@ -121,6 +141,39 @@ void SGLangCopyLayout::bind(TemplateDefinition & definition, const nlohmann::jso
         if (extent)
             definition.transfer_layouts.emplace(observation.source_span,
                                                 TransferParameterLayout{ *extent, definition.source_requests.size(), 0, tensor.element_bytes });
+    }
+}
+
+void SGLangCopyLayout::bind_input_transfers(TemplateDefinition & definition) const {
+    if (definition.step != StepKind::Prefill || definition.phase != BatchPhase::Prefill) return;
+    std::uint64_t tokens = 0;
+    for (const auto & request : definition.source_requests) {
+        if (request.context_tokens != 0) return;
+        tokens += request.input_tokens;
+    }
+
+    for (const auto & region : definition.regions) {
+        if (region.binding != "sglang.inputs.resolve" || !region.module) continue;
+        const auto & staging = region.module->inputs.at("prefill_input_ids_cpu");
+        const auto & copy = region.module->result.at("input_copy");
+        if (!staging || copy.is_null() || staging->dtype != "torch.int64" || staging->shape != std::vector<std::int64_t>{ static_cast<std::int64_t>(tokens) }
+            || staging->stride != std::vector<std::int64_t>{ 1 } || copy.at("bytes") != tokens * sizeof(std::int64_t))
+            continue;
+
+        // Runtime extraction binds the physical driver leaf; this producer
+        // independently qualifies native input addresses and tensor semantics.
+        // The core receives only a token extent, independent of SGLang names.
+        for (const auto index : region.nodes) {
+            const auto & node = definition.graph[index];
+            const auto & node_observation = definition.observation(node);
+            if (!input_transfers_.contains(node_observation.source_span) || node_observation.source_scope != region.source_call || !node_observation.transfer
+                || node_observation.transfer->direction != TransferDirection::HostToDevice
+                || node_observation.transfer->bytes != copy.at("bytes").get<std::uint64_t>())
+                continue;
+            definition.transfer_layouts.emplace(
+                node_observation.source_span,
+                TransferParameterLayout{ TransferExtent::InputTokens, definition.source_requests.size(), 0, sizeof(std::int64_t) });
+        }
     }
 }
 

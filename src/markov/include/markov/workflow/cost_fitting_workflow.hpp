@@ -9,15 +9,17 @@ namespace markov {
 
 class CostFittingWorkflow {
 public:
-    nlohmann::json run(const std::filesystem::path & manifest_path, std::string_view unit = "admission") const;
+    nlohmann::json run(const std::filesystem::path & manifest_path, std::string_view unit = "all") const;
     nlohmann::json evaluate(const std::filesystem::path & candidate_path, const std::filesystem::path & manifest_path) const;
 
 private:
+    struct Observation;
     struct Measurements;
-    Measurements read(const std::filesystem::path & manifest_path, std::string_view unit) const;
-    void read_admission(Measurements & data, const std::filesystem::path & manifest_path) const;
-    void read_workers(Measurements & data, const std::filesystem::path & manifest_path) const;
-    void read_device(Measurements & data, const std::filesystem::path & manifest_path, std::string_view unit) const;
+    Observation read(const std::filesystem::path & manifest_path) const;
+    Measurements select(const Observation & source, std::string_view unit) const;
+    void read_host_transfers(Measurements & data, const Observation & source) const;
+    void read_device(Measurements & data, const Observation & source, std::string_view unit) const;
+    nlohmann::json fit(const Observation & source, std::string_view unit) const;
 };
 
 } // namespace markov

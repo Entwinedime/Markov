@@ -1,23 +1,27 @@
 #include "markov/graph/source_graph.hpp"
 
+#include "markov/contracts/json_input.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <limits>
 #include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 namespace markov {
 namespace {
 
-constexpr std::array cpu_parts{ "schedule_prefix", "prepare_body", "prepare_suffix", "execute", "publish", "dispatch" };
-
 constexpr std::array transfer_directions{ "host_to_host", "host_to_device", "device_to_host", "device_to_device" };
+
+constexpr std::array request_pool_operations{ "prefix_extend_write", "token_read", "token_write", "row_read", "relay_read", "relay_write" };
 
 std::string_view domain_name(SourceDomain domain) {
     switch (domain) {
@@ -38,31 +42,25 @@ std::string_view domain_name(SourceDomain domain) {
 
 } // namespace
 
-std::string_view SourceGraph::cpu_part_name(SourceCpuPart part) { return cpu_parts[static_cast<std::size_t>(part)]; }
-
-SourceCpuPart SourceGraph::parse_cpu_part(std::string_view name) {
-    const auto found = std::find(cpu_parts.begin(), cpu_parts.end(), name);
-    if (found == cpu_parts.end()) throw std::invalid_argument("unknown CPU service part: " + std::string(name));
-
-    return static_cast<SourceCpuPart>(found - cpu_parts.begin());
-}
-
 nlohmann::json SourceTransfer::describe() const {
     return {
-        {      "bytes",                                                    bytes },
-        {  "direction", transfer_directions[static_cast<std::size_t>(direction)] },
-        { "source_api",                                               source_api }
+        {      "bytes",                     bytes },
+        {  "direction", direction_name(direction) },
+        { "source_api",                source_api }
     };
 }
 
 SourceTransfer SourceTransfer::read(const nlohmann::json & value) {
-    const auto name = value.at("direction").get<std::string>();
-    const auto found = std::find(transfer_directions.begin(), transfer_directions.end(), name);
-    if (found == transfer_directions.end()) throw std::invalid_argument("unknown transfer direction: " + name);
+    return { value.at("bytes").get<std::uint64_t>(), parse_direction(value.at("direction").get<std::string>()), value.at("source_api").get<std::size_t>() };
+}
 
-    return { value.at("bytes").get<std::uint64_t>(),
-             static_cast<TransferDirection>(found - transfer_directions.begin()),
-             value.at("source_api").get<std::size_t>() };
+std::string_view SourceTransfer::direction_name(TransferDirection direction) { return transfer_directions[static_cast<std::size_t>(direction)]; }
+
+TransferDirection SourceTransfer::parse_direction(std::string_view name) {
+    const auto found = std::find(transfer_directions.begin(), transfer_directions.end(), name);
+    if (found == transfer_directions.end()) throw std::invalid_argument("unknown transfer direction: " + std::string(name));
+
+    return static_cast<TransferDirection>(found - transfer_directions.begin());
 }
 
 std::string_view SourceGraph::span_name(SourceSpanKind kind) {
@@ -276,6 +274,68 @@ nlohmann::json PageTableWorkload::describe() const {
     };
 }
 
+std::string_view RequestPoolWork::operation_name(RequestPoolOperation operation) { return request_pool_operations[static_cast<std::size_t>(operation)]; }
+
+RequestPoolWork RequestPoolWork::read(const nlohmann::json & value) {
+    const auto role = input::string_value(value.at("role"));
+    const auto found = std::ranges::find(request_pool_operations, role);
+    if (found == request_pool_operations.end()) throw std::invalid_argument("unknown request pool operation: " + role);
+
+    const auto operation = static_cast<RequestPoolOperation>(found - request_pool_operations.begin());
+    constexpr auto maximum_slot = std::numeric_limits<std::uint32_t>::max();
+    constexpr auto maximum_token = std::numeric_limits<std::int64_t>::max();
+    if (operation == RequestPoolOperation::PrefixExtendWrite) {
+        std::vector<RequestPoolRange> ranges;
+        for (const auto & member : value.at("members")) {
+            ranges.push_back({ static_cast<std::uint32_t>(input::integer(member.at("slot"), 0, maximum_slot)),
+                               input::integer(member.at("prefix_tokens"), 0, maximum_token),
+                               input::integer(member.at("input_tokens"), 1, maximum_token) });
+        }
+        return { operation, std::move(ranges) };
+    }
+    if (operation == RequestPoolOperation::TokenRead || operation == RequestPoolOperation::TokenWrite) {
+        std::vector<RequestPoolPoint> points;
+        for (const auto & member : value.at("members")) {
+            points.push_back(
+                { static_cast<std::uint32_t>(input::integer(member.at("slot"), 0, maximum_slot)), input::integer(member.at("column"), 0, maximum_token) });
+        }
+        return { operation, std::move(points) };
+    }
+
+    std::vector<std::uint32_t> slots;
+    for (const auto & slot : value.at("slots")) slots.push_back(static_cast<std::uint32_t>(input::integer(slot, 0, maximum_slot)));
+    return { operation, std::move(slots) };
+}
+
+nlohmann::json RequestPoolWork::describe() const {
+    nlohmann::json result{
+        { "role", operation_name(operation) }
+    };
+    if (operation == RequestPoolOperation::PrefixExtendWrite) {
+        auto ranges = nlohmann::json::array();
+        for (const auto & member : std::get<std::vector<RequestPoolRange>>(members)) {
+            ranges.push_back({
+                {          "slot",          member.slot },
+                { "prefix_tokens", member.prefix_tokens },
+                {  "input_tokens",  member.input_tokens }
+            });
+        }
+        result["members"] = std::move(ranges);
+    }
+    else if (operation == RequestPoolOperation::TokenRead || operation == RequestPoolOperation::TokenWrite) {
+        auto points = nlohmann::json::array();
+        for (const auto & member : std::get<std::vector<RequestPoolPoint>>(members)) {
+            points.push_back({
+                {   "slot",   member.slot },
+                { "column", member.column }
+            });
+        }
+        result["members"] = std::move(points);
+    }
+    else result["slots"] = std::get<std::vector<std::uint32_t>>(members);
+    return result;
+}
+
 nlohmann::json PositionWorkload::describe() const {
     auto ranges = nlohmann::json::array();
     std::int64_t offset = 0;
@@ -294,11 +354,6 @@ nlohmann::json PositionWorkload::describe() const {
         {     "total_tokens",               offset },
         { "parameter_source", "target_batch_input" }
     };
-}
-
-bool SourceKernel::has_semantic_work() const {
-    return positions || kv_allocation || kv_release || batch_filter || batch_merge || page_table || sequence_lengths || sequence_length_max || kv_new_pages
-           || request_pool_slots || attention || logits_token_indices;
 }
 
 nlohmann::json SourceKernel::describe() const {
@@ -333,11 +388,7 @@ nlohmann::json SourceKernel::describe() const {
             {            "pages",                        *kv_new_pages },
             { "parameter_source", "target_batch_lengths_and_page_size" }
         };
-    if (request_pool_slots)
-        result["request_pool_access"] = {
-            {            "slots",           *request_pool_slots },
-            { "parameter_source", "target_request_reservations" }
-        };
+    if (request_pool) result["request_pool_access"] = request_pool->describe();
     if (attention) result["attention_workload"] = attention->describe();
     if (logits_token_indices)
         result["logits_selection"] = {
@@ -462,31 +513,6 @@ void SourceGraph::observe_stream_wait(SourceSpanId span, SourceStreamWait wait) 
 
 void SourceGraph::observe_operation(SourceOperation operation) { operations_.push_back(std::move(operation)); }
 
-void SourceGraph::observe_cpu_work(SourceSpanId span, SourceCpuWork work) { cpu_work_.emplace(span, std::move(work)); }
-
-std::string_view SourceCpuWork::part_name(CpuSubmissionPart part) {
-    return part == CpuSubmissionPart::Before ? "before" : part == CpuSubmissionPart::Call ? "call" : "after";
-}
-
-CpuSubmissionPart SourceCpuWork::parse_part(std::string_view name) {
-    if (name == "before") return CpuSubmissionPart::Before;
-    if (name == "call") return CpuSubmissionPart::Call;
-    if (name == "after") return CpuSubmissionPart::After;
-    throw std::invalid_argument("unknown CPU submission part: " + std::string(name));
-}
-
-nlohmann::json SourceCpuWork::describe() const {
-    return {
-        {  "operation",       operation },
-        {       "part", part_name(part) },
-        { "submission",      submission }
-    };
-}
-
-SourceCpuWork SourceCpuWork::read(const nlohmann::json & record) {
-    return { record.at("operation").get<std::string>(), parse_part(record.at("part").get<std::string>()), record.at("submission").get<SourceSpanId>() };
-}
-
 std::size_t SourceGraph::lane(SourceDomain domain, std::uint32_t rank, std::uint64_t native_id) {
     const auto key = std::tuple(domain, rank, native_id);
     const auto [position, inserted] = lane_ids_.try_emplace(key, lanes_.size());
@@ -510,12 +536,11 @@ BoundaryId SourceGraph::boundary(std::size_t lane, std::int64_t time_ns) {
 }
 
 SourceSpanId SourceGraph::observe(SourceSpanKind kind, std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> owner_call,
-                                  std::optional<std::size_t> source_interval, std::optional<SourceCpuPart> control_part, std::optional<std::size_t> source_api,
-                                  std::optional<std::size_t> scope_call) {
+                                  std::optional<std::size_t> source_interval, std::optional<std::size_t> source_api, std::optional<std::size_t> scope_call) {
     const BoundaryId begin = boundary(lane, begin_ns);
     const BoundaryId end = boundary(lane, end_ns);
     const SourceSpanId identity = spans_.size();
-    spans_.push_back({ kind, owner_call, source_interval, begin, end, control_part, source_api, scope_call });
+    spans_.push_back({ kind, owner_call, source_interval, begin, end, source_api, scope_call });
     connect(begin, end, SourceRelation::IntervalExtent);
 
     return identity;
@@ -550,8 +575,6 @@ BoundaryId SourceGraph::complete(std::span<const SourceSpanId> spans, std::uint3
 SourceGraphSummary SourceGraph::seal() {
     std::optional<BoundaryId> previous;
     for (const auto & [key, identity] : boundary_ids_) {
-        const auto domain = lanes_[key.first].domain;
-        if (domain != SourceDomain::CpuThread) { continue; }
         if (previous && boundaries_[*previous].lane == key.first) { connect(*previous, identity, SourceRelation::ThreadOrder); }
         previous = identity;
     }
@@ -621,16 +644,6 @@ void SourceGraph::write(const std::filesystem::path & path) const {
         if (!first_kernel) stream << ',';
         first_kernel = false;
         auto record = kernel.describe();
-        record["source_span"] = span;
-        stream << record;
-    }
-
-    stream << "],\"cpu_work\":[";
-    bool first_cpu = true;
-    for (const auto & [span, work] : cpu_work_) {
-        if (!first_cpu) stream << ',';
-        first_cpu = false;
-        auto record = work.describe();
         record["source_span"] = span;
         stream << record;
     }
@@ -715,7 +728,6 @@ void SourceGraph::write(const std::filesystem::path & path) const {
             {           "begin",                                                                             span.begin },
             {             "end",                                                                               span.end }
         });
-        if (span.control_part) record["control_part"] = cpu_part_name(*span.control_part);
         stream << record;
     }
 

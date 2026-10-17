@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 
 namespace markov {
@@ -22,6 +23,8 @@ public:
     void bind(TemplateDefinition & definition, const nlohmann::json & calls, const std::map<std::size_t, NativeFilterSelection> & filters) const;
 
 private:
+    void bind_input_transfers(TemplateDefinition & definition) const;
+
     struct Tensor {
         std::uint64_t elements;
         std::uint64_t element_bytes;
@@ -29,6 +32,7 @@ private:
     };
 
     std::map<SourceSpanId, Tensor> tensors_;
+    std::set<SourceSpanId> input_transfers_;
 };
 
 } // namespace markov

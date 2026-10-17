@@ -311,15 +311,18 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
         for (const auto & request : input.requests) pending_prefill_->push_back(request.request_id);
     }
 
-    return {
-        InvokeStep{ schedule_id,StepKind::Schedule,input,        std::move(schedule_dependencies),{}                                                                                                    },
-        InvokeStep{  prepare_id,  StepKind::Prepare, input, { { schedule_id, PortKind::Selected } },                                  {} },
-        InvokeStep{  execute_id,       execute_step, input,  { { prepare_id, PortKind::Prepared } },                                  {} },
-        InvokeStep{  publish_id,
-                   StepKind::Publish,
-                   input, { { execute_id, PortKind::Submitted } },
-                   { { { execute_id, PortKind::DeviceDone }, PortKind::Published } }                                                    }
-    };
+    std::vector<ControlAction> actions;
+    actions.emplace_back(InvokeStep{ schedule_id, StepKind::Schedule, input, std::move(schedule_dependencies), {} });
+    actions.emplace_back(InvokeStep{ prepare_id, StepKind::Prepare, input, { { schedule_id, PortKind::Selected } }, {} });
+    actions.emplace_back(InvokeStep{ execute_id, execute_step, input, { { prepare_id, PortKind::Prepared } }, {} });
+
+    // Submission opens publication; device completion gates its visible result.
+    actions.emplace_back(InvokeStep{ publish_id,
+                                     StepKind::Publish,
+                                     input,
+                                     { { execute_id, PortKind::Submitted } },
+                                     { { { execute_id, PortKind::DeviceDone }, PortKind::Published } } });
+    return actions;
 }
 
 ControllerSummary LightweightController::finish() const {

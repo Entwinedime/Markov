@@ -11,13 +11,13 @@ from collections.abc import Callable
 from typing import Any
 
 from markov_collection.instrumentation.blocks import BlockWrapper, BoundBlock
-from markov_collection.instrumentation.recording import Recorder
+from markov_collection.instrumentation.recording import ProfilerMarkers, Recorder
 
 
 class SGLangInlineRegion(BlockWrapper):
     def __init__(self, observer: Any, contract: dict[str, Any], binding: dict[str, Any]) -> None:
         parameters = tuple(parameter["name"] for parameter in contract["definition"]["parameters"])
-        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),))
+        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),), observer.markers)
         self.observer = observer
         self.binding = binding
 
@@ -47,20 +47,20 @@ class SGLangInlineRegion(BlockWrapper):
             "request_id": request_id,
         }
 
-    def scope_statement(self, body: list[ast.stmt], arguments: list[str]) -> ast.With:
-        scope = ast.Call(
-            func=ast.Subscript(
-                value=ast.Name(id="_markov_region_scopes", ctx=ast.Load()),
-                slice=ast.Constant(value=self.binding["id"]),
-                ctx=ast.Load(),
-            ),
-            args=[ast.Name(id=name, ctx=ast.Load()) for name in arguments],
-            keywords=[],
-        )
-        region = ast.With(items=[ast.withitem(context_expr=scope)], body=body)
-        return ast.copy_location(region, body[0])
-
     def wrap_prefix(self, method: ast.FunctionDef, boundary_call: str, arguments: list[str]) -> None:
+        SGLangInlineMethod.wrap_prefix(method, self.binding["id"], boundary_call, arguments)
+
+
+class SGLangInlineMethod:
+    """Compile all declared regions of one native method in a single rewrite."""
+
+    def __init__(self, regions: list[SGLangInlineRegion], markers: ProfilerMarkers) -> None:
+        self.regions = regions
+        self.markers = markers
+        self.instrumented: Callable[..., Any] | None = None
+
+    @staticmethod
+    def wrap_prefix(method: ast.FunctionDef, identity: str, boundary_call: str, arguments: list[str]) -> None:
         expected = ast.dump(ast.parse(boundary_call, mode="eval").body)
         positions = [
             index
@@ -78,17 +78,46 @@ class SGLangInlineRegion(BlockWrapper):
         boundary = positions[0]
         method.body = [
             *method.body[:start],
-            self.scope_statement(method.body[start:boundary], arguments),
+            SGLangInlineMethod.scope_statement(identity, method.body[start:boundary], arguments),
             *method.body[boundary:],
         ]
 
+    @staticmethod
+    def wrap_transition(method: ast.FunctionDef, binding: dict[str, Any]) -> None:
+        SGLangInlineMethod.wrap_prefix(method, binding["id"], "self.get_new_batch_prefill()", ["self"])
 
-class SGLangInlineMethod:
-    """Compile all declared regions of one native method in a single rewrite."""
+    @staticmethod
+    def scope_statement(identity: str, body: list[ast.stmt], arguments: list[str]) -> ast.With:
+        scope = ast.Call(
+            func=ast.Subscript(
+                value=ast.Name(id="_markov_region_scopes", ctx=ast.Load()),
+                slice=ast.Constant(value=identity),
+                ctx=ast.Load(),
+            ),
+            args=[ast.Name(id=name, ctx=ast.Load()) for name in arguments],
+            keywords=[],
+        )
+        region = ast.With(items=[ast.withitem(context_expr=scope)], body=body)
+        return ast.copy_location(region, body[0])
 
-    def __init__(self, regions: list[SGLangInlineRegion]) -> None:
-        self.regions = regions
-        self.instrumented: Callable[..., Any] | None = None
+    @staticmethod
+    def wrap_publication(method: ast.FunctionDef, binding: dict[str, Any]) -> None:
+        # Select the declared publication member body.
+        # The other prefill loop serves embedding/reward models.
+        prefill = binding["method"] == "process_batch_result_prefill"
+        iterator = "enumerate(zip(batch.reqs, next_token_ids))" if prefill else "enumerate(batch.reqs)"
+        expected = ast.dump(ast.parse(iterator, mode="eval").body)
+        loops = [node for node in ast.walk(method) if isinstance(node, ast.For) and ast.dump(node.iter) == expected]
+        if len(loops) != 1:
+            raise ValueError("native request publication loop does not match the declared binding")
+
+        loop = loops[0]
+        expected_target = "(i, (req, next_token_id))" if prefill else "(i, req)"
+        target = ast.parse(f"for {expected_target} in requests: pass").body[0].target
+        if ast.dump(loop.target) != ast.dump(target):
+            raise ValueError("native request publication loop variables do not match the declared binding")
+
+        loop.body = [SGLangInlineMethod.scope_statement(binding["id"], loop.body, ["req", "i"])]
 
     def instrument(self, original: Callable[..., Any]) -> Callable[..., Any]:
         source, line = inspect.getsourcelines(original)
@@ -125,7 +154,9 @@ class SGLangInlineMethod:
 
     def invoke(self, original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         if self.instrumented is None:
-            self.instrumented = self.instrument(original)
+            # Compiling the semantic wrapper is observer work.
+            with self.markers.observer():
+                self.instrumented = self.instrument(original)
 
         return self.instrumented(*args, **kwargs)
 
@@ -135,22 +166,7 @@ class SGLangRequestPublication(SGLangInlineRegion):
         return {"request_index": index}, req.rid
 
     def rewrite(self, method: ast.FunctionDef) -> None:
-        # The other prefill loop serves embedding/reward models. Match structure,
-        # not source line numbers, and preserve continue/exception cleanup.
-        prefill = self.binding["method"] == "process_batch_result_prefill"
-        iterator = "enumerate(zip(batch.reqs, next_token_ids))" if prefill else "enumerate(batch.reqs)"
-        expected = ast.dump(ast.parse(iterator, mode="eval").body)
-        loops = [node for node in ast.walk(method) if isinstance(node, ast.For) and ast.dump(node.iter) == expected]
-        if len(loops) != 1:
-            raise ValueError("native request publication loop does not match the declared binding")
-
-        loop = loops[0]
-        expected_target = "(i, (req, next_token_id))" if prefill else "(i, req)"
-        target = ast.parse(f"for {expected_target} in requests: pass").body[0].target
-        if ast.dump(loop.target) != ast.dump(target):
-            raise ValueError("native request publication loop variables do not match the declared binding")
-
-        loop.body = [self.scope_statement(loop.body, ["req", "i"])]
+        SGLangInlineMethod.wrap_publication(method, self.binding)
 
 
 class SGLangBatchTransition(SGLangInlineRegion):
@@ -165,7 +181,7 @@ class SGLangBatchTransition(SGLangInlineRegion):
         }, None
 
     def rewrite(self, method: ast.FunctionDef) -> None:
-        self.wrap_prefix(method, "self.get_new_batch_prefill()", ["self"])
+        SGLangInlineMethod.wrap_transition(method, self.binding)
 
 
 class SGLangAdmissionPrefix(SGLangInlineRegion):
@@ -281,7 +297,7 @@ class SGLangAdmissionBudget(SGLangInlineRegion):
             'if _markov_budget is not None:\n    _markov_budget.result["horizon_checks"] += 1\n'
         ).body
         self.record_returns(method)
-        region = self.scope_statement(method.body, ["self", "req"])
+        region = SGLangInlineMethod.scope_statement(self.binding["id"], method.body, ["self", "req"])
         region.items[0].optional_vars = ast.Name(id="_markov_budget", ctx=ast.Store())
         region.body[:0] = ast.parse(
             'if _markov_budget is not None:\n    _markov_budget.result["horizon_checks"] = 0\n'
@@ -343,7 +359,7 @@ class SGLangPrefillStatistics(SGLangInlineRegion):
         index = assignments[0]
         # Keep the post-Prepare scan separate from the admission prefix. Its
         # queue length is observed here, after native selection and compaction.
-        method.body[index] = self.scope_statement([method.body[index]], ["self"])
+        method.body[index] = SGLangInlineMethod.scope_statement(self.binding["id"], [method.body[index]], ["self"])
 
 
 class SGLangDecodeUpdatePrefix(SGLangInlineRegion):
@@ -390,7 +406,9 @@ class SGLangLastLocations(SGLangInlineRegion):
         for parent in ast.walk(method):
             for _, value in ast.iter_fields(parent):
                 if isinstance(value, list) and assignment in value:
-                    value[value.index(assignment)] = self.scope_statement([assignment], ["batch"])
+                    value[value.index(assignment)] = SGLangInlineMethod.scope_statement(
+                        self.binding["id"], [assignment], ["batch"]
+                    )
                     return
 
 
@@ -406,7 +424,11 @@ class SGLangLastLocation(SGLangLastLocations):
         # The native expression runs inside its own scope. Returning its tensor
         # leaves list insertion and iterator advancement in the aggregate region.
         expression_return = ast.Return(value=comprehension.elt)
-        helper.body = [self.scope_statement([expression_return], ["batch", "_markov_request_index", "t"])]
+        helper.body = [
+            SGLangInlineMethod.scope_statement(
+                self.binding["id"], [expression_return], ["batch", "_markov_request_index", "t"]
+            )
+        ]
         comprehension.elt = ast.parse("_markov_last_location(t, _markov_request_index)", mode="eval").body
         generator = comprehension.generators[0]
         generator.target = ast.Tuple(

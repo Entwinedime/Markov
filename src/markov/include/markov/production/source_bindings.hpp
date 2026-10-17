@@ -20,8 +20,6 @@ public:
 
     virtual const NativeRegionBinding & region(std::string_view identity) const = 0;
     virtual bool supports_native_path(const nlohmann::json & environment) const = 0;
-    virtual std::size_t bind_transfers(SourceGraph & graph, const nlohmann::json & intervals, const nlohmann::json & records,
-                                       std::span<const SourceCall> calls) const = 0;
     virtual nlohmann::json extract_blocks(const SourceGraph & graph, std::span<const SourceCall> calls,
                                           const std::vector<std::vector<std::size_t>> & native_api_members, bool native_dense_path) const = 0;
 };

@@ -60,7 +60,6 @@ class AscendProfileWindow:
             record["end_ns"] = time.perf_counter_ns()
             self._controls.append(record)
             directory = self.directory.parent / "profile_controls"
-            directory.mkdir(parents=True, exist_ok=True)
             write_json(directory / f"rank-{self._rank}-pid-{os.getpid()}.json", self._controls)
 
     def configure(self, original: Callable[..., Any], config: Any, *args: Any, **kwargs: Any) -> Any:

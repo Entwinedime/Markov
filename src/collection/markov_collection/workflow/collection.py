@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
-import argparse
 import fcntl
 import json
+import os
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json, write_json
+from markov_collection.workflow.container_environment import ContainerEnvironment
+from markov_collection.workflow.modeling_job import ModelingJob, ModelingJobFailed
+from markov_collection.workflow.run_directory import RunDirectory
 
 
 class CaptureProcessingFailed(RuntimeError):
@@ -23,32 +25,67 @@ class CaptureProcessingFailed(RuntimeError):
 class CollectionWorkflow:
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.compose = [
-            "docker",
-            "compose",
-            "-p",
-            "markov-next-redesign",
-            "-f",
-            str(root / "docker/compose/inference.yml"),
-        ]
+        self.environment = ContainerEnvironment(root)
 
-    def _host_path(self, path: str) -> Path:
-        declared = Path(path)
-        if declared.is_relative_to("/workspace/trace-sim"):
-            return self.root / declared.relative_to("/workspace/trace-sim")
-        return declared
+    def _preparation_mounts(
+        self, project: Path, measurements: Path | None, communication: bool, prediction_result: Path | None
+    ) -> list[str]:
+        # Discover file dependencies only. The C++ reader owns input validation
+        # and framework semantics; host absolute paths keep their declared names.
+        target = Path(self.environment.container_path(project))
+        inputs = read_json(project)
+        paths = {target: project}
+        for key, field in (("configurations", "config"), ("request_workloads", "path")):
+            for item in inputs[key]:
+                paths[target.parent / item[field]] = self.environment.host_path(str(project.parent / item[field]))
+        if measurements is not None:
+            paths[Path(self.environment.container_path(measurements))] = measurements
 
-    def _container_path(self, path: Path) -> str:
-        if path.is_relative_to(self.root):
-            return str(Path("/workspace/trace-sim") / path.relative_to(self.root))
-        # External declared inputs retain their absolute path. The consuming
-        # operation mounts each required file explicitly, with its own access mode.
-        return str(path)
+        if prediction_result is not None:
+            paths[Path(self.environment.container_path(prediction_result))] = prediction_result
+            # Planning reads provenance and observed domains, never raw timing
+            # exports. Missing optional history stays unknown in the C++ plan.
+            manifests = {
+                Path(os.path.normpath(target.parent / reference))
+                for reference in inputs.get("assets", {}).get("performance_manifests", [])
+            }
+            for model in read_json(prediction_result)["cost_models"]:
+                if model["status"] == "loaded":
+                    manifests.add(Path(model["source_manifest"]))
 
-    def _save(self, path: Path, value: Any) -> None:
-        write_json(path, value)
+            for manifest_path in sorted(manifests):
+                source = self.environment.host_path(str(manifest_path))
+                if not source.is_file():
+                    continue
 
-    def _prepare(
+                paths[manifest_path] = source
+                manifest = read_json(source)
+                if "input" in manifest:
+                    prepared = self.environment.host_path(str(source.parent / manifest["input"]))
+                    if prepared.is_file():
+                        paths[manifest_path.parent / manifest["input"]] = prepared
+
+        if communication:
+            for reference in inputs.get("assets", {}).get("performance_manifests", []):
+                manifest_path = Path(os.path.normpath(target.parent / reference))
+                source = self.environment.host_path(str(project.parent / reference))
+                paths[manifest_path] = source
+                manifest = read_json(source)
+                if manifest["measurement_kind"] == "native_device_work":
+                    for field in ("input", "device_measurements"):
+                        paths[manifest_path.parent / manifest[field]] = self.environment.host_path(
+                            str(source.parent / manifest[field])
+                        )
+
+        binary = self.root / "build/markov/markov"
+        mounts = ["--mount", f"type=bind,src={binary},dst={self.environment.container_path(binary)},readonly"]
+        paths = {Path(os.path.normpath(path)): source for path, source in paths.items()}
+        for path, source in sorted(paths.items()):
+            source = source.resolve()
+            mounts += ["--mount", f"type=bind,src={source},dst={path},readonly"]
+        return mounts
+
+    def prepare(
         self,
         project: Path,
         role: str,
@@ -58,7 +95,9 @@ class CollectionWorkflow:
         configuration_id: str | None = None,
         workload_id: str | None = None,
         budget_sec: int | None = None,
+        purpose: str | None = None,
         representative: bool = False,
+        prediction_result: Path | None = None,
     ) -> dict[str, Any]:
         command = "prepare" if role == "base" else "prepare-sampling"
         if representative:
@@ -67,18 +106,24 @@ class CollectionWorkflow:
             command = "prepare-target"
         if role == "prediction":
             command = "prepare-prediction"
+        if role == "performance_plan":
+            command = "prepare-performance"
         if role == "performance" and measurement_kind == "communication":
             command = "prepare-communication"
 
-        arguments = [command, "--project", self._container_path(project)]
+        arguments = [command, "--project", self.environment.container_path(project)]
         if configuration_id is not None:
             arguments += ["--configuration", configuration_id]
         if workload_id is not None:
             arguments += ["--workload", workload_id]
         if role == "validation":
             arguments += ["--budget-sec", str(budget_sec)]
+            if purpose is not None:
+                arguments += ["--purpose", purpose]
         if measurement_requests is not None:
-            arguments += ["--measurement-requests", self._container_path(measurement_requests)]
+            arguments += ["--measurement-requests", self.environment.container_path(measurement_requests)]
+        if prediction_result is not None:
+            arguments += ["--prediction-result", self.environment.container_path(prediction_result)]
 
         result = subprocess.run(
             [
@@ -87,11 +132,12 @@ class CollectionWorkflow:
                 "--rm",
                 "--pull=never",
                 "--network=none",
-                "--mount",
-                f"type=bind,src={self.root},dst=/workspace/trace-sim,readonly",
+                *self._preparation_mounts(
+                    project, measurement_requests, command == "prepare-communication", prediction_result
+                ),
                 "--workdir",
                 "/workspace/trace-sim",
-                self._service_image("modeling"),
+                self.environment.service_image("modeling"),
                 "build/markov/markov",
                 *arguments,
             ],
@@ -101,36 +147,21 @@ class CollectionWorkflow:
         )
         return json.loads(result.stdout)
 
-    def _service_image(self, service: str) -> str:
-        definition = subprocess.run(
-            self.compose + ["config", "--format", "json"], check=True, text=True, capture_output=True
-        )
-        return json.loads(definition.stdout)["services"][service]["image"]
-
-    def _native_entrypoint(self, service: str) -> list[str]:
-        image = self._service_image(service)
-        inspection = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{json .Config.Entrypoint}}", image],
-            check=True,
-            text=True,
-            capture_output=True,
-        )
-        return json.loads(inspection.stdout)
-
     def profile(
         self,
         project: Path,
         *,
         role: str = "base",
         repetitions: int = 3,
-        measurement_kind: str = "cpu",
+        measurement_kind: str = "transfer",
         measurement_requests: Path | None = None,
         configuration_id: str | None = None,
         workload_id: str | None = None,
         budget_sec: int | None = None,
+        purpose: str | None = None,
         representative: bool = False,
     ) -> dict[str, Any]:
-        prepared = self._prepare(
+        prepared = self.prepare(
             project,
             role,
             measurement_kind,
@@ -138,51 +169,81 @@ class CollectionWorkflow:
             configuration_id=configuration_id,
             workload_id=workload_id,
             budget_sec=budget_sec,
+            purpose=purpose,
             representative=representative,
         )
         if role == "performance":
             prepared["repetitions"] = repetitions
             prepared["measurement_kind"] = measurement_kind
 
-        # A timestamp alone can collide across independent project directories.
-        run_name = f"{datetime.now():run-%Y%m%d-%H%M%S-%f}-{uuid4().hex}"
-        directory = self._host_path(prepared["output_directory"]) / run_name
-        directory.mkdir(parents=True)
+        run = RunDirectory.create(
+            self.environment.host_path(prepared["output_directory"]), prepared["framework"], prepared["model_path"]
+        )
+        directory = run.root
         state: dict[str, Any] = {
+            "id": run.identity,
             "project": str(project),
-            "task_status": "planned",
-            "status": "needs_data",
             "framework": prepared["framework"],
-            "role": role,
-            "base_manifest": None,
-            "performance_manifest": None,
             "collection": {
                 kind: {"consumed_wall_time_ns": 0, **permission} for kind, permission in prepared["permissions"].items()
             },
             "attempts": [],
         }
 
-        state[f"{role}_manifest"] = None
-        if role == "validation":
-            state["candidate_id"] = prepared["candidate_id"]
-
-        self._save(directory / "prepared_input.json", prepared)
-
-        self._save(directory / "run.json", state)
-        if not prepared["permission"]["allow_run"]:
-            state.update(task_status="finished", status="needs_data", reason=f"{role}_collection_disabled")
-            self._save(directory / "run.json", state)
-            return {"run": str(directory), **state}
-
+        write_json(directory / "inputs/prepared_input.json", prepared)
+        self.select(prepared, directory, state)
+        write_json(directory / "run.json", state)
         with (directory / "run.lock").open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            self._collect(prepared, directory, state)
+            self.collect(directory, state)
 
-        return {"run": str(directory), **state}
+        return self._result(directory, state)
+
+    def select(
+        self,
+        prepared: dict[str, Any],
+        directory: Path,
+        state: dict[str, Any],
+        *,
+        max_wall_time_sec: int | None = None,
+    ) -> None:
+        """Register one capture without changing its parent's prediction phase."""
+        write_json(directory / "work/prepared_input.json", prepared)
+        state["capture"] = {
+            "role": prepared["role"],
+            "attempt_index": len(state["attempts"]),
+            "phase": "planned",
+            "status": "needs_data",
+            "manifest": None,
+            "max_wall_time_sec": max_wall_time_sec,
+        }
+
+    def collect(self, directory: Path, state: dict[str, Any]) -> None:
+        acquisition = state["capture"]
+        if acquisition["manifest"] is None:
+            if len(state["attempts"]) == acquisition["attempt_index"]:
+                self._collect(read_json(directory / "work/prepared_input.json"), directory, state)
+            elif state["attempts"][-1]["status"] == "prepared":
+                self._launch(directory, state)
+            elif state["attempts"][-1]["status"] == "completed":
+                self._finalize(directory, state)
+
+        # The parent ledger now owns the manifest. Completed processor receipts
+        # can disappear; a failed or still active processor keeps its work.
+        write_json(directory / "run.json", state)
+        if acquisition["manifest"] is not None:
+            (directory / "work/prepared_input.json").unlink(missing_ok=True)
+            RunDirectory(directory, state["id"]).consume_work("processing", acquisition["attempt_index"] + 1)
 
     def _collect(self, prepared: dict[str, Any], directory: Path, state: dict[str, Any]) -> None:
-        role = state["role"]
+        acquisition = state["capture"]
+        role = acquisition["role"]
         permission = state["collection"][role]
+        if not permission["allow_run"]:
+            acquisition.update(phase="finished", status="needs_data", reason=f"{role}_collection_disabled")
+            write_json(directory / "run.json", state)
+            return
+
         prepared["permissions"] = {
             kind: {"allow_run": value["allow_run"], "max_wall_time_sec": value["max_wall_time_sec"]}
             for kind, value in state["collection"].items()
@@ -191,46 +252,79 @@ class CollectionWorkflow:
 
         # Retries share the task budget; a new attempt does not reset consumed time.
         remaining_ns = permission["max_wall_time_sec"] * 1_000_000_000 - permission["consumed_wall_time_ns"]
+        limit = acquisition["max_wall_time_sec"]
+        if limit is not None:
+            remaining_ns = min(remaining_ns, limit * 1_000_000_000)
+            prepared["permission"] = {**prepared["permission"], "max_wall_time_sec": limit}
         if remaining_ns <= 0:
-            state.update(task_status="finished", status="needs_data", reason=f"{role}_collection_budget_exhausted")
-            self._save(directory / "run.json", state)
+            acquisition.update(phase="finished", status="needs_data", reason=f"{role}_collection_budget_exhausted")
+            write_json(directory / "run.json", state)
             return
 
         environment = prepared["environment"]
-        native_entrypoint = self._native_entrypoint(environment["service"])
-        attempt_directory = directory / role / f"attempt-{len(state['attempts']) + 1}"
-        attempt_directory.mkdir(parents=True)
-        self._save(attempt_directory / "prepared_input.json", prepared)
-        container = "markov-capture-" + directory.name + f"-{len(state['attempts']) + 1}"
+        native_entrypoint = self.environment.native_entrypoint(environment["service"])
+        run = RunDirectory(directory, state["id"])
+        ordinal = len(state["attempts"]) + 1
+        attempt_directory = run.capture(role, ordinal)
+        # Before the attempt is registered, an interrupted preparation may have
+        # left this directory; no native process has been launched for it yet.
+        attempt_directory.mkdir(parents=True, exist_ok=True)
+        write_json(attempt_directory / "prepared_input.json", prepared)
+        container = run.container(f"capture-{ordinal:03d}")
         attempt = {
             "role": role,
+            "measurement_kind": prepared["measurement_kind"] if role == "performance" else None,
             "directory": str(attempt_directory),
+            "processing_directory": str(run.work("processing", ordinal)),
             "container": container,
             "created_at_ns": time.time_ns(),
-            "status": "collecting",
+            "status": "prepared",
             "pid": None,
         }
 
         # Persist the attempt identity before launch so resume can recover its container.
         state["attempts"].append(attempt)
-        state["task_status"] = "collecting"
-        state["status"] = "needs_data"
-        state.pop("reason", None)
-        self._save(
+        acquisition["phase"] = "planned"
+        acquisition["status"] = "needs_data"
+        acquisition.pop("reason", None)
+        write_json(
             attempt_directory / "attempt_input.json",
             {
                 "framework": prepared["framework"],
                 "role": role,
                 "measurement_kind": prepared["measurement_kind"] if role == "performance" else None,
+                "observation_purpose": prepared["observation_purpose"] if role == "validation" else None,
                 "created_at_ns": attempt["created_at_ns"],
                 "remaining_wall_time_ns": remaining_ns,
                 "native_entrypoint": native_entrypoint,
+                "log": self.environment.container_path(run.log(f"native-{ordinal:03d}")),
             },
         )
 
-        self._save(directory / "run.json", state)
+        write_json(directory / "run.json", state)
+        self._launch(directory, state)
 
-        command = self.compose + [
+    def _launch(self, directory: Path, state: dict[str, Any]) -> None:
+        acquisition = state["capture"]
+        attempt = state["attempts"][-1]
+        attempt_directory = Path(attempt["directory"])
+        prepared = read_json(attempt_directory / "prepared_input.json")
+        environment = prepared["environment"]
+        run = RunDirectory(directory, state["id"])
+        ordinal = len(state["attempts"])
+        container = attempt["container"]
+
+        # Registration is durable before launch. A host may stop between them;
+        # time spent waiting for a later resume is not container bootstrap time.
+        configuration = read_json(attempt_directory / "attempt_input.json")
+        configuration["created_at_ns"] = time.time_ns()
+        write_json(attempt_directory / "attempt_input.json", configuration)
+        remaining_ns = configuration["remaining_wall_time_ns"]
+        attempt.update(status="collecting", created_at_ns=configuration["created_at_ns"], pid=None)
+        acquisition.update(phase="collecting", status="needs_data")
+        write_json(directory / "run.json", state)
+
+        command = self.environment.compose + [
             "run",
             "-d",
             "-T",
@@ -247,14 +341,26 @@ class CollectionWorkflow:
             "-m",
             "markov_collection.workflow.attempt",
             "--attempt",
-            self._container_path(attempt_directory / "attempt_input.json"),
+            self.environment.container_path(attempt_directory / "attempt_input.json"),
         ]
+        existing = self.environment.container_state(container)
+        if existing is not None:
+            # A created container reserves the same identity but has not run its
+            # monitor. Resume starts it rather than creating another attempt.
+            command = ["docker", "start", container]
 
         started_ns = time.perf_counter_ns()
-        with (attempt_directory / "launch.log").open("w", encoding="utf-8") as log:
+        launch_log = run.log(f"launch-{ordinal:03d}")
+        launch_log.parent.mkdir(parents=True, exist_ok=True)
+        print(
+            f"Capturing {acquisition['role']}, attempt {ordinal}; log: {run.log(f'native-{ordinal:03d}')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        with launch_log.open("w", encoding="utf-8") as log:
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
             attempt["pid"] = process.pid
-            self._save(directory / "run.json", state)
+            write_json(directory / "run.json", state)
             try:
                 code = process.wait(timeout=remaining_ns / 1_000_000_000)
                 launch_result = {
@@ -262,8 +368,8 @@ class CollectionWorkflow:
                     "elapsed_wall_time_ns": time.perf_counter_ns() - started_ns,
                     "ended_at_ns": time.time_ns(),
                 }
-                self._save(attempt_directory / "launch_result.json", launch_result)
-                container_state = self._container_state(container)
+                write_json(attempt_directory / "launch_result.json", launch_result)
+                container_state = self.environment.container_state(container)
                 failed_start = container_state is None or (
                     container_state["Status"] == "created" and bool(container_state["Error"])
                 )
@@ -273,121 +379,143 @@ class CollectionWorkflow:
                     )
                 else:
                     subprocess.run(["docker", "wait", container], check=True, stdout=log, stderr=subprocess.STDOUT)
-                    self._reconcile(state)
+                    self.reconcile(state)
             except subprocess.TimeoutExpired:
                 self._stop(container, process, log)
-                if self._container_state(container) is None:
+                if self.environment.container_state(container) is None:
                     self._finish_attempt(
                         state, "budget_exhausted", 124, time.perf_counter_ns() - started_ns, time.time_ns()
                     )
                 else:
-                    self._reconcile(state)
+                    self.reconcile(state)
             except KeyboardInterrupt:
                 self._stop(container, process, log)
-                if self._container_state(container) is None:
+                if self.environment.container_state(container) is None:
                     self._finish_attempt(state, "interrupted", 130, time.perf_counter_ns() - started_ns, time.time_ns())
                 else:
-                    self._reconcile(state)
+                    self.reconcile(state)
             finally:
-                self._save(directory / "run.json", state)
+                write_json(directory / "run.json", state)
 
-        if state["status"] == "captured":
+        if acquisition["status"] == "captured":
             self._finalize(directory, state)
 
     def _finalize(self, directory: Path, state: dict[str, Any]) -> None:
-        if self._completed_processing(state):
-            self._save(directory / "run.json", state)
+        acquisition = state["capture"]
+        failure = self._reconcile_processing(state)
+        write_json(directory / "run.json", state)
+        if failure is not None:
+            raise CaptureProcessingFailed(failure["message"])
+        if acquisition["manifest"] is not None:
             return
 
-        self._raise_processing_failure(directory, state)
+        if acquisition["role"] == "performance":
+            prepared = read_json(Path(state["attempts"][-1]["directory"]) / "prepared_input.json")
+            if prepared["measurement_kind"] == "transfer":
+                raise RuntimeError("native transfer sampler exited without publishing its performance manifest")
 
-        if state["role"] == "performance":
-            with (directory / "prepared_input.json").open(encoding="utf-8") as stream:
-                prepared = json.load(stream)
-            if prepared["measurement_kind"] == "cpu":
-                raise RuntimeError("native CPU sampler exited without publishing its performance manifest")
+        acquisition["phase"] = "processing"
 
-        state["task_status"] = "processing"
+        write_json(directory / "run.json", state)
+        attempt = state["attempts"][-1]
+        capture = Path(attempt["directory"]) / "native_capture.json"
+        run = RunDirectory(directory, state["id"])
+        ordinal = len(state["attempts"])
+        task = f"processing-{ordinal:03d}"
+        print(f"Processing {acquisition['role']}; log: {run.log(task)}", file=sys.stderr, flush=True)
+        work = Path(attempt["processing_directory"])
+        job = ModelingJob(self.environment, run.container(task), work, run.log(task))
+        arguments = [
+            "python3",
+            "-m",
+            "markov_collection.workflow.processing",
+            "--capture",
+            self.environment.container_path(capture),
+            "--role",
+            acquisition["role"],
+            "--directory",
+            self.environment.container_path(work),
+        ]
+        outputs = {capture.parent}
+        if acquisition["role"] == "base":
+            prepared = read_json(capture.parent / "prepared_input.json")
+            templates = run.asset("templates", ordinal)
+            intermediates = run.diagnostics("base", ordinal) if prepared["diagnostics"] else work / "source"
+            outputs.update({templates, intermediates})
+            arguments += [
+                "--template-directory",
+                self.environment.container_path(templates),
+                "--work-directory",
+                self.environment.container_path(intermediates),
+            ]
 
-        self._save(directory / "run.json", state)
-        capture = Path(state["attempts"][-1]["directory"]) / "native_capture.json"
         try:
-            with (capture.parent / "processing_launch.log").open("a", encoding="utf-8") as log:
-                subprocess.run(
-                    self.compose
-                    + [
-                        "run",
-                        "--rm",
-                        "-T",
-                        "--no-deps",
-                        "-e",
-                        "PYTHONPATH=/workspace/trace-sim/src/collection",
-                        "modeling",
-                        "python3",
-                        "-m",
-                        "markov_collection.workflow.processing",
-                        "--capture",
-                        self._container_path(capture),
-                        "--role",
-                        state["role"],
-                    ],
-                    check=True,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                )
-            if not self._completed_processing(state):
+            job.run(arguments, {self.root / "build/markov/markov", self.root / "src/collection"}, outputs)
+            self._reconcile_processing(state)
+            if acquisition["manifest"] is None:
                 raise RuntimeError("capture processor exited without publishing its result")
-        except subprocess.CalledProcessError:
-            self._raise_processing_failure(directory, state)
-            state.update(task_status="interrupted", reason=f"{state['role']}_processing_interrupted")
-            self._save(directory / "run.json", state)
+        except (subprocess.CalledProcessError, ModelingJobFailed):
+            failure = self._reconcile_processing(state)
+            if failure is not None:
+                write_json(directory / "run.json", state)
+                raise CaptureProcessingFailed(failure["message"]) from None
+            acquisition.update(phase="interrupted", reason=f"{acquisition['role']}_processing_interrupted")
+            write_json(directory / "run.json", state)
             raise
         except (Exception, KeyboardInterrupt):
-            state.update(task_status="interrupted", reason=f"{state['role']}_processing_interrupted")
-            self._save(directory / "run.json", state)
+            acquisition.update(phase="interrupted", reason=f"{acquisition['role']}_processing_interrupted")
+            write_json(directory / "run.json", state)
             raise
 
-        self._save(directory / "run.json", state)
+        write_json(directory / "run.json", state)
 
-    def _raise_processing_failure(self, directory: Path, state: dict[str, Any]) -> None:
+    def _reconcile_processing(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        acquisition = state["capture"]
+        role = acquisition["role"]
+        if (
+            len(state["attempts"]) <= acquisition["attempt_index"]
+            or state["attempts"][-1]["status"] != "completed"
+            or acquisition["manifest"] is not None
+        ):
+            return None
+
         attempt = state["attempts"][-1]
+        directory = Path(attempt["directory"])
         try:
-            with (Path(attempt["directory"]) / "processing_failure.json").open(encoding="utf-8") as stream:
+            with (Path(attempt["processing_directory"]) / "processing_failure.json").open(encoding="utf-8") as stream:
                 failure = json.load(stream)
         except FileNotFoundError:
-            return
+            failure = None
+        if failure is not None:
+            attempt["processing_failure"] = failure
+            acquisition.update(phase="finished", status="failed", reason=f"{role}_processing_failed")
+            return failure
 
-        attempt["processing_failure"] = failure
-        state.update(task_status="finished", reason=f"{state['role']}_processing_failed")
-        self._save(directory / "run.json", state)
-        raise CaptureProcessingFailed(failure["message"])
-
-    def _completed_processing(self, state: dict[str, Any]) -> bool:
-        role = state["role"]
-        if state["status"] != "captured" or state[f"{role}_manifest"] is not None:
-            return False
-
-        directory = Path(state["attempts"][-1]["directory"])
-        result_path = directory / ("performance_manifest.json" if role == "performance" else "processing_result.json")
+        # Native completion and processing outcome are separate facts. Status and
+        # resume consume the same terminal records without launching another job.
+        native_transfer = role == "performance" and attempt["measurement_kind"] == "transfer"
+        result_path = (
+            directory / "performance_manifest.json"
+            if native_transfer
+            else Path(attempt["processing_directory"]) / "processing_result.json"
+        )
         try:
             with result_path.open(encoding="utf-8") as stream:
                 result = json.load(stream)
         except FileNotFoundError:
-            return False
+            return None
 
-        if role == "base":
-            state.update(base_manifest=str(directory / "profile_manifest.json"), source_readiness=result["readiness"])
-        elif role == "validation":
-            state.update(
-                validation_manifest=str(directory / "validation_manifest.json"),
-                observation_readiness=result["readiness"],
-            )
-        else:
-            state.update(performance_manifest=str(result_path), sample_readiness=result["readiness"])
-        state["task_status"] = "finished"
-        state.pop("reason", None)
+        manifest = (
+            directory / "performance_manifest.json"
+            if native_transfer
+            else self.environment.host_path(result[f"{role}_manifest"])
+        )
+        acquisition.update(manifest=str(manifest), readiness=result["readiness"])
+        attempt.pop("processing_failure", None)
+        acquisition.update(phase="finished", status="captured")
+        acquisition.pop("reason", None)
 
-        return True
+        return None
 
     def resume(self, directory: Path, *, budgets: dict[str, int] | None = None) -> dict[str, Any]:
         with (directory / "run.lock").open("a", encoding="utf-8") as lock:
@@ -398,39 +526,43 @@ class CollectionWorkflow:
 
             with (directory / "run.json").open(encoding="utf-8") as stream:
                 state = json.load(stream)
-            live, active_ns = self._reconcile(state)
-            self._save(directory / "run.json", state)
+            live, active_ns = self.reconcile(state)
+            write_json(directory / "run.json", state)
             if live:
-                result = {"run": str(directory), "live_attempt": True, "active_wall_time_ns": active_ns, **state}
+                result = {
+                    **state,
+                    "run": str(directory),
+                    "task_status": state["capture"]["phase"],
+                    "status": state["capture"]["status"],
+                    "live_attempt": True,
+                    "active_wall_time_ns": active_ns,
+                }
                 if budgets:
                     result["requested_changes_applied"] = False
                 return result
 
             if budgets:
                 self._revise_budget(directory, state, budgets)
-            if state["status"] == "captured":
-                if state[f"{state['role']}_manifest"] is None:
-                    self._finalize(directory, state)
-                return {"run": str(directory), **state}
-            if not state["collection"][state["role"]]["allow_run"]:
-                return {"run": str(directory), **state}
+            acquisition = state["capture"]
+            if (
+                state["attempts"]
+                and state["attempts"][-1]["status"] in {"failed", "interrupted", "budget_exhausted"}
+                and len(state["attempts"]) > acquisition["attempt_index"]
+            ):
+                self.select(read_json(directory / "inputs/prepared_input.json"), directory, state)
+            self.collect(directory, state)
 
-            # Reuse recorded inputs; changing business configuration requires a new run.
-            with (directory / "prepared_input.json").open(encoding="utf-8") as stream:
-                prepared = json.load(stream)
-            self._collect(prepared, directory, state)
-
-        return {"run": str(directory), **state}
+        return self._result(directory, state)
 
     def _revise_budget(self, directory: Path, state: dict[str, Any], budgets: dict[str, int]) -> None:
-        role = state["role"]
+        role = state["capture"]["role"]
         if set(budgets) != {role}:
             raise ValueError(f"this {role} collection task only accepts its own budget")
 
         seconds = budgets[role]
         if seconds <= 0 or seconds * 1_000_000_000 < state["collection"][role]["consumed_wall_time_ns"]:
             raise ValueError(f"{role} total budget must be positive and cover its consumed time")
-        with (directory / "prepared_input.json").open(encoding="utf-8") as stream:
+        with (directory / "inputs/prepared_input.json").open(encoding="utf-8") as stream:
             prepared = json.load(stream)
         if prepared["environment"] is None:
             raise ValueError("enabled collection requires the task's declared environment")
@@ -438,23 +570,7 @@ class CollectionWorkflow:
         permission = {"allow_run": True, "max_wall_time_sec": seconds}
         state["collection"][role].update(permission)
 
-        self._save(directory / "run.json", state)
-
-    def _container_state(self, container: str) -> dict[str, Any] | None:
-        inspection = subprocess.run(
-            ["docker", "inspect", "--format", "{{json .State}}", container],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if inspection.returncode == 0:
-            return json.loads(inspection.stdout)
-        if "No such object" in inspection.stderr or "No such container" in inspection.stderr:
-            return None
-
-        raise subprocess.CalledProcessError(
-            inspection.returncode, inspection.args, inspection.stdout, inspection.stderr
-        )
+        write_json(directory / "run.json", state)
 
     def _live_launcher(self, attempt: dict[str, Any]) -> bool:
         if attempt["pid"] is None:
@@ -469,28 +585,29 @@ class CollectionWorkflow:
         return process.returncode == 0 and attempt["container"] in process.stdout
 
     def _finish_attempt(self, state: dict[str, Any], status: str, code: int, elapsed_ns: int, ended_ns: int) -> None:
+        acquisition = state["capture"]
         attempt = state["attempts"][-1]
         attempt.update(status=status, return_code=code, elapsed_wall_time_ns=elapsed_ns, ended_at_ns=ended_ns)
 
-        role = state["role"]
+        role = acquisition["role"]
         state["collection"][role]["consumed_wall_time_ns"] += elapsed_ns
 
-        state.update(task_status="finished", status="needs_data")
+        acquisition.update(phase="finished", status="needs_data")
         if status == "completed":
-            state.update(task_status="processing", status="captured")
+            acquisition.update(phase="processing", status="captured")
         elif status == "failed":
-            state.update(status="failed", reason=f"{role}_collection_failed")
+            acquisition.update(status="failed", reason=f"{role}_collection_failed")
         elif status == "interrupted":
-            state.update(task_status="interrupted", reason=f"{role}_collection_interrupted")
+            acquisition.update(phase="interrupted", reason=f"{role}_collection_interrupted")
         else:
-            state["reason"] = f"{role}_collection_budget_exhausted"
+            acquisition["reason"] = f"{role}_collection_budget_exhausted"
 
-    def _reconcile(self, state: dict[str, Any]) -> tuple[bool, int]:
-        if not state["attempts"] or state["attempts"][-1]["status"] != "collecting":
+    def reconcile(self, state: dict[str, Any]) -> tuple[bool, int]:
+        if not state["attempts"] or state["attempts"][-1]["status"] not in {"prepared", "collecting"}:
             return False, 0
 
         attempt = state["attempts"][-1]
-        container = self._container_state(attempt["container"])
+        container = self.environment.container_state(attempt["container"])
         try:
             with (Path(attempt["directory"]) / "attempt_status.json").open(encoding="utf-8") as stream:
                 record = json.load(stream)
@@ -505,6 +622,25 @@ class CollectionWorkflow:
                     launch = json.load(stream)
             except FileNotFoundError:
                 launch = None
+
+            if record is not None and record["ended_at_ns"] is not None:
+                self._finish_attempt(
+                    state,
+                    record["status"],
+                    record["return_code"],
+                    record["elapsed_wall_time_ns"],
+                    record["ended_at_ns"],
+                )
+                return False, 0
+
+            if record is None and launch is None:
+                # This workflow retains native containers. An absent handle and
+                # no monitor/launcher outcome means launch has not completed.
+                # Reuse its name: Docker also prevents competing creates from
+                # launching a second native job after a lost host.
+                attempt["status"] = "prepared"
+                state["capture"]["phase"] = "planned"
+                return False, 0
 
             # A failed launcher plus an absent/failed-created container proves
             # no monitor ran. Charge the recorded launch interval, never time
@@ -548,194 +684,27 @@ class CollectionWorkflow:
 
         return False, 0
 
+    def _result(self, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
+        live, active_ns = self.reconcile(state)
+        self._reconcile_processing(state)
+        acquisition = state["capture"]
+        return {
+            **state,
+            "run": str(directory),
+            "task_status": acquisition["phase"],
+            "status": acquisition["status"],
+            "live_attempt": live,
+            "active_wall_time_ns": active_ns,
+        }
+
     def status(self, directory: Path) -> dict[str, Any]:
-        with (directory / "run.json").open(encoding="utf-8") as stream:
-            state = json.load(stream)
-        live, active_ns = self._reconcile(state)
-        self._completed_processing(state)
-        return {"run": str(directory), "live_attempt": live, "active_wall_time_ns": active_ns, **state}
+        return self._result(directory, read_json(directory / "run.json"))
 
     def _stop(self, container: str, process: subprocess.Popen[Any], log: Any) -> None:
         if process.poll() is None:
             process.terminate()
         process.wait()
-        if self._container_state(container) is not None:
+        if self.environment.container_state(container) is not None:
             subprocess.run(
                 ["docker", "stop", "--time", "30", container], stdout=log, stderr=subprocess.STDOUT, check=True
             )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["profile", "observe-target", "sample", "predict", "resume", "status"])
-    parser.add_argument("--configuration", help="configuration id for explicit diagnostic acquisition")
-    parser.add_argument("--workload", help="request workload id for explicit acquisition or sampling prompts")
-    parser.add_argument("--budget-sec", type=int, help="explicit target observation wall-time budget")
-    parser.add_argument("--validation-budget-sec", type=int, help="new total target observation budget on resume")
-    parser.add_argument("--repetitions", type=int, default=3, help="independent sampling repetitions per grid point")
-    parser.add_argument(
-        "--measurement-requests",
-        type=Path,
-        help="sample explicit missing phase/input/context/prompt/finished-count work domains",
-    )
-    parser.add_argument(
-        "--kind", choices=["cpu", "device", "communication"], default="cpu", help="independent measurement kind"
-    )
-
-    inputs = parser.add_mutually_exclusive_group(required=True)
-    inputs.add_argument("--project", type=Path)
-    inputs.add_argument("--run", type=Path)
-    parser.add_argument("--template-assets", type=Path, help="replace prediction template imports with a JSON array")
-    parser.add_argument(
-        "--cost-model", type=Path, action="append", help="replace fitted cost inputs on prediction resume"
-    )
-    parser.add_argument(
-        "--performance-manifest",
-        type=Path,
-        action="append",
-        help="replace prediction performance imports; repeat for multiple independent assets",
-    )
-    parser.add_argument("--base-budget-sec", type=int, help="new total base budget for prediction resume")
-    parser.add_argument("--performance-budget-sec", type=int, help="new total performance budget for prediction resume")
-    parser.add_argument("--representative", action="store_true", help="observe the planned representative recipe")
-    arguments = parser.parse_args()
-
-    if arguments.representative and (arguments.command != "profile" or arguments.workload is not None):
-        parser.error("--representative requires profile without --workload")
-
-    acquisition = arguments.command in {"profile", "sample", "observe-target"}
-    if acquisition:
-        if arguments.configuration is None:
-            parser.error("explicit acquisition requires --configuration")
-        communication = arguments.command == "sample" and arguments.kind == "communication"
-        if not communication and not arguments.representative and arguments.workload is None:
-            parser.error("explicit acquisition requires --workload")
-        if communication and arguments.workload is not None:
-            parser.error("communication sampling uses declared device assets, not --workload")
-    elif arguments.configuration is not None or arguments.workload is not None:
-        parser.error("--configuration and --workload apply only to explicit acquisition")
-
-    if arguments.command == "observe-target":
-        if arguments.budget_sec is None or arguments.budget_sec <= 0:
-            parser.error("observe-target requires a positive --budget-sec")
-    elif arguments.budget_sec is not None:
-        parser.error("--budget-sec requires observe-target")
-
-    if arguments.measurement_requests is not None and (
-        arguments.command != "sample" or arguments.kind == "communication"
-    ):
-        parser.error("measurement requests require sample --kind cpu|device")
-
-    if arguments.command == "sample" and arguments.kind != "communication" and arguments.measurement_requests is None:
-        parser.error("CPU/device sampling requires --measurement-requests; automatic workload grids are not supported")
-
-    revisions = any(
-        value is not None
-        for value in [
-            arguments.template_assets,
-            arguments.performance_manifest,
-            arguments.cost_model,
-            arguments.base_budget_sec,
-            arguments.performance_budget_sec,
-            arguments.validation_budget_sec,
-        ]
-    )
-    if revisions and arguments.command != "resume":
-        parser.error("asset and budget revisions require resume")
-
-    root = Path(__file__).resolve().parents[4]
-    workflow = CollectionWorkflow(root)
-    if arguments.command == "predict":
-        if arguments.project is None:
-            parser.error("predict requires --project")
-        from markov_collection.workflow.prediction import PredictionWorkflow
-
-        result = PredictionWorkflow(workflow).predict(arguments.project.resolve())
-    elif arguments.command in {"profile", "sample", "observe-target"}:
-        if arguments.project is None:
-            parser.error(f"{arguments.command} requires --project")
-        if arguments.repetitions <= 0:
-            parser.error("sampling repetitions must be positive")
-        result = workflow.profile(
-            arguments.project.resolve(),
-            role={"profile": "base", "sample": "performance", "observe-target": "validation"}[arguments.command],
-            configuration_id=arguments.configuration,
-            workload_id=arguments.workload,
-            budget_sec=arguments.budget_sec,
-            representative=arguments.representative,
-            repetitions=arguments.repetitions,
-            measurement_kind=arguments.kind,
-            measurement_requests=arguments.measurement_requests.resolve()
-            if arguments.measurement_requests is not None
-            else None,
-        )
-    else:
-        if arguments.run is None:
-            parser.error(f"{arguments.command} requires --run")
-        directory = arguments.run.resolve()
-        with (directory / "run.json").open(encoding="utf-8") as stream:
-            state = json.load(stream)
-        budgets = {
-            role: seconds
-            for role, seconds in [
-                ("base", arguments.base_budget_sec),
-                ("performance", arguments.performance_budget_sec),
-                ("validation", arguments.validation_budget_sec),
-            ]
-            if seconds is not None
-        }
-        if "prediction" in state:
-            if arguments.validation_budget_sec is not None:
-                parser.error("validation budget applies only to an observe-target task")
-            from markov_collection.workflow.prediction import PredictionWorkflow
-
-            prediction = PredictionWorkflow(workflow)
-            result = (
-                prediction.status(directory)
-                if arguments.command == "status"
-                else prediction.resume(
-                    directory,
-                    budgets=budgets,
-                    template_assets=arguments.template_assets.resolve()
-                    if arguments.template_assets is not None
-                    else None,
-                    performance_manifests=(
-                        [path.resolve() for path in arguments.performance_manifest]
-                        if arguments.performance_manifest is not None
-                        else None
-                    ),
-                    cost_models=[path.resolve() for path in arguments.cost_model]
-                    if arguments.cost_model is not None
-                    else None,
-                )
-            )
-        else:
-            if (
-                arguments.template_assets is not None
-                or arguments.performance_manifest is not None
-                or arguments.cost_model is not None
-            ):
-                parser.error("asset revisions require a prediction task")
-            result = (
-                workflow.status(directory)
-                if arguments.command == "status"
-                else workflow.resume(directory, budgets=budgets)
-            )
-
-    print(json.dumps(result, indent=2))
-    if result.get("status") == "failed" and arguments.command != "status":
-        raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except subprocess.CalledProcessError as error:
-        print(error.stderr.strip() if isinstance(error.stderr, str) else str(error), file=sys.stderr)
-        raise SystemExit(2) from None
-    except (ValueError, OSError) as error:
-        print(error, file=sys.stderr)
-        raise SystemExit(2) from None
-    except RuntimeError as error:
-        print(error, file=sys.stderr)
-        raise SystemExit(1) from None

@@ -1,14 +1,17 @@
 #include "markov/workflow/prediction_workflow.hpp"
 
+#include "markov/workflow/performance_requirements_plan.hpp"
+
 #include "markov/adapters/template_adapter.hpp"
 #include "markov/contracts/json_input.hpp"
 #include "markov/controller/lightweight_controller.hpp"
 #include "markov/execution/simulation.hpp"
 #include "markov/performance/communication_cost_model.hpp"
-#include "markov/performance/cpu_cost_model.hpp"
+#include "markov/performance/device_command_cost_model.hpp"
 #include "markov/performance/kernel_cost_model.hpp"
 #include "markov/performance/node_costs.hpp"
 #include "markov/performance/node_durations.hpp"
+#include "markov/performance/transfer_cost_model.hpp"
 #include "markov/templates/template_asset.hpp"
 #include "markov/templates/templates.hpp"
 
@@ -17,7 +20,6 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -58,7 +60,7 @@ Json incomplete(std::string_view status, std::string_view kind, std::string_view
 
 } // namespace
 
-nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json collection_plan) const {
+nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json collection_plan, const std::filesystem::path & catalog_directory) const {
     std::vector<LoadedTemplate> sources;
     NodeDurations durations;
     auto asset_reports = Json::array();
@@ -72,28 +74,29 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
         try {
             auto metadata = input::read_json(path);
             const auto kind = metadata.at("kind").get<std::string>();
-            if (metadata.at("unit") != "ns" || metadata.at("status") != "candidate"
-                || (kind != "empirical_worker_median" && kind != "empirical_admission_median" && kind != "empirical_kernel_median"
-                    && kind != "empirical_communication_median"))
+            if (metadata.at("unit") != "ns" || metadata.at("status") != "candidate")
                 throw std::invalid_argument("cost model requires an empirical candidate in ns");
 
             std::unique_ptr<CostModel> model;
-            const bool kernel = kind == "empirical_kernel_median";
-            const bool communication = kind == "empirical_communication_median";
             std::string_view query_policy;
-            if (communication) {
+            if (kind == "empirical_transfer_median") {
+                model = std::make_unique<TransferCostModel>(metadata.at("entries"));
+                query_policy = "exact execution boundary, bytes and direction; asynchronous device service or complete synchronous host driver call; preceding "
+                               "submission and waits excluded";
+            }
+            else if (kind == "empirical_device_command_median") {
+                model = std::make_unique<DeviceCommandCostModel>(metadata.at("entries"));
+                query_policy = "physical device record command with exact adapter task type; CPU submission, waits and collective tasks excluded";
+            }
+            else if (kind == "empirical_communication_median") {
                 model = std::make_unique<CommunicationCostModel>(metadata.at("entries"));
                 query_policy = "exact physical task kind, operation, bytes, dtype, transport and rank endpoints; waits and envelopes excluded";
             }
-            else if (kernel) {
+            else if (kind == "empirical_kernel_median") {
                 model = std::make_unique<KernelCostModel>(metadata.at("entries"));
-                query_policy = "exact tensors with one sampled launch variant; additional semantic work requires another model";
+                query_policy = "exact tensors and one sampled launch variant; explicit tensor-traversal assumption or matching observed semantic operands";
             }
-            else {
-                const auto unit = kind == "empirical_worker_median" ? CpuCostUnit::Worker : CpuCostUnit::Admission;
-                model = std::make_unique<CpuCostModel>(unit, metadata.at("entries"));
-                query_policy = "target admission member or complete worker submission key";
-            }
+            else throw std::invalid_argument("unknown cost model kind: " + kind);
             const auto & context = metadata.at("observed_context");
             const auto & deployment = context.at("deployment");
             const auto adapter =
@@ -139,9 +142,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             { "manifest", input.manifest.string() }
         };
         try {
-            std::ifstream stream(input.manifest);
-            stream.exceptions(std::ios::failbit | std::ios::badbit);
-            const auto manifest = Json::parse(stream);
+            const auto manifest = markov::input::read_json(input.manifest);
             if (manifest.at("role") != "base") throw std::invalid_argument("prediction templates require role=base");
             const auto adapter =
                 std::ranges::find_if(adapters_, [&](const TemplateAdapter * item) { return item->name() == manifest.at("framework").get<std::string_view>(); });
@@ -196,6 +197,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
     for (const auto & source : sources) banks.push_back({ source.bank.get(), &source.configuration });
 
     auto source_coverage = Json::array();
+    PerformanceRequirementsPlan requirement_plans(catalog_directory.empty() ? project.output_directory / "catalogs" : catalog_directory);
     auto combinations = Json::array();
     std::size_t combination_index = 0;
     for (const auto & candidate : project.configurations) {
@@ -214,7 +216,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             for (const auto & model : models) {
                 std::string_view reason;
                 if (model.model_path != project.model_path || model.framework != binding.name()) reason = "cost_model_implementation_mismatch";
-                else if (!binding.supports_cost_configuration(model.configuration, candidate.configuration)) reason = "cost_model_configuration_mismatch";
+                else if (!binding.shares_execution_path(model.configuration, candidate.configuration)) reason = "cost_model_configuration_mismatch";
                 else if (model.deployment.devices != candidate.environment.devices || model.deployment.service != candidate.environment.service
                          || model.runtime != "docker")
                     reason = "cost_model_deployment_mismatch";
@@ -269,9 +271,10 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                     result = incomplete("unsupported", "implementation", "text_tokenization_not_implemented");
                 else if (selected->duration_error) result = incomplete("failed", "node_durations", *selected->duration_error);
                 else if (model_error) result = incomplete("failed", "cost_model", *model_error);
-                else if (!durations.contains(selected->input->manifest) && applicable_models.empty())
-                    result = incomplete("needs_data", "input", models.empty() ? "node_durations_missing" : "cost_model_context_mismatch");
                 else {
+                    // Object relations and conservative target bounds exist
+                    // before timing; the runtime refines actual feature points.
+                    auto requirements_plan = requirement_plans.run(*selected->bank, donors, operation_sources, workload.requests, *limits);
                     // All mutable serving state belongs to this one combination.
                     LightweightController controller(selected->bank->page_size_tokens(), *selected->bank->admission_policy());
                     const NodeCosts costs(durations, applicable_models);
@@ -282,6 +285,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                                               costs,
                                               project.diagnostics ? std::optional(graph_path) : std::nullopt);
                     result = runtime.run(*limits);
+                    result["performance_requirements"]["plan"] = std::move(requirements_plan);
                 }
             }
             catch (const std::exception & error) {

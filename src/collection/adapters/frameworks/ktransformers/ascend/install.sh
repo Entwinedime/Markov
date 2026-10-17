@@ -138,56 +138,12 @@ patch_archive_config() {
 from pathlib import Path
 import sys
 
+import yaml
+
 path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-lines = text.splitlines()
-out = []
-in_attn = False
-attn_indent = None
-seen_page = False
-seen_chunk = False
-
-def emit_missing():
-    emitted = []
-    if not seen_page:
-        emitted.append("  page_size: 128")
-    if not seen_chunk:
-        emitted.append("  chunk_size: 16384")
-    return emitted
-
-for line in lines:
-    stripped = line.strip()
-    indent = len(line) - len(line.lstrip(" "))
-
-    if in_attn and stripped and indent <= attn_indent and not line.startswith(" " * (attn_indent + 1)):
-        out.extend(emit_missing())
-        in_attn = False
-
-    if stripped == "attn:":
-        in_attn = True
-        attn_indent = indent
-        seen_page = False
-        seen_chunk = False
-        out.append(line)
-        continue
-
-    if in_attn and stripped.startswith("page_size:"):
-        out.append(" " * (attn_indent + 2) + "page_size: 128")
-        seen_page = True
-        continue
-
-    if in_attn and stripped.startswith("chunk_size:"):
-        out.append(" " * (attn_indent + 2) + "chunk_size: 16384")
-        seen_chunk = True
-        continue
-
-    out.append(line)
-
-if in_attn:
-    out.extend(emit_missing())
-
-path.write_text("\n".join(out) + "\n", encoding="utf-8")
+configuration = yaml.safe_load(path.read_text(encoding="utf-8"))
+configuration["attn"].update(page_size=128, chunk_size=16384)
+path.write_text(yaml.safe_dump(configuration, sort_keys=False), encoding="utf-8")
 PY
 }
 

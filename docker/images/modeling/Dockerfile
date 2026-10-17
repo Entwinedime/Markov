@@ -35,6 +35,7 @@ RUN apt-get update \
         python3-venv \
         python3-yaml \
         rsync \
+        zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN locale-gen en_US.UTF-8

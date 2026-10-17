@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
+from markov_collection.artifacts.json_file import write_json
 
 
 class WorkspaceCapture:
@@ -24,11 +24,11 @@ class WorkspaceCapture:
 
     def begin(self) -> None:
         self.state["initial"] = self._snapshot()
-        self._write()
+        write_json(self.path, self.state, compact=True)
 
     def end(self) -> None:
         self.state["final"] = self._snapshot()
-        self._write()
+        write_json(self.path, self.state, compact=True)
 
     def _snapshot(self) -> list[dict[str, int]]:
         import torch_npu
@@ -55,7 +55,3 @@ class WorkspaceCapture:
         finally:
             if not history_enabled:
                 torch_npu.npu.memory._record_memory_history(enabled=None)
-
-    def _write(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.state, separators=(",", ":")) + "\n", encoding="utf-8")

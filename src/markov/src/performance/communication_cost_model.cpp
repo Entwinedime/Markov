@@ -53,13 +53,11 @@ std::optional<std::int64_t> CommunicationCostModel::measured_cost(const Communic
     return found->second;
 }
 
-std::optional<std::int64_t> CommunicationCostModel::estimate(const ServiceWork & work) const {
-    if (!work.communication || (work.node_kind != SourceSpanKind::Dma && work.node_kind != SourceSpanKind::DeviceMarker)) return std::nullopt;
-
-    // Waits remain dependencies. Neither the parent collective duration nor
-    // its element count is charged again at these physical task boundaries.
-    const auto & task = *work.communication;
-    return measured_cost({ work.node_kind, task.operation, task.bytes, task.data_type, task.transport, task.source_rank, task.destination_rank });
+CostModelResult CommunicationCostModel::estimate(const CostQuery & query) const {
+    for (const auto & object : query.objects)
+        if (object.kind == CostQueryKind::Communication && object.issue == CostQueryIssue::None)
+            return measured(measured_cost(std::get<CommunicationCostFeatures>(object.features)));
+    return std::unexpected(CostModelGap{});
 }
 
 } // namespace markov

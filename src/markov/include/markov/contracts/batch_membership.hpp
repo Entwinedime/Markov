@@ -2,6 +2,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <compare>
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -15,7 +16,7 @@ struct BatchTransitionState {
     std::optional<std::size_t> pending_prefill_requests;
     bool admission_blocked;
 
-    bool operator==(const BatchTransitionState &) const = default;
+    auto operator<=>(const BatchTransitionState &) const = default;
     nlohmann::json describe() const;
 };
 
@@ -50,7 +51,7 @@ struct BatchFilter {
     std::size_t input_count;
     std::vector<std::size_t> retained_indices;
 
-    bool operator==(const BatchFilter &) const = default;
+    auto operator<=>(const BatchFilter &) const = default;
     nlohmann::json describe() const;
 };
 
@@ -59,7 +60,7 @@ struct BatchMerge {
     std::size_t left_count;
     std::size_t right_count;
 
-    bool operator==(const BatchMerge &) const = default;
+    auto operator<=>(const BatchMerge &) const = default;
     nlohmann::json describe() const;
 };
 

@@ -95,7 +95,7 @@ std::expected<RequestPoolParameterLayout, std::string> RequestPoolLayout::bind_b
     const auto paired = bind(binding.write_span, write, source_requests);
     if (!paired) return std::unexpected(paired.error());
     if (!*paired) return std::unexpected("indexed_write_destination_not_qualified");
-    return RequestPoolParameterLayout(TensorParameterLayout({}, {}, 0), false, true);
+    return RequestPoolParameterLayout(TensorParameterLayout({}, {}, 0), std::nullopt, true);
 }
 
 std::optional<std::int64_t> RequestPoolLayout::sequence_capacity() const {
@@ -127,6 +127,7 @@ std::expected<std::optional<RequestPoolParameterLayout>, std::string> RequestPoo
     using Extent = TensorAxisExtent;
     std::vector<TensorParameterAxis> input_axes;
     std::vector<TensorParameterAxis> output_axes;
+    std::optional<RequestPoolOperation> access;
     KernelShapes inputs(source.input_shapes);
     KernelShapes outputs(source.output_shapes);
     const bool index = source.name == "aclnnIndex_IndexAiCore_Index";
@@ -152,6 +153,7 @@ std::expected<std::optional<RequestPoolParameterLayout>, std::string> RequestPoo
         output_axes = {
             { 0, 1, index ? Extent::Requests : Extent::RequestPoolRows }
         };
+        access = index ? RequestPoolOperation::RelayRead : RequestPoolOperation::RelayWrite;
     }
     else {
         bool touches_table = false;
@@ -171,12 +173,13 @@ std::expected<std::optional<RequestPoolParameterLayout>, std::string> RequestPoo
             };
             if (source.input_dtypes != "INT64;UINT64;INT64;INT64") return std::unexpected("request_pool_operand_dtype_unmapped");
             if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::unexpected("request_pool_operand_layout_unmapped");
-            // Vendor exposes only four input tensors; this does not qualify
-            // unreported pointer operands or target slot identities.
+            // Tensor extents come from the vendor signature. Indexed rows and
+            // write ranges come from the target reservations, not pointer data.
             for (std::size_t slot = 0; slot < inputs.tensors.size(); ++slot) input_axes.push_back({ slot, 1, Extent::Requests });
             output_axes = {
                 { 0, 1, Extent::RequestPoolRows }
             };
+            access = RequestPoolOperation::PrefixExtendWrite;
         }
         else if (source.name == "aclnnIndex_SliceAiCore_Slice") {
             expected_inputs = {
@@ -218,6 +221,7 @@ std::expected<std::optional<RequestPoolParameterLayout>, std::string> RequestPoo
                 { 0, 1, Extent::Requests },
                 { 0, 1, Extent::SequenceTokens, 1 }
             };
+            access = RequestPoolOperation::RowRead;
         }
         else if (index || write) {
             expected_inputs = index ? std::vector<std::vector<std::int64_t>>{ { rows, columns }, { 2 }, { 1 }, { observed_batch_size }, { observed_batch_size } }
@@ -245,12 +249,12 @@ std::expected<std::optional<RequestPoolParameterLayout>, std::string> RequestPoo
                     { 0, 1, Extent::RequestPoolRows }
                 };
             }
+            access = index ? RequestPoolOperation::TokenRead : RequestPoolOperation::TokenWrite;
         }
         else return std::unexpected("request_pool_operand_layout_unmapped");
     }
 
-    const bool indexed_slots = index || write || source.name == "write_req_to_token_pool_triton";
-    return RequestPoolParameterLayout(TensorParameterLayout(std::move(input_axes), std::move(output_axes), 0), indexed_slots);
+    return RequestPoolParameterLayout(TensorParameterLayout(std::move(input_axes), std::move(output_axes), 0), access);
 }
 
 } // namespace markov

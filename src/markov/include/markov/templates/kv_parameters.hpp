@@ -46,6 +46,7 @@ public:
           release_member_inputs_(release_member_inputs) {}
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input,
                                                       std::optional<std::size_t> request_slot = std::nullopt) const;
+    nlohmann::json describe_parameters() const;
     std::optional<bool> allocation_branch() const { return domain_.allocates_pages; }
 
 private:

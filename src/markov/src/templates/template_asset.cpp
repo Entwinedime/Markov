@@ -1,5 +1,6 @@
 #include "markov/templates/template_asset.hpp"
 
+#include "markov/contracts/json_input.hpp"
 #include "markov/templates/templates.hpp"
 
 #include <nlohmann/json.hpp>
@@ -9,6 +10,7 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -216,6 +218,9 @@ private:
     Json write(const PositionWorkload & value) const { return record(value.sequences); }
     PositionWorkload read(const Json & data, std::type_identity<PositionWorkload>) const { return { read<std::vector<PositionSequence>>(data.at(0)) }; }
 
+    Json write(const RequestPoolWork & value) const { return value.describe(); }
+    RequestPoolWork read(const Json & data, std::type_identity<RequestPoolWork>) const { return RequestPoolWork::read(data); }
+
     Json write(const SourceKernel & value) const {
         return record(value.name,
                       value.operation,
@@ -235,7 +240,7 @@ private:
                       value.sequence_length_max,
                       value.sequence_lengths,
                       value.kv_new_pages,
-                      value.request_pool_slots,
+                      value.request_pool,
                       value.attention);
     }
     SourceKernel read(const Json & data, std::type_identity<SourceKernel>) const {
@@ -257,7 +262,7 @@ private:
                  read<std::optional<std::int64_t>>(data.at(15)),
                  read<std::optional<std::vector<std::int64_t>>>(data.at(16)),
                  read<std::optional<std::int64_t>>(data.at(17)),
-                 read<std::optional<std::vector<std::uint32_t>>>(data.at(18)),
+                 read<std::optional<RequestPoolWork>>(data.at(18)),
                  read<std::optional<AttentionWorkload>>(data.at(19)) };
     }
 
@@ -766,9 +771,9 @@ private:
                  read<KvParameterOutput>(data.at(4)), read<bool>(data.at(5)) };
     }
 
-    Json write(const RequestPoolParameterLayout & value) const { return record(value.shapes_, value.indexed_slots_, value.single_request_only_); }
+    Json write(const RequestPoolParameterLayout & value) const { return record(value.shapes_, value.access_, value.single_request_only_); }
     RequestPoolParameterLayout read(const Json & data, std::type_identity<RequestPoolParameterLayout>) const {
-        return { read<TensorParameterLayout>(data.at(0)), read<bool>(data.at(1)), read<bool>(data.at(2)) };
+        return { read<TensorParameterLayout>(data.at(0)), read<std::optional<RequestPoolOperation>>(data.at(1)), read<bool>(data.at(2)) };
     }
 
     Json write(const PublicationParameterLayout & value) const {
@@ -801,13 +806,11 @@ private:
                  read<std::vector<std::optional<std::size_t>>>(data.at(3)) };
     }
 
-    Json write(const SourceCpuWork & value) const { return record(value.operation, value.part, value.submission); }
-    SourceCpuWork read(const Json & data, std::type_identity<SourceCpuWork>) const {
-        return { read<std::string>(data.at(0)), read<CpuSubmissionPart>(data.at(1)), read<SourceSpanId>(data.at(2)) };
-    }
+    Json write(const DeviceCommandWork & value) const { return value.describe(); }
+    DeviceCommandWork read(const Json & data, std::type_identity<DeviceCommandWork>) const { return DeviceCommandWork::read(data); }
 
     Json write(const TemplateNodeObservation & value) const {
-        return record(value.source_span, value.kernel, value.source_scope, value.communication, value.transfer, value.control_part, value.cpu_work);
+        return record(value.source_span, value.kernel, value.source_scope, value.communication, value.transfer, value.device_command);
     }
     TemplateNodeObservation read(const Json & data, std::type_identity<TemplateNodeObservation>) const {
         return { read<SourceSpanId>(data.at(0)),
@@ -815,8 +818,7 @@ private:
                  read<std::optional<std::size_t>>(data.at(2)),
                  read<const SourceCommunicationTask *>(data.at(3)),
                  read<const SourceTransfer *>(data.at(4)),
-                 read<std::optional<SourceCpuPart>>(data.at(5)),
-                 read<std::optional<SourceCpuWork>>(data.at(6)) };
+                 read<std::optional<DeviceCommandWork>>(data.at(5)) };
     }
 
     Json write(const TemplateGraph & value) const {
@@ -872,6 +874,7 @@ private:
             {    "admission_cpu_request_count",    write(value.admission_cpu_request_count) },
             {              "admission_regions",              write(value.admission_regions) },
             {                        "filters",                        write(value.filters) },
+            {                 "filter_regions",                 write(value.filter_regions) },
             {                          "merge",                          write(value.merge) },
             {                        "binding",                        write(value.binding) },
             {                 "source_subtree",                 write(value.source_subtree) },
@@ -936,6 +939,7 @@ private:
         result.admission_cpu_request_count = read<std::optional<std::size_t>>(data.at("admission_cpu_request_count"));
         result.admission_regions = read<std::vector<std::size_t>>(data.at("admission_regions"));
         result.filters = read<std::vector<BatchFilter>>(data.at("filters"));
+        result.filter_regions = read<std::map<BatchFilterBinding, std::size_t>>(data.at("filter_regions"));
         result.merge = read<std::optional<BatchMerge>>(data.at("merge"));
         result.binding = read<std::string>(data.at("binding"));
         result.source_subtree = read<std::vector<std::size_t>>(data.at("source_subtree"));
@@ -1027,7 +1031,6 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
 
     return {
         {              "manifest_path",            source.manifest_path.string() },
-        {             "templates_path",           source.templates_path.string() },
         {                 "model_path",                        source.model_path },
         {              "configuration",                     source.configuration },
         {                      "ranks",                             source.ranks },
@@ -1059,7 +1062,6 @@ Json TemplateAssetCodec::encode(const TemplateSource & source) {
 TemplateSource TemplateAssetCodec::decode(const Json & data) {
     TemplateSource result;
     result.manifest_path = data.at("manifest_path").get<std::string>();
-    result.templates_path = data.at("templates_path").get<std::string>();
     result.model_path = data.at("model_path").get<std::string>();
     result.configuration = data.at("configuration");
     result.ranks = read<std::uint32_t>(data.at("ranks"));

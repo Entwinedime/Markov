@@ -47,6 +47,7 @@ public:
           domains_(std::move(domains)),
           relations_(std::move(relations)) {}
     std::expected<std::vector<SourceCommunicationTask>, std::string> evaluate(std::span<const SourceCommunicationTask> source, std::uint64_t count) const;
+    nlohmann::json describe_parameters() const;
 
     CommunicationOperation operation() const { return operation_; }
     auto operator<=>(const CommunicationWorkLayout &) const = default;

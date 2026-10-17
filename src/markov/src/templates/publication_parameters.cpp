@@ -1,7 +1,5 @@
 #include "markov/templates/publication_parameters.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 
 namespace markov {
@@ -17,32 +15,6 @@ bool PublicationParameterLayout::can_reuse_members_from(const PublicationParamet
     // Members carry their own target slot; the recipient alone owns shared
     // output membership. Only output policy must agree across member donors.
     return interval_tokens_ == donor.interval_tokens_ && context_limit_ == donor.context_limit_ && sender_enabled_ == donor.sender_enabled_;
-}
-
-nlohmann::json PublicationMemberWork::describe() const {
-    return {
-        {                "request_id",                            request_id },
-        {          "generated_tokens",                      generated_tokens },
-        {                     "emits",                                 emits },
-        {             "output_tokens",                         output_tokens },
-        {     "decode_context_tokens",                 decode_context_tokens },
-        {    "previous_output_tokens",                previous_output_tokens },
-        { "decode_read_offset_tokens",             decode_read_offset_tokens },
-        {                  "finishes",                              finishes },
-        {              "first_output",  emits && previous_output_tokens == 0 },
-        {             "decode_tokens", output_tokens + decode_context_tokens }
-    };
-}
-
-nlohmann::json PublicationWork::describe() const {
-    auto rows = nlohmann::json::array();
-    for (const auto & member : members) rows.push_back(member.describe());
-    return {
-        {    "source_span",                      source_span },
-        {        "members",                  std::move(rows) },
-        { "sender_enabled",                   sender_enabled },
-        {         "branch", "periodic_non_streaming_outputs" }
-    };
 }
 
 std::expected<PublicationWork, std::string> PublicationParameterLayout::evaluate(const BatchInput & input) const {

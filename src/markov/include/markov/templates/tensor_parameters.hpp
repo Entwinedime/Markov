@@ -32,6 +32,7 @@ public:
           outputs_(std::move(outputs)),
           page_size_tokens_(page_size_tokens) {}
     SourceKernel evaluate(const SourceKernel & source, const BatchInput & input, std::optional<std::uint32_t> request_capacity = std::nullopt) const;
+    nlohmann::json describe_parameters() const;
     std::int64_t page_size_tokens() const { return page_size_tokens_; }
     auto operator<=>(const TensorParameterLayout &) const = default;
 

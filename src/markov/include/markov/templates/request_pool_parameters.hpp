@@ -21,15 +21,16 @@ class RequestPoolParameterLayout {
     friend class TemplateAssetCodec;
 
 public:
-    RequestPoolParameterLayout(TensorParameterLayout shapes, bool indexed_slots, bool single_request_only = false)
+    RequestPoolParameterLayout(TensorParameterLayout shapes, std::optional<RequestPoolOperation> access, bool single_request_only = false)
         : shapes_(std::move(shapes)),
-          indexed_slots_(indexed_slots),
+          access_(access),
           single_request_only_(single_request_only) {}
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input, std::uint32_t capacity) const;
+    nlohmann::json describe_parameters() const;
 
 private:
     TensorParameterLayout shapes_;
-    bool indexed_slots_;
+    std::optional<RequestPoolOperation> access_;
     bool single_request_only_;
 };
 

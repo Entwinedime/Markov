@@ -6,18 +6,57 @@ import argparse
 import json
 import os
 from pathlib import Path
+from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.instrumentation.session import CaptureSession
 
 
-class NativeCapture(CaptureSession):
+class NativeCapture:
+    def __init__(self, prepared: dict[str, Any], directory: Path) -> None:
+        self.prepared = prepared
+        self.directory = directory
+
+    def _session(self) -> CaptureSession:
+        framework = self.prepared["framework"]
+        if framework == "sglang":
+            if self.prepared["role"] == "performance":
+                from markov_collection.adapters.frameworks.sglang.sampling import SGLangSampling
+
+                return SGLangSampling(self.prepared, self.directory)
+
+            from markov_collection.adapters.frameworks.sglang.capture import SGLangCapture
+
+            return SGLangCapture(self.prepared, self.directory)
+
+        if framework == "ktransformers" and self.prepared["role"] != "performance":
+            from markov_collection.adapters.frameworks.ktransformers.capture import KTransformersCapture
+
+            return KTransformersCapture(self.prepared, self.directory)
+
+        raise ValueError(f"unsupported {self.prepared['role']} capture framework: {framework}")
+
     def run(self) -> None:
         if not self.prepared["permission"]["allow_run"]:
             raise ValueError("native collection permission is disabled")
 
-        artifacts = AscendCaptureArtifacts(self.prepared, self.directory)
+        session = self._session()
+        # Capture log offsets before native startup. One outer owner publishes
+        # vendor artifacts; direct target ports have no vendor exports or journal.
+        ports_only = self.prepared["role"] == "validation" and self.prepared["observation_purpose"] == "ports"
+        profiling = not ports_only and (
+            self.prepared["role"] != "performance" or self.prepared["measurement_kind"] == "device"
+        )
+        artifacts = AscendCaptureArtifacts(self.prepared, self.directory) if profiling else None
+        if self.prepared["role"] != "performance":
+            self._prepare_requests()
+
+        session.run()
+        if artifacts is not None:
+            artifacts.publish()
+
+    def _prepare_requests(self) -> None:
         requests = self.prepared["requests"]
         if any("text" in request for request in requests):
             from transformers import AutoTokenizer
@@ -31,19 +70,6 @@ class NativeCapture(CaptureSession):
         write_json(self.directory / "prepared_input.json", self.prepared)
         os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
         os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
-
-        if self.prepared["framework"] == "ktransformers":
-            from markov_collection.adapters.frameworks.ktransformers.capture import KTransformersCapture
-
-            KTransformersCapture(self.prepared, self.directory).run()
-        elif self.prepared["framework"] == "sglang":
-            from markov_collection.adapters.frameworks.sglang.capture import SGLangCapture
-
-            SGLangCapture(self.prepared, self.directory).run()
-        else:
-            raise ValueError(f"unsupported capture framework: {self.prepared['framework']}")
-
-        artifacts.publish()
 
 
 def main() -> None:

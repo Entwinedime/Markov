@@ -144,10 +144,11 @@ private:
 
 } // namespace
 
-nlohmann::json SGLangTemplateAdapter::extract(const std::filesystem::path & manifest_path, nlohmann::json manifest) const {
+nlohmann::json SGLangTemplateAdapter::extract(const std::filesystem::path & manifest_path, nlohmann::json manifest,
+                                              const std::filesystem::path & work_directory) const {
     // Framework bindings outlive runtime extraction and its borrowed block declarations.
     const SGLangBindings bindings;
-    return AscendSourceExtractor(bindings).extract(manifest_path, std::move(manifest));
+    return AscendSourceExtractor(bindings).extract(manifest_path, std::move(manifest), work_directory);
 }
 
 TemplateSource SGLangTemplateAdapter::produce(const std::filesystem::path & manifest_path) const { return SGLangTemplateBindings::produce(manifest_path); }
@@ -156,7 +157,7 @@ FrameworkConfiguration SGLangTemplateAdapter::source_configuration(const nlohman
     return SGLangConfiguration::from_parameters(parameters);
 }
 
-bool SGLangTemplateAdapter::supports_cost_configuration(const FrameworkConfiguration & source, const FrameworkConfiguration & target) const {
+bool SGLangTemplateAdapter::shares_execution_path(const FrameworkConfiguration & source, const FrameworkConfiguration & target) const {
     const auto & source_configuration = std::get<SGLangConfiguration>(source);
     const auto & target_configuration = std::get<SGLangConfiguration>(target);
     const SGLangBindings bindings;
@@ -185,7 +186,7 @@ TemplateSourceSelection SGLangTemplateAdapter::select_sources(const Candidate & 
         if (source.deployment.service != candidate.environment.service || source.deployment.devices != candidate.environment.devices) continue;
 
         deployment_available = true;
-        if (!SGLangBindings{}.supports_configuration_change(*source_configuration, configuration)) continue;
+        if (!shares_execution_path(*candidate_source.configuration, candidate.configuration)) continue;
 
         // A locally reusable operation does not grant the source's whole pool
         // or initialization state permission to migrate to the target.
@@ -352,7 +353,7 @@ nlohmann::json SGLangTemplateAdapter::configurations(std::span<const Candidate *
         for (auto & group : groups) {
             const auto & source = *group.representative;
             if (source.environment.service != candidate.environment.service || source.environment.devices != candidate.environment.devices) continue;
-            if (!SGLangBindings{}.supports_configuration_change(std::get<SGLangConfiguration>(source.configuration), configuration)) continue;
+            if (!shares_execution_path(source.configuration, candidate.configuration)) continue;
             selected = &group;
             break;
         }

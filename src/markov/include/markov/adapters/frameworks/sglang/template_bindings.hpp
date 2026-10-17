@@ -44,7 +44,6 @@ public:
               std::uint32_t page_size_tokens);
 
 private:
-    void bind_input_transfers();
     void bind_regions(const nlohmann::json & regions);
     void bind_admission_work();
     void bind_transition_merge();

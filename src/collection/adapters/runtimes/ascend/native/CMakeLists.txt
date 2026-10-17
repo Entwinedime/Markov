@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(ASCEND_ROOT /usr/local/Ascend/ascend-toolkit/latest CACHE PATH "Installed CANN SDK")
-add_library(markov_native_observation SHARED observation.cpp worker_sampling.cpp)
+add_library(markov_native_observation SHARED observation.cpp transfer_sampling.cpp)
 target_include_directories(markov_native_observation PRIVATE
     ${ASCEND_ROOT}/include
     ${ASCEND_ROOT}/include/experiment/runtime

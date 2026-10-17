@@ -365,7 +365,8 @@ class KTransformersCapture(CaptureSession):
         from ktransformers.server.balance_serve.settings import sched_ext
 
         origin_ns = time.perf_counter_ns()
-        requests = self.prepared["requests"]
+        # Workloads need not be ordered. Equal arrivals retain declaration order.
+        requests = sorted(self.prepared["requests"], key=lambda request: request["arrival_time_ns"])
         next_request = 0
         pending: dict[int, dict[str, Any]] = {}
         responses = []

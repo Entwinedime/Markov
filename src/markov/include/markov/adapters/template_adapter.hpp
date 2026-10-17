@@ -1,7 +1,7 @@
 #pragma once
 
+#include "markov/adapters/configuration.hpp"
 #include "markov/contracts/control.hpp"
-#include "markov/contracts/project.hpp"
 #include "markov/templates/templates.hpp"
 
 #include <nlohmann/json_fwd.hpp>
@@ -39,12 +39,13 @@ public:
 
     virtual Framework framework() const = 0;
     virtual std::string_view name() const = 0;
-    virtual nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest) const = 0;
+    virtual nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest,
+                                   const std::filesystem::path & work_directory) const = 0;
     virtual TemplateSource produce(const std::filesystem::path & manifest_path) const = 0;
     virtual FrameworkConfiguration source_configuration(const nlohmann::json & parameters) const = 0;
-    // Candidate eligibility only. The cost model must still match target work;
-    // equal implementation paths do not prove service-time portability.
-    virtual bool supports_cost_configuration(const FrameworkConfiguration & source, const FrameworkConfiguration & target) const = 0;
+    // Shared by source selection and cost candidate eligibility. This describes
+    // native configuration semantics, never service-time portability.
+    virtual bool shares_execution_path(const FrameworkConfiguration & source, const FrameworkConfiguration & target) const = 0;
     virtual std::expected<ServingLimits, std::string_view> control_limits(const FrameworkConfiguration & configuration) const = 0;
     virtual nlohmann::json configurations(std::span<const Candidate * const> candidates) const = 0;
     virtual TemplateSourceSelection select_sources(const Candidate & candidate, std::span<const TemplateSourceCandidate> sources) const = 0;

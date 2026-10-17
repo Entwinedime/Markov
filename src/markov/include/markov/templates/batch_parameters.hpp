@@ -29,6 +29,7 @@ struct BatchOperationVariant {
     bool request_pool_rebindable = false;
 
     bool accepts(const BatchInput & input) const;
+    nlohmann::json describe_parameters() const;
 };
 
 // Identity within the serving flow, independent of preceding filter calls.
@@ -62,8 +63,12 @@ public:
           rows_(std::move(rows)),
           request_(request),
           input_arity_(input_arity) {}
+
+    // Rebind an existing filter layout without changing its tensor or request constraints.
+    BatchParameterLayout with_filter_binding(BatchFilterBinding binding) const;
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input,
                                                       std::optional<std::size_t> request_slot = std::nullopt) const;
+    nlohmann::json describe_parameters() const;
 
 private:
     std::optional<BatchFilterBinding> filter_;

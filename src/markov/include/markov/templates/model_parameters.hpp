@@ -72,6 +72,7 @@ public:
           workload_(workload),
           partial_operands_(partial_operands) {}
     SourceKernel evaluate(const SourceKernel & source, const BatchInput & input) const;
+    nlohmann::json describe_parameters() const;
     ModelKernelRole role() const { return role_; }
     bool has_partial_operands() const { return partial_operands_; }
     auto operator<=>(const ModelParameterRule &) const = default;

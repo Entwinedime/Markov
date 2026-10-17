@@ -1,10 +1,14 @@
 #include "markov/contracts/json_input.hpp"
 
 #include <nlohmann/json.hpp>
+#include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <fstream>
+#include <ios>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 
 namespace markov::input {
@@ -13,15 +17,35 @@ using Json = nlohmann::json;
 using Path = std::filesystem::path;
 
 Json read_json(const Path & path) {
-    std::ifstream stream;
-    stream.exceptions(std::ios::badbit | std::ios::failbit);
-    stream.open(path);
-
     try {
+        if (path.extension() == ".gz") {
+            std::unique_ptr<gzFile_s, decltype(&gzclose)> stream(gzopen(path.c_str(), "rb"), &gzclose);
+            if (!stream) throw std::runtime_error("cannot open compressed JSON: " + path.string());
+
+            std::string content;
+            std::array<char, 64 * 1'024> buffer;
+            int bytes;
+            while ((bytes = gzread(stream.get(), buffer.data(), buffer.size())) > 0) content.append(buffer.data(), bytes);
+
+            // A missing trailer may return all JSON bytes before reporting an
+            // incomplete stream. Publication requires the complete gzip member.
+            int error;
+            const auto message = gzerror(stream.get(), &error);
+            if (error != Z_OK) throw std::runtime_error(path.string() + ": " + message);
+
+            return Json::parse(content);
+        }
+
+        std::ifstream stream;
+        stream.exceptions(std::ios::badbit | std::ios::failbit);
+        stream.open(path);
         return Json::parse(stream);
     }
     catch (const Json::exception & error) {
         throw std::invalid_argument(path.string() + ": " + error.what());
+    }
+    catch (const std::ios_base::failure & error) {
+        throw std::runtime_error(path.string() + ": " + error.what());
     }
 }
 

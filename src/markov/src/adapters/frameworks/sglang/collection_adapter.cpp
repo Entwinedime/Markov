@@ -40,6 +40,11 @@ nlohmann::json SGLangCollectionAdapter::workloads(const Candidate & candidate, s
     return SGLangSamplingRecipes{}.workloads(std::get<SGLangConfiguration>(candidate.configuration), prompts, measurement_requests);
 }
 
+nlohmann::json SGLangCollectionAdapter::sampling_requests(const Candidate & candidate, std::span<const Request> prompts,
+                                                          const nlohmann::json & requirements) const {
+    return SGLangSamplingRecipes{}.sampling_requests(std::get<SGLangConfiguration>(candidate.configuration), prompts, requirements);
+}
+
 nlohmann::json SGLangCollectionAdapter::collectives(const Candidate & candidate, std::span<const std::filesystem::path> performance_manifests) const {
     return SGLangSamplingRecipes{}.collectives(std::get<SGLangConfiguration>(candidate.configuration), candidate.environment, performance_manifests);
 }

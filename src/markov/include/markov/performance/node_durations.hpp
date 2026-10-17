@@ -1,6 +1,6 @@
 #pragma once
 
-#include "markov/performance/service_work.hpp"
+#include "markov/graph/source_graph.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -18,7 +18,7 @@ class NodeDurations {
 public:
     void load(const std::filesystem::path & path, const std::filesystem::path & base_manifest);
     bool contains(const std::filesystem::path & manifest) const;
-    std::optional<std::int64_t> duration(const ServiceWork & work) const;
+    std::optional<std::int64_t> duration(const std::filesystem::path & manifest, SourceSpanId span) const;
     nlohmann::json describe(const std::filesystem::path & manifest) const;
 
 private:

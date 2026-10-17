@@ -1,6 +1,6 @@
 #pragma once
 
-#include "markov/contracts/project.hpp"
+#include "markov/workflow/project.hpp"
 
 #include <span>
 

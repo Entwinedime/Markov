@@ -63,7 +63,6 @@ struct SourceCall {
     std::vector<SourceRequest> requests;
 
     std::optional<SourceSpanId> marker;
-    std::int64_t observed_thread_cpu_ns;
     std::int64_t observed_start_ns; // Native monotonic entry, only for ordering source observations.
     std::optional<SourceTensorLayout> input_layout;
     std::optional<BoundaryId> device_done;

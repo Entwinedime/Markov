@@ -1,5 +1,7 @@
 #include "markov/execution/execution_graph.hpp"
 
+#include "markov/performance/cost_query.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -25,7 +27,6 @@ std::size_t ExecutionGraph::register_source(const std::filesystem::path & manife
 }
 
 bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<const InvokeStep> invocations, std::int64_t release_ns) {
-    const auto first_node = nodes_.size();
     pending_port_ = ports_.size();
     std::map<std::pair<std::size_t, BoundaryId>, BoundaryId> shared;
     for (const auto * instance : instances) {
@@ -57,26 +58,22 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
             const auto & node = definition.graph[index];
             const auto & node_observation = definition.observation(node);
             if (members.emplace(source_asset, node_observation.source_span).second) {
-                const auto member = instance->publication_member_slots.find(node_observation.source_span);
-                const bool member_service = member != instance->publication_member_slots.end();
+                const auto * transfer = instance->transfer(node);
+                // Preserve host boundaries and causality without pricing control
+                // service. A synchronous host copy remains physical transfer work.
+                const auto role = node.kind == SourceSpanKind::CpuControl && !transfer ? TemplateNodeRole::Annotation : node.role();
                 nodes_.push_back({ instance->work_id,
                                    definition.rank,
                                    source_asset,
                                    node_observation.source_span,
-                                   node.role(),
+                                   role,
                                    node.kind,
                                    instance->kernel(node),
                                    instance->communication(node),
                                    local[node.begin],
                                    local[node.end],
-                                   instance->transfer(node),
-                                   instance->publication_work && (instance->publication_work->source_span == node_observation.source_span || member_service)
-                                       ? &*instance->publication_work
-                                       : nullptr,
-                                   member_service ? std::optional(member->second) : std::nullopt,
-                                   node_observation.control_part,
-                                   node.kind == SourceSpanKind::CpuControl ? definition.admission_member_slot(node_observation.source_span) : std::nullopt,
-                                   node_observation.cpu_work ? std::optional(CpuSubmissionWork{ &*node_observation.cpu_work, {} }) : std::nullopt });
+                                   transfer,
+                                   node_observation.device_command ? &*node_observation.device_command : nullptr });
             }
         }
 
@@ -84,25 +81,20 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
         // provenance, not an identity to deduplicate against other instances.
         for (const auto & inserted : instance->topology.inserted_nodes()) {
             const auto & node = inserted.node;
-            const bool member_service = instance->publication_work && node.kind == SourceSpanKind::CpuControl && inserted.request_slot.has_value();
+            const auto * transfer = inserted.transfer();
+            const auto role = node.kind == SourceSpanKind::CpuControl && !transfer ? TemplateNodeRole::Annotation : node.role();
             nodes_.push_back({ instance->work_id,
                                definition.rank,
                                register_source(inserted.definition->source_manifest),
                                inserted.observation().source_span,
-                               node.role(),
+                               role,
                                node.kind,
                                inserted.kernel(),
                                inserted.communication(),
                                local[node.begin],
                                local[node.end],
-                               inserted.transfer(),
-                               member_service ? &*instance->publication_work : nullptr,
-                               member_service ? inserted.request_slot : std::nullopt,
-                               inserted.observation().control_part,
-                               node.kind == SourceSpanKind::CpuControl && inserted.definition->admission_member_slot(inserted.observation().source_span)
-                                   ? inserted.request_slot
-                                   : std::nullopt,
-                               inserted.observation().cpu_work ? std::optional(CpuSubmissionWork{ &*inserted.observation().cpu_work, {} }) : std::nullopt });
+                               transfer,
+                               inserted.observation().device_command ? &*inserted.observation().device_command : nullptr });
         }
 
         for (const auto index : instance->topology.dependencies()) {
@@ -177,49 +169,9 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
         if (source != target) edges_.push_back({ source, target, relation });
     }
 
-    bind_cpu_submissions(first_node);
     ++batches_;
     acyclic_ = acyclic();
     return acyclic_;
-}
-
-void ExecutionGraph::bind_cpu_submissions(std::size_t first_node) {
-    std::map<std::tuple<std::size_t, SourceSpanId, BoundaryId>, BoundaryId> call_entries;
-    std::map<BoundaryId, std::vector<std::size_t>> submitted_nodes;
-    for (auto index = first_node; index < nodes_.size(); ++index) {
-        const auto & node = nodes_[index];
-        if (node.cpu_submission && node.cpu_submission->observation->part == CpuSubmissionPart::Call)
-            call_entries.emplace(std::tuple{ node.source_asset, node.cpu_submission->observation->submission, node.end }, node.begin);
-        if (node.kind != SourceSpanKind::CpuControl && node.kind != SourceSpanKind::CpuObservation) submitted_nodes[node.begin].push_back(index);
-    }
-
-    std::map<BoundaryId, std::vector<std::size_t>> roots;
-    for (const auto & edge : edges_) {
-        if (edge.relation != SourceRelation::NativeFlow) continue;
-        const auto targets = submitted_nodes.find(edge.target);
-        if (targets != submitted_nodes.end()) roots[edge.source].insert(roots[edge.source].end(), targets->second.begin(), targets->second.end());
-    }
-
-    for (auto index = first_node; index < nodes_.size(); ++index) {
-        auto & node = nodes_[index];
-        if (!node.cpu_submission) continue;
-        auto & work = *node.cpu_submission;
-        const auto & source = *work.observation;
-        auto entry = source.part == CpuSubmissionPart::Before ? node.end : node.begin;
-        if (source.part == CpuSubmissionPart::After) {
-            // The target return endpoint disambiguates repeated donor insertions.
-            const auto call = call_entries.find({ node.source_asset, source.submission, node.begin });
-            if (call == call_entries.end()) continue;
-            entry = call->second;
-        }
-
-        const auto submitted = roots.find(entry);
-        if (submitted == roots.end()) continue;
-        for (const auto target : submitted->second) {
-            const auto & device = nodes_[target];
-            work.roots.push_back({ device.kind, device.kernel, device.communication, device.transfer });
-        }
-    }
 }
 
 bool ExecutionGraph::acyclic() const {
@@ -251,6 +203,35 @@ bool ExecutionGraph::acyclic() const {
     return ready.size() == boundaries_.size();
 }
 
+ServiceWork ExecutionGraph::Node::service_work() const { return { kind, kernel, communication, transfer, device_command }; }
+
+void ExecutionGraph::record_requirement(const CostQuery & query, const NodeCosts & costs, const Node & owner, const InvokeStep & invocation) {
+    const ServingContract contract;
+    auto members = nlohmann::json::array();
+    for (const auto & request : invocation.input.requests) {
+        members.push_back({
+            {       "request_id",       request.request_id },
+            {     "input_tokens",     request.input_tokens },
+            {   "context_tokens",   request.context_tokens },
+            { "generated_tokens", request.generated_tokens },
+            {         "finishes",         request.finishes }
+        });
+    }
+
+    // Request provenance constructs native sample inputs; it is deliberately
+    // separate from the cost object's canonical feature identity.
+    requirements_.record(
+        query,
+        costs,
+        {
+            {         "work_id",                            owner.work },
+            {            "rank",                            owner.rank },
+            {     "source_span",                          owner.source },
+            { "source_manifest", sources_[owner.source_asset].string() }
+    },
+        { { "step", contract.block(invocation.step).name }, { "phase", contract.phase_name(invocation.input.phase) }, { "requests", std::move(members) } });
+}
+
 std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::schedule(const NodeCosts & costs,
                                                                                       const std::map<WorkId, const InvokeStep *> & invocations) {
     if (!unresolved_.empty()) {
@@ -267,31 +248,41 @@ std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::sch
         std::int64_t duration_ns;
     };
     std::vector<TimedEdge> constraints;
+    std::optional<ExecutionTimingGap> first_gap;
     constraints.reserve(edges_.size() + nodes_.size());
     for (const auto & edge : edges_) constraints.push_back({ edge.source, edge.target, 0 });
-    for (auto & node : nodes_) {
+    for (std::size_t index = 0; index < nodes_.size(); ++index) {
+        auto & node = nodes_[index];
         if (node.role != TemplateNodeRole::Service) continue;
-        const auto & manifest = sources_[node.source_asset];
-        const ServiceWork work{ manifest,
-                                node.source,
-                                node.rank,
-                                node.kind,
-                                *invocations.at(node.work),
-                                node.kernel,
-                                node.communication,
-                                node.transfer,
-                                node.publication,
-                                node.publication_member_slot,
-                                node.control_part,
-                                node.admission_member_slot,
-                                node.cpu_submission ? &*node.cpu_submission : nullptr };
-        const auto duration = costs.estimate(work);
-        if (!duration)
-            return std::unexpected(ExecutionTimingGap{ std::string(duration.error()), node.work, node.rank, node.source, manifest, work.describe() });
+        auto & cost = node.cost;
+        if (cost && index < requirement_frontier_) {
+            constraints.push_back({ node.begin, node.end, cost->duration_ns });
+            continue;
+        }
 
-        node.cost = *duration;
-        constraints.push_back({ node.begin, node.end, duration->duration_ns });
+        const auto & invocation = *invocations.at(node.work);
+        const auto work = node.service_work();
+        const auto query = CostQuery::from_work(work);
+        if (index >= requirement_frontier_) record_requirement(query, costs, node, invocation);
+
+        // Target work and cost providers are immutable for this combination.
+        // Reuse its estimate when later batches extend the same graph.
+        if (!cost) {
+            const auto & manifest = sources_[node.source_asset];
+            const auto duration = costs.estimate(query, NodeCostSource{ &manifest, node.source });
+            if (!duration) {
+                if (!first_gap) first_gap = ExecutionTimingGap{ std::string(duration.error()), node.work, node.rank, node.source, manifest, work.describe() };
+                continue;
+            }
+
+            cost = *duration;
+        }
+        constraints.push_back({ node.begin, node.end, cost->duration_ns });
     }
+    requirement_frontier_ = nodes_.size();
+    // Unknown costs never enter the event clock. Analyze the complete assembled
+    // frontier first, then return the first execution location plus all demands.
+    if (first_gap) return std::unexpected(std::move(*first_gap));
 
     // Waiting and annotations contribute dependencies, not service charges.
     // The runtime supplies release times and remains the sole event clock.
@@ -390,12 +381,7 @@ void ExecutionGraph::write(const std::filesystem::path & path) const {
         });
         if (node.communication) record["communication"] = node.communication->describe();
         if (node.transfer) record["transfer"] = node.transfer->describe();
-        if (node.cpu_submission) record["cpu_submission"] = node.cpu_submission->describe();
-        if (node.publication_member_slot) {
-            record["publication_member_work"] = node.publication->members[*node.publication_member_slot].describe();
-            record["publication_member_work"]["slot"] = *node.publication_member_slot;
-        }
-        else if (node.publication) { record["publication_work"] = node.publication->describe(); }
+        if (node.device_command) record["device_command"] = node.device_command->describe();
         if (node.cost) {
             record["service_cost"] = {
                 { "duration_ns",                                                                     node.cost->duration_ns },
@@ -464,10 +450,19 @@ nlohmann::json ExecutionGraph::describe() const {
     std::size_t waits = 0;
     std::size_t annotations = 0;
     auto cost_usage = nlohmann::json::object();
+    std::map<std::string, std::map<std::string, std::size_t>> cost_usage_by_work;
     for (const auto & node : nodes_) {
         if (node.cost) {
             const auto name = std::string(NodeCosts::basis_name(node.cost->basis));
             cost_usage[name] = cost_usage.value(name, std::size_t{ 0 }) + 1;
+
+            // Summarize actual queries without publishing a full target graph.
+            // Logical waits/annotations have no cost and never enter this table.
+            std::string work = std::string(SourceGraph::span_name(node.kind));
+            if (node.communication) work = "communication";
+            else if (node.transfer) work = "transfer";
+            else if (node.kernel && node.kernel->attention) work = "attention";
+            ++cost_usage_by_work[work][name];
         }
 
         switch (node.role) {
@@ -482,7 +477,6 @@ nlohmann::json ExecutionGraph::describe() const {
             break;
         }
     }
-
     auto sources = nlohmann::json::array();
     for (const auto & manifest : sources_) sources.push_back(manifest.string());
     nlohmann::json result = {
@@ -493,6 +487,7 @@ nlohmann::json ExecutionGraph::describe() const {
         {                  "edges",                                                                 edges_.size() },
         {                "acyclic",                                                                      acyclic_ },
         {             "cost_usage",                                                                    cost_usage },
+        {     "cost_usage_by_work",                                                            cost_usage_by_work },
         {             "node_roles", { { "service", services }, { "wait", waits }, { "annotation", annotations } } },
         {                  "ports",                                                                         ports },
         { "unresolved_connections",                                                                    unresolved }

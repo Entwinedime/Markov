@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from markov_collection.instrumentation.recording import Observation, Recorder
+from markov_collection.instrumentation.recording import Observation, ProfilerMarkers, Recorder
 
 
 @dataclass(frozen=True)
@@ -20,8 +20,9 @@ class BoundBlock:
 
 
 class BlockWrapper(ABC):
-    def __init__(self, blocks: tuple[BoundBlock, ...]) -> None:
+    def __init__(self, blocks: tuple[BoundBlock, ...], markers: ProfilerMarkers) -> None:
         self.blocks = blocks
+        self.markers = markers
 
     @abstractmethod
     def context(self, *args: Any, **kwargs: Any) -> tuple[Recorder, dict[str, Any]] | None:
@@ -37,27 +38,35 @@ class BlockWrapper(ABC):
 
     @contextmanager
     def scope(self, *args: Any, **kwargs: Any) -> Iterator[Observation | None]:
-        context = self.context(*args, **kwargs)
+        # Context can read tensor metadata before a Recorder is available.
+        # Its operations must never become native serving anchors.
+        with self.markers.observer():
+            context = self.context(*args, **kwargs)
+            if context is not None:
+                recorder, values = context
+                block = self.blocks[0]
+                if len(self.blocks) > 1:
+                    block = next(candidate for candidate in self.blocks if candidate.phase == values["phase"])
+
+                metadata = {name: values[name] for name in block.parameters}
+                observation = recorder.scope(block.step, metadata, binding=block.identity)
+
         if context is None:
             yield None
             return
 
-        recorder, values = context
-        block = self.blocks[0]
-        if len(self.blocks) > 1:
-            block = next(candidate for candidate in self.blocks if candidate.phase == values["phase"])
-
         # Method wrappers and inline regions share identity and exception cleanup.
-        metadata = {name: values[name] for name in block.parameters}
-        with recorder.scope(block.step, metadata, binding=block.identity) as observation:
+        with observation:
             yield observation
 
-        self.closed(observation)
+        with self.markers.observer():
+            self.closed(observation)
 
     def invoke(self, original: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         with self.scope(*args, **kwargs) as observation:
             result = original(*args, **kwargs)
             if observation is not None:
-                self.completed(observation, result, *args, **kwargs)
+                with self.markers.observer():
+                    self.completed(observation, result, *args, **kwargs)
 
         return result

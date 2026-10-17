@@ -219,8 +219,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_re
 
         if (last) break;
 
-        // Parent work remains a charged subgraph between members, including
-        // its annotations and internal boundaries. It is never a zero-cost edge.
+        // Keep parent work between members, including annotations and internal
+        // boundaries; a direct edge would discard their required causality.
         const auto & bridge = separators[std::min(slot, separators.size() - 1)];
         entry = graph.boundary_count() + result.inserted_boundaries.size();
         result.inserted_boundaries.push_back({ { lane }, boundary_observations[bridge.exit].source_boundary, &source_manifest });

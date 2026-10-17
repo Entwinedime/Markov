@@ -1,6 +1,25 @@
 #include "markov/templates/transfer_parameters.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <array>
+
 namespace markov {
+
+nlohmann::json TransferParameterLayout::describe_parameters() const {
+    static constexpr std::array extents{ "fixed_at_request_count",       "input_tokens",
+                                         "finished_sequence_tokens",     "request_elements",
+                                         "transition_retained_requests", "running_retained_requests" };
+    nlohmann::json result{
+        {        "rule",                                "transfer" },
+        { "byte_extent", extents[static_cast<std::size_t>(extent)] }
+    };
+    if (extent == TransferExtent::FixedAtRequestCount) result["required_request_count"] = request_count;
+    else result["element_bytes"] = element_bytes;
+
+    if (extent == TransferExtent::FinishedSequenceTokens) result["required_finished_count"] = finished_count;
+    return result;
+}
 
 std::expected<SourceTransfer, std::string> TransferParameterLayout::evaluate(const SourceTransfer & source, const BatchInput & input) const {
     if (extent == TransferExtent::TransitionRetainedRequests || extent == TransferExtent::RunningRetainedRequests) {

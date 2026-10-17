@@ -1,5 +1,6 @@
 #pragma once
 
+#include "markov/adapters/frameworks/sglang/configuration.hpp"
 #include "markov/production/block_binding.hpp"
 #include "markov/production/source_bindings.hpp"
 
@@ -18,8 +19,6 @@ class SourceGraph;
 // Native locations and their extraction meaning are declared together.
 class SGLangBindings final : public SourceBindings {
 public:
-    std::size_t bind_transfers(SourceGraph & graph, const nlohmann::json & intervals, const nlohmann::json & records,
-                               std::span<const SourceCall> calls) const override;
     std::expected<ServingLimits, std::string_view> control_limits(const SGLangConfiguration & configuration) const;
     bool supports_native_path(const nlohmann::json & environment) const override;
     bool supports_configuration_change(const SGLangConfiguration & source, SGLangConfiguration target) const;

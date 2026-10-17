@@ -50,7 +50,7 @@ class NativeRegionWrapper(BlockWrapper):
     def __init__(
         self, binding: BoundNativeRegion, path: str, module: Any, recorder: Recorder, original: Callable[..., Any]
     ) -> None:
-        super().__init__((binding,))
+        super().__init__((binding,), recorder.markers)
         self.binding = binding
         self.path = path
         self.module = module

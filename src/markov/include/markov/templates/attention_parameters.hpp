@@ -15,6 +15,7 @@ class AttentionParameterRule {
 public:
     AttentionParameterRule(TensorParameterLayout shapes, AttentionWorkload workload) : shapes_(std::move(shapes)), workload_(std::move(workload)) {}
     SourceKernel evaluate(const SourceKernel & source, const BatchInput & input) const;
+    nlohmann::json describe_parameters() const;
     auto operator<=>(const AttentionParameterRule &) const = default;
     const AttentionWorkload & geometry() const { return workload_; }
 

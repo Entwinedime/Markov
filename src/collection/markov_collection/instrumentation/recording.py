@@ -19,6 +19,10 @@ class ProfilerMarkers(ABC):
     def scope(self, name: str) -> AbstractContextManager:
         """Return a native profiler range without starting or synchronizing it."""
 
+    def observer(self) -> AbstractContextManager:
+        """Identify collection work separately from the observed native body."""
+        return self.scope("markov_observer")
+
 
 class Recorder:
     def __init__(self, directory: Path, rank: int, markers: ProfilerMarkers) -> None:
@@ -56,22 +60,24 @@ class Recorder:
         return getattr(self._local, "current", None) is not None
 
     def write(self, record: dict[str, Any]) -> None:
-        if self._stream is None:
-            self.directory.mkdir(parents=True, exist_ok=True)
-            self._stream = (self.directory / f"rank-{self.rank}-pid-{os.getpid()}.jsonl").open("a", encoding="utf-8")
+        with self.markers.observer():
+            if self._stream is None:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                self._stream = (self.directory / f"rank-{self.rank}-pid-{os.getpid()}.jsonl").open(
+                    "a", encoding="utf-8"
+                )
 
-        record["rank"] = self.rank
-        record["pid"] = os.getpid()
-        record["tid"] = threading.get_native_id()
+            record["rank"] = self.rank
+            record["pid"] = os.getpid()
+            record["tid"] = threading.get_native_id()
 
-        self._stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+            self._stream.write(json.dumps(record, separators=(",", ":")) + "\n")
 
-        # Explicit flushes belong to the outer serving action. Nested records
-        # still use normal file buffering; adding region markers must not force
-        # a Python/native flush for every module or layer.
-        if getattr(self._local, "current", None) is None:
-            self._stream.flush()
-            self.flush_native(close_window=False)
+            # Nested records keep normal buffering. Their serialization remains
+            # observation work even while the enclosing serving scope is active.
+            if getattr(self._local, "current", None) is None:
+                self._stream.flush()
+                self.flush_native(close_window=False)
 
     def flush_native(self, *, close_window: bool) -> None:
         if self._native is not None and self._native.markov_native_flush(int(close_window)) != 0:
@@ -99,23 +105,28 @@ class Observation:
         self.parent = getattr(self.recorder._local, "current", None)
         self.recorder.set_scope(self.identity)
 
-        self._marker = self.recorder.markers.scope(f"markov/{self.step}/{self.identity}")
-        self._marker.__enter__()
+        # Marker lifecycle and scalar clock reads stay outside observer ranges.
+        # Wrapping marker entry/exit would break the native profiler stack.
+        try:
+            self._marker = self.recorder.markers.scope(f"markov/{self.step}/{self.identity}")
+            self._marker.__enter__()
+        except BaseException:
+            self.recorder.set_scope(self.parent)
+            raise
 
-        self.thread_start_ns = time.thread_time_ns()
         self.wall_time_ns = time.time_ns()
         self.start_ns = time.perf_counter_ns()
 
         return self
 
     def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        # Keep thread-clock sampling outside the interval of the observed call.
         end_ns = time.perf_counter_ns()
-        thread_end_ns = time.thread_time_ns()
 
         # Restore the enclosing scope before persisting this observation.
-        self._marker.__exit__(exc_type, exc_value, traceback)
-        self.recorder.set_scope(self.parent)
+        try:
+            self._marker.__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.recorder.set_scope(self.parent)
 
         self.recorder.write(
             {
@@ -125,7 +136,6 @@ class Observation:
                 "binding": self.binding,
                 "start_ns": self.start_ns,
                 "end_ns": end_ns,
-                "thread_cpu_ns": thread_end_ns - self.thread_start_ns,
                 "wall_time_ns": self.wall_time_ns,
                 "metadata": self.metadata,
                 "result": self.result,

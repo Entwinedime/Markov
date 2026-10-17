@@ -1,7 +1,7 @@
 #pragma once
 
 #include "markov/contracts/batch_membership.hpp"
-#include "markov/contracts/project.hpp"
+#include "markov/contracts/request.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -17,7 +17,6 @@ namespace markov {
 
 using RequestId = std::size_t; // Index in the current immutable workload, not a display ID.
 using WorkId = std::uint64_t;
-using TimerId = std::uint64_t;
 
 enum class StepKind { Schedule, Prepare, Prefill, Decode, Publish };
 enum class PortKind { Selected, Prepared, Submitted, DeviceDone, Published };
@@ -63,15 +62,6 @@ struct InvokeStep {
     std::vector<PortDependency> port_dependencies;
 };
 
-struct RegisterTimer {
-    TimerId timer_id;
-    std::int64_t deadline_ns;
-};
-
-struct CancelTimer {
-    TimerId timer_id;
-};
-
 struct CompleteRequest {
     RequestId request_id;
     PortRef published;
@@ -82,7 +72,7 @@ struct UnsupportedControl {
 };
 
 // An empty action list yields to the runtime. It does not busy-poll or charge time.
-using ControlAction = std::variant<InvokeStep, RegisterTimer, CancelTimer, CompleteRequest, UnsupportedControl>;
+using ControlAction = std::variant<InvokeStep, CompleteRequest, UnsupportedControl>;
 
 struct RequestArrived {
     RequestId request_id;
@@ -92,13 +82,9 @@ struct WorkPortCompleted {
     PortRef port;
 };
 
-struct TimerExpired {
-    TimerId timer_id;
-};
-
 struct ControlEvent {
     std::int64_t time_ns;
-    std::variant<RequestArrived, WorkPortCompleted, TimerExpired> payload;
+    std::variant<RequestArrived, WorkPortCompleted> payload;
 };
 
 // The runtime owns work status and time. Views live only through handle().

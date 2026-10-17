@@ -2,6 +2,8 @@
 
 #include "markov/adapters/frameworks/sglang/copy_layout.hpp"
 
+#include "markov/contracts/json_input.hpp"
+
 #include "markov/adapters/frameworks/sglang/batch_layout.hpp"
 #include "markov/adapters/frameworks/sglang/bindings.hpp"
 #include "markov/adapters/frameworks/sglang/models/attention_kernel_layout.hpp"
@@ -58,10 +60,7 @@ void SGLangTemplateBindings::bind_publication(const nlohmann::json * published_r
         if (policy != source_state.end()) {
             if (!policy->at("non_streaming").get<bool>())
                 throw std::invalid_argument("native streaming output is outside the supported non-streaming serving scope");
-            const auto interval = policy->at("force_interval_tokens").get<std::int64_t>();
-            if (interval <= 0 || interval > std::numeric_limits<std::uint32_t>::max())
-                throw std::invalid_argument("native output interval must be a positive uint32 token count");
-            definition_.output_policy = PeriodicOutputPolicy{ static_cast<std::uint32_t>(interval) };
+            definition_.output_policy = PeriodicOutputPolicy{ input::positive(policy->at("force_interval_tokens")) };
         }
     }
 
@@ -136,38 +135,6 @@ void SGLangTemplateBindings::bind_kv(std::uint32_t page_size_tokens) {
         // Region selection reuses the already qualified node branch; the core
         // never needs the native allocator class or the wrapper's binding name.
         if (branch) definition_.kv_region = KvRegionBranch{ KvRegionKind::Allocation, index, *branch };
-    }
-}
-
-void SGLangTemplateBindings::bind_input_transfers() {
-    if (definition_.step != StepKind::Prefill || definition_.phase != BatchPhase::Prefill) return;
-    std::uint64_t tokens = 0;
-    for (const auto & request : definition_.source_requests) {
-        if (request.context_tokens != 0) return;
-        tokens += request.input_tokens;
-    }
-
-    for (const auto & region : definition_.regions) {
-        if (region.binding != "sglang.inputs.resolve" || !region.module) continue;
-        const auto & staging = region.module->inputs.at("prefill_input_ids_cpu");
-        const auto & copy = region.module->result.at("input_copy");
-        if (!staging || copy.is_null() || staging->dtype != "torch.int64" || staging->shape != std::vector<std::int64_t>{ static_cast<std::int64_t>(tokens) }
-            || staging->stride != std::vector<std::int64_t>{ 1 } || copy.at("bytes") != tokens * sizeof(std::int64_t))
-            continue;
-
-        // Extraction has already qualified the native addresses and CPU service.
-        // The core receives only a token extent, independent of SGLang names.
-        for (const auto index : region.nodes) {
-            const auto & node = definition_.graph[index];
-            const auto & node_observation = definition_.observation(node);
-            if (node_observation.source_scope != region.source_call || !node_observation.transfer
-                || node_observation.transfer->direction != TransferDirection::HostToDevice
-                || node_observation.transfer->bytes != copy.at("bytes").get<std::uint64_t>())
-                continue;
-            definition_.transfer_layouts.emplace(
-                node_observation.source_span,
-                TransferParameterLayout{ TransferExtent::InputTokens, definition_.source_requests.size(), 0, sizeof(std::int64_t) });
-        }
     }
 }
 
@@ -616,15 +583,17 @@ void SGLangTemplateBindings::bind_publication_output() {
             return;
     }
 
-    std::optional<SourceSpanId> service;
+    // Observer exclusion can split the shared output body. One source anchor
+    // identifies its semantics; complete regions preserve relocation and waits.
+    std::optional<SourceSpanId> anchor;
     for (const auto index : output->nodes) {
         const auto & node = definition_.graph[index];
         if (node.kind != SourceSpanKind::CpuControl) continue;
-        if (service) return;
-        service = definition_.observation(node).source_span;
+        anchor = definition_.observation(node).source_span;
+        break;
     }
-    if (!service) return;
-    definition_.publication_layout.emplace(*service, definition_.output_policy->interval_tokens, context_limit, work.at("sender_enabled").get<bool>());
+    if (!anchor) return;
+    definition_.publication_layout.emplace(*anchor, definition_.output_policy->interval_tokens, context_limit, work.at("sender_enabled").get<bool>());
     // Decode's member cuts are CPU-only; Prefill owns its prefix-copy or
     // direct-release work. Both keep shared output outside the member region.
     std::vector<std::optional<std::size_t>> members(count);
@@ -667,8 +636,8 @@ void SGLangTemplateBindings::bind_publication_progress() {
     if (std::ranges::find(covered, false) != covered.end()) return;
 
     // No token payload is emitted, but the native streamer still sends an
-    // empty batch message. Preserve all shared CPU work and completion waits;
-    // this domain neither removes nodes nor assigns zero cost to publication.
+    // empty batch message. Preserve its shared control work and completion
+    // waits even though host CPU service time is outside the pricing scope.
     for (const auto & node : definition_.graph) {
         if (node.kind == SourceSpanKind::CpuObservation || node.kind == SourceSpanKind::CpuControl) continue;
         if (node.kind != SourceSpanKind::HostWait
@@ -682,7 +651,6 @@ void SGLangTemplateBindings::bind_publication_progress() {
 void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::json & regions, const nlohmann::json & calls, const SGLangCopyLayout & copies,
                                   std::uint32_t page_size_tokens) {
     bind_regions(regions);
-    bind_input_transfers();
     bind_admission_work();
     bind_publication_progress();
     bind_publication_output();
@@ -724,10 +692,16 @@ void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::
 
         // Only a qualified parent identifies a movable filtering operation.
         // Retraction's additional filters are outside this supported update.
-        if (transition || (update && index == parent->module->call_parameters.at("filter_prefix_count")))
-            filter_scopes.emplace(
-                region.source_call,
-                NativeFilterSelection{ static_cast<std::size_t>(index), transition ? BatchFilterBinding::Transition : BatchFilterBinding::RunningUpdate });
+        if (transition || (update && index == parent->module->call_parameters.at("filter_prefix_count"))) {
+            const auto role = transition ? BatchFilterBinding::Transition : BatchFilterBinding::RunningUpdate;
+            filter_scopes.emplace(region.source_call, NativeFilterSelection{ static_cast<std::size_t>(index), role });
+
+            // A known helper supplies parameter bindings; moving its region also
+            // requires the enclosing transition or ordinary update qualification.
+            const auto qualified_parent = transition ? definition_.transition_region : definition_.running_update_region;
+            if (qualified_parent && *qualified_parent == static_cast<std::size_t>(parent - definition_.regions.begin()))
+                definition_.filter_regions.emplace(role, static_cast<std::size_t>(&region - definition_.regions.data()));
+        }
     }
 
     copies.bind(definition_, calls, filter_scopes);

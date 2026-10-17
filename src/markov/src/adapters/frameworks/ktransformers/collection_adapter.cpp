@@ -4,7 +4,9 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <stdexcept>
+#include <utility>
 #include <variant>
 
 namespace markov {
@@ -62,6 +64,20 @@ nlohmann::json KTransformersCollectionAdapter::instrumentation() const {
 
 nlohmann::json KTransformersCollectionAdapter::workloads(const Candidate &, std::span<const Request>, const nlohmann::json &) const {
     throw std::invalid_argument("independent sampling currently implements SGLang");
+}
+
+nlohmann::json KTransformersCollectionAdapter::sampling_requests(const Candidate &, std::span<const Request>, const nlohmann::json & requirements) const {
+    auto unresolved = nlohmann::json::array();
+    for (std::size_t index = 0; index < requirements.size(); ++index)
+        unresolved.push_back({
+            { "requirement_index",                                            index },
+            {            "reason", "framework_performance_sampling_not_implemented" }
+        });
+    return {
+        { "measurement_requests", nlohmann::json::array() },
+        {          "assignments", nlohmann::json::array() },
+        {           "unresolved",   std::move(unresolved) }
+    };
 }
 
 nlohmann::json KTransformersCollectionAdapter::collectives(const Candidate &, std::span<const std::filesystem::path>) const {

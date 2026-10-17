@@ -1,8 +1,38 @@
 #include "markov/templates/communication_work.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 
 namespace markov {
+
+nlohmann::json CommunicationWorkLayout::describe_parameters() const {
+    auto domains = nlohmann::json::array();
+    for (const auto & domain : domains_)
+        domains.push_back({
+            { "minimum_count", domain.minimum },
+            { "maximum_count", domain.maximum },
+            {           "gap",     domain.gap }
+        });
+
+    auto relations = nlohmann::json::array();
+    for (const auto & relation : relations_)
+        relations.push_back({
+            {   "task_slot",                                                                             relation.task },
+            { "byte_extent", relation.extent == CommunicationByteExtent::Payload ? "payload" : "destination_partition" }
+        });
+
+    return {
+        {             "rule",                                                               "communication" },
+        {        "operation", operation_ == CommunicationOperation::AllReduce ? "all_reduce" : "all_gather" },
+        {    "element_bytes",                                                                element_bytes_ },
+        {       "partitions",                                                                   partitions_ },
+        {  "alignment_bytes",                                                                    alignment_ },
+        { "count_conditions",                                                            std::move(domains) },
+        {       "task_bytes",                                                          std::move(relations) },
+        {   "unlisted_tasks",                                                "fixed_source_control_payload" }
+    };
+}
 
 std::expected<std::vector<SourceCommunicationTask>, std::string> CommunicationWorkLayout::evaluate(std::span<const SourceCommunicationTask> source,
                                                                                                    std::uint64_t count) const {

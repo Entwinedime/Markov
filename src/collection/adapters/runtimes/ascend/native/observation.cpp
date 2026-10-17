@@ -1,13 +1,11 @@
-#include "worker_sampling.hpp"
+#include "transfer_sampling.hpp"
 
 #include <driver/ascend_hal_base.h>
 #include <runtime/dev.h>
 #include <runtime/event.h>
-#include <runtime/kernel.h>
 #include <runtime/mem.h>
 #include <runtime/rt_ffts_plus.h>
 #include <runtime/rt_stars.h>
-#include <runtime/rts/rts_kernel.h>
 #include <runtime/stream.h>
 
 #include <algorithm>
@@ -147,24 +145,29 @@ struct DriverCopy {
     std::uint64_t bytes;
     std::int64_t start_ns;
     std::int64_t end_ns;
-    std::int64_t thread_cpu_ns;
     std::int32_t result;
 };
 
 // A driver call belongs to the enclosing runtime copy on this thread only.
-// RAII restores nesting and never keeps a reference past the API observation.
+// RAII restores nesting and never keeps a reference past the runtime call.
 class DriverCopyScope {
 public:
-    explicit DriverCopyScope(std::vector<DriverCopy> & records) : previous_(active_) { active_ = &records; }
+    explicit DriverCopyScope(std::int32_t kind, std::vector<DriverCopy> * records = nullptr) : previous_(active_), records_(records), kind_(kind) {
+        active_ = this;
+    }
     ~DriverCopyScope() { active_ = previous_; }
     DriverCopyScope(const DriverCopyScope &) = delete;
     DriverCopyScope & operator=(const DriverCopyScope &) = delete;
 
-    static std::vector<DriverCopy> * active() { return active_; }
+    static DriverCopyScope * active() { return active_; }
+    std::vector<DriverCopy> * records() const { return records_; }
+    std::int32_t kind() const { return kind_; }
 
 private:
-    std::vector<DriverCopy> * previous_;
-    inline static thread_local std::vector<DriverCopy> * active_ = nullptr;
+    DriverCopyScope * previous_;
+    std::vector<DriverCopy> * records_;
+    std::int32_t kind_;
+    inline static thread_local DriverCopyScope * active_ = nullptr;
 };
 
 struct WorkspaceTransition {
@@ -194,7 +197,6 @@ struct ApiRecord {
     std::int64_t wall_time_ns;
     std::int64_t start_ns;
     std::int64_t end_ns;
-    std::int64_t thread_cpu_ns;
     rtError_t result;
     std::optional<FftsSubmission> ffts;
     std::vector<DriverCopy> driver_copies;
@@ -203,10 +205,10 @@ struct ApiRecord {
     bool initial_event;
 };
 
-enum class ObservationMode { Off, EventHistory, Journal, CpuSampling };
+enum class ObservationMode { Off, EventHistory, Journal };
 
 // Before the serving window, retain only event lifecycle history. Device
-// sampling includes its declared warmups; CPU counter mode writes no journal.
+// sampling includes its declared warmups; transfer sampling writes no journal.
 // Buffering keeps file I/O out of each API; explicit scope/profile flushes persist
 // records before multiprocessing shutdown can bypass destructors.
 class NativeJournal {
@@ -228,15 +230,6 @@ public:
         const auto mode = mode_.load();
         return mode == ObservationMode::EventHistory || mode == ObservationMode::Journal;
     }
-    bool cpu_sampling() const { return mode_.load() == ObservationMode::CpuSampling; }
-
-    void begin_cpu_sampling() { mode_.store(ObservationMode::CpuSampling); }
-
-    CpuCounters & cpu_counters() {
-        static thread_local CpuCounters counters;
-        return counters;
-    }
-
     std::uint64_t next_id() { return sequence_.fetch_add(1); }
 
     std::uint64_t & current_scope() {
@@ -306,8 +299,7 @@ public:
                 if (index != 0) stream << ',';
                 const auto & copy = record.driver_copies[index];
                 stream << "{\"source\":" << copy.addresses.source << ",\"destination\":" << copy.addresses.destination << ",\"bytes\":" << copy.bytes
-                       << ",\"start_ns\":" << copy.start_ns << ",\"end_ns\":" << copy.end_ns << ",\"thread_cpu_ns\":" << copy.thread_cpu_ns
-                       << ",\"result\":" << copy.result << '}';
+                       << ",\"start_ns\":" << copy.start_ns << ",\"end_ns\":" << copy.end_ns << ",\"result\":" << copy.result << '}';
             }
             stream << ']';
 
@@ -319,7 +311,7 @@ public:
             else stream << "null";
 
             stream << ",\"wall_time_ns\":" << record.wall_time_ns << ",\"start_ns\":" << record.start_ns << ",\"end_ns\":" << record.end_ns
-                   << ",\"thread_cpu_ns\":" << record.thread_cpu_ns << ",\"result\":" << record.result;
+                   << ",\"result\":" << record.result;
             if (std::strcmp(record.api, "rtEventQueryStatus") == 0) {
                 stream << ",\"event_status\":";
                 if (record.event_status) stream << static_cast<std::int32_t>(*record.event_status);
@@ -365,40 +357,6 @@ private:
     std::vector<ApiRecord> records_;
 };
 
-// Only the original synchronous runtime call contributes to wait CPU time.
-// These counters never create hardware synchronization or a target service cost.
-class CpuWaitObservation {
-public:
-    CpuWaitObservation()
-        : wrapper_start_ns_(clock_ns(CLOCK_THREAD_CPUTIME_ID)),
-          original_wall_start_ns_(clock_ns(CLOCK_MONOTONIC)),
-          original_start_ns_(clock_ns(CLOCK_THREAD_CPUTIME_ID)) {}
-
-    void finish(rtError_t result) {
-        const auto original_cpu_end_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID);
-        const auto original_wall_end_ns = clock_ns(CLOCK_MONOTONIC);
-        const auto original_cpu_ns = original_cpu_end_ns - original_start_ns_;
-
-        auto & counters = NativeJournal::instance().cpu_counters();
-        counters.last_sync_start_ns = original_wall_start_ns_;
-        counters.last_sync_end_ns = original_wall_end_ns;
-        counters.last_sync_cpu_end_ns = original_cpu_end_ns;
-
-        // Probe work before the original call is outside the CPU suffix after
-        // completion; work after it remains part of the measured suffix probes.
-        counters.last_sync_probe_cpu_ns = counters.probe_cpu_ns + original_start_ns_ - wrapper_start_ns_;
-        counters.last_sync_result = result;
-        counters.wait_cpu_ns += original_cpu_ns;
-        counters.wait_wall_ns += original_wall_end_ns - original_wall_start_ns_;
-        counters.probe_cpu_ns += clock_ns(CLOCK_THREAD_CPUTIME_ID) - wrapper_start_ns_ - original_cpu_ns;
-    }
-
-private:
-    std::int64_t wrapper_start_ns_;
-    std::int64_t original_wall_start_ns_;
-    std::int64_t original_start_ns_;
-};
-
 class ApiObservation {
 public:
     ApiObservation(const char * api, rtStream_t stream, rtEvent_t event, bool submits_task = false, std::optional<std::uint64_t> bytes = std::nullopt,
@@ -419,7 +377,6 @@ public:
                    0,
                    0,
                    0,
-                   0,
                    std::nullopt,
                    {},
                    std::nullopt,
@@ -432,9 +389,8 @@ public:
             if (get_id(stream, &identity) == RT_ERROR_NONE) record_.stream_id = identity;
         }
 
-        // Stream metadata query is outside the original API's CPU-time sample.
-        // Its observation overhead still needs paired collection before costing.
-        thread_start_ns_ = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+        // These wall boundaries associate the API with device work and waits.
+        // Host CPU service is outside the prediction scope.
         record_.wall_time_ns = clock_ns(CLOCK_REALTIME);
         record_.start_ns = clock_ns(CLOCK_MONOTONIC);
     }
@@ -452,10 +408,7 @@ public:
     }
 
     void finish(rtError_t result, std::optional<FftsSubmission> ffts = std::nullopt, std::optional<rtEventStatus_t> event_status = std::nullopt) {
-        // Keep CPU-clock reads outside the wall interval used to split waits.
-        // CPU observations still include probe overhead and are not service costs.
         record_.end_ns = clock_ns(CLOCK_MONOTONIC);
-        record_.thread_cpu_ns = clock_ns(CLOCK_THREAD_CPUTIME_ID) - thread_start_ns_;
         record_.result = result;
         record_.ffts = std::move(ffts);
         record_.event_status = event_status;
@@ -463,7 +416,7 @@ public:
         if (submits_task_ && result == RT_ERROR_NONE) {
             // The SDK reports the calling thread's last submitted task. Query
             // immediately after the original API, before any other submission.
-            // This identity query is outside the original API's CPU sample.
+            // This identity query is outside the original API's wall interval.
             static const auto get_task = resolve<decltype(&rtGetTaskIdAndStreamID)>("rtGetTaskIdAndStreamID");
             std::uint32_t task;
             std::uint32_t stream;
@@ -478,7 +431,6 @@ public:
 
 private:
     ApiRecord record_;
-    std::int64_t thread_start_ns_;
     bool submits_task_;
 };
 
@@ -505,12 +457,6 @@ extern "C" void markov_native_begin_window(const char * directory) { NativeJourn
 
 extern "C" void markov_native_set_scope(std::uint64_t call_id) { NativeJournal::instance().current_scope() = call_id; }
 
-extern "C" void markov_native_begin_cpu_sampling() { NativeJournal::instance().begin_cpu_sampling(); }
-
-CpuCounters & markov_native_cpu_counters() { return NativeJournal::instance().cpu_counters(); }
-
-extern "C" void markov_native_read_cpu_counters(CpuCounters * counters) { *counters = markov_native_cpu_counters(); }
-
 extern "C" int markov_native_flush(int close_window) {
     try {
         NativeJournal::instance().flush(close_window != 0);
@@ -523,7 +469,6 @@ extern "C" int markov_native_flush(int close_window) {
 }
 
 extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
-    WorkerSubmission worker_point("rtEventRecord");
     static const auto original = resolve<decltype(&rtEventRecord)>("rtEventRecord");
     if (!NativeJournal::instance().observes_events()) return original(event, stream);
 
@@ -534,7 +479,6 @@ extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
 }
 
 extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * status) {
-    WorkerSubmission worker_point("rtEventQueryStatus");
     static const auto original = resolve<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
     if (!NativeJournal::instance().observes_events()) return original(event, status);
 
@@ -547,7 +491,6 @@ extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * statu
 }
 
 extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
-    WorkerSubmission worker_point("rtStreamWaitEvent");
     static const auto original = resolve<decltype(&rtStreamWaitEvent)>("rtStreamWaitEvent");
     if (!NativeJournal::instance().enabled()) return original(stream, event);
 
@@ -558,14 +501,7 @@ extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
 }
 
 extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
-    WorkerSubmission worker_point("rtStreamSynchronize");
     static const auto original = resolve<decltype(&rtStreamSynchronize)>("rtStreamSynchronize");
-    if (NativeJournal::instance().cpu_sampling()) {
-        CpuWaitObservation observation;
-        const auto result = original(stream);
-        observation.finish(result);
-        return result;
-    }
 
     if (!NativeJournal::instance().enabled()) return original(stream);
 
@@ -576,14 +512,7 @@ extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
 }
 
 extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int32_t timeout) {
-    WorkerSubmission worker_point("rtStreamSynchronizeWithTimeout");
     static const auto original = resolve<decltype(&rtStreamSynchronizeWithTimeout)>("rtStreamSynchronizeWithTimeout");
-    if (NativeJournal::instance().cpu_sampling()) {
-        CpuWaitObservation observation;
-        const auto result = original(stream, timeout);
-        observation.finish(result);
-        return result;
-    }
 
     if (!NativeJournal::instance().enabled()) return original(stream, timeout);
 
@@ -594,14 +523,7 @@ extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int3
 }
 
 extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
-    WorkerSubmission worker_point("rtEventSynchronize");
     static const auto original = resolve<decltype(&rtEventSynchronize)>("rtEventSynchronize");
-    if (NativeJournal::instance().cpu_sampling()) {
-        CpuWaitObservation observation;
-        const auto result = original(event);
-        observation.finish(result);
-        return result;
-    }
 
     if (!NativeJournal::instance().enabled()) return original(event);
 
@@ -612,14 +534,7 @@ extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
 }
 
 extern "C" rtError_t rtDeviceSynchronize() {
-    WorkerSubmission worker_point("rtDeviceSynchronize");
     static const auto original = resolve<decltype(&rtDeviceSynchronize)>("rtDeviceSynchronize");
-    if (NativeJournal::instance().cpu_sampling()) {
-        CpuWaitObservation observation;
-        const auto result = original();
-        observation.finish(result);
-        return result;
-    }
 
     if (!NativeJournal::instance().enabled()) return original();
 
@@ -630,14 +545,7 @@ extern "C" rtError_t rtDeviceSynchronize() {
 }
 
 extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
-    WorkerSubmission worker_point("rtDeviceSynchronizeWithTimeout");
     static const auto original = resolve<decltype(&rtDeviceSynchronizeWithTimeout)>("rtDeviceSynchronizeWithTimeout");
-    if (NativeJournal::instance().cpu_sampling()) {
-        CpuWaitObservation observation;
-        const auto result = original(timeout);
-        observation.finish(result);
-        return result;
-    }
 
     if (!NativeJournal::instance().enabled()) return original(timeout);
 
@@ -648,7 +556,6 @@ extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
 }
 
 extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
-    WorkerSubmission worker_point("rtEventDestroy");
     static const auto original = resolve<decltype(&rtEventDestroy)>("rtEventDestroy");
 
     if (!NativeJournal::instance().observes_events()) return original(event);
@@ -661,8 +568,11 @@ extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
 
 extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_bytes, const void * source, std::uint64_t bytes, rtMemcpyKind_t kind,
                                    rtStream_t stream) {
-    WorkerSubmission worker_point("rtMemcpyAsync");
     static const auto original = resolve<decltype(&rtMemcpyAsync)>("rtMemcpyAsync");
+    if (markov_transfer_sampling_enabled()) {
+        DriverCopyScope copies(static_cast<std::int32_t>(kind));
+        return original(destination, maximum_bytes, source, bytes, kind, stream);
+    }
     if (!NativeJournal::instance().enabled()) return original(destination, maximum_bytes, source, bytes, kind, stream);
 
     ApiObservation observation("rtMemcpyAsync",
@@ -672,7 +582,7 @@ extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_byt
                                bytes,
                                static_cast<std::int32_t>(kind),
                                CopyAddresses{ reinterpret_cast<std::uintptr_t>(source), reinterpret_cast<std::uintptr_t>(destination) });
-    DriverCopyScope copies(observation.driver_copies());
+    DriverCopyScope copies(static_cast<std::int32_t>(kind), &observation.driver_copies());
     const auto result = original(destination, maximum_bytes, source, bytes, kind, stream);
     observation.finish(result);
     return result;
@@ -680,14 +590,20 @@ extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_byt
 
 extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes, DVdeviceptr source, std::size_t bytes) {
     static const auto original = resolve<decltype(&drvMemcpy)>("drvMemcpy");
-    auto * records = DriverCopyScope::active();
-    if (records == nullptr) return original(destination, maximum_bytes, source, bytes);
+    auto * scope = DriverCopyScope::active();
+    if (scope == nullptr) return original(destination, maximum_bytes, source, bytes);
 
-    const auto cpu_start = clock_ns(CLOCK_THREAD_CPUTIME_ID);
+    auto * records = scope->records();
+    if (records == nullptr) {
+        TransferDriverCopy observation(bytes, scope->kind());
+        const auto result = original(destination, maximum_bytes, source, bytes);
+        observation.finish(static_cast<std::int32_t>(result));
+        return result;
+    }
+
     const auto start = clock_ns(CLOCK_MONOTONIC);
     const auto result = original(destination, maximum_bytes, source, bytes);
     const auto end = clock_ns(CLOCK_MONOTONIC);
-    const auto cpu_end = clock_ns(CLOCK_THREAD_CPUTIME_ID);
 
     // The driver contract is synchronous. Its entry is after the runtime's
     // internal stream wait, not the beginning of that wait or a pure CPU cost.
@@ -696,14 +612,12 @@ extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes
         bytes,
         start,
         end,
-        cpu_end - cpu_start,
         static_cast<std::int32_t>(result)
     });
     return result;
 }
 
 extern "C" rtError_t rtGeneralCtrl(std::uintptr_t * control, std::uint32_t count, std::uint32_t type) {
-    WorkerSubmission worker_point("rtGeneralCtrl");
     static const auto original = resolve<decltype(&rtGeneralCtrl)>("rtGeneralCtrl");
     if (!NativeJournal::instance().enabled() || type != RT_GNL_CTRL_TYPE_FFTS_PLUS || count != 2) return original(control, count, type);
 
@@ -716,34 +630,4 @@ extern "C" rtError_t rtGeneralCtrl(std::uintptr_t * control, std::uint32_t count
     const auto result = original(control, count, type);
     observation.finish(result, std::move(submission));
     return result;
-}
-
-// Compute submission boundaries observed in the current Ascend mainline.
-// Forward arguments unchanged; do not inspect tensor memory or synchronize.
-extern "C" rtError_t rtKernelLaunch(const void * stub, std::uint32_t blocks, void * args, std::uint32_t args_size, rtSmDesc_t * shared_memory,
-                                    rtStream_t stream) {
-    static const auto original = resolve<decltype(&rtKernelLaunch)>("rtKernelLaunch");
-    WorkerSubmission worker_point("rtKernelLaunch");
-    return original(stub, blocks, args, args_size, shared_memory, stream);
-}
-
-extern "C" rtError_t rtKernelLaunchWithHandle(void * handle, const std::uint64_t tiling_key, std::uint32_t blocks, rtArgsEx_t * args,
-                                              rtSmDesc_t * shared_memory, rtStream_t stream, const void * kernel_info) {
-    static const auto original = resolve<decltype(&rtKernelLaunchWithHandle)>("rtKernelLaunchWithHandle");
-    WorkerSubmission worker_point("rtKernelLaunchWithHandle");
-    return original(handle, tiling_key, blocks, args, shared_memory, stream, kernel_info);
-}
-
-extern "C" rtError_t rtKernelLaunchWithHandleV2(void * handle, const std::uint64_t tiling_key, std::uint32_t blocks, rtArgsEx_t * args,
-                                                rtSmDesc_t * shared_memory, rtStream_t stream, const rtTaskCfgInfo_t * configuration) {
-    static const auto original = resolve<decltype(&rtKernelLaunchWithHandleV2)>("rtKernelLaunchWithHandleV2");
-    WorkerSubmission worker_point("rtKernelLaunchWithHandleV2");
-    return original(handle, tiling_key, blocks, args, shared_memory, stream, configuration);
-}
-
-extern "C" rtError_t rtsLaunchKernelWithHostArgs(rtFuncHandle handle, std::uint32_t blocks, rtStream_t stream, rtKernelLaunchCfg_t * configuration, void * args,
-                                                 std::uint32_t args_size, rtPlaceHolderInfo_t * placeholders, std::uint32_t placeholder_count) {
-    static const auto original = resolve<decltype(&rtsLaunchKernelWithHostArgs)>("rtsLaunchKernelWithHostArgs");
-    WorkerSubmission worker_point("rtsLaunchKernelWithHostArgs");
-    return original(handle, blocks, stream, configuration, args, args_size, placeholders, placeholder_count);
 }

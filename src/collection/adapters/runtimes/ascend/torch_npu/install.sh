@@ -42,6 +42,7 @@ fetch_source nlohmann/json "$JSON_COMMIT" "$BUILD_ROOT/third_party/nlohmann"
 
 patch --batch --forward -d "$BUILD_ROOT" -p1 < "$MARKOV_ADAPTER_ROOT/workspace.patch"
 patch --batch --forward -d "$BUILD_ROOT" -p1 < "$MARKOV_ADAPTER_ROOT/queue.patch"
+patch --batch --forward -d "$BUILD_ROOT" -p1 < "$MARKOV_ADAPTER_ROOT/record_scope.patch"
 cp "$MARKOV_ADAPTER_ROOT/queue_observation.hpp" \
     "$BUILD_ROOT/torch_npu/csrc/core/npu/markov_queue_observation.hpp"
 cp "$MARKOV_ADAPTER_ROOT/workspace_observation.hpp" \
@@ -64,6 +65,8 @@ for library in libtorch_npu.so libop_plugin_atb.so libnpu_profiler.so; do
 done
 install -m 644 "$BUILD_ROOT/torch_npu/profiler/analysis/prof_parse/_fwk_file_parser.py" \
     "$TORCH_NPU_PACKAGE/profiler/analysis/prof_parse/_fwk_file_parser.py"
+install -m 644 "$BUILD_ROOT/torch_npu/profiler/analysis/prof_bean/_torch_op_bean.py" \
+    "$TORCH_NPU_PACKAGE/profiler/analysis/prof_bean/_torch_op_bean.py"
 
 python3 - "$TORCH_NPU_PACKAGE" "$TORCH_NPU_COMMIT" "$OP_PLUGIN_COMMIT" "$FMT_COMMIT" "$JSON_COMMIT" <<'PY'
 import json
@@ -76,10 +79,11 @@ provenance = {
     "source_patch": "src/collection/adapters/runtimes/ascend/torch_npu/workspace.patch",
     "queue_patch": "src/collection/adapters/runtimes/ascend/torch_npu/queue.patch",
     "queue_probe_header": "src/collection/adapters/runtimes/ascend/torch_npu/queue_observation.hpp",
+    "record_scope_patch": "src/collection/adapters/runtimes/ascend/torch_npu/record_scope.patch",
     "probe_header": "src/collection/adapters/runtimes/ascend/torch_npu/workspace_observation.hpp",
     "libraries": ["libtorch_npu.so", "libop_plugin_atb.so", "libnpu_profiler.so"],
     "profiler_reader": "profiler/analysis/prof_parse/_fwk_file_parser.py",
-    "scope": "shared workspace allocation and cached release; scoped enqueue and worker calls; uncached release is not observed",
+    "scope": "shared workspace allocation and cached release; queue identities for scoped synchronous transfers; uncached release is not observed",
 }
 (Path(sys.argv[1]) / "markov_workspace_build.json").write_text(json.dumps(provenance, indent=2) + "\n")
 PY

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "markov/contracts/service_work.hpp"
+#include "markov/performance/cost_requirements.hpp"
 #include "markov/performance/node_costs.hpp"
 #include "markov/templates/templates.hpp"
 
@@ -13,6 +15,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -33,6 +36,7 @@ public:
     bool append(std::span<TemplateInstance *> instances, std::span<const InvokeStep> invocations, std::int64_t release_ns);
     std::expected<std::vector<ControlEvent>, ExecutionTimingGap> schedule(const NodeCosts & costs, const std::map<WorkId, const InvokeStep *> & invocations);
     nlohmann::json describe() const;
+    nlohmann::json performance_requirements() const { return requirements_.describe(); }
     void write(const std::filesystem::path & path) const;
 
 private:
@@ -53,13 +57,11 @@ private:
         const SourceCommunicationTask * communication; // Owned by the source definition or runtime instance.
         BoundaryId begin;
         BoundaryId end;
-        const SourceTransfer * transfer;               // Owned by the bank or target instance.
-        const PublicationWork * publication = nullptr; // Instance-owned target output or member work.
-        std::optional<std::size_t> publication_member_slot = std::nullopt;
-        std::optional<SourceCpuPart> control_part = std::nullopt;
-        std::optional<std::size_t> admission_member_slot = std::nullopt;
-        std::optional<CpuSubmissionWork> cpu_submission = std::nullopt;
+        const SourceTransfer * transfer;                    // Owned by the bank or target instance.
+        const DeviceCommandWork * device_command = nullptr; // Immutable source observation; endpoint relocation preserves its work.
         std::optional<NodeCostEstimate> cost = std::nullopt;
+
+        ServiceWork service_work() const;
     };
     struct Edge {
         BoundaryId source;
@@ -80,7 +82,7 @@ private:
     };
 
     bool acyclic() const;
-    void bind_cpu_submissions(std::size_t first_node);
+    void record_requirement(const CostQuery & query, const NodeCosts & costs, const Node & owner, const InvokeStep & invocation);
     BoundaryId resolve(const TemplateEndpoint & endpoint) const;
     std::size_t register_source(const std::filesystem::path & manifest);
 
@@ -95,6 +97,8 @@ private:
     bool acyclic_ = true;
     std::size_t pending_port_ = 0;
     std::vector<std::int64_t> completion_ns_;
+    CostRequirements requirements_;
+    std::size_t requirement_frontier_ = 0;
 };
 
 } // namespace markov

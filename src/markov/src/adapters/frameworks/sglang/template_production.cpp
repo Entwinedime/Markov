@@ -1,8 +1,11 @@
 #include "markov/adapters/frameworks/sglang/template_bindings.hpp"
 
+#include "markov/contracts/json_input.hpp"
+
 #include "markov/adapters/frameworks/sglang/bindings.hpp"
 #include "markov/adapters/frameworks/sglang/copy_layout.hpp"
 #include "markov/adapters/frameworks/sglang/request_pool_layout.hpp"
+#include "markov/adapters/runtimes/ascend/source_extractor.hpp"
 #include "markov/adapters/runtimes/ascend/workspace_bindings.hpp"
 #include "markov/graph/kernel_shapes.hpp"
 #include "markov/graph/source_graph.hpp"
@@ -15,7 +18,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
 #include <map>
 #include <optional>
 #include <set>
@@ -30,11 +32,7 @@ namespace {
 
 using Json = nlohmann::json;
 
-Json read_json(const std::filesystem::path & path) {
-    std::ifstream stream(path);
-    stream.exceptions(std::ios::failbit | std::ios::badbit);
-    return Json::parse(stream);
-}
+using input::read_json;
 
 // Resource roles come from native ownership and dependency relationships.
 // Ambiguous resources retain their local identity and cannot qualify migration.
@@ -174,8 +172,7 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
 
     result.page_size_tokens = environment.at("effective_server_args").at("page_size").get<std::uint32_t>();
     if (result.page_size_tokens == 0) throw std::invalid_argument("native KV page size must be positive");
-    result.templates_path = directory / manifest.at("templates").get<std::string>();
-    const auto data = read_json(result.templates_path);
+    const auto data = read_json(directory / manifest.at("templates").get<std::string>());
 
     std::map<std::uint32_t, std::pair<std::int64_t, SourceAdmissionPolicy>> initial_policies;
     std::optional<AdmissionPolicy> common_policy;
@@ -266,9 +263,6 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
                                              kernel.at("output_formats").get<std::string>() });
     }
 
-
-    std::map<SourceSpanId, SourceCpuWork> cpu_work;
-    for (const auto & work : graph.at("cpu_work")) cpu_work.emplace(work.at("source_span").get<SourceSpanId>(), SourceCpuWork::read(work));
 
     for (const auto & transfer : graph.at("transfers"))
         result.transfers.emplace(transfer.at("source_span").get<SourceSpanId>(), SourceTransfer::read(transfer));
@@ -422,8 +416,9 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
         for (const auto & node : definition.graph) {
             const auto transfer = result.transfers.find(definition.observation(node).source_span);
             if (transfer != result.transfers.end()) definition.observation(node).transfer = &transfer->second;
-            const auto cpu = cpu_work.find(definition.observation(node).source_span);
-            if (cpu != cpu_work.end()) definition.observation(node).cpu_work = cpu->second;
+            if (node.kind == SourceSpanKind::DeviceMarker)
+                definition.observation(node).device_command =
+                    AscendSourceExtractor::device_command(facts.at("intervals").at(definition.observation(node).source_span));
         }
 
         bindings.bind(graph, data.at("regions"), calls, copies, result.page_size_tokens);

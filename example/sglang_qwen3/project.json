@@ -1,0 +1,26 @@
+{
+  "model": {"path": "/models/Qwen3-32B"},
+  "configurations": [
+    {
+      "id": "concurrency-2",
+      "framework": "sglang",
+      "environment": {"runtime": "docker", "service": "sglang-profile", "devices": [0, 1]},
+      "config": "../../configs/redesign/sglang/base.json"
+    },
+    {
+      "id": "concurrency-1",
+      "framework": "sglang",
+      "environment": {"runtime": "docker", "service": "sglang-profile", "devices": [0, 1]},
+      "config": "../../configs/redesign/sglang/target.json"
+    }
+  ],
+  "request_workloads": [{"id": "short-requests", "path": "requests.json"}],
+  "simulation": {"controller": "lightweight", "scope": "modeled"},
+  "initial_state": {"cache": "cold"},
+  "collection": {
+    "base": {"allow_run": true, "max_wall_time_sec": 600},
+    "performance": {"allow_run": true, "max_wall_time_sec": 2400}
+  },
+  "assets": {"templates": [], "performance_manifests": [], "cost_models": []},
+  "output": {"directory": "../../data", "diagnostics": false}
+}

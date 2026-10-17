@@ -1,8 +1,19 @@
 #include "markov/templates/model_parameters.hpp"
 
 #include <algorithm>
+#include <array>
 
 namespace markov {
+
+nlohmann::json ModelParameterRule::describe_parameters() const {
+    static constexpr std::array workloads{ "none",      "sequence_length_max", "sequence_lengths",    "page_table",
+                                           "positions", "last_positions",      "logits_token_indices" };
+    auto result = shapes_.describe_parameters();
+    result["rule"] = "model";
+    result["value_work"] = workloads[static_cast<std::size_t>(workload_)];
+    result["partial_operands"] = partial_operands_;
+    return result;
+}
 
 SourceKernel ModelParameterRule::evaluate(const SourceKernel & source, const BatchInput & input) const {
     SourceKernel target = shapes_.evaluate(source, input);

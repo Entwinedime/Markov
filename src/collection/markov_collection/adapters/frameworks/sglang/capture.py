@@ -11,16 +11,17 @@ import signal
 import time
 from typing import Any
 
+from markov_collection.adapters.frameworks.sglang.session import SGLangSession
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.artifacts.json_file import write_json
-from markov_collection.instrumentation.session import CaptureSession
 
 
-class SGLangCapture(CaptureSession):
+class SGLangCapture(SGLangSession):
     def run(self) -> None:
         from sglang.srt.entrypoints.engine import Engine
 
         requests = self.prepared["requests"]
+        profiling = self.prepared["role"] != "validation" or self.prepared["observation_purpose"] == "structure"
         os.environ["SGLANG_PLUGINS"] = "markov"
 
         # Host wall times describe collection overhead, never target node costs.
@@ -37,48 +38,50 @@ class SGLangCapture(CaptureSession):
             if "representative_recipe" in self.prepared:
                 self._resolve_representative_requests(engine)
 
-            # One prefill and one decode establish a workload-independent start.
-            # With radix cache disabled, normal completion releases request KV;
-            # do not flush the device allocator and discard warmed resources.
-            warmup_id = "markov-warmup"
             request_ids = {request["id"] for request in requests}
-            while warmup_id in request_ids:
-                warmup_id += "_"
-
-            warmup_input = [1]
-            warmup_sampling = {"max_new_tokens": 2, "ignore_eos": True, "temperature": 0}
             warmup_started_ns = time.perf_counter_ns()
-            engine.generate(
-                input_ids=warmup_input,
-                sampling_params=warmup_sampling,
-                rid=warmup_id,
-            )
+            warmup = self._warmup(engine, request_ids)
             warmup_finished_ns = time.perf_counter_ns()
 
-            # Native tokenizer setup installs an asyncio SIGQUIT handler during warmup.
-            # A failed worker must unwind this capture instead of leaving stop_profile
-            # awaiting a response from that dead worker until the full budget expires.
-            engine.loop.remove_signal_handler(signal.SIGQUIT)
-            signal.signal(signal.SIGQUIT, self._handle_worker_failure)
-
             profile_start_ns = time.perf_counter_ns()
-            engine.start_profile(
-                output_dir=str(self.directory / "native_profile"),
-                activities=["CPU", "GPU"],
-                record_shapes=True,
-                with_stack=False,
-            )
+            if profiling:
+                engine.start_profile(
+                    output_dir=str(self.directory / "native_profile"),
+                    activities=["CPU", "GPU"],
+                    record_shapes=True,
+                    with_stack=False,
+                )
             observation_started_ns = time.perf_counter_ns()
             try:
-                responses = engine.loop.run_until_complete(self._execute(engine))
+                request_timing, responses = engine.loop.run_until_complete(self._execute(engine))
                 cleanup = []
                 if self.prepared["role"] == "base":
                     cleanup = engine.loop.run_until_complete(self._await_cleanup(request_ids))
             finally:
                 observation_finished_ns = time.perf_counter_ns()
                 if not self._worker_failed:
-                    engine.stop_profile()
+                    if profiling:
+                        engine.stop_profile()
+                    else:
+                        # Even a negative cache-reset reply acknowledges the next
+                        # worker iteration. The observed port files, not a reset,
+                        # establish publication completeness after the window.
+                        engine.flush_cache()
             profile_finished_ns = time.perf_counter_ns()
+
+            wall_times = {
+                "engine_initialization": engine_ready_ns - engine_started_ns,
+                "request_preparation": warmup_started_ns - engine_ready_ns,
+                "warmup": warmup_finished_ns - warmup_started_ns,
+                "post_warmup_setup": profile_start_ns - warmup_finished_ns,
+                "observation_and_cleanup": observation_finished_ns - observation_started_ns,
+            }
+            wall_times["profile_start" if profiling else "port_observer_setup"] = (
+                observation_started_ns - profile_start_ns
+            )
+            wall_times["profile_stop_and_export" if profiling else "final_publication_acknowledgement"] = (
+                profile_finished_ns - observation_finished_ns
+            )
 
             write_json(self.directory / "responses.json", responses)
             write_json(
@@ -91,28 +94,53 @@ class SGLangCapture(CaptureSession):
                     "model_configuration": self._model_configuration(),
                     "effective_server_args": dataclasses.asdict(engine.tokenizer_manager.server_args),
                     "collection_completion": cleanup,
-                    "collection_wall_time_ns": {
-                        "engine_initialization": engine_ready_ns - engine_started_ns,
-                        "request_preparation": warmup_started_ns - engine_ready_ns,
-                        "warmup": warmup_finished_ns - warmup_started_ns,
-                        "post_warmup_setup": profile_start_ns - warmup_finished_ns,
-                        "profile_start": observation_started_ns - profile_start_ns,
-                        "observation_and_cleanup": observation_finished_ns - observation_started_ns,
-                        "profile_stop_and_export": profile_finished_ns - observation_finished_ns,
-                    },
+                    "profiler_enabled": profiling,
+                    "semantic_instrumentation_enabled": profiling,
+                    "native_api_journal_enabled": profiling,
+                    "target_port_observation_enabled": not profiling,
+                    # The driver origin defines planned arrivals, not admission
+                    # into a modeled block or a directly measured service cost.
+                    "request_timing": request_timing,
+                    "collection_wall_time_ns": wall_times,
                     "initialization": {
                         "engine": "fresh_process",
-                        "warmup": {
-                            "input_tokens": len(warmup_input),
-                            "input_ids": warmup_input,
-                            "sampling_parameters": warmup_sampling,
-                        },
-                        "workspace_snapshot": "after_warmup_before_profile",
+                        "warmup": warmup,
+                        "workspace_snapshot": "after_warmup_before_profile" if profiling else "not_observed",
                     },
                 },
             )
         finally:
             engine.shutdown()
+
+        if not profiling:
+            self._publish_ports()
+
+    def _publish_ports(self) -> None:
+        write_json(
+            self.directory / "native_capture.json",
+            {
+                "role": "validation",
+                "framework": "sglang",
+                "observation_purpose": "ports",
+                "candidate_id": self.prepared["candidate_id"],
+                "input": "prepared_input.json",
+                "environment": "native_environment.json",
+                "responses": "responses.json",
+                "expected_ranks": list(range(self.prepared["configuration"]["tp_size"])),
+                "ports": [
+                    str(path.relative_to(self.directory))
+                    for path in sorted((self.directory / "observations").glob("rank-*-ports.json"))
+                ],
+                "boundaries": {
+                    "submitted": "Scheduler.run_batch ScopeReturn; not device completion",
+                    "published": "Scheduler.process_batch_result ScopeReturn",
+                    "observation": (
+                        "timestamp immediately after native return, before metadata or journal writing; "
+                        "not profiler marker.end"
+                    ),
+                },
+            },
+        )
 
     async def _await_cleanup(self, request_ids: set[str]) -> list[dict[str, Any]]:
         paths = [
@@ -152,8 +180,8 @@ class SGLangCapture(CaptureSession):
         write_json(self.directory / "prepared_input.json", self.prepared)
 
     async def _submit_group(self, engine: Any, requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        # Pretokenized requests in one native batch reach the scheduler in one
-        # message. Separate submissions can split a logical arrival cohort.
+        # This pretokenized path sends one arrival cohort in a scheduler message.
+        # Native admission can still split that message into multiple batches.
         submitted_ns = time.perf_counter_ns()
         responses = await engine.async_generate(
             input_ids=[request["input_tokens"] for request in requests],
@@ -175,8 +203,26 @@ class SGLangCapture(CaptureSession):
             for request, response in zip(requests, responses, strict=True)
         ]
 
-    async def _execute_groups(self, engine: Any) -> list[dict[str, Any]]:
+    @staticmethod
+    def _request_origin() -> dict[str, Any]:
+        # Profiler markers use MONOTONIC_RAW. Bracket the scheduling clock's
+        # origin instead of treating the two clock domains as interchangeable.
+        raw_before_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
         origin_ns = time.perf_counter_ns()
+        raw_after_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+
+        return {
+            "clock": "perf_counter_ns",
+            "clock_implementation": time.get_clock_info("perf_counter").implementation,
+            "origin_ns": origin_ns,
+            "raw_clock": "CLOCK_MONOTONIC_RAW",
+            "raw_before_ns": raw_before_ns,
+            "raw_after_ns": raw_after_ns,
+        }
+
+    async def _execute_groups(self, engine: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        request_timing = self._request_origin()
+        origin_ns = request_timing["origin_ns"]
         results: list[dict[str, Any]] = []
         completed_ids: set[str] = set()
         completions = []
@@ -197,9 +243,9 @@ class SGLangCapture(CaptureSession):
 
         write_json(self.directory / "group_completions.json", completions)
         write_json(self.directory / "prepared_input.json", self.prepared)
-        return results
+        return request_timing, results
 
-    async def _execute(self, engine: Any) -> list[dict[str, Any]]:
+    async def _execute(self, engine: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if "submission_groups" in self.prepared:
             return await self._execute_groups(engine)
 
@@ -207,7 +253,8 @@ class SGLangCapture(CaptureSession):
         for request in self.prepared["requests"]:
             arrivals.setdefault(request["arrival_time_ns"], []).append(request)
 
-        origin_ns = time.perf_counter_ns()
+        request_timing = self._request_origin()
+        origin_ns = request_timing["origin_ns"]
         results: list[dict[str, Any]] = []
 
         async def submit(arrival_ns: int, requests: list[dict[str, Any]]) -> None:
@@ -220,4 +267,4 @@ class SGLangCapture(CaptureSession):
             results.extend(await self._submit_group(engine, requests))
 
         await asyncio.gather(*(submit(arrival, requests) for arrival, requests in sorted(arrivals.items())))
-        return results
+        return request_timing, results

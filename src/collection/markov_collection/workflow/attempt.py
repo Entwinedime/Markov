@@ -56,20 +56,23 @@ class NativeAttempt:
     def _command(self) -> list[str]:
         build = self.root / "build/collection/ascend" / self.configuration["framework"]
         role = self.configuration["role"]
-        setup = (
-            'cmake -S src/collection/adapters/runtimes/ascend/native -B "$3" -DCMAKE_BUILD_TYPE=Release && '
-            'cmake --build "$3" -j2 && '
-            "python3 -m pip install --no-deps --no-build-isolation -e . && "
-            'export LD_PRELOAD="$3/libmarkov_native_observation.so${LD_PRELOAD:+:$LD_PRELOAD}" && '
-        )
-        if role in {"base", "validation"} or self.configuration["measurement_kind"] in {"device", "communication"}:
-            setup += 'export MARKOV_NATIVE_OBSERVATIONS="$2/native_api" && '
+        ports = role == "validation" and self.configuration["observation_purpose"] == "ports"
+        setup = ""
+        if not ports:
+            setup = (
+                'cmake -S src/collection/adapters/runtimes/ascend/native -B "$3" -DCMAKE_BUILD_TYPE=Release && '
+                'cmake --build "$3" -j2 && '
+            )
 
-        module = (
-            "markov_collection.workflow.capture"
-            if role in {"base", "validation"}
-            else "markov_collection.adapters.frameworks.sglang.sampling"
-        )
+        # Port observation shares the native lifecycle without building or
+        # loading the structure journal and device instrumentation.
+        setup += "python3 -m pip install --no-deps --no-build-isolation -e . && "
+        if not ports:
+            setup += 'export LD_PRELOAD="$3/libmarkov_native_observation.so${LD_PRELOAD:+:$LD_PRELOAD}" && '
+            if role in {"base", "validation"} or self.configuration["measurement_kind"] in {"device", "communication"}:
+                setup += 'export MARKOV_NATIVE_OBSERVATIONS="$2/native_api" && '
+
+        module = "markov_collection.workflow.capture"
         if role == "performance" and self.configuration["measurement_kind"] == "communication":
             module = "markov_collection.adapters.runtimes.ascend.collective_sampling"
 
@@ -105,7 +108,7 @@ class NativeAttempt:
                 if remaining_ns <= 0:
                     raise subprocess.TimeoutExpired("container bootstrap", 0)
 
-                with (self.directory / "process.log").open("w", encoding="utf-8") as log:
+                with Path(self.configuration["log"]).open("w", encoding="utf-8") as log:
                     process = subprocess.Popen(self._command(), stdout=log, stderr=subprocess.STDOUT)
                     deadline_ns = self.started_ns + remaining_ns
                     code = process.wait(timeout=max(0, deadline_ns - time.perf_counter_ns()) / 1_000_000_000)

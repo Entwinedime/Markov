@@ -1,7 +1,8 @@
 #pragma once
 
 #include "markov/contracts/control.hpp"
-#include "markov/contracts/project.hpp"
+#include "markov/contracts/environment.hpp"
+#include "markov/contracts/service_work.hpp"
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/source_graph.hpp"
 #include "markov/templates/attention_parameters.hpp"
@@ -329,8 +330,7 @@ struct TemplateNodeObservation {
     std::optional<std::size_t> source_scope;
     const SourceCommunicationTask * communication = nullptr; // Borrowed from this source definition's collective tasks.
     const SourceTransfer * transfer = nullptr;               // Borrowed from TemplateSource::transfers.
-    std::optional<SourceCpuPart> control_part = std::nullopt;
-    std::optional<SourceCpuWork> cpu_work = std::nullopt;
+    std::optional<DeviceCommandWork> device_command = std::nullopt;
 };
 
 // Each insertion owns its target descriptor. Donor observations and definition
@@ -343,7 +343,8 @@ struct TemplateInsertedNode {
     std::optional<SourceCommunicationTask> communication_override = std::nullopt;
     std::optional<TemplateStreamWait> stream_wait = std::nullopt;
     std::optional<SourceTransfer> transfer_override = std::nullopt;
-    std::optional<std::size_t> request_slot = std::nullopt; // Target request for relocated member work and parameters.
+    std::optional<std::size_t> request_slot = std::nullopt;          // Target request for relocated member work and parameters.
+    std::optional<BatchFilterBinding> filter_binding = std::nullopt; // Target call role for a relocated filtering helper.
 
     const TemplateNodeObservation & observation() const;
 
@@ -537,7 +538,7 @@ struct TemplateDefinition {
     TemplateSubgraphRegion workspace_region(const TemplateWorkspaceUse & use) const;
     TemplateSubgraphRegion semantic_region(const TemplateRegion & source) const;
     bool is_cpu_region(const TemplateRegion & region) const;
-    std::optional<std::size_t> admission_member_slot(SourceSpanId span) const;
+    bool is_cpu_region(std::span<const std::size_t> nodes) const;
     bool has_resource_roles() const;
     bool matches_running_filter(const BatchInput & target) const;
     std::expected<std::vector<TemplateRegionPort>, std::string> region_ports(const TemplateSubgraphRegion & region) const;
@@ -551,6 +552,7 @@ struct TemplateDefinition {
     bool is_resource_wait_import(const TemplateConnection & connection) const;
     bool is_region_wait_import(const TemplateDependency & edge, const TemplateSubgraphRegion & region) const;
     bool matches_transition(const BatchInput & target) const;
+    bool matches_partial_filter(BatchFilterBinding source_role, BatchFilterBinding target_role, const BatchInput & target) const;
     std::expected<TemplateOperationRewrite, std::string> plan_region_replacement(const TemplateRegion & region, const TemplateDefinition & donor,
                                                                                  const TemplateRegion & donor_region) const;
     std::expected<TemplateOperationRewrite, std::string> plan_workspace_replacement(const TemplateWorkspaceUse & use, const TemplateDefinition & donor,
@@ -580,6 +582,7 @@ struct TemplateDefinition {
     std::optional<std::size_t> admission_cpu_request_count; // Qualified CPU-only admission; zero denotes a pre-adder early return.
     std::vector<std::size_t> admission_regions;             // Ordered accepted candidates; first initializes state, later members insert.
     std::vector<BatchFilter> filters;
+    std::map<BatchFilterBinding, std::size_t> filter_regions; // Producer-qualified calls to the same membership helper.
     std::optional<BatchMerge> merge;
     std::string binding; // Native binding that supplied this definition, retained across target instantiation.
     std::vector<std::size_t> source_subtree;
@@ -727,7 +730,6 @@ struct TemplateInstance {
     std::map<SourceSpanId, SourceTransfer> transfer_overrides;
     std::vector<TemplateWorkspaceUseInstance> workspace_uses; // Only uses present in the final target topology; no capacity mutation.
     std::optional<PublicationWork> publication_work;
-    std::map<SourceSpanId, std::size_t> publication_member_slots; // Retained CPU services to target members.
     std::map<SourceSpanId, SourceCommunicationTask> communication_overrides;
     std::vector<TemplateTargetStreamWait> stream_waits;
     std::map<std::size_t, TemplateConnectionInstance> resource_imports;
@@ -784,7 +786,6 @@ struct TemplateSource {
     TemplateSource & operator=(TemplateSource &&) = default;
 
     std::filesystem::path manifest_path;
-    std::filesystem::path templates_path;
     std::string model_path;
     nlohmann::json configuration;
     std::uint32_t ranks;
@@ -835,7 +836,6 @@ public:
 
     std::uint32_t page_size_tokens() const;
     const std::expected<AdmissionPolicy, TemplateGap> & admission_policy() const;
-    const Environment & deployment() const;
     std::span<const TemplateWorkspacePool> workspace_pools() const { return source_.workspace_pools; }
     const TemplateWorkspacePool & workspace_pool(const TemplateDefinition & definition, std::size_t index) const;
     std::expected<TemplateOperationRewrite, std::string> plan_workspace_replacement(const TemplateInstance & instance, const TemplateWorkspaceUseInstance & use,
@@ -869,11 +869,14 @@ private:
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_publication_members(const TemplateDefinition & source,
                                                                                                const BatchInput & target) const;
     std::expected<std::optional<TemplateOperationRewrite>, std::string> plan_transition(const TemplateDefinition & source, const BatchInput & target) const;
+    std::expected<TemplateOperationRewrite, std::string> plan_filter(const TemplateDefinition & source, BatchFilterBinding role,
+                                                                     const BatchInput & target) const;
     std::expected<std::optional<TemplateOperationRewrite>, std::string> plan_running_update(const TemplateDefinition & source, const BatchInput & target) const;
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_batch_operations(const TemplateDefinition & source, const BatchInput & target) const;
     std::expected<std::optional<SourceKernel>, std::string> transform_kernel(const TemplateNodeObservation & observation, const TemplateDefinition & source,
                                                                              const InvokeStep & invocation, std::uint32_t request_capacity,
-                                                                             std::optional<std::size_t> request_slot = std::nullopt) const;
+                                                                             std::optional<std::size_t> request_slot = std::nullopt,
+                                                                             std::optional<BatchFilterBinding> filter_binding = std::nullopt) const;
 
     TemplateSource source_;
     std::vector<const TemplateDefinition *> operation_sources_; // Borrowed from workflow-owned banks; only declared independent operations.

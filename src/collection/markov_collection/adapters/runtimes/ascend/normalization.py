@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import argparse
 import csv
+import gzip
 import json
 import re
 import sqlite3
@@ -12,9 +12,11 @@ from collections import Counter, defaultdict
 from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
+from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
 from markov_collection.adapters.runtimes.ascend.event_history import EventHistory
+from markov_collection.adapters.runtimes.ascend.kernel_work import AscendKernelWork
 from markov_collection.adapters.runtimes.ascend.torch_npu.allocator import WorkspaceAllocation
 from markov_collection.artifacts.json_file import write_json
 
@@ -27,6 +29,7 @@ def timestamp_ns(value: str | int | float) -> int:
 
 class ObservationNormalizer:
     def __init__(self, capture: Path) -> None:
+        self.capture_path = capture
         self.directory = capture.parent
         with capture.open(encoding="utf-8") as stream:
             self.capture = json.load(stream)
@@ -41,6 +44,15 @@ class ObservationNormalizer:
         self.trace_clock_offsets: dict[int, int] = {}
         self.devices: list[dict[str, Any]] = []
         self.profile_controls: list[dict[str, Any]] = []
+
+    def release(self) -> None:
+        AscendCaptureArtifacts.release_observation_exports(self.capture_path)
+
+    def _open_export(self, reference: str) -> TextIO:
+        path = self.directory / reference
+        if path.suffix == ".gz":
+            return gzip.open(path, "rt", encoding="utf-8", newline="")
+        return path.open(encoding="utf-8", newline="")
 
     def _task_samples(
         self, collectives: dict[tuple[int, int], list[dict[str, Any]]], unresolved: Counter
@@ -107,6 +119,8 @@ class ObservationNormalizer:
         return samples
 
     def _read_capture(self) -> None:
+        if self.capture.get("profile_retention", {}).get("raw_exports") == "released":
+            raise ValueError("raw observations were released; use retained normalized facts or a diagnostic capture")
         for reference in self.capture["observations"]:
             with (self.directory / reference).open(encoding="utf-8") as stream:
                 for line in stream:
@@ -282,14 +296,11 @@ class ObservationNormalizer:
             with (self.directory / reference).open(encoding="utf-8") as stream:
                 for line_number, line in enumerate(stream, start=1):
                     record = json.loads(line)
-                    if record["end_ns"] < record["start_ns"] or record["thread_cpu_ns"] < 0:
+                    if record["end_ns"] < record["start_ns"]:
                         raise ValueError(f"invalid native API clock interval at {reference}:{line_number}")
 
                     for copy in record["driver_copies"]:
-                        if (
-                            not (record["start_ns"] <= copy["start_ns"] <= copy["end_ns"] <= record["end_ns"])
-                            or copy["thread_cpu_ns"] < 0
-                        ):
+                        if not (record["start_ns"] <= copy["start_ns"] <= copy["end_ns"] <= record["end_ns"]):
                             raise ValueError(f"driver copy lies outside its parent API at {reference}:{line_number}")
 
                     # Scope identity is thread-local; timestamps alone cannot establish ownership.
@@ -588,7 +599,7 @@ class ObservationNormalizer:
         # The export origin is not identical to a later realtime/monotonic pair.
         self.trace_clock_offsets[rank] = timestamp_ns(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
 
-        with (self.directory / reference["trace"]).open(encoding="utf-8") as stream:
+        with self._open_export(reference["trace"]) as stream:
             events = json.load(stream)
 
         processes = {
@@ -625,7 +636,7 @@ class ObservationNormalizer:
                 )
 
         kernels: dict[tuple[int, int, int], dict[str, str]] = {}
-        with (self.directory / reference["kernel_details"]).open(encoding="utf-8", newline="") as stream:
+        with self._open_export(reference["kernel_details"]) as stream:
             for row_index, row in enumerate(csv.DictReader(stream)):
                 # Collective summaries intentionally have no physical task ID.
                 if row["Stream ID"] == "N/A" or row["Task ID"] == "N/A":
@@ -675,6 +686,14 @@ class ObservationNormalizer:
             start_ns = timestamp_ns(event["ts"])
             end_ns = start_ns + timestamp_ns(event["dur"])
             arguments = event.get("args", {})
+
+            # Runtime exports the original RecordScope. Namespace names cannot
+            # distinguish function bodies from nested SDK and user ranges.
+            # RecordScope::FUNCTION is 0 in the pinned Torch scope protocol.
+            operator_function = False
+            if event.get("cat") == "cpu_op":
+                operator_function = None if self.capture["role"] == "performance" else arguments["Record scope"] == 0
+
             kind = "cpu"
             if process == "Ascend Hardware":
                 task_type = arguments["Task Type"]
@@ -726,6 +745,7 @@ class ObservationNormalizer:
                 "observed_wall_ns": end_ns - start_ns,
                 "owner_call": owner,
                 "arguments": arguments,
+                "operator_function": operator_function,
                 "source": {"trace": reference["trace"], "event_index": event_index},
             }
             if process == "Communication" and event["name"].startswith("hcom_"):
@@ -1105,7 +1125,7 @@ class ServingNormalizer(ObservationNormalizer):
         self._read_capture()
         workspace_states = self._read_workspace_states()
         event_states = self._read_event_states()
-        facts_path = self.directory / ("source_facts.json" if self.role == "base" else "observation_facts.json")
+        facts_path = self.directory / ("source_facts.json.gz" if self.role == "base" else "observation_facts.json.gz")
         write_json(
             facts_path,
             {
@@ -1133,7 +1153,6 @@ class ServingNormalizer(ObservationNormalizer):
                     "profiler export epoch coordinates in ns, converted from vendor decimal microseconds"
                 ),
                 "calls": "monotonic_ns; paired wall_time_ns is retained for clock association",
-                "thread_cpu_ns": "per-thread CPU time; not a migrated wall service estimate",
                 "native_api": (
                     "monotonic_ns; trace_interval uses recorded CANN export origin, wall_time_ns is raw provenance"
                 ),
@@ -1162,41 +1181,24 @@ class ServingNormalizer(ObservationNormalizer):
             manifest_path = self.directory / "validation_manifest.json"
             manifest.update(
                 candidate_id=self.capture["candidate_id"],
+                observation_purpose=self.capture["observation_purpose"],
                 observations=facts_path.name,
                 readiness="partial" if self.gaps else "observed",
             )
 
         write_json(manifest_path, manifest)
 
+        # Keep raw exports until both normalized facts and their manifest exist.
+        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         return manifest_path
 
 
 class DeviceCostNormalizer(ObservationNormalizer):
-    def __init__(self, capture: Path) -> None:
+    def __init__(self, capture: Path, kernel_work: AscendKernelWork) -> None:
         super().__init__(capture)
+        self.kernel_work = kernel_work
         if self.capture["role"] != "performance":
             raise ValueError("independent device costs must come from a performance capture")
-
-    @staticmethod
-    def kernel_cost_work(interval: dict[str, Any]) -> dict[str, Any] | None:
-        kernel = interval.get("kernel")
-        if interval["kind"] != "compute" or kernel is None:
-            return None
-
-        # Vendor column names stop at this adapter. Capacity, rank and trace
-        # identities are not substitutes for the actual launch dimensions.
-        return {
-            "name": interval["name"],
-            "operation": kernel["Type"],
-            "input_shapes": kernel["Input Shapes"],
-            "output_shapes": kernel["Output Shapes"],
-            "input_dtypes": kernel["Input Data Types"],
-            "output_dtypes": kernel["Output Data Types"],
-            "input_formats": kernel["Input Formats"],
-            "output_formats": kernel["Output Formats"],
-            "task_type": interval["arguments"]["Task Type"],
-            "launch_blocks": int(kernel["Block Dim" if "Block Dim" in kernel else "Block Num"]),
-        }
 
     def extract(self) -> Path:
         from markov_collection.artifacts.sampling_domain import SamplingDomain
@@ -1230,7 +1232,6 @@ class DeviceCostNormalizer(ObservationNormalizer):
                     "rank": interval["rank"],
                     "stage": domain.stage(call["metadata"]),
                     "step": call["step"],
-                    "metadata": call["metadata"],
                     "operation": interval["name"].split("__", 1)[0],
                     "element_count": arguments["count"],
                     "data_type": arguments["data_type"],
@@ -1243,7 +1244,13 @@ class DeviceCostNormalizer(ObservationNormalizer):
             collective_owners[(interval["rank"], arguments["connection_id"])].append(collectives[-1])
 
         for interval in self.intervals:
-            if interval["kind"] not in ("compute", "dma"):
+            # Keep the physical record task separate from its CPU launch and
+            # event wait. Profiler controls and collective commands stay outside
+            # this cost object; their raw observations are still retained.
+            command = None
+            if interval["kind"] == "device_marker" and interval["arguments"]["Task Type"] == "EVENT_RECORD":
+                command = {"task_type": interval["arguments"]["Task Type"]}
+            if interval["kind"] not in ("compute", "dma") and command is None:
                 continue
 
             owner = interval["owner_call"]
@@ -1258,29 +1265,36 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 if api["api"] == "rtMemcpyAsync":
                     transfer = {
                         "bytes": api["transfer_bytes"],
-                        "direction": api["transfer_kind"],
+                        # CANN enum interpretation belongs to this producer;
+                        # cost fitting receives the shared semantic direction.
+                        "direction": ("host_to_host", "host_to_device", "device_to_host", "device_to_device")[
+                            api["transfer_kind"]
+                        ],
                         "source": api["source"],
                     }
 
-            samples.append(
-                {
-                    "rank": interval["rank"],
-                    "stage": domain.stage(call["metadata"]),
-                    "step": call["step"],
-                    "metadata": call["metadata"],
-                    "kind": interval["kind"],
-                    "name": interval["name"],
-                    "duration_ns": interval["observed_wall_ns"],
-                    "arguments": interval["arguments"],
-                    "kernel": interval.get("kernel"),
-                    "kernel_work": self.kernel_cost_work(interval),
-                    "transfer": transfer,
-                    "source": interval["source"],
-                }
-            )
+            sample = {
+                "rank": interval["rank"],
+                "stage": domain.stage(call["metadata"]),
+                "step": call["step"],
+                "kind": interval["kind"],
+                "name": interval["name"],
+                "duration_ns": interval["observed_wall_ns"],
+                "kernel_work": self.kernel_work.describe(interval, call["metadata"], call["step"]),
+                "device_command": command,
+                "transfer": transfer,
+                "source": interval["source"],
+            }
+            samples.append(sample)
+            if sample["kernel_work"] is not None:
+                domain.observe_work_facts(
+                    interval["rank"],
+                    call["metadata"],
+                    kernel_operand_fields=sample["kernel_work"].get("operand_work", {}),
+                )
 
         task_samples = self._task_samples(collective_owners, unresolved)
-        sample_path = self.directory / "device_measurements.json"
+        sample_path = self.directory / "device_measurements.json.gz"
         write_json(
             sample_path,
             {
@@ -1300,7 +1314,14 @@ class DeviceCostNormalizer(ObservationNormalizer):
         coverage = domain.coverage()
         if coverage["missing_conditions"]:
             self.gaps.append({"kind": "cost", "reason": "warmup_execution_domain_incomplete"})
+        feature_coverage = domain.feature_coverage(kernel_operand_fields=True)
+        if feature_coverage["missing_point_indices"]:
+            self.gaps.append({"kind": "cost", "reason": "requested_batch_work_not_observed"})
+        completion_coverage = domain.completion_coverage()
+        if completion_coverage["missing_request_ids"]:
+            self.gaps.append({"kind": "observation", "reason": "measurement_completion_observation_incomplete"})
 
+        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         manifest_path = self.directory / "performance_manifest.json"
         write_json(
             manifest_path,
@@ -1314,6 +1335,8 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 "native_capture": "native_capture.json",
                 "device_measurements": sample_path.name,
                 "warmup_coverage": coverage,
+                "feature_coverage": feature_coverage,
+                "completion_coverage": completion_coverage,
                 "coverage": {
                     "samples": len(samples),
                     "stage_kind": dict(Counter(f"{sample['stage']}/{sample['kind']}" for sample in samples)),
@@ -1342,7 +1365,7 @@ class CollectiveCostNormalizer(ObservationNormalizer):
         with (self.directory / self.capture["input"]).open(encoding="utf-8") as stream:
             prepared = json.load(stream)
 
-        world_size = prepared["configuration"]["tp_size"]
+        world_size = len(prepared["environment"]["devices"])
         samples = []
         grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         collectives: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
@@ -1383,7 +1406,6 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                 "observed_wall_ns": interval["observed_wall_ns"],
                 "host_start_ns": call["start_ns"],
                 "host_end_ns": call["end_ns"],
-                "host_active_cpu_ns": call["thread_cpu_ns"],
                 "source": interval["source"],
             }
 
@@ -1417,7 +1439,7 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                     }
                 )
 
-        measurements = self.directory / "collective_measurements.json"
+        measurements = self.directory / "collective_measurements.json.gz"
         task_samples = self._task_samples(collectives, unresolved)
         write_json(
             measurements,
@@ -1431,6 +1453,7 @@ class CollectiveCostNormalizer(ObservationNormalizer):
         self.gaps.append({"kind": "cost", "reason": "collective_admission_skew_and_service_not_separated"})
         self.gaps.append({"kind": "cost", "reason": "device_profiler_overhead_not_calibrated"})
 
+        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         manifest = self.directory / "performance_manifest.json"
         write_json(
             manifest,
@@ -1460,27 +1483,3 @@ class CollectiveCostNormalizer(ObservationNormalizer):
         )
 
         return manifest
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture", type=Path, required=True)
-    parser.add_argument("--role", choices=["base", "performance", "validation"], default="base")
-    arguments = parser.parse_args()
-
-    if arguments.role in {"base", "validation"}:
-        normalizer = ServingNormalizer(arguments.capture, arguments.role)
-    else:
-        with (arguments.capture.parent / "prepared_input.json").open(encoding="utf-8") as stream:
-            prepared = json.load(stream)
-        normalizer = (
-            CollectiveCostNormalizer(arguments.capture)
-            if prepared["measurement_kind"] == "communication"
-            else DeviceCostNormalizer(arguments.capture)
-        )
-
-    print(normalizer.extract())
-
-
-if __name__ == "__main__":
-    main()

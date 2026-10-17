@@ -1,9 +1,7 @@
 #pragma once
 
 #include "markov/contracts/control.hpp"
-#include "markov/graph/source_graph.hpp"
-
-#include <nlohmann/json_fwd.hpp>
+#include "markov/contracts/service_work.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,28 +28,8 @@ struct PeriodicOutputPolicy {
 };
 
 
-struct PublicationMemberWork {
-    RequestId request_id;
-    std::uint64_t generated_tokens;
-    bool emits;
-    std::uint64_t output_tokens;
-    std::uint64_t decode_context_tokens;
-    std::uint64_t previous_output_tokens;
-    std::uint64_t decode_read_offset_tokens;
-    bool finishes;
-
-    nlohmann::json describe() const;
-};
-
-struct PublicationWork {
-    SourceSpanId source_span;
-    std::vector<PublicationMemberWork> members;
-    bool sender_enabled;
-
-    nlohmann::json describe() const;
-};
-
-// One shared CPU service scans ordered members and packs non-streaming outputs.
+// A qualified shared output region scans ordered members and packs outputs.
+// Its source span is a retained work anchor, not an indivisible CPU cost unit.
 // The native interval and context window determine incremental offsets from
 // published progress; no second mutable request state is needed.
 class PublicationParameterLayout {

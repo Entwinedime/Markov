@@ -4,7 +4,6 @@
 #include <dlfcn.h>
 
 #include "torch_npu/csrc/core/npu/interface/AsyncTaskQueueInterface.h"
-#include "torch_npu/csrc/framework/NPUDefine.h"
 
 namespace markov::collection {
 
@@ -17,21 +16,7 @@ public:
         end_ = end;
         if (begin == nullptr || end == nullptr) return;
 
-        const char * operation = nullptr;
-        switch (task.paramType) {
-        case c10_npu::queue::COMPILE_AND_EXECUTE:
-            operation = static_cast<const at_npu::native::ExecuteParas *>(task.paramVal)->opType;
-            break;
-        case c10_npu::queue::EXECUTE_OPAPI:
-            operation = static_cast<const at_npu::native::ExecuteParasOpApi *>(task.paramVal)->opType;
-            break;
-        case c10_npu::queue::EXECUTE_OPAPI_V2:
-            operation = static_cast<const at_npu::native::ExecuteParasOpApiV2 *>(task.paramVal)->opName->c_str();
-            break;
-        default:
-            break;
-        }
-        observation_ = begin(task.correlation_id, task.paramType, worker, operation);
+        observation_ = begin(task.correlation_id, worker);
     }
 
     ~QueueObservation() {
@@ -49,7 +34,7 @@ public:
     }
 
 private:
-    using Begin = void * (*)(std::uint64_t, std::int32_t, int, const char *);
+    using Begin = void * (*)(std::uint64_t, int);
     using End = void (*)(void *, int);
 
     void * observation_ = nullptr;

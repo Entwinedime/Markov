@@ -7,29 +7,29 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(nlohmann_json 3.11 REQUIRED)
+find_package(ZLIB REQUIRED)
 
 add_library(markov_core
     src/markov/src/contracts/control.cpp
     src/markov/src/contracts/json_input.cpp
-    src/markov/src/contracts/project.cpp
+    src/markov/src/contracts/service_work.cpp
     src/markov/src/contracts/source_observations.cpp
     src/markov/src/controller/lightweight_controller.cpp
     src/markov/src/execution/execution_graph.cpp
     src/markov/src/execution/simulation.cpp
+    src/markov/src/execution/execution_details.cpp
     src/markov/src/execution/workspace_state.cpp
     src/markov/src/graph/kernel_shapes.cpp
     src/markov/src/graph/source_graph.cpp
-    src/markov/src/performance/service_work.cpp
     src/markov/src/performance/node_durations.cpp
     src/markov/src/performance/node_costs.cpp
-    src/markov/src/performance/cpu_cost_model.cpp
-    src/markov/src/performance/admission_cost_fitter.cpp
+    src/markov/src/performance/cost_query.cpp
+    src/markov/src/performance/cost_requirements.cpp
     src/markov/src/performance/cost_statistics.cpp
-    src/markov/src/performance/worker_cost_fitter.cpp
-    src/markov/src/performance/kernel_cost_fitter.cpp
     src/markov/src/performance/kernel_cost_model.cpp
-    src/markov/src/performance/communication_cost_fitter.cpp
     src/markov/src/performance/communication_cost_model.cpp
+    src/markov/src/performance/transfer_cost_model.cpp
+    src/markov/src/performance/device_command_cost_model.cpp
     src/markov/src/production/block_binding.cpp
     src/markov/src/production/block_extractor.cpp
     src/markov/src/production/source_call.cpp
@@ -47,13 +47,14 @@ add_library(markov_core
     src/markov/src/templates/template_assembly.cpp
     src/markov/src/templates/template_asset.cpp
     src/markov/src/templates/template_topology.cpp
-    src/markov/src/templates/templates.cpp
+    src/markov/src/templates/template_definition.cpp
+    src/markov/src/templates/template_bank.cpp
     src/markov/src/templates/tensor_parameters.cpp
     src/markov/src/templates/transfer_parameters.cpp
     src/markov/src/templates/workspace_parameters.cpp
 )
 target_include_directories(markov_core PUBLIC src/markov/include)
-target_link_libraries(markov_core PUBLIC nlohmann_json::nlohmann_json)
+target_link_libraries(markov_core PUBLIC nlohmann_json::nlohmann_json ZLIB::ZLIB)
 target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
@@ -75,6 +76,7 @@ add_library(markov_adapters
     src/markov/src/adapters/frameworks/sglang/template_production.cpp
     src/markov/src/adapters/runtimes/ascend/hccl_mesh_layout.cpp
     src/markov/src/adapters/runtimes/ascend/source_extractor.cpp
+    src/markov/src/adapters/runtimes/ascend/source_transfers.cpp
     src/markov/src/adapters/runtimes/ascend/workspace_bindings.cpp
 )
 target_include_directories(markov_adapters PUBLIC src/markov/include)
@@ -82,11 +84,14 @@ target_link_libraries(markov_adapters PUBLIC markov_core)
 target_compile_options(markov_adapters PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_workflow
+    src/markov/src/workflow/project.cpp
     src/markov/src/workflow/extraction_workflow.cpp
     src/markov/src/workflow/cost_fitting_workflow.cpp
     src/markov/src/workflow/plan.cpp
     src/markov/src/workflow/project_reader.cpp
     src/markov/src/workflow/prediction_workflow.cpp
+    src/markov/src/workflow/performance_requirements_plan.cpp
+    src/markov/src/workflow/performance_sampling_plan.cpp
 )
 target_include_directories(markov_workflow PUBLIC src/markov/include)
 target_link_libraries(markov_workflow PUBLIC markov_adapters)

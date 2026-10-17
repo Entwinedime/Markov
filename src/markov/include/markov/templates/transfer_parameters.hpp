@@ -19,6 +19,7 @@ struct TransferParameterLayout {
     std::uint64_t element_bytes = 0;
 
     std::expected<SourceTransfer, std::string> evaluate(const SourceTransfer & source, const BatchInput & input) const;
+    nlohmann::json describe_parameters() const;
 };
 
 } // namespace markov

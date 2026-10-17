@@ -2,10 +2,68 @@
 
 #include "markov/graph/kernel_shapes.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 
 namespace markov {
+
+nlohmann::json BatchOperationVariant::describe_parameters() const {
+    static constexpr std::array roles{ "relay_write", "request_table_write", "last_location_concat", "page_table_divide", "logits_reshape" };
+    static constexpr std::array materializations{ "contiguous", "single_column", "strided" };
+
+    // These are the stored selector constraints. Reporting them does not run a
+    // second branch selector or grant a fragment whole-template eligibility.
+    return {
+        {                       "role",                                                                          roles[static_cast<std::size_t>(role)] },
+        {            "source_requests",                                                                                                source_requests },
+        {           "minimum_requests",                                                                                               minimum_requests },
+        {           "maximum_requests",                                                                                               maximum_requests },
+        { "page_table_materialization", page_table ? nlohmann::json(materializations[static_cast<std::size_t>(*page_table)]) : nlohmann::json(nullptr) },
+        {           "page_size_tokens",                                        page_table ? nlohmann::json(page_size_tokens) : nlohmann::json(nullptr) },
+        {    "request_pool_rebindable",                                                                                        request_pool_rebindable }
+    };
+}
+
+BatchParameterLayout BatchParameterLayout::with_filter_binding(BatchFilterBinding binding) const {
+    auto rebound = *this;
+    if (rebound.filter_) rebound.filter_ = binding;
+    return rebound;
+}
+
+nlohmann::json BatchParameterLayout::describe_parameters() const {
+    static constexpr std::array extents{ "filter_input_requests",  "filter_retained_requests", "merge_left_requests",
+                                         "merge_right_requests",   "merge_total_requests",     "requests",
+                                         "request_sequence_tokens" };
+    nlohmann::json rows = nlohmann::json::array();
+    for (const auto & row : rows_) {
+        rows.push_back({
+            { "operand",               row.output ? "output" : "input" },
+            {    "slot",                                      row.slot },
+            {    "axis",                                             0 },
+            {  "extent", extents[static_cast<std::size_t>(row.extent)] }
+        });
+    }
+
+    nlohmann::json result{
+        {        "rule",                                                          "batch" },
+        { "tensor_axes",                                                  std::move(rows) },
+        { "input_arity", input_arity_ == BatchInputArity::Requests ? "requests" : "fixed" }
+    };
+    if (filter_) {
+        result["filter_source"] = *filter_ == BatchFilterBinding::Transition ? "transition" : "running_update";
+        result["filter_condition"] = "nonempty_partial_retention";
+    }
+    if (request_) {
+        result["request_binding"] = {
+            { "source_request_count",   request_->request_count },
+            {          "source_slot",            request_->slot },
+            {           "relocation", "qualified_target_member" }
+        };
+    }
+    return result;
+}
 
 bool BatchOperationVariant::accepts(const BatchInput & input) const {
     const auto requests = input.requests.size();

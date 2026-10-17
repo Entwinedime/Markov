@@ -3,6 +3,7 @@
 #include "markov/adapters/collection_adapter.hpp"
 #include "markov/adapters/template_adapter.hpp"
 #include "markov/contracts/control.hpp"
+#include "markov/workflow/performance_sampling_plan.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -15,6 +16,11 @@
 #include <vector>
 
 namespace markov {
+
+nlohmann::json Planner::prepare_performance(const Project & project, const nlohmann::json & prediction) const {
+    return PerformanceSamplingPlan(collection_adapters_, adapters_).run(project, prediction);
+}
+
 namespace {
 
 using Json = nlohmann::json;
@@ -173,26 +179,30 @@ nlohmann::json Planner::collection_plan(const Project & project) const {
     };
 }
 
-nlohmann::json Planner::prepare_collection(const Project & project, const Candidate & candidate, std::span<const Request> input) const {
+nlohmann::json Planner::prepare_inputs(const Project & project, const Candidate & candidate) const {
     const auto & adapter = collection_adapter(candidate.framework);
     const auto snapshot = adapter.configuration(candidate.configuration);
     auto values = snapshot.at("parameters");
     values.update(snapshot.at("model_assets"));
-    auto result = adapter.instrumentation();
-    result.update({
-        { "role", "base" },
-        { "framework", adapter.name() },
-        { "configuration_id", candidate.id },
-        { "model_path", project.model_path.string() },
-        { "tokenizer_path", project.tokenizer_path.string() },
-        { "configuration", std::move(values) },
-        { "requests", requests(input, true) },
-        { "environment", environment(candidate.environment) },
-        { "permission", permission(project.base_collection) },
-        { "permissions", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
-        { "diagnostics", project.diagnostics },
-        { "output_directory", project.output_directory.string() }
-    });
+    return {
+        {             "role",                                                                                                             "base" },
+        {        "framework",                                                                                                     adapter.name() },
+        { "configuration_id",                                                                                                       candidate.id },
+        {       "model_path",                                                                                        project.model_path.string() },
+        {   "tokenizer_path",                                                                                    project.tokenizer_path.string() },
+        {    "configuration",                                                                                                  std::move(values) },
+        {      "environment",                                                                                 environment(candidate.environment) },
+        {       "permission",                                                                                permission(project.base_collection) },
+        {      "permissions", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
+        {      "diagnostics",                                                                                                project.diagnostics },
+        { "output_directory",                                                                                  project.output_directory.string() }
+    };
+}
+
+nlohmann::json Planner::prepare_collection(const Project & project, const Candidate & candidate, std::span<const Request> input) const {
+    auto result = prepare_inputs(project, candidate);
+    result.update(collection_adapter(candidate.framework).instrumentation());
+    result["requests"] = requests(input, true);
     return result;
 }
 
@@ -226,7 +236,9 @@ nlohmann::json Planner::prepare_representative(const Project & project, const Ca
     throw std::invalid_argument("configuration is not a planned representative");
 }
 
-nlohmann::json Planner::prepare_target(const Project & project, const Candidate & candidate, const RequestWorkload & workload, std::int64_t budget_sec) const {
+nlohmann::json Planner::prepare_target(const Project & project, const Candidate & candidate, const RequestWorkload & workload, std::int64_t budget_sec,
+                                       std::string_view purpose) const {
+    if (purpose != "ports" && purpose != "structure") throw std::invalid_argument("target observation purpose must be ports or structure");
     if (!collection_adapter(candidate.framework).supports_target_observation())
         throw std::invalid_argument("target observation not implemented for this framework");
     if (budget_sec <= 0 || budget_sec > std::numeric_limits<std::int64_t>::max() / 1'000'000'000)
@@ -234,13 +246,14 @@ nlohmann::json Planner::prepare_target(const Project & project, const Candidate 
 
     auto result = prepare_collection(project, candidate, workload.requests);
     result["role"] = "validation";
+    result["observation_purpose"] = std::string(purpose);
     result["candidate_id"] = candidate.id;
     result["request_workload_id"] = workload.id;
     result["permission"] = permission({ true, budget_sec });
     result["permissions"] = {
         { "validation", result["permission"] }
     };
-    result["output_directory"] = (project.output_directory / "validation").string();
+    result["output_directory"] = project.output_directory.string();
     return result;
 }
 
@@ -306,10 +319,9 @@ nlohmann::json Planner::prepare_sampling(const Project & project, const Candidat
                                          const Json & measurement_requests) const {
     if (project.controller != "lightweight") throw std::invalid_argument("sampling requires lightweight control");
     auto grid = collection_adapter(candidate.framework).workloads(candidate, prompts.requests, measurement_requests);
-    auto prepared = prepare_collection(project, candidate, {});
+    auto prepared = prepare_inputs(project, candidate);
     prepared["role"] = "performance";
     prepared["permission"] = permission(project.performance_collection);
-    prepared.erase("requests");
     prepared["measurement_grid"] = std::move(grid);
     prepared["measurement_requests"] = measurement_requests;
     return prepared;
@@ -320,10 +332,9 @@ nlohmann::json Planner::prepare_communication(const Project & project, const Can
     if (grid.empty() && project.performance_collection.allow_run)
         throw std::invalid_argument("communication sampling needs independent device measurements with collective work domains");
 
-    auto prepared = prepare_collection(project, candidate, {});
+    auto prepared = prepare_inputs(project, candidate);
     prepared["role"] = "performance";
     prepared["permission"] = permission(project.performance_collection);
-    prepared.erase("requests");
     prepared["measurement_grid"] = std::move(grid);
     return prepared;
 }

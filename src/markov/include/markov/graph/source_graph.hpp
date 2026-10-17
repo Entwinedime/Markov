@@ -15,6 +15,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace markov {
@@ -34,8 +35,9 @@ struct SourceTransfer {
 
     nlohmann::json describe() const;
     static SourceTransfer read(const nlohmann::json & value);
+    static std::string_view direction_name(TransferDirection direction);
+    static TransferDirection parse_direction(std::string_view name);
 };
-enum class SourceCpuPart { SchedulePrefix, PrepareBody, PrepareSuffix, Execute, Publish, Dispatch };
 enum class SourceRelation {
     IntervalExtent,
     ThreadOrder,
@@ -70,7 +72,6 @@ struct SourceSpan {
     std::optional<std::size_t> source_interval;
     BoundaryId begin;
     BoundaryId end;
-    std::optional<SourceCpuPart> control_part;
     std::optional<std::size_t> source_api; // Native host waits use this instead of a profiler source_interval.
     std::optional<std::size_t> scope_call; // Innermost observed call; owner_call remains the serving action.
 };
@@ -140,6 +141,35 @@ struct KvReleaseWorkload {
     nlohmann::json describe() const;
 };
 
+enum class RequestPoolOperation { PrefixExtendWrite, TokenRead, TokenWrite, RowRead, RelayRead, RelayWrite };
+
+struct RequestPoolRange {
+    std::uint32_t slot;
+    std::int64_t prefix_tokens;
+    std::int64_t input_tokens;
+
+    auto operator<=>(const RequestPoolRange &) const = default;
+};
+
+struct RequestPoolPoint {
+    std::uint32_t slot;
+    std::int64_t column;
+
+    auto operator<=>(const RequestPoolPoint &) const = default;
+};
+
+// Access roles come from the framework producer; the core retains their actual
+// rows and token ranges without interpreting kernel names or device values.
+struct RequestPoolWork {
+    RequestPoolOperation operation;
+    std::variant<std::vector<std::uint32_t>, std::vector<RequestPoolPoint>, std::vector<RequestPoolRange>> members;
+
+    static RequestPoolWork read(const nlohmann::json & value);
+    static std::string_view operation_name(RequestPoolOperation operation);
+    nlohmann::json describe() const;
+    auto operator<=>(const RequestPoolWork &) const = default;
+};
+
 struct PositionSequence {
     std::int64_t prefix_tokens;
     std::int64_t input_tokens;
@@ -154,7 +184,7 @@ struct PositionWorkload {
 
 // Vendor tensor text is retained exactly, including empty optional slots.
 // Template instances transform copies and may attach derived workload metadata;
-// raw observations do not carry target attention parameters.
+// raw observations leave derived workload metadata absent.
 struct SourceKernel {
     std::string name;
     std::string operation;
@@ -174,10 +204,9 @@ struct SourceKernel {
     std::optional<std::int64_t> sequence_length_max = std::nullopt;
     std::optional<std::vector<std::int64_t>> sequence_lengths = std::nullopt;
     std::optional<std::int64_t> kv_new_pages = std::nullopt;
-    std::optional<std::vector<std::uint32_t>> request_pool_slots = std::nullopt;
+    std::optional<RequestPoolWork> request_pool = std::nullopt;
     std::optional<AttentionWorkload> attention = std::nullopt; // Target semantic parameters, absent in raw kernel observations.
 
-    bool has_semantic_work() const;
     nlohmann::json describe() const;
 };
 
@@ -189,21 +218,6 @@ struct SourceOperation {
     std::optional<std::string> input_shapes = std::nullopt;
     std::optional<std::string> input_types = std::nullopt;
     std::vector<SourceSpanId> collective_spans = {};
-};
-
-enum class CpuSubmissionPart { Before, Call, After };
-
-// A complete measured interval around one submission. These identities locate
-// the operation; target device descriptors must come from the expanded graph.
-struct SourceCpuWork {
-    std::string operation;
-    CpuSubmissionPart part;
-    SourceSpanId submission;
-
-    nlohmann::json describe() const;
-    static SourceCpuWork read(const nlohmann::json & record);
-    static std::string_view part_name(CpuSubmissionPart part);
-    static CpuSubmissionPart parse_part(std::string_view name);
 };
 
 // Collective envelopes describe logical work; physical services retain their own
@@ -282,19 +296,16 @@ class SourceGraph {
 public:
     static std::string_view span_name(SourceSpanKind kind);
     static std::string_view relation_name(SourceRelation relation);
-    static std::string_view cpu_part_name(SourceCpuPart part);
-    static SourceCpuPart parse_cpu_part(std::string_view name);
     static SourceRelation parse_relation(std::string_view name);
     static SourceDomain parse_domain(std::string_view name);
     std::size_t lane(SourceDomain domain, std::uint32_t rank, std::uint64_t native_id);
     SourceSpanId observe(SourceSpanKind kind, std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> owner_call,
-                         std::optional<std::size_t> source_interval, std::optional<SourceCpuPart> control_part = std::nullopt,
-                         std::optional<std::size_t> source_api = std::nullopt, std::optional<std::size_t> scope_call = std::nullopt);
+                         std::optional<std::size_t> source_interval, std::optional<std::size_t> source_api = std::nullopt,
+                         std::optional<std::size_t> scope_call = std::nullopt);
     void observe_kernel(SourceSpanId span, SourceKernel kernel);
     void observe_transfer(SourceSpanId span, SourceTransfer transfer);
     void observe_stream_wait(SourceSpanId span, SourceStreamWait wait);
     void observe_operation(SourceOperation operation);
-    void observe_cpu_work(SourceSpanId span, SourceCpuWork work);
     void observe_collective(SourceCollective collective);
     void connect(BoundaryId source, BoundaryId target, SourceRelation relation, std::optional<std::size_t> source_reference = std::nullopt);
 
@@ -322,7 +333,6 @@ private:
     std::vector<SourceSpan> spans_;
     std::map<SourceSpanId, SourceKernel> kernels_;
     std::map<SourceSpanId, SourceTransfer> transfers_;
-    std::map<SourceSpanId, SourceCpuWork> cpu_work_;
     std::map<SourceSpanId, SourceStreamWait> stream_waits_;
     std::vector<SourceOperation> operations_;
     std::vector<SourceCollective> collectives_;

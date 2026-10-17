@@ -1,35 +1,26 @@
-"""Independent CPU or device measurements over a requested batch/length domain."""
+"""Independent device or synchronous-transfer measurements over requested batch work."""
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import dataclasses
 import importlib.metadata
-import json
 import os
 import signal
-from pathlib import Path
+import time
 from typing import Any
 
-from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
+from markov_collection.adapters.frameworks.sglang.session import SGLangSession
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
-from markov_collection.adapters.runtimes.ascend.worker_units import CpuWorkerUnits
+from markov_collection.adapters.runtimes.ascend.transfer_sampling import TransferMeasurements
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.artifacts.sampling_domain import SamplingDomain
-from markov_collection.instrumentation.session import CaptureSession
 
 
-class NativeSampling(CaptureSession):
+class SGLangSampling(SGLangSession):
     def run(self) -> None:
-        if not self.prepared["permission"]["allow_run"]:
-            raise ValueError("performance collection permission is disabled")
-        if self.prepared["framework"] != "sglang":
-            raise ValueError("independent sampling currently implements SGLang")
-
         from sglang.srt.entrypoints.engine import Engine
 
-        artifacts = AscendCaptureArtifacts(self.prepared, self.directory)
         grid = self.prepared["measurement_grid"]
         repetitions = self.prepared["repetitions"]
         device = self.prepared["measurement_kind"] == "device"
@@ -45,18 +36,23 @@ class NativeSampling(CaptureSession):
 
         write_json(self.directory / "prepared_input.json", self.prepared)
         os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
-        os.environ["MARKOV_CPU_SAMPLES"] = str(self.directory / "cpu_samples")
+        os.environ["MARKOV_TRANSFER_SCOPES"] = str(self.directory / "transfer_scopes")
         os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
         os.environ["SGLANG_PLUGINS"] = "markov"
 
+        engine_started_ns = time.perf_counter_ns()
         engine = Engine(
             model_path=self.prepared["model_path"],
             tokenizer_path=self.prepared["tokenizer_path"],
             skip_tokenizer_init=True,
             **self.prepared["configuration"],
         )
+        engine_ready_ns = time.perf_counter_ns()
         signal.signal(signal.SIGQUIT, self._handle_worker_failure)
         try:
+            warmup_started_ns = time.perf_counter_ns()
+            warmup = self._warmup(engine, set(self.prepared["measurement_ids"]) | set(self.prepared["warmup_ids"]))
+            warmup_finished_ns = time.perf_counter_ns()
             if device:
                 engine.start_profile(
                     output_dir=str(self.directory / "native_profile"),
@@ -65,11 +61,14 @@ class NativeSampling(CaptureSession):
                     with_stack=False,
                 )
 
+            observation_started_ns = time.perf_counter_ns()
             try:
                 completions = self._measure(engine, grid, repetitions)
             finally:
+                observation_finished_ns = time.perf_counter_ns()
                 if device and not self._worker_failed:
                     engine.stop_profile()
+            profile_finished_ns = time.perf_counter_ns()
 
             write_json(
                 self.directory / "native_environment.json",
@@ -77,11 +76,19 @@ class NativeSampling(CaptureSession):
                     "framework": "sglang",
                     "framework_version": importlib.metadata.version("sglang"),
                     "runtime": RuntimeEnvironment().describe(),
-                    "cpu_count": os.cpu_count(),
                     "effective_server_args": dataclasses.asdict(engine.tokenizer_manager.server_args),
                     "profiler_enabled": device,
                     "native_api_journal_enabled": device,
-                    "native_wait_cpu_sampling_enabled": not device,
+                    "synchronous_transfer_sampling_enabled": not device,
+                    "semantic_instrumentation_enabled": False,
+                    "collection_wall_time_ns": {
+                        "engine_initialization": engine_ready_ns - engine_started_ns,
+                        "warmup": warmup_finished_ns - warmup_started_ns,
+                        "profile_start": observation_started_ns - warmup_finished_ns,
+                        "point_warmup_and_measurement": observation_finished_ns - observation_started_ns,
+                        "profile_stop_and_export": profile_finished_ns - observation_finished_ns,
+                    },
+                    "initialization": {"engine": "fresh_process", "warmup": warmup},
                 },
             )
         finally:
@@ -89,23 +96,23 @@ class NativeSampling(CaptureSession):
 
         write_json(self.directory / "measurement_completions.json", completions)
         if device:
-            artifacts.publish()
             return
 
-        samples = sorted((self.directory / "cpu_samples").glob("*.jsonl"))
+        scopes = sorted((self.directory / "transfer_scopes").glob("*.jsonl"))
         workers = sorted((self.directory / "cpu_workers").glob("*.jsonl"))
-        worker_units = self.directory / "cpu_worker_units.json"
-        worker_coverage = CpuWorkerUnits(samples, workers).publish(worker_units)
-        warmup_coverage, completion_coverage = self._cpu_coverage(samples)
-        gaps = [
-            {"kind": "cost", "reason": "non_runtime_wait_cpu_not_classified"},
-            {"kind": "cost", "reason": "clock_probe_overhead_not_calibrated"},
-            {"kind": "cost", "reason": "joint_latency_includes_native_internal_waits"},
-        ]
+        domain = SamplingDomain(self.prepared)
+        worker_units = self.directory / "cpu_worker_units.json.gz"
+        coverage = TransferMeasurements(scopes, workers, domain).publish(worker_units)
+        completion_coverage = domain.completion_coverage()
+        warmup_coverage = domain.coverage()
+        feature_coverage = domain.feature_coverage(transfer_executions=True)
+        gaps = []
         if warmup_coverage["missing_conditions"]:
             gaps.append({"kind": "cost", "reason": "warmup_execution_domain_incomplete"})
         if completion_coverage["missing_request_ids"]:
             gaps.append({"kind": "observation", "reason": "measurement_completion_observation_incomplete"})
+        if feature_coverage["missing_point_indices"]:
+            gaps.append({"kind": "cost", "reason": "requested_batch_work_not_observed"})
 
         write_json(
             self.directory / "performance_manifest.json",
@@ -116,39 +123,21 @@ class NativeSampling(CaptureSession):
                 "input": "prepared_input.json",
                 "environment": "native_environment.json",
                 "completions": "measurement_completions.json",
-                "cpu_samples": [str(path.relative_to(self.directory)) for path in samples],
-                "cpu_units": [
-                    str(path.relative_to(self.directory))
-                    for path in sorted((self.directory / "cpu_units").glob("*.jsonl"))
-                ],
+                "transfer_scopes": [str(path.relative_to(self.directory)) for path in scopes],
                 "cpu_workers": [str(path.relative_to(self.directory)) for path in workers],
                 "cpu_worker_units": worker_units.name,
-                "cpu_worker_coverage": worker_coverage,
-                "cpu_worker_readiness": "needs_data",
-                "cpu_worker_gaps": [
-                    "runtime_submission_semantics_not_qualified",
-                    "unmeasured_observation_boundary_overhead",
-                    "target_operation_matching_not_implemented",
-                ],
-                "cpu_unit_boundary": "complete native call; phase samples remain inclusive of this work",
-                "cpu_unit_readiness": "needs_data",
-                "cpu_unit_gaps": [
-                    "call_and_clock_boundary_overhead_not_qualified",
-                    "independent_cost_validation_missing",
-                ],
+                "cpu_worker_coverage": coverage,
+                "cpu_worker_readiness": "needs_data" if coverage["gaps"] else "ready",
+                "cpu_worker_gaps": coverage["gaps"],
                 "worker_environments": [
                     str(path.relative_to(self.directory))
-                    for path in sorted((self.directory / "cpu_samples").glob("*-environment.json"))
+                    for path in sorted((self.directory / "transfer_scopes").glob("*-environment.json"))
                 ],
-                "clock": {
-                    "cpu_active_ns": "per-thread CPU time",
-                    "runtime_wait_wall_ns": "existing runtime sync wall time; not service cost",
-                    "start_ns/end_ns": "monotonic; not a service cost",
-                },
-                "completion_boundary": "conservative native synchronization proxy, not an exact hardware end",
+                "clock": {"wall_ns": "monotonic synchronous driver entry and return"},
                 "warmup_coverage": warmup_coverage,
+                "feature_coverage": feature_coverage,
                 "completion_coverage": completion_coverage,
-                "readiness": "needs_data",
+                "readiness": "needs_data" if gaps or coverage["gaps"] else "ready",
                 "gaps": gaps,
             },
         )
@@ -156,18 +145,12 @@ class NativeSampling(CaptureSession):
     def _measure(self, engine: Any, grid: list[dict[str, Any]], repetitions: int) -> list[dict[str, Any]]:
         completions = []
         for point in grid:
-            if not engine.flush_cache():
-                raise RuntimeError("independent sampling could not reset the native request/cache state")
-
             # Observe actual batches; client batch size alone does not prove
             # that the native scheduler warmed the requested execution path.
             self._generate(engine, point, f"markov-measure-warmup/{point['id']}")
-            engine.loop.remove_signal_handler(signal.SIGQUIT)
-            signal.signal(signal.SIGQUIT, self._handle_worker_failure)
 
             for repetition in range(repetitions):
-                if not engine.flush_cache():
-                    raise RuntimeError("independent sampling could not reset the native request/cache state")
+                self._reset(engine)
                 response = self._generate(engine, point, f"markov-measure/{point['id']}/{repetition}")
                 completions.append(
                     {
@@ -177,11 +160,7 @@ class NativeSampling(CaptureSession):
                     }
                 )
 
-        # Generation replies are sent inside native publication. This control RPC
-        # reaches the next scheduler iteration, after the observer has persisted
-        # its final records, before shutdown can terminate the worker.
-        if not engine.flush_cache():
-            raise RuntimeError("independent sampling could not acknowledge final publication")
+            self._reset(engine)
 
         return completions
 
@@ -246,37 +225,3 @@ class NativeSampling(CaptureSession):
                 for release, gate in gates.items():
                     if meta["completion_tokens"] >= release:
                         gate.set()
-
-    def _cpu_coverage(self, samples: list[Path]) -> tuple[dict[str, Any], dict[str, Any]]:
-        domain = SamplingDomain(self.prepared)
-        finished: set[str] = set()
-        for path in samples:
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    record = json.loads(line)
-                    domain.observe(record["rank"], record["step"], record["metadata"])
-                    if record["step"] == "publish":
-                        finished.update(record["metadata"]["finished_request_ids"])
-
-        declared = domain.measurement_ids | domain.warmup_ids
-        return domain.coverage(), {
-            "declared_requests": len(declared),
-            "observed_finished_requests": len(finished),
-            "missing_request_ids": sorted(declared - finished),
-        }
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    arguments = parser.parse_args()
-
-    with arguments.input.open(encoding="utf-8") as stream:
-        prepared = json.load(stream)
-
-    NativeSampling(prepared, arguments.output).run()
-
-
-if __name__ == "__main__":
-    main()

@@ -2,9 +2,47 @@
 
 #include "markov/graph/kernel_shapes.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <array>
 
 namespace markov {
+
+nlohmann::json KvParameterLayout::describe_parameters() const {
+    static constexpr std::array kinds{ "extend", "decode", "release" };
+    static constexpr std::array extents{ "requests",           "input_tokens",   "free_kv_pages",
+                                         "released_tokens",    "released_pages", "free_pages_before_release",
+                                         "pages_after_release" };
+    static constexpr std::array outputs{ "none", "kv_new_pages", "kv_allocation", "kv_release" };
+    nlohmann::json axes = nlohmann::json::array();
+    for (const auto & axis : axes_) {
+        axes.push_back({
+            { "operand",               axis.output ? "output" : "input" },
+            {    "slot",                                      axis.slot },
+            {    "axis",                                              0 },
+            {  "extent", extents[static_cast<std::size_t>(axis.extent)] }
+        });
+    }
+
+    nlohmann::json conditions = nlohmann::json::object();
+    if (domain_.maximum_new_pages) conditions["maximum_new_pages"] = *domain_.maximum_new_pages;
+    if (domain_.allocates_pages) conditions["allocates_pages"] = *domain_.allocates_pages;
+    if (domain_.release_free_empty) conditions["release_free_empty"] = *domain_.release_free_empty;
+    if (domain_.release_request_slot) conditions["source_release_slot"] = *domain_.release_request_slot;
+
+    // Free lists and finished membership come from target state. Reporting the
+    // stored branch does not claim that it is reachable for a requested workload.
+    return {
+        {                  "rule",                                       "kv" },
+        {                  "kind",     kinds[static_cast<std::size_t>(kind_)] },
+        {      "page_size_tokens",                                 page_size_ },
+        {           "tensor_axes",                            std::move(axes) },
+        {            "value_work", outputs[static_cast<std::size_t>(output_)] },
+        {            "conditions",                      std::move(conditions) },
+        { "release_member_inputs",                     release_member_inputs_ },
+        {          "state_source",        "target_kv_and_finished_membership" }
+    };
+}
 
 std::expected<SourceKernel, std::string> KvParameterLayout::evaluate(const SourceKernel & source, const BatchInput & input,
                                                                      std::optional<std::size_t> request_slot) const {

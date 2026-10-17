@@ -1,5 +1,7 @@
 #include "markov/adapters/runtimes/ascend/source_extractor.hpp"
 
+#include "markov/contracts/json_input.hpp"
+
 #include "markov/production/block_binding.hpp"
 #include "markov/production/block_extractor.hpp"
 #include "markov/production/source_bindings.hpp"
@@ -18,13 +20,18 @@
 #include <utility>
 
 namespace markov {
+
+std::optional<DeviceCommandWork> AscendSourceExtractor::device_command(const nlohmann::json & interval) {
+    if (interval.at("kind") != "device_marker" || interval.at("arguments").at("Task Type") != "EVENT_RECORD") return std::nullopt;
+
+    // This is the physical record task. Its host submission and dependent wait
+    // keep their own graph nodes and timing responsibilities.
+    return DeviceCommandWork{ interval.at("arguments").at("Task Type").get<std::string>() };
+}
+
 namespace {
 
-nlohmann::json read_json(const std::filesystem::path & path) {
-    std::ifstream stream(path);
-    stream.exceptions(std::ios::failbit | std::ios::badbit);
-    return nlohmann::json::parse(stream);
-}
+using input::read_json;
 
 void write_json(const std::filesystem::path & path, const nlohmann::json & value) {
     auto temporary = path;
@@ -71,7 +78,6 @@ void AscendSourceExtractor::read_calls(const nlohmann::json & records) {
                          std::nullopt,
                          {},
                          std::nullopt,
-                         record.at("thread_cpu_ns").get<std::int64_t>(),
                          record.at("start_ns").get<std::int64_t>(),
                          std::nullopt,
                          std::nullopt,
@@ -99,10 +105,7 @@ void AscendSourceExtractor::read_calls(const nlohmann::json & records) {
         if (name == "publish") {
             const auto policy = record.at("result").find("output_policy");
             if (policy != record.at("result").end()) {
-                const auto interval = policy->at("force_interval_tokens").get<std::int64_t>();
-                if (interval <= 0 || interval > std::numeric_limits<std::uint32_t>::max())
-                    throw std::invalid_argument("native output interval must be a positive uint32 token count");
-                call.output_policy = SourceOutputPolicy{ static_cast<std::uint32_t>(interval), policy->at("non_streaming").get<bool>() };
+                call.output_policy = SourceOutputPolicy{ input::positive(policy->at("force_interval_tokens")), policy->at("non_streaming").get<bool>() };
             }
 
             for (const auto & request : record.at("result").at("requests")) {
@@ -168,6 +171,7 @@ void AscendSourceExtractor::read_calls(const nlohmann::json & records) {
 
 void AscendSourceExtractor::read_intervals(const nlohmann::json & intervals) {
     std::size_t collective_roots = 0;
+    std::size_t observer_markers = 0;
     std::map<std::pair<std::size_t, std::size_t>, std::vector<SourceSpanId>> operator_intervals;
     for (const auto & interval : intervals) {
         const std::size_t identity = interval.at("id").get<std::size_t>();
@@ -189,16 +193,21 @@ void AscendSourceExtractor::read_intervals(const nlohmann::json & intervals) {
         if (!interval.at("owner_call").is_null()) { owner = call_ids_.at(interval.at("owner_call").get<std::string>()); }
         std::optional<std::size_t> scope;
         if (!interval.at("scope_call").is_null()) scope = call_ids_.at(interval.at("scope_call").get<std::string>());
-        const auto span_id = graph_.observe(kind, lane, begin_ns, end_ns, owner, identity, std::nullopt, std::nullopt, scope);
+        const auto span_id = graph_.observe(kind, lane, begin_ns, end_ns, owner, identity, std::nullopt, scope);
 
         const std::string name = interval.at("name").get<std::string>();
+        if (kind == SourceSpanKind::CpuObservation && name == "markov_observer" && begin_ns < end_ns) {
+            observer_windows_[lane].emplace_back(begin_ns, end_ns);
+            ++observer_markers;
+        }
         if (kind == SourceSpanKind::CpuObservation && (name == "MarkovWorkspaceAllocate" || name == "MarkovWorkspaceRelease")) {
             // Allocation is a replaceable resource operation inside a worker.
             // Its marker must cut CPU service too, not only annotate the graph.
             cpu_service_boundaries_[lane].insert(begin_ns);
             cpu_service_boundaries_[lane].insert(end_ns);
         }
-        if (kind == SourceSpanKind::CpuObservation && owner && scope && name.starts_with("aten::")) operator_intervals[{ lane, *scope }].push_back(span_id);
+        if (kind == SourceSpanKind::CpuObservation && owner && scope && interval.at("operator_function").get<bool>())
+            operator_intervals[{ lane, *scope }].push_back(span_id);
         if (const auto kernel = interval.find("kernel"); kernel != interval.end()) {
             graph_.observe_kernel(span_id,
                                   { name,
@@ -220,8 +229,23 @@ void AscendSourceExtractor::read_intervals(const nlohmann::json & intervals) {
         if (kind == SourceSpanKind::CommunicationObservation && name.starts_with("hcom_")) ++collective_roots;
     }
 
-    // A backend launch may be nested in an ATen operation that also allocates
+    // Profiler events need not follow their nesting order. Collect every marker
+    // before classifying functions, then merge nested or touching observer work.
+    std::size_t observer_ranges = 0;
+    for (auto & [lane, windows] : observer_windows_) {
+        std::ranges::sort(windows);
+        std::vector<std::pair<std::int64_t, std::int64_t>> merged;
+        for (const auto & window : windows) {
+            if (merged.empty() || merged.back().second < window.first) merged.push_back(window);
+            else merged.back().second = std::max(merged.back().second, window.second);
+        }
+        windows = std::move(merged);
+        observer_ranges += windows.size();
+    }
+
+    // A backend launch may be nested in a function that also allocates
     // or copies storage. Delimit the outer operation, not each internal helper.
+    std::size_t observer_functions = 0;
     for (auto & [location, members] : operator_intervals) {
         std::sort(members.begin(), members.end(), [&](SourceSpanId left, SourceSpanId right) {
             const auto & a = graph_.spans()[left];
@@ -233,6 +257,10 @@ void AscendSourceExtractor::read_intervals(const nlohmann::json & intervals) {
         });
         std::optional<std::int64_t> outer_end;
         for (const auto identity : members) {
+            if (observer_work(identity)) {
+                ++observer_functions;
+                continue;
+            }
             const auto & span = graph_.spans()[identity];
             const auto begin = graph_.boundaries()[span.begin].observed_time_ns;
             const auto end = graph_.boundaries()[span.end].observed_time_ns;
@@ -247,16 +275,35 @@ void AscendSourceExtractor::read_intervals(const nlohmann::json & intervals) {
         }
     }
 
-    gaps_.push_back({
-        {   "kind",                                         "cost" },
-        { "reason", "cpu_service_and_probe_overhead_not_separated" }
-    });
+    if (observer_markers != 0)
+        gaps_.push_back({
+            {      "kind",                      "scope" },
+            {    "reason", "observer_cpu_work_excluded" },
+            {   "markers",             observer_markers },
+            {    "ranges",              observer_ranges },
+            { "functions",           observer_functions }
+        });
+
     if (collective_roots != 0)
         gaps_.push_back({
             {      "kind",                                       "cost" },
             {    "reason", "collective_transport_service_not_separated" },
             { "intervals",                             collective_roots }
         });
+}
+
+bool AscendSourceExtractor::observer_work(SourceSpanId identity) const {
+    const auto & span = graph_.spans()[identity];
+    if (span.kind != SourceSpanKind::CpuObservation) return false;
+    const auto & begin = graph_.boundaries()[span.begin];
+    const auto found = observer_windows_.find(begin.lane);
+    if (found == observer_windows_.end()) return false;
+
+    const auto & windows = found->second;
+    const auto position = std::upper_bound(windows.begin(), windows.end(), begin.observed_time_ns, [](std::int64_t time_ns, const auto & window) {
+        return time_ns < window.first;
+    });
+    return position != windows.begin() && graph_.boundaries()[span.end].observed_time_ns <= std::prev(position)->second;
 }
 
 SourceSpanId AscendSourceExtractor::operation_host(SourceSpanId identity) const {
@@ -288,7 +335,7 @@ void AscendSourceExtractor::read_operations(const nlohmann::json & intervals, co
         if (flow.at("category") != "async_npu" || flow.at("source_intervals").size() != 1) continue;
         const auto call = flow.at("source_intervals")[0].get<SourceSpanId>();
         const auto & span = graph_.spans()[call];
-        if (span.kind != SourceSpanKind::CpuObservation || !span.owner_call || !span.scope_call) continue;
+        if (span.kind != SourceSpanKind::CpuObservation || !span.owner_call || !span.scope_call || observer_work(call)) continue;
         const auto host = operation_host(call);
         for (const auto & target : flow.at("target_intervals")) {
             const auto device = target.get<SourceSpanId>();
@@ -319,7 +366,7 @@ void AscendSourceExtractor::read_operations(const nlohmann::json & intervals, co
         const auto dequeue = flow.at("target_intervals")[0].get<SourceSpanId>();
         const auto & source = graph_.spans()[enqueue];
         const auto & worker = graph_.spans()[dequeue];
-        if (!source.scope_call || source.scope_call != worker.scope_call || source.owner_call != worker.owner_call) continue;
+        if (!source.scope_call || source.scope_call != worker.scope_call || source.owner_call != worker.owner_call || observer_work(enqueue)) continue;
         const auto & begin = graph_.boundaries()[source.begin];
         const auto end = graph_.boundaries()[source.end].observed_time_ns;
         const auto candidates = hosts.find({ begin.lane, *source.scope_call });
@@ -403,6 +450,7 @@ void AscendSourceExtractor::read_cpu_scopes() {
 void AscendSourceExtractor::read_flows(const nlohmann::json & flows) {
     std::size_t index = 0;
     for (const auto & flow : flows) {
+        bool observer_submission = false;
         // The vendor flow is anchored at API/queue start, not at API return.
         // Connecting return to device start would manufacture a CPU/NPU barrier.
         for (const auto & source : flow.at("source_intervals")) {
@@ -410,6 +458,9 @@ void AscendSourceExtractor::read_flows(const nlohmann::json & flows) {
             for (const auto & target : flow.at("target_intervals")) {
                 const auto target_id = target.get<SourceSpanId>();
                 graph_.connect(graph_.spans().at(source_id).begin, graph_.spans().at(target_id).begin, SourceRelation::NativeFlow, index);
+                const auto & target_span = graph_.spans()[target_id];
+                if (observer_work(source_id) && (flow.at("category") == "async_task_queue" || target_span.kind != SourceSpanKind::CpuObservation))
+                    observer_submission = true;
 
                 for (const auto endpoint : { source_id, target_id }) {
                     const auto & span = graph_.spans()[endpoint];
@@ -422,6 +473,14 @@ void AscendSourceExtractor::read_flows(const nlohmann::json & flows) {
                 }
             }
         }
+        if (observer_submission)
+            gaps_.push_back({
+                {             "kind",                               "observation" },
+                {           "reason", "observer_scope_contains_native_submission" },
+                {             "flow",                                       index },
+                { "source_intervals",                 flow.at("source_intervals") },
+                { "target_intervals",                 flow.at("target_intervals") }
+            });
         ++index;
     }
 }
@@ -961,6 +1020,13 @@ void AscendSourceExtractor::read_copy_boundaries(const nlohmann::json & records,
             continue;
         }
 
+        if (observer_work(record.at("source_interval").get<SourceSpanId>()))
+            gaps_.push_back({
+                {       "kind",                              "observation" },
+                {     "reason", "observer_scope_contains_synchronous_copy" },
+                { "source_api",                                      index }
+            });
+
         const auto & parent = intervals.at(record.at("source_interval").get<std::size_t>());
         if (begin_ns < parent.at("start_ns").get<std::int64_t>() || end_ns > parent.at("end_ns").get<std::int64_t>()) {
             gaps_.push_back({
@@ -1164,6 +1230,14 @@ void AscendSourceExtractor::read_host_waits(const nlohmann::json & records, cons
     for (const auto & [thread, sequence] : native_syncs) {
         for (const auto index : sequence) {
             const auto & record = records[index];
+            const auto observed = synchronized_calls.find(index);
+            if (observed != synchronized_calls.end() && observer_work(observed->second))
+                gaps_.push_back({
+                    {       "kind",                         "observation" },
+                    {     "reason", "observer_scope_contains_native_wait" },
+                    { "source_api",                                 index }
+                });
+
             const bool internal_copy_wait = record.at("copy_execution") == "synchronous_driver";
             const auto begin_ns = internal_copy_wait ? intervals[synchronized_calls.at(index)].at("start_ns").get<std::int64_t>()
                                                      : record.at("trace_interval").at("begin_ns").get<std::int64_t>();
@@ -1174,7 +1248,7 @@ void AscendSourceExtractor::read_host_waits(const nlohmann::json & records, cons
             if (!record.at("owner_call").is_null()) owner = call_ids_.at(record.at("owner_call").get<std::string>());
             std::optional<std::size_t> scope;
             if (!record.at("scope_call").is_null()) scope = call_ids_.at(record.at("scope_call").get<std::string>());
-            const auto wait = graph_.observe(SourceSpanKind::HostWait, lane, begin_ns, end_ns, owner, std::nullopt, std::nullopt, index, scope);
+            const auto wait = graph_.observe(SourceSpanKind::HostWait, lane, begin_ns, end_ns, owner, std::nullopt, index, scope);
             host_waits_.push_back(wait);
 
             // The synchronized object exists even when the observed stream had
@@ -1272,23 +1346,31 @@ void AscendSourceExtractor::read_host_waits(const nlohmann::json & records, cons
 }
 
 void AscendSourceExtractor::observe_cpu_control(std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::size_t owner,
-                                                std::optional<std::size_t> source_interval, SourceCpuPart part, std::optional<std::size_t> recorded_scope) {
-    std::vector<std::pair<std::int64_t, std::int64_t>> waits;
+                                                std::optional<std::size_t> source_interval, std::optional<std::size_t> recorded_scope) {
+    std::vector<std::pair<std::int64_t, std::int64_t>> excluded;
     for (const auto identity : host_waits_) {
         const auto & wait = graph_.spans()[identity];
         const auto & begin = graph_.boundaries()[wait.begin];
         const auto & end = graph_.boundaries()[wait.end];
         if (begin.lane != lane || begin.observed_time_ns >= end_ns || end.observed_time_ns <= begin_ns) continue;
-        waits.emplace_back(std::max(begin_ns, begin.observed_time_ns), std::min(end_ns, end.observed_time_ns));
+        excluded.emplace_back(std::max(begin_ns, begin.observed_time_ns), std::min(end_ns, end.observed_time_ns));
+    }
+    if (const auto observer = observer_windows_.find(lane); observer != observer_windows_.end()) {
+        const auto & windows = observer->second;
+        auto current =
+            std::lower_bound(windows.begin(), windows.end(), begin_ns, [](const auto & window, std::int64_t time_ns) { return window.second <= time_ns; });
+        for (; current != windows.end() && current->first < end_ns; ++current)
+            excluded.emplace_back(std::max(begin_ns, current->first), std::min(end_ns, current->second));
     }
 
-    // Waiting is a dependency, so remove its extent from CPU service candidates.
-    std::sort(waits.begin(), waits.end());
+    // Wait dependencies and explicit observer work retain their graph facts,
+    // but neither contributes native CPU service or a measured CPU cost.
+    std::sort(excluded.begin(), excluded.end());
     std::vector<std::pair<std::int64_t, std::int64_t>> segments;
     auto cursor_ns = begin_ns;
-    for (const auto & [wait_begin, wait_end] : waits) {
-        if (cursor_ns < wait_begin) segments.emplace_back(cursor_ns, wait_begin);
-        cursor_ns = std::max(cursor_ns, wait_end);
+    for (const auto & [excluded_begin, excluded_end] : excluded) {
+        if (cursor_ns < excluded_begin) segments.emplace_back(cursor_ns, excluded_begin);
+        cursor_ns = std::max(cursor_ns, excluded_end);
     }
     if (cursor_ns < end_ns) segments.emplace_back(cursor_ns, end_ns);
 
@@ -1304,7 +1386,7 @@ void AscendSourceExtractor::observe_cpu_control(std::size_t lane, std::int64_t b
             const auto change = scopes.upper_bound(cursor_ns);
             auto scope = recorded_scope;
             if (!scope && change != scopes.begin()) scope = std::prev(change)->second;
-            graph_.observe(SourceSpanKind::CpuControl, lane, cursor_ns, next_ns, owner, source_interval, part, std::nullopt, scope);
+            graph_.observe(SourceSpanKind::CpuControl, lane, cursor_ns, next_ns, owner, source_interval, std::nullopt, scope);
             cursor_ns = next_ns;
             if (point != cuts.end()) ++point;
         }
@@ -1329,63 +1411,22 @@ void AscendSourceExtractor::extract_cpu_control() {
                     selection_ns = graph_.boundaries()[graph_.spans()[*child.marker].begin].observed_time_ns;
                 }
             }
-            observe_cpu_control(lane, begin_ns, selection_ns, index, marker.source_interval, SourceCpuPart::SchedulePrefix);
+            observe_cpu_control(lane, begin_ns, selection_ns, index, marker.source_interval);
             continue;
         }
 
         if (call.step == StepKind::Prepare) {
-            observe_cpu_control(lane, begin_ns, end_ns, index, marker.source_interval, SourceCpuPart::PrepareBody);
+            observe_cpu_control(lane, begin_ns, end_ns, index, marker.source_interval);
             const auto schedule = call.serving_parent(calls_);
             if (schedule && calls_[*schedule].marker) {
                 const SourceSpan parent = graph_.spans()[*calls_[*schedule].marker];
                 const auto returned_ns = graph_.boundaries()[parent.end].observed_time_ns;
-                observe_cpu_control(lane, end_ns, returned_ns, index, parent.source_interval, SourceCpuPart::PrepareSuffix);
+                observe_cpu_control(lane, end_ns, returned_ns, index, parent.source_interval);
             }
             continue;
         }
 
-        const auto part = call.step == StepKind::Publish ? SourceCpuPart::Publish : SourceCpuPart::Execute;
-        observe_cpu_control(lane, begin_ns, end_ns, index, marker.source_interval, part);
-    }
-}
-
-void AscendSourceExtractor::bind_worker_cpu(const nlohmann::json & intervals, const nlohmann::json & flows) {
-    std::map<std::pair<BoundaryId, BoundaryId>, SourceSpanId> submissions;
-    for (const auto & flow : flows) {
-        if (flow.value("source_binding", "") != "native_flow_runtime_submission") continue;
-        const auto identity = flow.at("source_intervals").at(0).get<SourceSpanId>();
-        const auto & span = graph_.spans()[identity];
-        submissions.emplace(std::pair{ span.begin, span.end }, identity);
-    }
-
-    std::map<std::size_t, std::vector<SourceSpanId>> services;
-    for (SourceSpanId identity = 0; identity < graph_.spans().size(); ++identity) {
-        const auto & span = graph_.spans()[identity];
-        if (span.kind == SourceSpanKind::CpuControl && span.control_part == SourceCpuPart::Dispatch && span.source_interval)
-            services[*span.source_interval].push_back(identity);
-    }
-
-    for (auto & [worker, members] : services) {
-        const auto name = intervals.at(worker).at("name").get<std::string>();
-        if (!name.starts_with("Dequeue@") || members.size() != 3) continue;
-        std::ranges::sort(members, [&](SourceSpanId left, SourceSpanId right) {
-            return graph_.boundaries()[graph_.spans()[left].begin].observed_time_ns < graph_.boundaries()[graph_.spans()[right].begin].observed_time_ns;
-        });
-
-        const auto & before = graph_.spans()[members[0]];
-        const auto & call = graph_.spans()[members[1]];
-        const auto & after = graph_.spans()[members[2]];
-        const auto & window = graph_.spans()[worker];
-        if (before.begin != window.begin || before.end != call.begin || call.end != after.begin || after.end != window.end) continue;
-        const auto submission = submissions.find({ call.begin, call.end });
-        if (submission == submissions.end()) continue;
-
-        // Bind existing complete services only. Extra waits or cuts are neither
-        // removed nor assigned a fraction of a whole-worker measurement.
-        const auto operation = name.substr(std::string_view("Dequeue@").size());
-        graph_.observe_cpu_work(members[0], { operation, CpuSubmissionPart::Before, submission->second });
-        graph_.observe_cpu_work(members[1], { operation, CpuSubmissionPart::Call, submission->second });
-        graph_.observe_cpu_work(members[2], { operation, CpuSubmissionPart::After, submission->second });
+        observe_cpu_control(lane, begin_ns, end_ns, index, marker.source_interval);
     }
 }
 
@@ -1444,14 +1485,7 @@ void AscendSourceExtractor::extract_worker_cpu() {
                     coverage->end_ns = time_ns;
                 }
                 else {
-                    if (coverage)
-                        observe_cpu_control(lane,
-                                            coverage->begin_ns,
-                                            coverage->end_ns,
-                                            coverage->owner,
-                                            coverage->source_interval,
-                                            SourceCpuPart::Dispatch,
-                                            coverage->scope);
+                    if (coverage) observe_cpu_control(lane, coverage->begin_ns, coverage->end_ns, coverage->owner, coverage->source_interval, coverage->scope);
                     coverage = Coverage{ previous_ns, time_ns, owner, source_interval, scope };
                 }
             }
@@ -1478,14 +1512,7 @@ void AscendSourceExtractor::extract_worker_cpu() {
 
         // Nested observations remain in the graph. Only identical continuous
         // service coverage is combined; observe_cpu_control retains causal cuts.
-        if (coverage)
-            observe_cpu_control(lane,
-                                coverage->begin_ns,
-                                coverage->end_ns,
-                                coverage->owner,
-                                coverage->source_interval,
-                                SourceCpuPart::Dispatch,
-                                coverage->scope);
+        if (coverage) observe_cpu_control(lane, coverage->begin_ns, coverage->end_ns, coverage->owner, coverage->source_interval, coverage->scope);
 
         if (conflicts != 0) {
             gaps_.push_back({
@@ -1529,7 +1556,8 @@ void AscendSourceExtractor::complete_device_work() {
     }
 }
 
-nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & manifest_path, nlohmann::json manifest) {
+nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & manifest_path, nlohmann::json manifest,
+                                              const std::filesystem::path & work_directory) {
     if (manifest.at("role") != "base") throw std::invalid_argument("source extraction requires a role=base manifest");
 
     const auto directory = manifest_path.parent_path();
@@ -1552,8 +1580,7 @@ nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & mani
     // CPU segmentation needs the flow endpoints and explicit waits collected above.
     extract_cpu_control();
     extract_worker_cpu();
-    bind_worker_cpu(facts.at("intervals"), facts.at("flows"));
-    if (const auto unresolved = bindings_.bind_transfers(graph_, facts.at("intervals"), facts.at("native_api"), calls_))
+    if (const auto unresolved = read_transfers(facts.at("intervals"), facts.at("native_api")))
         gaps_.push_back({
             {      "kind",                    "observation" },
             {    "reason", "transfer_parameters_unresolved" },
@@ -1565,8 +1592,8 @@ nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & mani
     const auto summary = graph_.seal();
 
     const bool acyclic = summary.visited_boundaries == summary.boundaries;
-    const auto graph_path = directory / "source_graph.json";
-    const auto template_path = directory / "templates.json";
+    const auto graph_path = work_directory / "source_graph.json";
+    const auto template_path = work_directory / "templates.json";
     graph_.write(graph_path);
     const auto templates = bindings_.extract_blocks(graph_, calls_, native_api_members_, native_dense_path_);
     write_json(template_path, templates);
@@ -1584,9 +1611,9 @@ nlohmann::json AscendSourceExtractor::extract(const std::filesystem::path & mani
         });
     }
 
-    manifest["source_graph"] = graph_path.filename().string();
-    manifest["source_dag"] = acyclic ? nlohmann::json(graph_path.filename().string()) : nlohmann::json(nullptr);
-    manifest["templates"] = template_path.filename().string();
+    manifest["source_graph"] = std::filesystem::relative(graph_path, directory).string();
+    manifest["source_dag"] = acyclic ? manifest["source_graph"] : nlohmann::json(nullptr);
+    manifest["templates"] = std::filesystem::relative(template_path, directory).string();
     manifest.erase("compiled_templates");
 
     // Each stage owns its gap list. Re-extracting a captured base replaces this

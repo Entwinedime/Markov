@@ -2,101 +2,50 @@
 
 from __future__ import annotations
 
-import json
 import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from markov_collection.adapters.runtimes.ascend.torch_npu.profiling import AscendProfileWindow
-from markov_collection.adapters.runtimes.pytorch.profiling import TorchProfilerMarkers
+from markov_collection.adapters.frameworks.sglang.batch_observer import SGLangProfileObserver
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.instrumentation.blocks import BlockWrapper, BoundBlock
 from markov_collection.instrumentation.native_regions import BoundNativeRegion, NativeRegions, NativeRegionWrapper
 from markov_collection.instrumentation.recording import Observation, Recorder
 
 
-class SGLangObserver:
+class SGLangObserver(SGLangProfileObserver):
     def __init__(
         self, directory: Path, request_ids: set[str], regions: dict[str, Any], *, capture_cleanup: bool = False
     ) -> None:
-        self.directory = directory
-        self.request_ids = request_ids
-        self.recorder: Recorder | None = None
-        self.profile = AscendProfileWindow(self.directory.parent / "workspace_states")
-        self._batch_sequence = 0
-        self._batch_ids: dict[int, int] = {}
-        self._finished_ids: set[str] = set()
+        super().__init__(directory, request_ids)
         self.capture_cleanup = capture_cleanup
         self._cleaned_ids: set[str] = set()
         self._schedule_filters: list[dict[str, list[str]]] | None = None
         self._regions = NativeRegions(regions)
 
-    def _recorder(self, rank: int) -> Recorder:
-        if self.recorder is None:
-            self.recorder = Recorder(self.directory, rank, TorchProfilerMarkers())
-
-        return self.recorder
-
-    def _tracked(self, reqs: list[Any]) -> bool:
-        return any(req.rid in self.request_ids and not req.finished() for req in reqs)
-
-    def _batch(self, batch: Any, phase: str) -> dict[str, Any]:
-        requests = []
-        for req in batch.reqs:
-            prompt_tokens = len(req.origin_input_ids)
-            generated_tokens = len(req.output_ids)
-            requests.append(
-                {
-                    "id": req.rid,
-                    "input_tokens": req.extend_input_len if phase == "prefill" else 1,
-                    "context_tokens": len(req.prefix_indices)
-                    if phase == "prefill"
-                    else prompt_tokens + generated_tokens - 1,
-                    "prompt_tokens": prompt_tokens,
-                    "generated_tokens": generated_tokens,
-                }
-            )
-
-        return {"batch_id": self._batch_ids[id(batch)], "phase": phase, "requests": requests}
-
     def forward(self, original: Callable[..., Any], worker: Any, batch: Any, *args: Any, **kwargs: Any) -> Any:
         if not self._tracked(batch.reqs):
             return original(worker, batch, *args, **kwargs)
 
-        # Current SGLang defers input H2D/gather to resolve_forward_inputs. The
-        # device tensor exists here, rather than at prepare_for_extend/decode return.
-        phase = "prefill" if batch.forward_mode.is_extend() else "decode"
-        metadata = self._batch(batch, phase)
-        metadata.update(
-            input_shape=list(batch.input_ids.shape),
-            input_dtype=str(batch.input_ids.dtype),
-            input_stride=list(batch.input_ids.stride()),
-            input_device=str(batch.input_ids.device),
-        )
+        with self.markers.observer():
+            # Inputs exist here after native H2D/gather. Reading their metadata
+            # and installing wrappers are collection work, outside the model body.
+            phase = "prefill" if batch.forward_mode.is_extend() else "decode"
+            metadata = self._batch(batch, phase)
+            metadata.update(
+                input_shape=list(batch.input_ids.shape),
+                input_dtype=str(batch.input_ids.dtype),
+                input_stride=list(batch.input_ids.stride()),
+                input_device=str(batch.input_ids.device),
+            )
 
-        self._regions.install(worker.model_runner.model, self.recorder)
-        self._regions.install_components(worker.model_runner, self.recorder, "model_runner")
-        with self.recorder.scope("model_forward", metadata):
+            self._regions.install(worker.model_runner.model, self.recorder)
+            self._regions.install_components(worker.model_runner, self.recorder, "model_runner")
+            observation = self.recorder.scope("model_forward", metadata)
+
+        with observation:
             return original(worker, batch, *args, **kwargs)
-
-    def start_profile(self, original: Callable[..., Any], manager: Any, *args: Any, **kwargs: Any) -> Any:
-        self.profile.begin(manager.ps.tp_rank)
-        # Observe allocator changes during profiler startup as well as requests.
-        # Warmup state is read above; starting a journal must not imply an empty cache.
-        self._recorder(manager.ps.tp_rank)
-
-        with self.profile.starting():
-            return original(manager, *args, **kwargs)
-
-    def stop_profile(self, original: Callable[..., Any], manager: Any, *args: Any, **kwargs: Any) -> Any:
-        with self.profile.stopping():
-            result = original(manager, *args, **kwargs)
-        if self.recorder is not None:
-            self.recorder.flush_native(close_window=True)
-        self.profile.end()
-
-        return result
 
 
 class SGLangBlockWrapper(BlockWrapper):
@@ -112,7 +61,7 @@ class SGLangBlockWrapper(BlockWrapper):
             )
             for binding in bindings
         )
-        super().__init__(blocks)
+        super().__init__(blocks, observer.markers)
         self.observer = observer
 
 
@@ -189,7 +138,7 @@ class SGLangScheduleWrapper(SGLangBlockWrapper):
 class SGLangBatchWrapper(BlockWrapper):
     def __init__(self, observer: SGLangObserver, contract: dict[str, Any], binding: dict[str, Any]) -> None:
         parameters = tuple(parameter["name"] for parameter in contract["definition"]["parameters"])
-        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),))
+        super().__init__((BoundBlock(binding["id"], binding["step"], binding["phase"], parameters),), observer.markers)
         self.observer = observer
         self.binding = binding
 
@@ -387,146 +336,95 @@ class SGLangRegionHook:
         self.wrapper_type = wrapper_type
 
     def invoke(self, original: Callable[..., Any], component: Any, *args: Any, **kwargs: Any) -> Any:
-        recorder = self.observer.recorder
-        if recorder is None or not recorder.in_scope():
+        with self.observer.markers.observer():
+            recorder = self.observer.recorder
+            active = recorder is not None and recorder.in_scope()
+            if active:
+                # Retain the native hook-chain function; wrapper construction
+                # observes its signature but never advances serving state.
+                native = original.__get__(component, type(component))
+                wrapper = self.wrapper_type(self.binding, self.binding.identity, component, recorder, native)
+
+        if not active:
             return original(component, *args, **kwargs)
 
-        # Bind the native function supplied by the hook chain, not the patched
-        # class attribute. Keep invocation state local and leave slots untouched.
-        native = original.__get__(component, type(component))
-        wrapper = self.wrapper_type(self.binding, self.binding.identity, component, recorder, native)
         return wrapper(*args, **kwargs)
 
 
-def install() -> None:
-    prepared_input = os.environ.get("MARKOV_PREPARED_INPUT")
-    if prepared_input is None:
-        return
-
-    # SGLang loads this entry point in each worker before starting its scheduler.
-    # Hooks only observe native calls; third_party and installed source stay intact.
+def install(prepared: dict[str, Any]) -> None:
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
-    with Path(prepared_input).open(encoding="utf-8") as stream:
-        prepared = json.load(stream)
+    observer = SGLangObserver(
+        Path(os.environ["MARKOV_OBSERVATIONS"]),
+        {request["id"] for request in prepared["requests"]},
+        prepared["native_regions"],
+        capture_cleanup=prepared["role"] == "base",
+    )
 
-    cpu_sampling = prepared["role"] == "performance" and prepared["measurement_kind"] == "cpu"
-    if cpu_sampling:
-        from markov_collection.adapters.frameworks.sglang.cpu_sampling import CpuSamplingObserver
+    # Inline hooks stay inside the serving wrapper on a shared target.
+    from markov_collection.adapters.frameworks.sglang.inline import (
+        SGLangAdmissionBudget,
+        SGLangAdmissionPrefix,
+        SGLangBatchTransition,
+        SGLangDecodeUpdatePrefix,
+        SGLangInlineMethod,
+        SGLangLastLocation,
+        SGLangLastLocations,
+        SGLangPrefillStatistics,
+        SGLangRequestPublication,
+    )
 
-        observer = CpuSamplingObserver(
-            Path(os.environ["MARKOV_CPU_SAMPLES"]),
-            set(prepared["measurement_ids"]),
-            set(prepared["warmup_ids"]),
-            prepared["native_regions"],
-        )
-    elif prepared["role"] in {"base", "validation"}:
-        observer = SGLangObserver(
-            Path(os.environ["MARKOV_OBSERVATIONS"]),
-            {request["id"] for request in prepared["requests"]},
-            prepared["native_regions"],
-            capture_cleanup=prepared["role"] == "base",
-        )
-    else:
-        observer = SGLangObserver(
-            Path(os.environ["MARKOV_OBSERVATIONS"]),
-            set(prepared["measurement_ids"]) | set(prepared["warmup_ids"]),
-            prepared["native_regions"],
-        )
+    regions = prepared["native_regions"]
+    inline_regions = {
+        "batch_transition": SGLangBatchTransition,
+        "decode_update_prefix": SGLangDecodeUpdatePrefix,
+        "admission_prefix": SGLangAdmissionPrefix,
+        "admission_budget": SGLangAdmissionBudget,
+        "prefill_statistics": SGLangPrefillStatistics,
+        "request_publication": SGLangRequestPublication,
+        "last_locations": SGLangLastLocations,
+        "last_location": SGLangLastLocation,
+    }
+    methods = {}
+    for binding in regions["bindings"]:
+        region_type = inline_regions.get(binding["semantic"])
+        if region_type is not None:
+            region = region_type(observer, regions, binding)
+            methods.setdefault(binding["hook"], []).append(region)
 
-    if not cpu_sampling:
-        # Inline hooks must be inside the serving wrapper on a shared target.
-        from markov_collection.adapters.frameworks.sglang.inline import (
-            SGLangAdmissionBudget,
-            SGLangAdmissionPrefix,
-            SGLangBatchTransition,
-            SGLangDecodeUpdatePrefix,
-            SGLangInlineMethod,
-            SGLangLastLocation,
-            SGLangLastLocations,
-            SGLangPrefillStatistics,
-            SGLangRequestPublication,
-        )
+    for hook, method_regions in methods.items():
+        method = SGLangInlineMethod(method_regions, observer.markers)
+        HookRegistry.register(hook, method.invoke, HookType.AROUND)
 
-        regions = prepared["native_regions"]
-        inline_regions = {
-            "batch_transition": SGLangBatchTransition,
-            "decode_update_prefix": SGLangDecodeUpdatePrefix,
-            "admission_prefix": SGLangAdmissionPrefix,
-            "admission_budget": SGLangAdmissionBudget,
-            "prefill_statistics": SGLangPrefillStatistics,
-            "request_publication": SGLangRequestPublication,
-            "last_locations": SGLangLastLocations,
-            "last_location": SGLangLastLocation,
-        }
-        methods = {}
-        for binding in regions["bindings"]:
-            region_type = inline_regions.get(binding["semantic"])
-            if region_type is not None:
-                region = region_type(observer, regions, binding)
-                methods.setdefault(binding["hook"], []).append(region)
+    definitions = {definition["step"]: definition for definition in prepared["blocks"]}
+    wrappers = {
+        "schedule": SGLangScheduleWrapper,
+        "prepare": SGLangPrepareWrapper,
+        "execute": SGLangExecutionWrapper,
+        "publish": SGLangPublishWrapper,
+    }
+    hooks: dict[str, list[dict[str, Any]]] = {}
+    for binding in prepared["block_bindings"]:
+        hooks.setdefault(binding["hook"], []).append(binding)
 
-        for hook, method_regions in methods.items():
-            method = SGLangInlineMethod(method_regions)
-            HookRegistry.register(hook, method.invoke, HookType.AROUND)
+    # One native hook may implement several phase-specific standard blocks.
+    for hook, bindings in hooks.items():
+        wrapper = wrappers[bindings[0]["wrapper"]](observer, definitions, bindings)
+        HookRegistry.register(hook, wrapper.invoke, HookType.AROUND)
 
-    if cpu_sampling:
-        scheduler = "sglang.srt.managers.scheduler.Scheduler"
-        batch = "sglang.srt.managers.schedule_batch.ScheduleBatch"
-        HookRegistry.register(f"{scheduler}.get_next_batch_to_run", observer.schedule, HookType.AROUND)
-        HookRegistry.register(f"{batch}.prepare_for_extend", observer.prepare_prefill, HookType.AROUND)
-        HookRegistry.register(f"{batch}.prepare_for_decode", observer.prepare_decode, HookType.AROUND)
-        HookRegistry.register(f"{scheduler}.run_batch", observer.execute, HookType.AROUND)
-        HookRegistry.register(f"{scheduler}.process_batch_result", observer.publish, HookType.AROUND)
-        for binding in prepared["native_regions"]["bindings"]:
-            if binding["semantic"] == "admission_budget":
-                HookRegistry.register(binding["hook"], observer.admission_budget, HookType.AROUND)
-    else:
-        definitions = {definition["step"]: definition for definition in prepared["blocks"]}
-        wrappers = {
-            "schedule": SGLangScheduleWrapper,
-            "prepare": SGLangPrepareWrapper,
-            "execute": SGLangExecutionWrapper,
-            "publish": SGLangPublishWrapper,
-        }
-        hooks: dict[str, list[dict[str, Any]]] = {}
-        for binding in prepared["block_bindings"]:
-            hooks.setdefault(binding["hook"], []).append(binding)
+    region_wrappers = {
+        "batch_output": SGLangOutputWrapper,
+        "input_resolution": SGLangInputResolutionWrapper,
+    }
+    for binding in regions["bindings"]:
+        if binding["semantic"] in region_wrappers:
+            wrapper = SGLangRegionHook(observer, regions, binding, region_wrappers[binding["semantic"]])
+            HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
+        elif binding["semantic"] in {"batch_filter", "batch_merge"}:
+            wrapper = SGLangBatchWrapper(observer, regions, binding)
+            HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
 
-        # One native hook may implement several phase-specific standard blocks.
-        for hook, bindings in hooks.items():
-            wrapper = wrappers[bindings[0]["wrapper"]](observer, definitions, bindings)
-            HookRegistry.register(hook, wrapper.invoke, HookType.AROUND)
-
-    if not cpu_sampling:
-        regions = prepared["native_regions"]
-        region_wrappers = {
-            "batch_output": SGLangOutputWrapper,
-            "input_resolution": SGLangInputResolutionWrapper,
-        }
-        for binding in regions["bindings"]:
-            if binding["semantic"] in region_wrappers:
-                wrapper = SGLangRegionHook(observer, regions, binding, region_wrappers[binding["semantic"]])
-                HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
-            elif binding["semantic"] in {"batch_filter", "batch_merge"}:
-                wrapper = SGLangBatchWrapper(observer, regions, binding)
-                HookRegistry.register(binding["hook"], wrapper.invoke, HookType.AROUND)
-
-        HookRegistry.register(
-            "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation", observer.forward, HookType.AROUND
-        )
-        HookRegistry.register(
-            "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._start_profile",
-            observer.start_profile,
-            HookType.AROUND,
-        )
-        HookRegistry.register(
-            observer.profile.configuration_hook,
-            observer.profile.configure,
-            HookType.AROUND,
-        )
-        HookRegistry.register(
-            "sglang.srt.managers.scheduler_components.profiler_manager.SchedulerProfilerManager._stop_profile",
-            observer.stop_profile,
-            HookType.AROUND,
-        )
+    HookRegistry.register(
+        "sglang.srt.managers.tp_worker.TpModelWorker.forward_batch_generation", observer.forward, HookType.AROUND
+    )
+    observer.install_profile_hooks()

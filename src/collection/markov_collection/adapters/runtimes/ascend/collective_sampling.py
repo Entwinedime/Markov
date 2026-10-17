@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
 import socket
@@ -29,7 +30,7 @@ class CollectiveWorker:
         import torch.distributed as distributed
         import torch_npu
 
-        world_size = self.prepared["configuration"]["tp_size"]
+        world_size = len(self.prepared["environment"]["devices"])
         torch.npu.set_device(self.rank)
         distributed.init_process_group(
             backend="hccl",
@@ -123,15 +124,17 @@ class NativeCollectiveSampling(CaptureSession):
             listener.bind(("127.0.0.1", 0))
             port = listener.getsockname()[1]
 
-        world_size = self.prepared["configuration"]["tp_size"]
+        world_size = len(self.prepared["environment"]["devices"])
         multiprocessing.spawn(run_worker, args=(self.prepared, self.directory, port), nprocs=world_size, join=True)
 
         write_json(
             self.directory / "native_environment.json",
             {
                 "framework": self.prepared["framework"],
+                "framework_version": importlib.metadata.version(self.prepared["framework"]),
                 "configuration": self.prepared["configuration"],
                 "deployment": self.prepared["environment"],
+                "runtime": RuntimeEnvironment().describe(),
                 "backend": "hccl",
                 "workers": [f"rank-{rank}-environment.json" for rank in range(world_size)],
                 "profiler_enabled": True,
