@@ -1,4 +1,5 @@
 .cache/
+.ruff_cache/
 .DS_Store
 .env
 .env.*
@@ -20,5 +21,6 @@ venv/
 
 # Local runtime assets
 /data/
+/export_only_prof_dir/
 kernel_meta/
 
