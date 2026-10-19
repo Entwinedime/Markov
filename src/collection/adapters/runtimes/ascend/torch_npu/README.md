@@ -16,12 +16,12 @@ Python 配套位于 `src/collection/markov_collection/adapters/runtimes/ascend/t
 
 部署时替换三个原生库及 profiler reader，保留匹配 wheel 的 Python 扩展；包内 `markov_workspace_build.json` 记录真实安装来源。没有观察库回调时不产生 journal；启用观察后记录请求大小、设备/stream、前后容量及地址、成功或失败。独立 `markov.workspace` 文件避免与另一缓冲写入器交错，停止 profiling 后使用原生解码器合并。
 
-当前 SGLang 镜像装配该适配，KT 镜像不装配。已取得的证据覆盖 cached 分配、扩容、复用、清空，以及限定 SGLang serving 窗口；uncached 仅观察申请，释放未覆盖。目标需求、模板消费及等待关系的资格由相应规则与证据判断，当前状态见[实施计划](../../../../../../docs/redesign-workflow/2026-10-08_redesign_execution_plan.md)。不能因框架同用 torch_npu 就推定采集或预测资格相同。
+SGLang 镜像装配该适配，KT 镜像不装配。cached 分配、扩容、复用和清空可提供观察事实；uncached 仅观察申请，释放未覆盖。目标需求、模板消费及等待关系还须由对应规则与实际证据判断，不能因框架同用 torch_npu 就推定采集或预测资格相同。
 
 升级 torch_npu 时一并核对 allocator 插入点、profiler 格式与写入器、Python 快照 API、ABI 和依赖，修改当前适配并重新验证；不增加按版本并列维护的实现。此目录不改变官方 submodule，所有补丁作用于镜像内构建副本。
 
 同步传输采样由相邻 native 库的 `transfer_sampling` 实现。Python 只读原生 batch 元数据并设置观察 scope；入队将该身份与原生 correlation ID 关联，worker 取回同一身份。队列区间只用于配对、确认成功和检查叶子归属，不产生 CPU 服务成本。同步 `drvMemcpy` 叶子保留完整单调墙钟首尾，不扣除 I/O 等待，也不拿外层 `rtMemcpyAsync` 或整个 worker 的墙钟替代传输时延。
 
-当前队列入口为 `markov_native_queue_begin(correlation_id, worker)`。部署时须将新的 native 库与使用当前队列头文件重新编译的 torch_npu 一同安装；历史 enqueue/scope 镜像使用的四参数入口不能用于当前 transfer 采样。`markov-transfer-20261016-sglang:ubuntu22.04`已完成本次成套部署，真实transfer运行验证了队列配对及完整driver记录；旧镜像不能因此获得相同资格。独立单元与目标精度仍见实施计划。
+队列入口为 `markov_native_queue_begin(correlation_id, worker)`。部署时须将 native 库与使用同一队列头文件重编译的 torch_npu 一同安装；历史四参数入口不能用于此 transfer 采样。实际安装来源由 `markov_workspace_build.json` 记录，队列配对和完整 driver 记录仍需运行核对，不能由镜像名称推定精度资格。
 
 只有已跟踪的队列 worker、已配对成功的入队和完整观察 scope 能提供同步传输样本。没有队列身份、失败或不完整的记录保留为缺口；不会按时间邻近推断归属。采样不启用 CPU operator profiler，不记录提交计数、CPU 等待/探针扣减或完整 Enqueue 服务时间。现有结构采集的 task、queue、event、wait 和 workspace 因果继续由原生 trace 与 journal 提供。
