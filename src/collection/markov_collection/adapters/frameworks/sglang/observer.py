@@ -29,16 +29,9 @@ class SGLangObserver(SGLangProfileObserver):
             return original(worker, batch, *args, **kwargs)
 
         with self.markers.observer():
-            # Inputs exist here after native H2D/gather. Reading their metadata
-            # and installing wrappers are collection work, outside the model body.
+            # Installing wrappers is collection work, outside the model body.
             phase = "prefill" if batch.forward_mode.is_extend() else "decode"
             metadata = self._batch(batch, phase)
-            metadata.update(
-                input_shape=list(batch.input_ids.shape),
-                input_dtype=str(batch.input_ids.dtype),
-                input_stride=list(batch.input_ids.stride()),
-                input_device=str(batch.input_ids.device),
-            )
 
             self._regions.install(worker.model_runner.model, self.recorder)
             self._regions.install_components(worker.model_runner, self.recorder, "model_runner")

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "markov/templates/kv_workload.hpp"
+#include "markov/contracts/control.hpp"
+#include "markov/graph/source_graph.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,7 +47,6 @@ public:
           release_member_inputs_(release_member_inputs) {}
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input,
                                                       std::optional<std::size_t> request_slot = std::nullopt) const;
-    nlohmann::json describe_parameters() const;
     std::optional<bool> allocation_branch() const { return domain_.allocates_pages; }
 
 private:

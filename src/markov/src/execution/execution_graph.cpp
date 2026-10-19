@@ -1,5 +1,6 @@
 #include "markov/execution/execution_graph.hpp"
 
+#include "markov/graph/directed_graph.hpp"
 #include "markov/performance/cost_query.hpp"
 
 #include <nlohmann/json.hpp>
@@ -28,21 +29,23 @@ std::size_t ExecutionGraph::register_source(const std::filesystem::path & manife
 
 bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<const InvokeStep> invocations, std::int64_t release_ns) {
     pending_port_ = ports_.size();
+    const auto first_node = nodes_.size();
     std::map<std::pair<std::size_t, BoundaryId>, BoundaryId> shared;
     for (const auto * instance : instances) {
         const auto & definition = *instance->definition;
         const auto source_asset = register_source(definition.source_manifest);
         auto & local = instance_boundaries_[{ instance->work_id, definition.rank }];
         local.reserve(definition.graph.boundary_count());
-        for (const auto & boundary : definition.boundary_observations) {
+        for (std::size_t index = 0; index < definition.boundary_observations.size(); ++index) {
+            const auto & boundary = definition.boundary_observations[index];
             const auto [position, inserted] = shared.try_emplace(std::pair{ source_asset, boundary.source_boundary }, boundaries_.size());
-            if (inserted) boundaries_.push_back({ boundary.source_boundary, source_asset, batches_, release_ns });
+            if (inserted) boundaries_.push_back({ boundary.source_boundary, source_asset, batches_, release_ns, definition.cpu_boundary(index) });
             local.push_back(position->second);
         }
         // Donor provenance does not grant sharing with any other insertion.
         for (const auto & boundary : instance->topology.inserted_boundaries()) {
             local.push_back(boundaries_.size());
-            boundaries_.push_back({ boundary.source_boundary, register_source(*boundary.source_manifest), batches_, release_ns });
+            boundaries_.push_back({ boundary.source_boundary, register_source(*boundary.source_manifest), batches_, release_ns, boundary.cpu });
         }
     }
 
@@ -50,6 +53,9 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
     // in a later iteration creates new target points instead of aliasing old work.
     std::set<std::pair<std::size_t, SourceSpanId>> members;
     std::set<std::tuple<BoundaryId, BoundaryId, std::optional<SourceRelation>>> constraints;
+    // Resolved connections retain their edge semantics. Only interfaces with
+    // no current edge need an explicit cut for CPU service grouping.
+    std::vector<BoundaryId> interfaces;
     for (const auto * instance : instances) {
         const auto & definition = *instance->definition;
         const auto source_asset = register_source(definition.source_manifest);
@@ -59,14 +65,11 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
             const auto & node_observation = definition.observation(node);
             if (members.emplace(source_asset, node_observation.source_span).second) {
                 const auto * transfer = instance->transfer(node);
-                // Preserve host boundaries and causality without pricing control
-                // service. A synchronous host copy remains physical transfer work.
-                const auto role = node.kind == SourceSpanKind::CpuControl && !transfer ? TemplateNodeRole::Annotation : node.role();
                 nodes_.push_back({ instance->work_id,
                                    definition.rank,
                                    source_asset,
                                    node_observation.source_span,
-                                   role,
+                                   node.role(),
                                    node.kind,
                                    instance->kernel(node),
                                    instance->communication(node),
@@ -82,12 +85,11 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
         for (const auto & inserted : instance->topology.inserted_nodes()) {
             const auto & node = inserted.node;
             const auto * transfer = inserted.transfer();
-            const auto role = node.kind == SourceSpanKind::CpuControl && !transfer ? TemplateNodeRole::Annotation : node.role();
             nodes_.push_back({ instance->work_id,
                                definition.rank,
                                register_source(inserted.definition->source_manifest),
                                inserted.observation().source_span,
-                               role,
+                               node.role(),
                                node.kind,
                                inserted.kernel(),
                                inserted.communication(),
@@ -111,23 +113,38 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
 
         for (const auto & [boundary, binding] : instance->resource_imports) {
             if (binding.rule == TemplateConnectionRule::Unresolved) {
+                interfaces.push_back(local[boundary]);
                 unresolved_.push_back({ instance->work_id, definition.rank, std::nullopt, std::nullopt });
                 continue;
             }
-            for (const auto & peer : binding.peers) constraints.emplace(resolve(peer), local[boundary], std::nullopt);
+            if (binding.peers.empty()) interfaces.push_back(local[boundary]);
+            const auto domain = instance->lane(instance->boundary(boundary).lane).resource().domain;
+            const auto relation = domain == SourceDomain::CpuThread ? SourceRelation::ThreadOrder : SourceRelation::StreamOrder;
+            for (const auto & peer : binding.peers) {
+                const auto remote = resolve(peer);
+                constraints.emplace(remote, local[boundary], relation);
+            }
         }
-        for (const auto & [peer, boundary] : instance->resource_dependencies) constraints.emplace(resolve(peer), local[boundary], std::nullopt);
+        // Replacement resource seams carry FIFO order. The actual dependency
+        // is sufficient; a private seam does not introduce a new CPU cost cut.
+        for (const auto & [peer, boundary] : instance->resource_dependencies) {
+            const auto domain = instance->lane(instance->boundary(boundary).lane).resource().domain;
+            const auto relation = domain == SourceDomain::CpuThread ? SourceRelation::ThreadOrder : SourceRelation::StreamOrder;
+            constraints.emplace(resolve(peer), local[boundary], relation);
+        }
 
         for (const auto & target : instance->connections) {
             const auto & source = target.connection;
             const auto & binding = target.binding;
             if (binding.rule == TemplateConnectionRule::Unresolved) {
+                interfaces.push_back(local[source.local_boundary]);
                 unresolved_.push_back({ instance->work_id, definition.rank, source.source_edge, std::nullopt });
                 continue;
             }
 
             // Initial resources and exports do not invent zero-duration service
             // nodes. Their meaning is the declared start state or future imports.
+            if (binding.peers.empty()) interfaces.push_back(local[source.local_boundary]);
             for (const auto & peer : binding.peers) {
                 const auto remote = resolve(peer);
                 const auto here = local[source.local_boundary];
@@ -171,41 +188,16 @@ bool ExecutionGraph::append(std::span<TemplateInstance *> instances, std::span<c
 
     ++batches_;
     acyclic_ = acyclic();
+    // The partition traverses serial paths; reject a cyclic assembly first.
+    if (acyclic_) group_cpu_services(first_node, invocations, interfaces);
     return acyclic_;
 }
 
-bool ExecutionGraph::acyclic() const {
-    std::vector<std::size_t> incoming(boundaries_.size());
-    std::vector<std::size_t> offsets(boundaries_.size() + 1);
-    for (const auto & edge : edges_) {
-        ++incoming[edge.target];
-        ++offsets[edge.source + 1];
-    }
-    for (std::size_t index = 1; index < offsets.size(); ++index) offsets[index] += offsets[index - 1];
+bool ExecutionGraph::acyclic() const { return DirectedGraph(boundaries_.size(), edges_).acyclic(); }
 
-    auto positions = offsets;
-    std::vector<BoundaryId> successors(edges_.size());
-    for (const auto & edge : edges_) successors[positions[edge.source]++] = edge.target;
+ServiceWork ExecutionGraph::Node::service_work() const { return { kind, kernel, communication, transfer, device_command, cpu ? &*cpu : nullptr }; }
 
-    std::vector<BoundaryId> ready;
-    for (BoundaryId point = 0; point < incoming.size(); ++point) {
-        if (incoming[point] == 0) ready.push_back(point);
-    }
-
-    for (std::size_t cursor = 0; cursor < ready.size(); ++cursor) {
-        const auto point = ready[cursor];
-        for (auto edge = offsets[point]; edge < offsets[point + 1]; ++edge) {
-            const auto target = successors[edge];
-            if (--incoming[target] == 0) ready.push_back(target);
-        }
-    }
-
-    return ready.size() == boundaries_.size();
-}
-
-ServiceWork ExecutionGraph::Node::service_work() const { return { kind, kernel, communication, transfer, device_command }; }
-
-void ExecutionGraph::record_requirement(const CostQuery & query, const NodeCosts & costs, const Node & owner, const InvokeStep & invocation) {
+void ExecutionGraph::record_requirement(const CostQuery & query, const NodeCostResult & measured, const Node & owner, const InvokeStep & invocation) {
     const ServingContract contract;
     auto members = nlohmann::json::array();
     for (const auto & request : invocation.input.requests) {
@@ -217,23 +209,31 @@ void ExecutionGraph::record_requirement(const CostQuery & query, const NodeCosts
             {         "finishes",         request.finishes }
         });
     }
+    auto filters = nlohmann::json::array();
+    for (const auto & filter : invocation.input.filters) filters.push_back(filter.describe());
+    nlohmann::json origin{
+        {          "step",        contract.block(invocation.step).name },
+        {         "phase", contract.phase_name(invocation.input.phase) },
+        {      "requests",                          std::move(members) },
+        { "batch_filters",                          std::move(filters) }
+    };
+    if (invocation.input.merge) origin["batch_merge"] = invocation.input.merge->describe();
 
     // Request provenance constructs native sample inputs; it is deliberately
-    // separate from the cost object's canonical feature identity.
-    requirements_.record(
-        query,
-        costs,
-        {
-            {         "work_id",                            owner.work },
-            {            "rank",                            owner.rank },
-            {     "source_span",                          owner.source },
-            { "source_manifest", sources_[owner.source_asset].string() }
+    // separate from the cost object's canonical feature identity. The selected
+    // members alone cannot reconstruct work that removes a finished member.
+    requirements_.record(query,
+                         measured,
+                         {
+                             {         "work_id",                            owner.work },
+                             {            "rank",                            owner.rank },
+                             {     "source_span",                          owner.source },
+                             { "source_manifest", sources_[owner.source_asset].string() }
     },
-        { { "step", contract.block(invocation.step).name }, { "phase", contract.phase_name(invocation.input.phase) }, { "requests", std::move(members) } });
+                         std::move(origin));
 }
 
-std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::schedule(const NodeCosts & costs,
-                                                                                      const std::map<WorkId, const InvokeStep *> & invocations) {
+std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::schedule(const NodeCosts & costs, std::span<const InvokeStep> invocations) {
     if (!unresolved_.empty()) {
         const auto & missing = unresolved_.front();
         return std::unexpected(ExecutionTimingGap{ missing.source_span ? "target_stream_wait_unresolved" : "target_connection_unresolved",
@@ -251,70 +251,58 @@ std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::sch
     std::optional<ExecutionTimingGap> first_gap;
     constraints.reserve(edges_.size() + nodes_.size());
     for (const auto & edge : edges_) constraints.push_back({ edge.source, edge.target, 0 });
-    for (std::size_t index = 0; index < nodes_.size(); ++index) {
-        auto & node = nodes_[index];
+    for (auto & node : nodes_) {
         if (node.role != TemplateNodeRole::Service) continue;
-        auto & cost = node.cost;
-        if (cost && index < requirement_frontier_) {
-            constraints.push_back({ node.begin, node.end, cost->duration_ns });
+        // A successful earlier batch already owns its immutable estimate and
+        // demand record. Only newly appended work needs invocation context.
+        if (node.cost) {
+            constraints.push_back({ node.begin, node.end, node.cost->duration_ns });
             continue;
         }
 
-        const auto & invocation = *invocations.at(node.work);
+        const auto & invocation = *std::ranges::find(invocations, node.work, &InvokeStep::work_id);
         const auto work = node.service_work();
         const auto query = CostQuery::from_work(work);
-        if (index >= requirement_frontier_) record_requirement(query, costs, node, invocation);
+        const auto measured = costs.query_cost(query);
+        record_requirement(query, measured, node, invocation);
 
-        // Target work and cost providers are immutable for this combination.
-        // Reuse its estimate when later batches extend the same graph.
-        if (!cost) {
-            const auto & manifest = sources_[node.source_asset];
-            const auto duration = costs.estimate(query, NodeCostSource{ &manifest, node.source });
-            if (!duration) {
-                if (!first_gap) first_gap = ExecutionTimingGap{ std::string(duration.error()), node.work, node.rank, node.source, manifest, work.describe() };
-                continue;
-            }
-
-            cost = *duration;
+        // Coverage retains the measured result even when explicit given
+        // durations let this otherwise unmeasured work advance the clock.
+        const auto & manifest = sources_[node.source_asset];
+        std::vector<NodeCostSource> remaining;
+        for (const auto member : node.cpu_members) {
+            const auto & source = nodes_[member];
+            remaining.push_back({ &sources_[source.source_asset], source.source });
         }
-        constraints.push_back({ node.begin, node.end, cost->duration_ns });
+        const auto duration = costs.estimate(measured, NodeCostSource{ &manifest, node.source }, remaining);
+        if (!duration) {
+            if (!first_gap) first_gap = ExecutionTimingGap{ std::string(duration.error()), node.work, node.rank, node.source, manifest, work.describe() };
+            continue;
+        }
+
+        node.cost = *duration;
+        constraints.push_back({ node.begin, node.end, duration->duration_ns });
     }
-    requirement_frontier_ = nodes_.size();
     // Unknown costs never enter the event clock. Analyze the complete assembled
     // frontier first, then return the first execution location plus all demands.
     if (first_gap) return std::unexpected(std::move(*first_gap));
 
     // Waiting and annotations contribute dependencies, not service charges.
     // The runtime supplies release times and remains the sole event clock.
-    std::vector<std::size_t> incoming(boundaries_.size());
-    std::vector<std::size_t> offsets(boundaries_.size() + 1);
-    for (const auto & edge : constraints) {
-        ++incoming[edge.target];
-        ++offsets[edge.source + 1];
-    }
-    for (std::size_t index = 1; index < offsets.size(); ++index) offsets[index] += offsets[index - 1];
-    auto positions = offsets;
-    std::vector<std::size_t> successors(constraints.size());
-    for (std::size_t edge = 0; edge < constraints.size(); ++edge) successors[positions[constraints[edge].source]++] = edge;
+    const DirectedGraph graph(boundaries_.size(), constraints);
+    if (!graph.acyclic()) throw std::logic_error("timed graph contains a dependency cycle");
 
     completion_ns_.clear();
     for (const auto & boundary : boundaries_) completion_ns_.push_back(boundary.release_ns);
-    std::vector<BoundaryId> ready;
-    for (BoundaryId point = 0; point < incoming.size(); ++point) {
-        if (incoming[point] == 0) ready.push_back(point);
-    }
-    for (std::size_t cursor = 0; cursor < ready.size(); ++cursor) {
-        const auto point = ready[cursor];
-        for (auto index = offsets[point]; index < offsets[point + 1]; ++index) {
-            const auto & edge = constraints[successors[index]];
+    for (const auto point : graph.order()) {
+        for (const auto index : graph.outgoing(point)) {
+            const auto & edge = constraints[index];
             if (edge.duration_ns > std::numeric_limits<std::int64_t>::max() - completion_ns_[point]) {
                 throw std::overflow_error("node execution time exceeds int64 nanoseconds");
             }
             completion_ns_[edge.target] = std::max(completion_ns_[edge.target], completion_ns_[point] + edge.duration_ns);
-            if (--incoming[edge.target] == 0) ready.push_back(edge.target);
         }
     }
-    if (ready.size() != boundaries_.size()) throw std::logic_error("timed graph contains a dependency cycle");
 
     // A public port completes once all its rank-local boundaries complete.
     std::map<std::pair<WorkId, PortKind>, std::int64_t> completions;
@@ -328,7 +316,7 @@ std::expected<std::vector<ControlEvent>, ExecutionTimingGap> ExecutionGraph::sch
     return events;
 }
 
-void ExecutionGraph::write(const std::filesystem::path & path) const {
+void ExecutionGraph::write(const std::filesystem::path & path, const nlohmann::json & invocations) const {
     auto temporary = path;
     temporary += ".tmp";
     std::ofstream stream(temporary);
@@ -338,7 +326,7 @@ void ExecutionGraph::write(const std::filesystem::path & path) const {
     // graph in memory. Array indices are target identities within this candidate.
     auto sources = nlohmann::json::array();
     for (const auto & manifest : sources_) sources.push_back(manifest.string());
-    stream << "{\"sources\":" << sources << ",\"boundaries\":[";
+    stream << "{\"sources\":" << sources << ",\"invocations\":" << invocations << ",\"boundaries\":[";
     for (std::size_t index = 0; index < boundaries_.size(); ++index) {
         const auto & boundary = boundaries_[index];
         if (index != 0) stream << ',';
@@ -382,6 +370,8 @@ void ExecutionGraph::write(const std::filesystem::path & path) const {
         if (node.communication) record["communication"] = node.communication->describe();
         if (node.transfer) record["transfer"] = node.transfer->describe();
         if (node.device_command) record["device_command"] = node.device_command->describe();
+        if (node.cpu) record["cpu"] = node.cpu->describe();
+        if (!node.cpu_members.empty()) record["cpu_members"] = node.cpu_members;
         if (node.cost) {
             record["service_cost"] = {
                 { "duration_ns",                                                                     node.cost->duration_ns },

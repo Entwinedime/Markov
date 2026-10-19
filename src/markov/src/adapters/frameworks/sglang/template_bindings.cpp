@@ -1,8 +1,8 @@
 #include "markov/adapters/frameworks/sglang/template_bindings.hpp"
+#include "markov/production/block_binding.hpp"
 
 #include "markov/adapters/frameworks/sglang/copy_layout.hpp"
 
-#include "markov/contracts/json_input.hpp"
 
 #include "markov/adapters/frameworks/sglang/batch_layout.hpp"
 #include "markov/adapters/frameworks/sglang/bindings.hpp"
@@ -29,15 +29,14 @@
 
 namespace markov {
 
-void SGLangTemplateBindings::bind_membership(const nlohmann::json & source_state) {
+void SGLangTemplateBindings::bind_membership(std::span<const SourceBatchFilter> recorded_filters) {
     if (definition_.step != StepKind::Schedule) return;
 
-    const auto & recorded_filters = source_state.at("batch_filters");
     for (const auto & filter : recorded_filters) {
-        const auto before = filter.at("before").get<std::vector<std::string>>();
+        const auto & before = filter.before;
         BatchFilter selection{ before.size(), {} };
-        for (const auto & request : filter.at("after")) {
-            const auto position = std::find(before.begin(), before.end(), request.get<std::string>());
+        for (const auto & request : filter.after) {
+            const auto position = std::find(before.begin(), before.end(), request);
             if (position == before.end()) throw std::invalid_argument("native batch filter introduced a request");
             selection.retained_indices.push_back(static_cast<std::size_t>(position - before.begin()));
         }
@@ -47,27 +46,21 @@ void SGLangTemplateBindings::bind_membership(const nlohmann::json & source_state
     // On the fixed non-overlap decode path, prefill filtering precedes
     // running filtering. The latter's input preserves left+right order.
     if (definition_.phase == BatchPhase::Decode && recorded_filters.size() == 2) {
-        const auto & appended = recorded_filters[0].at("after");
-        const auto & combined = recorded_filters[1].at("before");
+        const auto & appended = recorded_filters[0].after;
+        const auto & combined = recorded_filters[1].before;
         if (!appended.empty() && combined.size() > appended.size() && std::equal(appended.rbegin(), appended.rend(), combined.rbegin()))
             definition_.merge = BatchMerge{ combined.size() - appended.size(), appended.size() };
     }
 }
 
-void SGLangTemplateBindings::bind_publication(const nlohmann::json * published_requests, const nlohmann::json & source_state) {
-    if (definition_.step == StepKind::Publish) {
-        const auto policy = source_state.find("output_policy");
-        if (policy != source_state.end()) {
-            if (!policy->at("non_streaming").get<bool>())
-                throw std::invalid_argument("native streaming output is outside the supported non-streaming serving scope");
-            definition_.output_policy = PeriodicOutputPolicy{ input::positive(policy->at("force_interval_tokens")) };
-        }
+void SGLangTemplateBindings::bind_publication(std::span<const SourcePublication> publications, const std::optional<SourceOutputPolicy> & policy) {
+    if (definition_.step == StepKind::Publish && policy) {
+        if (!policy->non_streaming) throw std::invalid_argument("native streaming output is outside the supported non-streaming serving scope");
+        definition_.output_policy = PeriodicOutputPolicy{ policy->force_interval_tokens };
     }
 
     std::map<std::string, bool> observations;
-    if (published_requests) {
-        for (const auto & request : *published_requests) observations.emplace(request.at("request_id").get<std::string>(), request.at("finished").get<bool>());
-    }
+    for (const auto & publication : publications) observations.emplace(publication.request_id, publication.finished);
 
     // Native identity is resolved only here; consumers use ordered target slots.
     for (const auto & request : definition_.source_requests) {
@@ -94,7 +87,7 @@ void SGLangTemplateBindings::bind_kv(std::uint32_t page_size_tokens) {
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
         if (!node_observation.kernel) continue;
-        auto layout = PagedKvLayout::bind(definition_, node, finished, page_size_tokens);
+        auto layout = PagedKvLayout::bind(definition_, node, native_regions_, finished, page_size_tokens);
         if (!layout) definition_.kv_kernel_layouts.emplace(node_observation.source_span, std::unexpected(layout.error()));
         else if (*layout) definition_.kv_kernel_layouts.emplace(node_observation.source_span, std::move(**layout));
     }
@@ -106,7 +99,8 @@ void SGLangTemplateBindings::bind_kv(std::uint32_t page_size_tokens) {
         }
         for (std::size_t index = 0; index < definition_.regions.size(); ++index) {
             const auto & region = definition_.regions[index];
-            if (region.binding == "sglang.npu.allocator.free_group_end" && region.parent_call == definition_.source_call) {
+            if ((region.semantic == "kv_release_group" && native_regions_.at(region.source_call).method == "free_group_end")
+                && region.parent_call == definition_.source_call) {
                 // In the supported non-overlap path, finished requests populate
                 // this group. An empty group performs no page release.
                 const auto count = finished->size();
@@ -121,7 +115,7 @@ void SGLangTemplateBindings::bind_kv(std::uint32_t page_size_tokens) {
     if (definition_.step != StepKind::Prepare || definition_.phase != BatchPhase::Decode) return;
     for (std::size_t index = 0; index < definition_.regions.size(); ++index) {
         const auto & region = definition_.regions[index];
-        if (region.binding != "sglang.npu.allocator.decode") continue;
+        if (region.semantic != "kv_allocation" || native_regions_.at(region.source_call).method != "alloc_decode") continue;
         std::optional<bool> branch;
         for (const auto node_index : region.nodes) {
             const auto & node = definition_.graph[node_index];
@@ -140,14 +134,16 @@ void SGLangTemplateBindings::bind_kv(std::uint32_t page_size_tokens) {
 
 void SGLangTemplateBindings::bind_release_transfer(std::uint64_t sequence_tokens) {
     for (const auto & group : definition_.regions) {
-        if (group.binding != "sglang.npu.allocator.free_group_end" || group.parent_call != definition_.source_call) continue;
+        if (group.semantic != "kv_release_group" || native_regions_.at(group.source_call).method != "free_group_end"
+            || group.parent_call != definition_.source_call)
+            continue;
 
         // TensorList shapes are absent in ATen. The nested free receives the
         // Cat result and supplies its actual one-dimensional INT32 descriptor.
         const SourceTensorLayout * indices = nullptr;
         for (const auto & child : definition_.regions) {
-            if (child.parent_call != group.source_call || child.binding != "sglang.npu.allocator.free" || !child.module) continue;
-            const auto & value = child.module->inputs.at("free_index");
+            if (child.parent_call != group.source_call || child.semantic != "kv_release") continue;
+            const auto & value = native_regions_.at(child.source_call).inputs.at("free_index");
             if (!value || indices) return;
             indices = &*value;
         }
@@ -197,7 +193,7 @@ void SGLangTemplateBindings::bind_length_domain(std::uint32_t page_size_tokens, 
     // An observed input upload also needs its CPU work parameter before
     // changing lengths. Missing association cannot silently retain source work.
     for (const auto & region : definition_.regions) {
-        if (region.binding != "sglang.inputs.resolve" || !region.module || region.module->result.at("input_copy").is_null()) continue;
+        if (region.semantic != "input_resolution" || native_regions_.at(region.source_call).result.at("input_copy").is_null()) continue;
         std::size_t bound = 0;
         for (const auto index : region.nodes) {
             const auto relation = definition_.transfer_layouts.find(definition_.observation(definition_.graph[index]).source_span);
@@ -275,19 +271,20 @@ void SGLangTemplateBindings::bind_request_pool(const RequestPoolLayout & pool) {
     }
 }
 
-void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
+void SGLangTemplateBindings::bind_regions(std::span<const SourceCall> calls) {
     std::map<std::size_t, TemplateRegion *> local_regions;
     for (auto & region : definition_.regions) local_regions.emplace(region.source_call, &region);
 
     // Topology and local cuts are already assembled. Only the producer knows
     // how a native binding interprets the recorded module parameters.
     const SGLangBindings bindings;
-    for (const auto & source : regions) {
-        if (source.at("serving_call").get<std::size_t>() != definition_.source_call || source.at("module").is_null()) continue;
-        auto & region = *local_regions.at(source.at("source_call").get<std::size_t>());
-        region.module = bindings.region(region.binding.value()).read(source.at("module"));
-        if (region.module->semantic == "decode_update_prefix") {
-            const auto & parameters = region.module->call_parameters;
+    for (auto & region : definition_.regions) {
+        const auto & source = calls[region.source_call];
+        if (source.module.is_null()) continue;
+        auto [native, inserted] = native_regions_.emplace(region.source_call, bindings.region(source.binding.value()).read(source.module));
+        region.semantic = native->second.semantic;
+        if (region.semantic == "decode_update_prefix") {
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
             const auto index = parameters.at("filter_prefix_count");
             const auto full = parameters.at("batch_is_full");
             if (definition_.step != StepKind::Schedule || definition_.phase == BatchPhase::Prefill || region.parent_call != definition_.source_call || index < 0
@@ -295,8 +292,8 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
                 || parameters.at("request_count") != static_cast<std::int64_t>(definition_.filters[static_cast<std::size_t>(index)].input_count))
                 throw std::invalid_argument("native decode update disagrees with its running filter");
         }
-        if (region.module->semantic == "batch_transition") {
-            const auto & parameters = region.module->call_parameters;
+        if (region.semantic == "batch_transition") {
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
             const auto pending = parameters.at("pending_prefill_requests");
             const auto present = parameters.at("has_pending_prefill");
             const auto full = parameters.at("batch_is_full");
@@ -310,8 +307,8 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
                                                            present != 0 ? std::optional(static_cast<std::size_t>(pending)) : std::nullopt,
                                                            full != 0 };
         }
-        if (region.module->semantic == "admission_prefix") {
-            const auto & parameters = region.module->call_parameters;
+        if (region.semantic == "admission_prefix") {
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
             const auto waiting = parameters.at("waiting_requests");
             const auto running = parameters.at("running_requests");
             const auto full = parameters.at("batch_is_full");
@@ -326,21 +323,21 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
 
             definition_.admission = AdmissionEntryState{ static_cast<std::size_t>(waiting), static_cast<std::size_t>(running), full != 0 };
         }
-        if (region.module->semantic == "last_locations") {
+        if (region.semantic == "last_locations") {
             const bool cold = std::ranges::all_of(definition_.source_requests, [](const auto & request) { return request.context_tokens == 0; });
-            const auto & parameters = region.module->call_parameters;
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
             if (definition_.step != StepKind::Prepare || definition_.phase != BatchPhase::Prefill || region.parent_call != definition_.source_call
                 || parameters.at("request_count") != static_cast<std::int64_t>(definition_.source_requests.size())
                 || parameters.at("cold_prefix") != static_cast<std::int64_t>(cold))
                 throw std::invalid_argument("native last-location construction disagrees with its Prepare batch");
         }
-        if (region.module->request_id) {
-            const auto request = std::ranges::find(definition_.source_requests, *region.module->request_id, &SourceRequest::id);
+        if (native_regions_.at(region.source_call).request_id) {
+            const auto request = std::ranges::find(definition_.source_requests, *native_regions_.at(region.source_call).request_id, &SourceRequest::id);
             if (request == definition_.source_requests.end()) throw std::invalid_argument("native request region is outside its serving batch");
             region.request_slot = static_cast<std::size_t>(request - definition_.source_requests.begin());
         }
-        if (region.module->semantic == "request_publication") {
-            const auto index = region.module->call_parameters.at("request_index");
+        if (region.semantic == "request_publication") {
+            const auto index = native_regions_.at(region.source_call).call_parameters.at("request_index");
             if (definition_.step != StepKind::Publish || region.parent_call != definition_.source_call || !region.request_slot || index < 0
                 || static_cast<std::size_t>(index) != *region.request_slot)
                 throw std::invalid_argument("native publication iteration disagrees with its request slot");
@@ -351,9 +348,9 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
     // every explicit identity first, so source record order cannot change it.
     for (auto & region : definition_.regions) {
         auto parent = local_regions.find(region.parent_call);
-        if (region.module && region.module->semantic == "last_location") {
-            const auto & parameters = region.module->call_parameters;
-            if (parent == local_regions.end() || !parent->second->module || parent->second->module->semantic != "last_locations" || !region.request_slot
+        if (region.semantic == "last_location") {
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
+            if (parent == local_regions.end() || parent->second->semantic != "last_locations" || !region.request_slot
                 || parameters.at("request_index") != static_cast<std::int64_t>(*region.request_slot)
                 || parameters.at("cold_prefix") != static_cast<std::int64_t>(definition_.source_requests[*region.request_slot].context_tokens == 0))
                 throw std::invalid_argument("native last-location member disagrees with its request identity");
@@ -372,8 +369,7 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
     // Prefix membership and decode-update membership have separate scopes.
     // The supported native prefix filters a pending prefill exactly once.
     if (definition_.step != StepKind::Schedule || !definition_.transition) return;
-    const auto transition =
-        std::ranges::find_if(definition_.regions, [](const auto & region) { return region.module && region.module->semantic == "batch_transition"; });
+    const auto transition = std::ranges::find_if(definition_.regions, [](const auto & region) { return region.semantic == "batch_transition"; });
     if (transition == definition_.regions.end()) return;
     const auto prefix_count = definition_.transition->pending_prefill_requests ? 1U : 0U;
     std::size_t observed_prefix_filters = 0;
@@ -382,25 +378,23 @@ void SGLangTemplateBindings::bind_regions(const nlohmann::json & regions) {
     std::size_t observed_merges = 0;
     // An empty decision can still execute update_running_batch. Derive its
     // presence from the observed region, not from the selected batch phase.
-    const auto update_count =
-        std::ranges::count_if(definition_.regions, [](const auto & region) { return region.module && region.module->semantic == "decode_update_prefix"; });
+    const auto update_count = std::ranges::count_if(definition_.regions, [](const auto & region) { return region.semantic == "decode_update_prefix"; });
     if (update_count > 1 || (definition_.phase == BatchPhase::Prefill && update_count != 0) || (definition_.phase == BatchPhase::Decode && update_count != 1)
         || definition_.filters.size() != prefix_count + static_cast<std::size_t>(update_count))
         return;
     for (const auto & region : definition_.regions) {
-        if (!region.module || (region.module->semantic != "batch_filter" && region.module->semantic != "batch_merge")) continue;
+        if (region.semantic.empty() || (region.semantic != "batch_filter" && region.semantic != "batch_merge")) continue;
         auto parent = local_regions.find(region.parent_call);
-        while (parent != local_regions.end() && parent->second != &*transition
-               && (!parent->second->module || parent->second->module->semantic != "decode_update_prefix"))
+        while (parent != local_regions.end() && parent->second != &*transition && (parent->second->semantic != "decode_update_prefix"))
             parent = local_regions.find(parent->second->parent_call);
         if (parent == local_regions.end()) return;
         const bool in_prefix = parent->second == &*transition;
-        if (region.module->semantic == "batch_merge") {
+        if (region.semantic == "batch_merge") {
             if (!in_prefix || !definition_.merge) return;
             ++observed_merges;
             continue;
         }
-        const auto index = region.module->call_parameters.at("filter_index");
+        const auto index = native_regions_.at(region.source_call).call_parameters.at("filter_index");
         if (in_prefix) {
             if (prefix_count != 1 || index != 0) return;
             ++observed_prefix_filters;
@@ -446,14 +440,14 @@ void SGLangTemplateBindings::bind_admission_work() {
     const TemplateRegion * admission = nullptr;
     const TemplateRegion * statistics = nullptr;
     for (const auto & region : definition_.regions) {
-        if (!region.module) continue;
-        if (region.module->semantic == "admission_prefix") admission = &region;
-        if (region.module->semantic == "prefill_statistics") statistics = &region;
+        if (region.semantic.empty()) continue;
+        if (region.semantic == "admission_prefix") admission = &region;
+        if (region.semantic == "prefill_statistics") statistics = &region;
     }
-    if (!admission || !admission->module->result.contains("admission_work")) return;
+    if (!admission || !native_regions_.at(admission->source_call).result.contains("admission_work")) return;
 
     const auto & entry = *definition_.admission;
-    const auto & observed = admission->module->result.at("admission_work");
+    const auto & observed = native_regions_.at(admission->source_call).result.at("admission_work");
     AdmissionWork work;
     work.candidate_checks = observed.at("candidate_checks").get<std::size_t>();
     const auto stop = observed.at("native_stop").get<std::string>();
@@ -468,16 +462,16 @@ void SGLangTemplateBindings::bind_admission_work() {
     std::map<std::size_t, std::size_t> members;
     for (std::size_t index = 0; index < definition_.regions.size(); ++index) {
         const auto & region = definition_.regions[index];
-        if (!region.module || region.module->semantic != "admission_budget" || region.parent_call != admission->source_call) continue;
-        const auto & result = region.module->result;
+        if (region.semantic != "admission_budget" || region.parent_call != admission->source_call) continue;
+        const auto & result = native_regions_.at(region.source_call).result;
         if (!result.contains("horizon_checks") || !result.at("candidate_accepted").get<bool>()) return;
-        const auto slot = static_cast<std::size_t>(region.module->call_parameters.at("accepted_requests"));
+        const auto slot = static_cast<std::size_t>(native_regions_.at(region.source_call).call_parameters.at("accepted_requests"));
         if (!members.emplace(slot, index).second) return;
     }
     if (members.size() != observed.at("request_checks").get<std::size_t>() || members.size() > work.candidate_checks) return;
     for (const auto & [slot, index] : members) {
         if (slot != work.request_horizon_checks.size()) return;
-        work.request_horizon_checks.push_back(definition_.regions[index].module->result.at("horizon_checks").get<std::size_t>());
+        work.request_horizon_checks.push_back(native_regions_.at(definition_.regions[index].source_call).result.at("horizon_checks").get<std::size_t>());
     }
 
     // Queue scans are separate native work. Qualify the derived common counts
@@ -486,7 +480,7 @@ void SGLangTemplateBindings::bind_admission_work() {
     if (observed.at("queue_compaction_items").get<std::size_t>() != (admitted == 0 ? 0 : entry.waiting_requests)) return;
     if (admitted != 0) {
         if (!statistics || statistics->parent_call != definition_.source_call) return;
-        const auto & parameters = statistics->module->call_parameters;
+        const auto & parameters = native_regions_.at(statistics->source_call).call_parameters;
         if (parameters.at("has_chunked_request") != 0 || parameters.at("waiting_requests") != static_cast<std::int64_t>(entry.waiting_requests - admitted)
             || parameters.at("running_requests") != static_cast<std::int64_t>(entry.running_requests))
             return;
@@ -511,7 +505,7 @@ void SGLangTemplateBindings::bind_admission_work() {
     std::vector<TemplateRegionReference> sequence;
     for (const auto & [slot, index] : members) {
         const auto & member = definition_.regions[index];
-        if (member.module->result.at("native_result") != "CONTINUE" || !definition_.is_cpu_region(member)) return;
+        if (native_regions_.at(member.source_call).result.at("native_result") != "CONTINUE" || !definition_.is_cpu_region(member)) return;
         member_regions.push_back(index);
         sequence.push_back({ &definition_, index });
     }
@@ -525,7 +519,7 @@ void SGLangTemplateBindings::bind_publication_output() {
 
     const TemplateRegion * output = nullptr;
     for (const auto & region : definition_.regions) {
-        if (!region.module || region.module->semantic != "batch_output") continue;
+        if (region.semantic != "batch_output") continue;
         if (output) return;
         output = &region;
     }
@@ -533,7 +527,7 @@ void SGLangTemplateBindings::bind_publication_output() {
         || output->outputs.size() != 1)
         return;
 
-    const auto & module = *output->module;
+    const auto & module = native_regions_.at(output->source_call);
     const auto observed = module.result.find("output_work");
     if (observed == module.result.end() || module.parameters.at("is_generation") != 1 || module.call_parameters.at("return_logprob") != 0) return;
     const auto & work = *observed;
@@ -599,7 +593,7 @@ void SGLangTemplateBindings::bind_publication_output() {
     std::vector<std::optional<std::size_t>> members(count);
     for (std::size_t index = 0; index < definition_.regions.size(); ++index) {
         const auto & region = definition_.regions[index];
-        if (!region.module || region.module->semantic != "request_publication") continue;
+        if (region.semantic != "request_publication") continue;
         if (region.parent_call != definition_.source_call || !region.request_slot) return;
         if (definition_.phase == BatchPhase::Decode) {
             if (!definition_.is_cpu_region(region) || region.inputs.size() != 1 || region.outputs.size() != 1) return;
@@ -628,7 +622,7 @@ void SGLangTemplateBindings::bind_publication_progress() {
             return;
     }
     for (const auto & region : definition_.regions) {
-        if (!region.module || region.module->semantic != "request_publication") continue;
+        if (region.semantic != "request_publication") continue;
         const auto slot = *region.request_slot;
         if (covered[slot] || !definition_.is_cpu_region(region)) return;
         covered[slot] = true;
@@ -637,7 +631,7 @@ void SGLangTemplateBindings::bind_publication_progress() {
 
     // No token payload is emitted, but the native streamer still sends an
     // empty batch message. Preserve its shared control work and completion
-    // waits even though host CPU service time is outside the pricing scope.
+    // waits; CPU service is charged at its retained causal cuts.
     for (const auto & node : definition_.graph) {
         if (node.kind == SourceSpanKind::CpuObservation || node.kind == SourceSpanKind::CpuControl) continue;
         if (node.kind != SourceSpanKind::HostWait
@@ -648,9 +642,8 @@ void SGLangTemplateBindings::bind_publication_progress() {
     definition_.publication_cpu_progress = true;
 }
 
-void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::json & regions, const nlohmann::json & calls, const SGLangCopyLayout & copies,
-                                  std::uint32_t page_size_tokens) {
-    bind_regions(regions);
+void SGLangTemplateBindings::bind(std::span<const SourceCall> calls, const SGLangCopyLayout & copies, std::uint32_t page_size_tokens) {
+    bind_regions(calls);
     bind_admission_work();
     bind_publication_progress();
     bind_publication_output();
@@ -658,16 +651,14 @@ void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::
     std::map<std::size_t, NativeFilterSelection> filter_scopes;
     std::unordered_set<std::size_t> merge_scopes;
     for (const auto & region : definition_.regions) {
-        if (!region.module || (region.binding != "sglang.batch.merge" && region.binding != "sglang.batch.filter")) continue;
+        if (region.semantic != "batch_merge" && region.semantic != "batch_filter") continue;
 
         const bool direct = region.parent_call == definition_.source_call;
         const auto parent = std::ranges::find(definition_.regions, region.parent_call, &TemplateRegion::source_call);
-        const bool transition = parent != definition_.regions.end() && parent->module && parent->module->semantic == "batch_transition"
-                                && parent->parent_call == definition_.source_call;
-        const bool update = parent != definition_.regions.end() && parent->module && parent->module->semantic == "decode_update_prefix"
-                            && parent->parent_call == definition_.source_call;
-        if (region.binding == "sglang.batch.merge") {
-            const auto & parameters = region.module->call_parameters;
+        const bool transition = parent != definition_.regions.end() && parent->semantic == "batch_transition" && parent->parent_call == definition_.source_call;
+        const bool update = parent != definition_.regions.end() && parent->semantic == "decode_update_prefix" && parent->parent_call == definition_.source_call;
+        if (region.semantic == "batch_merge") {
+            const auto & parameters = native_regions_.at(region.source_call).call_parameters;
             // Merge precedes selection of the next phase. A following prefill
             // has no running filter from which to infer the merged batch.
             const auto left = parameters.at("left_requests");
@@ -684,15 +675,15 @@ void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::
             merge_scopes.insert(region.source_call);
             continue;
         }
-        const auto index = region.module->call_parameters.at("filter_index");
+        const auto index = native_regions_.at(region.source_call).call_parameters.at("filter_index");
         if (definition_.step != StepKind::Schedule || (!direct && !transition && !update) || (transition && index != 0)
-            || (update && index < parent->module->call_parameters.at("filter_prefix_count")) || index < 0
+            || (update && index < native_regions_.at(parent->source_call).call_parameters.at("filter_prefix_count")) || index < 0
             || static_cast<std::size_t>(index) >= definition_.filters.size())
             throw std::invalid_argument("native batch filter region has no enclosing Schedule selection");
 
         // Only a qualified parent identifies a movable filtering operation.
         // Retraction's additional filters are outside this supported update.
-        if (transition || (update && index == parent->module->call_parameters.at("filter_prefix_count"))) {
+        if (transition || (update && index == native_regions_.at(parent->source_call).call_parameters.at("filter_prefix_count"))) {
             const auto role = transition ? BatchFilterBinding::Transition : BatchFilterBinding::RunningUpdate;
             filter_scopes.emplace(region.source_call, NativeFilterSelection{ static_cast<std::size_t>(index), role });
 
@@ -704,7 +695,7 @@ void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::
         }
     }
 
-    copies.bind(definition_, calls, filter_scopes);
+    copies.bind(definition_, calls, filter_scopes, native_regions_);
 
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
@@ -732,14 +723,13 @@ void SGLangTemplateBindings::bind(const nlohmann::json & graph, const nlohmann::
     bind_last_locations(page_size_tokens);
     bind_decode_locations();
     bind_prefix_publication();
-    bind_layouts(graph, calls, page_size_tokens);
+    bind_layouts(calls, page_size_tokens);
     bind_rotary_positions();
     const auto counts = bind_collectives();
     for (const auto & collective : definition_.collectives) {
-        const bool serial_completion = collective.completion && collective.entry_boundaries.size() == 1 && collective.exit_boundaries.size() == 1;
         const auto count = counts.find(collective.envelope_node);
         CollectiveParameterRule parameters{ count == counts.end() ? std::nullopt : std::optional(count->second),
-                                            HcclMeshLayout{}.bind(collective.observation, serial_completion) };
+                                            HcclMeshLayout{}.bind(source_.collectives().at(collective.source_span), collective.serial_completion) };
         const auto [rule, inserted] = collective_rules_.insert(std::move(parameters));
         definition_.graph.bind_collective_rule(collective.envelope_node, *rule);
     }
@@ -780,11 +770,11 @@ void SGLangTemplateBindings::bind_prefix_publication() {
     // ordered slots; changing membership still requires a qualified rewrite.
     std::map<std::size_t, std::size_t> scopes;
     for (const auto & region : definition_.regions) {
-        if (region.binding != "sglang.chunk_cache.publish_prefix" || !region.module || !region.request_slot) continue;
+        if (region.semantic != "prefix_publication" || !region.request_slot) continue;
         const auto slot = *region.request_slot;
         const auto & request = definition_.source_requests[slot];
         const auto length = static_cast<std::int64_t>(request.context_tokens) + request.input_tokens;
-        if (region.module->call_parameters.at("sequence_tokens") != length)
+        if (native_regions_.at(region.source_call).call_parameters.at("sequence_tokens") != length)
             throw std::invalid_argument("native prefix publication length disagrees with its request");
         scopes.emplace(region.source_call, slot);
     }
@@ -836,8 +826,8 @@ void SGLangTemplateBindings::bind_request_initialization() {
     std::optional<std::size_t> parent;
     for (std::size_t index = 0; index < definition_.regions.size(); ++index) {
         const auto & region = definition_.regions[index];
-        if (!region.module || region.module->semantic != "last_location") continue;
-        if (region.module->call_parameters.at("cold_prefix") != 1) return;
+        if (region.semantic != "last_location") continue;
+        if (native_regions_.at(region.source_call).call_parameters.at("cold_prefix") != 1) return;
         // CPU-only ports can still enclose a native host wait. Its dependency
         // belongs to the sequence planner, not to service-only qualification.
         const auto ports = definition_.region_ports(definition_.semantic_region(region));
@@ -946,11 +936,14 @@ void SGLangTemplateBindings::bind_decode_locations() {
         selected = &operation;
         work = *found;
     }
-    if (!selected || !selected->input_shapes || !selected->input_types) return;
+    if (!selected) return;
+
+    const auto & observed = source_.operations().at(selected->host.source_span);
+    if (!observed.input_shapes || !observed.input_types) return;
 
     const auto requests = definition_.source_requests.size();
-    const KernelShapes input(selected->input_shapes->substr(0, selected->input_shapes->find(';')));
-    if (selected->input_types->substr(0, selected->input_types->find(';')) != "long int"
+    const KernelShapes input(observed.input_shapes->substr(0, observed.input_shapes->find(';')));
+    if (observed.input_types->substr(0, observed.input_types->find(';')) != "long int"
         || input.tensors != std::vector<std::vector<std::int64_t>>{ { static_cast<std::int64_t>(requests) } } || work->kind != SourceSpanKind::Dma
         || !definition_.observation(*work).transfer || definition_.observation(*work).transfer->direction != TransferDirection::DeviceToDevice
         || definition_.observation(*work).transfer->bytes != requests * sizeof(std::int64_t))
@@ -960,7 +953,7 @@ void SGLangTemplateBindings::bind_decode_locations() {
                                          TransferParameterLayout{ TransferExtent::RequestElements, requests, 0, sizeof(std::int64_t) });
 }
 
-void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nlohmann::json & calls, std::uint32_t page_size_tokens) {
+void SGLangTemplateBindings::bind_layouts(std::span<const SourceCall> calls, std::uint32_t page_size_tokens) {
     std::map<SourceSpanId, ModelKernelLayout> model_layouts;
 
     // Use the recorded operation membership, not temporal proximity, to
@@ -976,26 +969,25 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
     std::map<std::size_t, const SourceNativeRegion *> modules;
     std::map<std::pair<std::size_t, std::string_view>, std::vector<const SourceNativeRegion *>> parameter_children;
     for (const auto & region : definition_.regions) {
-        if (region.module) {
-            modules.emplace(region.source_call, &*region.module);
-            if (region.module->semantic == "logits_selection" || region.module->semantic == "embedding")
-                parameter_children[{ region.parent_call, region.module->semantic }].push_back(&*region.module);
+        if (!region.semantic.empty()) {
+            modules.emplace(region.source_call, &native_regions_.at(region.source_call));
+            if (region.semantic == "logits_selection" || region.semantic == "embedding")
+                parameter_children[{ region.parent_call, region.semantic }].push_back(&native_regions_.at(region.source_call));
         }
     }
 
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
         if (!node_observation.kernel) continue;
-        const auto & scope = graph.at("spans").at(node_observation.source_span).at("scope_call");
-        if (scope.is_null()) continue;
+        const auto & scope = source_.spans().at(node_observation.source_span).scope_call;
+        if (!scope) continue;
 
         // Forward-input work belongs to its explicit native scope, not to a
         // model child with a coincidentally matching tensor shape.
-        if (calls.at(scope.get<std::size_t>()).at("native_step") == "model_forward") {
-            auto layout = ModelKernelLayout::bind_page_table(scope.get<std::size_t>(), *node_observation.kernel, definition_.source_requests, page_size_tokens);
+        if (calls[*scope].kind == SourceCallKind::ForwardInputs) {
+            auto layout = ModelKernelLayout::bind_page_table(*node_observation.kernel, definition_.source_requests, page_size_tokens);
             if (!layout)
-                layout = ModelKernelLayout::bind_forward_inputs(scope.get<std::size_t>(),
-                                                                *node_observation.kernel,
+                layout = ModelKernelLayout::bind_forward_inputs(*node_observation.kernel,
                                                                 serving_tokens,
                                                                 definition_.source_requests.size(),
                                                                 definition_.step,
@@ -1003,13 +995,11 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
             if (layout) model_layouts.emplace(node_observation.source_span, std::move(*layout));
             continue;
         }
-        const auto module = modules.find(scope.get<std::size_t>());
+        const auto module = modules.find(*scope);
         if (module == modules.end()) continue;
         if (module->second->semantic == "attention_metadata") {
-            auto layout = ModelKernelLayout::bind_page_table(scope.get<std::size_t>(), *node_observation.kernel, definition_.source_requests, page_size_tokens);
-            if (!layout)
-                layout =
-                    ModelKernelLayout::bind_sequence_lengths(*module->second, scope.get<std::size_t>(), *node_observation.kernel, definition_.source_requests);
+            auto layout = ModelKernelLayout::bind_page_table(*node_observation.kernel, definition_.source_requests, page_size_tokens);
+            if (!layout) layout = ModelKernelLayout::bind_sequence_lengths(*module->second, *node_observation.kernel, definition_.source_requests);
             if (layout) model_layouts.emplace(node_observation.source_span, std::move(*layout));
             continue;
         }
@@ -1021,22 +1011,17 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
         const auto children = parameter_children.find({ module->first, child_semantic });
         if (children != parameter_children.end() && children->second.size() == 1) parameter_child = children->second.front();
         auto layout = ModelKernelLayout::bind(*module->second,
-                                              module->first,
                                               *node_observation.kernel,
                                               serving_tokens,
                                               definition_.source_requests.size(),
                                               definition_.step,
                                               parameter_child);
         if (layout) model_layouts.emplace(node_observation.source_span, std::move(*layout));
-        auto attention = AttentionKernelLayout::bind(*module->second,
-                                                     module->first,
-                                                     *node_observation.kernel,
-                                                     definition_.step,
-                                                     definition_.source_requests,
-                                                     page_size_tokens);
+        auto attention =
+            AttentionKernelLayout::bind(*module->second, *node_observation.kernel, definition_.step, definition_.source_requests, page_size_tokens);
         if (attention) {
             const auto [rule, inserted] = attention_rules_.insert(attention->compile());
-            definition_.attention_kernel_layouts.emplace(node_observation.source_span, AttentionParameterObservation{ &*rule, attention->describe() });
+            definition_.attention_kernel_layouts.emplace(node_observation.source_span, &*rule);
         }
     }
 
@@ -1075,8 +1060,8 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
     std::map<std::size_t, std::vector<const ModelKernelLayout *>> logits_outputs;
     for (const auto & [span, layout] : model_layouts) {
         if (layout.role() != ModelKernelRole::LogitsCast) continue;
-        const auto scope = graph.at("spans").at(span).at("scope_call").get<std::size_t>();
-        logits_outputs[calls.at(scope).at("parent").get<std::size_t>()].push_back(&layout);
+        const auto scope = *source_.spans().at(span).scope_call;
+        logits_outputs[calls[scope].parent.value()].push_back(&layout);
     }
 
     // More than one subtraction in the sampling scope is ambiguous without
@@ -1089,24 +1074,20 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
         if (!node_observation.kernel || model_layouts.contains(node_observation.source_span)) continue;
-        const auto & scope = graph.at("spans").at(node_observation.source_span).at("scope_call");
-        if (scope.is_null()) continue;
-        auto forward_scope = scope.get<std::size_t>();
+        const auto & scope = source_.spans().at(node_observation.source_span).scope_call;
+        if (!scope) continue;
+        auto forward_scope = *scope;
         const auto region = modules.find(forward_scope);
         if (region != modules.end() && region->second->semantic == "sampling") {
             if (region->second->call_parameters.at("is_all_greedy") != 1 || region->second->call_parameters.at("return_logprob") != 0) continue;
-            forward_scope = calls.at(forward_scope).at("parent").get<std::size_t>();
+            forward_scope = calls[forward_scope].parent.value();
         }
-        if (calls.at(forward_scope).at("native_step") != "model_forward") continue;
+        if (calls[forward_scope].kind != SourceCallKind::ForwardInputs) continue;
         const auto outputs = logits_outputs.find(forward_scope);
         if (outputs == logits_outputs.end() || outputs->second.size() != 1) continue;
-        auto layout = outputs->second.front()->bind_sampling(scope.get<std::size_t>(), *node_observation.kernel);
-        if (!layout && region != modules.end() && region->second->semantic == "sampling" && sampling_subtractions[scope.get<std::size_t>()] == 1)
-            layout = ModelKernelLayout::bind_sampling_positions(*region->second,
-                                                                scope.get<std::size_t>(),
-                                                                *node_observation.kernel,
-                                                                definition_.source_requests,
-                                                                definition_.step);
+        auto layout = outputs->second.front()->bind_sampling(*node_observation.kernel);
+        if (!layout && region != modules.end() && region->second->semantic == "sampling" && sampling_subtractions[*scope] == 1)
+            layout = ModelKernelLayout::bind_sampling_positions(*region->second, *node_observation.kernel, definition_.source_requests, definition_.step);
         if (layout) model_layouts.emplace(node_observation.source_span, std::move(*layout));
     }
 
@@ -1119,16 +1100,27 @@ void SGLangTemplateBindings::bind_layouts(const nlohmann::json & graph, const nl
 
         const auto [rule, inserted] = model_rules_.insert(layout->second.compile(*node_observation.kernel));
         definition_.graph.bind_model_rule(node.observation_slot, *rule);
-        definition_.model_kernel_layouts.emplace(node_observation.source_span, ModelParameterObservation{ node.observation_slot, layout->second.describe() });
+        definition_.model_kernel_layouts.emplace(node_observation.source_span, node.observation_slot);
+        model_roles_.emplace(node_observation.source_span, layout->second.role());
     }
 }
 
 void SGLangTemplateBindings::bind_rotary_positions() {
     if (definition_.step != StepKind::Decode) return;
+
+    // Retain unqualified copies as explicit requirements. A missing native
+    // producer must not silently leave a copy in the one-request target path.
+    for (std::size_t index = 0; index < definition_.operations.size(); ++index) {
+        const auto & operation = definition_.operations[index];
+        if (operation.device_spans.size() != 1) continue;
+        const auto role = model_roles_.find(operation.device_spans.front());
+        if (role != model_roles_.end() && role->second == ModelKernelRole::PositionSlice) definition_.single_request_views.emplace(index, std::nullopt);
+    }
+
     std::map<std::size_t, const SourceNativeRegion *> modules;
     for (const auto & region : definition_.regions) {
-        if (region.module && region.module->semantic == "qkv_preparation" && region.module->method == "forward_prepare_npu")
-            modules.emplace(region.source_call, &*region.module);
+        if (region.semantic == "qkv_preparation" && native_regions_.at(region.source_call).method == "forward_prepare_npu")
+            modules.emplace(region.source_call, &native_regions_.at(region.source_call));
     }
 
     std::vector<std::size_t> gathers;
@@ -1136,9 +1128,9 @@ void SGLangTemplateBindings::bind_rotary_positions() {
     std::vector<std::size_t> slices;
     std::vector<std::size_t> consumers;
     for (std::size_t index = 0; index < definition_.graph.size(); ++index) {
-        const auto found = definition_.model_kernel_layouts.find(definition_.observation(definition_.graph[index]).source_span);
-        if (found == definition_.model_kernel_layouts.end()) continue;
-        switch (definition_.graph.model_rule(found->second.node).role()) {
+        const auto found = model_roles_.find(definition_.observation(definition_.graph[index]).source_span);
+        if (found == model_roles_.end()) continue;
+        switch (found->second) {
         case ModelKernelRole::PositionGather:
             gathers.push_back(index);
             break;
@@ -1181,22 +1173,22 @@ void SGLangTemplateBindings::bind_rotary_positions() {
     for (const auto consumer : consumers) {
         for (const auto producer_node : producers) definition_.rotary_position_dependencies.push_back({ producer_node, consumer });
     }
+    for (auto & [operation, view_producer] : definition_.single_request_views) view_producer = tiles.front();
 }
 
 void SGLangTemplateBindings::bind_logits_reshape() {
-    definition_.logits_reshape_operation = logits_gather_reshape();
-    if (!definition_.logits_reshape_operation) return;
+    const auto index = logits_gather_reshape();
+    if (!index) return;
 
-    const auto & operation = definition_.operations[*definition_.logits_reshape_operation];
+    const auto & operation = definition_.operations[*index];
     const auto requests = definition_.source_requests.size();
     if (requests == 1) {
-        if (!definition_.logits_view_service()) return;
+        if (!definition_.operation_view_service(operation)) return;
     }
     else {
         if (operation.device_spans.size() != 1) return;
-        const auto layout = definition_.model_kernel_layouts.find(operation.device_spans.front());
-        if (layout == definition_.model_kernel_layouts.end() || definition_.graph.model_rule(layout->second.node).role() != ModelKernelRole::LogitsTranspose)
-            return;
+        const auto role = model_roles_.find(operation.device_spans.front());
+        if (role == model_roles_.end() || role->second != ModelKernelRole::LogitsTranspose) return;
     }
 
     // The fixed TP>1 permuted [B, TP, Vrank] view is contiguous only at B=1.
@@ -1215,17 +1207,15 @@ void SGLangTemplateBindings::bind_logits_reshape() {
 std::optional<std::size_t> SGLangTemplateBindings::logits_gather_reshape() const {
     std::optional<TemplateNode> projection;
     std::optional<TemplateNode> cast;
-    std::map<SourceSpanId, TemplateNode> observed;
     for (const auto & node : definition_.graph) {
         const auto & node_observation = definition_.observation(node);
-        observed.emplace(node_observation.source_span, node);
-        const auto layout = definition_.model_kernel_layouts.find(node_observation.source_span);
-        if (layout == definition_.model_kernel_layouts.end()) continue;
-        if (definition_.graph.model_rule(layout->second.node).role() == ModelKernelRole::LogitsProjection) {
+        const auto role = model_roles_.find(node_observation.source_span);
+        if (role == model_roles_.end()) continue;
+        if (role->second == ModelKernelRole::LogitsProjection) {
             if (projection) return std::nullopt;
             projection = node;
         }
-        if (definition_.graph.model_rule(layout->second.node).role() == ModelKernelRole::LogitsCast) {
+        if (role->second == ModelKernelRole::LogitsCast) {
             if (cast) return std::nullopt;
             cast = node;
         }
@@ -1248,14 +1238,15 @@ std::optional<std::size_t> SGLangTemplateBindings::logits_gather_reshape() const
     std::optional<std::size_t> selected;
     for (std::size_t index = 0; index < definition_.operations.size(); ++index) {
         const auto & operation = definition_.operations[index];
-        if (operation.name != "aten::reshape" || !operation.input_shapes || !operation.input_types
-            || definition_.observation(observed.at(operation.host.source_span)).source_scope != definition_.observation(*projection).source_scope)
+        if (operation.name != "aten::reshape" || source_.spans()[operation.host.source_span].scope_call != definition_.observation(*projection).source_scope)
             continue;
-        const auto type = operation.input_types->substr(0, operation.input_types->find(';'));
+        const auto & observed = source_.operations().at(operation.host.source_span);
+        if (!observed.input_shapes || !observed.input_types) continue;
+        const auto type = observed.input_types->substr(0, observed.input_types->find(';'));
         if (type != "c10::BFloat16" || definition_.observation(*projection).kernel->output_dtypes != "DT_BF16"
             || definition_.observation(*cast).kernel->input_dtypes != "DT_BF16")
             continue;
-        const KernelShapes input(operation.input_shapes->substr(0, operation.input_shapes->find(';')));
+        const KernelShapes input(observed.input_shapes->substr(0, observed.input_shapes->find(';')));
         if (input.tensors.front() != shape) continue;
         if (selected) return std::nullopt;
         selected = index;
@@ -1267,12 +1258,12 @@ std::map<std::size_t, CollectiveCountRule> SGLangTemplateBindings::bind_collecti
     std::map<std::size_t, CollectiveCountRule> result;
     std::map<std::size_t, const SourceNativeRegion *> modules;
     for (const auto & region : definition_.regions)
-        if (region.module) modules.emplace(region.source_call, &*region.module);
+        if (!region.semantic.empty()) modules.emplace(region.source_call, &native_regions_.at(region.source_call));
 
     std::int64_t tokens = 0;
     for (const auto & request : definition_.source_requests) tokens += request.input_tokens;
     for (const auto & collective : definition_.collectives) {
-        const auto & observed = collective.observation;
+        const auto & observed = source_.collectives().at(collective.source_span);
         const auto scope = definition_.observation(definition_.graph[collective.envelope_node]).source_scope;
         if (!scope || observed.data_type != "BFP16") continue;
         const auto module = modules.find(*scope);
@@ -1305,10 +1296,8 @@ std::map<std::size_t, CollectiveCountRule> SGLangTemplateBindings::bind_collecti
             for (const auto & node : definition_.graph) {
                 const auto & node_observation = definition_.observation(node);
                 if (node_observation.source_scope != scope) continue;
-                const auto layout = definition_.model_kernel_layouts.find(node_observation.source_span);
-                if (layout == definition_.model_kernel_layouts.end()
-                    || definition_.graph.model_rule(layout->second.node).role() != ModelKernelRole::LogitsProjection)
-                    continue;
+                const auto role = model_roles_.find(node_observation.source_span);
+                if (role == model_roles_.end() || role->second != ModelKernelRole::LogitsProjection) continue;
                 if (projection) ambiguous = true;
                 projection = node;
             }

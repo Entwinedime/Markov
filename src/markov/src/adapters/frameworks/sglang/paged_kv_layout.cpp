@@ -1,4 +1,5 @@
 #include "markov/adapters/frameworks/sglang/paged_kv_layout.hpp"
+#include "markov/production/block_binding.hpp"
 
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/kernel_shapes.hpp"
@@ -13,11 +14,12 @@
 namespace markov {
 
 std::expected<std::optional<KvParameterLayout>, std::string> PagedKvLayout::bind(const TemplateDefinition & source, const TemplateNode & node,
+                                                                                 const std::map<std::size_t, SourceNativeRegion> & regions,
                                                                                  const std::optional<std::vector<SourceRequest>> & finished,
                                                                                  std::uint32_t page_size_tokens) {
     for (const auto & region : source.regions) {
-        if (!region.module || source.observation(node).source_scope != region.source_call) continue;
-        const auto & module = *region.module;
+        if (region.semantic.empty() || source.observation(node).source_scope != region.source_call) continue;
+        const auto & module = regions.at(region.source_call);
 
         if (module.semantic == "kv_allocation") {
             if (module.method == "alloc_extend") return extend(*source.observation(node).kernel, module, source.source_requests, page_size_tokens);
@@ -43,8 +45,7 @@ std::expected<std::optional<KvParameterLayout>, std::string> PagedKvLayout::bind
             const auto parent = std::find_if(source.regions.begin(), source.regions.end(), [&](const TemplateRegion & candidate) {
                 return candidate.source_call == region.parent_call;
             });
-            if (parent == source.regions.end() || !parent->module || parent->module->method != "free_group_end")
-                return std::unexpected("npu_release_group_parent_missing");
+            if (parent == source.regions.end() || parent->semantic != "kv_release_group") return std::unexpected("npu_release_group_parent_missing");
         }
         if (!finished) return std::unexpected("kv_release_source_publication_missing");
         return release(*source.observation(node).kernel, module, *finished, page_size_tokens);

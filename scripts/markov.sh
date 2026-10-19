@@ -19,8 +19,7 @@ Usage: scripts/markov.sh plan --project project.json
        scripts/markov.sh status --run run-directory
        scripts/markov.sh resume --run run-directory [--cost-model FILE ...]
        scripts/markov.sh extract --base-manifest profile_manifest.json
-       scripts/markov.sh compile-templates --base-manifest profile_manifest.json
-       scripts/markov.sh fit-costs --performance-manifest performance_manifest.json [--unit all|kernel|communication|transfer|command]
+       scripts/markov.sh fit-costs --performance-manifest performance_manifest.json [--unit all|kernel|communication|transfer|command|cpu]
        scripts/markov.sh evaluate-costs --model-candidate candidate.json --performance-manifest held-out-manifest.json
 
 plan describes configuration/workload combinations without collecting. predict
@@ -33,11 +32,11 @@ profile --representative executes the candidate recipe within the base budget.
 profile and sample are explicit diagnostic acquisition commands; observe-target
 produces validation-only facts, using direct return ports by default. --purpose structure
 retains full profiler/semantic observations. extract rebuilds compiled templates from observations.
-compile-templates reuses existing source graphs and instances for binding changes.
 status/resume share the task's cumulative budgets. resume --template-assets FILE
 replaces the explicit template list; paths in that JSON array are relative to FILE.
 Transfer/device samples require explicit nonempty measurement requests.
-fit-costs produces kernel, physical communication, memory-transfer or device-command candidates.
+predict/explore plan CPU sampling from template demands and observed native work.
+fit-costs produces CPU, kernel, physical communication, memory-transfer or device-command candidates.
 --unit all fits every unit declared by one independent measurement manifest.
 Explicit cost candidates can enter conditional prediction under their declared query policies.
 All candidates preserve measurement gaps and do not establish cost qualification.

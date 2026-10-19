@@ -45,6 +45,12 @@ class TransferMeasurements:
         self.worker_paths = workers
         self.domain = domain
 
+    def consume_journals(self) -> None:
+        # Normalized units retain measured copies and source coordinates. The
+        # capture owner calls this after publishing the manifest that owns them.
+        for path in self.worker_paths:
+            path.unlink()
+
     def publish(self, output: Path) -> dict[str, Any]:
         scopes = {}
         for path in self.scope_paths:
@@ -55,7 +61,7 @@ class TransferMeasurements:
                     if identity in scopes:
                         raise ValueError("duplicate native transfer observation scope")
                     scopes[identity] = record
-                    if record["completed"]:
+                    if record["completed"] and record["metadata"] is not None and not record["control"]:
                         self.domain.observe(record["rank"], record["step"], record["metadata"])
 
         pairs: dict[tuple[int, int], dict[str, Any]] = defaultdict(dict)
@@ -87,6 +93,8 @@ class TransferMeasurements:
                 scope = scopes.get((identity[0], pair["enqueue"]["scope_id"]))
                 if scope is None or not scope["completed"]:
                     reason = "completed_observation_scope_missing"
+                elif scope["metadata"] is None:
+                    reason = "native_batch_metadata_missing"
 
             if reason is not None:
                 gaps.append({"identity": list(identity), "reason": reason})
@@ -127,9 +135,6 @@ class TransferMeasurements:
                         "result": copy["result"],
                         "source": source,
                     }
-                )
-                self.domain.observe_work_facts(
-                    scope["rank"], scope["metadata"], transfer_executions=("synchronous_host_driver",)
                 )
 
         coverage = {"queue_pairs": len(pairs), "transfer_units": len(units), "gaps": gaps}

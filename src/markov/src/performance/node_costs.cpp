@@ -2,11 +2,13 @@
 
 #include "markov/performance/cost_query.hpp"
 
+#include <limits>
+#include <stdexcept>
 #include <utility>
 
 namespace markov {
 
-std::expected<NodeCostEstimate, CostModelGap> NodeCosts::query_cost(const CostQuery & query) const {
+NodeCostResult NodeCosts::query_cost(const CostQuery & query) const {
     CostModelGap gap;
     for (std::size_t index = 0; index < models_.size(); ++index) {
         const auto * model = models_[index];
@@ -19,12 +21,20 @@ std::expected<NodeCostEstimate, CostModelGap> NodeCosts::query_cost(const CostQu
     return std::unexpected(gap);
 }
 
-std::expected<NodeCostEstimate, std::string_view> NodeCosts::estimate(const CostQuery & query, const NodeCostSource & source) const {
-    if (auto cost = query_cost(query)) return *cost;
+std::expected<NodeCostEstimate, std::string_view> NodeCosts::estimate(const NodeCostResult & measured, const NodeCostSource & source,
+                                                                      std::span<const NodeCostSource> remaining) const {
+    if (measured) return *measured;
 
     const auto duration = given_.duration(*source.manifest, source.span);
     if (!duration) return std::unexpected(has_models() ? "node_cost_missing" : "given_node_duration_missing");
-    return NodeCostEstimate{ *duration, NodeCostBasis::Given };
+    auto total = *duration;
+    for (const auto & member : remaining) {
+        const auto part = given_.duration(*member.manifest, member.span);
+        if (!part) return std::unexpected(has_models() ? "node_cost_missing" : "given_node_duration_missing");
+        if (*part > std::numeric_limits<std::int64_t>::max() - total) throw std::overflow_error("CPU service duration exceeds int64 nanoseconds");
+        total += *part;
+    }
+    return NodeCostEstimate{ total, NodeCostBasis::Given };
 }
 
 std::string_view NodeCosts::basis_name(NodeCostBasis basis) {
@@ -39,6 +49,8 @@ std::string_view NodeCosts::basis_name(NodeCostBasis basis) {
         return "empirical_transfer_candidate";
     case NodeCostBasis::DeviceCommandCandidate:
         return "empirical_device_command_candidate";
+    case NodeCostBasis::CpuCandidate:
+        return "empirical_cpu_service_candidate";
     }
     std::unreachable();
 }

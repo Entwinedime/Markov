@@ -75,7 +75,10 @@ nlohmann::json KTransformersCollectionAdapter::sampling_requests(const Candidate
         });
     return {
         { "measurement_requests", nlohmann::json::array() },
+        {     "measurement_grid", nlohmann::json::array() },
         {          "assignments", nlohmann::json::array() },
+        {     "lifecycle_points", nlohmann::json::array() },
+        {       "lifecycle_gaps", nlohmann::json::array() },
         {           "unresolved",   std::move(unresolved) }
     };
 }

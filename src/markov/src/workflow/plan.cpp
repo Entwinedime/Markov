@@ -85,13 +85,6 @@ nlohmann::json Planner::describe(const Project & project) const {
                     { "reason", "control_path_not_implemented" }
                 });
             }
-            if (project.controller != "lightweight" || project.scope != Scope::Modeled || project.initial_cache != CacheState::Cold) {
-                supported = false;
-                gaps.push_back({
-                    {   "kind",                                  "implementation" },
-                    { "reason", "only_lightweight_cold_modeled_scope_implemented" }
-                });
-            }
             if (std::any_of(workload.requests.begin(), workload.requests.end(), [](const Request & request) {
                     return std::holds_alternative<std::string>(request.input);
                 })) {
@@ -132,12 +125,6 @@ nlohmann::json Planner::describe(const Project & project) const {
 }
 
 nlohmann::json Planner::collection_plan(const Project & project) const {
-    if (project.controller != "lightweight" || project.scope != Scope::Modeled || project.initial_cache != CacheState::Cold) {
-        return {
-            { "status",                                     "unsupported" },
-            { "reason", "only_lightweight_cold_modeled_scope_implemented" }
-        };
-    }
     auto groups = Json::array();
     std::map<std::string, Json> exclusions;
     std::vector<std::string> selection_bases;
@@ -302,8 +289,6 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
         {             "model",                 { { "path", project.model_path.string() }, { "tokenizer_path", project.tokenizer_path.string() } } },
         {    "configurations",                                                                                                     configurations },
         { "request_workloads",                                                                                                          workloads },
-        {        "simulation",    { { "controller", project.controller }, { "scope", project.scope == Scope::Modeled ? "modeled" : "http_e2e" } } },
-        {     "initial_state",                                       { { "cache", project.initial_cache == CacheState::Cold ? "cold" : "warm" } } },
         {        "collection", { { "base", permission(project.base_collection) }, { "performance", permission(project.performance_collection) } } },
         {            "assets",               { { "templates", templates }, { "performance_manifests", performances }, { "cost_models", models } } },
         {            "output",                     { { "directory", project.output_directory.string() }, { "diagnostics", project.diagnostics } } }
@@ -317,7 +302,6 @@ nlohmann::json Planner::prepare_prediction(const Project & project) const {
 
 nlohmann::json Planner::prepare_sampling(const Project & project, const Candidate & candidate, const RequestWorkload & prompts,
                                          const Json & measurement_requests) const {
-    if (project.controller != "lightweight") throw std::invalid_argument("sampling requires lightweight control");
     auto grid = collection_adapter(candidate.framework).workloads(candidate, prompts.requests, measurement_requests);
     auto prepared = prepare_inputs(project, candidate);
     prepared["role"] = "performance";

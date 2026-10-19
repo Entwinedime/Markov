@@ -9,7 +9,7 @@
 #include "markov/adapters/runtimes/ascend/workspace_bindings.hpp"
 #include "markov/graph/kernel_shapes.hpp"
 #include "markov/graph/source_graph.hpp"
-#include "markov/production/source_call.hpp"
+#include "markov/production/source_subgraph.hpp"
 #include "markov/templates/templates.hpp"
 
 #include <nlohmann/json.hpp>
@@ -34,41 +34,61 @@ using Json = nlohmann::json;
 
 using input::read_json;
 
+bool warmup_preserves_initial_workspace(const Json & warmup, const Json & states, std::uint32_t capacity) {
+    using PoolKey = std::tuple<std::uint32_t, std::uint64_t, std::int64_t, std::uint64_t>;
+    const auto capacities = [](const Json & windows) {
+        std::map<PoolKey, std::uint64_t> result;
+        for (const auto & window : windows)
+            for (const auto & pool : window.at("initial"))
+                result.emplace(PoolKey{ window.at("rank"), window.at("pid"), pool.at("device"), pool.at("stream_handle") }, pool.at("capacity_bytes"));
+        return result;
+    };
+
+    // Each recorded cohort is a complete prefix of the common warmup recipe.
+    // Compare retained capacities, not addresses or raw profiler observations.
+    const auto initial = capacities(states);
+    std::set<std::uint32_t> observed;
+    for (const auto & cohort : warmup.at("workspace")) {
+        if (capacities(cohort.at("states")) != initial) return false;
+        observed.insert(cohort.at("request_capacity").get<std::uint32_t>());
+    }
+
+    // The existing row-shrink domain describes every smaller capacity. A
+    // partially observed warmup domain cannot qualify that whole interval.
+    return observed.size() == capacity && *observed.begin() == 1 && *observed.rbegin() == capacity;
+}
+
 // Resource roles come from native ownership and dependency relationships.
 // Ambiguous resources retain their local identity and cannot qualify migration.
 class SGLangResourceBindings {
 public:
-    SGLangResourceBindings(const Json & graph, const Json & instances) {
-        const auto & lanes = graph.at("lanes");
-        const auto & boundaries = graph.at("boundaries");
-        for (const auto & lane : lanes)
-            resources_.push_back({ SourceGraph::parse_domain(lane.at("domain").get<std::string>()),
-                                   lane.at("rank").get<std::uint32_t>(),
-                                   lane.at("native_id").get<std::uint64_t>(),
-                                   std::nullopt });
+    SGLangResourceBindings(const SourceGraph & graph, std::span<const BlockSubgraph> blocks, std::span<const SourceCall> calls) {
+        const auto & lanes = graph.lanes();
+        const auto & boundaries = graph.boundaries();
+        for (const auto & lane : lanes) resources_.push_back({ lane.domain, lane.rank, lane.native_id });
 
-        for (const auto & instance : instances) {
-            const auto point = instance.at("ports").at("entered").get<std::size_t>();
-            const auto lane = boundaries.at(point).at("lane").get<std::size_t>();
+        for (const auto & block : blocks) {
+            const auto point = graph.spans().at(calls[block.call].marker.value()).begin;
+            const auto lane = boundaries.at(point).lane;
             if (resources_[lane].domain == SourceDomain::CpuThread) add(TemplateResourceRole::Control, lane);
         }
-        for (const auto & span : graph.at("spans")) {
-            if (span.at("kind") != "compute" || span.at("owner_call").is_null()) continue;
-            const auto lane = boundaries.at(span.at("begin").get<std::size_t>()).at("lane").get<std::size_t>();
+        for (const auto & span : graph.spans()) {
+            if (span.kind != SourceSpanKind::Compute || !span.owner_call) continue;
+            const auto lane = boundaries.at(span.begin).lane;
             add(TemplateResourceRole::Model, lane);
         }
 
         std::set<std::pair<std::size_t, std::size_t>> signals, submissions;
-        for (const auto & edge : graph.at("edges")) {
-            const auto from = boundaries.at(edge.at("source").get<std::size_t>()).at("lane").get<std::size_t>();
-            const auto to = boundaries.at(edge.at("target").get<std::size_t>()).at("lane").get<std::size_t>();
+        for (const auto & edge : graph.edges()) {
+            const auto from = boundaries.at(edge.source).lane;
+            const auto to = boundaries.at(edge.target).lane;
             const auto & source = resources_[from];
             const auto & target = resources_[to];
             if (source.rank != target.rank) continue;
 
-            if (edge.at("relation") == "collective_submission" && target.domain == SourceDomain::DeviceStream) add(TemplateResourceRole::Collective, to);
-            if (edge.at("relation") == "native_event_signal") signals.emplace(from, to);
-            if (edge.at("relation") != "native_flow") continue;
+            if (edge.relation == SourceRelation::CollectiveSubmission && target.domain == SourceDomain::DeviceStream) add(TemplateResourceRole::Collective, to);
+            if (edge.relation == SourceRelation::NativeEventSignal) signals.emplace(from, to);
+            if (edge.relation != SourceRelation::NativeFlow) continue;
 
             if (source.domain == SourceDomain::CpuThread && target.domain == SourceDomain::CpuThread
                 && candidates_[{ source.rank, TemplateResourceRole::Control }].contains(from) && from != to)
@@ -129,17 +149,10 @@ private:
 
 } // namespace
 
-TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & manifest_path) {
+TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & manifest_path, const Json & manifest, const SourceGraph & graph,
+                                               const SourceSubgraphs & subgraphs, std::span<const SourceCall> calls, const Json & facts) {
     TemplateSource result;
     result.manifest_path = std::filesystem::absolute(manifest_path).lexically_normal();
-
-    const auto manifest = read_json(result.manifest_path);
-    if (manifest.at("role") != "base" || manifest.at("framework") != "sglang") {
-        throw std::invalid_argument("native dense templates require the declared SGLang base");
-    }
-    if (!manifest.at("graph_coverage").at("acyclic").get<bool>() || manifest.at("source_dag").is_null()) {
-        throw std::invalid_argument("base source DAG is not acyclic");
-    }
 
     const auto directory = result.manifest_path.parent_path();
     const auto prepared = read_json(directory / manifest.at("input").get<std::string>());
@@ -155,61 +168,55 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     }
 
     const auto environment = read_json(directory / manifest.at("environment").get<std::string>());
-    // Qualification belongs to the producer. Historical observations remain
-    // useful source evidence, but cannot imply the fixed warmup contract.
-    const auto initialization = environment.find("initialization");
-    if (initialization == environment.end()) result.initialization_gap = "initialization_not_observed";
+    // The session observes worker warmup and first use. This producer consumes
+    // that qualification; matching a request recipe alone cannot prove steady state.
+    const auto steady = environment.find("steady_state");
+    if (steady == environment.end()) result.steady_state_gap = "steady_state_not_observed";
     else {
-        const Json warmup{
-            {        "input_tokens",                                                                         1 },
-            {           "input_ids",                                                        Json::array({ 1 }) },
-            { "sampling_parameters", { { "max_new_tokens", 2 }, { "ignore_eos", true }, { "temperature", 0 } } }
-        };
-        if (initialization->at("engine") != "fresh_process" || initialization->at("warmup") != warmup
-            || initialization->at("workspace_snapshot") != "after_warmup_before_profile")
-            result.initialization_gap = "fixed_warmup_not_observed";
+        const auto & initialization = environment.at("initialization");
+        const auto & warmup = initialization.at("warmup");
+        if (initialization.at("engine") != "fresh_process" || warmup.at("strategy") != "paged_extent_bins" || warmup.at("logical_kv") != "empty"
+            || warmup.at("in_flight") != false || initialization.at("workspace_snapshot") != "after_warmup_before_profile")
+            result.steady_state_gap = "steady_initial_state_not_observed";
+        else if (steady->at("status") != "steady") result.steady_state_gap = steady->at("status").get<std::string>();
     }
 
     result.page_size_tokens = environment.at("effective_server_args").at("page_size").get<std::uint32_t>();
     if (result.page_size_tokens == 0) throw std::invalid_argument("native KV page size must be positive");
-    const auto data = read_json(directory / manifest.at("templates").get<std::string>());
 
     std::map<std::uint32_t, std::pair<std::int64_t, SourceAdmissionPolicy>> initial_policies;
     std::optional<AdmissionPolicy> common_policy;
     bool missing_policy = false;
     bool different_policies = false;
     std::set<std::uint32_t> observed_worker_ranks;
-    for (const auto & source : data.at("instances")) {
-        if (source.at("step") != "schedule") continue;
-        const auto & state = source.at("source_state");
-        const auto rank = source.at("rank").get<std::uint32_t>();
-        const auto controls = state.find("worker_controls");
-        if (controls == state.end()) {
+    for (const auto & call : calls) {
+        if (call.is_annotation() || call.step != StepKind::Schedule) continue;
+        const auto rank = call.rank;
+        if (!call.worker_controls) {
             if (!result.source_gap)
                 result.source_gap =
                     TemplateGap{ TemplateGapKind::Observation, "native_worker_controls_not_observed", StepKind::Schedule, BatchPhase::Idle, rank };
         }
         else {
             observed_worker_ranks.insert(rank);
-            const auto observed = SourceWorkerControls::read(*controls);
+            const auto & observed = *call.worker_controls;
             if (observed.waiting_timeout_seconds > 0 || observed.running_timeout_seconds > 0 || observed.test_retract || observed.require_mlp_sync)
                 result.source_gap =
                     TemplateGap{ TemplateGapKind::Rule, "native_worker_control_path_not_implemented", StepKind::Schedule, BatchPhase::Idle, rank };
         }
 
-        const auto record = state.find("admission_policy");
-        if (record == state.end()) {
+        if (!call.admission_policy) {
             missing_policy = true;
             continue;
         }
 
-        const auto observed = SourceAdmissionPolicy::read(*record);
+        const auto & observed = *call.admission_policy;
         if (common_policy && *common_policy != observed.parameters) different_policies = true;
         else common_policy = observed.parameters;
 
         // Call indices identify records, not execution order. Compare native
         // monotonic entry times within each rank, never across target clocks.
-        const auto start = source.at("observed_start_ns").get<std::int64_t>();
+        const auto start = call.observed_start_ns;
         const auto found = initial_policies.find(rank);
         if (found == initial_policies.end() || start < found->second.first) initial_policies.insert_or_assign(rank, std::pair{ start, observed });
     }
@@ -231,53 +238,34 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
 
     // Publication records live only while producing definitions. Runtime branch
     // checks receive slot-ordered facts rather than a native identity lookup.
-    std::map<std::pair<std::uint32_t, std::uint64_t>, Json> publications;
-    for (const auto & source : data.at("instances")) {
-        if (source.at("step") != "publish") continue;
-        const auto key = std::pair(source.at("rank").get<std::uint32_t>(), source.at("batch_id").get<std::uint64_t>());
-        auto & records = publications.try_emplace(key, Json::array()).first->second;
-        const auto & requests = source.at("source_state").at("published_requests");
-        records.insert(records.end(), requests.begin(), requests.end());
+    std::map<std::pair<std::uint32_t, std::uint64_t>, std::vector<SourcePublication>> publications;
+    for (const auto & call : calls) {
+        if (call.is_annotation() || call.step != StepKind::Publish) continue;
+        auto & records = publications[{ call.rank, call.batch_id.value() }];
+        records.insert(records.end(), call.publications.begin(), call.publications.end());
     }
 
-    const auto graph = read_json(directory / manifest.at("source_dag").get<std::string>());
-    const SGLangResourceBindings resources(graph, data.at("instances"));
-    const auto facts = read_json(directory / manifest.at("source_facts").get<std::string>());
+    const SGLangResourceBindings resources(graph, subgraphs.blocks, calls);
     const SGLangCopyLayout copies(graph, facts);
     const bool native_path = SGLangBindings{}.supports_native_path(environment);
-    const bool supported = native_path && !result.source_gap && data.at("semantic_resolution") == "native_dense_module";
+    const bool supported = native_path && !result.source_gap;
     result.resolution = supported ? "native_dense_module" : "observed_subgraph";
     if (!native_path) result.source_gap = TemplateGap{ TemplateGapKind::Rule, "native_source_path_not_implemented", StepKind::Schedule, BatchPhase::Idle, 0 };
-    else if (!result.source_gap && !supported)
-        result.source_gap = TemplateGap{ TemplateGapKind::Rule, "native_module_rule_not_implemented", StepKind::Schedule, BatchPhase::Idle, 0 };
 
-    for (const auto & kernel : graph.at("kernels")) {
-        result.kernels.emplace(kernel.at("source_span").get<SourceSpanId>(),
-                               SourceKernel{ kernel.at("name").get<std::string>(),
-                                             kernel.at("operation").get<std::string>(),
-                                             kernel.at("input_shapes").get<std::string>(),
-                                             kernel.at("output_shapes").get<std::string>(),
-                                             kernel.at("input_dtypes").get<std::string>(),
-                                             kernel.at("output_dtypes").get<std::string>(),
-                                             kernel.at("input_formats").get<std::string>(),
-                                             kernel.at("output_formats").get<std::string>() });
-    }
-
-
-    for (const auto & transfer : graph.at("transfers"))
-        result.transfers.emplace(transfer.at("source_span").get<SourceSpanId>(), SourceTransfer::read(transfer));
+    result.kernels = graph.kernels();
+    result.transfers = graph.transfers();
 
     // Preserve crossing edges before releasing the source graph. Port names alone
     // cannot represent worker-thread, stream and synchronization dependencies.
     std::map<std::size_t, std::vector<TemplateConnection>> connections;
-    for (const auto & crossing : data.at("cross_template_edges")) {
-        const auto edge_id = crossing.at("source_edge").get<std::size_t>();
-        const auto & edge = graph.at("edges").at(edge_id);
-        const auto relation = SourceGraph::parse_relation(edge.at("relation").get<std::string>());
-        const auto source = crossing.at("source_boundary").get<BoundaryId>();
-        const auto target = crossing.at("target_boundary").get<BoundaryId>();
-        const auto sources = crossing.at("source_calls").get<std::vector<std::size_t>>();
-        const auto targets = crossing.at("target_calls").get<std::vector<std::size_t>>();
+    for (const auto & crossing : subgraphs.crossings) {
+        const auto edge_id = crossing.edge;
+        const auto & edge = graph.edges().at(edge_id);
+        const auto relation = edge.relation;
+        const auto source = edge.source;
+        const auto target = edge.target;
+        const auto & sources = crossing.sources;
+        const auto & targets = crossing.targets;
 
         // A shared owner already consumes this edge internally. Only owners
         // on one side need an external connection; keep all remote identities.
@@ -294,9 +282,9 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     // Ordering qualifies native imports within a rank, including earlier stages
     // of the same batch. Target connections use invocation order, never these times.
     std::map<std::uint32_t, std::vector<std::pair<std::int64_t, std::size_t>>> serving_order;
-    for (const auto & source : data.at("instances")) {
-        serving_order[source.at("rank").get<std::uint32_t>()].emplace_back(source.at("observed_start_ns").get<std::int64_t>(),
-                                                                           source.at("source_call").get<std::size_t>());
+    for (const auto & block : subgraphs.blocks) {
+        const auto & call = calls[block.call];
+        serving_order[call.rank].emplace_back(call.observed_start_ns, block.call);
     }
     std::map<std::size_t, std::uint64_t> source_orders;
     for (auto & [rank, calls] : serving_order) {
@@ -315,11 +303,11 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
             if (connection.relation == SourceRelation::NativeHostWait)
                 resource_boundary = incoming ? connection.remote_source_boundary : connection.local_boundary;
             if (resource_boundary) {
-                const auto & point = graph.at("boundaries").at(*resource_boundary);
-                const auto & lane = graph.at("lanes").at(point.at("lane").get<std::size_t>());
-                const auto domain = SourceGraph::parse_domain(lane.at("domain").get<std::string>());
+                const auto & point = graph.boundaries().at(*resource_boundary);
+                const auto & lane = graph.lanes().at(point.lane);
+                const auto domain = lane.domain;
                 if (domain == SourceDomain::CpuThread || domain == SourceDomain::DeviceStream) {
-                    connection.resource = TemplateResource{ domain, lane.at("rank").get<std::uint32_t>(), lane.at("native_id").get<std::uint64_t>() };
+                    connection.resource = TemplateResource{ domain, lane.rank, lane.native_id };
                 }
             }
 
@@ -334,7 +322,7 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
         }
     }
 
-    const RequestPoolLayout request_pool(result.configuration.at("max_running_requests").get<std::uint32_t>(), result.kernels, graph.at("operations"));
+    const RequestPoolLayout request_pool(result.configuration.at("max_running_requests").get<std::uint32_t>(), result.kernels, graph.operations());
     result.request_pool_domain = request_pool.capacity_domain();
     if (const auto table_tokens = request_pool.sequence_capacity()) {
         const auto & model = environment.at("model_configuration");
@@ -355,63 +343,20 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     }
 
 
-    const auto & calls = data.at("calls");
-    std::vector<std::vector<std::size_t>> children(calls.size());
-    for (std::size_t index = 0; index < calls.size(); ++index) {
-        const auto & parent = calls[index].at("parent");
-        if (!parent.is_null()) children[parent.get<std::size_t>()].push_back(index);
-    }
-    const ServingContract contract;
-    for (const auto & source : data.at("instances")) {
-        const auto step = contract.block(source.at("step").get<std::string>()).kind;
-        const auto phase = source.at("phase").is_null() ? BatchPhase::Idle : source.at("phase") == "prefill" ? BatchPhase::Prefill : BatchPhase::Decode;
-        const auto rank = source.at("rank").get<std::uint32_t>();
-        const auto key = std::tuple(step, phase, rank);
-        auto & entry = result.definitions[key];
-        const auto & transforms = source.at("allowed_transforms");
-        if (std::find(transforms.begin(), transforms.end(), "request_identity") == transforms.end()) { continue; }
+    for (const auto & block : subgraphs.blocks) {
+        const auto & call = calls[block.call];
+        auto definition = block.build(graph, calls, subgraphs.regions, result.kernels, std::move(connections[block.call]));
+        definition.source_order = source_orders.at(block.call);
+        SGLangTemplateBindings bindings(graph, definition, result.model_rules, result.collective_rules, result.attention_rules);
+        bindings.bind_membership(call.batch_filters);
 
-        TemplateDefinition definition{ step, phase, rank, source.at("source_call").get<std::size_t>() };
-        definition.entry = source.at("ports").at("entered").get<BoundaryId>();
-        if (!source.at("batch_id").is_null()) definition.source_batch = source.at("batch_id").get<std::uint64_t>();
-        definition.source_order = source_orders.at(definition.source_call);
-        SGLangTemplateBindings bindings(definition, result.model_rules, result.collective_rules, result.attention_rules);
-        bindings.bind_membership(source.at("source_state"));
-        definition.binding = source.at("binding").get<std::string>();
-        for (const auto & request : source.at("requests")) {
-            definition.source_requests.push_back({ request.at("request_id").get<std::string>(),
-                                                   request.at("input_tokens").get<std::uint32_t>(),
-                                                   request.at("context_tokens").get<std::uint32_t>(),
-                                                   request.at("prompt_tokens").get<std::uint32_t>(),
-                                                   request.at("generated_tokens").get<std::uint32_t>() });
+        std::span<const SourcePublication> publication;
+        if (call.batch_id) {
+            const auto found = publications.find({ call.rank, *call.batch_id });
+            if (found != publications.end()) publication = found->second;
         }
+        bindings.bind_publication(publication, call.output_policy);
 
-        const Json * publication = nullptr;
-        if (definition.source_batch) {
-            const auto found = publications.find({ rank, *definition.source_batch });
-            if (found != publications.end()) publication = &found->second;
-        }
-        bindings.bind_publication(publication, source.at("source_state"));
-
-        definition.source_subtree.push_back(definition.source_call);
-        for (std::size_t position = 0; position < definition.source_subtree.size(); ++position) {
-            const auto & descendants = children[definition.source_subtree[position]];
-            for (const auto child : descendants) definition.source_subtree.push_back(child);
-        }
-
-        for (const auto port : contract.block(step).exits) {
-            definition.ports.emplace(port, source.at("ports").at(std::string(contract.port_name(port))).get<std::size_t>());
-        }
-
-        const auto & layout = source.at("input_layout");
-        if (!layout.is_null()) {
-            definition.input_layout = SourceTensorLayout{ layout.at("shape").get<std::vector<std::int64_t>>(),
-                                                          layout.at("stride").get<std::vector<std::int64_t>>(),
-                                                          layout.at("dtype").get<std::string>(),
-                                                          layout.at("device").get<std::string>() };
-        }
-
-        definition.read_structure(source, graph, data.at("regions"), calls, result.kernels, std::move(connections[definition.source_call]));
         resources.bind(definition);
         for (const auto & node : definition.graph) {
             const auto transfer = result.transfers.find(definition.observation(node).source_span);
@@ -421,23 +366,21 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
                     AscendSourceExtractor::device_command(facts.at("intervals").at(definition.observation(node).source_span));
         }
 
-        bindings.bind(graph, data.at("regions"), calls, copies, result.page_size_tokens);
+        bindings.bind(calls, copies, result.page_size_tokens);
         bindings.bind_request_pool(request_pool);
 
         bindings.bind_kv(result.page_size_tokens);
         bindings.bind_length_domain(result.page_size_tokens, result.sequence_capacity_tokens);
-        // Framework semantics choose regions; the core shares exact local topology
-        // without interpreting module names or changing external connections.
+        // Declared native regions supply semantic identity. The common graph
+        // partitions nested ownership and shares parent/child composition.
         std::vector<std::size_t> shared_regions;
         for (std::size_t index = 0; index < definition.regions.size(); ++index) {
             const auto & region = definition.regions[index];
-            // These sibling module scopes are disjoint; nested attention_core
-            // stays inside its attention owner instead of being shared twice.
-            if (region.module && (region.module->semantic == "feed_forward" || region.module->semantic == "attention")) shared_regions.push_back(index);
+            if (!region.semantic.empty() && region.cpu_scope) shared_regions.push_back(index);
         }
         definition.graph.share(definition, shared_regions, result.region_structures);
 
-        entry.push_back(std::move(definition));
+        result.definitions[{ definition.step, definition.phase, definition.rank }].push_back(std::move(definition));
     }
 
     result.gaps = manifest.at("gaps");
@@ -452,14 +395,9 @@ TemplateSource SGLangTemplateBindings::produce(const std::filesystem::path & man
     if (supported && !result.workspace_binding_gap) AscendWorkspaceBindings{}.bind_demands(result, facts, environment);
 
     result.initialization_pool_domain = { result.request_pool_domain.maximum, "workspace_initial_capacity_migration_not_qualified" };
-    if (supported && !result.initialization_gap && !result.workspace_binding_gap) {
-        // On the eager dense path, shrinking the request table changes backing
-        // rows, not the single-request warmup's model shapes. Token capacity,
-        // model, TP and runtime stay fixed in the configuration-change binding.
-        // Reuse is bounded by the producer's existing row-shrink domain.
+    if (supported && !result.steady_state_gap && !result.workspace_binding_gap && !result.request_pool_domain.shrink_gap
+        && warmup_preserves_initial_workspace(environment.at("initialization").at("warmup"), facts.at("workspace_states"), result.request_pool_domain.maximum))
         result.initialization_pool_domain = result.request_pool_domain;
-    }
-
 
     result.transforms = { "request_identity", "request_pool_rows", "kv_free_pages", "qualified_prefill_lengths", "qualified_batch_membership" };
     result.limits = {

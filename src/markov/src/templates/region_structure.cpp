@@ -2,14 +2,70 @@
 
 #include <algorithm>
 #include <map>
+#include <numeric>
 #include <optional>
-#include <set>
-#include <stdexcept>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 namespace markov {
+
+namespace {
+
+// Hierarchy and physical ownership are resolved before graph canonicalization.
+// Only these value arrays survive the source-call traversal.
+class RegionPartition {
+public:
+    RegionPartition(const TemplateDefinition & source, std::span<const std::size_t> regions, std::size_t node_count) {
+        const auto root = regions.size();
+        const auto region_count = root + 1;
+        std::map<std::size_t, const TemplateRegion *> observed_regions;
+        for (const auto & region : source.regions) observed_regions.emplace(region.source_call, &region);
+
+        std::map<std::size_t, std::size_t> selected;
+        for (std::size_t index = 0; index < root; ++index) selected.emplace(source.regions[regions[index]].source_call, index);
+        std::vector<std::size_t> parents(root, root);
+        for (std::size_t index = 0; index < root; ++index) {
+            auto parent = source.regions[regions[index]].parent_call;
+            while (parent != source.source_call) {
+                if (const auto found = selected.find(parent); found != selected.end()) {
+                    parents[index] = found->second;
+                    break;
+                }
+                parent = observed_regions.at(parent)->parent_call;
+            }
+        }
+
+        std::vector<std::size_t> depths(region_count);
+        for (std::size_t index = 0; index < root; ++index)
+            for (auto current = index; current != root; current = parents[current]) ++depths[index];
+
+        order.resize(region_count);
+        std::iota(order.begin(), order.end(), 0);
+        std::ranges::sort(order, [&](std::size_t left, std::size_t right) {
+            const auto entered = [&](std::size_t index) {
+                const auto point = index == root ? source.entry : source.regions[regions[index]].cpu_scope->begin;
+                return source.boundary_observations[point].observed_time_ns;
+            };
+            return std::tuple(depths[left], entered(left), left) < std::tuple(depths[right], entered(right), right);
+        });
+
+        std::vector<std::size_t> node_owners(node_count, root + 1);
+        // Shallow scopes yield to their selected descendants. A physical span has
+        // one owner; parent composition never introduces another executable copy.
+        for (const auto region : order) {
+            if (region == root) continue;
+            for (const auto index : source.regions[regions[region]].nodes) node_owners[index] = region + 1;
+        }
+        members.resize(region_count);
+        for (std::size_t index = 0; index < node_count; ++index) members[node_owners[index] - 1].push_back(index);
+    }
+
+    std::vector<std::vector<std::size_t>> members;
+    std::vector<std::size_t> order;
+};
+
+} // namespace
 
 TemplateNode TemplateGraph::resolve(std::size_t index, const Location & location) const {
     if (location.region == 0) return local_[location.member];
@@ -92,14 +148,15 @@ const CollectiveParameterRule & TemplateGraph::collective_rule(std::size_t node)
 }
 
 void TemplateGraph::share(const TemplateDefinition & source, std::span<const std::size_t> regions, TemplateRegionStructures & pool) {
-    if (regions.empty()) return;
+    RegionPartition partition(source, regions, local_.size());
+    const auto root = regions.size();
+    const auto region_count = root + 1;
+    auto & region_members = partition.members;
+    const auto & order = partition.order;
 
-    std::vector<std::size_t> node_owners(local_.size());
     std::map<std::size_t, std::optional<std::size_t>> boundary_owners;
-    for (std::size_t region = 0; region < regions.size(); ++region) {
-        for (const auto index : source.regions[regions[region]].nodes) {
-            if (node_owners[index] != 0) throw std::invalid_argument("shared model regions must not overlap");
-            node_owners[index] = region + 1;
+    for (std::size_t region = 0; region < region_count; ++region) {
+        for (const auto index : region_members[region]) {
             const auto & node = local_[index];
             for (const auto point : { node.begin, node.end }) {
                 const auto [position, inserted] = boundary_owners.try_emplace(point, region + 1);
@@ -132,36 +189,28 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         if (!inserted && position->second != owner) position->second.reset();
     }
 
-    // Endpoint aliasing does not transfer an outside span's extent to a region.
-    std::set<std::pair<std::size_t, std::size_t>> retained_extents;
-    for (std::size_t index = 0; index < local_.size(); ++index) {
-        if (node_owners[index] == 0) retained_extents.emplace(local_[index].begin, local_[index].end);
-    }
-    std::vector<std::vector<std::size_t>> region_edges(regions.size());
+    std::vector<std::vector<std::size_t>> region_edges(region_count);
     for (std::size_t index = 0; index < local_dependencies_.size(); ++index) {
         const auto & edge = local_dependencies_[index];
-        if (edge.relation == SourceRelation::IntervalExtent && retained_extents.contains({ edge.source, edge.target })) continue;
         const auto from = boundary_owners.find(edge.source);
         const auto to = boundary_owners.find(edge.target);
         if (from == boundary_owners.end() || to == boundary_owners.end() || !from->second || from->second != to->second) continue;
         region_edges[*from->second - 1].push_back(index);
     }
 
-    std::vector<std::vector<std::pair<std::size_t, TemplateConnectionDirection>>> region_ports(regions.size());
+    std::vector<std::vector<std::pair<std::size_t, TemplateConnectionDirection>>> region_ports(region_count);
     for (std::size_t index = 0; index < local_dependencies_.size(); ++index) {
         const auto & edge = local_dependencies_[index];
         const auto from = boundary_owners.find(edge.source);
         const auto to = boundary_owners.find(edge.target);
         const auto source_owner = from == boundary_owners.end() ? std::nullopt : from->second;
         const auto target_owner = to == boundary_owners.end() ? std::nullopt : to->second;
-        // Same-region retained extents still belong to outside work. Leave the
-        // original dependency local instead of changing its ownership.
         if (source_owner == target_owner) continue;
         if (source_owner) region_ports[*source_owner - 1].emplace_back(index, TemplateConnectionDirection::Outgoing);
         if (target_owner) region_ports[*target_owner - 1].emplace_back(index, TemplateConnectionDirection::Incoming);
     }
 
-    std::vector<std::vector<std::size_t>> region_connections(regions.size());
+    std::vector<std::vector<std::size_t>> region_connections(region_count);
     for (std::size_t index = 0; index < local_connections_.size(); ++index) {
         const auto owner = boundary_owners.find(local_connections_[index].contract.local_boundary);
         if (owner != boundary_owners.end() && owner->second) region_connections[*owner->second - 1].push_back(index);
@@ -174,15 +223,21 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
 
     locations_.resize(local_.size());
     dependency_locations_.resize(local_dependencies_.size());
-    for (std::size_t region = 0; region < regions.size(); ++region) {
-        auto members = source.regions[regions[region]].nodes;
+    std::vector<std::size_t> binding_regions;
+    // Child invocation count and selection belong to the existing region tree,
+    // not the identity of the parent's own reusable work.
+    for (const auto region : order) {
+        auto members = std::move(region_members[region]);
         // Source time orders records within a lane, never independent resources.
         std::ranges::sort(members, [&](std::size_t left, std::size_t right) {
             const auto key = [&](std::size_t index) {
                 const auto & node = local_[index];
-                const auto & lane = source.lanes[source.graph.boundary(node.begin).lane].source;
+                const auto & resource = source.lanes[source.graph.boundary(node.begin).lane];
+                const auto & lane = resource.source;
                 return std::tuple(lane.domain,
-                                  lane.native_id,
+                                  resource.role,
+                                  lane.rank == source.rank ? 0 : lane.rank + 1,
+                                  resource.role ? 0 : lane.native_id,
                                   source.boundary_observations[node.begin].observed_time_ns,
                                   source.boundary_observations[node.end].observed_time_ns,
                                   index);
@@ -191,8 +246,10 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         });
 
         Binding binding;
+        binding.source_region = region == root ? std::nullopt : std::optional(regions[region]);
         std::map<std::size_t, std::size_t> points;
         TemplateRegionStructure structure;
+        structure.semantic = region == root ? "serving." + std::string(ServingContract{}.block(source.step).name) : source.regions[regions[region]].semantic;
         structure.nodes.reserve(members.size());
         for (const auto index : members) {
             auto node = local_[index];
@@ -296,7 +353,7 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
             if (inserted) {
                 binding.lanes.push_back(lane_index);
                 const auto [rank, added] = ranks.try_emplace(lane.rank, ranks.size());
-                structure.resources.push_back({ lane.domain, rank->second });
+                structure.resources.push_back({ lane.domain, rank->second, source.lanes[lane_index].role });
             }
             structure.boundaries.push_back({ resource->second });
         }
@@ -308,7 +365,8 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
             if (inserted) {
                 binding.lanes.push_back(remote.local_boundary ? std::optional(local_boundaries_[*remote.local_boundary].lane) : std::nullopt);
                 const auto [rank, added] = ranks.try_emplace(lane.rank, ranks.size());
-                structure.resources.push_back({ lane.domain, rank->second });
+                const auto role = remote.local_boundary ? source.lanes[local_boundaries_[*remote.local_boundary].lane].role : std::nullopt;
+                structure.resources.push_back({ lane.domain, rank->second, role });
             }
             std::optional<std::size_t> local_alias;
             if (remote.local_boundary) {
@@ -320,6 +378,7 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
 
         const auto [position, inserted] = pool.insert(std::move(structure));
         binding.structure = &*position;
+        binding_regions.push_back(region);
         bindings_.push_back(std::move(binding));
     }
 
@@ -329,7 +388,7 @@ void TemplateGraph::share(const TemplateDefinition & source, std::span<const std
         for (std::size_t member = 0; member < binding.boundaries.size(); ++member) {
             const auto point = binding.boundaries[member];
             // Ambiguous endpoints stay source-local; no region acquires ownership.
-            if (boundary_owners.at(point) == region + 1) boundary_locations_[point] = { region + 1, member };
+            if (boundary_owners.at(point) == binding_regions[region] + 1) boundary_locations_[point] = { region + 1, member };
         }
     }
     std::vector<TemplateBoundary> remaining_boundaries;

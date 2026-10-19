@@ -1,20 +1,9 @@
 #include "markov/templates/request_pool_parameters.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <utility>
 #include <vector>
 
 namespace markov {
-
-nlohmann::json RequestPoolParameterLayout::describe_parameters() const {
-    auto result = shapes_.describe_parameters();
-    result["rule"] = "request_pool";
-    result["access"] = access_ ? nlohmann::json(RequestPoolWork::operation_name(*access_)) : nlohmann::json(nullptr);
-    result["single_request_only"] = single_request_only_;
-    if (access_) result["slot_source"] = "target_request_reservations";
-    return result;
-}
 
 std::optional<std::string> RequestPoolCapacityDomain::unsupported(std::uint32_t capacity) const {
     if (capacity == maximum) return std::nullopt;

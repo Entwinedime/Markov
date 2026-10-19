@@ -61,6 +61,7 @@ nlohmann::json ServiceWork::describe() const {
         result["transfer"] = transfer->describe();
     }
     if (device_command) result["device_command"] = device_command->describe();
+    if (cpu) result["cpu"] = cpu->describe();
     return result;
 }
 

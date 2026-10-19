@@ -1,6 +1,7 @@
 #pragma once
 
 #include "markov/contracts/batch_membership.hpp"
+#include "markov/contracts/cpu_service.hpp"
 
 #include <nlohmann/json_fwd.hpp>
 
@@ -31,7 +32,7 @@ enum class TransferDirection { HostToHost, HostToDevice, DeviceToHost, DeviceToD
 struct SourceTransfer {
     std::uint64_t bytes;
     TransferDirection direction;
-    std::size_t source_api;
+    std::optional<std::size_t> source_api; // Supplementary provenance; hardware payload facts do not require an SDK hook.
 
     nlohmann::json describe() const;
     static SourceTransfer read(const nlohmann::json & value);
@@ -101,7 +102,7 @@ struct KvSequence {
 
     auto operator<=>(const KvSequence &) const = default;
 
-    nlohmann::json describe_addresses(std::int64_t page_size, std::int64_t batch_offset, bool include_writes) const;
+    nlohmann::json describe() const;
 };
 
 // Derived from the target invocation, not from cache capacity or source timing.
@@ -114,29 +115,6 @@ struct AttentionWorkload {
     std::int64_t page_size_tokens;
     std::int64_t cache_pages; // Observed allocated layout, including padding; not the live KV length.
     auto operator<=>(const AttentionWorkload &) const = default;
-
-    nlohmann::json describe() const;
-};
-
-struct KvAllocationWorkload {
-    std::int64_t page_size_tokens;
-    std::uint64_t free_pages_before;
-    std::vector<KvSequence> sequences;
-
-    nlohmann::json describe() const;
-};
-
-struct PageTableWorkload {
-    std::int64_t page_size_tokens;
-    std::vector<KvSequence> sequences;
-
-    nlohmann::json describe() const;
-};
-
-struct KvReleaseWorkload {
-    std::int64_t page_size_tokens;
-    std::uint64_t free_pages_before;
-    std::vector<KvSequence> sequences;
 
     nlohmann::json describe() const;
 };
@@ -196,16 +174,12 @@ struct SourceKernel {
     std::string output_formats;
     std::optional<std::vector<std::int64_t>> logits_token_indices = std::nullopt;
     std::optional<PositionWorkload> positions = std::nullopt;
-    std::optional<KvAllocationWorkload> kv_allocation = std::nullopt;
-    std::optional<KvReleaseWorkload> kv_release = std::nullopt;
     std::optional<BatchFilter> batch_filter = std::nullopt;
-    std::optional<BatchMerge> batch_merge = std::nullopt;
-    std::optional<PageTableWorkload> page_table = std::nullopt;
-    std::optional<std::int64_t> sequence_length_max = std::nullopt;
-    std::optional<std::vector<std::int64_t>> sequence_lengths = std::nullopt;
-    std::optional<std::int64_t> kv_new_pages = std::nullopt;
     std::optional<RequestPoolWork> request_pool = std::nullopt;
     std::optional<AttentionWorkload> attention = std::nullopt; // Target semantic parameters, absent in raw kernel observations.
+    // Value-dependent work without a measured operand contract. Keep its identity;
+    // full request/KV state remains on the invocation instead of each kernel.
+    std::vector<std::string> value_dependencies = {};
 
     nlohmann::json describe() const;
 };
@@ -274,7 +248,6 @@ struct SourceCollective {
     std::vector<SourceCommunicationTask> tasks;
 
     nlohmann::json describe() const;
-    static SourceCollective read(const nlohmann::json & value);
 };
 
 struct SourceGraphSummary {
@@ -296,8 +269,6 @@ class SourceGraph {
 public:
     static std::string_view span_name(SourceSpanKind kind);
     static std::string_view relation_name(SourceRelation relation);
-    static SourceRelation parse_relation(std::string_view name);
-    static SourceDomain parse_domain(std::string_view name);
     std::size_t lane(SourceDomain domain, std::uint32_t rank, std::uint64_t native_id);
     SourceSpanId observe(SourceSpanKind kind, std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::optional<std::size_t> owner_call,
                          std::optional<std::size_t> source_interval, std::optional<std::size_t> source_api = std::nullopt,
@@ -306,6 +277,7 @@ public:
     void observe_transfer(SourceSpanId span, SourceTransfer transfer);
     void observe_stream_wait(SourceSpanId span, SourceStreamWait wait);
     void observe_operation(SourceOperation operation);
+    void observe_cpu_boundary(BoundaryId boundary, CpuBoundary description);
     void observe_collective(SourceCollective collective);
     void connect(BoundaryId source, BoundaryId target, SourceRelation relation, std::optional<std::size_t> source_reference = std::nullopt);
 
@@ -319,9 +291,15 @@ public:
     SourceGraphSummary seal();
 
     const std::vector<SourceSpan> & spans() const;
-    const std::vector<SourceCollective> & collectives() const;
+    const std::map<SourceSpanId, SourceOperation> & operations() const;
+    const std::map<SourceSpanId, SourceCollective> & collectives() const;
     const std::vector<SourceEdge> & edges() const;
+    const std::vector<SourceLane> & lanes() const;
     const std::vector<SourceBoundary> & boundaries() const;
+    const std::map<SourceSpanId, SourceKernel> & kernels() const { return kernels_; }
+    const std::map<SourceSpanId, SourceTransfer> & transfers() const { return transfers_; }
+    const std::map<SourceSpanId, SourceStreamWait> & stream_waits() const { return stream_waits_; }
+    const std::map<BoundaryId, CpuBoundary> & cpu_boundaries() const { return cpu_boundaries_; }
 
     void write(const std::filesystem::path & path) const;
 
@@ -334,8 +312,9 @@ private:
     std::map<SourceSpanId, SourceKernel> kernels_;
     std::map<SourceSpanId, SourceTransfer> transfers_;
     std::map<SourceSpanId, SourceStreamWait> stream_waits_;
-    std::vector<SourceOperation> operations_;
-    std::vector<SourceCollective> collectives_;
+    std::map<SourceSpanId, SourceOperation> operations_;
+    std::map<BoundaryId, CpuBoundary> cpu_boundaries_;
+    std::map<SourceSpanId, SourceCollective> collectives_;
     std::vector<SourceEdge> edges_;
 
     std::map<std::tuple<SourceDomain, std::uint32_t, std::uint64_t>, std::size_t> lane_ids_;

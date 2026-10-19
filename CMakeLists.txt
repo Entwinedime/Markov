@@ -13,12 +13,13 @@ add_library(markov_core
     src/markov/src/contracts/control.cpp
     src/markov/src/contracts/json_input.cpp
     src/markov/src/contracts/service_work.cpp
-    src/markov/src/contracts/source_observations.cpp
+    src/markov/src/contracts/cpu_service.cpp
     src/markov/src/controller/lightweight_controller.cpp
     src/markov/src/execution/execution_graph.cpp
+    src/markov/src/execution/cpu_services.cpp
     src/markov/src/execution/simulation.cpp
-    src/markov/src/execution/execution_details.cpp
     src/markov/src/execution/workspace_state.cpp
+    src/markov/src/graph/cpu_service_partition.cpp
     src/markov/src/graph/kernel_shapes.cpp
     src/markov/src/graph/source_graph.cpp
     src/markov/src/performance/node_durations.cpp
@@ -29,10 +30,10 @@ add_library(markov_core
     src/markov/src/performance/kernel_cost_model.cpp
     src/markov/src/performance/communication_cost_model.cpp
     src/markov/src/performance/transfer_cost_model.cpp
-    src/markov/src/performance/device_command_cost_model.cpp
     src/markov/src/production/block_binding.cpp
     src/markov/src/production/block_extractor.cpp
     src/markov/src/production/source_call.cpp
+    src/markov/src/production/source_subgraph.cpp
     src/markov/src/templates/attention_parameters.cpp
     src/markov/src/templates/batch_parameters.cpp
     src/markov/src/templates/collective_replacement.cpp
@@ -58,12 +59,13 @@ target_link_libraries(markov_core PUBLIC nlohmann_json::nlohmann_json ZLIB::ZLIB
 target_compile_options(markov_core PRIVATE -Wall -Wextra -Wpedantic)
 
 add_library(markov_adapters
+    src/markov/src/adapters/template_adapter.cpp
     src/markov/src/adapters/frameworks/ktransformers/collection_adapter.cpp
     src/markov/src/adapters/frameworks/sglang/collection_adapter.cpp
     src/markov/src/adapters/frameworks/sglang/configuration.cpp
     src/markov/src/adapters/frameworks/sglang/batch_layout.cpp
     src/markov/src/adapters/frameworks/sglang/bindings.cpp
-    src/markov/src/adapters/frameworks/sglang/block_extractor.cpp
+    src/markov/src/adapters/frameworks/sglang/source_ports.cpp
     src/markov/src/adapters/frameworks/sglang/template_adapter.cpp
     src/markov/src/adapters/frameworks/sglang/copy_layout.cpp
     src/markov/src/adapters/frameworks/sglang/models/attention_kernel_layout.cpp
@@ -76,6 +78,8 @@ add_library(markov_adapters
     src/markov/src/adapters/frameworks/sglang/template_production.cpp
     src/markov/src/adapters/runtimes/ascend/hccl_mesh_layout.cpp
     src/markov/src/adapters/runtimes/ascend/source_extractor.cpp
+    src/markov/src/adapters/runtimes/ascend/source_cpu.cpp
+    src/markov/src/adapters/runtimes/ascend/source_events.cpp
     src/markov/src/adapters/runtimes/ascend/source_transfers.cpp
     src/markov/src/adapters/runtimes/ascend/workspace_bindings.cpp
 )
@@ -90,7 +94,7 @@ add_library(markov_workflow
     src/markov/src/workflow/plan.cpp
     src/markov/src/workflow/project_reader.cpp
     src/markov/src/workflow/prediction_workflow.cpp
-    src/markov/src/workflow/performance_requirements_plan.cpp
+    src/markov/src/workflow/cpu_sampling_catalog.cpp
     src/markov/src/workflow/performance_sampling_plan.cpp
 )
 target_include_directories(markov_workflow PUBLIC src/markov/include)

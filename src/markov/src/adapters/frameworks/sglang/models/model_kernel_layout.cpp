@@ -1,41 +1,30 @@
 #include "markov/adapters/frameworks/sglang/models/model_kernel_layout.hpp"
+#include "markov/production/block_binding.hpp"
 
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/kernel_shapes.hpp"
 #include "markov/graph/source_graph.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
-#include <array>
 #include <string_view>
 #include <vector>
 
 namespace markov {
 
-ModelKernelLayout::ModelKernelLayout(ModelKernelRole role, std::size_t source_call, std::int64_t tokens, std::int64_t input_width, std::int64_t output_width)
-    : role_(role),
-      source_call_(source_call),
-      source_tokens_(tokens),
-      input_width_(input_width),
-      output_width_(output_width) {}
+ModelKernelLayout::ModelKernelLayout(ModelKernelRole role, std::int64_t output_width) : role_(role), output_width_(output_width) {}
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_page_table(std::size_t source_call, const SourceKernel & kernel,
-                                                                    std::span<const SourceRequest> requests, std::uint32_t page_size_tokens) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_page_table(const SourceKernel & kernel, std::span<const SourceRequest> requests,
+                                                                    std::uint32_t page_size_tokens) {
     const bool maximum = kernel.name == "aclnnMax_ReduceMaxAiCore_ReduceMax";
     if (!maximum && !kernel.name.starts_with("aclnnFloorDivides_")) return std::nullopt;
     std::int64_t max_sequence = 0;
-    std::int64_t tokens = 0;
-    for (const auto & request : requests) {
-        max_sequence = std::max(max_sequence, static_cast<std::int64_t>(request.context_tokens) + request.input_tokens);
-        tokens += request.input_tokens;
-    }
+    for (const auto & request : requests) { max_sequence = std::max(max_sequence, static_cast<std::int64_t>(request.context_tokens) + request.input_tokens); }
     const auto batch = static_cast<std::int64_t>(requests.size());
     const auto columns = (max_sequence + page_size_tokens - 1) / page_size_tokens;
     const KernelShapes inputs(kernel.input_shapes);
     const KernelShapes outputs(kernel.output_shapes);
     const std::vector<std::int64_t> matrix{ batch, columns };
-    ModelKernelLayout layout(ModelKernelRole::PageTableCast, source_call, tokens, maximum ? 1 : columns, maximum ? 1 : columns);
+    ModelKernelLayout layout(ModelKernelRole::PageTableCast, maximum ? 1 : columns);
     layout.source_requests_ = batch;
     layout.page_size_tokens_ = page_size_tokens;
     layout.input_token_axes_ = {
@@ -89,11 +78,11 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_page_table(std::size_t 
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(std::size_t source_call, const SourceKernel & kernel, std::int64_t tokens,
-                                                                        std::int64_t requests, StepKind step, bool foreach_copy) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(const SourceKernel & kernel, std::int64_t tokens, std::int64_t requests, StepKind step,
+                                                                        bool foreach_copy) {
     const KernelShapes inputs(kernel.input_shapes);
     const KernelShapes outputs(kernel.output_shapes);
-    ModelKernelLayout layout(ModelKernelRole::ForwardPositions, source_call, tokens, 1, 1);
+    ModelKernelLayout layout(ModelKernelRole::ForwardPositions, 1);
     layout.source_requests_ = requests;
     layout.input_token_axes_ = {
         { 0, 1, AxisExtent::Requests }
@@ -111,7 +100,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(std::siz
             || outputs.tensors != expected)
             return std::nullopt;
 
-        layout.role_ = ModelKernelRole::ForwardInputCopies;
+        layout.role_ = ModelKernelRole::ShapeOnly;
         layout.input_token_axes_ = {
             { 0, 1,   AxisExtent::Tokens },
             { 1, 1,   AxisExtent::Tokens },
@@ -128,7 +117,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(std::siz
         const std::vector<std::vector<std::int64_t>> expected{ { tokens } };
         if (kernel.input_dtypes != "INT32" || kernel.output_dtypes != "INT64" || inputs.tensors != expected || outputs.tensors != expected) return std::nullopt;
 
-        layout.role_ = ModelKernelRole::ForwardInputCopies;
+        layout.role_ = ModelKernelRole::ShapeOnly;
         layout.input_token_axes_ = {
             { 0, 1, AxisExtent::Tokens }
         };
@@ -157,7 +146,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(std::siz
         // Scalar slots stay fixed; only the per-request vector varies.
         std::vector<std::vector<std::int64_t>> expected_inputs{ { requests }, {} };
         if (kernel.name == "aclnnSubs_SubAiCore_Sub" && kernel.operation == "Sub" && kernel.input_dtypes == "INT64;INT64")
-            layout.role_ = ModelKernelRole::DecodePositionOffset;
+            layout.role_ = ModelKernelRole::ShapeOnly;
         else if (kernel.name == "aclnnClamp_ClipByValueV2AiCore_ClipByValueV2" && kernel.operation == "ClipByValueV2"
                  && kernel.input_dtypes == "INT64;INT64;INT64") {
             layout.role_ = ModelKernelRole::DecodePositionClamp;
@@ -172,8 +161,8 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_forward_inputs(std::siz
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_sequence_lengths(const SourceNativeRegion & region, std::size_t source_call,
-                                                                          const SourceKernel & kernel, std::span<const SourceRequest> requests) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_sequence_lengths(const SourceNativeRegion & region, const SourceKernel & kernel,
+                                                                          std::span<const SourceRequest> requests) {
     if (region.semantic != "attention_metadata" || region.method != "init_forward_metadata" || region.parameters.at("is_hybrid_swa") != 0) return std::nullopt;
     if (kernel.name != "aclnnInplaceCopy_CastAiCore_Cast" || kernel.operation != "Cast" || kernel.input_dtypes != "INT64" || kernel.output_dtypes != "INT32")
         return std::nullopt;
@@ -184,17 +173,15 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sequence_lengths(const 
     if (!lengths || lengths->dtype != "torch.int64" || lengths->shape != std::vector<std::int64_t>{ rows } || values.size() != requests.size())
         return std::nullopt;
 
-    std::int64_t tokens = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
         if (values[index] != static_cast<std::int64_t>(requests[index].context_tokens) + requests[index].input_tokens) return std::nullopt;
-        tokens += requests[index].input_tokens;
     }
     const std::vector<std::vector<std::int64_t>> expected{ { rows } };
     if (KernelShapes(kernel.input_shapes).tensors != expected || KernelShapes(kernel.output_shapes).tensors != expected) return std::nullopt;
 
     // This is the backend's per-request length vector, distinct from the
     // two-dimensional block table casts in the same metadata scope.
-    ModelKernelLayout layout(ModelKernelRole::SequenceLengthsCast, source_call, tokens, 1, 1);
+    ModelKernelLayout layout(ModelKernelRole::SequenceLengthsCast, 1);
     layout.source_requests_ = rows;
     layout.input_token_axes_ = {
         { 0, 1, AxisExtent::Requests }
@@ -203,9 +190,8 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sequence_lengths(const 
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling_positions(const SourceNativeRegion & region, std::size_t source_call,
-                                                                            const SourceKernel & kernel, std::span<const SourceRequest> requests,
-                                                                            StepKind step) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling_positions(const SourceNativeRegion & region, const SourceKernel & kernel,
+                                                                            std::span<const SourceRequest> requests, StepKind step) {
     if (step != StepKind::Prefill || region.semantic != "sampling" || region.method != "sample" || region.call_parameters.at("is_all_greedy") != 1
         || region.call_parameters.at("return_logprob") != 0)
         return std::nullopt;
@@ -217,10 +203,8 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling_positions(cons
     if (!lengths || lengths->dtype != "torch.int64" || lengths->shape != std::vector<std::int64_t>{ rows }) return std::nullopt;
     const auto & values = region.cpu_values.at("forward_batch.seq_lens_cpu");
     if (values.size() != requests.size()) return std::nullopt;
-    std::int64_t tokens = 0;
     for (std::size_t index = 0; index < requests.size(); ++index) {
         if (values[index] != static_cast<std::int64_t>(requests[index].context_tokens) + requests[index].input_tokens) return std::nullopt;
-        tokens += requests[index].input_tokens;
     }
 
     const KernelShapes inputs(kernel.input_shapes);
@@ -228,7 +212,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling_positions(cons
     if (inputs.tensors != std::vector<std::vector<std::int64_t>>{ { rows }, {} } || outputs.tensors != std::vector<std::vector<std::int64_t>>{ { rows } })
         return std::nullopt;
 
-    ModelKernelLayout layout(ModelKernelRole::SamplingPositions, source_call, tokens, 1, 1);
+    ModelKernelLayout layout(ModelKernelRole::SamplingPositions, 1);
     layout.source_requests_ = rows;
     layout.input_token_axes_ = {
         { 0, 1, AxisExtent::Requests }
@@ -237,14 +221,14 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling_positions(cons
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling(std::size_t source_call, const SourceKernel & kernel) const {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling(const SourceKernel & kernel) const {
     if (role_ != ModelKernelRole::LogitsCast) return std::nullopt;
 
     // Native greedy sampling reduces the vocabulary axis of the qualified
     // logits output. B rows are independent of prefill's total token count.
     const KernelShapes inputs(kernel.input_shapes);
     const KernelShapes outputs(kernel.output_shapes);
-    ModelKernelLayout layout(ModelKernelRole::GreedySelection, source_call, source_tokens_, output_width_, 1);
+    ModelKernelLayout layout(ModelKernelRole::ShapeOnly, 1);
     std::vector<std::vector<std::int64_t>> expected;
     if (kernel.name == "aclnnArgMax_ArgMaxV2AiCore_ArgMaxV2" && kernel.operation == "ArgMaxV2" && kernel.input_dtypes == "FLOAT;INT64"
         && kernel.output_dtypes == "INT32") {
@@ -254,8 +238,6 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_sampling(std::size_t so
         };
     }
     else if (kernel.name == "aclnnArgMax_CastAiCore_Cast" && kernel.operation == "Cast" && kernel.input_dtypes == "INT32" && kernel.output_dtypes == "INT64") {
-        layout.role_ = ModelKernelRole::GreedyTokenCast;
-        layout.input_width_ = 1;
         expected = { { source_requests_ } };
     }
     else return std::nullopt;
@@ -281,17 +263,16 @@ bool ModelKernelLayout::matches(const KernelShapes & inputs, const KernelShapes 
     return inputs.tensors == expected && outputs.tensors == expected_outputs;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                         std::int64_t serving_tokens, std::int64_t requests, StepKind step,
-                                                         const SourceNativeRegion * parameter_child) {
-    if (region.semantic == "logits") return bind_logits_output(region, parameter_child, source_call, kernel, serving_tokens, requests, step);
-    if (region.semantic == "logits_selection") return bind_logits_selection(region, source_call, kernel, serving_tokens, requests, step);
+std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t serving_tokens,
+                                                         std::int64_t requests, StepKind step, const SourceNativeRegion * parameter_child) {
+    if (region.semantic == "logits") return bind_logits_output(region, parameter_child, kernel, serving_tokens, requests, step);
+    if (region.semantic == "logits_selection") return bind_logits_selection(region, kernel, serving_tokens, requests, step);
     if (region.semantic == "qkv_preparation" && region.method == "forward_prepare_npu"
         && (kernel.operation == "GatherV3" || kernel.operation == "Tile" || kernel.operation == "Slice"))
-        return bind_positions(region, source_call, kernel, serving_tokens);
-    if (region.semantic == "embedding") return bind_embedding(region, source_call, kernel, serving_tokens);
-    if (region.semantic == "attention_core") return bind_attention_rows(region, source_call, kernel, serving_tokens);
-    if (kernel.operation == "RmsNorm" || kernel.operation == "AddRmsNorm") return bind_norm(region, source_call, kernel, serving_tokens, parameter_child);
+        return bind_positions(region, kernel, serving_tokens);
+    if (region.semantic == "embedding") return bind_embedding(region, kernel, serving_tokens);
+    if (region.semantic == "attention_core") return bind_attention_rows(region, kernel, serving_tokens);
+    if (kernel.operation == "RmsNorm" || kernel.operation == "AddRmsNorm") return bind_norm(region, kernel, serving_tokens, parameter_child);
 
     // These rules follow Qwen3's dense projections and Qwen2MLP's merged
     // gate/up -> SwiGLU -> down path. Scope identity selects the native role;
@@ -317,11 +298,11 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegio
     if (mlp) {
         const auto intermediate = region.parameters.at("intermediate_partition");
         if (kernel.operation == "SwiGlu" && matches(inputs, outputs, serving_tokens, 2 * intermediate, intermediate, false))
-            return ModelKernelLayout(ModelKernelRole::MlpActivation, source_call, serving_tokens, 2 * intermediate, intermediate);
+            return ModelKernelLayout(ModelKernelRole::ShapeOnly, intermediate);
         if (kernel.operation == "MatMulV2" && matches(inputs, outputs, serving_tokens, hidden, 2 * intermediate, true))
-            return ModelKernelLayout(ModelKernelRole::MlpGateUp, source_call, serving_tokens, hidden, 2 * intermediate);
+            return ModelKernelLayout(ModelKernelRole::ShapeOnly, 2 * intermediate);
         if (kernel.operation == "MatMulV2" && matches(inputs, outputs, serving_tokens, intermediate, hidden, true))
-            return ModelKernelLayout(ModelKernelRole::MlpDown, source_call, serving_tokens, intermediate, hidden);
+            return ModelKernelLayout(ModelKernelRole::ShapeOnly, hidden);
         return std::nullopt;
     }
 
@@ -341,7 +322,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegio
         };
         if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
 
-        ModelKernelLayout layout(ModelKernelRole::Rope, source_call, serving_tokens, query, kv);
+        ModelKernelLayout layout(ModelKernelRole::ShapeOnly, kv);
         layout.input_token_axes_ = {
             { 0,     1 },
             { 1, query },
@@ -367,7 +348,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegio
         const auto & output = outputs.tensors.front();
         if (output != std::vector<std::int64_t>{ serving_tokens, query } && output != std::vector<std::int64_t>{ serving_tokens, kv }) return std::nullopt;
 
-        return ModelKernelLayout(ModelKernelRole::QkvSlice, source_call, serving_tokens, query + 2 * kv, output[1]);
+        return ModelKernelLayout(ModelKernelRole::ShapeOnly, output[1]);
     }
 
     if (fused_qkv) {
@@ -387,7 +368,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegio
 
         // Preserve the partial vendor record. The native function returns
         // three outputs, but this trace cannot identify both K and V operands.
-        ModelKernelLayout layout(ModelKernelRole::FusedQkv, source_call, serving_tokens, query + 2 * kv, query);
+        ModelKernelLayout layout(ModelKernelRole::FusedQkv, query);
         layout.input_token_axes_ = {
             { 0, 1 },
             { 1, 1 },
@@ -399,22 +380,19 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind(const SourceNativeRegio
         };
         return layout;
     }
-    if (qkv && matches(inputs, outputs, serving_tokens, hidden, query + 2 * kv, true))
-        return ModelKernelLayout(ModelKernelRole::QkvProjection, source_call, serving_tokens, hidden, query + 2 * kv);
-    if (attention && matches(inputs, outputs, serving_tokens, query, hidden, true))
-        return ModelKernelLayout(ModelKernelRole::AttentionOutput, source_call, serving_tokens, query, hidden);
+    if (qkv && matches(inputs, outputs, serving_tokens, hidden, query + 2 * kv, true)) return ModelKernelLayout(ModelKernelRole::ShapeOnly, query + 2 * kv);
+    if (attention && matches(inputs, outputs, serving_tokens, query, hidden, true)) return ModelKernelLayout(ModelKernelRole::ShapeOnly, hidden);
 
     return std::nullopt;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_positions(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                                   std::int64_t tokens) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_positions(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t tokens) {
     const auto & positions = region.inputs.at("positions");
     if (!positions || positions->shape != std::vector<std::int64_t>{ tokens }) return std::nullopt;
     const auto width = region.parameters.at("head_dim");
     const KernelShapes inputs(kernel.input_shapes);
     const KernelShapes outputs(kernel.output_shapes);
-    ModelKernelLayout layout(ModelKernelRole::PositionGather, source_call, tokens, 1, width);
+    ModelKernelLayout layout(ModelKernelRole::PositionGather, width);
     std::vector<std::vector<std::int64_t>> expected_inputs;
     std::vector<std::vector<std::int64_t>> expected_outputs;
 
@@ -431,7 +409,6 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_positions(const SourceN
     else if (kernel.operation == "Tile") {
         // Native reshape(-1, 2, D/2).repeat(1, 1, 2) duplicates each half.
         layout.role_ = ModelKernelRole::PositionTile;
-        layout.input_width_ = width;
         layout.output_width_ = 2 * width;
         expected_inputs = {
             { tokens, 2, width / 2 },
@@ -446,7 +423,6 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_positions(const SourceN
         // With a single row it is contiguous; multiple rows materialize it.
         if (tokens <= 1) return std::nullopt;
         layout.role_ = ModelKernelRole::PositionSlice;
-        layout.input_width_ = 2 * width;
         expected_inputs = {
             { tokens, 2 * width },
             { 2 },
@@ -461,8 +437,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_positions(const SourceN
 }
 
 std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_output(const SourceNativeRegion & region, const SourceNativeRegion * selection,
-                                                                       std::size_t source_call, const SourceKernel & kernel, std::int64_t tokens,
-                                                                       std::int64_t requests, StepKind step) {
+                                                                       const SourceKernel & kernel, std::int64_t tokens, std::int64_t requests, StepKind step) {
     if (!selection) return std::nullopt;
     const auto mode = selection->call_parameters.at("forward_mode");
     // The unique direct selection child establishes the parent invocation's
@@ -513,7 +488,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_output(const Sou
     }
     else return std::nullopt;
 
-    ModelKernelLayout layout(role, source_call, tokens, input_width, output_width);
+    ModelKernelLayout layout(role, output_width);
     layout.source_requests_ = requests;
     layout.input_token_axes_ = {
         { 0, 1, AxisExtent::Requests }
@@ -525,9 +500,8 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_output(const Sou
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_selection(const SourceNativeRegion & region, std::size_t source_call,
-                                                                          const SourceKernel & kernel, std::int64_t tokens, std::int64_t requests,
-                                                                          StepKind step) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_selection(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t tokens,
+                                                                          std::int64_t requests, StepKind step) {
     // SGLang ForwardMode::EXTEND is 1 in the bound native implementation.
     // Padding, logprob, decode and speculative paths have separate semantics.
     if (step != StepKind::Prefill || region.call_parameters.at("forward_mode") != 1 || region.call_parameters.at("extend_return_logprob") != 0
@@ -540,7 +514,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_selection(const 
         return std::nullopt;
 
     const auto width = hidden->shape[1];
-    ModelKernelLayout layout(ModelKernelRole::LogitsSelect, source_call, tokens, 1, 1);
+    ModelKernelLayout layout(ModelKernelRole::LogitsSelect, 1);
     layout.source_requests_ = requests;
     layout.input_token_axes_ = {
         { 0, 1, AxisExtent::Requests }
@@ -551,17 +525,16 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_selection(const 
     std::vector<std::vector<std::int64_t>> expected_inputs{ { requests } };
     std::vector<std::vector<std::int64_t>> expected_outputs{ { requests } };
 
-    if (kernel.operation == "Cast") layout.role_ = ModelKernelRole::LogitsLengthsCast;
+    if (kernel.operation == "Cast") layout.role_ = ModelKernelRole::ShapeOnly;
     else if (kernel.operation == "Cumsum") {
-        layout.role_ = ModelKernelRole::LogitsPrefixSum;
+        layout.role_ = ModelKernelRole::ShapeOnly;
         expected_inputs.push_back({ 1 });
     }
     else if (kernel.operation == "Sub") {
-        layout.role_ = ModelKernelRole::LogitsLastIndex;
+        layout.role_ = ModelKernelRole::ShapeOnly;
         expected_inputs.push_back({});
     }
     else if (kernel.operation == "Index") {
-        layout.input_width_ = width;
         layout.output_width_ = width;
         // Native Index records fixed dimension descriptors before the B
         // selected row indices. Only data rows use T; selection rows use B.
@@ -585,8 +558,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_logits_selection(const 
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_embedding(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                                   std::int64_t tokens) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_embedding(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t tokens) {
     const auto & ids = region.inputs.at("input_");
     if (!ids || ids->shape != std::vector<std::int64_t>{ tokens }) return std::nullopt;
     const auto hidden = region.parameters.at("hidden_size");
@@ -603,7 +575,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_embedding(const SourceN
 
         // Weight rows belong to the fixed native TP shard. Only token IDs
         // and gathered activations vary with this invocation.
-        ModelKernelLayout layout(ModelKernelRole::EmbeddingGather, source_call, tokens, 1, hidden);
+        ModelKernelLayout layout(ModelKernelRole::ShapeOnly, hidden);
         layout.input_token_axes_ = {
             { 1, 1 }
         };
@@ -620,7 +592,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_embedding(const SourceN
         };
         if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
 
-        ModelKernelLayout layout(ModelKernelRole::EmbeddingMask, source_call, tokens, hidden, hidden);
+        ModelKernelLayout layout(ModelKernelRole::ShapeOnly, hidden);
         layout.input_token_axes_ = {
             { 0, 1 },
             { 1, 1 }
@@ -646,13 +618,12 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_embedding(const SourceN
 
     const std::vector<std::vector<std::int64_t>> expected_outputs{ { tokens } };
     if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
-    ModelKernelLayout layout(ModelKernelRole::EmbeddingPointwise, source_call, tokens, 1, 1);
+    ModelKernelLayout layout(ModelKernelRole::ShapeOnly, 1);
     if (second_vector) layout.input_token_axes_.push_back({ 1, 1 });
     return layout;
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_attention_rows(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                                        std::int64_t tokens) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_attention_rows(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t tokens) {
     if (kernel.operation != "Cast" && kernel.operation != "Slice") return std::nullopt;
 
     const auto kv_heads = region.parameters.at("kv_heads");
@@ -667,7 +638,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_attention_rows(const So
         // from int64 to int32. Slot values are not copied into target state.
         const std::vector<std::vector<std::int64_t>> slots{ { tokens } };
         if (inputs.tensors != slots || outputs.tensors != slots || kernel.input_dtypes != "INT64" || kernel.output_dtypes != "INT32") return std::nullopt;
-        return ModelKernelLayout(ModelKernelRole::CacheSlotCast, source_call, tokens, 1, 1);
+        return ModelKernelLayout(ModelKernelRole::ShapeOnly, 1);
     }
 
     // Prefill V is a strided view into QKV. Require the observed row stride,
@@ -684,11 +655,11 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_attention_rows(const So
     };
     if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
 
-    return ModelKernelLayout(ModelKernelRole::ValueSlice, source_call, tokens, packed_heads * head_dim, kv_heads * head_dim);
+    return ModelKernelLayout(ModelKernelRole::ShapeOnly, kv_heads * head_dim);
 }
 
-std::optional<ModelKernelLayout> ModelKernelLayout::bind_norm(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                              std::int64_t serving_tokens, const SourceNativeRegion * parameter_child) {
+std::optional<ModelKernelLayout> ModelKernelLayout::bind_norm(const SourceNativeRegion & region, const SourceKernel & kernel, std::int64_t serving_tokens,
+                                                              const SourceNativeRegion * parameter_child) {
     const bool layer = region.semantic == "decoder_layer";
     const bool qkv = region.semantic == "qkv_preparation" && region.method == "forward_prepare_native";
     const bool model = region.semantic == "model_body";
@@ -712,8 +683,6 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_norm(const SourceNative
     const KernelShapes inputs(kernel.input_shapes);
     const KernelShapes outputs(kernel.output_shapes);
     const bool residual = kernel.operation == "AddRmsNorm";
-    auto role = residual ? ModelKernelRole::ResidualNorm : ModelKernelRole::HiddenNorm;
-    if (model) role = ModelKernelRole::ModelOutputNorm;
     std::int64_t multiplier = 1;
 
     if (qkv) {
@@ -721,17 +690,10 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_norm(const SourceNative
         width = region.parameters.at("head_dim");
         const auto query_heads = region.parameters.at("query_heads");
         const auto kv_heads = region.parameters.at("kv_heads");
-        // apply_qk_norm flattens tokens * heads into rows. Distinct native head
-        // counts identify Q and K here; equal counts cannot establish the role.
-        if (query_heads == kv_heads) return std::nullopt;
-        if (inputs.tensors[0] == std::vector<std::int64_t>{ serving_tokens * query_heads, width }) {
-            role = ModelKernelRole::QueryNorm;
-            multiplier = query_heads;
-        }
-        else if (inputs.tensors[0] == std::vector<std::int64_t>{ serving_tokens * kv_heads, width }) {
-            role = ModelKernelRole::KeyNorm;
-            multiplier = kv_heads;
-        }
+        // apply_qk_norm flattens tokens * heads into rows. Equal Q/K head
+        // counts describe the same row relation and need no role distinction.
+        if (inputs.tensors[0] == std::vector<std::int64_t>{ serving_tokens * query_heads, width }) { multiplier = query_heads; }
+        else if (inputs.tensors[0] == std::vector<std::int64_t>{ serving_tokens * kv_heads, width }) { multiplier = kv_heads; }
         else return std::nullopt;
     }
 
@@ -748,7 +710,7 @@ std::optional<ModelKernelLayout> ModelKernelLayout::bind_norm(const SourceNative
     if (residual) expected_outputs.push_back({ rows, width });
     if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
 
-    ModelKernelLayout layout(role, source_call, serving_tokens, width, width);
+    ModelKernelLayout layout(ModelKernelRole::ShapeOnly, width);
     layout.input_token_axes_ = {
         { 0, multiplier }
     };
@@ -774,188 +736,7 @@ ModelParameterRule ModelKernelLayout::compile(const SourceKernel & source) const
     else if (role_ == ModelKernelRole::SamplingPositions) workload = ModelWorkload::LastPositions;
     else if (role_ == ModelKernelRole::LogitsSelect) workload = ModelWorkload::LogitsIndices;
 
-    return ModelParameterRule(role_, input_token_axes_, output_token_axes_, page_size_tokens_, workload, has_partial_operands());
-}
-
-nlohmann::json ModelKernelLayout::describe() const {
-    std::string_view role;
-    switch (role_) {
-    case ModelKernelRole::SamplingPositions:
-        role = "sampling_positions";
-        break;
-    case ModelKernelRole::GreedySelection:
-        role = "greedy_selection";
-        break;
-    case ModelKernelRole::GreedyTokenCast:
-        role = "greedy_token_cast";
-        break;
-    case ModelKernelRole::SequenceLengthsCast:
-        role = "sequence_lengths_cast";
-        break;
-    case ModelKernelRole::SequenceLengthMaximum:
-        role = "sequence_length_maximum";
-        break;
-    case ModelKernelRole::PageTableView:
-        role = "page_table_view";
-        break;
-    case ModelKernelRole::PageTableSlice:
-        role = "page_table_slice";
-        break;
-    case ModelKernelRole::PageTableCast:
-        role = "page_table_cast";
-        break;
-    case ModelKernelRole::PageTableDivide:
-        role = "page_table_divide";
-        break;
-    case ModelKernelRole::DecodePositionOffset:
-        role = "decode_position_offset";
-        break;
-    case ModelKernelRole::DecodePositionClamp:
-        role = "decode_position_clamp";
-        break;
-    case ModelKernelRole::ForwardInputCopies:
-        role = "forward_input_copies";
-        break;
-    case ModelKernelRole::ForwardPositions:
-        role = "forward_positions";
-        break;
-    case ModelKernelRole::QkvProjection:
-        role = "qkv_projection";
-        break;
-    case ModelKernelRole::PositionGather:
-        role = "position_gather";
-        break;
-    case ModelKernelRole::PositionTile:
-        role = "position_tile";
-        break;
-    case ModelKernelRole::PositionSlice:
-        role = "position_slice";
-        break;
-    case ModelKernelRole::Rope:
-        role = "rope";
-        break;
-    case ModelKernelRole::CacheSlotCast:
-        role = "cache_slot_cast";
-        break;
-    case ModelKernelRole::LogitsProjection:
-        role = "logits_projection";
-        break;
-    case ModelKernelRole::LogitsTranspose:
-        role = "logits_transpose";
-        break;
-    case ModelKernelRole::LogitsCast:
-        role = "logits_cast";
-        break;
-    case ModelKernelRole::LogitsLengthsCast:
-        role = "logits_lengths_cast";
-        break;
-    case ModelKernelRole::LogitsPrefixSum:
-        role = "logits_prefix_sum";
-        break;
-    case ModelKernelRole::LogitsLastIndex:
-        role = "logits_last_index";
-        break;
-    case ModelKernelRole::LogitsSelect:
-        role = "logits_select";
-        break;
-    case ModelKernelRole::EmbeddingPointwise:
-        role = "embedding_pointwise";
-        break;
-    case ModelKernelRole::EmbeddingGather:
-        role = "embedding_gather";
-        break;
-    case ModelKernelRole::EmbeddingMask:
-        role = "embedding_mask";
-        break;
-    case ModelKernelRole::ValueSlice:
-        role = "value_slice";
-        break;
-    case ModelKernelRole::QkvSlice:
-        role = "qkv_slice";
-        break;
-    case ModelKernelRole::AttentionOutput:
-        role = "attention_output";
-        break;
-    case ModelKernelRole::MlpGateUp:
-        role = "mlp_gate_up";
-        break;
-    case ModelKernelRole::MlpActivation:
-        role = "mlp_activation";
-        break;
-    case ModelKernelRole::MlpDown:
-        role = "mlp_down";
-        break;
-    case ModelKernelRole::HiddenNorm:
-        role = "hidden_norm";
-        break;
-    case ModelKernelRole::ModelOutputNorm:
-        role = "model_output_norm";
-        break;
-    case ModelKernelRole::ResidualNorm:
-        role = "residual_norm";
-        break;
-    case ModelKernelRole::QueryNorm:
-        role = "query_norm";
-        break;
-    case ModelKernelRole::KeyNorm:
-        role = "key_norm";
-        break;
-    case ModelKernelRole::FusedQkv:
-        role = "fused_qkv_norm_rope";
-        break;
-    }
-    auto input_axes = nlohmann::json::array();
-    auto output_axes = nlohmann::json::array();
-    static constexpr std::array extent_names{ "input_tokens", "requests", "max_sequence_tokens", "page_columns", "request_sequence_storage" };
-    for (const auto & axis : input_token_axes_)
-        input_axes.push_back({
-            {       "slot",                                           axis.slot },
-            {       "axis",                                           axis.axis },
-            { "multiplier",                                     axis.multiplier },
-            {     "extent", extent_names[static_cast<std::size_t>(axis.extent)] }
-        });
-    for (const auto & axis : output_token_axes_)
-        output_axes.push_back({
-            {       "slot",                                           axis.slot },
-            {       "axis",                                           axis.axis },
-            { "multiplier",                                     axis.multiplier },
-            {     "extent", extent_names[static_cast<std::size_t>(axis.extent)] }
-        });
-
-    nlohmann::json result{
-        {                   "role",                                                   role },
-        {          "source_region",                                           source_call_ },
-        {           "token_source",                            "sum(request.input_tokens)" },
-        {          "source_tokens",                                         source_tokens_ },
-        {            "input_width",                                           input_width_ },
-        {           "output_width",                                          output_width_ },
-        {           "varying_axes", { { "input", input_axes }, { "output", output_axes } } },
-        { "topology_qualification",                    "not_established_by_shape_relation" }
-    };
-    if (role_ == ModelKernelRole::PositionSlice) result["presence_condition"] = "input_tokens > 1; native sin/cos chunk view has row stride 2 * head_dim";
-    if (role_ == ModelKernelRole::LogitsTranspose) result["presence_condition"] = "requests > 1 and observed TP rank count > 1";
-    if (source_requests_ != 0) result["source_requests"] = source_requests_;
-    if (page_size_tokens_ != 0) {
-        result["page_size_tokens"] = page_size_tokens_;
-        result["page_columns"] = "ceil(max_sequence_tokens / page_size_tokens)";
-        result["request_sequence_storage"] = "requests * max_sequence_tokens";
-    }
-    if (role_ == ModelKernelRole::PageTableSlice) result["presence_condition"] = "page_columns == 1 and requests > 1 and max_sequence_tokens > 1";
-    if (role_ == ModelKernelRole::PageTableView) {
-        result["presence_condition"] = "page_columns > 1 and page_size_tokens > 1";
-        result["view_strides"] = { "max_sequence_tokens", "page_size_tokens" };
-    }
-    if (role_ == ModelKernelRole::LogitsProjection || role_ == ModelKernelRole::LogitsCast)
-        result["row_policy_source"] = "unique_direct_logits_selection_child";
-    if (role_ == ModelKernelRole::ModelOutputNorm) result["width_source"] = "unique_direct_embedding_child";
-    if (role_ == ModelKernelRole::GreedySelection || role_ == ModelKernelRole::GreedyTokenCast) result["row_policy_source"] = "unique_direct_logits_output";
-    if (has_partial_operands()) {
-        result["operand_coverage"] = "partial_vendor_record";
-        result["reported_output_roles"] = { "q", "one_of_k_or_v" };
-        result["native_return_roles"] = { "q", "k", "v" };
-        result["unreported_tensor_inputs"] = { "q_norm_weight", "k_norm_weight" };
-    }
-    return result;
+    return ModelParameterRule(input_token_axes_, output_token_axes_, page_size_tokens_, workload);
 }
 
 } // namespace markov

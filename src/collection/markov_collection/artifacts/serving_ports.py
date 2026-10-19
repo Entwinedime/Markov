@@ -19,17 +19,19 @@ class ServingPortObservations:
     def release(self) -> None:
         """Port-only observations have no disposable vendor exports."""
 
-    def _read_ports(self, clock: dict[str, Any]) -> tuple[list[dict[str, Any]], set[int]]:
+    def _read_ports(self, clock: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[int]]:
         expected = set(self.capture["expected_ranks"])
         ranks: set[int] = set()
         identities: set[tuple[int, int, str]] = set()
         ports = []
+        arrivals = []
         for reference in self.capture["ports"]:
             record = read_json(self.directory / reference)
             rank = record["rank"]
             if type(rank) is not int or rank not in expected or rank in ranks:
                 raise ValueError(f"port observation rank is invalid or repeated: {reference}")
             ranks.add(rank)
+            arrivals.extend({**arrival, "rank": rank} for arrival in record["arrivals"])
 
             if record["clock"] != {"name": clock["name"], "implementation": clock["implementation"]}:
                 self.gaps.append(
@@ -55,10 +57,17 @@ class ServingPortObservations:
         for rank in sorted(expected - ranks):
             self.gaps.append({"kind": "observation", "reason": "port_rank_missing", "rank": rank})
 
-        return ports, ranks
+        return ports, arrivals, ranks
 
-    def _coverage(self, ports: list[dict[str, Any]], ranks: set[int], requests: list[dict[str, Any]]) -> dict[str, Any]:
+    def _coverage(
+        self,
+        ports: list[dict[str, Any]],
+        arrivals: list[dict[str, Any]],
+        ranks: set[int],
+        requests: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         batches: dict[tuple[int, int], set[str]] = defaultdict(set)
+        entries = Counter((arrival["rank"], arrival["request_id"]) for arrival in arrivals)
         publications: dict[tuple[int, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
         for port in ports:
             batches[(port["rank"], port["metadata"]["batch_id"])].add(port["port"])
@@ -84,6 +93,15 @@ class ServingPortObservations:
         # required only for the declared requests, separately on each rank.
         for rank in sorted(ranks):
             for request in requests:
+                if entries[(rank, request["id"])] != 1:
+                    self.gaps.append(
+                        {
+                            "kind": "observation",
+                            "reason": "request_entry_not_unique",
+                            "rank": rank,
+                            "request_id": request["id"],
+                        }
+                    )
                 progress = sorted(publications[(rank, request["id"])], key=lambda item: item[0])
                 if progress and progress[0][1]["generated_tokens"] == 1:
                     first_tokens += 1
@@ -116,6 +134,7 @@ class ServingPortObservations:
             "expected_ranks": self.capture["expected_ranks"],
             "observed_ranks": sorted(ranks),
             "ports": dict(Counter(port["port"] for port in ports)),
+            "rank_request_entries": len(arrivals),
             "rank_batches": len(batches),
             "declared_requests": len(requests),
             "rank_request_first_generations": first_tokens,
@@ -128,19 +147,21 @@ class ServingPortObservations:
 
         prepared = read_json(self.directory / self.capture["input"])
         environment = read_json(self.directory / self.capture["environment"])
+        if environment["steady_state"]["status"] != "steady":
+            self.gaps.append({"kind": "observation", "reason": environment["steady_state"]["status"]})
         timing = environment["request_timing"]
         clock = {
             "name": timing["clock"],
             "implementation": timing["clock_implementation"],
             "origin_ns": timing["origin_ns"],
         }
-        ports, ranks = self._read_ports(clock)
-        coverage = self._coverage(ports, ranks, prepared["requests"])
+        ports, arrivals, ranks = self._read_ports(clock)
+        coverage = self._coverage(ports, arrivals, ranks, prepared["requests"])
 
         # These are observed method-return ports, not device completion or
         # performance samples. Missing observations never create inferred ports.
         facts = self.directory / "observation_facts.json"
-        write_json(facts, {"ports": ports, "clock": clock}, compact=True)
+        write_json(facts, {"ports": ports, "arrivals": arrivals, "clock": clock}, compact=True)
         manifest = self.directory / "validation_manifest.json"
         write_json(
             manifest,

@@ -33,14 +33,10 @@ class ValidationWorkflow:
             if item["status"] == "captured":
                 continue
 
-            # A failed native attempt can retry on an explicit resume, within
-            # the same total budget. A processing failure retains its capture;
+            # The parent workflow retries native acquisition on explicit resume.
+            # A processing failure retains its capture;
             # only an explicit repair can replace its terminal failure receipt.
-            if item["status"] == "pending" or (
-                item["status"] in {"failed", "needs_data"}
-                and len(state["attempts"]) > state["capture"]["attempt_index"]
-                and state["attempts"][-1]["status"] in {"failed", "interrupted", "budget_exhausted"}
-            ):
+            if item["status"] == "pending":
                 prepared = self.collection.prepare(
                     directory / "inputs/project.json",
                     "validation",

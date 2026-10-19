@@ -91,12 +91,12 @@ class PerformanceImport:
             "device_measurements",
             "collective_measurements",
             "cpu_worker_units",
+            "cpu_service_units",
         ):
             if field in metadata:
                 paths.add(environment.host_path(str(self.manifest.parent / metadata[field])).resolve())
-        for field in ("worker_environments", "cpu_workers"):
-            for reference in metadata.get(field, []):
-                paths.add(environment.host_path(str(self.manifest.parent / reference)).resolve())
+        for reference in metadata.get("worker_environments", []):
+            paths.add(environment.host_path(str(self.manifest.parent / reference)).resolve())
 
         self.job.run(
             [

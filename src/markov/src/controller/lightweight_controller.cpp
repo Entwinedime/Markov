@@ -26,35 +26,31 @@ void LightweightController::initialize(std::span<const Request> requests, Servin
     const auto pages = limits_.kv_capacity_tokens / page_size_tokens_;
     for (std::uint32_t page = 1; page <= pages; ++page) free_pages_.push_back(page);
 
-    arrival_order_.clear();
+    incoming_.clear();
+    waiting_.clear();
     reserved_batch_.reset();
     previous_completion_.reset();
 
     next_work_id_ = 1;
-    awaited_completion_.reset();
     running_members_.clear();
     pending_prefill_.reset();
     admission_blocked_ = false;
     admission_ratio_ = admission_policy_.initial_ratio;
 }
 
-std::vector<ControlAction> LightweightController::handle(std::span<const ControlEvent> events, const RuntimeView &) {
+std::vector<ControlAction> LightweightController::handle(std::span<const ControlEvent> events) {
     std::vector<ControlAction> actions;
     for (const auto & event : events) {
         if (const auto * arrival = std::get_if<RequestArrived>(&event.payload)) {
-            progress_[arrival->request_id].phase = RequestPhase::Waiting;
-            arrival_order_.push_back(arrival->request_id);
+            incoming_.push_back(arrival->request_id);
             continue;
         }
 
-        const auto * completion = std::get_if<WorkPortCompleted>(&event.payload);
-        if (!completion || !awaited_completion_ || completion->port.work_id != awaited_completion_->work_id
-            || completion->port.port != awaited_completion_->port) {
-            continue;
-        }
+        const auto & completion = std::get<WorkPortCompleted>(event.payload);
+        if (!reserved_batch_ || completion.port != reserved_batch_->completion) continue;
 
         // Only the publication port changes token visibility or frees logical KV.
-        for (const auto & slice : reserved_batch_->requests) {
+        for (const auto & slice : reserved_batch_->input.requests) {
             auto & progress = progress_[slice.request_id];
             ++progress.published_tokens;
             if (progress.published_tokens == requests_[slice.request_id].output_tokens) {
@@ -65,14 +61,14 @@ std::vector<ControlAction> LightweightController::handle(std::span<const Control
                 // a backend free-list tensor; its operations remain in templates.
                 free_pages_.insert(free_pages_.end(), progress.kv_pages.begin(), progress.kv_pages.end());
                 progress.kv_pages.clear();
-                actions.emplace_back(CompleteRequest{ slice.request_id, completion->port });
+                actions.emplace_back(CompleteRequest{ slice.request_id, completion.port });
             }
             else { progress.phase = RequestPhase::Active; }
         }
 
-        previous_completion_ = completion->port;
+        previous_completion_ = completion.port;
 
-        if (reserved_batch_->phase == BatchPhase::Idle && std::ranges::none_of(progress_, [](const auto & request) {
+        if (reserved_batch_->input.phase == BatchPhase::Idle && std::ranges::none_of(progress_, [](const auto & request) {
                 return request.phase == RequestPhase::Waiting || request.phase == RequestPhase::Active;
             }))
             admission_ratio_ = admission_policy_.initial_ratio;
@@ -81,6 +77,16 @@ std::vector<ControlAction> LightweightController::handle(std::span<const Control
     }
 
     if (reserved_batch_) { return actions; }
+
+    // A non-overlap reader consumes new inputs between native batch returns.
+    // Keep their logical arrival separate from entry into the scheduling queue.
+    while (!incoming_.empty()) {
+        const auto request = incoming_.front();
+        incoming_.pop_front();
+        progress_[request].phase = RequestPhase::Waiting;
+        waiting_.push_back(request);
+        actions.emplace_back(ReceiveRequest{ request });
+    }
 
     if (finish().completed_requests == requests_.size()) return actions;
 
@@ -123,9 +129,7 @@ BatchInput LightweightController::select_batch() {
         pending_prefill_.reset();
     }
 
-    batch.admission = { static_cast<std::size_t>(std::ranges::count_if(progress_, [](const auto & request) { return request.phase == RequestPhase::Waiting; })),
-                        running_members_.size(),
-                        admission_blocked_ };
+    batch.admission = { waiting_.size(), running_members_.size(), admission_blocked_ };
     admit_prefill(batch);
     if (!batch.requests.empty()) { return batch; }
 
@@ -198,8 +202,7 @@ void LightweightController::admit_prefill(BatchInput & batch) {
 
     std::vector<Horizon> horizons;
     std::uint64_t prefill_tokens = 0;
-    for (const auto id : arrival_order_) {
-        if (progress_[id].phase != RequestPhase::Waiting) continue;
+    for (const auto id : waiting_) {
         ++work.candidate_checks;
         if (running_members_.size() + batch.requests.size() == limits_.request_capacity) {
             admission_blocked_ = true;
@@ -276,6 +279,7 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
         if (input.phase == BatchPhase::Prefill) {
             progress.pool_slot = free_request_slots_.front();
             free_request_slots_.pop_front();
+            waiting_.pop_front();
         }
         slice.pool_slot = *progress.pool_slot;
 
@@ -292,10 +296,12 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
     const auto schedule_id = next_work_id_++;
     std::vector<PortRef> schedule_dependencies;
     if (previous_completion_) schedule_dependencies.push_back(*previous_completion_);
-    reserved_batch_ = input;
 
     if (input.phase == BatchPhase::Idle) {
-        awaited_completion_ = PortRef{ schedule_id, PortKind::Selected };
+        reserved_batch_ = PendingBatch{
+            input,
+            { schedule_id, PortKind::Selected }
+        };
         return {
             InvokeStep{ schedule_id, StepKind::Schedule, input, std::move(schedule_dependencies), {} }
         };
@@ -305,7 +311,10 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
     const auto execute_id = next_work_id_++;
     const auto publish_id = next_work_id_++;
     const auto execute_step = input.phase == BatchPhase::Prefill ? StepKind::Prefill : StepKind::Decode;
-    awaited_completion_ = PortRef{ publish_id, PortKind::Published };
+    reserved_batch_ = PendingBatch{
+        input,
+        { publish_id, PortKind::Published }
+    };
     if (input.phase == BatchPhase::Prefill) {
         pending_prefill_.emplace();
         for (const auto & request : input.requests) pending_prefill_->push_back(request.request_id);
@@ -326,12 +335,7 @@ std::vector<ControlAction> LightweightController::invoke(BatchInput input) {
 }
 
 ControllerSummary LightweightController::finish() const {
-    std::size_t completed_requests = 0;
-    for (const auto & progress : progress_) {
-        if (progress.phase == RequestPhase::Finished) { ++completed_requests; }
-    }
-
-    return { completed_requests };
+    return { static_cast<std::size_t>(std::ranges::count(progress_, RequestPhase::Finished, &Progress::phase)) };
 }
 
 } // namespace markov

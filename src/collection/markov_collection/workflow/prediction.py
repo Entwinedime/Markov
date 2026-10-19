@@ -34,8 +34,7 @@ class PredictionProcessing:
             fcntl.flock(lock, fcntl.LOCK_EX)
 
             try:
-                with (self.directory / "result.json").open(encoding="utf-8") as stream:
-                    return json.load(stream)
+                return read_json(self.directory / "result.json")
             except FileNotFoundError:
                 pass
 
@@ -111,7 +110,7 @@ class PredictionWorkflow:
             "comparison": None,
             "summary": None,
             "validation": None,
-            "prediction": {"round": 0, "result": None, "recompute_configurations": None},
+            "prediction": {"round": 0, "result": None},
             "representatives": {},
             "active_representative": None,
             "performance_imports": {},
@@ -136,8 +135,7 @@ class PredictionWorkflow:
     def _result(self, directory: Path, state: dict[str, Any]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if state["prediction"]["result"] is not None:
-            with (directory / state["prediction"]["result"]).open(encoding="utf-8") as stream:
-                result = json.load(stream)
+            result = read_json(directory / state["prediction"]["result"])
 
         live, active_ns = self.collection.reconcile(state)
         if result:
@@ -170,8 +168,7 @@ class PredictionWorkflow:
         return ModelingJob(self.environment, run.container(task), run.work("prediction", ordinal), run.log(task))
 
     def status(self, directory: Path) -> dict[str, Any]:
-        with (directory / "run.json").open(encoding="utf-8") as stream:
-            state = json.load(stream)
+        state = read_json(directory / "run.json")
         return self._result(directory, state)
 
     def compare(self, directory: Path, manifests: list[Path]) -> dict[str, Any]:
@@ -241,8 +238,7 @@ class PredictionWorkflow:
                     result["requested_changes_applied"] = False
                 return result
 
-            with (directory / "run.json").open(encoding="utf-8") as stream:
-                state = json.load(stream)
+            state = read_json(directory / "run.json")
             self._apply_input_revision(directory, state)
             live, _ = self.collection.reconcile(state)
             write_json(directory / "run.json", state)
@@ -255,12 +251,18 @@ class PredictionWorkflow:
                 return result
 
             # Complete a recorded representative's handoff before replacement;
-            # its imported asset and group scope must not override the revision.
+            # its imported asset must not override the revision.
             active = state["active_representative"]
-            if revisions and active is not None and len(state["attempts"]) > state["capture"]["attempt_index"]:
+            completed = bool(state["attempts"]) and state["attempts"][-1]["status"] == "completed"
+            if (
+                revisions
+                and completed
+                and active is not None
+                and len(state["attempts"]) > state["capture"]["attempt_index"]
+            ):
                 self._collect_representative(directory, state)
             active_performance = state["active_performance"]
-            if revisions and active_performance is not None:
+            if revisions and completed and active_performance is not None:
                 if len(state["attempts"]) > state["capture"]["attempt_index"]:
                     self._collect_performance(directory, state)
 
@@ -268,6 +270,15 @@ class PredictionWorkflow:
                 self._revise_assets(
                     directory, state, budgets or {}, template_assets, performance_manifests, cost_models
                 )
+
+            capture = state["capture"]
+            if capture is not None and (
+                state["active_representative"] is not None
+                or state["active_performance"] is not None
+                or (state["task_status"] == "validating" and capture["role"] == "validation")
+            ):
+                self.collection.retry_native(directory, state)
+
             if (
                 state["task_status"] == "finished"
                 and state["active_representative"] is None
@@ -283,8 +294,8 @@ class PredictionWorkflow:
                 else:
                     self._continue(directory, state)
             except KeyboardInterrupt:
-                # Host interruption does not stop the container. Preserve the
-                # durable phase so resume consumes this round before starting another.
+                # Preserve the current owner's phase. Resume reconciles its
+                # live or terminal job before selecting new work.
                 state["reason"] = "prediction_workflow_interrupted"
                 write_json(directory / "run.json", state)
                 self._summarize(directory, state)
@@ -346,8 +357,7 @@ class PredictionWorkflow:
                 raise ValueError(f"resume import requires role={role}: {path}")
 
         project_path = directory / "inputs/project.json"
-        with project_path.open(encoding="utf-8") as stream:
-            project = json.load(stream)
+        project = read_json(project_path)
         for role, seconds in budgets.items():
             state["collection"][role].update(allow_run=True, max_wall_time_sec=seconds)
             if role != "validation":
@@ -367,17 +377,32 @@ class PredictionWorkflow:
         if cost_models is not None:
             project["assets"]["cost_models"] = [self.environment.container_path(path) for path in cost_models]
 
+        # Quotas do not change simulation inputs or ownership of an unfinished
+        # capture. Explicit resume retries that same handoff with the new budget.
+        if all(value is None for value in (template_assets, performance_manifests, cost_models)):
+            write_json(project_path, project)
+            if (
+                state["task_status"] == "finished"
+                or state["active_representative"] is not None
+                or state["active_performance"] is not None
+            ):
+                state["task_status"] = "selecting" if state["prediction"]["result"] is not None else "planned"
+            state.pop("reason", None)
+            write_json(directory / "run.json", state)
+            return
+
         # A remaining selection has no attempt. Revised assets and budgets must
         # be considered before deciding whether this group still needs capture.
         active = state["active_representative"]
         if active is not None:
-            del state["representatives"][active["configuration_id"]]
+            del state["representatives"][active]
             state["active_representative"] = None
         active_performance = state["active_performance"]
         if active_performance is not None:
             del state["performance_sampling"][active_performance]
             state["active_performance"] = None
         state["performance_plan"] = None
+
         # No result from the previous inputs may be presented as this revision.
         # The pending input lives in the same atomic ledger as its invalidation;
         # a stopped writer finishes this handoff before any further work.
@@ -386,9 +411,6 @@ class PredictionWorkflow:
         state["prediction"]["result"] = None
         state["pending_input"] = project
 
-        # Explicit asset replacement can affect any source selection. Only the
-        # automatic representative path has a producer-qualified group scope.
-        state["prediction"]["recompute_configurations"] = None
         state.update(task_status="planned", status="needs_data")
         state.pop("reason", None)
 
@@ -450,16 +472,12 @@ class PredictionWorkflow:
             # A host may stop after creating the directory and before saving the
             # round identity; no worker has been launched at this point.
             round_directory.mkdir(parents=True, exist_ok=True)
-            with (directory / "inputs/project.json").open(encoding="utf-8") as stream:
-                inputs = json.load(stream)
+            inputs = read_json(directory / "inputs/project.json")
             inputs["assets"]["cost_models"] = self._performance_models(directory, state, inputs)
-            affected = state["prediction"]["recompute_configurations"]
-            if affected is not None:
-                inputs["configurations"] = [item for item in inputs["configurations"] if item["id"] in affected]
             for workload in inputs["request_workloads"]:
                 workload["path"] = self.environment.container_path(directory / "inputs" / workload["path"])
             # Detailed graphs have their own retained location. Temporary round
-            # inputs/results can be removed after the merged report is published.
+            # inputs/results can be removed after the complete report is published.
             inputs["output"]["directory"] = self.environment.container_path(run.diagnostics("prediction", ordinal))
             for candidate in inputs["configurations"]:
                 candidate["config"] = self.environment.container_path(directory / "inputs" / candidate["config"])
@@ -469,8 +487,7 @@ class PredictionWorkflow:
             write_json(directory / "run.json", state)
 
         project = round_directory / "project.json"
-        with project.open(encoding="utf-8") as stream:
-            inputs = json.load(stream)
+        inputs = read_json(project)
 
         # Expose only declared prediction inputs; the full repository is not mounted.
         mounts = {
@@ -516,30 +533,13 @@ class PredictionWorkflow:
             else {run.catalogs},
         )
 
-        with (round_directory / "result.json").open(encoding="utf-8") as stream:
-            result = json.load(stream)
-        if state["prediction"]["recompute_configurations"] is None:
-            return result
-
-        # Keep the raw round limited to its actual inputs. The published task
-        # result combines replacements with immutable prior combination reports.
-        with (directory / state["prediction"]["result"]).open(encoding="utf-8") as stream:
-            previous = json.load(stream)
-        replacements = {
-            (item["configuration_id"], item["request_workload_id"]): item for item in result["combinations"]
-        }
-        result["combinations"] = [
-            replacements.get((item["configuration_id"], item["request_workload_id"]), item)
-            for item in previous["combinations"]
-        ]
-        coverage = {item["configuration_id"]: item for item in result["representative_collection"]["source_coverage"]}
-        plan = previous["representative_collection"]
-        plan["source_coverage"] = [coverage.get(item["configuration_id"], item) for item in plan["source_coverage"]]
-        result["representative_collection"] = plan
-        return result
+        return read_json(round_directory / "result.json")
 
     def _publish(self, directory: Path, state: dict[str, Any], result: dict[str, Any]) -> None:
         result["collection_performed"] = bool(state["attempts"])
+        # The next sampling plan consumes the same durable attempt history.
+        # Regrouping missing objects must not restart an unchanged native point.
+        result["performance_sampling"] = state["performance_sampling"]
         usage = {
             role: {"consumed_wall_time_ns": permission["consumed_wall_time_ns"]}
             for role, permission in state["collection"].items()
@@ -563,11 +563,10 @@ class PredictionWorkflow:
         relative = Path("results/prediction.json")
         write_json(directory / relative, result)
         state["prediction"]["result"] = str(relative)
-        state["prediction"]["recompute_configurations"] = None
 
         write_json(directory / "run.json", state)
 
-        # The immutable asset references are now in the merged result and the
+        # The immutable asset references are now in the published result and the
         # ledger points to it. No later stage reads this round's full result.
         RunDirectory(directory, state["id"]).consume_work("prediction", state["prediction"]["round"])
 
@@ -658,19 +657,15 @@ class PredictionWorkflow:
             pass
 
         if state["capture"]["manifest"] is None:
-            state["representatives"][active["configuration_id"]] = state["capture"].get(
-                "reason", "representative_collection_incomplete"
-            )
+            state["representatives"][active] = state["capture"].get("reason", "representative_collection_incomplete")
         else:
             project_path = directory / "inputs/project.json"
-            with project_path.open(encoding="utf-8") as stream:
-                project = json.load(stream)
+            project = read_json(project_path)
             manifest = self.environment.container_path(Path(state["capture"]["manifest"]))
             # Publishing the input can precede the state write on interruption.
             if not any(asset["manifest"] == manifest for asset in project["assets"]["templates"]):
                 project["assets"]["templates"].append({"manifest": manifest, "node_durations": None})
                 write_json(project_path, project)
-            state["prediction"]["recompute_configurations"] = active["configuration_ids"]
 
         # Failed collection changes only the group's outcome, not simulation
         # inputs. Persist the reusable-result phase across a host interruption.
@@ -682,7 +677,7 @@ class PredictionWorkflow:
     def _select_performance(
         self, directory: Path, state: dict[str, Any], result: dict[str, Any]
     ) -> tuple[bool, str | None]:
-        # Publish the merged result before planning. An interrupted host resumes
+        # Publish the complete result before planning. An interrupted host resumes
         # this selection, rather than running another prediction for the same inputs.
         state["task_status"] = "selecting"
         self._publish(directory, state, result)
@@ -722,7 +717,6 @@ class PredictionWorkflow:
             write_json(directory / requests, group["measurement_requests"])
             sampling = {
                 "configuration_id": group["configuration_id"],
-                "configuration_ids": group["configuration_ids"],
                 "measurement_kind": group["measurement_kind"],
                 "status": "selected",
                 "manifest": None,
@@ -745,6 +739,9 @@ class PredictionWorkflow:
                 continue
 
             prepared["measurement_kind"] = group["measurement_kind"]
+            if group["measurement_kind"] == "cpu":
+                prepared["cpu_services"] = group["cpu_services"]
+                prepared["cpu_service_descriptors"] = group["cpu_service_descriptors"]
             prepared["repetitions"] = 3
             self.collection.select(prepared, directory, state)
             state["performance_sampling"][key] = sampling
@@ -760,6 +757,8 @@ class PredictionWorkflow:
     def _collect_performance(self, directory: Path, state: dict[str, Any]) -> None:
         key = state["active_performance"]
         sampling = state["performance_sampling"][key]
+        sampling["status"] = "selected"
+        sampling.pop("reason", None)
         try:
             self.collection.collect(directory, state)
         except CaptureProcessingFailed:
@@ -769,6 +768,11 @@ class PredictionWorkflow:
         models: list[str] = []
         if manifest is None:
             sampling.update(status="failed", reason=state["capture"].get("reason", "performance_collection_incomplete"))
+            if sampling["reason"] == "performance_collection_budget_exhausted":
+                # Keep this group's owner for explicit resume. The failed native
+                # attempt and its consumed quota remain in the collection ledger.
+                self._finish(directory, state, read_json(directory / state["prediction"]["result"]), sampling["reason"])
+                return
         else:
             manifest = self.environment.container_path(Path(manifest))
             # The active handoff remains durable while fitting. A resumed host
@@ -788,8 +792,6 @@ class PredictionWorkflow:
                 if manifest not in project["assets"]["performance_manifests"]:
                     project["assets"]["performance_manifests"].append(manifest)
                     write_json(project_path, project)
-                if models:
-                    state["prediction"]["recompute_configurations"] = sampling["configuration_ids"]
 
         state.update(active_performance=None, task_status="planned" if models else "selecting", status="needs_data")
         state.pop("reason", None)
@@ -800,10 +802,11 @@ class PredictionWorkflow:
             self._collect_representative(directory, state)
         if state["active_performance"] is not None:
             self._collect_performance(directory, state)
+            if state["task_status"] == "finished":
+                return
 
         if state["task_status"] == "selecting":
-            with (directory / state["prediction"]["result"]).open(encoding="utf-8") as stream:
-                result = json.load(stream)
+            result = read_json(directory / state["prediction"]["result"])
         else:
             result = self._simulate(directory, state)
 
@@ -846,7 +849,7 @@ class PredictionWorkflow:
 
             if source_group is None:
                 # Publish structural reasons on their combinations before any
-                # performance handoff; partial recomputation preserves them.
+                # performance handoff.
                 if source_reason is not None:
                     state["reason"] = source_reason
                 selected, reason = self._select_performance(directory, state, result)
@@ -854,6 +857,8 @@ class PredictionWorkflow:
                     self._finish(directory, state, result, source_reason or reason)
                     return
                 self._collect_performance(directory, state)
+                if state["task_status"] == "finished":
+                    return
                 if state["task_status"] != "selecting":
                     result = self._simulate(directory, state)
                 continue
@@ -868,13 +873,7 @@ class PredictionWorkflow:
             )
             self.collection.select(prepared, directory, state)
             state["representatives"][representative] = None
-            state.update(
-                active_representative={
-                    "configuration_id": representative,
-                    "configuration_ids": source_group["configuration_ids"],
-                },
-                task_status="planned",
-            )
+            state.update(active_representative=representative, task_status="planned")
             self._publish(directory, state, result)
 
             self._collect_representative(directory, state)

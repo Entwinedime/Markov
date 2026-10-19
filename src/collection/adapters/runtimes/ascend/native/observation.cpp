@@ -1,4 +1,8 @@
+#include "cpu_sampling.hpp"
+#include "native_symbols.hpp"
 #include "transfer_sampling.hpp"
+
+#include "markov/adapters/runtimes/ascend/cpu_identity.hpp"
 
 #include <driver/ascend_hal_base.h>
 #include <runtime/dev.h>
@@ -30,16 +34,7 @@
 
 namespace {
 
-template <typename Function> Function resolve(const char * name) {
-    const auto symbol = dlsym(RTLD_NEXT, name);
-    if (symbol == nullptr) {
-        // This is the external dynamic-link boundary, not an internal invariant.
-        std::fprintf(stderr, "Markov native observation cannot resolve %s: %s\n", name, dlerror());
-        std::abort();
-    }
-
-    return reinterpret_cast<Function>(symbol);
-}
+using markov::collection::native_symbol;
 
 std::int64_t clock_ns(clockid_t clock) {
     timespec value;
@@ -384,13 +379,13 @@ public:
                    NativeJournal::instance().initial_events() },
           submits_task_(submits_task) {
         if (stream != nullptr) {
-            static const auto get_id = resolve<decltype(&rtGetStreamId)>("rtGetStreamId");
+            static const auto get_id = native_symbol<decltype(&rtGetStreamId)>("rtGetStreamId");
             std::int32_t identity;
             if (get_id(stream, &identity) == RT_ERROR_NONE) record_.stream_id = identity;
         }
 
         // These wall boundaries associate the API with device work and waits.
-        // Host CPU service is outside the prediction scope.
+        // CPU service is measured separately by the thread-clock sampler.
         record_.wall_time_ns = clock_ns(CLOCK_REALTIME);
         record_.start_ns = clock_ns(CLOCK_MONOTONIC);
     }
@@ -417,7 +412,7 @@ public:
             // The SDK reports the calling thread's last submitted task. Query
             // immediately after the original API, before any other submission.
             // This identity query is outside the original API's wall interval.
-            static const auto get_task = resolve<decltype(&rtGetTaskIdAndStreamID)>("rtGetTaskIdAndStreamID");
+            static const auto get_task = native_symbol<decltype(&rtGetTaskIdAndStreamID)>("rtGetTaskIdAndStreamID");
             std::uint32_t task;
             std::uint32_t stream;
             if (get_task(&task, &stream) == RT_ERROR_NONE) {
@@ -469,7 +464,8 @@ extern "C" int markov_native_flush(int close_window) {
 }
 
 extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
-    static const auto original = resolve<decltype(&rtEventRecord)>("rtEventRecord");
+    static const auto original = native_symbol<decltype(&rtEventRecord)>("rtEventRecord");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Submission, "rtEventRecord");
     if (!NativeJournal::instance().observes_events()) return original(event, stream);
 
     ApiObservation observation("rtEventRecord", stream, event, NativeJournal::instance().enabled());
@@ -479,7 +475,8 @@ extern "C" rtError_t rtEventRecord(rtEvent_t event, rtStream_t stream) {
 }
 
 extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * status) {
-    static const auto original = resolve<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
+    static const auto original = native_symbol<decltype(&rtEventQueryStatus)>("rtEventQueryStatus");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Query, "rtEventQueryStatus");
     if (!NativeJournal::instance().observes_events()) return original(event, status);
 
     // Preserve the native query and returned state; observing completion must
@@ -491,7 +488,8 @@ extern "C" rtError_t rtEventQueryStatus(rtEvent_t event, rtEventStatus_t * statu
 }
 
 extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
-    static const auto original = resolve<decltype(&rtStreamWaitEvent)>("rtStreamWaitEvent");
+    static const auto original = native_symbol<decltype(&rtStreamWaitEvent)>("rtStreamWaitEvent");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Submission, "rtStreamWaitEvent");
     if (!NativeJournal::instance().enabled()) return original(stream, event);
 
     ApiObservation observation("rtStreamWaitEvent", stream, event, true);
@@ -501,7 +499,8 @@ extern "C" rtError_t rtStreamWaitEvent(rtStream_t stream, rtEvent_t event) {
 }
 
 extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
-    static const auto original = resolve<decltype(&rtStreamSynchronize)>("rtStreamSynchronize");
+    static const auto original = native_symbol<decltype(&rtStreamSynchronize)>("rtStreamSynchronize");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Wait, "rtStreamSynchronize");
 
     if (!NativeJournal::instance().enabled()) return original(stream);
 
@@ -512,7 +511,8 @@ extern "C" rtError_t rtStreamSynchronize(rtStream_t stream) {
 }
 
 extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int32_t timeout) {
-    static const auto original = resolve<decltype(&rtStreamSynchronizeWithTimeout)>("rtStreamSynchronizeWithTimeout");
+    static const auto original = native_symbol<decltype(&rtStreamSynchronizeWithTimeout)>("rtStreamSynchronizeWithTimeout");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Wait, "rtStreamSynchronizeWithTimeout");
 
     if (!NativeJournal::instance().enabled()) return original(stream, timeout);
 
@@ -523,7 +523,8 @@ extern "C" rtError_t rtStreamSynchronizeWithTimeout(rtStream_t stream, std::int3
 }
 
 extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
-    static const auto original = resolve<decltype(&rtEventSynchronize)>("rtEventSynchronize");
+    static const auto original = native_symbol<decltype(&rtEventSynchronize)>("rtEventSynchronize");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Wait, "rtEventSynchronize");
 
     if (!NativeJournal::instance().enabled()) return original(event);
 
@@ -534,7 +535,8 @@ extern "C" rtError_t rtEventSynchronize(rtEvent_t event) {
 }
 
 extern "C" rtError_t rtDeviceSynchronize() {
-    static const auto original = resolve<decltype(&rtDeviceSynchronize)>("rtDeviceSynchronize");
+    static const auto original = native_symbol<decltype(&rtDeviceSynchronize)>("rtDeviceSynchronize");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Wait, "rtDeviceSynchronize");
 
     if (!NativeJournal::instance().enabled()) return original();
 
@@ -545,7 +547,8 @@ extern "C" rtError_t rtDeviceSynchronize() {
 }
 
 extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
-    static const auto original = resolve<decltype(&rtDeviceSynchronizeWithTimeout)>("rtDeviceSynchronizeWithTimeout");
+    static const auto original = native_symbol<decltype(&rtDeviceSynchronizeWithTimeout)>("rtDeviceSynchronizeWithTimeout");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Wait, "rtDeviceSynchronizeWithTimeout");
 
     if (!NativeJournal::instance().enabled()) return original(timeout);
 
@@ -556,7 +559,7 @@ extern "C" rtError_t rtDeviceSynchronizeWithTimeout(std::int32_t timeout) {
 }
 
 extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
-    static const auto original = resolve<decltype(&rtEventDestroy)>("rtEventDestroy");
+    static const auto original = native_symbol<decltype(&rtEventDestroy)>("rtEventDestroy");
 
     if (!NativeJournal::instance().observes_events()) return original(event);
 
@@ -568,7 +571,8 @@ extern "C" rtError_t rtEventDestroy(rtEvent_t event) {
 
 extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_bytes, const void * source, std::uint64_t bytes, rtMemcpyKind_t kind,
                                    rtStream_t stream) {
-    static const auto original = resolve<decltype(&rtMemcpyAsync)>("rtMemcpyAsync");
+    static const auto original = native_symbol<decltype(&rtMemcpyAsync)>("rtMemcpyAsync");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Submission, "rtMemcpyAsync");
     if (markov_transfer_sampling_enabled()) {
         DriverCopyScope copies(static_cast<std::int32_t>(kind));
         return original(destination, maximum_bytes, source, bytes, kind, stream);
@@ -589,9 +593,11 @@ extern "C" rtError_t rtMemcpyAsync(void * destination, std::uint64_t maximum_byt
 }
 
 extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes, DVdeviceptr source, std::size_t bytes) {
-    static const auto original = resolve<decltype(&drvMemcpy)>("drvMemcpy");
+    static const auto original = native_symbol<decltype(&drvMemcpy)>("drvMemcpy");
     auto * scope = DriverCopyScope::active();
     if (scope == nullptr) return original(destination, maximum_bytes, source, bytes);
+
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Transfer, markov::ascend_cpu::driver_copy);
 
     auto * records = scope->records();
     if (records == nullptr) {
@@ -618,7 +624,8 @@ extern "C" DVresult drvMemcpy(DVdeviceptr destination, std::size_t maximum_bytes
 }
 
 extern "C" rtError_t rtGeneralCtrl(std::uintptr_t * control, std::uint32_t count, std::uint32_t type) {
-    static const auto original = resolve<decltype(&rtGeneralCtrl)>("rtGeneralCtrl");
+    static const auto original = native_symbol<decltype(&rtGeneralCtrl)>("rtGeneralCtrl");
+    const markov::collection::CpuActivity cpu(markov::collection::CpuActivityKind::Submission, "rtGeneralCtrl");
     if (!NativeJournal::instance().enabled() || type != RT_GNL_CTRL_TYPE_FFTS_PLUS || count != 2) return original(control, count, type);
 
     // Installed HCCL submits [descriptor, stream] through this SDK command.

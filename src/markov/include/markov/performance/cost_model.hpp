@@ -9,7 +9,7 @@
 
 namespace markov {
 
-enum class NodeCostBasis { Given, KernelCandidate, CommunicationCandidate, TransferCandidate, DeviceCommandCandidate };
+enum class NodeCostBasis { Given, KernelCandidate, CommunicationCandidate, TransferCandidate, DeviceCommandCandidate, CpuCandidate };
 
 // An empty reason means this candidate did not match. Contract gaps originate
 // in the actual lookup, so coverage never reimplements model applicability.

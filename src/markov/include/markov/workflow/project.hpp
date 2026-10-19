@@ -12,9 +12,6 @@
 
 namespace markov {
 
-enum class Scope { Modeled, HttpE2E };
-enum class CacheState { Cold, Warm };
-
 struct CollectionPermission {
     bool allow_run = false;
     std::int64_t max_wall_time_sec = 0;
@@ -39,10 +36,6 @@ struct Project {
     std::vector<Candidate> configurations;
     std::vector<RequestWorkload> request_workloads;
     std::vector<TemplateInput> templates;
-
-    std::string controller = "lightweight";
-    Scope scope = Scope::Modeled;
-    CacheState initial_cache = CacheState::Cold;
 
     CollectionPermission base_collection;
     CollectionPermission performance_collection;

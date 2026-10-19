@@ -24,7 +24,8 @@ public:
     virtual nlohmann::json configuration(const FrameworkConfiguration & configuration) const = 0;
     virtual nlohmann::json instrumentation() const = 0;
     virtual bool supports_target_observation() const = 0;
-    // Pure request planning. Proposed work points still require native feature coverage.
+    // Pure request planning: required points and bounded lifecycle opportunities.
+    // Proposed work still requires actual native feature coverage.
     virtual nlohmann::json sampling_requests(const Candidate & candidate, std::span<const Request> prompts, const nlohmann::json & requirements) const = 0;
     virtual nlohmann::json workloads(const Candidate & candidate, std::span<const Request> prompts, const nlohmann::json & measurement_requests) const = 0;
     virtual nlohmann::json collectives(const Candidate & candidate, std::span<const std::filesystem::path> performance_manifests) const = 0;

@@ -1,4 +1,5 @@
 #include "transfer_sampling.hpp"
+#include "cpu_sampling.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -40,6 +41,7 @@ struct QueueCall {
     int result = -1;
     std::vector<DriverCopy> copies;
     QueueCall * previous = nullptr;
+    std::unique_ptr<markov::collection::CpuScope> cpu_scope;
 };
 
 class TransferSampling {
@@ -62,25 +64,37 @@ public:
     QueueCall * begin(std::uint64_t correlation_id, bool worker) {
         if (!enabled()) return nullptr;
 
-        auto scope_id = scope_;
-        if (scope_id == 0 && active_ != nullptr) scope_id = active_->scope_id;
+        std::unique_ptr<QueueCall> call;
+        std::uint64_t scope_id;
         {
-            const std::lock_guard lock(mutex_);
-            if (worker) {
-                const auto found = pending_.find(correlation_id);
-                if (found == pending_.end()) return nullptr;
+            const markov::collection::CpuObserver observer;
+            scope_id = scope_;
+            if (scope_id == 0 && active_ != nullptr) scope_id = active_->scope_id;
+            {
+                const std::lock_guard lock(mutex_);
+                if (worker) {
+                    const auto found = pending_.find(correlation_id);
+                    if (found == pending_.end()) return nullptr;
 
-                scope_id = found->second;
-                pending_.erase(found);
+                    scope_id = found->second;
+                    pending_.erase(found);
+                }
+                else {
+                    if (scope_id == 0) return nullptr;
+                    pending_.emplace(correlation_id, scope_id);
+                }
             }
-            else {
-                if (scope_id == 0) return nullptr;
-                pending_.emplace(correlation_id, scope_id);
-            }
+
+            call = std::make_unique<QueueCall>(
+                QueueCall{ correlation_id, scope_id, static_cast<std::uint64_t>(syscall(SYS_gettid)), worker, wall_ns(), 0, -1, {}, active_, nullptr });
         }
 
-        auto call = std::make_unique<QueueCall>(
-            QueueCall{ correlation_id, scope_id, static_cast<std::uint64_t>(syscall(SYS_gettid)), worker, wall_ns(), 0, -1, {}, active_ });
+        if (markov::collection::cpu_sampling_enabled())
+            call->cpu_scope = std::make_unique<markov::collection::CpuScope>(scope_id,
+                                                                             worker ? markov::collection::CpuActivityKind::Worker
+                                                                                    : markov::collection::CpuActivityKind::Enqueue,
+                                                                             "torch_npu_queue",
+                                                                             correlation_id);
         active_ = call.get();
         return call.release();
     }
@@ -88,8 +102,10 @@ public:
     void end(QueueCall * handle, int result) {
         if (handle == nullptr) return;
 
+        const markov::collection::CpuObserver observer;
         std::unique_ptr<QueueCall> call(handle);
         call->end = wall_ns();
+        call->cpu_scope.reset();
         call->result = result;
         active_ = call->previous;
 

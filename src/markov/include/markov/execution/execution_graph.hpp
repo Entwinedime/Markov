@@ -34,10 +34,10 @@ struct ExecutionTimingGap {
 class ExecutionGraph {
 public:
     bool append(std::span<TemplateInstance *> instances, std::span<const InvokeStep> invocations, std::int64_t release_ns);
-    std::expected<std::vector<ControlEvent>, ExecutionTimingGap> schedule(const NodeCosts & costs, const std::map<WorkId, const InvokeStep *> & invocations);
+    std::expected<std::vector<ControlEvent>, ExecutionTimingGap> schedule(const NodeCosts & costs, std::span<const InvokeStep> invocations);
     nlohmann::json describe() const;
-    nlohmann::json performance_requirements() const { return requirements_.describe(); }
-    void write(const std::filesystem::path & path) const;
+    nlohmann::json performance_requirements(bool diagnostics) const { return requirements_.describe(diagnostics); }
+    void write(const std::filesystem::path & path, const nlohmann::json & invocations) const;
 
 private:
     struct Boundary {
@@ -45,6 +45,7 @@ private:
         std::size_t source_asset;
         std::size_t batch;
         std::int64_t release_ns;
+        const CpuBoundary * cpu = nullptr;
     };
     struct Node {
         WorkId work;
@@ -59,6 +60,8 @@ private:
         BoundaryId end;
         const SourceTransfer * transfer;                    // Owned by the bank or target instance.
         const DeviceCommandWork * device_command = nullptr; // Immutable source observation; endpoint relocation preserves its work.
+        std::optional<CpuServiceWork> cpu = std::nullopt;
+        std::vector<std::size_t> cpu_members = {};
         std::optional<NodeCostEstimate> cost = std::nullopt;
 
         ServiceWork service_work() const;
@@ -82,7 +85,8 @@ private:
     };
 
     bool acyclic() const;
-    void record_requirement(const CostQuery & query, const NodeCosts & costs, const Node & owner, const InvokeStep & invocation);
+    void group_cpu_services(std::size_t first_node, std::span<const InvokeStep> invocations, std::span<const BoundaryId> interfaces);
+    void record_requirement(const CostQuery & query, const NodeCostResult & measured, const Node & owner, const InvokeStep & invocation);
     BoundaryId resolve(const TemplateEndpoint & endpoint) const;
     std::size_t register_source(const std::filesystem::path & manifest);
 
@@ -98,7 +102,6 @@ private:
     std::size_t pending_port_ = 0;
     std::vector<std::int64_t> completion_ns_;
     CostRequirements requirements_;
-    std::size_t requirement_frontier_ = 0;
 };
 
 } // namespace markov

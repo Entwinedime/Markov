@@ -4,6 +4,7 @@
 #include "markov/contracts/environment.hpp"
 #include "markov/contracts/service_work.hpp"
 #include "markov/contracts/source_observations.hpp"
+#include "markov/graph/dependency_paths.hpp"
 #include "markov/graph/source_graph.hpp"
 #include "markov/templates/attention_parameters.hpp"
 #include "markov/templates/batch_parameters.hpp"
@@ -106,6 +107,7 @@ struct TemplateInsertedBoundary {
     TemplateBoundary boundary;
     BoundaryId source_boundary;
     const std::filesystem::path * source_manifest;
+    const CpuBoundary * cpu = nullptr;
 };
 
 struct TemplateDefinition;
@@ -169,6 +171,7 @@ struct TemplateConnectionEndpoint {
 struct TemplateResourceSlot {
     SourceDomain domain;
     std::size_t rank; // Zero is this definition's rank; peer slots preserve rank aliases.
+    std::optional<TemplateResourceRole> role = std::nullopt;
     auto operator<=>(const TemplateResourceSlot &) const = default;
 };
 
@@ -190,6 +193,7 @@ struct TemplateRegionStructure {
     std::vector<TemplateRemoteBoundary> remote_boundaries; // Shares resource slots with local boundaries.
     std::map<std::size_t, const CollectiveParameterRule *> collective_rules;
     std::map<std::size_t, const ModelParameterRule *> model_rules; // Source-owned canonical rules, indexed by local node.
+    std::string semantic;
     auto operator<=>(const TemplateRegionStructure &) const = default;
 };
 
@@ -281,7 +285,8 @@ public:
     void bind_collective_rule(std::size_t node, const CollectiveParameterRule & rule) { collective_rules_.emplace(node, &rule); }
     const CollectiveParameterRule & collective_rule(std::size_t node) const;
 
-    // Producer finalization, once, after parameter binding. Regions are disjoint.
+    // Producer finalization, once, after parameter binding. Regions share only
+    // their own work; TemplateDefinition::regions retains the invocation tree.
     // The source-owned pool outlives every definition and target instance.
     void share(const TemplateDefinition & source, std::span<const std::size_t> regions, TemplateRegionStructures & pool);
     std::size_t shared_regions() const { return bindings_.size(); }
@@ -305,6 +310,7 @@ private:
         std::vector<std::size_t> boundaries;
         std::vector<RemoteBoundaryBinding> remote_boundaries;
         std::vector<std::optional<std::size_t>> lanes; // Peer-only resources have no lane in this definition.
+        std::optional<std::size_t> source_region;      // Empty for the enclosing serving root.
     };
 
     TemplateNode resolve(std::size_t index, const Location & location) const;
@@ -372,15 +378,20 @@ struct TemplateConnectionObservation {
     std::optional<std::uint64_t> remote_order;
 };
 
+struct TemplateRegionScope {
+    std::size_t begin;
+    std::size_t end;
+};
+
 struct TemplateRegion {
     std::size_t source_call;
     std::size_t parent_call;
-    std::optional<std::string> binding;
-    std::optional<SourceNativeRegion> module;
+    std::string semantic;
     std::vector<std::size_t> nodes; // Indices in the enclosing definition; never additional executable nodes.
     std::vector<std::size_t> inputs;
     std::vector<std::size_t> outputs;
-    std::optional<std::size_t> request_slot = std::nullopt; // Producer-resolved slot in source_requests, inherited by nested regions.
+    std::optional<std::size_t> request_slot = std::nullopt;      // Producer-resolved slot in source_requests, inherited by nested regions.
+    std::optional<TemplateRegionScope> cpu_scope = std::nullopt; // Observed profiler region, including wrapper bookkeeping; not a CPU service duration.
 };
 
 struct RotaryPositionDependency {
@@ -399,8 +410,6 @@ struct TemplateOperation {
     TemplateOperationWindow host;
     std::vector<TemplateOperationWindow> workers;
     std::vector<SourceSpanId> device_spans;
-    std::optional<std::string> input_shapes = std::nullopt;
-    std::optional<std::string> input_types = std::nullopt;
     std::vector<SourceSpanId> collective_spans = {};
 };
 
@@ -418,8 +427,6 @@ struct TemplateSubgraphRegion {
     std::vector<std::size_t> external_connections;
     std::vector<std::size_t> incoming_rotary_dependencies;
     std::vector<std::size_t> outgoing_rotary_dependencies;
-
-    nlohmann::json describe() const;
 };
 
 // A resource entry/exit for the currently qualified region replacement rules.
@@ -430,8 +437,6 @@ struct TemplateRegionPort {
     std::size_t entry;
     std::size_t exit;
     std::optional<std::size_t> device_done = std::nullopt;
-
-    nlohmann::json describe() const;
 };
 
 struct TemplateRegionResourceAnchor {
@@ -445,19 +450,14 @@ struct TemplateDeviceOperationPorts {
     std::size_t stream_entry;
     std::size_t stream_exit;
     std::size_t device_done;
-
-    nlohmann::json describe() const;
 };
 
-// Collective stream ordering fans out to all tasks. Cross-rank notifications
-// are group-internal interfaces and must be rebound by the joint planner.
+// A collective operation includes its stream commands as well as HCCL tasks.
+// Cross-rank notifications are rebound by the joint planner.
 struct TemplateCollectiveOperationPorts {
-    std::optional<std::size_t> stream_predecessor;
-    std::size_t stream_completion;
+    std::vector<TemplateRegionPort> resources;
     std::size_t enclosing_completion;
     std::vector<std::size_t> notification_connections;
-
-    nlohmann::json describe() const;
 };
 
 struct TemplateOperationRewrite {
@@ -484,13 +484,14 @@ struct TemplateOperationRewrite {
 // Observation metadata references existing local nodes; it creates no extra
 // communication service and does not imply a qualified target transformation.
 struct TemplateCollective {
-    SourceCollective observation;
+    SourceSpanId source_span;
+    std::string data_type;
+    std::vector<SourceCommunicationTask> tasks;
     std::size_t envelope_node;
     std::vector<std::size_t> task_nodes;
-    std::vector<std::size_t> entry_boundaries;
-    std::vector<std::size_t> exit_boundaries;
-    std::vector<std::size_t> internal_dependencies;
-    std::optional<std::size_t> completion = std::nullopt;
+    // One physical task entry/exit and a unique join of all member completions.
+    // The actual boundaries and dependencies remain in the graph.
+    bool serial_completion = false;
 };
 
 // Preserves request multiplicity and a producer-qualified length branch.
@@ -531,8 +532,6 @@ struct TemplateDefinition {
           phase(source_phase),
           rank(source_rank),
           source_call(call) {}
-    void read_structure(const nlohmann::json & source, const nlohmann::json & graph, const nlohmann::json & regions, const nlohmann::json & calls,
-                        const std::map<SourceSpanId, SourceKernel> & kernels, std::vector<TemplateConnection> source_connections);
 
     TemplateSubgraphRegion operation_region(const TemplateOperation & operation) const;
     TemplateSubgraphRegion workspace_region(const TemplateWorkspaceUse & use) const;
@@ -542,7 +541,7 @@ struct TemplateDefinition {
     bool has_resource_roles() const;
     bool matches_running_filter(const BatchInput & target) const;
     std::expected<std::vector<TemplateRegionPort>, std::string> region_ports(const TemplateSubgraphRegion & region) const;
-    bool region_precedes(const TemplateRegion & first, const TemplateRegion & second) const;
+    std::partial_ordering region_order(const TemplateRegion & first, const TemplateRegion & second) const;
     std::expected<std::optional<TemplateRegionResourceAnchor>, std::string> region_resource_anchor(const TemplateRegion & region,
                                                                                                    const TemplateResource & resource) const;
     std::expected<TemplateDeviceOperationPorts, std::string> device_operation_ports(const TemplateOperation & operation,
@@ -559,9 +558,9 @@ struct TemplateDefinition {
                                                                                     const TemplateWorkspaceUse & donor_use) const;
     std::expected<TemplateOperationRewrite, std::string> plan_region_sequence(std::span<const std::size_t> source_members,
                                                                               std::span<const TemplateRegionReference> members) const;
-    std::optional<std::size_t> logits_gather_reshape() const;
-    std::optional<std::size_t> logits_view_service() const;
-    std::expected<TemplateOperationRewrite, std::string> plan_position_materialization_removal(const TemplateOperation & operation) const;
+    std::optional<std::size_t> operation_view_service(const TemplateOperation & operation) const;
+    std::expected<TemplateOperationRewrite, std::string> plan_view_materialization_removal(const TemplateOperation & operation,
+                                                                                           std::optional<std::size_t> view_producer) const;
     std::expected<TemplateOperationRewrite, std::string> plan_operation_replacement(const TemplateOperation & operation, const TemplateDefinition & donor,
                                                                                     const TemplateOperation & donor_operation) const;
 
@@ -584,12 +583,9 @@ struct TemplateDefinition {
     std::vector<BatchFilter> filters;
     std::map<BatchFilterBinding, std::size_t> filter_regions; // Producer-qualified calls to the same membership helper.
     std::optional<BatchMerge> merge;
-    std::string binding; // Native binding that supplied this definition, retained across target instantiation.
-    std::vector<std::size_t> source_subtree;
 
     std::size_t entry;
     std::map<PortKind, std::size_t> ports; // Indices in boundaries, as are node/dependency endpoints and inputs/outputs.
-    std::optional<SourceTensorLayout> input_layout;
     std::vector<SourceRequest> source_requests;
     std::optional<RequestLengthDomain> length_domain;
     // One observation per request slot; unknown is distinct from unfinished.
@@ -602,11 +598,16 @@ struct TemplateDefinition {
 
     std::vector<TemplateLane> lanes;
     std::vector<TemplateBoundaryObservation> boundary_observations; // Same local indices; owned by this source definition.
+    std::map<std::size_t, CpuBoundary> cpu_boundaries;
     TemplateGraph graph;
     std::vector<TemplateNodeObservation> node_observations; // Source-owned bindings, indexed only by local observation_slot.
 
     const TemplateNodeObservation & observation(const TemplateNode & node) const { return node_observations[node.observation_slot]; }
     TemplateNodeObservation & observation(const TemplateNode & node) { return node_observations[node.observation_slot]; }
+    const CpuBoundary * cpu_boundary(std::size_t boundary) const {
+        const auto found = cpu_boundaries.find(boundary);
+        return found == cpu_boundaries.end() ? nullptr : &found->second;
+    }
 
     std::vector<TemplateRegion> regions;
     std::optional<KvRegionBranch> kv_region;
@@ -614,15 +615,17 @@ struct TemplateDefinition {
     std::vector<TemplateWorkspaceUse> workspace_uses;
     std::map<SourceSpanId, BatchOperationVariant> batch_operations;
     std::map<SourceSpanId, TransferParameterLayout> transfer_layouts;
-    std::optional<std::size_t> logits_reshape_operation; // Producer-qualified index in operations.
     std::vector<TemplateCollective> collectives;
-    std::map<SourceSpanId, ModelParameterObservation> model_kernel_layouts;
-    std::map<SourceSpanId, AttentionParameterObservation> attention_kernel_layouts;
+    std::map<SourceSpanId, std::size_t> model_kernel_layouts;
+    std::map<SourceSpanId, const AttentionParameterRule *> attention_kernel_layouts;
     std::map<SourceSpanId, std::expected<KvParameterLayout, std::string>> kv_kernel_layouts;
     std::map<SourceSpanId, std::expected<RequestPoolParameterLayout, std::string>> request_pool_layouts;
     std::map<SourceSpanId, std::expected<BatchParameterLayout, std::string>> batch_kernel_layouts;
     std::vector<TemplateStreamWait> stream_waits;
     std::vector<RotaryPositionDependency> rotary_position_dependencies;
+    // Operation index -> view producer when one request makes the copy unnecessary.
+    // A missing producer retains an observed copy whose replacement is unqualified.
+    std::map<std::size_t, std::optional<std::size_t>> single_request_views;
     std::vector<TemplateConnectionObservation> connection_observations;
     TemplateConnection connection(std::size_t index) const;
     std::vector<BoundaryId> inputs;
@@ -635,8 +638,6 @@ private:
                                                                                    const TemplateRegion * region) const;
     TemplateSubgraphRegion complete_region(TemplateSubgraphRegion region) const;
     std::expected<TemplateSubgraphRegion, std::string> cpu_sequence_separator(std::size_t entry, std::size_t exit, std::size_t parent) const;
-    std::optional<std::size_t> operation_view_service(const TemplateOperation & operation) const;
-    void bind_collective_boundaries();
     std::expected<TemplateOperationRewrite, std::string> plan_device_operation_removal(const TemplateOperation & operation) const;
 };
 
@@ -768,8 +769,7 @@ public:
     std::expected<void, std::string> connect(std::span<TemplateInstance *> instances);
 
 private:
-    static void prune_frontier(std::map<TemplateBoundaryIdentity, TemplateEndpoint> & candidates,
-                               const std::map<TemplateBoundaryIdentity, std::vector<TemplateBoundaryIdentity>> & adjacency);
+    static void prune_frontier(std::map<TemplateBoundaryIdentity, TemplateEndpoint> & candidates, const DependencyPaths<TemplateBoundaryIdentity> & paths);
 
     // An absent resource has no prior modeled work. An empty value is an observed
     // resource whose export is unknown, and must not be treated as initially idle.
@@ -793,7 +793,7 @@ struct TemplateSource {
     Environment deployment;
     std::string resolution;
     std::optional<TemplateGap> source_gap;
-    std::optional<std::string> initialization_gap;
+    std::optional<std::string> steady_state_gap;
     std::expected<AdmissionPolicy, TemplateGap> admission_policy =
         std::unexpected(TemplateGap{ TemplateGapKind::Observation, "admission_policy_not_observed", StepKind::Schedule, BatchPhase::Idle, 0 });
     std::map<SourceSpanId, SourceKernel> kernels;
@@ -842,7 +842,7 @@ public:
                                                                                     WorkspaceBranch branch, const BatchInput & input) const;
     std::expected<void, TemplateGap> qualify(std::uint32_t request_capacity) const;
     std::expected<void, TemplateGap> qualify_initialization(std::uint32_t request_capacity) const;
-    nlohmann::json describe() const;
+    nlohmann::json describe(bool diagnostics) const;
 
 private:
     std::expected<std::vector<TemplateOperationRewrite>, std::string> plan_materializations(const TemplateDefinition & source, const BatchInput & target) const;
@@ -854,7 +854,14 @@ private:
     struct SelectionFailure {
         MatchStage stage;
         TemplateGap gap;
+
+        SelectionFailure(MatchStage stage, TemplateGap gap) : stage(stage), gap(std::move(gap)) {}
+        SelectionFailure(MatchStage stage, TemplateGapKind kind, std::string reason, const InvokeStep & invocation, std::uint32_t rank)
+            : stage(stage),
+              gap{ kind, std::move(reason), invocation.step, invocation.input.phase, rank } {}
     };
+
+    static std::expected<void, SelectionFailure> qualify_source(const TemplateDefinition & source, const InvokeStep & invocation);
 
     std::expected<TemplateInstance, SelectionFailure> instantiate_step(const TemplateSource & anchor_source, const InvokeStep & invocation,
                                                                        std::optional<std::uint64_t> source_batch, std::uint32_t rank,

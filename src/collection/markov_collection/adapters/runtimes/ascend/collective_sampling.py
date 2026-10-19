@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
-import json
 import os
 import socket
 from pathlib import Path
@@ -13,7 +12,7 @@ from typing import Any
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.adapters.runtimes.pytorch.profiling import TorchProfilerMarkers
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json, write_json
 from markov_collection.instrumentation.recording import Recorder
 from markov_collection.instrumentation.session import CaptureSession
 
@@ -155,8 +154,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
 
-    with arguments.input.open(encoding="utf-8") as stream:
-        prepared = json.load(stream)
+    prepared = read_json(arguments.input)
 
     NativeCollectiveSampling(prepared, arguments.output).run()
 

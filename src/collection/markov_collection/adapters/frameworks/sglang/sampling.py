@@ -1,29 +1,28 @@
-"""Independent device or synchronous-transfer measurements over requested batch work."""
+"""Independent device and host measurements over requested native batch work."""
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import importlib.metadata
 import os
 import signal
 import time
+from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.frameworks.sglang.session import SGLangSession
+from markov_collection.adapters.runtimes.ascend.cpu_boundaries import AscendCpuBoundaries
 from markov_collection.adapters.runtimes.ascend.environment import RuntimeEnvironment
 from markov_collection.adapters.runtimes.ascend.transfer_sampling import TransferMeasurements
+from markov_collection.artifacts.cpu_measurements import CpuMeasurements
 from markov_collection.artifacts.json_file import write_json
 from markov_collection.artifacts.sampling_domain import SamplingDomain
 
 
 class SGLangSampling(SGLangSession):
-    def run(self) -> None:
-        from sglang.srt.entrypoints.engine import Engine
-
+    def prepare(self) -> None:
         grid = self.prepared["measurement_grid"]
         repetitions = self.prepared["repetitions"]
-        device = self.prepared["measurement_kind"] == "device"
         self.prepared["measurement_ids"] = [
             f"markov-measure/{point['id']}/{repetition}/{slot}"
             for point in grid
@@ -33,11 +32,26 @@ class SGLangSampling(SGLangSession):
         self.prepared["warmup_ids"] = [
             f"markov-measure-warmup/{point['id']}/{slot}" for point in grid for slot in range(len(point["requests"]))
         ]
+        self.prepared["control_ids"] = (
+            [
+                f"markov-control/{point['id']}/{repetition}/{slot}"
+                for point in grid
+                for repetition in range(repetitions)
+                for slot in range(len(point["requests"]))
+            ]
+            if self.prepared["measurement_kind"] == "cpu"
+            else []
+        )
 
-        write_json(self.directory / "prepared_input.json", self.prepared)
-        os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
         os.environ["MARKOV_TRANSFER_SCOPES"] = str(self.directory / "transfer_scopes")
-        os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
+        super().prepare()
+
+    def run(self) -> None:
+        from sglang.srt.entrypoints.engine import Engine
+
+        grid = self.prepared["measurement_grid"]
+        repetitions = self.prepared["repetitions"]
+        device = self.prepared["measurement_kind"] == "device"
         os.environ["SGLANG_PLUGINS"] = "markov"
 
         engine_started_ns = time.perf_counter_ns()
@@ -51,7 +65,7 @@ class SGLangSampling(SGLangSession):
         signal.signal(signal.SIGQUIT, self._handle_worker_failure)
         try:
             warmup_started_ns = time.perf_counter_ns()
-            warmup = self._warmup(engine, set(self.prepared["measurement_ids"]) | set(self.prepared["warmup_ids"]))
+            warmup = self._warmup(engine)
             warmup_finished_ns = time.perf_counter_ns()
             if device:
                 engine.start_profile(
@@ -69,6 +83,12 @@ class SGLangSampling(SGLangSession):
                 if device and not self._worker_failed:
                     engine.stop_profile()
             profile_finished_ns = time.perf_counter_ns()
+            windows = []
+            for item in completions:
+                windows.append(item["window"])
+                if "inactive_recorder_window" in item:
+                    windows.append(item["inactive_recorder_window"])
+            steady_state = self._steady_windows(windows, warmup)
 
             write_json(
                 self.directory / "native_environment.json",
@@ -80,7 +100,9 @@ class SGLangSampling(SGLangSession):
                     "profiler_enabled": device,
                     "native_api_journal_enabled": device,
                     "synchronous_transfer_sampling_enabled": not device,
+                    "cpu_activity_sampling_enabled": self.prepared["measurement_kind"] == "cpu",
                     "semantic_instrumentation_enabled": False,
+                    "steady_state": steady_state,
                     "collection_wall_time_ns": {
                         "engine_initialization": engine_ready_ns - engine_started_ns,
                         "warmup": warmup_finished_ns - warmup_started_ns,
@@ -102,11 +124,14 @@ class SGLangSampling(SGLangSession):
         workers = sorted((self.directory / "cpu_workers").glob("*.jsonl"))
         domain = SamplingDomain(self.prepared)
         worker_units = self.directory / "cpu_worker_units.json.gz"
-        coverage = TransferMeasurements(scopes, workers, domain).publish(worker_units)
+        transfers = TransferMeasurements(scopes, workers, domain)
+        coverage = transfers.publish(worker_units)
         completion_coverage = domain.completion_coverage()
         warmup_coverage = domain.coverage()
-        feature_coverage = domain.feature_coverage(transfer_executions=True)
+        feature_coverage = domain.feature_coverage()
         gaps = []
+        if steady_state["status"] != "steady":
+            gaps.append({"kind": "observation", "reason": steady_state["status"]})
         if warmup_coverage["missing_conditions"]:
             gaps.append({"kind": "cost", "reason": "warmup_execution_domain_incomplete"})
         if completion_coverage["missing_request_ids"]:
@@ -114,114 +139,123 @@ class SGLangSampling(SGLangSession):
         if feature_coverage["missing_point_indices"]:
             gaps.append({"kind": "cost", "reason": "requested_batch_work_not_observed"})
 
-        write_json(
-            self.directory / "performance_manifest.json",
-            {
-                "role": "performance",
-                "framework": "sglang",
-                "measurement_kind": "native_serving_timing",
-                "input": "prepared_input.json",
-                "environment": "native_environment.json",
-                "completions": "measurement_completions.json",
-                "transfer_scopes": [str(path.relative_to(self.directory)) for path in scopes],
-                "cpu_workers": [str(path.relative_to(self.directory)) for path in workers],
-                "cpu_worker_units": worker_units.name,
-                "cpu_worker_coverage": coverage,
-                "cpu_worker_readiness": "needs_data" if coverage["gaps"] else "ready",
-                "cpu_worker_gaps": coverage["gaps"],
-                "worker_environments": [
-                    str(path.relative_to(self.directory))
-                    for path in sorted((self.directory / "transfer_scopes").glob("*-environment.json"))
-                ],
-                "clock": {"wall_ns": "monotonic synchronous driver entry and return"},
-                "warmup_coverage": warmup_coverage,
-                "feature_coverage": feature_coverage,
-                "completion_coverage": completion_coverage,
-                "readiness": "needs_data" if gaps or coverage["gaps"] else "ready",
-                "gaps": gaps,
-            },
+        manifest = {
+            "role": "performance",
+            "framework": "sglang",
+            "measurement_kind": "native_serving_timing",
+            "input": "prepared_input.json",
+            "environment": "native_environment.json",
+            "completions": "measurement_completions.json",
+            "transfer_scopes": [str(path.relative_to(self.directory)) for path in scopes],
+            "cpu_worker_units": worker_units.name,
+            "cpu_worker_coverage": coverage,
+            "cpu_worker_readiness": "needs_data" if coverage["gaps"] else "ready",
+            "cpu_worker_gaps": coverage["gaps"],
+            "worker_environments": [
+                str(path.relative_to(self.directory))
+                for path in sorted((self.directory / "transfer_scopes").glob("*-environment.json"))
+            ],
+            "clock": {"wall_ns": "monotonic synchronous driver entry and return"},
+            "warmup_coverage": warmup_coverage,
+            "feature_coverage": feature_coverage,
+            "completion_coverage": completion_coverage,
+            "readiness": "needs_data" if gaps or coverage["gaps"] else "ready",
+            "gaps": gaps,
+        }
+        cpu_measurements = None
+        if self.prepared["measurement_kind"] == "cpu":
+            cpu_measurements = self._publish_cpu(manifest, scopes, domain, completions)
+        write_json(self.directory / "performance_manifest.json", manifest)
+        transfers.consume_journals()
+        if cpu_measurements is not None and manifest["readiness"] == "ready":
+            cpu_measurements.consume_journals()
+
+    def _publish_cpu(
+        self,
+        manifest: dict[str, Any],
+        scopes: list[Path],
+        domain: SamplingDomain,
+        completions: list[dict[str, Any]],
+    ) -> CpuMeasurements:
+        summary_path = self.directory / "cpu_measurements.json"
+        measurements = CpuMeasurements(
+            self.directory / "cpu_activities",
+            scopes,
+            domain,
+            AscendCpuBoundaries(),
+            self.prepared["cpu_services"],
+            self.prepared["cpu_service_descriptors"],
         )
+        summary = measurements.publish(summary_path, completions)
+        manifest.update(
+            {
+                "measurement_kind": "native_cpu_activity",
+                "cpu_activities": [str(path.relative_to(self.directory)) for path in measurements.paths],
+                "cpu_measurements": summary_path.name,
+                "readiness": "needs_data",
+                "clock": {
+                    "wall_ns": "CLOCK_MONOTONIC at native activity boundaries",
+                    "thread_cpu_ns": "CLOCK_THREAD_CPUTIME_ID with marked observer CPU excluded",
+                    "observer_cpu_ns": "cumulative excluded CPU on this thread",
+                    "observer_cycles": "completed outer observer intervals on this thread",
+                    "service_cpu_ns": "exclusive service CPU minus lane-calibrated clock-read cost per observer cycle",
+                },
+            }
+        )
+        if "service_units" in summary:
+            manifest["cpu_service_units"] = summary["service_units"]
+            manifest["cpu_service_readiness"] = summary["cost_readiness"]
+        if summary["cost_gap"] is not None:
+            manifest["gaps"].append({"kind": "cost", "reason": summary["cost_gap"]})
+        manifest["gaps"].extend(summary["gaps"])
+        manifest["readiness"] = "needs_data" if manifest["gaps"] else "ready"
+        return measurements
 
     def _measure(self, engine: Any, grid: list[dict[str, Any]], repetitions: int) -> list[dict[str, Any]]:
         completions = []
         for point in grid:
             # Observe actual batches; client batch size alone does not prove
             # that the native scheduler warmed the requested execution path.
-            self._generate(engine, point, f"markov-measure-warmup/{point['id']}")
+            self._cohorts.generate(point["requests"], f"markov-measure-warmup/{point['id']}")
+            self._reset(engine)
 
             for repetition in range(repetitions):
+                control = None
+                control_identity = f"markov-control/{point['id']}/{repetition}"
+                if self.prepared["measurement_kind"] == "cpu":
+                    # Undeclared IDs pass through native serving without active
+                    # cost scopes. The global callback remains installed: this
+                    # pair measures active-recorder perturbation, not its full
+                    # difference from a process without callbacks.
+                    control_started_ns = time.perf_counter_ns()
+                    self._cohorts.generate(point["requests"], control_identity)
+                    self._reset(engine)
+                    control = {"started_ns": control_started_ns, "ended_ns": time.perf_counter_ns()}
+
+                started_ns = time.perf_counter_ns()
+                identity = f"markov-measure/{point['id']}/{repetition}"
+                response = self._cohorts.generate(point["requests"], identity)
+                # A client response can precede the final native publication.
+                # Qualification encloses that completion; costs keep their own scopes.
                 self._reset(engine)
-                response = self._generate(engine, point, f"markov-measure/{point['id']}/{repetition}")
+                ended_ns = time.perf_counter_ns()
                 completions.append(
                     {
                         "grid": point["id"],
                         "repetition": repetition,
+                        "window": {"started_ns": started_ns, "ended_ns": ended_ns},
                         "completion_tokens": [item["meta_info"]["completion_tokens"] for item in response],
+                        "request_ids": [f"{identity}/{slot}" for slot in range(len(point["requests"]))],
+                        **(
+                            {
+                                "inactive_recorder_window": control,
+                                "inactive_request_ids": [
+                                    f"{control_identity}/{slot}" for slot in range(len(point["requests"]))
+                                ],
+                            }
+                            if control is not None
+                            else {}
+                        ),
                     }
                 )
-
-            self._reset(engine)
-
         return completions
-
-    def _generate(self, engine: Any, point: dict[str, Any], identity: str) -> list[dict[str, Any]]:
-        requests = point["requests"]
-        if any(request["release_after_tokens"] for request in requests):
-            return engine.loop.run_until_complete(self._staggered(engine, requests, identity))
-
-        return engine.generate(
-            input_ids=[request["input_tokens"] for request in requests],
-            sampling_params=[
-                {"max_new_tokens": request["output_tokens"], "ignore_eos": True, "temperature": 0}
-                for request in requests
-            ],
-            rid=[f"{identity}/{slot}" for slot in range(len(requests))],
-        )
-
-    async def _staggered(self, engine: Any, requests: list[dict[str, Any]], identity: str) -> list[dict[str, Any]]:
-        groups: dict[int, list[int]] = {}
-        for slot, request in enumerate(requests):
-            groups.setdefault(request["release_after_tokens"], []).append(slot)
-
-        # Gates follow observed token progress, rather than assumed execution delays.
-        gates = {offset: asyncio.Event() for offset in groups}
-        gates[0].set()
-        responses: dict[str, dict[str, Any]] = {}
-
-        await asyncio.gather(
-            *[
-                self._generate_group(engine, requests, identity, slots, offset, gates, responses)
-                for offset, slots in groups.items()
-            ]
-        )
-
-        return [responses[f"{identity}/{slot}"] for slot in range(len(requests))]
-
-    async def _generate_group(
-        self,
-        engine: Any,
-        requests: list[dict[str, Any]],
-        identity: str,
-        slots: list[int],
-        offset: int,
-        gates: dict[int, asyncio.Event],
-        responses: dict[str, dict[str, Any]],
-    ) -> None:
-        await gates[offset].wait()
-        stream = await engine.async_generate(
-            input_ids=[requests[slot]["input_tokens"] for slot in slots],
-            sampling_params=[
-                {"max_new_tokens": requests[slot]["output_tokens"], "ignore_eos": True, "temperature": 0}
-                for slot in slots
-            ],
-            rid=[f"{identity}/{slot}" for slot in slots],
-            stream=True,
-        )
-
-        async for response in stream:
-            meta = response["meta_info"]
-            responses[meta["id"]] = response
-            if meta["id"] == f"{identity}/0":
-                for release, gate in gates.items():
-                    if meta["completion_tokens"] >= release:
-                        gate.set()

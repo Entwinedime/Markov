@@ -4,6 +4,7 @@
 #include "markov/graph/source_graph.hpp"
 #include "markov/templates/batch_parameters.hpp"
 
+#include <cstddef>
 #include <expected>
 #include <optional>
 #include <span>

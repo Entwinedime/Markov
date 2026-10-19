@@ -76,7 +76,7 @@ Project ProjectReader::read(const std::filesystem::path & path) const {
     Project project;
     project.path = std::filesystem::absolute(path).lexically_normal();
     const auto data = read_json(project.path);
-    fields(data, { "model", "configurations", "request_workloads", "simulation", "initial_state", "collection", "assets", "output" });
+    fields(data, { "model", "configurations", "request_workloads", "collection", "assets", "output" });
 
     const auto & model = data.at("model");
     fields(model, { "path", "tokenizer_path" });
@@ -126,21 +126,6 @@ Project ProjectReader::read(const std::filesystem::path & path) const {
         project.request_workloads.push_back({ id, workload_path, read_workload(workload_path) });
     }
 
-    if (data.contains("simulation")) {
-        const auto & simulation = data.at("simulation");
-        fields(simulation, { "controller", "scope" });
-        project.controller = simulation.value("controller", std::string("lightweight"));
-        const auto scope = simulation.value("scope", std::string("modeled"));
-        if (scope != "modeled" && scope != "http_e2e") throw std::invalid_argument("scope must be modeled or http_e2e");
-        project.scope = scope == "modeled" ? Scope::Modeled : Scope::HttpE2E;
-    }
-    if (data.contains("initial_state")) {
-        const auto & initial = data.at("initial_state");
-        fields(initial, { "cache" });
-        const auto cache = initial.value("cache", std::string("cold"));
-        if (cache != "cold" && cache != "warm") throw std::invalid_argument("cache must be cold or warm");
-        project.initial_cache = cache == "cold" ? CacheState::Cold : CacheState::Warm;
-    }
     if (data.contains("collection")) {
         const auto & collection = data.at("collection");
         fields(collection, { "base", "performance" });

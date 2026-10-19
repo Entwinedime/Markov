@@ -7,7 +7,6 @@
 
 #include <array>
 #include <compare>
-#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -70,8 +69,8 @@ struct KernelCostFeatures {
     std::string output_formats;
     std::string task_type;
     std::int64_t launch_blocks;
-    // Producer-declared assumption for a fixed tensor traversal. Semantic
-    // values remain on target work but need not be duplicated in this cost key.
+    // Producer-declared assumption for a fixed tensor traversal. Other
+    // value dependencies still require an explicit measured operand contract.
     bool tensor_traversal;
     std::optional<AttentionCostFeatures> attention = std::nullopt;
     KernelOperandFeatures operands = {};
@@ -119,7 +118,6 @@ struct KernelCostQuery {
     std::optional<AttentionCostFeatures> attention;
     KernelOperandFeatures operands;
     std::vector<std::string> unmodeled_operands;
-    const SourceKernel * work; // Borrowed for this query and its immediate report.
 
     static KernelCostQuery from_work(const SourceKernel & work);
     nlohmann::json describe() const;
@@ -129,32 +127,26 @@ struct KernelCostQuery {
 struct UnresolvedCostQuery {
     SourceSpanKind node_kind;
 
-    static UnresolvedCostQuery from_work(const ServiceWork & work);
     nlohmann::json describe() const;
 };
 
-enum class CostQueryKind { Undefined, Kernel, Communication, Transfer, DeviceCommand };
+enum class CostQueryKind { Undefined, Kernel, Communication, Transfer, DeviceCommand, Cpu };
 
 enum class CostQueryIssue { None, FeaturesUndefined };
 
-using CostQueryFeatures = std::variant<KernelCostQuery, CommunicationCostFeatures, TransferCostFeatures, DeviceCommandWork, UnresolvedCostQuery>;
+using CostQueryFeatures =
+    std::variant<KernelCostQuery, CommunicationCostFeatures, TransferCostFeatures, DeviceCommandWork, CpuServiceWork, UnresolvedCostQuery>;
 
-struct CostObject {
+// One physical service has one cost query. Coverage and execution share it.
+struct CostQuery {
     CostQueryKind kind;
     CostQueryFeatures features;
     CostQueryIssue issue = CostQueryIssue::None;
     std::string_view contract_gap = {};
 
+    static CostQuery from_work(const ServiceWork & work);
     static std::string_view kind_name(CostQueryKind kind);
     nlohmann::json describe() const;
-};
-
-// Feature extraction is shared by coverage reporting and every model lookup.
-// Host control services expose no performance object in the current scope.
-struct CostQuery {
-    std::vector<CostObject> objects;
-
-    static CostQuery from_work(const ServiceWork & work);
 };
 
 } // namespace markov

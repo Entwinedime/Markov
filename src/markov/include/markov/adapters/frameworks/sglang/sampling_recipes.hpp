@@ -6,6 +6,7 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstdint>
 #include <filesystem>
 #include <span>
 
@@ -20,6 +21,9 @@ public:
                              const nlohmann::json & measurement_requests) const;
     nlohmann::json collectives(const SGLangConfiguration & configuration, const Environment & environment,
                                std::span<const std::filesystem::path> performance_manifests) const;
+
+private:
+    static nlohmann::json make_request(const Request & source, std::uint32_t prompt_tokens, std::uint32_t output_tokens, std::uint32_t release_after_tokens);
 };
 
 } // namespace markov

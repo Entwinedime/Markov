@@ -1,4 +1,5 @@
 #include "markov/adapters/frameworks/sglang/models/attention_kernel_layout.hpp"
+#include "markov/production/block_binding.hpp"
 
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/kernel_shapes.hpp"
@@ -12,18 +13,17 @@
 
 namespace markov {
 
-AttentionKernelLayout::AttentionKernelLayout(std::size_t source_call, AttentionOperation operation, std::int64_t query_heads, std::int64_t kv_heads,
-                                             std::int64_t head_dim, std::int64_t page_size_tokens, std::int64_t cache_pages)
-    : source_call_(source_call),
-      operation_(operation),
+AttentionKernelLayout::AttentionKernelLayout(AttentionOperation operation, std::int64_t query_heads, std::int64_t kv_heads, std::int64_t head_dim,
+                                             std::int64_t page_size_tokens, std::int64_t cache_pages)
+    : operation_(operation),
       query_heads_(query_heads),
       kv_heads_(kv_heads),
       head_dim_(head_dim),
       page_size_tokens_(page_size_tokens),
       cache_pages_(cache_pages) {}
 
-std::optional<AttentionKernelLayout> AttentionKernelLayout::bind(const SourceNativeRegion & region, std::size_t source_call, const SourceKernel & kernel,
-                                                                 StepKind step, std::span<const SourceRequest> requests, std::uint32_t page_size_tokens) {
+std::optional<AttentionKernelLayout> AttentionKernelLayout::bind(const SourceNativeRegion & region, const SourceKernel & kernel, StepKind step,
+                                                                 std::span<const SourceRequest> requests, std::uint32_t page_size_tokens) {
     if (region.semantic != "attention_core") return std::nullopt;
     AttentionOperation operation;
     if (kernel.operation == "ReshapeAndCacheNdKernel") operation = AttentionOperation::CacheWrite;
@@ -95,7 +95,7 @@ std::optional<AttentionKernelLayout> AttentionKernelLayout::bind(const SourceNat
     }
     if (inputs.tensors != expected_inputs || outputs.tensors != expected_outputs) return std::nullopt;
 
-    return AttentionKernelLayout(source_call, operation, query_heads, kv_heads, head_dim, page_size_tokens, cache[0]);
+    return AttentionKernelLayout(operation, query_heads, kv_heads, head_dim, page_size_tokens, cache[0]);
 }
 
 AttentionParameterRule AttentionKernelLayout::compile() const {
@@ -115,18 +115,6 @@ AttentionParameterRule AttentionKernelLayout::compile() const {
 
     const AttentionWorkload workload{ operation_, {}, query_heads_, kv_heads_, head_dim_, page_size_tokens_, cache_pages_ };
     return AttentionParameterRule(TensorParameterLayout(std::move(inputs), std::move(outputs), page_size_tokens_), workload);
-}
-
-nlohmann::json AttentionKernelLayout::describe() const {
-    const AttentionWorkload layout{ operation_, {}, query_heads_, kv_heads_, head_dim_, page_size_tokens_, cache_pages_ };
-    auto result = layout.describe();
-    result.erase("sequences");
-    result.erase("query_tokens");
-    result.erase("logical_causal_pairs_per_head");
-    result["source_region"] = source_call_;
-    result["block_table_columns"] = "ceil(max(prefix_tokens + query_tokens) / page_size_tokens)";
-    result["topology_qualification"] = "not_established_by_shape_relation";
-    return result;
 }
 
 } // namespace markov

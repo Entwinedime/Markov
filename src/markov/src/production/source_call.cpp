@@ -26,17 +26,6 @@ SourceAdmissionPolicy SourceAdmissionPolicy::read(const nlohmann::json & value) 
     return observed;
 }
 
-nlohmann::json SourceAdmissionPolicy::describe() const {
-    return {
-        {                "initial_ratio",                parameters.initial_ratio },
-        {                "minimum_ratio",                parameters.minimum_ratio },
-        {             "decay_per_decode",             parameters.decay_per_decode },
-        {                  "entry_ratio",                             entry_ratio },
-        { "output_estimate_limit_tokens", parameters.output_estimate_limit_tokens },
-        {   "reserve_tokens_per_request",   parameters.reserve_tokens_per_request }
-    };
-}
-
 SourceWorkerControls SourceWorkerControls::read(const nlohmann::json & value) {
     SourceWorkerControls observed{ value.at("waiting_timeout_seconds").get<double>(),
                                    value.at("running_timeout_seconds").get<double>(),
@@ -45,15 +34,6 @@ SourceWorkerControls SourceWorkerControls::read(const nlohmann::json & value) {
     if (!std::isfinite(observed.waiting_timeout_seconds) || !std::isfinite(observed.running_timeout_seconds))
         throw std::invalid_argument("native request timeouts must be finite seconds");
     return observed;
-}
-
-nlohmann::json SourceWorkerControls::describe() const {
-    return {
-        { "waiting_timeout_seconds", waiting_timeout_seconds },
-        { "running_timeout_seconds", running_timeout_seconds },
-        {            "test_retract",            test_retract },
-        {        "require_mlp_sync",        require_mlp_sync }
-    };
 }
 
 } // namespace markov

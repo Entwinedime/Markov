@@ -43,14 +43,15 @@ struct PublicationWork {
     nlohmann::json describe() const;
 };
 
-// Borrowed for one cost query. Only modeled physical work enters this contract;
-// host control and its causal boundaries belong to the execution structure.
+// Borrowed for one cost query. Dependencies and controller state stay in the
+// execution structure; models receive only resolved work descriptions.
 struct ServiceWork {
     SourceSpanKind node_kind;
     const SourceKernel * kernel;
     const SourceCommunicationTask * communication;
     const SourceTransfer * transfer;
     const DeviceCommandWork * device_command;
+    const CpuServiceWork * cpu = nullptr;
 
     nlohmann::json describe() const;
 };

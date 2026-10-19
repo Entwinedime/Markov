@@ -1,8 +1,6 @@
 #include "markov/adapters/frameworks/sglang/bindings.hpp"
 #include "markov/adapters/frameworks/sglang/models/qwen3_regions.hpp"
 
-#include "markov/adapters/frameworks/sglang/block_extractor.hpp"
-
 #include "markov/graph/source_graph.hpp"
 #include "markov/production/source_call.hpp"
 
@@ -495,11 +493,6 @@ nlohmann::json SGLangBindings::describe_regions() const {
         { "definition", { { "parameters", parameters } } },
         {   "bindings",                         bindings }
     };
-}
-
-nlohmann::json SGLangBindings::extract_blocks(const SourceGraph & graph, std::span<const SourceCall> calls,
-                                              const std::vector<std::vector<std::size_t>> & native_api_members, bool native_dense_path) const {
-    return SGLangBlockExtractor(graph, calls, native_api_members, native_dense_path, *this).extract();
 }
 
 } // namespace markov

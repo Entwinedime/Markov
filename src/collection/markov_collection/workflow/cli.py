@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from markov_collection.artifacts.json_file import read_json
 from markov_collection.workflow.collection import CollectionWorkflow
 
 
@@ -122,8 +123,7 @@ def main() -> None:
         )
     else:
         directory = arguments.run.resolve()
-        with (directory / "run.json").open(encoding="utf-8") as stream:
-            state = json.load(stream)
+        state = read_json(directory / "run.json")
         budgets = {}
         if arguments.command == "resume":
             budgets = {

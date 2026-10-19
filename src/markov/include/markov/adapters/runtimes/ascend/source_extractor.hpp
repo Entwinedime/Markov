@@ -3,13 +3,12 @@
 #include "markov/contracts/service_work.hpp"
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/source_graph.hpp"
-#include "markov/production/source_call.hpp"
+#include "markov/production/source_subgraph.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
 #include <cstdint>
-#include <expected>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -32,6 +31,10 @@ public:
     explicit AscendSourceExtractor(const SourceBindings & bindings) : bindings_(bindings) {}
 
     nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest, const std::filesystem::path & work_directory);
+    const SourceGraph & graph() const { return graph_; }
+    const nlohmann::json & facts() const { return facts_; }
+    const SourceSubgraphs & subgraphs() const { return subgraphs_; }
+    std::span<const SourceCall> calls() const { return calls_; }
     static std::optional<DeviceCommandWork> device_command(const nlohmann::json & interval);
 
 private:
@@ -56,13 +59,15 @@ private:
 
     void extract_cpu_control();
     void extract_worker_cpu();
+    void read_cpu_service_boundaries();
+    void read_cpu_boundaries(const nlohmann::json & intervals, const nlohmann::json & flows, const nlohmann::json & records);
+    void retain_cpu_window(SourceSpanId identity);
     void observe_cpu_control(std::size_t lane, std::int64_t begin_ns, std::int64_t end_ns, std::size_t owner, std::optional<std::size_t> source_interval,
                              std::optional<std::size_t> recorded_scope = std::nullopt);
 
     std::size_t read_transfers(const nlohmann::json & intervals, const nlohmann::json & records);
     void read_communication(const nlohmann::json & intervals);
     void read_event_signals(const nlohmann::json & records, const nlohmann::json & intervals);
-    std::expected<std::vector<SourceSpanId>, std::string> event_wait_frontier(const nlohmann::json & record, const nlohmann::json & intervals) const;
     void read_copy_boundaries(const nlohmann::json & records, const nlohmann::json & intervals);
     void read_host_waits(const nlohmann::json & records, const nlohmann::json & intervals);
 
@@ -70,10 +75,11 @@ private:
 
     const SourceBindings & bindings_; // Owned by the production entry for the complete extraction.
     SourceGraph graph_;
+    nlohmann::json facts_;
+    SourceSubgraphs subgraphs_;
     std::vector<SourceCall> calls_;
     std::unordered_map<std::string, std::size_t> call_ids_;
 
-    std::vector<std::vector<std::size_t>> native_api_members_;
     std::vector<SourceSpanId> host_waits_;
     // Chain/position exists only where read_device_order established a path.
     std::map<SourceSpanId, std::pair<std::size_t, std::size_t>> device_order_;
@@ -84,7 +90,6 @@ private:
     std::map<std::size_t, std::vector<std::pair<std::int64_t, std::int64_t>>> observer_windows_;
 
     nlohmann::json gaps_ = nlohmann::json::array();
-    bool native_dense_path_ = false;
 };
 
 } // namespace markov

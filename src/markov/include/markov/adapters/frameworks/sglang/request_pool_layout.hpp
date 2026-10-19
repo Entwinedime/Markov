@@ -6,7 +6,6 @@
 #include "markov/templates/request_pool_parameters.hpp"
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <map>
@@ -29,7 +28,8 @@ struct IndexedWriteSource {
 // arbitrary tensors whose dimensions happen to contain the same integer.
 class RequestPoolLayout {
 public:
-    RequestPoolLayout(std::uint32_t source_capacity, const std::map<SourceSpanId, SourceKernel> & kernels, const nlohmann::json & operations);
+    RequestPoolLayout(std::uint32_t source_capacity, const std::map<SourceSpanId, SourceKernel> & kernels,
+                      const std::map<SourceSpanId, SourceOperation> & operations);
     const IndexedWriteSource * indexed_write(SourceSpanId operation) const;
     RequestPoolCapacityDomain capacity_domain() const;
     std::optional<std::int64_t> sequence_capacity() const;

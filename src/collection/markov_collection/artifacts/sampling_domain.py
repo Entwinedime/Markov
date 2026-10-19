@@ -1,6 +1,6 @@
 """Compare declared work points with actual native batches and warmup coverage."""
 
-from collections import Counter, defaultdict
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
@@ -14,13 +14,10 @@ class SamplingDomain:
         self._warmup_records = 0
         self._measurement_records = 0
         self._requested = prepared["measurement_requests"]
-        self._ranks = range(len(prepared["environment"]["devices"]))
-        self._features: Counter[tuple[Any, ...]] = Counter()
+        self.ranks = range(len(prepared["environment"]["devices"]))
         self._completed_work: set[tuple[Any, ...]] = set()
         self._finished: dict[int, set[str]] = defaultdict(set)
-        self._kernel_operand_fields: dict[tuple[Any, ...], set[str]] = defaultdict(set)
-        self._filter_operand_fields: dict[tuple[Any, ...], set[str]] = defaultdict(set)
-        self._transfer_executions: dict[tuple[Any, ...], set[str]] = defaultdict(set)
+        self._filter_work: set[tuple[Any, ...]] = set()
 
     @staticmethod
     def _member_key(request: dict[str, Any]) -> tuple[int, ...]:
@@ -28,11 +25,6 @@ class SamplingDomain:
         if "request_pool_slot" in request:
             member += (request["request_pool_slot"],)
         return member
-
-    @staticmethod
-    def _describe_members(members: tuple[tuple[int, ...], ...]) -> list[dict[str, int]]:
-        fields = ("input_tokens", "context_tokens", "prompt_tokens", "request_pool_slot")
-        return [dict(zip(fields[: len(member)], member, strict=True)) for member in members]
 
     @classmethod
     def _work_key(
@@ -46,6 +38,8 @@ class SamplingDomain:
 
     def stage(self, metadata: dict[str, Any]) -> str:
         ids = {request["id"] for request in metadata["requests"]}
+        if not ids:
+            ids = set(metadata["scope_request_ids"])
         if ids <= self.warmup_ids:
             return "warmup"
         if ids <= self.measurement_ids:
@@ -76,9 +70,10 @@ class SamplingDomain:
             if key not in self._warmed:
                 self._missing[key] = {"rank": rank, "step": step, "phase": metadata["phase"], "requests": requests}
 
-            if step == metadata["phase"]:
+            if step == "schedule" and metadata["phase"] == "idle":
+                # Selected completes an empty decision; it has no Publish.
                 work = self._work_key(metadata["phase"], requests, [])
-                self._features[(rank, *work[:2])] += 1
+                self._completed_work.add((rank, *work))
             if step == "publish":
                 # Completion belongs to the native request identity. Native
                 # batch order need not retain the sampling recipe's member order.
@@ -107,48 +102,16 @@ class SamplingDomain:
                     "batch_filter": metadata["batch_filter"],
                 }
 
-    def observe_work_facts(
-        self,
-        rank: int,
-        metadata: dict[str, Any],
-        *,
-        kernel_operand_fields: Iterable[str] = (),
-        transfer_executions: Iterable[str] = (),
-    ) -> None:
-        if self.stage(metadata) != "measurement":
+    def observe_filter_work(self, rank: int, metadata: dict[str, Any], operand_fields: Iterable[str]) -> None:
+        # A filter point needs a physical kernel with the actual typed selection;
+        # observing a same-sized model batch cannot establish this coverage.
+        if "batch_filter" not in metadata or "batch_filter" not in operand_fields:
             return
 
-        if "batch_filter" in metadata:
-            self._filter_operand_fields[self._filter_key(rank, metadata)].update(kernel_operand_fields)
-            return
+        if self.stage(metadata) == "measurement":
+            self._filter_work.add(self._filter_key(rank, metadata))
 
-        # These facts retain native member order. Unlike requested-point
-        # coverage, they must not turn one observed permutation into another.
-        members = tuple(self._member_key(request) for request in metadata["requests"])
-        key = (rank, metadata["phase"], members)
-        if kernel_operand_fields:
-            self._kernel_operand_fields[key].update(kernel_operand_fields)
-        if transfer_executions:
-            self._transfer_executions[key].update(transfer_executions)
-
-    @classmethod
-    def _describe_facts(cls, facts: dict[tuple[Any, ...], set[str]], field: str) -> list[dict[str, Any]]:
-        return [
-            {
-                "rank": rank,
-                "phase": phase,
-                "requests": cls._describe_members(members),
-                field: sorted(values),
-            }
-            for (rank, phase, members), values in facts.items()
-        ]
-
-    def feature_coverage(
-        self,
-        *,
-        kernel_operand_fields: bool = False,
-        transfer_executions: bool = False,
-    ) -> dict[str, Any]:
+    def feature_coverage(self) -> dict[str, Any]:
         points = []
         for index, domain in enumerate(self._requested):
             if "batch_filter" in domain:
@@ -156,23 +119,22 @@ class SamplingDomain:
                 observed = sorted(
                     {
                         rank
-                        for (rank, members, count, indices), fields in self._filter_operand_fields.items()
+                        for rank, members, count, indices in self._filter_work
                         if count == selection["input_count"]
                         and indices == tuple(selection["retained_indices"])
                         and all(prompt == domain["prompt_tokens"] and generated == 1 for prompt, generated in members)
-                        and "batch_filter" in fields
                     }
                 )
             else:
-                # The declared recipe makes the first K members finish. Actual
-                # publication resolves identities rather than assuming order.
+                # Completion is attached to each member; a partial finish never
+                # reorders its workload or native reservation coordinates.
                 requests = domain["requests"]
                 if "pool_slots" in domain:
                     requests = [
                         {**request, "request_pool_slot": slot}
                         for request, slot in zip(requests, domain["pool_slots"], strict=True)
                     ]
-                finished = requests[: domain["finished_request_count"]]
+                finished = [request for request in requests if request["finishes"]]
                 work = self._work_key(domain["phase"], requests, finished)
                 observed = set()
                 for rank, phase, members, finished_members in self._completed_work:
@@ -184,59 +146,14 @@ class SamplingDomain:
                     if (phase, members, finished_members) == work:
                         observed.add(rank)
                 observed = sorted(observed)
-            missing = [rank for rank in self._ranks if rank not in observed]
+            missing = [rank for rank in self.ranks if rank not in observed]
             points.append({"index": index, "work": domain, "observed_ranks": observed, "missing_ranks": missing})
 
-        features = []
-        for (rank, phase, members), count in sorted(self._features.items()):
-            features.append(
-                {
-                    "rank": rank,
-                    "phase": phase,
-                    "batch_request_count": len(members),
-                    "total_input_tokens": sum(member[0] for member in members),
-                    "requests": self._describe_members(members),
-                    "observations": count,
-                }
-            )
-
-        completed = []
-        for rank, phase, members, finished_members in sorted(self._completed_work):
-            completed.append(
-                {
-                    "rank": rank,
-                    "phase": phase,
-                    "requests": self._describe_members(members),
-                    "finished_requests": self._describe_members(finished_members),
-                }
-            )
-
-        coverage = {
+        return {
             "requested_points": points,
             "missing_point_indices": [point["index"] for point in points if point["missing_ranks"]],
-            "observed_batch_features": features,
-            "observed_completed_batch_features": completed,
             "boundary": "actual batch work; not proof of node-cost applicability or unobserved feature interpolation",
         }
-        if kernel_operand_fields:
-            coverage["observed_kernel_operand_fields"] = self._describe_facts(self._kernel_operand_fields, "fields")
-            # A filter scope is not another model batch. Qualify its operand
-            # coverage only when a physical kernel supplied that actual work.
-            coverage["observed_batch_filter_work"] = [
-                {
-                    "rank": rank,
-                    "requests": [
-                        {"prompt_tokens": prompt, "generated_tokens": generated} for prompt, generated in members
-                    ],
-                    "batch_filter": {"input_count": count, "retained_indices": list(indices)},
-                    "fields": sorted(fields),
-                }
-                for (rank, members, count, indices), fields in self._filter_operand_fields.items()
-                if fields
-            ]
-        if transfer_executions:
-            coverage["observed_transfer_executions"] = self._describe_facts(self._transfer_executions, "executions")
-        return coverage
 
     def coverage(self) -> dict[str, Any]:
         return {
@@ -253,7 +170,7 @@ class SamplingDomain:
                 "observed_finished_requests": len(declared & self._finished[rank]),
                 "missing_request_ids": sorted(declared - self._finished[rank]),
             }
-            for rank in self._ranks
+            for rank in self.ranks
         ]
         missing = {identity for rank in ranks for identity in rank["missing_request_ids"]}
         # A request is completely observed only when every declared rank records

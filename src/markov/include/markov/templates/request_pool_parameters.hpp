@@ -26,7 +26,6 @@ public:
           access_(access),
           single_request_only_(single_request_only) {}
     std::expected<SourceKernel, std::string> evaluate(const SourceKernel & source, const BatchInput & input, std::uint32_t capacity) const;
-    nlohmann::json describe_parameters() const;
 
 private:
     TensorParameterLayout shapes_;

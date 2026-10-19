@@ -22,26 +22,16 @@ std::expected<TemplateSubgraphRegion, std::string> TemplateDefinition::cpu_seque
 
     // The cut is the native CPU path between member ports, not the interval
     // between their timestamps. Preserve every observed service on that path.
-    std::map<std::size_t, std::vector<std::size_t>> successors, predecessors;
+    DependencyPaths<std::size_t> successors;
     for (const auto & edge : graph.dependencies()) {
         if (edge.relation != SourceRelation::ThreadOrder && edge.relation != SourceRelation::IntervalExtent) continue;
         if (graph.boundary(edge.source).lane != lane || graph.boundary(edge.target).lane != lane) continue;
-        successors[edge.source].push_back(edge.target);
-        predecessors[edge.target].push_back(edge.source);
+        successors.connect(edge.source, edge.target);
     }
-    std::set<std::size_t> reached{ entry }, ancestors{ exit };
-    std::vector<std::size_t> pending{ entry };
-    for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-        for (const auto point : successors[pending[cursor]])
-            if (reached.insert(point).second) pending.push_back(point);
-    }
+    const auto reached = successors.reachable({ entry });
     if (!reached.contains(exit)) return std::unexpected("request_sequence_separator_not_observed");
 
-    pending = { exit };
-    for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-        for (const auto point : predecessors[pending[cursor]])
-            if (ancestors.insert(point).second) pending.push_back(point);
-    }
+    const auto ancestors = successors.reversed().reachable({ exit });
     TemplateSubgraphRegion cut;
     for (const auto point : reached)
         if (ancestors.contains(point)) cut.boundaries.push_back(point);
@@ -169,7 +159,8 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_re
         auto exit = port.exit;
         if (!last) {
             exit = graph.boundary_count() + result.inserted_boundaries.size();
-            result.inserted_boundaries.push_back({ { lane }, donor.boundary_observations[donor_host->exit].source_boundary, &donor.source_manifest });
+            result.inserted_boundaries.push_back(
+                { { lane }, donor.boundary_observations[donor_host->exit].source_boundary, &donor.source_manifest, donor.cpu_boundary(donor_host->exit) });
         }
         std::map<std::size_t, std::size_t> mapping{
             { donor_host->entry, entry },
@@ -223,7 +214,7 @@ std::expected<TemplateOperationRewrite, std::string> TemplateDefinition::plan_re
         // boundaries; a direct edge would discard their required causality.
         const auto & bridge = separators[std::min(slot, separators.size() - 1)];
         entry = graph.boundary_count() + result.inserted_boundaries.size();
-        result.inserted_boundaries.push_back({ { lane }, boundary_observations[bridge.exit].source_boundary, &source_manifest });
+        result.inserted_boundaries.push_back({ { lane }, boundary_observations[bridge.exit].source_boundary, &source_manifest, cpu_boundary(bridge.exit) });
         result.insert_subgraph(*this,
                                *this,
                                bridge.region.nodes,

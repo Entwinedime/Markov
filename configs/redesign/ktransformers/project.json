@@ -34,13 +34,6 @@
       "path": "../workload.json"
     }
   ],
-  "simulation": {
-    "controller": "lightweight",
-    "scope": "modeled"
-  },
-  "initial_state": {
-    "cache": "cold"
-  },
   "collection": {
     "base": {
       "allow_run": false,

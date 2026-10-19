@@ -52,12 +52,15 @@ class ServingComparison:
         self, facts: dict[str, Any], requests: list[dict[str, Any]], ranks: list[int]
     ) -> tuple[dict[str, Any], dict[int, int]]:
         publications: dict[tuple[int, str], list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+        arrivals: dict[str, list[int]] = defaultdict(list)
         batches: Counter[int] = Counter()
         origin = facts["clock"]["origin_ns"]
+        for entry in facts["arrivals"]:
+            arrivals[entry["request_id"]].append(entry["at_ns"] - origin)
         for port in facts["ports"]:
             if port["port"] == "submitted":
                 batches[port["rank"]] += 1
-            else:
+            elif port["port"] == "published":
                 for request in port["result"]["requests"]:
                     publications[(port["rank"], request["id"])].append((port["at_ns"] - origin, request))
 
@@ -76,27 +79,34 @@ class ServingComparison:
                     )
                 )
 
-            # Published means every rank has returned. CPU and scope-excluded
-            # time remain in these native intervals; no residual is subtracted.
+            # The first observed native arrival starts the serving interval;
+            # publication requires every rank. Driver-to-entry time is separate.
             first_ns, completed_ns = max(first), max(completed)
-            arrival = request["arrival_time_ns"]
+            arrival = min(arrivals[request["id"]])
             if first_ns < arrival or completed_ns < first_ns:
                 raise ValueError("native publication order does not match the request clock")
             metrics.append(
                 {
                     "id": request["id"],
+                    "native_arrival_ns": arrival,
+                    "entry_skew_ns": arrival - request["arrival_time_ns"],
+                    "rank_entry_spread_ns": max(arrivals[request["id"]]) - arrival,
                     "first_published_ns": first_ns,
                     "completed_ns": completed_ns,
                     "ttft_ns": first_ns - arrival,
                     "request_latency_ns": completed_ns - arrival,
+                    "driver_ttft_ns": first_ns - request["arrival_time_ns"],
+                    "driver_request_latency_ns": completed_ns - request["arrival_time_ns"],
                     "tpot_ns": (completed_ns - first_ns) / (request["output_tokens"] - 1)
                     if request["output_tokens"] > 1
                     else None,
                 }
             )
-        window = max(item["completed_ns"] for item in metrics) - min(item["arrival_time_ns"] for item in requests)
+        final = max(item["completed_ns"] for item in metrics)
+        window = final - min(item["native_arrival_ns"] for item in metrics)
         return {
             "window_time_ns": window,
+            "driver_window_time_ns": final - min(item["arrival_time_ns"] for item in requests),
             "output_tokens_per_sec": sum(item["output_tokens"] for item in requests) * 1_000_000_000 / window
             if window > 0
             else None,
@@ -136,6 +146,7 @@ class ServingComparison:
                 continue
 
             path, manifest, prepared = observations[key]
+            row["observation_boundaries"] = manifest["boundaries"]
             row["validation_manifest"] = (
                 relpath(path, self.prediction_path.parent)
                 if path.is_relative_to(self.prediction_path.parent.parent)
@@ -183,7 +194,7 @@ class ServingComparison:
             "status": "complete" if all(item["status"] == "compared" for item in rows) else "incomplete",
             "purpose": "fixed prediction versus independent serving Published ports",
             "observed_completion": "latest return across all declared ranks",
-            "comparison_scope": "native intervals include excluded host CPU and other out-of-scope time",
+            "comparison_scope": "observed native arrival to all-rank Published; anchors listed per combination",
             "validation_used_for_templates_or_fitting": False,
             "accuracy_qualified": False,
             "combinations": rows,

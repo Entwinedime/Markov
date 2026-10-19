@@ -2,6 +2,7 @@
 
 #include "markov/contracts/json_input.hpp"
 #include "markov/performance/communication_cost_model.hpp"
+#include "markov/performance/cpu_cost_model.hpp"
 #include "markov/performance/device_command_cost_model.hpp"
 #include "markov/performance/kernel_cost_model.hpp"
 #include "markov/performance/measured_cost_fitter.hpp"
@@ -25,6 +26,8 @@ struct CostFittingWorkflow::Observation {
     nlohmann::json manifest;
     nlohmann::json context;
     nlohmann::json measurements;
+    std::filesystem::path cpu_path;
+    nlohmann::json cpu_samples;
     nlohmann::json readiness;
     nlohmann::json gaps;
     std::set<std::filesystem::path> device_sources;
@@ -33,10 +36,11 @@ struct CostFittingWorkflow::Observation {
 struct CostFittingWorkflow::Measurements {
     std::map<std::string, std::size_t> excluded;
     nlohmann::json sources = nlohmann::json::array();
-    std::vector<MeasuredCostSample<KernelCostFeatures>> kernel_samples;
-    std::vector<MeasuredCostSample<CommunicationCostFeatures>> communication_samples;
-    std::vector<MeasuredCostSample<TransferCostFeatures>> transfer_samples;
-    std::vector<MeasuredCostSample<DeviceCommandWork>> command_samples;
+    MeasuredCostFitter<KernelCostFeatures> kernels;
+    MeasuredCostFitter<CommunicationCostFeatures> communication;
+    MeasuredCostFitter<TransferCostFeatures> transfers;
+    MeasuredCostFitter<DeviceCommandWork> commands;
+    MeasuredCostFitter<CpuServiceWork> cpu;
 };
 
 CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem::path & manifest_path) const {
@@ -45,11 +49,15 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
     source.manifest = input::read_json(manifest_path);
     const auto & manifest = source.manifest;
     const auto & kind = manifest.at("measurement_kind");
-    if (manifest.at("role") != "performance" || (kind != "native_serving_timing" && kind != "native_device_work" && kind != "native_collective_work"))
+    if (manifest.at("role") != "performance"
+        || (kind != "native_serving_timing" && kind != "native_cpu_activity" && kind != "native_device_work" && kind != "native_collective_work"))
         throw std::invalid_argument("cost fitting requires independent performance measurements");
 
     const auto prepared = input::read_json(input::resolve_path(manifest_path, manifest.at("input")));
     const auto environment = input::read_json(input::resolve_path(manifest_path, manifest.at("environment")));
+    if (kind != "native_collective_work" && environment.at("steady_state").at("status") != "steady")
+        throw std::invalid_argument("serving cost fitting requires observed steady measurement windows");
+
     source.context = {
         {         "framework",         environment.at("framework") },
         { "framework_version", environment.at("framework_version") },
@@ -59,7 +67,7 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
         {           "runtime",           environment.at("runtime") }
     };
     source.gaps = manifest.at("gaps");
-    const bool host_transfer = kind == "native_serving_timing";
+    const bool host_transfer = kind == "native_serving_timing" || kind == "native_cpu_activity";
     std::string_view field = "device_measurements";
     if (host_transfer) field = "cpu_worker_units";
     else if (kind == "native_collective_work") field = "collective_measurements";
@@ -69,6 +77,10 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
     source.measurements = input::read_json(source.measurements_path);
 
     if (host_transfer) {
+        if (manifest.contains("cpu_service_units")) {
+            source.cpu_path = input::resolve_path(manifest_path, manifest.at("cpu_service_units"));
+            source.cpu_samples = input::read_json(source.cpu_path);
+        }
         auto workers = nlohmann::json::array();
         for (const auto & reference : manifest.at("worker_environments")) {
             const auto worker = input::read_json(input::resolve_path(manifest_path, reference));
@@ -101,16 +113,37 @@ CostFittingWorkflow::Observation CostFittingWorkflow::read(const std::filesystem
 }
 
 CostFittingWorkflow::Measurements CostFittingWorkflow::select(const Observation & source, std::string_view unit) const {
-    if (unit != "kernel" && unit != "communication" && unit != "transfer" && unit != "command")
+    if (unit != "kernel" && unit != "communication" && unit != "transfer" && unit != "command" && unit != "cpu")
         throw std::invalid_argument("unknown cost unit: " + std::string(unit));
     const auto & kind = source.manifest.at("measurement_kind");
-    if ((kind == "native_serving_timing" && unit != "transfer") || (kind == "native_collective_work" && unit != "communication"))
+    const bool host = kind == "native_serving_timing" || kind == "native_cpu_activity";
+    if ((host && unit != "transfer" && unit != "cpu") || (kind == "native_collective_work" && unit != "communication"))
         throw std::invalid_argument("cost fitting requires independent measurements for the selected unit");
 
     Measurements data;
-    if (kind == "native_serving_timing") read_host_transfers(data, source);
+    if (unit == "cpu") read_cpu(data, source);
+    else if (host) read_host_transfers(data, source);
     else read_device(data, source, unit);
     return data;
+}
+
+void CostFittingWorkflow::read_cpu(Measurements & data, const Observation & source) const {
+    const auto & observations = source.cpu_samples;
+    if (observations.at("kind") != "cpu_service_samples" || observations.at("unit") != "ns")
+        throw std::invalid_argument("CPU fitting requires named exclusive service intervals in ns");
+
+    data.sources.push_back(std::filesystem::weakly_canonical(source.cpu_path).string());
+    for (const auto field : { "cpu_activities", "transfer_scopes" })
+        for (const auto & reference : source.manifest.at(field))
+            data.sources.push_back(std::filesystem::weakly_canonical(input::resolve_path(source.manifest_path, reference)).string());
+
+    // Native layers and repetitions reference one work definition. Resolve it
+    // once before accumulating durations into the common measured groups.
+    std::vector<CpuServiceWork> features;
+    for (const auto & value : observations.at("features")) features.push_back(CpuServiceWork::read(value));
+    for (const auto & sample : observations.at("samples"))
+        data.cpu.observe(features.at(sample.at("feature").get<std::size_t>()),
+                         input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()));
 }
 
 void CostFittingWorkflow::read_host_transfers(Measurements & data, const Observation & source) const {
@@ -119,8 +152,6 @@ void CostFittingWorkflow::read_host_transfers(Measurements & data, const Observa
         throw std::invalid_argument("host transfer fitting requires normalized CPU worker units in ns");
 
     data.sources.push_back(std::filesystem::weakly_canonical(source.measurements_path).string());
-    for (const auto & reference : source.manifest.at("cpu_workers"))
-        data.sources.push_back(std::filesystem::weakly_canonical(input::resolve_path(source.manifest_path, reference)).string());
 
     constexpr auto maximum = std::numeric_limits<std::int64_t>::max();
     for (const auto & record : observations.at("transfer_units")) {
@@ -146,7 +177,7 @@ void CostFittingWorkflow::read_host_transfers(Measurements & data, const Observa
 
         // The complete driver call includes its I/O stalls. Thread CPU and
         // probe counters cannot be subtracted from that wall completion time.
-        data.transfer_samples.push_back({ features, duration });
+        data.transfers.observe(features, duration);
     }
 }
 
@@ -169,8 +200,8 @@ void CostFittingWorkflow::read_device(Measurements & data, const Observation & s
                 continue;
             }
 
-            data.communication_samples.push_back(
-                { CommunicationCostFeatures::read(sample), input::integer(sample.at("observed_wall_ns"), 0, std::numeric_limits<std::int64_t>::max()) });
+            data.communication.observe(CommunicationCostFeatures::read(sample),
+                                       input::integer(sample.at("observed_wall_ns"), 0, std::numeric_limits<std::int64_t>::max()));
             continue;
         }
         if (unit == "command") {
@@ -179,8 +210,8 @@ void CostFittingWorkflow::read_device(Measurements & data, const Observation & s
                 continue;
             }
 
-            data.command_samples.push_back({ DeviceCommandWork::read(sample.at("device_command")),
-                                             input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()) });
+            data.commands.observe(DeviceCommandWork::read(sample.at("device_command")),
+                                  input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()));
             continue;
         }
         if (unit == "transfer") {
@@ -197,8 +228,7 @@ void CostFittingWorkflow::read_device(Measurements & data, const Observation & s
             // DMA role supplies the execution boundary of the fitted cost key.
             auto transfer = sample.at("transfer");
             transfer["execution"] = "asynchronous_device";
-            data.transfer_samples.push_back(
-                { TransferCostFeatures::read(transfer), input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()) });
+            data.transfers.observe(TransferCostFeatures::read(transfer), input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()));
             continue;
         }
         if (sample.at("kind") != "compute") {
@@ -210,8 +240,8 @@ void CostFittingWorkflow::read_device(Measurements & data, const Observation & s
             continue;
         }
 
-        data.kernel_samples.push_back(
-            { KernelCostFeatures::read(sample.at("kernel_work")), input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()) });
+        data.kernels.observe(KernelCostFeatures::read(sample.at("kernel_work")),
+                             input::integer(sample.at("duration_ns"), 0, std::numeric_limits<std::int64_t>::max()));
     }
     for (const auto & source : sources) data.sources.push_back(std::filesystem::weakly_canonical(source).string());
 }
@@ -223,8 +253,9 @@ nlohmann::json CostFittingWorkflow::run(const std::filesystem::path & manifest_p
     std::vector<std::string_view> units;
     const auto & manifest = source.manifest;
     const auto & kind = manifest.at("measurement_kind");
-    if (kind == "native_serving_timing") {
+    if (kind == "native_serving_timing" || kind == "native_cpu_activity") {
         if (manifest.at("cpu_worker_coverage").contains("transfer_units")) units.push_back("transfer");
+        if (manifest.contains("cpu_service_units")) units.push_back("cpu");
     }
     else if (kind == "native_device_work") units = { "kernel", "communication", "transfer", "command" };
     else units = { "communication" };
@@ -246,8 +277,18 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
     nlohmann::json entries;
     std::string_view kind;
     std::vector<std::string> assumptions;
-    if (unit == "command") {
-        entries = MeasuredCostFitter<DeviceCommandWork>{}.fit(data.command_samples);
+    if (unit == "cpu") {
+        entries = data.cpu.fit();
+        kind = "empirical_cpu_service_median";
+        assumptions = { "normalized thread CPU between observed named entries; marked observer work and directly observed waits/transfers excluded",
+                        "exact shared service descriptor and resolved target work; no interpolation or extrapolation",
+                        "native public runtime entries are associated with CANN implementation ranges by the runtime adapter",
+                        "opaque SDK readiness CPU, including any polling, overlaps its retained device dependency; internal CPU placement is not reconstructed",
+                        "median rounded down to integral ns; repeated layers remain one native run, not independent validation",
+                        "descheduling and unobserved external contention excluded; recorded deployment only; independent accuracy not established" };
+    }
+    else if (unit == "command") {
+        entries = data.commands.fit();
         kind = "empirical_device_command_median";
         assumptions = { "physical device record command span only; CPU submission and dependent waits remain separate",
                         "exact adapter-provided task type; event identity, stream and rank omitted",
@@ -255,9 +296,10 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "profiler resolution, overhead and internal stalls not removed; recorded deployment only; service transfer not established" };
     }
     else if (unit == "transfer") {
-        entries = MeasuredCostFitter<TransferCostFeatures>{}.fit(data.transfer_samples);
+        entries = data.transfers.fit();
         kind = "empirical_transfer_median";
-        const bool host_transfer = source.manifest.at("measurement_kind") == "native_serving_timing";
+        const bool host_transfer =
+            source.manifest.at("measurement_kind") == "native_serving_timing" || source.manifest.at("measurement_kind") == "native_cpu_activity";
         assumptions = { host_transfer
                             ? "complete synchronous host driver copy wall interval, including its I/O stalls; preceding runtime wait and CPU setup excluded"
                             : "physical asynchronous device memory-copy span only; CPU submission and waits excluded",
@@ -268,7 +310,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "rank and host-memory properties omitted; recorded deployment only; service transfer not established" };
     }
     else if (unit == "communication") {
-        entries = MeasuredCostFitter<CommunicationCostFeatures>{}.fit(data.communication_samples);
+        entries = data.communication.fit();
         kind = "empirical_communication_median";
         assumptions = { "physical data and command tasks only; waits and collective envelopes excluded",
                         "physical device span; profiler overhead and internal transport stalls not removed",
@@ -277,7 +319,7 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
                         "recorded deployment only; concurrent contention and runtime transfer not established" };
     }
     else if (unit == "kernel") {
-        entries = MeasuredCostFitter<KernelCostFeatures>{}.fit(data.kernel_samples);
+        entries = data.kernels.fit();
         kind = "empirical_kernel_median";
         assumptions = { "physical device span; profiler overhead and hidden stalls not removed",
                         "median rounded down to integral ns; no outlier removal",
@@ -289,17 +331,17 @@ nlohmann::json CostFittingWorkflow::fit(const Observation & source, std::string_
 
     // Fitting never upgrades measurement readiness or absorbs waits into cost.
     return {
-        {                  "kind",                                                                        kind },
-        {                  "unit",                                                                        "ns" },
-        {                "status",                                entries.empty() ? "needs_data" : "candidate" },
-        {       "source_manifest", std::filesystem::absolute(source.manifest_path).lexically_normal().string() },
-        {        "sample_sources",                                                                data.sources },
-        {      "observed_context",                                                              source.context },
-        { "measurement_readiness",                                                            source.readiness },
-        {      "measurement_gaps",                                                                 source.gaps },
-        {               "entries",                                                                     entries },
-        {              "excluded",                                                               data.excluded },
-        {           "assumptions",                                                                 assumptions }
+        {                  "kind",                                                                           kind },
+        {                  "unit",                                                                           "ns" },
+        {                "status",                                   entries.empty() ? "needs_data" : "candidate" },
+        {       "source_manifest",    std::filesystem::absolute(source.manifest_path).lexically_normal().string() },
+        {        "sample_sources",                                                                   data.sources },
+        {      "observed_context",                                                                 source.context },
+        { "measurement_readiness", unit == "cpu" ? source.manifest.at("cpu_service_readiness") : source.readiness },
+        {      "measurement_gaps",                                                                    source.gaps },
+        {               "entries",                                                                        entries },
+        {              "excluded",                                                                  data.excluded },
+        {           "assumptions",                                                                    assumptions }
     };
 }
 
@@ -311,6 +353,7 @@ nlohmann::json CostFittingWorkflow::evaluate(const std::filesystem::path & candi
     else if (kind == "empirical_communication_median") unit = "communication";
     else if (kind == "empirical_transfer_median") unit = "transfer";
     else if (kind == "empirical_device_command_median") unit = "command";
+    else if (kind == "empirical_cpu_service_median") unit = "cpu";
     else throw std::invalid_argument("unknown cost model kind");
     if (candidate.at("unit") != "ns" || candidate.at("status") != "candidate")
         throw std::invalid_argument("cost evaluation requires a measured median candidate in ns");
@@ -328,12 +371,11 @@ nlohmann::json CostFittingWorkflow::evaluate(const std::filesystem::path & candi
     // Evaluate the fixed values directly. This path never calls fit or changes
     // the candidate; equal recorded contexts alone do not establish portability.
     nlohmann::json comparison;
-    if (unit == "command") comparison = MeasuredCostFitter<DeviceCommandWork>{}.evaluate(DeviceCommandCostModel(candidate.at("entries")), data.command_samples);
-    else if (unit == "transfer")
-        comparison = MeasuredCostFitter<TransferCostFeatures>{}.evaluate(TransferCostModel(candidate.at("entries")), data.transfer_samples);
-    else if (unit == "communication")
-        comparison = MeasuredCostFitter<CommunicationCostFeatures>{}.evaluate(CommunicationCostModel(candidate.at("entries")), data.communication_samples);
-    else comparison = MeasuredCostFitter<KernelCostFeatures>{}.evaluate(KernelCostModel(candidate.at("entries")), data.kernel_samples);
+    if (unit == "cpu") comparison = data.cpu.evaluate(CpuCostModel(candidate.at("entries")));
+    else if (unit == "command") comparison = data.commands.evaluate(DeviceCommandCostModel(candidate.at("entries")));
+    else if (unit == "transfer") comparison = data.transfers.evaluate(TransferCostModel(candidate.at("entries")));
+    else if (unit == "communication") comparison = data.communication.evaluate(CommunicationCostModel(candidate.at("entries")));
+    else comparison = data.kernels.evaluate(KernelCostModel(candidate.at("entries")));
     return {
         {                          "status", comparison.at("overall").at("count") == 0 ? "needs_data" : "evaluated" },
         {                   "qualification",                                                      "not_established" },

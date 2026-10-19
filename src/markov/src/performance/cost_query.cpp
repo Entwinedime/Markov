@@ -71,19 +71,10 @@ nlohmann::json KernelOperandFeatures::describe() const {
 bool KernelOperandFeatures::empty() const { return !position_lengths && !logits_rows && !request_pool && !batch_filter; }
 
 KernelCostQuery KernelCostQuery::from_work(const SourceKernel & work) {
-    KernelCostQuery query{ tensor_descriptor(work),
-                           work.attention ? std::optional(AttentionCostFeatures::from_work(*work.attention)) : std::nullopt,
-                           KernelOperandFeatures::from_work(work),
-                           {},
-                           &work };
-    if (work.kv_allocation) query.unmodeled_operands.push_back("kv_allocation");
-    if (work.kv_release) query.unmodeled_operands.push_back("kv_release");
-    if (work.batch_merge) query.unmodeled_operands.push_back("batch_merge");
-    if (work.page_table) query.unmodeled_operands.push_back("page_table");
-    if (work.sequence_lengths) query.unmodeled_operands.push_back("sequence_lengths");
-    if (work.sequence_length_max) query.unmodeled_operands.push_back("sequence_length_max");
-    if (work.kv_new_pages) query.unmodeled_operands.push_back("kv_new_pages");
-    return query;
+    return { tensor_descriptor(work),
+             work.attention ? std::optional(AttentionCostFeatures::from_work(*work.attention)) : std::nullopt,
+             KernelOperandFeatures::from_work(work),
+             work.value_dependencies };
 }
 
 nlohmann::json KernelCostQuery::describe() const {
@@ -100,16 +91,9 @@ nlohmann::json KernelCostQuery::describe() const {
     };
     if (attention) result["attention_work"] = attention->describe();
     if (!operands.empty()) result["operand_work"] = operands.describe();
-    if (!unmodeled_operands.empty()) {
-        auto unmodeled = nlohmann::json::object();
-        const auto description = work->describe();
-        for (const auto & name : unmodeled_operands) unmodeled[name] = description.at(name);
-        result["unmodeled_operands"] = std::move(unmodeled);
-    }
+    if (!unmodeled_operands.empty()) result["unmodeled_operands"] = unmodeled_operands;
     return result;
 }
-
-UnresolvedCostQuery UnresolvedCostQuery::from_work(const ServiceWork & work) { return { work.node_kind }; }
 
 nlohmann::json UnresolvedCostQuery::describe() const {
     return {
@@ -117,7 +101,7 @@ nlohmann::json UnresolvedCostQuery::describe() const {
     };
 }
 
-std::string_view CostObject::kind_name(CostQueryKind kind) {
+std::string_view CostQuery::kind_name(CostQueryKind kind) {
     switch (kind) {
     case CostQueryKind::Undefined:
         return "undefined";
@@ -129,11 +113,13 @@ std::string_view CostObject::kind_name(CostQueryKind kind) {
         return "transfer";
     case CostQueryKind::DeviceCommand:
         return "device_command";
+    case CostQueryKind::Cpu:
+        return "cpu";
     }
     std::unreachable();
 }
 
-nlohmann::json CostObject::describe() const {
+nlohmann::json CostQuery::describe() const {
     nlohmann::json name = nullptr;
     nlohmann::json boundary = nullptr;
     nlohmann::json values = nullptr;
@@ -158,6 +144,11 @@ nlohmann::json CostObject::describe() const {
         values = value->describe();
     }
 
+    else if (const auto * value = std::get_if<CpuServiceWork>(&features)) {
+        name = "cpu_service";
+        boundary = "named_thread_service_interval";
+        values = value->describe();
+    }
     else if (const auto * value = std::get_if<UnresolvedCostQuery>(&features)) { values = value->describe(); }
 
     std::string_view status = "complete";
@@ -173,51 +164,34 @@ nlohmann::json CostObject::describe() const {
 }
 
 CostQuery CostQuery::from_work(const ServiceWork & work) {
-    CostQuery result;
-    auto & objects = result.objects;
     if (work.node_kind == SourceSpanKind::CpuControl) {
         if (work.transfer)
-            objects.push_back({
+            return {
                 CostQueryKind::Transfer,
                 TransferCostFeatures{ work.transfer->bytes, work.transfer->direction, TransferExecution::SynchronousHostDriver }
-            });
-        // Control-service time is deliberately outside the current model.
-        return result;
+            };
+        if (work.cpu) return { CostQueryKind::Cpu, *work.cpu };
+        return { CostQueryKind::Undefined, UnresolvedCostQuery{ work.node_kind }, CostQueryIssue::FeaturesUndefined, "cpu_service_features_not_defined" };
     }
-
     if (work.node_kind == SourceSpanKind::Compute) {
-        if (!work.kernel)
-            objects.push_back({ CostQueryKind::Kernel, UnresolvedCostQuery::from_work(work), CostQueryIssue::FeaturesUndefined, "kernel_work_undefined" });
-        else {
-            // An unmeasured physical key is a data gap. Value-operand projection
-            // is qualified by the candidate policy during lookup; absence of a
-            // candidate does not prove that this projection is unsupported.
-            objects.push_back({ CostQueryKind::Kernel, KernelCostQuery::from_work(*work.kernel) });
-        }
-        return result;
+        if (!work.kernel) return { CostQueryKind::Kernel, UnresolvedCostQuery{ work.node_kind }, CostQueryIssue::FeaturesUndefined, "kernel_work_undefined" };
+        // Launch and operand policies belong to the selected cost model.
+        return { CostQueryKind::Kernel, KernelCostQuery::from_work(*work.kernel) };
     }
-
     if (work.communication && (work.node_kind == SourceSpanKind::Dma || work.node_kind == SourceSpanKind::DeviceMarker)) {
         const auto & task = *work.communication;
-        objects.push_back({
+        return {
             CostQueryKind::Communication,
             CommunicationCostFeatures{ work.node_kind, task.operation, task.bytes, task.data_type, task.transport, task.source_rank, task.destination_rank }
-        });
+        };
     }
-    else if (work.node_kind == SourceSpanKind::Dma && work.transfer) {
-        objects.push_back({
+    if (work.node_kind == SourceSpanKind::Dma && work.transfer)
+        return {
             CostQueryKind::Transfer,
             TransferCostFeatures{ work.transfer->bytes, work.transfer->direction, TransferExecution::DeviceAsync }
-        });
-    }
-    else if (work.node_kind == SourceSpanKind::DeviceMarker && work.device_command) {
-        objects.push_back({ CostQueryKind::DeviceCommand, *work.device_command });
-    }
-    else {
-        objects.push_back(
-            { CostQueryKind::Undefined, UnresolvedCostQuery::from_work(work), CostQueryIssue::FeaturesUndefined, "service_work_features_undefined" });
-    }
-    return result;
+        };
+    if (work.node_kind == SourceSpanKind::DeviceMarker && work.device_command) return { CostQueryKind::DeviceCommand, *work.device_command };
+    return { CostQueryKind::Undefined, UnresolvedCostQuery{ work.node_kind }, CostQueryIssue::FeaturesUndefined, "service_work_features_undefined" };
 }
 
 } // namespace markov

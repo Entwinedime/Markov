@@ -1,5 +1,7 @@
 #include "markov/templates/templates.hpp"
 
+#include "markov/templates/kv_workload.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <set>
@@ -305,6 +307,16 @@ std::expected<std::vector<TemplateOperationRewrite>, std::string> TemplateBank::
     if (!operations) return std::unexpected(operations.error());
     auto rewrites = std::move(*operations);
 
+    // Production declares which copies become views for one request. The core
+    // qualifies their cuts and preserves the declared producer's readiness.
+    if (target.requests.size() == 1) {
+        for (const auto & [operation, producer] : source.single_request_views) {
+            auto removal = source.plan_view_materialization_removal(source.operations.at(operation), producer);
+            if (!removal) return std::unexpected(removal.error());
+            rewrites.push_back(std::move(*removal));
+        }
+    }
+
     if (source.source_requests.size() != target.requests.size()) {
         const bool admission = source.step == StepKind::Schedule && source.phase == BatchPhase::Prefill;
         const auto & regions = admission ? source.admission_regions : source.request_initialization_regions;
@@ -471,227 +483,138 @@ std::expected<std::vector<std::vector<TemplateInstance>>, TemplateGap> TemplateB
     return std::unexpected(failure->second);
 }
 
+std::expected<void, TemplateBank::SelectionFailure> TemplateBank::qualify_source(const TemplateDefinition & source, const InvokeStep & invocation) {
+    const auto & input = invocation.input;
+    const auto rank = source.rank;
+    const bool same_count = source.source_requests.size() == input.requests.size();
+    if (!same_count) {
+        // Count changes need both parameterized device work and movable request
+        // loops. The rewrite planner still qualifies their full interfaces.
+        if (!source.length_domain || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Schedule && source.admission_regions.empty())
+            || (input.phase == BatchPhase::Prefill && invocation.step == StepKind::Prepare && source.request_initialization_regions.empty())
+            || (invocation.step == StepKind::Publish && (source.publication_regions.empty() || !source.publication_layout)))
+            return std::unexpected(
+                SelectionFailure{ MatchStage::RequestCount, TemplateGapKind::Rule, "request_count_transform_not_implemented", invocation, rank });
+    }
+
+    if (invocation.step == StepKind::Publish && same_count) {
+        for (std::size_t slot = 0; slot < input.requests.size(); ++slot) {
+            const auto finishes = source.publication_finishes[slot];
+            if (!finishes)
+                return std::unexpected(
+                    SelectionFailure{ MatchStage::Publication, TemplateGapKind::Observation, "native_publication_branch_not_observed", invocation, rank });
+            if (*finishes != input.requests[slot].finishes && source.publication_regions.empty())
+                return std::unexpected(
+                    SelectionFailure{ MatchStage::Publication, TemplateGapKind::Rule, "publication_member_branch_rewrite_not_implemented", invocation, rank });
+        }
+    }
+
+    const bool same_shapes = std::ranges::equal(source.source_requests, input.requests, [](const SourceRequest & source, const RequestSlice & target) {
+        return source.input_tokens == target.input_tokens && source.context_tokens == target.context_tokens;
+    });
+    if (!same_shapes && (!source.length_domain || !source.length_domain->accepts(input)))
+        return std::unexpected(SelectionFailure{ MatchStage::Shape,
+                                                 TemplateGapKind::Rule,
+                                                 source.length_domain ? "request_length_outside_parameter_domain" : "internal_shape_transform_not_implemented",
+                                                 invocation,
+                                                 rank });
+
+    if (invocation.step == StepKind::Publish && same_count) {
+        for (std::size_t slot = 0; slot < input.requests.size(); ++slot) {
+            const auto observed = source.source_requests[slot].generated_tokens;
+            const auto & target = input.requests[slot];
+            if (observed == target.generated_tokens) continue;
+            if (!source.output_policy)
+                return std::unexpected(
+                    SelectionFailure{ MatchStage::Structure, TemplateGapKind::Observation, "publication_output_policy_missing", invocation, rank });
+
+            const auto before = source.output_policy->evaluate(observed, target.finishes);
+            const auto after = source.output_policy->evaluate(target.generated_tokens, target.finishes);
+            if (source.publication_cpu_progress && !after.emits && before == after) continue;
+            if (source.publication_layout) {
+                const auto output = source.publication_layout->evaluate(input);
+                if (output) continue;
+                return std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, output.error(), invocation, rank });
+            }
+            return std::unexpected(
+                SelectionFailure{ MatchStage::Structure,
+                                  TemplateGapKind::Rule,
+                                  before == after ? "publication_shared_work_transform_not_implemented" : "publication_output_branch_rewrite_not_implemented",
+                                  invocation,
+                                  rank });
+        }
+    }
+    if (invocation.step != StepKind::Schedule) return {};
+
+    if (!source.transition)
+        return std::unexpected(
+            SelectionFailure{ MatchStage::Structure, TemplateGapKind::Observation, "batch_transition_state_not_observed", invocation, rank });
+    if (*source.transition != input.transition && !source.transition_region)
+        return std::unexpected(
+            SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, "batch_transition_prefix_rewrite_not_implemented", invocation, rank });
+    if (source.transition_region && !source.running_update_region) {
+        const auto source_prefix = source.transition->pending_prefill_requests ? 1U : 0U;
+        const auto target_prefix = input.transition.pending_prefill_requests ? 1U : 0U;
+        if (!std::ranges::equal(std::span(source.filters).subspan(source_prefix), std::span(input.filters).subspan(target_prefix)))
+            return std::unexpected(
+                SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, "batch_update_filter_transform_not_implemented", invocation, rank });
+    }
+    if (!source.admission)
+        return std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Observation, "admission_entry_state_not_observed", invocation, rank });
+
+    // Decode carries running members but admits no new prefill requests.
+    const auto admitted = input.phase == BatchPhase::Prefill ? input.requests.size() : 0;
+    const bool parameterized = source.admission_cpu_request_count
+                               && (*source.admission_cpu_request_count == admitted || (admitted > 0 && !source.admission_regions.empty()))
+                               && input.admission_work.parameterized_cpu_path(input.admission, admitted);
+    if (*source.admission != input.admission && !parameterized)
+        return std::unexpected(
+            SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, "admission_prefix_work_transform_not_implemented", invocation, rank });
+    if (!source.admission_work)
+        return std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Observation, "admission_work_not_qualified", invocation, rank });
+    if (*source.admission_work != input.admission_work && !parameterized)
+        return std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, "admission_work_transform_not_implemented", invocation, rank });
+
+    if (!source.transition_region) {
+        if (source.filters != input.filters)
+            return std::unexpected(SelectionFailure{ MatchStage::Structure,
+                                                     TemplateGapKind::Rule,
+                                                     source.filters.size() == input.filters.size() ? "batch_filter_membership_transform_not_implemented"
+                                                                                                   : "batch_filter_sequence_rewrite_not_implemented",
+                                                     invocation,
+                                                     rank });
+        if (source.merge != input.merge)
+            return std::unexpected(
+                SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, "batch_merge_branch_rewrite_not_implemented", invocation, rank });
+    }
+    return {};
+}
+
 std::expected<TemplateInstance, TemplateBank::SelectionFailure> TemplateBank::instantiate_step(const TemplateSource & anchor_source,
                                                                                                const InvokeStep & invocation,
                                                                                                std::optional<std::uint64_t> source_batch, std::uint32_t rank,
                                                                                                std::uint32_t request_capacity) const {
     const auto found = anchor_source.definitions.find({ invocation.step, invocation.input.phase, rank });
-    if (found == anchor_source.definitions.end()) {
-        return std::unexpected(SelectionFailure{
-            MatchStage::Source,
-            { TemplateGapKind::Observation, "native_step_not_observed", invocation.step, invocation.input.phase, rank }
-        });
-    }
-    if (found->second.empty()) {
-        return std::unexpected(SelectionFailure{
-            MatchStage::Source,
-            { TemplateGapKind::Rule, "native_transform_rule_missing", invocation.step, invocation.input.phase, rank }
-        });
-    }
+    if (found == anchor_source.definitions.end())
+        return std::unexpected(SelectionFailure{ MatchStage::Source, TemplateGapKind::Observation, "native_step_not_observed", invocation, rank });
+    if (found->second.empty())
+        return std::unexpected(SelectionFailure{ MatchStage::Source, TemplateGapKind::Rule, "native_transform_rule_missing", invocation, rank });
 
-    // Matching token shapes selects a source instance, not a proof of target equivalence.
-    std::optional<TemplateInstance> selected;
-    std::optional<TemplateGap> transform_gap;
-    bool token_shape_match = false;
-    bool length_domain_rejected = false;
-    bool publication_match = false;
-    bool publication_rewrite_missing = false;
-    bool request_count_match = false;
-    bool batch_observed = false;
+    SelectionFailure failure{ MatchStage::Source, TemplateGapKind::Observation, "native_batch_step_not_observed", invocation, rank };
     for (const auto & source : found->second) {
-        // The four actions of one non-overlap batch share native source identity.
-        // Independent shape matches could otherwise join unrelated iterations.
+        // One native batch owns the cross-rank cohort. Local shape matches must
+        // not stitch unrelated source iterations together.
         if (source.source_batch != source_batch) continue;
-        batch_observed = true;
-        const bool same_count = source.source_requests.size() == invocation.input.requests.size();
-        if (!same_count) {
-            // A count change is only a candidate when all source device work
-            // has parameter relations and each request loop has a semantic cut.
-            // Materialization planning below must still qualify every operation.
-            if (!source.length_domain) continue;
-            if (invocation.input.phase == BatchPhase::Prefill) {
-                if (invocation.step == StepKind::Schedule && source.admission_regions.empty()) continue;
-                if (invocation.step == StepKind::Prepare && source.request_initialization_regions.empty()) continue;
-            }
-            if (invocation.step == StepKind::Publish && (source.publication_regions.empty() || !source.publication_layout)) continue;
+        auto qualified = qualify_source(source, invocation);
+        if (qualified) {
+            auto candidate = instantiate_source(source, invocation, request_capacity);
+            if (candidate) return std::move(*candidate);
+            qualified = std::unexpected(SelectionFailure{ MatchStage::Structure, TemplateGapKind::Rule, candidate.error(), invocation, rank });
         }
-
-        request_count_match = true;
-        bool matches = true;
-        // Completion controls Publish's request loop and release work. Earlier
-        // stages consume current membership and sequence inputs; future finish
-        // masks must not restrict those stages or mislabel their missing rules.
-        if (invocation.step == StepKind::Publish && same_count) {
-            for (std::size_t slot = 0; slot < source.source_requests.size(); ++slot) {
-                const auto publication = source.publication_finishes[slot];
-                if (!publication) {
-                    matches = false;
-                    break;
-                }
-                if (*publication != invocation.input.requests[slot].finishes && source.publication_regions.empty()) {
-                    // The source branch is known; changing it needs a region
-                    // rewrite. Another observation cannot implement that rule.
-                    publication_rewrite_missing = true;
-                    matches = false;
-                    break;
-                }
-            }
-        }
-        if (!matches) continue;
-        publication_match = true;
-
-        matches = same_count;
-        if (same_count) {
-            for (std::size_t slot = 0; slot < source.source_requests.size(); ++slot) {
-                const auto & observed = source.source_requests[slot];
-                const auto & requested = invocation.input.requests[slot];
-                if (observed.input_tokens != requested.input_tokens || observed.context_tokens != requested.context_tokens) {
-                    matches = false;
-                    break;
-                }
-            }
-        }
-        if (!matches && source.length_domain) {
-            matches = source.length_domain->accepts(invocation.input);
-            length_domain_rejected = length_domain_rejected || !matches;
-        }
-        if (!matches) continue;
-        token_shape_match = true;
-
-        if (invocation.step == StepKind::Publish && same_count) {
-            for (std::size_t slot = 0; slot < source.source_requests.size(); ++slot) {
-                const auto observed = source.source_requests[slot].generated_tokens;
-                const auto & target = invocation.input.requests[slot];
-                if (observed == target.generated_tokens) continue;
-
-                auto kind = TemplateGapKind::Observation;
-                std::string reason = "publication_output_policy_missing";
-                if (source.output_policy) {
-                    kind = TemplateGapKind::Rule;
-                    const auto before = source.output_policy->evaluate(observed, target.finishes);
-                    const auto after = source.output_policy->evaluate(target.generated_tokens, target.finishes);
-                    if (source.publication_cpu_progress && !after.emits && before == after) continue;
-                    reason = before == after ? "publication_shared_work_transform_not_implemented" : "publication_output_branch_rewrite_not_implemented";
-                    if (source.publication_layout) {
-                        const auto output = source.publication_layout->evaluate(invocation.input);
-                        if (output) continue;
-                        reason = output.error();
-                    }
-                }
-                if (!transform_gap) transform_gap = TemplateGap{ kind, std::move(reason), invocation.step, invocation.input.phase, rank };
-                matches = false;
-                break;
-            }
-        }
-        if (!matches) continue;
-
-        if (invocation.step == StepKind::Schedule) {
-            if (!source.transition) {
-                if (!transform_gap)
-                    transform_gap =
-                        TemplateGap{ TemplateGapKind::Observation, "batch_transition_state_not_observed", invocation.step, invocation.input.phase, rank };
-                continue;
-            }
-            if (*source.transition != invocation.input.transition && !source.transition_region) {
-                if (!transform_gap)
-                    transform_gap =
-                        TemplateGap{ TemplateGapKind::Rule, "batch_transition_prefix_rewrite_not_implemented", invocation.step, invocation.input.phase, rank };
-                continue;
-            }
-            if (source.transition_region && !source.running_update_region) {
-                const auto source_prefix = source.transition->pending_prefill_requests ? 1U : 0U;
-                const auto target_prefix = invocation.input.transition.pending_prefill_requests ? 1U : 0U;
-                if (!std::ranges::equal(std::span(source.filters).subspan(source_prefix), std::span(invocation.input.filters).subspan(target_prefix))) {
-                    if (!transform_gap)
-                        transform_gap = TemplateGap{ TemplateGapKind::Rule,
-                                                     "batch_update_filter_transform_not_implemented",
-                                                     invocation.step,
-                                                     invocation.input.phase,
-                                                     rank };
-                    continue;
-                }
-            }
-            if (!source.admission) {
-                if (!transform_gap)
-                    transform_gap =
-                        TemplateGap{ TemplateGapKind::Observation, "admission_entry_state_not_observed", invocation.step, invocation.input.phase, rank };
-                continue;
-            }
-            // Decode carries running requests, but admits no new prefill members.
-            const auto admitted = invocation.input.phase == BatchPhase::Prefill ? invocation.input.requests.size() : 0;
-            const bool parameterized_admission = source.admission_cpu_request_count
-                                                 && (*source.admission_cpu_request_count == admitted || (admitted > 0 && !source.admission_regions.empty()))
-                                                 && invocation.input.admission_work.parameterized_cpu_path(invocation.input.admission, admitted);
-            if (*source.admission != invocation.input.admission && !parameterized_admission) {
-                if (!transform_gap)
-                    transform_gap =
-                        TemplateGap{ TemplateGapKind::Rule, "admission_prefix_work_transform_not_implemented", invocation.step, invocation.input.phase, rank };
-                continue;
-            }
-            if (!source.admission_work || (*source.admission_work != invocation.input.admission_work && !parameterized_admission)) {
-                if (!transform_gap)
-                    transform_gap = TemplateGap{ source.admission_work ? TemplateGapKind::Rule : TemplateGapKind::Observation,
-                                                 source.admission_work ? "admission_work_transform_not_implemented" : "admission_work_not_qualified",
-                                                 invocation.step,
-                                                 invocation.input.phase,
-                                                 rank };
-                continue;
-            }
-        }
-
-        if (invocation.step == StepKind::Schedule && !source.transition_region
-            && (source.filters != invocation.input.filters || source.merge != invocation.input.merge)) {
-            // Observed membership is present; changing the call sequence or its
-            // branch requires a rewrite, not another observation of token shapes.
-            std::string reason = "batch_merge_branch_rewrite_not_implemented";
-            if (source.filters != invocation.input.filters)
-                reason = source.filters.size() == invocation.input.filters.size() ? "batch_filter_membership_transform_not_implemented"
-                                                                                  : "batch_filter_sequence_rewrite_not_implemented";
-            if (!transform_gap) transform_gap = TemplateGap{ TemplateGapKind::Rule, std::move(reason), invocation.step, invocation.input.phase, rank };
-            continue;
-        }
-        auto candidate = instantiate_source(source, invocation, request_capacity);
-        if (!candidate) {
-            // A matching observation can still lie outside a parameter or
-            // rewrite domain. Other sources must get the same qualification.
-            if (!transform_gap) transform_gap = TemplateGap{ TemplateGapKind::Rule, candidate.error(), invocation.step, invocation.input.phase, rank };
-            continue;
-        }
-
-        selected.emplace(std::move(*candidate));
-        break;
+        const auto & rejected = qualified.error();
+        if (rejected.stage > failure.stage || (rejected.stage == failure.stage && rejected.gap.kind > failure.gap.kind)) failure = rejected;
     }
-
-    if (!batch_observed)
-        return std::unexpected(SelectionFailure{
-            MatchStage::Source,
-            { TemplateGapKind::Observation, "native_batch_step_not_observed", invocation.step, invocation.input.phase, rank }
-        });
-    if (!request_count_match)
-        return std::unexpected(SelectionFailure{
-            MatchStage::RequestCount,
-            { TemplateGapKind::Rule, "request_count_transform_not_implemented", invocation.step, invocation.input.phase, rank }
-        });
-    if (!publication_match)
-        return std::unexpected(SelectionFailure{
-            MatchStage::Publication,
-            { publication_rewrite_missing ? TemplateGapKind::Rule : TemplateGapKind::Observation,
-                           publication_rewrite_missing ? "publication_member_branch_rewrite_not_implemented" : "native_publication_branch_not_observed",
-                           invocation.step,
-                           invocation.input.phase,
-                           rank }
-        });
-    if (!token_shape_match)
-        return std::unexpected(SelectionFailure{
-            MatchStage::Shape,
-            { TemplateGapKind::Rule,
-                     length_domain_rejected ? "request_length_outside_parameter_domain" : "internal_shape_transform_not_implemented",
-                     invocation.step,
-                     invocation.input.phase,
-                     rank }
-        });
-    if (!selected) return std::unexpected(SelectionFailure{ MatchStage::Structure, *transform_gap });
-    return std::move(*selected);
+    return std::unexpected(std::move(failure));
 }
 
 std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(const TemplateDefinition & source, const InvokeStep & invocation,
@@ -717,12 +640,12 @@ std::expected<TemplateInstance, std::string> TemplateBank::instantiate_source(co
         if (!target) return std::unexpected(target.error());
         if (!*target) continue;
 
-        // Model layouts already carry identity relations in diagnostics; only
+        // Compiled model rules already carry identity relations; only
         // materialized descriptor changes need an extra override record.
         const auto & kernel = **target;
         if (source.model_kernel_layouts.contains(node_observation.source_span) && kernel.input_shapes == node_observation.kernel->input_shapes
-            && kernel.output_shapes == node_observation.kernel->output_shapes && !kernel.logits_token_indices && !kernel.positions && !kernel.page_table
-            && !kernel.sequence_length_max && !kernel.sequence_lengths)
+            && kernel.output_shapes == node_observation.kernel->output_shapes && !kernel.logits_token_indices && !kernel.positions
+            && kernel.value_dependencies.empty())
             continue;
         instance.kernel_overrides.emplace(node_observation.source_span, std::move(**target));
     }
@@ -766,9 +689,9 @@ std::expected<std::optional<SourceKernel>, std::string> TemplateBank::transform_
     }
 
     const auto attention = source.attention_kernel_layouts.find(observation.source_span);
-    if (attention != source.attention_kernel_layouts.end()) return attention->second.rule->evaluate(*observation.kernel, invocation.input);
+    if (attention != source.attention_kernel_layouts.end()) return attention->second->evaluate(*observation.kernel, invocation.input);
     const auto model = source.model_kernel_layouts.find(observation.source_span);
-    if (model != source.model_kernel_layouts.end()) return source.graph.model_rule(model->second.node).evaluate(*observation.kernel, invocation.input);
+    if (model != source.model_kernel_layouts.end()) return source.graph.model_rule(model->second).evaluate(*observation.kernel, invocation.input);
 
     const auto pool = source.request_pool_layouts.find(observation.source_span);
     if (pool != source.request_pool_layouts.end()) {
@@ -874,8 +797,8 @@ std::expected<void, TemplateGap> TemplateBank::qualify(std::uint32_t request_cap
 }
 
 std::expected<void, TemplateGap> TemplateBank::qualify_initialization(std::uint32_t request_capacity) const {
-    if (source_.initialization_gap)
-        return std::unexpected(TemplateGap{ TemplateGapKind::Observation, *source_.initialization_gap, StepKind::Schedule, BatchPhase::Idle, 0 });
+    if (source_.steady_state_gap)
+        return std::unexpected(TemplateGap{ TemplateGapKind::Observation, *source_.steady_state_gap, StepKind::Schedule, BatchPhase::Idle, 0 });
     if (source_.workspace_binding_gap)
         return std::unexpected(TemplateGap{ TemplateGapKind::Observation, *source_.workspace_binding_gap, StepKind::Schedule, BatchPhase::Idle, 0 });
     if (const auto gap = source_.initialization_pool_domain.unsupported(request_capacity))
@@ -883,7 +806,7 @@ std::expected<void, TemplateGap> TemplateBank::qualify_initialization(std::uint3
     return {};
 }
 
-nlohmann::json TemplateBank::describe() const {
+nlohmann::json TemplateBank::describe(bool diagnostics) const {
     std::size_t workspace_uses = 0;
     std::size_t workspace_synchronizations = 0;
     std::size_t workspace_demand_rules = 0;
@@ -912,9 +835,14 @@ nlohmann::json TemplateBank::describe() const {
     std::size_t model_rule_observations = 0;
     std::size_t attention_rule_observations = 0;
     std::size_t collective_rule_observations = 0;
-    auto observations = Json::array();
+    std::map<std::string, std::size_t> structure_kinds;
+    std::map<SourceSpanKind, std::size_t> definition_nodes;
+    std::map<SourceSpanKind, std::size_t> source_nodes;
+    for (const auto & structure : source_.region_structures) {
+        ++structure_kinds[structure.semantic];
+        for (const auto & node : structure.nodes) ++definition_nodes[node.kind];
+    }
     std::set<TemplateResource> resources;
-    const ServingContract contract;
     for (const auto & [key, instances] : source_.definitions) {
         if (!instances.empty()) ++observed_groups;
         source_instances += instances.size();
@@ -922,6 +850,7 @@ nlohmann::json TemplateBank::describe() const {
         // Each row is a source call. A step/phase/rank bucket is not a
         // structural family, and repeated observations are not new variants.
         for (const auto & source : instances) {
+            for (const auto & node : source.graph) ++source_nodes[node.kind];
             for (const auto & lane : source.lanes)
                 if (lane.source.domain == SourceDomain::CpuThread || lane.source.domain == SourceDomain::DeviceStream) resources.insert(lane.resource());
             for (const auto & wait : source.stream_waits) resources.insert(wait.resources.begin(), wait.resources.end());
@@ -932,89 +861,16 @@ nlohmann::json TemplateBank::describe() const {
             model_rule_observations += source.model_kernel_layouts.size();
             attention_rule_observations += source.attention_kernel_layouts.size();
             collective_rule_observations += source.collectives.size();
-            auto requests = Json::array();
-            for (std::size_t slot = 0; slot < source.source_requests.size(); ++slot) {
-                const auto & request = source.source_requests[slot];
-                const auto publication = source.publication_finishes[slot];
-                requests.push_back({
-                    {     "input_tokens",                             request.input_tokens },
-                    {   "context_tokens",                           request.context_tokens },
-                    { "generated_tokens",                         request.generated_tokens },
-                    {         "finishes", publication ? Json(*publication) : Json(nullptr) }
-                });
-            }
-            auto filters = Json::array();
-            for (const auto & filter : source.filters) filters.push_back(filter.describe());
-            auto initialization_regions = Json::array();
-            for (const auto index : source.request_initialization_regions) initialization_regions.push_back(source.regions[index].source_call);
-
-            auto length_domain = Json(nullptr);
-            if (source.length_domain) {
-                length_domain = {
-                    { "minimum_context_tokens", source.length_domain->minimum_context_tokens },
-                    { "maximum_context_tokens", source.length_domain->maximum_context_tokens },
-                    {   "minimum_input_tokens",   source.length_domain->minimum_input_tokens },
-                    {   "maximum_input_tokens",   source.length_domain->maximum_input_tokens }
-                };
-            }
-            Json admission_regions = Json::array();
-            for (const auto index : source.admission_regions) admission_regions.push_back(source.regions[index].source_call);
-
-            Json publication_regions = Json::array();
-            for (const auto index : source.publication_regions) publication_regions.push_back(source.regions[index].source_call);
-
-            // Expose the producer's existing branch qualification, not a new
-            // coverage heuristic. Node layouts and target ports still qualify
-            // independently during instantiation.
-            Json kv_region = nullptr;
-            if (source.kv_region) {
-                const auto & branch = *source.kv_region;
-                kv_region = {
-                    {          "kind", branch.kind == KvRegionKind::Allocation ? "allocation" : "release_group" },
-                    {   "source_call",                                source.regions[branch.region].source_call },
-                    { "changes_pages",                                                     branch.changes_pages }
-                };
-                if (branch.kind == KvRegionKind::ReleaseGroup) {
-                    kv_region["minimum_members"] = branch.minimum_members;
-                    kv_region["maximum_members"] = branch.maximum_members;
-                }
-            }
-
-            // Report existing facts and binding qualification separately. An
-            // observed branch is not a promise that all targets can reuse it.
-            observations.push_back({
-                { "transition", source.transition ? source.transition->describe() : Json(nullptr) },
-                { "admission_entry", source.admission ? source.admission->describe() : Json(nullptr) },
-                { "admission_work",
-                 source.admission && source.admission_work
-                      ? source.admission_work->describe(*source.admission, source.phase == BatchPhase::Prefill ? source.source_requests.size() : 0)
-                      : Json(nullptr) },
-                { "admission_cpu_request_count", source.admission_cpu_request_count ? Json(*source.admission_cpu_request_count) : Json(nullptr) },
-                { "admission_regions", admission_regions },
-                { "transition_cpu_parameters", source.transition_cpu_parameters },
-                { "transition_merge_parameters", source.transition_merge_parameters },
-                { "running_update_parameters", source.running_update_region.has_value() },
-                { "running_update_cpu_only",
-                 source.running_update_region ? Json(source.is_cpu_region(source.regions[*source.running_update_region])) : Json(nullptr) },
-                { "publication_regions", publication_regions },
-                { "kv_region", kv_region },
-                { "periodic_output_interval_tokens", source.output_policy ? Json(source.output_policy->interval_tokens) : Json(nullptr) },
-                { "length_domain", length_domain },
-                { "step", contract.block(source.step).name },
-                { "phase", ServingContract{}.phase_name(std::get<1>(key)) },
-                { "rank", source.rank },
-                { "source_batch", source.source_batch ? Json(*source.source_batch) : Json(nullptr) },
-                { "source_call", source.source_call },
-                { "requests", requests },
-                { "request_initialization_regions", initialization_regions },
-                { "batch_filters", filters },
-                { "batch_merge", source.merge ? source.merge->describe() : Json(nullptr) }
-            });
         }
     }
 
     auto resource_bindings = Json::array();
     for (const auto & resource : resources) resource_bindings.push_back(resource.describe());
+
+    auto source_node_counts = Json::object();
+    auto definition_node_counts = Json::object();
+    for (const auto & [kind, count] : source_nodes) source_node_counts[std::string(SourceGraph::span_name(kind))] = count;
+    for (const auto & [kind, count] : definition_nodes) definition_node_counts[std::string(SourceGraph::span_name(kind))] = count;
 
     Json admission;
     if (source_.admission_policy) {
@@ -1057,7 +913,10 @@ nlohmann::json TemplateBank::describe() const {
         initialization_status["reason"] = gap.reason;
     }
 
-    return {
+    std::map<std::string, std::map<std::string, std::size_t>> source_gaps;
+    for (const auto & gap : source_.gaps) ++source_gaps[gap.at("kind").get<std::string>()][gap.at("reason").get<std::string>()];
+
+    Json result{
         {                  "initialization",                                        initialization_status                                            },
         {                       "workspace",
          { { "source_binding", source_.workspace_binding_gap ? "needs_data" : "available" },
@@ -1083,16 +942,22 @@ nlohmann::json TemplateBank::describe() const {
         {        "region_structure_sharing",
          { { "definitions", source_.region_structures.size() },
          { "regions", shared_regions },
-         { "scope", "nodes_dependencies_model_and_collective_rules_resources_and_interfaces" } }                                                     },
+         { "semantic_kinds", structure_kinds.size() },
+         { "definitions_by_semantic", structure_kinds },
+         { "source_nodes_by_kind", source_node_counts },
+         { "definition_nodes_by_kind", definition_node_counts },
+         { "scope", "semantic_self_work_rules_resources_and_interfaces" },
+         { "composition", "source_region_tree_and_target_bindings" } }                                                                               },
         {       "attention_parameter_rules",   { { "definitions", source_.attention_rules.size() }, { "observations", attention_rule_observations } } },
         {           "model_parameter_rules",           { { "definitions", source_.model_rules.size() }, { "observations", model_rule_observations } } },
         {      "collective_parameter_rules", { { "definitions", source_.collective_rules.size() }, { "observations", collective_rule_observations } } },
         {               "resource_bindings",                                                                                        resource_bindings },
-        {                    "observations",                                                                                             observations },
-        {                     "source_gaps",                                                                                             source_.gaps },
+        {              "source_gap_summary",                            { { "records", source_.gaps.size() }, { "by_kind_and_reason", source_gaps } } },
         {                      "transforms",                                                                                       source_.transforms },
         {                          "limits",                                                                                           source_.limits }
     };
+    if (diagnostics) { result["source_gaps"] = source_.gaps; }
+    return result;
 }
 
 } // namespace markov

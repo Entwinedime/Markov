@@ -11,6 +11,20 @@ from markov_collection.adapters.frameworks.sglang.batch_observer import SGLangPr
 
 
 class DeviceSamplingObserver(SGLangProfileObserver):
+    def merge(self, original: Callable[..., Any], batch: Any, other: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self._tracked(batch.reqs + other.reqs):
+            return original(batch, other, *args, **kwargs)
+
+        # Merging happens between model executions. Its device work still
+        # belongs to Schedule, even though no selected batch exists yet.
+        with self.markers.observer():
+            metadata = self._batch(batch, "decode")
+            metadata["requests"].extend(self._batch(other, "decode")["requests"])
+            observation = self.recorder.scope("schedule", metadata)
+
+        with observation:
+            return original(batch, other, *args, **kwargs)
+
     def filter(self, original: Callable[..., Any], batch: Any, *args: Any, **kwargs: Any) -> Any:
         if not self._tracked(batch.reqs):
             return original(batch, *args, **kwargs)
@@ -128,6 +142,7 @@ def install(prepared: dict[str, Any]) -> None:
     )
     batch = "sglang.srt.managers.schedule_batch.ScheduleBatch"
     scheduler = "sglang.srt.managers.scheduler.Scheduler"
+    HookRegistry.register(f"{batch}.merge_batch", observer.merge, HookType.AROUND)
     HookRegistry.register(f"{batch}.filter_batch", observer.filter, HookType.AROUND)
     HookRegistry.register(f"{batch}.prepare_for_extend", observer.prepare_prefill, HookType.AROUND)
     HookRegistry.register(f"{batch}.prepare_for_decode", observer.prepare_decode, HookType.AROUND)

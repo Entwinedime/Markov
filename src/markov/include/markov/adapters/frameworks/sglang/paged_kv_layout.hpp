@@ -3,8 +3,12 @@
 #include "markov/templates/kv_parameters.hpp"
 
 #include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <map>
 #include <optional>
 #include <span>
+#include <vector>
 
 namespace markov {
 
@@ -20,6 +24,7 @@ public:
     static constexpr std::size_t release_concat_limit = 32;
 
     static std::expected<std::optional<KvParameterLayout>, std::string> bind(const TemplateDefinition & source, const TemplateNode & node,
+                                                                             const std::map<std::size_t, SourceNativeRegion> & regions,
                                                                              const std::optional<std::vector<SourceRequest>> & finished,
                                                                              std::uint32_t page_size_tokens);
 

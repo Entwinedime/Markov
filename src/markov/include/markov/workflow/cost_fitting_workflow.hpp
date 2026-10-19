@@ -18,6 +18,7 @@ private:
     Observation read(const std::filesystem::path & manifest_path) const;
     Measurements select(const Observation & source, std::string_view unit) const;
     void read_host_transfers(Measurements & data, const Observation & source) const;
+    void read_cpu(Measurements & data, const Observation & source) const;
     void read_device(Measurements & data, const Observation & source, std::string_view unit) const;
     nlohmann::json fit(const Observation & source, std::string_view unit) const;
 };

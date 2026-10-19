@@ -21,7 +21,7 @@ class SGLangKernelWork(AscendKernelWork):
 
         operands = self._operand_work(work, metadata, step)
         if operands is None:
-            return None  # Raw kernels remain available when actual operand facts are missing.
+            return None  # Unmapped operands do not yield a physical-only cost.
         if operands:
             work["operand_work"] = operands
 
@@ -29,7 +29,7 @@ class SGLangKernelWork(AscendKernelWork):
         if role is not None:
             attention = self._attention(work["input_shapes"], metadata, role)
             if attention is None:
-                return None  # Keep raw data; incomplete operands are not physical-only cost samples.
+                return None  # Attention requires its actual sequence operands.
             work["attention_work"] = attention
         return work
 
@@ -91,6 +91,23 @@ class SGLangKernelWork(AscendKernelWork):
                 end += length
                 rows.append(end - 1)
             return {"logits_rows": rows}
+
+        # NPUPagedTokenToKVPoolAllocator.alloc_decode gathers prefix-cumsum
+        # page ordinals from free_pages. Its tensor signature is the current
+        # cost key; this Prepare operation is not a request-pool access.
+        if (
+            name == "aclnnIndex_IndexAiCore_Index"
+            and step == "prepare"
+            and metadata["phase"] == "decode"
+            and work["operation"] == "Index"
+            and work["input_dtypes"] == "INT64;INT64;INT64;INT64"
+            and work["output_dtypes"] == "INT64"
+            and len(inputs) == 4
+            and len(inputs[0]) == 1
+            and inputs[1:] == [(1,), (1,), (batch,)]
+            and outputs == [(batch,)]
+        ):
+            return {}
 
         return self._request_pool(work, metadata, step, inputs, outputs)
 

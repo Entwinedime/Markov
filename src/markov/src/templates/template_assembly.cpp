@@ -110,20 +110,11 @@ void TemplateInstance::collect_stream_waits() {
 }
 
 void TemplateAssembly::prune_frontier(std::map<TemplateBoundaryIdentity, TemplateEndpoint> & candidates,
-                                      const std::map<TemplateBoundaryIdentity, std::vector<TemplateBoundaryIdentity>> & adjacency) {
-    std::vector<TemplateBoundaryIdentity> pending;
-    for (const auto & [boundary, endpoint] : candidates) {
-        const auto found = adjacency.find(boundary);
-        if (found != adjacency.end()) pending.insert(pending.end(), found->second.begin(), found->second.end());
-    }
-    std::set<TemplateBoundaryIdentity> ancestors;
-    for (std::size_t cursor = 0; cursor < pending.size(); ++cursor) {
-        const auto boundary = pending[cursor];
-        if (!ancestors.insert(boundary).second) continue;
-        const auto found = adjacency.find(boundary);
-        if (found != adjacency.end()) pending.insert(pending.end(), found->second.begin(), found->second.end());
-    }
-    for (const auto boundary : ancestors) candidates.erase(boundary);
+                                      const DependencyPaths<TemplateBoundaryIdentity> & paths) {
+    std::set<TemplateBoundaryIdentity> boundaries;
+    for (const auto & [boundary, endpoint] : candidates) boundaries.insert(boundary);
+    const auto frontier = paths.frontier(std::move(boundaries));
+    std::erase_if(candidates, [&frontier](const auto & candidate) { return !frontier.contains(candidate.first); });
 }
 
 std::vector<bool> TemplateInstance::reachable_boundaries(const std::vector<std::vector<std::size_t>> & adjacency, std::vector<std::size_t> pending) {
@@ -322,7 +313,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
 
     // Every modeled service/wait exports its actual completion, including a
     // source capture's last batch. Explicit cross-batch edges alone omit that tail.
-    std::map<TemplateBoundaryIdentity, std::vector<TemplateBoundaryIdentity>> predecessors;
+    DependencyPaths<TemplateBoundaryIdentity> predecessors;
     struct ResourceWork {
         TemplateResource resource;
         TemplateInstance * instance;
@@ -361,14 +352,14 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
         }
         for (const auto index : instance->topology.dependencies()) {
             const auto & edge = definition.graph.dependencies()[index];
-            predecessors[instance->boundary_identity(edge.target)].push_back(instance->boundary_identity(edge.source));
+            predecessors.connect(instance->boundary_identity(edge.target), instance->boundary_identity(edge.source));
         }
         for (const auto & edge : instance->topology.added_dependencies()) {
-            predecessors[instance->boundary_identity(edge.target)].push_back(instance->boundary_identity(edge.source));
+            predecessors.connect(instance->boundary_identity(edge.target), instance->boundary_identity(edge.source));
         }
         for (const auto & target : instance->stream_waits)
             for (const auto & peer : target.binding.peers)
-                predecessors[instance->boundary_identity(target.wait.completion)].push_back(instance->boundary_identity(peer.boundary));
+                predecessors.connect(instance->boundary_identity(target.wait.completion), instance->boundary_identity(peer.boundary));
         for (const auto & target : instance->connections) {
             const auto & binding = target.binding;
             if (binding.rule != TemplateConnectionRule::NativeBoundary && binding.rule != TemplateConnectionRule::CpuThreadProjection) continue;
@@ -376,8 +367,8 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
             const auto local = instance->boundary_identity(connection.local_boundary);
             for (const auto & peer : binding.peers) {
                 const auto remote = targets.at({ peer.work_id, peer.rank })->boundary_identity(peer.boundary);
-                if (connection.direction == TemplateConnectionDirection::Incoming) predecessors[local].push_back(remote);
-                else predecessors[remote].push_back(local);
+                if (connection.direction == TemplateConnectionDirection::Incoming) predecessors.connect(local, remote);
+                else predecessors.connect(remote, local);
             }
         }
     }
@@ -386,10 +377,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
     // Existing paths carry it to later entries; no source-time ordering is used.
     std::set<TemplateEndpoint> resource_entries;
     if (!introduced_resources.empty()) {
-        std::map<TemplateBoundaryIdentity, std::vector<TemplateBoundaryIdentity>> successors;
-        for (const auto & [target, sources] : predecessors) {
-            for (const auto & source : sources) successors[source].push_back(target);
-        }
+        const auto successors = predecessors.reversed();
         std::map<std::pair<TemplateResource, WorkId>, std::map<TemplateBoundaryIdentity, TemplateEndpoint>> entries;
         for (const auto & work : resource_work) {
             entries[{ work.resource, work.instance->work_id }].emplace(work.instance->boundary_identity(work.begin),
@@ -430,12 +418,12 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
                         { instance->work_id, instance->definition->rank, port.exit },
                         work.begin
                     });
-                    predecessors[work.instance->boundary_identity(work.begin)].push_back(instance->boundary_identity(port.exit));
+                    predecessors.connect(work.instance->boundary_identity(work.begin), instance->boundary_identity(port.exit));
                 }
             }
             for (const auto & peer : binding.peers) {
                 const auto local = targets.find({ peer.work_id, peer.rank });
-                if (local != targets.end()) predecessors[instance->boundary_identity(port.entry)].push_back(local->second->boundary_identity(peer.boundary));
+                if (local != targets.end()) predecessors.connect(instance->boundary_identity(port.entry), local->second->boundary_identity(peer.boundary));
             }
             exports[port.resource].emplace(instance->boundary_identity(port.exit),
                                            TemplateEndpoint{ instance->work_id, instance->definition->rank, port.exit });
@@ -477,7 +465,7 @@ std::expected<void, std::string> TemplateAssembly::connect(std::span<TemplateIns
                 }
                 for (const auto & [boundary, endpoint] : prior.at(resource)) {
                     binding.peers.push_back(endpoint);
-                    predecessors[instance->boundary_identity(wait.completion)].push_back(boundary);
+                    predecessors.connect(instance->boundary_identity(wait.completion), boundary);
                 }
             }
             if (binding.rule != TemplateConnectionRule::Unresolved && !binding.peers.empty()) binding.rule = TemplateConnectionRule::ResourcePredecessor;

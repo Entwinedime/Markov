@@ -6,26 +6,19 @@
 
 #include <cstdint>
 #include <map>
-#include <span>
 #include <utility>
 
 namespace markov {
 
-template <class Features> struct MeasuredCostSample {
-    Features features;
-    std::int64_t observed_ns;
-};
-
-// Independently measured candidates share exact-key statistics. Their models
-// retain ownership of feature interpretation and target-work applicability.
+// Own each feature definition once. Fitting and evaluation consume the same
+// measured groups without reconstructing a per-sample feature table.
 template <class Features> class MeasuredCostFitter {
 public:
-    nlohmann::json fit(std::span<const MeasuredCostSample<Features>> samples) const {
-        std::map<Features, CostDistribution> groups;
-        for (const auto & sample : samples) groups[sample.features].observe(sample.observed_ns);
+    void observe(const Features & features, std::int64_t duration_ns) { groups_[features].observe(duration_ns); }
 
+    nlohmann::json fit() const {
         auto entries = nlohmann::json::array();
-        for (const auto & [features, distribution] : groups) {
+        for (const auto & [features, distribution] : groups_) {
             auto entry = distribution.describe();
             entry["features"] = features.describe();
             entries.push_back(std::move(entry));
@@ -33,33 +26,30 @@ public:
         return entries;
     }
 
-    template <class Model> nlohmann::json evaluate(const Model & estimates, std::span<const MeasuredCostSample<Features>> samples) const {
+    template <class Model> nlohmann::json evaluate(const Model & estimates) const {
         CostErrors total;
-        std::map<Features, CostErrors> groups;
-        std::map<Features, std::size_t> unmatched;
-        for (const auto & sample : samples) {
-            const auto estimate = estimates.measured_cost(sample.features);
+        auto reports = nlohmann::json::array();
+        auto missing = nlohmann::json::array();
+        for (const auto & [features, distribution] : groups_) {
+            const auto estimate = estimates.measured_cost(features);
             if (!estimate) {
-                ++unmatched[sample.features];
+                missing.push_back({
+                    { "features",           features.describe() },
+                    {    "count", distribution.samples().size() }
+                });
                 continue;
             }
-            total.observe(*estimate, sample.observed_ns);
-            groups[sample.features].observe(*estimate, sample.observed_ns);
-        }
 
-        auto reports = nlohmann::json::array();
-        for (const auto & [features, errors] : groups)
+            CostErrors errors;
+            for (const auto observed_ns : distribution.samples()) {
+                total.observe(*estimate, observed_ns);
+                errors.observe(*estimate, observed_ns);
+            }
             reports.push_back({
                 { "features", features.describe() },
                 {   "errors",   errors.describe() }
             });
-
-        auto missing = nlohmann::json::array();
-        for (const auto & [features, count] : unmatched)
-            missing.push_back({
-                { "features", features.describe() },
-                {    "count",               count }
-            });
+        }
 
         return {
             {   "overall",   total.describe() },
@@ -67,6 +57,9 @@ public:
             { "unmatched", std::move(missing) }
         };
     }
+
+private:
+    std::map<Features, CostDistribution> groups_;
 };
 
 } // namespace markov

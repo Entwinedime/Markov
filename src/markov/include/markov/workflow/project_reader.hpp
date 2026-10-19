@@ -2,6 +2,7 @@
 
 #include "markov/workflow/project.hpp"
 
+#include <filesystem>
 #include <span>
 
 namespace markov {

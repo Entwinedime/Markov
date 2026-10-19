@@ -32,7 +32,7 @@ std::map<std::size_t, std::size_t> TemplateOperationRewrite::insert_subgraph(con
         auto point = donor.graph.boundary(index);
         point.lane = lane_mapping.at(point.lane);
         boundary_mapping.emplace(index, recipient.graph.boundary_count() + inserted_boundaries.size());
-        inserted_boundaries.push_back({ point, donor.boundary_observations.at(index).source_boundary, &donor.source_manifest });
+        inserted_boundaries.push_back({ point, donor.boundary_observations.at(index).source_boundary, &donor.source_manifest, donor.cpu_boundary(index) });
     }
 
     for (const auto index : donor_nodes) {
@@ -165,11 +165,10 @@ std::expected<std::vector<std::size_t>, std::string> TemplateTopology::apply_ope
                 const auto & a = uses[left];
                 const auto & b = uses[right];
                 if (!a.region || !b.region) return std::unexpected("region_new_resource_order_not_qualified");
-                const bool before = definition.region_precedes(definition.regions[*a.region], definition.regions[*b.region]);
-                const bool after = definition.region_precedes(definition.regions[*b.region], definition.regions[*a.region]);
-                if (before == after) return std::unexpected("region_new_resource_order_not_qualified");
-                const auto & first = before ? a : b;
-                const auto & second = before ? b : a;
+                const auto order = definition.region_order(definition.regions[*a.region], definition.regions[*b.region]);
+                if (order == std::partial_ordering::unordered) return std::unexpected("region_new_resource_order_not_qualified");
+                const auto & first = order < 0 ? a : b;
+                const auto & second = order < 0 ? b : a;
                 const auto relation = (resource).domain == SourceDomain::CpuThread ? SourceRelation::ThreadOrder : SourceRelation::StreamOrder;
                 replacement.added_dependencies_.push_back({ relation, first.port.exit, second.port.entry });
 

@@ -17,14 +17,14 @@ public:
     LightweightController(std::uint32_t page_size_tokens, AdmissionPolicy policy);
 
     void initialize(std::span<const Request> requests, ServingLimits limits) override;
-    std::vector<ControlAction> handle(std::span<const ControlEvent> events, const RuntimeView & runtime) override;
+    std::vector<ControlAction> handle(std::span<const ControlEvent> events) override;
     ControllerSummary finish() const override;
 
 private:
-    enum class RequestPhase { NotArrived, Waiting, Active, Finished };
+    enum class RequestPhase { NotReceived, Waiting, Active, Finished };
 
     struct Progress {
-        RequestPhase phase = RequestPhase::NotArrived;
+        RequestPhase phase = RequestPhase::NotReceived;
         std::uint32_t published_tokens = 0;
         std::optional<std::uint32_t> pool_slot;
         std::vector<std::uint32_t> kv_pages;
@@ -44,12 +44,16 @@ private:
     std::vector<Progress> progress_;
     std::deque<std::uint32_t> free_request_slots_;
     std::deque<std::uint32_t> free_pages_;
-    std::vector<RequestId> arrival_order_;
+    std::deque<RequestId> incoming_;
+    std::deque<RequestId> waiting_;
 
-    std::optional<BatchInput> reserved_batch_;
+    struct PendingBatch {
+        BatchInput input;
+        PortRef completion;
+    };
+    std::optional<PendingBatch> reserved_batch_;
     std::optional<PortRef> previous_completion_;
     WorkId next_work_id_ = 1;
-    std::optional<PortRef> awaited_completion_;
     std::vector<RequestId> running_members_;
     std::optional<std::vector<RequestId>> pending_prefill_;
     bool admission_blocked_ = false;

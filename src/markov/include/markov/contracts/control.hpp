@@ -25,6 +25,8 @@ enum class BatchPhase { Prefill, Decode, Idle };
 struct PortRef {
     WorkId work_id;
     PortKind port;
+
+    bool operator==(const PortRef &) const = default;
 };
 
 struct RequestSlice {
@@ -67,12 +69,17 @@ struct CompleteRequest {
     PortRef published;
 };
 
+// Input has become visible to scheduling; admission can still wait for capacity.
+struct ReceiveRequest {
+    RequestId request_id;
+};
+
 struct UnsupportedControl {
     std::string_view reason;
 };
 
 // An empty action list yields to the runtime. It does not busy-poll or charge time.
-using ControlAction = std::variant<InvokeStep, CompleteRequest, UnsupportedControl>;
+using ControlAction = std::variant<InvokeStep, CompleteRequest, ReceiveRequest, UnsupportedControl>;
 
 struct RequestArrived {
     RequestId request_id;
@@ -85,12 +92,6 @@ struct WorkPortCompleted {
 struct ControlEvent {
     std::int64_t time_ns;
     std::variant<RequestArrived, WorkPortCompleted> payload;
-};
-
-// The runtime owns work status and time. Views live only through handle().
-struct RuntimeView {
-    std::int64_t time_ns;
-    std::span<const WorkId> in_flight;
 };
 
 struct ControllerSummary {
@@ -122,7 +123,7 @@ public:
     virtual void initialize(std::span<const Request> requests, ServingLimits limits) = 0;
 
     // All events at time_ns are ordered and delivered together, before a new decision.
-    virtual std::vector<ControlAction> handle(std::span<const ControlEvent> events, const RuntimeView & runtime) = 0;
+    virtual std::vector<ControlAction> handle(std::span<const ControlEvent> events) = 0;
     virtual ControllerSummary finish() const = 0;
 };
 
@@ -138,6 +139,7 @@ struct BlockDefinition {
     std::string_view name;
     std::string_view entry;
     std::span<const PortKind> exits;
+    PortKind cpu_completion; // End of this action's host work, distinct from device completion.
     std::string_view effect;
     std::span<const BlockParameter> parameters;
 };

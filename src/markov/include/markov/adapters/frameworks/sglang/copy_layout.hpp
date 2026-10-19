@@ -9,21 +9,25 @@
 #include <cstdint>
 #include <map>
 #include <set>
+#include <span>
 #include <string>
 
 namespace markov {
 
 struct TemplateDefinition;
+struct SourceNativeRegion;
+struct SourceCall;
 
 // Native tensor provenance is consumed once at production. Runtime templates
 // retain only the qualified extent and element size, never profiler records.
 class SGLangCopyLayout {
 public:
-    SGLangCopyLayout(const nlohmann::json & graph, const nlohmann::json & facts);
-    void bind(TemplateDefinition & definition, const nlohmann::json & calls, const std::map<std::size_t, NativeFilterSelection> & filters) const;
+    SGLangCopyLayout(const SourceGraph & graph, const nlohmann::json & facts);
+    void bind(TemplateDefinition & definition, std::span<const SourceCall> calls, const std::map<std::size_t, NativeFilterSelection> & filters,
+              const std::map<std::size_t, SourceNativeRegion> & regions) const;
 
 private:
-    void bind_input_transfers(TemplateDefinition & definition) const;
+    void bind_input_transfers(TemplateDefinition & definition, const std::map<std::size_t, SourceNativeRegion> & regions) const;
 
     struct Tensor {
         std::uint64_t elements;

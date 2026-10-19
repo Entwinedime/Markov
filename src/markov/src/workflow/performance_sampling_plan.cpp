@@ -8,8 +8,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
-#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -38,39 +36,20 @@ Json object_identity(const Json & object) {
 
 std::string measurement_kind(const Json & object) {
     const auto & kind = object.at("kind");
+    if (kind == "cpu") return "cpu";
     if (kind == "transfer" && object.at("features").at("execution") == "synchronous_host_driver") return "transfer";
     return "device";
 }
 
-std::set<std::string> kernel_operand_fields(const Json & requirement) {
-    const auto & object = requirement.at("object");
-    if (object.at("kind") != "kernel") return {};
-    const auto operands = object.at("features").find("operand_work");
-    if (operands == object.at("features").end()) return {};
-
-    std::set<std::string> fields;
-    for (const auto & [name, value] : operands->items()) fields.insert(name);
-    return fields;
-}
-
-std::set<std::string> transfer_executions(const Json & requirement) {
-    const auto & object = requirement.at("object");
-    if (object.at("kind") == "transfer" && object.at("features").at("execution") == "synchronous_host_driver") return { "synchronous_host_driver" };
-    return {};
-}
-
-struct ObservationRequirement {
-    std::string_view plan_key;
-    std::string_view summary_key;
-    std::string_view field;
-    std::set<std::string> required;
-};
-
-std::array<ObservationRequirement, 2> observation_requirements(const Json & requirement) {
-    return {
-        { { "kernel_operand_fields", "observed_kernel_operand_fields", "fields", kernel_operand_fields(requirement) },
-         { "transfer_executions", "observed_transfer_executions", "executions", transfer_executions(requirement) } }
-    };
+Json measurement_trigger(const Json & requests) {
+    auto result = Json::array();
+    for (const auto & request : requests)
+        result.push_back({
+            {        "prompt_tokens",  request.at("input_tokens").size() },
+            {        "output_tokens",        request.at("output_tokens") },
+            { "release_after_tokens", request.at("release_after_tokens") }
+        });
+    return result;
 }
 
 struct SelectedRequirement {
@@ -89,8 +68,8 @@ struct SamplingGroup {
     std::set<std::string> configuration_ids;
 };
 
-// Only independent sampling metadata is read here. Candidate timing keys still
-// belong to CostQuery/NodeCosts; a previously seen batch is never a cost match.
+// History prevents repeated native work. Cost applicability remains owned by
+// CostQuery/NodeCosts; observing a model batch does not reproduce its prior state.
 class MeasurementHistory {
 public:
     MeasurementHistory(const Project & project, const Json & prediction) {
@@ -112,8 +91,6 @@ public:
             item.models.insert(model.at("path").get<std::string>());
         }
 
-        // A successful capture can have no usable cost candidates. Its observed
-        // domains still prevent another capture of an unchanged missing point.
         for (auto & [path, item] : declarations) {
             try {
                 const auto manifest = input::read_json(path);
@@ -121,14 +98,6 @@ public:
                     unavailable_.push_back({
                         { "source_manifest",                                        path },
                         {          "reason", "independent_measurement_metadata_required" }
-                    });
-                    continue;
-                }
-                const auto coverage = manifest.find("feature_coverage");
-                if (coverage == manifest.end()) {
-                    unavailable_.push_back({
-                        { "source_manifest",                                              path },
-                        {          "reason", "independent_measurement_domain_metadata_missing" }
                     });
                     continue;
                 }
@@ -140,12 +109,12 @@ public:
                     {   "environment",   prepared.at("environment") }
                 };
                 item.kind = manifest.at("measurement_kind").get<std::string>();
-                item.coverage = *coverage;
+                for (const auto & point : prepared.at("measurement_grid")) item.cohorts.insert(measurement_trigger(point.at("requests")).dump());
                 measurements_.push_back(std::move(item));
             }
             catch (const std::exception & error) {
-                // Missing historical metadata does not invalidate a self-contained
-                // cost candidate. It leaves the no-repeat evidence unresolved.
+                // A self-contained cost candidate may remain usable when its
+                // optional provenance is absent. No native history is invented.
                 unavailable_.push_back({
                     { "source_manifest",                                           path },
                     {          "reason", "independent_measurement_metadata_unavailable" },
@@ -155,16 +124,16 @@ public:
         }
     }
 
-    Json observed(const Project & project, const Candidate & candidate, const CollectionAdapter & collection, const TemplateAdapter & binding,
-                  const SamplingGroup & group, const Json & requirement, const Json & domain) const {
+    Json previous(const Project & project, const Candidate & candidate, const CollectionAdapter & collection, const TemplateAdapter & binding,
+                  const SamplingGroup & group, const Json & trigger) const {
         auto evidence = Json::array();
-        const auto required = observation_requirements(requirement);
         const auto target_limits = binding.control_limits(candidate.configuration);
+        const auto trigger_key = trigger.dump();
         for (const auto & measurement : measurements_) {
             const bool applicable = measurement.declared || std::ranges::any_of(group.model_paths, [&](const Json & path) {
                                         return measurement.models.contains(path.get<std::string>());
                                     });
-            if (!applicable || !matching_kind(group.kind, measurement.kind)) continue;
+            if (!applicable || !matching_kind(group.kind, measurement.kind) || !measurement.cohorts.contains(trigger_key)) continue;
 
             const auto & prepared = measurement.prepared;
             if (prepared.at("framework") != collection.name() || prepared.at("model_path") != project.model_path.string()) continue;
@@ -175,90 +144,40 @@ public:
             const auto source_configuration = binding.source_configuration(prepared.at("configuration"));
             if (!binding.shares_execution_path(source_configuration, candidate.configuration)) continue;
             const auto source_limits = binding.control_limits(source_configuration);
+            // The same arrivals can produce different batches under a different
+            // admission budget. Cost sharing does not imply sampling equivalence.
             if (!source_limits || !target_limits || source_limits->request_capacity != target_limits->request_capacity
-                || source_limits->kv_capacity_tokens != target_limits->kv_capacity_tokens)
+                || source_limits->kv_capacity_tokens != target_limits->kv_capacity_tokens
+                || source_limits->prefill_capacity_tokens != target_limits->prefill_capacity_tokens)
                 continue;
 
-            // Filtering is post-publication work. Its physical selection must
-            // be observed directly, not inferred from a later model batch.
-            if (domain.contains("batch_filter")) {
-                if (observed_filter_work(measurement.coverage, domain, candidate.environment.devices.size()))
-                    evidence.push_back({
-                        { "source_manifest",           measurement.manifest_path },
-                        {        "boundary", "observed_native_batch_filter_work" }
-                    });
-                continue;
-            }
-
-            // Batch exposure alone cannot close a new observation contract.
-            // Each required fact must have been recorded on every rank.
-            bool instrumented = true;
-            for (const auto & fact : required) {
-                if (!fact.required.empty()
-                    && !observed_instrumentation(measurement.coverage,
-                                                 domain,
-                                                 fact.summary_key,
-                                                 fact.field,
-                                                 fact.required,
-                                                 candidate.environment.devices.size())) {
-                    instrumented = false;
-                    break;
-                }
-            }
-            if (!instrumented) continue;
-
-            std::string_view boundary;
-            if (completed_domain(measurement.coverage, domain, candidate.environment.devices.size())) boundary = "completed_requested_work";
-            else if (group.kind == "transfer" && requirement.at("work_origin").at("step") != "publish"
-                     && prepublication_domain(measurement.coverage, domain, candidate.environment.devices.size()))
-                boundary = "observed_prepublication_batch_work";
-            if (!boundary.empty())
-                evidence.push_back({
-                    { "source_manifest", measurement.manifest_path },
-                    {        "boundary",                  boundary }
-                });
+            evidence.push_back({
+                { "source_manifest",            measurement.manifest_path },
+                {        "boundary", "previous_native_measurement_cohort" },
+                {            "work",                              trigger }
+            });
+            return evidence;
         }
-        return evidence;
-    }
 
-    Json attempted(const SamplingGroup & group, const Json & requirement, const Json & domain) const {
-        auto evidence = Json::array();
         if (!attempts_) return evidence;
-        const auto required = observation_requirements(requirement);
         for (const auto & [key, attempt] : attempts_->items()) {
             const auto & status = attempt.at("status");
             if (status != "captured" && status != "no_candidates" && status != "failed") continue;
 
-            // The planner owns this key's JSON meaning; Python persists it
-            // opaquely. Compare individual points so regrouping cannot retry a
-            // failed or unproductive point as a smaller request list.
             const auto plan = Json::parse(key);
-            if (plan.at("configuration_id") != group.configuration_id || plan.at("measurement_kind") != group.kind) continue;
-
-            bool requested_all = true;
-            for (const auto & fact : required) {
-                if (fact.required.empty()) continue;
-                const auto requested = plan.find(fact.plan_key);
-                if (requested == plan.end() || !std::ranges::includes(requested->get<std::set<std::string>>(), fact.required)) {
-                    requested_all = false;
-                    break;
-                }
-            }
-            if (!requested_all) continue;
-
-            for (const auto & previous : plan.at("measurement_requests")) {
-                if (!same_domain(previous, domain)) continue;
+            if (plan.at("configuration_id") != candidate.id || plan.at("measurement_kind") != group.kind) continue;
+            for (const auto & previous : plan.at("native_work")) {
+                if (previous != trigger) continue;
                 Json record{
-                    {        "plan",        attempt.at("plan") },
-                    { "group_index", attempt.at("group_index") },
-                    {      "status",                    status },
-                    {    "manifest",    attempt.at("manifest") },
-                    {        "work",                    domain }
+                    { "sampling_key",                    key },
+                    {       "status",                 status },
+                    {     "manifest", attempt.at("manifest") },
+                    {         "work",                trigger }
                 };
                 const auto reason = attempt.find("reason");
                 if (reason != attempt.end()) record["reason"] = *reason;
                 evidence.push_back(std::move(record));
-                break;
+                return evidence;
             }
         }
         return evidence;
@@ -268,9 +187,9 @@ public:
         auto sources = Json::array();
         for (const auto & measurement : measurements_) sources.push_back(measurement.manifest_path);
         return {
-            { "source_manifests",                                                                           std::move(sources) },
-            {      "unavailable",                                                                                 unavailable_ },
-            {         "boundary", "independent request/batch metadata only; prior domain exposure is not object cost coverage" }
+            { "source_manifests",                                                                             std::move(sources) },
+            {      "unavailable",                                                                                   unavailable_ },
+            {         "boundary", "native cohort history under the same deployment and control limits; not object cost coverage" }
         };
     }
 
@@ -281,121 +200,13 @@ private:
         bool declared = false;
         std::string kind;
         Json prepared;
-        Json coverage;
+        std::set<std::string> cohorts;
     };
 
     static bool matching_kind(std::string_view requested, std::string_view observed) {
-        return requested == "transfer" ? observed == "native_serving_timing" : observed == "native_device_work";
-    }
-
-    struct RequestMember {
-        std::array<std::uint64_t, 3> work;
-        std::optional<std::uint64_t> pool_slot;
-
-        auto operator<=>(const RequestMember &) const = default;
-    };
-
-    static std::vector<RequestMember> request_members(const Json & requests, std::size_t count, bool with_slots = false) {
-        std::vector<RequestMember> members;
-        for (std::size_t index = 0; index < count; ++index) {
-            const auto & request = requests.at(index);
-            std::optional<std::uint64_t> slot;
-            if (with_slots) {
-                const auto actual = request.find("request_pool_slot");
-                if (actual != request.end() && !actual->is_null()) slot = actual->get<std::uint64_t>();
-            }
-            members.push_back({
-                { request.at("input_tokens").get<std::uint64_t>(),
-                 request.at("context_tokens").get<std::uint64_t>(),
-                 request.at("prompt_tokens").get<std::uint64_t>() },
-                slot
-            });
-        }
-        std::ranges::sort(members);
-        return members;
-    }
-
-    static std::vector<RequestMember> requested_members(const Json & domain, std::size_t count) {
-        auto requests = domain.at("requests");
-        const auto slots = domain.find("pool_slots");
-        if (slots != domain.end())
-            for (std::size_t index = 0; index < count; ++index) requests.at(index)["request_pool_slot"] = slots->at(index);
-
-        // Pair work and coordinates before sorting. Separate multisets could
-        // attribute one request's measured slot to another request's work.
-        return request_members(requests, count, slots != domain.end());
-    }
-
-    static std::vector<RequestMember> requested_members(const Json & domain) { return requested_members(domain, domain.at("requests").size()); }
-
-    static bool same_domain(const Json & left, const Json & right) {
-        if (left.contains("batch_filter") || right.contains("batch_filter"))
-            return left.contains("batch_filter") && right.contains("batch_filter") && left.at("batch_filter") == right.at("batch_filter");
-        if (left.contains("pool_slots") != right.contains("pool_slots")) return false;
-
-        // Recipe order only assigns completion to the first K members. Member
-        // order itself is irrelevant, but the completed subset is a new trigger.
-        return left.at("phase") == right.at("phase") && requested_members(left) == requested_members(right)
-               && requested_members(left, left.at("finished_request_count").get<std::size_t>())
-                      == requested_members(right, right.at("finished_request_count").get<std::size_t>());
-    }
-
-    static bool observed_filter_work(const Json & coverage, const Json & domain, std::size_t ranks) {
-        const auto observed = coverage.find("observed_batch_filter_work");
-        if (observed == coverage.end()) return false;
-
-        std::set<std::size_t> complete;
-        for (const auto & work : *observed) {
-            if (work.at("batch_filter") != domain.at("batch_filter")) continue;
-            if (!std::ranges::all_of(work.at("requests"), [&](const Json & request) {
-                    return request.at("prompt_tokens") == domain.at("prompt_tokens") && request.at("generated_tokens") == 1;
-                }))
-                continue;
-
-            const auto fields = work.at("fields").get<std::set<std::string>>();
-            if (fields.contains("batch_filter")) complete.insert(work.at("rank").get<std::size_t>());
-        }
-        return complete.size() == ranks;
-    }
-
-    static bool observed_instrumentation(const Json & coverage, const Json & domain, std::string_view summary, std::string_view field,
-                                         const std::set<std::string> & required, std::size_t ranks) {
-        const auto observed = coverage.find(summary);
-        if (observed == coverage.end()) return false;
-
-        const auto members = requested_members(domain);
-        std::set<std::size_t> complete;
-        for (const auto & batch : *observed) {
-            if (batch.at("phase") != domain.at("phase")
-                || request_members(batch.at("requests"), batch.at("requests").size(), domain.contains("pool_slots")) != members)
-                continue;
-            const auto available = batch.at(field).get<std::set<std::string>>();
-            if (std::ranges::includes(available, required)) complete.insert(batch.at("rank").get<std::size_t>());
-        }
-        return complete.size() == ranks;
-    }
-
-    static bool completed_domain(const Json & coverage, const Json & domain, std::size_t ranks) {
-        const auto members = requested_members(domain);
-        const auto finished = requested_members(domain, domain.at("finished_request_count").get<std::size_t>());
-        std::set<std::size_t> observed;
-        for (const auto & batch : coverage.at("observed_completed_batch_features"))
-            if (batch.at("phase") == domain.at("phase")
-                && request_members(batch.at("requests"), batch.at("requests").size(), domain.contains("pool_slots")) == members
-                && request_members(batch.at("finished_requests"), batch.at("finished_requests").size(), domain.contains("pool_slots")) == finished)
-                observed.insert(batch.at("rank").get<std::size_t>());
-        return observed.size() == ranks;
-    }
-
-    static bool prepublication_domain(const Json & coverage, const Json & domain, std::size_t ranks) {
-        const auto members = requested_members(domain);
-        std::set<std::size_t> observed;
-        for (const auto & batch : coverage.at("observed_batch_features")) {
-            if (batch.at("phase") != domain.at("phase")) continue;
-            if (request_members(batch.at("requests"), batch.at("requests").size(), domain.contains("pool_slots")) != members) continue;
-            observed.insert(batch.at("rank").get<std::size_t>());
-        }
-        return observed.size() == ranks;
+        if (requested == "cpu") return observed == "native_cpu_activity";
+        if (requested == "transfer") return observed == "native_serving_timing" || observed == "native_cpu_activity";
+        return observed == "native_device_work";
     }
 
     std::vector<Measurement> measurements_;
@@ -429,7 +240,7 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
                 {    "configuration_id", configuration },
                 { "request_workload_id",      workload }
             };
-            if (row.at("coverage") != "needs_data" || !row.at("measurement_required").get<bool>()) {
+            if (row.at("coverage") != "needs_data") {
                 pending.push_back({
                     {   "object",                                                                                 row.at("object") },
                     { "consumer",                                                                                         consumer },
@@ -447,8 +258,6 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
             auto & requirement = entry->second;
             if (inserted) {
                 requirement.row = row;
-                requirement.row["work_origin"] = row.at("measurement_origin");
-                requirement.row["example"] = row.at("measurement_example");
                 requirement.row["consumers"] = Json::array();
                 requirement.configuration_id = configuration;
                 requirement.workload_id = workload;
@@ -473,105 +282,194 @@ nlohmann::json PerformanceSamplingPlan::run(const Project & project, const Json 
             group.workload_id = requirement.workload_id;
             group.kind = kind;
             group.model_paths = std::move(requirement.model_paths);
+            // A new candidate can cover other feature points in this shared
+            // execution context, including combinations not yet expanded.
+            for (const auto & configuration : representative_groups.at(contexts.at(group.configuration_id)).at("configuration_ids"))
+                group.configuration_ids.insert(configuration.get<std::string>());
         }
-        for (const auto & consumer : requirement.row.at("consumers")) group.configuration_ids.insert(consumer.at("configuration_id").get<std::string>());
         group.requirements.push_back(std::move(requirement.row));
+    }
+
+    // Read each applicable catalog once, and only when CPU sampling is needed.
+    // Definitions supply interval identities; target queries still own point coverage.
+    std::set<std::string> cpu_configurations;
+    for (const auto & [key, group] : grouped)
+        if (group.kind == "cpu") cpu_configurations.insert(group.configuration_id);
+
+    std::map<std::string, std::set<std::string>> catalogs;
+    for (const auto & combination : prediction.at("combinations")) {
+        const auto configuration = combination.at("configuration_id").get<std::string>();
+        if (!cpu_configurations.contains(configuration)) continue;
+        const auto requirements = combination.find("performance_requirements");
+        if (requirements != combination.end() && requirements->contains("cpu_service_catalog"))
+            catalogs[requirements->at("cpu_service_catalog").get<std::string>()].insert(configuration);
+    }
+    std::map<std::string, std::map<std::string, Json>> cpu_services;
+    for (const auto & [path, configurations] : catalogs) {
+        const auto catalog = input::read_json(path);
+        for (const auto & service : catalog.at("services")) {
+            const auto key = service.dump();
+            for (const auto & configuration : configurations) cpu_services[configuration].emplace(key, service);
+        }
     }
 
     const MeasurementHistory history(project, prediction);
     auto groups = Json::array();
     for (const auto & [identity, group] : grouped) {
-        const auto & candidate = project.configuration(group.configuration_id);
+        const auto & target = project.configuration(group.configuration_id);
         const auto collection =
-            std::ranges::find_if(collection_adapters_, [&](const CollectionAdapter * item) { return item->framework() == candidate.framework; });
-        const auto binding = std::ranges::find_if(template_adapters_, [&](const TemplateAdapter * item) { return item->framework() == candidate.framework; });
+            std::ranges::find_if(collection_adapters_, [&](const CollectionAdapter * item) { return item->framework() == target.framework; });
+        const auto binding = std::ranges::find_if(template_adapters_, [&](const TemplateAdapter * item) { return item->framework() == target.framework; });
         const auto & prompts = project.workload(group.workload_id);
-        auto recipe = (*collection)->sampling_requests(candidate, prompts.requests, group.requirements);
-        auto assignments = std::move(recipe["assignments"]);
-        auto requests = std::move(recipe["measurement_requests"]);
-        std::set<std::size_t> used;
-        for (auto & assignment : assignments) {
-            const auto requirement_index = assignment.at("requirement_index").get<std::size_t>();
-            auto fresh = Json::array();
-            auto evidence = Json::array();
-            auto previous_attempts = Json::array();
-            for (const auto & point_index : assignment.at("point_indices")) {
-                const auto index = point_index.get<std::size_t>();
-                const auto observed =
-                    history.observed(project, candidate, **collection, **binding, group, group.requirements.at(requirement_index), requests.at(index));
-                if (!observed.empty()) {
-                    for (const auto & source : observed) evidence.push_back(source);
-                    continue;
+
+        // An already requested admission budget may expose a different native
+        // batching path. Keep storage and request-pool capacities unchanged;
+        // try another configuration only after the earlier recipe is exhausted.
+        std::vector<const Candidate *> candidates{ &target };
+        const auto limits = (*binding)->control_limits(target.configuration);
+        if (limits) {
+            for (const auto & candidate : project.configurations) {
+                if (candidate.id == target.id || !group.configuration_ids.contains(candidate.id)) continue;
+                if (candidate.environment.service != target.environment.service || candidate.environment.devices != target.environment.devices) continue;
+                if (!(*binding)->shares_execution_path(target.configuration, candidate.configuration)) continue;
+                const auto alternative = (*binding)->control_limits(candidate.configuration);
+                if (alternative && alternative->request_capacity == limits->request_capacity && alternative->kv_capacity_tokens == limits->kv_capacity_tokens
+                    && alternative->prefill_capacity_tokens != limits->prefill_capacity_tokens)
+                    candidates.push_back(&candidate);
+            }
+        }
+
+        for (std::size_t observation = 0; observation < candidates.size(); ++observation) {
+            const auto & candidate = *candidates[observation];
+            auto recipe = (*collection)->sampling_requests(candidate, prompts.requests, group.requirements);
+            auto assignments = std::move(recipe["assignments"]);
+            auto requests = std::move(recipe["measurement_requests"]);
+            auto grid = std::move(recipe["measurement_grid"]);
+            auto earlier = Json::array();
+            for (const auto & point : grid)
+                earlier.push_back(history.previous(project, candidate, **collection, **binding, group, measurement_trigger(point.at("requests"))));
+
+            std::set<std::size_t> used;
+            for (auto & assignment : assignments) {
+                auto fresh = Json::array();
+                auto previous_attempts = Json::array();
+                for (const auto & point_index : assignment.at("point_indices")) {
+                    const auto index = point_index.get<std::size_t>();
+                    const auto & previous = earlier.at(index);
+                    if (!previous.empty()) {
+                        for (const auto & attempt : previous) previous_attempts.push_back(attempt);
+                        continue;
+                    }
+                    fresh.push_back(index);
+                    used.insert(index);
                 }
-                const auto attempted = history.attempted(group, group.requirements.at(requirement_index), requests.at(index));
-                if (!attempted.empty()) {
-                    for (const auto & attempt : attempted) previous_attempts.push_back(attempt);
-                    continue;
+                assignment["point_indices"] = std::move(fresh);
+                if (assignment.at("point_indices").empty()) {
+                    assignment["status"] = "previous_sampling_attempt_without_new_trigger";
+                    assignment["reason"] = "previous_sampling_attempt_without_new_trigger";
                 }
-                fresh.push_back(index);
-                used.insert(index);
+                if (!previous_attempts.empty()) assignment["previous_sampling_attempts"] = std::move(previous_attempts);
             }
-            assignment["point_indices"] = std::move(fresh);
-            if (assignment.at("point_indices").empty()) {
-                const auto reason =
-                    previous_attempts.empty() ? "observed_domain_without_required_measurement" : "previous_sampling_attempt_without_new_trigger";
-                assignment["status"] = reason;
-                assignment["reason"] = reason;
+            for (const auto & unresolved : recipe.at("unresolved")) {
+                auto assignment = unresolved;
+                assignment["point_indices"] = Json::array();
+                assignment["status"] = "unresolved";
+                assignments.push_back(std::move(assignment));
             }
-            if (!evidence.empty()) assignment["previous_measurements"] = std::move(evidence);
-            if (!previous_attempts.empty()) assignment["previous_sampling_attempts"] = std::move(previous_attempts);
-        }
-        for (const auto & unresolved : recipe.at("unresolved")) {
-            auto assignment = unresolved;
-            assignment["point_indices"] = Json::array();
-            assignment["status"] = "unresolved";
-            assignments.push_back(std::move(assignment));
-        }
 
-        Json retained = Json::array();
-        std::map<std::size_t, std::size_t> relocated;
-        for (const auto index : used) {
-            relocated.emplace(index, retained.size());
-            retained.push_back(std::move(requests.at(index)));
-        }
-        for (auto & assignment : assignments)
-            for (auto & point : assignment.at("point_indices")) point = relocated.at(point.get<std::size_t>());
+            if (used.empty() && observation + 1 < candidates.size()) continue;
 
-        const bool ready = !retained.empty();
-        Json key{
-            {     "configuration_id", group.configuration_id },
-            {     "measurement_kind",             group.kind },
-            { "measurement_requests",               retained }
-        };
-        std::map<std::string_view, std::set<std::string>> required;
-        for (const auto & requirement : group.requirements) {
-            for (const auto & fact : observation_requirements(requirement)) {
-                auto & values = required[fact.plan_key];
-                values.insert(fact.required.begin(), fact.required.end());
+            Json lifecycle_points = Json::array();
+            if (!used.empty()) {
+                for (const auto & point : recipe.at("lifecycle_points")) {
+                    const auto index = point.get<std::size_t>();
+                    if (!earlier.at(index).empty()) continue;
+                    lifecycle_points.push_back(index);
+                    used.insert(index);
+                }
             }
-        }
-        for (const auto & [plan_key, values] : required)
-            if (!values.empty()) key[plan_key] = values;
 
-        groups.push_back({
-            {                  "key",                                                                      key.dump() },
-            {     "configuration_id",                                                          group.configuration_id },
-            {    "configuration_ids",                                                         group.configuration_ids },
-            {          "workload_id",                                                               group.workload_id },
-            {     "measurement_kind",                                                                      group.kind },
-            { "measurement_requests",                                                             std::move(retained) },
-            {         "requirements",                                                              group.requirements },
-            {          "assignments",                                                          std::move(assignments) },
-            {               "status",                                                  ready ? "ready" : "needs_data" },
-            {               "reason", ready ? Json(nullptr) : Json("no_new_reachable_independent_measurement_domain") }
-        });
+            std::optional<std::size_t> empty_schedule_point;
+            if (group.kind == "cpu" && !used.empty()
+                && std::ranges::any_of(cpu_services.at(group.configuration_id), [](const auto & entry) { return entry.second.at("phase") == "idle"; })) {
+                // Cover the known empty-control mechanism in the same CPU run,
+                // before later timing exposes it as a target cost requirement.
+                const Json idle{
+                    {    "phase",        "idle" },
+                    { "requests", Json::array() }
+                };
+                const auto found = std::ranges::find(requests, idle);
+                const auto index = found == requests.end() ? requests.size() : static_cast<std::size_t>(found - requests.begin());
+                if (found == requests.end()) {
+                    auto probe = (*collection)->workloads(candidate, prompts.requests, Json::array({ idle }));
+                    probe.at(0)["id"] = index;
+                    requests.push_back(idle);
+                    grid.push_back(std::move(probe.at(0)));
+                    earlier.push_back(history.previous(project, candidate, **collection, **binding, group, measurement_trigger(grid.at(index).at("requests"))));
+                }
+                if (earlier.at(index).empty()) {
+                    used.insert(index);
+                    empty_schedule_point = index;
+                }
+            }
+
+            Json retained = Json::array();
+            std::map<std::size_t, std::size_t> relocated;
+            for (const auto index : used) {
+                relocated.emplace(index, retained.size());
+                retained.push_back(std::move(requests.at(index)));
+            }
+            for (auto & assignment : assignments)
+                for (auto & point : assignment.at("point_indices")) point = relocated.at(point.get<std::size_t>());
+
+            const bool ready = !retained.empty();
+            Json key{
+                { "configuration_id",  candidate.id },
+                { "measurement_kind",    group.kind },
+                {      "native_work", Json::array() }
+            };
+            for (const auto index : used) key["native_work"].push_back(measurement_trigger(grid.at(index).at("requests")));
+            Json cpu_points = Json::array();
+            if (group.kind == "cpu") {
+                for (const auto & requirement : group.requirements) cpu_points.push_back(requirement.at("object").at("features"));
+                // An idle recipe triggers a mechanism, not a zero-member work
+                // label: filtering may still inspect an existing native batch.
+                // Static descriptors let sampling record its actual work.
+            }
+            Json planned_group{
+                {                  "key",                                                                      key.dump() },
+                {     "configuration_id",                                                                    candidate.id },
+                {    "configuration_ids",                                                         group.configuration_ids },
+                {          "workload_id",                                                               group.workload_id },
+                {     "measurement_kind",                                                                      group.kind },
+                { "measurement_requests",                                                             std::move(retained) },
+                {       "lifecycle_gaps",                                                     recipe.at("lifecycle_gaps") },
+                {         "requirements",                                                              group.requirements },
+                {          "assignments",                                                          std::move(assignments) },
+                {               "status",                                                  ready ? "ready" : "needs_data" },
+                {               "reason", ready ? Json(nullptr) : Json("no_new_reachable_independent_measurement_domain") }
+            };
+            if (!lifecycle_points.empty()) {
+                planned_group["mechanism_points"]["request_lifecycles"] = Json::array();
+                for (const auto & index : lifecycle_points)
+                    planned_group["mechanism_points"]["request_lifecycles"].push_back(relocated.at(index.get<std::size_t>()));
+            }
+            if (group.kind == "cpu") {
+                planned_group["cpu_services"] = std::move(cpu_points);
+                planned_group["cpu_service_descriptors"] = Json::array();
+                for (const auto & [key, service] : cpu_services[group.configuration_id]) planned_group["cpu_service_descriptors"].push_back(service);
+                if (empty_schedule_point) planned_group["mechanism_points"]["empty_schedule"] = relocated.at(*empty_schedule_point);
+            }
+            groups.push_back(std::move(planned_group));
+            break;
+        }
     }
     return {
-        {  "status",                                                                                    "planned" },
-        {  "groups",                                                                            std::move(groups) },
-        { "pending",                                                                           std::move(pending) },
-        { "history",                                                                           history.describe() },
-        {   "scope", "actual named target requirements; source prototypes and unexpanded paths remain unresolved" }
+        {  "status",                                                                                                       "planned" },
+        {  "groups",                                                                                               std::move(groups) },
+        { "pending",                                                                                              std::move(pending) },
+        { "history",                                                                                              history.describe() },
+        {   "scope", "actual target points plus source CPU interval descriptors; unexpanded target feature points remain unresolved" }
     };
 }
 

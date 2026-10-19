@@ -9,8 +9,6 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
-#include <map>
-#include <set>
 #include <string_view>
 #include <utility>
 #include <variant>
@@ -29,129 +27,20 @@ constexpr std::array<std::string_view, 6> partial_completion_mechanisms{ "decode
                                                                          "single_member_decode", "empty_release_group", "single_member_release_group" };
 constexpr std::array<std::string_view, 2> joint_completion_mechanisms{ "multi_member_release_group", "completed_batch_transition" };
 constexpr std::array<std::string_view, 2> queued_admission_mechanisms{ "single_member_prefill", "running_batch_merge" };
-constexpr std::array<std::span<const std::string_view>, 4> recipe_mechanisms{
-    prefill_mechanisms, partial_completion_mechanisms, joint_completion_mechanisms, queued_admission_mechanisms
-};
-
-class MechanismEvidence {
-public:
-    void observe(const TemplateDefinition & definition) {
-        const auto members = definition.source_requests.size();
-        if (definition.step == StepKind::Schedule && definition.phase == BatchPhase::Prefill && definition.admission) {
-            const bool bound = definition.admission_cpu_request_count == members && definition.admission_regions.size() == members;
-            add("admission_members", definition, bound ? "admission_member_regions" : "");
-        }
-
-        if (definition.step == StepKind::Schedule) {
-            if (definition.merge) add("running_batch_merge", definition, definition.transition_merge_parameters ? "transition_merge_parameters" : "");
-            for (const auto & filter : definition.filters) {
-                if (filter.retained_indices.size() == filter.input_count) continue;
-                add(filter.retained_indices.empty() ? "completed_batch_transition" : "partial_filter", definition, "");
-            }
-        }
-        if (definition.step == StepKind::Decode && members == 1) add("single_member_decode", definition, "");
-        if (definition.step == StepKind::Prefill && members == 1) add("single_member_prefill", definition, "");
-
-        for (const auto & region : definition.regions) {
-            if (!region.module) continue;
-            const auto & observation = *region.module;
-            if (observation.semantic == "last_locations") {
-                const bool bound = std::ranges::any_of(definition.batch_operations,
-                                                       [](const auto & item) { return item.second.role == BatchOperationRole::LastLocationConcat; });
-                add("last_location_members", definition, bound ? "last_location_variant" : "");
-            }
-            // The recipe asks for Prefill's direct release. Decode group-end
-            // also calls free after toggling the allocator flag; it is another branch.
-            if (observation.semantic == "kv_release" && definition.step == StepKind::Publish && definition.phase == BatchPhase::Prefill) {
-                const auto mode = observation.parameters.find("is_not_in_free_group");
-                if (mode != observation.parameters.end() && mode->second != 0) add("direct_kv_release", definition, "");
-            }
-            if (observation.semantic == "batch_output") add("shared_output", definition, definition.publication_layout ? "publication_layout" : "");
-        }
-
-        // Reuse the producer's finite branches, without inventing page formulas
-        // or treating source binding as a target transformation certificate.
-        if (!definition.kv_region) return;
-        const auto & branch = *definition.kv_region;
-        if (branch.kind == KvRegionKind::Allocation && definition.phase == BatchPhase::Decode)
-            add(branch.changes_pages ? "decode_new_pages" : "decode_no_new_pages", definition, "kv_allocation_branch");
-
-        if (branch.kind == KvRegionKind::ReleaseGroup) {
-            if (std::ranges::any_of(definition.publication_finishes, [](auto value) { return !value.has_value(); })) return;
-            const auto finished = std::ranges::count(definition.publication_finishes, std::optional(true));
-            std::string_view name = "multi_member_release_group";
-            if (finished == 0) name = "empty_release_group";
-            else if (finished == 1) name = "single_member_release_group";
-            add(name, definition, "kv_release_member_domain");
-        }
-    }
-
-    nlohmann::json describe(std::uint32_t required_ranks) const {
-        auto result = nlohmann::json::array();
-        for (const auto group : recipe_mechanisms) {
-            for (const auto name : group) {
-                auto calls = nlohmann::json::array();
-                std::set<std::uint32_t> ranks;
-                const auto found = observations_.find(name);
-                if (found != observations_.end()) {
-                    for (const auto & [definition, binding] : found->second) {
-                        ranks.insert(definition->rank);
-                        nlohmann::json row{
-                            {         "manifest",                                                           definition->source_manifest.string() },
-                            {             "rank",                                                                               definition->rank },
-                            {      "source_call",                                                                        definition->source_call },
-                            {     "source_batch", definition->source_batch ? nlohmann::json(*definition->source_batch) : nlohmann::json(nullptr) },
-                            { "producer_binding",                            binding.empty() ? nlohmann::json(nullptr) : nlohmann::json(binding) }
-                        };
-                        if (binding == "kv_release_member_domain") {
-                            row["minimum_members"] = definition->kv_region->minimum_members;
-                            row["maximum_members"] = definition->kv_region->maximum_members;
-                        }
-                        calls.push_back(std::move(row));
-                    }
-                }
-
-                auto missing_ranks = nlohmann::json::array();
-                for (std::uint32_t rank = 0; rank < required_ranks; ++rank)
-                    if (!ranks.contains(rank)) missing_ranks.push_back(rank);
-                result.push_back({
-                    {     "mechanism",                                                                                         name },
-                    {        "status",                     ranks.empty() ? "no_compiled_evidence" : "requires_target_qualification" },
-                    { "missing_ranks",                                                                                missing_ranks },
-                    {   "next_action", missing_ranks.empty() ? "qualify_target_relation" : "inspect_existing_observations_or_rules" },
-                    {  "source_calls",                                                                             std::move(calls) }
-                });
-            }
-        }
-        return result;
-    }
-
-private:
-    struct Observation {
-        const TemplateDefinition * definition;
-        std::string_view binding;
-    };
-
-    void add(std::string_view mechanism, const TemplateDefinition & definition, std::string_view binding) {
-        // Several members can witness one mechanism in the same serving call.
-        // Preserve source order and one reference, not another template count.
-        auto & calls = observations_[mechanism];
-        if (std::ranges::find(calls, &definition, &Observation::definition) == calls.end()) calls.push_back({ &definition, binding });
-    }
-
-    std::map<std::string_view, std::vector<Observation>> observations_;
-};
 
 } // namespace
 
-nlohmann::json SGLangTemplateAdapter::extract(const std::filesystem::path & manifest_path, nlohmann::json manifest,
-                                              const std::filesystem::path & work_directory) const {
+TemplateProduction SGLangTemplateAdapter::produce(const std::filesystem::path & manifest_path, nlohmann::json manifest,
+                                                  const std::filesystem::path & work_directory) const {
     // Framework bindings outlive runtime extraction and its borrowed block declarations.
     const SGLangBindings bindings;
-    return AscendSourceExtractor(bindings).extract(manifest_path, std::move(manifest), work_directory);
+    AscendSourceExtractor extractor(bindings);
+    TemplateProduction result{ extractor.extract(manifest_path, std::move(manifest), work_directory), std::nullopt };
+    if (result.manifest.at("graph_coverage").at("acyclic").get<bool>())
+        result.source =
+            SGLangTemplateBindings::produce(manifest_path, result.manifest, extractor.graph(), extractor.subgraphs(), extractor.calls(), extractor.facts());
+    return result;
 }
-
-TemplateSource SGLangTemplateAdapter::produce(const std::filesystem::path & manifest_path) const { return SGLangTemplateBindings::produce(manifest_path); }
 
 FrameworkConfiguration SGLangTemplateAdapter::source_configuration(const nlohmann::json & parameters) const {
     return SGLangConfiguration::from_parameters(parameters);
@@ -175,7 +64,6 @@ std::expected<ServingLimits, std::string_view> SGLangTemplateAdapter::control_li
 TemplateSourceSelection SGLangTemplateAdapter::select_sources(const Candidate & candidate, std::span<const TemplateSourceCandidate> sources) const {
     const auto & configuration = std::get<SGLangConfiguration>(candidate.configuration);
     TemplateSourceSelection selection;
-    selection.ranks = configuration.tp_size;
     bool deployment_available = false;
     for (const auto & candidate_source : sources) {
         const auto * source_configuration = std::get_if<SGLangConfiguration>(candidate_source.configuration);
@@ -222,37 +110,6 @@ TemplateSourceSelection SGLangTemplateAdapter::select_sources(const Candidate & 
                                      0 };
     }
     return selection;
-}
-
-nlohmann::json SGLangTemplateAdapter::describe_sources(const TemplateSourceSelection & selection) const {
-    auto donors = nlohmann::json::array();
-    auto initial_sources = nlohmann::json::array();
-    MechanismEvidence mechanisms;
-    for (const auto * source : selection.donors) {
-        donors.push_back(source->source().manifest_path.string());
-        for (const auto & [key, definitions] : source->source().definitions)
-            for (const auto & definition : definitions) mechanisms.observe(definition);
-    }
-    for (const auto * source : selection.initial_sources) initial_sources.push_back(source->source().manifest_path.string());
-
-    std::set<std::string> operation_manifests;
-    for (const auto * definition : selection.operation_sources) operation_manifests.insert(definition->source_manifest.string());
-
-    // This is source eligibility, not a certificate for every mechanism or target.
-    nlohmann::json report{
-        {                    "scope", "source_identity_policy_capacities_and_initialization" },
-        {                   "status",                                            "available" },
-        {          "donor_manifests",                                      std::move(donors) },
-        { "initialization_manifests",                             std::move(initial_sources) },
-        {       "mechanism_coverage",                                        "not_qualified" }
-    };
-    if (selection.gap) {
-        report["status"] = selection.gap->kind == TemplateGapKind::Observation ? "needs_data" : "unsupported";
-        report["reason"] = selection.gap->reason;
-    }
-    report["operation_fragment_manifests"] = operation_manifests;
-    report["mechanisms"] = mechanisms.describe(selection.ranks);
-    return report;
 }
 
 nlohmann::json SGLangTemplateAdapter::candidate_recipe(const SGLangConfiguration & configuration) const {

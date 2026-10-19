@@ -20,14 +20,12 @@ class CaptureNormalizer(Protocol):
 class CaptureProcessing:
     def __init__(
         self,
-        capture: Path,
         role: str,
         normalizer: CaptureNormalizer,
         directory: Path,
         template_directory: Path | None,
         work_directory: Path | None,
     ) -> None:
-        self.capture = capture
         self.role = role
         self.normalizer = normalizer
         self.directory = directory
@@ -40,8 +38,7 @@ class CaptureProcessing:
         with (self.directory / "processing.lock").open("a", encoding="utf-8") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
-                with (self.directory / "processing_result.json").open(encoding="utf-8") as stream:
-                    return json.load(stream)
+                return read_json(self.directory / "processing_result.json")
             except FileNotFoundError:
                 pass  # A stopped processor has not published a completed result.
 
@@ -65,7 +62,7 @@ class CaptureProcessing:
             manifest = Path(read_json(normalized)["manifest"])
         else:
             manifest = self.normalizer.extract()
-            # Normalization is already published. A later interrupted compile
+            # Normalization is already published. A later interrupted production
             # or export cleanup resumes from these facts, not the raw profiler.
             write_json(normalized, {"manifest": str(manifest)})
 
@@ -98,7 +95,7 @@ def main() -> None:
     parser.add_argument("--role", choices=["base", "performance", "validation"], required=True)
     parser.add_argument("--directory", type=Path, help="processing receipts and lock")
     parser.add_argument("--template-directory", type=Path, help="published compiled templates")
-    parser.add_argument("--work-directory", type=Path, help="intermediate source graph and instances")
+    parser.add_argument("--work-directory", type=Path, help="optional source graph diagnostics")
     arguments = parser.parse_args()
 
     # This process entry point composes the installed adapters. The persisted
@@ -126,7 +123,6 @@ def main() -> None:
             raise ValueError(f"device cost adapter is not implemented for {capture['framework']}")
 
     result = CaptureProcessing(
-        arguments.capture,
         arguments.role,
         normalizer,
         arguments.directory or arguments.capture.parent,

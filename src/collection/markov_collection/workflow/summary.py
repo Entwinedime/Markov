@@ -23,7 +23,8 @@ class RunSummary:
             f"模型：`{project['model']['path']}`。",
             f"流程状态：`{state['status']}`；当前阶段：`{state['task_status']}`。",
             "",
-            "性能精度尚未通过验收。原生 Published 窗口包含预测排除的 CPU 等时间，偏差保留原值。",
+            "预测计入统一流程内的 CPU 与设备工作；初始化、预热和模板外服务不计入。",
+            "原生窗口与预测范围的差异见对照报告；流程完成和成本命中不代表精度合格。",
         ]
         if state.get("reason"):
             lines += ["", f"本次停止原因：`{state['reason']}`。"]

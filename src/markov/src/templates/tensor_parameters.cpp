@@ -2,44 +2,10 @@
 
 #include "markov/graph/kernel_shapes.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 
 namespace markov {
-
-nlohmann::json TensorParameterLayout::describe_parameters() const {
-    static constexpr std::array names{
-        "input_tokens", "requests", "maximum_sequence_tokens", "page_columns", "sequence_storage_elements", "request_pool_rows"
-    };
-    nlohmann::json axes = nlohmann::json::array();
-    for (const auto & axis : inputs_) {
-        axes.push_back({
-            {    "operand",                                      "input" },
-            {       "slot",                                    axis.slot },
-            {       "axis",                                    axis.axis },
-            { "multiplier",                              axis.multiplier },
-            {     "extent", names[static_cast<std::size_t>(axis.extent)] }
-        });
-    }
-    for (const auto & axis : outputs_) {
-        axes.push_back({
-            {    "operand",                                     "output" },
-            {       "slot",                                    axis.slot },
-            {       "axis",                                    axis.axis },
-            { "multiplier",                              axis.multiplier },
-            {     "extent", names[static_cast<std::size_t>(axis.extent)] }
-        });
-    }
-
-    // Only these axes vary; unlisted dimensions retain the source descriptor.
-    // Extent names describe relations, never samples or a target range.
-    return {
-        {      "tensor_axes",   std::move(axes) },
-        { "page_size_tokens", page_size_tokens_ }
-    };
-}
 
 SourceKernel TensorParameterLayout::evaluate(const SourceKernel & source, const BatchInput & input, std::optional<std::uint32_t> request_capacity) const {
     std::int64_t tokens = 0;

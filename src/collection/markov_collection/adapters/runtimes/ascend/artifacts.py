@@ -1,9 +1,7 @@
 """Publish Ascend profiler exports and worker journals from one attempt."""
 
-import gzip
 import json
 import shutil
-import time
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +29,7 @@ class AscendCaptureArtifacts:
             profiler_directory = trace.parent.parent
             profiler_info = next(profiler_directory.glob("profiler_info_*.json"))
             (clock_start_info,) = profiler_directory.glob("PROF*/host/start_info")
-            with profiler_info.open(encoding="utf-8") as stream:
-                rank = json.load(stream)["rank_id"]
+            rank = read_json(profiler_info)["rank_id"]
 
             traces.append(
                 {
@@ -104,79 +101,16 @@ class AscendCaptureArtifacts:
             capture["candidate_id"] = self.prepared["candidate_id"]
             capture["observation_purpose"] = self.prepared["observation_purpose"]
 
-        self._compress_profile_exports(capture)
-        write_json(self.directory / "native_capture.json", capture)
-
-    def _compress_profile_exports(self, capture: dict[str, Any]) -> None:
-        started_ns = time.perf_counter_ns()
         profile = self.directory / "native_profile"
-        before = sum(path.stat().st_size for path in profile.rglob("*") if path.is_file())
-        # A trace alone does not establish a complete export. Validate declared
-        # files before any pruning so failed vendor analysis keeps its evidence.
-        for trace in capture["traces"]:
-            references = [
-                trace[name] for name in ("trace", "kernel_details", "profiler_info", "clock_start_info", "database")
-            ]
-            for reference in references + trace["device_info"]:
-                path = self.directory / reference
-                if not path.is_file():
-                    raise FileNotFoundError(f"incomplete profiler export: {path}")
-
-        for trace in capture["traces"]:
-            for name in ("trace", "kernel_details"):
-                path = self.directory / trace[name]
-                compressed = path.with_suffix(path.suffix + ".gz")
-                # Preserve every exported event/row and its original index. Only
-                # encoding changes; no scope filtering or cost aggregation occurs.
-                with path.open("rb") as source, gzip.open(compressed, "wb", compresslevel=1) as destination:
-                    shutil.copyfileobj(source, destination)
-                trace[name] = str(compressed.relative_to(self.directory))
-
+        exported_bytes = sum(path.stat().st_size for path in profile.rglob("*") if path.is_file())
+        # Normalize native exports directly. The processing owner releases them
+        # only after publishing facts/assets; diagnostics keeps the original files.
         capture["profile_retention"] = {
-            "exported_bytes": before,
-            "retained_bytes": sum(path.stat().st_size for path in profile.rglob("*") if path.is_file()),
-            "encoding": "lossless gzip for trace and kernel details; other declared exports unchanged",
-            "processing_wall_time_ns": time.perf_counter_ns() - started_ns,
-            "pending_cleanup": bool(capture["traces"]),
+            "exported_bytes": exported_bytes,
+            "retained_bytes": exported_bytes,
+            "raw_exports": "retained",
         }
-
-    @staticmethod
-    def finish_profile_retention(capture_path: Path, capture: dict[str, Any]) -> None:
-        retention = capture.get("profile_retention", {})
-        if not retention.get("pending_cleanup", False):
-            return
-
-        started_ns = time.perf_counter_ns()
-        directory = capture_path.parent
-        profile = directory.resolve() / "native_profile"
-        retained: set[Path] = set()
-        completed_exports: set[Path] = set()
-        for trace in capture["traces"]:
-            path = (directory / trace["trace"]).resolve()
-            # A derived replay may reference an older capture. Its successful
-            # normalization never authorizes deleting that capture's raw files.
-            if not path.is_relative_to(profile):
-                continue
-
-            completed_exports.add(path.parent.parent)
-            references = [
-                trace[name] for name in ("trace", "kernel_details", "profiler_info", "clock_start_info", "database")
-            ]
-            retained.update((directory / reference).resolve() for reference in references + trace["device_info"])
-        if not completed_exports:
-            return
-
-        # Only a fully normalized capture reaches this operation.
-        # Missing-rank exports and history without pending work remain intact.
-        for completed in completed_exports:
-            for path in completed.rglob("*"):
-                if path.is_file() and path.resolve() not in retained:
-                    path.unlink()
-
-        retention["pending_cleanup"] = False
-        retention["retained_bytes"] = sum(path.stat().st_size for path in profile.rglob("*") if path.is_file())
-        retention["processing_wall_time_ns"] += time.perf_counter_ns() - started_ns
-        write_json(capture_path, capture)
+        write_json(self.directory / "native_capture.json", capture)
 
     @staticmethod
     def release_observation_exports(capture_path: Path) -> None:

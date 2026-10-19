@@ -4,8 +4,6 @@
 #include "markov/graph/kernel_shapes.hpp"
 #include "markov/graph/source_graph.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <limits>
 
@@ -13,14 +11,18 @@
 #include <vector>
 
 namespace markov {
-RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::map<SourceSpanId, SourceKernel> & kernels, const nlohmann::json & operations)
+RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::map<SourceSpanId, SourceKernel> & kernels,
+                                     const std::map<SourceSpanId, SourceOperation> & operations)
     : source_capacity_(source_capacity) {
     for (const auto & [span, kernel] : kernels) {
         if (kernel.name != "write_req_to_token_pool_triton") continue;
         const auto shapes = KernelShapes(kernel.output_shapes);
+        if (shapes.tensors.size() != 1) {
+            table_.reset();
+            return;
+        }
         const auto & shape = shapes.tensors.front();
-        if (shapes.tensors.size() != 1 || shape.size() != 2 || shape[0] != static_cast<std::int64_t>(source_capacity_) + 1 || shape[1] <= 0
-            || (table_ && (*table_)[1] != shape[1])) {
+        if (shape.size() != 2 || shape[0] != static_cast<std::int64_t>(source_capacity_) + 1 || shape[1] <= 0 || (table_ && (*table_)[1] != shape[1])) {
             table_.reset();
             return;
         }
@@ -28,9 +30,9 @@ RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::m
     }
 
     // Pair by recorded operation membership, then interpret the root assignment.
-    for (const auto & operation : operations) {
-        if (operation.at("name") != "aten::index_put_" || operation.at("input_shapes").is_null() || operation.at("input_types").is_null()) continue;
-        const auto members = operation.at("device_spans").get<std::vector<SourceSpanId>>();
+    for (const auto & [span, operation] : operations) {
+        if (operation.name != "aten::index_put_" || !operation.input_shapes || !operation.input_types) continue;
+        const auto & members = operation.device_spans;
         if (members.empty() || members.size() > 2) continue;
         const SourceKernel * write = nullptr;
         SourceSpanId write_span = 0;
@@ -46,8 +48,8 @@ RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::m
         }
         if (!write || members.size() != (broadcast ? 2 : 1) || !table_) continue;
 
-        auto shapes = operation.at("input_shapes").get<std::string>();
-        auto types = operation.at("input_types").get<std::string>();
+        auto shapes = *operation.input_shapes;
+        auto types = *operation.input_types;
         std::erase_if(shapes, [](char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; });
         std::erase_if(types, [](char c) { return c == ' ' || c == '\r' || c == '\n' || c == '\t'; });
         const KernelShapes root(shapes);
@@ -65,7 +67,7 @@ RequestPoolLayout::RequestPoolLayout(std::uint32_t source_capacity, const std::m
             destination = BatchOperationRole::RequestTableWrite;
         else continue;
 
-        const auto host = operation.at("host_span").get<SourceSpanId>();
+        const auto host = operation.host_span;
         const auto requests = scalar ? 1 : static_cast<std::uint64_t>(root.tensors[2][0]);
         const BatchOperationVariant variant{ destination, requests, scalar ? 1U : 2U, scalar ? 1 : std::numeric_limits<std::uint64_t>::max() };
         indexed_writes_.emplace(host, IndexedWriteSource{ variant, write_span, write, broadcast });

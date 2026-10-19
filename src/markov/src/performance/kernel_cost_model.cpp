@@ -133,29 +133,25 @@ std::optional<std::int64_t> KernelCostModel::measured_cost(const KernelCostFeatu
 }
 
 CostModelResult KernelCostModel::estimate(const CostQuery & query) const {
-    for (const auto & object : query.objects) {
-        if (object.kind != CostQueryKind::Kernel) continue;
-        const auto * features = std::get_if<KernelCostQuery>(&object.features);
-        if (!features) continue;
+    if (query.kind != CostQueryKind::Kernel || query.issue != CostQueryIssue::None) return std::unexpected(CostModelGap{});
+    const auto * features = &std::get<KernelCostQuery>(query.features);
 
-        auto found = entries_.find({ features->tensors, features->attention, features->operands });
-        if (found == entries_.end() && !features->operands.empty()) {
-            // Only an existing producer-declared tensor traversal may omit the
-            // value operands. A physical-only non-traversal sample cannot match.
-            found = entries_.find({ features->tensors, features->attention, {} });
-            if (found != entries_.end() && std::ranges::none_of(found->second, &Launch::tensor_traversal)) found = entries_.end();
-        }
-        if (found == entries_.end()) return std::unexpected(CostModelGap{});
-        if (found->second.size() != 1) return std::unexpected(CostModelGap{ CostQueryIssue::FeaturesUndefined, "kernel_launch_mapping_undefined" });
-
-        // The producer's traversal assumption can explicitly project semantic
-        // values out of this key. Other unmodeled loops/indexing remain gaps.
-        const auto & launch = found->second.front();
-        if (!launch.tensor_traversal && !features->unmodeled_operands.empty())
-            return std::unexpected(CostModelGap{ CostQueryIssue::FeaturesUndefined, "kernel_operand_projection_undefined" });
-        return launch.duration_ns;
+    auto found = entries_.find({ features->tensors, features->attention, features->operands });
+    if (found == entries_.end() && !features->operands.empty()) {
+        // Only an existing producer-declared tensor traversal may omit the
+        // value operands. A physical-only non-traversal sample cannot match.
+        found = entries_.find({ features->tensors, features->attention, {} });
+        if (found != entries_.end() && std::ranges::none_of(found->second, &Launch::tensor_traversal)) found = entries_.end();
     }
-    return std::unexpected(CostModelGap{});
+    if (found == entries_.end()) return std::unexpected(CostModelGap{});
+    if (found->second.size() != 1) return std::unexpected(CostModelGap{ CostQueryIssue::FeaturesUndefined, "kernel_launch_mapping_undefined" });
+
+    // The producer's traversal assumption can explicitly project semantic
+    // values out of this key. Other unmodeled loops/indexing remain gaps.
+    const auto & launch = found->second.front();
+    if (!launch.tensor_traversal && !features->unmodeled_operands.empty())
+        return std::unexpected(CostModelGap{ CostQueryIssue::FeaturesUndefined, "kernel_operand_projection_undefined" });
+    return launch.duration_ns;
 }
 
 } // namespace markov

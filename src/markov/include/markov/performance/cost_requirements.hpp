@@ -1,5 +1,7 @@
 #pragma once
 
+#include "markov/performance/node_costs.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
@@ -8,15 +10,12 @@
 
 namespace markov {
 
-struct CostQuery;
-class NodeCosts;
-
 // Only modeled physical services contribute performance requirements.
-// Coverage and execution consume the same typed cost query.
+// Coverage consumes the execution query result, never a second model lookup.
 class CostRequirements {
 public:
-    void record(const CostQuery & query, const NodeCosts & costs, const nlohmann::json & location, const nlohmann::json & work_origin);
-    nlohmann::json describe() const;
+    void record(const CostQuery & query, const NodeCostResult & measured, const nlohmann::json & location, const nlohmann::json & work_origin);
+    nlohmann::json describe(bool diagnostics) const;
 
 private:
     struct Requirement {
@@ -26,9 +25,6 @@ private:
         std::string coverage;
         std::string reason;
         std::size_t actual_services = 0;
-        std::size_t measurement_required_services = 0;
-        nlohmann::json measurement_example;
-        nlohmann::json measurement_origin;
     };
 
     std::map<std::string, Requirement> requirements_;

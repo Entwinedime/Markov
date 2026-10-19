@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import json
-import os
 from pathlib import Path
 from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json
 from markov_collection.instrumentation.session import CaptureSession
 
 
@@ -52,6 +50,7 @@ class NativeCapture:
         if self.prepared["role"] != "performance":
             self._prepare_requests()
 
+        session.prepare()
         session.run()
         if artifacts is not None:
             artifacts.publish()
@@ -67,10 +66,6 @@ class NativeCapture:
                     request["original_text"] = request.pop("text")
                     request["input_tokens"] = tokenizer.encode(request["original_text"])
 
-        write_json(self.directory / "prepared_input.json", self.prepared)
-        os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
-        os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -78,8 +73,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
 
-    with arguments.input.open(encoding="utf-8") as stream:
-        prepared = json.load(stream)
+    prepared = read_json(arguments.input)
 
     NativeCapture(prepared, arguments.output).run()
 

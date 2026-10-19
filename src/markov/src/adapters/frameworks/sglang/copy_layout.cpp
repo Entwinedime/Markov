@@ -1,4 +1,6 @@
 #include "markov/adapters/frameworks/sglang/copy_layout.hpp"
+#include "markov/production/block_binding.hpp"
+#include "markov/production/source_call.hpp"
 
 #include "markov/graph/kernel_shapes.hpp"
 #include "markov/templates/templates.hpp"
@@ -25,7 +27,7 @@ std::string tensor_arguments(std::string text) {
 
 } // namespace
 
-SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann::json & facts) {
+SGLangCopyLayout::SGLangCopyLayout(const SourceGraph & graph, const nlohmann::json & facts) {
     const auto & intervals = facts.at("intervals");
     std::map<std::size_t, std::vector<std::size_t>> enqueues;
     for (const auto & flow : facts.at("flows")) {
@@ -43,10 +45,11 @@ SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann:
             copies[{ interval.at("rank").get<std::uint32_t>(), interval.at("tid").get<std::uint64_t>() }].push_back(&interval);
     }
 
-    for (const auto & transfer : graph.at("transfers")) {
-        const auto & api = facts.at("native_api").at(transfer.at("source_api").get<std::size_t>());
-        if (api.at("copy_execution") != "synchronous_driver" || transfer.at("direction") != "host_to_device") continue;
-        const auto span = transfer.at("source_span").get<SourceSpanId>();
+    for (const auto & [span, transfer] : graph.transfers()) {
+        if (transfer.direction != TransferDirection::HostToDevice || !transfer.source_api) continue;
+
+        const auto & api = facts.at("native_api").at(*transfer.source_api);
+        if (api.at("copy_execution") != "synchronous_driver") continue;
 
         // Input upload identity comes from the recorded wrapper result. Bytes
         // alone cannot distinguish this tensor from another copy in the scope.
@@ -65,9 +68,9 @@ SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann:
                 }
             }
         }
-        const auto & source_interval = graph.at("spans").at(span).at("source_interval");
-        if (source_interval.is_null()) continue;
-        const auto worker_id = source_interval.get<std::size_t>();
+        const auto source_interval = graph.spans().at(span).source_interval;
+        if (!source_interval) continue;
+        const auto worker_id = *source_interval;
         const auto & worker = intervals.at(worker_id);
         if (worker.at("name") != "Dequeue@acl_memcpy_host_to_device") continue;
         const auto hosts = enqueues.find(worker_id);
@@ -103,13 +106,14 @@ SGLangCopyLayout::SGLangCopyLayout(const nlohmann::json & graph, const nlohmann:
         else if (dtype == "int" || dtype == "float") element_bytes = 4;
         else continue;
         const auto elements = static_cast<std::uint64_t>(shapes.tensors[0][0]);
-        if (elements * element_bytes != transfer.at("bytes").get<std::uint64_t>()) continue;
+        if (elements * element_bytes != transfer.bytes) continue;
         tensors_.emplace(span, Tensor{ elements, element_bytes, dtype });
     }
 }
 
-void SGLangCopyLayout::bind(TemplateDefinition & definition, const nlohmann::json & calls, const std::map<std::size_t, NativeFilterSelection> & filters) const {
-    bind_input_transfers(definition);
+void SGLangCopyLayout::bind(TemplateDefinition & definition, std::span<const SourceCall> calls, const std::map<std::size_t, NativeFilterSelection> & filters,
+                            const std::map<std::size_t, SourceNativeRegion> & regions) const {
+    bind_input_transfers(definition, regions);
 
     const bool cold_prefill = definition.phase == BatchPhase::Prefill
                               && std::ranges::all_of(definition.source_requests, [](const auto & request) { return request.context_tokens == 0; });
@@ -123,10 +127,10 @@ void SGLangCopyLayout::bind(TemplateDefinition & definition, const nlohmann::jso
 
         // prepare_for_extend and its allocation/sampling setup construct
         // request vectors; forward metadata constructs two INT32 vectors.
-        const auto & call = calls.at(scope);
+        const auto & call = calls[scope];
         if (cold_prefill && tensor.elements == definition.source_requests.size()) {
             if (definition.step == StepKind::Prepare && scope == definition.source_call) extent = TransferExtent::RequestElements;
-            if (definition.step == StepKind::Prefill && call.at("native_step") == "model_forward" && call.at("parent") == definition.source_call
+            if (definition.step == StepKind::Prefill && call.kind == SourceCallKind::ForwardInputs && call.parent == definition.source_call
                 && tensor.dtype == "int")
                 extent = TransferExtent::RequestElements;
         }
@@ -144,7 +148,7 @@ void SGLangCopyLayout::bind(TemplateDefinition & definition, const nlohmann::jso
     }
 }
 
-void SGLangCopyLayout::bind_input_transfers(TemplateDefinition & definition) const {
+void SGLangCopyLayout::bind_input_transfers(TemplateDefinition & definition, const std::map<std::size_t, SourceNativeRegion> & regions) const {
     if (definition.step != StepKind::Prefill || definition.phase != BatchPhase::Prefill) return;
     std::uint64_t tokens = 0;
     for (const auto & request : definition.source_requests) {
@@ -153,9 +157,9 @@ void SGLangCopyLayout::bind_input_transfers(TemplateDefinition & definition) con
     }
 
     for (const auto & region : definition.regions) {
-        if (region.binding != "sglang.inputs.resolve" || !region.module) continue;
-        const auto & staging = region.module->inputs.at("prefill_input_ids_cpu");
-        const auto & copy = region.module->result.at("input_copy");
+        if (region.semantic != "input_resolution") continue;
+        const auto & staging = regions.at(region.source_call).inputs.at("prefill_input_ids_cpu");
+        const auto & copy = regions.at(region.source_call).result.at("input_copy");
         if (!staging || copy.is_null() || staging->dtype != "torch.int64" || staging->shape != std::vector<std::int64_t>{ static_cast<std::int64_t>(tokens) }
             || staging->stride != std::vector<std::int64_t>{ 1 } || copy.at("bytes") != tokens * sizeof(std::int64_t))
             continue;

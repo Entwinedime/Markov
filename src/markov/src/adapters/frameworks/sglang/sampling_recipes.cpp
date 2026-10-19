@@ -33,6 +33,7 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
     if (!requirements.is_array()) throw std::invalid_argument("performance sampling requirements must be an array");
 
     Json points = Json::array();
+    Json grid = Json::array();
     Json assignments = Json::array();
     Json unresolved = Json::array();
     std::map<std::string, std::expected<std::size_t, std::string>> planned;
@@ -52,7 +53,13 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
         const auto * filter = operands != features.end() && operands->contains("batch_filter") ? &operands->at("batch_filter") : nullptr;
         const auto * pool = operands != features.end() && operands->contains("request_pool") ? &operands->at("request_pool") : nullptr;
         Json point;
-        if (filter) {
+        if (requirement.at("object").at("kind") == "cpu" && features.at("phase") == "idle") {
+            point = {
+                {    "phase",        "idle" },
+                { "requests", Json::array() }
+            };
+        }
+        else if (filter) {
             // Filter costs depend on selection, not target request history.
             // A short native prefill triggers the same helper without restoring KV state.
             point = {
@@ -82,8 +89,7 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
                 if (pool_slots.size() != origin->at("requests").size()) reason = "sampling_request_pool_membership_unresolved";
             }
 
-            std::vector<std::tuple<bool, Json, Json>> members;
-            std::size_t finished = 0;
+            Json requests = Json::array();
             for (const auto & request : origin->at("requests")) {
                 if (!reason.empty()) break;
                 const auto request_id = request.at("request_id").get<std::size_t>();
@@ -109,14 +115,13 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
                 }
 
                 const bool finishes = request.at("finishes").get<bool>();
-                finished += finishes;
-                members.emplace_back(finishes,
-                                     Json{
-                                         {   "input_tokens",   input },
-                                         { "context_tokens", context },
-                                         {  "prompt_tokens",  prompt }
-                },
-                                     pool ? pool_slots.at(members.size()) : Json(nullptr));
+                requests.push_back({
+                    {   "input_tokens",                input },
+                    { "context_tokens",              context },
+                    {  "prompt_tokens",               prompt },
+                    {  "output_tokens", source.output_tokens },
+                    {       "finishes",             finishes }
+                });
             }
             if (!reason.empty()) {
                 unresolved.push_back({
@@ -126,21 +131,26 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
                 continue;
             }
 
-            // The existing recipe names the first K members as finished. It still
-            // lets the native scheduler own batching; real named features decide coverage.
-            std::stable_sort(members.begin(), members.end(), [](const auto & left, const auto & right) { return std::get<0>(left) > std::get<0>(right); });
-            Json requests = Json::array();
-            pool_slots = Json::array();
-            for (auto & [finishes, request, slot] : members) {
-                requests.push_back(std::move(request));
-                if (pool) pool_slots.push_back(std::move(slot));
-            }
+            // Preserve native member coordinates and the declared output horizon.
+            // One cohort also observes its later decode and partial-filter work.
             point = Json{
-                {                  "phase",               phase },
-                {               "requests", std::move(requests) },
-                { "finished_request_count",            finished }
+                {    "phase",               phase },
+                { "requests", std::move(requests) }
             };
             if (pool) point["pool_slots"] = std::move(pool_slots);
+            if (requirement.at("object").at("kind") == "cpu" && origin->at("step") == "schedule" && phase == "decode") {
+                // Recreate the preceding selection with real short requests.
+                // A survivor singleton never executes its member-removal work.
+                const auto & filters = origin->at("batch_filters");
+                for (auto selection = filters.rbegin(); selection != filters.rend(); ++selection) {
+                    const auto retained = selection->at("retained_indices").size();
+                    if (retained == point.at("requests").size() && retained < selection->at("input_count").get<std::size_t>()) {
+                        point["preceding_filter"] = *selection;
+                        if (const auto merge = origin->find("batch_merge"); merge != origin->end()) point["preceding_merge"] = *merge;
+                        break;
+                    }
+                }
+            }
         }
 
         const auto key = point.dump();
@@ -150,7 +160,7 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
             try {
                 // Reuse actual request construction for legal prompt, capacity
                 // and context checks instead of maintaining another native rule set.
-                const auto recipes = workloads(configuration, prompt_sources, Json::array({ point }));
+                auto recipes = workloads(configuration, prompt_sources, Json::array({ point }));
                 if (!point.contains("batch_filter")) {
                     auto domain = point;
                     domain.erase("pool_slots");
@@ -166,7 +176,11 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
                         }
                     }
                 }
-                if (*result == points.size()) points.push_back(std::move(point));
+                if (*result == points.size()) {
+                    recipes.at(0)["id"] = points.size();
+                    points.push_back(std::move(point));
+                    grid.push_back(std::move(recipes.at(0)));
+                }
             }
             catch (const std::invalid_argument & error) {
                 result = std::unexpected(error.what());
@@ -187,10 +201,70 @@ nlohmann::json SGLangSamplingRecipes::sampling_requests(const SGLangConfiguratio
             });
     }
 
+    // Every declared request also supplies a bounded singleton lifecycle. These
+    // cohorts cover later admission and completion in the same engine session;
+    // they do not claim to enumerate timing-dependent multi-request batches.
+    std::set<std::size_t> lifecycles;
+    Json lifecycle_gaps = Json::array();
+    std::map<std::string, std::size_t> cohorts;
+    for (std::size_t index = 0; index < grid.size(); ++index) cohorts.try_emplace(grid.at(index).at("requests").dump(), index);
+    for (const auto & source : prompt_sources) {
+        const auto * tokens = std::get_if<std::vector<std::uint32_t>>(&source.input);
+        if (!tokens) {
+            lifecycle_gaps.push_back({
+                { "request_id",                           source.id },
+                {     "reason", "sampling_prompt_tokens_unresolved" }
+            });
+            continue;
+        }
+
+        Json member{
+            {   "input_tokens",            tokens->size() },
+            { "context_tokens",                         0 },
+            {  "prompt_tokens",            tokens->size() },
+            {  "output_tokens",      source.output_tokens },
+            {       "finishes", source.output_tokens == 1 }
+        };
+        Json point{
+            {    "phase",                          "prefill" },
+            { "requests", Json::array({ std::move(member) }) }
+        };
+        try {
+            auto recipe = workloads(configuration, prompt_sources, Json::array({ point }));
+            const auto [entry, inserted] = cohorts.try_emplace(recipe.at(0).at("requests").dump(), points.size());
+            if (inserted) {
+                recipe.at(0)["id"] = points.size();
+                points.push_back(std::move(point));
+                grid.push_back(std::move(recipe.at(0)));
+            }
+            lifecycles.insert(entry->second);
+        }
+        catch (const std::invalid_argument & error) {
+            lifecycle_gaps.push_back({
+                { "request_id",    source.id },
+                {     "reason", error.what() }
+            });
+        }
+    }
+
     return {
-        { "measurement_requests",      std::move(points) },
-        {          "assignments", std::move(assignments) },
-        {           "unresolved",  std::move(unresolved) }
+        { "measurement_requests",         std::move(points) },
+        {     "measurement_grid",           std::move(grid) },
+        {          "assignments",    std::move(assignments) },
+        {     "lifecycle_points",     std::move(lifecycles) },
+        {       "lifecycle_gaps", std::move(lifecycle_gaps) },
+        {           "unresolved",     std::move(unresolved) }
+    };
+}
+
+nlohmann::json SGLangSamplingRecipes::make_request(const Request & source, std::uint32_t prompt_tokens, std::uint32_t output_tokens,
+                                                   std::uint32_t release_after_tokens) {
+    const auto & tokens = std::get<std::vector<std::uint32_t>>(source.input);
+    return {
+        { "input_tokens", std::vector<std::uint32_t>(tokens.begin(), tokens.begin() + prompt_tokens) },
+        { "output_tokens", output_tokens },
+        { "release_after_tokens", release_after_tokens },
+        { "prompt_source", { { "request_id", source.id }, { "available_tokens", tokens.size() }, { "selected_tokens", prompt_tokens } } }
     };
 }
 
@@ -233,19 +307,13 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
                 throw std::invalid_argument("filter sampling lacks a prompt source or sufficient batch capacity");
 
             const auto & representative = *source->second;
-            const auto & tokens = std::get<std::vector<std::uint32_t>>(representative.input);
             Json recipe = Json::array();
             for (std::uint32_t slot = 0; slot < count; ++slot) {
                 // Preserve the first selection, then let retained members
                 // finish in order within this same native request lifecycle.
                 const auto kept = std::ranges::lower_bound(retained, slot);
                 const auto output = kept != retained.end() && *kept == slot ? 2U + static_cast<std::uint32_t>(kept - retained.begin()) : 1U;
-                recipe.push_back({
-                    { "input_tokens", std::vector<std::uint32_t>(tokens.begin(), tokens.begin() + prompt) },
-                    { "output_tokens", output },
-                    { "release_after_tokens", 0 },
-                    { "prompt_source", { { "request_id", representative.id }, { "available_tokens", tokens.size() }, { "selected_tokens", prompt } } }
-                });
+                recipe.push_back(make_request(representative, prompt, output, 0));
             }
             grid.push_back({
                 {       "id",       grid.size() },
@@ -254,13 +322,32 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
             continue;
         }
 
-        input::fields(domain, { "phase", "requests", "finished_request_count", "pool_slots" });
+        input::fields(domain, { "phase", "requests", "pool_slots", "preceding_filter", "preceding_merge" });
 
         const auto phase = domain.at("phase").get<std::string>();
         const auto & requests = domain.at("requests");
-        const auto finished = measurement_count(domain.at("finished_request_count"));
-        if ((phase != "prefill" && phase != "decode") || !requests.is_array() || requests.empty() || requests.size() > configuration.max_running_requests
-            || finished > requests.size()) {
+        if (phase == "idle") {
+            if (!requests.is_array() || !requests.empty() || domain.contains("pool_slots") || domain.contains("preceding_filter")
+                || domain.contains("preceding_merge") || representatives.empty())
+                throw std::invalid_argument("empty scheduling work requires no model members and an available prompt source");
+
+            const auto & source = *representatives.begin()->second;
+            const auto prompt = static_cast<std::uint32_t>(std::min<std::size_t>(std::get<std::vector<std::uint32_t>>(source.input).size(),
+                                                                                 configuration.max_prefill_tokens / configuration.max_running_requests));
+            if (prompt == 0) throw std::invalid_argument("empty scheduling probe cannot fill native request capacity within the input budget");
+
+            // A full batch must finish in Decode while another request waits.
+            // The native scheduler owns admission, cleanup and the empty return.
+            Json recipe = Json::array();
+            for (std::size_t slot = 0; slot < static_cast<std::size_t>(configuration.max_running_requests) + 1; ++slot)
+                recipe.push_back(make_request(source, prompt, 2, 0));
+            grid.push_back({
+                {       "id",       grid.size() },
+                { "requests", std::move(recipe) }
+            });
+            continue;
+        }
+        if ((phase != "prefill" && phase != "decode") || !requests.is_array() || requests.empty() || requests.size() > configuration.max_running_requests) {
             throw std::invalid_argument("measurement request exceeds the declared phase or batch domain");
         }
 
@@ -272,18 +359,38 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
             if (pool_slots.back() > configuration.max_running_requests || !std::ranges::is_sorted(pool_slots)
                 || std::ranges::adjacent_find(pool_slots) != pool_slots.end())
                 throw std::invalid_argument("pool slots must follow the native ascending reservation order within capacity");
-            if (phase == "prefill" && pool_slots.back() != requests.size())
-                throw std::invalid_argument("prefill slot probes would change the requested batch shape");
         }
+
+        std::size_t cohort_count = pool_slots.empty() ? requests.size() : pool_slots.back();
+        const bool preceding_filter = domain.contains("preceding_filter");
+        if (preceding_filter) {
+            const auto & selection = domain.at("preceding_filter");
+            input::fields(selection, { "input_count", "retained_indices" });
+            cohort_count = input::positive(selection.at("input_count"));
+            if (phase != "decode" || domain.contains("pool_slots") || cohort_count > configuration.max_running_requests
+                || !selection.at("retained_indices").is_array() || selection.at("retained_indices").size() != requests.size()
+                || requests.size() >= cohort_count)
+                throw std::invalid_argument("preceding selection requires a partial decode batch within native capacity");
+
+            for (const auto & index : selection.at("retained_indices"))
+                pool_slots.push_back(static_cast<std::uint32_t>(input::integer(index, 0, cohort_count - 1)) + 1);
+            if (!std::ranges::is_sorted(pool_slots) || std::ranges::adjacent_find(pool_slots) != pool_slots.end())
+                throw std::invalid_argument("preceding selection must retain native member order");
+        }
+        const auto padding = cohort_count - requests.size();
+        const bool preceding_prefill = phase == "prefill" && padding != 0;
+        if (preceding_prefill && pool_slots.front() != padding + 1)
+            throw std::invalid_argument("prefill reservation probes require a contiguous payload after the earlier running members");
 
         std::vector<std::uint32_t> generated;
         std::uint64_t prefill_prefix_tokens = 0;
         for (const auto & request : requests) {
-            input::fields(request, { "input_tokens", "context_tokens", "prompt_tokens" });
+            input::fields(request, { "input_tokens", "context_tokens", "prompt_tokens", "output_tokens", "finishes" });
 
             const auto prompt = measurement_count(request.at("prompt_tokens"));
             const auto context = measurement_count(request.at("context_tokens"));
             const auto input = measurement_count(request.at("input_tokens"));
+            const auto output = input::positive(request.at("output_tokens"));
             if (prompt == 0 || representatives.lower_bound(prompt) == representatives.end()
                 || static_cast<std::uint64_t>(std::max(prompt, context)) + 2 > configuration.max_total_tokens
                 || (phase == "prefill" && (context != 0 || input != prompt)) || (phase == "decode" && (input != 1 || context < prompt))) {
@@ -298,7 +405,10 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
                 prefill_prefix_tokens += prompt;
             }
 
-            generated.push_back(phase == "prefill" ? 0 : context - prompt + 1);
+            const auto progress = phase == "prefill" ? 0 : context - prompt + 1;
+            if (output <= progress || request.at("finishes").get<bool>() != (output == progress + 1))
+                throw std::invalid_argument("measurement completion must agree with the declared output horizon");
+            generated.push_back(progress);
         }
 
         const auto maximum_generated = *std::max_element(generated.begin(), generated.end());
@@ -306,24 +416,62 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
             throw std::invalid_argument("pool slot probes require simultaneously submitted payload requests");
 
         Json recipe = Json::array();
+        std::uint32_t maximum_output = 0;
         for (std::size_t slot = 0; slot < requests.size(); ++slot) {
             const auto prompt = requests[slot].at("prompt_tokens").get<std::uint32_t>();
             const auto & representative = *representatives.lower_bound(prompt)->second;
-            const auto & tokens = std::get<std::vector<std::uint32_t>>(representative.input);
+            const auto output = input::positive(requests[slot].at("output_tokens"));
+            maximum_output = std::max(maximum_output, output);
             // Use a real token prefix from the smallest sufficient source. The
             // request workload supplies content, not a serving arrival sequence.
-            recipe.push_back({
-                { "input_tokens", std::vector<std::uint32_t>(tokens.begin(), tokens.begin() + prompt) },
-                { "output_tokens", generated[slot] + (slot < finished ? 1 : 2) },
-                { "release_after_tokens", maximum_generated - generated[slot] },
-                { "prompt_source", { { "request_id", representative.id }, { "available_tokens", tokens.size() }, { "selected_tokens", prompt } } }
-            });
+            // The client gate proposes an admission opportunity while native
+            // serving can already advance another Decode. Actual work qualifies
+            // the requested progress; the release count is not a batch counter.
+            const auto release = preceding_prefill ? 1 : maximum_generated - generated[slot];
+            recipe.push_back(make_request(representative, prompt, output, release));
         }
 
-        if (!pool_slots.empty()) {
-            const auto padding = pool_slots.back() - requests.size();
+        if (domain.contains("preceding_merge")) {
+            const auto & merge = domain.at("preceding_merge");
+            input::fields(merge, { "left_count", "right_count" });
+            const auto left = input::positive(merge.at("left_count"));
+            const auto right = input::positive(merge.at("right_count"));
+            if (!preceding_filter || left + static_cast<std::uint64_t>(right) != cohort_count || right != requests.size() || pool_slots.front() != left + 1
+                || maximum_generated != 1)
+                throw std::invalid_argument("merge selection sampling requires the first Decode of the retained incoming prefill batch");
+
+            std::uint64_t reserved_tokens = static_cast<std::uint64_t>(left) * 4 + (configuration.max_running_requests - left) * 3;
+            std::uint64_t prefill_tokens = 0;
+            for (const auto & request : recipe) {
+                prefill_tokens += request.at("input_tokens").size();
+                reserved_tokens += request.at("input_tokens").size() + request.at("output_tokens").get<std::uint32_t>();
+            }
+            if (configuration.max_running_requests > configuration.max_prefill_tokens || prefill_tokens > configuration.max_prefill_tokens
+                || reserved_tokens > configuration.max_total_tokens)
+                throw std::invalid_argument("merge selection prelude and payload exceed the declared token capacity");
+
+            // Fill capacity, then retire blockers one Decode before the left
+            // members. Queued payloads enter while those finished members are
+            // still in running_batch; native serving merges, then filters them.
+            Json cohort = Json::array();
+            const auto & source = *representatives.begin()->second;
+            for (std::size_t slot = 0; slot < configuration.max_running_requests; ++slot) cohort.push_back(make_request(source, 1, slot < left ? 3 : 2, 0));
+            for (auto & request : recipe) cohort.push_back(std::move(request));
+            recipe = std::move(cohort);
+        }
+        else if (!pool_slots.empty()) {
+            // Decode selection removes fillers at the requested progress.
+            // Prefill reserves earlier slots before releasing the payload;
+            // those real requests remain live for the payload's output horizon.
+            std::uint32_t filler_output = 1;
+            if (preceding_filter) filler_output = maximum_generated;
+            else if (preceding_prefill) {
+                if (maximum_output == std::numeric_limits<std::uint32_t>::max())
+                    throw std::invalid_argument("prefill reservation probe output horizon exceeds the native integer domain");
+                filler_output = maximum_output + 1;
+            }
             std::uint64_t prefill_tokens = padding;
-            std::uint64_t reserved_tokens = 2 * padding;
+            std::uint64_t reserved_tokens = (static_cast<std::uint64_t>(filler_output) + 1) * padding;
             for (const auto & request : recipe) {
                 const auto prompt = request.at("input_tokens").size();
                 prefill_tokens += prompt;
@@ -334,25 +482,17 @@ nlohmann::json SGLangSamplingRecipes::workloads(const SGLangConfiguration & conf
 
             if (padding != 0) {
                 const auto source = representatives.lower_bound(1);
-                if (source == representatives.end()) throw std::invalid_argument("pool slot probes require a nonempty token source");
                 const auto & representative = *source->second;
-                const auto & tokens = std::get<std::vector<std::uint32_t>>(representative.input);
                 Json cohort = Json::array();
                 std::size_t payload = 0;
-                // These are real requests, not writes to native allocator state.
-                // Their completion releases the lower reservations naturally.
-                for (std::size_t slot = 1; slot <= pool_slots.back(); ++slot) {
+                // The native framework owns these real requests and releases
+                // their reservations at completion.
+                for (std::size_t slot = 1; slot <= cohort_count; ++slot) {
                     if (payload < pool_slots.size() && slot == pool_slots[payload]) {
                         cohort.push_back(std::move(recipe[payload]));
                         ++payload;
                     }
-                    else
-                        cohort.push_back({
-                            {         "input_tokens",                                                             std::vector<std::uint32_t>{ tokens.front() } },
-                            {        "output_tokens",                                                                                                        1 },
-                            { "release_after_tokens",                                                                                                        0 },
-                            {        "prompt_source", { { "request_id", representative.id }, { "available_tokens", tokens.size() }, { "selected_tokens", 1 } } }
-                        });
+                    else cohort.push_back(make_request(representative, 1, filler_output, 0));
                 }
                 recipe = std::move(cohort);
             }

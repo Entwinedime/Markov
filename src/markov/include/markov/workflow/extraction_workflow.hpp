@@ -20,7 +20,6 @@ public:
           work_directory_(std::move(work_directory)) {}
 
     nlohmann::json run(const std::filesystem::path & manifest_path) const;
-    nlohmann::json compile(const std::filesystem::path & manifest_path) const;
 
 private:
     const TemplateAdapter * adapter(std::string_view framework) const;

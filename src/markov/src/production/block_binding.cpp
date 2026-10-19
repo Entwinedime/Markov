@@ -1,7 +1,5 @@
 #include "markov/production/block_binding.hpp"
 
-#include "markov/contracts/source_observations.hpp"
-
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -9,16 +7,18 @@
 
 namespace markov {
 
+std::optional<SourceTensorLayout> SourceTensorLayout::read(const nlohmann::json & value) {
+    if (value.is_null()) return std::nullopt;
+    return SourceTensorLayout{ value.at("shape").get<std::vector<std::int64_t>>(),
+                               value.at("stride").get<std::vector<std::int64_t>>(),
+                               value.at("dtype").get<std::string>(),
+                               value.at("device").get<std::string>() };
+}
+
 SourceNativeRegion NativeRegionBinding::read(const nlohmann::json & metadata) const {
-    SourceNativeRegion region{ std::string(semantic),
-                               metadata.at("module_path").get<std::string>(),
-                               metadata.at("module_type").get<std::string>(),
-                               metadata.at("method").get<std::string>(),
-                               {},
-                               {},
-                               {},
-                               {},
-                               {} };
+    SourceNativeRegion region{
+        std::string(semantic), metadata.at("module_type").get<std::string>(), metadata.at("method").get<std::string>(), {}, {}, {}, {}, {}
+    };
     if (region.module_type != module_type || region.method != method) {
         throw std::invalid_argument("model region native implementation disagrees with binding: " + std::string(identity));
     }

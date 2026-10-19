@@ -4,7 +4,7 @@
 #include "markov/contracts/source_observations.hpp"
 #include "markov/graph/source_graph.hpp"
 
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +17,6 @@ namespace markov {
 
 struct SourcePublication {
     std::string request_id;
-    std::uint32_t generated_tokens;
     bool finished;
 };
 
@@ -31,7 +30,6 @@ struct SourceAdmissionPolicy {
     double entry_ratio;
 
     static SourceAdmissionPolicy read(const nlohmann::json & value);
-    nlohmann::json describe() const;
 };
 
 struct SourceWorkerControls {
@@ -41,7 +39,6 @@ struct SourceWorkerControls {
     bool require_mlp_sync;
 
     static SourceWorkerControls read(const nlohmann::json & value);
-    nlohmann::json describe() const;
 };
 
 struct SourceBatchFilter {
@@ -64,14 +61,12 @@ struct SourceCall {
 
     std::optional<SourceSpanId> marker;
     std::int64_t observed_start_ns; // Native monotonic entry, only for ordering source observations.
-    std::optional<SourceTensorLayout> input_layout;
     std::optional<BoundaryId> device_done;
 
-    std::vector<std::string> visible_requests;
     std::vector<SourcePublication> publications;
     std::optional<std::string> binding;
     std::vector<SourceBatchFilter> batch_filters;
-    std::optional<SourceNativeRegion> region;
+    nlohmann::json module = nullptr; // Opaque observation; interpreted once by the template producer.
     std::optional<SourceOutputPolicy> output_policy = std::nullopt;
     std::optional<SourceAdmissionPolicy> admission_policy = std::nullopt;
     std::optional<SourceWorkerControls> worker_controls = std::nullopt;

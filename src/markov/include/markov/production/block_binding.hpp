@@ -2,16 +2,41 @@
 
 #include "markov/contracts/control.hpp"
 
-#include <nlohmann/json_fwd.hpp>
+#include <nlohmann/json.hpp>
 
 #include <cstddef>
+#include <cstdint>
+#include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
+#include <vector>
 
 namespace markov {
 
-struct SourceNativeRegion;
+// Native layouts and wrapper metadata exist only while producing templates.
+struct SourceTensorLayout {
+    std::vector<std::int64_t> shape;
+    std::vector<std::int64_t> stride;
+    std::string dtype;
+    std::string device;
+
+    static std::optional<SourceTensorLayout> read(const nlohmann::json & value);
+};
+
+struct SourceNativeRegion {
+    std::string semantic;
+    std::string module_type;
+    std::string method;
+    std::map<std::string, std::int64_t> parameters;
+    std::map<std::string, std::int64_t> call_parameters;
+    std::map<std::string, std::optional<SourceTensorLayout>> inputs;
+    std::map<std::string, std::optional<SourceTensorLayout>> outputs;
+    std::map<std::string, std::vector<std::int64_t>> cpu_values;
+    std::optional<std::string> request_id = std::nullopt;
+    nlohmann::json result = nullptr;
+};
 
 enum class NativePortAnchor { ScheduleDecision, ParentScheduleReturn, ScopeReturn, OwnedDeviceCompletion };
 enum class NativeWrapperKind { Schedule, Prepare, Execute, Publish };

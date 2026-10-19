@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -40,17 +41,18 @@ private:
     struct Work {
         InvokeStep invocation;
         std::vector<TemplateInstance> instances;
-        std::optional<std::int64_t> start_ns;
         std::map<PortKind, std::int64_t> completed_ports;
     };
 
     struct RequestTiming {
+        std::optional<std::int64_t> ready_ns;
         std::optional<std::int64_t> first_published_ns;
         std::optional<std::int64_t> completed_ns;
     };
 
     std::optional<nlohmann::json> accept(std::span<const ControlAction> actions);
     void enqueue(ControlEvent event);
+    nlohmann::json describe_invocation(const InvokeStep & invocation) const;
     nlohmann::json report(std::string_view status, const nlohmann::json & gaps) const;
 
     std::span<const Request> requests_; // Borrowed from the selected workload for this simulation.

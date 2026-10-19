@@ -105,21 +105,20 @@ std::span<const BlockDefinition> ServingContract::steps() const {
         BlockParameter{ "requests",  BlockParameterKind::RequestBatch }
     };
 
-    static constexpr BlockDefinition schedule{
-        StepKind::Schedule, "schedule", "arrival or previous published", schedule_ports, "commit batch selection or an empty scheduling decision",
-        schedule_inputs
-    };
-    static constexpr BlockDefinition prepare{ StepKind::Prepare, "prepare", "selected", prepare_ports, "input and KV metadata ready", batch_inputs };
-    static constexpr BlockDefinition prefill{
-        StepKind::Prefill, "prefill", "prepared", execution_ports, "device_done makes prefill result ready", batch_inputs
-    };
+    static constexpr BlockDefinition schedule{ StepKind::Schedule, "schedule",         "arrival or previous published",
+                                               schedule_ports,     PortKind::Selected, "commit batch selection or an empty scheduling decision",
+                                               schedule_inputs };
+    static constexpr BlockDefinition prepare{ StepKind::Prepare, "prepare", "selected", prepare_ports, PortKind::Prepared, "input and KV metadata ready",
+                                              batch_inputs };
+    static constexpr BlockDefinition prefill{ StepKind::Prefill, "prefill",           "prepared",
+                                              execution_ports,   PortKind::Submitted, "device_done makes prefill result ready",
+                                              batch_inputs };
     static constexpr BlockDefinition decode{
-        StepKind::Decode, "decode", "prepared and previous published", execution_ports, "device_done makes next result ready", batch_inputs
+        StepKind::Decode, "decode", "prepared and previous published", execution_ports, PortKind::Submitted, "device_done makes next result ready", batch_inputs
     };
-    static constexpr BlockDefinition publish{
-        StepKind::Publish, "publish", "submitted; device_done gates published", publish_ports, "advance tokens, expose result, release finished request KV",
-        batch_inputs
-    };
+    static constexpr BlockDefinition publish{ StepKind::Publish, "publish",           "submitted; device_done gates published",
+                                              publish_ports,     PortKind::Published, "advance tokens, expose result, release finished request KV",
+                                              batch_inputs };
 
     static constexpr std::array contracts{ schedule, prepare, prefill, decode, publish };
 
@@ -178,11 +177,12 @@ nlohmann::json ServingContract::describe() const {
         }
 
         definitions.push_back({
-            { "parameters",        parameters },
-            {       "step",   definition.name },
-            {      "entry",  definition.entry },
-            { "exit_ports",             ports },
-            {     "effect", definition.effect }
+            {     "parameters",                           parameters },
+            {           "step",                      definition.name },
+            {          "entry",                     definition.entry },
+            {     "exit_ports",                                ports },
+            { "cpu_completion", port_name(definition.cpu_completion) },
+            {         "effect",                    definition.effect }
         });
     }
 

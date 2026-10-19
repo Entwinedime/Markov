@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace markov {
@@ -12,6 +13,7 @@ class CostDistribution {
 public:
     void observe(std::int64_t duration_ns);
     nlohmann::json describe() const;
+    std::span<const std::int64_t> samples() const { return values_; }
 
 private:
     std::vector<std::int64_t> values_;

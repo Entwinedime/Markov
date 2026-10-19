@@ -2,8 +2,6 @@
 
 #include "markov/templates/tensor_parameters.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <compare>
 #include <utility>
 
@@ -15,7 +13,6 @@ class AttentionParameterRule {
 public:
     AttentionParameterRule(TensorParameterLayout shapes, AttentionWorkload workload) : shapes_(std::move(shapes)), workload_(std::move(workload)) {}
     SourceKernel evaluate(const SourceKernel & source, const BatchInput & input) const;
-    nlohmann::json describe_parameters() const;
     auto operator<=>(const AttentionParameterRule &) const = default;
     const AttentionWorkload & geometry() const { return workload_; }
 
@@ -24,9 +21,5 @@ private:
     AttentionWorkload workload_; // Fixed operation and cache geometry; target sequences are supplied per instance.
 };
 
-struct AttentionParameterObservation {
-    const AttentionParameterRule * rule; // Owned by TemplateSource; observations retain their native provenance.
-    nlohmann::json annotations;
-};
 
 } // namespace markov

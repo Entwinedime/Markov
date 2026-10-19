@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import gzip
 import json
 import re
 import sqlite3
@@ -12,13 +11,13 @@ from collections import Counter, defaultdict
 from contextlib import closing
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from markov_collection.adapters.runtimes.ascend.artifacts import AscendCaptureArtifacts
 from markov_collection.adapters.runtimes.ascend.event_history import EventHistory
 from markov_collection.adapters.runtimes.ascend.kernel_work import AscendKernelWork
 from markov_collection.adapters.runtimes.ascend.torch_npu.allocator import WorkspaceAllocation
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json, write_json
 
 
 def timestamp_ns(value: str | int | float) -> int:
@@ -31,14 +30,12 @@ class ObservationNormalizer:
     def __init__(self, capture: Path) -> None:
         self.capture_path = capture
         self.directory = capture.parent
-        with capture.open(encoding="utf-8") as stream:
-            self.capture = json.load(stream)
+        self.capture = read_json(capture)
 
         self.calls: dict[str, dict[str, Any]] = {}
         self.intervals: list[dict[str, Any]] = []
         self.flows: list[dict[str, Any]] = []
         self.native_api: list[dict[str, Any]] = []
-        self.supplementary_work: list[dict[str, Any]] = []
         self.gaps: list[dict[str, Any]] = []
         self.communicators: dict[tuple[int, str], dict[str, Any]] = {}
         self.trace_clock_offsets: dict[int, int] = {}
@@ -47,12 +44,6 @@ class ObservationNormalizer:
 
     def release(self) -> None:
         AscendCaptureArtifacts.release_observation_exports(self.capture_path)
-
-    def _open_export(self, reference: str) -> TextIO:
-        path = self.directory / reference
-        if path.suffix == ".gz":
-            return gzip.open(path, "rt", encoding="utf-8", newline="")
-        return path.open(encoding="utf-8", newline="")
 
     def _task_samples(
         self, collectives: dict[tuple[int, int], list[dict[str, Any]]], unresolved: Counter
@@ -566,8 +557,7 @@ class ObservationNormalizer:
             return
 
         for reference in references:
-            with (self.directory / reference).open(encoding="utf-8") as stream:
-                information = json.load(stream)
+            information = read_json(self.directory / reference)
 
             for device in information["DeviceInfo"]:
                 cube_cores = int(device["ai_core_num"])
@@ -589,17 +579,15 @@ class ObservationNormalizer:
                 )
 
     def _read_trace(self, reference: dict[str, Any]) -> None:
-        with (self.directory / reference["profiler_info"]).open(encoding="utf-8") as stream:
-            information = json.load(stream)
+        information = read_json(self.directory / reference["profiler_info"])
         rank = information["rank_id"]
         self._read_devices(rank, reference["device_info"])
-        with (self.directory / reference["clock_start_info"]).open(encoding="utf-8") as stream:
-            clock = json.load(stream)
+        clock = read_json(self.directory / reference["clock_start_info"])
         # Match CANNFileParser.get_localtime_diff / ProfilerConfig.get_local_time.
         # The export origin is not identical to a later realtime/monotonic pair.
         self.trace_clock_offsets[rank] = timestamp_ns(clock["collectionTimeBegin"]) - int(clock["clockMonotonicRaw"])
 
-        with self._open_export(reference["trace"]) as stream:
+        with (self.directory / reference["trace"]).open(encoding="utf-8") as stream:
             events = json.load(stream)
 
         processes = {
@@ -636,13 +624,10 @@ class ObservationNormalizer:
                 )
 
         kernels: dict[tuple[int, int, int], dict[str, str]] = {}
-        with self._open_export(reference["kernel_details"]) as stream:
-            for row_index, row in enumerate(csv.DictReader(stream)):
+        with (self.directory / reference["kernel_details"]).open(encoding="utf-8", newline="") as stream:
+            for row in csv.DictReader(stream):
                 # Collective summaries intentionally have no physical task ID.
                 if row["Stream ID"] == "N/A" or row["Task ID"] == "N/A":
-                    self.supplementary_work.append(
-                        {"rank": rank, "source": reference["kernel_details"], "row_index": row_index, "values": row}
-                    )
                     continue
 
                 key = (int(row["Stream ID"]), int(row["Task ID"]), timestamp_ns(row["Start Time(us)"]))
@@ -859,13 +844,10 @@ class ObservationNormalizer:
             source, target = endpoints["s"], endpoints["f"]
             source_ids = starts[(source["pid"], source["tid"], timestamp_ns(source["ts"]))]
             target_ids = starts[(target["pid"], target["tid"], timestamp_ns(target["ts"]))]
-            profiler_source_ids = source_ids
-            source_binding = None
             if category == "HostToDevice":
                 submission = self._flow_submission(source_ids, target_ids, runtime_submissions)
                 if submission is not None:
                     source_ids = [submission]
-                    source_binding = "native_flow_runtime_submission"
             if category == "async_npu" and len(target_ids) == 1:
                 enqueue = self._flow_enqueue(self.intervals[target_ids[0]], submissions, worker_windows, enqueues)
                 if enqueue is not None:
@@ -881,7 +863,6 @@ class ObservationNormalizer:
                     )
                     if not valid:
                         source_ids = [enqueue]
-                        source_binding = "native_connection_queue"
 
             owners = {self.intervals[index]["owner_call"] for index in source_ids} - {None}
             if len(owners) == 1:
@@ -902,14 +883,8 @@ class ObservationNormalizer:
                     "identity": identity,
                     "source_intervals": source_ids,
                     "target_intervals": target_ids,
-                    "source_time_ns": timestamp_ns(source["ts"]),
-                    "target_time_ns": timestamp_ns(target["ts"]),
                 }
             )
-            if source_ids != profiler_source_ids:
-                self.flows[-1]["profiler_source_intervals"] = profiler_source_ids
-                self.flows[-1]["source_binding"] = source_binding
-                self.flows[-1]["source_time_ns"] = self.intervals[source_ids[0]]["start_ns"]
 
         # CANN, hardware tasks and HCCL summaries share explicit connection IDs.
         # The collective root receives its owner through the native flow; propagate
@@ -1133,7 +1108,6 @@ class ServingNormalizer(ObservationNormalizer):
                 "intervals": self.intervals,
                 "flows": self.flows,
                 "native_api": self.native_api,
-                "supplementary_work": self.supplementary_work,
                 "workspace_states": workspace_states,
                 "event_states": event_states,
                 "profile_controls": self.profile_controls,
@@ -1169,7 +1143,7 @@ class ServingNormalizer(ObservationNormalizer):
         }
         if self.role == "base":
             manifest_path = self.directory / "profile_manifest.json"
-            manifest.update(source_facts=facts_path.name, source_dag=None, templates=None, readiness="needs_data")
+            manifest.update(source_facts=facts_path.name, readiness="needs_data")
             manifest["gaps"] = self.gaps + [
                 {
                     "kind": "implementation",
@@ -1188,24 +1162,50 @@ class ServingNormalizer(ObservationNormalizer):
 
         write_json(manifest_path, manifest)
 
-        # Keep raw exports until both normalized facts and their manifest exist.
-        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         return manifest_path
 
 
 class DeviceCostNormalizer(ObservationNormalizer):
+    _transfer_directions = ("host_to_host", "host_to_device", "device_to_host", "device_to_device")
+    _hardware_transfer_directions = {direction.replace("_", " "): direction for direction in _transfer_directions}
+
     def __init__(self, capture: Path, kernel_work: AscendKernelWork) -> None:
         super().__init__(capture)
         self.kernel_work = kernel_work
         if self.capture["role"] != "performance":
             raise ValueError("independent device costs must come from a performance capture")
 
+    def _transfer(self, interval: dict[str, Any]) -> dict[str, Any] | None:
+        if interval["kind"] != "dma":
+            return None
+
+        arguments = interval["arguments"]
+        direction = self._hardware_transfer_directions.get(arguments.get("operation"))
+        if "size(B)" in arguments and direction is not None:
+            # A complete physical payload does not depend on an SDK match.
+            # This is the same transfer boundary consumed by source extraction.
+            return {"bytes": arguments["size(B)"], "direction": direction, "source": interval["source"]}
+
+        identity = interval.get("native_api")
+        if identity is None:
+            return None
+        api = self.native_api[identity]
+        if api["api"] != "rtMemcpyAsync" or api["result"] != 0 or api["hardware_intervals"] != [interval["id"]]:
+            return None
+        kind = api["transfer_kind"]
+        if kind not in range(len(self._transfer_directions)) or api["transfer_bytes"] is None:
+            return None
+        return {"bytes": api["transfer_bytes"], "direction": self._transfer_directions[kind], "source": api["source"]}
+
     def extract(self) -> Path:
         from markov_collection.artifacts.sampling_domain import SamplingDomain
 
         self._read_capture()
-        with (self.directory / self.capture["input"]).open(encoding="utf-8") as stream:
-            prepared = json.load(stream)
+        prepared = read_json(self.directory / self.capture["input"])
+
+        environment = read_json(self.directory / self.capture["environment"])
+        if environment["steady_state"]["status"] != "steady":
+            self.gaps.append({"kind": "observation", "reason": environment["steady_state"]["status"]})
 
         domain = SamplingDomain(prepared)
         for call in sorted(self.calls.values(), key=lambda call: (call["rank"], call["start_ns"])):
@@ -1259,19 +1259,7 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 continue
 
             call = self.calls[owner]
-            transfer = None
-            if "native_api" in interval:
-                api = self.native_api[interval["native_api"]]
-                if api["api"] == "rtMemcpyAsync":
-                    transfer = {
-                        "bytes": api["transfer_bytes"],
-                        # CANN enum interpretation belongs to this producer;
-                        # cost fitting receives the shared semantic direction.
-                        "direction": ("host_to_host", "host_to_device", "device_to_host", "device_to_device")[
-                            api["transfer_kind"]
-                        ],
-                        "source": api["source"],
-                    }
+            transfer = self._transfer(interval)
 
             sample = {
                 "rank": interval["rank"],
@@ -1286,12 +1274,9 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 "source": interval["source"],
             }
             samples.append(sample)
-            if sample["kernel_work"] is not None:
-                domain.observe_work_facts(
-                    interval["rank"],
-                    call["metadata"],
-                    kernel_operand_fields=sample["kernel_work"].get("operand_work", {}),
-                )
+            kernel_work = sample["kernel_work"]
+            if kernel_work is not None:
+                domain.observe_filter_work(interval["rank"], call["metadata"], kernel_work.get("operand_work", {}))
 
         task_samples = self._task_samples(collective_owners, unresolved)
         sample_path = self.directory / "device_measurements.json.gz"
@@ -1301,7 +1286,6 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 "samples": samples,
                 "collective_descriptors": collectives,
                 "task_samples": task_samples,
-                "collective_observations": self.supplementary_work,
                 "devices": self.devices,
             },
             compact=True,
@@ -1314,14 +1298,13 @@ class DeviceCostNormalizer(ObservationNormalizer):
         coverage = domain.coverage()
         if coverage["missing_conditions"]:
             self.gaps.append({"kind": "cost", "reason": "warmup_execution_domain_incomplete"})
-        feature_coverage = domain.feature_coverage(kernel_operand_fields=True)
+        feature_coverage = domain.feature_coverage()
         if feature_coverage["missing_point_indices"]:
             self.gaps.append({"kind": "cost", "reason": "requested_batch_work_not_observed"})
         completion_coverage = domain.completion_coverage()
         if completion_coverage["missing_request_ids"]:
             self.gaps.append({"kind": "observation", "reason": "measurement_completion_observation_incomplete"})
 
-        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         manifest_path = self.directory / "performance_manifest.json"
         write_json(
             manifest_path,
@@ -1340,7 +1323,6 @@ class DeviceCostNormalizer(ObservationNormalizer):
                 "coverage": {
                     "samples": len(samples),
                     "stage_kind": dict(Counter(f"{sample['stage']}/{sample['kind']}" for sample in samples)),
-                    "collective_observations": len(self.supplementary_work),
                     "collective_descriptors": len(collectives),
                     "task_samples": len(task_samples),
                     "task_kinds": dict(Counter(sample["kind"] for sample in task_samples)),
@@ -1362,12 +1344,9 @@ class CollectiveCostNormalizer(ObservationNormalizer):
 
     def extract(self) -> Path:
         self._read_capture()
-        with (self.directory / self.capture["input"]).open(encoding="utf-8") as stream:
-            prepared = json.load(stream)
-
-        world_size = len(prepared["environment"]["devices"])
-        samples = []
-        grouped: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        prepared = read_json(self.directory / self.capture["input"])
+        expected_ranks = set(range(len(prepared["environment"]["devices"])))
+        cohorts: dict[tuple[int, int], list[int]] = defaultdict(list)
         collectives: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         unresolved = Counter()
         for interval in self.intervals:
@@ -1381,10 +1360,9 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                 continue
 
             call = self.calls[owner]
-            metadata = call["metadata"]
             if call["step"] == "setup":
                 continue
-
+            metadata = call["metadata"]
             operation = interval["name"].split("__", 1)[0]
             if operation != metadata["operation"] or args["count"] != metadata["element_count"]:
                 unresolved["collective_operation_decomposition_differs"] += 1
@@ -1392,60 +1370,23 @@ class CollectiveCostNormalizer(ObservationNormalizer):
             if args["data_type"] != metadata["data_type"] or args["alg_type"] != metadata["algorithm"]:
                 unresolved["collective_implementation_differs"] += 1
 
-            sample = {
-                "rank": interval["rank"],
-                "stage": metadata["stage"],
-                "grid": metadata["grid"],
-                "repetition": metadata["repetition"],
-                "operation": operation,
-                "element_count": args["count"],
-                "data_type": args["data_type"],
-                "algorithm": args["alg_type"],
-                "device_start_ns": interval["start_ns"],
-                "device_end_ns": interval["end_ns"],
-                "observed_wall_ns": interval["observed_wall_ns"],
-                "host_start_ns": call["start_ns"],
-                "host_end_ns": call["end_ns"],
-                "source": interval["source"],
-            }
+            # Envelopes establish ownership and cohort completeness. Their wall
+            # times are neither service costs nor a second measurement product.
+            collectives[(interval["rank"], args["connection_id"])].append(metadata)
+            cohorts[(metadata["grid"], metadata["repetition"])].append(interval["rank"])
 
-            samples.append(sample)
-            collectives[(interval["rank"], args["connection_id"])].append(sample)
-            grouped[(metadata["grid"], metadata["repetition"])].append(sample)
-
-        # A collective sample requires all ranks from the same grid point and repetition.
-        groups = []
+        completed = Counter()
         for point in prepared["measurement_grid"]:
             for repetition in range(-1, prepared["repetitions"]):
-                records = grouped[(point["id"], repetition)]
-                if len(records) != world_size or {record["rank"] for record in records} != set(range(world_size)):
+                ranks = cohorts[(point["id"], repetition)]
+                if len(ranks) != len(expected_ranks) or set(ranks) != expected_ranks:
                     unresolved["collective_rank_observation_incomplete"] += 1
                     continue
-
-                starts = [record["device_start_ns"] for record in records]
-                ends = [record["device_end_ns"] for record in records]
-                groups.append(
-                    {
-                        "grid": point["id"],
-                        "stage": "warmup" if repetition == -1 else "measurement",
-                        "repetition": repetition,
-                        "operation": point["operation"],
-                        "element_count": point["element_count"],
-                        "data_type": point["data_type"],
-                        "rank_start_skew_ns": max(starts) - min(starts),
-                        "group_observed_wall_ns": max(ends) - min(starts),
-                        "after_all_ranks_started_ns": max(ends) - max(starts),
-                        "ranks": records,
-                    }
-                )
+                completed["warmup" if repetition == -1 else "measurement"] += 1
 
         measurements = self.directory / "collective_measurements.json.gz"
         task_samples = self._task_samples(collectives, unresolved)
-        write_json(
-            measurements,
-            {"rank_samples": samples, "groups": groups, "task_samples": task_samples, "devices": self.devices},
-            compact=True,
-        )
+        write_json(measurements, {"task_samples": task_samples, "devices": self.devices}, compact=True)
         if unresolved:
             self.gaps.append(
                 {"kind": "cost", "reason": "collective_measurement_incomplete", "counts": dict(unresolved)}
@@ -1453,7 +1394,6 @@ class CollectiveCostNormalizer(ObservationNormalizer):
         self.gaps.append({"kind": "cost", "reason": "collective_admission_skew_and_service_not_separated"})
         self.gaps.append({"kind": "cost", "reason": "device_profiler_overhead_not_calibrated"})
 
-        AscendCaptureArtifacts.finish_profile_retention(self.capture_path, self.capture)
         manifest = self.directory / "performance_manifest.json"
         write_json(
             manifest,
@@ -1467,19 +1407,14 @@ class CollectiveCostNormalizer(ObservationNormalizer):
                 "native_capture": "native_capture.json",
                 "collective_measurements": measurements.name,
                 "coverage": {
-                    "rank_samples": len(samples),
-                    "groups": len(groups),
-                    "stage_groups": dict(Counter(group["stage"] for group in groups)),
+                    "cohorts": sum(completed.values()),
+                    "stage_cohorts": dict(completed),
                     "task_samples": len(task_samples),
                     "task_kinds": dict(Counter(sample["kind"] for sample in task_samples)),
                 },
-                "clock": {
-                    "device_start_ns/device_end_ns": "wall_epoch_ns; native per-rank collective spans",
-                    "host_start_ns/host_end_ns": "native monotonic_ns; host call, not hardware service",
-                },
+                "clock": {"device_start_ns/device_end_ns": "profiler export epoch coordinates in ns; physical tasks"},
                 "readiness": "needs_data",
                 "gaps": self.gaps,
             },
         )
-
         return manifest

@@ -1,7 +1,10 @@
 #include "markov/adapters/runtimes/ascend/source_extractor.hpp"
 
+#include <algorithm>
 #include <array>
 #include <set>
+#include <string>
+#include <string_view>
 
 namespace markov {
 namespace {
@@ -33,14 +36,31 @@ std::size_t AscendSourceExtractor::read_transfers(const nlohmann::json & interva
                                      TransferDirection::HostToDevice,
                                      TransferDirection::DeviceToHost,
                                      TransferDirection::DeviceToDevice };
+    constexpr std::array<std::string_view, 4> hardware_directions{ "host to host", "host to device", "device to host", "device to device" };
     std::set<SourceSpanId> communication;
-    for (const auto & collective : graph_.collectives())
+    for (const auto & [span, collective] : graph_.collectives())
         for (const auto & task : collective.tasks) communication.insert(task.span);
 
     std::size_t unresolved = 0;
     for (const auto & interval : intervals) {
         if (interval.at("kind") != "dma" || communication.contains(interval.at("id").get<SourceSpanId>())) continue;
         const auto api = interval.find("native_api");
+        const auto & arguments = interval.at("arguments");
+        const auto bytes = arguments.find("size(B)");
+        const auto operation = arguments.find("operation");
+        if (bytes != arguments.end() && operation != arguments.end()) {
+            const auto direction = std::ranges::find(hardware_directions, operation->get_ref<const std::string &>());
+            if (direction != hardware_directions.end()) {
+                // The physical payload is complete even when a framework copy
+                // bypasses the intercepted SDK entry. Keep that absence explicit.
+                graph_.observe_transfer(interval.at("id").get<SourceSpanId>(),
+                                        { bytes->get<std::uint64_t>(),
+                                          directions[direction - hardware_directions.begin()],
+                                          api == interval.end() ? std::nullopt : std::optional(api->get<std::size_t>()) });
+                continue;
+            }
+        }
+
         if (api == interval.end()) {
             ++unresolved;
             continue;

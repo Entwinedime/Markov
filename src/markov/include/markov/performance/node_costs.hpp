@@ -21,6 +21,8 @@ struct NodeCostEstimate {
     std::optional<std::size_t> model_index = std::nullopt;
 };
 
+using NodeCostResult = std::expected<NodeCostEstimate, CostModelGap>;
+
 struct NodeCostSource {
     const std::filesystem::path * manifest;
     SourceSpanId span;
@@ -32,8 +34,9 @@ class NodeCosts {
 public:
     NodeCosts(const NodeDurations & given, std::span<const CostModel * const> models) : given_(given), models_(models) {}
 
-    std::expected<NodeCostEstimate, std::string_view> estimate(const CostQuery & query, const NodeCostSource & source) const;
-    std::expected<NodeCostEstimate, CostModelGap> query_cost(const CostQuery & query) const;
+    std::expected<NodeCostEstimate, std::string_view> estimate(const NodeCostResult & measured, const NodeCostSource & source,
+                                                               std::span<const NodeCostSource> remaining = {}) const;
+    NodeCostResult query_cost(const CostQuery & query) const;
     bool has_models() const { return !models_.empty(); }
     static std::string_view basis_name(NodeCostBasis basis);
 

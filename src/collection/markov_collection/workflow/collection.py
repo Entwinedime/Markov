@@ -43,13 +43,20 @@ class CollectionWorkflow:
 
         if prediction_result is not None:
             paths[Path(self.environment.container_path(prediction_result))] = prediction_result
-            # Planning reads provenance and observed domains, never raw timing
+            prediction = read_json(prediction_result)
+            for combination in prediction["combinations"]:
+                requirements = combination.get("performance_requirements")
+                if requirements is not None and "cpu_service_catalog" in requirements:
+                    catalog = Path(requirements["cpu_service_catalog"])
+                    paths[catalog] = self.environment.host_path(str(catalog))
+
+            # Planning reads provenance and native cohorts, never raw timing
             # exports. Missing optional history stays unknown in the C++ plan.
             manifests = {
                 Path(os.path.normpath(target.parent / reference))
                 for reference in inputs.get("assets", {}).get("performance_manifests", [])
             }
-            for model in read_json(prediction_result)["cost_models"]:
+            for model in prediction["cost_models"]:
                 if model["status"] == "loaded":
                     manifests.add(Path(model["source_manifest"]))
 
@@ -394,6 +401,7 @@ class CollectionWorkflow:
                     self._finish_attempt(state, "interrupted", 130, time.perf_counter_ns() - started_ns, time.time_ns())
                 else:
                     self.reconcile(state)
+                raise
             finally:
                 write_json(directory / "run.json", state)
 
@@ -411,8 +419,8 @@ class CollectionWorkflow:
 
         if acquisition["role"] == "performance":
             prepared = read_json(Path(state["attempts"][-1]["directory"]) / "prepared_input.json")
-            if prepared["measurement_kind"] == "transfer":
-                raise RuntimeError("native transfer sampler exited without publishing its performance manifest")
+            if prepared["measurement_kind"] in {"transfer", "cpu"}:
+                raise RuntimeError("native host sampler exited without publishing its performance manifest")
 
         acquisition["phase"] = "processing"
 
@@ -482,8 +490,7 @@ class CollectionWorkflow:
         attempt = state["attempts"][-1]
         directory = Path(attempt["directory"])
         try:
-            with (Path(attempt["processing_directory"]) / "processing_failure.json").open(encoding="utf-8") as stream:
-                failure = json.load(stream)
+            failure = read_json(Path(attempt["processing_directory"]) / "processing_failure.json")
         except FileNotFoundError:
             failure = None
         if failure is not None:
@@ -493,21 +500,20 @@ class CollectionWorkflow:
 
         # Native completion and processing outcome are separate facts. Status and
         # resume consume the same terminal records without launching another job.
-        native_transfer = role == "performance" and attempt["measurement_kind"] == "transfer"
+        native_host = role == "performance" and attempt["measurement_kind"] in {"transfer", "cpu"}
         result_path = (
             directory / "performance_manifest.json"
-            if native_transfer
+            if native_host
             else Path(attempt["processing_directory"]) / "processing_result.json"
         )
         try:
-            with result_path.open(encoding="utf-8") as stream:
-                result = json.load(stream)
+            result = read_json(result_path)
         except FileNotFoundError:
             return None
 
         manifest = (
             directory / "performance_manifest.json"
-            if native_transfer
+            if native_host
             else self.environment.host_path(result[f"{role}_manifest"])
         )
         acquisition.update(manifest=str(manifest), readiness=result["readiness"])
@@ -524,8 +530,7 @@ class CollectionWorkflow:
             except BlockingIOError:
                 return {**self.status(directory), "workflow_busy": True}
 
-            with (directory / "run.json").open(encoding="utf-8") as stream:
-                state = json.load(stream)
+            state = read_json(directory / "run.json")
             live, active_ns = self.reconcile(state)
             write_json(directory / "run.json", state)
             if live:
@@ -543,16 +548,33 @@ class CollectionWorkflow:
 
             if budgets:
                 self._revise_budget(directory, state, budgets)
-            acquisition = state["capture"]
-            if (
-                state["attempts"]
-                and state["attempts"][-1]["status"] in {"failed", "interrupted", "budget_exhausted"}
-                and len(state["attempts"]) > acquisition["attempt_index"]
-            ):
-                self.select(read_json(directory / "inputs/prepared_input.json"), directory, state)
+            self.retry_native(directory, state)
             self.collect(directory, state)
 
         return self._result(directory, state)
+
+    def retry_native(self, directory: Path, state: dict[str, Any]) -> None:
+        # Only an explicit resume retries a terminated native acquisition.
+        # Selection preserves the failed attempt and its consumed budget.
+        acquisition = state["capture"]
+        permission = state["collection"][acquisition["role"]]
+        if (
+            not permission["allow_run"]
+            or permission["consumed_wall_time_ns"] >= permission["max_wall_time_sec"] * 1_000_000_000
+        ):
+            return
+
+        if (
+            state["attempts"]
+            and state["attempts"][-1]["status"] in {"failed", "interrupted", "budget_exhausted"}
+            and len(state["attempts"]) > acquisition["attempt_index"]
+        ):
+            self.select(
+                read_json(Path(state["attempts"][-1]["directory"]) / "prepared_input.json"),
+                directory,
+                state,
+                max_wall_time_sec=acquisition["max_wall_time_sec"],
+            )
 
     def _revise_budget(self, directory: Path, state: dict[str, Any], budgets: dict[str, int]) -> None:
         role = state["capture"]["role"]
@@ -562,8 +584,7 @@ class CollectionWorkflow:
         seconds = budgets[role]
         if seconds <= 0 or seconds * 1_000_000_000 < state["collection"][role]["consumed_wall_time_ns"]:
             raise ValueError(f"{role} total budget must be positive and cover its consumed time")
-        with (directory / "inputs/prepared_input.json").open(encoding="utf-8") as stream:
-            prepared = json.load(stream)
+        prepared = read_json(directory / "inputs/prepared_input.json")
         if prepared["environment"] is None:
             raise ValueError("enabled collection requires the task's declared environment")
 
@@ -609,8 +630,7 @@ class CollectionWorkflow:
         attempt = state["attempts"][-1]
         container = self.environment.container_state(attempt["container"])
         try:
-            with (Path(attempt["directory"]) / "attempt_status.json").open(encoding="utf-8") as stream:
-                record = json.load(stream)
+            record = read_json(Path(attempt["directory"]) / "attempt_status.json")
         except FileNotFoundError:
             record = None  # The container has not entered its monitor yet.
 
@@ -618,8 +638,7 @@ class CollectionWorkflow:
             if self._live_launcher(attempt):
                 return True, time.time_ns() - attempt["created_at_ns"]
             try:
-                with (Path(attempt["directory"]) / "launch_result.json").open(encoding="utf-8") as stream:
-                    launch = json.load(stream)
+                launch = read_json(Path(attempt["directory"]) / "launch_result.json")
             except FileNotFoundError:
                 launch = None
 

@@ -22,7 +22,7 @@ namespace {
 constexpr std::string_view usage = "Usage: markov {plan|predict|prepare-prediction} --project project.json\n"
                                    "       markov predict --project project.json [--catalog-directory DIR]\n"
                                    "       markov fit-costs --performance-manifest performance_manifest.json [--unit "
-                                   "all|kernel|communication|transfer|command]\n"
+                                   "all|kernel|communication|transfer|command|cpu]\n"
                                    "       markov evaluate-costs --model-candidate candidate.json --performance-manifest performance_manifest.json\n"
                                    "       markov prepare --project project.json --configuration ID --workload ID\n"
                                    "       markov prepare-representative --project project.json --configuration ID\n"
@@ -31,7 +31,7 @@ constexpr std::string_view usage = "Usage: markov {plan|predict|prepare-predicti
                                    "       markov prepare-sampling --project project.json --configuration ID --workload ID --measurement-requests FILE\n"
                                    "       markov prepare-performance --project project.json --prediction-result FILE\n"
                                    "       markov prepare-communication --project project.json --configuration ID\n"
-                                   "       markov {extract|compile-templates} --base-manifest profile_manifest.json "
+                                   "       markov extract --base-manifest profile_manifest.json "
                                    "[--output-directory DIR] [--work-directory DIR]\n";
 }
 
@@ -43,22 +43,12 @@ int main(int argc, char ** argv) {
     try {
         if (argc < 4 || argc % 2 != 0) throw std::invalid_argument(std::string(usage));
         const std::string_view command = argv[1];
-        const std::set<std::string_view> commands{ "plan",
-                                                   "predict",
-                                                   "prepare-prediction",
-                                                   "prepare-representative",
-                                                   "prepare",
-                                                   "prepare-target",
-                                                   "prepare-sampling",
-                                                   "prepare-communication",
-                                                   "extract",
-                                                   "compile-templates",
-                                                   "fit-costs",
-                                                   "evaluate-costs",
-                                                   "prepare-performance" };
+        const std::set<std::string_view> commands{ "plan",    "predict",        "prepare-prediction", "prepare-representative",
+                                                   "prepare", "prepare-target", "prepare-sampling",   "prepare-communication",
+                                                   "extract", "fit-costs",      "evaluate-costs",     "prepare-performance" };
         if (!commands.contains(command)) throw std::invalid_argument(std::string(usage));
 
-        const bool source_command = command == "extract" || command == "compile-templates";
+        const bool source_command = command == "extract";
         std::set<std::string_view> required{ source_command ? "--base-manifest" : "--project" };
         if (command == "fit-costs") required = { "--performance-manifest" };
         if (command == "evaluate-costs") required = { "--model-candidate", "--performance-manifest" };
@@ -102,7 +92,7 @@ int main(int argc, char ** argv) {
                                                       options.contains("--output-directory") ? options.at("--output-directory") : "",
                                                       options.contains("--work-directory") ? options.at("--work-directory") : "");
             const auto & manifest = options.at("--base-manifest");
-            const auto result = command == "extract" ? workflow.run(manifest) : workflow.compile(manifest);
+            const auto result = workflow.run(manifest);
             std::cout << result.dump(2) << '\n';
             return 0;
         }

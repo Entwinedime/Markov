@@ -6,7 +6,6 @@
 
 #include <nlohmann/json_fwd.hpp>
 
-#include <cstdint>
 #include <expected>
 #include <filesystem>
 #include <optional>
@@ -23,11 +22,19 @@ struct TemplateSourceCandidate {
 };
 
 struct TemplateSourceSelection {
-    std::uint32_t ranks;
     std::vector<const TemplateBank *> donors;
     std::vector<const TemplateDefinition *> operation_sources;
     std::vector<const TemplateBank *> initial_sources;
     std::optional<TemplateGap> gap;
+
+    nlohmann::json describe() const;
+};
+
+// Production owns extraction and binding in one call. The workflow publishes
+// the resulting asset and manifest after both stages have completed.
+struct TemplateProduction {
+    nlohmann::json manifest;
+    std::optional<TemplateSource> source;
 };
 
 // Native extraction, template production and configuration interpretation end here.
@@ -39,9 +46,8 @@ public:
 
     virtual Framework framework() const = 0;
     virtual std::string_view name() const = 0;
-    virtual nlohmann::json extract(const std::filesystem::path & manifest_path, nlohmann::json manifest,
-                                   const std::filesystem::path & work_directory) const = 0;
-    virtual TemplateSource produce(const std::filesystem::path & manifest_path) const = 0;
+    virtual TemplateProduction produce(const std::filesystem::path & manifest_path, nlohmann::json manifest,
+                                       const std::filesystem::path & work_directory) const = 0;
     virtual FrameworkConfiguration source_configuration(const nlohmann::json & parameters) const = 0;
     // Shared by source selection and cost candidate eligibility. This describes
     // native configuration semantics, never service-time portability.
@@ -49,7 +55,6 @@ public:
     virtual std::expected<ServingLimits, std::string_view> control_limits(const FrameworkConfiguration & configuration) const = 0;
     virtual nlohmann::json configurations(std::span<const Candidate * const> candidates) const = 0;
     virtual TemplateSourceSelection select_sources(const Candidate & candidate, std::span<const TemplateSourceCandidate> sources) const = 0;
-    virtual nlohmann::json describe_sources(const TemplateSourceSelection & selection) const = 0;
 };
 
 } // namespace markov

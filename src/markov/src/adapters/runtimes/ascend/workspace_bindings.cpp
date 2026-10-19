@@ -14,7 +14,7 @@
 
 namespace markov {
 
-void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json & facts, const nlohmann::json & graph) const {
+void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json & facts, const SourceGraph & graph) const {
     using PoolKey = std::tuple<std::uint32_t, std::uint64_t, std::int64_t, std::uint64_t>;
     std::map<PoolKey, std::uint64_t> initial;
     std::set<std::pair<std::uint32_t, std::uint64_t>> workers;
@@ -43,11 +43,11 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
     for (auto & [key, members] : source.definitions)
         for (auto & definition : members) definitions.emplace(definition.source_call, &definition);
 
-    const auto & spans = graph.at("spans");
-    const auto & boundaries = graph.at("boundaries");
+    const auto & spans = graph.spans();
+    const auto & boundaries = graph.boundaries();
     std::map<std::size_t, std::size_t> interval_spans;
     for (std::size_t index = 0; index < spans.size(); ++index)
-        if (!spans[index].at("source_interval").is_null()) interval_spans.emplace(spans[index].at("source_interval"), index);
+        if (spans[index].source_interval) interval_spans.emplace(*spans[index].source_interval, index);
 
     std::map<PoolKey, std::size_t> pools;
     const auto & records = facts.at("native_api");
@@ -66,24 +66,24 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
         }
         const auto span_id = interval_spans.at(record.at("source_interval"));
         const auto & span = spans[span_id];
-        if (span.at("owner_call").is_null() || span.at("scope_call").is_null() || !definitions.contains(span.at("owner_call"))) {
+        if (!span.owner_call || !span.scope_call || !definitions.contains(*span.owner_call)) {
             source.workspace_binding_gap = "workspace_serving_owner_unresolved";
             return;
         }
-        auto & definition = *definitions.at(span.at("owner_call"));
-        const auto & begin = boundaries.at(span.at("begin").get<std::size_t>());
-        const auto & end = boundaries.at(span.at("end").get<std::size_t>());
+        auto & definition = *definitions.at(*span.owner_call);
+        const auto & begin = boundaries.at(span.begin);
+        const auto & end = boundaries.at(span.end);
         std::optional<std::pair<std::size_t, std::size_t>> owner;
         for (std::size_t operation = 0; operation < definition.operations.size(); ++operation) {
             const auto & workers = definition.operations[operation].workers;
             for (std::size_t worker = 0; worker < workers.size(); ++worker) {
                 const auto & candidate = spans.at(workers[worker].source_span);
-                const auto & entry = boundaries.at(candidate.at("begin").get<std::size_t>());
-                const auto & exit = boundaries.at(candidate.at("end").get<std::size_t>());
+                const auto & entry = boundaries.at(candidate.begin);
+                const auto & exit = boundaries.at(candidate.end);
                 // Queue flows already bind this worker to its host operation.
                 // Same scope, lane and containment locate the allocator inside it.
-                if (candidate.at("scope_call") != span.at("scope_call") || entry.at("lane") != begin.at("lane")
-                    || entry.at("observed_time_ns") > begin.at("observed_time_ns") || exit.at("observed_time_ns") < end.at("observed_time_ns"))
+                if (candidate.scope_call != span.scope_call || entry.lane != begin.lane || entry.observed_time_ns > begin.observed_time_ns
+                    || exit.observed_time_ns < end.observed_time_ns)
                     continue;
                 if (owner) {
                     source.workspace_binding_gap = "workspace_operation_ambiguous";
@@ -124,8 +124,8 @@ void AscendWorkspaceBindings::bind(TemplateSource & source, const nlohmann::json
         std::optional<std::size_t> local_begin, local_end;
         for (std::size_t index = 0; index < definition.boundary_observations.size(); ++index) {
             const auto boundary = definition.boundary_observations[index].source_boundary;
-            if (boundary == span.at("begin")) local_begin = index;
-            if (boundary == span.at("end")) local_end = index;
+            if (boundary == span.begin) local_begin = index;
+            if (boundary == span.end) local_end = index;
         }
         if (!local_begin || !local_end) {
             source.workspace_binding_gap = "workspace_operation_boundaries_missing";
@@ -209,7 +209,7 @@ void AscendWorkspaceBindings::bind_demands(TemplateSource & source, const nlohma
                     use.demand = std::unexpected("workspace_attention_parameters_not_qualified");
                     continue;
                 }
-                const auto & parameters = layout->second.rule->geometry();
+                const auto & parameters = layout->second->geometry();
                 const auto heads = static_cast<std::uint32_t>(parameters.query_heads);
                 const auto dimension = static_cast<std::uint32_t>(parameters.head_dim);
                 const auto & kernel = source.kernels.at(span);

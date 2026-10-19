@@ -1,12 +1,13 @@
 #include "markov/workflow/prediction_workflow.hpp"
 
-#include "markov/workflow/performance_requirements_plan.hpp"
+#include "markov/workflow/cpu_sampling_catalog.hpp"
 
 #include "markov/adapters/template_adapter.hpp"
 #include "markov/contracts/json_input.hpp"
 #include "markov/controller/lightweight_controller.hpp"
 #include "markov/execution/simulation.hpp"
 #include "markov/performance/communication_cost_model.hpp"
+#include "markov/performance/cpu_cost_model.hpp"
 #include "markov/performance/device_command_cost_model.hpp"
 #include "markov/performance/kernel_cost_model.hpp"
 #include "markov/performance/node_costs.hpp"
@@ -79,7 +80,11 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
 
             std::unique_ptr<CostModel> model;
             std::string_view query_policy;
-            if (kind == "empirical_transfer_median") {
+            if (kind == "empirical_cpu_service_median") {
+                model = std::make_unique<CpuCostModel>(metadata.at("entries"));
+                query_policy = "exact named CPU interval and resolved work; directly observed waits/transfers excluded; opaque readiness overlaps device waits";
+            }
+            else if (kind == "empirical_transfer_median") {
                 model = std::make_unique<TransferCostModel>(metadata.at("entries"));
                 query_policy = "exact execution boundary, bytes and direction; asynchronous device service or complete synchronous host driver call; preceding "
                                "submission and waits excluded";
@@ -169,7 +174,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                                    (*adapter)->source_configuration(source.configuration),
                                    std::make_unique<TemplateBank>(std::move(source)),
                                    std::nullopt };
-            report["source"] = loaded.bank->describe();
+            report["source"] = loaded.bank->describe(project.diagnostics);
 
             // A bad cost input must not turn reusable structure into a request
             // for native collection. Preserve the source and isolate the error.
@@ -197,7 +202,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
     for (const auto & source : sources) banks.push_back({ source.bank.get(), &source.configuration });
 
     auto source_coverage = Json::array();
-    PerformanceRequirementsPlan requirement_plans(catalog_directory.empty() ? project.output_directory / "catalogs" : catalog_directory);
+    CpuSamplingCatalog cpu_catalogs(catalog_directory.empty() ? project.output_directory / "catalogs" : catalog_directory);
     auto combinations = Json::array();
     std::size_t combination_index = 0;
     for (const auto & candidate : project.configurations) {
@@ -240,7 +245,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
             const auto selection = binding.select_sources(candidate, banks);
             donors = selection.donors;
             operation_sources = selection.operation_sources;
-            auto coverage = binding.describe_sources(selection);
+            auto coverage = selection.describe();
             coverage["configuration_id"] = candidate.id;
             source_coverage.push_back(std::move(coverage));
 
@@ -256,9 +261,6 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                 configuration_gap = incomplete(missing ? "needs_data" : "unsupported", missing ? "observation" : "rule", selection.gap->reason);
             }
         }
-        if (project.controller != "lightweight" || project.scope != Scope::Modeled || project.initial_cache != CacheState::Cold)
-            configuration_gap = incomplete("unsupported", "scope", "only_lightweight_cold_modeled_scope_implemented");
-
         if (selected) selected->bank->bind_sources(donors, operation_sources);
 
         for (const auto & workload : project.request_workloads) {
@@ -272,9 +274,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                 else if (selected->duration_error) result = incomplete("failed", "node_durations", *selected->duration_error);
                 else if (model_error) result = incomplete("failed", "cost_model", *model_error);
                 else {
-                    // Object relations and conservative target bounds exist
-                    // before timing; the runtime refines actual feature points.
-                    auto requirements_plan = requirement_plans.run(*selected->bank, donors, operation_sources, workload.requests, *limits);
+                    const auto cpu_catalog = cpu_catalogs.publish(*selected->bank, donors, operation_sources);
                     // All mutable serving state belongs to this one combination.
                     LightweightController controller(selected->bank->page_size_tokens(), *selected->bank->admission_policy());
                     const NodeCosts costs(durations, applicable_models);
@@ -285,7 +285,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
                                               costs,
                                               project.diagnostics ? std::optional(graph_path) : std::nullopt);
                     result = runtime.run(*limits);
-                    result["performance_requirements"]["plan"] = std::move(requirements_plan);
+                    result["performance_requirements"]["cpu_service_catalog"] = cpu_catalog.string();
                 }
             }
             catch (const std::exception & error) {
@@ -294,7 +294,7 @@ nlohmann::json PredictionWorkflow::run(const Project & project, nlohmann::json c
 
             result["configuration_id"] = candidate.id;
             result["request_workload_id"] = workload.id;
-            result["scope"] = project.scope == Scope::Modeled ? "modeled" : "http_e2e";
+            result["scope"] = "modeled";
             // The anchor is distinct from the graph's actual source set.
             // Per-source cost inputs are reported once in assets.
             result["provenance"] = {

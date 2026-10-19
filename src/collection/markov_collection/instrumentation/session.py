@@ -1,9 +1,11 @@
 """Shared inputs and lifetime of an explicitly requested native capture."""
 
-import json
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+from markov_collection.artifacts.json_file import read_json, write_json
 
 
 class CaptureSession(ABC):
@@ -12,13 +14,17 @@ class CaptureSession(ABC):
         self.directory = directory
         self._worker_failed = False
 
+    def prepare(self) -> None:
+        write_json(self.directory / "prepared_input.json", self.prepared)
+        os.environ["MARKOV_PREPARED_INPUT"] = str(self.directory / "prepared_input.json")
+        os.environ["MARKOV_OBSERVATIONS"] = str(self.directory / "observations")
+
     def _handle_worker_failure(self, signum: int, frame: Any) -> None:
         self._worker_failed = True
         raise RuntimeError("native scheduler worker failed; see the collection process log")
 
     def _model_configuration(self) -> dict[str, Any]:
-        with (Path(self.prepared["model_path"]) / "config.json").open(encoding="utf-8") as stream:
-            return json.load(stream)
+        return read_json(Path(self.prepared["model_path"]) / "config.json")
 
     @abstractmethod
     def run(self) -> None:

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import faulthandler
 import importlib.metadata
-import json
 import os
 import queue
 import signal
@@ -19,7 +18,7 @@ from typing import Any
 from ktransformers.server.backend.interfaces import balance_serve as native
 
 from markov_collection.adapters.runtimes.pytorch.profiling import TorchProfilerMarkers
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json, write_json
 from markov_collection.instrumentation.recording import Recorder
 from markov_collection.instrumentation.session import CaptureSession
 
@@ -31,8 +30,7 @@ class CaptureFinished(Exception):
 class KTransformersObserver:
     def __init__(self, engine: Any) -> None:
         self.engine = engine
-        with Path(os.environ["MARKOV_PREPARED_INPUT"]).open(encoding="utf-8") as stream:
-            self.prepared = json.load(stream)
+        self.prepared = read_json(Path(os.environ["MARKOV_PREPARED_INPUT"]))
 
         self.directory = Path(os.environ["MARKOV_PREPARED_INPUT"]).parent
         self.recorder: Recorder | None = None
@@ -351,8 +349,7 @@ class KTransformersCapture(CaptureSession):
             process.join()
         self._check_workers(interface)
 
-        with (self.directory / "worker_completed.json").open(encoding="utf-8") as stream:
-            completed = json.load(stream)
+        completed = read_json(self.directory / "worker_completed.json")
         if set(completed["native_request_ids"]) != {response["native_id"] for response in responses}:
             raise RuntimeError("native completion messages do not cover the declared requests")
 

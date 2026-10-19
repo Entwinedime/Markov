@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import json
 import os
 import signal
 import subprocess
@@ -12,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from markov_collection.artifacts.json_file import write_json
+from markov_collection.artifacts.json_file import read_json, write_json
 
 
 class NativeAttempt:
@@ -141,8 +140,7 @@ def main() -> None:
     parser.add_argument("--attempt", type=Path, required=True)
     arguments = parser.parse_args()
 
-    with arguments.attempt.open(encoding="utf-8") as stream:
-        configuration = json.load(stream)
+    configuration = read_json(arguments.attempt)
 
     raise SystemExit(NativeAttempt(configuration, arguments.attempt.parent).run())
 

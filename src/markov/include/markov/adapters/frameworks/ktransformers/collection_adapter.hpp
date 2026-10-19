@@ -2,6 +2,10 @@
 
 #include "markov/adapters/collection_adapter.hpp"
 
+#include <filesystem>
+#include <span>
+#include <string_view>
+
 namespace markov {
 
 class KTransformersCollectionAdapter final : public CollectionAdapter {

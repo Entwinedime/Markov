@@ -39,25 +39,4 @@ nlohmann::json CommunicationCostFeatures::describe() const {
     };
 }
 
-CommunicationCostModel::CommunicationCostModel(const nlohmann::json & entries) {
-    for (const auto & entry : entries) {
-        const auto features = CommunicationCostFeatures::read(entry.at("features"));
-        const auto duration = input::integer(entry.at("estimate_ns"), 0, std::numeric_limits<std::int64_t>::max());
-        if (!entries_.emplace(features, duration).second) throw std::invalid_argument("duplicate communication cost features");
-    }
-}
-
-std::optional<std::int64_t> CommunicationCostModel::measured_cost(const CommunicationCostFeatures & features) const {
-    const auto found = entries_.find(features);
-    if (found == entries_.end()) return std::nullopt;
-    return found->second;
-}
-
-CostModelResult CommunicationCostModel::estimate(const CostQuery & query) const {
-    for (const auto & object : query.objects)
-        if (object.kind == CostQueryKind::Communication && object.issue == CostQueryIssue::None)
-            return measured(measured_cost(std::get<CommunicationCostFeatures>(object.features)));
-    return std::unexpected(CostModelGap{});
-}
-
 } // namespace markov

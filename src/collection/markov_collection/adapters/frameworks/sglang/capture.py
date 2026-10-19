@@ -40,7 +40,7 @@ class SGLangCapture(SGLangSession):
 
             request_ids = {request["id"] for request in requests}
             warmup_started_ns = time.perf_counter_ns()
-            warmup = self._warmup(engine, request_ids)
+            warmup = self._warmup(engine)
             warmup_finished_ns = time.perf_counter_ns()
 
             profile_start_ns = time.perf_counter_ns()
@@ -101,6 +101,15 @@ class SGLangCapture(SGLangSession):
                     # The driver origin defines planned arrivals, not admission
                     # into a modeled block or a directly measured service cost.
                     "request_timing": request_timing,
+                    "steady_state": self._steady_windows(
+                        [
+                            {
+                                "started_ns": observation_started_ns,
+                                "ended_ns": observation_finished_ns if profiling else profile_finished_ns,
+                            }
+                        ],
+                        warmup,
+                    ),
                     "collection_wall_time_ns": wall_times,
                     "initialization": {
                         "engine": "fresh_process",
@@ -132,11 +141,17 @@ class SGLangCapture(SGLangSession):
                     for path in sorted((self.directory / "observations").glob("rank-*-ports.json"))
                 ],
                 "boundaries": {
+                    "arrival": "Scheduler.handle_generate_request ScopeReturn; native request ready for scheduling",
                     "submitted": "Scheduler.run_batch ScopeReturn; not device completion",
                     "published": "Scheduler.process_batch_result ScopeReturn",
                     "observation": (
                         "timestamp immediately after native return, before metadata or journal writing; "
                         "not profiler marker.end"
+                    ),
+                    "native_call": (
+                        "coarse run_batch/process_batch_result wall and control-thread CPU brackets; "
+                        "includes CPU consumed by waits/transfers and clock boundary overhead; "
+                        "independent validation diagnostics, not cost samples"
                     ),
                 },
             },
