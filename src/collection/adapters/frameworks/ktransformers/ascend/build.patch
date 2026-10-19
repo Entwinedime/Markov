@@ -1,0 +1,48 @@
+--- a/setup.py
++++ b/setup.py
+@@ -14,6 +14,7 @@
+ '''
+ 
+ import os
++from importlib.metadata import version
+ import sys
+ import re
+ import ast
+@@ -42,11 +43,8 @@
+ KTRANSFORMERS_BUILD_XPU = torch.xpu.is_available()
+ 
+ 
+-try:
+-    import torch_npu
+-    KTRANSFORMERS_BUILD_NPU = torch_npu.npu.is_available()
+-except:
+-    KTRANSFORMERS_BUILD_NPU = False
++# This image builds only the NPU backend, without opening a device at install time.
++KTRANSFORMERS_BUILD_NPU = True
+ 
+ # 检测 DEV_BACKEND 环境变量
+ dev_backend = os.environ.get("DEV_BACKEND", "").lower()
+@@ -249,7 +247,7 @@
+         elif torch.xpu.is_available():
+             backend_version = f"xpu"
+         elif KTRANSFORMERS_BUILD_NPU:
+-            backend_version = f"npu{torch_npu.__version__}"
++            backend_version = f"npu{version('torch-npu')}"
+         else:
+             raise ValueError("Unsupported backend: CUDA_HOME MUSA_HOME ROCM_HOME all not set and XPU is not available.")
+         package_version = f"{flash_version}+{backend_version}torch{torch_version}{cpu_instruct}"
+--- a/csrc/balance_serve/CMakeLists.txt
++++ b/csrc/balance_serve/CMakeLists.txt
+@@ -10,11 +10,7 @@
+     
+     link_directories(${TORCH_INSTALL_PREFIX}/../torch.libs)
+     # find torch_npu
+-    execute_process(
+-            COMMAND python -c "import torch; import torch_npu; print(torch_npu.__path__[0])"
+-            OUTPUT_VARIABLE TORCH_NPU_PATH
+-            OUTPUT_STRIP_TRAILING_WHITESPACE
+-    )
++    set(TORCH_NPU_PATH "$ENV{TORCH_NPU_PATH}")
+     message(STATUS "Found PTA at: ${TORCH_NPU_PATH}")
+     find_library(PTA_LIBRARY torch_npu PATH "${TORCH_NPU_PATH}/lib")
+ endif()

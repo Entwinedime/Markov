@@ -1,143 +1,54 @@
 #!/usr/bin/env bash
-# Install the KTransformers archive NPU runtime from submodule source.
-#
-# Build adaptations apply only to an image-local copy of the official archive.
-# The mounted submodule remains unchanged.
+# Build the official archive in an image-local copy. The checkout stays untouched.
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-    echo "usage: $0 <trace-sim-root>" >&2
+if (($# != 1)); then
+    printf 'usage: %s <trace-sim-root>\n' "$0" >&2
     exit 2
 fi
 
-TRACE_SIM_ROOT="$1"
-KTRANSFORMERS_INPUT_SRC="${TRACE_SIM_ROOT}/third_party/ktransformers"
-KTRANSFORMERS_SRC="/opt/markov/ktransformers"
-KTRANSFORMERS_RUNTIME_SRC="${KTRANSFORMERS_SRC}/archive"
+MARKOV_ADAPTER_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+MARKOV_KT_SOURCE=/opt/markov/ktransformers
+MARKOV_KT_ARCHIVE="$MARKOV_KT_SOURCE/archive"
+mkdir -p "$MARKOV_KT_SOURCE"
+cp -a "$1/third_party/ktransformers/." "$MARKOV_KT_SOURCE/"
 
-# Emit timestamped installation messages.
-log() {
-    echo "[$(date +"%Y-%m-%d %H:%M:%S")] $*"
-}
+set +u
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+set -u
+export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
+export TASK_QUEUE_ENABLE=0 INF_NAN_MODE_FORCE_DISABLE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export TORCH_NPU_PATH="$(python3 -c 'from importlib.metadata import distribution; print(distribution("torch-npu").locate_file("torch_npu"))')"
 
-# Restore dependencies omitted when upstream moved the runtime into archive.
-# Revisions are the official gitlinks immediately before upstream's #1581 move,
-# not the current kt-kernel dependencies or revisions from the Markov fork.
-prepare_archive_source() {
-    mkdir -p "$KTRANSFORMERS_SRC"
-    cp -a "${KTRANSFORMERS_INPUT_SRC}/." "$KTRANSFORMERS_SRC/"
+# Official gitlinks immediately before upstream moved this runtime into archive.
+# Current kt-kernel dependencies belong to a different implementation.
+while read -r name repository revision; do
+    destination="$MARKOV_KT_ARCHIVE/third_party/$name"
+    git init "$destination"
+    git -C "$destination" remote add origin "https://github.com/$repository.git"
+    git -C "$destination" fetch --depth 1 origin "$revision"
+    git -C "$destination" checkout --detach FETCH_HEAD
+    git -C "$destination" submodule update --init --recursive --depth 1
+done <<'DEPENDENCIES'
+PhotonLibOS alibaba/PhotonLibOS 92f56d4527c24aafcee75d87fd72fce25680266f
+llama.cpp ggerganov/llama.cpp a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f
+prometheus-cpp jupp0r/prometheus-cpp f13cdd052eeae5e89decc11bf03697d0f78b15bc
+pybind11 pybind/pybind11 bb05e0810b87e74709d9f4c4545f1f57a1b386f5
+spdlog gabime/spdlog 48bcf39a661a13be22666ac64db8a7f886f2637e
+xxHash Cyan4973/xxHash 953a09abc39096da9e216b6eb0002c681cdc1199
+DEPENDENCIES
 
-    local dependencies=(
-        "PhotonLibOS https://github.com/alibaba/PhotonLibOS.git 92f56d4527c24aafcee75d87fd72fce25680266f"
-        "llama.cpp https://github.com/ggerganov/llama.cpp.git a94e6ff8774b7c9f950d9545baf0ce35e8d1ed2f"
-        "prometheus-cpp https://github.com/jupp0r/prometheus-cpp.git f13cdd052eeae5e89decc11bf03697d0f78b15bc"
-        "pybind11 https://github.com/pybind/pybind11.git bb05e0810b87e74709d9f4c4545f1f57a1b386f5"
-        "spdlog https://github.com/gabime/spdlog.git 48bcf39a661a13be22666ac64db8a7f886f2637e"
-        "xxHash https://github.com/Cyan4973/xxHash.git 953a09abc39096da9e216b6eb0002c681cdc1199"
-    )
-    local dependency name url revision destination
-    for dependency in "${dependencies[@]}"; do
-        read -r name url revision <<< "$dependency"
-        destination="${KTRANSFORMERS_RUNTIME_SRC}/third_party/${name}"
-
-        log "Fetching archive dependency: ${name} ${revision}"
-        git init "$destination"
-        git -C "$destination" remote add origin "$url"
-        git -C "$destination" fetch --depth 1 origin "$revision"
-        git -C "$destination" checkout --detach FETCH_HEAD
-        git -C "$destination" submodule update --init --recursive --depth 1
-    done
-}
-
-# Load Ascend toolkit and ATB environments plus required runtime variables.
-source_ascend_env() {
-    set +u
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-    # shellcheck disable=SC1091
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-    set -u
-
-    export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:${LD_LIBRARY_PATH:-}"
-    export TASK_QUEUE_ENABLE=0
-    export INF_NAN_MODE_FORCE_DISABLE=1
-}
-
-# Verify torch and torch_npu availability and print their versions.
-check_torch_npu() {
-    TORCH_DEVICE_BACKEND_AUTOLOAD=0 python3 - <<'PY'
-from pathlib import Path
-import site
-import torch
-
-print(f"torch={torch.__version__}")
-
-version_files = [
-    Path(site_dir) / "torch_npu" / "version.py"
-    for site_dir in site.getsitepackages()
-]
-version_file = next((path for path in version_files if path.is_file()), None)
-if version_file is None:
-    raise SystemExit("torch_npu version.py is missing")
-
-namespace = {}
-exec(version_file.read_text(encoding="utf-8"), namespace)
-print(f"torch_npu={namespace.get('__version__', 'unknown')}")
-PY
-}
-
-# Disable conflicting llamafile arm82 macro aliases on ARM platforms.
-patch_arm82_llamafile() {
-    case "$(uname -m)" in
-        aarch64|arm64) ;;
-        *) return 0 ;;
-    esac
-
-    local file
-    for file in \
-        "${KTRANSFORMERS_RUNTIME_SRC}/third_party/llamafile/iqk_mul_mat_arm82.cpp" \
-        "${KTRANSFORMERS_SRC}/third_party/llamafile/iqk_mul_mat_arm82.cpp"; do
-        if [ ! -f "$file" ]; then
-            continue
-        fi
-
-        log "Patching arm82 llamafile aliases: ${file}"
-        python3 - "$file" <<'PY'
+patch --batch -d "$MARKOV_KT_ARCHIVE" -p1 < "$MARKOV_ADAPTER_ROOT/build.patch"
+case "$(uname -m)" in
+    aarch64|arm64)
+        sed -i '/^#define iqk_mul_mat iqk_mul_mat_arm82$/d; /^#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82$/d' \
+            "$MARKOV_KT_ARCHIVE/third_party/llamafile/iqk_mul_mat_arm82.cpp"
+        ;;
+esac
+python3 - "$MARKOV_KT_ARCHIVE/ktransformers/configs/config.yaml" <<'PY'
 from pathlib import Path
 import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-lines = []
-for line in text.splitlines(keepends=True):
-    stripped = line.strip()
-    if stripped in {
-        "#define iqk_mul_mat iqk_mul_mat_arm82",
-        "#define iqk_mul_mat_moe iqk_mul_mat_moe_arm82",
-    } and not line.lstrip().startswith("//"):
-        indent = line[: len(line) - len(line.lstrip())]
-        line = f"{indent}// TRACE_SIM_ASCEND_DISABLED {line.lstrip()}"
-    lines.append(line)
-
-path.write_text("".join(lines), encoding="utf-8")
-PY
-    done
-}
-
-# Pin archive attention page/chunk defaults for this runtime environment.
-patch_archive_config() {
-    local config="${KTRANSFORMERS_RUNTIME_SRC}/ktransformers/configs/config.yaml"
-    if [ ! -f "$config" ]; then
-        log "Missing ktransformers archive config: ${config}"
-        exit 1
-    fi
-
-    log "Patching archive config attn.page_size=128, attn.chunk_size=16384"
-    python3 - "$config" <<'PY'
-from pathlib import Path
-import sys
-
 import yaml
 
 path = Path(sys.argv[1])
@@ -145,168 +56,7 @@ configuration = yaml.safe_load(path.read_text(encoding="utf-8"))
 configuration["attn"].update(page_size=128, chunk_size=16384)
 path.write_text(yaml.safe_dump(configuration, sort_keys=False), encoding="utf-8")
 PY
-}
 
-# Permit explicit NPU build selection to avoid install-time device probing.
-patch_archive_setup_npu_backend() {
-    local setup_py="${KTRANSFORMERS_RUNTIME_SRC}/setup.py"
-    if [ ! -f "$setup_py" ]; then
-        log "Missing ktransformers archive setup.py: ${setup_py}"
-        exit 1
-    fi
-
-    log "Patching archive setup.py to allow explicit NPU build selection"
-    python3 - "$setup_py" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-old = '''try:
-    import torch_npu
-    KTRANSFORMERS_BUILD_NPU = torch_npu.npu.is_available()
-except:
-    KTRANSFORMERS_BUILD_NPU = False
-'''
-
-new = '''def _trace_sim_torch_npu_version():
-    import site
-    from pathlib import Path
-
-    for site_dir in site.getsitepackages():
-        version_file = Path(site_dir) / "torch_npu" / "version.py"
-        if not version_file.is_file():
-            continue
-        namespace = {}
-        exec(version_file.read_text(encoding="utf-8"), namespace)
-        return namespace.get("__version__", "unknown")
-    return "unknown"
-
-
-if os.environ.get("KTRANSFORMERS_BUILD_NPU", "0") == "1":
-    class _TraceSimTorchNpu:
-        __version__ = _trace_sim_torch_npu_version()
-
-    torch_npu = _TraceSimTorchNpu()
-    KTRANSFORMERS_BUILD_NPU = True
-else:
-    try:
-        import torch_npu
-        KTRANSFORMERS_BUILD_NPU = torch_npu.npu.is_available()
-    except:
-        KTRANSFORMERS_BUILD_NPU = False
-'''
-
-if old not in text:
-    if "_trace_sim_torch_npu_version" in text:
-        raise SystemExit(0)
-    raise SystemExit("target torch_npu detection block not found")
-
-path.write_text(text.replace(old, new), encoding="utf-8")
-PY
-}
-
-# Make balance_serve prefer the explicitly supplied TORCH_NPU_PATH.
-patch_balance_serve_torch_npu_lookup() {
-    local cmake_file="${KTRANSFORMERS_RUNTIME_SRC}/csrc/balance_serve/CMakeLists.txt"
-    if [ ! -f "$cmake_file" ]; then
-        log "Missing balance_serve CMakeLists.txt: ${cmake_file}"
-        exit 1
-    fi
-
-    log "Patching balance_serve torch_npu lookup to use TORCH_NPU_PATH"
-    python3 - "$cmake_file" <<'PY'
-from pathlib import Path
-import sys
-
-path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-
-old = '''    # find torch_npu
-    execute_process(
-            COMMAND python -c "import torch; import torch_npu; print(torch_npu.__path__[0])"
-            OUTPUT_VARIABLE TORCH_NPU_PATH
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-    )
-    message(STATUS "Found PTA at: ${TORCH_NPU_PATH}")
-    find_library(PTA_LIBRARY torch_npu PATH "${TORCH_NPU_PATH}/lib")
-'''
-
-new = '''    # find torch_npu
-    if(DEFINED ENV{TORCH_NPU_PATH})
-        set(TORCH_NPU_PATH "$ENV{TORCH_NPU_PATH}")
-    else()
-        execute_process(
-                COMMAND python -c "import torch; import torch_npu; print(torch_npu.__path__[0])"
-                OUTPUT_VARIABLE TORCH_NPU_PATH
-                OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-    endif()
-    message(STATUS "Found PTA at: ${TORCH_NPU_PATH}")
-    find_library(PTA_LIBRARY torch_npu PATH "${TORCH_NPU_PATH}/lib")
-'''
-
-if old not in text:
-    if "DEFINED ENV{TORCH_NPU_PATH}" in text:
-        raise SystemExit(0)
-    raise SystemExit("target torch_npu lookup block not found")
-
-path.write_text(text.replace(old, new), encoding="utf-8")
-PY
-}
-
-# Install the KTransformers archive runtime.
-install_archive_runtime() {
-    if [ ! -f "${KTRANSFORMERS_RUNTIME_SRC}/install.sh" ]; then
-        log "Missing ktransformers archive install script: ${KTRANSFORMERS_RUNTIME_SRC}/install.sh"
-        exit 1
-    fi
-
-    local torch_npu_path
-    torch_npu_path="$(python3 - <<'PY'
-from pathlib import Path
-import site
-
-for site_dir in site.getsitepackages():
-    path = Path(site_dir) / "torch_npu"
-    if (path / "lib" / "libtorch_npu.so").is_file():
-        print(path)
-        break
-PY
-)"
-    if [ -z "$torch_npu_path" ]; then
-        log "Missing torch_npu library path"
-        exit 1
-    fi
-
-    rm -rf "${KTRANSFORMERS_RUNTIME_SRC}/csrc/balance_serve/build"
-
-    log "Installing ktransformers archive runtime: ${KTRANSFORMERS_RUNTIME_SRC}"
-    (
-        cd "$KTRANSFORMERS_RUNTIME_SRC"
-        env -u USE_NUMA \
-            TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-            TORCH_NPU_PATH="$torch_npu_path" \
-            USE_BALANCE_SERVE=1 \
-            KTRANSFORMERS_BUILD_NPU=1 \
-            KTRANSFORMERS_FORCE_BUILD=TRUE \
-            bash ./install.sh --dev npu
-    )
-}
-
-# Validate source layout, apply build patches, and install.
-main() {
-    source_ascend_env
-    check_torch_npu
-
-    prepare_archive_source
-    patch_arm82_llamafile
-    patch_archive_config
-    patch_archive_setup_npu_backend
-    patch_balance_serve_torch_npu_lookup
-    install_archive_runtime
-}
-
-main "$@"
-python3 "$(dirname -- "${BASH_SOURCE[0]}")/runtime.py"
+cd "$MARKOV_KT_ARCHIVE"
+env -u USE_NUMA USE_BALANCE_SERVE=1 KTRANSFORMERS_FORCE_BUILD=TRUE bash ./install.sh --dev npu
+python3 "$MARKOV_ADAPTER_ROOT/runtime.py"
