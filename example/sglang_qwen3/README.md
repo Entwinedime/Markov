@@ -1,4 +1,22 @@
-# SGLang + Qwen3-32B 全流程示例
+# SGLang + Qwen3-32B 示例
+
+## 先走执行结构
+
+```bash
+python3 example/sglang_qwen3/structure.py --model /models/Qwen3-32B --devices 4 --service-ns 1000 --image-prefix YOUR_PREFIX
+```
+
+该入口先增量构建 modeling 程序，再通过正式预测流程从空资产采集代表结构、生产模板和工作需求。随后在同一时间运行根的 `inputs/` 发布每个来源的给定耗时和模板资产声明，用公开恢复入口展开两配置 × 两请求集：并发上限 2/1，及同步两请求、错峰且生成长度不同的两请求。模板在组合间固定复用，逻辑 TP2 的主角色与普通角色由框架 adapter 在同一物理卡上顺序采集，共享 base 预算；已完成角色在恢复时保留。设备参数填写实际可见卡。
+
+`--service-ns` 必须显式指定。它给每个实际计费服务相同的纳秒数，包括 CPU、计算、通信、传输和命令；等待仍由因果依赖决定。**这些数值只用于执行结构的条件展开，没有真实性能意义，不是性能数据或精度证明。** 性能采样和独立目标验证关闭，不启动拟合；必要性能需求仍由正式流程保留。生成的 `inputs/structure-given-*.json` 记录假设与来源，`inputs/structure-template-assets.json` 是公开资产修订输入。正式结构与模板留在常规 `captures/` 和 `assets/`，先读 `results/summary.md`。
+
+```bash
+python3 example/sglang_qwen3/structure.py --resume data/YOUR_RUN --image-prefix YOUR_PREFIX
+```
+
+给定文件已发布后，恢复复用原假设和正式模板；终态重复恢复不新增采集或预测轮次。若首次采集返回前宿主退出，给定参数尚未持久化，恢复必须重新明确提供 `--service-ns`；采集的恢复、剩余额度与后处理仍由原流程负责。已发布后传入不同耗时会报错，需要新建任务或使用公开入口明确修订。缺少结构、资产无法加载、规则不支持或预算不足时如实保留未完成状态并返回非零，不用给定耗时掩盖结构问题。两角色共享的 base 累计预算为 1,000 秒，诊断默认关闭。
+
+## 含性能采样与独立对照的全流程
 
 从空模板和空成本资产开始，自动完成统一预热、代表采集、模板生产、CPU/设备性能需求与有界采样、预测、独立端口对照和结果汇总。主线为 Ascend TP2，比较并发上限 2/1 两配置；两个请求同时到达，每个输入 64 个显式 token、输出 2 个 token。
 
@@ -25,18 +43,22 @@ data/<开始时间>_sglang-qwen3-32b/
 ├── run.json
 ├── inputs/
 ├── captures/{base,performance,validation}/
-├── assets/{templates,costs,catalogs}/
+├── assets/{templates,costs}/
 ├── results/
 │   ├── prediction.json
-│   ├── comparison.json
+│   ├── requests.jsonl
+│   ├── comparison.json          # 实际比较后生成
+│   ├── comparison-requests.jsonl
+│   ├── sampling-plan.json       # 仅有未完成需求时保留摘要
 │   └── summary.md
-├── logs/
-└── work/                  # 未完成交接或失败时保留
+├── logs/<阶段>/
+├── work/<阶段>/<轮次>/          # 未消费的完整机器需求与配方
+└── diagnostics/<阶段>/<轮次>/   # output.diagnostics 开启时记录
 ```
 
-默认结果保留覆盖统计和成本缺口；完整已覆盖特征、来源明细和目标图由 `output.diagnostics` 控制。成功交接后清理可重建中间产物，释放已消费的原始导出和 journal，保留规范样本、校准/边界事实及轻量端口；诊断模式按需保留原始包。未完成的性能需求另保留 `results/sampling-plan.json`。模型权重、环境镜像与共享编译产物不复制到运行目录。
+默认报告保留指标、覆盖数量和少量缺口示例，摘要逐组合列出计时依据，区分给定耗时与候选/条件输入；逐请求指标独立保存，完整需求与采样配方在 `work/` 交接，不受诊断开关裁剪。`results/sampling-plan.json` 只提供待处理计划的摘要。即使给定耗时使条件执行完成，尚未解决的性能需求仍保留；消费确认后清理对应中间文件。`output.diagnostics` 额外控制目标图、原始导出和模块布局等验证信息。模型权重、环境镜像与共享编译产物不复制到运行目录。
 
-原生累计预算为 base 600 秒、performance 2400 秒、validation 两配置合计 600 秒且每配置最多 300 秒；包括初始化、统一预热、导出与失败尝试。离线提取/编译/拟合时间另计，因此这些预算不是总运行时长承诺。超限或没有新覆盖时停止，保留结果及原因；不会自动增加预算。运行开销和保留规模由当前执行的日志与产物报告，旧数值不作为当前承诺。需等待模型启动、采集和离线处理多个阶段。
+原生累计预算为 base 1,000 秒、performance 2400 秒、validation 两配置合计 600 秒且每配置最多 300 秒；包括全部角色的初始化、统一预热、导出与失败尝试。离线提取/编译/拟合时间另计，因此这些预算不是总运行时长承诺。超限或没有新覆盖时停止，保留结果及原因；不会自动增加预算。运行开销和保留规模由当前执行的日志与产物报告，旧数值不作为当前承诺。需等待模型启动、采集和离线处理多个阶段。
 
 ## 失败与继续
 
@@ -49,4 +71,4 @@ scripts/markov.sh status --run data/YOUR_RUN
 
 如需明确增加验证总预算，使用 `scripts/markov.sh resume --run data/YOUR_RUN --validation-budget-sec NEW_TOTAL`。进入独立验证后不接受模板或成本替换；改变模型、配置、请求或预测资产时新建探索。未完成返回非零退出码，完整运行即使误差很大也不伪报失败或自动调参。
 
-预测覆盖统一 serving 流程内的 CPU 服务、设备计算、通信、传输和必要命令。计时从统一预热后开始：逻辑 KV 清空，符合协议的编译缓存和 workspace 保留；模型加载、初始化、首次编译、预热及 HTTP/tokenization 不计入预测。独立对照从原生请求就绪到所有 rank 发布完成，并另报驱动器到达偏移。验证数据不参与模板或拟合；此短示例不证明任意请求、TP、backend 或模型均可泛化。
+预测覆盖统一 serving 流程内的 CPU 服务、设备计算、通信、传输和必要命令。计时从统一预热后开始：逻辑 KV 清空，符合协议的编译缓存和 workspace 保留；模型加载、初始化、首次编译、预热及 HTTP/tokenization 不计入预测。独立对照从原生请求就绪到实际输出角色的 Published，全部 rank 的观察覆盖与入口偏移单独核对。验证数据不参与模板或拟合；此短示例不证明任意请求、TP、backend 或模型均可泛化。

@@ -16,7 +16,7 @@
   ],
   "request_workloads": [{"id": "short-requests", "path": "requests.json"}],
   "collection": {
-    "base": {"allow_run": true, "max_wall_time_sec": 600},
+    "base": {"allow_run": true, "max_wall_time_sec": 1000},
     "performance": {"allow_run": true, "max_wall_time_sec": 2400}
   },
   "assets": {"templates": [], "performance_manifests": [], "cost_models": []},
