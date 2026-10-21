@@ -13,7 +13,7 @@ modeling 使用 Ubuntu 24.04、GCC 13、C++23、CMake≥3.20、Ninja、nlohmann-
 
 正式目标为 `markov_core`、`markov_adapters`、`markov_workflow` 和 `markov`，没有独立测试 target。公开脚本固定 Compose project `markov-next-redesign`；镜像前缀通过 `MARKOV_IMAGE_PREFIX` 指定。
 
-框架镜像、模型权重及可用设备须事先准备。Dockerfile 组合 `src/collection/adapters` 内的安装适配；官方子模块不保存采集业务修改。框架/环境版本以 gitlink、实际镜像与 manifest 为准，不用历史镜像名称推定兼容。
+真实采集前须准备框架镜像、模型权重及可用设备；已保存模型配置与固定镜像身份的离线预测只需 modeling 环境及声明资产。Dockerfile 组合 `src/collection/adapters` 内的安装适配；官方子模块不保存采集业务修改。框架/环境版本以 gitlink、实际镜像与 manifest 为准，不用历史镜像名称推定兼容。
 
 Ascend 同步传输观察要求 torch_npu 队列头文件与原生库成套编译，入口为 `markov_native_queue_begin(correlation_id, worker)`。只替换 preload 不会重编镜像内 torch_npu；依据 `markov_workspace_build.json` 核对组合，不猜测 ABI 或保留旧入口。
 
@@ -47,7 +47,7 @@ scripts/markov.sh resume --run data/YOUR_RUN
 
 `plan` 只解析和规划，不采集、不加载编译模板。`predict` 读取显式资产，按项目开关和累计预算组织必要采集。空资产禁采时返回缺口，不存在默认成本或隐式历史目录。
 
-新任务在输出位置下建立 UTC 时间加任务名的运行根，恢复沿用同一根。终端 JSON 是状态与指标摘要；完整需求和逐请求数据读取 `run.json` 所指的 `results/prediction.json`，不能把终端重定向结果当完整报告传给采样准备。
+新任务在输出位置下建立 UTC 时间加任务名的运行根，恢复沿用同一根。终端 JSON 是状态与指标摘要；逐请求数据与机器交接以 `run.json` 登记的正式产物为准。采样准备必须接收预测流程交付的完整工作需求，不能把终端重定向的摘要当作完整输入。
 
 全流程示例：
 
@@ -82,7 +82,7 @@ scripts/markov.sh sample --project path/to/project.json --configuration CONFIG_I
 scripts/markov.sh sample --project path/to/project.json --configuration CONFIG_ID --kind communication --repetitions 3
 ```
 
-transfer/device 要求显式非空请求域；CPU 由 predict/explore 的共同需求计划提供区间与目标特征，不开放缺少这些合同的手工 CPU 入口。准备性能计划读取完整预测报告，不从终端摘要或图文件猜测需求。
+transfer/device 要求显式非空请求域；CPU 由 predict/explore 的共同需求计划提供区间与目标特征，不开放缺少这些合同的手工 CPU 入口。准备性能计划读取正式交接的完整工作需求，不从摘要或图文件猜测需求。
 
 SGLang 经原生 Engine 执行短请求，复用统一预热和 idle 清理；原生 scheduler 管理状态。实际成员、特征、槽位和各 rank 工作决定覆盖，客户端批量提交不能保证命中。
 
@@ -94,11 +94,11 @@ SGLang 经原生 Engine 执行短请求，复用统一预热和 idle 清理；�
 | `collective_measurements.json.gz` | 独立通信的物理 task 样本，不用父包络计费 |
 
 ```bash
-scripts/markov.sh fit-costs --performance-manifest path/to/performance_manifest.json --unit all > candidate-model.json
-scripts/markov.sh evaluate-costs --model-candidate candidate-model.json --performance-manifest path/to/held-out-performance-manifest.json
+scripts/markov.sh fit-costs --performance-manifest path/to/performance_manifest.json --unit kernel > kernel-candidate.json
+scripts/markov.sh evaluate-costs --model-candidate kernel-candidate.json --performance-manifest path/to/held-out-performance-manifest.json
 ```
 
-unit 支持 `all|kernel|communication|transfer|command|cpu`，默认 all。拟合消费角色明确的独立样本；固定评价只读候选与独立留出，不回写或补采。重新压缩同一份数据不产生独立样本。
+unit 支持 `all|kernel|communication|transfer|command|cpu`，默认 all。指定单个 unit 时输出一份候选；all 输出包含 `candidates` 数组的集合，不能直接作为单个模型交给 evaluate-costs 或 resume。自动流程会将有效候选分别发布到 `assets/costs/`。拟合消费角色明确的独立样本；固定评价只读候选与独立留出，不回写或补采。重新压缩同一份数据不产生独立样本。
 
 标准化成功且资产交接后可释放原始导出与已消费 journal，保留规范样本、校准/覆盖事实和来源。`raw_exports=released` 时不能宣称从 raw 重放；结构重建使用保留 facts，诊断模式才额外保留原始包。
 
@@ -107,11 +107,13 @@ unit 支持 `all|kernel|communication|transfer|command|cpu`，默认 all。拟�
 ```bash
 scripts/markov.sh resume --run data/YOUR_RUN --template-assets template-assets.json
 scripts/markov.sh resume --run data/YOUR_RUN --performance-manifest path/to/performance_manifest.json
-scripts/markov.sh resume --run data/YOUR_RUN --cost-model candidate-model.json
+scripts/markov.sh resume --run data/YOUR_RUN --cost-model kernel-candidate.json
 scripts/markov.sh resume --run data/YOUR_RUN --base-budget-sec NEW_TOTAL --performance-budget-sec NEW_TOTAL
 ```
 
-模板列表文件是完整 JSON 数组，项为 manifest 及可选 node_durations，路径相对列表文件。性能 manifest 和成本选项可重复，分别替换对应完整列表。新增资产从初态重算全部组合；活跃预测/拟合期间不接受修订，终态无修订恢复不新增轮次。
+模板列表文件是完整 JSON 数组，项为 manifest 及可选 node_durations，路径相对列表文件。性能 manifest 和成本选项可重复，分别替换对应完整列表。新增资产从初态重算全部组合；活跃预测、拟合或未交接的结构比较期间不接受修订，终态无修订恢复不新增轮次。
+
+结构比较由命名 modeling 容器写入正式处理收据。宿主中断后先用 status 确认原任务，再用 resume 接回；活动期间不另启动比较，传入不同 validation manifest 须先完成当前交接。比较结果发布并确认消费后才释放其终态容器和临时收据，进程日志不承担业务数据恢复。
 
 原生 completed 与处理 succeeded 分开。确定的后处理失败由登记工作目录中的 `processing_failure.json` 表达；修正原因后可在 modeling 容器显式重处理保留捕获：
 
